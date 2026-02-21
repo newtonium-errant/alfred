@@ -21,11 +21,11 @@ def _init_state(config: JanitorConfig) -> JanitorState:
     return state
 
 
-def cmd_scan(config: JanitorConfig, base_dir: Path, structural_only: bool = False) -> None:
+def cmd_scan(config: JanitorConfig, skills_dir: Path, structural_only: bool = False) -> None:
     """Run Phase 1 scan, print issue report, no fixes."""
     state = _init_state(config)
     result = asyncio.run(run_sweep(
-        config, state, base_dir,
+        config, state, skills_dir,
         structural_only=True,  # scan never invokes agent
         fix_mode=False,
     ))
@@ -44,11 +44,11 @@ def cmd_scan(config: JanitorConfig, base_dir: Path, structural_only: bool = Fals
     print(build_issue_report(result.issues))
 
 
-def cmd_fix(config: JanitorConfig, base_dir: Path, structural_only: bool = False) -> None:
+def cmd_fix(config: JanitorConfig, skills_dir: Path, structural_only: bool = False) -> None:
     """Run scan + invoke agent to fix issues."""
     state = _init_state(config)
     result = asyncio.run(run_sweep(
-        config, state, base_dir,
+        config, state, skills_dir,
         structural_only=structural_only,
         fix_mode=True,
     ))
@@ -66,11 +66,11 @@ def cmd_fix(config: JanitorConfig, base_dir: Path, structural_only: bool = False
             print(f"  {sev}: {count}")
 
 
-def cmd_watch(config: JanitorConfig, base_dir: Path) -> None:
+def cmd_watch(config: JanitorConfig, skills_dir: Path) -> None:
     """Daemon mode — sweep on interval."""
     state = _init_state(config)
     try:
-        asyncio.run(run_watch(config, state, base_dir))
+        asyncio.run(run_watch(config, state, skills_dir))
     except KeyboardInterrupt:
         log.info("daemon.interrupted")
         print("\nStopped.")

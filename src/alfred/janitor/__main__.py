@@ -67,18 +67,18 @@ def main() -> None:
     config = load_config(args.config)
     setup_logging(config.logging.level, config.logging.file)
 
-    # Resolve base_dir (where skills/ lives) relative to config file
-    base_dir = Path(args.config).resolve().parent
+    from alfred._data import get_skills_dir
+    skills_dir = get_skills_dir()
 
     # Import CLI commands here to avoid circular imports
     from .cli import cmd_scan, cmd_fix, cmd_watch, cmd_status, cmd_history, cmd_ignore
 
     if args.command == "scan":
-        cmd_scan(config, base_dir, structural_only=getattr(args, "structural_only", False))
+        cmd_scan(config, skills_dir, structural_only=getattr(args, "structural_only", False))
     elif args.command == "fix":
-        cmd_fix(config, base_dir, structural_only=getattr(args, "structural_only", False))
+        cmd_fix(config, skills_dir, structural_only=getattr(args, "structural_only", False))
     elif args.command == "watch":
-        cmd_watch(config, base_dir)
+        cmd_watch(config, skills_dir)
     elif args.command == "status":
         cmd_status(config)
     elif args.command == "history":

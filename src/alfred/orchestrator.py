@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-def _run_curator(raw: dict[str, Any], base_dir: str) -> None:
+def _run_curator(raw: dict[str, Any], skills_dir: str) -> None:
     """Curator daemon process entry point."""
     from alfred.curator.config import load_from_unified
     from alfred.curator.utils import setup_logging
@@ -20,10 +20,10 @@ def _run_curator(raw: dict[str, Any], base_dir: str) -> None:
     log_cfg = raw.get("logging", {})
     setup_logging(level=log_cfg.get("level", "INFO"), log_file=f"{log_cfg.get('dir', './data')}/curator.log")
     from alfred.curator.daemon import run
-    asyncio.run(run(config, Path(base_dir)))
+    asyncio.run(run(config, Path(skills_dir)))
 
 
-def _run_janitor(raw: dict[str, Any], base_dir: str) -> None:
+def _run_janitor(raw: dict[str, Any], skills_dir: str) -> None:
     """Janitor watch daemon process entry point."""
     from alfred.janitor.config import load_from_unified
     from alfred.janitor.utils import setup_logging
@@ -34,10 +34,10 @@ def _run_janitor(raw: dict[str, Any], base_dir: str) -> None:
     from alfred.janitor.daemon import run_watch
     state = JanitorState(config.state.path, config.state.max_sweep_history)
     state.load()
-    asyncio.run(run_watch(config, state, Path(base_dir)))
+    asyncio.run(run_watch(config, state, Path(skills_dir)))
 
 
-def _run_distiller(raw: dict[str, Any], base_dir: str) -> None:
+def _run_distiller(raw: dict[str, Any], skills_dir: str) -> None:
     """Distiller watch daemon process entry point."""
     from alfred.distiller.config import load_from_unified
     from alfred.distiller.utils import setup_logging
@@ -48,7 +48,7 @@ def _run_distiller(raw: dict[str, Any], base_dir: str) -> None:
     from alfred.distiller.daemon import run_watch
     state = DistillerState(config.state.path, config.state.max_run_history)
     state.load()
-    asyncio.run(run_watch(config, state, Path(base_dir)))
+    asyncio.run(run_watch(config, state, Path(skills_dir)))
 
 
 _MISSING_DEPS_EXIT = 78  # exit code signaling missing optional dependencies
@@ -62,7 +62,7 @@ def _run_surveyor(raw: dict[str, Any]) -> None:
         from alfred.surveyor.daemon import Daemon
     except ImportError as e:
         print(f"  [surveyor] ERROR: missing dependencies: {e}")
-        print(f"  [surveyor] Install with: pip install -e '.[all]'")
+        print(f"  [surveyor] Install with: pip install alfred-vault[all]")
         sys.exit(_MISSING_DEPS_EXIT)
 
     config = load_from_unified(raw)
@@ -83,14 +83,15 @@ TOOL_RUNNERS = {
 def run_all(
     raw: dict[str, Any],
     only: str | None = None,
-    base_dir: Path | None = None,
+    skills_dir: Path | None = None,
     pid_path: Path | None = None,
 ) -> None:
     """Start selected daemons as child processes with auto-restart."""
-    if base_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent.parent
+    if skills_dir is None:
+        from alfred._data import get_skills_dir
+        skills_dir = get_skills_dir()
 
-    base_dir_str = str(base_dir)
+    skills_dir_str = str(skills_dir)
 
     # Write PID file so ``alfred down`` can find us
     if pid_path is not None:
@@ -123,7 +124,7 @@ def run_all(
         if tool == "surveyor":
             p = multiprocessing.Process(target=runner, args=(raw,), name=f"alfred-{tool}")
         else:
-            p = multiprocessing.Process(target=runner, args=(raw, base_dir_str), name=f"alfred-{tool}")
+            p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str), name=f"alfred-{tool}")
         p.daemon = True
         p.start()
         print(f"  [{tool}] started (pid {p.pid})")

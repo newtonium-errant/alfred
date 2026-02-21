@@ -21,12 +21,6 @@ def _load_unified_config(config_path: str) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def _get_base_dir() -> Path:
-    """Return the monorepo root (where skills/ and scaffold/ live)."""
-    # Walk up from this file: src/alfred/cli.py -> src/alfred -> src -> alfred/
-    return Path(__file__).resolve().parent.parent.parent
-
-
 def _setup_logging_from_config(raw: dict[str, Any]) -> None:
     """Set up logging from the unified config's logging section."""
     log_cfg = raw.get("logging", {})
@@ -64,7 +58,8 @@ def cmd_up(args: argparse.Namespace) -> None:
         # Run in foreground (current behavior) — used by --foreground and --_internal-foreground
         _setup_logging_from_config(raw)
         from alfred.orchestrator import run_all
-        run_all(raw, only=args.only, base_dir=_get_base_dir(), pid_path=pid_path)
+        from alfred._data import get_skills_dir
+        run_all(raw, only=args.only, skills_dir=get_skills_dir(), pid_path=pid_path)
     else:
         # Daemon mode: re-exec as detached background process
         from alfred.daemon import spawn_daemon
@@ -172,8 +167,9 @@ def cmd_curator(args: argparse.Namespace) -> None:
     from alfred.curator.config import load_from_unified
     config = load_from_unified(raw)
     from alfred.curator.daemon import run
+    from alfred._data import get_skills_dir
     try:
-        asyncio.run(run(config, _get_base_dir()))
+        asyncio.run(run(config, get_skills_dir()))
     except KeyboardInterrupt:
         print("\nStopped.")
 
@@ -183,17 +179,18 @@ def cmd_janitor(args: argparse.Namespace) -> None:
     _setup_logging_from_config(raw)
     from alfred.janitor.config import load_from_unified
     config = load_from_unified(raw)
-    base_dir = _get_base_dir()
+    from alfred._data import get_skills_dir
+    skills_dir = get_skills_dir()
 
     from alfred.janitor import cli as jcli
     subcmd = args.janitor_cmd
 
     if subcmd == "scan":
-        jcli.cmd_scan(config, base_dir)
+        jcli.cmd_scan(config, skills_dir)
     elif subcmd == "fix":
-        jcli.cmd_fix(config, base_dir)
+        jcli.cmd_fix(config, skills_dir)
     elif subcmd == "watch":
-        jcli.cmd_watch(config, base_dir)
+        jcli.cmd_watch(config, skills_dir)
     elif subcmd == "status":
         jcli.cmd_status(config)
     elif subcmd == "history":
@@ -210,17 +207,18 @@ def cmd_distiller(args: argparse.Namespace) -> None:
     _setup_logging_from_config(raw)
     from alfred.distiller.config import load_from_unified
     config = load_from_unified(raw)
-    base_dir = _get_base_dir()
+    from alfred._data import get_skills_dir
+    skills_dir = get_skills_dir()
 
     from alfred.distiller import cli as dcli
     subcmd = args.distiller_cmd
 
     if subcmd == "scan":
-        dcli.cmd_scan(config, base_dir, project=args.project)
+        dcli.cmd_scan(config, skills_dir, project=args.project)
     elif subcmd == "run":
-        dcli.cmd_run(config, base_dir, project=args.project)
+        dcli.cmd_run(config, skills_dir, project=args.project)
     elif subcmd == "watch":
-        dcli.cmd_watch(config, base_dir)
+        dcli.cmd_watch(config, skills_dir)
     elif subcmd == "status":
         dcli.cmd_status(config)
     elif subcmd == "history":
@@ -318,7 +316,7 @@ def cmd_surveyor(args: argparse.Namespace) -> None:
         from alfred.surveyor.daemon import Daemon
     except ImportError as e:
         print(f"Surveyor dependencies not installed: {e}")
-        print("Install with: pip install -e '.[all]'")
+        print("Install with: pip install alfred-vault[all]")
         sys.exit(1)
 
     config = load_from_unified(raw)

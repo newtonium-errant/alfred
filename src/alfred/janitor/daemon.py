@@ -25,16 +25,16 @@ from .utils import file_hash, get_logger
 log = get_logger(__name__)
 
 
-def _load_skill(base_dir: Path) -> str:
+def _load_skill(skills_dir: Path) -> str:
     """Load SKILL.md and all reference templates into a single text block."""
-    skill_path = base_dir / "skills" / "vault-janitor" / "SKILL.md"
+    skill_path = skills_dir / "vault-janitor" / "SKILL.md"
     if not skill_path.exists():
         log.warning("daemon.skill_not_found", path=str(skill_path))
         return ""
 
     parts: list[str] = [skill_path.read_text(encoding="utf-8")]
 
-    refs_dir = base_dir / "skills" / "vault-janitor" / "references"
+    refs_dir = skills_dir / "vault-janitor" / "references"
     if refs_dir.is_dir():
         for ref_file in sorted(refs_dir.glob("*.md")):
             content = ref_file.read_text(encoding="utf-8")
@@ -123,7 +123,7 @@ def _build_affected_records(
 async def run_sweep(
     config: JanitorConfig,
     state: JanitorState,
-    base_dir: Path,
+    skills_dir: Path,
     structural_only: bool = False,
     fix_mode: bool = False,
 ) -> SweepResult:
@@ -155,7 +155,7 @@ async def run_sweep(
 
     # Phase 2: Agent fix (only if fix_mode and not structural_only)
     if fix_mode and not structural_only:
-        skill_text = _load_skill(base_dir)
+        skill_text = _load_skill(skills_dir)
         if not skill_text:
             log.warning("sweep.no_skill", msg="No SKILL.md found — skipping agent fix")
         else:
@@ -265,7 +265,7 @@ async def run_sweep(
 async def run_watch(
     config: JanitorConfig,
     state: JanitorState,
-    base_dir: Path,
+    skills_dir: Path,
 ) -> None:
     """Daemon mode — sweep on interval until interrupted."""
     interval = config.sweep.interval_seconds
@@ -287,10 +287,10 @@ async def run_watch(
         if hours_since_deep >= deep_interval_hours:
             # Deep sweep with agent
             log.info("daemon.deep_sweep")
-            await run_sweep(config, state, base_dir, structural_only=False, fix_mode=True)
+            await run_sweep(config, state, skills_dir, structural_only=False, fix_mode=True)
             last_deep = now
         else:
             # Structural-only sweep
-            await run_sweep(config, state, base_dir, structural_only=True, fix_mode=False)
+            await run_sweep(config, state, skills_dir, structural_only=True, fix_mode=False)
 
         await asyncio.sleep(interval)

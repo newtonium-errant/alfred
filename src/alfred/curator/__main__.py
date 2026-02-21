@@ -14,7 +14,6 @@ from .utils import setup_logging, get_logger
 
 def main() -> None:
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
-    base_dir = Path(config_path).resolve().parent
 
     config = load_config(config_path)
     setup_logging(level=config.logging.level, log_file=config.logging.file)
@@ -35,7 +34,8 @@ def main() -> None:
             loop.add_signal_handler(sig, _shutdown, sig)
 
     try:
-        loop.run_until_complete(run(config, base_dir))
+        from alfred._data import get_skills_dir
+        loop.run_until_complete(run(config, get_skills_dir()))
     except KeyboardInterrupt:
         log.info("curator.interrupted")
     except asyncio.CancelledError:

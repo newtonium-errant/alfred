@@ -3,9 +3,11 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "alfred"
+name = "alfred-vault"
 version = "0.1.0"
-description = "Alfred — unified vault operations suite"
+description = "AI-powered background services for Obsidian vault maintenance"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "pyyaml>=6.0",
@@ -24,7 +26,17 @@ surveyor = [
     "numpy>=1.26",
     "openai>=1.30",
 ]
-all = ["alfred[surveyor]"]
+all = ["alfred-vault[surveyor]"]
+
+[project.urls]
+Homepage = "https://github.com/ssdavidai/alfred"
+Repository = "https://github.com/ssdavidai/alfred"
 
 [project.scripts]
 alfred = "alfred.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alfred"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/alfred/", "README.md", "LICENSE"]

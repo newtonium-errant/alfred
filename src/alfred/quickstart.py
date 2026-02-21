@@ -12,8 +12,9 @@ import yaml
 
 
 def _get_scaffold_dir() -> Path:
-    """Return path to scaffold/ in the monorepo."""
-    return Path(__file__).resolve().parent.parent.parent / "scaffold"
+    """Return path to bundled scaffold/."""
+    from alfred._data import get_scaffold_dir
+    return get_scaffold_dir()
 
 
 ENTITY_DIRS = [
@@ -118,16 +119,15 @@ def run_quickstart() -> None:
         # Install surveyor dependencies
         print("\n  Installing surveyor dependencies...")
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-e", ".[all]"],
+            [sys.executable, "-m", "pip", "install", "alfred-vault[all]"],
             capture_output=True, text=True,
-            cwd=str(Path(__file__).resolve().parent.parent.parent),
         )
         if result.returncode == 0:
             print("  [OK] Surveyor dependencies installed")
         else:
             print("  [!!] Failed to install surveyor dependencies:")
             print(f"       {result.stderr.strip()[:200]}")
-            print("       Run manually: pip install -e '.[all]'")
+            print("       Run manually: pip install alfred-vault[all]")
 
         if _check_ollama():
             print("  [OK] Ollama is running")
@@ -272,7 +272,7 @@ def run_quickstart() -> None:
     print(f"    2. Run `alfred up` to start all daemons")
     print(f"    3. Or run individual tools: `alfred janitor scan`")
     if not enable_surveyor:
-        print(f"    4. To enable surveyor later: pip install -e '.[all]'")
+        print(f"    4. To enable surveyor later: pip install alfred-vault[all]")
 
     # Auto-launch prompt
     start_now = _prompt("\nStart daemons now?", "n").lower() in ("y", "yes")

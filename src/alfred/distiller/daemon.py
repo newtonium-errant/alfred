@@ -35,16 +35,16 @@ from .utils import get_logger
 log = get_logger(__name__)
 
 
-def _load_skill(base_dir: Path) -> str:
+def _load_skill(skills_dir: Path) -> str:
     """Load SKILL.md and all reference templates into a single text block."""
-    skill_path = base_dir / "skills" / "vault-distiller" / "SKILL.md"
+    skill_path = skills_dir / "vault-distiller" / "SKILL.md"
     if not skill_path.exists():
         log.warning("daemon.skill_not_found", path=str(skill_path))
         return ""
 
     parts: list[str] = [skill_path.read_text(encoding="utf-8")]
 
-    refs_dir = base_dir / "skills" / "vault-distiller" / "references"
+    refs_dir = skills_dir / "vault-distiller" / "references"
     if refs_dir.is_dir():
         for ref_file in sorted(refs_dir.glob("*.md")):
             content = ref_file.read_text(encoding="utf-8")
@@ -163,7 +163,7 @@ def _build_batches(
 async def run_extraction(
     config: DistillerConfig,
     state: DistillerState,
-    base_dir: Path,
+    skills_dir: Path,
     project_filter: str | None = None,
 ) -> RunResult:
     """Run a complete extraction: Phase 1 scan + Phase 2 agent extraction."""
@@ -197,7 +197,7 @@ async def run_extraction(
         return result
 
     # Phase 2: Build batches and invoke agent
-    skill_text = _load_skill(base_dir)
+    skill_text = _load_skill(skills_dir)
     if not skill_text:
         log.warning("extraction.no_skill", msg="No SKILL.md found — skipping agent")
         state.add_run(result)
@@ -321,7 +321,7 @@ async def run_extraction(
 async def run_watch(
     config: DistillerConfig,
     state: DistillerState,
-    base_dir: Path,
+    skills_dir: Path,
 ) -> None:
     """Daemon mode — extract on interval until interrupted."""
     interval = config.extraction.interval_seconds
@@ -341,7 +341,7 @@ async def run_watch(
 
         if hours_since_deep >= deep_interval_hours:
             log.info("daemon.deep_extraction")
-            await run_extraction(config, state, base_dir)
+            await run_extraction(config, state, skills_dir)
             last_deep = now
         else:
             # Light pass — just scan, no agent invocation

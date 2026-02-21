@@ -28,9 +28,9 @@ from .writer import diff_vault, mark_processed, snapshot_vault
 log = get_logger(__name__)
 
 
-def _load_skill(base_dir: Path) -> str:
+def _load_skill(skills_dir: Path) -> str:
     """Load SKILL.md and all reference templates into a single text block."""
-    skill_path = base_dir / "skills" / "vault-curator" / "SKILL.md"
+    skill_path = skills_dir / "vault-curator" / "SKILL.md"
     if not skill_path.exists():
         log.warning("daemon.skill_not_found", path=str(skill_path))
         return ""
@@ -38,7 +38,7 @@ def _load_skill(base_dir: Path) -> str:
     parts: list[str] = [skill_path.read_text(encoding="utf-8")]
 
     # Inline all reference templates so the agent has the full schema
-    refs_dir = base_dir / "skills" / "vault-curator" / "references"
+    refs_dir = skills_dir / "vault-curator" / "references"
     if refs_dir.is_dir():
         for ref_file in sorted(refs_dir.glob("*.md")):
             content = ref_file.read_text(encoding="utf-8")
@@ -158,12 +158,12 @@ async def _process_file(
     )
 
 
-async def run(config: CuratorConfig, base_dir: Path) -> None:
+async def run(config: CuratorConfig, skills_dir: Path) -> None:
     """Main daemon entry point."""
     log.info("daemon.starting", backend=config.agent.backend)
 
     # Load skill text
-    skill_text = _load_skill(base_dir)
+    skill_text = _load_skill(skills_dir)
     if not skill_text:
         log.warning("daemon.no_skill", msg="Running without SKILL.md — agent may not produce correct output")
 

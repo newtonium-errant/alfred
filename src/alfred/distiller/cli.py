@@ -20,7 +20,7 @@ def _init_state(config: DistillerConfig) -> DistillerState:
     return state
 
 
-def cmd_scan(config: DistillerConfig, base_dir: Path, project: str | None = None) -> None:
+def cmd_scan(config: DistillerConfig, skills_dir: Path, project: str | None = None) -> None:
     """Phase 1 only: identify candidates, print report. No agent invocation."""
     state = _init_state(config)
 
@@ -75,10 +75,10 @@ def cmd_scan(config: DistillerConfig, base_dir: Path, project: str | None = None
         print()
 
 
-def cmd_run(config: DistillerConfig, base_dir: Path, project: str | None = None) -> None:
+def cmd_run(config: DistillerConfig, skills_dir: Path, project: str | None = None) -> None:
     """Full pipeline: scan + invoke agent to extract learnings."""
     state = _init_state(config)
-    result = asyncio.run(run_extraction(config, state, base_dir, project_filter=project))
+    result = asyncio.run(run_extraction(config, state, skills_dir, project_filter=project))
 
     print(f"\n=== Extraction Run {result.run_id} — {result.timestamp} ===")
     print(f"Candidates found: {result.candidates_found}")
@@ -94,11 +94,11 @@ def cmd_run(config: DistillerConfig, base_dir: Path, project: str | None = None)
         print("\nNo records created.")
 
 
-def cmd_watch(config: DistillerConfig, base_dir: Path) -> None:
+def cmd_watch(config: DistillerConfig, skills_dir: Path) -> None:
     """Daemon mode — extract on interval."""
     state = _init_state(config)
     try:
-        asyncio.run(run_watch(config, state, base_dir))
+        asyncio.run(run_watch(config, state, skills_dir))
     except KeyboardInterrupt:
         log.info("daemon.interrupted")
         print("\nStopped.")
