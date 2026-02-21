@@ -46,9 +46,45 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
 
 def cmd_up(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
-    _setup_logging_from_config(raw)
-    from alfred.orchestrator import run_all
-    run_all(raw, only=args.only, base_dir=_get_base_dir())
+    log_cfg = raw.get("logging", {})
+    log_dir = log_cfg.get("dir", "./data")
+    pid_path = Path(log_dir) / "alfred.pid"
+
+    # Check if already running
+    from alfred.daemon import check_already_running
+    existing = check_already_running(pid_path)
+    if existing:
+        print(f"Alfred is already running (pid {existing}).")
+        print("Use `alfred down` to stop it first.")
+        sys.exit(1)
+
+    foreground = getattr(args, "_internal_foreground", False) or getattr(args, "foreground", False)
+
+    if foreground:
+        # Run in foreground (current behavior) — used by --foreground and --_internal-foreground
+        _setup_logging_from_config(raw)
+        from alfred.orchestrator import run_all
+        run_all(raw, only=args.only, base_dir=_get_base_dir(), pid_path=pid_path)
+    else:
+        # Daemon mode: re-exec as detached background process
+        from alfred.daemon import spawn_daemon
+        log_file = f"{log_dir}/alfred.log"
+        pid = spawn_daemon(config_path=args.config, only=args.only, log_file=log_file)
+        print(f"Alfred started (pid {pid}). Logs: {log_file}")
+        print("Stop with: alfred down")
+
+
+def cmd_down(args: argparse.Namespace) -> None:
+    raw = _load_unified_config(args.config)
+    log_cfg = raw.get("logging", {})
+    log_dir = log_cfg.get("dir", "./data")
+    pid_path = Path(log_dir) / "alfred.pid"
+
+    from alfred.daemon import stop_daemon
+    if stop_daemon(pid_path):
+        print("Alfred stopped.")
+    else:
+        print("Alfred is not running.")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -57,6 +93,17 @@ def cmd_status(args: argparse.Namespace) -> None:
     print("=" * 60)
     print("ALFRED STATUS")
     print("=" * 60)
+
+    # Daemon status
+    log_cfg = raw.get("logging", {})
+    log_dir = log_cfg.get("dir", "./data")
+    pid_path = Path(log_dir) / "alfred.pid"
+    from alfred.daemon import check_already_running
+    running_pid = check_already_running(pid_path)
+    if running_pid:
+        print(f"Daemon: running (pid {running_pid})")
+    else:
+        print("Daemon: not running")
 
     # Curator status
     print("\n--- Curator ---")
@@ -183,6 +230,85 @@ def cmd_distiller(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_vault(args: argparse.Namespace) -> None:
+    from alfred.vault.cli import handle_vault_command
+    handle_vault_command(args)
+
+
+def cmd_exec(args: argparse.Namespace) -> None:
+    """Run a command with vault env vars set up automatically."""
+    import os
+    import subprocess
+
+    from alfred.vault.mutation_log import (
+        append_to_audit_log,
+        cleanup_session_file,
+        create_session_file,
+        read_mutations,
+    )
+    from alfred.vault.scope import SCOPE_RULES
+
+    raw = _load_unified_config(args.config)
+    vault_cfg = raw.get("vault", {})
+    vault_path = str(Path(vault_cfg.get("path", "./vault")).resolve())
+
+    scope = args.scope
+    if scope and scope not in SCOPE_RULES:
+        print(f"Unknown scope: '{scope}'. Valid: {', '.join(sorted(SCOPE_RULES))}")
+        sys.exit(1)
+
+    session_file = create_session_file()
+
+    env = {
+        **os.environ,
+        "ALFRED_VAULT_PATH": vault_path,
+        "ALFRED_VAULT_SESSION": session_file,
+    }
+    if scope:
+        env["ALFRED_VAULT_SCOPE"] = scope
+
+    command = args.exec_command
+    # Strip leading '--' separator if present
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        print("No command provided. Usage: alfred exec [--scope SCOPE] -- <command...>")
+        cleanup_session_file(session_file)
+        sys.exit(1)
+
+    try:
+        result = subprocess.run(command, env=env)
+    except FileNotFoundError:
+        print(f"Command not found: {command[0]}")
+        cleanup_session_file(session_file)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        result = None
+
+    # Report mutations
+    mutations = read_mutations(session_file)
+    total = sum(len(v) for v in mutations.values())
+
+    # Audit log
+    if total > 0:
+        log_cfg = raw.get("logging", {})
+        audit_path = Path(log_cfg.get("dir", "./data")) / "vault_audit.log"
+        append_to_audit_log(str(audit_path), "exec", mutations, detail=" ".join(command))
+
+    if total > 0:
+        print(f"\n--- Vault mutations ({total}) ---")
+        for path in mutations["files_created"]:
+            print(f"  + {path}")
+        for path in mutations["files_modified"]:
+            print(f"  ~ {path}")
+        for path in mutations["files_deleted"]:
+            print(f"  - {path}")
+
+    cleanup_session_file(session_file)
+    sys.exit(result.returncode if result else 1)
+
+
 def cmd_surveyor(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw)
@@ -220,11 +346,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("quickstart", help="Interactive setup wizard")
 
     # up
-    up_parser = sub.add_parser("up", help="Start all daemons")
+    up_parser = sub.add_parser("up", help="Start all daemons (background by default)")
     up_parser.add_argument(
         "--only", type=str, default=None,
         help="Comma-separated list of tools to start (e.g. curator,janitor)",
     )
+    up_parser.add_argument(
+        "--foreground", action="store_true", default=False,
+        help="Stay attached to the terminal (for development/debugging)",
+    )
+    up_parser.add_argument(
+        "--_internal-foreground", dest="_internal_foreground",
+        action="store_true", default=False,
+        help=argparse.SUPPRESS,
+    )
+
+    # down
+    sub.add_parser("down", help="Stop the background daemon")
 
     # status
     sub.add_parser("status", help="Show status from all tools")
@@ -257,6 +395,24 @@ def build_parser() -> argparse.ArgumentParser:
     dist_hist = dist_sub.add_parser("history", help="Show run history")
     dist_hist.add_argument("--limit", type=int, default=10)
 
+    # vault
+    from alfred.vault.cli import build_vault_parser
+    build_vault_parser(sub)
+
+    # exec
+    exec_parser = sub.add_parser(
+        "exec",
+        help="Run a command with vault env vars (ALFRED_VAULT_PATH, etc.)",
+    )
+    exec_parser.add_argument(
+        "--scope", default=None,
+        help="Agent scope: curator, janitor, distiller (default: unrestricted)",
+    )
+    exec_parser.add_argument(
+        "exec_command", nargs=argparse.REMAINDER,
+        help="Command to run (use -- before the command)",
+    )
+
     # surveyor
     sub.add_parser("surveyor", help="Start surveyor pipeline")
 
@@ -274,10 +430,13 @@ def main() -> None:
     handlers = {
         "quickstart": cmd_quickstart,
         "up": cmd_up,
+        "down": cmd_down,
         "status": cmd_status,
         "curator": cmd_curator,
         "janitor": cmd_janitor,
         "distiller": cmd_distiller,
+        "vault": cmd_vault,
+        "exec": cmd_exec,
         "surveyor": cmd_surveyor,
     }
 

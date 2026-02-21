@@ -18,6 +18,32 @@ class BackendResult:
     files_changed: list[str] = field(default_factory=list)
 
 
+VAULT_CLI_REFERENCE = """
+## Vault CLI Reference
+
+Use `alfred vault` commands via Bash. Never access the filesystem directly.
+All commands output JSON to stdout.
+
+```bash
+# Read a record
+alfred vault read "conversation/Thread.md"
+
+# Search by glob or grep
+alfred vault search --glob "decision/*.md"
+alfred vault search --grep "Eagle Farm"
+
+# List all records of a type
+alfred vault list assumption
+
+# Create a learning record
+alfred vault create assumption "Timber Pricing Stable" --set status=active --set confidence=medium --set 'project=["[[project/Eagle Farm]]"]'
+
+# Create with body from stdin
+echo "# Insight Title\n\n## Claim\n..." | alfred vault create assumption "Title" --set status=active --body-stdin
+```
+"""
+
+
 def build_extraction_prompt(
     skill_text: str,
     vault_path: str,
@@ -33,12 +59,11 @@ def build_extraction_prompt(
 
 ---
 
-## Vault Location
+## Vault Access
 
-The vault is at: `{vault_path}`
+Use `alfred vault` commands. Never access the filesystem directly.
 
-All file paths are relative to this root. When creating files, use absolute paths
-(e.g. `{vault_path}/decision/Decision Title.md`).
+{VAULT_CLI_REFERENCE}
 
 ---
 
@@ -69,7 +94,7 @@ Read these source records. Extract any latent:
 - **Contradictions** — conflicting information between records
 - **Synthesis** — patterns emerging across multiple records
 
-For each learning found, create the appropriate record file in the vault.
+For each learning found, create the appropriate record file using `alfred vault create`.
 Link back to source records via `based_on`, `cluster_sources`, `source`, etc.
 
 When done, output a structured summary:

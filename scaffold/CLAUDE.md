@@ -14,7 +14,7 @@ There are no build steps, tests, or linting commands. The vault is edited direct
 
 Every file is a **record** with a `type` frontmatter property. The core types are: `project`, `task`, `session`, `conversation`, `input`, `person`, `org`, `location`, `note`, `decision`, `process`, `run`, `event`.
 
-The **Learn system** adds 5 epistemic types: `assumption`, `constraint`, `contradiction`, `decision` (v2 via learn-decision template), `synthesis`. These live in `learn/{type}/` subdirectories and track beliefs, limits, conflicts, choices, and synthesized insights with confidence levels and evidence chains.
+The **Learn system** adds 5 epistemic types: `assumption`, `constraint`, `contradiction`, `decision` (v2 via learn-decision template), `synthesis`. Each has its own top-level directory (e.g. `assumption/`, `decision/`). They track beliefs, limits, conflicts, choices, and synthesized insights with confidence levels and evidence chains.
 
 **Resource types** `account` and `asset` track financial/service accounts and software/hardware/licenses. They integrate into person, org, and project views.
 
@@ -32,10 +32,9 @@ Each type has a **template** in `_templates/` defining its frontmatter schema an
 
 - `_templates/` — Record type templates (one per type)
 - `_bases/` — Base view definitions (`.base` files with YAML filters/sorts)
-- `_docs/` — Architecture documentation
 - `view/` — Views (Home, CRM, Task Manager) combining base views + Alfred dynamic sections
-- `project/`, `person/`, `org/`, `location/`, `conversation/`, `process/`, `account/`, `asset/` — Standing entity records by type
-- `learn/` — Epistemic records: `assumption/`, `constraint/`, `contradiction/`, `decision/`, `synthesis/`
+- `project/`, `task/`, `person/`, `org/`, `location/`, `conversation/`, `process/`, `account/`, `asset/`, `event/`, `note/`, `run/`, `input/`, `session/`, `thread/` — Entity records by type
+- `assumption/`, `constraint/`, `contradiction/`, `decision/`, `synthesis/` — Epistemic (learn) records
 - `YYYY/MM/DD/` — Date-organized temporal content:
   - `inbox/` — Inbound items (emails, voice memos)
   - `{person}/HHMM_{slug}/` — Human session folders (session.md + tasks, notes, decisions)

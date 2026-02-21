@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import os
 import signal
 import sys
 import time
@@ -83,12 +84,18 @@ def run_all(
     raw: dict[str, Any],
     only: str | None = None,
     base_dir: Path | None = None,
+    pid_path: Path | None = None,
 ) -> None:
     """Start selected daemons as child processes with auto-restart."""
     if base_dir is None:
         base_dir = Path(__file__).resolve().parent.parent.parent
 
     base_dir_str = str(base_dir)
+
+    # Write PID file so ``alfred down`` can find us
+    if pid_path is not None:
+        from alfred.daemon import write_pid
+        write_pid(pid_path, os.getpid())
 
     # Determine which tools to run
     if only:
@@ -127,11 +134,20 @@ def run_all(
         processes[tool] = start_process(tool)
         restart_counts[tool] = 0
 
+    # Sentinel file path — ``alfred down`` creates this to signal shutdown
+    sentinel_path = pid_path.parent / "alfred.stop" if pid_path else None
+
     # Monitor loop
     try:
         while True:
             time.sleep(5)
-            for tool in tools:
+
+            # Check for shutdown sentinel
+            if sentinel_path and sentinel_path.exists():
+                print("Shutdown sentinel detected, stopping...")
+                break
+
+            for tool in list(tools):
                 p = processes[tool]
                 if not p.is_alive():
                     exit_code = p.exitcode
@@ -147,11 +163,23 @@ def run_all(
                         print(f"  [{tool}] exceeded restart limit, giving up")
     except KeyboardInterrupt:
         print("\nShutting down...")
-        for tool, p in processes.items():
+
+    # Terminate child processes
+    for tool, p in processes.items():
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=5)
             if p.is_alive():
-                p.terminate()
-                p.join(timeout=5)
-                if p.is_alive():
-                    p.kill()
-                print(f"  [{tool}] stopped")
-        print("All daemons stopped.")
+                p.kill()
+            print(f"  [{tool}] stopped")
+    print("All daemons stopped.")
+
+    # Clean up PID file and sentinel
+    if pid_path:
+        from alfred.daemon import remove_pid
+        remove_pid(pid_path)
+    if sentinel_path:
+        try:
+            sentinel_path.unlink(missing_ok=True)
+        except OSError:
+            pass

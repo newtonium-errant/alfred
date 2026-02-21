@@ -8,6 +8,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
+
 from .backends import (
     BaseBackend,
     BackendResult,
@@ -203,6 +205,7 @@ async def run_extraction(
         return result
 
     backend = _create_backend(config)
+    use_mutation_log = isinstance(backend, (ClaudeBackend, OpenClawBackend))
     batches = _build_batches(config, candidates, vault_path)
     result.batches = len(batches)
 
@@ -218,8 +221,16 @@ async def run_extraction(
             source_records_formatted=format_source_records(batch.source_records),
         )
 
-        # Snapshot before
-        before = snapshot_vault(vault_path, config.vault.ignore_dirs)
+        session_path = None
+        if use_mutation_log:
+            session_path = create_session_file()
+            backend.env_overrides = {
+                "ALFRED_VAULT_PATH": str(vault_path),
+                "ALFRED_VAULT_SCOPE": "distiller",
+                "ALFRED_VAULT_SESSION": session_path,
+            }
+        else:
+            before = snapshot_vault(vault_path, config.vault.ignore_dirs)
 
         log.info(
             "extraction.agent_invoke",
@@ -234,9 +245,21 @@ async def run_extraction(
             vault_path=str(vault_path),
         )
 
-        # Snapshot after and diff
-        after = snapshot_vault(vault_path, config.vault.ignore_dirs)
-        created, modified, deleted = diff_vault(before, after)
+        # Determine what changed
+        if use_mutation_log and session_path:
+            mutations = read_mutations(session_path)
+            created = mutations["files_created"]
+            modified = mutations["files_modified"]
+            deleted = mutations["files_deleted"]
+            cleanup_session_file(session_path)
+        else:
+            after = snapshot_vault(vault_path, config.vault.ignore_dirs)
+            created, modified, deleted = diff_vault(before, after)
+
+        # Audit log
+        audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
+        audit_path = str(Path(config.state.path).parent / "vault_audit.log")
+        append_to_audit_log(audit_path, "distiller", audit_mutations, detail=run_id)
 
         result.candidates_processed += len(batch.source_records)
 

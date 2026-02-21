@@ -21,7 +21,7 @@ ENTITY_DIRS = [
     "inbox", "inbox/processed",
     "account", "asset", "conversation", "note",
     "decision", "assumption", "constraint", "contradiction", "synthesis",
-    "event", "dashboard", "view",
+    "event", "task", "session", "run", "input", "thread", "view",
 ]
 
 
@@ -273,3 +273,13 @@ def run_quickstart() -> None:
     print(f"    3. Or run individual tools: `alfred janitor scan`")
     if not enable_surveyor:
         print(f"    4. To enable surveyor later: pip install -e '.[all]'")
+
+    # Auto-launch prompt
+    start_now = _prompt("\nStart daemons now?", "n").lower() in ("y", "yes")
+    if start_now:
+        from alfred.daemon import spawn_daemon
+        log_dir = config.get("logging", {}).get("dir", "./data")
+        log_file = f"{log_dir}/alfred.log"
+        pid = spawn_daemon(config_path="config.yaml", only=None, log_file=log_file)
+        print(f"\n  Alfred started (pid {pid}). Logs: {log_file}")
+        print("  Stop with: alfred down")

@@ -22,6 +22,46 @@ class BackendResult:
     files_changed: list[str] = field(default_factory=list)
 
 
+VAULT_CLI_REFERENCE = """
+## Vault CLI Reference
+
+Use `alfred vault` commands via Bash. Never access the filesystem directly.
+All commands output JSON to stdout.
+
+```bash
+# Read a record
+alfred vault read "person/John Smith.md"
+
+# Search by glob or grep
+alfred vault search --glob "person/*.md"
+alfred vault search --grep "Eagle Farm"
+
+# List all records of a type
+alfred vault list person
+
+# Get compact vault summary
+alfred vault context
+
+# Create a record
+alfred vault create person "John Smith" --set status=active --set 'org="[[org/Acme]]"'
+
+# Create with body from stdin
+echo "# John Smith" | alfred vault create person "John Smith" --set status=active --body-stdin
+
+# Edit a record
+alfred vault edit "person/John Smith.md" --set status=inactive
+alfred vault edit "conversation/Thread.md" --append 'participants="[[person/Jane]]"'
+alfred vault edit "note/My Note.md" --body-append "New paragraph content"
+
+# Move a record
+alfred vault move "inbox/raw.md" "inbox/processed/raw.md"
+
+# Delete a record
+alfred vault delete "note/garbage.md"
+```
+"""
+
+
 def build_prompt(
     inbox_content: str,
     skill_text: str,
@@ -31,18 +71,17 @@ def build_prompt(
 ) -> str:
     """Assemble the full prompt sent to any backend.
 
-    The agent has direct filesystem access to the vault.
+    The agent uses ``alfred vault`` CLI commands via Bash.
     """
     return f"""{skill_text}
 
 ---
 
-## Vault Location
+## Vault Access
 
-The vault is at: `{vault_path}`
+Use `alfred vault` commands. Never access the filesystem directly.
 
-All file paths are relative to this root. When creating files, use absolute paths
-(e.g. `{vault_path}/person/John Smith.md`).
+{VAULT_CLI_REFERENCE}
 
 ---
 
@@ -55,7 +94,11 @@ All file paths are relative to this root. When creating files, use absolute path
 ## Inbox File to Process
 
 **Filename:** {inbox_filename}
-**Full path:** `{vault_path}/inbox/{inbox_filename}`
+
+To read its contents:
+```bash
+alfred vault read "inbox/{inbox_filename}"
+```
 
 ```
 {inbox_content}
@@ -63,7 +106,7 @@ All file paths are relative to this root. When creating files, use absolute path
 
 ---
 
-Process this inbox file now. Read existing vault records as needed, then create/update the appropriate records directly in the vault. When done, output a brief summary of what you created or modified."""
+Process this inbox file now. Search existing vault records as needed, then create/update the appropriate records using `alfred vault` commands. When done, output a brief summary of what you created or modified."""
 
 
 class BaseBackend(ABC):

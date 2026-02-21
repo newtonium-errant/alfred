@@ -44,9 +44,7 @@ class ClaudeBackendConfig:
     command: str = "claude"
     args: list[str] = field(default_factory=lambda: ["-p"])
     timeout: int = 600
-    allowed_tools: list[str] = field(default_factory=lambda: [
-        "Read", "Write", "Edit", "Glob", "Grep", "Bash",
-    ])
+    allowed_tools: list[str] = field(default_factory=lambda: ["Bash"])
 
 
 @dataclass

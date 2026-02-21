@@ -19,6 +19,33 @@ class BackendResult:
     files_changed: list[str] = field(default_factory=list)
 
 
+VAULT_CLI_REFERENCE = """
+## Vault CLI Reference
+
+Use `alfred vault` commands via Bash. Never access the filesystem directly.
+All commands output JSON to stdout.
+
+```bash
+# Read a record
+alfred vault read "person/John Smith.md"
+
+# Search by glob or grep
+alfred vault search --glob "person/*.md"
+alfred vault search --grep "Eagle Farm"
+
+# List all records of a type
+alfred vault list person
+
+# Edit a record (set or append frontmatter fields)
+alfred vault edit "person/John Smith.md" --set status=inactive
+alfred vault edit "task/My Task.md" --set 'janitor_note="FM001 — needs review"'
+
+# Delete a record (garbage only)
+alfred vault delete "note/garbage.md"
+```
+"""
+
+
 def build_sweep_prompt(
     skill_text: str,
     issue_report: str,
@@ -30,12 +57,11 @@ def build_sweep_prompt(
 
 ---
 
-## Vault Location
+## Vault Access
 
-The vault is at: `{vault_path}`
+Use `alfred vault` commands. Never access the filesystem directly.
 
-All file paths are relative to this root. When modifying files, use absolute paths
-(e.g. `{vault_path}/person/John Smith.md`).
+{VAULT_CLI_REFERENCE}
 
 ---
 
@@ -55,9 +81,10 @@ flag what requires human judgment.
 ---
 
 Fix the issues listed above. For each file:
-1. Read the file
-2. Apply the appropriate fix
+1. Read the file using `alfred vault read "<path>"`
+2. Apply the appropriate fix using `alfred vault edit "<path>" --set field=value`
 3. If the fix requires human judgment, add a `janitor_note` frontmatter field instead
+4. If the file is garbage, use `alfred vault delete "<path>"`
 
 When done, output a structured summary:
 - FIXED: count

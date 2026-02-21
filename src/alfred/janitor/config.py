@@ -44,9 +44,7 @@ class ClaudeBackendConfig:
     command: str = "claude"
     args: list[str] = field(default_factory=lambda: ["-p"])
     timeout: int = 600
-    allowed_tools: list[str] = field(default_factory=lambda: [
-        "Read", "Write", "Edit", "Glob", "Grep", "Bash",
-    ])
+    allowed_tools: list[str] = field(default_factory=lambda: ["Bash"])
 
 
 @dataclass
@@ -81,7 +79,7 @@ class SweepConfig:
     deep_sweep_interval_hours: int = 24
     structural_only: bool = False
     stub_body_threshold_chars: int = 50
-    orphan_exempt_dirs: list[str] = field(default_factory=lambda: ["dashboard", "view"])
+    orphan_exempt_dirs: list[str] = field(default_factory=lambda: ["view"])
     max_files_per_agent_call: int = 30
     fix_log_in_vault: bool = True
 

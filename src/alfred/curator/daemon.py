@@ -1,14 +1,18 @@
 """Main daemon loop — orchestrates the full inbox processing pipeline.
 
-Architecture: agent-writes-directly. The agent (Claude Code, Zo, OpenClaw) has
-full vault access and creates/modifies files directly. Curator orchestrates:
-detect inbox → snapshot vault → invoke agent → diff vault → mark processed → track state.
+Architecture: agent-writes-via-CLI. The agent uses ``alfred vault`` commands
+(via Bash tool) to create/modify vault files. Curator orchestrates:
+detect inbox → create session → invoke agent → read mutation log → mark processed → track state.
+
+For non-CLI backends (Zo HTTP), falls back to snapshot/diff.
 """
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+
+from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
 
 from .backends import BaseBackend
 from .backends.cli import ClaudeBackend
@@ -44,7 +48,7 @@ def _load_skill(base_dir: Path) -> str:
 
 
 def _create_backend(config: CuratorConfig) -> BaseBackend:
-    """Instantiate the configured backend."""
+    """Instantiate the configured backend with vault env vars for CLI backends."""
     backend_name = config.agent.backend
     if backend_name == "claude":
         return ClaudeBackend(config.agent.claude)
@@ -54,6 +58,11 @@ def _create_backend(config: CuratorConfig) -> BaseBackend:
         return OpenClawBackend(config.agent.openclaw)
     else:
         raise ValueError(f"Unknown backend: {backend_name}")
+
+
+def _is_cli_backend(backend: BaseBackend) -> bool:
+    """Check if backend supports env-var-based vault access (CLI backends)."""
+    return isinstance(backend, (ClaudeBackend, OpenClawBackend))
 
 
 async def _process_file(
@@ -81,21 +90,45 @@ async def _process_file(
     )
     context_text = vault_context.to_prompt_text()
 
-    # Snapshot vault before agent runs
-    before = snapshot_vault(config.vault.vault_path, ignore_dirs=config.vault.ignore_dirs)
+    vault_path_str = str(config.vault.vault_path)
+    use_mutation_log = _is_cli_backend(backend)
+    session_path = None
 
-    # Invoke agent — it writes files directly
+    if use_mutation_log:
+        # Create session file and set env vars on the backend
+        session_path = create_session_file()
+        backend.env_overrides = {
+            "ALFRED_VAULT_PATH": vault_path_str,
+            "ALFRED_VAULT_SCOPE": "curator",
+            "ALFRED_VAULT_SESSION": session_path,
+        }
+    else:
+        # Fallback: snapshot vault before agent runs
+        before = snapshot_vault(config.vault.vault_path, ignore_dirs=config.vault.ignore_dirs)
+
+    # Invoke agent
     result = await backend.process(
         inbox_content=inbox_content,
         skill_text=skill_text,
         vault_context=context_text,
         inbox_filename=filename,
-        vault_path=str(config.vault.vault_path),
+        vault_path=vault_path_str,
     )
 
-    # Snapshot vault after agent runs and diff
-    after = snapshot_vault(config.vault.vault_path, ignore_dirs=config.vault.ignore_dirs)
-    files_created, files_modified = diff_vault(before, after)
+    # Determine what changed
+    if use_mutation_log and session_path:
+        mutations = read_mutations(session_path)
+        files_created = mutations["files_created"]
+        files_modified = mutations["files_modified"]
+        cleanup_session_file(session_path)
+    else:
+        after = snapshot_vault(config.vault.vault_path, ignore_dirs=config.vault.ignore_dirs)
+        files_created, files_modified = diff_vault(before, after)
+        mutations = {"files_created": files_created, "files_modified": files_modified, "files_deleted": []}
+
+    # Audit log
+    audit_path = str(Path(config.state.path).parent / "vault_audit.log")
+    append_to_audit_log(audit_path, "curator", mutations, detail=filename)
 
     if not result.success:
         log.error("daemon.agent_failed", file=filename, summary=result.summary[:500])

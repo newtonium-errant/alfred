@@ -8,6 +8,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
+
 from .backends import BaseBackend, BackendResult, build_issue_report
 from .backends.cli import ClaudeBackend
 from .backends.http import ZoBackend
@@ -159,6 +161,7 @@ async def run_sweep(
         else:
             backend = _create_backend(config)
             vault_path = config.vault.vault_path
+            use_mutation_log = isinstance(backend, (ClaudeBackend, OpenClawBackend))
 
             # Batch issues if too many
             max_per_call = config.sweep.max_files_per_agent_call
@@ -171,8 +174,16 @@ async def run_sweep(
                 issue_report = build_issue_report(batch_issues)
                 affected_records = _build_affected_records(batch_issues, vault_path)
 
-                # Snapshot before
-                before = snapshot_vault(vault_path, config.vault.ignore_dirs)
+                session_path = None
+                if use_mutation_log:
+                    session_path = create_session_file()
+                    backend.env_overrides = {
+                        "ALFRED_VAULT_PATH": str(vault_path),
+                        "ALFRED_VAULT_SCOPE": "janitor",
+                        "ALFRED_VAULT_SESSION": session_path,
+                    }
+                else:
+                    before = snapshot_vault(vault_path, config.vault.ignore_dirs)
 
                 # Invoke agent
                 log.info(
@@ -188,9 +199,21 @@ async def run_sweep(
                     vault_path=str(vault_path),
                 )
 
-                # Snapshot after and diff
-                after = snapshot_vault(vault_path, config.vault.ignore_dirs)
-                created, modified, deleted = diff_vault(before, after)
+                # Determine what changed
+                if use_mutation_log and session_path:
+                    mutations = read_mutations(session_path)
+                    created = mutations["files_created"]
+                    modified = mutations["files_modified"]
+                    deleted = mutations["files_deleted"]
+                    cleanup_session_file(session_path)
+                else:
+                    after = snapshot_vault(vault_path, config.vault.ignore_dirs)
+                    created, modified, deleted = diff_vault(before, after)
+
+                # Audit log
+                audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
+                audit_path = str(Path(config.state.path).parent / "vault_audit.log")
+                append_to_audit_log(audit_path, "janitor", audit_mutations, detail=sweep_id)
 
                 result.files_fixed += len(modified) + len(created)
                 result.files_deleted += len(deleted)

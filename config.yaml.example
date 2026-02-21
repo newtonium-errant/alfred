@@ -9,7 +9,7 @@ agent:
     command: "claude"
     args: ["-p"]
     timeout: 600
-    allowed_tools: ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+    allowed_tools: ["Bash"]
   zo:
     url: "https://api.zo.computer/zo/ask"
     method: "POST"
@@ -44,7 +44,7 @@ janitor:
     deep_sweep_interval_hours: 24
     structural_only: false
     stub_body_threshold_chars: 50
-    orphan_exempt_dirs: ["dashboard", "view"]
+    orphan_exempt_dirs: ["view"]
     max_files_per_agent_call: 30
     fix_log_in_vault: true
   state:

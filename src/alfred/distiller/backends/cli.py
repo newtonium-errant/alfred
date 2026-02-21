@@ -1,8 +1,9 @@
-"""Claude Code backend — runs claude -p with full vault access."""
+"""Claude Code backend — runs claude -p with vault access via alfred vault CLI."""
 
 from __future__ import annotations
 
 import asyncio
+import os
 
 from ..config import ClaudeBackendConfig
 from ..utils import get_logger
@@ -12,8 +13,9 @@ log = get_logger(__name__)
 
 
 class ClaudeBackend(BaseBackend):
-    def __init__(self, config: ClaudeBackendConfig) -> None:
+    def __init__(self, config: ClaudeBackendConfig, env_overrides: dict[str, str] | None = None) -> None:
         self.config = config
+        self.env_overrides = env_overrides or {}
 
     async def process(
         self,
@@ -22,15 +24,15 @@ class ClaudeBackend(BaseBackend):
     ) -> BackendResult:
         cmd = [self.config.command, *self.config.args]
 
-        # Give Claude full vault access
-        cmd.extend(["--add-dir", vault_path])
-
-        # Restrict to safe tools
+        # Restrict to Bash-only (agent uses alfred vault commands)
         if self.config.allowed_tools:
             cmd.extend(["--allowedTools", ",".join(self.config.allowed_tools)])
 
         # Prompt is the last argument
         cmd.append(prompt)
+
+        # Build environment with vault env vars
+        env = {**os.environ, **self.env_overrides}
 
         log.info(
             "claude.dispatching",
@@ -44,6 +46,7 @@ class ClaudeBackend(BaseBackend):
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
