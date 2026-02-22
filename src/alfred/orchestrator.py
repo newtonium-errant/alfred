@@ -69,7 +69,7 @@ def _run_surveyor(raw: dict[str, Any]) -> None:
     log_cfg = raw.get("logging", {})
     setup_logging(level=log_cfg.get("level", "INFO"), log_file=f"{log_cfg.get('dir', './data')}/surveyor.log")
     daemon = Daemon(config)
-    daemon.run()
+    asyncio.run(daemon.run())
 
 
 TOOL_RUNNERS = {

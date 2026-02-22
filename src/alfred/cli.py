@@ -319,10 +319,11 @@ def cmd_surveyor(args: argparse.Namespace) -> None:
         print("Install with: pip install alfred-vault[all]")
         sys.exit(1)
 
+    import asyncio
     config = load_from_unified(raw)
     daemon = Daemon(config)
     try:
-        daemon.run()
+        asyncio.run(daemon.run())
     except KeyboardInterrupt:
         print("\nStopped.")
 
