@@ -65,10 +65,15 @@ class Embedder:
             schema=schema,
         )
         # Create index for vector search
+        index_params = self.milvus.prepare_index_params()
+        index_params.add_index(
+            field_name="embedding",
+            index_type="FLAT",
+            metric_type="COSINE",
+        )
         self.milvus.create_index(
             collection_name=self.collection_name,
-            field_name="embedding",
-            index_params={"index_type": "FLAT", "metric_type": "COSINE"},
+            index_params=index_params,
         )
         log.info("embedder.collection_created", name=self.collection_name)
 
