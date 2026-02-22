@@ -1,4 +1,4 @@
-"""Watch inbox/ for new markdown files with debounce."""
+"""Watch inbox/ for new files with debounce."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ log = get_logger(__name__)
 
 
 class InboxHandler(FileSystemEventHandler):
-    """Collect .md file events from inbox/ with debounce."""
+    """Collect file events from inbox/ with debounce."""
 
     def __init__(self, debounce_seconds: float = 10.0) -> None:
         super().__init__()
@@ -34,9 +34,7 @@ class InboxHandler(FileSystemEventHandler):
 
     def _handle(self, src_path: str) -> None:
         path = Path(src_path)
-        # Only .md files, not in processed/
-        if path.suffix.lower() != ".md":
-            return
+        # Skip processed/ subdirectory
         if "processed" in path.parts:
             return
         with self._lock:
@@ -84,11 +82,13 @@ class InboxWatcher:
         return self.handler.collect_ready()
 
     def full_scan(self, state_processed: set[str] | None = None) -> list[Path]:
-        """Scan inbox for unprocessed .md files (startup catch-up)."""
+        """Scan inbox for unprocessed files (startup catch-up)."""
         state_processed = state_processed or set()
         unprocessed: list[Path] = []
 
-        for md_file in self.inbox_path.glob("*.md"):
+        for md_file in self.inbox_path.iterdir():
+            if not md_file.is_file():
+                continue
             if md_file.name in state_processed:
                 continue
             # Check frontmatter status
