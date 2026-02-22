@@ -70,6 +70,16 @@ alfred up --only curator,janitor       # start specific tools
 alfred down                            # stop daemons
 alfred status                          # per-tool status overview
 
+# Batch processing
+alfred process                         # batch-process all inbox files (Rich TUI)
+alfred process -j 8                    # 8 parallel workers (default: 4)
+alfred process -n 10                   # process only 10 files
+alfred process --dry-run               # show what would be processed
+
+# Bulk import
+alfred ingest conversations.json       # split ChatGPT/Anthropic export into inbox files
+alfred ingest export.json --dry-run    # preview without writing
+
 # Run tools individually
 alfred curator                         # curator daemon (foreground)
 alfred janitor scan                    # structural scan, print report
