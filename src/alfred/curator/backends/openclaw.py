@@ -3,14 +3,46 @@
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import os
+import shutil
 import uuid
+from pathlib import Path
 
 from ..config import OpenClawBackendConfig
 from ..utils import get_logger
 from . import BackendResult, BaseBackend, build_prompt
 
 log = get_logger(__name__)
+
+
+def _clear_agent_sessions(agent_id: str) -> None:
+    """Remove all session files for an agent so each invocation starts fresh.
+
+    OpenClaw ties each agent to a single session file.  Concurrent or
+    back-to-back invocations will deadlock on the session lock unless we
+    wipe the session state between runs.
+    """
+    sessions_dir = Path.home() / ".openclaw" / "agents" / agent_id / "sessions"
+    if not sessions_dir.exists():
+        return
+    for f in sessions_dir.iterdir():
+        try:
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def sync_workspace_claude_md(agent_id: str, vault_path: str) -> None:
+    """Copy the vault's CLAUDE.md into the agent's workspace so OpenClaw
+    injects it into the system prompt (vault architecture / ontology reference).
+    """
+    workspace = Path.home() / ".openclaw" / "agents" / agent_id / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    src = Path(vault_path) / "CLAUDE.md"
+    dst = workspace / "CLAUDE.md"
+    if src.exists():
+        shutil.copy2(src, dst)
 
 
 class OpenClawBackend(BaseBackend):
@@ -36,16 +68,19 @@ class OpenClawBackend(BaseBackend):
                "--session-id", session_id,
                "--message", prompt, "--local", "--json"]
 
-        cwd = self.config.workspace_mount or vault_path
-
         log.info(
             "openclaw.dispatching",
             command=self.config.command,
             agent_id=self.config.agent_id,
             session_id=session_id,
-            cwd=cwd,
             timeout=self.config.timeout,
         )
+
+        # Clear previous session state to avoid lock contention.
+        _clear_agent_sessions(self.config.agent_id)
+
+        # Ensure workspace has latest vault CLAUDE.md for ontology context.
+        sync_workspace_claude_md(self.config.agent_id, vault_path)
 
         try:
             env = {**os.environ, **self.env_overrides}
@@ -53,7 +88,6 @@ class OpenClawBackend(BaseBackend):
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
                 env=env,
             )
             stdout, stderr = await asyncio.wait_for(

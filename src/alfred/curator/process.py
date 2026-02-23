@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -251,6 +252,45 @@ async def _process_one(
     live.update(tui.render())
 
 
+def _cleanup_stale_openclaw_locks() -> int:
+    """Remove stale .lock files from OpenClaw session dirs where the holding PID is dead."""
+    import json as _json
+
+    cleaned = 0
+    sessions_root = Path.home() / ".openclaw" / "agents"
+    if not sessions_root.exists():
+        return 0
+    for lock_file in sessions_root.rglob("*.lock"):
+        try:
+            content = lock_file.read_text().strip()
+            # Lock files are JSON: {"pid": 12345, "createdAt": "..."}
+            pid = None
+            try:
+                data = _json.loads(content)
+                pid = data.get("pid")
+            except (_json.JSONDecodeError, AttributeError):
+                # Fallback: try plain text "pid=NNNN" or bare number
+                pid_str = content.split("=")[-1].strip() if "=" in content else content
+                if pid_str.isdigit():
+                    pid = int(pid_str)
+
+            if pid is not None:
+                try:
+                    os.kill(pid, 0)  # Check if process exists
+                except OSError:
+                    lock_file.unlink(missing_ok=True)
+                    cleaned += 1
+            else:
+                # Can't determine PID — remove if file is old (> 5 min)
+                age = time.time() - lock_file.stat().st_mtime
+                if age > 300:
+                    lock_file.unlink(missing_ok=True)
+                    cleaned += 1
+        except Exception:
+            pass
+    return cleaned
+
+
 async def run_batch(
     config: CuratorConfig,
     skills_dir: Path,
@@ -264,6 +304,20 @@ async def run_batch(
     from .watcher import InboxWatcher
 
     console = Console()
+
+    # Clean up stale OpenClaw session locks from previous runs
+    cleaned = _cleanup_stale_openclaw_locks()
+    if cleaned:
+        console.print(f"Cleaned up {cleaned} stale OpenClaw session lock(s).")
+
+    # OpenClaw ties each agent to a single session file, so concurrent
+    # invocations of the same agent deadlock.  Force serial processing.
+    if config.agent.backend == "openclaw" and concurrency > 1:
+        console.print(
+            "[yellow]OpenClaw backend: forcing concurrency=1 "
+            "(agent sessions cannot run in parallel)[/yellow]"
+        )
+        concurrency = 1
 
     # Load skill
     skill_text = _load_skill(skills_dir)

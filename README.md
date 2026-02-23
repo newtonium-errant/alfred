@@ -36,7 +36,7 @@ alfred down     # stop everything
 
 ## The Four Tools
 
-**Curator** watches your `inbox/` folder. When a new file appears (email, voice memo transcript, raw notes), curator reads it, invokes the AI agent with full vault context, and the agent creates structured records — conversations, people, tasks, whatever the content calls for.
+**Curator** watches your `inbox/` folder. When a new file appears (email, voice memo transcript, raw notes), curator processes it through a 4-stage pipeline: (1) an LLM analyzes the content and creates a rich note, (2) pure-Python entity resolution deduplicates and creates people, orgs, projects, and other entities, (3) interlinking wires up wikilinks between the note and all entities, and (4) a per-entity LLM pass enriches each record with substantive body content and filled frontmatter. The result is a dense, well-connected graph — not stubs.
 
 **Janitor** periodically scans every file in your vault for structural problems: broken wikilinks, missing or invalid frontmatter fields, orphaned files with no connections, stub records with no real content. It reports what it finds, and in fix mode, hands the issues to the AI agent to repair.
 
