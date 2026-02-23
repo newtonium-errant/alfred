@@ -1,4 +1,11 @@
-"""Extraction orchestrator — two-phase scan + agent extraction pipeline."""
+"""Extraction orchestrator — two-phase scan + agent extraction pipeline.
+
+For OpenClaw backends, uses a multi-stage pipeline (pipeline.py):
+  Pass A: EXTRACT (LLM per-source) → DEDUP (Python) → CREATE (LLM per-learning)
+  Pass B: Cross-learning meta-analysis (contradictions, syntheses across records)
+
+For other backends, falls back to the legacy single-LLM-call approach.
+"""
 
 from __future__ import annotations
 
@@ -29,10 +36,16 @@ from .candidates import (
 )
 from .config import DistillerConfig
 from .parser import parse_file
+from .pipeline import run_meta_analysis, run_pipeline
 from .state import DistillerState, ExtractionLogEntry, RunResult
 from .utils import get_logger
 
 log = get_logger(__name__)
+
+
+def _use_pipeline(config: DistillerConfig) -> bool:
+    """Check if the multi-stage pipeline should be used (OpenClaw backend only)."""
+    return config.agent.backend == "openclaw"
 
 
 def _load_skill(skills_dir: Path) -> str:
@@ -196,114 +209,196 @@ async def run_extraction(
         state.save()
         return result
 
-    # Phase 2: Build batches and invoke agent
-    skill_text = _load_skill(skills_dir)
-    if not skill_text:
-        log.warning("extraction.no_skill", msg="No SKILL.md found — skipping agent")
-        state.add_run(result)
-        state.save()
-        return result
-
-    backend = _create_backend(config)
-    use_mutation_log = isinstance(backend, (ClaudeBackend, OpenClawBackend))
+    # Phase 2: Build batches and extract
     batches = _build_batches(config, candidates, vault_path)
     result.batches = len(batches)
 
-    for batch in batches:
-        project_desc = _get_project_description(vault_path, batch.project)
+    if _use_pipeline(config):
+        # Multi-stage pipeline for OpenClaw backend
+        session_path = create_session_file()
+        any_created = False
 
-        prompt = build_extraction_prompt(
-            skill_text=skill_text,
-            vault_path=str(vault_path),
-            project_name=batch.project,
-            project_description=project_desc,
-            existing_learns_formatted=format_existing_learns(batch.existing_learns),
-            source_records_formatted=format_source_records(batch.source_records),
-        )
+        for batch in batches:
+            log.info(
+                "extraction.pipeline_invoke",
+                run_id=run_id,
+                project=batch.project or "(ungrouped)",
+                sources=len(batch.source_records),
+            )
 
-        session_path = None
-        if use_mutation_log:
-            session_path = create_session_file()
-            backend.env_overrides = {
-                "ALFRED_VAULT_PATH": str(vault_path),
-                "ALFRED_VAULT_SCOPE": "distiller",
-                "ALFRED_VAULT_SESSION": session_path,
-            }
-        else:
-            before = snapshot_vault(vault_path, config.vault.ignore_dirs)
+            pipeline_result = await run_pipeline(
+                batch=batch,
+                config=config,
+                session_path=session_path,
+            )
 
-        log.info(
-            "extraction.agent_invoke",
-            run_id=run_id,
-            project=batch.project or "(ungrouped)",
-            sources=len(batch.source_records),
-        )
+            result.candidates_processed += pipeline_result.candidates_processed
 
-        # Invoke agent
-        agent_result = await backend.process(
-            prompt=prompt,
-            vault_path=str(vault_path),
-        )
+            # Merge records_created counts
+            for lt, count in pipeline_result.records_created.items():
+                result.records_created[lt] = (
+                    result.records_created.get(lt, 0) + count
+                )
+                any_created = True
 
-        # Determine what changed
-        if use_mutation_log and session_path:
+            # Update source file states
             mutations = read_mutations(session_path)
             created = mutations["files_created"]
-            modified = mutations["files_modified"]
-            deleted = mutations["files_deleted"]
-            cleanup_session_file(session_path)
-        else:
-            after = snapshot_vault(vault_path, config.vault.ignore_dirs)
-            created, modified, deleted = diff_vault(before, after)
+            source_paths = [sc.record.rel_path for sc in batch.source_records]
 
-        # Audit log
-        audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
+            for f in created:
+                learn_type = "unknown"
+                for lt in config.extraction.learn_types:
+                    if f.startswith(f"{lt}/"):
+                        learn_type = lt
+                        break
+
+                state.add_log_entry(
+                    ExtractionLogEntry(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        run_id=run_id,
+                        action="created",
+                        learn_type=learn_type,
+                        learn_file=f,
+                        source_files=source_paths,
+                        detail=f"Pipeline: {batch.project or 'ungrouped'} batch",
+                    )
+                )
+
+            for sc in batch.source_records:
+                learn_paths = [
+                    f
+                    for f in created
+                    if any(f.startswith(f"{lt}/") for lt in config.extraction.learn_types)
+                ]
+                state.update_file(sc.record.rel_path, sc.md5, learn_paths)
+
+            if not pipeline_result.success:
+                log.error(
+                    "extraction.pipeline_failed",
+                    run_id=run_id,
+                    summary=pipeline_result.summary[:500],
+                )
+
+        # Pass B: Cross-learning meta-analysis (runs once after all batches)
+        if any_created:
+            log.info("extraction.passb_start", run_id=run_id)
+            meta_created = await run_meta_analysis(config, session_path)
+            if meta_created > 0:
+                result.records_created["meta"] = meta_created
+
+        # Final audit and cleanup
+        mutations = read_mutations(session_path)
+        audit_mutations = {
+            "files_created": mutations["files_created"],
+            "files_modified": mutations["files_modified"],
+            "files_deleted": mutations["files_deleted"],
+        }
         audit_path = str(Path(config.state.path).parent / "vault_audit.log")
         append_to_audit_log(audit_path, "distiller", audit_mutations, detail=run_id)
+        cleanup_session_file(session_path)
 
-        result.candidates_processed += len(batch.source_records)
+    else:
+        # Legacy path for Claude and Zo backends
+        skill_text = _load_skill(skills_dir)
+        if not skill_text:
+            log.warning("extraction.no_skill", msg="No SKILL.md found — skipping agent")
+            state.add_run(result)
+            state.save()
+            return result
 
-        # Log created learn records
-        source_paths = [sc.record.rel_path for sc in batch.source_records]
-        for f in created:
-            # Try to identify learn type from path
-            learn_type = "unknown"
-            for lt in config.extraction.learn_types:
-                if f.startswith(f"{lt}/"):
-                    learn_type = lt
-                    break
+        backend = _create_backend(config)
+        use_mutation_log = isinstance(backend, (ClaudeBackend, OpenClawBackend))
 
-            result.records_created[learn_type] = (
-                result.records_created.get(learn_type, 0) + 1
+        for batch in batches:
+            project_desc = _get_project_description(vault_path, batch.project)
+
+            prompt = build_extraction_prompt(
+                skill_text=skill_text,
+                vault_path=str(vault_path),
+                project_name=batch.project,
+                project_description=project_desc,
+                existing_learns_formatted=format_existing_learns(batch.existing_learns),
+                source_records_formatted=format_source_records(batch.source_records),
             )
 
-            state.add_log_entry(
-                ExtractionLogEntry(
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    run_id=run_id,
-                    action="created",
-                    learn_type=learn_type,
-                    learn_file=f,
-                    source_files=source_paths,
-                    detail=f"Extracted from {batch.project or 'ungrouped'} batch",
-                )
-            )
+            session_path = None
+            if use_mutation_log:
+                session_path = create_session_file()
+                backend.env_overrides = {
+                    "ALFRED_VAULT_PATH": str(vault_path),
+                    "ALFRED_VAULT_SCOPE": "distiller",
+                    "ALFRED_VAULT_SESSION": session_path,
+                }
+            else:
+                before = snapshot_vault(vault_path, config.vault.ignore_dirs)
 
-        # Update source file states
-        for sc in batch.source_records:
-            learn_paths = [
-                f
-                for f in created
-                if any(f.startswith(f"{lt}/") for lt in config.extraction.learn_types)
-            ]
-            state.update_file(sc.record.rel_path, sc.md5, learn_paths)
-
-        if not agent_result.success:
-            log.error(
-                "extraction.agent_failed",
+            log.info(
+                "extraction.agent_invoke",
                 run_id=run_id,
-                summary=agent_result.summary[:500],
+                project=batch.project or "(ungrouped)",
+                sources=len(batch.source_records),
             )
+
+            agent_result = await backend.process(
+                prompt=prompt,
+                vault_path=str(vault_path),
+            )
+
+            if use_mutation_log and session_path:
+                mutations = read_mutations(session_path)
+                created = mutations["files_created"]
+                modified = mutations["files_modified"]
+                deleted = mutations["files_deleted"]
+                cleanup_session_file(session_path)
+            else:
+                after = snapshot_vault(vault_path, config.vault.ignore_dirs)
+                created, modified, deleted = diff_vault(before, after)
+
+            audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
+            audit_path = str(Path(config.state.path).parent / "vault_audit.log")
+            append_to_audit_log(audit_path, "distiller", audit_mutations, detail=run_id)
+
+            result.candidates_processed += len(batch.source_records)
+
+            source_paths = [sc.record.rel_path for sc in batch.source_records]
+            for f in created:
+                learn_type = "unknown"
+                for lt in config.extraction.learn_types:
+                    if f.startswith(f"{lt}/"):
+                        learn_type = lt
+                        break
+
+                result.records_created[learn_type] = (
+                    result.records_created.get(learn_type, 0) + 1
+                )
+
+                state.add_log_entry(
+                    ExtractionLogEntry(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        run_id=run_id,
+                        action="created",
+                        learn_type=learn_type,
+                        learn_file=f,
+                        source_files=source_paths,
+                        detail=f"Extracted from {batch.project or 'ungrouped'} batch",
+                    )
+                )
+
+            for sc in batch.source_records:
+                learn_paths = [
+                    f
+                    for f in created
+                    if any(f.startswith(f"{lt}/") for lt in config.extraction.learn_types)
+                ]
+                state.update_file(sc.record.rel_path, sc.md5, learn_paths)
+
+            if not agent_result.success:
+                log.error(
+                    "extraction.agent_failed",
+                    run_id=run_id,
+                    summary=agent_result.summary[:500],
+                )
 
     log.info(
         "extraction.complete",
