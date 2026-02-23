@@ -55,6 +55,27 @@ def _load_stage_prompt(stage_file: str) -> str:
     return prompt_path.read_text(encoding="utf-8")
 
 
+def _load_user_profile(vault_path: Path) -> str:
+    """Load the vault owner's profile for entity relevance filtering.
+
+    Searches for a user-profile.md in the vault root first, then falls back
+    to common locations.
+    """
+    candidates = [
+        vault_path / "user-profile.md",
+        Path.home() / ".config" / "alfred" / "user-profile.md",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                text = path.read_text(encoding="utf-8")
+                if text.strip():
+                    return text
+            except OSError:
+                continue
+    return "(no user profile available — use your best judgement about relevance)"
+
+
 def _parse_entity_manifest(stdout: str) -> list[dict]:
     """Extract the JSON entity manifest from LLM stdout.
 
@@ -242,43 +263,60 @@ async def _stage1_analyze(
         inbox_filename=inbox_filename,
         inbox_content=inbox_content,
         manifest_path=manifest_path,
+        user_profile=_load_user_profile(config.vault.vault_path),
     )
 
-    stdout = await _call_llm(prompt, config, session_path, "s1-analyze")
-
-    # Find the note that was created via mutation log
-    note_path = _find_created_note(stdout, session_path)
-    if not note_path:
-        log.warning("pipeline.s1_no_note_created", file=inbox_filename)
-
-    # Try to read the entity manifest from the temp file first
+    max_attempts = 3
+    note_path = ""
     manifest: list[dict] = []
-    try:
-        manifest_file = Path(manifest_path)
-        if manifest_file.exists():
-            raw_json = manifest_file.read_text(encoding="utf-8").strip()
-            data = json.loads(raw_json)
-            if isinstance(data.get("entities"), list):
-                manifest = data["entities"]
-                log.info(
-                    "pipeline.manifest_from_file",
-                    path=manifest_path,
-                    entities=len(manifest),
-                )
-    except (json.JSONDecodeError, OSError, KeyError) as e:
-        log.warning("pipeline.manifest_file_read_failed", path=manifest_path, error=str(e))
-    finally:
-        # Clean up the temp manifest file
-        try:
-            Path(manifest_path).unlink(missing_ok=True)
-        except OSError:
-            pass
 
-    # Fallback: parse entity manifest from stdout if file method failed
-    if not manifest:
-        manifest = _parse_entity_manifest(stdout)
+    for attempt in range(1, max_attempts + 1):
+        stdout = await _call_llm(prompt, config, session_path, "s1-analyze")
+
+        # Find the note that was created via mutation log (only on first attempt)
+        if not note_path:
+            note_path = _find_created_note(stdout, session_path)
+            if not note_path:
+                log.warning("pipeline.s1_no_note_created", file=inbox_filename)
+
+        # Try to read the entity manifest from the temp file first
+        try:
+            manifest_file = Path(manifest_path)
+            if manifest_file.exists():
+                raw_json = manifest_file.read_text(encoding="utf-8").strip()
+                data = json.loads(raw_json)
+                if isinstance(data.get("entities"), list):
+                    manifest = data["entities"]
+                    log.info(
+                        "pipeline.manifest_from_file",
+                        path=manifest_path,
+                        entities=len(manifest),
+                    )
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            log.warning("pipeline.manifest_file_read_failed", path=manifest_path, error=str(e))
+        finally:
+            # Clean up the temp manifest file
+            try:
+                Path(manifest_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        # Fallback: parse entity manifest from stdout if file method failed
+        if not manifest:
+            manifest = _parse_entity_manifest(stdout)
+            if manifest:
+                log.info("pipeline.manifest_from_stdout", entities=len(manifest))
+
         if manifest:
-            log.info("pipeline.manifest_from_stdout", entities=len(manifest))
+            break
+
+        if attempt < max_attempts:
+            log.warning(
+                "pipeline.s1_manifest_retry",
+                file=inbox_filename,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
 
     log.info(
         "pipeline.s1_complete",

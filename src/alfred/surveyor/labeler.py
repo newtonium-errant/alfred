@@ -195,6 +195,13 @@ class Labeler:
                     messages=[{"role": "user", "content": prompt}],
                     temperature=self.temperature,
                 )
+                if resp.usage:
+                    log.info(
+                        "labeler.usage",
+                        total_tokens=resp.usage.total_tokens,
+                        prompt_tokens=resp.usage.prompt_tokens,
+                        completion_tokens=resp.usage.completion_tokens,
+                    )
                 await asyncio.sleep(API_CALL_DELAY)
                 return resp.choices[0].message.content
             except Exception as e:

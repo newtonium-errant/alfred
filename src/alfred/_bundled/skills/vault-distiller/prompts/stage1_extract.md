@@ -73,7 +73,9 @@ Use the pre-scan signals as hints for where to look, but do not limit yourself t
 
 ## Output Format
 
-Write your JSON output to the following file using a shell command:
+**CRITICAL: You MUST write the JSON manifest file.** This is not optional. The pipeline reads this file to process your results. If you skip writing the file, your analysis is lost and the entire extraction fails.
+
+Write your JSON output to the following file using a shell command. **Execute this command — do not just display it:**
 
 **Manifest path:** `{manifest_path}`
 
@@ -84,6 +86,8 @@ cat > {manifest_path} << 'MANIFEST_EOF'
 ]}}
 MANIFEST_EOF
 ```
+
+Even if you find zero learnings, you MUST still write the file with an empty array: `{{"learnings": []}}`
 
 The JSON object must have this structure:
 

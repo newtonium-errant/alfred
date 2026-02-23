@@ -50,11 +50,15 @@ BODY
 
 ## Task 2: Write the Entity Manifest to a File
 
-After creating the note, write a JSON file listing every entity (person, org, project, location, event, conversation, task, decision, etc.) mentioned in the source material.
+**CRITICAL: You MUST write the entity manifest JSON file.** This is not optional. The pipeline reads this file to create entity records. If you skip writing the file, no entities will be created and the extraction is lost.
+
+After creating the note, write a JSON file listing entities that are **directly relevant to the vault owner** (see Relevance filter below).
 
 **Write the JSON to this exact file path:** `{manifest_path}`
 
 Do NOT create these entities in the vault — just list them in the JSON file. The pipeline will create them automatically.
+
+**Execute this command — do not just display it.** Even if you find zero entities, you MUST still write the file with an empty array: `{{"entities": []}}`
 
 Write the file using a bash command like this:
 
@@ -71,16 +75,38 @@ MANIFEST_EOF
 ```
 
 **Entity extraction rules:**
-- **person**: Every identifiable person with a full name. Skip first-name-only mentions.
-- **org**: Every company, organization, team, institution mentioned.
-- **project**: Every project, initiative, product with clear objectives.
-- **location**: Every specific physical place relevant to projects/events.
-- **conversation**: If the source is a multi-turn exchange (email thread, chat, meeting).
-- **task**: Every action item, to-do, follow-up mentioned or implied.
-- **event**: Every scheduled or past event with a date.
-- **decision**: Every explicit choice made, with rationale.
-- **assumption**: Beliefs stated or challenged.
-- **constraint**: Hard limits, rules, regulations identified.
+- **person**: People the vault owner directly works with, communicates with, or needs to track. Must have a full name. Skip first-name-only mentions.
+- **org**: Companies, organizations, teams the vault owner has a relationship with (clients, employers, partners, service providers).
+- **project**: Initiatives the vault owner is actively working on, planning, or has a stake in. A project must be something the owner does, builds, manages, or directly participates in.
+- **location**: Specific physical places relevant to the vault owner's projects, events, or life.
+- **conversation**: If the source is a multi-turn exchange (email thread, chat, meeting) the vault owner participated in.
+- **task**: Action items for the vault owner or their collaborators.
+- **event**: Scheduled or past events the vault owner attended or will attend.
+- **decision**: Choices the vault owner or their team made.
+- **assumption**: Beliefs the vault owner or their team is operating on.
+- **constraint**: Hard limits affecting the vault owner's work.
+
+**Relevance filter — CRITICAL:**
+Only extract entities that the vault owner has a **direct relationship with**. Ask: "Would the vault owner recognize this as something they work on, interact with, or need to track?"
+
+**DO NOT extract:**
+- Media, entertainment, or cultural references merely mentioned or analyzed (TV shows, movies, books, songs, games)
+- Historical figures, celebrities, or public figures the owner doesn't work with
+- Third-party products, companies, or projects used only as examples or analogies
+- Academic concepts, theories, or frameworks discussed in passing
+- Legislative packages, regulations, or policies the owner doesn't directly work on
+- Anything that is the *subject of analysis* rather than something the owner *does or uses*
+
+**Examples of what to SKIP:**
+- A note analyzing "Mad Men" leadership styles → do NOT create project/Mad Men
+- A note referencing "The Sopranos" as a cultural touchpoint → do NOT create project/The Sopranos
+- A briefing mentioning EU transport regulations → do NOT create project/Transport Enforcement Package (unless the owner works on that regulation)
+- A note discussing GPT-2 architecture → do NOT create project/GPT-2 (unless the owner is building/modifying GPT-2)
+
+**Examples of what to EXTRACT:**
+- "We're building a new API integration for Acme" → YES, create project/Acme API Integration
+- "Meeting with John Smith about the kitchen renovation" → YES, create person/John Smith, project/Kitchen Renovation
+- "Started using n8n for workflow automation" → YES, create project if the owner is building workflows with it
 
 **For each entity provide:**
 - `type`: The vault record type
@@ -92,13 +118,21 @@ MANIFEST_EOF
 
 ---
 
+## Vault Owner Profile
+
+Use this profile to determine what is relevant to the vault owner. Only extract entities that connect to this person's life, work, projects, and relationships.
+
+{user_profile}
+
+---
+
 ## Important Rules
 
 - **Write everything in English.** Translate if the source is in another language. Keep proper nouns in original form.
 - **Use `alfred vault` commands for vault records.** The only direct filesystem write allowed is the entity manifest JSON to the specified `/tmp/` path.
 - **Do NOT create entity records** — only create the note. Write the entity manifest JSON to the specified file path.
 - **Do NOT move the inbox file** — the system handles this after processing.
-- **Be thorough in extraction** — it's better to list too many entities than too few. The system will deduplicate.
+- **Prefer precision over recall** — only extract entities the vault owner directly interacts with. When in doubt, leave it out.
 
 ---
 

@@ -145,6 +145,41 @@ def _load_template(vault_path: Path, record_type: str) -> tuple[dict, str] | Non
     return _parse_record(template_path)
 
 
+_BASE_EMBED_RE = re.compile(r"^(##\s+.+\n)?!\[\[.+\.base#.+\]\]$", re.MULTILINE)
+
+
+def _extract_base_embeds(template_body: str, name: str) -> str:
+    """Extract section-heading + base-embed lines from a template body.
+
+    Returns a string like:
+        ## Assumptions
+        ![[project.base#Assumptions]]
+
+        ## Decisions
+        ![[project.base#Decisions]]
+    """
+    lines = template_body.replace("{{title}}", name).splitlines()
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Check for "## Section\n![[*.base#*]]" pairs
+        if line.startswith("## ") and i + 1 < len(lines) and "![[" in lines[i + 1] and ".base#" in lines[i + 1]:
+            if result:
+                result.append("")
+            result.append(line)
+            result.append(lines[i + 1])
+            i += 2
+            continue
+        # Standalone base embed without heading
+        if "![[" in line and ".base#" in line:
+            if result:
+                result.append("")
+            result.append(line)
+        i += 1
+    return "\n".join(result) + "\n" if result else ""
+
+
 # --- Public operations ---
 
 
@@ -348,6 +383,12 @@ def vault_create(
     # Resolve body
     if body is not None:
         final_body = body
+        # Append base-view embeds from template so entity records get their
+        # Dataview sections even when a custom body is provided.
+        if template:
+            base_embeds = _extract_base_embeds(template_body, name)
+            if base_embeds and base_embeds not in final_body:
+                final_body = final_body.rstrip("\n") + "\n\n---\n" + base_embeds
     else:
         # Process template body — replace {{title}} and {{date}}
         final_body = template_body.replace("{{title}}", name).replace("{{date}}", date.today().isoformat())

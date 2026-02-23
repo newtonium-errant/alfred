@@ -389,40 +389,58 @@ async def _stage1_extract(
     )[:30]
     stage_label = f"s1-{safe_name}"
 
-    stdout = await _call_llm(prompt, config, session_path, stage_label)
-
-    # Primary: read manifest from the temp file the LLM was instructed to write
+    max_attempts = 3
     manifest: list[dict] = []
-    try:
-        manifest_text = Path(manifest_path).read_text(encoding="utf-8")
-        manifest = _parse_extraction_manifest(manifest_text)
-        if manifest:
-            log.info(
-                "pipeline.s1_manifest_from_file",
-                source=rec.rel_path,
-                learnings=len(manifest),
-            )
-    except (OSError, UnicodeDecodeError) as exc:
-        log.info(
-            "pipeline.s1_manifest_file_missing",
-            source=rec.rel_path,
-            error=str(exc),
-        )
-    finally:
-        # Clean up temp file
-        try:
-            os.unlink(manifest_path)
-        except OSError:
-            pass
 
-    # Fallback: parse manifest from stdout if file read failed
-    if not manifest and stdout:
-        manifest = _parse_extraction_manifest(stdout)
-        if manifest:
+    for attempt in range(1, max_attempts + 1):
+        # Generate a fresh manifest path per attempt so stale files can't
+        # interfere — the path embedded in the prompt stays the same across
+        # retries (it was already baked in above), but we still need to read
+        # from the exact path the prompt references.
+        stdout = await _call_llm(prompt, config, session_path, stage_label)
+
+        # Primary: read manifest from the temp file the LLM was instructed to write
+        try:
+            manifest_text = Path(manifest_path).read_text(encoding="utf-8")
+            manifest = _parse_extraction_manifest(manifest_text)
+            if manifest:
+                log.info(
+                    "pipeline.s1_manifest_from_file",
+                    source=rec.rel_path,
+                    learnings=len(manifest),
+                )
+        except (OSError, UnicodeDecodeError) as exc:
             log.info(
-                "pipeline.s1_manifest_from_stdout",
+                "pipeline.s1_manifest_file_missing",
                 source=rec.rel_path,
-                learnings=len(manifest),
+                error=str(exc),
+            )
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(manifest_path)
+            except OSError:
+                pass
+
+        # Fallback: parse manifest from stdout if file read failed
+        if not manifest and stdout:
+            manifest = _parse_extraction_manifest(stdout)
+            if manifest:
+                log.info(
+                    "pipeline.s1_manifest_from_stdout",
+                    source=rec.rel_path,
+                    learnings=len(manifest),
+                )
+
+        if manifest:
+            break
+
+        if attempt < max_attempts:
+            log.warning(
+                "pipeline.s1_manifest_retry",
+                source=rec.rel_path,
+                attempt=attempt,
+                max_attempts=max_attempts,
             )
 
     log.info(
