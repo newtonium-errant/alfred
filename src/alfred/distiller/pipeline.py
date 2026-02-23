@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import re
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -257,11 +258,30 @@ async def _call_llm(
     _clear_agent_sessions(oc.agent_id)
     _sync_workspace_claude_md(oc.agent_id, str(config.vault.vault_path))
 
+    # Write prompt to a temp file and pass via reference to avoid
+    # OSError: [Errno 7] Argument list too long when the prompt
+    # (which includes full record content) exceeds the OS arg limit.
+    prompt_file = None
+    try:
+        prompt_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix=f"alfred-distiller-{stage_label}-",
+            suffix=".md",
+            delete=False,
+            encoding="utf-8",
+        )
+        prompt_file.write(prompt)
+        prompt_file.close()
+        prompt_path = prompt_file.name
+    except OSError:
+        log.error("pipeline.prompt_file_write_failed", stage=stage_label)
+        return ""
+
     cmd = [
         oc.command, "agent", *oc.args,
         "--agent", oc.agent_id,
         "--session-id", session_id,
-        "--message", prompt,
+        "--message", f"Follow the instructions in {prompt_path}",
         "--local", "--json",
     ]
 
@@ -277,6 +297,7 @@ async def _call_llm(
         stage=stage_label,
         agent_id=oc.agent_id,
         session_id=session_id,
+        prompt_file=prompt_path,
     )
 
     try:
@@ -296,6 +317,13 @@ async def _call_llm(
     except FileNotFoundError:
         log.error("pipeline.command_not_found", command=oc.command)
         return ""
+    finally:
+        # Clean up prompt temp file
+        if prompt_file is not None:
+            try:
+                os.unlink(prompt_path)
+            except OSError:
+                pass
 
     raw = stdout_bytes.decode("utf-8", errors="replace")
     err = stderr_bytes.decode("utf-8", errors="replace")
@@ -333,6 +361,11 @@ async def _stage1_extract(
     source_type = rec.record_type
     source_path_no_ext = rec.rel_path.removesuffix(".md")
 
+    # Generate a unique temp file path for the manifest output.
+    # The LLM will write its JSON manifest here instead of relying on stdout,
+    # which is polluted by OpenClaw's agent conversation/reasoning output.
+    manifest_path = f"/tmp/alfred-distiller-{uuid.uuid4().hex[:12]}-manifest.json"
+
     prompt = template.format(
         learn_type_schemas=_load_learn_type_schemas(),
         extraction_rules=_EXTRACTION_RULES.get(
@@ -348,6 +381,7 @@ async def _stage1_extract(
         candidate_signals=_format_candidate_signals(source.signals),
         existing_learn_titles=_format_dedup_titles(existing_learns),
         vault_cli_reference=VAULT_CLI_REFERENCE,
+        manifest_path=manifest_path,
     )
 
     safe_name = re.sub(
@@ -356,7 +390,40 @@ async def _stage1_extract(
     stage_label = f"s1-{safe_name}"
 
     stdout = await _call_llm(prompt, config, session_path, stage_label)
-    manifest = _parse_extraction_manifest(stdout)
+
+    # Primary: read manifest from the temp file the LLM was instructed to write
+    manifest: list[dict] = []
+    try:
+        manifest_text = Path(manifest_path).read_text(encoding="utf-8")
+        manifest = _parse_extraction_manifest(manifest_text)
+        if manifest:
+            log.info(
+                "pipeline.s1_manifest_from_file",
+                source=rec.rel_path,
+                learnings=len(manifest),
+            )
+    except (OSError, UnicodeDecodeError) as exc:
+        log.info(
+            "pipeline.s1_manifest_file_missing",
+            source=rec.rel_path,
+            error=str(exc),
+        )
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(manifest_path)
+        except OSError:
+            pass
+
+    # Fallback: parse manifest from stdout if file read failed
+    if not manifest and stdout:
+        manifest = _parse_extraction_manifest(stdout)
+        if manifest:
+            log.info(
+                "pipeline.s1_manifest_from_stdout",
+                source=rec.rel_path,
+                learnings=len(manifest),
+            )
 
     log.info(
         "pipeline.s1_complete", source=rec.rel_path, learnings=len(manifest)

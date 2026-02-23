@@ -38,8 +38,16 @@ def _resolve_vault_path(vault_path: Path, rel_path: str) -> Path:
 
 
 def _parse_record(file_path: Path) -> tuple[dict, str]:
-    """Parse a vault file into (frontmatter_dict, body_str)."""
-    post = frontmatter.load(str(file_path))
+    """Parse a vault file into (frontmatter_dict, body_str).
+
+    Raises VaultError if the file contains malformed YAML frontmatter.
+    """
+    try:
+        post = frontmatter.load(str(file_path))
+    except yaml.YAMLError as exc:
+        raise VaultError(
+            f"Malformed YAML frontmatter in {file_path.name}: {exc}"
+        ) from exc
     return dict(post.metadata), post.content
 
 

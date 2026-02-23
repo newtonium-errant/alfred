@@ -4,11 +4,40 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+def _load_env_file(env_path: Path | None = None) -> None:
+    """Load a .env file into os.environ (without overriding existing vars).
+
+    Supports lines of the form KEY=VALUE (with optional quoting).
+    Skips blank lines and comments (#).
+    """
+    if env_path is None:
+        env_path = Path(".env")
+    if not env_path.is_file():
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            # Remove surrounding quotes if present
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            # Only set if not already in environment (don't override)
+            if key not in os.environ:
+                os.environ[key] = value
 
 
 def _load_unified_config(config_path: str) -> dict[str, Any]:
@@ -506,6 +535,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    _load_env_file()
+
     parser = build_parser()
     args = parser.parse_args()
 

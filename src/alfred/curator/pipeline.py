@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import re
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,11 +124,30 @@ async def _call_llm(
     # Ensure workspace has latest vault CLAUDE.md
     sync_workspace_claude_md(oc.agent_id, str(config.vault.vault_path))
 
+    # Write prompt to a temp file and pass via stdin to avoid
+    # OSError: [Errno 7] Argument list too long when the prompt
+    # (which includes full inbox content) exceeds the OS arg limit.
+    prompt_file = None
+    try:
+        prompt_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix=f"alfred-curator-{stage_label}-",
+            suffix=".md",
+            delete=False,
+            encoding="utf-8",
+        )
+        prompt_file.write(prompt)
+        prompt_file.close()
+        prompt_path = prompt_file.name
+    except OSError:
+        log.error("pipeline.prompt_file_write_failed", stage=stage_label)
+        return ""
+
     cmd = [
         oc.command, "agent", *oc.args,
         "--agent", oc.agent_id,
         "--session-id", session_id,
-        "--message", prompt,
+        "--message", f"Follow the instructions in {prompt_path}",
         "--local", "--json",
     ]
 
@@ -143,6 +163,7 @@ async def _call_llm(
         stage=stage_label,
         agent_id=oc.agent_id,
         session_id=session_id,
+        prompt_file=prompt_path,
     )
 
     try:
@@ -162,6 +183,13 @@ async def _call_llm(
     except FileNotFoundError:
         log.error("pipeline.command_not_found", command=oc.command)
         return ""
+    finally:
+        # Clean up prompt temp file
+        if prompt_file is not None:
+            try:
+                os.unlink(prompt_path)
+            except OSError:
+                pass
 
     raw = stdout_bytes.decode("utf-8", errors="replace")
     err = stderr_bytes.decode("utf-8", errors="replace")
@@ -194,16 +222,26 @@ async def _stage1_analyze(
     """Stage 1: LLM creates a note and returns an entity manifest.
 
     Returns (note_path, entity_manifest).
+
+    The LLM is instructed to write the entity manifest JSON to a temp file
+    rather than stdout, because OpenClaw's stdout contains the full agent
+    conversation mixed in, making JSON extraction unreliable.  We fall back
+    to stdout parsing if the temp file is missing or unreadable.
     """
     template = _load_stage_prompt("stage1_analyze.md")
     if not template:
         return "", []
+
+    # Generate a unique manifest file path for the LLM to write to
+    manifest_id = uuid.uuid4().hex[:12]
+    manifest_path = f"/tmp/alfred-curator-{manifest_id}-manifest.json"
 
     prompt = template.format(
         vault_cli_reference=VAULT_CLI_REFERENCE,
         vault_context=vault_context_text,
         inbox_filename=inbox_filename,
         inbox_content=inbox_content,
+        manifest_path=manifest_path,
     )
 
     stdout = await _call_llm(prompt, config, session_path, "s1-analyze")
@@ -213,8 +251,34 @@ async def _stage1_analyze(
     if not note_path:
         log.warning("pipeline.s1_no_note_created", file=inbox_filename)
 
-    # Parse entity manifest from stdout
-    manifest = _parse_entity_manifest(stdout)
+    # Try to read the entity manifest from the temp file first
+    manifest: list[dict] = []
+    try:
+        manifest_file = Path(manifest_path)
+        if manifest_file.exists():
+            raw_json = manifest_file.read_text(encoding="utf-8").strip()
+            data = json.loads(raw_json)
+            if isinstance(data.get("entities"), list):
+                manifest = data["entities"]
+                log.info(
+                    "pipeline.manifest_from_file",
+                    path=manifest_path,
+                    entities=len(manifest),
+                )
+    except (json.JSONDecodeError, OSError, KeyError) as e:
+        log.warning("pipeline.manifest_file_read_failed", path=manifest_path, error=str(e))
+    finally:
+        # Clean up the temp manifest file
+        try:
+            Path(manifest_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Fallback: parse entity manifest from stdout if file method failed
+    if not manifest:
+        manifest = _parse_entity_manifest(stdout)
+        if manifest:
+            log.info("pipeline.manifest_from_stdout", entities=len(manifest))
 
     log.info(
         "pipeline.s1_complete",

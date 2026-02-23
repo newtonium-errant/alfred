@@ -6,6 +6,7 @@ import asyncio
 import json as _json
 import os
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -63,10 +64,30 @@ class OpenClawBackend(BaseBackend):
         # Use a unique session ID per invocation for full isolation
         session_id = f"curator-{uuid.uuid4().hex[:12]}"
 
+        # Write prompt to a temp file to avoid
+        # OSError: [Errno 7] Argument list too long when the prompt
+        # (which includes full inbox content) exceeds the OS arg limit.
+        prompt_file = None
+        try:
+            prompt_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                prefix="alfred-curator-oc-",
+                suffix=".md",
+                delete=False,
+                encoding="utf-8",
+            )
+            prompt_file.write(prompt)
+            prompt_file.close()
+            prompt_path = prompt_file.name
+        except OSError:
+            log.error("openclaw.prompt_file_write_failed")
+            return BackendResult(success=False, summary="ERROR: could not write prompt to temp file")
+
         cmd = [self.config.command, "agent", *self.config.args,
                "--agent", self.config.agent_id,
                "--session-id", session_id,
-               "--message", prompt, "--local", "--json"]
+               "--message", f"Follow the instructions in {prompt_path}",
+               "--local", "--json"]
 
         log.info(
             "openclaw.dispatching",
@@ -74,6 +95,7 @@ class OpenClawBackend(BaseBackend):
             agent_id=self.config.agent_id,
             session_id=session_id,
             timeout=self.config.timeout,
+            prompt_file=prompt_path,
         )
 
         # Clear previous session state to avoid lock contention.
@@ -103,6 +125,13 @@ class OpenClawBackend(BaseBackend):
                 success=False,
                 summary=f"ERROR: command not found: {self.config.command}",
             )
+        finally:
+            # Clean up prompt temp file
+            if prompt_file is not None:
+                try:
+                    os.unlink(prompt_path)
+                except OSError:
+                    pass
 
         raw = stdout.decode("utf-8", errors="replace")
         err = stderr.decode("utf-8", errors="replace")

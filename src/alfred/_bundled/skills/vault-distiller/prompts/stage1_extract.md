@@ -73,7 +73,19 @@ Use the pre-scan signals as hints for where to look, but do not limit yourself t
 
 ## Output Format
 
-Output ONLY a JSON object with this structure (no other text before or after):
+Write your JSON output to the following file using a shell command:
+
+**Manifest path:** `{manifest_path}`
+
+```bash
+cat > {manifest_path} << 'MANIFEST_EOF'
+{{"learnings": [
+  ...your learnings here...
+]}}
+MANIFEST_EOF
+```
+
+The JSON object must have this structure:
 
 ```json
 {{"learnings": [
