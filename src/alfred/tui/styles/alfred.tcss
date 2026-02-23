@@ -1,0 +1,262 @@
+/* Alfred TUI — main stylesheet */
+
+/* ---- Screen base ---- */
+Screen {
+    background: $surface;
+}
+
+/* ---- Stats bar (top header) ---- */
+StatsBar {
+    dock: top;
+    height: 1;
+    background: $primary-background;
+    color: $text;
+    text-style: bold;
+    padding: 0 1;
+}
+
+/* ---- Mutation strip (above footer) ---- */
+MutationStrip {
+    dock: bottom;
+    height: 1;
+    background: $primary-background;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+/* ---- Worker grid — 2x2 default ---- */
+#worker-grid {
+    layout: grid;
+    grid-size: 2 2;
+    grid-gutter: 1;
+    padding: 1;
+    height: 1fr;
+}
+
+#worker-grid.narrow {
+    grid-size: 1;
+}
+
+/* ---- Worker card ---- */
+WorkerCard {
+    border: round $accent;
+    padding: 0 1;
+    height: 1fr;
+}
+
+WorkerCard.tool-curator {
+    border: round #00d7ff;
+}
+WorkerCard.tool-janitor {
+    border: round #ffff00;
+}
+WorkerCard.tool-distiller {
+    border: round #ff00ff;
+}
+WorkerCard.tool-surveyor {
+    border: round #00ff00;
+}
+
+WorkerCard:focus {
+    border: heavy $accent;
+}
+WorkerCard.tool-curator:focus {
+    border: heavy #00d7ff;
+}
+WorkerCard.tool-janitor:focus {
+    border: heavy #ffff00;
+}
+WorkerCard.tool-distiller:focus {
+    border: heavy #ff00ff;
+}
+WorkerCard.tool-surveyor:focus {
+    border: heavy #00ff00;
+}
+
+/* Card sub-elements */
+.card-header {
+    height: 1;
+    text-style: bold;
+}
+
+.card-step {
+    height: 1;
+    color: $text-muted;
+}
+
+.card-feed {
+    height: 1fr;
+    overflow-y: auto;
+    scrollbar-size: 1 1;
+}
+
+.card-footer {
+    height: 1;
+    color: $text-muted;
+    text-style: italic;
+}
+
+/* ---- Health badge colors ---- */
+.health-idle {
+    color: $text-muted;
+}
+.health-working {
+    color: #00d7ff;
+    text-style: bold;
+}
+.health-degraded {
+    color: #ffff00;
+}
+.health-failing {
+    color: #ff0000;
+    text-style: bold;
+}
+.health-stopped {
+    color: #ff0000;
+    text-style: bold;
+}
+.health-restarting {
+    color: #ffff00;
+    text-style: bold;
+}
+.health-pending {
+    color: $text-muted;
+}
+
+/* ---- Feed entry severity ---- */
+.severity-info {
+    color: $text-muted;
+}
+.severity-success {
+    color: #00ff00;
+}
+.severity-warning {
+    color: #ffff00;
+}
+.severity-error {
+    color: #ff0000;
+    text-style: bold;
+}
+
+/* ---- Mutation colors ---- */
+.mut-create {
+    color: #00ff00;
+    text-style: bold;
+}
+.mut-edit, .mut-modify {
+    color: #ffff00;
+    text-style: bold;
+}
+.mut-delete {
+    color: #ff0000;
+    text-style: bold;
+}
+
+/* ---- Log screen ---- */
+#log-controls {
+    dock: top;
+    height: 3;
+    layout: horizontal;
+    padding: 0 1;
+    background: $primary-background;
+}
+
+#log-controls Select {
+    width: 20;
+    margin: 0 1;
+}
+
+#log-controls Checkbox {
+    margin: 0 1;
+}
+
+#log-feed {
+    height: 1fr;
+    padding: 0 1;
+}
+
+/* ---- Mutations screen ---- */
+#mutations-header {
+    dock: top;
+    height: 1;
+    padding: 0 1;
+    text-style: bold;
+}
+
+#mutations-table {
+    height: 1fr;
+}
+
+/* ---- Status screen ---- */
+#status-grid {
+    layout: grid;
+    grid-size: 2 2;
+    grid-gutter: 1;
+    padding: 1;
+    height: 1fr;
+}
+
+/* ---- Stat card ---- */
+StatCard {
+    border: round $accent;
+    padding: 1 2;
+    height: 1fr;
+}
+
+StatCard.tool-curator {
+    border: round #00d7ff;
+}
+StatCard.tool-janitor {
+    border: round #ffff00;
+}
+StatCard.tool-distiller {
+    border: round #ff00ff;
+}
+StatCard.tool-surveyor {
+    border: round #00ff00;
+}
+
+.stat-label {
+    color: $text-muted;
+}
+.stat-value {
+    text-style: bold;
+}
+
+/* ---- Confirm dialog ---- */
+ConfirmDialog {
+    align: center middle;
+}
+
+#confirm-container {
+    width: 50;
+    height: auto;
+    max-height: 12;
+    border: thick $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#confirm-title {
+    text-style: bold;
+    text-align: center;
+    width: 100%;
+    margin-bottom: 1;
+}
+
+#confirm-body {
+    text-align: center;
+    width: 100%;
+    margin-bottom: 1;
+}
+
+#confirm-buttons {
+    layout: horizontal;
+    align: center middle;
+    height: 3;
+}
+
+#confirm-buttons Button {
+    margin: 0 1;
+    min-width: 10;
+}

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alfred-vault"
-version = "0.2.0"
+version = "0.2.1"
 description = "AI-powered background services for Obsidian vault maintenance"
 readme = "README.md"
 license = "MIT"
@@ -16,6 +16,7 @@ dependencies = [
     "structlog>=24.0",
     "watchdog>=4.0",
     "rich>=13.0",
+    "textual>=0.89",
 ]
 
 [project.optional-dependencies]

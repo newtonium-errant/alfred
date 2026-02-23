@@ -170,17 +170,29 @@ def run_all(
     log_dir = Path(raw.get("logging", {}).get("dir", "./data"))
 
     if live_mode:
-        # Live TUI dashboard mode
-        from alfred.dashboard import run_live_dashboard
-        run_live_dashboard(
-            tools=tools,
-            processes=processes,
-            restart_counts=restart_counts,
-            start_process=start_process,
-            sentinel_path=sentinel_path,
-            log_dir=log_dir,
-            state_dir=log_dir,
-        )
+        # Live TUI dashboard mode — prefer Textual, fall back to Rich Live
+        try:
+            from alfred.tui import run_textual_dashboard
+            run_textual_dashboard(
+                tools=tools,
+                processes=processes,
+                restart_counts=restart_counts,
+                start_process=start_process,
+                sentinel_path=sentinel_path,
+                log_dir=log_dir,
+                state_dir=log_dir,
+            )
+        except ImportError:
+            from alfred.dashboard import run_live_dashboard
+            run_live_dashboard(
+                tools=tools,
+                processes=processes,
+                restart_counts=restart_counts,
+                start_process=start_process,
+                sentinel_path=sentinel_path,
+                log_dir=log_dir,
+                state_dir=log_dir,
+            )
     else:
         # Plain text monitor loop
         try:
