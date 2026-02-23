@@ -53,14 +53,15 @@ def cmd_up(args: argparse.Namespace) -> None:
         print("Use `alfred down` to stop it first.")
         sys.exit(1)
 
-    foreground = getattr(args, "_internal_foreground", False) or getattr(args, "foreground", False)
+    live_mode = getattr(args, "live", False)
+    foreground = getattr(args, "_internal_foreground", False) or getattr(args, "foreground", False) or live_mode
 
     if foreground:
-        # Run in foreground (current behavior) — used by --foreground and --_internal-foreground
+        # Run in foreground (current behavior) — used by --foreground, --live, and --_internal-foreground
         _setup_logging_from_config(raw)
         from alfred.orchestrator import run_all
         from alfred._data import get_skills_dir
-        run_all(raw, only=args.only, skills_dir=get_skills_dir(), pid_path=pid_path)
+        run_all(raw, only=args.only, skills_dir=get_skills_dir(), pid_path=pid_path, live_mode=live_mode)
     else:
         # Daemon mode: re-exec as detached background process
         from alfred.daemon import spawn_daemon
@@ -407,6 +408,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--_internal-foreground", dest="_internal_foreground",
         action="store_true", default=False,
         help=argparse.SUPPRESS,
+    )
+    up_parser.add_argument(
+        "--live", action="store_true", default=False,
+        help="Show live TUI dashboard (implies --foreground)",
     )
 
     # down

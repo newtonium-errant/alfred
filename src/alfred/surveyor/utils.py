@@ -24,12 +24,14 @@ def compute_md5_bytes(data: bytes) -> str:
     return hashlib.md5(data).hexdigest()
 
 
-def setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
+def setup_logging(level: str = "INFO", log_file: str | None = None, suppress_stdout: bool = False) -> None:
     """Configure structlog + stdlib logging."""
     log_level = getattr(logging, level.upper(), logging.INFO)
 
     # Stdlib root logger
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    handlers: list[logging.Handler] = []
+    if not suppress_stdout:
+        handlers.append(logging.StreamHandler(sys.stdout))
     if log_file:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
