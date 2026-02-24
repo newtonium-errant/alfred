@@ -62,6 +62,12 @@ src/alfred/
     obsidian.py         # Optional Obsidian CLI integration
     cli.py              # alfred vault subcommands
 
+  tui/                  # Textual TUI (Python, for alfred up --live)
+    app.py              # Main Textual application
+    data.py             # Shared data types and constants
+    screens/            # Dashboard, logs, mutations, status screens
+    widgets/            # Worker cards, stat cards, health badges
+
   _bundled/             # Data files shipped in the wheel
     skills/
       vault-curator/    # Curator skill prompts
@@ -74,6 +80,18 @@ src/alfred/
       _templates/       # Per-type Markdown templates
       _bases/           # Dataview base view definitions
       user-profile.md   # User profile template
+    tui_js/             # Bundled Ink TUI (built from tui-ink/)
+      index.js          # Single-file esbuild bundle
+
+tui-ink/                # Ink TUI source (React + TypeScript)
+  src/
+    index.tsx           # Entry point
+    app.tsx             # Root component, screen state machine
+    store.ts            # React context store
+    data/               # Types, parsers, interpreters, constants
+    hooks/              # File tailers, state pollers, time series
+    components/         # Header, Footer, WorkerLine, FeedLine, etc.
+  build.mjs             # esbuild config (outputs to _bundled/tui_js/)
 ```
 
 ## Design Patterns
@@ -127,6 +145,7 @@ Each tool has its own `config.py` with typed dataclasses. All follow the same pa
 
 - `alfred up` uses `multiprocessing` to spawn one process per tool
 - `orchestrator.py` manages auto-restart (max 5 retries, exit code 78 = missing deps)
+- `orchestrator.py` writes `data/workers.json` every 2s with per-tool PID, status, and restart counts (consumed by the Ink TUI)
 - `alfred up` (no flag) daemonizes via re-exec pattern
 - `alfred down` uses sentinel file + SIGTERM
 - Graceful shutdown via signal handling

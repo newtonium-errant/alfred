@@ -8,10 +8,11 @@ All commands accept `--config path/to/config.yaml` (default: `config.yaml` in cu
 |---------|-------------|
 | `alfred up` | Start all daemons in background |
 | `alfred up --foreground` | Start attached to terminal (for dev/debug) |
-| `alfred up --live` | Start with real-time TUI dashboard |
+| `alfred up --live` | Start with real-time TUI dashboard (Textual) |
 | `alfred up --only curator,janitor` | Start only specific tools |
 | `alfred down` | Stop all background daemons |
 | `alfred status` | Show per-tool status overview |
+| `alfred tui` | Launch standalone Ink TUI dashboard (requires Node.js) |
 
 ### How `alfred up` Works
 
@@ -19,7 +20,9 @@ All commands accept `--config path/to/config.yaml` (default: `config.yaml` in cu
 
 `alfred up --foreground` stays attached and prints log output to the terminal. Useful for development and debugging.
 
-`alfred up --live` starts the [Live Dashboard](Live-Dashboard) — a Rich TUI showing a 2x2 grid of per-worker interpreted feeds with health indicators, pipeline step tracking, and LLM usage stats.
+`alfred up --live` starts the [Live Dashboard](Live-Dashboard) — a Textual TUI showing a 2x2 grid of per-worker interpreted feeds with health indicators, pipeline step tracking, and LLM usage stats.
+
+`alfred tui` launches the standalone [Ink TUI dashboard](Live-Dashboard#ink-tui) — a Node.js-based terminal UI with sparklines, inline progress bars, pipeline visualizations, and hex color theming. It reads the same `data/` files as `--live` but runs as a separate process. Requires Node.js 18+.
 
 `alfred down` creates a sentinel file (`data/alfred.stop`) and sends SIGTERM. The orchestrator catches the signal and gracefully shuts down all workers.
 

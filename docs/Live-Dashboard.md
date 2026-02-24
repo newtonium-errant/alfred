@@ -1,16 +1,162 @@
 # Live Dashboard
 
-The live dashboard provides real-time visibility into all four Alfred workers through a Rich TUI interface.
+Alfred provides two dashboard options for real-time visibility into workers:
 
-## Starting the Dashboard
+| Dashboard | Command | Runtime | Best for |
+|-----------|---------|---------|----------|
+| **Ink TUI** | `alfred tui` | Node.js 18+ | Standalone monitoring, rich visuals |
+| **Textual TUI** | `alfred up --live` | Python (built-in) | Integrated mode, no extra deps |
+
+Both read the same `data/` files (logs, state, audit log, workers.json) and show the same information — they just render differently.
+
+---
+
+## Ink TUI (`alfred tui`)
+
+A React Ink terminal dashboard with sparklines, progress bars, pipeline visualizations, and hex color theming. Runs as a separate Node.js process.
+
+```bash
+alfred tui
+```
+
+Requires Node.js 18+ on PATH. The bundled JS ships inside the pip wheel — no `npm install` needed.
+
+### Dashboard Screen
+
+```
+ alfred v0.2.2  ██▓░ 4/4   ⚠ 0  ✕ 0  ⏱ 23m   ▁▂▃▅▇▅▃▁ 8/min
+ ────────────────────────────────────────────────────────────────────
+ ◐ curator    Processing inbox/mtg.md        ████░░░░ 2/4   ⚡12  ⚠0
+ ● janitor    Idle                                          ⚡ 3  ⚠0
+ ● distiller  Idle                                          ⚡ 0  ⚠0
+ ◐ surveyor   Embedding diff                 ██░░░░░░ 1/4   ⚡ 5  ⚠0
+ ────────────────────────────────────────────────────────────────────
+ │ 14:23  curator    ✓ Created person/Alice Johnson
+ │ 14:22  curator    → Stage 3 done — linked 4 entities
+ ▌ 14:21  janitor    ⚠ Broken link in project/X.md
+ │ 14:20  surveyor     Embedded meeting-notes.md
+ ↑↓ select  ⏎ detail  l logs  m mutations  ? actions  q quit
+```
+
+### Header
+
+- **Health blocks**: One per tool (`█` working, `▓` idle, `▒` degraded, `░` stopped), colored per tool
+- **Aggregate counts**: Workers up, warnings, errors, uptime
+- **Activity sparkline**: Rolling 10-minute event rate graph
+
+### Worker Lines
+
+- Tool name colored by tool identity
+- Inline progress bar (`████░░░░ 2/4`) when in a pipeline stage
+- `⚡` LLM call count, `⚠` error/warning count
+
+### Activity Stream
+
+Merged chronological feed from all tools plus vault mutations. Each line has a severity gutter:
+- `│` for info and success events
+- `▌` for warnings and errors
+
+### Worker Detail Screen
+
+Press Enter on a worker to see the expanded view:
+
+```
+ ◐ CURATOR — Processing inbox/meeting-notes.md            pid 12345
+   ✓ Extract → ✓ Resolve → ◐ Enrich → ○ Write
+ ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+   LLM Calls   12   ▁▂▃▅▇▃▁▁       Tokens   48.2k  ▁▁▃▅▇▅▃▁
+   Restarts     0                    Errors       1
+   Processed    6                    Warnings     0
+ ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+ │ 14:23  ✓ Created person/Alice Johnson
+ │ 14:22  → Stage 3 done — linked 4 entities
+```
+
+- **Pipeline visualization**: Per-tool stage labels with done/active/pending indicators
+- **Stats grid**: 2-column layout with sparklines for LLM calls and activity
+- **Filtered feed**: Events for this tool only
+
+### Mutations Screen
+
+Press `m` for the mutations view:
+
+```
+ Mutations — 23 total                   5m: 8  30m: 15  older: 0
+ ────────────────────────────────────────────────────────────────────
+  14:23  curator    + person       Alice Johnson
+  14:22  curator    ~ note         2024 meeting notes
+  14:20  janitor    ~ project      X
+```
+
+- Parses vault paths into record type + name
+- Record types colored by category
+- Time-grouped counts in header
+
+### Logs Screen
+
+Press `l` for the filtered log viewer:
+- Filter by tool (keys `0`-`4`)
+- Filter by severity (key `f` to cycle)
+- Scroll with arrows, Page Up/Down, `g` to jump to top
+
+### Keyboard Shortcuts
+
+| Key | Dashboard | Detail | Logs | Mutations |
+|-----|-----------|--------|------|-----------|
+| `↑↓` | Select worker | Scroll | Scroll | Scroll |
+| `⏎` | Open detail | — | — | — |
+| `Esc` | — | Back | Back | Back |
+| `l` | Logs view | — | — | — |
+| `m` | Mutations view | — | — | — |
+| `r` | — | Restart worker | — | — |
+| `0`-`4` | — | — | Filter tool | — |
+| `f` | — | — | Filter severity | — |
+| `g` | — | — | Jump to top | — |
+| `?` | Actions menu | Actions menu | — | — |
+| `q` | Quit | Quit | Quit | Quit |
+
+### Actions Menu
+
+Press `?` to open the command palette:
+- Restart a worker
+- Trigger curator (process inbox)
+- Force janitor sweep
+- Force distiller extraction
+- Refresh stats
+
+### Visual Features
+
+| Feature | Description |
+|---------|-------------|
+| **Sparklines** | `▁▂▃▅▇▅▃▁` — rolling 10-min window, sampled every 10s |
+| **Progress bars** | `████░░░░` — inline stage progress |
+| **Pipeline stages** | `✓ Extract → ◐ Enrich → ○ Write` — per-tool stage names |
+| **Health blocks** | `██▓░` — one block per tool in header |
+| **Severity gutters** | `│` info/success, `▌` warning/error |
+| **Hex colors** | Rich color theming for tools, severities, record types |
+
+### Time Series
+
+The dashboard samples metrics every 10 seconds and maintains a rolling 60-sample window (~10 minutes). Sparklines become meaningful after about 2 minutes of activity. Tracked metrics:
+- Activity rate (events per interval across all tools)
+- Per-tool activity
+- LLM call rate
+- Error rate
+- Mutation rate
+
+---
+
+## Textual TUI (`alfred up --live`)
+
+A Python Textual dashboard that runs integrated with the daemon orchestrator. No extra runtime needed.
 
 ```bash
 alfred up --live
 ```
 
-This starts all configured daemons and displays a 2x2 grid of per-worker feed panels.
+### Layout
 
-## Layout
+2x2 grid of per-worker feed panels:
 
 ```
 +-- Curator --- * healthy -- pid 1234 --------++-- Janitor --- @ degraded -- pid 1235 --------+
@@ -18,61 +164,28 @@ This starts all configured daemons and displays a 2x2 grid of per-worker feed pa
 |                                              ||                                               |
 | 14:23:01  v Pipeline complete - 3 entities   || 14:22:45  Scan found 12 issues                |
 | 14:22:58  Stage 4 done - enriched 2 entities || 14:22:40  Autofix - 8 fixed, 2 flagged        |
-| 14:22:50  Stage 3 done - linked 3 entities   || 14:22:30  ! Failed to fix person/Old.md       |
-| 14:22:45  v Created person/John Doe          || 14:22:20  v Sweep done - 10/12 issues fixed   |
-| 14:22:30  Stage 1 done - note + 3 entities   ||                                               |
 |                            12 calls  45k chars||                           8 calls  23k chars   |
 +----------------------------------------------++-----------------------------------------------+
-+-- Distiller - * healthy -- pid 1236 --------++-- Surveyor -- * healthy -- pid 1237 ----------+
-| Idle - next deep run in 45m                  || Embedding diff: 3 new, 1 changed              |
-|                                              ||                                               |
-| 14:20:01  v Run complete - 5 records created || 14:23:05  Tagged project/X [construction]      |
-| 14:19:55  Meta-analysis - 1 synthesis        || 14:23:00  v Labeled 3 clusters                 |
-| 14:19:45  v Created decision/API Architecture|| 14:22:50  Found 8 clusters (3 changed)         |
-| 14:19:30  Dedup - 8 candidates, 5 unique     || 14:22:40  Embedded 15 files, removed 2         |
-|                             5 calls  67k chars||                           3 calls  15k tokens  |
-+----------------------------------------------++-----------------------------------------------+
- Uptime: 1h 23m 45s  |  4/4 workers  |  0 errors  3 warnings  |  Ctrl+C to stop
 ```
 
-## Panel Components
+Each panel shows: tool name, health indicator, PID, current step, event feed, and LLM usage.
 
-Each worker panel has four parts:
-
-### Title Bar
-Shows the tool name, health indicator, and PID.
-
-### Current Step (top line, bold)
-What the worker is doing right now:
-- Curator: "Processing inbox/file.md", "Stage 2: Entity Resolution", "Watching inbox..."
-- Janitor: "Sweep #5", "Scanning...", "Stage 2: Link Repair", "Idle"
-- Distiller: "Extraction #3", "Analyzing project X", "Meta-analysis", "Idle"
-- Surveyor: "Initial sync", "Embedding diff", "Watching vault", "Idle"
-
-### Event Feed (middle, scrolling)
-Human-readable interpreted events, newest first. Each line has a timestamp and severity indicator:
-- (dim) Info — normal progress events
-- (green) Success — completed operations with results
-- (yellow) Warning — anomalies, retries, partial failures
-- (red) Error — hard failures
-
-### LLM Usage (bottom, dim)
-Call count and token/character usage for the session.
-
-## Health Indicators
+### Health Indicators
 
 | Indicator | Meaning |
 |-----------|---------|
 | * healthy | Running, no errors |
-| @ degraded | Running, 1-4 errors detected |
-| ! failing | Running, 5+ errors detected |
-| * stopped | Process exited, not restarting |
-| * restarting | Process died, waiting to restart |
+| @ degraded | Running, 1-4 errors |
+| ! failing | Running, 5+ errors |
+| * stopped | Process exited |
+| * restarting | Waiting to restart |
 | o pending | Not yet started |
+
+---
 
 ## Event Interpretation
 
-The dashboard interprets ~60+ structlog events into human-readable messages. Examples:
+Both dashboards interpret ~60+ structlog events into human-readable messages. Examples:
 
 ### Curator Events
 
@@ -113,7 +226,7 @@ The dashboard interprets ~60+ structlog events into human-readable messages. Exa
 
 ## Silent Failure Detection
 
-The dashboard flags anomalous "successes" that may indicate problems:
+Both dashboards flag anomalous "successes" that may indicate problems:
 
 - Curator pipeline "complete" with 0 entities created
 - Curator Stage 1 found 0 entities (warning)
@@ -121,26 +234,3 @@ The dashboard flags anomalous "successes" that may indicate problems:
 - Janitor fixed less than half of detected issues
 - Distiller run complete with 0 records created
 - Distiller manifest file missing (LLM didn't write it)
-
-## Footer
-
-The footer bar shows:
-- Uptime since dashboard start
-- Active/total worker count
-- Aggregate error and warning counts
-- Last 3 vault mutations (create/modify/delete with file names)
-
-## Adaptive Layout
-
-The dashboard adapts to the number of active workers:
-- 1 worker: full screen
-- 2 workers: side by side
-- 3 workers: 2 on top, 1 on bottom
-- 4 workers: 2x2 grid
-
-## Background Threads
-
-The dashboard runs three background threads:
-- **LogTailThread** — tails `data/{tool}.log` files, parses structlog entries, updates feeds
-- **AuditTailThread** — tails `data/vault_audit.log` for vault mutations
-- **StatReaderThread** — reads `data/*_state.json` files periodically for stats

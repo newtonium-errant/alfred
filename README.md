@@ -115,6 +115,7 @@ alfred up --foreground                 # attached mode (dev/debug)
 alfred up --only curator,janitor       # start specific tools
 alfred down                            # stop
 alfred status                          # overview
+alfred tui                             # live Ink TUI dashboard (requires Node.js)
 
 # Individual tools
 alfred curator                         # curator daemon (foreground)
