@@ -2,7 +2,9 @@
 
 # Alfred
 
-**Your AI runs 24/7. It maintains your knowledge, executes your workflows, and learns while you sleep.**
+**The agent you can forget about.**
+
+Turn any agentic runtime into an ambient butler that manages your digital life — so you can be present for the rest of it.
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-green.svg)](https://python.org)
@@ -12,32 +14,32 @@
 
 ---
 
-You go to bed. While you sleep, Alfred processes today's meeting transcripts into structured records — people, tasks, decisions, projects — all wikilinked. It notices two records contradict each other and flags it. It sweeps the vault, fixes three broken links, and fills in two stub records. It discovers a cluster of notes about the same theme you never connected and writes the relationship. By morning, your knowledge graph is richer than when you left it.
+200 emails on Tuesday. Alfred surfaced 1 that actually required attention.
 
-You didn't ask for any of this. It just happened.
+A meeting transcript dropped into the inbox at 3pm. By 3:02, Alfred had created the conversation record, updated three people records, filed two tasks under the right project, and linked everything together. Nobody asked for this. Nobody prompted anything. It just happened.
+
+That night, Alfred noticed two records in the vault contradicted each other and flagged it. Fixed three broken links. Discovered a cluster of notes about the same theme that were never connected. Wrote the relationships. By morning, the knowledge graph was richer than when everyone went home.
+
+**This is what a butler does.** Not just tasks when asked. Anticipatory attention. Owning things so you don't have to hold them in your head.
 
 ---
 
-## What Alfred Does
+## What is Alfred?
 
-**It turns your Obsidian vault into a self-maintaining knowledge graph.**
+Alfred connects to your agentic runtime — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenClaw](https://openclaw.com), or [Zo Computer](https://zo.computer) — and turns it into a butler you set up once and forget about.
 
-Drop anything into `inbox/` — meeting transcripts, emails, voice memos, notes. Alfred structures it, links it, and files it. Four background workers keep your vault clean, connected, and growing:
+It does three things:
 
-| | |
-|---|---|
-| **Curator** | Turns raw files into structured, interlinked records |
-| **Janitor** | Finds and fixes broken links, orphaned files, invalid metadata |
-| **Distiller** | Extracts hidden knowledge — assumptions, decisions, contradictions |
-| **Surveyor** | Discovers semantic relationships across hundreds of records |
+**1. It maintains a knowledge graph that never goes stale.**
+An Obsidian vault with 20 structured record types, wikilinked together, readable by both you and your agents. Four background workers — Curator, Janitor, Distiller, Surveyor — continuously process, clean, extract, and connect. The vault is your agent's operational memory and your second brain. Same artifact.
 
-**It executes durable workflows on your behalf.**
+**2. It executes durable workflows on your behalf.**
+A Temporal-based engine that runs scheduled and triggered operations. Daily briefings. Inbox processing. Vault health sweeps. If it crashes, it picks up where it left off. Write workflows in Python — the agent handles reasoning, Python handles control flow.
 
-Schedule your agent to process your inbox every morning. Run a weekly vault health sweep. Chain together multi-step operations that survive crashes and pick up where they left off. Write workflows in Python — the agent handles reasoning, Python handles control flow.
+**3. It meets you where you already are.**
+Telegram. WhatsApp. Slack. iMessage. Email. CLI. Whatever channels your runtime supports. Not another app to check — the butler comes to you.
 
-**It plugs into the tools you already use.**
-
-Telegram, WhatsApp, Slack, iMessage, email, CLI — Alfred meets you where you are. Three pluggable AI backends (Claude Code, Zo Computer, OpenClaw) mean you're never locked in. Self-hosted on your own hardware, so your data never leaves your control.
+The goal isn't to talk to your AI more. The goal is to **prompt less and live more.**
 
 ---
 
@@ -49,36 +51,55 @@ alfred quickstart
 alfred up
 ```
 
-Three commands. The wizard sets up your vault, picks your AI backend, and starts the workers. Drop a file into `inbox/` and watch it happen.
+Three commands. Drop a file into `inbox/` and it's handled.
 
 ---
 
-## Use Cases
+## The Four Workers
 
-### Personal Task Manager
+Alfred's semantic layer — four specialized workers that maintain your vault around the clock:
 
-Paste a meeting transcript. Alfred extracts every task mentioned, assigns them to people, links them to the right project, and tracks status. Open a project page in Obsidian — live tables of tasks, conversations, and people, populated automatically.
+| | |
+|---|---|
+| **Curator** | Watches `inbox/`. Turns raw files — transcripts, emails, voice memos — into structured, interlinked records. Creates people, tasks, conversations, projects. Links everything. |
+| **Janitor** | Sweeps for entropy. Broken wikilinks, invalid frontmatter, orphaned files, stub records. Fixes them automatically. |
+| **Distiller** | Reads your operational records and surfaces what's implicit — assumptions, decisions, constraints, contradictions. Builds an evidence graph that evolves with your vault. |
+| **Surveyor** | Embeds your vault into vectors, clusters by semantic similarity, and writes relationship tags back. Finds connections you'd never spot manually. |
 
-### Relationship Manager
+Each worker has **scope enforcement** — the Curator can create but not delete, the Janitor can delete but not create, the Distiller can only create learning records. No single worker has unconstrained access.
 
-Every conversation Alfred processes creates or updates person and org records. Who said what, when, in what context. Your vault becomes a relationship graph — open anyone's page and see every interaction, every project, every commitment.
+## Workflow Engine
 
-### Ambient Knowledge Base
+The kinetic layer — durable, scheduled execution powered by [Temporal](https://temporal.io):
 
-The Distiller reads your notes and surfaces what's implicit: assumptions your team operates on, decisions that were made in passing, constraints mentioned once and forgotten. The Surveyor finds patterns across hundreds of records you'd never connect manually. Together they build an evidence graph that evolves with your work.
+```bash
+alfred temporal worker                    # start the worker
+alfred temporal run DailyBriefing         # trigger a workflow
+alfred temporal schedule register crons.py  # register schedules
+```
 
-### Scheduled Automation
+Built-in activities: `spawn_agent`, `run_script`, `notify_slack`, `load_json_state`, `save_json_state`, and more. Per-workflow agent profiles — different workflows can use different backends, skills, and scopes.
 
-Daily inbox processing at 7am. Weekly vault health sweeps. Monthly knowledge distillation. Temporal workflows that survive crashes, sleep for days, and resume with full state. Nothing gets dropped.
+## Agent Backends
+
+Alfred doesn't contain an AI — it plugs into one:
+
+| Backend | Type | Setup |
+|---------|------|-------|
+| **Claude Code** | Subprocess | Default. `claude` on PATH |
+| **Zo Computer** | HTTP API | Set `ZO_API_KEY` |
+| **OpenClaw** | Subprocess | `openclaw` on PATH. Multi-stage pipelines. |
+
+Switch backends in config. No rewiring. The butler adapts to whichever runtime you run.
 
 ---
 
-## How It Works
+## Architecture
 
-Alfred is six layers of infrastructure working together:
+Six layers, each independent:
 
 ```
- Interface     Telegram, WhatsApp, Slack, iMessage, email, CLI, TUI
+ Interface     Telegram · WhatsApp · Slack · iMessage · email · CLI · TUI
      |
    Agent        Claude Code · Zo Computer · OpenClaw
      |
@@ -88,32 +109,30 @@ Alfred is six layers of infrastructure working together:
      |
    Data          Omi · Zoom · email · RSS — ambient capture pipelines
      |
-   Infra         Mac Mini · VPS · personal cloud — your hardware
+   Infra         Mac Mini · VPS · personal cloud — your hardware, your data
 ```
 
-**Semantic Layer** — Your Obsidian vault is the single source of truth. 20 structured record types with YAML frontmatter, connected by wikilinks. Both you and your agents read and write to it. The four workers maintain it continuously. Not a database — a browseable, versioned knowledge base.
+**Infra** — Runs on a Mac Mini under your desk, a Hetzner VPS, or a Zo Computer instance. Self-hosted. Your data never leaves your control.
 
-**Kinetic Layer** — A [Temporal](https://temporal.io)-based execution engine. Write workflows in Python. Built-in activities: `spawn_agent`, `run_script`, `notify_slack`, and more. If the worker crashes mid-workflow, it picks up exactly where it left off.
+**Data** — Anything that produces text can feed the inbox. Omi wearable transcripts, Zoom recordings, email digests, bulk conversation exports (`alfred ingest`).
 
-**Agent Layer** — Pluggable backends. Claude Code (subprocess, default), Zo Computer (HTTP API), OpenClaw (subprocess, multi-stage pipelines). Switch without rewiring. Configure per-workflow agent profiles with different backends, skills, and scopes.
+**Semantic** — The Obsidian vault. 20 record types, YAML frontmatter, wikilinks. Maintained by four workers. Not a database — a browseable, versioned, git-tracked knowledge base.
 
-**Data Layer** — Anything that produces text can feed Alfred's inbox. Omi wearable transcripts, Zoom recordings, email digests, RSS feeds, API webhooks, bulk conversation exports.
+**Kinetic** — Temporal workflows. Cron schedules, one-off triggers, durable execution. Crashes don't lose state. The agent sleeps for days and resumes with full context.
 
-**Interface Layer** — Governed by your agent runtime. OpenClaw gives you Telegram, WhatsApp, Slack, iMessage, Discord, Signal. Zo gives you Telegram, SMS, email. Locally: CLI and TUI dashboard.
+**Agent** — Pluggable AI backends. Per-workflow profiles. The butler delegates reasoning to whichever model you trust.
 
-**Infra Layer** — Self-hosted. A Mac Mini under your desk. A Hetzner VPS. A Zo Computer instance. Your data, your infrastructure, your control.
+**Interface** — Governed by your runtime. OpenClaw routes Telegram, WhatsApp, Slack, iMessage, Discord, Signal. Zo routes Telegram, SMS, email. Locally: `alfred` CLI and `alfred tui` dashboard.
 
 ---
 
 ## Install
 
 ```bash
-pip install alfred-vault                    # core (curator + janitor + distiller)
+pip install alfred-vault                    # core workers
 pip install "alfred-vault[temporal]"        # + workflow engine
-pip install "alfred-vault[all]"             # + surveyor + temporal
+pip install "alfred-vault[all]"             # everything
 ```
-
-**Prerequisites:** Python 3.11+ and an AI backend on PATH. Default is [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
 <details>
 <summary>From source</summary>
@@ -128,7 +147,6 @@ cd alfred && pip install -e ".[all]"
 
 ```bash
 alfred up                              # start workers (background)
-alfred up --foreground                 # attached mode
 alfred down                            # stop
 alfred status                          # overview
 alfred tui                             # live dashboard
@@ -142,14 +160,6 @@ alfred vault list [type]               # list records
 alfred process                         # batch-process inbox
 alfred ingest <file>                   # import conversation export
 ```
-
-## Configuration
-
-```bash
-alfred quickstart                      # recommended: interactive wizard
-```
-
-Or manually: `cp config.yaml.example config.yaml && cp .env.example .env`. Supports `${VAR}` environment variable substitution. See [`config.yaml.example`](config.yaml.example).
 
 ## Documentation
 
