@@ -234,10 +234,26 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
     watcher.start()
     log.info("daemon.watching", inbox=str(config.vault.inbox_path))
 
+    import time
+    last_rescan = time.monotonic()
+    rescan_interval = config.watcher.rescan_interval
+
     try:
         while True:
             await asyncio.sleep(config.watcher.poll_interval)
             ready = watcher.collect_ready()
+
+            # Periodic full_scan fallback (inotify may not work on all kernels/mounts)
+            now = time.monotonic()
+            if now - last_rescan >= rescan_interval:
+                last_rescan = now
+                rescan_hits = watcher.full_scan(
+                    state_processed=set(state_mgr.state.processed.keys()),
+                )
+                for f in rescan_hits:
+                    if f not in ready:
+                        ready.append(f)
+
             for inbox_file in ready:
                 # Skip if already processed (race condition guard)
                 if state_mgr.state.is_processed(inbox_file.name):

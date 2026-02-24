@@ -87,6 +87,7 @@ class AgentConfig:
 class WatcherConfig:
     poll_interval: int = 5
     debounce_seconds: int = 10
+    rescan_interval: int = 60
 
 
 @dataclass

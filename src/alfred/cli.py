@@ -444,8 +444,8 @@ def cmd_temporal(args: argparse.Namespace) -> None:
 
     try:
         from alfred.temporal import cli as tcli
-    except ImportError as e:
-        print(f"Temporal dependencies not installed: {e}")
+    except ImportError:
+        print("Temporal is not installed. Alfred's workflow engine won't work without it.")
         print("Install with: pip install alfred-vault[temporal]")
         sys.exit(1)
 

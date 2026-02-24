@@ -55,6 +55,37 @@ def _check_command(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _register_openclaw_agents(vault_path: str) -> None:
+    """Register required OpenClaw agents for Alfred."""
+    agents = ["vault-curator", "vault-janitor", "vault-distiller", "worker"]
+    print("\n  Registering OpenClaw agents...")
+    for agent in agents:
+        result = subprocess.run(
+            ["openclaw", "agents", "add", agent, "--workspace", vault_path, "--non-interactive"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            print(f"    [OK] {agent}")
+        elif "already exists" in (result.stdout + result.stderr).lower():
+            print(f"    [OK] {agent} (already registered)")
+        else:
+            msg = (result.stderr or result.stdout).strip()[:120]
+            print(f"    [!!] {agent}: {msg}")
+
+
+def _check_temporal() -> bool:
+    """Check if Temporal server is reachable at 127.0.0.1:7233."""
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        sock.connect(("127.0.0.1", 7233))
+        sock.close()
+        return True
+    except (OSError, socket.timeout):
+        return False
+
+
 def _check_ollama() -> bool:
     """Check if Ollama is reachable."""
     try:
@@ -160,6 +191,7 @@ def run_quickstart() -> None:
     elif backend == "openclaw":
         if _check_command("openclaw"):
             print("  [OK] `openclaw` found on PATH")
+            _register_openclaw_agents(vault_path)
         else:
             print("  [!!] `openclaw` not found on PATH")
 
@@ -315,6 +347,25 @@ def run_quickstart() -> None:
     Path("data").mkdir(exist_ok=True)
     print(f"  Created data/ directory")
 
+    # Check Temporal availability
+    try:
+        import temporalio  # noqa: F401
+        temporal_installed = True
+    except ImportError:
+        temporal_installed = False
+
+    if not temporal_installed:
+        print(f"  [!!] Temporal is not installed — Alfred's workflows won't work")
+        print(f"       Install with: pip install alfred-vault[temporal]")
+        temporal_ok = False
+    elif _check_temporal():
+        print(f"  [OK] Temporal server reachable at 127.0.0.1:7233")
+        temporal_ok = True
+    else:
+        print(f"  [!!] Temporal server not running at 127.0.0.1:7233 — workflows won't work")
+        print(f"       Start with: temporal server start-dev")
+        temporal_ok = False
+
     # Summary
     print(f"\n{'=' * 50}")
     print(f"  Setup complete!")
@@ -326,8 +377,16 @@ def run_quickstart() -> None:
     print(f"    1. Open {vault_path} as an Obsidian vault")
     print(f"    2. Run `alfred up` to start all daemons")
     print(f"    3. Or run individual tools: `alfred janitor scan`")
+    step = 4
     if not enable_surveyor:
-        print(f"    4. To enable surveyor later: pip install alfred-vault[all]")
+        print(f"    {step}. To enable surveyor later: pip install alfred-vault[all]")
+        step += 1
+    if not temporal_ok and not temporal_installed:
+        print(f"    {step}. Install Temporal for workflows: pip install alfred-vault[temporal]")
+        step += 1
+    elif not temporal_ok:
+        print(f"    {step}. Start Temporal for workflows: temporal server start-dev")
+        step += 1
 
     # Auto-launch prompt
     start_now = _prompt("\nStart daemons now?", "n").lower() in ("y", "yes")

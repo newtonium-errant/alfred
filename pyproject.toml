@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alfred-vault"
-version = "0.3.0"
+version = "0.3.1"
 description = "Personal agentic infrastructure. Self-hosted. Always on."
 readme = "README.md"
 license = "MIT"
@@ -20,6 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+temporal = ["temporalio>=1.9.0"]
 surveyor = [
     "pymilvus[milvus_lite]>=2.4",
     "scikit-learn>=1.4",
@@ -28,7 +29,6 @@ surveyor = [
     "numpy>=1.26",
     "openai>=1.30",
 ]
-temporal = ["temporalio>=1.9.0"]
 all = ["alfred-vault[surveyor]", "alfred-vault[temporal]"]
 
 [project.urls]

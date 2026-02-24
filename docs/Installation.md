@@ -12,14 +12,14 @@
 # Base install (curator + janitor + distiller)
 pip install alfred-vault
 
+# With Temporal workflow engine
+pip install "alfred-vault[temporal]"
+
 # With surveyor (adds ML/vector dependencies)
 pip install "alfred-vault[all]"
-
-# With Temporal (kinetic layer — durable workflow engine)
-pip install "alfred-vault[temporal]"
 ```
 
-The base install includes the semantic layer workers (curator, janitor, distiller). The `[all]` extra adds the surveyor (ML/vector deps) and Temporal (workflow engine).
+The base install includes the semantic layer workers (curator, janitor, distiller). The `[temporal]` extra adds the workflow engine. The `[all]` extra adds everything (surveyor ML/vector deps + Temporal).
 
 ## Install from Source
 
