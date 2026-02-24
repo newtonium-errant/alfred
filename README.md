@@ -2,9 +2,7 @@
 
 # Alfred
 
-**Personal agentic infrastructure. Self-hosted. Always on.**
-
-A layered AI architecture that captures your data, maintains your knowledge, executes your workflows, and communicates on your behalf.
+**Your AI runs 24/7. It maintains your knowledge, executes your workflows, and learns while you sleep.**
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-green.svg)](https://python.org)
@@ -14,220 +12,155 @@ A layered AI architecture that captures your data, maintains your knowledge, exe
 
 ---
 
-Chatbots answer questions. Agentic tools complete tasks. Alfred runs your life.
+You go to bed. While you sleep, Alfred processes today's meeting transcripts into structured records — people, tasks, decisions, projects — all wikilinked. It notices two records contradict each other and flags it. It sweeps the vault, fixes three broken links, and fills in two stub records. It discovers a cluster of notes about the same theme you never connected and writes the relationship. By morning, your knowledge graph is richer than when you left it.
 
-Alfred is a self-hosted agentic butler — six layers of intelligence that work together so your AI doesn't just respond when prompted, it observes, thinks, acts, and learns continuously. Your Obsidian vault becomes a living knowledge graph that both you and your agents maintain together. Temporal workflows execute durable, auditable operations. Data pipelines capture the world around you. And it all runs on infrastructure you control.
-
----
-
-## The Six Layers
-
-```
- Interface     Telegram, WhatsApp, Slack, iMessage, SMS, email, CLI, TUI
-     |
-   Agent        Claude Code, Zo Computer, OpenClaw — pluggable AI backends
-     |
-  Kinetic       Temporal workflows — durable, scheduled, auditable execution
-     |
- Semantic       Obsidian vault — human-readable, agent-writable knowledge graph
-     |
-   Data          Omi transcripts, meeting recordings, email digests, RSS — raw signal in
-     |
-   Infra         Mac Mini, VPS (Hetzner/DO/AWS), personal cloud (Zo Computer)
-```
-
-### Semantic Layer — Your vault is the single source of truth
-
-An Obsidian vault with 20 structured record types, wikilinked into a knowledge graph that both you and your agents can read, write, and reason over. Four specialized workers maintain it continuously:
-
-| Worker | Role |
-|--------|------|
-| **Curator** | Watches `inbox/` and turns raw files (transcripts, emails, notes) into structured, interlinked records |
-| **Janitor** | Scans for broken links, invalid frontmatter, orphaned files — and fixes them |
-| **Distiller** | Reads operational records and extracts latent knowledge: assumptions, decisions, constraints, contradictions |
-| **Surveyor** | Embeds content into vectors, clusters by semantic similarity, discovers and writes relationship tags |
-
-The vault is both the agent's operational memory and your second brain. Not a database — a browseable, versioned, wikilinked knowledge base.
-
-### Kinetic Layer — Durable workflow execution
-
-A Temporal-based execution engine that orchestrates agent work as durable workflows. If it crashes, it picks up where it left off. An agent can sleep for days and resume with full context.
-
-```bash
-alfred temporal worker                    # start the workflow worker
-alfred temporal run MyWorkflow            # trigger a workflow
-alfred temporal schedule register defs.py # register cron schedules
-alfred temporal list                      # list discovered workflows
-```
-
-Write workflows in Python. Activities like `spawn_agent`, `run_script`, and `notify_slack` are built in. The agent handles reasoning; Python handles control flow.
-
-### Agent Layer — Pluggable AI backends
-
-| Backend | Type | Notes |
-|---------|------|-------|
-| **Claude Code** | Subprocess | Default. Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code), `claude` on PATH |
-| **Zo Computer** | HTTP API | Cloud-based. Set `ZO_API_KEY` in `.env` |
-| **OpenClaw** | Subprocess | Self-hosted. Supports multi-stage pipelines |
-
-Switch backends without rewiring. Configure per-workflow agent profiles with different backends, skills, and scopes.
-
-### Data Layer — Pipelines that capture the world
-
-Feed data into your vault's `inbox/` from any source. The Curator processes it into structured records automatically.
-
-- Omi wearable transcripts (conversations processed into records)
-- Meeting recordings (Zoom, Sembly AI)
-- Email digests, RSS feeds, API webhooks
-- Bulk imports via `alfred ingest`
-
-### Interface Layer — Meet Alfred where you are
-
-The interface is governed by your agent runtime:
-- **OpenClaw**: Telegram, WhatsApp, Slack, iMessage, Discord, Signal
-- **Zo Computer**: Telegram, SMS, email
-- **Local**: CLI (`alfred`), TUI dashboard (`alfred tui`), Claude Code
-
-### Infra Layer — Runs where you trust
-
-Your data never leaves your control. Run Alfred on:
-- A Mac Mini under your desk
-- A VPS (Hetzner, DigitalOcean, AWS)
-- Personal cloud (Zo Computer)
+You didn't ask for any of this. It just happened.
 
 ---
 
-## Quickstart
+## What Alfred Does
+
+**It turns your Obsidian vault into a self-maintaining knowledge graph.**
+
+Drop anything into `inbox/` — meeting transcripts, emails, voice memos, notes. Alfred structures it, links it, and files it. Four background workers keep your vault clean, connected, and growing:
+
+| | |
+|---|---|
+| **Curator** | Turns raw files into structured, interlinked records |
+| **Janitor** | Finds and fixes broken links, orphaned files, invalid metadata |
+| **Distiller** | Extracts hidden knowledge — assumptions, decisions, contradictions |
+| **Surveyor** | Discovers semantic relationships across hundreds of records |
+
+**It executes durable workflows on your behalf.**
+
+Schedule your agent to process your inbox every morning. Run a weekly vault health sweep. Chain together multi-step operations that survive crashes and pick up where they left off. Write workflows in Python — the agent handles reasoning, Python handles control flow.
+
+**It plugs into the tools you already use.**
+
+Telegram, WhatsApp, Slack, iMessage, email, CLI — Alfred meets you where you are. Three pluggable AI backends (Claude Code, Zo Computer, OpenClaw) mean you're never locked in. Self-hosted on your own hardware, so your data never leaves your control.
+
+---
+
+## Get Started
 
 ```bash
 pip install alfred-vault
-alfred quickstart          # interactive setup wizard
-alfred up                  # start background daemons
+alfred quickstart
+alfred up
 ```
 
-That's it. The wizard handles vault path, agent backend, and directory scaffolding.
+Three commands. The wizard sets up your vault, picks your AI backend, and starts the workers. Drop a file into `inbox/` and watch it happen.
 
-**Prerequisites:** Python 3.11+ and an AI agent on PATH. Default is Claude Code.
+---
+
+## Use Cases
+
+### Personal Task Manager
+
+Paste a meeting transcript. Alfred extracts every task mentioned, assigns them to people, links them to the right project, and tracks status. Open a project page in Obsidian — live tables of tasks, conversations, and people, populated automatically.
+
+### Relationship Manager
+
+Every conversation Alfred processes creates or updates person and org records. Who said what, when, in what context. Your vault becomes a relationship graph — open anyone's page and see every interaction, every project, every commitment.
+
+### Ambient Knowledge Base
+
+The Distiller reads your notes and surfaces what's implicit: assumptions your team operates on, decisions that were made in passing, constraints mentioned once and forgotten. The Surveyor finds patterns across hundreds of records you'd never connect manually. Together they build an evidence graph that evolves with your work.
+
+### Scheduled Automation
+
+Daily inbox processing at 7am. Weekly vault health sweeps. Monthly knowledge distillation. Temporal workflows that survive crashes, sleep for days, and resume with full state. Nothing gets dropped.
+
+---
+
+## How It Works
+
+Alfred is six layers of infrastructure working together:
+
+```
+ Interface     Telegram, WhatsApp, Slack, iMessage, email, CLI, TUI
+     |
+   Agent        Claude Code · Zo Computer · OpenClaw
+     |
+  Kinetic       Temporal — durable, scheduled workflow execution
+     |
+ Semantic       Obsidian vault — knowledge graph for humans and agents
+     |
+   Data          Omi · Zoom · email · RSS — ambient capture pipelines
+     |
+   Infra         Mac Mini · VPS · personal cloud — your hardware
+```
+
+**Semantic Layer** — Your Obsidian vault is the single source of truth. 20 structured record types with YAML frontmatter, connected by wikilinks. Both you and your agents read and write to it. The four workers maintain it continuously. Not a database — a browseable, versioned knowledge base.
+
+**Kinetic Layer** — A [Temporal](https://temporal.io)-based execution engine. Write workflows in Python. Built-in activities: `spawn_agent`, `run_script`, `notify_slack`, and more. If the worker crashes mid-workflow, it picks up exactly where it left off.
+
+**Agent Layer** — Pluggable backends. Claude Code (subprocess, default), Zo Computer (HTTP API), OpenClaw (subprocess, multi-stage pipelines). Switch without rewiring. Configure per-workflow agent profiles with different backends, skills, and scopes.
+
+**Data Layer** — Anything that produces text can feed Alfred's inbox. Omi wearable transcripts, Zoom recordings, email digests, RSS feeds, API webhooks, bulk conversation exports.
+
+**Interface Layer** — Governed by your agent runtime. OpenClaw gives you Telegram, WhatsApp, Slack, iMessage, Discord, Signal. Zo gives you Telegram, SMS, email. Locally: CLI and TUI dashboard.
+
+**Infra Layer** — Self-hosted. A Mac Mini under your desk. A Hetzner VPS. A Zo Computer instance. Your data, your infrastructure, your control.
+
+---
 
 ## Install
 
 ```bash
-# Base (semantic layer workers: curator + janitor + distiller)
-pip install alfred-vault
+pip install alfred-vault                    # core (curator + janitor + distiller)
+pip install "alfred-vault[temporal]"        # + workflow engine
+pip install "alfred-vault[all]"             # + surveyor + temporal
+```
 
-# With surveyor (adds ML/vector dependencies)
-pip install "alfred-vault[all]"
+**Prerequisites:** Python 3.11+ and an AI backend on PATH. Default is [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
-# With Temporal (kinetic layer)
-pip install "alfred-vault[temporal]"
+<details>
+<summary>From source</summary>
 
-# Everything
-pip install "alfred-vault[all]"
-
-# From source
+```bash
 git clone https://github.com/ssdavidai/alfred.git
 cd alfred && pip install -e ".[all]"
 ```
+</details>
 
-## Vault Structure
-
-Structured Markdown with YAML frontmatter. 20 record types across three categories:
-
-| Category | Types |
-|----------|-------|
-| **Operational** | project, task, session, conversation, input, note, process, run, event, thread |
-| **Entity** | person, org, location, account, asset |
-| **Epistemic** | assumption, decision, constraint, contradiction, synthesis |
-
-Records link via `[[wikilinks]]` — open any project page and you'll see live tables of tasks, conversations, and people, populated automatically.
-
-## CLI Reference
+## CLI
 
 ```bash
-# Daemon management
-alfred up                              # start all (background)
-alfred up --foreground                 # attached mode (dev/debug)
-alfred up --only curator,janitor       # start specific workers
+alfred up                              # start workers (background)
+alfred up --foreground                 # attached mode
 alfred down                            # stop
 alfred status                          # overview
-alfred tui                             # live dashboard (requires Node.js)
+alfred tui                             # live dashboard
 
-# Semantic layer workers
-alfred curator                         # curator daemon (foreground)
-alfred janitor scan                    # scan + report
-alfred janitor fix                     # scan + AI fix
-alfred distiller scan                  # find candidates
-alfred distiller run                   # scan + extract
-alfred surveyor                        # full pipeline
-
-# Kinetic layer (requires: pip install alfred-vault[temporal])
 alfred temporal worker                 # start workflow worker
 alfred temporal run <workflow>         # trigger a workflow
-alfred temporal schedule register <f>  # register schedules from file
-alfred temporal schedule list          # list registered schedules
-alfred temporal list                   # list discovered workflows
+alfred temporal schedule register <f>  # register cron schedules
 
-# Vault operations
 alfred vault create <type> <name>      # create record
-alfred vault read <path>               # read record
-alfred vault edit <path>               # edit record
 alfred vault list [type]               # list records
-
-# Data ingestion
-alfred ingest <file>                   # split bulk export into inbox files
 alfred process                         # batch-process inbox
-
-# External commands with vault context
-alfred exec -- <command>               # injects ALFRED_VAULT_PATH
-alfred exec --scope curator -- <cmd>   # also sets ALFRED_VAULT_SCOPE
+alfred ingest <file>                   # import conversation export
 ```
 
 ## Configuration
 
 ```bash
-alfred quickstart                      # recommended: interactive setup
-# — or —
-cp config.yaml.example config.yaml
-cp .env.example .env
+alfred quickstart                      # recommended: interactive wizard
 ```
 
-`config.yaml` has sections for `vault`, `agent`, `logging`, each worker tool, and `temporal`. Supports `${VAR}` environment variable substitution. See [`config.yaml.example`](config.yaml.example) for all options.
+Or manually: `cp config.yaml.example config.yaml && cp .env.example .env`. Supports `${VAR}` environment variable substitution. See [`config.yaml.example`](config.yaml.example).
 
 ## Documentation
 
-Full documentation is available in [`docs/`](docs/) and on the [GitHub Wiki](https://github.com/ssdavidai/alfred/wiki):
+[GitHub Wiki](https://github.com/ssdavidai/alfred/wiki) · [Architecture](docs/Architecture.md) · [Semantic Layer](docs/Semantic-Layer.md) · [Kinetic Layer](docs/Kinetic-Layer.md) · [Agent Backends](docs/Agent-Backends.md)
 
-**Getting Started**
-- [Installation](docs/Installation.md) | [Configuration](docs/Configuration.md) | [User Profile](docs/User-Profile.md)
-
-**The Six Layers**
-- [Architecture](docs/Architecture.md) — layered architecture overview
-- [Semantic Layer](docs/Semantic-Layer.md) — vault as knowledge graph
-- [Kinetic Layer](docs/Kinetic-Layer.md) — Temporal workflow engine
-- [Agent Backends](docs/Agent-Backends.md) — Claude Code, Zo, OpenClaw
-
-**Workers**
-- [Curator](docs/Curator.md) | [Janitor](docs/Janitor.md) | [Distiller](docs/Distiller.md) | [Surveyor](docs/Surveyor.md)
-
-**Reference**
-- [CLI Commands](docs/CLI-Commands.md) | [Vault Schema](docs/Vault-Schema.md) | [Live Dashboard](docs/Live-Dashboard.md)
-
-## Use Cases
-
-**Task Manager** — Drop meeting transcripts into inbox. Alfred extracts tasks, assigns them to people, links them to projects, and maintains status. Query your vault for "all open tasks on Project X" and get live Dataview tables.
-
-**CRM** — Every conversation creates or updates person and org records. Relationships, interactions, and context accumulate automatically. Your vault becomes a relationship graph you can browse in Obsidian.
-
-**Automated Workflows** — Schedule Temporal workflows that run your agent on a cadence: daily inbox processing, weekly vault health sweeps, monthly knowledge distillation. Durable execution means nothing gets dropped.
-
-**Knowledge Base** — The Distiller surfaces assumptions your team is operating on, decisions that were made but never documented, and contradictions between records. The Surveyor finds semantic clusters you never noticed. Together they build an evidence graph that evolves with your work.
+[Curator](docs/Curator.md) · [Janitor](docs/Janitor.md) · [Distiller](docs/Distiller.md) · [Surveyor](docs/Surveyor.md) · [Vault Schema](docs/Vault-Schema.md) · [CLI Commands](docs/CLI-Commands.md)
 
 ## Contributing
 
-Alfred is early-stage and actively developed. Issues, PRs, and ideas are welcome.
+Early-stage, actively developed. Issues, PRs, and ideas welcome.
 
 ## License
 
-[MIT](LICENSE)
-
-Built by David Szabo-Stuban
+[MIT](LICENSE) · Built by [David Szabo-Stuban](https://screenlessdad.com)
