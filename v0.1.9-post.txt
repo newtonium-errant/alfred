@@ -1,0 +1,22 @@
+Alfred v0.1.9 is out and Alfred's Workers are a lot smarter now
+
+Alfred is a set of AI agents that keep your Obsidian vault organized. You drop raw files into an inbox folder — meeting transcripts, voice memos, rough notes — and Alfred turns them into structured, interlinked records. It runs in the background.
+
+The big change in v0.1.9: all three agent-backed workers got rewritten from monolithic single-LLM-call designs into multi-stage pipelines. Each stage has a short, focused prompt instead of one massive 2,000-line blob. The structural work that doesn't need an LLM (dedup, interlinking, fuzzy matching) is now pure Python.
+
+Here's what changed per worker:
+
+Curator (inbox processor) now runs 4 stages. Stage 1: an LLM reads the inbox file and creates one rich note, outputting a JSON entity manifest. Stage 2: pure Python entity resolution — checks each entity against the vault, creates new ones with real descriptions (no more template placeholder leaks like "Brief description of the project's purpose and goal" ending up in your records). Stage 3: pure Python interlinking wires up wikilinks between the note and all entities. Stage 4: a focused per-entity LLM call enriches each record with content from the source material.
+
+Janitor (vault quality scanner) now runs 3 stages. Stage 1: pure Python autofix handles all the deterministic stuff — missing frontmatter fields, invalid types, wrong statuses, field type mismatches. No LLM needed. Stage 2: per-broken-link LLM calls with candidate matches pre-computed in Python — the agent just picks the right one. Stage 3: per-record LLM enrichment for stub records, constrained to vault context and verifiable public facts only.
+
+Distiller (knowledge extractor) now runs a 2-pass architecture. Pass A has 3 stages: Stage 1 sends each source record to the LLM individually with signal hints (the Python scanner already counted how many times words like "decided", "assumed", "constraint" appear), and the LLM returns a JSON manifest of candidate learnings. Stage 2 is pure Python dedup — it normalizes titles, strips stop words, and uses overlap coefficient (Szymkiewicz-Simpson: intersection over the smaller set) to fuzzy-match candidates across sources. Anything above 0.7 similarity gets merged. It also checks against existing vault learnings at a stricter 0.8 threshold to avoid creating duplicates. Stage 3 sends each surviving learning to a focused per-record LLM call that creates it in the vault.
+
+Then there's Pass B — the meta-analysis layer. After Pass A finishes creating individual learnings, Pass B looks across the entire learning graph for higher-order patterns. It groups all learning records by project and type, then sends each cluster to the LLM with a specific brief: find contradictions (does Decision A conflict with Decision B?), surface shared assumptions (do three decisions all rely on the same unstated belief that could be wrong?), and identify syntheses (is there an emergent insight across these records that none of them individually captures?). Each meta-insight becomes its own record linked back to the learnings it synthesizes. So your vault doesn't just accumulate facts — it builds a reasoning graph where decisions reference the assumptions they depend on, and contradictions flag when your thinking has shifted.
+
+The fuzzy matching uses token-level overlap coefficient instead of Jaccard similarity because Jaccard punishes length differences too harshly. "Use Colorbond Steel Roofing" vs "Use Colorbond Steel Roof Material" scores 0.4 on Jaccard (miss) but 0.75 on overlap (correct merge). All of this runs in pure Python — no ML libraries needed for the matching.
+
+All three workers still support Claude Code, Zo Computer, and OpenClaw as agent backends. The multi-stage pipelines activate on OpenClaw; the other backends fall back to the legacy single-call path.
+
+GitHub: https://github.com/ssdavidai/alfred
+PyPI: pip install alfred-vault

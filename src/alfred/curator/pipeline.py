@@ -169,7 +169,7 @@ async def _call_llm(
         "--agent", oc.agent_id,
         "--session-id", session_id,
         "--message", f"Follow the instructions in {prompt_path}",
-        "--local", "--json",
+        "--json",
     ]
 
     env = {

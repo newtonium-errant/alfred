@@ -56,7 +56,7 @@ class OpenClawBackend(BaseBackend):
         cmd = [self.config.command, "agent", *self.config.args,
                "--agent", self.config.agent_id,
                "--session-id", session_id,
-               "--message", prompt, "--local", "--json"]
+               "--message", prompt, "--json"]
 
         log.info(
             "openclaw.dispatching",

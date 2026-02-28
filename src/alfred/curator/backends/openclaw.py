@@ -87,7 +87,7 @@ class OpenClawBackend(BaseBackend):
                "--agent", self.config.agent_id,
                "--session-id", session_id,
                "--message", f"Follow the instructions in {prompt_path}",
-               "--local", "--json"]
+               "--json"]
 
         log.info(
             "openclaw.dispatching",

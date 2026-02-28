@@ -87,7 +87,7 @@ async def _call_llm(
         "--agent", oc.agent_id,
         "--session-id", session_id,
         "--message", prompt,
-        "--local", "--json",
+        "--json",
     ]
 
     env = {

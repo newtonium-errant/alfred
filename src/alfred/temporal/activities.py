@@ -145,7 +145,7 @@ class AlfredActivities:
         session_id = f"temporal-{uuid.uuid4().hex[:12]}"
         cmd = [rt.agent_openclaw_command, "agent", *rt.agent_openclaw_args,
                "--agent", agent_id, "--session-id", session_id,
-               "--message", prompt, "--local", "--json"]
+               "--message", prompt, "--json"]
         self._clear_openclaw_sessions(agent_id)
         env = self._build_env(profile)
         try:
