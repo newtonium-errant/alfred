@@ -71,6 +71,16 @@ def _atomic_write(path: Path, content: str) -> None:
     tmp.replace(path)
 
 
+def _is_binary(path: Path) -> bool:
+    """Check if a file is binary by trying to decode the first 8KB as UTF-8."""
+    try:
+        with open(path, "rb") as f:
+            f.read(8192).decode("utf-8")
+        return False
+    except (UnicodeDecodeError, OSError):
+        return True
+
+
 def mark_processed(
     inbox_file: Path,
     processed_dir: Path,
@@ -78,12 +88,14 @@ def mark_processed(
     """Set status: processed in frontmatter and move to processed_dir.
 
     Returns the new path of the moved file.
+    For binary files, skips frontmatter parsing and just moves the file.
     """
-    # Update frontmatter
-    post = frontmatter.load(str(inbox_file))
-    post.metadata["status"] = "processed"
-    post.metadata["processed_at"] = datetime.now(timezone.utc).isoformat()
-    _atomic_write(inbox_file, frontmatter.dumps(post))
+    if not _is_binary(inbox_file):
+        # Update frontmatter only for text files
+        post = frontmatter.load(str(inbox_file))
+        post.metadata["status"] = "processed"
+        post.metadata["processed_at"] = datetime.now(timezone.utc).isoformat()
+        _atomic_write(inbox_file, frontmatter.dumps(post))
 
     # Move to processed dir
     processed_dir.mkdir(parents=True, exist_ok=True)
