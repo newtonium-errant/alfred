@@ -86,8 +86,12 @@ class InboxWatcher:
         return self.handler.collect_ready()
 
     def full_scan(self, state_processed: set[str] | None = None) -> list[Path]:
-        """Scan inbox for unprocessed files (startup catch-up)."""
-        state_processed = state_processed or set()
+        """Scan inbox for unprocessed files (startup catch-up).
+
+        Note: state_processed is intentionally NOT used to skip files.
+        A file re-uploaded with the same name should be reprocessed.
+        Properly processed files are moved to processed/ and won't appear here.
+        """
         unprocessed: list[Path] = []
 
         _skip_names = {".DS_Store", ".gitkeep", "Thumbs.db", ".gitignore"}
@@ -96,9 +100,7 @@ class InboxWatcher:
                 continue
             if md_file.name.startswith(".") or md_file.name in _skip_names:
                 continue
-            if md_file.name in state_processed:
-                continue
-            # Check frontmatter status
+            # Check frontmatter status (handles edge case where move failed)
             try:
                 post = frontmatter.load(str(md_file))
                 if post.metadata.get("status") == "processed":

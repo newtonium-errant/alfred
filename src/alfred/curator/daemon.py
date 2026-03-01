@@ -210,9 +210,7 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
     )
 
     # Startup scan for unprocessed files
-    unprocessed = watcher.full_scan(
-        state_processed=set(state_mgr.state.processed.keys()),
-    )
+    unprocessed = watcher.full_scan()
     for inbox_file in unprocessed:
         try:
             await _process_file(inbox_file, backend, skill_text, config, state_mgr)
@@ -226,6 +224,7 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
     import time
     last_rescan = time.monotonic()
     rescan_interval = config.watcher.rescan_interval
+    _processing: set[str] = set()  # guard against concurrent processing
 
     try:
         while True:
@@ -236,23 +235,24 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
             now = time.monotonic()
             if now - last_rescan >= rescan_interval:
                 last_rescan = now
-                rescan_hits = watcher.full_scan(
-                    state_processed=set(state_mgr.state.processed.keys()),
-                )
+                rescan_hits = watcher.full_scan()
                 for f in rescan_hits:
                     if f not in ready:
                         ready.append(f)
 
             for inbox_file in ready:
-                # Skip if already processed (race condition guard)
-                if state_mgr.state.is_processed(inbox_file.name):
-                    continue
                 if not inbox_file.exists():
                     continue
+                # Guard against concurrent processing of the same file
+                if str(inbox_file) in _processing:
+                    continue
+                _processing.add(str(inbox_file))
                 try:
                     await _process_file(inbox_file, backend, skill_text, config, state_mgr)
                 except Exception:
                     log.exception("daemon.process_error", file=inbox_file.name)
+                finally:
+                    _processing.discard(str(inbox_file))
     finally:
         watcher.stop()
         log.info("daemon.stopped")
