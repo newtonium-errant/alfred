@@ -39,7 +39,21 @@ SCOPE_RULES: dict[str, dict[str, bool | str]] = {
         "list": True,
         "context": True,
         "create": "learn_types_only",
-        "edit": False,
+        # Distiller writes distiller_signals and distiller_learnings
+        # back to source records (see distiller/pipeline.py).
+        "edit": "distiller_fields_only",
+        "move": False,
+        "delete": False,
+    },
+    "surveyor": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": False,
+        # Surveyor writes alfred_tags and relationships to frontmatter
+        # (see surveyor/writer.py). Content is read-only.
+        "edit": "tags_only",
         "move": False,
         "delete": False,
     },
@@ -55,7 +69,7 @@ def check_scope(
     """Check if an operation is allowed under the given scope.
 
     Args:
-        scope: The agent scope (curator, janitor, distiller) or None for unrestricted.
+        scope: The agent scope (curator, janitor, distiller, surveyor) or None for unrestricted.
         operation: The vault operation (read, search, list, context, create, edit, move, delete).
         rel_path: Relative path of the target file (for path-based checks).
         record_type: Record type (for type-based checks on create).
@@ -98,4 +112,16 @@ def check_scope(
                 f"Scope '{scope}' can only create learn types "
                 f"({', '.join(sorted(LEARN_TYPES))}). Got: '{record_type}'"
             )
+        return
+
+    # Distiller may only edit distiller_signals / distiller_learnings fields.
+    # Field-level enforcement is the caller's responsibility; this gate
+    # permits the edit operation to proceed.
+    if permission == "distiller_fields_only":
+        return
+
+    # Surveyor may only edit alfred_tags / relationships fields.
+    # Field-level enforcement is the caller's responsibility; this gate
+    # permits the edit operation to proceed.
+    if permission == "tags_only":
         return

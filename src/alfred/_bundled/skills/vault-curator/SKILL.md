@@ -566,7 +566,7 @@ tags: []
 
 ### 2.3 Learning Records
 
-#### decision (learn-decision)
+#### decision
 ```yaml
 ---
 type: decision                  # (required)
@@ -600,11 +600,11 @@ tags: []
 ## Rationale
 ## Consequences
 
-![[learn-decision.base#Based On]]
-![[learn-decision.base#Related]]
+![[decision.base#Based On]]
+![[decision.base#Related]]
 ```
 
-#### assumption (learn-assumption)
+#### assumption
 ```yaml
 ---
 type: assumption                # (required)
@@ -633,11 +633,11 @@ tags: []
 ## Evidence Trail
 ## Impact
 
-![[learn-assumption.base#Depends On This]]
-![[learn-assumption.base#Related]]
+![[assumption.base#Depends On This]]
+![[assumption.base#Related]]
 ```
 
-#### constraint (learn-constraint)
+#### constraint
 ```yaml
 ---
 type: constraint                # (required)
@@ -663,11 +663,11 @@ tags: []
 ## Implications
 ## Expiry / Review
 
-![[learn-constraint.base#Affected Projects]]
-![[learn-constraint.base#Related]]
+![[constraint.base#Affected Projects]]
+![[constraint.base#Related]]
 ```
 
-#### contradiction (learn-contradiction)
+#### contradiction
 ```yaml
 ---
 type: contradiction             # (required)
@@ -695,10 +695,10 @@ tags: []
 ## Analysis
 ## Resolution
 
-![[learn-contradiction.base#Related]]
+![[contradiction.base#Related]]
 ```
 
-#### synthesis (learn-synthesis)
+#### synthesis
 ```yaml
 ---
 type: synthesis                 # (required)
@@ -723,8 +723,8 @@ tags: []
 ## Implications
 ## Applicability
 
-![[learn-synthesis.base#Sources]]
-![[learn-synthesis.base#Related]]
+![[synthesis.base#Sources]]
+![[synthesis.base#Related]]
 ```
 
 ### 2.4 Bootstrap Records

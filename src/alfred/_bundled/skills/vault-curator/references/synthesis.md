@@ -28,5 +28,5 @@ tags: []
 
 <!-- Which projects, people, or contexts does this apply to? -->
 
-![[learn-synthesis.base#Sources]]
-![[learn-synthesis.base#Related]]
+![[synthesis.base#Sources]]
+![[synthesis.base#Related]]

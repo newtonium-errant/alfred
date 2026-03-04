@@ -29,5 +29,5 @@ tags: []
 
 <!-- Does this expire? When should it be re-checked? -->
 
-![[learn-constraint.base#Affected Projects]]
-![[learn-constraint.base#Related]]
+![[constraint.base#Affected Projects]]
+![[constraint.base#Related]]

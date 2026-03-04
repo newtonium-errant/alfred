@@ -31,4 +31,4 @@ tags: []
 
 <!-- How was this resolved? Which claim held? What changed? -->
 
-![[learn-contradiction.base#Related]]
+![[contradiction.base#Related]]

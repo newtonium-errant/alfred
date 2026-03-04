@@ -1,0 +1,35 @@
+filters:
+  and:
+    - file.hasLink(this.file)
+views:
+  - type: table
+    name: Projects
+    filters: type == "project"
+    order:
+      - file.name
+      - status
+    sort:
+      - property: file.name
+        direction: ASC
+  - type: table
+    name: Events
+    filters: type == "event"
+    order:
+      - file.name
+      - date
+    sort:
+      - property: date
+        direction: DESC
+  - type: table
+    name: Related
+    filters:
+      and:
+        - type != "project"
+        - type != "event"
+    order:
+      - file.name
+      - type
+      - status
+    sort:
+      - property: file.name
+        direction: ASC

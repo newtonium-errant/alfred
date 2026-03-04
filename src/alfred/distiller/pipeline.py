@@ -135,8 +135,8 @@ def _load_learn_type_schemas() -> str:
     refs_dir = get_skills_dir() / "vault-distiller" / "references"
     parts: list[str] = []
     for name in [
-        "learn-assumption.md", "learn-constraint.md", "learn-contradiction.md",
-        "learn-decision.md", "learn-synthesis.md",
+        "assumption.md", "constraint.md", "contradiction.md",
+        "decision.md", "synthesis.md",
     ]:
         ref_path = refs_dir / name
         if ref_path.exists():
@@ -150,10 +150,10 @@ def _load_single_learn_schema(learn_type: str) -> str:
     from alfred._data import get_skills_dir
 
     refs_dir = get_skills_dir() / "vault-distiller" / "references"
-    ref_path = refs_dir / f"learn-{learn_type}.md"
+    ref_path = refs_dir / f"{learn_type}.md"
     if ref_path.exists():
         return ref_path.read_text(encoding="utf-8")
-    return f"(no schema found for learn-{learn_type})"
+    return f"(no schema found for {learn_type})"
 
 
 def _normalize_title(title: str) -> str:

@@ -66,7 +66,7 @@ def read_mutations(session_path: str) -> dict:
             modified.append(file_path)
         elif op == "move":
             # Move = delete old + create new
-            modified.append(file_path)
+            deleted.append(file_path)
             to_path = entry.get("to", "")
             if to_path:
                 created.append(to_path)

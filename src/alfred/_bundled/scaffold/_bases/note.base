@@ -1,0 +1,14 @@
+filters:
+  and:
+    - file.hasLink(this.file)
+views:
+  - type: table
+    name: Related
+    order:
+      - file.name
+      - type
+      - status
+      - created
+    sort:
+      - property: created
+        direction: DESC

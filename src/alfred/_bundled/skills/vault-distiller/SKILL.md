@@ -24,7 +24,7 @@ You are a vault distiller. You read operational records (sessions, conversations
 
 ## 2. Learning Record Types — Complete Schemas
 
-### 2.1 Decision (learn-decision)
+### 2.1 Decision
 
 ```yaml
 ---
@@ -60,11 +60,11 @@ tags: []
 ## Rationale
 ## Consequences
 
-![[learn-decision.base#Based On]]
-![[learn-decision.base#Related]]
+![[decision.base#Based On]]
+![[decision.base#Related]]
 ```
 
-### 2.2 Assumption (learn-assumption)
+### 2.2 Assumption
 
 ```yaml
 ---
@@ -95,11 +95,11 @@ tags: []
 ## Evidence Trail
 ## Impact
 
-![[learn-assumption.base#Depends On This]]
-![[learn-assumption.base#Related]]
+![[assumption.base#Depends On This]]
+![[assumption.base#Related]]
 ```
 
-### 2.3 Constraint (learn-constraint)
+### 2.3 Constraint
 
 ```yaml
 ---
@@ -127,11 +127,11 @@ tags: []
 ## Implications
 ## Expiry / Review
 
-![[learn-constraint.base#Affected Projects]]
-![[learn-constraint.base#Related]]
+![[constraint.base#Affected Projects]]
+![[constraint.base#Related]]
 ```
 
-### 2.4 Contradiction (learn-contradiction)
+### 2.4 Contradiction
 
 ```yaml
 ---
@@ -161,10 +161,10 @@ tags: []
 ## Analysis
 ## Resolution
 
-![[learn-contradiction.base#Related]]
+![[contradiction.base#Related]]
 ```
 
-### 2.5 Synthesis (learn-synthesis)
+### 2.5 Synthesis
 
 ```yaml
 ---
@@ -191,8 +191,8 @@ tags: []
 ## Implications
 ## Applicability
 
-![[learn-synthesis.base#Sources]]
-![[learn-synthesis.base#Related]]
+![[synthesis.base#Sources]]
+![[synthesis.base#Related]]
 ```
 
 ---

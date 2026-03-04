@@ -1,0 +1,23 @@
+filters:
+  and:
+    - file.hasLink(this.file)
+views:
+  - type: table
+    name: Participants
+    filters: type == "person"
+    order:
+      - file.name
+      - role
+    sort:
+      - property: file.name
+        direction: ASC
+  - type: table
+    name: Related
+    filters: type != "person"
+    order:
+      - file.name
+      - type
+      - status
+    sort:
+      - property: file.name
+        direction: ASC

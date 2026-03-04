@@ -32,5 +32,5 @@ tags: []
 
 <!-- What decisions or plans depend on this assumption? -->
 
-![[learn-assumption.base#Depends On This]]
-![[learn-assumption.base#Related]]
+![[assumption.base#Depends On This]]
+![[assumption.base#Related]]

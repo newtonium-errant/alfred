@@ -14,7 +14,7 @@ There are no build steps, tests, or linting commands. The vault is edited direct
 
 Every file is a **record** with a `type` frontmatter property. The core types are: `project`, `task`, `session`, `conversation`, `input`, `person`, `org`, `location`, `note`, `decision`, `process`, `run`, `event`.
 
-The **Learn system** adds 5 epistemic types: `assumption`, `constraint`, `contradiction`, `decision` (v2 via learn-decision template), `synthesis`. Each has its own top-level directory (e.g. `assumption/`, `decision/`). They track beliefs, limits, conflicts, choices, and synthesized insights with confidence levels and evidence chains.
+The **Learn system** adds 5 epistemic types: `assumption`, `constraint`, `contradiction`, `decision`, `synthesis`. Each has its own top-level directory (e.g. `assumption/`, `decision/`). They track beliefs, limits, conflicts, choices, and synthesized insights with confidence levels and evidence chains.
 
 **Resource types** `account` and `asset` track financial/service accounts and software/hardware/licenses. They integrate into person, org, and project views.
 

@@ -1,0 +1,15 @@
+filters:
+  and:
+    - file.hasLink(this.file)
+views:
+  - type: table
+    name: Outputs
+    description: Records created during this session
+    order:
+      - file.name
+      - type
+      - status
+      - created
+    sort:
+      - property: created
+        direction: ASC
