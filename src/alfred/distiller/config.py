@@ -76,9 +76,9 @@ class AgentConfig:
 
 @dataclass
 class ExtractionConfig:
-    interval_seconds: int = 3600
-    deep_interval_hours: int = 24
-    candidate_threshold: float = 0.3
+    interval_seconds: int = 86400
+    deep_interval_hours: int = 168
+    candidate_threshold: float = 0.6
     max_sources_per_batch: int = 20
     source_types: list[str] = field(default_factory=lambda: [
         "conversation", "session", "note", "task", "project",

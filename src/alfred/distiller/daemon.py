@@ -38,7 +38,7 @@ from .config import DistillerConfig
 from .parser import parse_file
 from .pipeline import run_meta_analysis, run_pipeline
 from .state import DistillerState, ExtractionLogEntry, RunResult
-from .utils import get_logger
+from .utils import compute_md5, get_logger
 
 log = get_logger(__name__)
 
@@ -173,6 +173,38 @@ def _build_batches(
     return batches
 
 
+def recompute_source_md5s(
+    batch_source_records: list[ScoredCandidate],
+    vault_path: Path,
+    state: DistillerState,
+) -> None:
+    """Re-read source file MD5s after pipeline writes and update state.
+
+    The pipeline may write distiller_signals/distiller_learnings back into
+    source file frontmatter, changing the file's MD5. Without this refresh
+    the stored MD5 would be stale, causing the file to re-qualify as a
+    candidate on the next run (infinite loop).
+    """
+    for sc in batch_source_records:
+        full_path = vault_path / sc.record.rel_path
+        if not full_path.exists():
+            continue
+        try:
+            fresh_md5 = compute_md5(full_path)
+        except OSError:
+            continue
+        if fresh_md5 != sc.md5:
+            existing = state.files.get(sc.record.rel_path)
+            learn_records = existing.learn_records_created if existing else []
+            state.update_file(sc.record.rel_path, fresh_md5, learn_records)
+            log.debug(
+                "extraction.md5_refreshed",
+                path=sc.record.rel_path,
+                old_md5=sc.md5[:8],
+                new_md5=fresh_md5[:8],
+            )
+
+
 async def run_extraction(
     config: DistillerConfig,
     state: DistillerState,
@@ -272,6 +304,9 @@ async def run_extraction(
                     if any(f.startswith(f"{lt}/") for lt in config.extraction.learn_types)
                 ]
                 state.update_file(sc.record.rel_path, sc.md5, learn_paths)
+
+            # Refresh MD5s after pipeline may have written back to source files
+            recompute_source_md5s(batch.source_records, vault_path, state)
 
             if not pipeline_result.success:
                 log.error(
@@ -392,6 +427,9 @@ async def run_extraction(
                     if any(f.startswith(f"{lt}/") for lt in config.extraction.learn_types)
                 ]
                 state.update_file(sc.record.rel_path, sc.md5, learn_paths)
+
+            # Refresh MD5s after agent may have written back to source files
+            recompute_source_md5s(batch.source_records, vault_path, state)
 
             if not agent_result.success:
                 log.error(

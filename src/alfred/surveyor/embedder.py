@@ -63,9 +63,24 @@ class Embedder:
         self._ensure_collection()
 
     def _ensure_collection(self) -> None:
-        """Create the Milvus collection if it doesn't exist."""
+        """Create the Milvus collection if it doesn't exist, or recreate on dim mismatch."""
         if self.milvus.has_collection(self.collection_name):
-            return
+            # Check if existing collection dim matches configured embedding_dims
+            info = self.milvus.describe_collection(self.collection_name)
+            for f in info.get("fields", []):
+                if f.get("name") == "embedding":
+                    existing_dim = f.get("params", {}).get("dim")
+                    if existing_dim is not None and int(existing_dim) != self.embedding_dims:
+                        log.warning(
+                            "embedder.dim_mismatch",
+                            existing=existing_dim,
+                            configured=self.embedding_dims,
+                            action="drop_and_recreate",
+                        )
+                        self.milvus.drop_collection(self.collection_name)
+                        break
+            else:
+                return
 
         schema = CollectionSchema(
             fields=[
