@@ -83,6 +83,9 @@ class Embedder:
                             files_state = getattr(self.state, "files", None)
                             if isinstance(files_state, dict):
                                 files_state.clear()
+                                # Persist cleared state to disk so it survives restarts
+                                # (PipelineState.load() may be called later in Daemon.run())
+                                self.state.save()
                         except Exception as e:
                             log.warning("embedder.state_invalidate_failed", error=str(e))
                         break
