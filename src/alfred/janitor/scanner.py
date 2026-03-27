@@ -255,6 +255,9 @@ def _check_record(
 
     # LINK001: Broken wikilinks
     for target in record.wikilinks:
+        # Skip Dataview base view references (e.g. "person.base#Decisions")
+        if ".base" in target:
+            continue
         resolved = stem_index.get(target, set())
         if not resolved:
             issues.append(Issue(

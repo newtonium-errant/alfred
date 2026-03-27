@@ -311,8 +311,18 @@ async def _stage2_link_repair(
         safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', broken_target.replace(' ', '-').replace('/', '-'))[:30]
         stage_label = f"s2-link-{safe_name}"
 
+        # Snapshot file mtime before LLM call to detect actual changes.
+        # The mutation log doesn't work cross-container (openclaw-wrapper
+        # sends prompts via HTTP to the openclaw container which doesn't
+        # have ALFRED_VAULT_SESSION), so we check the filesystem directly.
+        target_path = config.vault.vault_path / issue.file
+        before_mtime = target_path.stat().st_mtime if target_path.exists() else 0
+
         await _call_llm(prompt, config, session_path, stage_label)
-        repaired += 1
+
+        after_mtime = target_path.stat().st_mtime if target_path.exists() else 0
+        if after_mtime > before_mtime:
+            repaired += 1
 
         log.info("pipeline.s2_llm_repair", file=issue.file, target=broken_target)
 
