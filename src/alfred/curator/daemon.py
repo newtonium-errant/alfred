@@ -251,6 +251,13 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
                     await _process_file(inbox_file, backend, skill_text, config, state_mgr)
                 except Exception:
                     log.exception("daemon.process_error", file=inbox_file.name)
+                    # Always move to processed — even on failure — to prevent
+                    # infinite reprocessing loops.  The error is logged above.
+                    if inbox_file.exists():
+                        try:
+                            mark_processed(inbox_file, config.vault.processed_path)
+                        except Exception:
+                            log.exception("daemon.mark_processed_fallback_failed", file=inbox_file.name)
                 finally:
                     _processing.discard(str(inbox_file))
     finally:
