@@ -83,11 +83,15 @@ async def _process_file(
     filename = inbox_file.name
     log.info("daemon.processing", file=filename)
 
-    # Always pass the file to the LLM — read as text if possible, otherwise point to the file
+    # Always pass the file to the LLM — read as text if possible, otherwise
+    # copy to shared /tmp so the agent (in the openclaw container) can read it.
     try:
         inbox_content = inbox_file.read_text(encoding="utf-8")
     except (UnicodeDecodeError, ValueError):
-        inbox_content = f"[File: {filename} — read it directly from: {inbox_file}]"
+        import shutil
+        tmp_copy = Path("/tmp") / filename
+        shutil.copy2(inbox_file, tmp_copy)
+        inbox_content = f"[Binary file: {filename} — copied to /tmp/{filename} for you to read. Use appropriate tools to extract text from this file type.]"
 
     # Build vault context
     vault_context = build_vault_context(
