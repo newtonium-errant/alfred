@@ -124,6 +124,11 @@ async def _process_file(
 
         if not pipeline_result.success:
             log.error("daemon.pipeline_failed", file=filename, summary=pipeline_result.summary[:500])
+            log.warning("daemon.skip_processed_move", file=filename)
+        else:
+            # Mark processed and move (skip if agent already moved the file)
+            if inbox_file.exists():
+                mark_processed(inbox_file, config.vault.processed_path)
 
         if not files_created and not files_modified:
             log.warning("daemon.no_changes", file=filename)
@@ -165,13 +170,14 @@ async def _process_file(
 
         if not result.success:
             log.error("daemon.agent_failed", file=filename, summary=result.summary[:500])
+            log.warning("daemon.skip_processed_move", file=filename)
+        else:
+            # Mark processed and move (skip if agent already moved the file)
+            if inbox_file.exists():
+                mark_processed(inbox_file, config.vault.processed_path)
 
         if not files_created and not files_modified:
             log.warning("daemon.no_changes", file=filename)
-
-    # Mark processed and move (skip if agent already moved the file)
-    if inbox_file.exists():
-        mark_processed(inbox_file, config.vault.processed_path)
 
     # Update state
     state_mgr.state.mark_processed(
