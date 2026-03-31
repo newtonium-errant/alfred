@@ -88,6 +88,7 @@ class WatcherConfig:
     poll_interval: int = 5
     debounce_seconds: int = 10
     rescan_interval: int = 60
+    max_concurrent: int = 4  # number of inbox files to process in parallel
 
 
 @dataclass

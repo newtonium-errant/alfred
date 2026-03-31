@@ -219,13 +219,21 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
         debounce_seconds=config.watcher.debounce_seconds,
     )
 
-    # Startup scan for unprocessed files
+    # Startup scan for unprocessed files — process concurrently
+    max_concurrent = config.watcher.max_concurrent
     unprocessed = watcher.full_scan()
-    for inbox_file in unprocessed:
-        try:
-            await _process_file(inbox_file, backend, skill_text, config, state_mgr)
-        except Exception:
-            log.exception("daemon.process_error", file=inbox_file.name)
+    if unprocessed:
+        log.info("daemon.startup_scan", files=len(unprocessed), max_concurrent=max_concurrent)
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _process_with_limit(f: Path) -> None:
+            async with sem:
+                try:
+                    await _process_file(f, backend, skill_text, config, state_mgr)
+                except Exception:
+                    log.exception("daemon.process_error", file=f.name)
+
+        await asyncio.gather(*[_process_with_limit(f) for f in unprocessed])
 
     # Start watching
     watcher.start()
@@ -250,26 +258,33 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
                     if f not in ready:
                         ready.append(f)
 
-            for inbox_file in ready:
-                if not inbox_file.exists():
-                    continue
-                # Guard against concurrent processing of the same file
-                if str(inbox_file) in _processing:
-                    continue
-                _processing.add(str(inbox_file))
-                try:
-                    await _process_file(inbox_file, backend, skill_text, config, state_mgr)
-                except Exception:
-                    log.exception("daemon.process_error", file=inbox_file.name)
-                    # Always move to processed — even on failure — to prevent
-                    # infinite reprocessing loops.  The error is logged above.
-                    if inbox_file.exists():
+            # Filter to files not already being processed
+            to_process = [
+                f for f in ready
+                if f.exists() and str(f) not in _processing
+            ]
+
+            if to_process:
+                for f in to_process:
+                    _processing.add(str(f))
+
+                sem = asyncio.Semaphore(max_concurrent)
+
+                async def _watch_process(inbox_file: Path) -> None:
+                    async with sem:
                         try:
-                            mark_processed(inbox_file, config.vault.processed_path)
+                            await _process_file(inbox_file, backend, skill_text, config, state_mgr)
                         except Exception:
-                            log.exception("daemon.mark_processed_fallback_failed", file=inbox_file.name)
-                finally:
-                    _processing.discard(str(inbox_file))
+                            log.exception("daemon.process_error", file=inbox_file.name)
+                            if inbox_file.exists():
+                                try:
+                                    mark_processed(inbox_file, config.vault.processed_path)
+                                except Exception:
+                                    log.exception("daemon.mark_processed_fallback_failed", file=inbox_file.name)
+                        finally:
+                            _processing.discard(str(inbox_file))
+
+                await asyncio.gather(*[_watch_process(f) for f in to_process])
     finally:
         watcher.stop()
         log.info("daemon.stopped")
