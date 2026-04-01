@@ -281,9 +281,18 @@ async def _stage1_analyze(
             if not note_path:
                 log.warning("pipeline.s1_no_note_created", file=inbox_filename)
 
-        # Try to read the entity manifest from the temp file first
+        # Try to read the entity manifest from the temp file first.
+        # The manifest_path uses /alfred-data/ (openclaw-workers mount point),
+        # but the alfred container mounts the same volume at /app/data/.
+        # Try both paths.
         try:
             manifest_file = Path(manifest_path)
+            if not manifest_file.exists():
+                # Translate /alfred-data/ → /app/data/ for cross-container access
+                alt_path = manifest_path.replace("/alfred-data/", "/app/data/")
+                alt_file = Path(alt_path)
+                if alt_file.exists():
+                    manifest_file = alt_file
             if manifest_file.exists():
                 raw_json = manifest_file.read_text(encoding="utf-8").strip()
                 data = json.loads(raw_json)
@@ -297,11 +306,12 @@ async def _stage1_analyze(
         except (json.JSONDecodeError, OSError, KeyError) as e:
             log.warning("pipeline.manifest_file_read_failed", path=manifest_path, error=str(e))
         finally:
-            # Clean up the temp manifest file
-            try:
-                Path(manifest_path).unlink(missing_ok=True)
-            except OSError:
-                pass
+            # Clean up the temp manifest file (try both possible paths)
+            for p in [manifest_path, manifest_path.replace("/alfred-data/", "/app/data/")]:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         # Fallback: parse entity manifest from stdout if file method failed
         if not manifest:
