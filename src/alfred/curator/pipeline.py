@@ -253,9 +253,11 @@ async def _stage1_analyze(
     if not template:
         return "", []
 
-    # Generate a unique manifest file path for the LLM to write to
+    # Generate a unique manifest file path for the LLM to write to.
+    # Use /alfred-data/ (shared volume between alfred and openclaw-workers
+    # containers) instead of /tmp (separate tmpfs per container).
     manifest_id = uuid.uuid4().hex[:12]
-    manifest_path = f"/tmp/alfred-curator-{manifest_id}-manifest.json"
+    manifest_path = f"/alfred-data/alfred-curator-{manifest_id}-manifest.json"
 
     prompt = template.format(
         vault_cli_reference=VAULT_CLI_REFERENCE,
