@@ -117,6 +117,27 @@ Each tool has its own `config.py` with typed dataclasses. All follow the same pa
 - `alfred up` (no flag) daemonizes via re-exec; `alfred down` uses sentinel file + SIGTERM
 - Graceful shutdown via signal handling in `orchestrator.py`
 
+## Coding Team
+
+This project uses the **Aftermath-Lab** shared development knowledge base at `/home/andrew/aftermath-lab/`. All agents MUST read the relevant aftermath-lab docs before writing code.
+
+### Spawning Agents
+
+- **Editing agents run in foreground** — they need permission prompts for file writes
+- **QA/review agents run in background** — read-only, no permissions needed
+- **Responsive spawning** — don't create all 4 agents for a simple task. Spawn specialists when the work requires them.
+- **Task routing** — route work to the right specialist. Don't ask a frontend agent to write n8n workflows.
+- **Plan mode** is the default for agents. Use `acceptEdits` for simple, well-defined tasks where plan approval adds friction without value.
+
+### Workflow Deliverables
+
+- **New n8n workflows:** generate importable JSON files (unless user says otherwise)
+- **Existing n8n workflows:** create instruction docs for manual UI application (workflow JSON breaks on import after UI edits). If the user asks for a complete rewrite, generate importable JSON.
+
+### Agent Knowledge Requirements
+
+Every agent must read their relevant aftermath-lab docs before building. The knowledge base covers n8n patterns/anti-patterns/gotchas, frontend patterns, Supabase patterns, auth patterns, and QA process. Agents that skip this will repeat known mistakes.
+
 ## Key Config
 
 `config.yaml` has sections: `vault`, `agent`, `logging`, `curator`, `janitor`, `distiller`, `surveyor`. Environment variables are substituted via `${VAR}` syntax. See `config.yaml.example` for all options.
