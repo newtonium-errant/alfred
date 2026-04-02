@@ -743,6 +743,23 @@ A task of `kind: task` with a checklist for sub-project/phase setup: define deli
 
 You MUST follow ALL 7 steps for EVERY inbox file. Do not skip steps. Do not take shortcuts.
 
+### Email Triage — Pre-Step for Email Inputs
+
+Before starting the 7 steps, if the inbox file is an email (has **From:** or **Account:** headers), read the triage rules:
+
+```bash
+alfred vault read "process/Email Triage Rules"
+```
+
+Apply the triage rules to determine the email's **priority level** (actionable, important, low, ignore) and **financial tags** if applicable.
+
+- **Ignore** emails: Move to `inbox/processed/` without creating any vault records. Done.
+- **Low** emails: Create a minimal note record with appropriate tags. No task records needed.
+- **Important** emails: Full curation. Create note + entity records. Add tags from the triage rules.
+- **Actionable** emails: Full curation. Create note + task records. Set task priority based on urgency. Add tags from the triage rules.
+
+For financial documents (invoices, receipts, statements): always add the `finance` tag plus the specific sub-tags defined in the triage rules (e.g., `business-expense`, `rrts`, `tax`). These must be findable by tag search.
+
 ---
 
 ### STEP 1: READ — Understand the input
