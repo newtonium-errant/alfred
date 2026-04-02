@@ -152,6 +152,28 @@ def cmd_status(config: DistillerConfig) -> None:
             )
 
 
+def cmd_consolidate(config: DistillerConfig, skills_dir: Path) -> None:
+    """Run consolidation sweep: merge duplicates, upgrade assumptions, resolve contradictions."""
+    from alfred.vault.mutation_log import (
+        cleanup_session_file,
+        create_session_file,
+        read_mutations,
+    )
+    from .pipeline import run_consolidation
+
+    session_path = create_session_file()
+    try:
+        modified = asyncio.run(run_consolidation(config, skills_dir, session_path))
+        mutations = read_mutations(session_path)
+    finally:
+        cleanup_session_file(session_path)
+
+    print(f"\n=== Consolidation Complete ===")
+    print(f"Records modified: {len(mutations.get('files_modified', []))}")
+    print(f"Records created: {len(mutations.get('files_created', []))}")
+    print(f"Records deleted: {len(mutations.get('files_deleted', []))}")
+
+
 def cmd_history(config: DistillerConfig, limit: int = 10) -> None:
     """Show past extraction runs."""
     state = _init_state(config)

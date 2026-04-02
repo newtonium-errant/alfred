@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date, datetime
 from pathlib import Path
 
 from alfred.vault.schema import (
@@ -340,4 +341,173 @@ def _check_record(
                     break
             existing.append((name, rel_path))
 
+    return issues
+
+
+# --- Semantic drift scan ---
+
+
+def _parse_date_field(fm: dict, field_name: str) -> date | None:
+    """Safely parse a date from frontmatter. Handles str, date, datetime."""
+    val = fm.get(field_name)
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    if isinstance(val, str):
+        val = val.strip().strip("'\"")
+        for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+            try:
+                return datetime.strptime(val[:19], fmt[:len(val) + 2 if len(val) < 19 else 19]).date()
+            except (ValueError, IndexError):
+                continue
+        # Try just the date portion
+        try:
+            return datetime.strptime(val[:10], "%Y-%m-%d").date()
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
+def _newest_linked_date(
+    rel_path: str,
+    inbound_index: dict[str, set[str]],
+    vault_path: Path,
+) -> date | None:
+    """Find the most recent created/last_activity date among inbound linkers."""
+    import frontmatter as fm_loader
+
+    inbound = inbound_index.get(rel_path, set())
+    newest: date | None = None
+
+    for linker_path in inbound:
+        linker_file = vault_path / linker_path
+        if not linker_file.is_file():
+            continue
+        try:
+            post = fm_loader.load(str(linker_file))
+        except Exception:
+            continue
+        for field in ("last_activity", "created"):
+            d = _parse_date_field(post.metadata, field)
+            if d and (newest is None or d > newest):
+                newest = d
+
+    return newest
+
+
+def _check_drift(
+    record: VaultRecord,
+    rel_path: str,
+    inbound_index: dict[str, set[str]],
+    vault_path: Path,
+) -> list[Issue]:
+    """Run semantic drift checks on a single record."""
+    issues: list[Issue] = []
+    fm = record.frontmatter
+    rec_type = fm.get("type", "")
+    status = fm.get("status", "")
+    today = date.today()
+
+    # SEM001: Stale active project — no linked activity in 30+ days
+    if rec_type == "project" and status == "active":
+        newest = _newest_linked_date(rel_path, inbound_index, vault_path)
+        own_date = _parse_date_field(fm, "last_activity") or _parse_date_field(fm, "created")
+        check_date = max(d for d in [newest, own_date] if d) if any(d for d in [newest, own_date] if d) else None
+        if check_date and (today - check_date).days >= 30:
+            issues.append(Issue(
+                code=IssueCode.STALE_ACTIVE_PROJECT,
+                severity=SEVERITY_MAP[IssueCode.STALE_ACTIVE_PROJECT],
+                file=rel_path,
+                message=f"Active project with no linked activity in {(today - check_date).days} days",
+                suggested_fix="Review: pause, complete, or update with recent activity",
+            ))
+
+    # SEM002: Stale todo task — created 90+ days ago
+    if rec_type == "task" and status == "todo":
+        created = _parse_date_field(fm, "created")
+        if created and (today - created).days >= 90:
+            issues.append(Issue(
+                code=IssueCode.STALE_TODO_TASK,
+                severity=SEVERITY_MAP[IssueCode.STALE_TODO_TASK],
+                file=rel_path,
+                message=f"Todo task created {(today - created).days} days ago with no progress",
+                suggested_fix="Review: start, cancel, or re-prioritize",
+            ))
+
+    # SEM003: Stale active conversation — no activity in 30+ days
+    if rec_type == "conversation" and status == "active":
+        last = _parse_date_field(fm, "last_activity") or _parse_date_field(fm, "created")
+        if last and (today - last).days >= 30:
+            issues.append(Issue(
+                code=IssueCode.STALE_ACTIVE_CONVERSATION,
+                severity=SEVERITY_MAP[IssueCode.STALE_ACTIVE_CONVERSATION],
+                file=rel_path,
+                message=f"Active conversation with no activity in {(today - last).days} days",
+                suggested_fix="Review: archive, close, or follow up",
+            ))
+
+    # SEM004: Stale active person — no linked activity in 60+ days
+    if rec_type == "person" and status == "active":
+        newest = _newest_linked_date(rel_path, inbound_index, vault_path)
+        own_date = _parse_date_field(fm, "last_activity") or _parse_date_field(fm, "created")
+        check_date = max(d for d in [newest, own_date] if d) if any(d for d in [newest, own_date] if d) else None
+        if check_date and (today - check_date).days >= 60:
+            issues.append(Issue(
+                code=IssueCode.STALE_ACTIVE_PERSON,
+                severity=SEVERITY_MAP[IssueCode.STALE_ACTIVE_PERSON],
+                file=rel_path,
+                message=f"Active person with no linked activity in {(today - check_date).days} days",
+                suggested_fix="Review: mark inactive or update with recent activity",
+            ))
+
+    return issues
+
+
+def run_drift_scan(
+    config: JanitorConfig,
+    state: JanitorState,
+) -> list[Issue]:
+    """Run semantic drift scan — stale/orphaned record detection."""
+    vault_path = config.vault.vault_path
+    ignore_dirs = set(config.vault.ignore_dirs)
+    ignore_files = set(config.vault.ignore_files)
+
+    # Collect all vault files
+    all_files: dict[str, str] = {}
+    for md_file in vault_path.rglob("*.md"):
+        rel = md_file.relative_to(vault_path)
+        if any(part in ignore_dirs for part in rel.parts):
+            continue
+        if md_file.name in ignore_files:
+            continue
+        rel_str = str(rel).replace("\\", "/")
+        if rel_str in state.ignored:
+            continue
+        try:
+            all_files[rel_str] = compute_md5(md_file)
+        except OSError:
+            continue
+
+    # Build inbound link index
+    inbound_index = _build_inbound_index(vault_path, all_files, ignore_dirs)
+
+    # Only check types that have drift rules
+    drift_types = {"project", "task", "conversation", "person"}
+
+    issues: list[Issue] = []
+    for rel_path in all_files:
+        try:
+            record = parse_file(vault_path, rel_path)
+        except Exception:
+            continue
+        rec_type = record.frontmatter.get("type", "")
+        if rec_type not in drift_types:
+            continue
+        file_issues = _check_drift(record, rel_path, inbound_index, vault_path)
+        issues.extend(file_issues)
+
+    log.info("scanner.drift_complete", issues=len(issues))
     return issues

@@ -141,6 +141,26 @@ def cmd_history(config: JanitorConfig, limit: int = 10) -> None:
         )
 
 
+def cmd_drift(config: JanitorConfig) -> None:
+    """Run semantic drift scan and print results."""
+    state = _init_state(config)
+
+    from .scanner import run_drift_scan
+    issues = run_drift_scan(config, state)
+
+    if not issues:
+        print("No drift issues found.")
+        return
+
+    print(f"\n=== Drift Scan — {len(issues)} issues ===\n")
+    for issue in sorted(issues, key=lambda i: (i.severity.value, i.file)):
+        print(f"  [{issue.severity.value}] {issue.file}")
+        print(f"    {issue.code.value} — {issue.message}")
+        if issue.suggested_fix:
+            print(f"    Fix: {issue.suggested_fix}")
+        print()
+
+
 def cmd_ignore(config: JanitorConfig, file_path: str, reason: str = "") -> None:
     """Add a file to the ignore list."""
     state = _init_state(config)

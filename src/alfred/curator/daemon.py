@@ -20,7 +20,7 @@ from .backends.cli import ClaudeBackend
 from .backends.http import ZoBackend
 from .backends.openclaw import OpenClawBackend
 from .config import CuratorConfig
-from .context import build_vault_context
+from .context import build_vault_context, extract_sender_email, gather_sender_context
 from .pipeline import run_pipeline
 from .state import StateManager
 from .utils import get_logger
@@ -95,6 +95,17 @@ async def _process_file(
         ignore_dirs=config.vault.ignore_dirs,
     )
     context_text = vault_context.to_prompt_text()
+
+    # Inject sender-specific context for emails
+    sender_email = extract_sender_email(inbox_content)
+    if sender_email:
+        sender_ctx = gather_sender_context(
+            config.vault.vault_path,
+            sender_email,
+            ignore_dirs=config.vault.ignore_dirs,
+        )
+        if sender_ctx:
+            context_text = context_text + "\n\n" + sender_ctx
 
     vault_path_str = str(config.vault.vault_path)
     session_path = create_session_file()

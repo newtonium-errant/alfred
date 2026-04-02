@@ -343,11 +343,14 @@ async def run_watch(
 
     # Start with epoch so the first sweep is always a deep sweep (fix mode)
     last_deep = datetime.min.replace(tzinfo=timezone.utc)
+    last_drift = datetime.min.replace(tzinfo=timezone.utc)
+    drift_interval_hours = config.sweep.drift_sweep_interval_hours
 
     log.info(
         "daemon.starting",
         interval=interval,
         deep_interval_hours=deep_interval_hours,
+        drift_interval_hours=drift_interval_hours,
     )
 
     while True:
@@ -363,6 +366,24 @@ async def run_watch(
             else:
                 # Structural-only sweep
                 await run_sweep(config, state, skills_dir, structural_only=True, fix_mode=False)
+
+            # Drift sweep (weekly by default)
+            hours_since_drift = (now - last_drift).total_seconds() / 3600
+            if hours_since_drift >= drift_interval_hours:
+                log.info("daemon.drift_sweep")
+                from .scanner import run_drift_scan
+                drift_issues = run_drift_scan(config, state)
+                if drift_issues:
+                    log.info("daemon.drift_issues_found", count=len(drift_issues))
+                    for issue in drift_issues:
+                        existing = state.files.get(issue.file)
+                        md5 = existing.md5 if existing else ""
+                        current_codes = list(existing.open_issues) if existing else []
+                        if issue.code.value not in current_codes:
+                            current_codes.append(issue.code.value)
+                        state.update_file(issue.file, md5, current_codes)
+                state.save()
+                last_drift = now
         except Exception:
             log.exception("daemon.sweep_error")
 

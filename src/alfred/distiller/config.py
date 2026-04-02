@@ -86,6 +86,7 @@ class ExtractionConfig:
     learn_types: list[str] = field(default_factory=lambda: [
         "assumption", "decision", "constraint", "contradiction", "synthesis",
     ])
+    consolidation_interval_hours: int = 168  # 7 days
 
 
 @dataclass

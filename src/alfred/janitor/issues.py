@@ -32,11 +32,12 @@ class IssueCode(str, Enum):
     STUB_RECORD = "STUB001"
     # Duplicate
     DUPLICATE_NAME = "DUP001"
-    # Semantic (agent-detected)
-    GARBAGE_CONTENT = "SEM001"
-    UNCONTEXTUALIZABLE = "SEM002"
-    EMPTY_CONVERSATION = "SEM003"
-    FLOATING_TASK = "SEM004"
+    # Semantic drift (deterministic date/link checks)
+    STALE_ACTIVE_PROJECT = "SEM001"
+    STALE_TODO_TASK = "SEM002"
+    STALE_ACTIVE_CONVERSATION = "SEM003"
+    STALE_ACTIVE_PERSON = "SEM004"
+    # Semantic (agent-detected, reserved)
     VAGUE_NOTE = "SEM005"
     DUPLICATE_SEMANTIC = "SEM006"
 
@@ -52,10 +53,10 @@ SEVERITY_MAP: dict[IssueCode, Severity] = {
     IssueCode.ORPHANED_RECORD: Severity.WARNING,
     IssueCode.STUB_RECORD: Severity.INFO,
     IssueCode.DUPLICATE_NAME: Severity.INFO,
-    IssueCode.GARBAGE_CONTENT: Severity.CRITICAL,
-    IssueCode.UNCONTEXTUALIZABLE: Severity.WARNING,
-    IssueCode.EMPTY_CONVERSATION: Severity.WARNING,
-    IssueCode.FLOATING_TASK: Severity.WARNING,
+    IssueCode.STALE_ACTIVE_PROJECT: Severity.WARNING,
+    IssueCode.STALE_TODO_TASK: Severity.INFO,
+    IssueCode.STALE_ACTIVE_CONVERSATION: Severity.WARNING,
+    IssueCode.STALE_ACTIVE_PERSON: Severity.INFO,
     IssueCode.VAGUE_NOTE: Severity.INFO,
     IssueCode.DUPLICATE_SEMANTIC: Severity.INFO,
 }

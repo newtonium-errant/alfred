@@ -946,3 +946,93 @@ async def run_pipeline(
     )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Consolidation sweep
+# ---------------------------------------------------------------------------
+
+
+def _format_learns_for_consolidation(learns: list[VaultRecord]) -> str:
+    """Format learning records compactly for the consolidation prompt."""
+    lines: list[str] = []
+    for rec in learns:
+        fm = rec.frontmatter
+        title = fm.get("name", "") or fm.get("subject", "") or Path(rec.rel_path).stem
+        status = fm.get("status", "")
+        confidence = fm.get("confidence", "")
+        body_preview = rec.body[:400].strip()
+
+        lines.append(f"### {rec.rel_path}")
+        lines.append(f"- Title: {title}")
+        parts = [f"Status: {status}"] if status else []
+        if confidence:
+            parts.append(f"Confidence: {confidence}")
+        if parts:
+            lines.append(f"- {', '.join(parts)}")
+        if body_preview:
+            lines.append(f"```\n{body_preview}\n```")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+async def run_consolidation(
+    config: DistillerConfig,
+    skills_dir: Path,
+    session_path: str,
+) -> int:
+    """Consolidation sweep: merge duplicates, upgrade assumptions, resolve contradictions.
+
+    Returns count of records modified/deleted.
+    """
+    vault_path = config.vault.vault_path
+    learn_types = config.extraction.learn_types
+
+    learns = collect_existing_learns(
+        vault_path, config.vault.ignore_dirs, learn_types
+    )
+    if len(learns) < 5:
+        log.info("pipeline.consolidation_skip", reason="too_few_learns", count=len(learns))
+        return 0
+
+    template = _load_stage_prompt("consolidate.md")
+    if not template:
+        log.warning("pipeline.consolidation_skip", reason="no_prompt")
+        return 0
+
+    # Snapshot mutations before
+    before = read_mutations(session_path)
+    before_modified = set(before.get("files_modified", []))
+    before_deleted = set(before.get("files_deleted", []))
+
+    # Group by learn type and process each group
+    by_type: dict[str, list[VaultRecord]] = {}
+    for rec in learns:
+        by_type.setdefault(rec.record_type, []).append(rec)
+
+    for learn_type, type_records in by_type.items():
+        if len(type_records) < 2:
+            continue
+
+        records_text = _format_learns_for_consolidation(type_records)
+        prompt = template.format(
+            learn_type=learn_type,
+            record_count=len(type_records),
+            records=records_text,
+            vault_cli_reference=VAULT_CLI_REFERENCE,
+        )
+
+        stage_label = f"consolidate-{learn_type}"
+        await _call_llm(prompt, config, session_path, stage_label)
+
+        log.info("pipeline.consolidation_type_done", learn_type=learn_type, records=len(type_records))
+
+    # Count changes
+    after = read_mutations(session_path)
+    after_modified = set(after.get("files_modified", []))
+    after_deleted = set(after.get("files_deleted", []))
+    total_changes = len(after_modified - before_modified) + len(after_deleted - before_deleted)
+
+    log.info("pipeline.consolidation_complete", changes=total_changes)
+    return total_changes

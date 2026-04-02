@@ -227,6 +227,8 @@ def cmd_janitor(args: argparse.Namespace) -> None:
         jcli.cmd_status(config)
     elif subcmd == "history":
         jcli.cmd_history(config, limit=args.limit)
+    elif subcmd == "drift":
+        jcli.cmd_drift(config)
     elif subcmd == "ignore":
         jcli.cmd_ignore(config, args.file, reason=args.reason)
     else:
@@ -255,6 +257,8 @@ def cmd_distiller(args: argparse.Namespace) -> None:
         dcli.cmd_status(config)
     elif subcmd == "history":
         dcli.cmd_history(config, limit=args.limit)
+    elif subcmd == "consolidate":
+        dcli.cmd_consolidate(config, skills_dir)
     else:
         print(f"Unknown distiller subcommand: {subcmd}")
         sys.exit(1)
@@ -485,6 +489,53 @@ def cmd_surveyor(args: argparse.Namespace) -> None:
         print("\nStopped.")
 
 
+def cmd_mail(args: argparse.Namespace) -> None:
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw)
+
+    from alfred.mail.config import load_from_unified
+    from alfred.mail.fetcher import fetch_all
+    from alfred.mail.state import StateManager
+
+    config = load_from_unified(raw)
+    vault_path = Path(raw.get("vault", {}).get("path", "./vault"))
+
+    subcmd = getattr(args, "mail_cmd", None)
+    if subcmd == "fetch":
+        if not config.accounts:
+            print("No mail accounts configured. Add a 'mail' section to config.yaml.")
+            print("See config.yaml.example for the format.")
+            sys.exit(1)
+        total = fetch_all(config, vault_path)
+        print(f"Fetched {total} new email(s).")
+        if not args.once:
+            import time
+            print(f"Polling every {config.poll_interval}s. Ctrl+C to stop.")
+            try:
+                while True:
+                    time.sleep(config.poll_interval)
+                    total = fetch_all(config, vault_path)
+                    if total:
+                        print(f"Fetched {total} new email(s).")
+            except KeyboardInterrupt:
+                print("\nStopped.")
+    elif subcmd == "webhook":
+        from alfred.mail.webhook import run_webhook
+        token = os.environ.get("MAIL_WEBHOOK_TOKEN", "")
+        inbox_path = vault_path / config.inbox_dir
+        run_webhook(inbox_path, host=args.host, port=args.port, token=token)
+    elif subcmd == "status":
+        sm = StateManager(config.state_path)
+        sm.load()
+        for name, ids in sm.state.seen_ids.items():
+            print(f"  {name}: {len(ids)} emails fetched")
+        if not sm.state.seen_ids:
+            print("  No emails fetched yet.")
+    else:
+        print("Usage: alfred mail {fetch|webhook|status}")
+        sys.exit(1)
+
+
 # --- Argument parser ---
 
 def build_parser() -> argparse.ArgumentParser:
@@ -537,6 +588,7 @@ def build_parser() -> argparse.ArgumentParser:
     jan_sub.add_parser("fix", help="Scan + agent fix")
     jan_sub.add_parser("watch", help="Daemon mode")
     jan_sub.add_parser("status", help="Show sweep status")
+    jan_sub.add_parser("drift", help="Run semantic drift scan")
     jan_hist = jan_sub.add_parser("history", help="Show sweep history")
     jan_hist.add_argument("--limit", type=int, default=10)
     jan_ignore = jan_sub.add_parser("ignore", help="Ignore a file")
@@ -552,6 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
     dist_run.add_argument("--project", "-p", default=None, help="Filter by project name")
     dist_sub.add_parser("watch", help="Daemon mode")
     dist_sub.add_parser("status", help="Show extraction status")
+    dist_sub.add_parser("consolidate", help="Consolidation sweep: merge duplicates, resolve contradictions")
     dist_hist = dist_sub.add_parser("history", help="Show run history")
     dist_hist.add_argument("--limit", type=int, default=10)
 
@@ -626,6 +679,16 @@ def build_parser() -> argparse.ArgumentParser:
     # tui
     sub.add_parser("tui", help="Launch interactive Ink TUI dashboard (requires Node.js)")
 
+    # mail
+    mail_p = sub.add_parser("mail", help="Email fetcher subcommands")
+    mail_sub = mail_p.add_subparsers(dest="mail_cmd")
+    mail_fetch = mail_sub.add_parser("fetch", help="Fetch new emails from configured accounts")
+    mail_fetch.add_argument("--once", action="store_true", default=False, help="Fetch once and exit (no polling)")
+    mail_sub.add_parser("status", help="Show mail fetcher state")
+    mail_webhook = mail_sub.add_parser("webhook", help="Start webhook receiver for incoming email")
+    mail_webhook.add_argument("--port", type=int, default=5005, help="Port to listen on (default: 5005)")
+    mail_webhook.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
+
     return parser
 
 
@@ -654,6 +717,7 @@ def main() -> None:
         "temporal": cmd_temporal,
         "surveyor": cmd_surveyor,
         "tui": cmd_tui,
+        "mail": cmd_mail,
     }
 
     handler = handlers.get(args.command)

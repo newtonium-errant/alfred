@@ -83,6 +83,7 @@ class SweepConfig:
     orphan_exempt_dirs: list[str] = field(default_factory=lambda: ["view"])
     max_files_per_agent_call: int = 30
     fix_log_in_vault: bool = True
+    drift_sweep_interval_hours: int = 168  # 7 days
 
 
 @dataclass

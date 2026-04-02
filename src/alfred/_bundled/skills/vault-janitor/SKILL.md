@@ -508,21 +508,26 @@ Moving files breaks wikilinks. Human must decide.
 
 **Fix:** NEVER merge automatically. Flag with `janitor_note: "DUP001 — possible duplicate of [[{other_path}]]"`.
 
-### SEM001 — GARBAGE_CONTENT
+### SEM001–SEM004 — Semantic Drift (Scanner-Detected)
 
-**Diagnosis:** File contains nonsensical, test, or clearly invalid content.
+These are detected automatically by the structural scanner based on dates and link counts. You do NOT need to detect these — the scanner handles it.
 
-**Fix:** Delete the file ONLY if you are certain it is garbage (e.g. "test test test", "asdfasdf", empty file with no useful frontmatter). Log the deletion.
+- **SEM001 — STALE_ACTIVE_PROJECT**: Project is `status: active` but has no linked activity in 30+ days.
+- **SEM002 — STALE_TODO_TASK**: Task is `status: todo` but was created 90+ days ago with no updates.
+- **SEM003 — STALE_ACTIVE_CONVERSATION**: Conversation is `status: active` but has no activity in 30+ days.
+- **SEM004 — STALE_ACTIVE_PERSON**: Person is `status: active` but has no linked activity in 60+ days.
 
-### SEM002–SEM006 — Semantic Issues
+**Fix:** Add `janitor_note` suggesting status review. Do NOT change status automatically — the vault owner decides.
 
-**Fix:** Use judgment. Add `janitor_note` with specific observations. Do NOT delete unless clearly garbage.
+### SEM005–SEM006 — Semantic Issues (Agent-Detected)
+
+**Fix:** Use judgment. Add `janitor_note` with specific observations. Do NOT delete unless clearly garbage (e.g. "test test test", "asdfasdf").
 
 ---
 
 ## 4. Destructive Action Rules
 
-1. **Never delete** unless the file is clearly garbage (SEM001). When in doubt, flag instead.
+1. **Never delete** unless the file is clearly garbage. When in doubt, flag instead.
 2. **Never merge** duplicate records. Flag with `janitor_note`.
 3. **Never move** files between directories. Flag with `janitor_note`.
 4. **Never touch** `_templates/`, `_bases/`, `_docs/`, `.obsidian/`, `inbox/`.
@@ -546,7 +551,7 @@ DELETED: {count}
 FIXED | person/John Smith.md | FM001 | Added missing 'created: 2026-02-19'
 FIXED | task/Review Quote.md | FM003 | Changed status 'open' → 'todo'
 FLAGGED | note/Old Notes.md | ORPHAN001 | No inbound links, added janitor_note
-DELETED | note/test test.md | SEM001 | Garbage content: "test test test"
+DELETED | note/test test.md | SEM005 | Garbage content: "test test test"
 SKIPPED | project/Eagle Farm.md | STUB001 | Not enough context to flesh out body
 ```
 

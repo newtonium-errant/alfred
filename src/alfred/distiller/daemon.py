@@ -424,11 +424,14 @@ async def run_watch(
 
     # Start with epoch so the first run is always a deep extraction
     last_deep = datetime.min.replace(tzinfo=timezone.utc)
+    last_consolidation = datetime.min.replace(tzinfo=timezone.utc)
+    consolidation_interval_hours = config.extraction.consolidation_interval_hours
 
     log.info(
         "daemon.starting",
         interval=interval,
         deep_interval_hours=deep_interval_hours,
+        consolidation_interval_hours=consolidation_interval_hours,
     )
 
     while True:
@@ -453,6 +456,32 @@ async def run_watch(
                 )
                 if candidates:
                     log.info("daemon.pending_candidates", count=len(candidates))
+
+            # Consolidation sweep (weekly by default)
+            hours_since_consolidation = (now - last_consolidation).total_seconds() / 3600
+            if hours_since_consolidation >= consolidation_interval_hours:
+                log.info("daemon.consolidation_start")
+                from alfred.vault.mutation_log import (
+                    append_to_audit_log,
+                    cleanup_session_file,
+                    create_session_file,
+                    read_mutations,
+                )
+                session_path = create_session_file()
+                try:
+                    from .pipeline import run_consolidation
+                    modified = await run_consolidation(config, skills_dir, session_path)
+                    log.info("daemon.consolidation_complete", modified=modified)
+                    mutations = read_mutations(session_path)
+                    total = sum(len(v) for v in mutations.values())
+                    if total > 0:
+                        audit_path = str(Path(config.state.path).parent / "vault_audit.log")
+                        append_to_audit_log(audit_path, "distiller", mutations, detail="consolidation")
+                except Exception:
+                    log.exception("daemon.consolidation_error")
+                finally:
+                    cleanup_session_file(session_path)
+                last_consolidation = now
         except Exception:
             log.exception("daemon.extraction_error")
 
