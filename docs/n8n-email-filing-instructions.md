@@ -28,50 +28,30 @@ Open the **Email to Alfred Ingest** workflow in the n8n editor.
 **Add after:** "POST to Alfred Ingest - HTTP Request"
 **Type:** Code node
 **Name:** `Categorize Email - Code`
-**Mode:** Run Once for All Items
+**Mode:** Run Once for All Items (processes all emails in batch)
 
 **Paste this code:**
 
 ```javascript
 // Restore original email context (mandatory — HTTP node replaces $json)
 // WARNING: If you rename "New Email - Outlook Trigger", update this reference
-const email = $('New Email - Outlook Trigger').first().json;
-const webhookResult = $input.first().json;
+const emails = $('New Email - Outlook Trigger').all();
+const webhookResults = $input.all();
 
-// Skip filing if webhook failed
-if (!webhookResult || webhookResult.status !== 'ok') {
-  return [{ json: { _route: 'skip', _reason: 'webhook_failed' } }];
+if (!emails.length || !emails[0].json?.from) {
+  throw new Error('Cannot restore email context. Was the trigger node renamed?');
 }
-
-const from = (email.from?.emailAddress?.address || '').toLowerCase();
-const subject = (email.subject || '').toLowerCase();
-const domain = from.split('@')[1] || '';
 
 // ---- TRIAGE RULES ----
 // First matching rule wins. To update: add/remove/reorder rules.
 // Keep in sync with vault/process/Email Triage Rules.md
 const rules = [
 
-  // === Business/Invoices ===
-  {
-    parent: 'Business',
-    child: 'Invoices',
-    match: () =>
-      domain === 'digitalocean.com' ||
-      domain === 'railway.app' ||
-      domain === 'cloudflare.com' ||
-      domain === 'supabase.com' ||
-      domain === 'n8n.io' ||
-      (subject.includes('invoice') && from.includes('noreply')) ||
-      subject.includes('your invoice') ||
-      subject.includes('billing statement')
-  },
-
-  // === Business/Receipts ===
+  // === Business/Receipts (before Invoices — receipt/payment keywords take priority) ===
   {
     parent: 'Business',
     child: 'Receipts',
-    match: () =>
+    match: (subject, domain) =>
       (subject.includes('receipt') && (
         domain === 'digitalocean.com' ||
         domain === 'railway.app' ||
@@ -86,11 +66,25 @@ const rules = [
       subject.includes('software license')
   },
 
+  // === Business/Invoices (domain match excluding receipts — receipts caught above) ===
+  {
+    parent: 'Business',
+    child: 'Invoices',
+    match: (subject, domain) =>
+      domain === 'digitalocean.com' ||
+      domain === 'railway.app' ||
+      domain === 'cloudflare.com' ||
+      domain === 'supabase.com' ||
+      domain === 'n8n.io' ||
+      subject.includes('your invoice') ||
+      subject.includes('billing statement')
+  },
+
   // === Finance/Tax (before Personal — CRA/T4 must not fall through) ===
   {
     parent: 'Finance',
     child: 'Tax',
-    match: () =>
+    match: (subject, domain, from) =>
       domain === 'cra-arc.gc.ca' ||
       from.includes('canada.ca') ||
       subject.includes('t4 ') ||
@@ -108,14 +102,17 @@ const rules = [
   {
     parent: 'Finance',
     child: 'Personal',
-    match: () =>
+    match: (subject, domain, from) =>
       (domain === 'patreon.com' && subject.includes('receipt')) ||
       (from.includes('apple.com') && (subject.includes('receipt') || subject.includes('invoice'))) ||
       (from.includes('microsoft.com') && subject.includes('receipt')) ||
-      domain === 'costco.ca' || domain === 'costco.com' ||
-      (from.includes('amazon') && (subject.includes('order') || subject.includes('receipt'))) ||
-      from.includes('doordash') || from.includes('ubereats') ||
-      from.includes('skipthedishes') ||
+      (domain === 'costco.ca' || domain === 'costco.com') ||
+      ((domain.includes('amazon.com') || domain.includes('amazon.ca')) &&
+        (subject.includes('order') || subject.includes('receipt'))) ||
+      (from.includes('doordash') && (subject.includes('receipt') || subject.includes('order'))) ||
+      (from.includes('ubereats') && (subject.includes('receipt') || subject.includes('order'))) ||
+      (from.includes('skipthedishes') && (subject.includes('receipt') || subject.includes('order'))) ||
+      (from.includes('pizzahut') && (subject.includes('receipt') || subject.includes('order'))) ||
       subject.includes('bank statement') ||
       subject.includes('credit card statement') ||
       subject.includes('interac') ||
@@ -125,21 +122,51 @@ const rules = [
 
 ];
 
-const matched = rules.find(r => r.match());
+// Process ALL emails in the batch (trigger may return multiple)
+const results = [];
 
-if (matched) {
-  return [{ json: {
-    _route: 'file',
-    _parentFolder: matched.parent,
-    _childFolder: matched.child,
-    _folderDisplay: matched.parent + '/' + matched.child,
-    _messageId: email.id,
-    _subject: email.subject,
-    _from: from
-  }}];
+for (let i = 0; i < emails.length; i++) {
+  const email = emails[i].json;
+  const webhookResult = webhookResults[i]?.json;
+
+  // Skip filing if webhook errored (continueOnFail puts error shape in $json)
+  if (!webhookResult || webhookResult.error) {
+    results.push({ json: {
+      _route: 'skip',
+      _reason: 'webhook_failed',
+      _subject: email.subject || '',
+      _from: (email.from?.emailAddress?.address || '')
+    }});
+    continue;
+  }
+
+  const from = (email.from?.emailAddress?.address || '').toLowerCase();
+  const subject = (email.subject || '').toLowerCase();
+  const domain = from.split('@')[1] || '';
+
+  const matched = rules.find(r => r.match(subject, domain, from));
+
+  if (matched) {
+    results.push({ json: {
+      _route: 'file',
+      _parentFolder: matched.parent,
+      _childFolder: matched.child,
+      _folderDisplay: matched.parent + '/' + matched.child,
+      _messageId: email.id,
+      _subject: email.subject,
+      _from: from
+    }});
+  } else {
+    results.push({ json: {
+      _route: 'skip',
+      _reason: 'no_matching_rule',
+      _subject: email.subject || '',
+      _from: from
+    }});
+  }
 }
 
-return [{ json: { _route: 'skip', _reason: 'no_matching_rule' } }];
+return results;
 ```
 
 **Connect:** Output of "POST to Alfred Ingest - HTTP Request" → this node
@@ -163,17 +190,13 @@ return [{ json: { _route: 'skip', _reason: 'no_matching_rule' } }];
 **Add after:** "Route Filing - Switch" (connect to the "file" output)
 **Type:** Code node
 **Name:** `Resolve Folder - Code`
-**Mode:** Run Once for All Items
+**Mode:** Run Once for All Items (processes all items, caches folder IDs within batch)
 
-This node uses `this.helpers.httpRequest()` to call the Microsoft Graph API, find or create the target folder, and return the folder ID.
+This node uses `this.helpers.httpRequestWithAuthentication()` to call the Microsoft Graph API, find or create the target folder, and return the folder ID. Folder IDs are cached within the execution so multiple emails going to the same folder only resolve once.
 
 **Paste this code:**
 
 ```javascript
-const item = $input.first().json;
-const parentName = item._parentFolder;
-const childName = item._childFolder;
-
 // Helper: Graph API call via n8n's built-in HTTP helper
 async function graphGet(url) {
   return await this.helpers.httpRequestWithAuthentication.call(
@@ -198,47 +221,70 @@ async function graphPost(url, body) {
 
 const baseUrl = 'https://graph.microsoft.com/v1.0/me/mailFolders';
 
-// Step 1: Find or create parent folder
-let parentId = null;
-const topFolders = await graphGet.call(this, baseUrl + '?$top=100');
-const existingParent = topFolders.value.find(
-  f => f.displayName.toLowerCase() === parentName.toLowerCase()
-);
+// Cache resolved folder IDs within this execution to avoid duplicate API calls
+const folderCache = {};
 
-if (existingParent) {
-  parentId = existingParent.id;
-} else {
-  const created = await graphPost.call(this, baseUrl, {
-    displayName: parentName
-  });
-  parentId = created.id;
-}
+async function resolveFolder(parentName, childName) {
+  const cacheKey = parentName + '/' + childName;
+  if (folderCache[cacheKey]) return folderCache[cacheKey];
 
-// Step 2: Find or create child folder
-let childId = null;
-const childFolders = await graphGet.call(
-  this, baseUrl + '/' + parentId + '/childFolders?$top=100'
-);
-const existingChild = childFolders.value.find(
-  f => f.displayName.toLowerCase() === childName.toLowerCase()
-);
-
-if (existingChild) {
-  childId = existingChild.id;
-} else {
-  const created = await graphPost.call(
-    this, baseUrl + '/' + parentId + '/childFolders', {
-      displayName: childName
-    }
+  // Step 1: Find or create parent folder
+  const topFolders = await graphGet.call(this, baseUrl + '?$top=100');
+  if (!topFolders || !topFolders.value) {
+    throw new Error('Graph API returned no folder data');
+  }
+  let parent = topFolders.value.find(
+    f => f.displayName.toLowerCase() === parentName.toLowerCase()
   );
-  childId = created.id;
+  if (!parent) {
+    parent = await graphPost.call(this, baseUrl, { displayName: parentName });
+  }
+
+  // Step 2: Find or create child folder
+  const childFolders = await graphGet.call(
+    this, baseUrl + '/' + parent.id + '/childFolders?$top=100'
+  );
+  if (!childFolders || !childFolders.value) {
+    throw new Error('Graph API returned no child folder data');
+  }
+  let child = childFolders.value.find(
+    f => f.displayName.toLowerCase() === childName.toLowerCase()
+  );
+  if (!child) {
+    child = await graphPost.call(
+      this, baseUrl + '/' + parent.id + '/childFolders',
+      { displayName: childName }
+    );
+  }
+
+  folderCache[cacheKey] = child.id;
+  return child.id;
 }
 
-// Pass through all fields plus the resolved folder ID
-return [{ json: { ...item, _folderId: childId } }];
+// Process ALL items in the batch
+const results = [];
+for (const item of $input.all()) {
+  try {
+    const folderId = await resolveFolder.call(
+      this, item.json._parentFolder, item.json._childFolder
+    );
+    results.push({ json: { ...item.json, _folderId: folderId } });
+  } catch (err) {
+    // On failure, pass through with error info — continueOnFail handles it
+    results.push({ json: {
+      ...item.json,
+      _folderId: null,
+      _folderError: err.message
+    }});
+  }
+}
+return results;
 ```
 
 **Important:** The credential name `microsoftOutlookOAuth2Api` must match the credential type used by your Outlook trigger. This is the internal n8n credential type name, not the display name.
+
+**Settings (gear icon):**
+- Enable **Continue On Fail** — if folder resolution fails, the move step is skipped gracefully
 
 **Connect:** "file" output of Switch → this node
 
