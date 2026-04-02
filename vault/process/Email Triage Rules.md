@@ -122,3 +122,5 @@ Edit this file directly in Obsidian. Examples of updates:
 - "Emails from school should be actionable" — already listed, adjust if needed
 - "Stop filing marketing from X" — add to Ignore patterns
 - "New Outlook folder for medical receipts" — add a new section under Financial Document Rules
+
+**Important:** The Outlook folder rules are mirrored in the n8n workflow's "Restore Context & Categorize" Code node. When you change folder rules here, also update the n8n Code node to match. See `docs/n8n-email-filing-instructions.md` for details.
