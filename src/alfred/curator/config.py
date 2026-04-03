@@ -76,11 +76,18 @@ class OpenClawBackendConfig:
 
 
 @dataclass
+class HermesBackendConfig:
+    url: str = ""  # Default: http://hermes-bg:8787 (set via HERMES_BG_URL env)
+    timeout: int = 300
+
+
+@dataclass
 class AgentConfig:
     backend: str = "claude"
     claude: ClaudeBackendConfig = field(default_factory=ClaudeBackendConfig)
     zo: ZoBackendConfig = field(default_factory=ZoBackendConfig)
     openclaw: OpenClawBackendConfig = field(default_factory=OpenClawBackendConfig)
+    hermes: HermesBackendConfig = field(default_factory=HermesBackendConfig)
 
 
 @dataclass
@@ -119,6 +126,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "claude": ClaudeBackendConfig,
     "zo": ZoBackendConfig,
     "openclaw": OpenClawBackendConfig,
+    "hermes": HermesBackendConfig,
     "watcher": WatcherConfig,
     "state": StateConfig,
     "logging": LoggingConfig,
