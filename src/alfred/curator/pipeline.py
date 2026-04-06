@@ -679,16 +679,23 @@ async def run_pipeline(
     )
 
     # Stage 4: Enrich Entities (LLM, per-entity)
-    enriched = await _stage4_enrich(
-        inbox_content=inbox_content,
-        inbox_filename=filename,
-        note_path=note_path,
-        resolved_entities=resolved,
-        manifest=manifest,
-        config=config,
-        session_path=session_path,
-    )
-    result.entities_enriched = enriched
+    # Gated behind config flag — skipping saves one LLM call per entity.
+    # Entities retain their stub content from Stage 2 (which already includes
+    # the description from the manifest). Ref: ssdavidai/alfred#14
+    if not config.skip_entity_enrichment:
+        enriched = await _stage4_enrich(
+            inbox_content=inbox_content,
+            inbox_filename=filename,
+            note_path=note_path,
+            resolved_entities=resolved,
+            manifest=manifest,
+            config=config,
+            session_path=session_path,
+        )
+        result.entities_enriched = enriched
+    else:
+        log.info("pipeline.s4_skipped", reason="skip_entity_enrichment=True")
+        result.entities_enriched = []
 
     result.success = True
     result.summary = (

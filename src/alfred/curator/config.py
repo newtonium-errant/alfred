@@ -116,6 +116,11 @@ class CuratorConfig:
     watcher: WatcherConfig = field(default_factory=WatcherConfig)
     state: StateConfig = field(default_factory=StateConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    # Skip Stage 4 entity enrichment to reduce token consumption.
+    # Entities keep their stub content from Stage 2 (includes description
+    # from the manifest). Re-enable by setting to False if richer entity
+    # bodies are needed. Ref: ssdavidai/alfred#14
+    skip_entity_enrichment: bool = True
 
 
 # --- Recursive builder ---

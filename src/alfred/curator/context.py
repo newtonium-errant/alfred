@@ -29,14 +29,29 @@ class VaultContext:
         return sum(len(v) for v in self.records_by_type.values())
 
     def to_prompt_text(self) -> str:
-        """Compact markdown listing grouped by type."""
+        """Compact entity index grouped by type.
+
+        Emits a slim name-only index instead of full record listings.
+        The LLM only needs entity names for dedup awareness — Stage 2
+        Python does the actual filesystem check.
+        Ref: ssdavidai/alfred#14 (curator token reduction)
+        """
         lines: list[str] = []
         for rec_type in sorted(self.records_by_type.keys()):
             records = self.records_by_type[rec_type]
-            lines.append(f"### {rec_type} ({len(records)} records)")
-            for rec in sorted(records, key=lambda r: r.name):
-                status_part = f" — status: {rec.status}" if rec.status else ""
-                lines.append(f"- [[{rec.path}|{rec.name}]]{status_part}")
+            names = [r.name for r in sorted(records, key=lambda r: r.name)]
+            lines.append(f"### {rec_type} ({len(names)})")
+            # Comma-separated names, wrapping at ~120 chars per line
+            current_line = ""
+            for name in names:
+                addition = name if not current_line else f", {name}"
+                if current_line and len(current_line) + len(addition) > 120:
+                    lines.append(current_line)
+                    current_line = name
+                else:
+                    current_line += addition
+            if current_line:
+                lines.append(current_line)
             lines.append("")
         return "\n".join(lines)
 
