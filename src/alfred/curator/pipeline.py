@@ -425,8 +425,16 @@ def _resolve_entities(
             log.info("pipeline.s2_entity_exists", entity=entity_key)
             continue
 
-        # Create the entity with description as body (avoids template placeholder leak)
-        body = f"# {name}\n\n{description}\n" if description else f"# {name}\n"
+        # Use the full body from the manifest if provided, otherwise fall back
+        # to a simple heading + description.
+        manifest_body = entity.get("body", "")
+        if manifest_body and manifest_body.strip():
+            body = manifest_body
+            # Ensure it ends with a newline
+            if not body.endswith("\n"):
+                body += "\n"
+        else:
+            body = f"# {name}\n\n{description}\n" if description else f"# {name}\n"
 
         # Parse fields — strip wrapping quotes from wikilink values
         set_fields: dict = {}
