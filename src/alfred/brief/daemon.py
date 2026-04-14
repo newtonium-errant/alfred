@@ -11,6 +11,7 @@ from .config import BriefConfig
 from .renderer import render_brief, serialize_record
 from .state import BriefRun, StateManager
 from .utils import get_logger
+from .operations import format_operations_section
 from .weather import fetch_and_format
 
 log = get_logger(__name__)
@@ -28,7 +29,12 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
 
     # Fetch weather section
     weather_md = await fetch_and_format(config.weather)
-    sections = [("Weather", weather_md)]
+
+    # Operations snapshot
+    data_dir = str(Path(config.state.path).parent)
+    ops_md = format_operations_section(data_dir, config.vault_path, since=today)
+
+    sections = [("Weather", weather_md), ("Operations", ops_md)]
 
     # Render
     frontmatter, body = render_brief(today, sections, config)
