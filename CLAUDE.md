@@ -119,15 +119,30 @@ Each tool has its own `config.py` with typed dataclasses. All follow the same pa
 
 ## Coding Team
 
-This project uses the **Aftermath-Lab** shared development knowledge base at `/home/andrew/aftermath-lab/`. All agents MUST read the relevant aftermath-lab docs before writing code.
+This project uses two knowledge sources:
+- **Aftermath-Lab** at `/home/andrew/aftermath-lab/` — shared development patterns (n8n, frontend, Supabase, auth, QA)
+- **Agent instructions** at `.claude/agents/` — Alfred-specific specialist roles
 
-### Spawning Agents
+### Agent Team
+
+| Agent | Role | Mode | When to spawn |
+|-------|------|------|---------------|
+| **builder** | Python implementation across all tools | foreground | Code changes to any tool, new features, refactors |
+| **vault-reviewer** | QA on vault output quality (not code) | background | After bulk processing, after prompt changes, periodic quality checks |
+| **prompt-tuner** | Owns SKILL.md and extraction prompts | foreground | When vault-reviewer finds output quality issues, when adding new record types |
+| **infra** | Ollama, n8n, tunnel, WSL2, dependencies | foreground | When infrastructure breaks or needs configuration |
+| **code-reviewer** | Code QA, regression checking | background | Before committing significant changes |
+
+Each agent reads `.claude/agents/{name}.md` for their specific instructions.
+
+### Spawning Rules
 
 - **Editing agents run in foreground** — they need permission prompts for file writes
 - **QA/review agents run in background** — read-only, no permissions needed
-- **Responsive spawning** — don't create all 4 agents for a simple task. Spawn specialists when the work requires them.
-- **Task routing** — route work to the right specialist. Don't ask a frontend agent to write n8n workflows.
+- **Responsive spawning** — don't create all 5 agents for a simple task. Spawn specialists when the work requires them.
+- **Task routing** — route work to the right specialist. Builder writes code, prompt-tuner changes prompts, vault-reviewer evaluates output.
 - **Plan mode** is the default for agents. Use `acceptEdits` for simple, well-defined tasks where plan approval adds friction without value.
+- **Feedback loop** — vault-reviewer findings inform prompt-tuner changes, which the builder may need to support with code changes. This cycle is how Alfred improves.
 
 ### Workflow Deliverables
 
@@ -136,11 +151,15 @@ This project uses the **Aftermath-Lab** shared development knowledge base at `/h
 
 ### Agent Knowledge Requirements
 
-Every agent must read their relevant aftermath-lab docs before building. The knowledge base covers n8n patterns/anti-patterns/gotchas, frontend patterns, Supabase patterns, auth patterns, and QA process. Agents that skip this will repeat known mistakes.
+- **builder** reads aftermath-lab docs + CLAUDE.md before writing code
+- **vault-reviewer** reads vault CLAUDE.md + schema.py + relevant SKILL.md
+- **prompt-tuner** reads current SKILL.md + vault-reviewer findings + sample output
+- **infra** reads infra agent instructions (contains current system state and known issues)
+- **code-reviewer** reads CLAUDE.md + the specific code being reviewed
 
 ## Key Config
 
-`config.yaml` has sections: `vault`, `agent`, `logging`, `curator`, `janitor`, `distiller`, `surveyor`. Environment variables are substituted via `${VAR}` syntax. See `config.yaml.example` for all options.
+`config.yaml` has sections: `vault`, `agent`, `logging`, `curator`, `janitor`, `distiller`, `surveyor`, `brief`, `mail`. Environment variables are substituted via `${VAR}` syntax. See `config.yaml.example` for all options.
 
 ## Vault Record Format
 
