@@ -28,6 +28,11 @@ Last updated: 2026-04-14
 - [x] Semantic drift detection — weekly scan for stale projects (30d), tasks (90d), conversations (30d), persons (60d). CLI: `alfred janitor drift`
 - [x] Consolidation sweep — weekly LLM pass to merge duplicates, upgrade assumptions, resolve contradictions. CLI: `alfred distiller consolidate`. Refactored pipeline from OpenClaw-only to backend-agnostic (2026-04-14); first successful run with Claude API: 31 records modified across 5 learn types
 
+### Morning Brief
+- [x] Weather module — METAR + TAF from aviationweather.gov (CYZX/CYHZ/CYAW/CYQI). No API key needed. CLI: `alfred brief`, `alfred brief weather` (refresh), `alfred brief generate --refresh`. Daemon auto-starts with `alfred up` at 0600 ADT daily. Output: `vault/run/Morning Brief {date}.md`
+- [ ] Strategic Overview — depends on RRTS integration
+- [ ] Personnel, Equipment, Operations, Finance — depends on RRTS integration
+
 ### Team & Knowledge Base
 - [x] Aftermath-Lab shared knowledge base (25+ docs: n8n, frontend, Supabase, auth, QA)
 - [x] Agent instruction files (frontend, n8n-backend, supabase-db, qa-ux)
@@ -47,13 +52,6 @@ Last updated: 2026-04-14
 - [ ] Neutral channel not built — design calls for vault-based Phase 1, Supabase Phase 2
 
 ## Next Up
-
-### Morning Brief
-RCAF squadron-style daily briefing. Sections: Weather, Strategic Overview, Personnel, Equipment, Operations, Finance.
-
-- **Weather module** — ready to build. NAV CANADA public APIs (CYZX/CYHZ/CYAW/CYQI), no dependencies.
-- **Other sections** — depend on RRTS integration (business data not yet connected to Alfred)
-- Priority: weather first, then add sections as integrations come online
 
 ### Multi-Instance Architecture
 5 Alfred instances in hub-and-spoke topology:
