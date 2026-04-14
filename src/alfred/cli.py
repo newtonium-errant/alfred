@@ -489,6 +489,30 @@ def cmd_surveyor(args: argparse.Namespace) -> None:
         print("\nStopped.")
 
 
+def cmd_brief(args: argparse.Namespace) -> None:
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw)
+
+    from alfred.brief.config import load_from_unified
+    from alfred.brief import cli as bcli
+
+    config = load_from_unified(raw)
+    subcmd = getattr(args, "brief_cmd", None)
+    if subcmd == "weather":
+        bcli.cmd_weather(config)
+    elif subcmd == "status":
+        bcli.cmd_status(config)
+    elif subcmd == "history":
+        bcli.cmd_history(config, limit=args.limit)
+    elif subcmd == "watch":
+        bcli.cmd_watch(config)
+    elif subcmd == "generate":
+        bcli.cmd_generate(config, refresh=args.refresh)
+    else:
+        # Default: generate
+        bcli.cmd_generate(config)
+
+
 def cmd_mail(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw)
@@ -679,6 +703,17 @@ def build_parser() -> argparse.ArgumentParser:
     # tui
     sub.add_parser("tui", help="Launch interactive Ink TUI dashboard (requires Node.js)")
 
+    # brief
+    brief_p = sub.add_parser("brief", help="Morning brief subcommands")
+    brief_sub = brief_p.add_subparsers(dest="brief_cmd")
+    brief_gen = brief_sub.add_parser("generate", help="Generate a brief now")
+    brief_gen.add_argument("--refresh", action="store_true", default=False, help="Overwrite today's existing brief")
+    brief_sub.add_parser("weather", help="Update weather in today's brief with fresh data")
+    brief_sub.add_parser("status", help="Show brief status")
+    brief_hist = brief_sub.add_parser("history", help="Show brief history")
+    brief_hist.add_argument("--limit", type=int, default=10)
+    brief_sub.add_parser("watch", help="Daemon mode (generate on schedule)")
+
     # mail
     mail_p = sub.add_parser("mail", help="Email fetcher subcommands")
     mail_sub = mail_p.add_subparsers(dest="mail_cmd")
@@ -717,6 +752,7 @@ def main() -> None:
         "temporal": cmd_temporal,
         "surveyor": cmd_surveyor,
         "tui": cmd_tui,
+        "brief": cmd_brief,
         "mail": cmd_mail,
     }
 
