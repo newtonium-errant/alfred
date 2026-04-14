@@ -76,12 +76,29 @@ def _validate_status(record_type: str, status: str) -> None:
         )
 
 
+def _coerce_list_fields(fields: dict) -> None:
+    """Normalise list-field values so downstream code always sees a list.
+
+    - ``None`` or empty string → ``[]``
+    - Non-empty string         → ``[string]``   (single-item list)
+    - Already a list           → no change
+
+    Mutates *fields* in place.  Must be called **before** ``_validate_list_fields``.
+    """
+    for field_name in LIST_FIELDS:
+        if field_name not in fields:
+            continue
+        val = fields[field_name]
+        if val is None or val == "":
+            fields[field_name] = []
+        elif isinstance(val, str):
+            fields[field_name] = [val]
+
+
 def _validate_list_fields(fields: dict) -> None:
     for field_name in LIST_FIELDS:
         val = fields.get(field_name)
         if val is not None and not isinstance(val, list):
-            if field_name == "project" and isinstance(val, str):
-                continue
             raise VaultError(
                 f"Field '{field_name}' must be a list, got {type(val).__name__}"
             )
@@ -375,7 +392,8 @@ def vault_create(
     for k, v in set_fields.items():
         fm[k] = v
 
-    # Validate
+    # Coerce + validate
+    _coerce_list_fields(fm)
     _validate_status(record_type, fm.get("status", ""))
     _validate_list_fields(fm)
     _validate_required_fields(fm)
@@ -387,8 +405,16 @@ def vault_create(
         # Dataview sections even when a custom body is provided.
         if template:
             base_embeds = _extract_base_embeds(template_body, name)
-            if base_embeds and base_embeds not in final_body:
-                final_body = final_body.rstrip("\n") + "\n\n---\n" + base_embeds
+            if base_embeds:
+                # Check each embed line individually to avoid false negatives
+                # from whitespace differences (blank lines, trailing newlines).
+                missing = [
+                    line for line in base_embeds.splitlines()
+                    if line.strip() and "![[" in line and ".base#" in line
+                    and line.strip() not in final_body
+                ]
+                if missing:
+                    final_body = final_body.rstrip("\n") + "\n\n" + "\n".join(missing) + "\n"
     else:
         # Process template body — replace {{title}} and {{date}}
         final_body = template_body.replace("{{title}}", name).replace("{{date}}", date.today().isoformat())
@@ -444,7 +470,8 @@ def vault_edit(
                 fm[k] = [existing, v]
             fields_changed.append(k)
 
-    # Validate after edits
+    # Coerce + validate after edits
+    _coerce_list_fields(fm)
     record_type = fm.get("type", "")
     if record_type:
         _validate_status(record_type, fm.get("status", ""))

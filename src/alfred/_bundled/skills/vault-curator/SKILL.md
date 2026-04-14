@@ -113,7 +113,7 @@ vault/
 ├── contradiction/
 ├── synthesis/
 ├── inbox/           # Inbound — you process files FROM here
-│   └── processed/   # Curator moves files here after processing
+│   └── processed/   # Daemon moves files here automatically after agent finishes
 ├── _templates/      # DO NOT modify
 ├── _bases/          # DO NOT modify
 └── YYYY/MM/DD/      # Date-organized sessions
@@ -463,7 +463,7 @@ relationships: []
 tags: []
 ---
 ```
-**Directory:** `inbox/` (Curator moves to `inbox/processed/` after processing)
+**Directory:** `inbox/` (daemon moves to `inbox/processed/` automatically after agent finishes)
 **Note:** You do NOT create input records. The inbox file IS the input record. You process it and create other records from it.
 
 #### session
@@ -739,13 +739,13 @@ A task of `kind: task` with a checklist for sub-project/phase setup: define deli
 
 ---
 
-## 4. The Curation Process — Mandatory 7-Step Procedure
+## 4. The Curation Process — Mandatory 6-Step Procedure
 
-You MUST follow ALL 7 steps for EVERY inbox file. Do not skip steps. Do not take shortcuts.
+You MUST follow ALL 6 steps for EVERY inbox file. Do not skip steps. Do not take shortcuts.
 
 ### Email Triage — Pre-Step for Email Inputs
 
-Before starting the 7 steps, if the inbox file is an email (has **From:** or **Account:** headers), read the triage rules:
+Before starting the 6 steps, if the inbox file is an email (has **From:** or **Account:** headers), read the triage rules:
 
 ```bash
 alfred vault read "process/Email Triage Rules"
@@ -753,7 +753,7 @@ alfred vault read "process/Email Triage Rules"
 
 Apply the triage rules to determine the email's **priority level** (actionable, important, low, ignore) and **financial tags** if applicable.
 
-- **Ignore** emails: Move to `inbox/processed/` without creating any vault records. Done.
+- **Ignore** emails: Do nothing — create no vault records. The daemon will move the file to processed automatically. Done.
 - **Low** emails: Create a minimal note record with appropriate tags. No task records needed.
 - **Important** emails: Full curation. Create note + entity records. Add tags from the triage rules.
 - **Actionable** emails: Full curation. Create note + task records. Set task priority based on urgency. Add tags from the triage rules.
@@ -924,14 +924,7 @@ If anything fails these checks, fix it before proceeding.
 
 ---
 
-### STEP 7: MOVE — Mark the inbox file as processed
-
-Move the inbox file to the processed directory:
-```bash
-alfred vault move "inbox/filename.md" "inbox/processed/filename.md"
-```
-
-**NEVER move the file before completing Steps 1-6.**
+**After you complete Steps 1-6, your work is done.** The daemon automatically moves the inbox file to `inbox/processed/` after you finish. DO NOT move inbox files yourself.
 
 ---
 
@@ -991,8 +984,9 @@ alfred vault edit "note/My Note.md" --body-append "Additional paragraph content"
 
 ### Moving a record
 ```bash
-alfred vault move "inbox/raw.md" "inbox/processed/raw.md"
+alfred vault move "note/Old Name.md" "note/New Name.md"
 ```
+**Note:** DO NOT use `vault move` on inbox files. The daemon handles moving inbox files to `inbox/processed/` automatically.
 
 ### Wikilink format
 Always use `"[[directory/Record Name]]"` format in frontmatter field values:
@@ -1129,9 +1123,10 @@ Attendees: Henry, Sarah Chen, Mike Torres
 - **Don't invent data** — Only create records from information actually present in the input. Don't guess email addresses, phone numbers, or relationships.
 - **Don't skip base view embeds** — Every entity record (person, org, project, etc.) MUST include the appropriate `![[*.base#Section]]` embeds in the body. These are what make Obsidian's live views work.
 - **Don't break frontmatter format** — Always use proper YAML. Quote wikilinks: `"[[path/Name]]"`. Use arrays for lists: `["[[link1]]", "[[link2]]"]`.
-- **Don't create input records** — The inbox file IS the input. You process it; Curator handles marking it processed.
+- **Don't create input records** — The inbox file IS the input. You process it; the daemon handles marking it processed.
 - **Don't modify `_templates/` or `_bases/`** — These are system files.
 - **Don't use bare paths in frontmatter** — Always use `"[[wikilink]]"` format, not plain strings for references.
 - **Don't create records for vague references** — "Tom from the council" without a surname is too vague for a person record. Mention in body text instead.
-- **Don't set status: processed on inbox files** — Curator handles this after you finish.
-- **Don't skip the 7-step process** — Every inbox file goes through all 7 steps. No shortcuts.
+- **DO NOT move inbox files to processed** — The daemon handles this automatically after your work is complete. Moving inbox files yourself causes duplicate mutations and race conditions.
+- **Don't set status: processed on inbox files** — The daemon handles this after you finish.
+- **Don't skip the 6-step process** — Every inbox file goes through all 6 steps. No shortcuts.
