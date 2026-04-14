@@ -1,6 +1,6 @@
 # Alfred Roadmap
 
-Last updated: 2026-04-04
+Last updated: 2026-04-14
 
 ## Done
 
@@ -8,7 +8,7 @@ Last updated: 2026-04-04
 - [x] Curator — watches inbox, processes raw inputs into structured vault records
 - [x] Janitor — structural scan (12 issue codes), agent-driven fixes, autofix pipeline
 - [x] Distiller — extracts learning records (assumption, decision, constraint, contradiction, synthesis)
-- [x] Surveyor — embed, cluster, label, write (Milvus Lite + HDBSCAN + Leiden)
+- [x] Surveyor — embed, cluster, label, write (Milvus Lite + HDBSCAN + Leiden). Fully operational (2026-04-14): Ollama nomic-embed-text for embeddings, qwen2.5:14b for labeling, both running on local Windows GPU. Initial sync: 1419 files embedded, 165 semantic clusters, 538 clusters labeled
 - [x] Unified CLI (`alfred`), config (`config.yaml`), daemon management (`alfred up/down/status`)
 - [x] Vault operations layer with scope enforcement and mutation logging
 - [x] TUI dashboard (`alfred tui`)
@@ -26,7 +26,7 @@ Last updated: 2026-04-04
 ### Knowledge Management (KAIROS-inspired)
 - [x] Proactive context injection — curator extracts sender email, injects linked person/org/project/task context
 - [x] Semantic drift detection — weekly scan for stale projects (30d), tasks (90d), conversations (30d), persons (60d). CLI: `alfred janitor drift`
-- [x] Consolidation sweep — weekly LLM pass to merge duplicates, upgrade assumptions, resolve contradictions. CLI: `alfred distiller consolidate`
+- [x] Consolidation sweep — weekly LLM pass to merge duplicates, upgrade assumptions, resolve contradictions. CLI: `alfred distiller consolidate`. Refactored pipeline from OpenClaw-only to backend-agnostic (2026-04-14); first successful run with Claude API: 31 records modified across 5 learn types
 
 ### Team & Knowledge Base
 - [x] Aftermath-Lab shared knowledge base (25+ docs: n8n, frontend, Supabase, auth, QA)
@@ -41,9 +41,6 @@ Last updated: 2026-04-04
 - [ ] Expand triage rules as real emails arrive (new senders, new patterns)
 - [ ] Add Outlook categories/tags to filed emails for searchability
 - [ ] Gmail account integration (address TBD — webhook + n8n trigger)
-
-### Consolidation Sweep
-- [ ] Requires OpenClaw backend or local LLM to actually run — code is done, backend not available on current machine
 
 ### Session Notes Pipeline
 - [ ] Currently manual (point aftermath team at session notes file path)
@@ -104,5 +101,8 @@ Cross-instance communication channel:
 
 ### Local LLM
 - Eliminates API token costs for curator/distiller/consolidation
-- OpenClaw backend already supports local models
+- **Smoke test passed (2026-04-10):** Ollama on Windows (RTX 5070 Ti, 16GB VRAM) running `qwen2.5:14b` — all 4 tests passed (connectivity, structured JSON, single tool call, multi-turn tool use on real email). Details: `docs/ollama-smoke-test-2026-04-10.md`, test script: `scripts/ollama_smoke_test.py`
+- OpenClaw is a cloud model router, not local inference — pivoted to direct Ollama integration
+- Full `OllamaBackend` (~200-300 lines) deferred until Mac arrives for larger models
+- Current decision: stick with Claude API for production — 14B quality below Claude for nuanced extraction, vault is source of truth
 - Tradeoff: cost → zero, quality → depends on model and hardware

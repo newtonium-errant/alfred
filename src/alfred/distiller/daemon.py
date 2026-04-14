@@ -44,8 +44,13 @@ log = get_logger(__name__)
 
 
 def _use_pipeline(config: DistillerConfig) -> bool:
-    """Check if the multi-stage pipeline should be used (OpenClaw backend only)."""
-    return config.agent.backend == "openclaw"
+    """Check if the multi-stage pipeline should be used.
+
+    The pipeline (per-source extraction → dedup → create → meta-analysis)
+    is supported for Claude and OpenClaw backends. Zo uses the legacy
+    single-call path because it has its own filesystem access.
+    """
+    return config.agent.backend in ("claude", "openclaw")
 
 
 def _load_skill(skills_dir: Path) -> str:

@@ -34,6 +34,9 @@ alfred-saas/
 alfred-docs/
 alfred-documentation/
 
+# Finished n8n workflows (local only, repo is for coding knowledge)
+workflows/
+
 # OS
 .DS_Store
 Thumbs.db

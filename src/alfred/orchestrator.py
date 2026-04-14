@@ -96,11 +96,26 @@ def _run_surveyor(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     asyncio.run(daemon.run())
 
 
+def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """Mail webhook receiver process entry point."""
+    log_cfg = raw.get("logging", {})
+    if suppress_stdout:
+        _silence_stdio(f"{log_cfg.get('dir', './data')}/mail_webhook.log")
+    from alfred.mail.config import load_from_unified
+    config = load_from_unified(raw)
+    vault_path = Path(raw.get("vault", {}).get("path", "./vault"))
+    inbox_path = vault_path / config.inbox_dir
+    token = os.environ.get("MAIL_WEBHOOK_TOKEN", "")
+    from alfred.mail.webhook import run_webhook
+    run_webhook(inbox_path, token=token)
+
+
 TOOL_RUNNERS = {
     "curator": _run_curator,
     "janitor": _run_janitor,
     "distiller": _run_distiller,
     "surveyor": _run_surveyor,
+    "mail": _run_mail_webhook,
 }
 
 
@@ -131,6 +146,9 @@ def run_all(
         # Only add surveyor if config section exists
         if "surveyor" in raw:
             tools.append("surveyor")
+        # Only add mail webhook if config section exists
+        if "mail" in raw:
+            tools.append("mail")
 
     # Validate tool names
     for tool in tools:
@@ -149,7 +167,7 @@ def run_all(
 
     def start_process(tool: str) -> multiprocessing.Process:
         runner = TOOL_RUNNERS[tool]
-        if tool == "surveyor":
+        if tool in ("surveyor", "mail"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

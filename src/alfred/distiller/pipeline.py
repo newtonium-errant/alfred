@@ -25,7 +25,6 @@ from alfred.vault.mutation_log import log_mutation, read_mutations
 from alfred.vault.ops import VaultError, vault_edit
 
 from .backends import VAULT_CLI_REFERENCE
-from .backends.openclaw import _clear_agent_sessions, _sync_workspace_claude_md
 from .candidates import (
     CandidateSignal,
     ExtractionBatch,
@@ -251,94 +250,131 @@ async def _call_llm(
     session_path: str,
     stage_label: str,
 ) -> str:
-    """Make an isolated OpenClaw call and return stdout."""
-    oc = config.agent.openclaw
-    session_id = f"distiller-{stage_label}-{uuid.uuid4().hex[:8]}"
+    """Make an LLM call via the configured backend and return text output."""
+    backend_name = config.agent.backend
+    vault_path = str(config.vault.vault_path)
 
-    _clear_agent_sessions(oc.agent_id)
-    _sync_workspace_claude_md(oc.agent_id, str(config.vault.vault_path))
-
-    # Write prompt to a temp file and pass via reference to avoid
-    # OSError: [Errno 7] Argument list too long when the prompt
-    # (which includes full record content) exceeds the OS arg limit.
-    prompt_file = None
-    try:
-        prompt_file = tempfile.NamedTemporaryFile(
-            mode="w",
-            prefix=f"alfred-distiller-{stage_label}-",
-            suffix=".md",
-            delete=False,
-            encoding="utf-8",
-        )
-        prompt_file.write(prompt)
-        prompt_file.close()
-        prompt_path = prompt_file.name
-    except OSError:
-        log.error("pipeline.prompt_file_write_failed", stage=stage_label)
-        return ""
-
-    cmd = [
-        oc.command, "agent", *oc.args,
-        "--agent", oc.agent_id,
-        "--session-id", session_id,
-        "--message", f"Follow the instructions in {prompt_path}",
-        "--local", "--json",
-    ]
-
-    env = {
-        **os.environ,
-        "ALFRED_VAULT_PATH": str(config.vault.vault_path),
+    env_overrides = {
+        "ALFRED_VAULT_PATH": vault_path,
         "ALFRED_VAULT_SCOPE": "distiller",
         "ALFRED_VAULT_SESSION": session_path,
     }
 
-    log.info(
-        "pipeline.llm_call",
-        stage=stage_label,
-        agent_id=oc.agent_id,
-        session_id=session_id,
-        prompt_file=prompt_path,
-    )
+    if backend_name == "claude":
+        from .backends.cli import ClaudeBackend
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
+        backend = ClaudeBackend(config.agent.claude, env_overrides=env_overrides)
+        log.info("pipeline.llm_call", stage=stage_label, backend="claude")
+
+        result = await backend.process(prompt=prompt, vault_path=vault_path)
+
+        if not result.success:
+            log.warning(
+                "pipeline.llm_failed",
+                stage=stage_label,
+                summary=result.summary[:500],
+            )
+        else:
+            log.info(
+                "pipeline.llm_completed",
+                stage=stage_label,
+                stdout_len=len(result.summary),
+            )
+        return result.summary
+
+    elif backend_name == "openclaw":
+        from .backends.openclaw import (
+            _clear_agent_sessions,
+            _sync_workspace_claude_md,
         )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=oc.timeout,
-        )
-    except asyncio.TimeoutError:
-        log.error("pipeline.llm_timeout", stage=stage_label, timeout=oc.timeout)
-        return ""
-    except FileNotFoundError:
-        log.error("pipeline.command_not_found", command=oc.command)
-        return ""
-    finally:
-        # Clean up prompt temp file
-        if prompt_file is not None:
-            try:
-                os.unlink(prompt_path)
-            except OSError:
-                pass
 
-    raw = stdout_bytes.decode("utf-8", errors="replace")
-    err = stderr_bytes.decode("utf-8", errors="replace")
+        oc = config.agent.openclaw
+        session_id = f"distiller-{stage_label}-{uuid.uuid4().hex[:8]}"
 
-    if proc.returncode != 0:
-        log.warning(
-            "pipeline.llm_nonzero_exit",
+        _clear_agent_sessions(oc.agent_id)
+        _sync_workspace_claude_md(oc.agent_id, vault_path)
+
+        # Write prompt to a temp file and pass via reference to avoid
+        # OSError: [Errno 7] Argument list too long when the prompt
+        # (which includes full record content) exceeds the OS arg limit.
+        prompt_file = None
+        try:
+            prompt_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                prefix=f"alfred-distiller-{stage_label}-",
+                suffix=".md",
+                delete=False,
+                encoding="utf-8",
+            )
+            prompt_file.write(prompt)
+            prompt_file.close()
+            prompt_path = prompt_file.name
+        except OSError:
+            log.error("pipeline.prompt_file_write_failed", stage=stage_label)
+            return ""
+
+        cmd = [
+            oc.command, "agent", *oc.args,
+            "--agent", oc.agent_id,
+            "--session-id", session_id,
+            "--message", f"Follow the instructions in {prompt_path}",
+            "--local", "--json",
+        ]
+
+        env = {**os.environ, **env_overrides}
+
+        log.info(
+            "pipeline.llm_call",
             stage=stage_label,
-            code=proc.returncode,
-            stderr=err[:500],
+            backend="openclaw",
+            agent_id=oc.agent_id,
+            session_id=session_id,
+            prompt_file=prompt_path,
         )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=oc.timeout,
+            )
+        except asyncio.TimeoutError:
+            log.error("pipeline.llm_timeout", stage=stage_label, timeout=oc.timeout)
+            return ""
+        except FileNotFoundError:
+            log.error("pipeline.command_not_found", command=oc.command)
+            return ""
+        finally:
+            if prompt_file is not None:
+                try:
+                    os.unlink(prompt_path)
+                except OSError:
+                    pass
+
+        raw = stdout_bytes.decode("utf-8", errors="replace")
+        err = stderr_bytes.decode("utf-8", errors="replace")
+
+        if proc.returncode != 0:
+            log.warning(
+                "pipeline.llm_nonzero_exit",
+                stage=stage_label,
+                code=proc.returncode,
+                stderr=err[:500],
+            )
+            return raw
+
+        log.info("pipeline.llm_completed", stage=stage_label, stdout_len=len(raw))
         return raw
 
-    log.info("pipeline.llm_completed", stage=stage_label, stdout_len=len(raw))
-    return raw
+    else:
+        log.error("pipeline.unsupported_backend", backend=backend_name,
+                  msg="Pipeline requires 'claude' or 'openclaw' backend")
+        return ""
 
 
 # ---------------------------------------------------------------------------

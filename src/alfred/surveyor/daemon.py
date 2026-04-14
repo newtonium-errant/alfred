@@ -184,7 +184,7 @@ class Daemon:
 
                 # Update cluster state
                 cluster_key = f"semantic_{cid}"
-                from surveyor.state import ClusterState
+                from .state import ClusterState
                 from datetime import datetime, timezone
                 self.state.clusters[cluster_key] = ClusterState(
                     label=tags,
