@@ -135,6 +135,13 @@ This project uses two knowledge sources:
 
 Each agent reads `.claude/agents/{name}.md` for their specific instructions.
 
+### Agent Lifecycle
+
+- **Persistent agents** — spawn vault-reviewer and builder at session start. Keep alive via SendMessage. Don't respawn per task.
+- **On-demand agents** — spawn prompt-tuner, infra, code-reviewer when needed.
+- **Concurrent reviews** — vault-reviewer reviews each piece of work as it's completed, not batched at session end.
+- **Feedback loop** — vault-reviewer findings inform prompt-tuner changes, which the builder may need to support with code changes. This cycle is how Alfred improves.
+
 ### Spawning Rules
 
 - **Editing agents run in foreground** — they need permission prompts for file writes
@@ -142,12 +149,29 @@ Each agent reads `.claude/agents/{name}.md` for their specific instructions.
 - **Responsive spawning** — don't create all 5 agents for a simple task. Spawn specialists when the work requires them.
 - **Task routing** — route work to the right specialist. Builder writes code, prompt-tuner changes prompts, vault-reviewer evaluates output.
 - **Plan mode** is the default for agents. Use `acceptEdits` for simple, well-defined tasks where plan approval adds friction without value.
-- **Feedback loop** — vault-reviewer findings inform prompt-tuner changes, which the builder may need to support with code changes. This cycle is how Alfred improves.
+
+### Team Lead Rules
+
+- **Don't do agent work as team lead.** Route implementation to the builder, prompt changes to the prompt-tuner. The team lead orchestrates, reviews reports, makes decisions, and writes session notes. If you're writing code directly in the main conversation, you're doing it wrong.
+- **Pattern discovery = documentation trigger.** If the same bug appears twice, don't just fix it — flag it for documentation in agent instructions or CLAUDE.md.
+- **Cross-agent contracts first.** When work crosses domains (builder changing template variables that prompt-tuner depends on), agree on the interface before implementing.
 
 ### Workflow Deliverables
 
 - **New n8n workflows:** generate importable JSON files (unless user says otherwise)
 - **Existing n8n workflows:** create instruction docs for manual UI application (workflow JSON breaks on import after UI edits). If the user asks for a complete rewrite, generate importable JSON.
+
+### Session Notes — Learnings Section
+
+Every session note in `vault/session/` must include an `## Alfred Learnings` section. This flags reusable knowledge for the distiller:
+
+- **New gotchas** — bugs that cost debugging time (e.g., "pymilvus 2.6.10 incompatible with milvus-lite 2.5.1")
+- **Anti-patterns confirmed** — tried something, it failed (e.g., "OpenClaw can't run local models")
+- **Patterns validated** — approach worked well, should be standard (e.g., "Ollama's OpenAI-compatible endpoint works for labeling")
+- **Corrections** — something in agent instructions or CLAUDE.md is wrong or outdated
+- **Missing knowledge** — had to figure out something that should have been documented
+
+The distiller processes these on two levels: explicit flagged learnings first, then full session scan for implicit patterns (repeated rework, knowledge compliance gaps, undocumented standards).
 
 ### Agent Knowledge Requirements
 

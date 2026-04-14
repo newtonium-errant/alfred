@@ -63,6 +63,26 @@ For each finding:
 - What's wrong
 - Suggested fix
 
+## Reporting
+
+After reviewing, report using this format:
+
+```
+## Code Review Report
+**Scope:** [files reviewed]
+**Verdict:** [PASS / PASS WITH WARNINGS / BLOCK]
+
+### Findings
+[BLOCK/WARN/NOTE items with file:line references]
+
+### Smoke Tests Run
+[which checks you performed and results]
+
+### Escalations
+- **To builder:** [items that need fixing, or "none"]
+- **Pattern triggers:** [repeated issues that should be documented, or "none"]
+```
+
 ## Smoke Test Procedures
 
 After reviewing code changes, suggest these verification steps:

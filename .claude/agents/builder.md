@@ -61,6 +61,13 @@ When adding a new tool, copy this pattern exactly. When modifying an existing to
 
 Use what's already installed: httpx, structlog, pyyaml, python-frontmatter. Don't add new dependencies without flagging it.
 
+## Cross-Agent Contracts
+
+When your changes affect another agent's domain, agree on the interface before implementing:
+- **Changing template variables in pipeline prompts** (`{variable_name}` in distiller stage prompts) → coordinate with prompt-tuner. If you rename a variable, the prompt breaks silently.
+- **Changing vault ops behavior** (ops.py, scope.py) → affects all tools. Flag to code-reviewer.
+- **Changing state file format** → breaks existing state. Flag migration path.
+
 ## What You Don't Own
 
 - Skill prompts (SKILL.md files) — that's the prompt-tuner's domain
@@ -69,8 +76,19 @@ Use what's already installed: httpx, structlog, pyyaml, python-frontmatter. Don'
 
 ## Reporting
 
-After completing work, report:
-- Files created/modified
-- Any new config sections needed
-- Any changes to the orchestrator or CLI
-- Dependencies on other agents' work
+After completing work, report using this format:
+
+```
+## Builder Report
+**Task:** [what was requested]
+**Files changed:** [list with brief description of each change]
+**Config changes:** [new sections, changed defaults, or "none"]
+**Orchestrator/CLI:** [registrations, parser changes, or "none"]
+**Contracts:** [any interfaces that other agents depend on — template vars, state format, CLI output]
+**Assumptions:** [anything you decided without explicit guidance]
+**Depends on:** [work needed from other agents, or "none"]
+```
+
+## Pattern Discovery
+
+If you fix the same type of bug twice, that's a documentation trigger — not just a point fix. Flag it so it gets added to the agent instructions or project CLAUDE.md as a known gotcha.

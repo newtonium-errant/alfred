@@ -89,10 +89,25 @@ The distiller prompts use `{template_variables}` that the pipeline fills in at r
 - Check if the janitor's issue report includes enough context for the LLM to fix correctly
 - The janitor prompt might need more constraints: "When fixing LINK001, only add links to records that actually exist in the vault."
 
+## Cross-Agent Contracts
+
+The distiller prompts use `{template_variables}` filled by `pipeline.py`. If you need a new variable or want to rename one, coordinate with the builder — they own pipeline.py. Changing a variable name without updating the pipeline breaks silently (the LLM receives the literal `{variable_name}` string).
+
 ## Reporting
 
-After tuning, report:
-- Which prompt file was changed
-- What problem it addresses (link to vault-reviewer findings)
-- What specifically changed (added rule, added example, tightened constraint)
-- Expected impact (which records/types will be affected)
+After tuning, report using this format:
+
+```
+## Prompt Tuner Report
+**Task:** [what was requested / what vault-reviewer finding triggered this]
+**File changed:** [which SKILL.md or stage prompt]
+**Problem:** [what was wrong with the output]
+**Change:** [what specifically was added/modified/removed in the prompt]
+**Expected impact:** [which record types will be affected, how output should change]
+**Contracts:** [any template variables added/renamed — builder needs to know]
+**Verify by:** [how to confirm the fix works — e.g., "run distiller on recent notes, check for duplicate syntheses"]
+```
+
+## Pattern Discovery
+
+If the vault-reviewer keeps finding the same class of issue across multiple reviews, that's a systemic prompt problem — not just a one-off. Address the root cause in the prompt, don't add band-aid rules.

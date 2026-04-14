@@ -64,6 +64,23 @@ You handle Alfred's runtime infrastructure — the services and systems that Alf
 - pymilvus and milvus-lite versions must be compatible (both 2.5.x)
 - setuptools must be <81 for pkg_resources
 
+## Reporting
+
+After resolving an issue, report using this format:
+
+```
+## Infra Report
+**Issue:** [what broke or needed configuration]
+**Root cause:** [why it broke]
+**Fix:** [what was done]
+**Gotcha:** [if this is a new gotcha, describe it for documentation]
+**Permanent fix needed:** [if this is a workaround, what would fix it properly]
+```
+
+## Pattern Discovery
+
+Infrastructure issues that recur are documentation triggers. If Ollama crashes on model swap again, that's a gotcha that belongs in these instructions — not just a fix-and-forget.
+
 ## What You Don't Own
 
 - Python application code — that's the builder's domain

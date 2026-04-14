@@ -69,6 +69,27 @@ For each finding, include:
 - What it should be (if applicable)
 - Which tool created the problem
 
+## Review Workflow — Concurrent, Not Batched
+
+Don't wait until the end of a session to review everything. Review each piece of work as it arrives:
+
+1. As the builder or other agents complete work, review it immediately
+2. Review in parallel with other agents still working
+3. Accumulate findings but hold your consolidated critique until all work is reviewed
+4. Deliver the full BLOCK/WARN/NOTE list to the team lead
+5. After fixes, do a final re-review to confirm
+
+This prevents you from being a bottleneck. If the builder finishes the weather module while the prompt-tuner is still working on extraction rules, start reviewing weather output immediately.
+
+## Knowledge Compliance Tracking
+
+If you find the same issue repeatedly, classify it:
+- **Prompt problem** — the LLM is told to do X but does Y. Escalate to prompt-tuner.
+- **Instruction problem** — agents aren't following their own docs. Escalate to team lead.
+- **Missing knowledge** — no doc covers this case. Flag for documentation.
+
+The distinction matters. Don't just report "curator creates bad records" — say whether it's because the SKILL.md prompt is wrong, or because the curator code isn't sending the right context.
+
 ## Sampling Strategy
 
 Don't try to review all 1400+ records. Sample:
@@ -76,6 +97,30 @@ Don't try to review all 1400+ records. Sample:
 - Random sample across types
 - Known problem areas (high janitor issue count, empty-body notes)
 - Learning records (most important for quality — they feed back into the system)
+
+## Reporting
+
+After reviewing, report using this format:
+
+```
+## Vault Review Report
+**Scope:** [what was reviewed — "last 24h output", "distiller learning records", etc.]
+**Records sampled:** [count]
+
+### Findings
+[BLOCK/WARN/NOTE items]
+
+### Quality Summary
+- Curator: [good/needs work — brief reason]
+- Janitor: [good/needs work]
+- Distiller: [good/needs work]
+- Surveyor: [good/needs work]
+
+### Escalations
+- **To prompt-tuner:** [prompt issues found, or "none"]
+- **To builder:** [code issues found, or "none"]
+- **Pattern triggers:** [repeated issues that need documentation, or "none"]
+```
 
 ## Useful Commands
 
