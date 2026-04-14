@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from alfred.daemon import is_running, read_pid, remove_pid as _remove_pid_file, write_pid as _write_pid_file
+
 
 def _silence_stdio(log_file: str | None = None) -> None:
     """Redirect stdout/stderr away from the terminal in child processes for live mode.
@@ -124,6 +126,65 @@ def _run_brief(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     asyncio.run(run_daemon(config))
 
 
+# ---------------------------------------------------------------------------
+# Per-tool PID tracking — prevents zombie tool processes from surviving
+# across alfred down / alfred up cycles.
+# ---------------------------------------------------------------------------
+
+def _tool_pid_path(data_dir: Path, tool: str) -> Path:
+    """Return the PID file path for a specific tool."""
+    return data_dir / f"{tool}.pid"
+
+
+def _kill_stale_tool(data_dir: Path, tool: str) -> None:
+    """If a previous instance of *tool* is still running, kill it.
+
+    This catches zombie child processes that survived a previous
+    ``alfred down`` (e.g., because the orchestrator was SIGKILL'd before
+    it could terminate its children).
+    """
+    pid_file = _tool_pid_path(data_dir, tool)
+    old_pid = read_pid(pid_file)
+    if old_pid is None:
+        return
+    if old_pid == os.getpid():
+        # Stale file pointing at ourselves — just clean up
+        _remove_pid_file(pid_file)
+        return
+    if not is_running(old_pid):
+        _remove_pid_file(pid_file)
+        return
+    # Process is alive — kill it
+    print(f"  [{tool}] killing stale process (pid {old_pid})")
+    try:
+        os.kill(old_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _remove_pid_file(pid_file)
+        return
+    # Give it a moment to exit gracefully
+    for _ in range(30):  # 3 seconds
+        time.sleep(0.1)
+        if not is_running(old_pid):
+            break
+    else:
+        # Force kill
+        try:
+            os.kill(old_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    _remove_pid_file(pid_file)
+
+
+def _record_tool_pid(data_dir: Path, tool: str, pid: int) -> None:
+    """Write the tool's child-process PID to its PID file."""
+    _write_pid_file(_tool_pid_path(data_dir, tool), pid)
+
+
+def _cleanup_tool_pid(data_dir: Path, tool: str) -> None:
+    """Remove the tool's PID file on shutdown."""
+    _remove_pid_file(_tool_pid_path(data_dir, tool))
+
+
 TOOL_RUNNERS = {
     "curator": _run_curator,
     "janitor": _run_janitor,
@@ -177,6 +238,14 @@ def run_all(
     if not live_mode:
         print(f"Starting daemons: {', '.join(tools)}")
 
+    # Resolve data directory for per-tool PID files
+    data_dir = Path(raw.get("logging", {}).get("dir", "./data"))
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Kill any stale tool processes left over from a previous run
+    for tool in tools:
+        _kill_stale_tool(data_dir, tool)
+
     processes: dict[str, multiprocessing.Process] = {}
     restart_counts: dict[str, int] = {}
 
@@ -190,6 +259,8 @@ def run_all(
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")
         p.daemon = True
         p.start()
+        # Record per-tool PID so we can kill zombies on next startup
+        _record_tool_pid(data_dir, tool, p.pid)
         if not live_mode:
             print(f"  [{tool}] started (pid {p.pid})")
         return p
@@ -300,7 +371,7 @@ def run_all(
         except KeyboardInterrupt:
             print("\nShutting down...")
 
-    # Terminate child processes
+    # Terminate child processes and clean up per-tool PID files
     for tool, p in processes.items():
         if p.is_alive():
             p.terminate()
@@ -308,6 +379,7 @@ def run_all(
             if p.is_alive():
                 p.kill()
             print(f"  [{tool}] stopped")
+        _cleanup_tool_pid(data_dir, tool)
     print("All daemons stopped.")
 
     # Clean up PID file and sentinel

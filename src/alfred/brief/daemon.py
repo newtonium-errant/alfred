@@ -145,6 +145,15 @@ async def run_daemon(config: BriefConfig) -> None:
             path = await generate_brief(config, state_mgr)
             if path:
                 log.info("brief.daemon.generated", path=path)
+                # Best-effort vault snapshot after successful brief generation
+                try:
+                    from alfred.vault.snapshot import take_snapshot
+                    vault_path = Path(config.vault_path)
+                    commit = take_snapshot(vault_path)
+                    if commit:
+                        log.info("brief.daemon.snapshot", commit=commit)
+                except Exception:
+                    log.warning("brief.daemon.snapshot_failed", exc_info=True)
         except Exception:
             log.exception("brief.daemon.error")
 

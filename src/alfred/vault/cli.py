@@ -11,6 +11,7 @@ from pathlib import Path
 from .mutation_log import log_mutation
 from .ops import VaultError, vault_context, vault_create, vault_delete, vault_edit, vault_list, vault_move, vault_read, vault_search
 from .scope import ScopeError, check_scope
+from .snapshot import SnapshotError, get_status, init_repo, restore_file, take_snapshot
 
 
 def _env(name: str, default: str = "") -> str:
@@ -226,6 +227,29 @@ def cmd_delete(args: argparse.Namespace) -> None:
         _error(str(e))
 
 
+def cmd_snapshot(args: argparse.Namespace) -> None:
+    vault = _vault_path()
+
+    try:
+        if args.init:
+            commit_hash = init_repo(vault)
+            _output({"ok": True, "action": "init", "commit": commit_hash})
+        elif args.status:
+            status = get_status(vault)
+            _output(status)
+        elif args.restore:
+            restored_from = restore_file(vault, args.restore)
+            _output({"ok": True, "action": "restore", "path": args.restore, "from_commit": restored_from})
+        else:
+            commit_hash = take_snapshot(vault)
+            if commit_hash:
+                _output({"ok": True, "action": "snapshot", "commit": commit_hash})
+            else:
+                _output({"ok": True, "action": "snapshot", "commit": None, "message": "Nothing to commit"})
+    except SnapshotError as e:
+        _error(str(e))
+
+
 # --- Parser builder ---
 
 
@@ -274,6 +298,12 @@ def build_vault_parser(subparsers: argparse._SubParsersAction) -> None:
     p = vault_sub.add_parser("delete", help="Delete a vault record")
     p.add_argument("path", help="Relative path to the record")
 
+    # snapshot
+    p = vault_sub.add_parser("snapshot", help="Git snapshot of vault state")
+    p.add_argument("--init", action="store_true", help="Initialize vault git repo")
+    p.add_argument("--status", action="store_true", help="Show snapshot status")
+    p.add_argument("--restore", metavar="PATH", default=None, help="Restore a file from previous commit")
+
 
 def handle_vault_command(args: argparse.Namespace) -> None:
     """Dispatch to the correct vault subcommand handler."""
@@ -286,6 +316,7 @@ def handle_vault_command(args: argparse.Namespace) -> None:
         "edit": cmd_edit,
         "move": cmd_move,
         "delete": cmd_delete,
+        "snapshot": cmd_snapshot,
     }
     handler = handlers.get(args.vault_cmd)
     if handler:

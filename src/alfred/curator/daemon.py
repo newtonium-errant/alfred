@@ -11,6 +11,9 @@ For non-CLI backends (Zo HTTP), falls back to snapshot/diff.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import time as _time
 from pathlib import Path
 
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
@@ -70,6 +73,87 @@ def _is_cli_backend(backend: BaseBackend) -> bool:
 def _use_pipeline(config: CuratorConfig) -> bool:
     """Check if the 4-stage pipeline should be used (OpenClaw backend only)."""
     return config.agent.backend == "openclaw"
+
+
+# ---------------------------------------------------------------------------
+# Cross-process file locking — prevents two curator daemons from processing
+# the same inbox file simultaneously (root cause of duplicate records).
+# ---------------------------------------------------------------------------
+
+_LOCK_STALE_SECONDS = 600  # 10 minutes
+
+
+def _claim_file(inbox_file: Path, _retry: bool = True) -> bool:
+    """Atomically claim an inbox file for processing.
+
+    Creates ``{inbox_file}.lock`` containing our PID and timestamp.
+    Returns True if the lock was acquired, False if another live process
+    already holds it.
+    """
+    lock_path = inbox_file.with_suffix(inbox_file.suffix + ".lock")
+    my_pid = os.getpid()
+    payload = json.dumps({"pid": my_pid, "ts": _time.time()})
+
+    # Fast path — try exclusive create (O_CREAT | O_EXCL)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.write(fd, payload.encode())
+        os.close(fd)
+        log.debug("daemon.lock_acquired", file=inbox_file.name, pid=my_pid)
+        return True
+    except FileExistsError:
+        pass
+
+    # Lock file exists — inspect it
+    try:
+        data = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock_pid = int(data["pid"])
+        lock_ts = float(data["ts"])
+    except (OSError, json.JSONDecodeError, KeyError, ValueError):
+        # Corrupt lock file — break it and retry (once)
+        log.warning("daemon.lock_corrupt", file=inbox_file.name)
+        _release_file(inbox_file)
+        if _retry:
+            return _claim_file(inbox_file, _retry=False)
+        return False
+
+    # Same process? (shouldn't happen, but be safe)
+    if lock_pid == my_pid:
+        return True
+
+    # Is the holder still alive?
+    try:
+        os.kill(lock_pid, 0)
+    except ProcessLookupError:
+        # Dead process — break stale lock
+        log.info("daemon.lock_stale_dead_pid", file=inbox_file.name, dead_pid=lock_pid)
+        _release_file(inbox_file)
+        if _retry:
+            return _claim_file(inbox_file, _retry=False)
+        return False
+    except PermissionError:
+        pass  # process exists but owned by another user — treat as alive
+
+    # Alive but stale timestamp?
+    if (_time.time() - lock_ts) > _LOCK_STALE_SECONDS:
+        log.warning("daemon.lock_stale_timeout", file=inbox_file.name, holder_pid=lock_pid)
+        _release_file(inbox_file)
+        if _retry:
+            return _claim_file(inbox_file, _retry=False)
+        return False
+
+    # Another live process legitimately holds the lock
+    log.info("daemon.lock_held", file=inbox_file.name, holder_pid=lock_pid)
+    return False
+
+
+def _release_file(inbox_file: Path) -> None:
+    """Remove the lock file for an inbox file (idempotent)."""
+    lock_path = inbox_file.with_suffix(inbox_file.suffix + ".lock")
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 async def _process_file(
@@ -223,10 +307,15 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
     # Startup scan for unprocessed files
     unprocessed = watcher.full_scan()
     for inbox_file in unprocessed:
+        if not _claim_file(inbox_file):
+            log.info("daemon.skip_locked", file=inbox_file.name)
+            continue
         try:
             await _process_file(inbox_file, backend, skill_text, config, state_mgr)
         except Exception:
             log.exception("daemon.process_error", file=inbox_file.name)
+        finally:
+            _release_file(inbox_file)
 
     # Start watching
     watcher.start()
@@ -257,6 +346,10 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
                 # Guard against concurrent processing of the same file
                 if str(inbox_file) in _processing:
                     continue
+                # Cross-process lock — prevents duplicate processing by zombie daemons
+                if not _claim_file(inbox_file):
+                    log.info("daemon.skip_locked", file=inbox_file.name)
+                    continue
                 _processing.add(str(inbox_file))
                 try:
                     await _process_file(inbox_file, backend, skill_text, config, state_mgr)
@@ -264,6 +357,7 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
                     log.exception("daemon.process_error", file=inbox_file.name)
                 finally:
                     _processing.discard(str(inbox_file))
+                    _release_file(inbox_file)
     finally:
         watcher.stop()
         log.info("daemon.stopped")
