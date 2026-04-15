@@ -105,7 +105,7 @@ A custom PWA or native iOS app would give the most UX control but takes weeks to
 
 ### Per-instance talker
 
-Each Alfred instance runs its own talker tool. Same code, per-instance config. The talker's modes (grounded, generative, brainstorm-capture) are enabled or disabled per instance. The story-writer instance might enable generative mode; NP's instance might have grounded only with a different SKILL.md tone. The main Alfred starts with grounded only.
+Each Alfred instance runs its own talker tool. Same code, per-instance config. The talker's modes (grounded, generative, brainstorm-capture) are enabled or disabled per instance. The Knowledge Alfred instance enables generative mode for fiction and non-fiction writing; NP's eventual instance might have grounded only with a different SKILL.md tone. The main Alfred starts with grounded only.
 
 This fits the existing per-tool config pattern exactly. No new architecture needed for multi-tenancy — it's already how curator, janitor, etc. are configured per instance.
 
@@ -121,11 +121,13 @@ Vault search aggressive. Alfred cross-references the user's previous sessions, d
 
 The push-back is **bidirectional**: Alfred says "I'm hearing X, is that right?" and the user can confirm, correct, or realize their own thinking has shifted. Corrections become assumption/synthesis records, propagating to future sessions.
 
-### Generative mode (deferred — instance-specific)
+### Generative mode (deferred — Knowledge Alfred instance only)
 
-Vault search disabled or read-only. Alfred is free to imagine, propose, remix. "Yes and" energy. Best for story ideation, brainstorming creative work, exploring hypotheticals where vault grounding would inhibit creativity.
+Vault search disabled or read-only. Alfred is free to imagine, propose, remix. "Yes and" energy. Best for creative work — fiction drafts, story ideation, essay brainstorming, exploring hypotheticals where vault grounding would inhibit imagination.
 
-**Will not exist in the main Alfred instance.** Belongs to a future story-writer instance after multi-instance architecture is built. NP's instance probably also doesn't get this mode.
+**Will not exist in the main Alfred instance.** Belongs to the **Knowledge Alfred** instance — the planned instance that handles all writing work, both fiction and non-fiction. Knowledge Alfred is one of the five instances flagged in `project_multi_instance_design.md` memory and is the canonical home for generative voice mode. Stage 4a is gated on the multi-instance architecture (Stage 3.5) being built first, since Knowledge Alfred is a separate Alfred instance with its own vault, talker config, and calibration profile.
+
+NP's instance probably doesn't get generative mode either — her instance is for her operational work, not creative writing.
 
 ### Brainstorm-capture mode (Stage 2b)
 
@@ -141,29 +143,71 @@ Flow:
 
 This mode is the **flagship glasses use case** later but works on phone/Telegram today. Doesn't need streaming infrastructure because the conversation isn't real-time turn-taking — it's capture + post-processing.
 
-## Bidirectional Calibration via Profile Doc
+## Bidirectional Calibration via Person-Record Calibration Sections
 
 The most architecturally important piece of this design.
 
 ### The mechanism
 
-Alfred maintains its understanding of the primary user as a **first-class vault record** at `profile/Andrew Newton.md` (or equivalent per instance). The user can open this file in Obsidian and edit it directly. Alfred reads it as grounding context at the start of every voice session and writes to it during sessions when reflection-worthy moments occur.
+Alfred maintains its understanding of the primary user as a **delimited section inside the user's existing `person/` record**, not as a new entity type. The section is wrapped in `<!-- ALFRED:CALIBRATION -->` ... `<!-- END ALFRED:CALIBRATION -->` markers — the same pattern Alfred already uses for dynamic content (`<!-- ALFRED:DYNAMIC -->` per `vault/CLAUDE.md`). The talker writes only inside the markers; the user can edit anywhere in the file, including inside the markers.
+
+The record's frontmatter carries an `alfred_calibration: true` flag so the talker can fast-filter "which person records have calibration sections" without reading every file.
 
 **Two-way editable memory**: Alfred writes, user edits, Alfred reads the user's edits, behavior propagates. Most AI assistant calibration systems either keep the calibration opaque (the user can't see it), let the user view but not edit it, or let the user edit but don't react to the edits. Vault-backed and git-tracked, all three problems dissolve.
+
+### Why a person-record section instead of a new `profile/` type
+
+Calibration is fundamentally **Alfred's behavioral model of how to interact with a person**, not facts about the person. Person records hold facts (name, role, contact, history). Calibration is meta about those facts and lives alongside them in the same record. Three reasons this beats a new type:
+
+1. **Zero schema changes.** `KNOWN_TYPES`, `TYPE_DIRECTORY`, the curator's per-type rules, the janitor's per-type validators all stay untouched. New types have a real cost in this project; avoiding one when the existing structure works is the right call.
+2. **Single source of truth per person.** Facts and calibration live in one record. Open `person/Andrew Newton.md` in Obsidian and you see the whole picture.
+3. **Reuses an existing pattern.** The `<!-- ALFRED:DYNAMIC -->` delimited-section convention is already documented in `vault/CLAUDE.md`. Calibration sections are a sibling instance of the same pattern. Reusing established patterns is free.
+
+The pattern generalises: any record where Alfred wants to maintain a behavioral model can carry a calibration section. `org/PocketPills.md` could eventually have one ("preferred channel: email; response latency: 48h"). Out of scope for phase 1 but worth knowing the door is open.
+
+### Flagging primary users at the instance level
+
+Each Alfred instance declares its primary user(s) in `config.yaml` under the talker section:
+
+```yaml
+talker:
+  primary_users:
+    - "person/Andrew Newton"
+    # For a future couple's instance:
+    # - "person/NP"
+```
+
+The talker reads this list at startup. For each named primary user, it loads the corresponding person record's calibration section as grounding context for voice sessions. Single-user, dual-user (couples), and small-team instances all work via the same config field — no code changes needed for multi-tenancy.
+
+When voice identification arrives later (Stage 5+ feature), the talker can route to the right user's calibration based on who's speaking. Until then, the talker can ask "is this Andrew or NP?" at session start, or default to the first entry.
 
 ### Document shape
 
 ```markdown
 ---
-type: profile
+type: person
 name: Andrew Newton
-updated: 2026-04-15
 alfred_calibration: true
+updated: 2026-04-15
 ---
 
-# User Profile — Andrew Newton
+# Andrew Newton
 
-## Communication Style
+## Facts
+
+- Owner of Rural Route Transportation, owner of Struggle Bus brand
+- Based in Nova Scotia
+- Partner: NP
+
+## Notes / History
+
+(curator-written content from inbox, meetings, conversations)
+
+## Alfred's Calibration
+
+<!-- ALFRED:CALIBRATION -->
+
+### Communication Style
 
 - **Military-style comms**: terse, direct, high-signal/low-noise.
   _Confirmed 2026-03-01 · source: session/Alfred Setup and Email Integration 2026-03-26_
@@ -172,13 +216,7 @@ alfred_calibration: true
 - **Rejects excessive caveats and hedging.**
   _Corrected 2026-04-10 · replaced earlier "appreciates nuance"_
 
-## Roles and Responsibilities
-
-- **Primary**: operator of Rural Route Transportation, owner of the Struggle Bus brand
-- **Secondary**: builder of Alfred, personal knowledge/operational system
-- **Partnership context**: NP is partner, may become a primary user of a separate Alfred instance
-
-## Workflow Preferences
+### Workflow Preferences
 
 - One logical session per commit
 - Every commit paired with a session note in `vault/session/`
@@ -186,26 +224,34 @@ alfred_calibration: true
 - Python-layer enforcement first, prompt-layer as belt-and-braces
   _Updated 2026-04-15 from voice session — previous belief: prompt-first_
 
-## Current Priorities
+### Current Priorities
 
 - Shipping Alfred voice chat integration (Telegram first, glasses eventually)
 - Multi-instance architecture (hub-and-spoke, 5 instances planned)
-- Morning Brief module (RCAF-style briefing)
+- Knowledge Alfred for all writing (fiction and non-fiction)
 
-## What Alfred Is Still Unsure About
+### What Alfred Is Still Unsure About
 
 - [ ] How much push-back during voice journaling feels right (current setting: 4/10 — to be tuned)
 - [ ] Whether to auto-create task records from voice intent or always confirm first
-- [ ] Whether the story-writer instance should have any vault access at all
+- [ ] Whether Knowledge Alfred should have any vault access at all, or be a clean-slate creative space
+
+<!-- END ALFRED:CALIBRATION -->
 ```
+
+### Distiller awareness
+
+The distiller currently extracts learnings from session records. When the calibration-section pattern lands, the distiller needs to **skip content inside `<!-- ALFRED:CALIBRATION -->` markers** when processing person records — those are Alfred's own model, not user-authored claims to distill from. Same treatment as `<!-- ALFRED:DYNAMIC -->` blocks (assuming the distiller already handles those; if not, both need the skip-rule).
+
+Small distiller change required when implementing this section. Flagged as a Stage 2a sub-task.
 
 ### Provenance and auditability
 
 Three layers ensure the user can always see where a belief came from:
 
 1. **Inline source markers** on each bullet — `_source: session/[name]_` points to the session that produced the claim
-2. **Vault git history** — every edit to the profile is a commit in the vault's inner git repo. Full history available via `vault snapshot --log` or directly with git in `vault/.git`
-3. **Optional changelog section** at the bottom of the profile — chronological list of significant belief shifts with their source sessions, for fast scanning without digging through git history
+2. **Vault git history** — every edit to the person record is a commit in the vault's inner git repo. Full history available via `vault snapshot --log` or directly with git in `vault/.git`
+3. **Optional changelog section** at the bottom of the calibration block — chronological list of significant belief shifts with their source sessions, for fast scanning without digging through git history
 
 The user should never have to wonder "how did Alfred get this idea?" — the source is one click away.
 
@@ -215,21 +261,35 @@ When the talker detects a reflection-worthy moment:
 
 1. **Surface understanding**: "I'm hearing that you want X. That's a shift from your profile, which currently says Y. Want me to update the profile to X?"
 2. **User responds**: confirm, correct, or deflect ("let me think on that")
-3. **On confirmation**: talker calls `alfred vault edit profile/Andrew Newton.md` with the specific bullet change, including source-session attribution
+3. **On confirmation**: talker calls `alfred vault edit person/Andrew Newton.md` with the specific bullet change inside the calibration section, including source-session attribution
 4. **On correction**: talker uses the corrected statement instead, still attributed
-5. **On deflection**: talker leaves a `[needs confirmation]` entry in the "What Alfred Is Still Unsure About" section for next session
+5. **On deflection**: talker leaves a `[needs confirmation]` entry in the "What Alfred Is Still Unsure About" subsection for next session
 
 ### Confirmation policy
 
-Default policy: **explicit confirmation for profile edits, silent append for "[needs confirmation]" entries Alfred is unsure about**. Safer than silent writes for confident claims, faster than gating every edit, reviewable by the user later in Obsidian regardless. Tunable.
+The confirmation policy lives on a 1–5 scale where 1 is fully silent (Alfred writes whatever it infers, user reviews later in Obsidian) and 5 is fully explicit (Alfred asks before every single edit, no matter how minor). The policy isn't fixed — it's intentionally designed to evolve as Alfred's confidence in its model of the user grows.
 
-### Profile pattern beyond user calibration
+**Starting setting: 3-4** while the calibration mechanism is being validated. This means Alfred surfaces its understanding for confirmation on most non-trivial claims but can silently append low-confidence `[needs confirmation]` items to the "What Alfred Is Still Unsure About" subsection for later review. More intrusive than the long-run target, but the early iterations need feedback to learn what to surface and when.
 
-The profile-doc-as-vault-artifact pattern isn't limited to user calibration. Future extensions:
+**Self-tuning over time.** Once Alfred has accumulated enough confirmed calibrations and observed the user's correction rate stay low for a sustained period, it should be able to **recommend lowering the validation frequency itself**. Something like: "I've successfully predicted your responses on the last 20 reflections without a correction. Want me to drop validation from 4 to 3 going forward?" The user accepts, declines, or counter-proposes. The new setting is recorded in the calibration section's metadata so it persists.
 
-- `profile/Alfred.md` — Alfred's self-model. What it believes about its own behavior, known weaknesses, current experimental modes. The user edits this to change Alfred's self-understanding. Meta but potentially powerful.
-- `profile/{instance}.md` — per-instance profile so different Alfred instances behave differently
-- `profile/{person}.md` — for every person Alfred knows about, not just the primary user. "Here's what Alfred believes about Dr. Bailey." Updated when journaling about meetings. Used as context when next interacting with that person. Powerful but out of scope for phase 1.
+This makes the validation frequency itself part of the bidirectional calibration loop — Alfred learns not just the user's beliefs but also how much it can trust its own model of those beliefs. Meta-calibration. The user is in control either way; Alfred just makes recommendations when its confidence supports them.
+
+The setting is tunable manually at any time by editing the calibration section's metadata in Obsidian. Alfred reads it at session start.
+
+### Migrating the existing `vault/user-profile.md`
+
+You currently have an untracked `vault/user-profile.md` from a prior session. When implementing this design, migrate its content into the calibration section of `person/Andrew Newton.md` and delete the standalone file. Single source of truth, one place to look for Alfred's mental model.
+
+### Pattern beyond user calibration
+
+The calibration-section-in-existing-record pattern isn't limited to person records or user calibration. Future extensions:
+
+- **`org/{name}.md` calibration sections** — "how Alfred handles interactions with this org" (preferred channel, response latency expectations, who at the org to address). Useful for personal-business interactions where consistent context matters.
+- **`person/{anyone}.md` calibration sections** — for every person Alfred interacts with on the user's behalf, not just primary users. "Here's what Alfred believes about Dr. Bailey." Updated when journaling about appointments or meetings.
+- **A self-model on `project/Alfred.md`** — Alfred's own behavioral self-model, edited by the user to change how Alfred sees itself. Meta but potentially powerful.
+
+All extensions reuse the same `<!-- ALFRED:CALIBRATION -->` pattern. Out of scope for phase 1 but the door stays open.
 
 ## Session Persistence
 
@@ -265,7 +325,7 @@ When the user says "save that" without specifying where, the talker asks **one c
 | **2b** | Brainstorm-capture mode (long dictation + smart format + audio summary) | Telegram bot | Same talker, new SKILL.md mode | ~1 week after 2a | No |
 | **3** | Real-time streaming conversation | Telegram bot + maybe web PWA | ElevenLabs Conversational AI with Claude brain | ~2 weeks | Yes — Mac Studio, fall 2026 |
 | **3.5** | Multi-instance architecture (prerequisite for instance-specific talker modes) | — | Per-instance deploy pattern across the whole stack | Separate track, scope unknown | No, but big |
-| **4a** | Generative mode (story-writer instance only) | Telegram bot | Talker SKILL.md mode + per-instance config | Days, depends on 3.5 | No |
+| **4a** | Generative mode (Knowledge Alfred instance only — handles all writing, fiction and non-fiction) | Telegram bot | Talker SKILL.md mode + per-instance config | Days, depends on 3.5 | No |
 | **4b** | Hey Cyan glasses client | Cyan glasses + paired phone | HeyCyan community SDK via BLE → phone bridge → talker | ~2-3 weeks | Yes — Cyan glasses + SDK integration |
 
 ### Stage 1 — Async voice capture (~1 week)
@@ -282,10 +342,11 @@ This stage validates the end-to-end pipeline without committing to talker tool s
 - **New tool**: `src/alfred/talker/` following the existing pattern (`config.py`, `daemon.py`, `state.py`, `backends/{cli,http,openclaw}.py`, and a SKILL.md)
 - **Voice layer**: batch Whisper for STT, Claude API for the LLM via existing agent backend pattern, ElevenLabs for TTS
 - **Latency**: ~5–15s per turn, walkie-talkie feel. Acceptable for journaling, task execution, and query modes.
-- **Modes available**: grounded only. Generative is deferred.
+- **Modes available**: grounded only. Generative is deferred to Knowledge Alfred (Stage 4a).
 - **Push-back level**: 4/10 by default, configurable per-session
-- **Session shape**: one continuous session per "conversation start". User starts a session, talks back-and-forth, ends the session. Multi-session stitching is deferred to a future enhancement.
-- **Profile doc integration**: talker loads `profile/Andrew Newton.md` as grounding context at session start, writes to it during the session via the calibration update protocol
+- **Confirmation policy**: starts at 3-4/5 during validation, with self-tuning over time as Alfred's confidence in its model grows
+- **Session shape**: one continuous session per "conversation start". User starts a session, talks back-and-forth, ends the session. **Multi-session stitching is explicitly deferred to a future enhancement** (see "Future growth" below) — phase 1 keeps the model simple.
+- **Calibration integration**: talker loads the calibration sections from `person/` records named in `talker.primary_users` config as grounding context at session start, writes to them during the session via the calibration update protocol
 
 ### Stage 2b — Brainstorm-capture mode (~1 week after 2a)
 
@@ -303,13 +364,14 @@ This stage validates the end-to-end pipeline without committing to talker tool s
 
 ### Stage 3.5 — Multi-instance architecture (separate track)
 
-Prerequisite for Stage 4a (generative mode in a story-writer instance) and the eventual NP instance. Out of scope for this design doc but blocks the per-instance-mode features.
+Prerequisite for Stage 4a (generative mode in the Knowledge Alfred instance) and the eventual NP instance. Out of scope for this design doc but blocks the per-instance-mode features.
 
-### Stage 4a — Generative mode (instance-specific, depends on 3.5)
+### Stage 4a — Generative mode in Knowledge Alfred instance (depends on 3.5)
 
 - Same talker code, new SKILL.md mode
-- Enabled per-instance via config
-- Story-writer instance gets it, main Alfred and NP instance probably don't
+- Enabled in the Knowledge Alfred instance only — the planned instance for all writing work, fiction and non-fiction
+- Main Alfred and NP's instance keep grounded mode only
+- Days of work once multi-instance architecture (Stage 3.5) is in place
 
 ### Stage 4b — Hey Cyan glasses client (hardware-dependent)
 
@@ -381,26 +443,45 @@ Hey Cyan is the right starting point because it's cheap, has a community SDK, an
 
 ## Multi-Instance Implications
 
-Because each Alfred instance may have a different primary user, the talker tool deploys **per instance**. Three implications:
+Because each Alfred instance may have a different primary user, the talker tool deploys **per instance**. Four implications:
 
-1. **Per-instance Telegram bot**. Each instance runs its own bot with its own token, its own webhook endpoint, its own user. The main Alfred talks to @AndrewAlfredBot; NP's instance talks to @NPAlfredBot. They never share state.
+1. **Per-instance Telegram bot**. Each instance runs its own bot with its own token, its own webhook endpoint, its own user. The main Alfred talks to @AndrewAlfredBot; the Knowledge Alfred instance talks to @KnowledgeAlfredBot; NP's eventual instance talks to @NPAlfredBot. They never share state.
 
-2. **Per-instance talker config**. Modes (grounded, generative, brainstorm-capture) are enabled or disabled per-instance via the tool's config section. The story-writer instance enables generative; the main Alfred and NP's instance probably don't.
+2. **Per-instance talker config**. Modes (grounded, generative, brainstorm-capture) are enabled or disabled per-instance via the tool's config section. The Knowledge Alfred instance enables generative for fiction and non-fiction writing; the main Alfred and NP's instance keep grounded only.
 
-3. **Per-instance profile doc**. Each instance's vault has its own `profile/{user}.md`. The main Alfred's profile is `profile/Andrew Newton.md` in the main vault. NP's profile lives in NP's vault, not in Andrew's. Cross-instance profile sharing is out of scope and probably never wanted — calibration is private per user.
+3. **Per-instance primary users via `talker.primary_users` config field**. The list names which `person/` records the talker should treat as its primary calibration targets. Single-user instances list one person; couples or small-team instances list multiple. The talker loads each named person record's calibration section as grounding context for voice sessions.
+
+4. **Per-instance person record + calibration section**. Each instance's vault has its own `person/{user}.md` with its own `<!-- ALFRED:CALIBRATION -->` block. The main Alfred's calibration lives in `person/Andrew Newton.md` in the main vault. NP's calibration lives in NP's vault, not in Andrew's. Knowledge Alfred has its own vault and its own version of `person/Andrew Newton.md` with calibration tuned for creative collaboration rather than operational work. Cross-instance calibration sharing is out of scope and probably never wanted — calibration is private per user, per instance.
 
 The voice work doesn't add multi-instance complexity. It just rides on the per-instance pattern that already exists for every other Alfred tool.
 
-## Open Questions and Deferred Decisions
+### A note on Knowledge Alfred specifically
 
-These are explicitly NOT decided in this doc and will be revisited closer to implementation:
+Knowledge Alfred deserves a callout because it's the instance that uses every voice mode meaningfully:
+
+- **Grounded mode** for non-fiction work where vault context (research notes, prior drafts, references) is the whole point
+- **Generative mode** for fiction and brainstorming where vault grounding would inhibit creativity
+- **Brainstorm-capture mode** for long-form ideation that becomes a structured note afterward
+
+Knowledge Alfred's `person/Andrew Newton.md` calibration section will reflect Andrew's WRITING preferences, not his operational ones — different style cues, different push-back patterns, different Current Priorities. Same person, different facet of the user, different calibration. This is precisely why per-instance calibration matters: one Andrew is the operator of Rural Route Transportation, the other Andrew is the writer working on a novel. Alfred should know which one it's talking to.
+
+## Future Growth (Explicitly Deferred Beyond Phase 1)
+
+These are not on the immediate roadmap but are worth noting so future sessions know they're intentional gaps, not oversights:
+
+- **Multi-session stitching for journaling.** Phase 1 ships with one continuous session = one session record. The future enhancement: a `continues_from` frontmatter field linking related session records together so a multi-day journaling thread can be treated as one logical conversation. Alfred would surface "this picks up where you left off in session/X yesterday" at the start of a continuation. Worth doing when journaling becomes a regular practice and the cost of fragmented threads becomes felt. Not blocking anything; small to add later.
+- **Voice identification for multi-primary-user instances.** Phase 1 lists primary users in `talker.primary_users` config but doesn't auto-detect who's speaking. In a couple's instance, the talker can either ask "Andrew or NP?" at session start, or default to the first entry. Adding voice ID later (via ElevenLabs or a small local speaker-recognition model) would route automatically to the right calibration.
+- **Calibration sections on `org/` and other entity types.** The pattern works for any record where Alfred maintains a behavioral model. Out of scope for phase 1; the mechanism allows it without new infrastructure.
+- **Self-model for Alfred itself** via a calibration section on `project/Alfred.md`. Meta but potentially powerful.
+
+## Open Questions Deferred to Build Time
+
+These have obvious right answers that are easier to make when actually implementing rather than now:
 
 1. **STT provider for Stage 1.** Three candidates (ElevenLabs Scribe, Groq Whisper, local whisper.cpp). Pick when actually building, based on what's cheapest and easiest at that moment.
 2. **Default ElevenLabs voice for Alfred.** "Shimmer," "Rachel," or one of the conversational presets — pick when actually building, easy to swap.
-3. **Whether profile edits require explicit confirmation or can be silent.** Default is explicit confirmation for confident claims, silent append for `[needs confirmation]` entries. Tunable based on actual voice session feel.
-4. **Multi-session stitching for journaling.** Can a journaling session span multiple separate conversations across days? Simple answer for MVP: no, one conversation = one session record. Future enhancement: mark sessions as related via a `continues_from` frontmatter field.
-5. **Phone-side companion app for Stage 4b glasses.** What language / framework? React Native? Native Swift? Just a Python script using a BLE library? Decide when actually building Stage 4b.
-6. **Wake word fallback for Stage 4 if Cyan SDK can't support it.** openWakeWord on the paired phone is the obvious fallback. Decide when actually building.
+3. **Phone-side companion app for Stage 4b glasses.** What language / framework? React Native? Native Swift? Just a Python script using a BLE library? Decide when actually building Stage 4b.
+4. **Wake word fallback for Stage 4 if Cyan SDK can't support it.** openWakeWord on the paired phone is the obvious fallback. Decide when actually building.
 
 ## Sources and References
 
