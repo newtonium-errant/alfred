@@ -1,13 +1,16 @@
 ---
 alfred_tags:
-- automation/email-integration
-- system-buildout
+- software/alfred
+- email/integration
+- system/buildout
 created: '2026-04-02'
 description: Extended email pipeline to full triage/filing, added KAIROS-inspired
   features, established team conventions
 distiller_signals: constraint:1, contradiction:1, has_outcome
 intent: Build email triage and filing, strengthen knowledge management, document team
   conventions
+janitor_note: LINK001 — [[person/Andrew Newton]] does not exist as a vault record.
+  Participants field references vault owner; consider creating a person record.
 name: Email Pipeline and Knowledge Management
 outputs: []
 participants:

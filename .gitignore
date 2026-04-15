@@ -40,6 +40,13 @@ alfred-documentation/
 # Finished n8n workflows (local only, repo is for coding knowledge)
 workflows/
 
+# Vault: only session/ and process/ live in the outer repo.
+# Everything else under vault/ is tracked by the nested vault git repo
+# used by the snapshot system. Do not add it here or it will double-track.
+/vault/*
+!/vault/session/
+!/vault/process/
+
 # OS
 .DS_Store
 Thumbs.db

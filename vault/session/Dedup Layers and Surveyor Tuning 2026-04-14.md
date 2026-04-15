@@ -9,8 +9,11 @@ created: '2026-04-14'
 description: Completed 3-layer dedup prevention work, surveyor labeler prompt + threshold
   tuning, Pocketpills note merge, janitor follow-link rule, foreground-default enforcement
   hook, and subprocess failure logging hardening across CLI/pipeline/OpenClaw backends
+distiller_signals: decision:6, assumption:3, constraint:9, contradiction:9, has_outcome
 intent: Resume dedup-prevention work deferred from the earlier 2026-04-14 session
   and close out followups from vault review
+janitor_note: LINK001 — [[person/Andrew Newton]] does not exist; vault owner has no
+  person record yet. LINK002 — added [[account/PocketPills Pharmacy Account]] to related.
 name: Dedup Layers and Surveyor Tuning
 outputs: []
 participants:
@@ -19,6 +22,7 @@ project:
 - '[[project/Alfred]]'
 related:
 - '[[session/System Hardening and Agent Team 2026-04-14]]'
+- '[[account/PocketPills Pharmacy Account]]'
 relationships: []
 status: completed
 tags:

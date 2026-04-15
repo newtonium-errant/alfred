@@ -1,13 +1,16 @@
 ---
 alfred_tags:
-- automation/email-integration
-- system-buildout
+- software/alfred
+- email/integration
+- system/buildout
 created: '2026-04-14'
 description: Consolidation unblock, surveyor activation, Morning Brief, agent team
   setup, vault snapshots, curator duplication fix
 distiller_signals: decision:1, constraint:3, contradiction:3, has_outcome
 intent: Unblock deferred features, build Morning Brief, establish agent team, harden
   system reliability
+janitor_note: LINK001 — broken link [[person/Andrew Newton]] in participants field,
+  no person record exists. Create person/Andrew Newton.md or update participants link.
 name: System Hardening and Agent Team
 outputs:
 - '[[run/Morning Brief 2026-04-14]]'

@@ -155,6 +155,8 @@ Each agent reads `.claude/agents/{name}.md` for their specific instructions.
 - **Don't do agent work as team lead.** Route implementation to the builder, prompt changes to the prompt-tuner. The team lead orchestrates, reviews reports, makes decisions, and writes session notes. If you're writing code directly in the main conversation, you're doing it wrong.
 - **Pattern discovery = documentation trigger.** If the same bug appears twice, don't just fix it — flag it for documentation in agent instructions or CLAUDE.md.
 - **Cross-agent contracts first.** When work crosses domains (builder changing template variables that prompt-tuner depends on), agree on the interface before implementing.
+- **Session start requires a dirty-tree audit.** Before taking on new work, run `git status` and classify every dirty or untracked path in outer-repo scope as one of: (a) commit now, (b) discard, (c) explicitly deferred with a reason. No new work begins until every path has been accounted for. If something is intentionally deferred across sessions (e.g. a feature-in-progress like Layer 3), the reason must live in a memory entry or session note so the next session doesn't rediscover it cold. This is how uncommitted work stops accumulating.
+- **Surgical staging when pre-existing dirty files are in scope.** If this session touches a file that already has unrelated uncommitted changes from a prior session, do not stage the whole file. Back it up, revert to HEAD, re-apply only this session's hunks, commit, then restore the backup so the pre-existing work stays in the working tree for its own eventual commit. Scope bleed is worse than verbose git gymnastics.
 
 ### Workflow Deliverables
 

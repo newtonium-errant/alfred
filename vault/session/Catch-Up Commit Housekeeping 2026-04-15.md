@@ -1,13 +1,18 @@
 ---
 alfred_tags:
-- alfred/housekeeping
-- alfred/mail
+- software/alfred
+- email/integration
+- system/buildout
 created: '2026-04-15'
 description: Catch-up commit — previously-uncommitted IMAP mail module code and session
   note content updates from prior sessions, plus .gitignore cleanup for Claude Code
   local state
+distiller_signals: assumption:1, contradiction:1, has_outcome
 intent: Land pre-existing uncommitted state that accumulated before the current session
   without confusing its history with the subprocess/dedup/surveyor work
+janitor_note: LINK001 — broken link person/Andrew Newton in participants field, no
+  person record exists. Create person/Andrew Newton.md or update participants link.
+  ORPHAN001 — no inbound links, consider linking from a parent record.
 name: Catch-Up Commit Housekeeping
 outputs: []
 participants:
@@ -19,7 +24,26 @@ related:
 - '[[session/System Hardening and Agent Team 2026-04-14]]'
 - '[[session/Ollama Local LLM and System Buildout 2026-04-08]]'
 - '[[session/Email Pipeline and Knowledge Management 2026-04-02]]'
-relationships: []
+relationships:
+- confidence: 0.6
+  context: Both involve system maintenance.
+  source: session/Catch-Up Commit Housekeeping 2026-04-15.md
+  target: session/Email Pipeline and Knowledge Management 2026-04-02.md
+  type: related-to
+- confidence: 0.7
+  context: Both sessions involve system buildout
+  source: session/Catch-Up Commit Housekeeping 2026-04-15.md
+  source_anchor: reviewed system buildout status
+  target: session/Ollama Local LLM and System Buildout 2026-04-08.md
+  target_anchor: discussed Ollama local LLM setup
+  type: related-to
+- confidence: 0.7
+  context: System hardening discussed in both sessions
+  source: session/Catch-Up Commit Housekeeping 2026-04-15.md
+  source_anchor: system security review
+  target: session/System Hardening and Agent Team 2026-04-14.md
+  target_anchor: discussed system hardening
+  type: related-to
 status: completed
 tags:
 - housekeeping

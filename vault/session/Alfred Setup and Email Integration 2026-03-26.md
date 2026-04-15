@@ -1,12 +1,15 @@
 ---
 alfred_tags:
-- automation/email-integration
-- system-buildout
+- software/alfred
+- email/integration
+- system/buildout
 created: '2026-03-26'
 description: First session — setup, email pipeline, multi-instance design, Aftermath-Lab
   creation
 distiller_signals: constraint:1, has_outcome
 intent: Get Alfred running, build email pipeline, design multi-instance ecosystem
+janitor_note: LINK001 — [[person/Andrew Newton]] does not exist. Create person record
+  for vault owner or remove from participants.
 name: Alfred Setup and Email Integration
 outputs:
 - '[[org/Anthropic]]'
@@ -34,6 +37,11 @@ relationships:
   source: session/Alfred Setup and Email Integration 2026-03-26.md
   target: session/System Hardening and Agent Team 2026-04-14.md
   type: supports
+- confidence: 0.7
+  context: Both sessions involve system setup.
+  source: session/Alfred Setup and Email Integration 2026-03-26.md
+  target: session/Catch-Up Commit Housekeeping 2026-04-15.md
+  type: related-to
 status: completed
 tags:
 - setup

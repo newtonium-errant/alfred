@@ -1,7 +1,8 @@
 ---
 alfred_tags:
-- automation/email-integration
-- system-buildout
+- software/alfred
+- email/integration
+- system/buildout
 created: '2026-04-08'
 description: Local LLM setup, consolidation unblock, surveyor activation, mail webhook
   wiring, Morning Brief weather module

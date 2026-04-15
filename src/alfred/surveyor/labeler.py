@@ -64,7 +64,42 @@ Respond with ONLY a JSON array of objects, each with:
 - "target_anchor": short verbatim phrase (<= 80 chars) from the target that mentions the same shared entity
 
 Only include pairs where confidence >= 0.65 AND both anchors are present. If no grounded relationships are found, return [].
+
+Return the JSON array directly with no markdown code fences, no ```json wrapping, no prose explanation.
 """
+
+
+def _strip_code_fences(text: str) -> str:
+    """Strip markdown code fences from an LLM response, if present.
+
+    Handles:
+    - ```json\\n[...]\\n``` (with language tag)
+    - ```\\n[...]\\n``` (without language tag)
+    - [...] (raw, no fences — passthrough)
+    - Leading/trailing whitespace
+    - Surrounding prose before/after a fenced block (extracts the fenced content)
+    """
+    if not text:
+        return text
+    stripped = text.strip()
+    fence_start = stripped.find("```")
+    if fence_start == -1:
+        return stripped
+    # Everything after the opening fence
+    after_open = stripped[fence_start + 3 :]
+    # Drop an optional language tag on the same line as the opening fence
+    newline_idx = after_open.find("\n")
+    if newline_idx != -1:
+        first_line = after_open[:newline_idx]
+        # If the first line is a language tag (letters/digits only), skip it
+        if first_line.strip() and all(c.isalnum() for c in first_line.strip()):
+            after_open = after_open[newline_idx + 1 :]
+    # Find the closing fence
+    fence_end = after_open.find("```")
+    if fence_end == -1:
+        # Unterminated fence — return what we have after the opener
+        return after_open.strip()
+    return after_open[:fence_end].strip()
 
 # Rate limiting
 API_CALL_DELAY = 1.0
@@ -104,7 +139,7 @@ class Labeler:
             return []
 
         try:
-            tags = json.loads(response)
+            tags = json.loads(_strip_code_fences(response))
             if isinstance(tags, list) and all(isinstance(t, str) for t in tags):
                 return tags[:3]
         except (json.JSONDecodeError, TypeError):
@@ -138,7 +173,7 @@ class Labeler:
             return []
 
         try:
-            rels = json.loads(response)
+            rels = json.loads(_strip_code_fences(response))
             if isinstance(rels, list):
                 return [
                     r for r in rels
