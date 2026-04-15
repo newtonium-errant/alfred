@@ -506,9 +506,70 @@ Moving files breaks wikilinks. Human must decide.
 
 **Diagnosis:** Another record of the same type has the same name (including case-variant names like `PocketPills` vs `Pocketpills` — the filesystem treats these as distinct but the vault treats them as the same entity).
 
-**Default fix:** NEVER merge automatically during an autonomous sweep. Flag with `janitor_note: "DUP001 — possible duplicate of [[{other_path}]]"`.
+**Default action during an autonomous sweep: emit a triage task for human review.** NEVER merge automatically. The operator-directed merge procedure below is reserved for the escalation path — when the sweep context (action log, resolved triage task, or explicit sweep instruction) already tells you the operator has approved a specific merge.
 
-**Operator-directed merge procedure:** When a human operator explicitly instructs you to merge a duplicate pair (winner = the canonical name to keep, loser = the variant to remove), follow these steps IN ORDER. Do NOT skip the follow-link sweep — it is the most commonly missed step and leaves behind ghost duplicates in adjacent directories.
+#### Default Triage Flow (autonomous sweep)
+
+This is what you do every time you see a DUP001 in a normal sweep. It creates a lightweight `task` record that Andrew can review out-of-band, and is idempotent across sweeps.
+
+**Machine-vs-human discriminator.** Only emit triage when BOTH candidates are **entity types**: `org/`, `person/`, `note/`, `project/`, `location/`, `account/`, `asset/`, `task/`, `event/`, `input/`, `conversation/`, `process/`, `run/`. Do NOT emit triage for **learn types** (`contradiction/`, `assumption/`, `decision/`, `constraint/`, `synthesis/`) — those carry legitimate human semantic pointers with their own `confidence` fields and are not dedup candidates.
+
+> **Note:** The entity-type list above must stay in sync with `KNOWN_TYPES` minus `LEARN_TYPES` in `src/alfred/vault/schema.py`. If a new record type is added there, add it here too (or to the learn-type exclusion list if it's a learn type). If a DUP001 fires on a learn type, leave both records alone and add `janitor_note: "DUP001 — learn-type duplicate, not a triage candidate, ignored"` on the newer record only. Log it as a NOTE in the action log.
+
+1. **Compute the deterministic triage ID.** Use the dedicated CLI — do NOT try to compute the ID by hand, and do NOT reuse an ID from a previous sweep. The CLI is order-independent and accepts wikilink, bare path, or `.md` forms:
+   ```bash
+   alfred vault triage-id dedup "[[org/Acme Corp]]" "[[org/Acme Corporation]]"
+   ```
+   Returns JSON of the form `{"triage_id": "dedup-7954d66983fd", "kind": "dedup", ...}`. Capture the `triage_id` value — you will use it in steps 2 and 3.
+
+2. **Scan the `## Existing Open Triage Tasks` block** in the sweep prompt for a matching `alfred_triage_id`. This block is rendered between `## Affected Records` and the trailing `---`. If a task with the exact same `alfred_triage_id` is already listed there, **skip this DUP001 entirely**. Do not create a second task, do not edit the existing one, do not touch either candidate record. Move to the next issue. This is a soft idempotency layer — the scope enforcer also rejects duplicate creates, but you should avoid even attempting it.
+
+3. **Otherwise, create the triage task** via `alfred vault create task ...`. The `alfred_triage=true` flag is **load-bearing** — the janitor scope allows `create` on `task` ONLY when this flag is present. Use today's ISO date for `created`. Example:
+   ```bash
+   alfred vault create task "Triage - Acme org dedup" \
+     --set 'alfred_triage=true' \
+     --set 'alfred_triage_kind="dedup"' \
+     --set 'alfred_triage_id="dedup-a7f3c2b1d8e4"' \
+     --set 'status="open"' \
+     --set 'priority="normal"' \
+     --set 'candidates=["[[org/Acme Corp]]","[[org/Acme Corporation]]"]'
+   ```
+   The resulting frontmatter must look like:
+   ```yaml
+   type: task
+   name: "Triage - <candidate-summary>"
+   status: open
+   created: <today's ISO date>
+   alfred_triage: true
+   alfred_triage_kind: dedup
+   alfred_triage_id: <from the CLI>
+   candidates:
+     - "[[<type>/<Name>]]"
+     - "[[<type>/<Name>]]"
+   priority: normal
+   ```
+   Title the file `Triage - <short human description>` (e.g. `Triage - Acme org dedup`).
+
+4. **Log the action** as `FLAGGED | task/Triage - <name>.md | DUP001 | Created triage task <triage_id> for [[a]] vs [[b]]`. Then move to the next issue.
+
+**What you MUST NOT do while a DUP001 triage task is pending or being created:**
+- Do NOT auto-merge the candidates.
+- Do NOT edit, rename, or retag either candidate record (no `janitor_note`, no frontmatter touch-up, nothing).
+- Do NOT delete either candidate.
+- Do NOT change `status` on any existing triage task — that field is human-only.
+- Do NOT create triage tasks for non-dedup issues. Layer 3 currently covers `kind: dedup` only; other issue classes still flag via `janitor_note` as before.
+
+**Worked example — Acme Corp vs Acme Corporation:**
+1. Sweep detects DUP001: `org/Acme Corp.md` and `org/Acme Corporation.md`. Both are entity type `org/` — triage applies.
+2. Compute the ID: `alfred vault triage-id dedup "[[org/Acme Corp]]" "[[org/Acme Corporation]]"` → `{"triage_id": "dedup-a7f3c2b1d8e4", ...}`.
+3. Scan `## Existing Open Triage Tasks`: no task listed with `alfred_triage_id: dedup-a7f3c2b1d8e4`. Proceed.
+4. Create the triage task via `alfred vault create task "Triage - Acme org dedup" --set 'alfred_triage=true' --set 'alfred_triage_kind="dedup"' --set 'alfred_triage_id="dedup-a7f3c2b1d8e4"' --set 'status="open"' --set 'priority="normal"' --set 'candidates=["[[org/Acme Corp]]","[[org/Acme Corporation]]"]'`.
+5. Log: `FLAGGED | task/Triage - Acme org dedup.md | DUP001 | Created triage task dedup-a7f3c2b1d8e4 for [[org/Acme Corp]] vs [[org/Acme Corporation]]`. Leave both `org/` records untouched.
+6. Next sweep re-detects the same DUP001, recomputes the same ID, sees it in `## Existing Open Triage Tasks`, and skips — no duplication.
+
+#### Operator-Directed Merge (escalation path)
+
+Use this procedure ONLY when the operator has already approved the merge — i.e. the sweep context contains an explicit merge instruction (a human-authored action log, a resolved triage task, or a direct instruction naming winner and loser). Do NOT run it autonomously. Do NOT skip the follow-link sweep — it is the most commonly missed step and leaves behind ghost duplicates in adjacent directories.
 
 1. **Pick the winner.** Use the operator's chosen canonical form. If not specified, prefer the casing that matches how the entity self-identifies (website, letterhead, etc.).
 2. **Merge the two records themselves.** Copy any unique frontmatter fields and body content from the loser into the winner. Delete the loser record.

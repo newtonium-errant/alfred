@@ -32,6 +32,11 @@ class JanitorState:
         self.fix_log: list[FixLogEntry] = []  # permanent audit trail
         self.ignored: dict[str, str] = {}  # rel_path -> reason
         self.pending_writes: dict[str, str] = {}  # rel_path -> expected_md5
+        # Layer 3 triage queue: deterministic IDs of dedup/orphan/etc.
+        # candidate sets for which a triage task has already been surfaced.
+        # Prevents the agent from re-creating the same triage task across
+        # successive sweeps. Persisted as a JSON list; loaded as a set.
+        self.triage_ids_seen: set[str] = set()
 
     def load(self) -> None:
         """Load state from disk if it exists."""
@@ -48,7 +53,13 @@ class JanitorState:
         self.fix_log = [FixLogEntry.from_dict(e) for e in raw.get("fix_log", [])]
         self.ignored = raw.get("ignored", {})
         self.pending_writes = raw.get("pending_writes", {})
-        log.info("state.loaded", files=len(self.files), sweeps=len(self.sweeps))
+        self.triage_ids_seen = set(raw.get("triage_ids_seen", []))
+        log.info(
+            "state.loaded",
+            files=len(self.files),
+            sweeps=len(self.sweeps),
+            triage_ids_seen=len(self.triage_ids_seen),
+        )
 
     def save(self) -> None:
         """Atomic save: write to .tmp then os.replace."""
@@ -72,6 +83,7 @@ class JanitorState:
             "fix_log": [e.to_dict() for e in self.fix_log],
             "ignored": self.ignored,
             "pending_writes": self.pending_writes,
+            "triage_ids_seen": sorted(self.triage_ids_seen),
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.state_path.with_suffix(".tmp")
@@ -122,3 +134,11 @@ class JanitorState:
     def ignore_file(self, rel_path: str, reason: str = "") -> None:
         """Add a file to the ignore list."""
         self.ignored[rel_path] = reason
+
+    def has_seen_triage(self, triage_id: str) -> bool:
+        """Return True if the given triage id has already been surfaced."""
+        return triage_id in self.triage_ids_seen
+
+    def mark_triage_seen(self, triage_id: str) -> None:
+        """Record that a triage task has been surfaced for this id."""
+        self.triage_ids_seen.add(triage_id)

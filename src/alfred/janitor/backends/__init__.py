@@ -51,8 +51,21 @@ def build_sweep_prompt(
     issue_report: str,
     affected_records: str,
     vault_path: str,
+    open_triage_block: str = "",
 ) -> str:
-    """Assemble the full prompt sent to any backend for fix mode."""
+    """Assemble the full prompt sent to any backend for fix mode.
+
+    Args:
+        skill_text: The vault-janitor SKILL.md contents.
+        issue_report: Formatted issue report from the structural scanner.
+        affected_records: Contents of affected files, formatted for the agent.
+        vault_path: Absolute path to the vault (informational).
+        open_triage_block: Pre-formatted ``## Existing Open Triage Tasks``
+            section from ``janitor.triage.format_open_triage_block``. When
+            empty, the prompt omits the block entirely (backward compatible
+            with callers that haven't been updated).
+    """
+    triage_section = f"\n{open_triage_block}\n---\n" if open_triage_block else ""
     return f"""{skill_text}
 
 ---
@@ -79,6 +92,7 @@ flag what requires human judgment.
 {affected_records}
 
 ---
+{triage_section}
 
 Fix the issues listed above. For each file:
 1. Read the file using `alfred vault read "<path>"`
@@ -133,6 +147,13 @@ class BaseBackend(ABC):
         issue_report: str,
         affected_records: str,
         vault_path: str,
+        open_triage_block: str = "",
     ) -> BackendResult:
-        """Send issue report to the agent and return fix summary."""
+        """Send issue report to the agent and return fix summary.
+
+        ``open_triage_block`` is a pre-formatted context block listing open
+        Layer 3 triage tasks. Backends should forward it to
+        ``build_sweep_prompt``. Defaults to empty string for backward
+        compatibility.
+        """
         ...

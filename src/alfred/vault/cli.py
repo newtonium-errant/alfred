@@ -139,13 +139,18 @@ def cmd_context(args: argparse.Namespace) -> None:
 
 def cmd_create(args: argparse.Namespace) -> None:
     scope = _scope()
-    try:
-        check_scope(scope, "create", record_type=args.type)
-    except ScopeError as e:
-        _error(str(e))
-
     vault = _vault_path()
     set_fields = _parse_set_args(args.set)
+
+    try:
+        check_scope(
+            scope,
+            "create",
+            record_type=args.type,
+            frontmatter=set_fields,
+        )
+    except ScopeError as e:
+        _error(str(e))
 
     body = None
     if args.body_stdin:
@@ -230,6 +235,23 @@ def cmd_delete(args: argparse.Namespace) -> None:
         _error(str(e))
 
 
+def cmd_triage_id(args: argparse.Namespace) -> None:
+    """Compute a deterministic triage id for a candidate set.
+
+    Order-independent: the same candidates in any permutation yield the
+    same id. Used by the janitor agent when creating Layer 3 triage tasks
+    (see ``alfred.janitor.triage``).
+    """
+    from alfred.janitor.triage import compute_triage_id
+
+    try:
+        triage_id = compute_triage_id(args.kind, list(args.candidates))
+    except ValueError as e:
+        _error(str(e))
+        return
+    _output({"triage_id": triage_id, "kind": args.kind, "candidates": list(args.candidates)})
+
+
 def cmd_snapshot(args: argparse.Namespace) -> None:
     vault = _vault_path()
 
@@ -301,6 +323,18 @@ def build_vault_parser(subparsers: argparse._SubParsersAction) -> None:
     p = vault_sub.add_parser("delete", help="Delete a vault record")
     p.add_argument("path", help="Relative path to the record")
 
+    # triage-id
+    p = vault_sub.add_parser(
+        "triage-id",
+        help="Compute deterministic triage id for a candidate set",
+    )
+    p.add_argument("kind", help="Triage kind (e.g. dedup, orphan)")
+    p.add_argument(
+        "candidates",
+        nargs="+",
+        help="Candidate paths or wikilinks (order-independent)",
+    )
+
     # snapshot
     p = vault_sub.add_parser("snapshot", help="Git snapshot of vault state")
     p.add_argument("--init", action="store_true", help="Initialize vault git repo")
@@ -319,6 +353,7 @@ def handle_vault_command(args: argparse.Namespace) -> None:
         "edit": cmd_edit,
         "move": cmd_move,
         "delete": cmd_delete,
+        "triage-id": cmd_triage_id,
         "snapshot": cmd_snapshot,
     }
     handler = handlers.get(args.vault_cmd)

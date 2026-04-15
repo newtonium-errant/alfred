@@ -16,9 +16,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import frontmatter
+
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
 
 from .backends import BaseBackend, BackendResult, build_issue_report
+from .triage import collect_open_triage_tasks, format_open_triage_block
 from .backends.cli import ClaudeBackend
 from .backends.http import ZoBackend
 from .backends.openclaw import OpenClawBackend
@@ -134,6 +137,52 @@ def _build_affected_records(
     return "\n".join(parts)
 
 
+def _record_triage_ids_from_created(
+    created_paths: list[str],
+    vault_path: Path,
+    state: JanitorState,
+) -> None:
+    """Scan newly-created task files for triage frontmatter and record IDs.
+
+    Hard idempotency layer: any task created with ``alfred_triage: true`` has
+    its ``alfred_triage_id`` recorded in ``state.triage_ids_seen`` so that
+    closed/deleted triage tasks cannot be re-surfaced by a future sweep.
+    Non-triage tasks are silently skipped.
+    """
+    for rel_path in created_paths:
+        if not rel_path.startswith("task/") or not rel_path.endswith(".md"):
+            continue
+        full_path = vault_path / rel_path
+        try:
+            post = frontmatter.load(str(full_path))
+        except Exception as exc:  # noqa: BLE001 — skip unreadable
+            log.warning(
+                "daemon.triage_parse_failed",
+                path=rel_path,
+                error=str(exc)[:200],
+            )
+            continue
+
+        fm = post.metadata or {}
+        if not fm.get("alfred_triage"):
+            continue
+
+        triage_id = str(fm.get("alfred_triage_id", "")).strip()
+        if not triage_id:
+            log.warning(
+                "daemon.triage_create_missing_id",
+                path=rel_path,
+            )
+            continue
+
+        state.mark_triage_seen(triage_id)
+        log.info(
+            "daemon.triage_id_recorded",
+            triage_id=triage_id,
+            path=rel_path,
+        )
+
+
 async def run_sweep(
     config: JanitorConfig,
     state: JanitorState,
@@ -184,6 +233,10 @@ async def run_sweep(
             modified = mutations["files_modified"]
             deleted = mutations["files_deleted"]
             cleanup_session_file(session_path)
+
+            # Layer 3: record any newly-created triage task IDs in state so
+            # they cannot be re-surfaced on the next sweep even if closed.
+            _record_triage_ids_from_created(created, config.vault.vault_path, state)
 
             # Audit log
             audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
@@ -236,6 +289,14 @@ async def run_sweep(
                 max_per_call = config.sweep.max_files_per_agent_call
                 affected_files = list({i.file for i in issues})
 
+                # Layer 3: surface existing open triage tasks so the agent
+                # can skip already-queued candidates. Computed once per sweep.
+                open_triage_tasks = collect_open_triage_tasks(vault_path)
+                open_triage_block = format_open_triage_block(
+                    open_triage_tasks,
+                    seen_ids=state.triage_ids_seen,
+                )
+
                 for batch_start in range(0, len(affected_files), max_per_call):
                     batch_files = set(affected_files[batch_start:batch_start + max_per_call])
                     batch_issues = [i for i in issues if i.file in batch_files]
@@ -266,6 +327,7 @@ async def run_sweep(
                         issue_report=issue_report,
                         affected_records=affected_records,
                         vault_path=str(vault_path),
+                        open_triage_block=open_triage_block,
                     )
 
                     # Determine what changed
@@ -278,6 +340,12 @@ async def run_sweep(
                     else:
                         after = snapshot_vault(vault_path, config.vault.ignore_dirs)
                         created, modified, deleted = diff_vault(before, after)
+
+                    # Layer 3: record any newly-created triage task IDs in
+                    # state so they cannot be re-surfaced on the next sweep
+                    # even if the human closes or deletes them. Handles the
+                    # empty-created case naturally (loop is a no-op).
+                    _record_triage_ids_from_created(created, vault_path, state)
 
                     # Audit log
                     audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}

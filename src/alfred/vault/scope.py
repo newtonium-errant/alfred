@@ -28,7 +28,9 @@ SCOPE_RULES: dict[str, dict[str, bool | str]] = {
         "search": True,
         "list": True,
         "context": True,
-        "create": False,
+        # Janitor may create task records only when they carry the
+        # alfred_triage: true frontmatter flag (Layer 3 triage queue).
+        "create": "triage_tasks_only",
         "edit": True,
         "move": False,
         "delete": True,
@@ -65,6 +67,7 @@ def check_scope(
     operation: str,
     rel_path: str = "",
     record_type: str = "",
+    frontmatter: dict | None = None,
 ) -> None:
     """Check if an operation is allowed under the given scope.
 
@@ -73,6 +76,9 @@ def check_scope(
         operation: The vault operation (read, search, list, context, create, edit, move, delete).
         rel_path: Relative path of the target file (for path-based checks).
         record_type: Record type (for type-based checks on create).
+        frontmatter: Optional frontmatter dict of the record being written
+            (used by ``triage_tasks_only`` to enforce ``alfred_triage: true``).
+            Defaults to None — rules that require it fail closed when absent.
 
     Raises:
         ScopeError: If the operation is denied.
@@ -124,4 +130,20 @@ def check_scope(
     # Field-level enforcement is the caller's responsibility; this gate
     # permits the edit operation to proceed.
     if permission == "tags_only":
+        return
+
+    # Janitor may create task records only when they carry the
+    # alfred_triage: true frontmatter flag. Fails closed when no
+    # frontmatter is passed by the caller.
+    if permission == "triage_tasks_only":
+        if record_type != "task":
+            raise ScopeError(
+                f"Scope '{scope}' may only create 'task' records "
+                f"(with alfred_triage: true). Got: '{record_type}'"
+            )
+        if not frontmatter or not frontmatter.get("alfred_triage"):
+            raise ScopeError(
+                f"Scope '{scope}' may only create task records with "
+                f"'alfred_triage: true' set in frontmatter."
+            )
         return

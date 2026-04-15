@@ -48,8 +48,15 @@ class OpenClawBackend(BaseBackend):
         issue_report: str,
         affected_records: str,
         vault_path: str,
+        open_triage_block: str = "",
     ) -> BackendResult:
-        prompt = build_sweep_prompt(skill_text, issue_report, affected_records, vault_path)
+        prompt = build_sweep_prompt(
+            skill_text,
+            issue_report,
+            affected_records,
+            vault_path,
+            open_triage_block=open_triage_block,
+        )
 
         session_id = f"janitor-{uuid.uuid4().hex[:12]}"
 
