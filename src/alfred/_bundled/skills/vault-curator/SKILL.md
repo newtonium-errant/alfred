@@ -795,6 +795,43 @@ alfred vault search --grep "Eagle Farm"
 
 **You MUST search for every entity you plan to create.** Record what exists and what needs to be created.
 
+#### STEP 2a: DEDUP CHECK — Mandatory for standing entities
+
+Before creating ANY standing entity (`person/`, `org/`, `project/`, `location/`, `asset/`, `account/`), you MUST run this dedup sub-procedure. Duplicate standing entities are the single most common curator failure — two records for the same real-world thing fragment the graph and poison every downstream search.
+
+**Procedure — execute for each proposed standing entity:**
+
+1. **List every existing record in the target directory:**
+   ```bash
+   alfred vault list org
+   alfred vault list person
+   ```
+   Read the full list. Do not rely on a single `--grep` hit.
+
+2. **Case-insensitive name comparison.** Compare the proposed new name against every existing name AND every existing `aliases` value. Normalize both sides: lowercase, strip punctuation, collapse whitespace. Check for:
+   - **Exact match, different case** — `pocketpills` vs `Pocketpills` vs `PocketPills` → same entity
+   - **Substring/stem match** — `Alliance Dental` vs `Alliance Dental Coldbrook` → same entity, the extra word is a location discriminator, not a new org
+   - **Obvious brand/spelling variants** — `Pocket Pills` vs `Pocketpills`, `Canada Post` vs `CanadaPost`, `TD Bank` vs `TD Canada Trust` → same entity unless the input explicitly distinguishes them
+   - **Punctuation/spacing only** — `Red Cross` vs `Red-Cross` vs `RedCross` → same entity
+
+3. **If a near-match exists, REUSE it.** Do NOT create a parallel record. Link your new activity records to the existing canonical record. If the input brings new information (a location, a sub-department, a new contact email), ADD it to the existing record via `alfred vault edit` — don't shard the entity.
+
+4. **Canonical naming rules.** When you DO need to create a new standing entity, choose the shortest authoritative form of the name:
+   - **Location goes in a frontmatter field or the body, NOT the record name.** `org/Alliance Dental.md` with `location: "[[location/Coldbrook]]"`, not `org/Alliance Dental Coldbrook.md`.
+   - **Department/specialty/role goes in frontmatter or body, NOT the record name.** `org/Halifax Health.md` with a body section for the cardiology department, not `org/Halifax Health Cardiology.md`.
+   - **Prefer the brand's own preferred spelling** when the input is ambiguous (check their website capitalization if unsure — e.g., `Pocketpills` is the company's own spelling).
+   - **Person records use the full name as published**, not nicknames: `person/Jonathan Smith.md`, not `person/Jon Smith.md` — add `Jon` to `aliases` instead.
+
+5. **Record known variants in the `aliases` frontmatter field.** Every standing entity SHOULD have an `aliases: []` list capturing every spelling/casing/brand variant you've seen. This makes future `alfred vault search` hit the canonical record even when the input uses a variant. Example:
+   ```yaml
+   aliases: ["PocketPills", "Pocket Pills", "pocketpills"]
+   ```
+   When you reuse an existing entity and the input uses a new variant, append that variant to `aliases` via `alfred vault edit`.
+
+6. **Only create if no near-match exists.** After the above checks, if and only if no existing record could plausibly be the same entity, create the new one with the canonical name and a seeded `aliases` list.
+
+**If you are unsure whether two names refer to the same entity, default to REUSE.** It is far easier for the janitor to split one record later than to merge two fragmented ones.
+
 ---
 
 ### STEP 3: EXTRACT — Identify ALL entities to create or update
@@ -1127,6 +1164,8 @@ Attendees: Henry, Sarah Chen, Mike Torres
 - **Don't modify `_templates/` or `_bases/`** — These are system files.
 - **Don't use bare paths in frontmatter** — Always use `"[[wikilink]]"` format, not plain strings for references.
 - **Don't create records for vague references** — "Tom from the council" without a surname is too vague for a person record. Mention in body text instead.
+- **Don't create duplicate standing entities via case or spelling variants.** `PocketPills`, `Pocketpills`, and `Pocket Pills` are all the same company — they resolve to the single canonical `org/Pocketpills.md` record. If you see a case-variant or spacing-variant of an existing name, REUSE the existing record and append the variant to its `aliases` frontmatter field. Do NOT create `org/PocketPills.md` alongside `org/Pocketpills.md`.
+- **Don't encode location/department/specialty in the record name.** `Alliance Dental` and `Alliance Dental Coldbrook` are the SAME org — Coldbrook is a location field, not a name discriminator. Create `org/Alliance Dental.md` with `location: "[[location/Coldbrook]]"` in frontmatter, not a parallel `org/Alliance Dental Coldbrook.md`. Same rule for `Halifax Health` vs `Halifax Health Cardiology`, `RBC` vs `RBC Bedford Branch`, etc.
 - **DO NOT move inbox files to processed** — The daemon handles this automatically after your work is complete. Moving inbox files yourself causes duplicate mutations and race conditions.
 - **Don't set status: processed on inbox files** — The daemon handles this after you finish.
 - **Don't skip the 6-step process** — Every inbox file goes through all 6 steps. No shortcuts.

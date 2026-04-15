@@ -221,6 +221,7 @@ async def _call_llm(
             stage=stage_label,
             code=proc.returncode,
             stderr=err[:500],
+            stdout_tail=raw[-2000:] if raw else "",
         )
         return raw  # Return whatever output we got — note may still have been created
 

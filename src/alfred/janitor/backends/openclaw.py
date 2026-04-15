@@ -96,7 +96,10 @@ class OpenClawBackend(BaseBackend):
 
         if proc.returncode != 0:
             log.warning(
-                "openclaw.nonzero_exit", code=proc.returncode, stderr=err[:500]
+                "openclaw.nonzero_exit",
+                code=proc.returncode,
+                stderr=err[:500],
+                stdout_tail=raw[-2000:] if raw else "",
             )
             return BackendResult(
                 success=False,

@@ -106,5 +106,8 @@ surveyor:
     max_files_per_cluster_context: 20
     body_preview_chars: 200
     min_cluster_size_to_label: 2
+    # Drop any LLM-suggested relationship whose confidence is below this gate.
+    # Raised from the historical 0.5 default to filter out low-grounding guesses.
+    min_relationship_confidence: 0.65
   state:
     path: "./data/surveyor_state.json"

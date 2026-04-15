@@ -32,9 +32,24 @@ Respond with ONLY a JSON array of tag strings. Example: ["construction/residenti
 RELATIONSHIP_PROMPT = """\
 You are analyzing documents from an Obsidian vault that were found to be semantically related (in the same cluster) but don't currently link to each other.
 
-For each pair, suggest whether a relationship exists and what type it is.
+For each pair, decide whether a REAL relationship exists — grounded in concrete facts, not generic theme.
 
-Possible relationship types: "related-to", "supports", "depends-on", "part-of", "supersedes", "contradicts"
+GROUNDEDNESS RULE (hard requirement):
+Only suggest a relationship if both records share an explicit factual anchor — a named person, organization, project, product, date/date-range, location, or event mentioned in BOTH records. Generic thematic similarity ("both are organizations", "both offer services", "both are tech companies", "both are marketing emails") is NOT an acceptable anchor. If you cannot point to a concrete shared entity present in both texts, emit nothing for that pair.
+
+You must cite a short verbatim phrase from each side as "source_anchor" and "target_anchor". If you cannot cite both, DO NOT emit the relationship — drop the pair.
+
+Allowed relationship types (use exactly one, with the definition shown):
+- "related-to": both records reference the same named entity (person/org/project/event/location) but neither depends on nor supports the other.
+- "supports": the target provides evidence, documentation, or justification for a specific claim or decision stated in the source.
+- "depends-on": the source cannot function, be completed, or be understood without the target (prerequisite or required input).
+- "part-of": the source is a component, subset, phase, or deliverable of a larger whole named in the target.
+- "supersedes": the source explicitly replaces, overrides, or obsoletes the target (same subject, later version or decision).
+
+Do NOT use any other relationship type. In particular, do NOT emit "contradicts" — contradiction analysis is handled elsewhere, not here.
+
+NEGATIVE EXAMPLE (do not do this):
+BAD: `org/DigitalOcean.md → org/Marriott.md` type "related-to" with rationale "both are large enterprises offering services" — REJECTED. No named person, project, event, date, or location appears in both records. Generic "both are companies" is not a factual anchor. Drop the pair.
 
 Documents:
 {pairs}
@@ -42,11 +57,13 @@ Documents:
 Respond with ONLY a JSON array of objects, each with:
 - "source": source file path
 - "target": target file path
-- "type": relationship type
-- "context": brief explanation (max 50 chars)
+- "type": one of the allowed relationship types above
+- "context": brief explanation naming the shared anchor (max 80 chars)
 - "confidence": float 0-1
+- "source_anchor": short verbatim phrase (<= 80 chars) from the source that mentions the shared entity
+- "target_anchor": short verbatim phrase (<= 80 chars) from the target that mentions the same shared entity
 
-Only include pairs where confidence >= 0.5. If no relationships are found, return [].
+Only include pairs where confidence >= 0.65 AND both anchors are present. If no grounded relationships are found, return [].
 """
 
 # Rate limiting
@@ -66,6 +83,7 @@ class Labeler:
         self.max_files = labeler_cfg.max_files_per_cluster_context
         self.body_preview_chars = labeler_cfg.body_preview_chars
         self.min_cluster_size = labeler_cfg.min_cluster_size_to_label
+        self.min_relationship_confidence = labeler_cfg.min_relationship_confidence
 
     async def label_cluster(
         self,
@@ -125,8 +143,8 @@ class Labeler:
                 return [
                     r for r in rels
                     if isinstance(r, dict)
-                    and all(k in r for k in ("source", "target", "type", "context", "confidence"))
-                    and r["confidence"] >= 0.5
+                    and all(k in r for k in ("source", "target", "type", "context", "confidence", "source_anchor", "target_anchor"))
+                    and r["confidence"] >= self.min_relationship_confidence
                 ]
         except (json.JSONDecodeError, TypeError):
             log.warning("labeler.rel_parse_error", cluster_id=cluster_id, response=response[:200])

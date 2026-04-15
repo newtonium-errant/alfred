@@ -12,6 +12,7 @@ from datetime import date
 from pathlib import Path
 
 import frontmatter
+import structlog
 import yaml
 
 from . import obsidian
@@ -23,6 +24,8 @@ from .schema import (
     STATUS_BY_TYPE,
     TYPE_DIRECTORY,
 )
+
+log = structlog.get_logger(__name__)
 
 
 class VaultError(Exception):
@@ -118,6 +121,27 @@ def _check_directory(record_type: str, rel_path: str) -> str | None:
     parts = rel_path.replace("\\", "/").split("/")
     if len(parts) > 1 and parts[0] != expected_dir:
         return f"Type '{record_type}' expected in '{expected_dir}/', found in '{parts[0]}/'"
+    return None
+
+
+def _check_near_match(vault_path: Path, record_type: str, name: str) -> str | None:
+    """Return a warning if a case-insensitive filename collision exists.
+
+    Prevents accidental dedup misses like 'PocketPills' vs 'Pocketpills'.
+    This is a safety net, not a hard gate — the create still proceeds.
+    """
+    directory = TYPE_DIRECTORY.get(record_type, record_type)
+    type_dir = vault_path / directory
+    if not type_dir.is_dir():
+        return None
+    target = name.casefold()
+    for existing in type_dir.glob("*.md"):
+        if existing.stem.casefold() == target and existing.stem != name:
+            return (
+                f"Near-match exists: '{directory}/{existing.stem}.md' "
+                f"(case-insensitive match for '{name}'). "
+                f"Verify this is not a duplicate before continuing."
+            )
     return None
 
 
@@ -424,6 +448,16 @@ def vault_create(
     dir_warn = _check_directory(record_type, rel_path)
     if dir_warn:
         warnings.append(dir_warn)
+
+    # Check for case-insensitive near-match (dedup safety net)
+    near_warn = _check_near_match(vault_path, record_type, name)
+    if near_warn:
+        warnings.append(near_warn)
+        log.warning(
+            "vault_create.near_match",
+            new_path=rel_path,
+            near_match=near_warn,
+        )
 
     # Check wikilinks
     wl_warns = _check_wikilinks(final_body, fm, vault_path)

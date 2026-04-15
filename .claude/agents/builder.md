@@ -46,6 +46,21 @@ When adding a new tool, copy this pattern exactly. When modifying an existing to
 - When adding a new backend (e.g., OllamaBackend), add a branch to `_call_llm`
 - Backends all return text output; the pipeline parses it
 
+### Subprocess Failure Logging
+Whenever you log a non-zero subprocess exit, always capture BOTH stderr and a stdout tail:
+```python
+log.warning(
+    "subsystem.nonzero_exit",
+    code=proc.returncode,
+    stderr=err[:500],
+    stdout_tail=raw[-2000:] if raw else "",
+)
+```
+- **Why:** rate-limit and quota messages from `claude -p` land on stdout, not stderr. Stderr-only logging produced silent failures on 2026-04-14/15 (distiller consolidation) with `stderr=''` and an empty summary, forcing a manual `claude -p "OK"` probe to diagnose.
+- **The `stdout_tail=""` sentinel is load-bearing.** Emit it explicitly even when stdout is empty — the "no diagnostic output at all" signature is grep-able as `stdout_tail=''`.
+- **For enriched summaries** (e.g., `pipeline.llm_failed`): build a summary string as `f"Exit code {code}: {detail}"` where detail is first 200 chars of stdout, falling back to first 200 chars of stderr, falling back to `"(no output)"`. Never let the summary trail with a bare colon.
+- **Applies to:** every subprocess dispatcher (backends/cli.py, backends/openclaw.py, pipeline.py _call_llm, any new integration). Same pattern, same field names.
+
 ### Orchestrator Integration
 - Register new tools in `TOOL_RUNNERS` dict in orchestrator.py
 - Tools without skills_dir (surveyor, mail, brief) use `(raw, suppress_stdout)` signature

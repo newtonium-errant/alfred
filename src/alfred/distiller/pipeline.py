@@ -269,10 +269,26 @@ async def _call_llm(
         result = await backend.process(prompt=prompt, vault_path=vault_path)
 
         if not result.success:
+            # Enrich the failure log with stdout diagnostics. The backend's
+            # summary alone reads "Exit code 1: " when both stdout and stderr
+            # are empty — we surface the first 200 chars of stdout (rate-limit
+            # messages and similar errors front-load) plus a tail for grep.
+            raw_stdout = result.stdout or ""
+            raw_stderr = result.stderr or ""
+            if raw_stdout:
+                detail = raw_stdout[:200]
+            elif raw_stderr:
+                detail = raw_stderr[:200]
+            else:
+                detail = "(no output)"
+            enriched_summary = f"Exit code 1: {detail}"
             log.warning(
                 "pipeline.llm_failed",
                 stage=stage_label,
-                summary=result.summary[:500],
+                summary=enriched_summary[:500],
+                backend_summary=result.summary[:500],
+                stdout_tail=raw_stdout[-2000:] if raw_stdout else "",
+                stderr=raw_stderr[:500],
             )
         else:
             log.info(
@@ -365,6 +381,7 @@ async def _call_llm(
                 stage=stage_label,
                 code=proc.returncode,
                 stderr=err[:500],
+                stdout_tail=raw[-2000:] if raw else "",
             )
             return raw
 

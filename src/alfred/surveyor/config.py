@@ -66,6 +66,7 @@ class LabelerConfig:
     max_files_per_cluster_context: int = 20
     body_preview_chars: int = 200
     min_cluster_size_to_label: int = 2
+    min_relationship_confidence: float = 0.65
 
 
 @dataclass

@@ -16,6 +16,9 @@ class BackendResult:
     success: bool = False
     summary: str = ""
     files_changed: list[str] = field(default_factory=list)
+    stdout: str = ""  # Raw subprocess stdout — used by pipeline.py to surface
+                      # diagnostic output (e.g. rate-limit messages) on failure.
+    stderr: str = ""  # Raw subprocess stderr — same purpose.
 
 
 VAULT_CLI_REFERENCE = """

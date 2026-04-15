@@ -68,10 +68,17 @@ class ClaudeBackend(BaseBackend):
         err = stderr.decode("utf-8", errors="replace")
 
         if proc.returncode != 0:
-            log.warning("claude.nonzero_exit", code=proc.returncode, stderr=err[:500])
+            log.warning(
+                "claude.nonzero_exit",
+                code=proc.returncode,
+                stderr=err[:500],
+                stdout_tail=raw[-2000:],
+            )
             return BackendResult(
                 success=False,
                 summary=f"Exit code {proc.returncode}: {err[:500]}",
+                stdout=raw,
+                stderr=err,
             )
 
         log.info("claude.completed", summary_length=len(raw))

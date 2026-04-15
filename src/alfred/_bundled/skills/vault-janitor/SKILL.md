@@ -504,9 +504,26 @@ Moving files breaks wikilinks. Human must decide.
 
 ### DUP001 — DUPLICATE_NAME
 
-**Diagnosis:** Another record of the same type has the same name.
+**Diagnosis:** Another record of the same type has the same name (including case-variant names like `PocketPills` vs `Pocketpills` — the filesystem treats these as distinct but the vault treats them as the same entity).
 
-**Fix:** NEVER merge automatically. Flag with `janitor_note: "DUP001 — possible duplicate of [[{other_path}]]"`.
+**Default fix:** NEVER merge automatically during an autonomous sweep. Flag with `janitor_note: "DUP001 — possible duplicate of [[{other_path}]]"`.
+
+**Operator-directed merge procedure:** When a human operator explicitly instructs you to merge a duplicate pair (winner = the canonical name to keep, loser = the variant to remove), follow these steps IN ORDER. Do NOT skip the follow-link sweep — it is the most commonly missed step and leaves behind ghost duplicates in adjacent directories.
+
+1. **Pick the winner.** Use the operator's chosen canonical form. If not specified, prefer the casing that matches how the entity self-identifies (website, letterhead, etc.).
+2. **Merge the two records themselves.** Copy any unique frontmatter fields and body content from the loser into the winner. Delete the loser record.
+3. **Follow-link sweep (MANDATORY).** For BOTH the winner's name and the loser's name, grep the vault for inbound wikilinks **case-insensitively**. Example: if merging `org/Pocketpills` (winner) into `org/PocketPills` (loser), search for `[[org/PocketPills` AND `[[org/Pocketpills` AND any other case variants you see in the filenames. Use `alfred vault search` or `grep -ri`.
+4. **Inspect files containing inbound links.** For each file found in step 3, check whether that file has a **case-variant sibling** in its own directory whose filename differs only in capitalization of the merged entity's name. Example: after merging the org, you find `note/PocketPills Ozempic Order Preparation 2026-04-13.md` AND `note/Pocketpills Ozempic Order Preparation 2026-04-13.md` — these are sibling duplicates caused by the original split and MUST be merged too via this same procedure. Recurse AT MOST ONE additional hop to prevent runaway sweeps. If a second-hop merge reveals further case-variant siblings, flag them with `janitor_note` for a follow-up pass rather than recursing further.
+5. **Retarget inbound links.** In every file that linked to the loser, rewrite the wikilink to point at the winner. Match case-insensitively but replace with the winner's exact casing. This includes frontmatter fields (`org: "[[org/PocketPills]]"` → `org: "[[org/Pocketpills]]"`) and body prose.
+6. **Verify.** After the sweep, re-grep for the loser's name. Zero hits = clean merge. Any remaining hits must be explained in the action log.
+
+**Worked example — PocketPills/Pocketpills (2026-04-13):**
+- Operator merged `org/PocketPills` into `org/Pocketpills` (winner: lowercase-p variant).
+- The org records themselves were merged cleanly.
+- Follow-link sweep grepped case-insensitively for `[[org/pocketpills` and found inbound links from `note/` and `account/`.
+- Inspecting the `note/` hits revealed a case-variant sibling pair: `note/PocketPills Ozempic Order Preparation 2026-04-13.md` and `note/Pocketpills Ozempic Order Preparation 2026-04-13.md`. Both existed, both had nearly identical content — one was created before the org normalization, one after.
+- These notes were merged via the same DUP001 procedure (one hop deeper), then their inbound links were retargeted.
+- Lesson: an entity merge is never just about the two entity records. Downstream records that reference the entity in their own filenames propagate the case variance and become duplicate siblings. Always sweep one hop out. This complements the Layer 1 dedup rules in the curator SKILL (which prevent the duplicate pair from being created in the first place).
 
 ### SEM001–SEM004 — Semantic Drift (Scanner-Detected)
 
