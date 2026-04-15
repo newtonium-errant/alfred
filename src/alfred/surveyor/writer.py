@@ -64,6 +64,24 @@ class VaultWriter:
 
         existing_rels: list[dict] = post.metadata.get("relationships", [])
 
+        # Dedupe the incoming batch against itself before touching the file.
+        # The labeler sometimes emits near-duplicate rels in a single call
+        # (same source+target, possibly with different confidence/context);
+        # without this pass each near-dupe would drive a separate append +
+        # log line. Key on (target, type) so genuinely distinct relationship
+        # types between the same pair survive if the policy ever changes,
+        # while exact-pair dupes collapse to the first occurrence.
+        deduped_new: list[dict] = []
+        seen_new: set[tuple[str, str]] = set()
+        for rel in new_rels:
+            key = (rel.get("target", ""), rel.get("type", ""))
+            if not key[0]:
+                continue
+            if key in seen_new:
+                continue
+            seen_new.add(key)
+            deduped_new.append(rel)
+
         # Build set of existing machine-generated relationship targets
         existing_targets = set()
         for rel in existing_rels:
@@ -72,7 +90,7 @@ class VaultWriter:
 
         # Only add truly new relationships
         added = 0
-        for rel in new_rels:
+        for rel in deduped_new:
             target = rel.get("target", "")
             if target and target not in existing_targets:
                 existing_rels.append(rel)

@@ -19,7 +19,11 @@ from .writer import VaultWriter
 
 log = structlog.get_logger()
 
-LOOP_INTERVAL = 5.0  # seconds
+# Fallback if watcher config is missing — matches WatcherConfig default.
+# The actual per-tick sleep comes from self.cfg.watcher.debounce_seconds so
+# the daemon wakes in step with the debounce window rather than spinning
+# through useless ticks mid-debounce.
+DEFAULT_LOOP_INTERVAL = 30.0
 
 
 class Daemon:
@@ -64,10 +68,15 @@ class Daemon:
         # Start filesystem watcher
         self.watcher.start()
 
+        # Sleep at the debounce cadence: polling faster than the debounce
+        # window just spins through ticks that find nothing to do.
+        loop_interval = getattr(
+            self.cfg.watcher, "debounce_seconds", DEFAULT_LOOP_INTERVAL
+        )
         try:
             while not self._shutdown_requested:
                 await self._tick()
-                await asyncio.sleep(LOOP_INTERVAL)
+                await asyncio.sleep(loop_interval)
         finally:
             await self.shutdown()
 
@@ -248,11 +257,17 @@ class Daemon:
                     last_labeled=datetime.now(timezone.utc).isoformat(),
                 )
 
-            # Suggest relationships
+            # Suggest relationships. Group by source so the writer sees all
+            # new rels for a file in a single call — this lets it dedupe the
+            # batch against itself (and against the file's existing rels) and
+            # write the file at most once per source, emitting one log line.
             rels = await self.labeler.suggest_relationships(cid, members, records)
+            rels_by_source: dict[str, list[dict]] = {}
             for rel in rels:
                 source = rel.get("source", "")
                 if source in records:
-                    self.writer.write_relationships(source, [rel])
+                    rels_by_source.setdefault(source, []).append(rel)
+            for source, source_rels in rels_by_source.items():
+                self.writer.write_relationships(source, source_rels)
 
         log.info("daemon.labeling_complete", clusters_processed=len(all_changed))
