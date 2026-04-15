@@ -1,6 +1,6 @@
 vault:
   path: "./vault"
-  ignore_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view"]
+  ignore_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox"]
   ignore_files: [".gitkeep"]
 
 agent:

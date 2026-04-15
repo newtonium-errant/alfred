@@ -88,7 +88,7 @@ class VaultWriter:
 
     def _write_atomic(self, full_path: Path, rel_path: str, post: frontmatter.Post) -> None:
         """Write file atomically and register expected hash in state."""
-        content = frontmatter.dumps(post)
+        content = frontmatter.dumps(post) + "\n"
         content_bytes = content.encode("utf-8")
         expected_md5 = compute_md5_bytes(content_bytes)
 

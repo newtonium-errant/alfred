@@ -13,7 +13,7 @@ import yaml
 @dataclass
 class VaultConfig:
     path: Path
-    ignore_dirs: list[str] = field(default_factory=lambda: ["_templates", "_bases", "_docs", ".obsidian", "view"])
+    ignore_dirs: list[str] = field(default_factory=lambda: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox"])
     ignore_files: list[str] = field(default_factory=lambda: [".gitkeep"])
 
 

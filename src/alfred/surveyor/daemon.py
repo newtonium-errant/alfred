@@ -51,6 +51,12 @@ class Daemon:
         log.info("daemon.starting")
         self.state.load()
 
+        # Purge any pre-existing state + Milvus rows for paths that now fall
+        # under ignore_dirs. Without this, stale entries from a prior config
+        # would keep appearing in cluster memberships and getting re-labeled,
+        # driving continuous re-writes of session/inbox files.
+        self._purge_ignored_paths()
+
         # Initial sync if no state exists
         if not self.state.files:
             await self._initial_sync()
@@ -64,6 +70,51 @@ class Daemon:
                 await asyncio.sleep(LOOP_INTERVAL)
         finally:
             await self.shutdown()
+
+    def _is_ignored(self, rel_path: str) -> bool:
+        """Check whether a vault-relative path falls under any ignored directory."""
+        parts = rel_path.split("/")
+        ignore_dirs = set(self.cfg.vault.ignore_dirs)
+        for part in parts[:-1]:
+            if part in ignore_dirs:
+                return True
+        return False
+
+    def _purge_ignored_paths(self) -> None:
+        """Drop any state rows + Milvus rows whose path is now under ignore_dirs.
+
+        Needed when ignore_dirs is expanded in config: pre-existing embeddings
+        from the prior config would otherwise keep appearing in cluster
+        memberships and get re-labeled every tick, causing continuous rewrites.
+        """
+        # Purge from in-memory state
+        ignored_state = [p for p in self.state.files if self._is_ignored(p)]
+        for rel in ignored_state:
+            self.state.remove_file(rel)
+
+        # Purge from Milvus — collect all stored ids and delete any that match
+        purged_milvus = 0
+        embedding_data = self.embedder.get_all_embeddings()
+        if embedding_data is not None:
+            paths, _ = embedding_data
+            for rel in paths:
+                if self._is_ignored(rel):
+                    try:
+                        self.embedder.milvus.delete(
+                            collection_name=self.embedder.collection_name,
+                            filter=f'id == "{rel}"',
+                        )
+                        purged_milvus += 1
+                    except Exception as e:
+                        log.warning("daemon.purge_delete_error", path=rel, error=str(e))
+
+        if ignored_state or purged_milvus:
+            log.info(
+                "daemon.purged_ignored_paths",
+                state_removed=len(ignored_state),
+                milvus_removed=purged_milvus,
+            )
+            self.state.save()
 
     async def _initial_sync(self) -> None:
         """Full scan → embed all → cluster → label."""
@@ -163,10 +214,15 @@ class Daemon:
             log.info("daemon.no_changed_clusters")
             return
 
-        # Build cluster membership map (semantic)
+        # Build cluster membership map (semantic). Skip ignored paths so that
+        # stale embeddings (e.g. session/ rows surviving a config change that
+        # haven't been purged yet) cannot drive writebacks to files outside
+        # the surveyor's scope.
         cluster_members: dict[int, list[str]] = {}
         for path, cid in result.semantic.items():
             if cid == -1:
+                continue
+            if self._is_ignored(path):
                 continue
             cluster_members.setdefault(cid, []).append(path)
 

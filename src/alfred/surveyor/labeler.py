@@ -114,7 +114,12 @@ class Labeler:
             base_url=openrouter_cfg.base_url,
         )
         self.model = openrouter_cfg.model
-        self.temperature = openrouter_cfg.temperature
+        # Force deterministic labeling regardless of config value.
+        # Non-zero temperature caused identical clusters to produce different tag
+        # sets across sweeps, which drove continuous re-writes of alfred_tags on
+        # member files (including session notes). Hardcoded to 0 until/unless
+        # there's a strong reason to make it configurable again.
+        self.temperature = 0.0
         self.max_files = labeler_cfg.max_files_per_cluster_context
         self.body_preview_chars = labeler_cfg.body_preview_chars
         self.min_cluster_size = labeler_cfg.min_cluster_size_to_label
