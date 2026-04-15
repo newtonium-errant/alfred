@@ -51,14 +51,21 @@ def _load_unified_config(config_path: str) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def _setup_logging_from_config(raw: dict[str, Any]) -> None:
-    """Set up logging from the unified config's logging section."""
+def _setup_logging_from_config(raw: dict[str, Any], tool: str = "alfred") -> None:
+    """Set up logging from the unified config's logging section.
+
+    ``tool`` selects the per-tool log file: ``data/<tool>.log``. Default
+    ``"alfred"`` preserves backward compatibility for the daemon launcher
+    (``cmd_up``) and any handler that legitimately wants the shared log.
+
+    Each tool's ``utils.setup_logging`` helper has an identical signature,
+    so the choice to import curator's here is arbitrary — any of them work.
+    """
     log_cfg = raw.get("logging", {})
     level = log_cfg.get("level", "INFO")
     log_dir = log_cfg.get("dir", "./data")
-    # Each tool sets up its own logging, but we set a base level
     from alfred.curator.utils import setup_logging
-    setup_logging(level=level, log_file=f"{log_dir}/alfred.log")
+    setup_logging(level=level, log_file=f"{log_dir}/{tool}.log")
 
 
 # --- Subcommand handlers ---
@@ -195,7 +202,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 def cmd_curator(args: argparse.Namespace) -> None:
     import asyncio
     raw = _load_unified_config(args.config)
-    _setup_logging_from_config(raw)
+    _setup_logging_from_config(raw, tool="curator")
     from alfred.curator.config import load_from_unified
     config = load_from_unified(raw)
     from alfred.curator.daemon import run
@@ -222,7 +229,7 @@ def cmd_janitor(args: argparse.Namespace) -> None:
         from alfred.janitor.utils import setup_logging as _jan_setup_logging
         _jan_setup_logging(level=level, log_file=f"{log_dir}/janitor.log")
     except Exception:
-        _setup_logging_from_config(raw)
+        _setup_logging_from_config(raw, tool="janitor")
     from alfred.janitor.config import load_from_unified
     config = load_from_unified(raw)
     from alfred._data import get_skills_dir
@@ -252,7 +259,7 @@ def cmd_janitor(args: argparse.Namespace) -> None:
 
 def cmd_distiller(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
-    _setup_logging_from_config(raw)
+    _setup_logging_from_config(raw, tool="distiller")
     from alfred.distiller.config import load_from_unified
     config = load_from_unified(raw)
     from alfred._data import get_skills_dir
@@ -418,7 +425,7 @@ def cmd_process(args: argparse.Namespace) -> None:
     """Batch-process all unprocessed inbox files with progress display."""
     import asyncio
     raw = _load_unified_config(args.config)
-    _setup_logging_from_config(raw)
+    _setup_logging_from_config(raw, tool="curator")
     from alfred.curator.config import load_from_unified
     config = load_from_unified(raw)
     from alfred.curator.process import run_batch
@@ -482,7 +489,7 @@ def cmd_tui(args: argparse.Namespace) -> None:
 
 def cmd_temporal(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
-    _setup_logging_from_config(raw)
+    _setup_logging_from_config(raw, tool="temporal")
 
     try:
         from alfred.temporal import cli as tcli
@@ -508,7 +515,7 @@ def cmd_temporal(args: argparse.Namespace) -> None:
 
 def cmd_surveyor(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
-    _setup_logging_from_config(raw)
+    _setup_logging_from_config(raw, tool="surveyor")
 
     try:
         from alfred.surveyor.config import load_from_unified
@@ -529,7 +536,7 @@ def cmd_surveyor(args: argparse.Namespace) -> None:
 
 def cmd_brief(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
-    _setup_logging_from_config(raw)
+    _setup_logging_from_config(raw, tool="brief")
 
     from alfred.brief.config import load_from_unified
     from alfred.brief import cli as bcli
@@ -553,7 +560,7 @@ def cmd_brief(args: argparse.Namespace) -> None:
 
 def cmd_mail(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
-    _setup_logging_from_config(raw)
+    _setup_logging_from_config(raw, tool="mail")
 
     from alfred.mail.config import load_from_unified
     from alfred.mail.fetcher import fetch_all
