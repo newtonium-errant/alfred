@@ -1,23 +1,39 @@
 ---
-type: session
-status: completed
+alfred_tags:
+- automation/email-integration
+- system-buildout
+created: '2026-04-02'
+description: Extended email pipeline to full triage/filing, added KAIROS-inspired
+  features, established team conventions
+distiller_signals: constraint:1, contradiction:1, has_outcome
+intent: Build email triage and filing, strengthen knowledge management, document team
+  conventions
 name: Email Pipeline and Knowledge Management
-description: Extended email pipeline to full triage/filing, added KAIROS-inspired features, established team conventions
-intent: Build email triage and filing, strengthen knowledge management, document team conventions
-project:
-- "[[project/Alfred]]"
-participants:
-- "[[person/Andrew Newton]]"
 outputs: []
+participants:
+- '[[person/Andrew Newton]]'
+project:
+- '[[project/Alfred]]'
 related:
-- "[[session/Alfred Setup and Email Integration 2026-03-26]]"
-relationships: []
-created: "2026-04-02"
+- '[[session/Alfred Setup and Email Integration 2026-03-26]]'
+relationships:
+- confidence: 0.7
+  context: Both involve system management.
+  source: session/Email Pipeline and Knowledge Management 2026-04-02.md
+  target: session/Ollama Local LLM and System Buildout 2026-04-08.md
+  type: related-to
+- confidence: 0.7
+  context: Security for email management.
+  source: session/Email Pipeline and Knowledge Management 2026-04-02.md
+  target: session/System Hardening and Agent Team 2026-04-14.md
+  type: supports
+status: completed
 tags:
 - email
 - triage
 - kairos
 - aftermath-lab
+type: session
 ---
 
 # Email Pipeline and Knowledge Management — 2026-04-02

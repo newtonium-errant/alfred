@@ -1,19 +1,24 @@
 ---
-type: session
-status: completed
+alfred_tags:
+- automation/email-integration
+- system-buildout
+created: '2026-04-14'
+description: Consolidation unblock, surveyor activation, Morning Brief, agent team
+  setup, vault snapshots, curator duplication fix
+distiller_signals: decision:1, constraint:3, contradiction:3, has_outcome
+intent: Unblock deferred features, build Morning Brief, establish agent team, harden
+  system reliability
 name: System Hardening and Agent Team
-description: "Consolidation unblock, surveyor activation, Morning Brief, agent team setup, vault snapshots, curator duplication fix"
-intent: Unblock deferred features, build Morning Brief, establish agent team, harden system reliability
-project:
-- "[[project/Alfred]]"
-participants:
-- "[[person/Andrew Newton]]"
 outputs:
-- "[[run/Morning Brief 2026-04-14]]"
+- '[[run/Morning Brief 2026-04-14]]'
+participants:
+- '[[person/Andrew Newton]]'
+project:
+- '[[project/Alfred]]'
 related:
-- "[[session/Ollama Local LLM and System Buildout 2026-04-08]]"
+- '[[session/Ollama Local LLM and System Buildout 2026-04-08]]'
 relationships: []
-created: "2026-04-14"
+status: completed
 tags:
 - consolidation
 - surveyor
@@ -22,6 +27,7 @@ tags:
 - vault-snapshots
 - curator-fix
 - infrastructure
+type: session
 ---
 
 # System Hardening and Agent Team — 2026-04-14

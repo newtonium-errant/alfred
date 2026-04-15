@@ -1,26 +1,46 @@
 ---
-type: session
-status: completed
-name: Alfred Setup and Email Integration
-description: First session — setup, email pipeline, multi-instance design, Aftermath-Lab creation
+alfred_tags:
+- automation/email-integration
+- system-buildout
+created: '2026-03-26'
+description: First session — setup, email pipeline, multi-instance design, Aftermath-Lab
+  creation
+distiller_signals: constraint:1, has_outcome
 intent: Get Alfred running, build email pipeline, design multi-instance ecosystem
-project:
-- "[[project/Alfred]]"
-participants:
-- "[[person/Andrew Newton]]"
+name: Alfred Setup and Email Integration
 outputs:
-- "[[org/Anthropic]]"
-- "[[asset/Claude Code]]"
-- "[[note/Claude Code VS Code Setup]]"
-- "[[project/Alfred]]"
+- '[[org/Anthropic]]'
+- '[[asset/Claude Code]]'
+- '[[note/Claude Code VS Code Setup]]'
+- '[[project/Alfred]]'
+participants:
+- '[[person/Andrew Newton]]'
+project:
+- '[[project/Alfred]]'
 related: []
-relationships: []
-created: "2026-03-26"
+relationships:
+- confidence: 0.8
+  context: Email integration supports pipeline setup.
+  source: session/Alfred Setup and Email Integration 2026-03-26.md
+  target: session/Email Pipeline and Knowledge Management 2026-04-02.md
+  type: supports
+- confidence: 0.5
+  context: Both involve system setup.
+  source: session/Alfred Setup and Email Integration 2026-03-26.md
+  target: session/Ollama Local LLM and System Buildout 2026-04-08.md
+  type: related-to
+- confidence: 0.6
+  context: Email setup for security.
+  source: session/Alfred Setup and Email Integration 2026-03-26.md
+  target: session/System Hardening and Agent Team 2026-04-14.md
+  type: supports
+status: completed
 tags:
 - setup
 - email
 - design
 - aftermath-lab
+type: session
 ---
 
 # Alfred Setup and Email Integration — 2026-03-26 to 2026-03-31

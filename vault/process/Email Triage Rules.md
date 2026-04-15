@@ -1,18 +1,24 @@
 ---
-type: process
-status: active
-name: Email Triage Rules
-description: Living rules for how Alfred prioritizes, categorizes, and files incoming email
-owner: "[[person/Andrew Newton]]"
-frequency: as-needed
 area: email
+created: '2026-04-02'
 depends_on: []
+description: Living rules for how Alfred prioritizes, categorizes, and files incoming
+  email
+frequency: as-needed
 governed_by: []
+janitor_note: LINK001 — [[person/Andrew Newton]] does not exist. No person record
+  found for the vault owner. Create person/Andrew Newton.md to resolve.
+name: Email Triage Rules
+owner: '[[person/Andrew Newton]]'
 related:
-- "[[project/Alfred]]"
+- '[[project/Alfred]]'
 relationships: []
-created: "2026-04-02"
-tags: [email, triage, living-document]
+status: active
+tags:
+- email
+- triage
+- living-document
+type: process
 ---
 
 # Email Triage Rules
