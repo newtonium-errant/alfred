@@ -29,7 +29,16 @@ log = structlog.get_logger(__name__)
 
 
 class VaultError(Exception):
-    """Raised when a vault operation fails validation."""
+    """Raised when a vault operation fails validation.
+
+    Optional ``details`` dict carries structured error metadata that the CLI
+    layer surfaces to callers (e.g., the canonical path of a near-match
+    collision so the agent can pivot to ``vault_edit``).
+    """
+
+    def __init__(self, message: str, *, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.details = details
 
 
 def _resolve_vault_path(vault_path: Path, rel_path: str) -> Path:
@@ -124,11 +133,16 @@ def _check_directory(record_type: str, rel_path: str) -> str | None:
     return None
 
 
-def _check_near_match(vault_path: Path, record_type: str, name: str) -> str | None:
-    """Return a warning if a case-insensitive filename collision exists.
+def _check_near_match(
+    vault_path: Path, record_type: str, name: str
+) -> tuple[str, str] | None:
+    """Return ``(canonical_rel_path, message)`` if a case-insensitive filename
+    collision exists, else ``None``.
 
     Prevents accidental dedup misses like 'PocketPills' vs 'Pocketpills'.
-    This is a safety net, not a hard gate — the create still proceeds.
+    This is a hard gate inside ``vault_create``: the caller raises ``VaultError``
+    with ``details={"canonical_path": ..., "reason": "near_match"}`` so the
+    requesting agent can pivot to ``vault_edit`` on the existing record.
     """
     directory = TYPE_DIRECTORY.get(record_type, record_type)
     type_dir = vault_path / directory
@@ -137,11 +151,13 @@ def _check_near_match(vault_path: Path, record_type: str, name: str) -> str | No
     target = name.casefold()
     for existing in type_dir.glob("*.md"):
         if existing.stem.casefold() == target and existing.stem != name:
-            return (
-                f"Near-match exists: '{directory}/{existing.stem}.md' "
+            canonical = f"{directory}/{existing.stem}.md"
+            message = (
+                f"Near-match exists: '{canonical}' "
                 f"(case-insensitive match for '{name}'). "
-                f"Verify this is not a duplicate before continuing."
+                f"Use vault_edit on the existing record instead of creating a duplicate."
             )
+            return canonical, message
     return None
 
 
@@ -397,6 +413,28 @@ def vault_create(
     if file_path.exists():
         raise VaultError(f"File already exists: {rel_path}")
 
+    # Case-insensitive near-match is a hard refusal. This runs before any
+    # file write so a duplicate spelling can never land on disk. The caller
+    # gets the canonical path in VaultError.details so it can pivot to
+    # vault_edit on the existing record.
+    near = _check_near_match(vault_path, record_type, name)
+    if near is not None:
+        canonical_path, message = near
+        log.error(
+            "vault_create.refused",
+            reason="near_match",
+            attempted_path=rel_path,
+            canonical_path=canonical_path,
+        )
+        raise VaultError(
+            message,
+            details={
+                "canonical_path": canonical_path,
+                "reason": "near_match",
+                "attempted_path": rel_path,
+            },
+        )
+
     # Load template if available
     template = _load_template(vault_path, record_type)
     if template:
@@ -443,21 +481,11 @@ def vault_create(
         # Process template body — replace {{title}} and {{date}}
         final_body = template_body.replace("{{title}}", name).replace("{{date}}", date.today().isoformat())
 
-    # Check directory placement
+    # Check directory placement (soft warning — still writes)
     warnings: list[str] = []
     dir_warn = _check_directory(record_type, rel_path)
     if dir_warn:
         warnings.append(dir_warn)
-
-    # Check for case-insensitive near-match (dedup safety net)
-    near_warn = _check_near_match(vault_path, record_type, name)
-    if near_warn:
-        warnings.append(near_warn)
-        log.warning(
-            "vault_create.near_match",
-            new_path=rel_path,
-            near_match=near_warn,
-        )
 
     # Check wikilinks
     wl_warns = _check_wikilinks(final_body, fm, vault_path)

@@ -342,13 +342,23 @@ def _normalize_name(name: str, entity_type: str) -> str:
 
 
 def _entity_exists(vault_path: Path, entity_type: str, name: str) -> str | None:
-    """Check if an entity already exists. Returns rel_path if found, else None."""
+    """Check if an entity already exists (case-insensitive).
+
+    Returns the canonical rel_path as it lives on disk (preserving the
+    existing file's casing) if a case-insensitive stem match is found,
+    otherwise None. This prevents Stage 2 from creating duplicate records
+    like ``org/PocketPills.md`` when ``org/Pocketpills.md`` already exists.
+    """
     from alfred.vault.schema import TYPE_DIRECTORY
 
     directory = TYPE_DIRECTORY.get(entity_type, entity_type)
-    candidate = vault_path / directory / f"{name}.md"
-    if candidate.exists():
-        return f"{directory}/{name}.md"
+    type_dir = vault_path / directory
+    if not type_dir.is_dir():
+        return None
+    target = name.casefold()
+    for candidate in type_dir.glob("*.md"):
+        if candidate.stem.casefold() == target:
+            return f"{directory}/{candidate.stem}.md"
     return None
 
 
@@ -414,6 +424,21 @@ def _resolve_entities(
             log_mutation(session_path, "create", rel_path)
             log.info("pipeline.s2_entity_created", entity=entity_key, path=rel_path)
         except VaultError as e:
+            details = getattr(e, "details", None) or {}
+            # Near-match collision: vault_create refused because a record with
+            # a matching casefolded name already exists. Reuse the canonical
+            # path from the structured error details so downstream stages
+            # reference the existing record instead of dropping the entity.
+            if details.get("reason") == "near_match" and details.get("canonical_path"):
+                canonical_path = details["canonical_path"]
+                resolved[entity_key] = canonical_path
+                log.info(
+                    "pipeline.s2_entity_near_match_reused",
+                    entity=entity_key,
+                    attempted_path=f"{directory}/{name}.md",
+                    canonical_path=canonical_path,
+                )
+                continue
             log.warning("pipeline.s2_create_failed", entity=entity_key, error=str(e))
             # If creation failed because it already exists, record the path anyway
             if "already exists" in str(e).lower():

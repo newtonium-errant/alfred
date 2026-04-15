@@ -47,8 +47,11 @@ def _output(data: dict) -> None:
     print(json.dumps(data, default=str))
 
 
-def _error(msg: str, code: int = 1) -> None:
-    print(json.dumps({"error": msg}))
+def _error(msg: str, code: int = 1, details: dict | None = None) -> None:
+    payload: dict = {"error": msg}
+    if details:
+        payload["details"] = details
+    print(json.dumps(payload, default=str))
     sys.exit(code)
 
 
@@ -156,7 +159,7 @@ def cmd_create(args: argparse.Namespace) -> None:
         log_mutation(_session(), "create", result["path"])
         _output(result)
     except VaultError as e:
-        _error(str(e))
+        _error(str(e), details=getattr(e, "details", None))
 
 
 def cmd_edit(args: argparse.Namespace) -> None:
