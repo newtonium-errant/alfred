@@ -265,6 +265,30 @@ def cmd_distiller(args: argparse.Namespace) -> None:
 
 
 def cmd_vault(args: argparse.Namespace) -> None:
+    # Route logs to a dedicated file sink. The vault CLI emits JSON on stdout
+    # that calling agents parse, so logging MUST NOT leak to stdout. We use a
+    # shared ./data/vault.log (appended to atomically by the FileHandler) so
+    # warnings like `vault_create.near_match` are observable regardless of
+    # which daemon (curator/janitor/distiller) invoked the subprocess.
+    try:
+        raw = _load_unified_config(args.config)
+        log_cfg = raw.get("logging", {})
+        level = log_cfg.get("level", "INFO")
+        log_dir = log_cfg.get("dir", "./data")
+        from alfred.curator.utils import setup_logging
+        setup_logging(
+            level=level,
+            log_file=f"{log_dir}/vault.log",
+            suppress_stdout=True,
+        )
+    except SystemExit:
+        # _load_unified_config calls sys.exit on missing config; swallow so
+        # vault CLI still works in environments without config.yaml.
+        pass
+    except Exception:
+        # Never let logging setup break the vault CLI contract (JSON stdout).
+        pass
+
     from alfred.vault.cli import handle_vault_command
     handle_vault_command(args)
 

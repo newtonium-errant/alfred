@@ -41,6 +41,10 @@ class InboxHandler(FileSystemEventHandler):
             return
         if path.name.startswith("."):
             return
+        # Skip curator's own lock sidecars (see daemon._claim_file) — these
+        # were re-triggering the pipeline on themselves and producing duplicates.
+        if path.suffix == ".lock":
+            return
         with self._lock:
             self._pending[str(path)] = time.time()
             log.debug("watcher.event", path=str(path))
@@ -99,6 +103,12 @@ class InboxWatcher:
             if not md_file.is_file():
                 continue
             if md_file.name.startswith(".") or md_file.name in _skip_names:
+                continue
+            # Skip curator's own lock sidecars (see daemon._claim_file). These
+            # are created in-place next to the inbox file during processing and
+            # must never be treated as a fresh inbox entry — doing so caused
+            # duplicate record generation on 2026-04-15.
+            if md_file.suffix == ".lock":
                 continue
             # Check frontmatter status (handles edge case where move failed)
             try:

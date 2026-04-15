@@ -832,6 +832,92 @@ Before creating ANY standing entity (`person/`, `org/`, `project/`, `location/`,
 
 **If you are unsure whether two names refer to the same entity, default to REUSE.** It is far easier for the janitor to split one record later than to merge two fragmented ones.
 
+#### STEP 2a.1: HARD STOP — `vault create` near-match warnings are NOT optional
+
+This rule applies to **every** `alfred vault create` call you make — standing entities (`person/`, `org/`, `project/`, `location/`, `asset/`, `account/`, `process/`) AND activity records (`note/`, `task/`, `conversation/`, `event/`, etc.). Every type, every call.
+
+`alfred vault create` returns a JSON response. If that response contains a `warnings` array with ANY entry starting with `"Near-match exists:"`, you MUST treat it as a hard stop. No exceptions. No "but the content is different." No "but my version is the correct casing." STOP.
+
+**Critical subtlety:** the near-match check is a *soft* warning at the ops layer — the new file HAS ALREADY BEEN WRITTEN to disk when you see the warning. You are now holding two files: the existing canonical one and the one you just created. You must clean up the duplicate yourself. The daemon will not do it for you.
+
+**Mandatory recovery procedure — execute in this exact order:**
+
+1. **Stop.** Do not create any further records that reference the near-match path you just wrote. You will be referencing the existing canonical record instead.
+
+2. **Delete the file you just created.** Use the exact path from the `path` field in the response:
+   ```bash
+   alfred vault delete "<path from response>"
+   ```
+
+3. **Extract the canonical path from the warning text.** The warning is formatted `Near-match exists: '<canonical path>' (case-insensitive match for '<stem>'). ...`. The canonical path inside the single quotes is the record you must reuse.
+
+4. **Append the variant to the canonical record's `aliases` field** (for standing entities) so future searches hit it:
+   ```bash
+   alfred vault edit "<canonical path>" --append 'aliases="<variant you tried to create>"'
+   ```
+   For activity records (note, task, conversation) that don't have an `aliases` field, skip this step — the fix is simply to not duplicate the record. The canonical title already covers the content.
+
+5. **Merge any new information into the canonical record.** If your input brought new data (a role, a phone number, a new `related` link, body content), add it to the canonical record via `alfred vault edit` — don't lose the information just because you're reusing the existing file.
+
+6. **Continue the curation flow referencing the canonical path.** All downstream records (notes, tasks, etc.) must use the canonical wikilink, e.g. `"[[org/Pocketpills]]"`, never the variant you originally tried.
+
+**DO NOT:**
+- Ignore the warning and keep both files.
+- Rename either file with `vault move` to "merge" them — the delete-and-edit flow above is the supported path.
+- Treat case differences as meaningful ("PocketPills and Pocketpills are different brands"). They are not. The warning exists because they collide on a case-insensitive filesystem and in Obsidian's link resolver.
+- Proceed to STEP 3/4/5 with the duplicate still on disk.
+
+**Worked example — the PocketPills case (real failure from 2026-04-15):**
+
+Input email is a PocketPills prescription refill reminder. You correctly identify an `org/` is needed and a `note/` and a `task/` should be created.
+
+```bash
+# 1. You call vault create for the org.
+alfred vault create org "PocketPills" --set org_type=vendor --set 'description="Online pharmacy"'
+```
+Response:
+```json
+{
+  "path": "org/PocketPills.md",
+  "warnings": [
+    "Near-match exists: 'org/Pocketpills.md' (case-insensitive match for 'pocketpills'). Verify this is not a duplicate before continuing."
+  ]
+}
+```
+
+STOP. The warning fires. `org/PocketPills.md` is already on disk next to the canonical `org/Pocketpills.md`. Execute recovery:
+
+```bash
+# 2. Delete the duplicate you just created.
+alfred vault delete "org/PocketPills.md"
+
+# 3. Append the variant to the canonical record's aliases.
+alfred vault edit "org/Pocketpills.md" --append 'aliases="PocketPills"'
+
+# 4. (Optional) Merge any new info your input carried — e.g. a description update.
+alfred vault edit "org/Pocketpills.md" --set 'description="Online pharmacy — prescription delivery"'
+```
+
+Now create the note and task — and the SAME rule applies to these calls:
+
+```bash
+# 5. Create the note, referencing the CANONICAL wikilink.
+alfred vault create note "Pocketpills Prescription Refill Reminder 2026-04-15" \
+  --set 'related=["[[org/Pocketpills]]"]' \
+  --set subtype=reference
+```
+If this call also returns a `Near-match exists:` warning (e.g. a `note/pocketpills prescription refill reminder 2026-04-15.md` already exists from an earlier run), repeat the same delete-and-reuse procedure on the note path. Do not create `note/Pocketpills Prescription Refill Reminder 2026-04-15.md` alongside `note/PocketPills Prescription Refill Reminder 2026-04-15.md`. Same rule for the task.
+
+```bash
+# 6. Create the task, again referencing the canonical org wikilink.
+alfred vault create task "Refill PocketPills prescription" \
+  --set 'related=["[[org/Pocketpills]]", "[[note/Pocketpills Prescription Refill Reminder 2026-04-15]]"]' \
+  --set priority=medium
+```
+If this returns a near-match warning, same procedure: delete, reuse the existing task (appending any new context via `vault edit --body-append` or `--append 'related=...'`).
+
+**The invariant:** after you finish processing an inbox file, `alfred vault list <type>` must not show two files whose lowercase names are identical. If it does, you violated this rule and your session is defective — you must fix it before STEP 6 VERIFY passes.
+
 ---
 
 ### STEP 3: EXTRACT — Identify ALL entities to create or update
@@ -1007,6 +1093,8 @@ EOF
 ```
 The CLI validates type, status, required fields, and places the file in the correct directory automatically.
 
+**Always inspect the JSON response.** If the response contains a `warnings` array with an entry starting with `"Near-match exists:"`, the file WAS still written but a case-insensitive duplicate already exists. This is a hard stop — follow the recovery procedure in **STEP 2a.1** (delete the file you just created, append the variant to `aliases` on the canonical record, reuse the canonical path). Do not proceed with downstream records until you have cleaned up the duplicate. This applies to every type — `org/`, `person/`, `note/`, `task/`, everything.
+
 ### Editing a record
 ```bash
 # Set frontmatter fields
@@ -1165,6 +1253,7 @@ Attendees: Henry, Sarah Chen, Mike Torres
 - **Don't use bare paths in frontmatter** — Always use `"[[wikilink]]"` format, not plain strings for references.
 - **Don't create records for vague references** — "Tom from the council" without a surname is too vague for a person record. Mention in body text instead.
 - **Don't create duplicate standing entities via case or spelling variants.** `PocketPills`, `Pocketpills`, and `Pocket Pills` are all the same company — they resolve to the single canonical `org/Pocketpills.md` record. If you see a case-variant or spacing-variant of an existing name, REUSE the existing record and append the variant to its `aliases` frontmatter field. Do NOT create `org/PocketPills.md` alongside `org/Pocketpills.md`.
+- **Don't ignore `Near-match exists` warnings from `vault create`.** When `alfred vault create` returns a `warnings` array entry starting with `Near-match exists:`, the duplicate HAS been written to disk. You must run the STEP 2a.1 recovery (delete the file you just created, append the variant to the canonical record's `aliases`, reuse the canonical wikilink for all downstream records). This rule applies to EVERY type, not just orgs and people — `note/`, `task/`, `conversation/` near-match warnings require the same hard stop. Two files whose lowercase names are identical in the same directory is a curator defect.
 - **Don't encode location/department/specialty in the record name.** `Alliance Dental` and `Alliance Dental Coldbrook` are the SAME org — Coldbrook is a location field, not a name discriminator. Create `org/Alliance Dental.md` with `location: "[[location/Coldbrook]]"` in frontmatter, not a parallel `org/Alliance Dental Coldbrook.md`. Same rule for `Halifax Health` vs `Halifax Health Cardiology`, `RBC` vs `RBC Bedford Branch`, etc.
 - **DO NOT move inbox files to processed** — The daemon handles this automatically after your work is complete. Moving inbox files yourself causes duplicate mutations and race conditions.
 - **Don't set status: processed on inbox files** — The daemon handles this after you finish.
