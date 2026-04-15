@@ -208,7 +208,21 @@ def cmd_curator(args: argparse.Namespace) -> None:
 
 def cmd_janitor(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
-    _setup_logging_from_config(raw)
+    # Route janitor CLI logs to data/janitor.log so standalone `alfred janitor
+    # {scan,fix,drift,...}` runs produce the same sweep events as the
+    # long-running `alfred up` daemon. Without this, structlog has no file
+    # sink configured in the CLI subprocess and every sweep emitted from a
+    # manual run disappears. Matches the `_run_janitor` daemon entry point
+    # in orchestrator.py. Wrapped in try/except so logging setup failure
+    # cannot break the handler (same defensive pattern as `cmd_vault`).
+    try:
+        log_cfg = raw.get("logging", {})
+        level = log_cfg.get("level", "INFO")
+        log_dir = log_cfg.get("dir", "./data")
+        from alfred.janitor.utils import setup_logging as _jan_setup_logging
+        _jan_setup_logging(level=level, log_file=f"{log_dir}/janitor.log")
+    except Exception:
+        _setup_logging_from_config(raw)
     from alfred.janitor.config import load_from_unified
     config = load_from_unified(raw)
     from alfred._data import get_skills_dir

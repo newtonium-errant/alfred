@@ -232,16 +232,25 @@ async def run_sweep(
             created = mutations["files_created"]
             modified = mutations["files_modified"]
             deleted = mutations["files_deleted"]
-            cleanup_session_file(session_path)
 
             # Layer 3: record any newly-created triage task IDs in state so
             # they cannot be re-surfaced on the next sweep even if closed.
+            # Heartbeat log below makes every fix-mode sweep visible in
+            # janitor.log even when `created` is empty, so a "no activity"
+            # scenario shows up as an absence of this event rather than an
+            # absence of the downstream `daemon.triage_id_recorded` event.
+            log.info("daemon.triage_scan", created_count=len(created), sweep_id=sweep_id)
             _record_triage_ids_from_created(created, config.vault.vault_path, state)
 
             # Audit log
             audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
             audit_path = str(Path(config.state.path).parent / "vault_audit.log")
             append_to_audit_log(audit_path, "janitor", audit_mutations, detail=sweep_id)
+
+            # Cleanup is the LAST session-related operation — read mutations,
+            # act on them, then cleanup. Avoids brittleness if future changes
+            # want to read session-derived data during the helper.
+            cleanup_session_file(session_path)
 
             result.files_fixed += len(modified) + len(created)
             result.files_deleted += len(deleted)
@@ -336,7 +345,6 @@ async def run_sweep(
                         created = mutations["files_created"]
                         modified = mutations["files_modified"]
                         deleted = mutations["files_deleted"]
-                        cleanup_session_file(session_path)
                     else:
                         after = snapshot_vault(vault_path, config.vault.ignore_dirs)
                         created, modified, deleted = diff_vault(before, after)
@@ -345,12 +353,21 @@ async def run_sweep(
                     # state so they cannot be re-surfaced on the next sweep
                     # even if the human closes or deletes them. Handles the
                     # empty-created case naturally (loop is a no-op).
+                    # Heartbeat log below makes every fix-mode sweep visible
+                    # in janitor.log even when `created` is empty.
+                    log.info("daemon.triage_scan", created_count=len(created), sweep_id=sweep_id)
                     _record_triage_ids_from_created(created, vault_path, state)
 
                     # Audit log
                     audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
                     audit_path = str(Path(config.state.path).parent / "vault_audit.log")
                     append_to_audit_log(audit_path, "janitor", audit_mutations, detail=sweep_id)
+
+                    # Cleanup is the LAST session-related operation — read
+                    # mutations, act on them, then cleanup. Avoids brittleness
+                    # if future changes read session-derived data in helpers.
+                    if use_mutation_log and session_path:
+                        cleanup_session_file(session_path)
 
                     result.files_fixed += len(modified) + len(created)
                     result.files_deleted += len(deleted)
