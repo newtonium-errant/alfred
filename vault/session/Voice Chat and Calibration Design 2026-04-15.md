@@ -279,7 +279,31 @@ The setting is tunable manually at any time by editing the calibration section's
 
 ### Migrating the existing `vault/user-profile.md`
 
-You currently have an untracked `vault/user-profile.md` from a prior session. When implementing this design, migrate its content into the calibration section of `person/Andrew Newton.md` and delete the standalone file. Single source of truth, one place to look for Alfred's mental model.
+Two-stage plan. MVP collapses to single source of truth; long-term reintroduces the top-level file as a convenience view without duplication.
+
+**MVP (implement with Stage 2a):** migrate the content of the existing untracked `vault/user-profile.md` into the `<!-- ALFRED:CALIBRATION -->` section of `person/Andrew Newton.md` and delete the standalone file. Single source of truth during the validation period. Every read and write goes through the person record. No duplication, no sync concerns.
+
+**Long term (re-introduce after validation):** bring back `vault/user-profile.md` as a top-level convenience file that **transcludes** the calibration sections from the primary users named in `talker.primary_users`, using Obsidian's native embed syntax. Zero duplication — the transclusions are live views, not copies. The file looks something like:
+
+```markdown
+# User Profile — Aggregated View
+
+_This file is a convenience view. Calibration content lives in the
+`<!-- ALFRED:CALIBRATION -->` sections of the person records linked below.
+Edit there for changes to take effect; this file will reflect them._
+
+## Andrew Newton
+
+![[person/Andrew Newton#Alfred's Calibration]]
+
+## (other primary users — if any, for couple's or team instances)
+
+![[person/NP#Alfred's Calibration]]
+```
+
+**Why do it this way rather than a generated file**: Obsidian's transclusion is native and free. No background regeneration job, no race condition between the canonical record and the aggregate file, no duplication to keep in sync. The top-level file is discoverable ("open user-profile.md to see Alfred's mental model") but remains a live view of the canonical data.
+
+**When to re-introduce it**: once the calibration mechanism is validated and you find yourself navigating to `person/{user}.md` frequently to check Alfred's model of you. If you never miss the top-level file, don't bother adding it back. The MVP single-source-of-truth state is good enough to ship and operate against indefinitely.
 
 ### Pattern beyond user calibration
 
