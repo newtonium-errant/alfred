@@ -37,7 +37,7 @@ Triage record format (contract for prompt-tuner / janitor SKILL.md)
 
     type: task
     name: "Triage - <candidate-summary>"
-    status: open
+    status: todo
     created: <ISO date>
     alfred_triage: true
     alfred_triage_kind: dedup        # future kinds: orphan, broken_link, etc.
@@ -158,7 +158,7 @@ def collect_open_triage_tasks(vault_path: Path) -> list[dict]:
     ``triage_id``, ``triage_kind``, ``candidates``, ``created``. Sorted by
     triage_id for stable prompt output.
 
-    Tasks without ``alfred_triage: true`` or without ``status: open`` are
+    Tasks without ``alfred_triage: true`` or without ``status: todo`` are
     filtered out. Parse failures are skipped with a log entry.
     """
     task_dir = vault_path / "task"
@@ -180,7 +180,7 @@ def collect_open_triage_tasks(vault_path: Path) -> list[dict]:
         fm = post.metadata or {}
         if not fm.get("alfred_triage"):
             continue
-        if str(fm.get("status", "")).lower() != "open":
+        if str(fm.get("status", "")).lower() not in ("todo", "active"):
             continue
 
         rel_stem = str(md_file.relative_to(vault_path)).replace("\\", "/")

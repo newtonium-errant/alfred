@@ -530,7 +530,7 @@ This is what you do every time you see a DUP001 in a normal sweep. It creates a 
      --set 'alfred_triage=true' \
      --set 'alfred_triage_kind="dedup"' \
      --set 'alfred_triage_id="dedup-a7f3c2b1d8e4"' \
-     --set 'status="open"' \
+     --set 'status="todo"' \
      --set 'priority="normal"' \
      --set 'candidates=["[[org/Acme Corp]]","[[org/Acme Corporation]]"]'
    ```
@@ -538,7 +538,7 @@ This is what you do every time you see a DUP001 in a normal sweep. It creates a 
    ```yaml
    type: task
    name: "Triage - <candidate-summary>"
-   status: open
+   status: todo
    created: <today's ISO date>
    alfred_triage: true
    alfred_triage_kind: dedup
@@ -563,7 +563,7 @@ This is what you do every time you see a DUP001 in a normal sweep. It creates a 
 1. Sweep detects DUP001: `org/Acme Corp.md` and `org/Acme Corporation.md`. Both are entity type `org/` — triage applies.
 2. Compute the ID: `alfred vault triage-id dedup "[[org/Acme Corp]]" "[[org/Acme Corporation]]"` → `{"triage_id": "dedup-a7f3c2b1d8e4", ...}`.
 3. Scan `## Existing Open Triage Tasks`: no task listed with `alfred_triage_id: dedup-a7f3c2b1d8e4`. Proceed.
-4. Create the triage task via `alfred vault create task "Triage - Acme org dedup" --set 'alfred_triage=true' --set 'alfred_triage_kind="dedup"' --set 'alfred_triage_id="dedup-a7f3c2b1d8e4"' --set 'status="open"' --set 'priority="normal"' --set 'candidates=["[[org/Acme Corp]]","[[org/Acme Corporation]]"]'`.
+4. Create the triage task via `alfred vault create task "Triage - Acme org dedup" --set 'alfred_triage=true' --set 'alfred_triage_kind="dedup"' --set 'alfred_triage_id="dedup-a7f3c2b1d8e4"' --set 'status="todo"' --set 'priority="normal"' --set 'candidates=["[[org/Acme Corp]]","[[org/Acme Corporation]]"]'`.
 5. Log: `FLAGGED | task/Triage - Acme org dedup.md | DUP001 | Created triage task dedup-a7f3c2b1d8e4 for [[org/Acme Corp]] vs [[org/Acme Corporation]]`. Leave both `org/` records untouched.
 6. Next sweep re-detects the same DUP001, recomputes the same ID, sees it in `## Existing Open Triage Tasks`, and skips — no duplication.
 
