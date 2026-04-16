@@ -356,13 +356,77 @@ gh pr create \
 
 Origin reviews (self-review for personal use) and merges. Pattern becomes canonical. All forks get it on their next `git pull upstream master`.
 
-## Cross-Fork Visibility (the real value)
+## Cross-Fork Visibility
 
 The origin agent's unique perspective is that it sees patterns emerging across ALL projects simultaneously. If Alfred's team and RxFax's team independently discover the same gotcha, origin spots the convergence and promotes with high confidence — "this appeared in two independent projects, it's real."
 
 This cross-project signal is something no individual fork can see on its own. It's the federated learning loop: each project learns locally, contributes to a shared pool, and the curator determines what's generalizable.
 
 Structurally parallel to the voice calibration mechanism designed in the same session: each user calibrates Alfred locally, Alfred progressively learns per-user, corrections feed back into the model. Same bidirectional feedback loop, different level of abstraction (team knowledge vs user understanding).
+
+### Cross-team digests
+
+Local teams currently can't see each other's contributions directly — each fork is an isolated repo. To bridge this without giving every fork read access to every other fork (which adds complexity and may leak project-specific context), **origin writes a periodic digest to canonical** that summarizes recent activity across all forks.
+
+```
+aftermath-lab/ (canonical)
+  digests/
+    2026-04-16.md
+    2026-04-09.md
+```
+
+A digest summarizes each team's recent session notes, new candidate patterns/gotchas, and origin's review status:
+
+```markdown
+---
+date: 2026-04-16
+teams_active: [alfred, rxfax]
+teams_silent: []
+generated_by: origin
+---
+
+# Cross-Team Digest — 2026-04-16
+
+## teams/alfred (Alfred — RRTS)
+- **Session**: dedup hardening, surveyor drift root-cause, Layer 3 triage queue
+- **New candidate pattern**: per-tool-log-routing
+- **New candidate gotcha**: classification-temperature-drift
+- **Origin status**: pending review
+
+## teams/rxfax (RxFax)
+- **Session**: invoice workflow refactor, Supabase migration 0047
+- **New candidate pattern**: supabase-upsert-with-conflict
+- **Origin status**: promoted to stack/supabase/patterns.md on 2026-04-14
+```
+
+Every fork receives the digest on its next `git pull upstream master`. In 30 seconds of reading, a local team knows what every other team has been working on and whether there's overlap. Benefits:
+
+1. **Early pattern recognition** — a team sees another team's candidate and thinks "we hit something similar." The convergence signal appears before origin curates, accelerating the promotion pipeline.
+2. **Avoiding duplicate work** — a team sees a candidate already submitted by another team and adds context to the existing one instead of writing their own version.
+3. **Cross-pollination** — a pattern from one domain might inspire a solution in another, even across different project types.
+
+The digest is origin exercising its department-head role: "here's what your peers are working on, in case it's relevant to you." Same authority, same neutral channel, same reasoning-first principle — broadcast rather than point-to-point.
+
+**Cadence**: the digest is a natural byproduct of origin's curation session. When origin fetches and scans all forks, writing a 20-line digest at the end is ~2 minutes of extra work. The cadence matches the curation cadence.
+
+### Team health monitoring
+
+Origin tracks the **last activity date** for each registered fork. If a project hasn't checked in (pushed to its `teams/` directory) or answered an outstanding review request for more than a configurable window (default: two weeks), origin flags it in the digest:
+
+```markdown
+## Health Check
+
+- **teams/rxfax**: last activity 2026-03-28 (19 days ago) ⚠️
+  - Outstanding review request: 2026-03-30-origin-promote-upsert-pattern.md (unanswered 17 days)
+  - Possible causes: project on hold, team not running aftermath session-end workflow, or system not working
+- **teams/alfred**: last activity 2026-04-15 (1 day ago) ✓
+```
+
+The flag is deliberately neutral — "possible causes" includes legitimate ones (project is paused, team is on vacation, no relevant work happened) alongside systemic ones (the session-end ritual isn't being followed, the fork isn't being pushed to). Origin doesn't assume the worst; it surfaces the data and lets the user investigate.
+
+**Why this matters**: the federated system only works if local teams actually contribute. If a team goes silent, the system degrades silently — no error message, no crash, just an absence of signal. The health check makes the absence visible. It's the same principle as the janitor heartbeat log (`daemon.triage_scan`) that makes "the helper didn't fire" diagnosable in 5 seconds: observability over silence.
+
+If origin identifies a team that's been silent for an extended period and all review requests are unanswered, it can escalate in the digest: "teams/rxfax has been silent for 30 days with 2 unanswered reviews. Recommend checking whether the project is active and whether the session-end workflow is being followed." The user reads the digest and decides whether to investigate or accept the silence as intentional.
 
 ## Open Questions
 
