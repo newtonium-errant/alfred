@@ -288,23 +288,33 @@ gh api -X PATCH /repos/newtonium-errant/aftermath-lab -f is_template=true
 
 ```bash
 # Create the new private repo from the template
-gh repo create newtonium-errant/aftermath-alfred \
+gh repo create newtonium-errant/aftermath-<project> \
   --template newtonium-errant/aftermath-lab \
   --private \
-  --description "Aftermath notes from the Alfred project"
+  --description "Aftermath team notes from the <project> project"
 
 # Clone locally
 cd ~
-git clone https://github.com/newtonium-errant/aftermath-alfred.git
-cd aftermath-alfred
+git clone https://github.com/newtonium-errant/aftermath-<project>.git
+cd aftermath-<project>
 
 # Set up upstream remote for pulling canonical updates
 git remote add upstream https://github.com/newtonium-errant/aftermath-lab.git
 
+# CRITICAL: merge unrelated histories immediately.
+# Template-spawned repos have a different root commit than the template
+# origin, so git treats them as unrelated histories. This one-time merge
+# joins the two histories. After this, all future git pull upstream will
+# work normally because they share this merge commit as a common ancestor.
+# Skipping this step means the FIRST session-start pull will fail with
+# "refusing to merge unrelated histories" and confuse the team.
+git fetch upstream
+git merge upstream/master --allow-unrelated-histories --no-edit
+
 # Create the teams/ directory structure
-mkdir -p teams/alfred/{session-notes,candidate-patterns,candidate-gotchas,reviews,archived}
+mkdir -p teams/<project>/{session-notes,candidate-patterns,candidate-gotchas,reviews,archived}
 # Write situation.md and mission.md
-# Commit and push
+# Commit and push (includes the merge commit + team directory)
 ```
 
 ### Per-project: register the fork on the canonical checkout
@@ -489,3 +499,4 @@ Steps 1–6 completed on 2026-04-16. Steps 7–8 are future.
 
 - **"Fork" means different things in different contexts.** GitHub's "fork" feature is specifically for cross-account repo copying. "Forking" as a concept (starting a new thing from a canonical thing) maps better to GitHub's "template repository" feature for same-account use. The terminology mismatch will confuse anyone reading docs or running commands — worth noting explicitly in any setup instructions.
 - **`git pull upstream` can produce merge conflicts** if the fork has modified canonical files (which it shouldn't, per convention, but might accidentally). The session-start pull should probably be `git pull upstream master --ff-only` to fail fast rather than silently merge, so any accidental canonical-file modification surfaces immediately.
+- **Template-spawned repos have unrelated histories with the template origin.** GitHub's template feature creates a fresh initial commit with the template's content — the new repo shares no git ancestry with the original. The first `git pull upstream master` fails with "refusing to merge unrelated histories." The fix is `git merge upstream/master --allow-unrelated-histories` once, immediately after setup. After that first merge, all future pulls work normally. **This is now part of the per-project setup SOP** (see the setup steps above) so the team never hits it during a normal session-start pull. Discovered during the first live curation round-trip on 2026-04-16.
