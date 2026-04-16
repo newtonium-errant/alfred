@@ -316,20 +316,47 @@ git remote add alfred https://github.com/newtonium-errant/aftermath-alfred.git
 
 ## Daily Session Workflow (per project)
 
+### Session start (every session, before new work)
+
 ```bash
-# SESSION START — pull canonical updates (optional, recommended weekly)
+# 1. Pull canonical updates
 cd ~/aftermath-alfred
 git pull upstream master
 git push origin master    # keep fork in sync with canonical
 
-# SESSION WORK — write session notes, candidate patterns, gotchas
-# into teams/alfred/ as discoveries happen
-
-# SESSION END — commit and push to fork
-git add teams/alfred/
-git commit -m "Session notes for 2026-04-16"
-git push origin master
+# 2. Check teams/<project>/reviews/ for origin feedback
+# 3. Consult stack/ and principles/ before coding
 ```
+
+The upstream pull is a durable standing order (documented in Alfred's CLAUDE.md Team Lead Rules and in the fork's `teams/alfred/mission.md`). If the pull conflicts, resolve before starting — conflicts mean canonical files were accidentally modified in the fork.
+
+### During session
+
+Write candidate patterns and gotchas to `teams/<project>/candidate-patterns/` and `candidate-gotchas/` as discoveries happen. Include reasoning: why the pattern exists, what problem it solves, and whether you believe it's project-specific or generalizable. Origin makes the final call, but the team's assessment helps.
+
+### Session end
+
+1. **Review the session for aftermath-lab relevance.** Did we discover patterns, gotchas, or learnings the stack would care about?
+2. **If relevant**: write candidates to their directories and a short session note (~20-30 lines, curated summary with pointers) to `teams/<project>/session-notes/`.
+3. **If not relevant**: write an **ILB** (Intentionally Left Blank) entry to `teams/<project>/session-notes/`. This makes the review auditable — a future agent sees "this session was checked and nothing was relevant" rather than wondering whether anyone looked.
+   ```markdown
+   ---
+   date: 2026-04-16
+   project: alfred
+   ilb: true
+   ---
+   ILB — Session reviewed, no aftermath-lab-relevant content.
+   Work this session: [one-line summary so origin knows what was reviewed]
+   ```
+4. **Commit and push**:
+   ```bash
+   cd ~/aftermath-alfred
+   git add teams/<project>/
+   git commit -m "Session notes for <date>"
+   git push origin master
+   ```
+
+The ILB convention ensures origin's health monitoring never confuses "team checked in with nothing to report" with "team didn't check in at all." An ILB entry resets the last-activity clock the same way a full contribution does.
 
 ## Contribution Back to Canonical (promotion flow)
 
@@ -438,16 +465,17 @@ If origin identifies a team that's been silent for an extended period and all re
 
 ## Implementation Plan
 
-1. **Shut down other Claude Code sessions using aftermath-lab** (pending — user doing this now)
-2. **Mark aftermath-lab as a template repo** — one `gh api` call
-3. **Create `aftermath-alfred` from the template** — `gh repo create --template`
-4. **Add `teams/alfred/` directory** with initial `situation.md` and `mission.md`
-5. **Register the fork as a remote on canonical** — `git remote add alfred ...`
-6. **Try the workflow for one session** — write a real session note and a candidate pattern, commit and push, verify it lands on the fork
-7. **Try the curation flow once** — from the canonical checkout, `git fetch alfred`, read the candidate pattern, promote it to `stack/` via PR
-8. **Expand to other projects** when the workflow is validated
+Steps 1–6 completed on 2026-04-16. Steps 7–8 are future.
 
-Steps 2-5 are ~15 minutes of setup. Steps 6-7 are "try it once and see how it feels." Step 8 is future.
+1. ~~**Shut down other Claude Code sessions using aftermath-lab**~~ — done
+2. ~~**Mark aftermath-lab as a template repo**~~ — done (`gh api -X PATCH ... -f is_template=true`)
+3. ~~**Create `aftermath-alfred` from the template**~~ — done (`github.com/newtonium-errant/aftermath-alfred`, private)
+4. ~~**Add `teams/alfred/` directory**~~ — done (situation.md, mission.md with standing orders + ILB convention, 5 subdirs: session-notes, candidate-patterns, candidate-gotchas, reviews, archived)
+5. ~~**Register the fork as a remote on canonical**~~ — done (`git remote add alfred ...` on `~/aftermath-lab/`, verified with `git fetch alfred` + `git show alfred/master:teams/alfred/*`)
+6. ~~**First real contribution**~~ — done (session note for 2026-04-15, two candidate patterns: per-tool-log-routing and classification-temperature-drift, verified visible from canonical via `git show`)
+7. **Try the curation flow once** — from the canonical checkout, `git fetch alfred`, read a candidate pattern, write a review record, promote or decline via PR. This is the first exercise of origin's department-head role. Not done yet.
+8. **Expand to other projects** when the workflow is validated. Next candidates: RxFax (if still active), future projects as they come online.
+9. **Write the first digest** — after at least two forks exist, write the first cross-team digest to `digests/`. Requires step 8 for meaningful cross-team content.
 
 ## Alfred Learnings
 
