@@ -2,9 +2,81 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+def build_snapshot_summary(audit_log_path: Path, since: str | None = None) -> str:
+    """Build a human-readable commit message from vault_audit.log entries.
+
+    Reads JSONL entries from *audit_log_path*, filters to entries after *since*
+    (ISO timestamp string), groups by tool, and formats a multi-line summary.
+    Falls back to a bare timestamp message when the log is missing or empty.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    audit_log_path = Path(audit_log_path)
+
+    if not audit_log_path.exists():
+        return f"Vault snapshot {now}"
+
+    # Parse entries, filtering by timestamp
+    tool_ops: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    tool_sweeps: dict[str, set[str]] = defaultdict(set)
+    skipped = 0
+    total = 0
+
+    with audit_log_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                skipped += 1
+                continue
+            ts = entry.get("ts", "")
+            if since and ts <= since:
+                continue
+            tool = entry.get("tool", "unknown")
+            op = entry.get("op", "unknown")
+            tool_ops[tool][op] += 1
+            total += 1
+            # Track sweep IDs for janitor traceability
+            if tool == "janitor" and entry.get("detail"):
+                tool_sweeps["janitor"].add(entry["detail"])
+
+    if total == 0:
+        suffix = f" ({skipped} unparseable lines skipped)" if skipped else ""
+        return f"Vault snapshot {now} — no activity since last snapshot{suffix}"
+
+    # Build per-tool lines
+    lines = [f"Vault snapshot {now}", ""]
+    for tool in sorted(tool_ops):
+        parts = []
+        for op in ("create", "modify", "delete"):
+            count = tool_ops[tool].get(op, 0)
+            if count:
+                parts.append(f"{count} {op}d" if op != "modify" else f"{count} modified")
+        detail = ", ".join(parts)
+        if tool == "janitor" and tool_sweeps.get("janitor"):
+            ids = sorted(tool_sweeps["janitor"])
+            if len(ids) > 5:
+                sweep_ids = ", ".join(ids[:5]) + f" +{len(ids) - 5} more"
+            else:
+                sweep_ids = ", ".join(ids)
+            detail += f" (sweep {sweep_ids})"
+        lines.append(f"{tool}: {detail}")
+
+    lines.append("")
+    lines.append(f"Total: {total} operations across {len(tool_ops)} tools")
+    if skipped:
+        lines.append(f"({skipped} unparseable lines skipped)")
+
+    return "\n".join(lines)
 
 
 class SnapshotError(Exception):

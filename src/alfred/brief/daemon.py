@@ -141,19 +141,32 @@ async def run_daemon(config: BriefConfig) -> None:
                      sleep_hours=round(sleep_seconds / 3600, 1))
             await asyncio.sleep(sleep_seconds)
 
+        # Best-effort vault snapshot BEFORE brief — captures previous day's work
+        try:
+            from alfred.vault.snapshot import (
+                build_snapshot_summary,
+                get_status,
+                take_snapshot,
+            )
+
+            vault_path = Path(config.vault_path)
+            audit_log = Path(config.state.path).parent / "vault_audit.log"
+            status = get_status(vault_path)
+            since = status.get("last_commit_date")
+            summary = build_snapshot_summary(audit_log, since=since)
+            commit = take_snapshot(vault_path, message=summary)
+            if commit:
+                log.info("brief.daemon.snapshot", commit=commit)
+            else:
+                log.info("brief.daemon.snapshot_noop")
+        except Exception:
+            log.warning("brief.daemon.snapshot_failed", exc_info=True)
+
+        # Generate the morning brief
         try:
             path = await generate_brief(config, state_mgr)
             if path:
                 log.info("brief.daemon.generated", path=path)
-                # Best-effort vault snapshot after successful brief generation
-                try:
-                    from alfred.vault.snapshot import take_snapshot
-                    vault_path = Path(config.vault_path)
-                    commit = take_snapshot(vault_path)
-                    if commit:
-                        log.info("brief.daemon.snapshot", commit=commit)
-                except Exception:
-                    log.warning("brief.daemon.snapshot_failed", exc_info=True)
         except Exception:
             log.exception("brief.daemon.error")
 
