@@ -47,6 +47,24 @@ This design makes the flow bidirectional: each project gets its own private repo
 - **Projects that consult it**: Alfred (RRTS), RxFax, potentially future projects using the same stack
 - **The connection between projects and aftermath-lab is consultative, not derived**: each project has its own agent team (e.g. Alfred has builder/vault-reviewer/prompt-tuner/infra/code-reviewer, which are NOT instances of aftermath-lab's four stack agents). The agents consult aftermath-lab docs when doing stack work, but they're separate teams with separate instruction files.
 
+## Core Principle: Reasoning as Institutional Memory
+
+Every decision in this system — promote, decline, defer, override, archive — carries a short summary of WHY it was made. Not a full essay; just enough for a future agent, arriving with zero context about today's conversation, to understand the reasoning and judge whether it still holds.
+
+This matters because the agents making and consuming these decisions will change across sessions. Today's Coding Alfred will not be the same context window as next month's Coding Alfred. A local team's Claude Code session ends and starts fresh. The only thing that persists across those boundaries is the written record. If the reasoning isn't in the record, it's lost — and future agents either repeat the same evaluation from scratch (wasteful) or make a different decision without knowing why the first one was made (dangerous).
+
+The principle applies everywhere in Alfred, not just aftermath-lab:
+- **Voice calibration**: each bullet in the `<!-- ALFRED:CALIBRATION -->` section has an attributed source session and, for corrections, a note about what the previous belief was and why it changed
+- **Layer 3 triage tasks**: the `candidates` list and the triage ID trace back to the specific DUP001 that triggered the decision
+- **Aftermath-lab reviews**: the review records capture both origin's reasoning and local team's reasoning, permanently linked to the archived pattern if declined
+- **Distiller learnings**: assumptions, decisions, constraints, contradictions, syntheses all carry evidence chains and source references
+
+The standard is: **a future agent reading this record should be able to understand what was decided, why, what alternatives were considered, and whether the reasoning still applies given what it knows now.** Short is fine. Absent is not.
+
+Critically: **decisions are not permanent.** A future agent presented with new evidence — a second project discovering the same pattern, a change in the stack, a correction from the user — can and should revisit prior decisions. The reasoning record isn't a lock; it's a starting point. "Here's what was decided, here's why. Has anything changed?" If yes, the agent writes a new review record linked to the old one, explaining what new evidence prompted the revision. The chain of reasoning grows over time, and each link makes the next agent's decision more informed rather than starting from zero.
+
+This is the same self-correcting loop as the voice calibration mechanism: Alfred's model of the user starts wrong, gets corrected, improves. Aftermath-lab's canonical knowledge starts incomplete, gets enriched by project contributions, improves. Both are designed to change their minds when presented with more evidence — and to record why they changed, so the next change is even better informed.
+
 ## Key Design Decisions
 
 ### Template repository, not GitHub forks
