@@ -251,6 +251,26 @@ def run_all(
 
     suppress_stdout = live_mode
 
+    # Sentinel file path — ``alfred down`` creates this to signal shutdown
+    sentinel_path = pid_path.parent / "alfred.stop" if pid_path else None
+
+    log_dir = Path(raw.get("logging", {}).get("dir", "./data"))
+    workers_json_path = log_dir / "workers.json"
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # ---- Graceful SIGTERM/SIGINT handling --------------------------------
+    # Installed BEFORE spawning children so that SIGTERM arriving during the
+    # stagger sleep (10s between tool starts) sets the flag instead of killing
+    # the orchestrator instantly and orphaning already-started children.
+    shutdown_requested = False
+
+    def _handle_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        shutdown_requested = True
+
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
     def start_process(tool: str) -> multiprocessing.Process:
         runner = TOOL_RUNNERS[tool]
         if tool in ("surveyor", "mail", "brief"):
@@ -264,20 +284,6 @@ def run_all(
         if not live_mode:
             print(f"  [{tool}] started (pid {p.pid})")
         return p
-
-    # Start all — stagger by 10s to avoid thundering herd on shared infra
-    for i, tool in enumerate(tools):
-        if i > 0:
-            time.sleep(10)
-        processes[tool] = start_process(tool)
-        restart_counts[tool] = 0
-
-    # Sentinel file path — ``alfred down`` creates this to signal shutdown
-    sentinel_path = pid_path.parent / "alfred.stop" if pid_path else None
-
-    log_dir = Path(raw.get("logging", {}).get("dir", "./data"))
-    workers_json_path = log_dir / "workers.json"
-    started_at = datetime.now(timezone.utc).isoformat()
 
     def _write_workers_json() -> None:
         """Write current process status to workers.json for the Ink TUI."""
@@ -304,94 +310,143 @@ def run_all(
         except OSError:
             pass
 
-    # Write initial workers.json
-    _write_workers_json()
-    last_workers_write = time.monotonic()
-
-    if live_mode:
-        # Live TUI dashboard mode — prefer Textual, fall back to Rich Live
-        try:
-            from alfred.tui import run_textual_dashboard
-            run_textual_dashboard(
-                tools=tools,
-                processes=processes,
-                restart_counts=restart_counts,
-                start_process=start_process,
-                sentinel_path=sentinel_path,
-                log_dir=log_dir,
-                state_dir=log_dir,
-            )
-        except ImportError:
-            from alfred.dashboard import run_live_dashboard
-            run_live_dashboard(
-                tools=tools,
-                processes=processes,
-                restart_counts=restart_counts,
-                start_process=start_process,
-                sentinel_path=sentinel_path,
-                log_dir=log_dir,
-                state_dir=log_dir,
-            )
-    else:
-        # Plain text monitor loop
-        try:
-            while True:
-                time.sleep(5)
-
-                # Periodically write workers.json for the Ink TUI
-                now = time.monotonic()
-                if now - last_workers_write >= 2:
-                    _write_workers_json()
-                    last_workers_write = now
-
-                # Check for shutdown sentinel
-                if sentinel_path and sentinel_path.exists():
-                    print("Shutdown sentinel detected, stopping...")
+    try:
+        # Start all — stagger by 10s to avoid thundering herd on shared infra.
+        # Stagger sleep uses small increments so SIGTERM is noticed quickly.
+        for i, tool in enumerate(tools):
+            if i > 0:
+                for _ in range(100):  # 10s in 0.1s increments
+                    time.sleep(0.1)
+                    if shutdown_requested:
+                        break
+                if shutdown_requested:
                     break
+            processes[tool] = start_process(tool)
+            restart_counts[tool] = 0
 
-                for tool in list(tools):
-                    p = processes[tool]
-                    if not p.is_alive():
-                        exit_code = p.exitcode
-                        if exit_code == _MISSING_DEPS_EXIT:
-                            print(f"  [{tool}] missing dependencies, not restarting")
-                            tools = [t for t in tools if t != tool]
-                            continue
-                        restart_counts[tool] += 1
-                        if restart_counts[tool] <= 5:
-                            print(f"  [{tool}] exited ({exit_code}), restarting ({restart_counts[tool]}/5)...")
-                            processes[tool] = start_process(tool)
-                        else:
-                            print(f"  [{tool}] exceeded restart limit, giving up")
-                            tools = [t for t in tools if t != tool]
+        if shutdown_requested:
+            print("Shutdown requested during startup, stopping...")
 
-                if not tools:
-                    print("All daemons failed, exiting.")
-                    break
-        except KeyboardInterrupt:
-            print("\nShutting down...")
+        # Write initial workers.json
+        _write_workers_json()
+        last_workers_write = time.monotonic()
 
-    # Terminate child processes and clean up per-tool PID files
-    for tool, p in processes.items():
-        if p.is_alive():
+        if not shutdown_requested and live_mode:
+            # Live TUI dashboard mode — prefer Textual, fall back to Rich Live
+            # NOTE: Both TUI implementations check the sentinel file internally
+            # (Textual via set_interval, Rich Live in its 0.25s loop).  The
+            # SIGTERM handler + try/finally here ensures cleanup still runs if
+            # the signal arrives while the TUI event loop is active.
+            try:
+                from alfred.tui import run_textual_dashboard
+                run_textual_dashboard(
+                    tools=tools,
+                    processes=processes,
+                    restart_counts=restart_counts,
+                    start_process=start_process,
+                    sentinel_path=sentinel_path,
+                    log_dir=log_dir,
+                    state_dir=log_dir,
+                )
+            except ImportError:
+                from alfred.dashboard import run_live_dashboard
+                run_live_dashboard(
+                    tools=tools,
+                    processes=processes,
+                    restart_counts=restart_counts,
+                    start_process=start_process,
+                    sentinel_path=sentinel_path,
+                    log_dir=log_dir,
+                    state_dir=log_dir,
+                )
+        elif not shutdown_requested:
+            # Plain text monitor loop
+            try:
+                while True:
+                    # Sleep in small increments so the loop responds to
+                    # SIGTERM within ~100ms instead of waiting up to 5s.
+                    for _ in range(50):
+                        time.sleep(0.1)
+                        if shutdown_requested:
+                            break
+
+                    if shutdown_requested:
+                        print("SIGTERM received, stopping...")
+                        break
+
+                    # Periodically write workers.json for the Ink TUI
+                    now = time.monotonic()
+                    if now - last_workers_write >= 2:
+                        _write_workers_json()
+                        last_workers_write = now
+
+                    # Check for shutdown sentinel
+                    if sentinel_path and sentinel_path.exists():
+                        print("Shutdown sentinel detected, stopping...")
+                        break
+
+                    for tool in list(tools):
+                        p = processes[tool]
+                        if not p.is_alive():
+                            exit_code = p.exitcode
+                            if exit_code == _MISSING_DEPS_EXIT:
+                                print(f"  [{tool}] missing dependencies, not restarting")
+                                tools = [t for t in tools if t != tool]
+                                continue
+                            restart_counts[tool] += 1
+                            if restart_counts[tool] <= 5:
+                                print(f"  [{tool}] exited ({exit_code}), restarting ({restart_counts[tool]}/5)...")
+                                processes[tool] = start_process(tool)
+                            else:
+                                print(f"  [{tool}] exceeded restart limit, giving up")
+                                tools = [t for t in tools if t != tool]
+
+                    if not tools:
+                        print("All daemons failed, exiting.")
+                        break
+            except KeyboardInterrupt:
+                print("\nShutting down...")
+    finally:
+        # Terminate child processes and clean up per-tool PID files.
+        # This block runs on every exit path: normal break, SIGTERM,
+        # KeyboardInterrupt, or unhandled exception.
+        #
+        # Strategy: SIGTERM all children at once, give them a brief window
+        # to exit, then SIGKILL any survivors.  We must finish within the
+        # ~5s window that ``_stop_unix`` allows before it SIGKILLs us.
+        alive = {tool: p for tool, p in processes.items() if p.is_alive()}
+
+        # Phase 1: SIGTERM all children simultaneously
+        for tool, p in alive.items():
             p.terminate()
-            p.join(timeout=5)
+
+        # Phase 2: brief wait for graceful exit (1s total, not per-child)
+        deadline = time.monotonic() + 1.0
+        for tool, p in alive.items():
+            remaining = max(0, deadline - time.monotonic())
+            p.join(timeout=remaining)
+
+        # Phase 3: SIGKILL any survivors
+        for tool, p in alive.items():
             if p.is_alive():
                 p.kill()
+                p.join(timeout=0.5)
             print(f"  [{tool}] stopped")
-        _cleanup_tool_pid(data_dir, tool)
-    print("All daemons stopped.")
 
-    # Clean up PID file and sentinel
-    if pid_path:
-        from alfred.daemon import remove_pid
-        remove_pid(pid_path)
-    if sentinel_path:
+        for tool in processes:
+            _cleanup_tool_pid(data_dir, tool)
+        print("All daemons stopped.")
+
+        # Clean up PID file and sentinel
+        if pid_path:
+            from alfred.daemon import remove_pid
+            remove_pid(pid_path)
+        if sentinel_path:
+            try:
+                sentinel_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         try:
-            sentinel_path.unlink(missing_ok=True)
+            workers_json_path.unlink(missing_ok=True)
         except OSError:
             pass
-    try:
-        workers_json_path.unlink(missing_ok=True)
-    except OSError:
-        pass
