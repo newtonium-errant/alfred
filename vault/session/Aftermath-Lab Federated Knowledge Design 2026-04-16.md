@@ -74,6 +74,9 @@ teams/<project>/
   candidate-gotchas/        # gotchas confirmed, ready for origin to evaluate
     alfred-down-orphans-children.md
     setup-logging-hardcoded.md
+  reviews/                  # neutral communications channel (origin ↔ team)
+    2026-04-16-origin-promote-log-routing.md
+    2026-04-17-team-context-log-routing.md
 ```
 
 The `teams/` convention is the same across all forks. This means the origin agent's curation logic is generic: "for each registered fork, read `teams/*/candidate-patterns/*.md` and evaluate." No project-specific code in the curation path.
@@ -96,18 +99,131 @@ The `teams/` convention is the same across all forks. This means the origin agen
 
 Every operation is a standard git command. No custom tooling needed.
 
-### Origin agent as the curator
+### Origin agent as Coding Alfred — the department head
 
-The aftermath-lab origin becomes its own Claude Code session with its own CLAUDE.md or SKILL.md that instructs:
+The aftermath-lab origin is not a neutral librarian filing patterns. It IS **Coding Alfred** — instance #5 in the five-instance Alfred architecture, the department head of the coding domain. As a department head, it has:
 
-1. **Start**: `git fetch --all` to pull latest from all registered forks
+- **Domain authority**: makes final decisions about what belongs in canonical, considering but not bound by local team reasoning
+- **Strategic view**: sees all forks simultaneously, can spot cross-project convergence, and can evaluate patterns against the overall direction of the stack — not just whether they worked for one project
+- **Write authority over canonical**: only origin promotes patterns to `stack/`, `principles/`, `architecture/`. Local teams contribute candidates; origin decides.
+
+This mirrors the multi-instance hierarchy: each Alfred instance is a department head of its domain (Ops coordinates, Business owns RRTS decisions, Knowledge owns writing decisions, Medical owns clinical decisions, Coding owns stack/engineering decisions). Recommendations flow up from project teams; decisions flow down from the department head. Input is valued and considered, but the department head's broader view wins when there's a conflict.
+
+### The neutral communications channel: `reviews/`
+
+Curation decisions need transparent reasoning — both the origin's reasoning for promoting or declining, and the local team's context that might affect the decision. Without this, local teams see patterns appear (or not) in canonical and have to reverse-engineer why. That's the same opacity problem we identified with Alfred's voice calibration: if decisions aren't transparent, the affected party can't course-correct.
+
+**The `reviews/` directory** is the neutral communications channel between origin and each fork. Both parties write to it. Conversations are structured markdown records in git — permanent, versioned, auditable.
+
+In each fork:
+```
+teams/<project>/reviews/
+  2026-04-16-origin-promote-log-routing.md     ← origin writes its recommendation + reasoning
+  2026-04-17-team-context-log-routing.md       ← team responds with context or pushback
+```
+
+In canonical aftermath-lab:
+```
+reviews/
+  2026-04-16-promoted-log-routing-from-alfred.md     ← permanent decision record with both sides' reasoning
+  2026-04-18-declined-orphan-cleanup-from-rxfax.md   ← and the reasoning for declining
+```
+
+A review record looks like:
+
+```markdown
+---
+type: review
+from: origin
+to: teams/alfred
+date: 2026-04-16
+subject: per-tool-log-routing
+decision: promote
+confidence: high
+---
+
+## Promote "Per-Tool Log Routing" to Canonical
+
+**Source**: teams/alfred/candidate-patterns/per-tool-log-routing.md
+**Destination**: stack/n8n/per-tool-log-routing.md
+
+### Why promote
+This pattern addresses how CLI handlers route log events to per-tool files.
+Both Alfred and RxFax discovered it independently — cross-project convergence
+is the strongest promotion signal. The pattern is stack-level, not project-level.
+
+### What I'd generalize
+Remove Alfred-specific references. Generalize the helper signature. Note the
+suppress_stdout caveat for JSON-emitting handlers.
+
+### Request for team
+Any context I'm missing? Anything Alfred-specific that should NOT be in the
+canonical version?
+```
+
+The local team responds:
+
+```markdown
+---
+type: review
+from: teams/alfred
+to: origin
+date: 2026-04-17
+subject: per-tool-log-routing
+in-response-to: 2026-04-16-origin-promote-log-routing.md
+---
+
+## Context for Per-Tool Log Routing
+
+The suppress_stdout caveat is load-bearing — without it, any CLI handler that
+emits JSON on stdout breaks if a log handler leaks there. In Alfred this was
+cmd_vault specifically, but it applies to any tool that uses structured stdout.
+
+Also: the existing _setup_logging_from_config helper was the root cause — it
+hardcodes alfred.log as the destination regardless of which tool calls it.
+Worth noting in the canonical pattern as the anti-pattern to avoid.
+```
+
+Origin reads the response, incorporates the context into the canonical version, and writes a permanent decision record in canonical's `reviews/`:
+
+```markdown
+---
+type: review-decision
+from: origin
+date: 2026-04-17
+subject: per-tool-log-routing
+decision: promoted
+sources:
+  - teams/alfred/candidate-patterns/per-tool-log-routing.md
+  - teams/rxfax/candidate-gotchas/cli-log-misdirection.md
+promoted-to: stack/n8n/per-tool-log-routing.md
+---
+
+## Decision: Promoted with team context incorporated
+
+Cross-project convergence (Alfred + RxFax). Incorporated Alfred team's note
+about suppress_stdout being load-bearing for JSON-emitting handlers, and the
+anti-pattern of hardcoding log destinations in shared helpers. RxFax team
+did not provide additional context within the review window.
+```
+
+### Curation flow (updated with dialogue)
+
+The aftermath-lab origin (Coding Alfred) runs curation sessions with this flow:
+
+1. **Fetch**: `git fetch --all` to pull latest from all registered forks
 2. **Scan**: read every fork's `teams/*/candidate-patterns/`, `teams/*/candidate-gotchas/`, and `teams/*/session-notes/`
-3. **Evaluate**: for each candidate, ask "is this generalizable across projects, or project-specific?" and "has this pattern appeared in multiple forks independently?" (cross-project convergence is a strong promotion signal)
-4. **Promote**: write the generalizable ones into canonical `stack/`, `principles/`, or `architecture/`, attributed to the source project
-5. **Log**: write a curation session note in canonical `session-notes/` (origin's own session trail)
-6. **Push**: commit and push to origin's master
+3. **Evaluate**: for each candidate, assess generalizability. Cross-project convergence (same pattern in multiple forks independently) is the strongest promotion signal.
+4. **Write review records**: for each evaluated candidate, write a review record in the fork's `teams/<project>/reviews/` explaining the recommendation (promote, decline, defer, request-context) and the reasoning. Push to the fork's remote.
+5. **Wait for response** (optional, configurable): give local teams a review window to respond with context or pushback. Could be immediate (origin decides now, team can respond retroactively) or deferred (origin waits for a response before acting). Phase 1: immediate decisions with retroactive response.
+6. **Make the final decision**: origin reads any responses, incorporates relevant context, but retains authority to decide differently if the broader strategic view warrants it. The decision record in canonical's `reviews/` captures BOTH the local team's reasoning AND origin's reasoning, so the "why" is transparent even when origin overrides.
+7. **Execute**: if promoting, write the canonical pattern into `stack/`, `principles/`, or `architecture/`, attributed to the source project(s). Write the permanent decision record in canonical's `reviews/`.
+8. **Log**: write a curation session note in canonical's own session trail
+9. **Push**: commit and push to origin's master
 
-The origin agent doesn't modify any fork's content — it only reads forks and writes to canonical. The forks don't modify canonical — they only read canonical and write to themselves. Clean separation of write authority.
+**Key authority principle**: origin considers local team reasoning seriously but is not bound by it. Origin has the cross-project strategic view, the domain expertise, and the authority to make decisions that individual project teams can't see the full picture for. A local team saying "don't promote this, it's project-specific" might be overruled by origin saying "actually, this appeared independently in three projects — you just can't see the other two from where you sit." The reasoning for the override is always recorded.
+
+**Key transparency principle**: every decision — promote, decline, defer, override — has a review record with reasoning from both sides. No black-box curation. If a local team wants to understand why their pattern was declined (or why a pattern they didn't suggest was promoted), the answer is in `reviews/`.
 
 ### Sanitization: standard secret hygiene only
 
@@ -145,7 +261,7 @@ cd aftermath-alfred
 git remote add upstream https://github.com/newtonium-errant/aftermath-lab.git
 
 # Create the teams/ directory structure
-mkdir -p teams/alfred/{session-notes,candidate-patterns,candidate-gotchas}
+mkdir -p teams/alfred/{session-notes,candidate-patterns,candidate-gotchas,reviews}
 # Write situation.md and mission.md
 # Commit and push
 ```
