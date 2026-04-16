@@ -77,6 +77,8 @@ teams/<project>/
   reviews/                  # neutral communications channel (origin ↔ team)
     2026-04-16-origin-promote-log-routing.md
     2026-04-17-team-context-log-routing.md
+  archived/                 # declined candidates, linked to their review conversations
+    declined-orphan-cleanup.md
 ```
 
 The `teams/` convention is the same across all forks. This means the origin agent's curation logic is generic: "for each registered fork, read `teams/*/candidate-patterns/*.md` and evaluate." No project-specific code in the curation path.
@@ -225,6 +227,27 @@ The aftermath-lab origin (Coding Alfred) runs curation sessions with this flow:
 
 **Key transparency principle**: every decision — promote, decline, defer, override — has a review record with reasoning from both sides. No black-box curation. If a local team wants to understand why their pattern was declined (or why a pattern they didn't suggest was promoted), the answer is in `reviews/`.
 
+**Key archival principle**: patterns that origin declines to promote are NOT deleted. The local team moves them from `candidate-patterns/` (or `candidate-gotchas/`) to an `archived/` directory within their `teams/<project>/` space, with a link to the review conversation that explains why it was declined. Archived patterns remain discoverable and searchable — they may be project-specific today but become promotable later if a second project independently discovers the same pattern (at which point origin has the cross-project convergence signal it lacked before). The archive also serves as institutional memory: "we considered this, here's why we decided not to generalize it, and here's the conversation that led to that decision."
+
+Archive structure inside each fork:
+```
+teams/<project>/
+  archived/
+    declined-orphan-cleanup.md        ← moved from candidate-patterns/
+    declined-mutex-lock-pattern.md
+```
+
+Each archived file carries a frontmatter link to its review conversation:
+```markdown
+---
+archived: 2026-04-18
+review: reviews/2026-04-17-origin-decline-orphan-cleanup.md
+reason: project-specific — relies on Alfred's vault snapshot system which is not part of the standard stack
+---
+```
+
+If a second project later discovers the same pattern independently, origin can revisit the archived version alongside the new candidate, see the prior reasoning, and decide whether the convergence now justifies promotion. The archive is a living record, not a graveyard.
+
 ### Sanitization: standard secret hygiene only
 
 The forks are private repos under the same GitHub account. Personal data (names, paths, project details) is acceptable content — these aren't public. The only sanitization concern is standard secret hygiene:
@@ -261,7 +284,7 @@ cd aftermath-alfred
 git remote add upstream https://github.com/newtonium-errant/aftermath-lab.git
 
 # Create the teams/ directory structure
-mkdir -p teams/alfred/{session-notes,candidate-patterns,candidate-gotchas,reviews}
+mkdir -p teams/alfred/{session-notes,candidate-patterns,candidate-gotchas,reviews,archived}
 # Write situation.md and mission.md
 # Commit and push
 ```
