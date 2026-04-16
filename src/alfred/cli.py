@@ -51,12 +51,15 @@ def _load_unified_config(config_path: str) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def _setup_logging_from_config(raw: dict[str, Any], tool: str = "alfred") -> None:
+def _setup_logging_from_config(raw: dict[str, Any], tool: str = "alfred", suppress_stdout: bool = False) -> None:
     """Set up logging from the unified config's logging section.
 
     ``tool`` selects the per-tool log file: ``data/<tool>.log``. Default
     ``"alfred"`` preserves backward compatibility for the daemon launcher
     (``cmd_up``) and any handler that legitimately wants the shared log.
+
+    ``suppress_stdout`` prevents adding a StreamHandler to stdout, which is
+    load-bearing for the vault CLI (its stdout is a JSON contract).
 
     Each tool's ``utils.setup_logging`` helper has an identical signature,
     so the choice to import curator's here is arbitrary — any of them work.
@@ -65,7 +68,7 @@ def _setup_logging_from_config(raw: dict[str, Any], tool: str = "alfred") -> Non
     level = log_cfg.get("level", "INFO")
     log_dir = log_cfg.get("dir", "./data")
     from alfred.curator.utils import setup_logging
-    setup_logging(level=level, log_file=f"{log_dir}/{tool}.log")
+    setup_logging(level=level, log_file=f"{log_dir}/{tool}.log", suppress_stdout=suppress_stdout)
 
 
 # --- Subcommand handlers ---
@@ -215,21 +218,7 @@ def cmd_curator(args: argparse.Namespace) -> None:
 
 def cmd_janitor(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
-    # Route janitor CLI logs to data/janitor.log so standalone `alfred janitor
-    # {scan,fix,drift,...}` runs produce the same sweep events as the
-    # long-running `alfred up` daemon. Without this, structlog has no file
-    # sink configured in the CLI subprocess and every sweep emitted from a
-    # manual run disappears. Matches the `_run_janitor` daemon entry point
-    # in orchestrator.py. Wrapped in try/except so logging setup failure
-    # cannot break the handler (same defensive pattern as `cmd_vault`).
-    try:
-        log_cfg = raw.get("logging", {})
-        level = log_cfg.get("level", "INFO")
-        log_dir = log_cfg.get("dir", "./data")
-        from alfred.janitor.utils import setup_logging as _jan_setup_logging
-        _jan_setup_logging(level=level, log_file=f"{log_dir}/janitor.log")
-    except Exception:
-        _setup_logging_from_config(raw, tool="janitor")
+    _setup_logging_from_config(raw, tool="janitor")
     from alfred.janitor.config import load_from_unified
     config = load_from_unified(raw)
     from alfred._data import get_skills_dir
@@ -287,21 +276,11 @@ def cmd_distiller(args: argparse.Namespace) -> None:
 
 def cmd_vault(args: argparse.Namespace) -> None:
     # Route logs to a dedicated file sink. The vault CLI emits JSON on stdout
-    # that calling agents parse, so logging MUST NOT leak to stdout. We use a
-    # shared ./data/vault.log (appended to atomically by the FileHandler) so
-    # warnings like `vault_create.near_match` are observable regardless of
-    # which daemon (curator/janitor/distiller) invoked the subprocess.
+    # that calling agents parse, so logging MUST NOT leak to stdout.
+    # suppress_stdout=True is load-bearing for the JSON contract.
     try:
         raw = _load_unified_config(args.config)
-        log_cfg = raw.get("logging", {})
-        level = log_cfg.get("level", "INFO")
-        log_dir = log_cfg.get("dir", "./data")
-        from alfred.curator.utils import setup_logging
-        setup_logging(
-            level=level,
-            log_file=f"{log_dir}/vault.log",
-            suppress_stdout=True,
-        )
+        _setup_logging_from_config(raw, tool="vault", suppress_stdout=True)
     except SystemExit:
         # _load_unified_config calls sys.exit on missing config; swallow so
         # vault CLI still works in environments without config.yaml.
