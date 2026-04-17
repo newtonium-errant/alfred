@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from alfred.vault.mutation_log import log_mutation, read_mutations
-from alfred.vault.ops import VaultError, vault_edit
+from alfred.vault.ops import VaultError, vault_edit, vault_read
 
 from .backends import VAULT_CLI_REFERENCE
 from .candidates import (
@@ -964,17 +964,40 @@ async def run_pipeline(
             result.records_created[lt] = result.records_created.get(lt, 0) + 1
             created_paths.append(created_path)
 
-    # Update source records with links to created learnings
+    # Update source records with links to created learnings.
+    # Merge with existing distiller_learnings so re-processing a source does
+    # not wipe attributions from prior distiller runs. Existing links come
+    # first (preserve order), newly-added unique links follow.
     for source in batch.source_records:
         if created_paths:
             learn_links = [
                 f"[[{p.removesuffix('.md')}]]" for p in created_paths
             ]
             try:
+                current = vault_read(vault_path, source.record.rel_path)
+                existing_val = current.get("frontmatter", {}).get(
+                    "distiller_learnings"
+                )
+                if existing_val is None:
+                    existing_list: list[str] = []
+                elif isinstance(existing_val, str):
+                    existing_list = [existing_val] if existing_val else []
+                elif isinstance(existing_val, list):
+                    existing_list = [str(x) for x in existing_val if x]
+                else:
+                    existing_list = []
+
+                merged = list(existing_list)
+                seen = set(existing_list)
+                for link in learn_links:
+                    if link not in seen:
+                        merged.append(link)
+                        seen.add(link)
+
                 vault_edit(
                     vault_path,
                     source.record.rel_path,
-                    set_fields={"distiller_learnings": learn_links},
+                    set_fields={"distiller_learnings": merged},
                 )
                 log_mutation(session_path, "edit", source.record.rel_path)
             except VaultError:
