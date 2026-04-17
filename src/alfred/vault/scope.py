@@ -59,6 +59,27 @@ SCOPE_RULES: dict[str, dict[str, bool | str]] = {
         "move": False,
         "delete": False,
     },
+    "talker": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        # Talker (Telegram voice bot) may only create a limited set of
+        # conversational record types (see ``talker_types_only``).
+        "create": "talker_types_only",
+        "edit": True,
+        "move": False,
+        "delete": False,
+    },
+}
+
+
+# Record types the talker scope is allowed to create. Kept as a module-level
+# constant so the rule handler below and any future callers share one source
+# of truth.
+TALKER_CREATE_TYPES: set[str] = {
+    "task", "note", "decision", "event",
+    "session", "conversation", "assumption", "synthesis",
 }
 
 
@@ -117,6 +138,14 @@ def check_scope(
             raise ScopeError(
                 f"Scope '{scope}' can only create learn types "
                 f"({', '.join(sorted(LEARN_TYPES))}). Got: '{record_type}'"
+            )
+        return
+
+    if permission == "talker_types_only":
+        if record_type not in TALKER_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create talker types "
+                f"({', '.join(sorted(TALKER_CREATE_TYPES))}). Got: '{record_type}'"
             )
         return
 
