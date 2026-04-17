@@ -103,11 +103,121 @@ A custom PWA or native iOS app would give the most UX control but takes weeks to
 
 **iOS native app is the eventual ideal** for the most polished mobile experience, but only after Telegram has validated the design and identified what specifically a custom client should add.
 
+### Bot implementation: Python-native with direct Claude API
+
+**Decision: build the Python bot from the start** (Option B from the design discussion), not an n8n-first prototype. Rationale: no migration when Stage 2a arrives — the bot IS the talker's client from day one. The extra upfront work (~3-5 days vs ~1-2 days for n8n) is paid back immediately by zero migration tax.
+
+**Library**: `python-telegram-bot` v20+ (async-native, fits Alfred's asyncio pattern). Handles text and voice messages with the same handler pattern — voice just adds a transcription step before the same conversation pipeline. Module structure:
+
+```
+src/alfred/telegram/
+  __init__.py
+  bot.py          # Telegram bot setup, message handlers, voice download
+  conversation.py # Claude API conversation loop with tool_use
+  transcribe.py   # Voice → text via Whisper/Scribe
+  config.py       # Bot token, STT provider, model selection
+  session.py      # Session type routing, history management, session record writing
+```
+
+**Claude API pattern**: direct Anthropic SDK with `tool_use`, NOT the `claude -p` subprocess pattern used by curator/janitor/distiller. Conversation is the primary interaction (not vault mutation), so the direct API is more natural and lower-latency. Claude sees the conversation history, has access to vault operations via tool_use (search, read, create, edit), and responds in the same API call. One round-trip per turn (two if there's a tool call).
+
+```python
+response = client.messages.create(
+    model=session.model,              # sonnet or opus, per session type
+    system=system_prompt,             # calibration + vault context + conversation rules
+    messages=conversation_history,    # growing list of user + assistant turns
+    tools=[vault_search, vault_read, vault_create, vault_edit],
+)
+```
+
 ### Per-instance talker
 
-Each Alfred instance runs its own talker tool. Same code, per-instance config. The talker's modes (grounded, generative, brainstorm-capture) are enabled or disabled per instance. The Knowledge Alfred instance enables generative mode for fiction and non-fiction writing; NP's eventual instance might have grounded only with a different SKILL.md tone. The main Alfred starts with grounded only.
+Each Alfred instance runs its own talker tool. Same code, per-instance config. The talker's modes (grounded, generative, brainstorm-capture) and session types are configured per instance. The Knowledge Alfred instance enables generative mode for fiction and non-fiction writing; NP's eventual instance might have grounded only with a different SKILL.md tone. The main Alfred starts with grounded only.
 
 This fits the existing per-tool config pattern exactly. No new architecture needed for multi-tenancy — it's already how curator, janitor, etc. are configured per instance.
+
+## Session Management
+
+Sessions are **typed, resumable, and model-aware**. The opening cue does triple duty: identifies the session type, finds a previous session if continuing, and selects the right model. This is the core interaction design for the talker.
+
+### Session types
+
+Each type carries defaults for model, history scope, continuation behavior, and push-back frequency:
+
+| Type | Default model | History scope | Continues previous? | Push-back | Example cues |
+|---|---|---|---|---|---|
+| `note` | Sonnet | sliding window (last N turns) | no | low (1/10) | "Quick note", "Remind me to..." |
+| `task` | Sonnet | minimal (one-shot or 2-3 turns) | no | none | "Create a task to call Dr. Bailey" |
+| `journal` | Sonnet → Opus on depth | full session | optionally, by reference | 4/10 | "I want to think through the dental situation" |
+| `article` | Opus | full + previous session loaded | yes, by default | 3/10 | "Let's continue the last article" |
+| `brainstorm` | Sonnet capture, Opus format | full | optionally | 4/10 (minimal interjections) | "Brainstorm session about Q2 logistics" |
+
+These are starting-point defaults. Over time, the calibration mechanism learns which types consistently need which model and adjusts recommendations.
+
+### Opening-cue router
+
+When a message arrives, the talker's first job is to classify the opening cue. This is a lightweight Sonnet API call that reads the opening message and returns a routing decision:
+
+```json
+{
+  "session_type": "article",
+  "continue_from": "session/Article Draft - Multi-Instance Architecture 2026-04-12",
+  "model": "opus",
+  "reasoning": "User said 'continue the last article' — searching for most recent article session"
+}
+```
+
+The router:
+1. Classifies the session type from the natural-language cue
+2. If the type supports continuation AND the cue implies it ("let's continue...", "pick up where we left off..."), searches the vault for the most recent matching session record
+3. Selects the model based on the type's default (overridable by user cue — "quick article note" → Sonnet even for article type)
+4. Loads the appropriate context: previous session history (if continuing), vault summary, calibration profile
+
+Cost: one extra Sonnet API call at session start (~0.5s, minimal tokens). Worth it for correct routing. The router itself can be a simple structured-output prompt — it doesn't need tools, just classification.
+
+### Model selection and mid-session escalation
+
+**Starting model** is determined by the session type's default. General note-taking starts on Sonnet for speed. Articles start on Opus for depth.
+
+**Mid-session escalation** supports BOTH explicit and implicit detection:
+
+- **Explicit**: user types `/opus`, `/sonnet`, "use the bigger model", "switch to Opus." Talker switches immediately. Unambiguous.
+- **Implicit**: the talker detects it's giving shallow responses (short answers, hedging, not connecting dots across vault context) and offers: "This is getting complex — want me to switch to Opus for more depth?" User confirms or declines. Same bidirectional pattern as calibration.
+
+Both coexist: explicit always works, implicit is a learned behavior that improves over time.
+
+**Model-selection calibration** is recorded in the `<!-- ALFRED:CALIBRATION -->` section:
+
+```markdown
+### Model Preferences (learned)
+- article sessions: default Opus (escalated 9/10 times in first month)
+- note sessions: Sonnet is sufficient (never escalated)
+- journal sessions: start Sonnet, offer Opus after turn 5 (escalated ~40%)
+  _Updated 2026-05-15 — Alfred recommended changing article default to Opus_
+```
+
+This means model selection self-tunes the same way confirmation frequency does — Alfred observes the user's actual patterns and recommends adjustments when confidence is high enough.
+
+### Session boundaries
+
+**Start**: a new session begins when the user sends a message after a gap (no explicit `/start` needed). The opening-cue router classifies the type and loads context.
+
+**End**: two mechanisms, both active:
+- **Explicit**: user sends `/end` or "end session." Session record is written immediately.
+- **Implicit**: 30-minute gap with no messages. Session record is written automatically. The next message starts a fresh session (or continues a previous one if the cue says so).
+
+The implicit gap means you never have to remember to close a session — they expire naturally. The explicit command gives you control when you want the session note written NOW (e.g., before switching contexts).
+
+### Session records in the vault
+
+Each session writes a `session/` record at close with:
+- `session_type` in frontmatter (note/task/journal/article/brainstorm)
+- `model_used` — which model(s) were used, including any escalation events
+- `continues_from` — wikilink to the previous session if this was a continuation
+- Full conversation transcript as the body
+- Any vault operations performed during the session (tasks created, records edited) linked in `related`
+
+The distiller processes these on its normal cadence, extracting learnings just like any other session note.
 
 ## Modes
 
@@ -342,10 +452,13 @@ When the user says "save that" without specifying where, the talker asks **one c
 
 ## Staged Build Plan
 
+Note: Stage 1 (async-capture-only via n8n) was superseded by the decision to build the Python bot from the start (Option B). Stages 1 and 2a merge into a single build with weekly milestones. The table below reflects the current plan.
+
 | Stage | Target | Client | Stack | Time estimate | Hardware-dependent |
 |---|---|---|---|---|---|
-| **1** | Async voice capture (foundation) | Telegram bot | n8n → Whisper (Scribe/Groq/local) → inbox → curator | ~1 week | No |
-| **2a** | Turn-based grounded conversation (journaling, task exec, query) | Telegram bot | Talker tool + Claude + ElevenLabs STT/TTS batch | ~2-3 weeks | No |
+| **2a-wk1** | Text + voice back-and-forth MVP (single session type, Sonnet, full history) | Telegram bot (Python-native) | `python-telegram-bot` + Anthropic SDK direct + Groq Whisper or ElevenLabs Scribe | ~1 week | No |
+| **2a-wk2** | Session types + continuation + model routing (note/task/journal/article/brainstorm types, opening-cue router, previous-session loading) | Telegram bot | Same + vault session search | ~1 week | No |
+| **2a-wk3** | Model escalation + calibration integration (explicit /opus + implicit detection, calibration loading, push-back mechanism, session-end calibration writes) | Telegram bot | Same + calibration section read/write | ~1 week | No |
 | **2b** | Brainstorm-capture mode (long dictation + smart format + audio summary) | Telegram bot | Same talker, new SKILL.md mode | ~1 week after 2a | No |
 | **3** | Real-time streaming conversation | Telegram bot + maybe web PWA | ElevenLabs Conversational AI with Claude brain | ~2 weeks | Yes — Mac Studio, fall 2026 |
 | **3.5** | Multi-instance architecture (prerequisite for instance-specific talker modes) | — | Per-instance deploy pattern across the whole stack | Separate track, scope unknown | No, but big |
