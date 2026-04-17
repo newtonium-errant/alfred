@@ -199,6 +199,23 @@ def cmd_status(args: argparse.Namespace) -> None:
     except Exception as e:
         print(f"  (unavailable: {e})")
 
+    # Talker status — only show if config section exists, mirroring the
+    # orchestrator's auto-start gate.
+    if "telegram" in raw:
+        print("\n--- Talker ---")
+        try:
+            from alfred.telegram.config import load_from_unified as talker_cfg
+            from alfred.telegram.state import StateManager as TalkerState
+            cfg = talker_cfg(raw)
+            sm = TalkerState(cfg.session.state_path)
+            sm.load()
+            active = sm.state.get("active_sessions", {}) or {}
+            closed = sm.state.get("closed_sessions", []) or []
+            print(f"  Active sessions: {len(active)}")
+            print(f"  Closed sessions: {len(closed)}")
+        except Exception as e:
+            print(f"  (unavailable: {e})")
+
     print()
 
 
@@ -537,6 +554,137 @@ def cmd_brief(args: argparse.Namespace) -> None:
         bcli.cmd_generate(config)
 
 
+def cmd_talker(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred talker`` subcommands."""
+    raw = _load_unified_config(args.config)
+    subcmd = getattr(args, "talker_cmd", None)
+
+    # JSON-emitting subcommands suppress stdout logging so the JSON stream
+    # stays clean for downstream parsers. Same contract as the vault CLI.
+    wants_json = bool(getattr(args, "json", False))
+    _setup_logging_from_config(
+        raw,
+        tool="talker",
+        suppress_stdout=wants_json,
+    )
+
+    if subcmd == "watch":
+        import asyncio
+        from alfred.telegram.daemon import run as talker_run
+        from alfred._data import get_skills_dir
+        try:
+            code = asyncio.run(
+                talker_run(
+                    raw,
+                    skills_dir_str=str(get_skills_dir()),
+                    suppress_stdout=False,
+                )
+            )
+        except KeyboardInterrupt:
+            print("\nStopped.")
+            return
+        sys.exit(code)
+
+    # The remaining subcommands all touch state — share the load.
+    from alfred.telegram.config import load_from_unified as talker_cfg_loader
+    from alfred.telegram.state import StateManager
+    config = talker_cfg_loader(raw)
+    sm = StateManager(config.session.state_path)
+    sm.load()
+
+    if subcmd == "status":
+        active = sm.state.get("active_sessions", {}) or {}
+        closed = sm.state.get("closed_sessions", []) or []
+        if wants_json:
+            payload = {
+                "active_sessions": [
+                    {
+                        "chat_id": int(cid) if str(cid).lstrip("-").isdigit() else cid,
+                        "session_id": s.get("session_id"),
+                        "started_at": s.get("started_at"),
+                        "last_message_at": s.get("last_message_at"),
+                        "turn_count": len(s.get("transcript") or []),
+                    }
+                    for cid, s in active.items()
+                ],
+                "closed_count": len(closed),
+            }
+            print(json.dumps(payload, indent=2))
+            return
+        print("=" * 60)
+        print("TALKER STATUS")
+        print("=" * 60)
+        if not active:
+            print("Active sessions: none")
+        else:
+            print(f"Active sessions: {len(active)}")
+            for cid, s in active.items():
+                turns = len(s.get("transcript") or [])
+                print(f"  - chat_id={cid}")
+                print(f"      started_at:      {s.get('started_at', '?')}")
+                print(f"      last_message_at: {s.get('last_message_at', '?')}")
+                print(f"      turn_count:      {turns}")
+        print(f"Closed sessions: {len(closed)}")
+        return
+
+    if subcmd == "end":
+        chat_id = args.chat_id
+        active_dict = sm.get_active(chat_id)
+        if active_dict is None:
+            print(f"No active session for chat_id={chat_id}")
+            sys.exit(1)
+        from alfred.telegram import session as tsession
+        user_path = (
+            active_dict.get("_user_vault_path")
+            or (config.primary_users[0] if config.primary_users else None)
+        )
+        stt_model = active_dict.get("_stt_model_used") or config.stt.model
+        vault_root = active_dict.get("_vault_path_root") or config.vault.path
+        try:
+            rel_path = tsession.close_session(
+                sm,
+                vault_path_root=vault_root,
+                chat_id=int(chat_id),
+                reason="cli_manual",
+                user_vault_path=user_path,
+                stt_model_used=stt_model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to close session: {exc}")
+            sys.exit(1)
+        if wants_json:
+            print(json.dumps({"chat_id": chat_id, "record_path": rel_path}, indent=2))
+        else:
+            print(f"Closed session for chat_id={chat_id}")
+            print(f"  Record: {rel_path}")
+        return
+
+    if subcmd == "history":
+        closed = list(sm.state.get("closed_sessions", []) or [])
+        limit = getattr(args, "limit", 10) or 10
+        tail = closed[-limit:]
+        if wants_json:
+            print(json.dumps(tail, indent=2))
+            return
+        if not tail:
+            print("No closed sessions recorded.")
+            return
+        print(f"Showing last {len(tail)} closed session(s):")
+        for s in tail:
+            print(
+                f"  {s.get('ended_at', '?')}  chat={s.get('chat_id', '?')}  "
+                f"turns={s.get('message_count', 0)}  ops={s.get('vault_ops', 0)}  "
+                f"reason={s.get('reason', '?')}"
+            )
+            rp = s.get("record_path")
+            if rp:
+                print(f"      {rp}")
+        return
+
+    print("Usage: alfred talker {watch|status|end|history}")
+    sys.exit(1)
+
+
 def cmd_mail(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw, tool="mail")
@@ -738,6 +886,32 @@ def build_parser() -> argparse.ArgumentParser:
     brief_hist.add_argument("--limit", type=int, default=10)
     brief_sub.add_parser("watch", help="Daemon mode (generate on schedule)")
 
+    # talker
+    talker_p = sub.add_parser("talker", help="Telegram voice/text chat with Alfred")
+    talker_sub = talker_p.add_subparsers(dest="talker_cmd")
+    talker_watch = talker_sub.add_parser("watch", help="Start the Telegram bot daemon")
+    talker_watch.add_argument(
+        "--json", action="store_true", default=False,
+        help=argparse.SUPPRESS,
+    )
+    talker_status = talker_sub.add_parser("status", help="Show active/closed session counts")
+    talker_status.add_argument(
+        "--json", action="store_true", default=False,
+        help="Emit JSON instead of human-readable text",
+    )
+    talker_end = talker_sub.add_parser("end", help="Close an active session and write its vault record")
+    talker_end.add_argument("chat_id", help="Telegram chat_id of the session to end")
+    talker_end.add_argument(
+        "--json", action="store_true", default=False,
+        help="Emit JSON instead of human-readable text",
+    )
+    talker_history = talker_sub.add_parser("history", help="Show recent closed sessions")
+    talker_history.add_argument("--limit", type=int, default=10)
+    talker_history.add_argument(
+        "--json", action="store_true", default=False,
+        help="Emit JSON instead of human-readable text",
+    )
+
     # mail
     mail_p = sub.add_parser("mail", help="Email fetcher subcommands")
     mail_sub = mail_p.add_subparsers(dest="mail_cmd")
@@ -778,6 +952,7 @@ def main() -> None:
         "tui": cmd_tui,
         "brief": cmd_brief,
         "mail": cmd_mail,
+        "talker": cmd_talker,
     }
 
     handler = handlers.get(args.command)

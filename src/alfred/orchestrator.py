@@ -112,6 +112,24 @@ def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> Non
     run_webhook(inbox_path, token=token)
 
 
+def _run_talker(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = False) -> None:
+    """Talker (Telegram) daemon process entry point.
+
+    Mirrors the 3-arg curator runner: the talker needs ``skills_dir`` to
+    locate ``vault-talker/SKILL.md`` for the system prompt.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/talker.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    from alfred.telegram.daemon import run as talker_run
+    exit_code = asyncio.run(
+        talker_run(raw, skills_dir_str=skills_dir, suppress_stdout=suppress_stdout)
+    )
+    if exit_code:
+        sys.exit(exit_code)
+
+
 def _run_brief(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Brief daemon process entry point."""
     log_cfg = raw.get("logging", {})
@@ -192,6 +210,7 @@ TOOL_RUNNERS = {
     "surveyor": _run_surveyor,
     "mail": _run_mail_webhook,
     "brief": _run_brief,
+    "talker": _run_talker,
 }
 
 
@@ -227,6 +246,10 @@ def run_all(
             tools.append("mail")
         if "brief" in raw:
             tools.append("brief")
+        # Only add talker if config section exists — users without a Telegram
+        # bot shouldn't have a daemon spinning in a retry loop on 78 exits.
+        if "telegram" in raw:
+            tools.append("talker")
 
     # Validate tool names
     for tool in tools:

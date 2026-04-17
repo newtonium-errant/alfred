@@ -29,7 +29,11 @@ surveyor = [
     "numpy>=1.26",
     "openai>=1.30",
 ]
-all = ["alfred-vault[surveyor]", "alfred-vault[temporal]"]
+voice = [
+    "python-telegram-bot>=21.0",
+    "anthropic>=0.40",
+]
+all = ["alfred-vault[surveyor]", "alfred-vault[temporal]", "alfred-vault[voice]"]
 
 [project.urls]
 Homepage = "https://github.com/ssdavidai/alfred"

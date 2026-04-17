@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Alfred is a Python monorepo containing four AI-powered tools for managing an Obsidian vault. All tools share one config (`config.yaml`), one CLI entry point (`alfred`), and common infrastructure.
+Alfred is a Python monorepo containing five AI-powered tools for managing an Obsidian vault. All tools share one config (`config.yaml`), one CLI entry point (`alfred`), and common infrastructure.
 
 | Tool | Purpose |
 |------|---------|
@@ -12,6 +12,7 @@ Alfred is a Python monorepo containing four AI-powered tools for managing an Obs
 | **Janitor** | Scans vault for structural issues (broken links, invalid frontmatter, orphans) and fixes them |
 | **Distiller** | Extracts latent knowledge (assumptions, decisions, constraints) from operational records |
 | **Surveyor** | Embeds vault content, clusters semantically, labels clusters, discovers relationships |
+| **Talker** | Telegram voice/text chat with Alfred, vault-grounded |
 
 ## Install & Run
 
