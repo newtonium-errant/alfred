@@ -20,7 +20,14 @@ class VaultWriter:
         self.state = state
 
     def write_alfred_tags(self, rel_path: str, tags: list[str]) -> None:
-        """Set alfred_tags in frontmatter."""
+        """Set alfred_tags in frontmatter.
+
+        Skips the write when the normalized (sorted + deduped) new tag list
+        equals the normalized existing tag list. Cluster membership shifts
+        cause the labeler to re-propose tags every sweep; rewriting the file
+        with semantically identical content churns the vault's git history
+        for no gain, so we early-return on equality.
+        """
         full_path = self.vault_path / rel_path
         if not full_path.exists():
             log.warning("writer.file_not_found", path=rel_path)
@@ -33,14 +40,32 @@ class VaultWriter:
             log.warning("writer.parse_error", path=rel_path, error=str(e))
             return
 
-        # Check if tags actually changed
-        existing = post.metadata.get("alfred_tags", [])
-        if sorted(existing) == sorted(tags):
+        existing = post.metadata.get("alfred_tags", []) or []
+        if isinstance(existing, str):
+            existing = [existing]
+
+        # Normalize by sorting + deduplicating. ["a", "b"] vs ["b", "a", "b"]
+        # compare equal so duplicate-seeded inputs don't drive spurious writes.
+        norm_existing = sorted(set(str(t) for t in existing))
+        norm_new = sorted(set(str(t) for t in tags))
+
+        if norm_existing == norm_new:
+            log.info(
+                "writer.tags_unchanged",
+                path=rel_path,
+                tag_count=len(norm_new),
+            )
             return
 
         post.metadata["alfred_tags"] = tags
         self._write_atomic(full_path, rel_path, post)
-        log.info("writer.tags_written", path=rel_path, tags=tags)
+        log.info(
+            "writer.tags_updated",
+            path=rel_path,
+            before_count=len(norm_existing),
+            after_count=len(norm_new),
+            tags=tags,
+        )
 
     def write_relationships(self, rel_path: str, new_rels: list[dict]) -> None:
         """Append machine-generated relationships (only those with confidence < 1.0).
