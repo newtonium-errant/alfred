@@ -63,6 +63,30 @@ distiller:
     path: "./data/distiller_state.json"
     max_run_history: 20
 
+telegram:
+  # Telegram bot token from @BotFather
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  # Whitelist of Telegram user IDs allowed to talk to this bot.
+  # Single-user wk1: your own Telegram user ID only.
+  allowed_users: []
+  # Which person/ records the talker treats as primary-user calibration
+  # targets. Single-user wk1: just the vault owner.
+  primary_users:
+    - "person/Andrew Newton"
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    model: "claude-sonnet-4-6"
+    max_tokens: 4096
+    temperature: 0.7
+  stt:
+    provider: "groq"
+    api_key: "${GROQ_API_KEY}"
+    model: "whisper-large-v3"
+  session:
+    # Implicit session-end gap: 30 minutes of silence closes the session.
+    gap_timeout_seconds: 1800
+    state_path: "./data/talker_state.json"
+
 # temporal:
 #   address: "127.0.0.1:7233"
 #   namespace: "default"
