@@ -304,25 +304,44 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
         debounce_seconds=config.watcher.debounce_seconds,
     )
 
-    # Startup scan for unprocessed files
+    # Startup scan for unprocessed files — process concurrently up to
+    # watcher.max_concurrent. Each file retains its own claim + release and
+    # the mark_processed-on-failure fallback (Batch B item 1). One file's
+    # failure does not cancel peers (return_exceptions=True is implicit in
+    # the per-task exception handler). Ref upstream 163b7f9.
+    max_concurrent = config.watcher.max_concurrent
     unprocessed = watcher.full_scan()
-    for inbox_file in unprocessed:
-        if not _claim_file(inbox_file):
-            log.info("daemon.skip_locked", file=inbox_file.name)
-            continue
-        try:
-            await _process_file(inbox_file, backend, skill_text, config, state_mgr)
-        except Exception:
-            log.exception("daemon.process_error", file=inbox_file.name)
-            # Always move to processed — even on failure — to prevent
-            # infinite reprocessing loops. The error is logged above.
-            if inbox_file.exists():
+    if unprocessed:
+        log.info(
+            "daemon.startup_scan",
+            files=len(unprocessed),
+            max_concurrent=max_concurrent,
+        )
+        startup_sem = asyncio.Semaphore(max_concurrent)
+
+        async def _process_startup(inbox_file: Path) -> None:
+            async with startup_sem:
+                if not _claim_file(inbox_file):
+                    log.info("daemon.skip_locked", file=inbox_file.name)
+                    return
                 try:
-                    mark_processed(inbox_file, config.vault.processed_path)
+                    await _process_file(inbox_file, backend, skill_text, config, state_mgr)
                 except Exception:
-                    log.exception("daemon.mark_processed_fallback_failed", file=inbox_file.name)
-        finally:
-            _release_file(inbox_file)
+                    log.exception("daemon.process_error", file=inbox_file.name)
+                    # Always move to processed — even on failure — to prevent
+                    # infinite reprocessing loops. The error is logged above.
+                    if inbox_file.exists():
+                        try:
+                            mark_processed(inbox_file, config.vault.processed_path)
+                        except Exception:
+                            log.exception("daemon.mark_processed_fallback_failed", file=inbox_file.name)
+                finally:
+                    _release_file(inbox_file)
+
+        await asyncio.gather(
+            *[_process_startup(f) for f in unprocessed],
+            return_exceptions=True,
+        )
 
     # Start watching
     watcher.start()
@@ -347,31 +366,51 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
                     if f not in ready:
                         ready.append(f)
 
-            for inbox_file in ready:
-                if not inbox_file.exists():
-                    continue
-                # Guard against concurrent processing of the same file
-                if str(inbox_file) in _processing:
-                    continue
-                # Cross-process lock — prevents duplicate processing by zombie daemons
-                if not _claim_file(inbox_file):
-                    log.info("daemon.skip_locked", file=inbox_file.name)
-                    continue
-                _processing.add(str(inbox_file))
-                try:
-                    await _process_file(inbox_file, backend, skill_text, config, state_mgr)
-                except Exception:
-                    log.exception("daemon.process_error", file=inbox_file.name)
-                    # Always move to processed — even on failure — to prevent
-                    # infinite reprocessing loops. The error is logged above.
-                    if inbox_file.exists():
+            # Filter to files not already being processed in this loop, and
+            # claim them cross-process under the lock. Anything we claim must
+            # hit the _release_file path, so we do the claim inside the task.
+            to_process = [
+                f for f in ready
+                if f.exists() and str(f) not in _processing
+            ]
+
+            if to_process:
+                for f in to_process:
+                    _processing.add(str(f))
+
+                sem = asyncio.Semaphore(max_concurrent)
+
+                async def _watch_process(inbox_file: Path) -> None:
+                    async with sem:
+                        # Cross-process lock — prevents duplicate processing
+                        # by zombie daemons. Must be INSIDE the semaphore so
+                        # the in-memory _processing set stays consistent with
+                        # the filesystem lock.
+                        if not _claim_file(inbox_file):
+                            log.info("daemon.skip_locked", file=inbox_file.name)
+                            _processing.discard(str(inbox_file))
+                            return
                         try:
-                            mark_processed(inbox_file, config.vault.processed_path)
+                            await _process_file(inbox_file, backend, skill_text, config, state_mgr)
                         except Exception:
-                            log.exception("daemon.mark_processed_fallback_failed", file=inbox_file.name)
-                finally:
-                    _processing.discard(str(inbox_file))
-                    _release_file(inbox_file)
+                            log.exception("daemon.process_error", file=inbox_file.name)
+                            # Always move to processed — even on failure — to
+                            # prevent infinite reprocessing loops.
+                            if inbox_file.exists():
+                                try:
+                                    mark_processed(inbox_file, config.vault.processed_path)
+                                except Exception:
+                                    log.exception("daemon.mark_processed_fallback_failed", file=inbox_file.name)
+                        finally:
+                            _processing.discard(str(inbox_file))
+                            _release_file(inbox_file)
+
+                # return_exceptions=True: one file's failure must not cancel
+                # the gather (per-task handler already logs + marks processed).
+                await asyncio.gather(
+                    *[_watch_process(f) for f in to_process],
+                    return_exceptions=True,
+                )
     finally:
         watcher.stop()
         log.info("daemon.stopped")

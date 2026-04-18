@@ -88,6 +88,11 @@ class WatcherConfig:
     poll_interval: int = 5
     debounce_seconds: int = 10
     rescan_interval: int = 60
+    # Max number of inbox files to process concurrently via asyncio.gather.
+    # Per-file processing is bounded by a semaphore — backend calls (CLI
+    # subprocesses or HTTP) run in parallel up to this limit. Ref upstream
+    # 163b7f9; default matches upstream.
+    max_concurrent: int = 4
 
 
 @dataclass
