@@ -34,7 +34,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import conversation, router, session, session_types, transcribe
+from . import calibration, conversation, router, session, session_types, transcribe
 from .config import TalkerConfig
 from .session import Session
 from .state import StateManager
@@ -385,6 +385,21 @@ async def _open_routed_session(
         pushback_level=type_defaults.pushback_level,
     )
 
+    # Wk3 commit 2: snapshot the calibration block at session open so every
+    # turn in this session sees the same prefix. Reading on each turn would
+    # (a) defeat prompt caching and (b) race with commit 7's close-time
+    # writer. ``None`` is a valid value — the user may not have a
+    # calibration block yet.
+    from pathlib import Path
+    user_rel = config.primary_users[0] if config.primary_users else ""
+    calibration_snapshot = calibration.read_calibration(
+        Path(config.vault.path), user_rel,
+    )
+    active = state_mgr.get_active(chat_id) or {}
+    active["_calibration_snapshot"] = calibration_snapshot
+    state_mgr.set_active(chat_id, active)
+    state_mgr.save()
+
     # Continuation pre-seed: drop one context turn into the transcript so
     # the model knows what came before. We don't have the full prior
     # transcript in state (only a summary), so the primer references the
@@ -479,14 +494,15 @@ async def handle_message(
         except Exception as exc:  # noqa: BLE001
             log.debug("talker.bot.typing_action_failed", error=str(exc))
 
-        # Re-read the active dict to pull the stashed pushback level — it
-        # was written at session-open time by ``_open_session_with_stash``
-        # and is orthogonal to the :class:`Session` dataclass. ``None``
-        # means a pre-wk3 active dict (rehydrated from state) that was
-        # opened without a pushback stash; ``run_turn`` treats ``None`` as
-        # "skip the directive block entirely".
+        # Re-read the active dict to pull the stashed pushback level and
+        # calibration snapshot — both are written at session-open time by
+        # ``_open_routed_session`` and are orthogonal to the
+        # :class:`Session` dataclass. ``None`` on either means a pre-wk3
+        # active dict (rehydrated from state) that was opened without a
+        # stash; ``run_turn`` treats both as "skip that block entirely".
         active_for_turn = state_mgr.get_active(chat_id) or {}
         pushback_level = active_for_turn.get("_pushback_level")
+        calibration_str = active_for_turn.get("_calibration_snapshot")
 
         try:
             response_text = await conversation.run_turn(
@@ -498,6 +514,7 @@ async def handle_message(
                 vault_context_str=vault_context_str,
                 system_prompt=system_prompt,
                 user_kind="voice" if voice else "text",
+                calibration_str=calibration_str,
                 pushback_level=pushback_level,
             )
         except anthropic.APIError as exc:
