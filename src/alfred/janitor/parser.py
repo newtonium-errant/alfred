@@ -8,7 +8,7 @@ from pathlib import Path
 
 import frontmatter
 
-WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
+WIKILINK_RE = re.compile(r"(?<!!)\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
 
 # Embed pattern: ![[something.base#Section]] or ![[file]]
 EMBED_RE = re.compile(r"!\[\[[^\]]+\]\]")

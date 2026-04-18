@@ -726,9 +726,16 @@ async def _stage3_create(
     # Snapshot created files before this call
     before_created = set(read_mutations(session_path).get("files_created", []))
 
+    # Filesystem snapshot fallback: the mutation log may not be written when
+    # the agent runs in a separate container (openclaw) that doesn't have
+    # ALFRED_VAULT_SESSION set. We diff the learn-type directory instead.
+    vault_dir = config.vault.vault_path
+    learn_dir = vault_dir / spec.learn_type
+    before_files = set(learn_dir.glob("*.md")) if learn_dir.is_dir() else set()
+
     await _call_llm(prompt, config, session_path, stage_label)
 
-    # Check what's new
+    # Check what's new — first try the mutation log
     after_created = set(read_mutations(session_path).get("files_created", []))
     new_created = after_created - before_created
 
@@ -741,6 +748,16 @@ async def _stage3_create(
     for path in new_created:
         log.info("pipeline.s3_created", path=path, type=spec.learn_type)
         return path
+
+    # Fallback: filesystem diff (handles cross-container agent writes where
+    # the mutation log was never populated).
+    if learn_dir.is_dir():
+        after_files = set(learn_dir.glob("*.md"))
+        new_files = after_files - before_files
+        for f in new_files:
+            rel = f.relative_to(vault_dir)
+            log.info("pipeline.s3_created_via_fs_diff", path=str(rel), type=spec.learn_type)
+            return str(rel)
 
     log.warning("pipeline.s3_no_record_created", title=spec.title)
     return None
