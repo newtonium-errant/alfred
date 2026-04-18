@@ -19,6 +19,41 @@ KEN_DYNAMIC_RE = re.compile(
     re.DOTALL,
 )
 
+# Alfred dynamic (general) and calibration (voice-specific) block markers.
+# Both must be stripped before distillation runs:
+#   - ALFRED:DYNAMIC wraps machine-generated briefings / summaries Alfred
+#     rewrites on a cadence. Feeding them back through the distiller
+#     would re-learn Alfred's own prior output as new learnings.
+#   - ALFRED:CALIBRATION wraps Alfred's self-model of the user. Same
+#     feedback-loop risk, but more acute: the calibration block is
+#     literally "Alfred's current understanding of the user", and
+#     distilling it would turn that into an ever-growing pile of
+#     `synthesis` / `assumption` records about the user.
+# Both patterns use DOTALL + non-greedy so adjacent blocks don't merge.
+ALFRED_DYNAMIC_RE = re.compile(
+    r"<!-- ALFRED:DYNAMIC -->.*?<!-- END ALFRED:DYNAMIC -->",
+    re.DOTALL,
+)
+ALFRED_CALIBRATION_RE = re.compile(
+    r"<!-- ALFRED:CALIBRATION -->.*?<!-- END ALFRED:CALIBRATION -->",
+    re.DOTALL,
+)
+
+
+def _strip_excluded_blocks(text: str) -> str:
+    """Remove all marker-fenced blocks the distiller must not consume.
+
+    Central helper so the same strip pattern is applied to every surface
+    the distiller reads — the body on :class:`VaultRecord` and the length
+    calculation that gates whether a record is considered "empty".
+    Forgetting one surface is a silent bug where the distiller would
+    still see calibration content via ``stripped_body_length``.
+    """
+    text = KEN_DYNAMIC_RE.sub("", text)
+    text = ALFRED_DYNAMIC_RE.sub("", text)
+    text = ALFRED_CALIBRATION_RE.sub("", text)
+    return text
+
 
 @dataclass
 class VaultRecord:
@@ -35,13 +70,19 @@ def extract_wikilinks(text: str) -> list[str]:
 
 
 def parse_file(vault_path: Path, rel_path: str) -> VaultRecord:
-    """Parse a vault markdown file into a VaultRecord."""
+    """Parse a vault markdown file into a VaultRecord.
+
+    Strips ALFRED:DYNAMIC and ALFRED:CALIBRATION (and KEN:DYNAMIC) blocks
+    from the body before returning it — the distiller must never ingest
+    Alfred's own machine-generated content, or extraction becomes a
+    feedback loop. See :func:`_strip_excluded_blocks`.
+    """
     full_path = vault_path / rel_path
     raw_text = full_path.read_text(encoding="utf-8")
     post = frontmatter.loads(raw_text)
 
     fm = dict(post.metadata)
-    body = post.content
+    body = _strip_excluded_blocks(post.content)
     record_type = fm.get("type", "")
 
     wikilinks = extract_wikilinks(raw_text)
@@ -56,9 +97,15 @@ def parse_file(vault_path: Path, rel_path: str) -> VaultRecord:
 
 
 def stripped_body_length(body: str) -> int:
-    """Return body length after stripping embeds, KEN dynamic sections, and whitespace."""
+    """Return body length after stripping embeds, Alfred dynamic blocks, and whitespace.
+
+    Strips the same marker-fenced blocks as :func:`parse_file` so the
+    "empty record" check matches what the distiller actually sees. If
+    this diverged from ``parse_file``, a record that looks empty to the
+    distiller could still gate on calibration content here.
+    """
     text = EMBED_RE.sub("", body)
-    text = KEN_DYNAMIC_RE.sub("", text)
+    text = _strip_excluded_blocks(text)
     # Strip markdown headings that are just structural
     lines = []
     for line in text.split("\n"):
