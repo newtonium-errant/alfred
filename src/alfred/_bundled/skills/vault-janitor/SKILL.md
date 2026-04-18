@@ -438,6 +438,18 @@ Task records with `kind: task` containing project setup checklists. These live i
 
 ## 3. Fix Procedures by Issue Code
 
+### Writing `janitor_note` — Idempotency Rule
+
+Every `janitor_note` written by these procedures must begin with the issue code (`FM002 —`, `LINK001 —`, `DUP001 —`, `ORPHAN001 —`, `STUB001 —`, etc.). That prefix is load-bearing — it is how the janitor recognizes its own prior work across sweeps.
+
+**Before writing `janitor_note`, always `alfred vault read` the target record first.** Then:
+
+- If an existing `janitor_note` is present AND it starts with the same issue code you are about to write, **leave it untouched** — do not rewrite the prose. Log the action as `SKIPPED | {path} | {code} | janitor_note already present, no change`.
+- If an existing `janitor_note` is present but starts with a **different** issue code, replace it with the new note.
+- If no `janitor_note` is present, write the new note normally.
+
+This prevents sweep-to-sweep churn from LLM prose variance on identical underlying issues — the stable issue-code prefix is the equality check, not the prose body.
+
 ### FM001 — MISSING_REQUIRED_FIELD
 
 **Diagnosis:** Record is missing `type`, `created`, or `name`/`subject`.
