@@ -521,6 +521,58 @@ def _flag_issue(
     )
 
 
+def flag_unresolved_links(
+    unresolved: list[Issue],
+    vault_path: Path,
+    session_path: str,
+) -> list[str]:
+    """Flag LINK001 issues that Stage 2 couldn't repair.
+
+    Writes a deterministic janitor_note of the form
+    ``"LINK001 -- broken wikilink [[{target}]]; {n} candidate(s) found,
+    none unambiguous"`` so the prose is stable across sweeps and the LLM
+    is never asked to write it.
+
+    Args:
+        unresolved: LINK001 issues whose file was not modified by Stage 2.
+            The pipeline determines "not modified" via a file-mtime diff.
+        vault_path: Root of the vault.
+        session_path: Mutation-log session path (for audit tracking).
+
+    Returns:
+        Relative paths of files actually flagged (for telemetry).
+    """
+    import re as _re
+
+    flagged_files: list[str] = []
+    for issue in unresolved:
+        match = _re.search(r"\[\[([^\]]+)\]\]", issue.message)
+        broken_target = match.group(1) if match else "(unknown)"
+
+        # Candidate count: the scanner stashes it in the suggested_fix/detail
+        # string when available. Falls back to 0 when the scanner didn't
+        # annotate the issue.
+        n_candidates = 0
+        for blob in (issue.detail or "", issue.suggested_fix or ""):
+            m = _re.search(r"(\d+)\s+candidate", blob)
+            if m:
+                n_candidates = int(m.group(1))
+                break
+
+        note = (
+            f"LINK001 -- broken wikilink [[{broken_target}]]; "
+            f"{n_candidates} candidate(s) found, none unambiguous"
+        )
+        result = _flag_issue_with_note(
+            issue, issue.file, vault_path, session_path, note=note,
+        )
+        if result == "flagged":
+            flagged_files.append(issue.file)
+
+    log.info("autofix.link001_unresolved_flagged", count=len(flagged_files))
+    return flagged_files
+
+
 def _flag_issue_with_note(
     issue: Issue,
     rel_path: str,

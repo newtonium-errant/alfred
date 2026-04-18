@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 from alfred.vault.mutation_log import log_mutation
 from alfred.vault.ops import VaultError, vault_read, vault_search
 
-from .autofix import autofix_issues
+from .autofix import autofix_issues, flag_unresolved_links
 from .backends import VAULT_CLI_REFERENCE
 from .backends.openclaw import _clear_agent_sessions, _sync_workspace_claude_md
 from .config import JanitorConfig
@@ -270,10 +270,18 @@ async def _stage2_link_repair(
     link_issues: list[Issue],
     config: JanitorConfig,
     session_path: str,
-) -> int:
-    """Stage 2: Repair broken wikilinks. Returns count of links repaired."""
+) -> tuple[int, list[Issue]]:
+    """Stage 2: Repair broken wikilinks.
+
+    Returns ``(repaired_count, unresolved_issues)``. Unresolved issues are
+    the LINK001 entries whose target file was not modified by Stage 2
+    (either because no unambiguous Python fix was possible and the LLM
+    call didn't change the file, or the scanner message had no extractable
+    target). The caller flags these via ``autofix.flag_unresolved_links``
+    so the deterministic janitor_note prose is owned by Python.
+    """
     if not link_issues:
-        return 0
+        return 0, []
 
     if len(link_issues) > MAX_ISSUES_PER_SWEEP:
         log.warning(
@@ -287,12 +295,14 @@ async def _stage2_link_repair(
     ignore_dirs = config.vault.ignore_dirs
     template = _load_stage_prompt("stage2_link_repair.md")
     repaired = 0
+    unresolved: list[Issue] = []
 
     for issue in link_issues:
         # Extract broken target from message: "Broken wikilink: [[target]]"
         match = re.search(r"\[\[([^\]]+)\]\]", issue.message)
         if not match:
             log.warning("pipeline.s2_no_target", file=issue.file, message=issue.message)
+            unresolved.append(issue)
             continue
         broken_target = match.group(1)
 
@@ -312,9 +322,15 @@ async def _stage2_link_repair(
                 repaired += 1
                 continue
 
+        # Annotate the issue with a candidate count so ``flag_unresolved_links``
+        # can mention "{n} candidate(s) found" without re-running the search.
+        # detail is a free-form string; the flag helper greps for "\d+ candidate".
+        issue.detail = f"{len(candidates)} candidate(s) found"
+
         # Ambiguous or no match -- send to LLM if we have candidates and a template
         if not template:
             log.warning("pipeline.s2_no_template", file=issue.file)
+            unresolved.append(issue)
             continue
 
         candidates_text = _format_candidates(candidates)
@@ -354,9 +370,14 @@ async def _stage2_link_repair(
                 file=issue.file,
                 target=broken_target,
             )
+            unresolved.append(issue)
 
-    log.info("pipeline.s2_complete", repaired=repaired)
-    return repaired
+    log.info(
+        "pipeline.s2_complete",
+        repaired=repaired,
+        unresolved=len(unresolved),
+    )
+    return repaired, unresolved
 
 
 def _format_candidates(candidates: list[dict]) -> str:
@@ -645,11 +666,21 @@ async def run_pipeline(
         skipped=len(skipped),
     )
 
-    # Stage 2: Link Repair (LLM for ambiguous, Python for unambiguous)
+    # Stage 2: Link Repair (LLM for ambiguous, Python for unambiguous).
+    # Unresolved LINK001 issues (no unambiguous Python fix and the LLM
+    # call didn't modify the file) are flagged via
+    # ``flag_unresolved_links`` so the deterministic janitor_note prose
+    # lives in Python, not the SKILL. Pipeline tallies them into the
+    # existing ``files_flagged`` counter.
     log.info("pipeline.s2_start", issues=len(link_issues))
-    result.links_repaired = await _stage2_link_repair(
+    result.links_repaired, unresolved_links = await _stage2_link_repair(
         link_issues, config, session_path,
     )
+    if unresolved_links:
+        unresolved_flagged = flag_unresolved_links(
+            unresolved_links, vault_path, session_path,
+        )
+        result.files_flagged += len(unresolved_flagged)
 
     # Stage 3: Enrich stubs (LLM, per-file)
     # Pass state so the stage can filter stale stubs, apply the per-sweep
