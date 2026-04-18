@@ -36,7 +36,14 @@ class Daemon:
         self.embedder = Embedder(cfg.ollama, cfg.milvus, cfg.vault.path, self.state)
         self.clusterer = Clusterer(cfg.clustering, self.state)
         self.labeler = Labeler(cfg.openrouter, cfg.labeler)
-        self.writer = VaultWriter(cfg.vault.path, self.state)
+        # Mirror the curator/janitor/distiller pattern: derive the unified
+        # audit-log path from the state-file directory so every surveyor
+        # write lands in data/vault_audit.log alongside the other tools.
+        # Without this, drift investigations that grep the audit log for
+        # who-touched-what see zero surveyor entries even though the
+        # surveyor is the only daemon writing alfred_tags.
+        audit_log_path = Path(cfg.state.path).parent / "vault_audit.log"
+        self.writer = VaultWriter(cfg.vault.path, self.state, audit_log_path=audit_log_path)
 
     def request_shutdown(self) -> None:
         log.info("daemon.shutdown_requested")

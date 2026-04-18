@@ -8,6 +8,8 @@ from pathlib import Path
 import frontmatter
 import structlog
 
+from alfred.vault.mutation_log import append_to_audit_log
+
 from .state import PipelineState
 from .utils import compute_md5_bytes
 
@@ -15,9 +17,28 @@ log = structlog.get_logger()
 
 
 class VaultWriter:
-    def __init__(self, vault_path: Path, state: PipelineState) -> None:
+    def __init__(
+        self,
+        vault_path: Path,
+        state: PipelineState,
+        audit_log_path: str | Path | None = None,
+    ) -> None:
+        """Initialize the writer.
+
+        Args:
+            vault_path: Vault root.
+            state: Pipeline state (for pending-write hash registration).
+            audit_log_path: Optional path to ``data/vault_audit.log``. When
+                set, each successful tag/relationship write appends a
+                ``{"tool": "surveyor", "op": "modify", "path": ...}`` JSONL
+                line so surveyor mutations show up in the unified audit log
+                alongside curator/janitor/distiller. Without this, surveyor
+                writes are invisible to vault drift investigations even
+                though the structured log events are emitted.
+        """
         self.vault_path = vault_path
         self.state = state
+        self.audit_log_path = str(audit_log_path) if audit_log_path else None
 
     def write_alfred_tags(self, rel_path: str, tags: list[str]) -> None:
         """Set alfred_tags in frontmatter.
@@ -58,7 +79,7 @@ class VaultWriter:
             return
 
         post.metadata["alfred_tags"] = tags
-        self._write_atomic(full_path, rel_path, post)
+        self._write_atomic(full_path, rel_path, post, audit_detail="alfred_tags")
         log.info(
             "writer.tags_updated",
             path=rel_path,
@@ -126,11 +147,26 @@ class VaultWriter:
             return
 
         post.metadata["relationships"] = existing_rels
-        self._write_atomic(full_path, rel_path, post)
+        self._write_atomic(full_path, rel_path, post, audit_detail="relationships")
         log.info("writer.relationships_written", path=rel_path, added=added)
 
-    def _write_atomic(self, full_path: Path, rel_path: str, post: frontmatter.Post) -> None:
-        """Write file atomically and register expected hash in state."""
+    def _write_atomic(
+        self,
+        full_path: Path,
+        rel_path: str,
+        post: frontmatter.Post,
+        audit_detail: str = "",
+    ) -> None:
+        """Write file atomically and register expected hash in state.
+
+        On success, appends a ``modify`` line to ``data/vault_audit.log``
+        when the writer was constructed with ``audit_log_path``. The audit
+        entry is what makes surveyor writes show up in
+        ``alfred vault audit`` and in any drift-investigation workflow that
+        diffs the audit log to attribute changes by tool — without it,
+        surveyor mutations are invisible to those tools even though the
+        structured log events fire.
+        """
         content = frontmatter.dumps(post) + "\n"
         content_bytes = content.encode("utf-8")
         expected_md5 = compute_md5_bytes(content_bytes)
@@ -153,3 +189,21 @@ class VaultWriter:
 
         # Update file hash in state
         self.state.update_file(rel_path, expected_md5)
+
+        # Audit log: only emit on a real persisted write. Skip-if-equal
+        # paths in write_alfred_tags / write_relationships short-circuit
+        # before reaching here, so the audit log mirrors the actual file
+        # mutations, not every labeling attempt.
+        if self.audit_log_path:
+            try:
+                append_to_audit_log(
+                    self.audit_log_path,
+                    "surveyor",
+                    {"files_created": [], "files_modified": [rel_path], "files_deleted": []},
+                    detail=audit_detail,
+                )
+            except OSError as e:
+                # Audit-log failure must not break the write itself; surface
+                # it as a warning so monitoring sees the gap instead of
+                # silently dropping the entry like the pre-fix state.
+                log.warning("writer.audit_log_error", path=rel_path, error=str(e))
