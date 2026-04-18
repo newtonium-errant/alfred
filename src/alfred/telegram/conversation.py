@@ -408,6 +408,149 @@ async def _execute_tool(
         return _dumps({"error": f"unexpected error: {exc}"})
 
 
+# --- Implicit escalation detection ----------------------------------------
+
+# Ship-list per wk3 team-lead decision on open question #5. Each signal is
+# a cheap heuristic — we deliberately don't ML-classify this because the
+# offer is always an *offer*: the user just ignores the suggestion if it's
+# off-base. False positives cost one line of text, not an expensive
+# escalation.
+
+# Keyword phrases that strongly imply "I want more thinking here". Matched
+# case-insensitive, substring (not word-boundary) because voice
+# transcription routinely produces "think harder about this" with the
+# final "about this" tacked on and boundary-matching would miss it.
+_ESCALATION_KEYWORDS: Final[tuple[str, ...]] = (
+    "think harder",
+    "more depth",
+    "go deeper",
+    "dig into this",
+)
+
+# Length thresholds for the long-user/short-assistant signal. Calibrated
+# to typical voice-transcription turn lengths:
+#   - User turns over 400 chars (~60-70 words) are almost always
+#     "thinking out loud" about something substantive.
+#   - Assistant responses under 150 chars (~25 words) are almost always
+#     one-line acknowledgements, which is under-serving a substantive turn.
+# Wider windows tend to produce a lot of false negatives in testing; these
+# are a reasonable starting point and can be tuned from production logs.
+_LONG_USER_MIN_CHARS: Final[int] = 400
+_SHORT_ASSISTANT_MAX_CHARS: Final[int] = 150
+
+# Minimum number of prior user turns required to evaluate the "rephrase"
+# signal. Fewer than 2 means there's no prior user turn to compare to.
+_REPHRASE_MIN_TURNS: Final[int] = 2
+# Jaccard-similarity threshold for "substantially the same content". Set
+# high because we want repeated dissatisfaction, not topically adjacent
+# follow-ups.
+_REPHRASE_SIM_THRESHOLD: Final[float] = 0.55
+
+# Minimum turn-index gap between successive escalation offers. Without
+# this, the offer would be appended on every qualifying turn after the
+# first — which is noisy. Five turns is a reasonable debounce window:
+# long enough that the user has had time to either accept or ignore, but
+# short enough that if the escalation signal is still firing we surface
+# it again.
+_ESCALATION_COOLDOWN_TURNS: Final[int] = 5
+
+_ESCALATION_SUFFIX: Final[str] = (
+    "\n\n— want me to switch to Opus for the rest of this session? "
+    "/opus to confirm."
+)
+
+
+def _jaccard(a: str, b: str) -> float:
+    """Token-set Jaccard similarity between two short strings.
+
+    Simple enough for voice transcripts — both turns are the user's own
+    words, so identical wording trips Jaccard cleanly. Punctuation and
+    case differences shouldn't knock us below threshold, so we lowercase
+    and split on whitespace (close-enough tokenisation).
+    """
+    ta = set(a.lower().split())
+    tb = set(b.lower().split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _detect_escalation_signal(
+    session: Session,
+    user_message: str,
+    assistant_text: str,
+) -> str | None:
+    """Return the name of the first-firing escalation signal, or ``None``.
+
+    Signals, checked in order:
+        - ``keyword``: the user message contains a phrase like "think
+          harder" / "go deeper" / etc.
+        - ``long_user_short_assistant``: this user turn is substantive
+          but the assistant's response is terse.
+        - ``rephrase``: this user turn is highly similar to an earlier
+          one in the same session (user dissatisfaction signal).
+
+    Returns the signal name so the caller can log it. Returning a string
+    rather than ``bool`` costs one extra dispatch per turn and makes
+    log-correlation possible ("which signal fired most on this session?").
+    """
+    lower = user_message.lower()
+    for kw in _ESCALATION_KEYWORDS:
+        if kw in lower:
+            return "keyword"
+
+    # Long user / short assistant — both thresholds must hold.
+    if (
+        len(user_message) >= _LONG_USER_MIN_CHARS
+        and len(assistant_text) <= _SHORT_ASSISTANT_MAX_CHARS
+    ):
+        return "long_user_short_assistant"
+
+    # Rephrase against prior user turns in this session (only plain-text
+    # user turns, not tool_result lists).
+    prior_user_texts = [
+        t.get("content") for t in session.transcript
+        if t.get("role") == "user" and isinstance(t.get("content"), str)
+    ]
+    # The current message hasn't been appended yet at call time; guard
+    # anyway by skipping empty lists.
+    if len(prior_user_texts) >= _REPHRASE_MIN_TURNS:
+        # Check the last 3 prior user turns (excluding the very last,
+        # which would often be the message we're evaluating).
+        for prior in prior_user_texts[-4:-1]:
+            if _jaccard(prior, user_message) >= _REPHRASE_SIM_THRESHOLD:
+                return "rephrase"
+
+    return None
+
+
+def _should_offer_escalation(
+    active: dict[str, Any],
+    session: Session,
+) -> bool:
+    """Cooldown / disable-flag check for the implicit escalation offer.
+
+    Returns False when:
+        - the user has toggled ``_auto_escalate_disabled`` this session
+          (``/no-auto-escalate``),
+        - the session is already on Opus (no need to offer what's active),
+        - we offered within the cooldown window.
+    """
+    if active.get("_auto_escalate_disabled"):
+        return False
+    if session.model == "claude-opus-4-7" or session.model == "claude-opus-4-5":
+        return False
+    last_offered = active.get("_escalation_offered_at_turn")
+    if last_offered is None:
+        return True
+    try:
+        last_offered_int = int(last_offered)
+    except (TypeError, ValueError):
+        return True
+    current_turn = len(session.transcript)
+    return (current_turn - last_offered_int) > _ESCALATION_COOLDOWN_TURNS
+
+
 # --- Main turn ------------------------------------------------------------
 
 
@@ -514,9 +657,36 @@ async def run_turn(
             append_turn(state, session, "user", tool_results)
             continue
 
-        # end_turn (or any non-tool stop): extract text, record, return.
+        # end_turn (or any non-tool stop): extract text, record, run
+        # escalation detection, return.
         text = _extract_text(response.content)
         append_turn(state, session, "assistant", _blocks_to_jsonable(response.content))
+
+        # Wk3 commit 6: implicit escalation detection. Cheap heuristic —
+        # if the turn looks like the user wants more thinking and we
+        # aren't already on Opus and haven't offered recently, append an
+        # offer to the assistant reply. The user types /opus to confirm
+        # (commit 5 wiring), or ignores, or types /no-auto-escalate to
+        # disable this for the rest of the session.
+        active = state.get_active(session.chat_id)
+        if active is not None:
+            signal = _detect_escalation_signal(session, user_message, text)
+            if signal is not None:
+                if _should_offer_escalation(active, session):
+                    log.info(
+                        "talker.model.escalate_offered",
+                        chat_id=session.chat_id,
+                        session_id=session.session_id,
+                        signal=signal,
+                        turn_index=len(session.transcript),
+                    )
+                    text = text + _ESCALATION_SUFFIX
+                    active["_escalation_offered_at_turn"] = len(
+                        session.transcript
+                    )
+                    state.set_active(session.chat_id, active)
+                    state.save()
+
         return text
 
     # Hit the safety cap. Record an explanatory assistant turn so the

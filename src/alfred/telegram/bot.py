@@ -87,6 +87,13 @@ def build_app(
     # session just to flip its model).
     app.add_handler(CommandHandler("opus", on_opus))
     app.add_handler(CommandHandler("sonnet", on_sonnet))
+    # Wk3 commit 6: disables the implicit escalation offer for the rest
+    # of this session (state not persisted across sessions, per team-lead
+    # call on open question #4). PTB only allows [a-z0-9_] in command
+    # names, so the canonical command is ``no_auto_escalate``; the spec
+    # called for ``no-auto-escalate`` but dashes aren't legal in PTB —
+    # noting the deviation here and in the session note.
+    app.add_handler(CommandHandler("no_auto_escalate", on_no_auto_escalate))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
@@ -207,7 +214,14 @@ def _switch_model(
 
 
 async def on_opus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/opus`` — switch the active session to the Opus model."""
+    """``/opus`` — switch the active session to the Opus model.
+
+    Wk3 commit 6: if an implicit escalation offer was made within the
+    cooldown window just before this ``/opus``, log the flip as
+    ``escalate_accepted`` so downstream metrics can track acceptance
+    rate. Explicit un-prompted ``/opus`` still logs ``escalated`` with
+    ``trigger="explicit"``.
+    """
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
     state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
     if not _is_allowed(update, config):
@@ -218,26 +232,77 @@ async def on_opus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     active = state_mgr.get_active(chat_id) or {}
     previous = active.get("model", "")
+    offered_at = active.get("_escalation_offered_at_turn")
 
     reply = _switch_model(state_mgr, chat_id, _OPUS_MODEL, "Opus")
     if reply is None:
         await update.message.reply_text("no active session to switch.")
         return
 
-    # Only log the actual flip, not idempotent re-issues. The message
-    # schema matches commit 6's implicit escalate-offered events so a
-    # downstream consumer can aggregate both under ``talker.model.*``.
-    turn_index = len(active.get("transcript") or [])
     if previous != _OPUS_MODEL:
-        log.info(
-            "talker.model.escalated",
-            chat_id=chat_id,
-            session_id=active.get("session_id", ""),
-            **{"from": previous, "to": _OPUS_MODEL},
-            turn_index=turn_index,
-            trigger="explicit",
+        # Offer → acceptance gets its own event so we can measure uptake.
+        # The window matches ``_ESCALATION_COOLDOWN_TURNS`` in
+        # conversation.py: if ``/opus`` arrives within that window of an
+        # offer, we treat it as accepted. Outside the window, it's
+        # "explicit" and independent of any prior offer.
+        from . import conversation as _conv
+        turn_index = len(active.get("transcript") or [])
+        accepted = (
+            offered_at is not None
+            and (turn_index - int(offered_at)) <= _conv._ESCALATION_COOLDOWN_TURNS
         )
+        if accepted:
+            log.info(
+                "talker.model.escalate_accepted",
+                chat_id=chat_id,
+                session_id=active.get("session_id", ""),
+                **{"from": previous, "to": _OPUS_MODEL},
+                turn_index=turn_index,
+                offered_at_turn=int(offered_at),
+            )
+        else:
+            log.info(
+                "talker.model.escalated",
+                chat_id=chat_id,
+                session_id=active.get("session_id", ""),
+                **{"from": previous, "to": _OPUS_MODEL},
+                turn_index=turn_index,
+                trigger="explicit",
+            )
     await update.message.reply_text(reply)
+
+
+async def on_no_auto_escalate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/no-auto-escalate`` — suppress the implicit-escalation offer for this session.
+
+    Session-scoped only (team-lead call on open question #4) — the flag
+    does not persist into ``closed_sessions`` or the next session. The
+    rationale: auto-escalate tuning is a per-session policy, not a
+    permanent preference. If Andrew wants it off across sessions, commit
+    8's model-preferences calibration block is the right surface.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+
+    chat_id = update.effective_chat.id
+    active = state_mgr.get_active(chat_id)
+    if not active:
+        await update.message.reply_text("no active session.")
+        return
+
+    active["_auto_escalate_disabled"] = True
+    state_mgr.set_active(chat_id, active)
+    state_mgr.save()
+    log.info(
+        "talker.model.auto_escalate_disabled",
+        chat_id=chat_id,
+        session_id=active.get("session_id", ""),
+    )
+    await update.message.reply_text("auto-escalate off for this session.")
 
 
 async def on_sonnet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
