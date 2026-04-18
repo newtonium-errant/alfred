@@ -149,14 +149,33 @@ def append_turn(
     session: Session,
     role: str,
     content: str | list[dict[str, Any]],
+    kind: str = "text",
 ) -> None:
     """Append an Anthropic-format turn to the transcript and persist.
 
     ``content`` follows the SDK's shape: either a plain string (simple text
     turn) or a list of content blocks (tool_use / tool_result turns).
+
+    wk2 commit 5:
+    - Always stamp ``_ts`` (ISO 8601) on the turn so ``_build_session_body``
+      renders real per-turn timestamps. Wk1 relied on the session start time
+      for every turn, which made long sessions look like they happened in
+      one minute.
+    - ``kind`` (``"text"`` or ``"voice"``) is stamped as ``_kind`` on user
+      turns. Assistant / tool turns always carry ``_kind="text"`` — they
+      don't have an input modality. The voice/text counters in
+      ``_count_message_kinds`` read this field at close time.
     """
-    session.transcript.append({"role": role, "content": content})
-    session.last_message_at = _now_utc()
+    now = _now_utc()
+    turn: dict[str, Any] = {
+        "role": role,
+        "content": content,
+        "_ts": now.isoformat(),
+    }
+    if role == "user":
+        turn["_kind"] = kind
+    session.transcript.append(turn)
+    session.last_message_at = now
     _persist(state, session)
 
 

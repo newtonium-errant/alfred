@@ -300,10 +300,8 @@ def _open_session_with_stash(
     active["_stt_model_used"] = config.stt.model
     active["_session_type"] = session_type
     active["_continues_from"] = continues_from
-    # Per-session voice/text counters (not required by session.py but useful
-    # for status / telemetry / future review).
-    active.setdefault("voice_messages", 0)
-    active.setdefault("text_messages", 0)
+    # Voice / text counts are derived from per-turn ``_kind`` at close
+    # time by ``_count_message_kinds`` — no state-dict counter needed.
     state_mgr.set_active(chat_id, active)
     state_mgr.save()
     return sess
@@ -457,13 +455,9 @@ async def handle_message(
                 state_mgr, config, client, chat_id, text,
             )
 
-        # Bump per-kind counters on the state dict (kept alongside the
-        # stashed forward-contract fields).
-        raw = state_mgr.get_active(chat_id) or {}
-        key = "voice_messages" if voice else "text_messages"
-        raw[key] = int(raw.get(key, 0)) + 1
-        state_mgr.set_active(chat_id, raw)
-        state_mgr.save()
+        # Voice / text counts are tracked per-turn on the transcript
+        # (``_kind`` metadata) — the state-dict counters were wk1
+        # scaffolding that double-counted the same information. Dropped.
 
         # Typing indicator — best-effort; don't block the pipeline.
         try:
@@ -480,6 +474,7 @@ async def handle_message(
                 config=config,
                 vault_context_str=vault_context_str,
                 system_prompt=system_prompt,
+                user_kind="voice" if voice else "text",
             )
         except anthropic.APIError as exc:
             log.warning(

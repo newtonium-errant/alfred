@@ -226,7 +226,7 @@ async def _execute_tool(
 
     # Local imports — ops pulls heavy deps; we only want to pay that cost
     # when a tool actually fires.
-    from alfred.vault import mutation_log, ops, scope
+    from alfred.vault import ops, scope
 
     op = _TOOL_TO_OP.get(tool_name)
     if op is None:
@@ -275,9 +275,12 @@ async def _execute_tool(
                 set_fields=set_fields if isinstance(set_fields, dict) else None,
                 body=body,
             )
-            mutation_log.log_mutation(
-                session.session_id, "create", result["path"]
-            )
+            # Mutation is already tracked in ``session.vault_ops`` (via
+            # ``append_vault_op`` → session-record frontmatter) and in
+            # ``data/vault_audit.log`` once that wiring lands. The
+            # ``mutation_log`` module is JSONL-file scoped and expects a
+            # session *file path*; passing a UUID here created a stray
+            # file at the repo root. Dropped entirely — no functional loss.
             append_vault_op(state, session, "create", result["path"])
             return _dumps(result)
 
@@ -290,10 +293,6 @@ async def _execute_tool(
                 set_fields=set_fields if isinstance(set_fields, dict) else None,
                 append_fields=append_fields if isinstance(append_fields, dict) else None,
                 body_append=body_append,
-            )
-            mutation_log.log_mutation(
-                session.session_id, "edit", result["path"],
-                fields=result.get("fields_changed", []),
             )
             append_vault_op(state, session, "edit", result["path"])
             return _dumps(result)
@@ -333,15 +332,20 @@ async def run_turn(
     config: TalkerConfig,
     vault_context_str: str,
     system_prompt: str,
+    user_kind: str = "text",
 ) -> str:
     """Run one user turn through the model, handling tool_use internally.
+
+    ``user_kind`` is ``"text"`` or ``"voice"``; it lands on the user turn
+    as ``_kind`` so ``_count_message_kinds`` can produce accurate voice /
+    text totals in the session-record frontmatter at close time.
 
     Returns the final assistant text. Tool-use blocks and their results are
     appended to the session transcript (so the next turn sees the full
     context) and vault mutations are recorded against the session.
     """
     # Append the user's message first so it's visible inside the loop.
-    append_turn(state, session, "user", user_message)
+    append_turn(state, session, "user", user_message, kind=user_kind)
 
     system_blocks = _build_system_blocks(system_prompt, vault_context_str)
     vault_path = config.vault.path
