@@ -76,11 +76,26 @@ class OpenClawBackendConfig:
 
 
 @dataclass
+class HermesBackendConfig:
+    """Hermes HTTP backend config — sends prompts to a persistent Background
+    Hermes agent via its webui API (POST /api/chat/start → SSE stream).
+
+    ``url`` defaults to the empty string; at runtime the HermesBackend falls
+    back to the ``HERMES_BG_URL`` env var, and finally to
+    ``http://hermes-bg:8787`` (docker service name). Ref upstream 8e2673c.
+    """
+
+    url: str = ""
+    timeout: int = 300
+
+
+@dataclass
 class AgentConfig:
     backend: str = "claude"
     claude: ClaudeBackendConfig = field(default_factory=ClaudeBackendConfig)
     zo: ZoBackendConfig = field(default_factory=ZoBackendConfig)
     openclaw: OpenClawBackendConfig = field(default_factory=OpenClawBackendConfig)
+    hermes: HermesBackendConfig = field(default_factory=HermesBackendConfig)
 
 
 @dataclass
@@ -128,6 +143,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "claude": ClaudeBackendConfig,
     "zo": ZoBackendConfig,
     "openclaw": OpenClawBackendConfig,
+    "hermes": HermesBackendConfig,
     "watcher": WatcherConfig,
     "state": StateConfig,
     "logging": LoggingConfig,

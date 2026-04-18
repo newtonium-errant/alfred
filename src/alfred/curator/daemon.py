@@ -20,6 +20,7 @@ from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file,
 
 from .backends import BaseBackend
 from .backends.cli import ClaudeBackend
+from .backends.hermes import HermesBackend
 from .backends.http import ZoBackend
 from .backends.openclaw import OpenClawBackend
 from .config import CuratorConfig
@@ -61,6 +62,15 @@ def _create_backend(config: CuratorConfig) -> BaseBackend:
         return ZoBackend(config.agent.zo)
     elif backend_name == "openclaw":
         return OpenClawBackend(config.agent.openclaw)
+    elif backend_name == "hermes":
+        # Hermes is HTTP-based like Zo. No env-var-based vault access;
+        # the Hermes agent is expected to drive the alfred vault CLI
+        # itself. Ref upstream 8e2673c.
+        return HermesBackend(
+            config.agent.hermes,
+            vault_path=config.vault.path,
+            scope="curator",
+        )
     else:
         raise ValueError(f"Unknown backend: {backend_name}")
 
