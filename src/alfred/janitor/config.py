@@ -84,6 +84,12 @@ class SweepConfig:
     max_files_per_agent_call: int = 30
     fix_log_in_vault: bool = True
     drift_sweep_interval_hours: int = 168  # 7 days
+    # Upstream #15: cost guards for Stage 3 stub enrichment.
+    # max_stubs_per_sweep — cap the LLM calls per sweep.
+    # max_enrichment_attempts — stop retrying after N failed attempts;
+    # a content-hash change resets the counter.
+    max_stubs_per_sweep: int = 10
+    max_enrichment_attempts: int = 3
 
 
 @dataclass

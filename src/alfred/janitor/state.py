@@ -20,6 +20,12 @@ class FileState:
     md5: str
     last_scanned: str = ""
     open_issues: list[str] = field(default_factory=list)  # issue codes
+    # Upstream #15: Stage 3 stub-enrichment staleness tracking. After
+    # max_enrichment_attempts failures on the same content hash, we stop
+    # retrying until the file changes (hash reset clears the counter).
+    enrichment_attempts: int = 0
+    last_enrichment_attempt: str = ""
+    enrichment_stale: bool = False
 
 
 class JanitorState:
@@ -37,6 +43,12 @@ class JanitorState:
         # boot. Upstream observed 21 restarts in 3 days -> 968 wasted LLM
         # calls before adding this persistence.
         self.last_deep_sweep: str | None = None
+        # Upstream #15: snapshot of the last deep-sweep's issue set. Used
+        # for event-driven deep sweeps — on the next tick we only invoke
+        # the expensive fix pipeline if the current issue set contains
+        # codes not present in the previous snapshot. Shape: rel_path ->
+        # list of issue code strings.
+        self.previous_sweep_issues: dict[str, list[str]] = {}
         # Layer 3 triage queue: deterministic IDs of dedup/orphan/etc.
         # candidate sets for which a triage task has already been surfaced.
         # Prevents the agent from re-creating the same triage task across
@@ -59,6 +71,7 @@ class JanitorState:
         self.ignored = raw.get("ignored", {})
         self.pending_writes = raw.get("pending_writes", {})
         self.last_deep_sweep = raw.get("last_deep_sweep")
+        self.previous_sweep_issues = raw.get("previous_sweep_issues", {})
         self.triage_ids_seen = set(raw.get("triage_ids_seen", []))
         log.info(
             "state.loaded",
@@ -82,6 +95,9 @@ class JanitorState:
                     "md5": fs.md5,
                     "last_scanned": fs.last_scanned,
                     "open_issues": fs.open_issues,
+                    "enrichment_attempts": fs.enrichment_attempts,
+                    "last_enrichment_attempt": fs.last_enrichment_attempt,
+                    "enrichment_stale": fs.enrichment_stale,
                 }
                 for rel, fs in self.files.items()
             },
@@ -90,6 +106,7 @@ class JanitorState:
             "ignored": self.ignored,
             "pending_writes": self.pending_writes,
             "last_deep_sweep": self.last_deep_sweep,
+            "previous_sweep_issues": self.previous_sweep_issues,
             "triage_ids_seen": sorted(self.triage_ids_seen),
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,3 +166,60 @@ class JanitorState:
     def mark_triage_seen(self, triage_id: str) -> None:
         """Record that a triage task has been surfaced for this id."""
         self.triage_ids_seen.add(triage_id)
+
+    # --- Upstream #15: Stage 3 enrichment staleness helpers ---
+
+    def record_enrichment_attempt(self, rel_path: str, max_attempts: int = 3) -> None:
+        """Increment the enrichment attempt counter for ``rel_path``.
+
+        Marks the file as ``enrichment_stale`` once the counter reaches
+        ``max_attempts`` so the next sweep's Stage 3 will skip it. The
+        counter is reset on a content-hash change via
+        :meth:`reset_enrichment_staleness`.
+        """
+        if rel_path not in self.files:
+            return
+        fs = self.files[rel_path]
+        fs.enrichment_attempts += 1
+        fs.last_enrichment_attempt = datetime.now(timezone.utc).isoformat()
+        if fs.enrichment_attempts >= max_attempts:
+            fs.enrichment_stale = True
+
+    def reset_enrichment_staleness(self, rel_path: str) -> None:
+        """Clear enrichment staleness when the file's content has changed."""
+        if rel_path not in self.files:
+            return
+        fs = self.files[rel_path]
+        fs.enrichment_attempts = 0
+        fs.last_enrichment_attempt = ""
+        fs.enrichment_stale = False
+
+    def is_enrichment_stale(self, rel_path: str) -> bool:
+        """Return True if Stage 3 has exhausted attempts on this file."""
+        if rel_path not in self.files:
+            return False
+        return self.files[rel_path].enrichment_stale
+
+    # --- Upstream #15: event-driven deep sweep helpers ---
+
+    def get_new_issues(
+        self, current_issues: dict[str, list[str]],
+    ) -> dict[str, list[str]]:
+        """Return files whose current issue codes include ones NOT seen last sweep.
+
+        Used by run_watch to skip the expensive fix pipeline entirely when
+        no new issues surfaced since the last deep sweep. Compares per-file
+        issue-code sets; if a file has any code not in the previous snapshot,
+        that file's new codes are included in the result.
+        """
+        new: dict[str, list[str]] = {}
+        for path, codes in current_issues.items():
+            prev_codes = set(self.previous_sweep_issues.get(path, []))
+            novel = [c for c in codes if c not in prev_codes]
+            if novel:
+                new[path] = novel
+        return new
+
+    def save_sweep_issues(self, issues: dict[str, list[str]]) -> None:
+        """Persist the current sweep's issue snapshot for the next comparison."""
+        self.previous_sweep_issues = issues

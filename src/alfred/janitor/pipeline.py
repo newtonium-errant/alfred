@@ -14,6 +14,10 @@ import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .state import JanitorState
 
 from alfred.vault.mutation_log import log_mutation
 from alfred.vault.ops import VaultError, vault_read, vault_search
@@ -430,17 +434,73 @@ async def _stage3_enrich(
     stub_issues: list[Issue],
     config: JanitorConfig,
     session_path: str,
+    state: "JanitorState | None" = None,
 ) -> int:
-    """Stage 3: Enrich stub records. Returns count of stubs enriched."""
+    """Stage 3: Enrich stub records. Returns count of stubs enriched.
+
+    Upstream #15: filters out stubs that have exhausted their enrichment
+    attempts (state permitting), sorts the remaining by last_scanned DESC
+    then linked-record count DESC (more context = better enrichment odds),
+    and caps the list to config.sweep.max_stubs_per_sweep. Each attempt
+    increments state.files[file].enrichment_attempts so repeat failures on
+    unchanged content eventually mark the file stale.
+    """
     if not stub_issues:
         return 0
 
     vault_path = config.vault.vault_path
     ignore_dirs = config.vault.ignore_dirs
+    max_stubs = config.sweep.max_stubs_per_sweep
+    max_attempts = config.sweep.max_enrichment_attempts
     template = _load_stage_prompt("stage3_enrich.md")
     if not template:
         log.warning("pipeline.s3_no_template")
         return 0
+
+    # Filter out stubs whose enrichment has gone stale (N consecutive
+    # failures on the same content hash). A hash change elsewhere in the
+    # pipeline calls state.reset_enrichment_staleness() to reopen the file.
+    if state is not None:
+        filtered: list[Issue] = []
+        for issue in stub_issues:
+            if state.is_enrichment_stale(issue.file):
+                log.debug(
+                    "pipeline.s3_skip_stale",
+                    file=issue.file,
+                    msg="enrichment stale, skipping until content changes",
+                )
+                continue
+            filtered.append(issue)
+        stub_issues = filtered
+
+    if not stub_issues:
+        log.info("pipeline.s3_all_stale", msg="all stubs stale, nothing to enrich")
+        return 0
+
+    # Sort newest-scanned first, then by linked-record count (descending).
+    # The sort tuple is (last_scanned, -linked_count) and we reverse=True,
+    # giving DESC,DESC ordering.
+    def _stub_sort_key(issue: Issue) -> tuple[str, int]:
+        last_scanned = ""
+        linked_count = 0
+        if state is not None and issue.file in state.files:
+            last_scanned = state.files[issue.file].last_scanned
+        try:
+            raw_text = (vault_path / issue.file).read_text(encoding="utf-8")
+            linked_count = len(extract_wikilinks(raw_text))
+        except (OSError, UnicodeDecodeError):
+            pass
+        return (last_scanned, -linked_count)
+
+    stub_issues.sort(key=_stub_sort_key, reverse=True)
+
+    if len(stub_issues) > max_stubs:
+        log.info(
+            "pipeline.s3_capped",
+            total=len(stub_issues),
+            processing=max_stubs,
+        )
+        stub_issues = stub_issues[:max_stubs]
 
     enriched = 0
 
@@ -452,6 +512,10 @@ async def _stage3_enrich(
             record = vault_read(vault_path, file_path)
         except VaultError:
             log.warning("pipeline.s3_read_failed", file=file_path)
+            # A read failure still counts as an enrichment attempt so a
+            # permanently-broken file stops pinning Stage 3 capacity.
+            if state is not None:
+                state.record_enrichment_attempt(file_path, max_attempts)
             continue
 
         fm = record["frontmatter"]
@@ -483,6 +547,11 @@ async def _stage3_enrich(
         await _call_llm(prompt, config, session_path, stage_label)
         enriched += 1
 
+        # Record the attempt so Stage 3 stops retrying the same unchanged
+        # stub forever. A content-hash change elsewhere resets this counter.
+        if state is not None:
+            state.record_enrichment_attempt(file_path, max_attempts)
+
         log.info("pipeline.s3_enriched", file=file_path, type=record_type)
 
     log.info("pipeline.s3_complete", enriched=enriched)
@@ -498,6 +567,7 @@ async def run_pipeline(
     issues: list[Issue],
     config: JanitorConfig,
     session_path: str,
+    state: "JanitorState | None" = None,
 ) -> PipelineResult:
     """Run the 3-stage janitor pipeline on a list of issues.
 
@@ -505,6 +575,8 @@ async def run_pipeline(
         issues: Issues detected by the structural scanner.
         config: Janitor configuration.
         session_path: Path to the mutation log session file.
+        state: Optional janitor state for Stage 3 enrichment staleness
+            tracking and cost caps (upstream #15).
 
     Returns:
         PipelineResult with success status and details.
@@ -552,9 +624,11 @@ async def run_pipeline(
     )
 
     # Stage 3: Enrich stubs (LLM, per-file)
+    # Pass state so the stage can filter stale stubs, apply the per-sweep
+    # cap, and record each attempt. Upstream #15.
     log.info("pipeline.s3_start", issues=len(stub_issues))
     result.stubs_enriched = await _stage3_enrich(
-        stub_issues, config, session_path,
+        stub_issues, config, session_path, state=state,
     )
 
     result.success = True

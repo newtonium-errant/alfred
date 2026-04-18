@@ -226,6 +226,7 @@ async def run_sweep(
                 issues=issues,
                 config=config,
                 session_path=session_path,
+                state=state,
             )
 
             mutations = read_mutations(session_path)
@@ -452,9 +453,57 @@ async def run_watch(
 
         try:
             if hours_since_deep >= deep_interval_hours:
-                # Deep sweep with agent
-                log.info("daemon.deep_sweep")
-                await run_sweep(config, state, skills_dir, structural_only=False, fix_mode=True)
+                # Event-driven deep sweep (upstream #15). Do a cheap
+                # structural scan first and compare the resulting issue
+                # set against the previous sweep's snapshot. If no new
+                # issue codes AND no file content has changed since last
+                # time, skip the expensive LLM fix pipeline entirely —
+                # but still bump last_deep so we do not spin here every
+                # interval retrying the same check.
+                log.info("daemon.deep_sweep_check")
+                pre_scan_issues = run_structural_scan(config, state)
+                current_issue_map: dict[str, list[str]] = {}
+                for iss in pre_scan_issues:
+                    current_issue_map.setdefault(iss.file, []).append(iss.code.value)
+
+                # Detect content changes since the stored snapshot. A
+                # change resets that file's Stage 3 enrichment staleness
+                # so a newly-edited stub becomes eligible for enrichment
+                # again.
+                changed_files: set[str] = set()
+                for rel_path, fs in state.files.items():
+                    full = config.vault.vault_path / rel_path
+                    if full.exists():
+                        try:
+                            cur_md5 = file_hash(full)
+                        except OSError:
+                            continue
+                        if cur_md5 != fs.md5:
+                            changed_files.add(rel_path)
+                            state.reset_enrichment_staleness(rel_path)
+
+                new_issues = state.get_new_issues(current_issue_map)
+
+                if not new_issues and not changed_files:
+                    log.info(
+                        "daemon.deep_sweep_skipped",
+                        msg="no new issues and no content changes; skipping fix pipeline",
+                    )
+                else:
+                    log.info(
+                        "daemon.deep_sweep",
+                        new_issue_files=len(new_issues),
+                        changed_files=len(changed_files),
+                    )
+                    await run_sweep(
+                        config, state, skills_dir,
+                        structural_only=False, fix_mode=True,
+                    )
+
+                # Store snapshot for next comparison regardless of whether
+                # the pipeline ran — otherwise the first non-skip sweep
+                # would never see a baseline to diff against.
+                state.save_sweep_issues(current_issue_map)
                 last_deep = now
                 state.last_deep_sweep = now.isoformat()
                 state.save()
