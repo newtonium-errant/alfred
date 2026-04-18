@@ -34,7 +34,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import conversation, session, transcribe
+from . import conversation, router, session, transcribe
 from .config import TalkerConfig
 from .session import Session
 from .state import StateManager
@@ -309,6 +309,99 @@ def _open_session_with_stash(
     return sess
 
 
+def _recent_sessions_for_router(
+    state_mgr: StateManager,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Return the most-recent-first slice of ``closed_sessions``.
+
+    ``state.closed_sessions`` is append-only (oldest first) — reverse it
+    and cap at ``limit`` so the router prompt stays bounded. Missing
+    ``session_type`` (wk1 records) is tolerated by the router itself.
+    """
+    closed = state_mgr.state.get("closed_sessions", []) or []
+    # Copy-slice then reverse so the newest session is first.
+    return list(reversed(closed))[:limit]
+
+
+def _find_closed_session(
+    state_mgr: StateManager,
+    record_path: str,
+) -> dict[str, Any] | None:
+    """Return the ``closed_sessions`` entry for ``record_path``, or None."""
+    for entry in reversed(state_mgr.state.get("closed_sessions", []) or []):
+        if entry.get("record_path") == record_path:
+            return entry
+    return None
+
+
+async def _open_routed_session(
+    state_mgr: StateManager,
+    config: TalkerConfig,
+    client: Any,
+    chat_id: int,
+    first_message: str,
+) -> Session:
+    """Classify the opening cue, open a new session with the right defaults.
+
+    Flow:
+        1. Query recent closed sessions from state.
+        2. Call :func:`router.classify_opening_cue` — on any failure the
+           router returns a safe ``note`` fallback, so this never raises.
+        3. Open the session on the decision's model.
+        4. If the router flagged a valid continuation (path present in
+           state), seed the transcript with a single assistant-style
+           "continuing from X" primer and stash ``_continues_from`` on
+           the active dict.
+
+    Returns the opened :class:`Session`. Caller is responsible for
+    appending the user's actual first message via ``run_turn``.
+    """
+    recent = _recent_sessions_for_router(state_mgr)
+    decision = await router.classify_opening_cue(
+        client, first_message, recent,
+    )
+
+    sess = _open_session_with_stash(
+        state_mgr,
+        chat_id,
+        config,
+        model=decision.model,
+        session_type=decision.session_type,
+        continues_from=f"[[{decision.continues_from}]]"
+        if decision.continues_from
+        else None,
+    )
+
+    # Continuation pre-seed: drop one context turn into the transcript so
+    # the model knows what came before. We don't have the full prior
+    # transcript in state (only a summary), so the primer references the
+    # prior record by path — the model can use vault_read to fetch it if
+    # it wants the full body.
+    if decision.continues_from:
+        prior = _find_closed_session(state_mgr, decision.continues_from)
+        if prior is not None:
+            primer = (
+                f"[context: continuing from a prior {decision.session_type} "
+                f"session ({prior.get('message_count', '?')} turns, ended "
+                f"{prior.get('ended_at', '?')[:10]}). "
+                f"Record: session/{decision.continues_from.split('/')[-1]}. "
+                "Ask before assuming — you may need to read the record first.]"
+            )
+            # Assistant-style turn so it appears as "system context" above
+            # the first user message, without claiming to be the user.
+            session.append_turn(state_mgr, sess, "assistant", primer)
+
+    log.info(
+        "talker.bot.routed_open",
+        chat_id=chat_id,
+        session_type=decision.session_type,
+        model=decision.model,
+        continues=decision.continues_from is not None,
+    )
+    return sess
+
+
 async def handle_message(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -339,12 +432,16 @@ async def handle_message(
 
     async with lock:
         # Open or resume session.
+        # wk2: on a fresh session we run the opening-cue router to pick
+        # session type / model / continuation. On rehydrate failure we
+        # re-route too — the user's next message should feel like a fresh
+        # session, not a continuation of whatever state corruption we just
+        # discarded.
         active = state_mgr.get_active(chat_id)
         if active:
             try:
                 sess = Session.from_dict(active)
             except Exception as exc:  # noqa: BLE001
-                # State corruption — discard and open fresh.
                 log.warning(
                     "talker.bot.session_rehydrate_failed",
                     chat_id=chat_id,
@@ -352,9 +449,13 @@ async def handle_message(
                 )
                 state_mgr.pop_active(chat_id)
                 state_mgr.save()
-                sess = _open_session_with_stash(state_mgr, chat_id, config)
+                sess = await _open_routed_session(
+                    state_mgr, config, client, chat_id, text,
+                )
         else:
-            sess = _open_session_with_stash(state_mgr, chat_id, config)
+            sess = await _open_routed_session(
+                state_mgr, config, client, chat_id, text,
+            )
 
         # Bump per-kind counters on the state dict (kept alongside the
         # stashed forward-contract fields).

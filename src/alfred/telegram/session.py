@@ -88,8 +88,23 @@ def _now_utc() -> datetime:
 
 
 def _persist(state: StateManager, session: Session) -> None:
-    """Sync the session dataclass back into state and save."""
-    state.set_active(session.chat_id, session.to_dict())
+    """Sync the session dataclass back into state and save.
+
+    Preserves any stashed ``_*`` metadata (``_vault_path_root``,
+    ``_session_type``, etc.) that the bot layer wrote onto the active
+    dict — those fields are orthogonal to the :class:`Session` dataclass
+    but the timeout / shutdown close paths depend on them. Without this
+    merge, the first ``append_turn`` after ``_open_session_with_stash``
+    would wipe them.
+    """
+    existing = state.get_active(session.chat_id) or {}
+    merged = dict(existing)
+    merged.update(session.to_dict())
+    # Re-apply any stashed ``_*`` keys the dataclass doesn't know about.
+    for key, value in existing.items():
+        if key.startswith("_"):
+            merged[key] = value
+    state.set_active(session.chat_id, merged)
     state.save()
 
 
