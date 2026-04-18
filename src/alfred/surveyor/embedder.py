@@ -63,9 +63,40 @@ class Embedder:
         self._ensure_collection()
 
     def _ensure_collection(self) -> None:
-        """Create the Milvus collection if it doesn't exist."""
+        """Create the Milvus collection if it doesn't exist, or recreate on dim mismatch.
+
+        If the existing collection's embedding dim differs from the configured
+        value (e.g. user swapped embedding model), drop the collection and
+        invalidate the pipeline's file-hash state so a full re-embed runs on
+        the next pass. Without the state invalidation the daemon would reload
+        the stale hash map and skip all files. Ports upstream a3a44a4 +
+        f45d05d + 99cbd25 into one path.
+        """
         if self.milvus.has_collection(self.collection_name):
-            return
+            info = self.milvus.describe_collection(self.collection_name)
+            for f in info.get("fields", []):
+                if f.get("name") == "embedding":
+                    existing_dim = f.get("params", {}).get("dim")
+                    if existing_dim is not None and int(existing_dim) != self.embedding_dims:
+                        log.warning(
+                            "embedder.dim_mismatch",
+                            existing=existing_dim,
+                            configured=self.embedding_dims,
+                            action="drop_and_recreate",
+                        )
+                        self.milvus.drop_collection(self.collection_name)
+                        # Invalidate pipeline file-hash state and persist so a
+                        # full re-embed survives the next daemon restart.
+                        try:
+                            files_state = getattr(self.state, "files", None)
+                            if isinstance(files_state, dict):
+                                files_state.clear()
+                                self.state.save()
+                        except Exception as exc:
+                            log.warning("embedder.state_invalidate_failed", error=str(exc))
+                        break
+            else:
+                return
 
         schema = CollectionSchema(
             fields=[
