@@ -452,61 +452,33 @@ This prevents sweep-to-sweep churn from LLM prose variance on identical underlyi
 
 ### FM001 — MISSING_REQUIRED_FIELD
 
-**Diagnosis:** Record is missing `type`, `created`, or `name`/`subject`.
-
-**Fix:**
-- Missing `type` → infer from directory name (e.g. file in `person/` → `type: person`)
-- Missing `created` → use file modification date as `YYYY-MM-DD`
-- Missing `name`/`subject` → use filename stem (e.g. `Eagle Farm.md` → `name: "Eagle Farm"`)
-
-**When NOT to fix:** If the file has no frontmatter at all and is clearly not a vault record (e.g. a plain text note), flag with `janitor_note` instead.
+Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### FM002 — INVALID_TYPE_VALUE
 
-**Diagnosis:** `type` field contains an unknown value.
-
-**Fix:**
-- Check if it's a typo (e.g. `typ: project` → `type: project`)
-- Check if it's an old type name (e.g. `thread` → might be `conversation`)
-- If unresolvable, flag with `janitor_note: "FM002 — unknown type '{value}', needs manual review"`
+Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### FM003 — INVALID_STATUS_VALUE
 
-**Diagnosis:** `status` is not in the allowed set for this record type.
-
-**Fix:**
-- Map to nearest valid value (e.g. `status: open` for a task → `status: active`)
-- Common mappings: `open` → `active`, `closed` → `done`/`completed`, `pending` → `todo`
+Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### FM004 — INVALID_FIELD_TYPE
 
-**Diagnosis:** A field that should be a list is a scalar (e.g. `tags: "foo"` instead of `tags: ["foo"]`).
-
-**Fix:** Wrap the value in a list: `tags: ["foo"]`
+Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### DIR001 — WRONG_DIRECTORY
 
-**Diagnosis:** File is in the wrong directory for its type.
-
-**Fix:** Do NOT auto-move files. Flag with `janitor_note: "DIR001 — type is '{type}' but file is in '{dir}/'. Consider moving to '{expected_dir}/'."`
-
-Moving files breaks wikilinks. Human must decide.
+Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### LINK001 — BROKEN_WIKILINK
 
 **Diagnosis:** A wikilink target doesn't match any file.
 
-**Fix:**
-- Check for typos — search for similar filenames
-- Check for renames — search for files with the same stem
-- If unambiguous match exists, fix the link
-- If ambiguous, flag with `janitor_note: "LINK001 — broken link [[{target}]], possible matches: {candidates}"`
+**Fix:** If an unambiguous match exists, fix the link (update the wikilink to the correct target). Ambiguous / unresolved LINK001s are flagged by the structural scanner via deterministic janitor_note in `autofix.py` — you do not need to write the fallback flag yourself; if you see a LINK001 in your report, assume a resolution attempt is expected and only act when the mapping is unambiguous.
 
 ### ORPHAN001 — ORPHANED_RECORD
 
-**Diagnosis:** No other record links to this one.
-
-**Fix:** Do NOT delete. Add `janitor_note: "ORPHAN001 — no inbound links. Consider linking from a parent record."` only if the record seems intentional.
+Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### STUB001 — STUB_RECORD
 
@@ -526,7 +498,7 @@ This is what you do every time you see a DUP001 in a normal sweep. It creates a 
 
 **Machine-vs-human discriminator.** Only emit triage when BOTH candidates are **entity types**: `org/`, `person/`, `note/`, `project/`, `location/`, `account/`, `asset/`, `task/`, `event/`, `input/`, `conversation/`, `process/`, `run/`. Do NOT emit triage for **learn types** (`contradiction/`, `assumption/`, `decision/`, `constraint/`, `synthesis/`) — those carry legitimate human semantic pointers with their own `confidence` fields and are not dedup candidates.
 
-> **Note:** The entity-type list above must stay in sync with `KNOWN_TYPES` minus `LEARN_TYPES` in `src/alfred/vault/schema.py`. If a new record type is added there, add it here too (or to the learn-type exclusion list if it's a learn type). If a DUP001 fires on a learn type, leave both records alone and add `janitor_note: "DUP001 — learn-type duplicate, not a triage candidate, ignored"` on the newer record only. Log it as a NOTE in the action log.
+> **Note:** The entity-type list above must stay in sync with `KNOWN_TYPES` minus `LEARN_TYPES` in `src/alfred/vault/schema.py`. If a new record type is added there, add it here too (or to the learn-type exclusion list if it's a learn type). Learn-type DUP001s are deterministically flagged by the structural scanner in `autofix.py`; you should not see learn-type DUP001s in your issue report.
 
 1. **Compute the deterministic triage ID.** Use the dedicated CLI — do NOT try to compute the ID by hand, and do NOT reuse an ID from a previous sweep. The CLI is order-independent and accepts wikilink, bare path, or `.md` forms:
    ```bash
@@ -600,14 +572,7 @@ Use this procedure ONLY when the operator has already approved the merge — i.e
 
 ### SEM001–SEM004 — Semantic Drift (Scanner-Detected)
 
-These are detected automatically by the structural scanner based on dates and link counts. You do NOT need to detect these — the scanner handles it.
-
-- **SEM001 — STALE_ACTIVE_PROJECT**: Project is `status: active` but has no linked activity in 30+ days.
-- **SEM002 — STALE_TODO_TASK**: Task is `status: todo` but was created 90+ days ago with no updates.
-- **SEM003 — STALE_ACTIVE_CONVERSATION**: Conversation is `status: active` but has no activity in 30+ days.
-- **SEM004 — STALE_ACTIVE_PERSON**: Person is `status: active` but has no linked activity in 60+ days.
-
-**Fix:** Add `janitor_note` suggesting status review. Do NOT change status automatically — the vault owner decides.
+Handled by the structural scanner via deterministic flagging in `autofix.py`. You should not see these codes in your issue report; if you do, log a warning and proceed.
 
 ### SEM005–SEM006 — Semantic Issues (Agent-Detected)
 
