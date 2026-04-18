@@ -169,14 +169,21 @@ def cmd_create(args: argparse.Namespace) -> None:
 
 def cmd_edit(args: argparse.Namespace) -> None:
     scope = _scope()
-    try:
-        check_scope(scope, "edit", rel_path=args.path)
-    except ScopeError as e:
-        _error(str(e))
-
     vault = _vault_path()
     set_fields = _parse_set_args(args.set)
     append_fields = _parse_set_args(args.append)
+
+    # Compute the union of frontmatter fields being written. Body-only
+    # writes (--body-append, --body-stdin) are intentionally NOT routed
+    # through the field allowlist for now — body-write loophole is a known
+    # gap tracked as open question #3. The allowlist covers frontmatter
+    # only until that lands.
+    fields = list((set_fields or {}).keys()) + list((append_fields or {}).keys())
+
+    try:
+        check_scope(scope, "edit", rel_path=args.path, fields=fields)
+    except ScopeError as e:
+        _error(str(e))
 
     body_append = None
     if args.body_stdin:

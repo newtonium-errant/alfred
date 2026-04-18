@@ -12,7 +12,7 @@ class ScopeError(Exception):
 # Operation → {scope: checker_function}
 # Checkers receive (operation, rel_path, record_type) and raise ScopeError if denied.
 
-SCOPE_RULES: dict[str, dict[str, bool | str]] = {
+SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
     "curator": {
         "read": True,
         "search": True,
@@ -89,6 +89,7 @@ def check_scope(
     rel_path: str = "",
     record_type: str = "",
     frontmatter: dict | None = None,
+    fields: list[str] | None = None,
 ) -> None:
     """Check if an operation is allowed under the given scope.
 
@@ -100,6 +101,10 @@ def check_scope(
         frontmatter: Optional frontmatter dict of the record being written
             (used by ``triage_tasks_only`` to enforce ``alfred_triage: true``).
             Defaults to None — rules that require it fail closed when absent.
+        fields: Optional list of frontmatter field names being written
+            (used by ``field_allowlist`` to constrain which fields a scope
+            may mutate). Defaults to None — ``field_allowlist`` fails closed
+            when absent so callers must always pass the fields being written.
 
     Raises:
         ScopeError: If the operation is denied.
@@ -159,6 +164,35 @@ def check_scope(
     # Field-level enforcement is the caller's responsibility; this gate
     # permits the edit operation to proceed.
     if permission == "tags_only":
+        return
+
+    # Generic field-allowlist rule. The allowlist lives at
+    # ``rules[f"{operation}_fields_allowlist"]`` as an iterable of field
+    # names. ``fields`` is the list of frontmatter field names the caller
+    # intends to write; this rule fails closed when ``fields`` is None so
+    # callers can't accidentally bypass the check by omitting the argument.
+    if permission == "field_allowlist":
+        allowlist_key = f"{operation}_fields_allowlist"
+        allowlist_raw = rules.get(allowlist_key)
+        if allowlist_raw is None:
+            raise ScopeError(
+                f"Scope '{scope}' configured with field_allowlist for "
+                f"'{operation}' but no '{allowlist_key}' set in SCOPE_RULES."
+            )
+        allowlist = set(allowlist_raw)  # type: ignore[arg-type]
+        if fields is None:
+            raise ScopeError(
+                f"Scope '{scope}' may only {operation} fields in the "
+                f"allowlist ({', '.join(sorted(allowlist))}); caller did "
+                f"not supply the field list."
+            )
+        rejected = [f for f in fields if f not in allowlist]
+        if rejected:
+            raise ScopeError(
+                f"Scope '{scope}' may only {operation} fields in the "
+                f"allowlist ({', '.join(sorted(allowlist))}). Rejected: "
+                f"{', '.join(rejected)}"
+            )
         return
 
     # Janitor may create task records only when they carry the
