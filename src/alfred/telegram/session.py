@@ -207,6 +207,8 @@ def resolve_on_startup(
                 reason="timeout_on_restart",
                 user_vault_path=raw.get("_user_vault_path"),
                 stt_model_used=raw.get("_stt_model_used", ""),
+                session_type=raw.get("_session_type", "note"),
+                continues_from=raw.get("_continues_from"),
             )
             closed_paths.append(path)
         except Exception as exc:  # noqa: BLE001 — log and continue sweep
@@ -249,6 +251,8 @@ def check_timeouts(
                 reason="timeout",
                 user_vault_path=raw.get("_user_vault_path"),
                 stt_model_used=raw.get("_stt_model_used", ""),
+                session_type=raw.get("_session_type", "note"),
+                continues_from=raw.get("_continues_from"),
             )
             closed_paths.append(path)
         except Exception as exc:  # noqa: BLE001
@@ -267,11 +271,17 @@ def close_session(
     reason: str,
     user_vault_path: str | None,
     stt_model_used: str,
+    session_type: str = "note",
+    continues_from: str | None = None,
 ) -> str:
     """Close the active session for ``chat_id`` and write a ``session/`` record.
 
     Removes the session from ``active_sessions``, appends a summary to
     ``closed_sessions``, and returns the vault-relative path of the new record.
+
+    ``session_type`` / ``continues_from`` default to ``"note"`` / ``None`` so
+    the timeout / shutdown close paths can fall back to the wk1 behaviour when
+    the active dict was written before wk2 (``get("_session_type", "note")``).
     """
     # Import here to avoid a circular import at module load (ops pulls in
     # frontmatter + yaml which are heavier).
@@ -290,6 +300,8 @@ def close_session(
         reason=reason,
         user_vault_path=user_vault_path,
         stt_model_used=stt_model_used,
+        session_type=session_type,
+        continues_from=continues_from,
     )
     body = _build_session_body(session)
 
@@ -309,6 +321,10 @@ def close_session(
     rel_path = result["path"]
 
     # State cleanup: pop active, append closed-summary, save once.
+    # ``session_type`` / ``continues_from`` land here so the router can look up
+    # the most recent article/journal/brainstorm session from state alone in
+    # wk2 (plan open question #5 — state-only continuation for wk2; body-parser
+    # fallback is a wk3 task).
     state.pop_active(chat_id)
     state.append_closed({
         "session_id": session.session_id,
@@ -319,6 +335,8 @@ def close_session(
         "record_path": rel_path,
         "message_count": len(session.transcript),
         "vault_ops": len(session.vault_ops),
+        "session_type": session_type,
+        "continues_from": continues_from,
     })
     state.save()
 
@@ -343,12 +361,22 @@ def _build_session_frontmatter(
     reason: str,
     user_vault_path: str | None = None,
     stt_model_used: str = "",
+    session_type: str = "note",
+    continues_from: str | None = None,
 ) -> dict[str, Any]:
     """Produce the ``session/`` record frontmatter.
 
     Pure function — no side effects, no imports of vault ops. Matches section
     4 of the voice-design doc, with the correction that ``outputs`` is
     populated from ``session.vault_ops`` rather than left empty.
+
+    wk2 additions (plan open question #2):
+    - Top-level ``session_type`` — one of ``note|task|journal|article|brainstorm``.
+    - Top-level ``continues_from`` — wikilink string (``[[session/...]]``) or
+      ``None``. Emitted as YAML null when absent so downstream queries can
+      filter on ``continues_from != null``.
+    - ``telegram.model`` stays as-is (not renamed to ``model_used``) so wk1
+      records and wk2 records share the same telemetry schema.
     """
     voice_count, text_count = _count_message_kinds(session)
     participants = [f"[[{user_vault_path}]]"] if user_vault_path else []
@@ -371,6 +399,8 @@ def _build_session_frontmatter(
         "outputs": outputs,
         "related": [],
         "tags": ["voice", "telegram"],
+        "session_type": session_type,
+        "continues_from": continues_from,
         "telegram": {
             "chat_id": session.chat_id,
             "session_id": session.session_id,

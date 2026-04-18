@@ -145,6 +145,8 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 or (config.primary_users[0] if config.primary_users else None)
             ),
             stt_model_used=active.get("_stt_model_used") or config.stt.model,
+            session_type=active.get("_session_type", "note"),
+            continues_from=active.get("_continues_from"),
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("talker.bot.close_failed", chat_id=chat_id)
@@ -269,16 +271,26 @@ def _open_session_with_stash(
     state_mgr: StateManager,
     chat_id: int,
     config: TalkerConfig,
+    *,
+    model: str | None = None,
+    session_type: str = "note",
+    continues_from: str | None = None,
 ) -> Session:
     """Open a new session and stash the forward-contract metadata.
 
-    The three stashed fields (``_vault_path_root``, ``_user_vault_path``,
-    ``_stt_model_used``) are required by timeout-driven close paths in
+    The stashed fields are required by timeout-driven close paths in
     :mod:`session`. If they're missing, timeout closes log and skip and the
     record never lands — so this helper exists to keep that contract tight
     and co-located with ``open_session``.
+
+    wk2: ``model`` / ``session_type`` / ``continues_from`` are threaded
+    through so the router (commit 3+4) can open a session on the right model
+    and flag it as a continuation. All three have safe wk1-equivalent
+    defaults (``note`` type on the config-default model, no continuation).
     """
-    sess = session.open_session(state_mgr, chat_id, config.anthropic.model)
+    sess = session.open_session(
+        state_mgr, chat_id, model or config.anthropic.model,
+    )
     # Re-read the active dict, stamp the contract fields, save.
     active = state_mgr.get_active(chat_id) or {}
     active["_vault_path_root"] = config.vault.path
@@ -286,6 +298,8 @@ def _open_session_with_stash(
         config.primary_users[0] if config.primary_users else ""
     )
     active["_stt_model_used"] = config.stt.model
+    active["_session_type"] = session_type
+    active["_continues_from"] = continues_from
     # Per-session voice/text counters (not required by session.py but useful
     # for status / telemetry / future review).
     active.setdefault("voice_messages", 0)

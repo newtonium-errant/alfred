@@ -302,6 +302,8 @@ async def run(
                         reason="shutdown",
                         user_vault_path=user_path,
                         stt_model_used=stt_model,
+                        session_type=raw_sess.get("_session_type", "note"),
+                        continues_from=raw_sess.get("_continues_from"),
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
