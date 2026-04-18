@@ -80,6 +80,13 @@ def build_app(
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("end", on_end))
     app.add_handler(CommandHandler("status", on_status))
+    # Wk3 commit 5: explicit model overrides for the active session. Both
+    # flip ``session.model`` on the active dict; the next ``run_turn`` reads
+    # it and routes to the new model. If there's no active session the
+    # command is a no-op (tersely reported — we don't want to open a
+    # session just to flip its model).
+    app.add_handler(CommandHandler("opus", on_opus))
+    app.add_handler(CommandHandler("sonnet", on_sonnet))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
@@ -156,6 +163,115 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     log.info("talker.bot.session_closed", chat_id=chat_id, record=rel_path)
     await update.message.reply_text(f"session closed. saved to: {rel_path}")
+
+
+# --- Model-override commands ----------------------------------------------
+
+# Canonical model IDs for the two supported overrides. Centralised so the
+# commands, the log tags, and commit 8's calibration scaffold all read
+# from the same source of truth. If the Opus alias 404s at runtime
+# (wk3 instruction: fall back to ``claude-opus-4-5``), flip _OPUS_MODEL
+# here and re-deploy — not via a defensive retry, which would hide the
+# breakage.
+_OPUS_MODEL = "claude-opus-4-7"
+_SONNET_MODEL = "claude-sonnet-4-6"
+
+
+def _switch_model(
+    state_mgr: StateManager,
+    chat_id: int,
+    target: str,
+    label: str,
+) -> str | None:
+    """Flip the active session's model. Return a reply string (or ``None``).
+
+    Returns ``None`` when there's no active session — the caller renders
+    a terse "no active session" reply. A successful switch returns a
+    one-line confirmation ("switched to Opus.") with the new label.
+
+    The switch is idempotent: flipping to the model a session is already
+    on reports that without incrementing any counters.
+    """
+    active = state_mgr.get_active(chat_id)
+    if not active:
+        return None
+
+    current = active.get("model", "")
+    if current == target:
+        return f"already on {label}."
+
+    active["model"] = target
+    state_mgr.set_active(chat_id, active)
+    state_mgr.save()
+    return f"switched to {label}."
+
+
+async def on_opus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/opus`` — switch the active session to the Opus model."""
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+
+    chat_id = update.effective_chat.id
+    active = state_mgr.get_active(chat_id) or {}
+    previous = active.get("model", "")
+
+    reply = _switch_model(state_mgr, chat_id, _OPUS_MODEL, "Opus")
+    if reply is None:
+        await update.message.reply_text("no active session to switch.")
+        return
+
+    # Only log the actual flip, not idempotent re-issues. The message
+    # schema matches commit 6's implicit escalate-offered events so a
+    # downstream consumer can aggregate both under ``talker.model.*``.
+    turn_index = len(active.get("transcript") or [])
+    if previous != _OPUS_MODEL:
+        log.info(
+            "talker.model.escalated",
+            chat_id=chat_id,
+            session_id=active.get("session_id", ""),
+            **{"from": previous, "to": _OPUS_MODEL},
+            turn_index=turn_index,
+            trigger="explicit",
+        )
+    await update.message.reply_text(reply)
+
+
+async def on_sonnet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/sonnet`` — switch the active session to the Sonnet model."""
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+
+    chat_id = update.effective_chat.id
+    active = state_mgr.get_active(chat_id) or {}
+    previous = active.get("model", "")
+
+    reply = _switch_model(state_mgr, chat_id, _SONNET_MODEL, "Sonnet")
+    if reply is None:
+        await update.message.reply_text("no active session to switch.")
+        return
+
+    turn_index = len(active.get("transcript") or [])
+    if previous != _SONNET_MODEL:
+        # Use ``escalated`` for both directions — the label is "model
+        # changed", not "went bigger". Downstream aggregation cares about
+        # the from/to pair, not the direction.
+        log.info(
+            "talker.model.escalated",
+            chat_id=chat_id,
+            session_id=active.get("session_id", ""),
+            **{"from": previous, "to": _SONNET_MODEL},
+            turn_index=turn_index,
+            trigger="explicit",
+        )
+    await update.message.reply_text(reply)
 
 
 async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

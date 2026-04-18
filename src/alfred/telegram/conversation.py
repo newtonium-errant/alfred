@@ -440,6 +440,14 @@ async def run_turn(
     Returns the final assistant text. Tool-use blocks and their results are
     appended to the session transcript (so the next turn sees the full
     context) and vault mutations are recorded against the session.
+
+    Model resolution (wk3 commit 5 bug fix): the API call uses
+    ``session.model`` — which the session-open router and the
+    ``/opus`` / ``/sonnet`` command handlers write — not
+    ``config.anthropic.model``. Wk2 accidentally read from config, which
+    meant the router's model choice and explicit switches were silently
+    ignored on every turn after open. Regression-tested in
+    ``tests/telegram/test_run_turn_session_model.py``.
     """
     # Append the user's message first so it's visible inside the loop.
     append_turn(state, session, "user", user_message, kind=user_kind)
@@ -455,7 +463,7 @@ async def run_turn(
     for iteration in range(MAX_TOOL_ITERATIONS):
         try:
             response = await client.messages.create(
-                model=config.anthropic.model,
+                model=session.model,
                 max_tokens=config.anthropic.max_tokens,
                 temperature=config.anthropic.temperature,
                 system=system_blocks,
