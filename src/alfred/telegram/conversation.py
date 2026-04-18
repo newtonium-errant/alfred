@@ -348,7 +348,7 @@ async def run_turn(
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         try:
-            response = client.messages.create(
+            response = await client.messages.create(
                 model=config.anthropic.model,
                 max_tokens=config.anthropic.max_tokens,
                 temperature=config.anthropic.temperature,
