@@ -400,8 +400,17 @@ def _resolve_entities(
             log.info("pipeline.s2_entity_exists", entity=entity_key)
             continue
 
-        # Create the entity with description as body (avoids template placeholder leak)
-        body = f"# {name}\n\n{description}\n" if description else f"# {name}\n"
+        # Use the full body from the Stage 1 manifest if provided (upstream
+        # cbedd04 schema shift: Stage 1 now emits complete markdown bodies,
+        # not stubs). Fall back to description-as-body for manifests emitted
+        # before the schema shift landed (e.g., in-flight retries).
+        manifest_body = entity.get("body", "")
+        if manifest_body and manifest_body.strip():
+            body = manifest_body
+            if not body.endswith("\n"):
+                body += "\n"
+        else:
+            body = f"# {name}\n\n{description}\n" if description else f"# {name}\n"
 
         # Parse fields — strip wrapping quotes from wikilink values
         set_fields: dict = {}
