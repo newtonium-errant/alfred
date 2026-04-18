@@ -39,6 +39,13 @@ class Session:
     The canonical store is the JSON state file; this dataclass is a typed
     projection for callers that prefer attribute access. ``transcript`` holds
     Anthropic-format message dicts (``role`` + ``content``).
+
+    Wk3 commit 8: ``opening_model`` records the model the session was
+    *opened* on (via the router + calibration overrides). ``model`` may
+    be flipped mid-session by ``/opus`` / ``/sonnet`` / implicit
+    escalation; ``opening_model`` stays fixed. The diff between the two
+    at close time is the "session escalated" signal the model-preference
+    calibration threshold counts on.
     """
 
     session_id: str
@@ -48,6 +55,7 @@ class Session:
     model: str
     transcript: list[dict[str, Any]] = field(default_factory=list)
     vault_ops: list[dict[str, str]] = field(default_factory=list)
+    opening_model: str = ""
 
     # --- serialization ---
 
@@ -60,6 +68,7 @@ class Session:
             "model": self.model,
             "transcript": self.transcript,
             "vault_ops": self.vault_ops,
+            "opening_model": self.opening_model or self.model,
         }
 
     @classmethod
@@ -72,6 +81,10 @@ class Session:
             model=data["model"],
             transcript=list(data.get("transcript") or []),
             vault_ops=list(data.get("vault_ops") or []),
+            # Missing opening_model (wk2 records) → use current model as
+            # the opening snapshot. Conservative: a rehydrated wk2
+            # session was opened on its ``model`` so this is correct.
+            opening_model=data.get("opening_model") or data.get("model", ""),
         )
 
 
@@ -133,6 +146,7 @@ def open_session(
         started_at=now,
         last_message_at=now,
         model=model,
+        opening_model=model,
     )
     _persist(state, session)
     log.info(
@@ -375,6 +389,12 @@ def close_session(
         "vault_ops": len(session.vault_ops),
         "session_type": session_type,
         "continues_from": continues_from,
+        # Wk3 commit 8: record the opening and closing model so
+        # model_calibration.propose_default_flip can detect mid-session
+        # escalation. ``opening_model`` falls back to current ``model``
+        # for wk2 records being written during transition.
+        "opening_model": session.opening_model or session.model,
+        "closing_model": session.model,
     })
     state.save()
 

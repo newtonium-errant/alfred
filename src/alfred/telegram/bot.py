@@ -34,7 +34,15 @@ from telegram.ext import (
     filters,
 )
 
-from . import calibration, conversation, router, session, session_types, transcribe
+from . import (
+    calibration,
+    conversation,
+    model_calibration,
+    router,
+    session,
+    session_types,
+    transcribe,
+)
 from .config import TalkerConfig
 from .session import Session
 from .state import StateManager
@@ -190,7 +198,7 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     log.info("talker.bot.session_closed", chat_id=chat_id, record=rel_path)
 
-    # --- Calibration writes (wk3 commit 7) -------------------------------
+    # --- Calibration writes (wk3 commits 7 + 8) --------------------------
     # Runs after the session record is persisted so even a calibration
     # failure leaves the vault in a consistent state (session captured,
     # just no calibration delta). User-facing reply includes the applied
@@ -208,6 +216,15 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             session_type=session_type,
             source_session_rel=rel_path,
         )
+
+        # Commit 8: add a model-default flip proposal if the recent
+        # history warrants it. Runs AFTER the close so the
+        # ``closed_sessions`` entry for this session is already visible
+        # to the threshold calculation.
+        flip = model_calibration.propose_default_flip(session_type, state_mgr)
+        if flip is not None:
+            proposals.append(flip)
+
         result = calibration.apply_proposals(
             vault_path=Path(config.vault.path),
             user_rel_path=user_rel,
@@ -653,11 +670,36 @@ async def _open_routed_session(
     # lookup is sufficient here.
     type_defaults = session_types.defaults_for(decision.session_type)
 
+    # Wk3 commit 2 + 8: read the calibration snapshot BEFORE opening so
+    # model preferences (commit 8) can override the router's model
+    # choice for this type. The router picks a session-type default;
+    # learned preferences in the calibration block let Andrew's
+    # observed pattern override that default without a code change.
+    from pathlib import Path
+    user_rel = config.primary_users[0] if config.primary_users else ""
+    calibration_snapshot = calibration.read_calibration(
+        Path(config.vault.path), user_rel,
+    )
+
+    # Model preference override (commit 8). Empty dict = no preferences
+    # set; missing type in the dict = fall back to router's choice.
+    opening_model = decision.model
+    model_prefs = model_calibration.parse_model_preferences(calibration_snapshot)
+    pref = model_prefs.get(decision.session_type)
+    if pref is not None and pref.model:
+        log.info(
+            "talker.model_cal.override",
+            session_type=decision.session_type,
+            router_model=decision.model,
+            preferred_model=pref.model,
+        )
+        opening_model = pref.model
+
     sess = _open_session_with_stash(
         state_mgr,
         chat_id,
         config,
-        model=decision.model,
+        model=opening_model,
         session_type=decision.session_type,
         continues_from=f"[[{decision.continues_from}]]"
         if decision.continues_from
@@ -665,16 +707,6 @@ async def _open_routed_session(
         pushback_level=type_defaults.pushback_level,
     )
 
-    # Wk3 commit 2: snapshot the calibration block at session open so every
-    # turn in this session sees the same prefix. Reading on each turn would
-    # (a) defeat prompt caching and (b) race with commit 7's close-time
-    # writer. ``None`` is a valid value — the user may not have a
-    # calibration block yet.
-    from pathlib import Path
-    user_rel = config.primary_users[0] if config.primary_users else ""
-    calibration_snapshot = calibration.read_calibration(
-        Path(config.vault.path), user_rel,
-    )
     active = state_mgr.get_active(chat_id) or {}
     active["_calibration_snapshot"] = calibration_snapshot
     state_mgr.set_active(chat_id, active)
