@@ -134,9 +134,18 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/end — explicitly close the current session, return vault record path."""
+    """/end — explicitly close the current session, return vault record path.
+
+    Wk3 commit 7: after the session record is written, run
+    :func:`calibration.propose_updates` over the transcript and apply any
+    proposals via :func:`calibration.apply_proposals`. For dial 4 (default),
+    applied proposals are surfaced inline in the close reply so Andrew
+    can confirm / object. Errors in the calibration write are logged but
+    never block the close reply.
+    """
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
     state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
+    client: Any = ctx.application.bot_data[_KEY_CLIENT]
     if not _is_allowed(update, config):
         return
     if update.message is None or update.effective_chat is None:
@@ -147,6 +156,17 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not active:
         await update.message.reply_text("no active session.")
         return
+
+    # Snapshot transcript + user path BEFORE close_session pops the
+    # active session — close_session removes the active dict, so anything
+    # we want from it must be copied out first.
+    transcript_snapshot = list(active.get("transcript") or [])
+    user_rel = (
+        active.get("_user_vault_path")
+        or (config.primary_users[0] if config.primary_users else "")
+    )
+    session_type = active.get("_session_type", "note")
+    calibration_snapshot = active.get("_calibration_snapshot")
 
     try:
         rel_path = session.close_session(
@@ -159,7 +179,7 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 or (config.primary_users[0] if config.primary_users else None)
             ),
             stt_model_used=active.get("_stt_model_used") or config.stt.model,
-            session_type=active.get("_session_type", "note"),
+            session_type=session_type,
             continues_from=active.get("_continues_from"),
             pushback_level=active.get("_pushback_level"),
         )
@@ -169,7 +189,86 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     log.info("talker.bot.session_closed", chat_id=chat_id, record=rel_path)
-    await update.message.reply_text(f"session closed. saved to: {rel_path}")
+
+    # --- Calibration writes (wk3 commit 7) -------------------------------
+    # Runs after the session record is persisted so even a calibration
+    # failure leaves the vault in a consistent state (session captured,
+    # just no calibration delta). User-facing reply includes the applied
+    # proposals inline when dial >= 4.
+    suffix = ""
+    try:
+        from pathlib import Path
+        transcript_text = _render_transcript_for_calibration(
+            transcript_snapshot,
+        )
+        proposals = await calibration.propose_updates(
+            client=client,
+            transcript_text=transcript_text,
+            current_calibration=calibration_snapshot,
+            session_type=session_type,
+            source_session_rel=rel_path,
+        )
+        result = calibration.apply_proposals(
+            vault_path=Path(config.vault.path),
+            user_rel_path=user_rel,
+            proposals=proposals,
+            session_record_path=rel_path,
+            confirmation_dial=calibration.DEFAULT_CONFIRMATION_DIAL,
+        )
+        if result["written"] and result["applied"]:
+            # Surface the applied proposals inline so Andrew can react
+            # immediately. Dial 4 default — wk3 validation phase.
+            lines = ["", "calibration updates applied:"]
+            for p in result["applied"]:
+                sub = p.subsection or "Notes"
+                lines.append(f"• [{sub}] {p.bullet}")
+            suffix = "\n".join(lines)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.calibration_write_failed",
+            chat_id=chat_id,
+            error=str(exc),
+        )
+
+    await update.message.reply_text(
+        f"session closed. saved to: {rel_path}" + suffix
+    )
+
+
+def _render_transcript_for_calibration(
+    transcript: list[dict[str, Any]],
+    tail_turns: int = 20,
+) -> str:
+    """Render the last ``tail_turns`` turns as a compact transcript for Sonnet.
+
+    Keeps the prompt bounded — even a long session gets capped at a few
+    thousand characters here. Tool-use / tool-result blocks are elided
+    to one-liners because the model doesn't need the full JSON dump to
+    infer user patterns.
+    """
+    tail = transcript[-tail_turns:] if tail_turns > 0 else transcript
+    lines: list[str] = []
+    for turn in tail:
+        role = turn.get("role", "?")
+        content = turn.get("content", "")
+        if isinstance(content, list):
+            # Tool blocks — summarise.
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    btype = block.get("type", "")
+                    if btype == "text":
+                        parts.append(block.get("text", "").strip())
+                    else:
+                        parts.append(f"[{btype}]")
+            body = " ".join(p for p in parts if p).strip()
+        elif isinstance(content, str):
+            body = content.strip()
+        else:
+            body = str(content)
+        if body:
+            lines.append(f"{role.upper()}: {body}")
+    return "\n".join(lines)
 
 
 # --- Model-override commands ----------------------------------------------

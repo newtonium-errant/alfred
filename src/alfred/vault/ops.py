@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from datetime import date
 from pathlib import Path
+from typing import Callable
 
 import frontmatter
 import structlog
@@ -505,8 +506,24 @@ def vault_edit(
     set_fields: dict | None = None,
     append_fields: dict | None = None,
     body_append: str | None = None,
+    body_rewriter: Callable[[str], str] | None = None,
 ) -> dict:
-    """Edit a vault record. Returns {path, fields_changed}."""
+    """Edit a vault record. Returns {path, fields_changed}.
+
+    ``body_rewriter`` (wk3 commit 7) is an optional callable that takes
+    the current body string and returns a new body string. Runs after
+    ``body_append`` so a single edit can both append and rewrite, though
+    the common case is one or the other. If the rewriter returns the
+    body unchanged, ``body`` is NOT added to ``fields_changed`` — the
+    caller's check "did anything actually change?" stays honest.
+
+    Used by the telegram calibration writer to surgically replace the
+    interior of the ``<!-- ALFRED:CALIBRATION -->`` block without
+    disturbing the surrounding person-record body. Generic surface
+    rather than a calibration-specific ``body_replace`` kwarg because
+    the shape generalises to any marker-fenced rewrite (dynamic briefings,
+    section summaries) without another round of vault_ops surgery.
+    """
     file_path = _resolve_vault_path(vault_path, rel_path)
     if not file_path.exists():
         raise VaultError(f"File not found: {rel_path}")
@@ -543,6 +560,15 @@ def vault_edit(
     if body_append:
         body = body.rstrip() + "\n\n" + body_append + "\n"
         fields_changed.append("body")
+
+    # Rewrite body (wk3 commit 7 — runs last so append + rewrite compose
+    # in a predictable order if both are provided on the same call).
+    if body_rewriter is not None:
+        new_body = body_rewriter(body)
+        if new_body != body:
+            body = new_body
+            if "body" not in fields_changed:
+                fields_changed.append("body")
 
     # Write back
     file_path.write_text(_serialize_record(fm, body), encoding="utf-8")
