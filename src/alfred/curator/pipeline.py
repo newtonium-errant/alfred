@@ -76,24 +76,22 @@ def _load_user_profile(vault_path: Path) -> str:
     return "(no user profile available — use your best judgement about relevance)"
 
 
-def _parse_entity_manifest(stdout: str) -> list[dict]:
-    """Extract the JSON entity manifest from LLM stdout.
+def _extract_entities_from_text(text: str) -> list[dict] | None:
+    """Find a JSON object with an ``entities`` array anywhere in text.
 
-    Looks for a JSON object containing an "entities" array.
+    Uses brace-depth tracking to handle nested objects. Returns the parsed
+    list, or None if no match found.
     """
-    # Try to find a JSON block with {"entities": [...]}
-    # Search for the pattern in the full output
-    for match in re.finditer(r'\{[^{}]*"entities"\s*:\s*\[', stdout):
+    for match in re.finditer(r'\{[^{}]*"entities"\s*:\s*\[', text):
         start = match.start()
-        # Find the matching closing brace by tracking nesting
         depth = 0
-        for i in range(start, len(stdout)):
-            if stdout[i] == '{':
+        for i in range(start, len(text)):
+            if text[i] == '{':
                 depth += 1
-            elif stdout[i] == '}':
+            elif text[i] == '}':
                 depth -= 1
                 if depth == 0:
-                    candidate = stdout[start:i + 1]
+                    candidate = text[start:i + 1]
                     try:
                         data = json.loads(candidate)
                         if isinstance(data.get("entities"), list):
@@ -101,8 +99,39 @@ def _parse_entity_manifest(stdout: str) -> list[dict]:
                     except json.JSONDecodeError:
                         continue
                     break
+    return None
 
-    # Fallback: try to parse the entire stdout as JSON
+
+def _parse_entity_manifest(stdout: str) -> list[dict]:
+    """Extract the JSON entity manifest from LLM stdout.
+
+    Searches in order:
+      1. Markdown fenced code blocks (```json ... ```) — the preferred
+         fallback when the model can't (or won't) use the Write tool.
+      2. Raw JSON with ``"entities"`` anywhere in the output.
+      3. Entire stdout parsed as a JSON document.
+
+    Ref upstream f4dea8c — model-agnostic prompts may include the manifest
+    inline inside a ```json block instead of writing to the temp file.
+    """
+    if not stdout or '"entities"' not in stdout:
+        log.warning("pipeline.manifest_parse_failed", stdout_len=len(stdout))
+        return []
+
+    # Tier 1: Extract from markdown code blocks (```json ... ```)
+    for block_match in re.finditer(r'```(?:json)?\s*\n(.*?)\n```', stdout, re.DOTALL):
+        block = block_match.group(1).strip()
+        if '"entities"' in block:
+            result = _extract_entities_from_text(block)
+            if result is not None:
+                return result
+
+    # Tier 2: Find JSON with "entities" anywhere in the raw output
+    result = _extract_entities_from_text(stdout)
+    if result is not None:
+        return result
+
+    # Tier 3: Try to parse the entire stdout as JSON
     try:
         data = json.loads(stdout.strip())
         if isinstance(data.get("entities"), list):

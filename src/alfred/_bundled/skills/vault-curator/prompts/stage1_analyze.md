@@ -39,16 +39,16 @@ Before creating records, identify the content type and handle accordingly:
 
 ---
 
-## Task 1: Create the Note
+## Task 1: Create Vault Records
 
-Create a single, rich note record that captures the substance of the inbox file.
+### Single document (default)
 
-```bash
-cat <<'BODY' | alfred vault create note "<Descriptive Title>" \
-  --set status=active \
-  --set 'description="<1-2 sentence summary>"' \
-  --set 'project="[[project/Project Name]]"' \
-  --body-stdin
+If the inbox file contains one document (an email, a conversation, a note), create a single rich note.
+
+**Step 1:** Use the **Write** tool to create a temporary file with the note body.
+
+Write to `/tmp/note-body.md`:
+```markdown
 # <Descriptive Title>
 
 ## Context
@@ -66,8 +66,50 @@ cat <<'BODY' | alfred vault create note "<Descriptive Title>" \
 <Any tasks, follow-ups, or next steps identified>
 
 ![[related.base#All]]
-BODY
 ```
+
+**Step 2:** Use the **Bash** tool to create the vault record:
+
+```bash
+alfred vault create note "<Descriptive Title>" --set status=active --set 'description="<1-2 sentence summary>"' --set 'project="[[project/Project Name]]"' --body-stdin < /tmp/note-body.md
+```
+
+### Batched items (emails, messages, etc.)
+
+If the inbox file contains **multiple items** (indicated by headers like "## Email 1:", "## Item 1:", or a count in the title like "50 emails from github.com"), process them intelligently:
+
+- **Service/notification emails** (GitHub, Stripe, newsletters, automated notifications): Create ONE summary note for the domain/service describing the user's relationship with it. Don't create individual notes for each notification.
+- **Personal/business emails** (real conversations with people): Create a note for each significant conversation thread or topic. Skip trivial one-liners.
+- **Tasks/action items**: Create individual task records for anything actionable.
+- **Noise** (login codes, automated alerts, marketing spam): Skip entirely — don't create records.
+
+**For batched service emails, follow the same two-step pattern:**
+
+**Step 1:** Write to `/tmp/note-body.md`:
+```markdown
+# GitHub Activity Summary
+
+## Repositories
+
+<List repos the user is active on, with context>
+
+## Collaborators
+
+<People the user works with on GitHub>
+
+## Patterns
+
+<CI/CD activity, PR review patterns, etc.>
+
+![[related.base#All]]
+```
+
+**Step 2:** Run:
+```bash
+alfred vault create note "GitHub Activity Summary" --set status=active --set 'description="Summary of GitHub activity: repos, collaborators, CI/CD patterns"' --set subtype=reference --body-stdin < /tmp/note-body.md
+```
+
+**Create at least one note per inbox file.** Even for pure noise, create a brief note acknowledging the source (e.g., "20 marketing emails from stan.store — no actionable content").
 
 **Note quality requirements:**
 - The `description` field MUST be a meaningful 1-2 sentence summary, never null or empty
@@ -78,24 +120,29 @@ BODY
 
 ---
 
-## Task 2: Write the Entity Manifest to a File
+## Task 2: Write the Entity Manifest
 
-**CRITICAL: You MUST write the entity manifest JSON file.** This is not optional. The pipeline reads this file to create entity records. If you skip writing the file, no entities will be created and the extraction is lost.
+**CRITICAL: You MUST produce the entity manifest JSON.** This is not optional. The pipeline reads this to create entity records.
 
-After creating the note, write a JSON file listing entities that are **directly relevant to the vault owner** (see Relevance filter below).
+After creating the note, produce a JSON object listing entities that are **directly relevant to the vault owner** (see Relevance filter below). Even if you find zero entities, you MUST still produce: `{{"entities": []}}`
 
 **Provide FULL records** with body content for each entity — the pipeline creates complete vault records from your manifest. Each entity should be ready to become a standalone vault record with meaningful content.
 
-**Write the JSON to this exact file path:** `{manifest_path}`
+Do NOT create these entities in the vault yourself — the pipeline creates them automatically from your manifest.
 
-Do NOT create these entities in the vault — just list them in the JSON file. The pipeline will create them automatically.
+**Primary method:** Use the **Write** tool to write the JSON to this exact file path: `{manifest_path}`
 
-**Execute this command — do not just display it.** Even if you find zero entities, you MUST still write the file with an empty array: `{{"entities": []}}`
+**Fallback:** If the Write tool is unavailable or fails, include the JSON in your response inside a fenced code block marked `json`, like this:
 
-Write the file using a bash command like this:
+````
+```json
+{{"entities": [...]}}
+```
+````
 
-```bash
-cat > {manifest_path} <<'MANIFEST_EOF'
+**Example manifest content:**
+
+```json
 {{"entities": [
   {{
     "type": "person",
@@ -133,7 +180,6 @@ cat > {manifest_path} <<'MANIFEST_EOF'
     "fields": {{"status": "final", "confidence": "high", "project": "\"[[project/Acme API Integration]]\""}}
   }}
 ]}}
-MANIFEST_EOF
 ```
 
 **Entity extraction rules:**
@@ -192,10 +238,11 @@ Use this profile to determine what is relevant to the vault owner. Only extract 
 ## Important Rules
 
 - **Write everything in English.** Translate if the source is in another language. Keep proper nouns in original form.
-- **Use `alfred vault` commands for vault records.** The only direct filesystem write allowed is the entity manifest JSON to the specified `/tmp/` path.
+- **Use `alfred vault` commands for vault records.** Use the Write tool for the temporary note body file and the entity manifest JSON.
 - **Do NOT create entity records** — only create the note. The entity manifest JSON is for the pipeline to process.
 - **Do NOT move the inbox file** — the system handles this after processing.
 - **Prefer precision over recall** — only extract entities the vault owner directly interacts with. When in doubt, leave it out.
+- **Always produce the entity manifest** — even if empty. Use the Write tool to write to the specified path, OR include it in your response as a ```json code block.
 - **Entity body content must be substantive** — not just the description repeated. Include context, relationships, background, and details from the source material.
 
 ---
