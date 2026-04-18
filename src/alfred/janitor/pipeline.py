@@ -331,10 +331,29 @@ async def _stage2_link_repair(
         safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', broken_target.replace(' ', '-').replace('/', '-'))[:30]
         stage_label = f"s2-link-{safe_name}"
 
-        await _call_llm(prompt, config, session_path, stage_label)
-        repaired += 1
+        # Snapshot file mtime before the LLM call so we only count
+        # repairs that actually changed the file. Upstream 44cf675: the
+        # mutation log can't be trusted for cross-container backends
+        # (openclaw-wrapper HTTP API has no ALFRED_VAULT_SESSION), so we
+        # use filesystem mtime as the authoritative "did anything happen"
+        # signal. Prevents the counter from double-counting Python-path
+        # fixes (which already incremented above) or inflating on no-op
+        # LLM calls.
+        target_path = config.vault.vault_path / issue.file
+        before_mtime = target_path.stat().st_mtime if target_path.exists() else 0.0
 
-        log.info("pipeline.s2_llm_repair", file=issue.file, target=broken_target)
+        await _call_llm(prompt, config, session_path, stage_label)
+
+        after_mtime = target_path.stat().st_mtime if target_path.exists() else 0.0
+        if after_mtime > before_mtime:
+            repaired += 1
+            log.info("pipeline.s2_llm_repair", file=issue.file, target=broken_target)
+        else:
+            log.info(
+                "pipeline.s2_llm_no_change",
+                file=issue.file,
+                target=broken_target,
+            )
 
     log.info("pipeline.s2_complete", repaired=repaired)
     return repaired
