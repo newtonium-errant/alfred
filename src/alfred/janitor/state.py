@@ -32,6 +32,11 @@ class JanitorState:
         self.fix_log: list[FixLogEntry] = []  # permanent audit trail
         self.ignored: dict[str, str] = {}  # rel_path -> reason
         self.pending_writes: dict[str, str] = {}  # rel_path -> expected_md5
+        # ISO timestamp of last deep (fix-mode) sweep. Persisted so daemon
+        # restarts do not reset to epoch and trigger a full sweep on every
+        # boot. Upstream observed 21 restarts in 3 days -> 968 wasted LLM
+        # calls before adding this persistence.
+        self.last_deep_sweep: str | None = None
         # Layer 3 triage queue: deterministic IDs of dedup/orphan/etc.
         # candidate sets for which a triage task has already been surfaced.
         # Prevents the agent from re-creating the same triage task across
@@ -53,6 +58,7 @@ class JanitorState:
         self.fix_log = [FixLogEntry.from_dict(e) for e in raw.get("fix_log", [])]
         self.ignored = raw.get("ignored", {})
         self.pending_writes = raw.get("pending_writes", {})
+        self.last_deep_sweep = raw.get("last_deep_sweep")
         self.triage_ids_seen = set(raw.get("triage_ids_seen", []))
         log.info(
             "state.loaded",
@@ -83,6 +89,7 @@ class JanitorState:
             "fix_log": [e.to_dict() for e in self.fix_log],
             "ignored": self.ignored,
             "pending_writes": self.pending_writes,
+            "last_deep_sweep": self.last_deep_sweep,
             "triage_ids_seen": sorted(self.triage_ids_seen),
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)

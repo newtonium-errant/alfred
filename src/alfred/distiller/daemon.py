@@ -470,8 +470,16 @@ async def run_watch(
     interval = config.extraction.interval_seconds
     deep_interval_hours = config.extraction.deep_interval_hours
 
-    # Start with epoch so the first run is always a deep extraction
-    last_deep = datetime.min.replace(tzinfo=timezone.utc)
+    # Persist last deep extraction time across restarts. Without this,
+    # every daemon restart reset last_deep to epoch and re-triggered a
+    # full deep extraction on boot. Ports upstream e510cbe.
+    if state.last_deep_extraction:
+        try:
+            last_deep = datetime.fromisoformat(state.last_deep_extraction)
+        except (ValueError, TypeError):
+            last_deep = datetime.min.replace(tzinfo=timezone.utc)
+    else:
+        last_deep = datetime.min.replace(tzinfo=timezone.utc)
     last_consolidation = datetime.min.replace(tzinfo=timezone.utc)
     consolidation_interval_hours = config.extraction.consolidation_interval_hours
 
@@ -491,6 +499,8 @@ async def run_watch(
                 log.info("daemon.deep_extraction")
                 await run_extraction(config, state, skills_dir)
                 last_deep = now
+                state.last_deep_extraction = now.isoformat()
+                state.save()
             else:
                 # Light pass — just scan, no agent invocation
                 log.info("daemon.light_scan")

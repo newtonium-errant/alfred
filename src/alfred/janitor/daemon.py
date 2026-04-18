@@ -426,8 +426,16 @@ async def run_watch(
     deep_interval_hours = config.sweep.deep_sweep_interval_hours
     structural_only = config.sweep.structural_only
 
-    # Start with epoch so the first sweep is always a deep sweep (fix mode)
-    last_deep = datetime.min.replace(tzinfo=timezone.utc)
+    # Persist last deep sweep time across restarts. Without this, every
+    # daemon restart reset last_deep to epoch and triggered a full deep
+    # sweep (LLM-heavy) on boot — a runaway-cost bug in upstream.
+    if state.last_deep_sweep:
+        try:
+            last_deep = datetime.fromisoformat(state.last_deep_sweep)
+        except (ValueError, TypeError):
+            last_deep = datetime.min.replace(tzinfo=timezone.utc)
+    else:
+        last_deep = datetime.min.replace(tzinfo=timezone.utc)
     last_drift = datetime.min.replace(tzinfo=timezone.utc)
     drift_interval_hours = config.sweep.drift_sweep_interval_hours
 
@@ -448,6 +456,8 @@ async def run_watch(
                 log.info("daemon.deep_sweep")
                 await run_sweep(config, state, skills_dir, structural_only=False, fix_mode=True)
                 last_deep = now
+                state.last_deep_sweep = now.isoformat()
+                state.save()
             else:
                 # Structural-only sweep
                 await run_sweep(config, state, skills_dir, structural_only=True, fix_mode=False)

@@ -255,6 +255,13 @@ def _fix_link_in_python(
     return True
 
 
+# Cap Stage 2 LLM calls per sweep. Upstream observed 374 link issues in a
+# single runaway sweep burning hundreds of dollars; this caps per-sweep cost
+# to at most MAX_ISSUES_PER_SWEEP LLM calls. Unambiguous Python fixes still
+# run for all issues; only the LLM-routed ambiguous cases are capped.
+MAX_ISSUES_PER_SWEEP = 15
+
+
 async def _stage2_link_repair(
     link_issues: list[Issue],
     config: JanitorConfig,
@@ -263,6 +270,14 @@ async def _stage2_link_repair(
     """Stage 2: Repair broken wikilinks. Returns count of links repaired."""
     if not link_issues:
         return 0
+
+    if len(link_issues) > MAX_ISSUES_PER_SWEEP:
+        log.warning(
+            "pipeline.s2_capped",
+            total=len(link_issues),
+            processing=MAX_ISSUES_PER_SWEEP,
+        )
+        link_issues = link_issues[:MAX_ISSUES_PER_SWEEP]
 
     vault_path = config.vault.vault_path
     ignore_dirs = config.vault.ignore_dirs

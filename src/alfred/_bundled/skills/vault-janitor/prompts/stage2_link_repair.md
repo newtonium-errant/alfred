@@ -24,20 +24,25 @@ The following vault records were found as possible matches for `[[{broken_target
 ## Instructions
 
 1. Read the file using `alfred vault read "{file_path}"`
-2. Examine the candidates above and the file's context to determine the correct target
-3. If ONE candidate is clearly correct, fix the link using `alfred vault edit`
-4. If NO candidate is correct, or if the choice is ambiguous, add a `janitor_note` instead:
-   `alfred vault edit "{file_path}" --set 'janitor_note="LINK001 -- broken link [[{broken_target}]], possible matches: {candidate_names}"'`
+2. Examine the candidates above
+3. If ONE candidate is clearly the correct match, fix the link
+4. If you are NOT SURE, do NOTHING. Reply with "SKIP" and nothing else.
 
-## Rules
+## How to fix
 
-- Fix ONLY the one broken link described above. Do not modify anything else.
-- If fixing, replace the old wikilink target with the correct path in the body or frontmatter field where it appears.
-- To fix a wikilink in the body, use `alfred vault edit "{file_path}" --body-replace "[[{broken_target}]]" "[[correct/Target Name]]"`
-- To fix a wikilink in a frontmatter field, use `--set field="[[correct/Target Name]]"`
+- To fix a wikilink in the body: `alfred vault edit "{file_path}" --body-replace "[[{broken_target}]]" "[[correct/Target Name]]"`
+- To fix a wikilink in a frontmatter field: `alfred vault edit "{file_path}" --set field="[[correct/Target Name]]"`
 - Preserve `[[type/Name]]` format for wikilinks in frontmatter fields.
+
+## Rules — READ CAREFULLY
+
+- Fix ONLY the one broken link described above. Touch NOTHING else in the file.
+- Do NOT add any fields (no janitor_note, no tags, no metadata). Stage 1 owns janitor_note writes; Stage 2 must not persist notes.
+- Do NOT modify the body text except for the exact wikilink replacement.
+- Do NOT rewrite, reformat, or "improve" any content.
 - Do NOT delete, move, or create any files.
 - Do NOT modify files other than `{file_path}`.
+- If unsure, do NOTHING. It is better to skip than to make a wrong fix.
 
 ---
 

@@ -64,6 +64,10 @@ class DistillerState:
         self.runs: dict[str, RunResult] = {}  # run_id -> result
         self.extraction_log: list[ExtractionLogEntry] = []  # permanent audit trail
         self.pending_writes: dict[str, str] = {}  # rel_path -> expected_md5
+        # ISO timestamp of last deep extraction run. Persisted so daemon
+        # restarts do not reset to epoch and trigger a full deep extraction
+        # on every boot. Ports upstream e510cbe.
+        self.last_deep_extraction: str | None = None
 
     def load(self) -> None:
         """Load state from disk if it exists."""
@@ -81,6 +85,7 @@ class DistillerState:
             ExtractionLogEntry.from_dict(e) for e in raw.get("extraction_log", [])
         ]
         self.pending_writes = raw.get("pending_writes", {})
+        self.last_deep_extraction = raw.get("last_deep_extraction")
         log.info("state.loaded", files=len(self.files), runs=len(self.runs))
 
     def save(self) -> None:
@@ -106,6 +111,7 @@ class DistillerState:
             "runs": {rid: rr.to_dict() for rid, rr in self.runs.items()},
             "extraction_log": [e.to_dict() for e in self.extraction_log],
             "pending_writes": self.pending_writes,
+            "last_deep_extraction": self.last_deep_extraction,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.state_path.with_suffix(".tmp")
