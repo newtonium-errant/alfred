@@ -88,12 +88,16 @@ class AlfredActivities:
             return SpawnResult(success=False, output=f"Unknown backend: {backend_name}")
 
     async def _run_claude(self, prompt: str, profile: AgentProfile, timeout: int) -> SpawnResult:
+        from alfred.subprocess_env import claude_subprocess_env
+
         rt = self.runtime
         cmd = [rt.agent_claude_command, *rt.agent_claude_args]
         if rt.agent_claude_allowed_tools:
             cmd.extend(["--allowedTools", ",".join(rt.agent_claude_allowed_tools)])
         cmd.extend(["-p", "-"])
-        env = self._build_env(profile)
+        # Strip ANTHROPIC_API_KEY et al. so `claude -p` uses OAuth/Max-plan
+        # auth rather than API-credit billing.
+        env = claude_subprocess_env(base_env=self._build_env(profile))
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,

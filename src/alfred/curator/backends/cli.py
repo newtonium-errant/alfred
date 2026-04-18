@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
+
+from alfred.subprocess_env import claude_subprocess_env
 
 from ..config import ClaudeBackendConfig
 from ..utils import get_logger
@@ -37,8 +38,10 @@ class ClaudeBackend(BaseBackend):
         cmd.append("-p")
         cmd.append("-")
 
-        # Build environment with vault env vars
-        env = {**os.environ, **self.env_overrides}
+        # Build environment with vault env vars. ANTHROPIC_API_KEY et al.
+        # are stripped so `claude -p` uses OAuth/Max-plan auth instead of
+        # API-credit billing — see alfred.subprocess_env for details.
+        env = claude_subprocess_env(overrides=self.env_overrides)
 
         log.info(
             "claude.dispatching",
