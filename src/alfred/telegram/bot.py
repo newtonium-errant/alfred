@@ -34,7 +34,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import conversation, router, session, transcribe
+from . import conversation, router, session, session_types, transcribe
 from .config import TalkerConfig
 from .session import Session
 from .state import StateManager
@@ -147,6 +147,7 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             stt_model_used=active.get("_stt_model_used") or config.stt.model,
             session_type=active.get("_session_type", "note"),
             continues_from=active.get("_continues_from"),
+            pushback_level=active.get("_pushback_level"),
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("talker.bot.close_failed", chat_id=chat_id)
@@ -275,6 +276,7 @@ def _open_session_with_stash(
     model: str | None = None,
     session_type: str = "note",
     continues_from: str | None = None,
+    pushback_level: int | None = None,
 ) -> Session:
     """Open a new session and stash the forward-contract metadata.
 
@@ -287,6 +289,10 @@ def _open_session_with_stash(
     through so the router (commit 3+4) can open a session on the right model
     and flag it as a continuation. All three have safe wk1-equivalent
     defaults (``note`` type on the config-default model, no continuation).
+
+    wk3 commit 1: ``pushback_level`` (int 0-5) stashed as
+    ``_pushback_level`` on the active dict so :func:`handle_message` can
+    thread it into ``run_turn`` on every turn without a re-lookup.
     """
     sess = session.open_session(
         state_mgr, chat_id, model or config.anthropic.model,
@@ -300,6 +306,8 @@ def _open_session_with_stash(
     active["_stt_model_used"] = config.stt.model
     active["_session_type"] = session_type
     active["_continues_from"] = continues_from
+    if pushback_level is not None:
+        active["_pushback_level"] = pushback_level
     # Voice / text counts are derived from per-turn ``_kind`` at close
     # time by ``_count_message_kinds`` — no state-dict counter needed.
     state_mgr.set_active(chat_id, active)
@@ -360,6 +368,11 @@ async def _open_routed_session(
         client, first_message, recent,
     )
 
+    # Pushback level from the session-type defaults — the router doesn't
+    # currently override it (that's a wk4+ calibration hook), so a table
+    # lookup is sufficient here.
+    type_defaults = session_types.defaults_for(decision.session_type)
+
     sess = _open_session_with_stash(
         state_mgr,
         chat_id,
@@ -369,6 +382,7 @@ async def _open_routed_session(
         continues_from=f"[[{decision.continues_from}]]"
         if decision.continues_from
         else None,
+        pushback_level=type_defaults.pushback_level,
     )
 
     # Continuation pre-seed: drop one context turn into the transcript so
@@ -465,6 +479,15 @@ async def handle_message(
         except Exception as exc:  # noqa: BLE001
             log.debug("talker.bot.typing_action_failed", error=str(exc))
 
+        # Re-read the active dict to pull the stashed pushback level — it
+        # was written at session-open time by ``_open_session_with_stash``
+        # and is orthogonal to the :class:`Session` dataclass. ``None``
+        # means a pre-wk3 active dict (rehydrated from state) that was
+        # opened without a pushback stash; ``run_turn`` treats ``None`` as
+        # "skip the directive block entirely".
+        active_for_turn = state_mgr.get_active(chat_id) or {}
+        pushback_level = active_for_turn.get("_pushback_level")
+
         try:
             response_text = await conversation.run_turn(
                 client=client,
@@ -475,6 +498,7 @@ async def handle_message(
                 vault_context_str=vault_context_str,
                 system_prompt=system_prompt,
                 user_kind="voice" if voice else "text",
+                pushback_level=pushback_level,
             )
         except anthropic.APIError as exc:
             log.warning(

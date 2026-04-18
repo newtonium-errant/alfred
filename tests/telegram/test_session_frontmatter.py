@@ -113,3 +113,32 @@ def test_close_session_threads_fields_into_record_and_state(
     assert closed["session_type"] == "article"
     assert closed["continues_from"] == "[[session/Voice Session — prior]]"
     assert closed["record_path"] == rel_path
+
+
+def test_telegram_pushback_level_in_record() -> None:
+    """Wk3 commit 1: ``telegram.pushback_level`` lands on the session record."""
+    sess = _make_session()
+    ended = datetime(2026, 4, 18, 12, 15, tzinfo=timezone.utc)
+
+    fm = talker_session._build_session_frontmatter(
+        sess,
+        ended_at=ended,
+        reason="explicit",
+        user_vault_path="person/Andrew Newton",
+        stt_model_used="whisper-large-v3",
+        session_type="journal",
+        continues_from=None,
+        pushback_level=4,
+    )
+    assert fm["telegram"]["pushback_level"] == 4
+
+    # Omission → explicit None (so wk2 records stay parseable — absent
+    # field would trip downstream code that expects the key to exist).
+    fm_none = talker_session._build_session_frontmatter(
+        sess,
+        ended_at=ended,
+        reason="explicit",
+        user_vault_path=None,
+        stt_model_used="",
+    )
+    assert fm_none["telegram"]["pushback_level"] is None

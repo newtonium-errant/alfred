@@ -45,16 +45,28 @@ class SessionTypeDefaults:
         model: Anthropic model id to start the session on.
         supports_continuation: Whether a "continue previous" cue should look
             for a prior session record of this type and seed transcript.
-        pushback_frequency: Rough hint for how often the assistant should
-            offer opinions / challenge assumptions (``low|medium|high``).
-            Not wired into the turn loop yet — recorded here so wk3+ can
-            consume it without another schema change.
+        pushback_level: Integer 0-5 controlling how aggressively Alfred
+            challenges assumptions mid-session. Wk3 wires this into
+            ``conversation._build_system_blocks`` as a fourth cache-control
+            system text block. Levels:
+                0 → never challenge (task mode: just do the thing)
+                1 → acknowledge briefly, no probing (note capture)
+                2 → light clarifying questions
+                3 → surface tensions / ask "are you sure?"
+                4 → actively push back, propose alternatives (default for
+                   journal / brainstorm — reflective modes benefit from
+                   friction)
+                5 → confrontational, challenge framing
+            Renamed from the wk2 ``pushback_frequency`` string field —
+            integer buckets let the prompt builder render per-level copy
+            deterministically and lets the calibration block override
+            per-type defaults in wk4+.
     """
 
     session_type: str
     model: str
     supports_continuation: bool
-    pushback_frequency: str
+    pushback_level: int
 
 
 _DEFAULTS_TABLE: Final[dict[str, SessionTypeDefaults]] = {
@@ -62,31 +74,31 @@ _DEFAULTS_TABLE: Final[dict[str, SessionTypeDefaults]] = {
         session_type="note",
         model=_SONNET,
         supports_continuation=False,
-        pushback_frequency="low",
+        pushback_level=1,
     ),
     "task": SessionTypeDefaults(
         session_type="task",
         model=_SONNET,
         supports_continuation=False,
-        pushback_frequency="none",
+        pushback_level=0,
     ),
     "journal": SessionTypeDefaults(
         session_type="journal",
         model=_SONNET,
         supports_continuation=True,
-        pushback_frequency="high",
+        pushback_level=4,
     ),
     "article": SessionTypeDefaults(
         session_type="article",
         model=_OPUS,
         supports_continuation=True,
-        pushback_frequency="medium",
+        pushback_level=3,
     ),
     "brainstorm": SessionTypeDefaults(
         session_type="brainstorm",
         model=_SONNET,
         supports_continuation=True,
-        pushback_frequency="medium",
+        pushback_level=4,
     ),
 }
 

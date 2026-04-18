@@ -243,6 +243,7 @@ def resolve_on_startup(
                 stt_model_used=raw.get("_stt_model_used", ""),
                 session_type=raw.get("_session_type", "note"),
                 continues_from=raw.get("_continues_from"),
+                pushback_level=raw.get("_pushback_level"),
             )
             closed_paths.append(path)
         except Exception as exc:  # noqa: BLE001 — log and continue sweep
@@ -287,6 +288,7 @@ def check_timeouts(
                 stt_model_used=raw.get("_stt_model_used", ""),
                 session_type=raw.get("_session_type", "note"),
                 continues_from=raw.get("_continues_from"),
+                pushback_level=raw.get("_pushback_level"),
             )
             closed_paths.append(path)
         except Exception as exc:  # noqa: BLE001
@@ -307,6 +309,7 @@ def close_session(
     stt_model_used: str,
     session_type: str = "note",
     continues_from: str | None = None,
+    pushback_level: int | None = None,
 ) -> str:
     """Close the active session for ``chat_id`` and write a ``session/`` record.
 
@@ -336,6 +339,7 @@ def close_session(
         stt_model_used=stt_model_used,
         session_type=session_type,
         continues_from=continues_from,
+        pushback_level=pushback_level,
     )
     body = _build_session_body(session)
 
@@ -397,6 +401,7 @@ def _build_session_frontmatter(
     stt_model_used: str = "",
     session_type: str = "note",
     continues_from: str | None = None,
+    pushback_level: int | None = None,
 ) -> dict[str, Any]:
     """Produce the ``session/`` record frontmatter.
 
@@ -447,6 +452,11 @@ def _build_session_frontmatter(
             "voice_messages": voice_count,
             "text_messages": text_count,
             "vault_operations": list(session.vault_ops),
+            # wk3 commit 1: record the session's pushback dial so the
+            # distiller and vault-reviewer can correlate output style with
+            # the directive that produced it. Emitted as None when the
+            # session was opened before wk3 so wk2 records stay parseable.
+            "pushback_level": pushback_level,
         },
     }
 

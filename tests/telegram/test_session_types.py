@@ -40,3 +40,25 @@ def test_router_model_and_continuation_flags() -> None:
     continuable = {t for t in session_types.known_types()
                    if session_types.defaults_for(t).supports_continuation}
     assert continuable == {"journal", "article", "brainstorm"}
+
+
+def test_pushback_level_defaults_by_type() -> None:
+    """Wk3 commit 1: each session type carries an int ``pushback_level`` 0-5.
+
+    Values from the plan:
+        task=0, note=1, article=3, journal=4, brainstorm=4.
+    """
+    assert session_types.defaults_for("task").pushback_level == 0
+    assert session_types.defaults_for("note").pushback_level == 1
+    assert session_types.defaults_for("article").pushback_level == 3
+    assert session_types.defaults_for("journal").pushback_level == 4
+    assert session_types.defaults_for("brainstorm").pushback_level == 4
+
+    # All values fall in the documented 0-5 range.
+    for t in session_types.known_types():
+        level = session_types.defaults_for(t).pushback_level
+        assert isinstance(level, int)
+        assert 0 <= level <= 5
+
+    # Unknown type → ``note`` fallback → level 1.
+    assert session_types.defaults_for("xyzzy").pushback_level == 1

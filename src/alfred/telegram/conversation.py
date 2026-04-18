@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-from typing import Any
+from typing import Any, Final
 
 import anthropic
 
@@ -176,17 +176,86 @@ MAX_TOOL_ITERATIONS = 10
 # --- Prompt assembly ------------------------------------------------------
 
 
+# --- Pushback copy ---------------------------------------------------------
+
+# Per-level pushback directive text rendered into the system blocks.
+# Level 0 = never push back (task mode — just execute). Level 5 is reserved
+# for a deliberately confrontational mode we haven't validated yet; treated
+# as "max pushback" for now.
+# Keyed by int so the lookup is O(1) and unknown levels fall through to a
+# neutral ``3`` (matches the plan's "default to 4 during validation" rule —
+# 4 is the most common session-type default so the fallback should be close).
+_PUSHBACK_DIRECTIVES: Final[dict[int, str]] = {
+    0: (
+        "Pushback level 0 (task mode): do not challenge the user's framing "
+        "or assumptions. Confirm, execute, and reply concisely. Ask a "
+        "clarifying question only when the request is ambiguous enough that "
+        "proceeding would produce the wrong result."
+    ),
+    1: (
+        "Pushback level 1 (capture mode): acknowledge and capture. Do not "
+        "probe unless the user invites it. If you spot a factual error, "
+        "correct it briefly; otherwise defer to their framing."
+    ),
+    2: (
+        "Pushback level 2 (light): ask one clarifying question per turn "
+        "when it would materially sharpen the output. Do not argue."
+    ),
+    3: (
+        "Pushback level 3 (active): surface tensions you notice, ask \"are "
+        "you sure?\" when a claim contradicts prior vault content or earlier "
+        "in this session, and propose one alternative framing when it "
+        "genuinely adds value. Disagree politely, then defer."
+    ),
+    4: (
+        "Pushback level 4 (strong): actively challenge assumptions. Name "
+        "contradictions explicitly. Offer alternative framings and stress-"
+        "test the user's logic — this session benefits from friction. Do "
+        "not agree just to be agreeable; flagging weak reasoning is the "
+        "value you add here. Still respectful, never scolding."
+    ),
+    5: (
+        "Pushback level 5 (confrontational): challenge the premise of the "
+        "conversation if it's shaky. Demand evidence. Call out rationalisation. "
+        "Reserved for sessions where the user has explicitly asked for a hard "
+        "devil's-advocate partner."
+    ),
+}
+
+
+def _pushback_directive(level: int) -> str:
+    """Return the per-level directive text, falling back to level 3."""
+    if level in _PUSHBACK_DIRECTIVES:
+        return _PUSHBACK_DIRECTIVES[level]
+    # Out-of-range → neutral middle (active). We avoid defaulting to the
+    # extremes so a typo in config can't silently lobotomise the assistant
+    # (level 0) or make it hostile (level 5).
+    return _PUSHBACK_DIRECTIVES[3]
+
+
 def _build_system_blocks(
     system_prompt: str,
     vault_context_str: str,
+    calibration_str: str | None = None,
+    pushback_level: int | None = None,
 ) -> list[dict[str, Any]]:
     """Return ``system`` as a list of cacheable text blocks.
 
-    Two cache breakpoints — the Anthropic-recommended pattern for agents:
+    Up to four cache breakpoints (Anthropic-recommended for agents):
         1. The frozen SKILL.md-style system prompt (almost never changes).
         2. The vault context snapshot (changes across sessions but stable
-           within one, so the second + later turns of a session hit the
-           cache).
+           within one, so turn 2+ hits the cache).
+        3. The per-user calibration block (wk3 — Alfred's current model
+           of the user; stable within a session, updated at session close).
+        4. The per-session pushback directive (wk3 — derived from session
+           type's ``pushback_level``, stable within a session).
+
+    Order matters for caching: the most-stable prefix first, the most-
+    volatile last. System prompt > vault context > calibration > pushback,
+    because the system prompt is frozen across every session, the vault
+    context rolls over between sessions (on a cadence measured in days),
+    calibration updates at session close (days to weeks), and pushback is
+    determined per-session by the router.
 
     See claude-api skill → shared/prompt-caching.md.
     """
@@ -201,6 +270,24 @@ def _build_system_blocks(
         blocks.append({
             "type": "text",
             "text": vault_context_str,
+            "cache_control": {"type": "ephemeral"},
+        })
+    if calibration_str:
+        blocks.append({
+            "type": "text",
+            "text": (
+                "## Alfred's calibration for this user\n\n"
+                + calibration_str
+            ),
+            "cache_control": {"type": "ephemeral"},
+        })
+    if pushback_level is not None:
+        blocks.append({
+            "type": "text",
+            "text": (
+                "## Session pushback directive\n\n"
+                + _pushback_directive(pushback_level)
+            ),
             "cache_control": {"type": "ephemeral"},
         })
     return blocks
@@ -333,12 +420,22 @@ async def run_turn(
     vault_context_str: str,
     system_prompt: str,
     user_kind: str = "text",
+    calibration_str: str | None = None,
+    pushback_level: int | None = None,
 ) -> str:
     """Run one user turn through the model, handling tool_use internally.
 
     ``user_kind`` is ``"text"`` or ``"voice"``; it lands on the user turn
     as ``_kind`` so ``_count_message_kinds`` can produce accurate voice /
     text totals in the session-record frontmatter at close time.
+
+    ``calibration_str`` (wk3 commit 2) is Alfred's read of the user
+    profile — injected as a third cache-control system block. ``None``
+    skips the block entirely for backwards compat.
+
+    ``pushback_level`` (wk3 commit 1) is the session-type-derived int
+    0-5 that tunes how aggressively Alfred challenges the user. ``None``
+    skips the directive block for backwards compat.
 
     Returns the final assistant text. Tool-use blocks and their results are
     appended to the session transcript (so the next turn sees the full
@@ -347,7 +444,12 @@ async def run_turn(
     # Append the user's message first so it's visible inside the loop.
     append_turn(state, session, "user", user_message, kind=user_kind)
 
-    system_blocks = _build_system_blocks(system_prompt, vault_context_str)
+    system_blocks = _build_system_blocks(
+        system_prompt,
+        vault_context_str,
+        calibration_str=calibration_str,
+        pushback_level=pushback_level,
+    )
     vault_path = config.vault.path
 
     for iteration in range(MAX_TOOL_ITERATIONS):
