@@ -31,9 +31,43 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # Janitor may create task records only when they carry the
         # alfred_triage: true frontmatter flag (Layer 3 triage queue).
         "create": "triage_tasks_only",
-        "edit": True,
+        # Stage 1/2 (autofix + link repair) narrows frontmatter writes to
+        # a deliberate allowlist. Any field outside this set is rejected
+        # by ``check_scope`` so the janitor can't mutate user-authored
+        # content. Stage 3 enrichment runs under the separate
+        # ``janitor_enrich`` scope below with its own allowlist.
+        "edit": "field_allowlist",
+        "edit_fields_allowlist": {
+            "janitor_note",
+            "type", "status",              # FM002/FM003 autofix
+            "name", "subject",             # FM001 title
+            "created",                     # FM001 mtime
+            "related",                     # LINK002 autofix, DUP001 retargeting
+            "tags",                        # FM004 scalar→list coercion
+            "alfred_triage", "alfred_triage_kind", "alfred_triage_id",
+            "candidates", "priority",      # triage task creation
+        },
         "move": False,
         "delete": True,
+    },
+    # Stage 3 enrichment writes substantive content (description, role,
+    # email, etc.) onto existing stub person/org records. Split out as
+    # its own scope so the Stage 1/2 allowlist stays tight. Stage 3 never
+    # creates or moves records — it only fills in fields on records the
+    # structural scanner flagged as STUB001.
+    "janitor_enrich": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": False,
+        "edit": "field_allowlist",
+        "edit_fields_allowlist": {
+            "description", "role", "org", "email", "org_type",
+            "website", "phone", "aliases", "related", "tags",
+        },
+        "move": False,
+        "delete": False,
     },
     "distiller": {
         "read": True,

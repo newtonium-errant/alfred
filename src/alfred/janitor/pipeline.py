@@ -74,11 +74,17 @@ async def _call_llm(
     config: JanitorConfig,
     session_path: str,
     stage_label: str,
+    scope: str = "janitor",
 ) -> str:
     """Make an isolated OpenClaw call and return stdout.
 
     Handles session clearing, workspace sync, subprocess exec with
     --local --json, and timeout.
+
+    ``scope`` selects the ALFRED_VAULT_SCOPE the agent sees; defaults
+    to ``"janitor"`` (used by Stage 2 link repair). Stage 3 enrichment
+    passes ``"janitor_enrich"`` to widen the field allowlist to the
+    enrichment set while still blocking create/move/delete.
     """
     oc = config.agent.openclaw
     session_id = f"janitor-{stage_label}-{uuid.uuid4().hex[:8]}"
@@ -97,7 +103,7 @@ async def _call_llm(
     env = {
         **os.environ,
         "ALFRED_VAULT_PATH": str(config.vault.vault_path),
-        "ALFRED_VAULT_SCOPE": "janitor",
+        "ALFRED_VAULT_SCOPE": scope,
         "ALFRED_VAULT_SESSION": session_path,
     }
 
@@ -584,7 +590,10 @@ async def _stage3_enrich(
         safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', record_name.replace(' ', '-'))[:30]
         stage_label = f"s3-enrich-{safe_name}"
 
-        await _call_llm(prompt, config, session_path, stage_label)
+        # Stage 3 runs under the ``janitor_enrich`` scope so the
+        # allowlist covers description/role/email/etc. without opening
+        # up the narrower Stage 1/2 ``janitor`` scope.
+        await _call_llm(prompt, config, session_path, stage_label, scope="janitor_enrich")
         enriched += 1
 
         # Record the attempt so Stage 3 stops retrying the same unchanged
