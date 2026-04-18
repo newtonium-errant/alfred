@@ -25,7 +25,18 @@ def compute_md5_bytes(data: bytes) -> str:
 
 
 def setup_logging(level: str = "INFO", log_file: str | None = None, suppress_stdout: bool = False) -> None:
-    """Configure structlog + stdlib logging."""
+    """Configure structlog + stdlib logging.
+
+    The structlog config routes records through the stdlib ``logging`` module
+    so they hit the ``FileHandler`` configured below. The previous
+    ``PrintLoggerFactory`` setup wrote events directly to stdout, which the
+    orchestrator redirects to ``/dev/null`` in daemon mode — every
+    ``writer.tags_*`` / ``daemon.*`` event was silently dropped, leaving
+    ``data/surveyor.log`` populated only by ``httpx`` chatter (httpx uses
+    stdlib logging, so its records leaked through the FileHandler). Mirrors
+    the curator/janitor/distiller helpers — the four daemons must agree on
+    their logging contract or audits diverge per-tool.
+    """
     log_level = getattr(logging, level.upper(), logging.INFO)
 
     # Stdlib root logger
@@ -35,7 +46,7 @@ def setup_logging(level: str = "INFO", log_file: str | None = None, suppress_std
     if log_file:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+        handlers.append(logging.FileHandler(str(log_path), encoding="utf-8"))
 
     logging.basicConfig(
         format="%(message)s",
@@ -47,12 +58,13 @@ def setup_logging(level: str = "INFO", log_file: str | None = None, suppress_std
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
+            structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
             structlog.dev.ConsoleRenderer(),
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(log_level),
+        wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
