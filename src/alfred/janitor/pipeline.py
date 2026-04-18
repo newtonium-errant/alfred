@@ -605,7 +605,12 @@ async def run_pipeline(
 
     log.info("pipeline.start", issues=len(issues))
 
-    # Partition issues by stage
+    # Partition issues by stage. All codes here are handled deterministically
+    # by the Stage 1 autofix module — either fixed directly or flagged via
+    # janitor_note. SEM001-004 and learn-type DUP001 are routed to autofix
+    # so the LLM never sees them (the LLM can still produce SEM005-006 for
+    # semantic drift it detects itself). Entity-type DUP001 still falls
+    # through to the agent's triage-task path.
     autofix_codes = {
         IssueCode.MISSING_REQUIRED_FIELD,
         IssueCode.INVALID_TYPE_VALUE,
@@ -614,6 +619,10 @@ async def run_pipeline(
         IssueCode.WRONG_DIRECTORY,
         IssueCode.ORPHANED_RECORD,
         IssueCode.DUPLICATE_NAME,
+        IssueCode.STALE_ACTIVE_PROJECT,
+        IssueCode.STALE_TODO_TASK,
+        IssueCode.STALE_ACTIVE_CONVERSATION,
+        IssueCode.STALE_ACTIVE_PERSON,
     }
     autofix_issues_list = [i for i in issues if i.code in autofix_codes]
     link_issues = [i for i in issues if i.code == IssueCode.BROKEN_WIKILINK]

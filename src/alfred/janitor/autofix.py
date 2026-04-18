@@ -13,6 +13,7 @@ from alfred.vault.mutation_log import log_mutation
 from alfred.vault.ops import VaultError, vault_edit, vault_read
 from alfred.vault.schema import (
     KNOWN_TYPES,
+    LEARN_TYPES,
     LIST_FIELDS,
     NAME_FIELD_BY_TYPE,
     STATUS_BY_TYPE,
@@ -232,6 +233,24 @@ def _apply_fix(
     if code == IssueCode.ORPHANED_RECORD:
         return _flag_issue(issue, rel_path, vault_path, session_path)
     if code == IssueCode.DUPLICATE_NAME:
+        # Learn-type duplicates are not triage candidates — they carry
+        # legitimate human semantic pointers (confidence fields, etc.)
+        # and should just be flagged so the structural scanner's DUP001
+        # never reaches the LLM. Entity-type DUP001 continues to fall
+        # through to the LLM triage-task path (returns "skipped" so the
+        # pipeline doesn't double-flag it).
+        if _dup_is_learn_type(issue, vault_path):
+            return _flag_issue_with_note(
+                issue, rel_path, vault_path, session_path,
+                note="DUP001 -- learn-type duplicate, not a triage candidate, ignored",
+            )
+        return "skipped"
+
+    # Semantic drift codes — scanner-detected stale states. Flag with the
+    # scanner's own message (e.g. "STALE_ACTIVE_PROJECT -- status='active'
+    # but no activity in 42 days") so the LLM never sees these. Status
+    # changes remain human-only per the SKILL rule.
+    if code in _SEM_FLAG_CODES:
         return _flag_issue(issue, rel_path, vault_path, session_path)
 
     if code == IssueCode.UNLINKED_BODY_ENTITY:
@@ -239,6 +258,34 @@ def _apply_fix(
 
     # Issue codes handled by later stages (LINK001, STUB001) or not autofix-able
     return "skipped"
+
+
+# Semantic drift codes that the structural scanner detects deterministically
+# (date + link-count math). These should be flagged via janitor_note and
+# never sent to the LLM.
+_SEM_FLAG_CODES: set[IssueCode] = {
+    IssueCode.STALE_ACTIVE_PROJECT,
+    IssueCode.STALE_TODO_TASK,
+    IssueCode.STALE_ACTIVE_CONVERSATION,
+    IssueCode.STALE_ACTIVE_PERSON,
+}
+
+
+def _dup_is_learn_type(issue: Issue, vault_path: Path) -> bool:
+    """Return True iff the DUP001 record is a learn type.
+
+    Learn types (assumption, decision, constraint, contradiction,
+    synthesis) are not dedup triage candidates — they carry their own
+    confidence semantics and should not be merged automatically. The
+    scanner only produces one Issue per record, so a path-based type
+    lookup is enough.
+    """
+    try:
+        record = vault_read(vault_path, issue.file)
+    except VaultError:
+        return False
+    rec_type = record["frontmatter"].get("type", "")
+    return rec_type in LEARN_TYPES
 
 
 def _fix_missing_field(
@@ -461,12 +508,38 @@ def _flag_issue(
     vault_path: Path,
     session_path: str,
 ) -> str:
-    """Add a janitor_note to the record's frontmatter."""
+    """Add a janitor_note to the record's frontmatter.
+
+    Uses the generic ``{code} -- {message}`` format derived from the
+    Issue itself. For a fixed note string (e.g. the learn-type DUP001
+    branch), use :func:`_flag_issue_with_note`.
+    """
     code = issue.code.value
     note_text = f"{code} -- {issue.message}"
+    return _flag_issue_with_note(
+        issue, rel_path, vault_path, session_path, note=note_text,
+    )
 
+
+def _flag_issue_with_note(
+    issue: Issue,
+    rel_path: str,
+    vault_path: Path,
+    session_path: str,
+    note: str,
+) -> str:
+    """Write an explicit janitor_note string to ``rel_path``.
+
+    Shared tail path for all janitor flagging. Callers that want the
+    generic "{code} -- {message}" text should use :func:`_flag_issue`;
+    this variant is for deterministic notes the scanner wants to own
+    (DUP001 learn-type, LINK001 unresolved, etc.) so the prose matches
+    the SKILL's idempotency rule ({code} -- ...) exactly and doesn't
+    drift across sweeps.
+    """
+    code = issue.code.value
     try:
-        vault_edit(vault_path, rel_path, set_fields={"janitor_note": note_text})
+        vault_edit(vault_path, rel_path, set_fields={"janitor_note": note})
         log_mutation(session_path, "edit", rel_path)
         log.info("autofix.flagged", file=rel_path, code=code)
         return "flagged"
