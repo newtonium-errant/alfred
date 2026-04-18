@@ -173,6 +173,21 @@ _TOOL_TO_OP = {
 MAX_TOOL_ITERATIONS = 10
 
 
+def _messages_for_api(transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip metadata-only keys (``_ts``, ``_kind``, etc.) before API send.
+
+    wk2 stamps timing/kind metadata onto each transcript turn for session-
+    record rendering. The Anthropic Messages API strictly validates message
+    schemas and rejects unknown fields (400: ``Extra inputs are not
+    permitted``). Keep metadata on the persisted transcript; send only the
+    Anthropic-schema fields.
+    """
+    return [
+        {k: v for k, v in turn.items() if not k.startswith("_")}
+        for turn in transcript
+    ]
+
+
 # --- Prompt assembly ------------------------------------------------------
 
 
@@ -610,7 +625,7 @@ async def run_turn(
                 max_tokens=config.anthropic.max_tokens,
                 temperature=config.anthropic.temperature,
                 system=system_blocks,
-                messages=session.transcript,
+                messages=_messages_for_api(session.transcript),
                 tools=VAULT_TOOLS,
             )
         except anthropic.APIError:
