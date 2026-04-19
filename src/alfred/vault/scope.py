@@ -22,6 +22,9 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "edit": True,
         "move": "inbox_only",
         "delete": False,
+        # Curator writes full record bodies at creation time and during
+        # enrichment. Body writes stay allowed.
+        "allow_body_writes": True,
     },
     "janitor": {
         "read": True,
@@ -49,6 +52,14 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         },
         "move": False,
         "delete": True,
+        # Q3 body-write loophole: the field allowlist above gates
+        # set_fields/append_fields on frontmatter, but ``vault edit``
+        # also accepts ``--body-append`` / ``--body-stdin`` which would
+        # otherwise let a Stage 1/2 agent rewrite entire record bodies
+        # and sidestep the allowlist. Janitor's structural fixes never
+        # need to write body content — the body is user-authored and
+        # stays immutable under this scope.
+        "allow_body_writes": False,
     },
     # Stage 3 enrichment writes substantive content (description, role,
     # email, etc.) onto existing stub person/org records. Split out as
@@ -68,6 +79,10 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         },
         "move": False,
         "delete": False,
+        # Stage 3 may append a brief description paragraph to stub
+        # bodies when the frontmatter allowlist isn't enough. Body
+        # writes stay allowed under this scope.
+        "allow_body_writes": True,
     },
     "distiller": {
         "read": True,
@@ -80,6 +95,7 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "edit": "distiller_fields_only",
         "move": False,
         "delete": False,
+        "allow_body_writes": True,
     },
     "surveyor": {
         "read": True,
@@ -92,6 +108,10 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "edit": "tags_only",
         "move": False,
         "delete": False,
+        # Surveyor writes only frontmatter tags; leave the default
+        # permissive body-write rule on to avoid surprising a
+        # hypothetical future surveyor body-rewrite.
+        "allow_body_writes": True,
     },
     "talker": {
         "read": True,
@@ -104,6 +124,9 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "edit": True,
         "move": False,
         "delete": False,
+        # Talker creates notes / sessions / conversations with body
+        # content synthesised from the voice turn — body writes stay on.
+        "allow_body_writes": True,
     },
 }
 
@@ -124,6 +147,7 @@ def check_scope(
     record_type: str = "",
     frontmatter: dict | None = None,
     fields: list[str] | None = None,
+    body_write: bool = False,
 ) -> None:
     """Check if an operation is allowed under the given scope.
 
@@ -139,6 +163,14 @@ def check_scope(
             (used by ``field_allowlist`` to constrain which fields a scope
             may mutate). Defaults to None — ``field_allowlist`` fails closed
             when absent so callers must always pass the fields being written.
+        body_write: True if the caller is asking to write record body
+            content (``--body-append`` / ``--body-stdin`` on ``vault edit``,
+            or ``body`` on ``vault create``). Scopes that carry
+            ``allow_body_writes: False`` reject the operation when this
+            flag is set — closes the Q3 body-write loophole where the
+            janitor could bypass the frontmatter allowlist by rewriting
+            bodies. Defaults to False — callers that don't supply a body
+            are trivially compliant.
 
     Raises:
         ScopeError: If the operation is denied.
@@ -149,6 +181,20 @@ def check_scope(
     rules = SCOPE_RULES.get(scope)
     if rules is None:
         raise ScopeError(f"Unknown scope: '{scope}'")
+
+    # Body-write gate — applied independently of the operation-level
+    # permission because ``edit`` may succeed under an allowlist while
+    # still needing to refuse body writes. Default True preserves
+    # backwards compat for any scope (or explicit True) that hasn't
+    # opted out. Checked before the operation permission so a caller
+    # attempting a forbidden body write gets a body-specific error
+    # rather than a misleading allowlist message.
+    if body_write and rules.get("allow_body_writes", True) is False:
+        raise ScopeError(
+            f"Scope '{scope}' may not write record body content "
+            f"(body_append / body_stdin). This scope is restricted "
+            f"to frontmatter edits via its field allowlist."
+        )
 
     permission = rules.get(operation)
     if permission is None:

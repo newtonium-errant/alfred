@@ -142,12 +142,20 @@ def cmd_create(args: argparse.Namespace) -> None:
     vault = _vault_path()
     set_fields = _parse_set_args(args.set)
 
+    # Body-write gate for create mirrors the edit path: scopes with
+    # ``allow_body_writes: False`` must not be able to set a custom
+    # body via --body-stdin. Janitor triage-task creation flows through
+    # here too and never uses --body-stdin, so the gate is inert for
+    # the expected happy path and only fires on misuse.
+    body_write_requested = bool(args.body_stdin)
+
     try:
         check_scope(
             scope,
             "create",
             record_type=args.type,
             frontmatter=set_fields,
+            body_write=body_write_requested,
         )
     except ScopeError as e:
         _error(str(e))
@@ -174,14 +182,43 @@ def cmd_edit(args: argparse.Namespace) -> None:
     append_fields = _parse_set_args(args.append)
 
     # Compute the union of frontmatter fields being written. Body-only
-    # writes (--body-append, --body-stdin) are intentionally NOT routed
-    # through the field allowlist for now — body-write loophole is a known
-    # gap tracked as open question #3. The allowlist covers frontmatter
-    # only until that lands.
-    fields = list((set_fields or {}).keys()) + list((append_fields or {}).keys())
+    # writes (--body-append, --body-stdin) are gated separately by
+    # ``body_write`` — closes the Q3 body-write loophole where a scope
+    # with a narrow field allowlist could bypass it by rewriting the
+    # body. ``field_allowlist`` still fails closed when empty for
+    # frontmatter-carrying edits, so a pure body-write case must not
+    # appear as "no fields" against an allowlist scope. We signal that
+    # here by only passing ``fields`` when the caller actually supplied
+    # frontmatter keys.
+    fields_list = list((set_fields or {}).keys()) + list((append_fields or {}).keys())
 
+    # Detect whether a body write was requested so scope can veto.
+    body_write_requested = bool(args.body_stdin or args.body_append)
+
+    # When the caller is doing a pure body write (no --set / --append),
+    # skip the field allowlist check — there are no fields to validate
+    # and the allowlist rule would otherwise fail closed on the empty
+    # fields list. The body_write gate below still applies.
     try:
-        check_scope(scope, "edit", rel_path=args.path, fields=fields)
+        if fields_list:
+            check_scope(
+                scope, "edit",
+                rel_path=args.path,
+                fields=fields_list,
+                body_write=body_write_requested,
+            )
+        else:
+            # Frontmatter untouched — validate the operation itself and
+            # the body-write gate only. Pass an empty fields list so
+            # ``field_allowlist`` scopes that require fields won't fail
+            # closed when the caller is legitimately doing a body-only
+            # edit on a scope that allows body writes.
+            check_scope(
+                scope, "edit",
+                rel_path=args.path,
+                fields=[],
+                body_write=body_write_requested,
+            )
     except ScopeError as e:
         _error(str(e))
 
