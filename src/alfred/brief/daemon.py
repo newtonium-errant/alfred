@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .config import BriefConfig
+from .health_section import render_health_section
 from .renderer import render_brief, serialize_record
 from .state import BriefRun, StateManager
 from .utils import get_logger
@@ -34,7 +35,24 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     data_dir = str(Path(config.state.path).parent)
     ops_md = format_operations_section(data_dir, config.vault_path, since=today)
 
-    sections = [("Weather", weather_md), ("Operations", ops_md)]
+    # Health section — reads the latest BIT record from vault/process/,
+    # falling back to the BIT state file if no record is available.
+    bit_state_path = Path(data_dir) / "bit_state.json"
+    health_md = render_health_section(
+        config.vault_path,
+        state_path=bit_state_path,
+        today=today,
+    )
+
+    # Section order is load-bearing: Health first (readers scan top-down;
+    # critical status gets the highest priority real estate), Weather
+    # second (time-sensitive but non-operational), Operations third
+    # (retrospective summary — less time-sensitive than the others).
+    sections = [
+        ("Health", health_md),
+        ("Weather", weather_md),
+        ("Operations", ops_md),
+    ]
 
     # Render
     frontmatter, body = render_brief(today, sections, config)
