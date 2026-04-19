@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from urllib.parse import quote, unquote
+
 import httpx
 import numpy as np
 import structlog
@@ -24,14 +26,31 @@ EMBED_THROTTLE = 0.2
 
 # Chunking config — nomic-embed-text has an 8192-token context window.
 # Token-per-char ratio varies by language and content: ~4 for English prose,
-# but ~2 for Hungarian/agglutinative languages, dense structured data (YAML,
-# wikilinks), and code. 6000 chars keeps chunks safely under 8192 tokens
-# across all the content we actually see (mixed EN/HU VTTs, session logs
-# with lots of markup, code snippets, etc) with comfortable headroom.
+# but ~2 for Hungarian/agglutinative languages, and can spike even higher
+# for structured markup (YAML, wikilinks, URLs) and code. 3000 chars is
+# safe across all observed content (Hungarian VTTs, dense metadata blocks,
+# mixed code) with comfortable headroom under 8192 tokens.
 # Chunks are embedded independently; resulting vectors are mean-pooled and
 # L2-normalized into a single document-level vector.
-MAX_CHUNK_CHARS = 6000
-CHUNK_OVERLAP_CHARS = 600
+MAX_CHUNK_CHARS = 3000
+CHUNK_OVERLAP_CHARS = 300
+
+
+def _encode_id(path: str) -> str:
+    """URL-encode a vault path for use as a Milvus primary key.
+
+    Milvus Lite's internal upsert runs a filter-expression DELETE under the
+    hood (`id == '<path>'`). File paths with apostrophes, spaces, or tokens
+    the expression parser treats specially (e.g. "Road" in a filename with
+    an earlier `'`) crash with "near 'X': syntax error". URL-encoding
+    guarantees the ID only contains safe chars: A-Z, a-z, 0-9, -, _, ., ~.
+    """
+    return quote(path, safe="")
+
+
+def _decode_id(encoded: str) -> str:
+    """Inverse of _encode_id — recover the original vault path."""
+    return unquote(encoded)
 
 
 def _chunk_text(
@@ -198,6 +217,12 @@ class Embedder:
                 detail = ""
                 if isinstance(e, httpx.HTTPStatusError):
                     detail = e.response.text[:200]
+                # Context-length overflow is not retryable — the chunk size
+                # is fixed for this call. Bail immediately; the caller may
+                # try smaller chunks or skip the document.
+                if "exceeds the context length" in detail:
+                    log.warning("embedder.embed_skipped_oversized", detail=detail)
+                    return None
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
                 log.warning("embedder.embed_retry", attempt=attempt + 1, error=str(e), detail=detail, delay=delay)
                 await asyncio.sleep(delay)
@@ -272,22 +297,17 @@ class Embedder:
             # Throttle between requests to reduce Ollama pressure
             await asyncio.sleep(EMBED_THROTTLE)
 
-            # Upsert to Milvus.
-            # pymilvus' MilvusClient.upsert internally runs a filter-based
-            # delete, which chokes on file paths containing special chars
-            # (e.g., 'Sally Road' where "Road" hits the expression parser).
-            # Do it manually: delete-by-id (bypasses expr parser) + insert.
-            try:
-                self.milvus.delete(
-                    collection_name=self.collection_name,
-                    ids=[rel_path],
-                )
-            except Exception as e:
-                log.debug("embedder.delete_before_insert_noop", path=rel_path, error=str(e))
-            self.milvus.insert(
+            # Milvus Lite's upsert/insert internally runs a filter-based
+            # DELETE on the primary key. That parser chokes on IDs with
+            # apostrophes, spaces, or tokens like "Road" (real example from
+            # tenant vaults: "constraint/Fixed Rental Period for Parents'
+            # Road Trip.md"). URL-encode the ID so Milvus only ever sees
+            # safe chars. _decode_id reverses this in get_all_embeddings.
+            encoded_id = _encode_id(rel_path)
+            self.milvus.upsert(
                 collection_name=self.collection_name,
                 data=[{
-                    "id": rel_path,
+                    "id": encoded_id,
                     "embedding": embedding,
                     "record_type": record.record_type,
                     "name": record.frontmatter.get("name", rel_path),
@@ -300,10 +320,10 @@ class Embedder:
         # Delete removed
         for rel_path in deleted_paths:
             try:
-                # delete-by-id avoids the filter-expression parser
+                encoded_id = _encode_id(rel_path)
                 self.milvus.delete(
                     collection_name=self.collection_name,
-                    ids=[rel_path],
+                    ids=[encoded_id],
                 )
             except Exception as e:
                 log.warning("embedder.delete_error", path=rel_path, error=str(e))
@@ -344,6 +364,8 @@ class Embedder:
         if not all_results:
             return None
 
-        paths = [r["id"] for r in all_results]
+        # IDs in Milvus are URL-encoded (see _encode_id). Decode back to
+        # vault-relative paths for downstream consumers (clusterer, writer).
+        paths = [_decode_id(r["id"]) for r in all_results]
         vectors = np.array([r["embedding"] for r in all_results], dtype=np.float32)
         return paths, vectors
