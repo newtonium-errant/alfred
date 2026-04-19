@@ -1,12 +1,12 @@
 """Dispatch table tests — ``TOOL_RUNNERS`` contents and signature branching.
 
-The orchestrator has seven registered tool runners. Three of them
-(surveyor, mail, brief) take ``(raw, suppress_stdout)``; the other four
+The orchestrator has eight registered tool runners. Four of them
+(surveyor, mail, brief, bit) take ``(raw, suppress_stdout)``; the other four
 (curator, janitor, distiller, talker) take
 ``(raw, skills_dir, suppress_stdout)``.
 
 ``run_all`` picks the arity based on a hard-coded tuple literal
-``tool in ("surveyor", "mail", "brief")``. These tests guard that
+``tool in ("surveyor", "mail", "brief", "bit")``. These tests guard that
 contract: if someone adds a new tool and forgets to update the arity
 check, the dispatcher will pass the wrong number of args and ``Process``
 will swallow the ``TypeError`` inside the child.
@@ -22,9 +22,10 @@ import alfred.orchestrator as orchestrator
 EXPECTED_TOOLS = {
     "curator", "janitor", "distiller",
     "surveyor", "mail", "brief", "talker",
+    "bit",
 }
 
-TWO_ARG_TOOLS = {"surveyor", "mail", "brief"}
+TWO_ARG_TOOLS = {"surveyor", "mail", "brief", "bit"}
 THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "talker"}
 
 

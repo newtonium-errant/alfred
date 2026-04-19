@@ -130,6 +130,29 @@ def _run_talker(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = Fa
         sys.exit(exit_code)
 
 
+def _run_bit(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """BIT daemon process entry point.
+
+    Spawns the BIT scheduler. The BIT daemon writes to the vault without
+    setting ``ALFRED_VAULT_SCOPE`` — unscoped writes pass the scope
+    check in ``vault/scope.py`` (empty scope → unrestricted) — and runs
+    at ``brief.schedule.time`` minus ``bit.schedule.lead_minutes`` (default
+    5 minutes) so the Morning Brief can pick up a fresh BIT record.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/bit.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    from alfred.bit.config import load_from_unified
+    # Reuse brief's setup_logging — the signature matches and BIT
+    # doesn't need a bespoke logger.
+    from alfred.brief.utils import setup_logging
+    config = load_from_unified(raw)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    from alfred.bit.daemon import run_daemon
+    asyncio.run(run_daemon(config, raw))
+
+
 def _run_brief(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Brief daemon process entry point."""
     log_cfg = raw.get("logging", {})
@@ -210,6 +233,7 @@ TOOL_RUNNERS = {
     "surveyor": _run_surveyor,
     "mail": _run_mail_webhook,
     "brief": _run_brief,
+    "bit": _run_bit,
     "talker": _run_talker,
 }
 
@@ -246,6 +270,12 @@ def run_all(
             tools.append("mail")
         if "brief" in raw:
             tools.append("brief")
+        # BIT daemon auto-starts when the config has a ``bit`` section
+        # OR when the brief is configured (BIT is a brief pre-check —
+        # it makes no sense to have brief without BIT). Explicit
+        # ``bit:`` section wins if present.
+        if "bit" in raw or "brief" in raw:
+            tools.append("bit")
         # Only add talker if config section exists — users without a Telegram
         # bot shouldn't have a daemon spinning in a retry loop on 78 exits.
         if "telegram" in raw:
@@ -296,7 +326,10 @@ def run_all(
 
     def start_process(tool: str) -> multiprocessing.Process:
         runner = TOOL_RUNNERS[tool]
-        if tool in ("surveyor", "mail", "brief"):
+        # Tools whose runner signature is ``(raw, suppress_stdout)`` (no
+        # skills_dir). BIT has no skill prompts — it drives the
+        # aggregator directly — so it lives in this bucket.
+        if tool in ("surveyor", "mail", "brief", "bit"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

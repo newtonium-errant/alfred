@@ -111,6 +111,23 @@ telegram:
 #       skill: vault-curator
 #       scope: curator
 
+bit:
+  # BIT (built-in test) runs before the Morning Brief so the brief can
+  # report on system health. By default it fires 5 minutes before
+  # ``brief.schedule.time``; override with ``schedule.time: HH:MM``.
+  # ``mode`` is ``quick`` (5s per tool) or ``full`` (15s per tool).
+  schedule:
+    # time: "05:55"          # explicit HH:MM; empty = derive from brief
+    lead_minutes: 5          # subtract this from brief time
+    # timezone: "America/Halifax"  # empty = use brief's timezone
+    mode: "quick"
+  output:
+    directory: "process"
+    name_template: "Alfred BIT {date}"
+  state:
+    path: "./data/bit_state.json"
+    max_history: 30
+
 surveyor:
   watcher:
     debounce_seconds: 30

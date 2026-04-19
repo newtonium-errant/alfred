@@ -704,6 +704,32 @@ def cmd_talker(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def cmd_bit(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred bit`` subcommands (run-now / status / history)."""
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="bit")
+
+    from alfred.bit.config import load_from_unified
+    from alfred.bit import cli as bcli
+
+    config = load_from_unified(raw)
+    subcmd = getattr(args, "bit_cmd", None)
+    wants_json = bool(getattr(args, "json", False))
+
+    if subcmd == "run-now":
+        code = bcli.cmd_run_now(config, raw, wants_json=wants_json)
+    elif subcmd == "status":
+        code = bcli.cmd_status(config, wants_json=wants_json)
+    elif subcmd == "history":
+        limit = getattr(args, "limit", 10) or 10
+        code = bcli.cmd_history(config, limit=limit, wants_json=wants_json)
+    else:
+        print("Usage: alfred bit {run-now|status|history}")
+        sys.exit(1)
+
+    sys.exit(code)
+
+
 def cmd_check(args: argparse.Namespace) -> None:
     """Run Alfred's built-in test (BIT) and report health.
 
@@ -1000,6 +1026,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit JSON instead of human-readable text",
     )
 
+    # bit — built-in test daemon
+    bit_p = sub.add_parser("bit", help="Alfred built-in test (BIT) subcommands")
+    bit_sub = bit_p.add_subparsers(dest="bit_cmd")
+    bit_run = bit_sub.add_parser("run-now", help="Run one BIT sweep now and write a record")
+    bit_run.add_argument("--json", action="store_true", default=False, help="Emit JSON")
+    bit_status = bit_sub.add_parser("status", help="Show BIT schedule + latest run")
+    bit_status.add_argument("--json", action="store_true", default=False, help="Emit JSON")
+    bit_hist = bit_sub.add_parser("history", help="Show recent BIT runs")
+    bit_hist.add_argument("--limit", type=int, default=10)
+    bit_hist.add_argument("--json", action="store_true", default=False, help="Emit JSON")
+
     # mail
     mail_p = sub.add_parser("mail", help="Email fetcher subcommands")
     mail_sub = mail_p.add_subparsers(dest="mail_cmd")
@@ -1042,6 +1079,7 @@ def main() -> None:
         "mail": cmd_mail,
         "talker": cmd_talker,
         "check": cmd_check,
+        "bit": cmd_bit,
     }
 
     handler = handlers.get(args.command)
