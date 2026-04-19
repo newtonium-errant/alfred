@@ -484,13 +484,13 @@ Handled by the structural scanner via deterministic flagging in `autofix.py`. Yo
 
 **Diagnosis:** Body is empty or very short after stripping embeds.
 
-**Fix:** If enough context exists in frontmatter, flesh out the body with a heading and brief description. If not, flag with `janitor_note: "STUB001 — body is minimal, consider adding content"`.
+**Fix:** Flag with `janitor_note: "STUB001 — body is minimal, consider adding content"`. Do NOT attempt to flesh out the body — the janitor scope denies body writes (they will fail at the CLI scope gate). Stage 3 enrichment handles body content under a separate `janitor_enrich` scope; your job is only the flag.
 
 ### DUP001 — DUPLICATE_NAME
 
 **Diagnosis:** Another record of the same type has the same name (including case-variant names like `PocketPills` vs `Pocketpills` — the filesystem treats these as distinct but the vault treats them as the same entity).
 
-**Default action during an autonomous sweep: emit a triage task for human review.** NEVER merge automatically. The operator-directed merge procedure below is reserved for the escalation path — when the sweep context (action log, resolved triage task, or explicit sweep instruction) already tells you the operator has approved a specific merge.
+**Default action during an autonomous sweep: emit a triage task for human review.** NEVER merge automatically. Operator-directed merges run in deterministic Python outside the agent loop (see the Operator-Directed Merge section below); the agent never executes the retargeting itself.
 
 #### Default Triage Flow (autonomous sweep)
 
@@ -553,22 +553,11 @@ This is what you do every time you see a DUP001 in a normal sweep. It creates a 
 
 #### Operator-Directed Merge (escalation path)
 
-Use this procedure ONLY when the operator has already approved the merge — i.e. the sweep context contains an explicit merge instruction (a human-authored action log, a resolved triage task, or a direct instruction naming winner and loser). Do NOT run it autonomously. Do NOT skip the follow-link sweep — it is the most commonly missed step and leaves behind ghost duplicates in adjacent directories.
+Do NOT run merges yourself. The mechanical retargeting (copy unique frontmatter fields, append body with a provenance marker, vault-wide wikilink rewrite, delete the loser) runs in deterministic Python via `alfred.janitor.merge.merge_entities(vault_path, winner, loser, session_path=...)`. The janitor scope denies most of the frontmatter rewrites and all body writes the by-hand procedure used to perform — attempting it will fail at the CLI scope gate. Your only role in DUP001 is the Default Triage Flow above.
 
-1. **Pick the winner.** Use the operator's chosen canonical form. If not specified, prefer the casing that matches how the entity self-identifies (website, letterhead, etc.).
-2. **Merge the two records themselves.** Copy any unique frontmatter fields and body content from the loser into the winner. Delete the loser record.
-3. **Follow-link sweep (MANDATORY).** For BOTH the winner's name and the loser's name, grep the vault for inbound wikilinks **case-insensitively**. Example: if merging `org/Pocketpills` (winner) into `org/PocketPills` (loser), search for `[[org/PocketPills` AND `[[org/Pocketpills` AND any other case variants you see in the filenames. Use `alfred vault search` or `grep -ri`.
-4. **Inspect files containing inbound links.** For each file found in step 3, check whether that file has a **case-variant sibling** in its own directory whose filename differs only in capitalization of the merged entity's name. Example: after merging the org, you find `note/PocketPills Ozempic Order Preparation 2026-04-13.md` AND `note/Pocketpills Ozempic Order Preparation 2026-04-13.md` — these are sibling duplicates caused by the original split and MUST be merged too via this same procedure. Recurse AT MOST ONE additional hop to prevent runaway sweeps. If a second-hop merge reveals further case-variant siblings, flag them with `janitor_note` for a follow-up pass rather than recursing further.
-5. **Retarget inbound links.** In every file that linked to the loser, rewrite the wikilink to point at the winner. Match case-insensitively but replace with the winner's exact casing. This includes frontmatter fields (`org: "[[org/PocketPills]]"` → `org: "[[org/Pocketpills]]"`) and body prose.
-6. **Verify.** After the sweep, re-grep for the loser's name. Zero hits = clean merge. Any remaining hits must be explained in the action log.
+When the sweep context contains an explicit operator merge instruction (resolved triage task, action log, or direct sweep instruction naming winner and loser), **do not execute it**. Log a SKIPPED line noting that the merge is an operator-invoked Python call, e.g. `SKIPPED | org/Loser.md | DUP001 | Operator merge pending — run alfred.janitor.merge.merge_entities(winner, loser)`. Do not edit or delete either candidate. Do not retarget inbound wikilinks by hand.
 
-**Worked example — PocketPills/Pocketpills (2026-04-13):**
-- Operator merged `org/PocketPills` into `org/Pocketpills` (winner: lowercase-p variant).
-- The org records themselves were merged cleanly.
-- Follow-link sweep grepped case-insensitively for `[[org/pocketpills` and found inbound links from `note/` and `account/`.
-- Inspecting the `note/` hits revealed a case-variant sibling pair: `note/PocketPills Ozempic Order Preparation 2026-04-13.md` and `note/Pocketpills Ozempic Order Preparation 2026-04-13.md`. Both existed, both had nearly identical content — one was created before the org normalization, one after.
-- These notes were merged via the same DUP001 procedure (one hop deeper), then their inbound links were retargeted.
-- Lesson: an entity merge is never just about the two entity records. Downstream records that reference the entity in their own filenames propagate the case variance and become duplicate siblings. Always sweep one hop out. This complements the Layer 1 dedup rules in the curator SKILL (which prevent the duplicate pair from being created in the first place).
+(Belt + braces: the scope lock prevents this at the system level; this directive prevents it at the reasoning level.)
 
 ### SEM001–SEM004 — Semantic Drift (Scanner-Detected)
 
@@ -606,8 +595,8 @@ DELETED: {count}
 FIXED | person/John Smith.md | FM001 | Added missing 'created: 2026-02-19'
 FIXED | task/Review Quote.md | FM003 | Changed status 'open' → 'todo'
 FLAGGED | note/Old Notes.md | ORPHAN001 | No inbound links, added janitor_note
+FLAGGED | project/Eagle Farm.md | STUB001 | Body minimal, added janitor_note
 DELETED | note/test test.md | SEM005 | Garbage content: "test test test"
-SKIPPED | project/Eagle Farm.md | STUB001 | Not enough context to flesh out body
 ```
 
 ---
