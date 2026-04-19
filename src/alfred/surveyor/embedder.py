@@ -22,12 +22,16 @@ RETRY_BASE_DELAY = 2.0
 # Throttle between sequential embedding requests (seconds)
 EMBED_THROTTLE = 0.2
 
-# Chunking config — nomic-embed-text has an 8192-token context; at ~4 chars/token
-# for English, ~24000 chars is a safe payload with headroom for overhead.
-# Larger documents are chunked, each chunk is embedded, then the resulting
-# vectors are mean-pooled and L2-normalized into a single document vector.
-MAX_CHUNK_CHARS = 24000
-CHUNK_OVERLAP_CHARS = 2000
+# Chunking config — nomic-embed-text has an 8192-token context window.
+# Token-per-char ratio varies by language and content: ~4 for English prose,
+# but ~2 for Hungarian/agglutinative languages, dense structured data (YAML,
+# wikilinks), and code. Pick 12000 chars to keep chunks safely under 8192
+# tokens across all the content we actually see in tenant vaults (VTT
+# transcripts in EN+HU, session logs with lots of markup, etc).
+# Chunks are embedded independently; resulting vectors are mean-pooled and
+# L2-normalized into a single document-level vector.
+MAX_CHUNK_CHARS = 12000
+CHUNK_OVERLAP_CHARS = 1000
 
 
 def _chunk_text(
