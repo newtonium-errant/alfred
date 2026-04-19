@@ -706,10 +706,12 @@ async def run_pipeline(
         result.entities_enriched = []
 
     result.success = True
+    # Use result.entities_enriched (always set in both branches above) rather
+    # than the local `enriched`, which is unbound when stage 4 is skipped.
     result.summary = (
         f"Created note: {note_path}, "
         f"resolved {len(resolved)} entities, "
-        f"enriched {len(enriched)} entities"
+        f"enriched {len(result.entities_enriched)} entities"
     )
 
     log.info(
@@ -717,7 +719,7 @@ async def run_pipeline(
         file=filename,
         note=note_path,
         entities_resolved=len(resolved),
-        entities_enriched=len(enriched),
+        entities_enriched=len(result.entities_enriched),
     )
 
     return result
