@@ -25,13 +25,13 @@ EMBED_THROTTLE = 0.2
 # Chunking config — nomic-embed-text has an 8192-token context window.
 # Token-per-char ratio varies by language and content: ~4 for English prose,
 # but ~2 for Hungarian/agglutinative languages, dense structured data (YAML,
-# wikilinks), and code. Pick 12000 chars to keep chunks safely under 8192
-# tokens across all the content we actually see in tenant vaults (VTT
-# transcripts in EN+HU, session logs with lots of markup, etc).
+# wikilinks), and code. 6000 chars keeps chunks safely under 8192 tokens
+# across all the content we actually see (mixed EN/HU VTTs, session logs
+# with lots of markup, code snippets, etc) with comfortable headroom.
 # Chunks are embedded independently; resulting vectors are mean-pooled and
 # L2-normalized into a single document-level vector.
-MAX_CHUNK_CHARS = 12000
-CHUNK_OVERLAP_CHARS = 1000
+MAX_CHUNK_CHARS = 6000
+CHUNK_OVERLAP_CHARS = 600
 
 
 def _chunk_text(
@@ -272,8 +272,19 @@ class Embedder:
             # Throttle between requests to reduce Ollama pressure
             await asyncio.sleep(EMBED_THROTTLE)
 
-            # Upsert to Milvus
-            self.milvus.upsert(
+            # Upsert to Milvus.
+            # pymilvus' MilvusClient.upsert internally runs a filter-based
+            # delete, which chokes on file paths containing special chars
+            # (e.g., 'Sally Road' where "Road" hits the expression parser).
+            # Do it manually: delete-by-id (bypasses expr parser) + insert.
+            try:
+                self.milvus.delete(
+                    collection_name=self.collection_name,
+                    ids=[rel_path],
+                )
+            except Exception as e:
+                log.debug("embedder.delete_before_insert_noop", path=rel_path, error=str(e))
+            self.milvus.insert(
                 collection_name=self.collection_name,
                 data=[{
                     "id": rel_path,
@@ -289,9 +300,10 @@ class Embedder:
         # Delete removed
         for rel_path in deleted_paths:
             try:
+                # delete-by-id avoids the filter-expression parser
                 self.milvus.delete(
                     collection_name=self.collection_name,
-                    filter=f'id == "{rel_path}"',
+                    ids=[rel_path],
                 )
             except Exception as e:
                 log.warning("embedder.delete_error", path=rel_path, error=str(e))
