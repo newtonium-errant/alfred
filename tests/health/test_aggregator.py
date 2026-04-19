@@ -59,7 +59,7 @@ class TestRegistry:
 
 class TestAggregator:
     async def test_empty_registry_returns_ok_with_no_tools(self) -> None:
-        report = await agg.run_all_checks({}, mode="quick")
+        report = await agg.run_all_checks({}, mode="quick", _auto_load=False)
         assert report.overall_status == Status.OK
         assert report.tools == []
         assert report.mode == "quick"
@@ -68,7 +68,7 @@ class TestAggregator:
 
     async def test_single_ok_check(self) -> None:
         agg.register_check("fake", _ok_check)
-        report = await agg.run_all_checks({}, mode="quick")
+        report = await agg.run_all_checks({}, mode="quick", _auto_load=False)
         assert len(report.tools) == 1
         assert report.tools[0].tool == "fake"
         assert report.overall_status == Status.OK
@@ -79,12 +79,12 @@ class TestAggregator:
         agg.register_check("a", _ok_check)
         agg.register_check("b", _warn_check)
         agg.register_check("c", _fail_check)
-        report = await agg.run_all_checks({}, mode="quick")
+        report = await agg.run_all_checks({}, mode="quick", _auto_load=False)
         assert report.overall_status == Status.FAIL
 
     async def test_exception_in_check_becomes_fail(self) -> None:
         agg.register_check("boom", _boom_check)
-        report = await agg.run_all_checks({}, mode="quick")
+        report = await agg.run_all_checks({}, mode="quick", _auto_load=False)
         assert len(report.tools) == 1
         assert report.tools[0].status == Status.FAIL
         assert "exploded" in report.tools[0].detail
@@ -97,7 +97,7 @@ class TestAggregator:
         original = agg.QUICK_TIMEOUT_SECONDS
         agg.QUICK_TIMEOUT_SECONDS = 0.05
         try:
-            report = await agg.run_all_checks({}, mode="quick")
+            report = await agg.run_all_checks({}, mode="quick", _auto_load=False)
         finally:
             agg.QUICK_TIMEOUT_SECONDS = original
         assert report.tools[0].status == Status.FAIL
@@ -113,21 +113,21 @@ class TestAggregator:
 
         agg.register_check("bit", _named("bit"))
         agg.register_check("other", _named("other"))
-        report = await agg.run_all_checks({}, mode="quick", tools=["bit", "other"])
+        report = await agg.run_all_checks({}, mode="quick", tools=["bit", "other"], _auto_load=False)
         assert [t.tool for t in report.tools] == ["other"]
 
     async def test_unknown_tool_in_filter_is_dropped(self) -> None:
         async def _real(raw, mode):  # noqa: ANN001
             return ToolHealth(tool="real", status=Status.OK)
         agg.register_check("real", _real)
-        report = await agg.run_all_checks({}, mode="quick", tools=["real", "ghost"])
+        report = await agg.run_all_checks({}, mode="quick", tools=["real", "ghost"], _auto_load=False)
         assert [t.tool for t in report.tools] == ["real"]
 
     async def test_full_mode_uses_full_timeout(self) -> None:
         # Not directly observable in the report, but we can check that
         # ``mode`` is propagated through to the HealthReport.
         agg.register_check("fake", _ok_check)
-        report = await agg.run_all_checks({}, mode="full")
+        report = await agg.run_all_checks({}, mode="full", _auto_load=False)
         assert report.mode == "full"
 
     async def test_check_results_run_concurrently(self) -> None:
@@ -144,6 +144,6 @@ class TestAggregator:
 
         agg.register_check("one", _slow_ok)
         agg.register_check("two", _slow_ok_two)
-        report = await agg.run_all_checks({}, mode="quick")
+        report = await agg.run_all_checks({}, mode="quick", _auto_load=False)
         assert report.elapsed_ms is not None
         assert report.elapsed_ms < 300  # < 0.3s

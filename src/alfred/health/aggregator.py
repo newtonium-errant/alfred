@@ -32,19 +32,22 @@ from typing import Any
 from .types import CheckResult, HealthReport, Status, ToolHealth
 
 
-# Known tools — the aggregator will try to import ``alfred.<tool>.health``
-# for each of these. Absent modules are silently skipped (the tool may not
-# be installed, e.g. surveyor without its optional deps). ``bit`` is
-# deliberately omitted — see module docstring.
-KNOWN_TOOLS: tuple[str, ...] = (
-    "curator",
-    "janitor",
-    "distiller",
-    "surveyor",
-    "brief",
-    "mail",
-    "talker",
-)
+# Known tools mapped to the Python module path that hosts their
+# ``health_check`` callable. Most tools live under ``alfred.<tool>``,
+# but the talker's module is historically ``alfred.telegram.*`` —
+# we surface it to users as ``talker`` but the health module lives
+# alongside the rest of the telegram code. Absent modules are silently
+# skipped (the tool may not be installed, e.g. surveyor without its
+# optional deps). ``bit`` is deliberately omitted — see module docstring.
+KNOWN_TOOL_MODULES: dict[str, str] = {
+    "curator": "alfred.curator.health",
+    "janitor": "alfred.janitor.health",
+    "distiller": "alfred.distiller.health",
+    "surveyor": "alfred.surveyor.health",
+    "brief": "alfred.brief.health",
+    "mail": "alfred.mail.health",
+    "talker": "alfred.telegram.health",
+}
 
 
 # Per-tool timeout for ``quick`` mode in seconds. ``full`` mode gets a
@@ -75,17 +78,20 @@ def clear_registry() -> None:
 
 
 def _load_tool_checks() -> None:
-    """Attempt to import every known tool's health module.
+    """Ensure every known tool's health check is registered.
 
-    Import errors are swallowed — a tool may simply not be installed
-    (e.g. surveyor without ML extras) or not yet have a ``health.py``
-    written. The side-effect of a successful import is registration via
-    :func:`register_check`.
+    We import each tool's ``health`` module (lazily — absent or broken
+    modules are silently skipped) and, as a belt-and-braces step,
+    introspect the imported module for a ``health_check`` callable
+    and register it under the tool name. The introspection step makes
+    the aggregator robust to ``clear_registry()`` being called between
+    imports (e.g. in tests) — import side-effects only fire the first
+    time a module is loaded, but this function needs to work on every
+    call.
     """
-    for tool in KNOWN_TOOLS:
-        mod = f"alfred.{tool}.health"
+    for tool, mod_name in KNOWN_TOOL_MODULES.items():
         try:
-            importlib.import_module(mod)
+            mod = importlib.import_module(mod_name)
         except ImportError:
             # Tool not installed or health module not present — that's fine,
             # the aggregator simply won't run a check for it.
@@ -95,6 +101,12 @@ def _load_tool_checks() -> None:
             # We swallow and continue; the missing entry is visible to
             # callers (the tool won't appear in the report).
             continue
+        # Re-register on every call so ``clear_registry()`` between runs
+        # doesn't leave an empty registry when module top-level code
+        # (the register_check call) has already fired.
+        check_fn = getattr(mod, "health_check", None)
+        if check_fn is not None and tool not in _REGISTRY:
+            _REGISTRY[tool] = check_fn
 
 
 async def _run_one(
@@ -151,6 +163,7 @@ async def run_all_checks(
     raw: dict[str, Any],
     mode: str = "quick",
     tools: list[str] | None = None,
+    _auto_load: bool = True,
 ) -> HealthReport:
     """Run all registered health checks and return a ``HealthReport``.
 
@@ -163,6 +176,11 @@ async def run_all_checks(
         tools: Optional explicit list of tools to check. ``None`` runs
             every registered tool. ``"bit"`` in the list is silently
             filtered out — see module docstring.
+        _auto_load: Internal flag — when False, skip the implicit
+            ``_load_tool_checks`` pass. Useful for tests that want to
+            stub the registry directly without having real tool modules
+            register themselves. Production callers always leave this
+            at True.
 
     Returns:
         A ``HealthReport`` with one ``ToolHealth`` per tool that was
@@ -170,7 +188,8 @@ async def run_all_checks(
         ``Status.SKIP`` from their own check; see the per-tool health
         modules for the convention).
     """
-    _load_tool_checks()
+    if _auto_load:
+        _load_tool_checks()
 
     timeout = FULL_TIMEOUT_SECONDS if mode == "full" else QUICK_TIMEOUT_SECONDS
     started_dt = datetime.now(timezone.utc)
