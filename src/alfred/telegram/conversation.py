@@ -620,14 +620,18 @@ async def run_turn(
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         try:
-            response = await client.messages.create(
-                model=session.model,
-                max_tokens=config.anthropic.max_tokens,
-                temperature=config.anthropic.temperature,
-                system=system_blocks,
-                messages=_messages_for_api(session.transcript),
-                tools=VAULT_TOOLS,
-            )
+            create_kwargs: dict[str, Any] = {
+                "model": session.model,
+                "max_tokens": config.anthropic.max_tokens,
+                "system": system_blocks,
+                "messages": _messages_for_api(session.transcript),
+                "tools": VAULT_TOOLS,
+            }
+            # Opus 4.x deprecated the ``temperature`` param. Omit it for
+            # Opus models; keep it for Sonnet/Haiku/older Claude families.
+            if not session.model.startswith("claude-opus-"):
+                create_kwargs["temperature"] = config.anthropic.temperature
+            response = await client.messages.create(**create_kwargs)
         except anthropic.APIError:
             # Surface to caller — bot.py translates to a user-facing reply.
             log.warning("talker.api_error", iteration=iteration)
