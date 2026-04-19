@@ -92,6 +92,25 @@ def cmd_up(args: argparse.Namespace) -> None:
         print("Use `alfred down` to stop it first.")
         sys.exit(1)
 
+    # Optional preflight gate — ``alfred up --preflight`` runs a quick
+    # BIT sweep before spawning daemons. OK/WARN/SKIP continues; FAIL
+    # aborts with a non-zero exit so scripts can detect the gate failing.
+    # Per plan Part 11 Q3: WARN does not block, only FAIL does.
+    if getattr(args, "preflight", False):
+        import asyncio
+        from alfred.health.aggregator import run_all_checks
+        from alfred.health.renderer import render_human
+        from alfred.health.types import Status
+        print("Preflight BIT sweep (quick mode)...")
+        report = asyncio.run(run_all_checks(raw, mode="quick"))
+        for line in render_human(report):
+            print(line)
+        if report.overall_status == Status.FAIL:
+            print("\nPreflight FAILED — not starting daemons.")
+            print("Re-run without --preflight to start anyway, or fix the issues above.")
+            sys.exit(1)
+        print("\nPreflight passed. Starting daemons...\n")
+
     live_mode = getattr(args, "live", False)
     foreground = getattr(args, "_internal_foreground", False) or getattr(args, "foreground", False) or live_mode
 
@@ -685,6 +704,53 @@ def cmd_talker(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def cmd_check(args: argparse.Namespace) -> None:
+    """Run Alfred's built-in test (BIT) and report health.
+
+    Two output modes:
+      * default — streaming human-readable lines, line-by-line so a
+        slow probe doesn't leave the user waiting
+      * ``--json`` — batch JSON written to stdout, suitable for piping
+        to ``jq`` or for machine consumption
+
+    Exit code:
+      * 0  when overall_status is OK, WARN, or SKIP (WARN is not a
+        blocker — operators see it and decide, see plan Part 11 Q3)
+      * 1  when any tool reports FAIL
+    """
+    import asyncio
+
+    raw = _load_unified_config(args.config)
+
+    # Logging to the alfred.log sink — human-readable output goes to
+    # stdout. We suppress stdout logging to keep the BIT output clean.
+    _setup_logging_from_config(raw, tool="alfred", suppress_stdout=True)
+
+    mode = "full" if getattr(args, "full", False) else "quick"
+    wants_json = bool(getattr(args, "json", False))
+    filter_tools = getattr(args, "tools", None)
+    tools: list[str] | None = None
+    if filter_tools:
+        tools = [t.strip() for t in filter_tools.split(",") if t.strip()]
+
+    from alfred.health.aggregator import run_all_checks
+    from alfred.health.renderer import render_human, render_json
+    from alfred.health.types import Status
+
+    report = asyncio.run(run_all_checks(raw, mode=mode, tools=tools))
+
+    if wants_json:
+        # Batch output — JSON is useless to stream line-by-line.
+        print(render_json(report))
+    else:
+        # Streaming human output — push each line to stdout as it's
+        # produced. The renderer already ships a ``write`` hook for
+        # this pattern.
+        render_human(report, write=print)
+
+    sys.exit(1 if report.overall_status == Status.FAIL else 0)
+
+
 def cmd_mail(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw, tool="mail")
@@ -767,12 +833,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--live", action="store_true", default=False,
         help="Show live TUI dashboard (implies --foreground)",
     )
+    up_parser.add_argument(
+        "--preflight", action="store_true", default=False,
+        help="Run BIT quick check before starting daemons; abort if any tool FAILs",
+    )
 
     # down
     sub.add_parser("down", help="Stop the background daemon")
 
     # status
     sub.add_parser("status", help="Show status from all tools")
+
+    # check — run BIT (built-in test) across every tool
+    check_p = sub.add_parser(
+        "check",
+        help="Run built-in test (health checks across all tools)",
+    )
+    check_p.add_argument(
+        "--full", action="store_true", default=False,
+        help="Run deeper probes (15s per tool vs. 5s quick mode)",
+    )
+    check_p.add_argument(
+        "--json", action="store_true", default=False,
+        help="Emit JSON instead of human-readable streaming output",
+    )
+    check_p.add_argument(
+        "--tools", default=None,
+        help="Comma-separated subset of tools to check (default: all)",
+    )
 
     # curator
     sub.add_parser("curator", help="Start curator daemon")
@@ -953,6 +1041,7 @@ def main() -> None:
         "brief": cmd_brief,
         "mail": cmd_mail,
         "talker": cmd_talker,
+        "check": cmd_check,
     }
 
     handler = handlers.get(args.command)
