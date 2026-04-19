@@ -573,6 +573,55 @@ def flag_unresolved_links(
     return flagged_files
 
 
+# STUB001 unenrichable flag — deterministic prose. Matches Option E Q6
+# closure: with Q3's scope narrowing, body enrichment is Stage 3's
+# exclusive domain (``janitor_enrich`` scope). Any STUB001 that Stage 3
+# didn't enrich (capped, skipped-stale, read-failed, or LLM no-op) needs
+# a visible signal so the stub isn't invisible until the next deep sweep.
+# The LINK001 unresolved flag (commit 8d3d33e) is the template.
+_STUB001_UNENRICHABLE_NOTE = (
+    "STUB001 -- body is minimal; Stage 3 enrichment unavailable or "
+    "skipped. Consider adding content."
+)
+
+
+def flag_unenrichable_stubs(
+    unresolved_stubs: list[Issue],
+    vault_path: Path,
+    session_path: str,
+) -> list[str]:
+    """Flag STUB001 issues that Stage 3 couldn't enrich.
+
+    Writes a deterministic janitor_note whose prose is owned by Python,
+    not the SKILL, so the idempotency-by-issue-code-prefix rule holds
+    across sweeps. Called by the pipeline after Stage 3 with the subset
+    of stub issues whose target file was NOT modified by the enrichment
+    stage (mtime unchanged, stale, or read-failed).
+
+    Args:
+        unresolved_stubs: STUB001 issues whose file was not enriched.
+        vault_path: Root of the vault.
+        session_path: Mutation-log session path (for audit tracking).
+
+    Returns:
+        Relative paths of files actually flagged (for telemetry).
+    """
+    flagged_files: list[str] = []
+    for issue in unresolved_stubs:
+        result = _flag_issue_with_note(
+            issue,
+            issue.file,
+            vault_path,
+            session_path,
+            note=_STUB001_UNENRICHABLE_NOTE,
+        )
+        if result == "flagged":
+            flagged_files.append(issue.file)
+
+    log.info("autofix.stub001_unenrichable_flagged", count=len(flagged_files))
+    return flagged_files
+
+
 def _flag_issue_with_note(
     issue: Issue,
     rel_path: str,

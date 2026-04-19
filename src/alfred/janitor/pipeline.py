@@ -22,7 +22,11 @@ if TYPE_CHECKING:
 from alfred.vault.mutation_log import log_mutation
 from alfred.vault.ops import VaultError, vault_read, vault_search
 
-from .autofix import autofix_issues, flag_unresolved_links
+from .autofix import (
+    autofix_issues,
+    flag_unenrichable_stubs,
+    flag_unresolved_links,
+)
 from .backends import VAULT_CLI_REFERENCE
 from .backends.openclaw import _clear_agent_sessions, _sync_workspace_claude_md
 from .config import JanitorConfig
@@ -481,8 +485,15 @@ async def _stage3_enrich(
     config: JanitorConfig,
     session_path: str,
     state: "JanitorState | None" = None,
-) -> int:
-    """Stage 3: Enrich stub records. Returns count of stubs enriched.
+) -> tuple[int, list[Issue]]:
+    """Stage 3: Enrich stub records.
+
+    Returns ``(enriched_count, unresolved_stubs)``. Unresolved stubs are
+    the STUB001 entries whose target file was NOT modified by Stage 3
+    (stale, read-failed, skipped by the per-sweep cap, template-missing,
+    or an LLM call that didn't bump mtime). Callers flag these via
+    :func:`autofix.flag_unenrichable_stubs` so the deterministic
+    janitor_note prose is owned by Python, matching the LINK001 pattern.
 
     Upstream #15: filters out stubs that have exhausted their enrichment
     attempts (state permitting), sorts the remaining by last_scanned DESC
@@ -492,7 +503,7 @@ async def _stage3_enrich(
     unchanged content eventually mark the file stale.
     """
     if not stub_issues:
-        return 0
+        return 0, []
 
     vault_path = config.vault.vault_path
     ignore_dirs = config.vault.ignore_dirs
@@ -501,11 +512,17 @@ async def _stage3_enrich(
     template = _load_stage_prompt("stage3_enrich.md")
     if not template:
         log.warning("pipeline.s3_no_template")
-        return 0
+        # No template means we can't enrich anything — every stub is
+        # unresolved so Q6's fallback still fires.
+        return 0, list(stub_issues)
+
+    unresolved: list[Issue] = []
 
     # Filter out stubs whose enrichment has gone stale (N consecutive
     # failures on the same content hash). A hash change elsewhere in the
     # pipeline calls state.reset_enrichment_staleness() to reopen the file.
+    # Stale stubs are unresolved — Stage 3 won't retry them until content
+    # changes, so the janitor_note keeps them visible in the interim.
     if state is not None:
         filtered: list[Issue] = []
         for issue in stub_issues:
@@ -515,13 +532,14 @@ async def _stage3_enrich(
                     file=issue.file,
                     msg="enrichment stale, skipping until content changes",
                 )
+                unresolved.append(issue)
                 continue
             filtered.append(issue)
         stub_issues = filtered
 
     if not stub_issues:
         log.info("pipeline.s3_all_stale", msg="all stubs stale, nothing to enrich")
-        return 0
+        return 0, unresolved
 
     # Sort newest-scanned first, then by linked-record count (descending).
     # The sort tuple is (last_scanned, -linked_count) and we reverse=True,
@@ -546,6 +564,9 @@ async def _stage3_enrich(
             total=len(stub_issues),
             processing=max_stubs,
         )
+        # Over-cap stubs are unresolved for this sweep — the cap skipped
+        # them so the fallback flag keeps them visible.
+        unresolved.extend(stub_issues[max_stubs:])
         stub_issues = stub_issues[:max_stubs]
 
     enriched = 0
@@ -562,6 +583,7 @@ async def _stage3_enrich(
             # permanently-broken file stops pinning Stage 3 capacity.
             if state is not None:
                 state.record_enrichment_attempt(file_path, max_attempts)
+            unresolved.append(issue)
             continue
 
         fm = record["frontmatter"]
@@ -590,21 +612,42 @@ async def _stage3_enrich(
         safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', record_name.replace(' ', '-'))[:30]
         stage_label = f"s3-enrich-{safe_name}"
 
+        # Snapshot mtime before the LLM call so we only count as
+        # enriched when the file actually changed. Matches the LINK001
+        # pattern — mtime is the authoritative "did anything happen"
+        # signal across backends.
+        target_path = vault_path / file_path
+        before_mtime = target_path.stat().st_mtime if target_path.exists() else 0.0
+
         # Stage 3 runs under the ``janitor_enrich`` scope so the
         # allowlist covers description/role/email/etc. without opening
         # up the narrower Stage 1/2 ``janitor`` scope.
         await _call_llm(prompt, config, session_path, stage_label, scope="janitor_enrich")
-        enriched += 1
+
+        after_mtime = target_path.stat().st_mtime if target_path.exists() else 0.0
 
         # Record the attempt so Stage 3 stops retrying the same unchanged
         # stub forever. A content-hash change elsewhere resets this counter.
         if state is not None:
             state.record_enrichment_attempt(file_path, max_attempts)
 
-        log.info("pipeline.s3_enriched", file=file_path, type=record_type)
+        if after_mtime > before_mtime:
+            enriched += 1
+            log.info("pipeline.s3_enriched", file=file_path, type=record_type)
+        else:
+            log.info(
+                "pipeline.s3_llm_no_change",
+                file=file_path,
+                type=record_type,
+            )
+            unresolved.append(issue)
 
-    log.info("pipeline.s3_complete", enriched=enriched)
-    return enriched
+    log.info(
+        "pipeline.s3_complete",
+        enriched=enriched,
+        unresolved=len(unresolved),
+    )
+    return enriched, unresolved
 
 
 # ---------------------------------------------------------------------------
@@ -694,10 +737,19 @@ async def run_pipeline(
     # Stage 3: Enrich stubs (LLM, per-file)
     # Pass state so the stage can filter stale stubs, apply the per-sweep
     # cap, and record each attempt. Upstream #15.
+    # Unresolved STUB001s (stale, over-cap, read-failed, LLM no-op, or
+    # template missing) are flagged via ``flag_unenrichable_stubs`` so the
+    # deterministic janitor_note prose lives in Python and the stub stays
+    # visible between sweeps. Mirrors the LINK001 unresolved path above.
     log.info("pipeline.s3_start", issues=len(stub_issues))
-    result.stubs_enriched = await _stage3_enrich(
+    result.stubs_enriched, unresolved_stubs = await _stage3_enrich(
         stub_issues, config, session_path, state=state,
     )
+    if unresolved_stubs:
+        unresolved_stub_flagged = flag_unenrichable_stubs(
+            unresolved_stubs, vault_path, session_path,
+        )
+        result.files_flagged += len(unresolved_stub_flagged)
 
     result.success = True
     result.summary = (

@@ -482,9 +482,7 @@ Handled by the structural scanner via deterministic flagging in `autofix.py`. Yo
 
 ### STUB001 — STUB_RECORD
 
-**Diagnosis:** Body is empty or very short after stripping embeds.
-
-**Fix:** Flag with `janitor_note: "STUB001 — body is minimal, consider adding content"`. Do NOT attempt to flesh out the body — the janitor scope denies body writes (they will fail at the CLI scope gate). Stage 3 enrichment handles body content under a separate `janitor_enrich` scope; your job is only the flag.
+Handled end-to-end by the pipeline. Stage 3 enrichment (under the `janitor_enrich` scope) attempts to fill the body; any stub Stage 3 didn't enrich (capped, stale, read-failed, or LLM no-op) is flagged with a deterministic `janitor_note` by `autofix.flag_unenrichable_stubs` in the same sweep. You should not see this code in your issue report; if you do, log a warning and proceed.
 
 ### DUP001 — DUPLICATE_NAME
 
