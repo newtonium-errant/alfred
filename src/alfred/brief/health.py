@@ -106,6 +106,17 @@ async def _check_weather_api(weather: dict, timeout: float) -> CheckResult:
     Stations list may be empty (weather section skipped in brief).
     In that case return SKIP rather than FAIL — no need to probe an
     endpoint the brief won't use.
+
+    We probe the same endpoint shape the real client uses
+    (``{api_base}/metar?ids=<first-station>&format=json``) so a probe
+    success proves the brief's actual request path works, not just that
+    the domain resolves. Status mapping:
+
+    * HTTP 200        → OK    (endpoint healthy)
+    * HTTP 4xx        → WARN  (service reachable; probe URL or params
+                               may be wrong but the API itself is up)
+    * HTTP 5xx        → FAIL  (service is broken upstream)
+    * timeout / conn  → FAIL  (DNS / network / dead endpoint)
     """
     import httpx  # base dep
 
@@ -117,23 +128,46 @@ async def _check_weather_api(weather: dict, timeout: float) -> CheckResult:
             detail="no stations configured",
         )
 
+    # Use the first configured station — matches what the real client
+    # does at runtime (see brief/weather.py::fetch_metars).
+    first_id = ""
+    first = stations[0]
+    if isinstance(first, dict):
+        first_id = first.get("id", "") or ""
+    elif isinstance(first, str):
+        first_id = first
+    # Fall back to a known-good ICAO if the config entry is malformed —
+    # we still want the probe to exercise the real endpoint.
+    if not first_id:
+        first_id = "KJFK"
+
     api_base = weather.get("api_base", "https://aviationweather.gov/api/data")
-    url = api_base.rstrip("/") + "/"  # root doc endpoint
+    url = f"{api_base.rstrip('/')}/metar?ids={first_id}&format=json"
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url)
     except Exception as exc:  # noqa: BLE001
         return CheckResult(
             name="weather-api",
-            status=Status.WARN,
+            status=Status.FAIL,
             detail=f"unreachable: {exc.__class__.__name__}: {str(exc)[:120]}",
             data={"url": url},
         )
+
+    status_code = resp.status_code
+    if 200 <= status_code < 300:
+        status = Status.OK
+    elif 400 <= status_code < 500:
+        status = Status.WARN
+    else:
+        # 5xx (and any other non-2xx/non-4xx) — the upstream service is
+        # unhealthy.
+        status = Status.FAIL
     return CheckResult(
         name="weather-api",
-        status=Status.OK,
-        detail=f"HTTP {resp.status_code}",
-        data={"url": url, "status_code": resp.status_code},
+        status=status,
+        detail=f"HTTP {status_code}",
+        data={"url": url, "status_code": status_code},
     )
 
 

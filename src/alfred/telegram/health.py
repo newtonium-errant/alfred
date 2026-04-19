@@ -19,6 +19,7 @@ from typing import Any
 from alfred.health.aggregator import register_check
 from alfred.health.anthropic_auth import check_anthropic_auth
 from alfred.health.types import CheckResult, Status, ToolHealth
+from alfred.telegram.config import _substitute_env
 
 
 def _is_unresolved(value: str) -> bool:
@@ -82,6 +83,15 @@ def _check_stt_key(stt: dict) -> CheckResult:
 
 async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     """Run talker health checks."""
+    # Env-var substitution — the talker daemon runs `_substitute_env` on
+    # the raw config at startup via `telegram/config.py::load_from_unified`,
+    # so real env-supplied tokens are resolved by the time the SDK is
+    # called. The health aggregator hands us the pre-substitution dict,
+    # though, so we must mirror the substitution here or we falsely FAIL
+    # on `bot_token: "${TELEGRAM_BOT_TOKEN}"`-style configs even when the
+    # env var is set.
+    raw = _substitute_env(raw or {})
+
     tel = raw.get("telegram")
     if tel is None:
         return ToolHealth(

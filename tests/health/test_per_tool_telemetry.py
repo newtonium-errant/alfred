@@ -215,7 +215,13 @@ class TestBriefHealth:
         weather = next(r for r in result.results if r.name == "weather-api")
         assert weather.status == Status.SKIP
 
-    async def test_weather_api_unreachable_is_warn(self, monkeypatch, tmp_path: Path) -> None:
+    async def test_weather_api_timeout_is_fail(self, monkeypatch, tmp_path: Path) -> None:
+        """Timeouts / connection errors → FAIL.
+
+        Post-BIT-hotfix (2026-04-19): timeouts mean the service is
+        genuinely unreachable — not just "probe URL may be off". WARN
+        is reserved for 4xx, which proves the service is up.
+        """
         def _factory():
             return _FakeClient(raises=TimeoutError("too slow"))
         _patch_httpx(monkeypatch, brief_health, _factory)
@@ -228,7 +234,90 @@ class TestBriefHealth:
         }
         result = await brief_health.health_check(raw)
         weather = next(r for r in result.results if r.name == "weather-api")
+        assert weather.status == Status.FAIL
+
+    async def test_weather_api_200_is_ok(self, monkeypatch, tmp_path: Path) -> None:
+        _patch_httpx(monkeypatch, brief_health, lambda: _FakeClient(200))
+        raw = {
+            "vault": {"path": str(tmp_path)},
+            "brief": {
+                "schedule": {"time": "06:00", "timezone": "UTC"},
+                "weather": {"stations": [{"id": "CYZX"}]},
+            },
+        }
+        result = await brief_health.health_check(raw)
+        weather = next(r for r in result.results if r.name == "weather-api")
+        assert weather.status == Status.OK
+        assert "HTTP 200" in weather.detail
+
+    async def test_weather_api_404_is_warn(self, monkeypatch, tmp_path: Path) -> None:
+        """4xx → WARN: the service answered, but our probe URL may be stale.
+
+        This is the live-config case that surfaced on 2026-04-19: the
+        previous probe hit ``/`` (the API root) and got HTTP 404, but
+        the old status mapping coerced any response to OK. The hotfix
+        both (a) changes the probe URL to match the real client's
+        ``/metar?ids=...`` shape, and (b) returns WARN on 4xx so an
+        endpoint regression doesn't hide behind a false OK.
+        """
+        _patch_httpx(monkeypatch, brief_health, lambda: _FakeClient(404))
+        raw = {
+            "vault": {"path": str(tmp_path)},
+            "brief": {
+                "schedule": {"time": "06:00", "timezone": "UTC"},
+                "weather": {"stations": [{"id": "CYZX"}]},
+            },
+        }
+        result = await brief_health.health_check(raw)
+        weather = next(r for r in result.results if r.name == "weather-api")
         assert weather.status == Status.WARN
+        assert "HTTP 404" in weather.detail
+
+    async def test_weather_api_500_is_fail(self, monkeypatch, tmp_path: Path) -> None:
+        _patch_httpx(monkeypatch, brief_health, lambda: _FakeClient(500))
+        raw = {
+            "vault": {"path": str(tmp_path)},
+            "brief": {
+                "schedule": {"time": "06:00", "timezone": "UTC"},
+                "weather": {"stations": [{"id": "CYZX"}]},
+            },
+        }
+        result = await brief_health.health_check(raw)
+        weather = next(r for r in result.results if r.name == "weather-api")
+        assert weather.status == Status.FAIL
+        assert "HTTP 500" in weather.detail
+
+    async def test_weather_api_probes_real_metar_endpoint(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        """The probe must hit ``{api_base}/metar?ids=<first>&format=json``.
+
+        Guarantees the probe exercises the same request shape the brief
+        uses at runtime (see ``brief/weather.py::fetch_metars``).
+        """
+        captured: dict[str, str] = {}
+
+        class _CapturingClient(_FakeClient):
+            async def get(self, url):  # noqa: ANN001
+                captured["url"] = url
+                return _FakeResponse(200)
+
+        _patch_httpx(monkeypatch, brief_health, lambda: _CapturingClient(200))
+        raw = {
+            "vault": {"path": str(tmp_path)},
+            "brief": {
+                "schedule": {"time": "06:00", "timezone": "UTC"},
+                "weather": {
+                    "api_base": "https://aviationweather.gov/api/data",
+                    "stations": [{"id": "CYZX"}, {"id": "CYHZ"}],
+                },
+            },
+        }
+        await brief_health.health_check(raw)
+        assert "metar" in captured["url"]
+        assert "ids=CYZX" in captured["url"]
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +472,43 @@ class TestTalkerHealth:
         }
         result = await talker_health.health_check(raw)
         assert result.tool == "talker"
+        assert result.status == Status.OK
+
+    async def test_env_var_placeholders_are_expanded(self, monkeypatch) -> None:
+        """Regression: bot_token / stt.api_key / anthropic.api_key all
+        supplied via ``${VAR}`` placeholders must resolve to OK when the
+        env vars are set.
+
+        Before the 2026-04-19 hotfix, the talker health check inspected
+        the pre-substitution raw config, so a user with
+        ``bot_token: "${TELEGRAM_BOT_TOKEN}"`` would see FAIL even
+        though the daemon's own config loader expanded the same
+        placeholder at startup. The fix is to run ``_substitute_env``
+        on the raw dict at the top of ``health_check``, matching what
+        ``telegram/config.py::load_from_unified`` does.
+        """
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abcdef")
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-real")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-real")
+        monkeypatch.setattr(talker_health, "check_anthropic_auth", _ok_auth_stub)
+
+        raw = {
+            "telegram": {
+                "bot_token": "${TELEGRAM_BOT_TOKEN}",
+                "allowed_users": [1],
+                "anthropic": {"api_key": "${ANTHROPIC_API_KEY}"},
+                "stt": {"provider": "groq", "api_key": "${GROQ_API_KEY}"},
+            }
+        }
+        result = await talker_health.health_check(raw)
+
+        bot = next(r for r in result.results if r.name == "bot-token")
+        assert bot.status == Status.OK
+        assert "123" not in bot.detail  # secret shouldn't leak into detail
+        stt = next(r for r in result.results if r.name == "stt-key")
+        assert stt.status == Status.OK
+        ath = next(r for r in result.results if r.name == "anthropic-auth")
+        assert ath.status == Status.OK
         assert result.status == Status.OK
 
 
