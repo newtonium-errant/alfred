@@ -87,6 +87,22 @@ def _load_system_prompt(skills_dir: Path) -> str:
     return skill_path.read_text(encoding="utf-8")
 
 
+def _apply_instance_templating(prompt: str, config: TalkerConfig) -> str:
+    """Substitute ``{{instance_name}}`` / ``{{instance_canonical}}`` in the SKILL.
+
+    Plain ``str.replace`` — two calls, zero deps. See the comment at the
+    top of ``vault-talker/SKILL.md`` for the contract. The persona-only
+    tokens are templated; product/codebase references to ``Alfred``
+    (wikilinks, framework names, other-instance names like "Knowledge
+    Alfred") stay literal because they aren't placeholder tokens.
+    """
+    return (
+        prompt
+        .replace("{{instance_name}}", config.instance.name)
+        .replace("{{instance_canonical}}", config.instance.canonical)
+    )
+
+
 def _build_vault_context_str(config: TalkerConfig) -> str:
     """Build a compact vault-context snapshot string for the system blocks.
 
@@ -170,7 +186,9 @@ async def run(
         log.info("talker.daemon.startup_sweep", closed=len(closed))
 
     client = anthropic.AsyncAnthropic(api_key=config.anthropic.api_key)
-    system_prompt = _load_system_prompt(Path(skills_dir_str))
+    system_prompt = _apply_instance_templating(
+        _load_system_prompt(Path(skills_dir_str)), config,
+    )
     vault_context_str = _build_vault_context_str(config)
 
     app = bot.build_app(

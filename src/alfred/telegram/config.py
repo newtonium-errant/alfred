@@ -66,6 +66,24 @@ class LoggingConfig:
 
 
 @dataclass
+class InstanceConfig:
+    """Per-instance persona identity for the talker.
+
+    ``name`` is the casual, greeting-friendly form ("Alfred", "Salem").
+    ``canonical`` is the formal form used once in the SKILL's identity
+    paragraph ("Alfred", "S.A.L.E.M."). ``aliases`` is unused at this
+    stage — reserved for the multi-instance router (see
+    ``memory/project_multi_instance_design.md``) so case-insensitive
+    inbound routing can accept phone-autocorrect-friendly variants
+    (``"Salem"`` for ``S.A.L.E.M.``) without a code change.
+    """
+
+    name: str = "Alfred"
+    canonical: str = "Alfred"
+    aliases: list[str] = field(default_factory=list)
+
+
+@dataclass
 class TalkerConfig:
     bot_token: str = ""
     allowed_users: list[int] = field(default_factory=list)
@@ -75,6 +93,7 @@ class TalkerConfig:
     session: SessionConfig = field(default_factory=SessionConfig)
     vault: VaultConfig = field(default_factory=VaultConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    instance: InstanceConfig = field(default_factory=InstanceConfig)
 
 
 # --- Recursive builder ---
@@ -85,6 +104,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "stt": STTConfig,
     "session": SessionConfig,
     "logging": LoggingConfig,
+    "instance": InstanceConfig,
 }
 
 
@@ -132,4 +152,5 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
         "session": tool.get("session", {}) or {},
         "vault": vault_raw,
         "logging": log_raw,
+        "instance": tool.get("instance", {}) or {},
     })

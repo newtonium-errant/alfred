@@ -137,8 +137,9 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
     await update.message.reply_text(
-        "Hi — this is Alfred. Send a voice note or type a message and I'll "
-        "reply. Use /end to close the current session, /status for stats."
+        f"Hi — this is {config.instance.name}. Send a voice note or type a "
+        "message and I'll reply. Use /end to close the current session, "
+        "/status for stats."
     )
 
 

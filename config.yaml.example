@@ -73,6 +73,18 @@ telegram:
   # targets. Single-user wk1: just the vault owner.
   primary_users:
     - "person/Andrew Newton"
+  # Per-instance persona identity. The talker's SKILL.md is templated
+  # at load time — ``{{instance_name}}`` becomes casual greetings and
+  # ``{{instance_canonical}}`` becomes the formal identity line. Fresh
+  # installs get the neutral "Alfred" default; multi-instance deployments
+  # (e.g. Salem / STAY-C / KAL-LE) override this per instance.
+  # ``aliases`` is reserved for the multi-instance router so phone
+  # autocorrect / voice transcription variants still route correctly
+  # (unused today).
+  instance:
+    name: "Alfred"
+    canonical: "Alfred"
+    aliases: []
   anthropic:
     api_key: "${ANTHROPIC_API_KEY}"
     model: "claude-sonnet-4-6"
