@@ -22,6 +22,42 @@ RETRY_BASE_DELAY = 2.0
 # Throttle between sequential embedding requests (seconds)
 EMBED_THROTTLE = 0.2
 
+# Chunking config — nomic-embed-text has an 8192-token context; at ~4 chars/token
+# for English, ~24000 chars is a safe payload with headroom for overhead.
+# Larger documents are chunked, each chunk is embedded, then the resulting
+# vectors are mean-pooled and L2-normalized into a single document vector.
+MAX_CHUNK_CHARS = 24000
+CHUNK_OVERLAP_CHARS = 2000
+
+
+def _chunk_text(
+    text: str,
+    max_chars: int = MAX_CHUNK_CHARS,
+    overlap: int = CHUNK_OVERLAP_CHARS,
+) -> list[str]:
+    """Split text into overlapping chunks, preferring paragraph boundaries.
+
+    Returns a list with a single element when the text fits in one chunk.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + max_chars, n)
+        # Prefer breaking on a paragraph boundary in the back half of the window
+        if end < n:
+            para = text.rfind("\n\n", start + max_chars // 2, end)
+            if para != -1:
+                end = para
+        chunks.append(text[start:end])
+        if end >= n:
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
+
 
 class Embedder:
     def __init__(
@@ -129,8 +165,11 @@ class Embedder:
         if self._http is not None and not self._http.is_closed:
             await self._http.aclose()
 
-    async def _get_embedding(self, text: str) -> list[float] | None:
-        """Call embedding API with retry. Supports Ollama and OpenAI-compatible endpoints."""
+    async def _embed_single(self, text: str) -> list[float] | None:
+        """Call embedding API once for a single chunk, with retry.
+
+        Supports Ollama native and OpenAI-compatible endpoints.
+        """
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -160,6 +199,47 @@ class Embedder:
                 await asyncio.sleep(delay)
         log.error("embedder.embed_failed", max_retries=MAX_RETRIES)
         return None
+
+    async def _get_embedding(self, text: str) -> list[float] | None:
+        """Embed text, chunking if it exceeds the embedding model's context window.
+
+        For multi-chunk documents, each chunk is embedded independently and the
+        resulting vectors are mean-pooled and L2-normalized into a single
+        document-level vector. This preserves whole-document semantics without
+        losing content (vs. truncation) and keeps the downstream clustering
+        interface unchanged (one vector per document).
+        """
+        chunks = _chunk_text(text)
+        if len(chunks) == 1:
+            return await self._embed_single(chunks[0])
+
+        log.info(
+            "embedder.chunking",
+            total_chars=len(text),
+            num_chunks=len(chunks),
+        )
+
+        vectors: list[list[float]] = []
+        for idx, chunk in enumerate(chunks):
+            emb = await self._embed_single(chunk)
+            if emb is None:
+                log.warning("embedder.chunk_failed", chunk_idx=idx, num_chunks=len(chunks))
+                continue
+            vectors.append(emb)
+            # Throttle between chunks of the same document to reduce Ollama pressure
+            if idx < len(chunks) - 1:
+                await asyncio.sleep(EMBED_THROTTLE)
+
+        if not vectors:
+            return None
+
+        # Mean-pool then L2-normalize (standard practice for multi-chunk embeddings)
+        arr = np.array(vectors, dtype=np.float32)
+        pooled = arr.mean(axis=0)
+        norm = float(np.linalg.norm(pooled))
+        if norm > 0.0:
+            pooled = pooled / norm
+        return pooled.tolist()
 
     async def process_diff(
         self, new_paths: list[str], changed_paths: list[str], deleted_paths: list[str]
