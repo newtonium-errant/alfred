@@ -21,6 +21,7 @@ session record. We stash these immediately after ``open_session``.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 import anthropic
@@ -741,6 +742,87 @@ async def _open_routed_session(
     return sess
 
 
+# --- Inline-command pre-check --------------------------------------------
+#
+# PTB's ``CommandHandler`` only fires when the message text *starts* with
+# ``/command``. Real-world usage has the slash-command at the end of a
+# sentence ("Good. /end") or embedded inside prose ("please /opus"). Those
+# land on the text MessageHandler and get sent to Claude as conversational
+# input — the command never fires, the session doesn't close, the model
+# doesn't switch.
+#
+# This pre-check runs BEFORE the session pipeline in ``handle_message`` and
+# dispatches to the matching ``on_*`` handler when it spots an inline
+# command. The command is treated as the user's full intent; the surrounding
+# prose is NOT sent to Claude (tokens are wasted and the reply would likely
+# conflict with the command's reply).
+#
+# Dispatch rule: match ``/command`` at end-of-line OR at start-of-message
+# only. End-of-line catches "Good. /end"; start-of-message is a safety net
+# for anything the outer CommandHandler somehow missed (in practice it
+# shouldn't, because a pure "/end" message is filtered out of the text
+# MessageHandler by ``filters.TEXT & ~filters.COMMAND`` — but belt +
+# braces). Mid-line matches like "maybe I'll /end later" intentionally
+# fail so users can still discuss the commands in prose.
+_INLINE_COMMANDS: set[str] = {
+    "end",
+    "opus",
+    "sonnet",
+    "no_auto_escalate",
+    "status",
+    "start",
+}
+
+# Require whitespace or start-of-string before the slash so mid-word
+# tokens like ``foo/end`` don't trigger. End-of-line variant has ``\s*$``
+# so trailing whitespace is tolerated; start-of-message variant uses
+# ``\b`` so ``/end something`` still matches as start-form.
+_INLINE_CMD_RE = re.compile(r"(?:^|\s)/(\w+)\s*$|^/(\w+)\b")
+
+
+def _detect_inline_command(text: str) -> str | None:
+    """Return the lower-cased inline command name, or None.
+
+    Only inspects the first line of ``text`` so a user typing a multi-line
+    message where the second line happens to end in ``/end`` doesn't get
+    their session closed silently — commands are line-local by convention.
+    """
+    if not text:
+        return None
+    first_line = text.splitlines()[0]
+    match = _INLINE_CMD_RE.search(first_line)
+    if not match:
+        return None
+    cmd = (match.group(1) or match.group(2) or "").lower()
+    if cmd in _INLINE_COMMANDS:
+        return cmd
+    return None
+
+
+# Direct handler dispatch map. The command strings here MUST match the
+# ``_INLINE_COMMANDS`` set above — keep them in sync when adding new
+# commands. Reusing the ``on_*`` handlers (rather than factoring out
+# shared logic) keeps the inline path byte-for-byte compatible with the
+# CommandHandler path, including all the log events and reply prose.
+async def _dispatch_inline_command(
+    cmd: str,
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Invoke the ``on_*`` handler for ``cmd``. Returns True iff dispatched."""
+    handler = _INLINE_HANDLERS.get(cmd)
+    if handler is None:
+        return False
+    await handler(update, ctx)
+    return True
+
+
+# Populated at module-load time after the on_* handlers are defined
+# above. Declared here as a forward reference so the tooling knows the
+# shape; the actual mapping is assigned at the bottom of the module.
+_INLINE_HANDLERS: dict[str, Any] = {}
+
+
 async def handle_message(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -763,6 +845,24 @@ async def handle_message(
     if update.message is None or update.effective_chat is None:
         return
     chat_id = update.effective_chat.id
+
+    # Inline-command pre-check: "Good. /end" should close the session, not
+    # get forwarded to Claude as prose. Runs BEFORE the lock + LLM call so
+    # we don't waste tokens or mutate transcript state for a message whose
+    # intent is a command. Pure ``/end`` never reaches here — PTB's
+    # ``filters.TEXT & ~filters.COMMAND`` filter routes those to the
+    # CommandHandler directly, so no double-fire risk.
+    cmd = _detect_inline_command(text)
+    if cmd is not None:
+        log.info(
+            "talker.bot.inline_command",
+            chat_id=chat_id,
+            command=cmd,
+            text_length=len(text),
+        )
+        dispatched = await _dispatch_inline_command(cmd, update, ctx)
+        if dispatched:
+            return
 
     lock = locks.get(chat_id)
     if lock is None:
@@ -876,3 +976,18 @@ async def handle_message(
                 ok=False,
                 error=str(exc),
             )
+
+
+# Populate the inline-command dispatch map now that the on_* handlers
+# are defined. Kept at the bottom of the module so it can reference the
+# handler symbols directly without forward-ref gymnastics. Must stay in
+# sync with ``_INLINE_COMMANDS`` above — if either side gains a command,
+# add it here too.
+_INLINE_HANDLERS.update({
+    "start": on_start,
+    "end": on_end,
+    "status": on_status,
+    "opus": on_opus,
+    "sonnet": on_sonnet,
+    "no_auto_escalate": on_no_auto_escalate,
+})
