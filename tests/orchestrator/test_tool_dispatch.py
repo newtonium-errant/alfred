@@ -1,8 +1,8 @@
 """Dispatch table tests — ``TOOL_RUNNERS`` contents and signature branching.
 
-The orchestrator has eight registered tool runners. Four of them
-(surveyor, mail, brief, bit) take ``(raw, suppress_stdout)``; the other four
-(curator, janitor, distiller, talker) take
+The orchestrator has nine registered tool runners. Four of them
+(surveyor, mail, brief, bit) take ``(raw, suppress_stdout)``; the other
+five (curator, janitor, distiller, instructor, talker) take
 ``(raw, skills_dir, suppress_stdout)``.
 
 ``run_all`` picks the arity based on a hard-coded tuple literal
@@ -20,13 +20,13 @@ import alfred.orchestrator as orchestrator
 
 
 EXPECTED_TOOLS = {
-    "curator", "janitor", "distiller",
+    "curator", "janitor", "distiller", "instructor",
     "surveyor", "mail", "brief", "talker",
     "bit",
 }
 
 TWO_ARG_TOOLS = {"surveyor", "mail", "brief", "bit"}
-THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "talker"}
+THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "instructor", "talker"}
 
 
 def test_tool_runners_covers_every_registered_tool() -> None:

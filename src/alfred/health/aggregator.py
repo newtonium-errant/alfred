@@ -43,6 +43,7 @@ KNOWN_TOOL_MODULES: dict[str, str] = {
     "curator": "alfred.curator.health",
     "janitor": "alfred.janitor.health",
     "distiller": "alfred.distiller.health",
+    "instructor": "alfred.instructor.health",
     "surveyor": "alfred.surveyor.health",
     "brief": "alfred.brief.health",
     "mail": "alfred.mail.health",

@@ -218,6 +218,23 @@ def cmd_status(args: argparse.Namespace) -> None:
     except Exception as e:
         print(f"  (unavailable: {e})")
 
+    # Instructor status — only show if config section exists, mirroring
+    # the orchestrator's auto-start gate.
+    if "instructor" in raw:
+        print("\n--- Instructor ---")
+        try:
+            from alfred.instructor.config import load_from_unified as instructor_cfg
+            cfg = instructor_cfg(raw)
+            from alfred.instructor.state import InstructorState
+            st = InstructorState(cfg.state.path)
+            st.load()
+            pending = {k: v for k, v in st.retry_counts.items() if v > 0}
+            print(f"  Tracked records: {len(st.file_hashes)}")
+            print(f"  Retries pending: {len(pending)}")
+            print(f"  Last run:        {st.last_run_ts or 'never'}")
+        except Exception as e:
+            print(f"  (unavailable: {e})")
+
     # Talker status — only show if config section exists, mirroring the
     # orchestrator's auto-start gate.
     if "telegram" in raw:
@@ -307,6 +324,27 @@ def cmd_distiller(args: argparse.Namespace) -> None:
         dcli.cmd_consolidate(config, skills_dir)
     else:
         print(f"Unknown distiller subcommand: {subcmd}")
+        sys.exit(1)
+
+
+def cmd_instructor(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred instructor`` subcommands (scan/run/status)."""
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="instructor")
+    from alfred.instructor.config import load_from_unified
+    config = load_from_unified(raw)
+
+    from alfred.instructor import cli as icli
+    subcmd = getattr(args, "instructor_cmd", None)
+
+    if subcmd == "scan":
+        icli.cmd_scan(config)
+    elif subcmd == "run":
+        icli.cmd_run(config)
+    elif subcmd == "status":
+        icli.cmd_status(config)
+    else:
+        print("Usage: alfred instructor {scan|run|status}")
         sys.exit(1)
 
 
@@ -918,6 +956,16 @@ def build_parser() -> argparse.ArgumentParser:
     dist_hist = dist_sub.add_parser("history", help="Show run history")
     dist_hist.add_argument("--limit", type=int, default=10)
 
+    # instructor
+    inst = sub.add_parser(
+        "instructor",
+        help="Vault instructor subcommands (alfred_instructions watcher)",
+    )
+    inst_sub = inst.add_subparsers(dest="instructor_cmd")
+    inst_sub.add_parser("scan", help="One-shot scan: list pending directives, don't execute")
+    inst_sub.add_parser("run", help="Run the poll loop in foreground until Ctrl-C")
+    inst_sub.add_parser("status", help="Show tracked files, pending retries, last run")
+
     # vault
     from alfred.vault.cli import build_vault_parser
     build_vault_parser(sub)
@@ -1068,6 +1116,7 @@ def main() -> None:
         "curator": cmd_curator,
         "janitor": cmd_janitor,
         "distiller": cmd_distiller,
+        "instructor": cmd_instructor,
         "vault": cmd_vault,
         "exec": cmd_exec,
         "ingest": cmd_ingest,

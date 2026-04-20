@@ -77,6 +77,35 @@ def _run_distiller(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool =
     asyncio.run(run_watch(config, state, Path(skills_dir)))
 
 
+def _run_instructor(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = False) -> None:
+    """Instructor watch daemon process entry point.
+
+    Polls the vault for ``alfred_instructions`` directives and executes
+    them in-process via the Anthropic SDK. Takes the same 3-arg
+    signature as curator/janitor/distiller because the instructor also
+    needs a ``skills_dir`` (its SKILL.md lives at
+    ``vault-instructor/SKILL.md``).
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/instructor.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    from alfred.instructor.config import load_from_unified
+    from alfred.instructor.utils import setup_logging
+    config = load_from_unified(raw)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    from alfred.instructor.state import InstructorState
+    from alfred.instructor.daemon import run as run_instructor_daemon
+    state = InstructorState(config.state.path)
+    state.load()
+    asyncio.run(run_instructor_daemon(
+        config,
+        state=state,
+        suppress_stdout=suppress_stdout,
+        skills_dir=Path(skills_dir),
+    ))
+
+
 _MISSING_DEPS_EXIT = 78  # exit code signaling missing optional dependencies
 
 
@@ -230,6 +259,7 @@ TOOL_RUNNERS = {
     "curator": _run_curator,
     "janitor": _run_janitor,
     "distiller": _run_distiller,
+    "instructor": _run_instructor,
     "surveyor": _run_surveyor,
     "mail": _run_mail_webhook,
     "brief": _run_brief,
@@ -280,6 +310,11 @@ def run_all(
         # bot shouldn't have a daemon spinning in a retry loop on 78 exits.
         if "telegram" in raw:
             tools.append("talker")
+        # Instructor auto-starts when ``instructor:`` is in config.
+        # Without the section, the daemon has no Anthropic API key to
+        # work with and would spin in a retry loop on every directive.
+        if "instructor" in raw:
+            tools.append("instructor")
 
     # Validate tool names
     for tool in tools:

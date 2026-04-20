@@ -33,6 +33,7 @@ ALL_FAKES = {
     "curator": fake_runner_3arg,
     "janitor": fake_runner_3arg,
     "distiller": fake_runner_3arg,
+    "instructor": fake_runner_3arg,
     "surveyor": fake_runner_2arg,
     "mail": fake_runner_2arg,
     "brief": fake_runner_2arg,
@@ -150,14 +151,15 @@ def test_default_starts_only_required_trio_when_no_optional_sections(
 ) -> None:
     """Config with only required keys starts ONLY curator/janitor/distiller."""
     raw = orchestrator_raw_config
-    # No surveyor/mail/brief/telegram sections → those should NOT spawn.
+    # No surveyor/mail/brief/telegram/instructor sections → those should NOT spawn.
     assert "surveyor" not in raw
     assert "mail" not in raw
     assert "brief" not in raw
     assert "telegram" not in raw
+    assert "instructor" not in raw
 
     _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
-    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "talker"} else 2)
+    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
                             for t in ALL_FAKES})
 
     fire_sentinel_after(0.3)
@@ -182,6 +184,7 @@ def test_default_starts_only_required_trio_when_no_optional_sections(
     assert "mail" not in started
     assert "brief" not in started
     assert "talker" not in started
+    assert "instructor" not in started
 
 
 def test_surveyor_section_triggers_surveyor_start(
@@ -193,7 +196,7 @@ def test_surveyor_section_triggers_surveyor_start(
     raw["surveyor"] = {"some_key": "value"}
 
     _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
-    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "talker"} else 2)
+    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
                             for t in ALL_FAKES})
 
     fire_sentinel_after(0.4)
@@ -226,7 +229,7 @@ def test_telegram_section_triggers_talker_start(
     raw["telegram"] = {"bot_token": "fake"}
 
     _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
-    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "talker"} else 2)
+    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
                             for t in ALL_FAKES})
 
     fire_sentinel_after(0.5)
@@ -244,6 +247,37 @@ def test_telegram_section_triggers_talker_start(
     assert "talker" in started
 
 
+def test_instructor_section_triggers_instructor_start(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """Adding ``instructor`` to the config dict opts into instructor auto-start.
+
+    Mirror of the surveyor / telegram auto-start tests. Without the
+    section, the daemon would spin on a missing Anthropic API key.
+    """
+    raw = orchestrator_raw_config
+    raw["instructor"] = {"poll_interval_seconds": 60}
+
+    _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
+    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
+                            for t in ALL_FAKES})
+
+    fire_sentinel_after(0.5)
+    orchestrator.run_all(
+        raw, only=None, skills_dir=orch_dirs["skills"],
+        pid_path=orch_dirs["pid_path"], live_mode=False,
+    )
+
+    for _ in range(30):
+        started = _read_started_tools(orch_dirs["data"])
+        if "instructor" in started:
+            break
+        time.sleep(0.05)
+
+    assert "instructor" in started
+
+
 def test_only_flag_overrides_auto_start(
     orchestrator_raw_config, orch_dirs, fast_sleep,
     install_per_tool_fakes, fire_sentinel_after,
@@ -255,7 +289,7 @@ def test_only_flag_overrides_auto_start(
     raw["telegram"] = {}
 
     _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
-    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "talker"} else 2)
+    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
                             for t in ALL_FAKES})
 
     fire_sentinel_after(0.2)
@@ -303,7 +337,7 @@ def test_mail_and_brief_sections_trigger_their_tools(
     raw["brief"] = {}
 
     _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
-    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "talker"} else 2)
+    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
                             for t in ALL_FAKES})
 
     fire_sentinel_after(0.6)
@@ -330,7 +364,7 @@ def test_workers_json_records_started_tools(
     raw = orchestrator_raw_config
 
     _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
-    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "talker"} else 2)
+    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
                             for t in ALL_FAKES})
 
     # Give the orchestrator enough time to write workers.json before
