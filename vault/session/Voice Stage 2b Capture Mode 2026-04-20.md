@@ -183,6 +183,30 @@ update to this session note in one bundle per
   - `tests/telegram/test_tts_failure.py` (4 tests — not configured,
     API down fallback, missing session, implicit batch pass).
 
+### Commit 6 — BIT probe additions for TTS
+
+- Extended `src/alfred/telegram/health.py` with three new probes:
+  - `tts-key` (static, <50ms): verifies `telegram.tts.api_key`
+    present + env var resolved. SKIPs when tts section absent.
+  - `capture-handler-registered` (functional, <50ms): import
+    check on `capture_batch` and `capture_extract`.
+  - `elevenlabs-auth` (remote_network, <2s): GET
+    `https://api.elevenlabs.io/v1/user` with xi-api-key header.
+    Only runs in `full` mode (pre-brief quick mode stays fast).
+    SKIPs when tts section absent or key missing.
+- All three SKIP gracefully when `telegram.tts` is absent; `/brief`
+  is opt-in and its absence doesn't FAIL the rollup (though it DOES
+  mark the rollup SKIP because `Status.worst` ranks SKIP > OK —
+  the user correctly sees "we didn't check everything").
+- Two existing tests in
+  `tests/health/test_per_tool_telemetry.py` updated to reflect the
+  new reality: `test_happy_path_ok` + `test_env_var_placeholders_are_expanded`
+  now include a tts section so the rollup stays OK, and pass
+  `mode="quick"` so the remote elevenlabs probe isn't attempted.
+- New tests: `tests/telegram/test_health_tts_probes.py` (11 tests —
+  each probe's happy/FAIL/SKIP paths, quick-mode skips remote
+  probe, absent-tts doesn't FAIL rollup).
+
 ## Outcome
 
 _(updated on commit 7)_
@@ -276,3 +300,20 @@ _(updated on each commit)_
   `None` or a `MagicMock`). `_parse_short_id_arg` defensively
   checks `isinstance(args, list)` and falls back to regex-parsing
   the raw message text.
+
+- **Gotcha confirmed — `Status.worst` ranks SKIP above OK.**
+  This is deliberate per `types.py` ("the user should see 'we
+  didn't check everything' before they see a green rollup"), but
+  it means adding optional probes that SKIP when their config
+  section is absent will bubble up to mark the entire tool's
+  status SKIP rather than OK. Pre-existing tests that asserted
+  `result.status == Status.OK` must be updated when new optional
+  probes are added — either pass a config that exercises them or
+  assert per-probe status instead of the rollup.
+
+- **Pattern validated — quick vs full mode for remote network
+  probes.** The talker's remote elevenlabs-auth probe runs only
+  in `full` mode (nightly BIT) — quick mode (pre-brief) stays
+  under its latency budget by skipping the 2s ceiling call. This
+  matches the broader pattern: cheap static checks always run;
+  expensive network checks are full-mode-only.

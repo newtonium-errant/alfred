@@ -468,9 +468,14 @@ class TestTalkerHealth:
                 "allowed_users": [1, 2],
                 "anthropic": {"api_key": "sk-x", "model": "claude-sonnet-4-6"},
                 "stt": {"provider": "groq", "api_key": "gsk-x"},
+                # wk2b c6: include tts section so the new tts-key +
+                # elevenlabs-auth probes don't SKIP (which would bubble
+                # up to mark the rollup SKIP rather than OK).
+                "tts": {"api_key": "sk-xi-x"},
             }
         }
-        result = await talker_health.health_check(raw)
+        # Quick mode so the remote elevenlabs probe isn't attempted.
+        result = await talker_health.health_check(raw, mode="quick")
         assert result.tool == "talker"
         assert result.status == Status.OK
 
@@ -490,6 +495,7 @@ class TestTalkerHealth:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abcdef")
         monkeypatch.setenv("GROQ_API_KEY", "gsk-real")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-real")
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-xi-real")
         monkeypatch.setattr(talker_health, "check_anthropic_auth", _ok_auth_stub)
 
         raw = {
@@ -498,9 +504,12 @@ class TestTalkerHealth:
                 "allowed_users": [1],
                 "anthropic": {"api_key": "${ANTHROPIC_API_KEY}"},
                 "stt": {"provider": "groq", "api_key": "${GROQ_API_KEY}"},
+                # wk2b c6: include tts so the rollup stays OK (tts-key
+                # SKIP would bubble to SKIP otherwise).
+                "tts": {"api_key": "${ELEVENLABS_API_KEY}"},
             }
         }
-        result = await talker_health.health_check(raw)
+        result = await talker_health.health_check(raw, mode="quick")
 
         bot = next(r for r in result.results if r.name == "bot-token")
         assert bot.status == Status.OK
@@ -509,6 +518,9 @@ class TestTalkerHealth:
         assert stt.status == Status.OK
         ath = next(r for r in result.results if r.name == "anthropic-auth")
         assert ath.status == Status.OK
+        # wk2b c6: tts-key probe resolves the ELEVENLABS_API_KEY env var.
+        tts = next(r for r in result.results if r.name == "tts-key")
+        assert tts.status == Status.OK
         assert result.status == Status.OK
 
 
