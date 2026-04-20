@@ -98,7 +98,7 @@ async def test_brief_falls_back_to_text_when_tts_api_errors(
     state_mgr.save()
 
     talker_config.tts = TtsConfig(
-        api_key="sk-xi-test", voice_id="Rachel",
+        api_key="DUMMY_ELEVENLABS_TEST_KEY", voice_id="Rachel",
     )
 
     client = FakeAnthropicClient([
@@ -128,7 +128,7 @@ async def test_brief_falls_back_to_text_when_tts_api_errors(
 async def test_brief_missing_session_returns_no_session_reply(
     state_mgr, talker_config,
 ) -> None:
-    talker_config.tts = TtsConfig(api_key="sk-xi-test", voice_id="Rachel")
+    talker_config.tts = TtsConfig(api_key="DUMMY_ELEVENLABS_TEST_KEY", voice_id="Rachel")
     client = FakeAnthropicClient([])
     update, ctx = _make_update_and_ctx(
         state_mgr, talker_config, client, "nope1234",
@@ -175,7 +175,7 @@ async def test_brief_runs_batch_pass_implicitly_when_summary_missing(
     })
     state_mgr.save()
 
-    talker_config.tts = TtsConfig(api_key="sk-xi-test", voice_id="Rachel")
+    talker_config.tts = TtsConfig(api_key="DUMMY_ELEVENLABS_TEST_KEY", voice_id="Rachel")
 
     # Three LLM calls: batch structuring → compress → (synth is monkeypatched).
     client = FakeAnthropicClient([

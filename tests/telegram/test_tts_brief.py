@@ -63,7 +63,7 @@ async def test_synthesize_posts_to_elevenlabs_with_correct_headers(
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
 
     cfg = TtsConfig(
-        api_key="sk-xi-test",
+        api_key="DUMMY_ELEVENLABS_TEST_KEY",
         model="eleven_turbo_v2_5",
         voice_id="Rachel",
         summary_word_target=300,
@@ -71,7 +71,7 @@ async def test_synthesize_posts_to_elevenlabs_with_correct_headers(
     audio = await tts.synthesize("hello world", cfg)
     assert audio == b"FAKE-MP3-BYTES"
     assert captured["url"].endswith("21m00Tcm4TlvDq8ikWAM")
-    assert captured["headers"]["xi-api-key"] == "sk-xi-test"
+    assert captured["headers"]["xi-api-key"] == "DUMMY_ELEVENLABS_TEST_KEY"
     assert captured["json"]["text"] == "hello world"
     assert captured["json"]["model_id"] == "eleven_turbo_v2_5"
 
@@ -82,7 +82,7 @@ async def test_synthesize_raises_on_non_200(monkeypatch) -> None:
         return httpx.Response(429, text="rate limited")
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
 
-    cfg = TtsConfig(api_key="sk-xi-test", voice_id="Rachel")
+    cfg = TtsConfig(api_key="DUMMY_ELEVENLABS_TEST_KEY", voice_id="Rachel")
     with pytest.raises(tts.TtsError, match="429"):
         await tts.synthesize("hi", cfg)
 
@@ -205,7 +205,7 @@ async def test_brief_happy_path_sends_voice_message(
 
     # Configure TTS.
     talker_config.tts = TtsConfig(
-        api_key="sk-xi-test",
+        api_key="DUMMY_ELEVENLABS_TEST_KEY",
         voice_id="Rachel",
         model="eleven_turbo_v2_5",
         summary_word_target=300,
@@ -252,7 +252,7 @@ async def test_brief_happy_path_sends_voice_message(
 async def test_brief_usage_message_when_short_id_missing(
     state_mgr, talker_config,
 ) -> None:
-    talker_config.tts = TtsConfig(api_key="sk-x", voice_id="Rachel")
+    talker_config.tts = TtsConfig(api_key="test-key", voice_id="Rachel")
 
     update = MagicMock()
     update.effective_user.id = 1
@@ -303,7 +303,7 @@ def test_load_from_unified_picks_up_tts_section() -> None:
         "telegram": {
             "bot_token": "x",
             "tts": {
-                "api_key": "sk-xi-test",
+                "api_key": "DUMMY_ELEVENLABS_TEST_KEY",
                 "voice_id": "Rachel",
                 "model": "eleven_turbo_v2_5",
                 "summary_word_target": 250,
@@ -312,6 +312,6 @@ def test_load_from_unified_picks_up_tts_section() -> None:
     }
     cfg = load_from_unified(raw)
     assert cfg.tts is not None
-    assert cfg.tts.api_key == "sk-xi-test"
+    assert cfg.tts.api_key == "DUMMY_ELEVENLABS_TEST_KEY"
     assert cfg.tts.voice_id == "Rachel"
     assert cfg.tts.summary_word_target == 250

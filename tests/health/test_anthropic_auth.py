@@ -81,7 +81,7 @@ class TestCheckAnthropicAuth:
         client = _FakeClient(_FakeMessages(count_tokens=_count_tokens))
         _install_fake_anthropic(monkeypatch, client)
 
-        result = await mod.check_anthropic_auth("sk-test", model="claude-foo")
+        result = await mod.check_anthropic_auth("test-anthropic-key", model="claude-foo")
         assert result.status == Status.OK
         assert result.data["probe"] == "count_tokens"
         assert result.data["model"] == "claude-foo"
@@ -97,7 +97,7 @@ class TestCheckAnthropicAuth:
         client = _FakeClient(_FakeMessages(count_tokens=_count_tokens))
         _install_fake_anthropic(monkeypatch, client)
 
-        result = await mod.check_anthropic_auth("sk-bad")
+        result = await mod.check_anthropic_auth("bad-anthropic-key")
         assert result.status == Status.FAIL
         assert "401 unauthorized" in result.detail
 
@@ -112,7 +112,7 @@ class TestCheckAnthropicAuth:
         client = _FakeClient(_FakeMessages(create=_create))
         _install_fake_anthropic(monkeypatch, client)
 
-        result = await mod.check_anthropic_auth("sk-test")
+        result = await mod.check_anthropic_auth("test-anthropic-key")
         assert result.status == Status.WARN  # fallback surfaces as WARN
         assert "count_tokens unavailable" in result.detail
         assert result.data["probe"] == "messages.create"
@@ -125,7 +125,7 @@ class TestCheckAnthropicAuth:
         client = _FakeClient(_FakeMessages(create=_create))
         _install_fake_anthropic(monkeypatch, client)
 
-        result = await mod.check_anthropic_auth("sk-test")
+        result = await mod.check_anthropic_auth("test-anthropic-key")
         assert result.status == Status.FAIL
         assert "quota exceeded" in result.detail
 
@@ -136,7 +136,7 @@ class TestCheckAnthropicAuth:
             raises=ValueError("bad key format"),
         )
 
-        result = await mod.check_anthropic_auth("sk-garbage")
+        result = await mod.check_anthropic_auth("garbage-anthropic-key")
         assert result.status == Status.FAIL
         assert "bad key format" in result.detail
 
@@ -144,21 +144,21 @@ class TestCheckAnthropicAuth:
         # Force ``import anthropic`` to raise ImportError.
         monkeypatch.setitem(sys.modules, "anthropic", None)
 
-        result = await mod.check_anthropic_auth("sk-test")
+        result = await mod.check_anthropic_auth("test-anthropic-key")
         assert result.status == Status.FAIL
         assert "not installed" in result.detail
 
 
 class TestResolveApiKey:
     def test_env_var_wins(self, monkeypatch) -> None:
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-env")
-        raw = {"telegram": {"anthropic": {"api_key": "sk-config"}}}
-        assert mod.resolve_api_key(raw) == "sk-env"
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "key-from-env")
+        raw = {"telegram": {"anthropic": {"api_key": "key-from-config"}}}
+        assert mod.resolve_api_key(raw) == "key-from-env"
 
     def test_falls_back_to_telegram_config(self, monkeypatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        raw = {"telegram": {"anthropic": {"api_key": "sk-config"}}}
-        assert mod.resolve_api_key(raw) == "sk-config"
+        raw = {"telegram": {"anthropic": {"api_key": "key-from-config"}}}
+        assert mod.resolve_api_key(raw) == "key-from-config"
 
     def test_ignores_unresolved_placeholder(self, monkeypatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

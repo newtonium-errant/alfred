@@ -12,7 +12,7 @@ from alfred.subprocess_env import claude_subprocess_env
 
 def test_anthropic_credential_keys_are_stripped():
     base = {
-        "ANTHROPIC_API_KEY": "sk-ant-should-be-removed",
+        "ANTHROPIC_API_KEY": "DUMMY_ANTHROPIC_SHOULD_BE_REMOVED",
         "ANTHROPIC_AUTH_TOKEN": "should-be-removed",
         "ANTHROPIC_BASE_URL": "https://example.com",
         "PATH": "/usr/bin:/bin",

@@ -399,7 +399,7 @@ class TestTalkerHealth:
 
     async def test_empty_bot_token_fails(self, monkeypatch) -> None:
         monkeypatch.setattr(talker_health, "check_anthropic_auth", _ok_auth_stub)
-        raw = {"telegram": {"bot_token": "", "anthropic": {"api_key": "sk-x"}}}
+        raw = {"telegram": {"bot_token": "", "anthropic": {"api_key": "test-anthropic-key"}}}
         result = await talker_health.health_check(raw)
         assert result.status == Status.FAIL
         bot = next(r for r in result.results if r.name == "bot-token")
@@ -410,7 +410,7 @@ class TestTalkerHealth:
         raw = {
             "telegram": {
                 "bot_token": "${TELEGRAM_BOT_TOKEN}",
-                "anthropic": {"api_key": "sk-x"},
+                "anthropic": {"api_key": "test-anthropic-key"},
             }
         }
         result = await talker_health.health_check(raw)
@@ -422,10 +422,10 @@ class TestTalkerHealth:
         monkeypatch.setattr(talker_health, "check_anthropic_auth", _ok_auth_stub)
         raw = {
             "telegram": {
-                "bot_token": "123:abc",
+                "bot_token": "DUMMY_TELEGRAM_TEST_TOKEN",
                 "allowed_users": [],
-                "anthropic": {"api_key": "sk-x"},
-                "stt": {"api_key": "gsk-x"},
+                "anthropic": {"api_key": "test-anthropic-key"},
+                "stt": {"api_key": "test-stt-key"},
             }
         }
         result = await talker_health.health_check(raw)
@@ -436,9 +436,9 @@ class TestTalkerHealth:
         monkeypatch.setattr(talker_health, "check_anthropic_auth", _ok_auth_stub)
         raw = {
             "telegram": {
-                "bot_token": "123:abc",
+                "bot_token": "DUMMY_TELEGRAM_TEST_TOKEN",
                 "allowed_users": [1],
-                "anthropic": {"api_key": "sk-x"},
+                "anthropic": {"api_key": "test-anthropic-key"},
                 "stt": {"provider": "groq", "api_key": ""},
             }
         }
@@ -449,10 +449,10 @@ class TestTalkerHealth:
     async def test_missing_anthropic_key_fails(self) -> None:
         raw = {
             "telegram": {
-                "bot_token": "123:abc",
+                "bot_token": "DUMMY_TELEGRAM_TEST_TOKEN",
                 "allowed_users": [1],
                 "anthropic": {"api_key": ""},
-                "stt": {"api_key": "gsk-x"},
+                "stt": {"api_key": "test-stt-key"},
             }
         }
         result = await talker_health.health_check(raw)
@@ -464,14 +464,14 @@ class TestTalkerHealth:
         monkeypatch.setattr(talker_health, "check_anthropic_auth", _ok_auth_stub)
         raw = {
             "telegram": {
-                "bot_token": "123:abc",
+                "bot_token": "DUMMY_TELEGRAM_TEST_TOKEN",
                 "allowed_users": [1, 2],
-                "anthropic": {"api_key": "sk-x", "model": "claude-sonnet-4-6"},
-                "stt": {"provider": "groq", "api_key": "gsk-x"},
+                "anthropic": {"api_key": "test-anthropic-key", "model": "claude-sonnet-4-6"},
+                "stt": {"provider": "groq", "api_key": "test-stt-key"},
                 # wk2b c6: include tts section so the new tts-key +
                 # elevenlabs-auth probes don't SKIP (which would bubble
                 # up to mark the rollup SKIP rather than OK).
-                "tts": {"api_key": "sk-xi-x"},
+                "tts": {"api_key": "test-tts-key"},
             }
         }
         # Quick mode so the remote elevenlabs probe isn't attempted.
@@ -492,10 +492,10 @@ class TestTalkerHealth:
         on the raw dict at the top of ``health_check``, matching what
         ``telegram/config.py::load_from_unified`` does.
         """
-        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abcdef")
-        monkeypatch.setenv("GROQ_API_KEY", "gsk-real")
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-real")
-        monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-xi-real")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "DUMMY_TELEGRAM_TEST_TOKEN")
+        monkeypatch.setenv("GROQ_API_KEY", "DUMMY_GROQ_TEST_KEY")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "DUMMY_ANTHROPIC_TEST_KEY")
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "DUMMY_ELEVENLABS_TEST_KEY")
         monkeypatch.setattr(talker_health, "check_anthropic_auth", _ok_auth_stub)
 
         raw = {
@@ -513,7 +513,7 @@ class TestTalkerHealth:
 
         bot = next(r for r in result.results if r.name == "bot-token")
         assert bot.status == Status.OK
-        assert "123" not in bot.detail  # secret shouldn't leak into detail
+        assert "DUMMY_TELEGRAM_TEST_TOKEN" not in bot.detail  # secret shouldn't leak into detail
         stt = next(r for r in result.results if r.name == "stt-key")
         assert stt.status == Status.OK
         ath = next(r for r in result.results if r.name == "anthropic-auth")

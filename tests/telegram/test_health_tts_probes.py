@@ -50,10 +50,10 @@ def test_tts_key_fail_on_unresolved_placeholder() -> None:
 def test_tts_key_ok_when_populated() -> None:
     r = health._check_tts_key({
         "provider": "elevenlabs",
-        "api_key": "sk-xi-legit-key-1234",
+        "api_key": "DUMMY_ELEVENLABS_TEST_KEY",
     })
     assert r.status == Status.OK
-    assert r.data["length"] == len("sk-xi-legit-key-1234")
+    assert r.data["length"] == len("DUMMY_ELEVENLABS_TEST_KEY")
 
 
 # --- _check_capture_handlers ---------------------------------------------
@@ -72,11 +72,11 @@ def test_capture_handlers_ok_when_modules_import() -> None:
 async def test_elevenlabs_auth_ok_on_200(monkeypatch) -> None:
     async def _fake_get(self, url, **kwargs):
         assert url.endswith("/v1/user")
-        assert kwargs["headers"]["xi-api-key"] == "sk-xi-test"
+        assert kwargs["headers"]["xi-api-key"] == "DUMMY_ELEVENLABS_TEST_KEY"
         return httpx.Response(200, json={"subscription": {"tier": "starter"}})
     monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
 
-    r = await health._check_elevenlabs_auth({"api_key": "sk-xi-test"})
+    r = await health._check_elevenlabs_auth({"api_key": "DUMMY_ELEVENLABS_TEST_KEY"})
     assert r.status == Status.OK
     assert "200" in r.detail
 
@@ -87,7 +87,7 @@ async def test_elevenlabs_auth_fail_on_401(monkeypatch) -> None:
         return httpx.Response(401, text="unauthorized")
     monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
 
-    r = await health._check_elevenlabs_auth({"api_key": "sk-xi-bad"})
+    r = await health._check_elevenlabs_auth({"api_key": "DUMMY_ELEVENLABS_BAD_KEY"})
     assert r.status == Status.FAIL
     assert "401" in r.detail
 
@@ -114,8 +114,8 @@ async def test_health_check_without_tts_section_does_not_fail(monkeypatch) -> No
         "telegram": {
             "bot_token": "test-token-not-empty",
             "allowed_users": [1],
-            "stt": {"provider": "groq", "api_key": "gsk-test"},
-            "anthropic": {"api_key": "sk-ant-test"},
+            "stt": {"provider": "groq", "api_key": "DUMMY_GROQ_TEST_KEY"},
+            "anthropic": {"api_key": "DUMMY_ANTHROPIC_TEST_KEY"},
         },
     }
 
@@ -151,9 +151,9 @@ async def test_health_check_quick_mode_skips_remote_elevenlabs_probe(
         "telegram": {
             "bot_token": "test-token",
             "allowed_users": [1],
-            "stt": {"api_key": "gsk-test"},
-            "anthropic": {"api_key": "sk-ant-test"},
-            "tts": {"api_key": "sk-xi-test"},
+            "stt": {"api_key": "DUMMY_GROQ_TEST_KEY"},
+            "anthropic": {"api_key": "DUMMY_ANTHROPIC_TEST_KEY"},
+            "tts": {"api_key": "DUMMY_ELEVENLABS_TEST_KEY"},
         },
     }
     from alfred.health import anthropic_auth

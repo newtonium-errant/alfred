@@ -99,7 +99,7 @@ class TestCuratorHealth:
         vault: Path,
     ) -> None:
         monkeypatch.setattr(curator_health, "check_anthropic_auth", _ok_auth)
-        monkeypatch.setattr(curator_health, "resolve_api_key", lambda raw: "sk-x")
+        monkeypatch.setattr(curator_health, "resolve_api_key", lambda raw: "test-anthropic-key")
         result = await curator_health.health_check(_base_config(vault, backend="claude"))
         names = {r.name for r in result.results}
         assert "anthropic-auth" in names
