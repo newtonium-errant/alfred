@@ -37,6 +37,7 @@ from telegram.ext import (
 
 from . import (
     calibration,
+    capture_batch,
     conversation,
     model_calibration,
     router,
@@ -281,6 +282,45 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             error=str(exc),
         )
+
+    # wk2b c3: capture-mode batch structuring pass. Fires as a detached
+    # task so /end returns fast; the structured summary + follow-up
+    # Telegram message land asynchronously once Sonnet responds.
+    if session_type == "capture":
+        short_id = (active.get("session_id", "") or "").split("-")[0]
+        # Show the "processing..." marker up front so Andrew sees SOMETHING
+        # immediately even if the batch pass takes a few seconds.
+        close_reply = (
+            f"session closed. saved to: {rel_path}\ncapture processing…"
+        )
+
+        # Pre-bind chat_id so the orchestrator doesn't need a bot context.
+        async def _send_follow_up(text: str) -> None:
+            await ctx.bot.send_message(chat_id=chat_id, text=text)
+
+        try:
+            from pathlib import Path as _Path
+            batch_model = config.anthropic.model or "claude-sonnet-4-6"
+            asyncio.create_task(
+                capture_batch.process_capture_session(
+                    client=client,
+                    vault_path=_Path(config.vault.path),
+                    session_rel_path=rel_path,
+                    transcript=transcript_snapshot,
+                    model=batch_model,
+                    send_follow_up=_send_follow_up,
+                    short_id=short_id,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — scheduling shouldn't block close reply
+            log.warning(
+                "talker.capture.schedule_failed",
+                chat_id=chat_id,
+                error=str(exc),
+            )
+
+        await update.message.reply_text(close_reply + suffix)
+        return
 
     await update.message.reply_text(
         f"session closed. saved to: {rel_path}" + suffix

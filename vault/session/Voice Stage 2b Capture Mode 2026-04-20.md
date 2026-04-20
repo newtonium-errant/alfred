@@ -67,6 +67,35 @@ update to this session note in one bundle per
   bypass with canned responses, reaction emoji integration, fallback
   on reaction failure, /end during capture).
 
+### Commit 3 — Async batch structuring pass
+
+- New module `src/alfred/telegram/capture_batch.py` (~380 lines):
+  - `StructuredSummary` dataclass (6 list fields: topics, decisions,
+    open_questions, action_items, key_insights, raw_contradictions).
+  - `run_batch_structuring()` — one Sonnet call with `tool_choice` pinned
+    to `emit_structured_summary`, prompt caching on the system block.
+  - `render_summary_markdown()` / `render_failure_markdown()` — produce
+    the `## Structured Summary` block wrapped in `<!-- ALFRED:DYNAMIC -->`
+    markers.
+  - `write_summary_to_session_record()` — injects summary ABOVE the
+    `# Transcript` heading via `vault_edit(body_rewriter=...)`. Sets
+    `capture_structured: "true" | "failed"` frontmatter (string, not
+    bool — leaves room for future "partial" state without schema
+    migration). Idempotent: repeat runs replace the existing block.
+  - `process_capture_session()` — top-level orchestrator. Runs batch
+    pass, writes summary, sends follow-up Telegram message. Never
+    raises: failures are logged + surfaced via `capture_structured:
+    failed` flag + failure markdown.
+- `bot.on_end`: after the session record is written, if
+  `session_type == "capture"`, schedules the orchestrator via
+  `asyncio.create_task` and returns a "capture processing…" reply
+  immediately. The follow-up Telegram message (with `/extract` +
+  `/brief` hints) arrives once Sonnet finishes.
+- New tests: `tests/telegram/test_capture_batch_pass.py` (9 tests —
+  happy path, missing tool_use raises, schema coercion, markdown
+  rendering, idempotent writes, orchestrator happy/failure paths,
+  transcript flattener).
+
 ## Outcome
 
 _(updated on commit 7)_
@@ -97,3 +126,23 @@ _(updated on each commit)_
   was added to PTB in 21.x and is unchanged in 22.7. The fallback path
   (text dot) stays in place defensively but does not fire in the happy
   path.
+
+- **Pattern validated — `tool_choice={"type": "tool", "name": ...}`
+  for schema-enforced outputs.** The batch structuring pass uses a
+  single tool (`emit_structured_summary`) and pins `tool_choice` to it
+  so the model MUST emit a tool_use block. Avoids the "model narrates
+  instead of emitting" failure mode that plagues pure-text JSON
+  extraction. Also cheaper — no wasted tokens on preamble text.
+
+- **Pattern validated — frontmatter status as string, not bool.**
+  `capture_structured: "true" | "failed"` leaves room for future
+  states (`"partial"`, `"queued"`) without a schema migration. A bool
+  would force a second field or a breaking change. The same argument
+  applies to other multi-state flags we might add later.
+
+- **Pattern validated — `<!-- ALFRED:DYNAMIC -->` markers for
+  rewritable body blocks.** Mirrors the existing calibration-block
+  protocol. The distiller and any downstream parser can strip these
+  blocks uniformly via the marker pair. The `_insert_summary_above_transcript`
+  helper uses the markers to make writes idempotent — repeat runs
+  replace the block instead of stacking.
