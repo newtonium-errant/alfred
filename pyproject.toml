@@ -48,6 +48,9 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
+    # Outbound-push transport c2+: needed for aiohttp.test_utils fixtures
+    # (``aiohttp_client``) used in tests/test_transport_server.py.
+    "pytest-aiohttp>=1.0",
 ]
 all = ["alfred-vault[surveyor]", "alfred-vault[temporal]", "alfred-vault[voice]"]
 
