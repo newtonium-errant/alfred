@@ -66,6 +66,25 @@ class LoggingConfig:
 
 
 @dataclass
+class TtsConfig:
+    """ElevenLabs TTS config for the wk2b ``/brief`` command.
+
+    ``voice_id`` accepts either an ElevenLabs canonical voice id (e.g.
+    ``21m00Tcm4TlvDq8ikWAM`` for Rachel) or a friendly name (``"Rachel"``)
+    which the synthesiser resolves via a lookup at call time. The
+    friendly-name path is offered because ElevenLabs voice ids are
+    opaque and unmemorable; config-by-name lets users read their
+    config at a glance.
+    """
+
+    provider: str = "elevenlabs"
+    api_key: str = ""
+    model: str = "eleven_turbo_v2_5"
+    voice_id: str = "Rachel"
+    summary_word_target: int = 300
+
+
+@dataclass
 class InstanceConfig:
     """Per-instance persona identity for the talker.
 
@@ -94,6 +113,11 @@ class TalkerConfig:
     vault: VaultConfig = field(default_factory=VaultConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     instance: InstanceConfig = field(default_factory=InstanceConfig)
+    # wk2b c5: ``tts`` is optional — absent means /brief falls back to
+    # "not configured" reply, not a hard failure. ``None`` sentinel kept
+    # as a default so health.py can distinguish "section missing" from
+    # "section present with empty fields".
+    tts: TtsConfig | None = None
 
 
 # --- Recursive builder ---
@@ -105,6 +129,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "session": SessionConfig,
     "logging": LoggingConfig,
     "instance": InstanceConfig,
+    "tts": TtsConfig,
 }
 
 
@@ -143,7 +168,11 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     if "file" not in log_raw:
         log_raw["file"] = f"{log_dir}/talker.log"
 
-    return _build(TalkerConfig, {
+    # wk2b c5: the ``tts`` section is optional. If omitted we leave the
+    # field as ``None`` so health probes + /brief handler can distinguish
+    # "not configured" from "configured with empty values".
+    tts_raw = tool.get("tts")
+    built = _build(TalkerConfig, {
         "bot_token": tool.get("bot_token", ""),
         "allowed_users": tool.get("allowed_users", []) or [],
         "primary_users": tool.get("primary_users", []) or [],
@@ -154,3 +183,6 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
         "logging": log_raw,
         "instance": tool.get("instance", {}) or {},
     })
+    if isinstance(tts_raw, dict) and tts_raw:
+        built.tts = _build(TtsConfig, tts_raw)
+    return built

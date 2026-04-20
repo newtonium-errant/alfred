@@ -94,6 +94,15 @@ telegram:
     provider: "groq"
     api_key: "${GROQ_API_KEY}"
     model: "whisper-large-v3"
+  # wk2b: opt-in text-to-speech for /brief command. If this section is
+  # absent, /brief replies "not configured". Default voice is "Rachel"
+  # (ElevenLabs library default); model is Turbo v2.5 for low latency.
+  # tts:
+  #   provider: "elevenlabs"
+  #   api_key: "${ELEVENLABS_API_KEY}"
+  #   model: "eleven_turbo_v2_5"
+  #   voice_id: "Rachel"
+  #   summary_word_target: 300
   session:
     # Implicit session-end gap: 30 minutes of silence closes the session.
     gap_timeout_seconds: 1800

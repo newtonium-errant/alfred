@@ -45,6 +45,7 @@ from . import (
     session,
     session_types,
     transcribe,
+    tts as tts_mod,
 )
 from .config import TalkerConfig
 from .session import Session
@@ -110,6 +111,11 @@ def build_app(
     # emitted in the /end reply); idempotent if the session already has
     # derived_notes populated.
     app.add_handler(CommandHandler("extract", on_extract))
+    # wk2b c5: /brief <short-id> — audio summary via ElevenLabs Turbo v2.5.
+    # Compresses the structured summary to ~300 words of prose, synthesises,
+    # and sends as a Telegram voice message. Opt-in: requires telegram.tts
+    # section in config; degrades gracefully to a "not configured" reply.
+    app.add_handler(CommandHandler("brief", on_brief))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
@@ -619,6 +625,174 @@ async def on_extract(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Extracted {len(result.created_paths)} notes:\n{joined}"
     )
+
+
+async def on_brief(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/brief <short-id> — audio summary via ElevenLabs.
+
+    Flow:
+      1. Resolve short-id → session record path.
+      2. Load ``## Structured Summary`` block (or run batch pass first
+         if missing — implicit chain).
+      3. Compress to ~word_target words of prose via Sonnet.
+      4. Synthesize via ElevenLabs Turbo v2.5.
+      5. Send as Telegram voice message (or document for >50 MB audio).
+
+    Graceful degradation:
+      * tts section absent → "not configured" text reply
+      * ElevenLabs API down → fall back to text summary
+      * Audio >50 MB → send as document instead of voice
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
+    client: Any = ctx.application.bot_data[_KEY_CLIENT]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+
+    short_id = _parse_short_id_arg(update.message.text or "", ctx.args)
+    if not short_id:
+        await update.message.reply_text(
+            "usage: /brief <short-id>  (the 8-char id from the /end reply)"
+        )
+        return
+
+    if config.tts is None:
+        await update.message.reply_text(
+            "TTS is not configured. Add telegram.tts to config.yaml to "
+            "enable /brief."
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    log.info(
+        "talker.brief.invoked",
+        chat_id=chat_id,
+        short_id=short_id,
+    )
+
+    from pathlib import Path as _Path
+    model = config.anthropic.model or "claude-sonnet-4-6"
+    vault_path = _Path(config.vault.path)
+
+    # Resolve short-id → session record path.
+    session_rel = capture_extract._find_session_by_short_id(state_mgr, short_id)
+    if session_rel is None:
+        await update.message.reply_text(
+            f"No session found for short-id {short_id!r}. Is it closed?"
+        )
+        return
+
+    post = capture_extract._load_session_record(vault_path, session_rel)
+    if post is None:
+        await update.message.reply_text(
+            f"Session record missing for short-id {short_id!r}."
+        )
+        return
+
+    summary_block = capture_extract._extract_summary_from_post(post)
+    if not summary_block:
+        # Implicit chain — try to structure first.
+        try:
+            transcript = capture_extract._synthetic_transcript_from_body(
+                post.content
+            )
+            summary = await capture_batch.run_batch_structuring(
+                client, transcript, model,
+            )
+            summary_block = capture_batch.render_summary_markdown(summary)
+            await capture_batch.write_summary_to_session_record(
+                vault_path, session_rel, summary_block, "true",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "talker.brief.implicit_structure_failed",
+                short_id=short_id,
+                error=str(exc),
+            )
+            await update.message.reply_text(
+                f"Couldn't structure this session for a brief ({exc})."
+            )
+            return
+
+    # Compress to spoken prose.
+    try:
+        prose = await tts_mod.compress_summary_for_tts(
+            client=client,
+            summary_markdown=summary_block,
+            model=model,
+            word_target=config.tts.summary_word_target,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.brief.compress_failed", short_id=short_id, error=str(exc),
+        )
+        await update.message.reply_text(
+            f"Couldn't compress summary for brief ({exc})."
+        )
+        return
+
+    if not prose:
+        await update.message.reply_text(
+            "Compressed summary came back empty — try /extract instead?"
+        )
+        return
+
+    # Synthesize.
+    try:
+        audio = await tts_mod.synthesize(prose, config.tts)
+    except tts_mod.TtsNotConfigured:
+        await update.message.reply_text(
+            "TTS is not configured. Add telegram.tts.api_key to config.yaml."
+        )
+        return
+    except tts_mod.TtsError as exc:
+        # API down — fall back to the prose as a text reply so the user
+        # still gets content.
+        log.warning(
+            "talker.brief.tts_failed", short_id=short_id, error=str(exc),
+        )
+        await update.message.reply_text(
+            "Audio synthesis failed — here's the text summary:\n\n" + prose
+        )
+        return
+
+    # Per-session cost log line — approximate cost per 1k chars for
+    # Turbo v2.5 is ~$0.30 / 1M chars. Rendered in structlog output and
+    # grep-able as ``tts.cost_estimate``.
+    log.info(
+        "talker.brief.cost_estimate",
+        short_id=short_id,
+        chars=len(prose),
+        # $0.30 per 1M chars for Turbo v2.5 PAYG (approximate).
+        dollars_estimate=round(len(prose) * 0.30 / 1_000_000, 4),
+    )
+
+    try:
+        send_result = await tts_mod.send_voice_to_telegram(
+            bot=ctx.bot,
+            chat_id=chat_id,
+            audio_bytes=audio,
+            caption=f"brief for {short_id}",
+            filename=f"brief-{short_id}.mp3",
+        )
+        log.info(
+            "talker.brief.sent",
+            short_id=short_id,
+            mode=send_result.mode,
+            size_bytes=send_result.size_bytes,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.brief.send_failed",
+            short_id=short_id,
+            error=str(exc),
+        )
+        await update.message.reply_text(
+            "Synthesised audio but couldn't upload — here's the text:\n\n"
+            + prose
+        )
 
 
 # Inline ``/extract abc123`` detection. PTB's CommandHandler fires when
@@ -1235,10 +1409,5 @@ _INLINE_HANDLERS.update({
     "sonnet": on_sonnet,
     "no_auto_escalate": on_no_auto_escalate,
     "extract": on_extract,
-    # ``brief`` is registered here but its handler lives in commit 5.
-    # Adding the key now keeps the inline-dispatch surface in sync
-    # with ``_INLINE_COMMANDS`` above — the handler check in
-    # ``_dispatch_inline_command`` returns False if the key isn't in
-    # this map, so an early-firing ``/brief`` before commit 5 lands is
-    # routed to the LLM as prose (graceful).
+    "brief": on_brief,
 })

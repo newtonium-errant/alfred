@@ -32,6 +32,11 @@ surveyor = [
 voice = [
     "python-telegram-bot>=21.0",
     "anthropic>=0.40",
+    # wk2b c5: ElevenLabs TTS for the /brief audio summary command.
+    # The implementation uses httpx directly (no SDK import-time dep in
+    # src/), but pinning the official SDK here installs it for users who
+    # want to swap to SDK-based calls later without another pip install.
+    "elevenlabs>=1.0",
 ]
 dev = [
     "pytest>=8.0",

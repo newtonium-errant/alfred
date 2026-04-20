@@ -137,6 +137,52 @@ update to this session note in one bundle per
   structuring chain, inline detect, short-id parse, inline
   dispatch end-to-end).
 
+### Commit 5 — ElevenLabs TTS + `/brief` command
+
+- `pyproject.toml`: added `elevenlabs>=1.0` to `[voice]` extras. The
+  in-tree implementation uses httpx directly (no SDK import), but
+  pinning the SDK makes it available for future SDK-based swaps
+  without another pip install.
+- `src/alfred/telegram/config.py`: new `TtsConfig` dataclass
+  (provider, api_key, model=`eleven_turbo_v2_5`, voice_id=`Rachel`,
+  summary_word_target=300). `TalkerConfig.tts` defaults to `None`
+  so the /brief handler can distinguish "not configured" from
+  "configured with empty values". Section is optional in
+  `load_from_unified`.
+- New module `src/alfred/telegram/tts.py`:
+  - `resolve_voice_id()` — friendly-name → canonical id (Rachel →
+    `21m00Tcm4TlvDq8ikWAM`). Case-insensitive. Unknown names
+    pass through as raw ids.
+  - `synthesize()` — POSTs to
+    `https://api.elevenlabs.io/v1/text-to-speech/{voice_id}` via
+    httpx with `xi-api-key` header. Raises `TtsError` on non-200
+    or network failure, `TtsNotConfigured` on empty key.
+  - `send_voice_to_telegram()` — PTB `send_voice` under 50 MB,
+    `send_document` fallback above.
+  - `compress_summary_for_tts()` — Sonnet call rendering the
+    structured summary block as ~300 words of spoken prose.
+- `on_brief` handler in `bot.py`:
+  - Registered as `/brief` CommandHandler + inline handler.
+  - Usage reply on missing short-id; "not configured" reply on
+    absent tts section.
+  - Implicit chain: if session record has no summary block, runs
+    the batch pass before compressing.
+  - Failure modes: TTS API down → text fallback reply with the
+    compressed prose; upload failure → text fallback; send_voice
+    >50 MB → auto-falls-back to send_document via the tts.py
+    helper.
+  - Per-session cost log line (`talker.brief.cost_estimate`) with
+    approximate `$0.30/1M chars` Turbo v2.5 PAYG rate.
+- `config.yaml.example`: new commented-out `telegram.tts` block
+  with defaults.
+- `.env.example`: new `ELEVENLABS_API_KEY` placeholder.
+- New tests:
+  - `tests/telegram/test_tts_brief.py` (14 tests — happy path,
+    voice mapping, httpx mocking, compress, send_voice under/over
+    cap, config shape).
+  - `tests/telegram/test_tts_failure.py` (4 tests — not configured,
+    API down fallback, missing session, implicit batch pass).
+
 ## Outcome
 
 _(updated on commit 7)_
@@ -204,3 +250,29 @@ _(updated on each commit)_
   trailing arg. New `_INLINE_CMD_WITH_ARG_RE` is checked before the
   no-arg form so commands that take an argument (extract, brief)
   route correctly.
+
+- **Pattern validated — httpx direct for third-party REST, SDK in
+  extras only.** ElevenLabs ships a Python SDK but it pulls
+  `pydantic`, `websockets`, and `requests` as transitive deps.
+  Using httpx directly (our existing dep) keeps import graphs
+  clean and cuts the surface that needs mocking. SDK is still
+  listed in `[voice]` extras so users who want to swap to SDK-based
+  calls later can do so without reinstalling.
+
+- **Pattern validated — `TtsConfig | None` on the parent dataclass
+  for optional sections.** When a config section is OPTIONAL (the
+  feature degrades gracefully when absent), make the field
+  `None`-defaulting on the parent rather than stubbing an empty
+  dataclass. That way `config.tts is None` cleanly distinguishes
+  "user didn't configure this" from "user configured with empty
+  fields". `load_from_unified` only builds the dataclass when the
+  section is present in the raw dict.
+
+- **Gotcha confirmed — PTB `ctx.args` shape differs between
+  CommandHandler and inline dispatch.** When PTB routes a message
+  to a CommandHandler, `ctx.args` is a populated list of space-
+  separated tokens. When the inline-dispatch path re-invokes the
+  same handler, `ctx.args` is whatever the caller set (usually
+  `None` or a `MagicMock`). `_parse_short_id_arg` defensively
+  checks `isinstance(args, list)` and falls back to regex-parsing
+  the raw message text.
