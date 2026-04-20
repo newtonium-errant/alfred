@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from alfred.common.schedule import compute_next_fire
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
 from alfred.vault.ops import is_ignored_path
 
@@ -469,39 +470,55 @@ async def run_watch(
 ) -> None:
     """Daemon mode — extract on interval until interrupted."""
     interval = config.extraction.interval_seconds
-    deep_interval_hours = config.extraction.deep_interval_hours
+    deep_schedule = config.extraction.deep_extraction_schedule
 
     # Persist last deep extraction time across restarts. Without this,
     # every daemon restart reset last_deep to epoch and re-triggered a
-    # full deep extraction on boot. Ports upstream e510cbe.
+    # full deep extraction on boot. On first boot we seed last_deep =
+    # now so the first fire lands at the next scheduled window
+    # (03:30 Halifax by default) rather than immediately.
+    now_utc_init = datetime.now(timezone.utc)
     if state.last_deep_extraction:
         try:
             last_deep = datetime.fromisoformat(state.last_deep_extraction)
         except (ValueError, TypeError):
-            last_deep = datetime.min.replace(tzinfo=timezone.utc)
+            last_deep = now_utc_init
     else:
-        last_deep = datetime.min.replace(tzinfo=timezone.utc)
+        last_deep = now_utc_init
     last_consolidation = datetime.min.replace(tzinfo=timezone.utc)
     consolidation_interval_hours = config.extraction.consolidation_interval_hours
 
     log.info(
         "daemon.starting",
         interval=interval,
-        deep_interval_hours=deep_interval_hours,
+        deep_extraction_time=deep_schedule.time,
+        deep_extraction_tz=deep_schedule.timezone,
+        deep_extraction_day_of_week=deep_schedule.day_of_week,
         consolidation_interval_hours=consolidation_interval_hours,
     )
 
     while True:
         now = datetime.now(timezone.utc)
-        hours_since_deep = (now - last_deep).total_seconds() / 3600
+
+        # Clock-aligned deep extraction gate. ``compute_next_fire``
+        # returns the next scheduled fire strictly after ``last_deep``,
+        # so a restart inside the same window won't re-fire.
+        next_deep_fire = compute_next_fire(deep_schedule, last_deep)
+        deep_due = now >= next_deep_fire
 
         try:
-            if hours_since_deep >= deep_interval_hours:
+            if deep_due:
                 log.info("daemon.deep_extraction")
                 await run_extraction(config, state, skills_dir)
                 last_deep = now
                 state.last_deep_extraction = now.isoformat()
                 state.save()
+                log.info(
+                    "daemon.deep_extraction_next",
+                    next_fire=compute_next_fire(
+                        deep_schedule, last_deep,
+                    ).isoformat(),
+                )
             else:
                 # Light pass — just scan, no agent invocation
                 log.info("daemon.light_scan")

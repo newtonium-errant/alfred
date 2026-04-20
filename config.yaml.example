@@ -60,7 +60,13 @@ janitor:
 distiller:
   extraction:
     interval_seconds: 3600
-    deep_interval_hours: 24
+    # Deep extraction is LLM-heavy — runs overnight so it doesn't
+    # collide with the user's working hours. 03:30 America/Halifax
+    # daily by default, staggered ~1h after the janitor deep sweep.
+    # Omit the block entirely to fall back to deep_interval_hours.
+    deep_extraction_schedule:
+      time: "03:30"
+      timezone: "America/Halifax"
     candidate_threshold: 0.3
     max_sources_per_batch: 20
     source_types: ["conversation", "session", "note", "task", "project"]

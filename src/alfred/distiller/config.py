@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from alfred.common.schedule import ScheduleConfig
+
 ENV_RE = re.compile(r"\$\{(\w+)\}")
 
 
@@ -81,7 +83,19 @@ class AgentConfig:
 @dataclass
 class ExtractionConfig:
     interval_seconds: int = 86400
+    # Deprecated fallback — preserved so old config.yaml files still
+    # load, but ``deep_extraction_schedule`` is the canonical gate for
+    # the LLM-heavy deep extraction pass. See c4 in the scheduling
+    # consolidation arc. Value is ignored when the schedule is set.
     deep_interval_hours: int = 168
+    # Clock-aligned deep extraction. Default 03:30 Halifax daily so
+    # the LLM-heavy deep pass lands overnight, ~1h after the janitor
+    # deep sweep completes. Daily-only (day_of_week=None).
+    deep_extraction_schedule: ScheduleConfig = field(
+        default_factory=lambda: ScheduleConfig(
+            time="03:30", timezone="America/Halifax",
+        )
+    )
     candidate_threshold: float = 0.6
     max_sources_per_batch: int = 20
     source_types: list[str] = field(default_factory=lambda: [
@@ -90,6 +104,8 @@ class ExtractionConfig:
     learn_types: list[str] = field(default_factory=lambda: [
         "assumption", "decision", "constraint", "contradiction", "synthesis",
     ])
+    # Deprecated fallback for the weekly consolidation pass, replaced
+    # by ``consolidation_schedule`` in c5. Kept for backward-compat.
     consolidation_interval_hours: int = 168  # 7 days
 
 
@@ -123,6 +139,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "zo": ZoBackendConfig,
     "openclaw": OpenClawBackendConfig,
     "extraction": ExtractionConfig,
+    "deep_extraction_schedule": ScheduleConfig,
     "state": StateConfig,
     "logging": LoggingConfig,
 }
