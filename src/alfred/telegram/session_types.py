@@ -100,6 +100,22 @@ _DEFAULTS_TABLE: Final[dict[str, SessionTypeDefaults]] = {
         supports_continuation=True,
         pushback_level=4,
     ),
+    # wk2b capture: silent, append-only brainstorm-capture mode. The
+    # conversational turn is suppressed (no LLM call, no assistant reply)
+    # — the session accumulates a raw transcript until /end, at which
+    # point a single batch structuring pass produces a ``## Structured
+    # Summary`` section inside the session record. ``pushback_level=0``
+    # mirrors "task" mode (never challenge mid-session), but the more
+    # load-bearing signal for capture is the dedicated session-type
+    # string itself — ``run_turn`` dispatches on the type name, not the
+    # pushback level, so capture stays distinct from ``task`` even
+    # though they share a level-0 default.
+    "capture": SessionTypeDefaults(
+        session_type="capture",
+        model=_SONNET,
+        supports_continuation=False,
+        pushback_level=0,
+    ),
 }
 
 

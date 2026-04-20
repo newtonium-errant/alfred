@@ -91,6 +91,10 @@ act, not converse.
 "work on the draft").
 - brainstorm: divergent idea generation ("brainstorm names for X", \
 "ideas for Y").
+- capture: silent brainstorm-capture ("let me brainstorm", "thinking \
+out loud", "I want to ramble", "just let me talk for a while"). The \
+user wants to dump thoughts without interruption; the assistant stays \
+silent mid-session and a structured summary is produced at /end.
 
 Continuation: if the user says "continue the last journal", "pick up the \
 article we were writing", "same brainstorm as yesterday", etc., AND the \
@@ -104,10 +108,33 @@ Opening message:
 {opening}
 
 Respond with ONLY a JSON object, no prose, no markdown fences:
-{{"session_type": "<one of: note, task, journal, article, brainstorm>",
+{{"session_type": "<one of: note, task, journal, article, brainstorm, capture>",
   "continues_from": "<record_path or null>",
   "reasoning": "<one short sentence>"}}
 """
+
+
+# --- Deterministic prefix detection ---------------------------------------
+
+# The ``capture:`` prefix forces capture-session dispatch without an LLM
+# call. Matched case-insensitively against the leading token of the
+# opening message. The prefix is load-bearing: if the user explicitly
+# signals "this is a capture session" we should never round-trip to a
+# classifier and risk a mis-route on a borderline phrasing.
+_CAPTURE_PREFIX: str = "capture:"
+
+
+def _detect_capture_prefix(message: str) -> bool:
+    """Return True iff ``message`` starts with a ``capture:`` prefix.
+
+    Case-insensitive, leading-whitespace-tolerant. Deliberately narrow —
+    we check only the leading literal ``capture:`` token, not "let's
+    capture" or "capturing thoughts now" — those borderline cases are
+    the LLM classifier's job.
+    """
+    if not message:
+        return False
+    return message.lstrip().lower().startswith(_CAPTURE_PREFIX)
 
 
 # --- Helpers --------------------------------------------------------------
@@ -254,6 +281,26 @@ async def classify_opening_cue(
     """
     if not first_message:
         return _fallback_decision("empty_message")
+
+    # Deterministic capture-prefix short-circuit. Runs BEFORE the LLM
+    # call: an explicit ``capture:`` prefix is a user-asserted
+    # classification and we must never round-trip it to the classifier.
+    # Continuation is disabled for capture (``supports_continuation=False``
+    # on the session-type defaults), so ``continues_from`` is always None
+    # for this branch.
+    if _detect_capture_prefix(first_message):
+        capture_defaults = defaults_for("capture")
+        log.info(
+            "talker.router.capture_prefix",
+            session_type="capture",
+            model=capture_defaults.model,
+        )
+        return RouterDecision(
+            session_type=capture_defaults.session_type,
+            model=capture_defaults.model,
+            continues_from=None,
+            reasoning="capture: prefix (deterministic)",
+        )
 
     prompt = _ROUTER_PROMPT.format(
         recent_summary=_format_recent_summary(recent_sessions),
