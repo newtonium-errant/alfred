@@ -199,6 +199,74 @@ async def run(
         vault_context_str=vault_context_str,
     )
 
+    # ---- Outbound-push transport --------------------------------------
+    # The transport server runs as a sibling asyncio task inside the
+    # talker daemon so it shares the event loop and can invoke the
+    # Telegram bot directly (no IPC hop). The scheduler is another
+    # sibling task that fires task/ remind_at reminders and drains the
+    # server's pending queue.
+    transport_app = None
+    transport_state = None
+    transport_config = None
+    send_lock_map: dict[int, asyncio.Lock] = {}
+    try:
+        from alfred.transport.config import load_from_unified as load_transport
+        from alfred.transport.server import build_app as build_transport_app
+        from alfred.transport.state import TransportState
+        from alfred.transport import scheduler as transport_scheduler
+        from alfred.transport import server as transport_server_mod
+
+        transport_config = load_transport(raw)
+        transport_state = TransportState.create(transport_config.state.path)
+        transport_state.load()
+
+        async def _send_via_telegram(
+            user_id: int, text: str, dedupe_key: str | None = None,
+        ) -> list[int]:
+            """Dispatch one Telegram message, enforcing a 250ms per-chat floor.
+
+            Telegram rate-limits per-chat at ~1 msg/sec. We enforce a
+            250ms floor under an asyncio.Lock keyed by chat_id so
+            bursts (batch sends, scheduler drains) don't trip 429.
+            """
+            lock = send_lock_map.setdefault(user_id, asyncio.Lock())
+            async with lock:
+                try:
+                    msg = await app.bot.send_message(
+                        chat_id=user_id, text=text,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # 429 / retry_after surfaces as a TelegramError.
+                    log.warning(
+                        "talker.daemon.telegram_send_failed",
+                        user_id=user_id,
+                        error=str(exc),
+                        response_summary=(
+                            f"{exc.__class__.__name__}: {exc}"
+                        ),
+                    )
+                    raise
+                # 250ms inter-message floor per chat.
+                await asyncio.sleep(0.25)
+                return [msg.message_id]
+
+        transport_app = build_transport_app(
+            transport_config,
+            transport_state,
+            send_fn=_send_via_telegram,
+        )
+        log.info(
+            "talker.daemon.transport_configured",
+            host=transport_config.server.host,
+            port=transport_config.server.port,
+            peers=list(transport_config.auth.tokens.keys()),
+        )
+    except Exception:  # noqa: BLE001
+        # Missing transport config is non-fatal — the talker still
+        # handles Telegram chat even without the outbound push server.
+        log.exception("talker.daemon.transport_setup_failed")
+        transport_app = None
+
     # ---- Shutdown coordination -------------------------------------------
     # The event ties three things together: SIGTERM, the sweeper loop, and
     # the long-poll runner. Whichever fires first wins; the others observe
@@ -248,6 +316,42 @@ async def run(
                 log.exception("talker.daemon.sweep_error")
 
     sweeper_task = asyncio.create_task(_sweeper(), name="talker-sweeper")
+
+    # ---- Transport server + scheduler tasks ------------------------------
+    transport_server_task: asyncio.Task | None = None
+    scheduler_task: asyncio.Task | None = None
+    if transport_app is not None and transport_config is not None:
+        from alfred.transport.server import run_server as run_transport_server
+        from alfred.transport.scheduler import run as run_scheduler
+
+        transport_server_task = asyncio.create_task(
+            run_transport_server(
+                transport_app,
+                transport_config,
+                shutdown_event=shutdown_event,
+            ),
+            name="transport-server",
+        )
+        scheduler_user_id = (
+            config.allowed_users[0] if config.allowed_users else 0
+        )
+        if scheduler_user_id:
+            scheduler_task = asyncio.create_task(
+                run_scheduler(
+                    transport_config,
+                    transport_state,
+                    _send_via_telegram,
+                    Path(config.vault.path),
+                    scheduler_user_id,
+                    shutdown_event=shutdown_event,
+                ),
+                name="transport-scheduler",
+            )
+        else:
+            log.warning(
+                "talker.daemon.scheduler_no_user",
+                detail="allowed_users empty — scheduler not started",
+            )
 
     # ---- PTB lifecycle ---------------------------------------------------
     # Manual initialize/start/start_polling to coexist with our own loop.
@@ -301,6 +405,16 @@ async def run(
             await sweeper_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
+
+        # Stop the transport server + scheduler if they were started.
+        for t in (transport_server_task, scheduler_task):
+            if t is None:
+                continue
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
         # Close any still-open sessions so the record lands before exit.
         try:

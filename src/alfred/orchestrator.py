@@ -109,6 +109,41 @@ def _run_instructor(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool 
 _MISSING_DEPS_EXIT = 78  # exit code signaling missing optional dependencies
 
 
+def _inject_transport_env_vars(raw: dict[str, Any]) -> None:
+    """Set ``ALFRED_TRANSPORT_{HOST,PORT,TOKEN}`` in the current process env.
+
+    Child processes inherit the current environment (``fork`` +
+    ``multiprocessing.Process``), so setting these here means every
+    tool's subprocess sees the values. Matches the ``MAIL_WEBHOOK_TOKEN``
+    injection pattern — once injected, `alfred.transport.client`
+    picks them up via ``os.environ.get()``.
+
+    Values are read from the substituted config dict. Env vars
+    already set (e.g. from ``.env``) are preserved so a manual
+    override still wins.
+    """
+    transport = raw.get("transport", {}) or {}
+
+    server = transport.get("server", {}) or {}
+    host = str(server.get("host", "") or "")
+    port = server.get("port")
+    if host and "ALFRED_TRANSPORT_HOST" not in os.environ:
+        os.environ["ALFRED_TRANSPORT_HOST"] = host
+    if port and "ALFRED_TRANSPORT_PORT" not in os.environ:
+        os.environ["ALFRED_TRANSPORT_PORT"] = str(port)
+
+    # Token — pull from auth.tokens.local.token, the v1 entry.
+    auth = transport.get("auth", {}) or {}
+    tokens = auth.get("tokens", {}) or {}
+    local = tokens.get("local", {}) or {}
+    token = str(local.get("token", "") or "")
+    # Don't set if it's the unresolved ${VAR} placeholder — that
+    # would leak a literal placeholder into child env and confuse the
+    # client's "missing token" check.
+    if token and not token.startswith("${") and "ALFRED_TRANSPORT_TOKEN" not in os.environ:
+        os.environ["ALFRED_TRANSPORT_TOKEN"] = token
+
+
 def _run_surveyor(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Surveyor daemon process entry point."""
     log_cfg = raw.get("logging", {})
@@ -358,6 +393,11 @@ def run_all(
 
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
+
+    # Resolve transport env vars once — orchestrator injects these
+    # into every tool's child environment so any subprocess can call
+    # the outbound-push client without looking at config.yaml again.
+    _inject_transport_env_vars(raw)
 
     def start_process(tool: str) -> multiprocessing.Process:
         runner = TOOL_RUNNERS[tool]

@@ -348,6 +348,41 @@ def cmd_instructor(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_transport(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred transport`` subcommands."""
+    raw = _load_unified_config(args.config)
+    # Transport CLI may emit JSON; suppress stdout logging so the
+    # JSON contract stays clean.
+    wants_json = bool(getattr(args, "json", False))
+    _setup_logging_from_config(
+        raw, tool="transport", suppress_stdout=wants_json,
+    )
+
+    from alfred.transport import cli as tcli
+    subcmd = getattr(args, "transport_cmd", None)
+
+    if subcmd == "status":
+        sys.exit(tcli.cmd_status(raw, wants_json=wants_json))
+    if subcmd == "send-test":
+        sys.exit(tcli.cmd_send_test(
+            raw, user_id=args.user_id, text=args.text, wants_json=wants_json,
+        ))
+    if subcmd == "queue":
+        sys.exit(tcli.cmd_queue(raw, wants_json=wants_json))
+    if subcmd == "dead-letter":
+        sys.exit(tcli.cmd_dead_letter(
+            raw,
+            action=args.action,
+            entry_id=getattr(args, "entry_id", None),
+            wants_json=wants_json,
+        ))
+    if subcmd == "rotate":
+        sys.exit(tcli.cmd_rotate(raw))
+
+    print("Usage: alfred transport {status|send-test|queue|dead-letter|rotate}")
+    sys.exit(1)
+
+
 def cmd_vault(args: argparse.Namespace) -> None:
     # Route logs to a dedicated file sink. The vault CLI emits JSON on stdout
     # that calling agents parse, so logging MUST NOT leak to stdout.
@@ -966,6 +1001,10 @@ def build_parser() -> argparse.ArgumentParser:
     inst_sub.add_parser("run", help="Run the poll loop in foreground until Ctrl-C")
     inst_sub.add_parser("status", help="Show tracked files, pending retries, last run")
 
+    # transport
+    from alfred.transport.cli import build_subparser as build_transport_subparser
+    build_transport_subparser(sub)
+
     # vault
     from alfred.vault.cli import build_vault_parser
     build_vault_parser(sub)
@@ -1117,6 +1156,7 @@ def main() -> None:
         "janitor": cmd_janitor,
         "distiller": cmd_distiller,
         "instructor": cmd_instructor,
+        "transport": cmd_transport,
         "vault": cmd_vault,
         "exec": cmd_exec,
         "ingest": cmd_ingest,
