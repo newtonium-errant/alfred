@@ -392,6 +392,116 @@ def test_instructor_state_load_tolerates_corrupt_file(state_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Transport
+# ---------------------------------------------------------------------------
+
+def test_transport_state_roundtrip(state_path: Path) -> None:
+    """Transport state tracks pending scheduled sends + send log + dead letter."""
+    from alfred.transport.state import TransportState
+
+    state = TransportState.create(state_path)
+    state.enqueue({
+        "id": "evt-001",
+        "user_id": 123,
+        "text": "Reminder: call Dr Bailey",
+        "scheduled_at": "2026-04-21T12:00:00+00:00",
+        "dedupe_key": "reminder-task/call.md-20260421T1200",
+    })
+    state.record_send({
+        "id": "snd-001",
+        "user_id": 123,
+        "dedupe_key": "brief-2026-04-19",
+        "sent_at": "2026-04-19T10:00:00+00:00",
+        "telegram_message_ids": [42, 43],
+    })
+    state.append_dead_letter(
+        {
+            "id": "evt-stale",
+            "user_id": 123,
+            "text": "Stale reminder",
+            "scheduled_at": "2026-04-01T00:00:00+00:00",
+        },
+        reason="stale_reminder_window_exceeded",
+    )
+
+    state.save()
+    assert state_path.exists()
+    # .tmp file should NOT linger — atomic-rename contract
+    assert not state_path.with_suffix(".tmp").exists()
+
+    reloaded = TransportState.create(state_path)
+    reloaded.load()
+
+    assert reloaded.version == 1
+    assert len(reloaded.pending_queue) == 1
+    assert reloaded.pending_queue[0]["id"] == "evt-001"
+    assert len(reloaded.send_log) == 1
+    assert reloaded.send_log[0]["dedupe_key"] == "brief-2026-04-19"
+    assert len(reloaded.dead_letter) == 1
+    dl = reloaded.dead_letter[0]
+    assert dl["dead_letter_reason"] == "stale_reminder_window_exceeded"
+    assert "dead_lettered_at" in dl
+
+
+def test_transport_state_pop_due_splits_by_schedule(state_path: Path) -> None:
+    """``pop_due`` returns entries whose scheduled_at <= now; leaves others."""
+    from datetime import datetime, timezone
+
+    from alfred.transport.state import TransportState
+
+    state = TransportState.create(state_path)
+    state.enqueue({"id": "past", "scheduled_at": "2026-04-01T00:00:00+00:00"})
+    state.enqueue({"id": "future", "scheduled_at": "2099-01-01T00:00:00+00:00"})
+    state.enqueue({"id": "now-no-schedule"})  # no scheduled_at → send now
+
+    now = datetime(2026, 4, 20, 12, 0, tzinfo=timezone.utc)
+    due = state.pop_due(now)
+    due_ids = sorted(e["id"] for e in due)
+    assert due_ids == ["now-no-schedule", "past"]
+    # The future entry survives.
+    assert len(state.pending_queue) == 1
+    assert state.pending_queue[0]["id"] == "future"
+
+
+def test_transport_state_dedupe_window(state_path: Path) -> None:
+    """``find_recent_send`` honours the 24h window + empty-key short-circuit."""
+    from datetime import datetime, timedelta, timezone
+
+    from alfred.transport.state import TransportState
+
+    state = TransportState.create(state_path)
+    recent = datetime(2026, 4, 20, 10, 0, tzinfo=timezone.utc)
+    state.record_send({
+        "dedupe_key": "brief-2026-04-20",
+        "sent_at": recent.isoformat(),
+    })
+
+    # Within window
+    match = state.find_recent_send("brief-2026-04-20", now=recent + timedelta(hours=1))
+    assert match is not None
+    # Outside window
+    miss = state.find_recent_send("brief-2026-04-20", now=recent + timedelta(hours=25))
+    assert miss is None
+    # Empty key
+    assert state.find_recent_send("", now=recent) is None
+    # Unknown key
+    assert state.find_recent_send("never-seen", now=recent) is None
+
+
+def test_transport_state_tolerates_corrupt_file(state_path: Path) -> None:
+    """A malformed state file must not crash on load — empty state substitutes."""
+    state_path.write_text("{ this is not json", encoding="utf-8")
+
+    from alfred.transport.state import TransportState
+
+    state = TransportState.create(state_path)
+    state.load()
+    assert state.pending_queue == []
+    assert state.send_log == []
+    assert state.dead_letter == []
+
+
+# ---------------------------------------------------------------------------
 # Mail
 # ---------------------------------------------------------------------------
 

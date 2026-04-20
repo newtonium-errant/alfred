@@ -77,6 +77,42 @@ instructor:
   state:
     path: "./data/instructor_state.json"
 
+# Outbound-push transport — HTTP server hosted inside the talker daemon
+# that other tools POST to when they need to deliver a message to the
+# user via Telegram. First consumers: ``remind_at`` reminders on tasks
+# (scheduler client) + brief auto-push. See
+# ``src/alfred/transport/__init__.py`` and the ratified plan in
+# ``memory/project_outbound_transport.md``.
+#
+# Stage 3.5 extension: this same server hosts ``/peer/*`` and
+# ``/canonical/*`` routes for cross-instance messaging — today those
+# return 501 ``peer_not_implemented``. The ``auth.tokens`` dict is
+# keyed by peer name for the same reason (Stage 3.5 adds ``kal-le`` /
+# ``stay-c`` entries alongside ``local``).
+#
+# Generate a token with: python -c 'import secrets; print(secrets.token_hex(32))'
+# Or run: alfred transport rotate
+transport:
+  server:
+    host: "127.0.0.1"
+    port: 8891
+  scheduler:
+    poll_interval_seconds: 30
+    stale_reminder_max_minutes: 180
+  auth:
+    tokens:
+      local:
+        token: "${ALFRED_TRANSPORT_TOKEN}"
+        allowed_clients:
+          - scheduler
+          - brief
+          - janitor
+          - curator
+          - talker
+  state:
+    path: "./data/transport_state.json"
+    dead_letter_max_age_days: 30
+
 telegram:
   # Telegram bot token from @BotFather
   bot_token: "${TELEGRAM_BOT_TOKEN}"

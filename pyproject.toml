@@ -37,6 +37,12 @@ voice = [
     # src/), but pinning the official SDK here installs it for users who
     # want to swap to SDK-based calls later without another pip install.
     "elevenlabs>=1.0",
+    # Outbound-push transport (c1+): async HTTP server hosted inside the
+    # talker daemon, delivering messages from scheduler / brief / other
+    # tools via Telegram. aiohttp is lighter than FastAPI and shares
+    # the talker's event loop cleanly. Pulled in under ``voice`` because
+    # the server only runs when the talker is active.
+    "aiohttp>=3.10",
 ]
 dev = [
     "pytest>=8.0",
