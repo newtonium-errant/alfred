@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,16 @@ class PipelineState:
         self.files: dict[str, FileState] = {}
         self.clusters: dict[str, ClusterState] = {}
         self.pending_writes: dict[str, str] = {}  # rel_path -> expected_md5
+        # Guards the mark_pending_write → rename → update_file critical
+        # section in VaultWriter._write_atomic, and the symmetric read in
+        # compute_diff. Without it, a reader (save() serializing state, or a
+        # future watcher-side filter that consults pending_writes directly)
+        # can observe the dict between the mark and the rename and either
+        # miss the "this write is mine" signal or snapshot a half-updated
+        # view. Race window is microseconds and unobserved in the wild, but
+        # closing it is cheap and future-proofs the contract so the watcher
+        # can safely be made to consult pending_writes on event dispatch.
+        self.pending_write_lock = threading.Lock()
 
     def load(self) -> None:
         """Load state from disk if it exists."""
@@ -103,26 +114,35 @@ class PipelineState:
 
         Skips files in pending_writes whose hash matches the expected value
         (those are our own recent writes).
+
+        Acquires ``pending_write_lock`` to serialize against the writer's
+        ``mark_pending_write`` → rename critical section. Without the lock,
+        a concurrent writer can rename a file and mark its hash as pending
+        in either order relative to this read, so a reader could either
+        see the rename's hash with no pending_writes entry (false "changed"
+        diff) or see the pending entry with the pre-rename hash still on
+        disk (wasted diff-is-empty path).
         """
         diff = Diff()
 
-        # Check for new and changed
-        for rel, md5 in current_hashes.items():
-            # Skip our own writes
-            if rel in self.pending_writes and self.pending_writes[rel] == md5:
-                # Clear the pending write since it's been confirmed
-                del self.pending_writes[rel]
-                continue
+        with self.pending_write_lock:
+            # Check for new and changed
+            for rel, md5 in current_hashes.items():
+                # Skip our own writes
+                if rel in self.pending_writes and self.pending_writes[rel] == md5:
+                    # Clear the pending write since it's been confirmed
+                    del self.pending_writes[rel]
+                    continue
 
-            if rel not in self.files:
-                diff.new.append(rel)
-            elif self.files[rel].md5 != md5:
-                diff.changed.append(rel)
+                if rel not in self.files:
+                    diff.new.append(rel)
+                elif self.files[rel].md5 != md5:
+                    diff.changed.append(rel)
 
-        # Check for deleted
-        for rel in self.files:
-            if rel not in current_hashes:
-                diff.deleted.append(rel)
+            # Check for deleted
+            for rel in self.files:
+                if rel not in current_hashes:
+                    diff.deleted.append(rel)
 
         return diff
 

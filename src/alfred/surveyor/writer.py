@@ -171,24 +171,30 @@ class VaultWriter:
         content_bytes = content.encode("utf-8")
         expected_md5 = compute_md5_bytes(content_bytes)
 
-        # Mark pending write BEFORE writing so the watcher ignores it
-        self.state.mark_pending_write(rel_path, expected_md5)
-
-        # Atomic write: .tmp → rename
+        # Atomic write: .tmp → rename, bracketed by mark_pending_write and
+        # update_file under pending_write_lock. The lock makes the tuple
+        # (mark, rename, update) atomic from the perspective of compute_diff
+        # and any future watcher-thread filter that consults pending_writes
+        # directly. Without it, a reader could observe the post-rename md5
+        # on disk before mark_pending_write committed, miss the "mine"
+        # signal, and classify our own write as external — re-triggering
+        # the embed → cluster → label → write cycle.
         tmp_path = full_path.with_suffix(".md.tmp")
-        try:
-            tmp_path.write_bytes(content_bytes)
-            os.replace(tmp_path, full_path)
-        except OSError as e:
-            log.error("writer.write_error", path=rel_path, error=str(e))
-            # Clean up pending write on failure
-            self.state.pending_writes.pop(rel_path, None)
-            if tmp_path.exists():
-                tmp_path.unlink()
-            return
+        with self.state.pending_write_lock:
+            self.state.mark_pending_write(rel_path, expected_md5)
+            try:
+                tmp_path.write_bytes(content_bytes)
+                os.replace(tmp_path, full_path)
+            except OSError as e:
+                log.error("writer.write_error", path=rel_path, error=str(e))
+                # Clean up pending write on failure
+                self.state.pending_writes.pop(rel_path, None)
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                return
 
-        # Update file hash in state
-        self.state.update_file(rel_path, expected_md5)
+            # Update file hash in state
+            self.state.update_file(rel_path, expected_md5)
 
         # Audit log: only emit on a real persisted write. Skip-if-equal
         # paths in write_alfred_tags / write_relationships short-circuit
