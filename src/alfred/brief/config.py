@@ -46,6 +46,12 @@ class BriefConfig:
     state: StateConfig = field(default_factory=StateConfig)
     log_file: str = "./data/brief.log"
 
+    # Telegram user_id the post-write brief push dispatches to. v1
+    # single-user: first entry of ``telegram.allowed_users``. ``None``
+    # when no telegram section is configured — the push is skipped
+    # silently in that case.
+    primary_telegram_user_id: int | None = None
+
 
 def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
     """Build BriefConfig from the unified config dict."""
@@ -86,6 +92,18 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         path=state_raw.get("path", f"{log_dir}/brief_state.json"),
     )
 
+    # Primary Telegram user for post-write brief push. Reads the
+    # unified config's ``telegram.allowed_users[0]`` — single-user v1;
+    # peer protocol in Stage 3.5 will widen.
+    telegram_raw = raw.get("telegram", {}) or {}
+    allowed = telegram_raw.get("allowed_users") or []
+    primary_user: int | None = None
+    if allowed:
+        try:
+            primary_user = int(allowed[0])
+        except (TypeError, ValueError):
+            primary_user = None
+
     return BriefConfig(
         vault_path=vault_path,
         schedule=schedule,
@@ -93,4 +111,5 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         output=output,
         state=state,
         log_file=f"{log_dir}/brief.log",
+        primary_telegram_user_id=primary_user,
     )

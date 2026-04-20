@@ -18,6 +18,56 @@ from .weather import fetch_and_format
 log = get_logger(__name__)
 
 
+async def _push_brief_to_telegram(
+    content: str,
+    today: str,
+    user_id: int,
+) -> None:
+    """Dispatch the rendered brief as Telegram chunks via the transport.
+
+    Best-effort. Transport failures are logged and swallowed — the
+    brief is already written to the vault, so the user's primary
+    artifact is safe even if the push fails. Catches the
+    ``transport-down`` case (common during talker daemon restarts) so
+    brief generation doesn't become coupled to the talker's liveness.
+
+    Single-user v1: ``user_id`` is the first entry in
+    ``telegram.allowed_users``. Multi-user support arrives with the
+    peer protocol in Stage 3.5.
+    """
+    # Local imports so the brief module doesn't drag transport into
+    # tools that don't need it (e.g. when telegram isn't configured).
+    from alfred.transport.client import send_outbound_batch
+    from alfred.transport.exceptions import TransportError
+    from alfred.transport.utils import chunk_for_telegram
+
+    try:
+        chunks = chunk_for_telegram(content)
+        if not chunks or not chunks[0]:
+            log.info("brief.push_skipped_empty", date=today)
+            return
+        await send_outbound_batch(
+            user_id=user_id,
+            chunks=chunks,
+            dedupe_key=f"brief-{today}",
+            client_name="brief",
+        )
+        log.info(
+            "brief.pushed",
+            date=today,
+            chunks=len(chunks),
+            user_id=user_id,
+        )
+    except TransportError as exc:
+        log.warning(
+            "brief.push_failed",
+            date=today,
+            error_type=exc.__class__.__name__,
+            error=str(exc),
+            response_summary=f"{exc.__class__.__name__}: {exc}",
+        )
+
+
 async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: bool = False) -> str | None:
     """Generate a morning brief. Returns the vault-relative path, or None if skipped."""
     today = date.today().isoformat()
@@ -78,6 +128,15 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         success=True,
     ))
     state_mgr.save()
+
+    # Post-write push to Telegram — best-effort, swallows transport
+    # errors so the brief stays in the vault even if the talker daemon
+    # is restarting. ``primary_telegram_user_id`` is None when no
+    # telegram section is configured — skip the push silently.
+    if config.primary_telegram_user_id is not None:
+        await _push_brief_to_telegram(
+            content, today, config.primary_telegram_user_id,
+        )
 
     return rel_path
 

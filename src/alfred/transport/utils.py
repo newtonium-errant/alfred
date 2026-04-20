@@ -126,12 +126,15 @@ def chunk_for_telegram(text: str, max_chars: int = 3800) -> list[str]:
         # Single paragraph is larger than the limit — split it on
         # sentence boundaries, then hard-wrap any sentence that still
         # overflows. We rebuild the sentences with their terminator
-        # intact so the text remains readable.
+        # intact so the text remains readable. Pieces within a chunk
+        # are joined with ``\n\n`` on flush (same separator as
+        # paragraphs — 2 chars — so accounting matches _flush).
         pieces = _split_long_paragraph(para, max_chars)
         for piece in pieces:
-            if buf_len + len(piece) + (1 if buf else 0) <= max_chars:
+            join_cost = 2 if buf else 0
+            if buf_len + len(piece) + join_cost <= max_chars:
                 buf.append(piece)
-                buf_len += len(piece) + (1 if buf_len else 0)
+                buf_len += len(piece) + join_cost
             else:
                 _flush()
                 buf.append(piece)
