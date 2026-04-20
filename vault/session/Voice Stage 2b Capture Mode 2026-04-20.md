@@ -14,7 +14,7 @@ tags:
   - capture
   - telegram
   - stage-2b
-status: in-progress
+status: completed
 ---
 
 # Voice Stage 2b Capture Mode 2026-04-20
@@ -207,9 +207,76 @@ update to this session note in one bundle per
   each probe's happy/FAIL/SKIP paths, quick-mode skips remote
   probe, absent-tts doesn't FAIL rollup).
 
+### Commit 7 — SKILL audit: vault-talker SKILL.md for capture mode
+
+- Updated `src/alfred/_bundled/skills/vault-talker/SKILL.md`:
+  - Frontmatter version bumped `1.0-wk1` → `1.1-wk2b`.
+  - New `## Session types and capture mode` section after
+    `## Session boundaries`.
+  - Describes what the LLM sees on each of the three call paths
+    the bot layer invokes it through during a capture session:
+    (a) the batch structuring pass (`emit_structured_summary`
+    tool, six buckets, empty lists legal), (b) `/extract`
+    (`create_note` tool, up to 8 notes, quality over quantity),
+    (c) `/brief` (compress structured summary to ~word-target
+    prose, flowing paragraphs for spoken output).
+  - Notes that during a capture session the LLM is NOT invoked
+    turn-by-turn — the session is silent. The LLM only runs at
+    the post-`/end` batch pass, `/extract`, and `/brief` steps.
+  - Anti-patterns explicitly flagged: don't editorialise during
+    the batch pass; don't synthesise across sessions during
+    extraction; don't write eye-prose for /brief output.
+  - Preserved `{{instance_name}}` / `{{instance_canonical}}`
+    templating — nothing hardcoded to "Alfred" or "Salem".
+- Per the CLAUDE.md scope-SKILL audit rule, this closes the new
+  LLM-facing contracts introduced by commits 3 / 4 / 5 (the three
+  tool_use schemas) with a matching skill-prompt update.
+- No new tests — SKILL change is prompt-only. All 513 existing
+  tests still pass; `test_instance_templating.py` verifies the
+  `{{instance_name}}` substitution survives the edit.
+
 ## Outcome
 
-_(updated on commit 7)_
+All 7 commits landed successfully.
+
+**Commit hashes:**
+- c1 `cefe063` — capture session type + router integration (+5 tests)
+- c2 `09e5f7b` — silent capture behaviour (+6 tests)
+- c3 `68112e1` — async batch structuring pass (+9 tests)
+- c4 `fe2d3ac` — Telegram `/extract <short-id>` command (+11 tests)
+- c5 `b0c5345` — ElevenLabs TTS + `/brief` command (+18 tests)
+- c6 `2bab8e7` — BIT probe additions for TTS (+11 tests)
+- c7 `(this)` — SKILL audit for capture mode (no new tests)
+
+**Test count:** 453 (baseline) → 513 (+60). Full suite green.
+
+**BIT probes for /brief:**
+- `tts-key` (static, SKIP when tts section absent)
+- `capture-handler-registered` (functional, module import check)
+- `elevenlabs-auth` (remote_network, full mode only, SKIP when tts absent)
+
+**Session note:** this file, updated in place across all 7 commits
+per `feedback_session_notes_per_commit.md`.
+
+**Deviations from spec:**
+- Used plain `\N{HEAVY CHECK MARK}` (✔) for the capture reaction emoji
+  via PTB 22.7's `ReactionTypeEmoji`. PTB 22.7 supports
+  `set_message_reaction` directly — no fallback dot path needed in
+  the happy case (the fallback is still in place defensively).
+- Used httpx directly for ElevenLabs REST calls rather than the
+  `elevenlabs` SDK import. SDK is pinned in `[voice]` extras
+  per spec but not imported at runtime. This keeps our import
+  graph clean and tests can mock `httpx.AsyncClient.post` via
+  `monkeypatch`.
+- Two pre-existing talker health tests updated in place because
+  the new optional probes changed the SKIP/OK rollup shape
+  (`Status.worst` ranks SKIP > OK intentionally). Updates are
+  minimal: pass a `tts:` section + `mode="quick"` so the rollup
+  stays OK.
+
+**Daemon restart required** to pick up the new handlers and
+capture-mode routing in a live environment. Andrew to run
+`alfred down && alfred up` once he's ready to validate.
 
 ## Alfred Learnings
 
@@ -317,3 +384,15 @@ _(updated on each commit)_
   under its latency budget by skipping the 2s ceiling call. This
   matches the broader pattern: cheap static checks always run;
   expensive network checks are full-mode-only.
+
+- **Pattern validated — scope-SKILL audit at final commit.** Per
+  CLAUDE.md's "scope-SKILL audit rule", any commit that introduces
+  new LLM-facing contracts (new tool_use schemas, new prompts,
+  new call paths) must be accompanied by a SKILL.md update
+  documenting what the LLM is expected to do in each new path.
+  Commits 3/4/5 each introduced a distinct LLM-call contract
+  (batch structuring tool schema, create_note tool schema, brief
+  compression prompt) — commit 7 lands the matching skill-prompt
+  explanation in one place so prompt-tuner ownership of SKILL.md
+  stays explicit (builder writes the code; prompt-tuner / builder
+  together audit the skill).
