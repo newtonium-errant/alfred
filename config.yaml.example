@@ -63,6 +63,20 @@ distiller:
     path: "./data/distiller_state.json"
     max_run_history: 20
 
+# Instructor — polls every vault record for pending ``alfred_instructions``
+# directives and executes them in-process via the Anthropic SDK. See
+# src/alfred/instructor/ for the daemon + CLI + SKILL.
+instructor:
+  poll_interval_seconds: 60
+  max_retries: 3
+  audit_window_size: 5
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    model: "claude-sonnet-4-6"
+    max_tokens: 4096
+  state:
+    path: "./data/instructor_state.json"
+
 telegram:
   # Telegram bot token from @BotFather
   bot_token: "${TELEGRAM_BOT_TOKEN}"

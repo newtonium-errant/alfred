@@ -323,6 +323,75 @@ def test_brief_state_roundtrip(state_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Instructor
+# ---------------------------------------------------------------------------
+
+def test_instructor_state_roundtrip(state_path: Path) -> None:
+    """Instructor state tracks file hashes, retry counts, last run ts."""
+    from alfred.instructor.state import InstructorState
+
+    state = InstructorState(state_path)
+    state.record_hash("note/Some Note.md", "hash-aaa")
+    state.record_hash("task/Thing.md", "hash-bbb")
+    state.bump_retry("task/Thing.md")
+    state.bump_retry("task/Thing.md")
+    state.stamp_run()
+
+    state.save()
+    assert state_path.exists()
+    # .tmp file should NOT linger — atomic-rename contract
+    assert not state_path.with_suffix(".tmp").exists()
+
+    reloaded = InstructorState(state_path)
+    reloaded.load()
+
+    assert reloaded.version == 1
+    assert reloaded.file_hashes == {
+        "note/Some Note.md": "hash-aaa",
+        "task/Thing.md": "hash-bbb",
+    }
+    assert reloaded.get_retry_count("task/Thing.md") == 2
+    assert reloaded.get_retry_count("unknown") == 0
+    assert reloaded.last_run_ts is not None
+    assert "T" in reloaded.last_run_ts
+
+
+def test_instructor_state_clear_retry_on_load(state_path: Path) -> None:
+    """clear_retry drops the per-path entry; hash_unchanged gate works."""
+    from alfred.instructor.state import InstructorState
+
+    state = InstructorState(state_path)
+    state.record_hash("note/X.md", "hash-x")
+    state.bump_retry("note/X.md")
+    state.clear_retry("note/X.md")
+    state.save()
+
+    reloaded = InstructorState(state_path)
+    reloaded.load()
+    assert reloaded.get_retry_count("note/X.md") == 0
+    assert reloaded.hash_unchanged("note/X.md", "hash-x")
+    assert not reloaded.hash_unchanged("note/X.md", "something-else")
+
+
+def test_instructor_state_load_tolerates_corrupt_file(state_path: Path) -> None:
+    """Corrupt JSON state file must not crash the daemon on startup.
+
+    Same contract as every other tool: fall back to empty state so the
+    next save heals the file.
+    """
+    state_path.write_text("not valid json at all", encoding="utf-8")
+
+    from alfred.instructor.state import InstructorState
+
+    state = InstructorState(state_path)
+    state.load()
+    # Should NOT have raised — empty state substituted.
+    assert state.file_hashes == {}
+    assert state.retry_counts == {}
+    assert state.last_run_ts is None
+
+
+# ---------------------------------------------------------------------------
 # Mail
 # ---------------------------------------------------------------------------
 
