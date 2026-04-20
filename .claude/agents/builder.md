@@ -76,6 +76,17 @@ log.warning(
 
 Use what's already installed: httpx, structlog, pyyaml, python-frontmatter. Don't add new dependencies without flagging it.
 
+## Test fixtures for secret-shaped values
+
+When writing pytest fixtures that stand in for API keys, tokens, or other credential-shaped strings, use **obviously-fake patterns** — NOT realistic provider prefixes. Scanners (GitGuardian, etc.) pattern-match on prefixes + entropy and will fire false-positive alerts on test strings.
+
+- ❌ `sk-xi-test`, `sk-ant-test`, `gsk-real`, `xi-abc123`, `123:abcdef`
+- ✅ `DUMMY_ELEVENLABS_TEST_KEY`, `DUMMY_ANTHROPIC_TEST_KEY`, `DUMMY_GROQ_TEST_KEY`, `DUMMY_TELEGRAM_TEST_TOKEN`, `test-stt-key`
+
+Incident reference: 2026-04-20 commit `2bab8e7` tripped GitGuardian on `sk-xi-legit-key-1234`, a pytest fixture. Scrubbed in `9c8dd8e`. Pattern: the scanner can't distinguish test literals from real leaked keys — so don't make it try.
+
+Exception: if a test genuinely asserts on a prefix format (e.g., `key.startswith("sk-")`), keep the realistic prefix, and add a comment flagging why so reviewers/scanners can see intent.
+
 ## Cross-Agent Contracts
 
 When your changes affect another agent's domain, agree on the interface before implementing:
