@@ -71,6 +71,26 @@ INSTRUCTION_FIELDS: tuple[str, ...] = (
     "alfred_instructions_last",
 )
 
+# Optional frontmatter fields on ``task`` records that carry reminder
+# state. Part of the outbound-push transport contract:
+#   - ``remind_at``     — pending reminder timestamp (ISO 8601, UTC).
+#     When present and in the past, the transport scheduler fires a
+#     reminder via Telegram.
+#   - ``reminded_at``   — set by the scheduler on successful dispatch.
+#     Clears ``remind_at``. Updating ``remind_at`` to a later value
+#     (where ``reminded_at < remind_at``) re-arms the reminder.
+#   - ``reminder_text`` — optional verbatim text that overrides the
+#     default ``"Reminder: {title} (due {due})"`` template.
+#
+# Values are date or datetime when written from Python; the scheduler
+# tolerates ISO-string, date-only, and tz-aware timestamps. None of
+# these fields are required — they are opt-in per task.
+REMINDER_FIELDS: tuple[str, ...] = (
+    "remind_at",
+    "reminded_at",
+    "reminder_text",
+)
+
 # Fields that should be lists
 LIST_FIELDS: set[str] = {
     "tags", "aliases", "related", "relationships", "participants",
