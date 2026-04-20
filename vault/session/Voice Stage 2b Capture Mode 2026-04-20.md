@@ -44,6 +44,29 @@ update to this session note in one bundle per
   defaults, `known_types()`, prefix short-circuit, case/whitespace
   tolerance, LLM-path classification).
 
+### Commit 2 — Silent capture behaviour
+
+- Added `CAPTURE_SENTINEL` module-level constant in `conversation.py`
+  and a short-circuit in `run_turn` that fires when
+  `session_type == "capture"`: appends the user turn, skips the LLM
+  call, skips escalation detection, returns the sentinel.
+- Added `session_type` kwarg to `run_turn` (wired through from
+  `bot.handle_message` via the active dict's `_session_type`).
+- Added `_post_capture_ack()` helper in `bot.py` using PTB 22.7's
+  `Bot.set_message_reaction` API with `ReactionTypeEmoji("\N{HEAVY CHECK MARK}")`
+  (= ✔). PTB 22.7 exposes the endpoint — no fallback to a text dot
+  needed in the happy path.
+- `handle_message` recognises the sentinel and posts the reaction
+  instead of a text reply. Fallback: if `set_message_reaction` raises,
+  emit a minimal "." text reply.
+- Inline commands (`/end`, `/opus`, etc.) continue to fire during
+  capture — the inline-command pre-check runs BEFORE the lock +
+  `run_turn`, so the silent path is never entered for a command.
+- New tests: `tests/telegram/test_silent_capture.py` (6 tests —
+  transcript append + no LLM, regression on non-capture, sentinel
+  bypass with canned responses, reaction emoji integration, fallback
+  on reaction failure, /end during capture).
+
 ## Outcome
 
 _(updated on commit 7)_
@@ -59,3 +82,18 @@ _(updated on each commit)_
   borderline phrasings. Belongs BEFORE the LLM call in
   `classify_opening_cue`, not after (the post-classification fallback
   would already have paid a Sonnet token cost).
+
+- **Pattern validated — sentinel string for "no reply" paths.**
+  `run_turn` historically returned the assistant's text string. Adding a
+  "don't reply" mode via `Optional[str]` or a tuple would force every
+  existing caller to branch on the new shape. A module-level sentinel
+  string (`CAPTURE_SENTINEL`) stays backwards compatible at the type
+  level — callers that don't know about capture treat it as any other
+  text — and the capture-aware caller does `if text == SENTINEL` to
+  bypass the reply path. Cleanest upgrade.
+
+- **Pattern validated — PTB 22.7 exposes `set_message_reaction` cleanly.**
+  No version drift concern: the bot API endpoint `setMessageReaction`
+  was added to PTB in 21.x and is unchanged in 22.7. The fallback path
+  (text dot) stays in place defensively but does not fire in the happy
+  path.

@@ -569,6 +569,21 @@ def _should_offer_escalation(
 # --- Main turn ------------------------------------------------------------
 
 
+# --- Silent-capture sentinel ---------------------------------------------
+
+# Returned by ``run_turn`` when the session is a capture-type session.
+# Capture mode suppresses the conversational LLM call entirely: the
+# user's message is appended to the transcript so downstream /extract
+# and /brief have data to work with, but no assistant turn is generated.
+#
+# The bot layer (``bot.handle_message``) interprets this sentinel as
+# "do not send a text reply — post a receipt-ack emoji reaction
+# instead". Kept as a module-level string constant so both sides compare
+# against the same literal, not a duplicated magic value. Leading
+# underscore signals "internal protocol, not model output".
+CAPTURE_SENTINEL: Final[str] = "__ALFRED_CAPTURE_SILENT__"
+
+
 async def run_turn(
     client: Any,
     state: StateManager,
@@ -580,6 +595,7 @@ async def run_turn(
     user_kind: str = "text",
     calibration_str: str | None = None,
     pushback_level: int | None = None,
+    session_type: str | None = None,
 ) -> str:
     """Run one user turn through the model, handling tool_use internally.
 
@@ -609,6 +625,22 @@ async def run_turn(
     """
     # Append the user's message first so it's visible inside the loop.
     append_turn(state, session, "user", user_message, kind=user_kind)
+
+    # wk2b c2: capture-mode short-circuit. A ``capture`` session is silent
+    # mid-session — the user's message has been appended to the transcript
+    # (so /extract and /brief can see it later) but we DO NOT call the
+    # LLM, DO NOT generate an assistant turn, and DO NOT run escalation
+    # detection. The bot layer recognises the sentinel and posts a
+    # receipt-ack emoji reaction instead of a text reply.
+    if session_type == "capture":
+        log.info(
+            "talker.capture.silent_turn",
+            chat_id=session.chat_id,
+            session_id=session.session_id,
+            user_kind=user_kind,
+            turn_index=len(session.transcript),
+        )
+        return CAPTURE_SENTINEL
 
     system_blocks = _build_system_blocks(
         system_prompt,

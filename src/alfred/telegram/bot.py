@@ -109,6 +109,39 @@ def build_app(
     return app
 
 
+# --- Capture-mode ack helpers --------------------------------------------
+
+# Telegram reaction emoji used as a receipt ack during capture sessions.
+# Must be drawn from the "free" reaction set (checkmark is universally
+# available). See Telegram Bot API docs:
+# https://core.telegram.org/bots/api#setmessagereaction — "free" emojis
+# are rendered without forcing the user into a Premium prompt.
+_CAPTURE_REACTION_EMOJI = "\N{HEAVY CHECK MARK}"  # ✔
+
+
+async def _post_capture_ack(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> None:
+    """Post a receipt-ack reaction emoji on the user's message.
+
+    Uses PTB 21+'s ``Bot.set_message_reaction`` (aliased from Telegram's
+    ``setMessageReaction`` endpoint). Raises on any failure so the caller
+    can trigger the text fallback path. Kept tiny and dependency-free —
+    the reaction emoji is a constant and the call targets the message
+    that triggered this turn.
+    """
+    if update.message is None:
+        return
+    from telegram import ReactionTypeEmoji
+    await ctx.bot.set_message_reaction(
+        chat_id=chat_id,
+        message_id=update.message.message_id,
+        reaction=[ReactionTypeEmoji(emoji=_CAPTURE_REACTION_EMOJI)],
+    )
+
+
 # --- Allowlist helper -----------------------------------------------------
 
 
@@ -916,6 +949,7 @@ async def handle_message(
         active_for_turn = state_mgr.get_active(chat_id) or {}
         pushback_level = active_for_turn.get("_pushback_level")
         calibration_str = active_for_turn.get("_calibration_snapshot")
+        active_session_type = active_for_turn.get("_session_type", "note")
 
         try:
             response_text = await conversation.run_turn(
@@ -929,6 +963,7 @@ async def handle_message(
                 user_kind="voice" if voice else "text",
                 calibration_str=calibration_str,
                 pushback_level=pushback_level,
+                session_type=active_session_type,
             )
         except anthropic.APIError as exc:
             log.warning(
@@ -954,6 +989,31 @@ async def handle_message(
                 f"Something went wrong — {exc.__class__.__name__}. "
                 "Try again?"
             )
+            return
+
+        # wk2b c2: capture-mode silent reply. ``run_turn`` returned the
+        # capture sentinel instead of an assistant text — post a receipt-
+        # ack emoji reaction via the Bot API's setMessageReaction endpoint
+        # and return. If the reaction call fails (network, rate limit,
+        # rare PTB shape drift), fall back to a minimal dot text reply so
+        # the user still sees something.
+        if response_text == conversation.CAPTURE_SENTINEL:
+            try:
+                await _post_capture_ack(update, ctx, chat_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "talker.bot.capture_ack_fallback",
+                    chat_id=chat_id,
+                    error=str(exc),
+                )
+                try:
+                    await update.message.reply_text(".")
+                except Exception as fallback_exc:  # noqa: BLE001
+                    log.warning(
+                        "talker.bot.capture_ack_fallback_failed",
+                        chat_id=chat_id,
+                        error=str(fallback_exc),
+                    )
             return
 
         # Reply with Claude's text. Telegram has a 4096-char message cap;
