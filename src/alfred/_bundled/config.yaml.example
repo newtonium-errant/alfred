@@ -1,6 +1,11 @@
 vault:
   path: "./vault"
-  ignore_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view"]
+  # Top-level directories excluded from ALL processing tools.
+  # `inbox/processed` entry (with slash) is a path prefix — it matches
+  # `inbox/processed/*` but not `inbox/*` so the curator can still see
+  # fresh inbox items. Single-component entries (`_templates`, `.obsidian`)
+  # match any path component anywhere in the tree.
+  ignore_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "inbox/processed"]
   ignore_files: [".gitkeep"]
 
 agent:

@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from alfred.vault.ops import is_ignored_path
+
 from .parser import VaultRecord, parse_file, stripped_body_length, extract_wikilinks
 from .utils import compute_md5, get_logger
 
@@ -141,7 +143,7 @@ def scan_candidates(
         rel_str = str(rel).replace("\\", "/")
 
         # Skip ignored dirs/files
-        if any(part in ignore_d for part in rel.parts):
+        if is_ignored_path(rel, ignore_d):
             continue
         if rel.name in ignore_f:
             continue
@@ -215,7 +217,7 @@ def collect_existing_learns(
         rel = md_file.relative_to(vault_path)
         rel_str = str(rel).replace("\\", "/")
 
-        if any(part in ignore_d for part in rel.parts):
+        if is_ignored_path(rel, ignore_d):
             continue
 
         try:

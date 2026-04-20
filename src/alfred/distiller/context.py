@@ -7,6 +7,8 @@ from pathlib import Path
 
 import frontmatter
 
+from alfred.vault.ops import is_ignored_path
+
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -52,8 +54,7 @@ def build_vault_context(
 
     for md_file in vault_path.rglob("*.md"):
         rel = md_file.relative_to(vault_path)
-        parts = rel.parts
-        if any(p in ignore for p in parts):
+        if is_ignored_path(rel, ignore):
             continue
 
         try:

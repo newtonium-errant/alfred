@@ -6,6 +6,7 @@ import re
 from datetime import date, datetime
 from pathlib import Path
 
+from alfred.vault.ops import is_ignored_path
 from alfred.vault.schema import (
     KNOWN_TYPES,
     LIST_FIELDS,
@@ -39,7 +40,7 @@ def _build_stem_index(vault_path: Path, ignore_dirs: set[str]) -> dict[str, set[
     index: dict[str, set[str]] = {}
     for md_file in vault_path.rglob("*.md"):
         rel = md_file.relative_to(vault_path)
-        if any(part in ignore_dirs for part in rel.parts):
+        if is_ignored_path(rel, ignore_dirs):
             continue
         rel_str = str(rel).replace("\\", "/")
         stem = md_file.stem
@@ -95,7 +96,7 @@ def run_structural_scan(
     all_files: dict[str, str] = {}  # rel_path -> md5
     for md_file in vault_path.rglob("*.md"):
         rel = md_file.relative_to(vault_path)
-        if any(part in ignore_dirs for part in rel.parts):
+        if is_ignored_path(rel, ignore_dirs):
             continue
         if md_file.name in ignore_files:
             continue
@@ -482,7 +483,7 @@ def run_drift_scan(
     all_files: dict[str, str] = {}
     for md_file in vault_path.rglob("*.md"):
         rel = md_file.relative_to(vault_path)
-        if any(part in ignore_dirs for part in rel.parts):
+        if is_ignored_path(rel, ignore_dirs):
             continue
         if md_file.name in ignore_files:
             continue

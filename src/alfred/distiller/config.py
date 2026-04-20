@@ -31,7 +31,11 @@ def _substitute_env(value: Any) -> Any:
 @dataclass
 class VaultConfig:
     path: str = ""
-    ignore_dirs: list[str] = field(default_factory=lambda: [".obsidian"])
+    # `inbox/processed` is the curator's audit trail of consumed raw inputs;
+    # distilling from those risks double-extraction (once from the raw email,
+    # once from the derived note). Matches surveyor's full-inbox exclusion
+    # policy while keeping the curator's fresh inbox visible.
+    ignore_dirs: list[str] = field(default_factory=lambda: [".obsidian", "inbox/processed"])
     ignore_files: list[str] = field(default_factory=list)
 
     @property

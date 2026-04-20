@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
+from alfred.vault.ops import is_ignored_path
 
 from .backends import (
     BaseBackend,
@@ -95,7 +96,7 @@ def snapshot_vault(
 
     for md_file in vault_path.rglob("*.md"):
         rel = md_file.relative_to(vault_path)
-        if any(part in ignore for part in rel.parts):
+        if is_ignored_path(rel, ignore):
             continue
         try:
             content = md_file.read_bytes()

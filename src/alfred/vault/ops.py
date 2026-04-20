@@ -50,6 +50,41 @@ def _resolve_vault_path(vault_path: Path, rel_path: str) -> Path:
     return full
 
 
+def is_ignored_path(rel_path: str | Path, ignore_dirs: set[str] | list[str]) -> bool:
+    """Return True if ``rel_path`` should be skipped under ``ignore_dirs``.
+
+    Supports two entry shapes in ``ignore_dirs`` so callers can choose the
+    right granularity without changing schema:
+
+    - **Single component** (no ``/`` in the entry) — matches any path
+      component. ``".obsidian"`` matches ``foo/.obsidian/bar.md``. This is
+      the legacy behavior every scanner already relies on, and the only
+      shape fresh installs use today.
+    - **Nested path** (contains ``/``) — matches a path prefix. The entry
+      ``"inbox/processed"`` matches ``inbox/processed/x.md`` but does NOT
+      match ``inbox/x.md`` or ``notes/inbox/processed/x.md``. This lets
+      janitor/distiller exclude the curator's audit directory without
+      excluding the whole ``inbox/`` (curator needs to see fresh inbox
+      items, just not their processed copies).
+
+    Path separators are normalized to ``/`` before matching so Windows
+    paths work the same as POSIX.
+    """
+    rel_str = str(rel_path).replace("\\", "/").strip("/")
+    if not rel_str:
+        return False
+    parts = rel_str.split("/")
+    for ig in ignore_dirs:
+        if "/" in ig:
+            prefix = ig.strip("/")
+            if rel_str == prefix or rel_str.startswith(prefix + "/"):
+                return True
+        else:
+            if ig in parts:
+                return True
+    return False
+
+
 def _parse_record(file_path: Path) -> tuple[dict, str]:
     """Parse a vault file into (frontmatter_dict, body_str).
 

@@ -256,7 +256,7 @@ def run_quickstart() -> None:
     config = {
         "vault": {
             "path": vault_path,
-            "ignore_dirs": ["_templates", "_bases", "_docs", ".obsidian", "view"],
+            "ignore_dirs": ["_templates", "_bases", "_docs", ".obsidian", "view", "inbox/processed"],
             "ignore_files": [".gitkeep"],
         },
         "agent": {

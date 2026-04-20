@@ -34,7 +34,12 @@ class VaultConfig:
     # `_templates` contains placeholder wikilinks (`[[project/My Project]]`)
     # as syntax examples; the scanner must not flag those as broken links.
     # `_bases` holds Obsidian base view definitions with similar placeholders.
-    ignore_dirs: list[str] = field(default_factory=lambda: [".obsidian", "_templates", "_bases"])
+    # `inbox/processed` is the curator's audit trail of consumed raw inputs
+    # (emails, drops) — the derived vault records are the canonical artifacts,
+    # so janitor must not flag FM001 / LINK001 on raw email bodies. This
+    # matches surveyor's policy (which excludes all of `inbox`) and keeps
+    # the curator's fresh inbox visible for its own watcher.
+    ignore_dirs: list[str] = field(default_factory=lambda: [".obsidian", "_templates", "_bases", "inbox/processed"])
     ignore_files: list[str] = field(default_factory=list)
 
     @property
