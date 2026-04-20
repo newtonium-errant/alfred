@@ -471,6 +471,7 @@ async def run_watch(
     """Daemon mode — extract on interval until interrupted."""
     interval = config.extraction.interval_seconds
     deep_schedule = config.extraction.deep_extraction_schedule
+    consolidation_schedule = config.extraction.consolidation_schedule
 
     # Persist last deep extraction time across restarts. Without this,
     # every daemon restart reset last_deep to epoch and re-triggered a
@@ -485,8 +486,17 @@ async def run_watch(
             last_deep = now_utc_init
     else:
         last_deep = now_utc_init
-    last_consolidation = datetime.min.replace(tzinfo=timezone.utc)
-    consolidation_interval_hours = config.extraction.consolidation_interval_hours
+    # Consolidation is weekly (Sundays 04:00 Halifax by default). Seed
+    # ``last_consolidation = now`` on first boot so we don't fire
+    # immediately — wait for the next Sunday at 04:00. This is a
+    # behavior tightening from the pre-c5 rolling interval (which
+    # fired consolidation on first boot then waited 168h); the new
+    # semantics match Andrew's intent ("heavy passes land overnight").
+    # Not persisted across restarts — an in-process restart within the
+    # same window won't re-fire because last_consolidation is set by
+    # the first fire, but a full daemon restart after a fire will get
+    # a fresh seed. Acceptable for a weekly pass.
+    last_consolidation = now_utc_init
 
     log.info(
         "daemon.starting",
@@ -494,7 +504,9 @@ async def run_watch(
         deep_extraction_time=deep_schedule.time,
         deep_extraction_tz=deep_schedule.timezone,
         deep_extraction_day_of_week=deep_schedule.day_of_week,
-        consolidation_interval_hours=consolidation_interval_hours,
+        consolidation_time=consolidation_schedule.time,
+        consolidation_tz=consolidation_schedule.timezone,
+        consolidation_day_of_week=consolidation_schedule.day_of_week,
     )
 
     while True:
@@ -533,9 +545,13 @@ async def run_watch(
                 if candidates:
                     log.info("daemon.pending_candidates", count=len(candidates))
 
-            # Consolidation sweep (weekly by default)
-            hours_since_consolidation = (now - last_consolidation).total_seconds() / 3600
-            if hours_since_consolidation >= consolidation_interval_hours:
+            # Consolidation sweep — clock-aligned weekly (Sundays 04:00
+            # Halifax by default). Same pattern as deep extraction:
+            # fire when now >= compute_next_fire(schedule, last).
+            next_consolidation_fire = compute_next_fire(
+                consolidation_schedule, last_consolidation,
+            )
+            if now >= next_consolidation_fire:
                 log.info("daemon.consolidation_start")
                 from alfred.vault.mutation_log import (
                     append_to_audit_log,
@@ -558,6 +574,12 @@ async def run_watch(
                 finally:
                     cleanup_session_file(session_path)
                 last_consolidation = now
+                log.info(
+                    "daemon.consolidation_next",
+                    next_fire=compute_next_fire(
+                        consolidation_schedule, last_consolidation,
+                    ).isoformat(),
+                )
         except Exception:
             log.exception("daemon.extraction_error")
 

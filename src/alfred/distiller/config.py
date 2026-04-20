@@ -107,6 +107,15 @@ class ExtractionConfig:
     # Deprecated fallback for the weekly consolidation pass, replaced
     # by ``consolidation_schedule`` in c5. Kept for backward-compat.
     consolidation_interval_hours: int = 168  # 7 days
+    # Clock-aligned consolidation pass — weekly on Sundays at 04:00
+    # Halifax by default. ``day_of_week`` on ScheduleConfig turns the
+    # daily pattern into a weekly gate; the next fire is the upcoming
+    # Sunday (today if today is Sunday and the time is still ahead).
+    consolidation_schedule: ScheduleConfig = field(
+        default_factory=lambda: ScheduleConfig(
+            time="04:00", timezone="America/Halifax", day_of_week="sunday",
+        )
+    )
 
 
 @dataclass
@@ -140,6 +149,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "openclaw": OpenClawBackendConfig,
     "extraction": ExtractionConfig,
     "deep_extraction_schedule": ScheduleConfig,
+    "consolidation_schedule": ScheduleConfig,
     "state": StateConfig,
     "logging": LoggingConfig,
 }

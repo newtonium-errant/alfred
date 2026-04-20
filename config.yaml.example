@@ -67,6 +67,14 @@ distiller:
     deep_extraction_schedule:
       time: "03:30"
       timezone: "America/Halifax"
+    # Weekly consolidation pass — Sundays at 04:00 Halifax. The
+    # day_of_week key turns the ScheduleConfig into a weekly gate;
+    # one of monday..sunday (case-insensitive). Omit the block to
+    # fall back to consolidation_interval_hours.
+    consolidation_schedule:
+      time: "04:00"
+      timezone: "America/Halifax"
+      day_of_week: "sunday"
     candidate_threshold: 0.3
     max_sources_per_batch: 20
     source_types: ["conversation", "session", "note", "task", "project"]
