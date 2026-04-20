@@ -166,3 +166,67 @@ def test_janitor_create_denies_body_write():
             frontmatter={"alfred_triage": True},
             body_write=True,
         )
+
+
+# ---- instructor scope (alfred_instructions watcher) -------------------------
+
+
+def test_instructor_allows_read():
+    check_scope("instructor", "read", rel_path="note/Some Note.md")
+
+
+def test_instructor_allows_search():
+    check_scope("instructor", "search")
+
+
+def test_instructor_allows_list():
+    check_scope("instructor", "list")
+
+
+def test_instructor_allows_context():
+    check_scope("instructor", "context")
+
+
+def test_instructor_allows_edit_any_field():
+    # Instructor has no field allowlist — directives can touch any
+    # frontmatter field. ``description`` is NOT on the janitor allowlist;
+    # instructor must still accept it.
+    check_scope(
+        "instructor", "edit",
+        rel_path="person/Someone.md",
+        fields=["description", "role", "aliases"],
+    )
+
+
+def test_instructor_allows_create():
+    # Instructor can create records of any type — directives may ask for
+    # a new task, note, or project. No ``*_types_only`` constraint.
+    check_scope("instructor", "create", record_type="project")
+
+
+def test_instructor_allows_move():
+    # Instructor may move records anywhere in the vault (janitor cannot).
+    check_scope(
+        "instructor", "move",
+        rel_path="task/Some Task.md",
+    )
+
+
+def test_instructor_allows_body_writes():
+    # Directives can ask for drafting or restructuring body content.
+    check_scope(
+        "instructor", "edit",
+        rel_path="note/Some Note.md",
+        body_write=True,
+    )
+
+
+def test_instructor_denies_delete():
+    # Deletion is always an explicit operator task — the instructor
+    # watcher must never execute a delete on its own, even when a
+    # directive asks for it.
+    with pytest.raises(ScopeError, match="denied for scope 'instructor'"):
+        check_scope(
+            "instructor", "delete",
+            rel_path="task/Some Task.md",
+        )

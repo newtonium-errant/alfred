@@ -59,12 +59,26 @@ TYPE_DIRECTORY: dict[str, str] = {
     # session, input have flexible placement
 }
 
+# Frontmatter field names that carry instructor directives. Part of the
+# alfred_instructions watcher contract:
+#   - ``alfred_instructions`` — pending queue. Each entry is a directive
+#     string the instructor daemon picks up and executes.
+#   - ``alfred_instructions_last`` — completed archive. Each entry is a
+#     dict of ``{text, executed_at, result}`` describing the directive
+#     and its outcome.
+INSTRUCTION_FIELDS: tuple[str, ...] = (
+    "alfred_instructions",
+    "alfred_instructions_last",
+)
+
 # Fields that should be lists
 LIST_FIELDS: set[str] = {
     "tags", "aliases", "related", "relationships", "participants",
     "outputs", "depends_on", "blocked_by", "based_on", "supports",
     "challenged_by", "approved_by", "confirmed_by", "invalidated_by",
     "cluster_sources", "governed_by", "references", "project",
+    # Instruction fields — both are lists (pending queue + executed archive).
+    "alfred_instructions", "alfred_instructions_last",
 }
 
 # Required fields for all records

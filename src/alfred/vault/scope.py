@@ -128,6 +128,27 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # content synthesised from the voice turn — body writes stay on.
         "allow_body_writes": True,
     },
+    # Instructor executes natural-language directives parked in the
+    # ``alfred_instructions`` frontmatter field. Broader than janitor
+    # (may create + move + write bodies; no frontmatter allowlist) but
+    # narrower than talker — delete is denied because removing a record
+    # is always an explicit operator task, never an instruction the
+    # watcher should execute on its own. Part of the 6-commit
+    # alfred_instructions watcher rollout.
+    "instructor": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": True,
+        "edit": True,
+        "move": True,
+        "delete": False,
+        # Instructor may write full record bodies — directives can ask
+        # for drafting, restructuring, or inserting content into an
+        # existing record body.
+        "allow_body_writes": True,
+    },
 }
 
 
