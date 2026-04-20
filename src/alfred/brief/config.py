@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from alfred.common.schedule import ScheduleConfig
+
 
 @dataclass
 class StationConfig:
@@ -18,12 +20,6 @@ class WeatherConfig:
     stations: list[StationConfig] = field(default_factory=list)
     api_base: str = "https://aviationweather.gov/api/data"
     timeout: int = 30
-
-
-@dataclass
-class ScheduleConfig:
-    time: str = "06:00"
-    timezone: str = "America/Halifax"
 
 
 @dataclass
@@ -79,6 +75,7 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
     schedule = ScheduleConfig(
         time=schedule_raw.get("time", "06:00"),
         timezone=schedule_raw.get("timezone", "America/Halifax"),
+        # Brief is daily-only; day_of_week stays None.
     )
 
     output_raw = section.get("output", {})

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+from alfred.common.schedule import compute_next_fire
 
 from .config import BriefConfig
 from .health_section import render_health_section
@@ -186,17 +188,6 @@ async def update_weather(config: BriefConfig) -> str:
     return rel_path
 
 
-def _next_run_time(schedule_time: str, tz_name: str) -> datetime:
-    """Calculate the next scheduled run time."""
-    tz = ZoneInfo(tz_name)
-    now = datetime.now(tz)
-    hour, minute = map(int, schedule_time.split(":"))
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return target
-
-
 async def run_daemon(config: BriefConfig) -> None:
     """Daily brief generator daemon. Runs at configured time."""
     log.info("brief.daemon.starting",
@@ -208,8 +199,11 @@ async def run_daemon(config: BriefConfig) -> None:
 
     while True:
         tz = ZoneInfo(config.schedule.timezone)
-        target = _next_run_time(config.schedule.time, config.schedule.timezone)
         now = datetime.now(tz)
+        # Clock-aligned next-fire via shared helper (see
+        # ``alfred.common.schedule``). Daily-only for brief; the weekly
+        # gate there is used by distiller consolidation, not brief.
+        target = compute_next_fire(config.schedule, now)
         sleep_seconds = (target - now).total_seconds()
 
         if sleep_seconds > 0:
