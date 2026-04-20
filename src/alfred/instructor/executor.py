@@ -522,13 +522,17 @@ def _surface_error(
 # --- Skill loader -----------------------------------------------------------
 
 
-def _load_skill(skills_dir: Path) -> str:
-    """Load ``vault-instructor/SKILL.md`` if present.
+def _load_skill(skills_dir: Path, config: InstructorConfig | None = None) -> str:
+    """Load ``vault-instructor/SKILL.md`` and apply instance templating.
 
-    Commit 4 doesn't ship the SKILL yet (commit 5 does) — if the file
-    is missing we raise loud rather than returning an empty prompt so
-    the issue is obvious the first time the daemon tries to execute a
-    directive. Tests inject a minimal SKILL via the ``skills_dir`` arg.
+    ``{{instance_name}}`` and ``{{instance_canonical}}`` placeholders
+    are substituted from ``config.instance`` — same mechanism the
+    talker uses (see ``alfred.telegram.daemon._apply_instance_templating``).
+    Plain ``str.replace``, zero extra deps.
+
+    Raises ``FileNotFoundError`` if the skill is missing so a
+    misconfigured ``skills_dir`` surfaces at the first directive
+    dispatch rather than silently succeeding with an empty prompt.
     """
     skill_path = skills_dir / "vault-instructor" / "SKILL.md"
     if not skill_path.exists():
@@ -537,7 +541,14 @@ def _load_skill(skills_dir: Path) -> str:
             f"Ensure the skills_dir is correct — commit 5 ships the "
             f"default skill file."
         )
-    return skill_path.read_text(encoding="utf-8")
+    prompt = skill_path.read_text(encoding="utf-8")
+    if config is not None:
+        prompt = (
+            prompt
+            .replace("{{instance_name}}", config.instance.name)
+            .replace("{{instance_canonical}}", config.instance.canonical)
+        )
+    return prompt
 
 
 # --- Main executor ----------------------------------------------------------
@@ -568,7 +579,7 @@ async def execute(
     provide a valid skills_dir.
     """
     dry_run = is_destructive(directive, config.destructive_keywords)
-    system_prompt = _load_skill(skills_dir)
+    system_prompt = _load_skill(skills_dir, config)
 
     vault_path = config.vault.vault_path
     md_path = vault_path / record_path

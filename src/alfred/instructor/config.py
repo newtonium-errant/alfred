@@ -92,6 +92,20 @@ class AnthropicConfig:
 
 
 @dataclass
+class InstanceConfig:
+    """Per-instance persona identity for the instructor SKILL.
+
+    Mirrors the talker's ``InstanceConfig`` — ``{{instance_name}}`` and
+    ``{{instance_canonical}}`` placeholders in the SKILL.md are
+    substituted at load time so a multi-instance deploy can give each
+    instance its own identity without forking the skill file.
+    """
+
+    name: str = "Alfred"
+    canonical: str = "Alfred"
+
+
+@dataclass
 class StateConfig:
     path: str = "./data/instructor_state.json"
 
@@ -108,6 +122,7 @@ class InstructorConfig:
 
     vault: VaultConfig = field(default_factory=VaultConfig)
     anthropic: AnthropicConfig = field(default_factory=AnthropicConfig)
+    instance: InstanceConfig = field(default_factory=InstanceConfig)
     state: StateConfig = field(default_factory=StateConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
@@ -137,6 +152,7 @@ class InstructorConfig:
 _DATACLASS_MAP: dict[str, type] = {
     "vault": VaultConfig,
     "anthropic": AnthropicConfig,
+    "instance": InstanceConfig,
     "state": StateConfig,
     "logging": LoggingConfig,
 }
@@ -194,7 +210,7 @@ def load_from_unified(raw: dict[str, Any]) -> InstructorConfig:
     }
     # Copy instructor-specific subsections/scalars through to _build.
     for key in (
-        "anthropic", "state",
+        "anthropic", "instance", "state",
         "poll_interval_seconds", "max_retries",
         "audit_window_size", "destructive_keywords",
     ):
