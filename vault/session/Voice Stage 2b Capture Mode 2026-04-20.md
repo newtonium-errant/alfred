@@ -96,6 +96,47 @@ update to this session note in one bundle per
   rendering, idempotent writes, orchestrator happy/failure paths,
   transcript flattener).
 
+### Commit 4 — Telegram `/extract <short-id>` command
+
+- New module `src/alfred/telegram/capture_extract.py` (~330 lines):
+  - `ExtractResult` dataclass (`created_paths` + `skipped_reason`).
+  - `extract_notes_from_capture()` — resolve short-id via
+    `closed_sessions`, load session record, run extraction LLM call
+    (tool_choice=auto so the model can emit fewer notes), create
+    note records via `vault_create`, update session frontmatter
+    `derived_notes` with wikilinks.
+  - Each note carries `created_by_capture: true`, `source_session:
+    [[session/...]]`, `confidence_tier: high|medium` frontmatter.
+    Body includes a source-quote blockquote + `_Source: [[...]]_`
+    attribution.
+  - Implicit chain: if the session record has no
+    `## Structured Summary` block, run the batch pass first via a
+    synthetic transcript reconstructed from the body
+    `**Andrew** (hh:mm):` lines.
+  - Idempotency: if the session already has `derived_notes`
+    populated, return the existing list with
+    `skipped_reason="already_extracted"` (no LLM call).
+  - Max-notes defensive trim (DEFAULT_MAX_NOTES=8, configurable).
+- New `on_extract` handler in `bot.py`:
+  - Registered as `/extract` CommandHandler.
+  - Inline-command dispatch extended: new
+    `_INLINE_CMD_WITH_ARG_RE` matches `/extract <short-id>` at
+    start-of-message AND end-of-line (end-of-line form requires a
+    trailing arg so the no-arg path doesn't shadow it).
+  - `_parse_short_id_arg()` tolerates both `ctx.args` (from
+    CommandHandler) and inline regex extraction from the message
+    text.
+  - `on_extract` surfaces all skip reasons as distinct reply
+    strings (no session / already extracted / no notes / llm
+    error).
+- `_INLINE_COMMANDS` gains `"extract"` + `"brief"` (brief handler
+  lands in commit 5 but the set entry is a single point of
+  truth).
+- New tests: `tests/telegram/test_capture_extract.py` (11 tests —
+  happy path, idempotency, missing session, max-notes cap, implicit
+  structuring chain, inline detect, short-id parse, inline
+  dispatch end-to-end).
+
 ## Outcome
 
 _(updated on commit 7)_
@@ -146,3 +187,20 @@ _(updated on each commit)_
   blocks uniformly via the marker pair. The `_insert_summary_above_transcript`
   helper uses the markers to make writes idempotent — repeat runs
   replace the block instead of stacking.
+
+- **Pattern validated — idempotency via frontmatter list presence.**
+  `/extract` checks the session record's `derived_notes` field; if it's
+  non-empty, skip and return the existing list. No state duplication,
+  no extra cache. The frontmatter list IS the state. Applies generally:
+  any derived-output command should store its outputs in a frontmatter
+  list and skip-if-present rather than storing a "has been run" bool
+  separately.
+
+- **Pattern validated — inline-command with-arg regex has priority
+  over no-arg regex.** The existing `_INLINE_CMD_RE` matches
+  `/command\s*$` (no trailing args). Without a separate with-arg
+  matcher that fires FIRST, `please /extract abc123` would fall
+  through to no-arg matching, which would fail because of the
+  trailing arg. New `_INLINE_CMD_WITH_ARG_RE` is checked before the
+  no-arg form so commands that take an argument (extract, brief)
+  route correctly.

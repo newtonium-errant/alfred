@@ -38,6 +38,7 @@ from telegram.ext import (
 from . import (
     calibration,
     capture_batch,
+    capture_extract,
     conversation,
     model_calibration,
     router,
@@ -104,6 +105,11 @@ def build_app(
     # called for ``no-auto-escalate`` but dashes aren't legal in PTB —
     # noting the deviation here and in the session note.
     app.add_handler(CommandHandler("no_auto_escalate", on_no_auto_escalate))
+    # wk2b c4: /extract <short-id> — opt-in note extraction from a
+    # capture session. Takes one positional arg (the 8-char short-id
+    # emitted in the /end reply); idempotent if the session already has
+    # derived_notes populated.
+    app.add_handler(CommandHandler("extract", on_extract))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
@@ -530,6 +536,121 @@ async def on_sonnet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(reply)
 
 
+async def on_extract(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/extract <short-id> — extract standalone notes from a capture session.
+
+    Idempotency: if the session record already has a populated
+    ``derived_notes`` frontmatter list, we refuse and surface the
+    existing note paths rather than appending a second batch. The user
+    must delete the existing notes to re-run.
+
+    Implicit chain: if the session doesn't yet have a
+    ``## Structured Summary`` block (e.g. the batch pass failed or
+    hasn't fired), the extraction call runs a synthetic structuring
+    pass first.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
+    client: Any = ctx.application.bot_data[_KEY_CLIENT]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+
+    short_id = _parse_short_id_arg(update.message.text or "", ctx.args)
+    if not short_id:
+        await update.message.reply_text(
+            "usage: /extract <short-id>  (the 8-char id from the /end reply)"
+        )
+        return
+
+    from pathlib import Path as _Path
+    model = config.anthropic.model or "claude-sonnet-4-6"
+    log.info(
+        "talker.extract.invoked",
+        chat_id=update.effective_chat.id,
+        short_id=short_id,
+    )
+
+    result = await capture_extract.extract_notes_from_capture(
+        client=client,
+        state=state_mgr,
+        vault_path=_Path(config.vault.path),
+        short_id=short_id,
+        model=model,
+    )
+
+    if result.skipped_reason == "already_extracted":
+        joined = ", ".join(result.created_paths[:5])
+        if len(result.created_paths) > 5:
+            joined += f", +{len(result.created_paths) - 5} more"
+        await update.message.reply_text(
+            f"Already extracted {len(result.created_paths)} notes "
+            f"({joined}). Delete first to re-run."
+        )
+        return
+
+    if result.skipped_reason == "no_session":
+        await update.message.reply_text(
+            f"No session found for short-id {short_id!r}. Is it closed?"
+        )
+        return
+
+    if result.skipped_reason == "no_record":
+        await update.message.reply_text(
+            f"Session record missing for short-id {short_id!r}."
+        )
+        return
+
+    if result.skipped_reason.startswith("llm_error"):
+        await update.message.reply_text(
+            f"Extraction failed: {result.skipped_reason[len('llm_error: '):]}"
+        )
+        return
+
+    if not result.created_paths:
+        await update.message.reply_text(
+            "No notes extracted — nothing in this session warranted a "
+            "standalone note."
+        )
+        return
+
+    joined = "\n".join(f"• {p}" for p in result.created_paths)
+    await update.message.reply_text(
+        f"Extracted {len(result.created_paths)} notes:\n{joined}"
+    )
+
+
+# Inline ``/extract abc123`` detection. PTB's CommandHandler fires when
+# the message STARTS with /extract — the inline path here matches
+# ``please /extract abc123`` at end-of-line. The short-id is parsed
+# from the text ourselves because the inline path doesn't populate
+# ``ctx.args``.
+_INLINE_EXTRACT_RE = re.compile(r"(?:^|\s)/extract\s+(\w+)\s*$")
+
+
+def _parse_short_id_arg(text: str, args: Any) -> str:
+    """Return the short-id argument, tolerating both CommandHandler + inline forms.
+
+    ``args`` may be ``None`` (inline path didn't populate it), a list
+    (CommandHandler populated from the command suffix), or a stray
+    object like a MagicMock (some test paths). We defensively check for
+    list-shape before indexing, and fall back to regex extraction from
+    the raw message text in every other case.
+    """
+    if isinstance(args, list) and args:
+        return str(args[0]).strip()
+    first_line = text.splitlines()[0] if text else ""
+    match = _INLINE_EXTRACT_RE.search(first_line)
+    if match:
+        return match.group(1).strip()
+    # Also try the with-arg regex for inline ``/extract <id>`` forms.
+    match2 = _INLINE_CMD_WITH_ARG_RE.search(first_line)
+    if match2 and match2.group(1).lower() == "extract":
+        return match2.group(2).strip()
+    return ""
+
+
 async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/status — debug helper: active session count, turn count, last-message age."""
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
@@ -845,6 +966,11 @@ _INLINE_COMMANDS: set[str] = {
     "no_auto_escalate",
     "status",
     "start",
+    # Commands taking an argument — detected via _INLINE_CMD_WITH_ARG_RE
+    # below. For these, the inline path forwards the full message text
+    # to the handler so it can parse the arg via _parse_short_id_arg.
+    "extract",
+    "brief",
 }
 
 # Require whitespace or start-of-string before the slash so mid-word
@@ -853,6 +979,12 @@ _INLINE_COMMANDS: set[str] = {
 # ``\b`` so ``/end something`` still matches as start-form.
 _INLINE_CMD_RE = re.compile(r"(?:^|\s)/(\w+)\s*$|^/(\w+)\b")
 
+# Commands that take a short-id argument. Matched as
+# ``/extract <arg>`` at end-of-line (``please /extract abc123``) or
+# ``/extract <arg>`` at start-of-message (``/extract abc123 now``).
+# The arg is a bare word (alphanumeric + underscore).
+_INLINE_CMD_WITH_ARG_RE = re.compile(r"(?:^|\s)/(extract|brief)\s+(\w+)\b")
+
 
 def _detect_inline_command(text: str) -> str | None:
     """Return the lower-cased inline command name, or None.
@@ -860,10 +992,21 @@ def _detect_inline_command(text: str) -> str | None:
     Only inspects the first line of ``text`` so a user typing a multi-line
     message where the second line happens to end in ``/end`` doesn't get
     their session closed silently — commands are line-local by convention.
+
+    Also detects ``/extract <short-id>`` / ``/brief <short-id>`` embedded
+    in prose — the with-arg matcher fires before the no-arg matcher so
+    ``please /extract abc123`` routes to the extract handler (not ignored
+    because the no-arg regex's ``\\s*$`` tail rejects the trailing arg).
     """
     if not text:
         return None
     first_line = text.splitlines()[0]
+    # With-arg form has priority — it's the more specific pattern.
+    match_arg = _INLINE_CMD_WITH_ARG_RE.search(first_line)
+    if match_arg:
+        cmd_arg = match_arg.group(1).lower()
+        if cmd_arg in _INLINE_COMMANDS:
+            return cmd_arg
     match = _INLINE_CMD_RE.search(first_line)
     if not match:
         return None
@@ -1091,4 +1234,11 @@ _INLINE_HANDLERS.update({
     "opus": on_opus,
     "sonnet": on_sonnet,
     "no_auto_escalate": on_no_auto_escalate,
+    "extract": on_extract,
+    # ``brief`` is registered here but its handler lives in commit 5.
+    # Adding the key now keeps the inline-dispatch surface in sync
+    # with ``_INLINE_COMMANDS`` above — the handler check in
+    # ``_dispatch_inline_command`` returns False if the key isn't in
+    # this map, so an early-firing ``/brief`` before commit 5 lands is
+    # routed to the LLM as prose (graceful).
 })
