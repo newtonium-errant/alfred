@@ -41,7 +41,13 @@ curator:
 janitor:
   sweep:
     interval_seconds: 3600
-    deep_sweep_interval_hours: 24
+    # Deep sweep is LLM-heavy — runs overnight so it doesn't collide
+    # with the user's working hours. 02:30 America/Halifax daily by
+    # default. Add ``day_of_week: sunday`` etc. for a weekly gate, or
+    # omit the block entirely to fall back to deep_sweep_interval_hours.
+    deep_sweep_schedule:
+      time: "02:30"
+      timezone: "America/Halifax"
     structural_only: false
     stub_body_threshold_chars: 50
     orphan_exempt_dirs: ["view"]

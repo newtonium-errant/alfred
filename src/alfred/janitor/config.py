@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from alfred.common.schedule import ScheduleConfig
+
 ENV_RE = re.compile(r"\$\{(\w+)\}")
 
 
@@ -85,7 +87,20 @@ class AgentConfig:
 @dataclass
 class SweepConfig:
     interval_seconds: int = 3600
+    # Deprecated fallback — preserved so old config.yaml files still
+    # load, but ``deep_sweep_schedule`` is the canonical gate. See
+    # c3 in the scheduling consolidation arc. When ``deep_sweep_schedule``
+    # is present the interval value is ignored.
     deep_sweep_interval_hours: int = 24
+    # Clock-aligned deep sweep. Default: 02:30 Halifax daily so the
+    # LLM-heavy fix pipeline runs overnight and doesn't collide with
+    # the user's working hours. Weekly variants supported via
+    # day_of_week if a project ever needs them.
+    deep_sweep_schedule: ScheduleConfig = field(
+        default_factory=lambda: ScheduleConfig(
+            time="02:30", timezone="America/Halifax",
+        )
+    )
     structural_only: bool = False
     stub_body_threshold_chars: int = 50
     orphan_exempt_dirs: list[str] = field(default_factory=lambda: ["view"])
@@ -130,6 +145,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "zo": ZoBackendConfig,
     "openclaw": OpenClawBackendConfig,
     "sweep": SweepConfig,
+    "deep_sweep_schedule": ScheduleConfig,
     "state": StateConfig,
     "logging": LoggingConfig,
 }

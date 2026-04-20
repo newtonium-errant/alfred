@@ -18,6 +18,7 @@ from pathlib import Path
 
 import frontmatter
 
+from alfred.common.schedule import compute_next_fire
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
 from alfred.vault.ops import is_ignored_path
 
@@ -425,35 +426,52 @@ async def run_watch(
 ) -> None:
     """Daemon mode — sweep on interval until interrupted."""
     interval = config.sweep.interval_seconds
-    deep_interval_hours = config.sweep.deep_sweep_interval_hours
+    deep_schedule = config.sweep.deep_sweep_schedule
     structural_only = config.sweep.structural_only
 
     # Persist last deep sweep time across restarts. Without this, every
     # daemon restart reset last_deep to epoch and triggered a full deep
-    # sweep (LLM-heavy) on boot — a runaway-cost bug in upstream.
+    # sweep (LLM-heavy) on boot — a runaway-cost bug in upstream. On
+    # first boot we seed ``last_deep`` to "now" so the first fire is at
+    # the next scheduled window (e.g. 02:30 Halifax) rather than
+    # immediately on start.
+    now_utc_init = datetime.now(timezone.utc)
     if state.last_deep_sweep:
         try:
             last_deep = datetime.fromisoformat(state.last_deep_sweep)
         except (ValueError, TypeError):
-            last_deep = datetime.min.replace(tzinfo=timezone.utc)
+            last_deep = now_utc_init
     else:
-        last_deep = datetime.min.replace(tzinfo=timezone.utc)
+        last_deep = now_utc_init
     last_drift = datetime.min.replace(tzinfo=timezone.utc)
     drift_interval_hours = config.sweep.drift_sweep_interval_hours
 
     log.info(
         "daemon.starting",
         interval=interval,
-        deep_interval_hours=deep_interval_hours,
+        deep_sweep_time=deep_schedule.time,
+        deep_sweep_tz=deep_schedule.timezone,
+        deep_sweep_day_of_week=deep_schedule.day_of_week,
         drift_interval_hours=drift_interval_hours,
     )
 
     while True:
         now = datetime.now(timezone.utc)
-        hours_since_deep = (now - last_deep).total_seconds() / 3600
+
+        # Clock-aligned deep sweep gate: fire when we've crossed the
+        # next scheduled fire time relative to the last one. The helper
+        # returns the next fire strictly after its input, so we never
+        # double-fire within the same scheduled window — restarts that
+        # happen between 02:30 and the next 02:30 don't re-fire because
+        # ``last_deep`` was updated on the previous successful fire.
+        next_fire_after_last = compute_next_fire(deep_schedule, last_deep)
+        # ``now`` is UTC; the helper returns in the schedule's tz. Both
+        # are tz-aware, so Python's datetime comparison handles the
+        # offset correctly.
+        deep_due = now >= next_fire_after_last
 
         try:
-            if hours_since_deep >= deep_interval_hours:
+            if deep_due:
                 # Event-driven deep sweep (upstream #15). Do a cheap
                 # structural scan first and compare the resulting issue
                 # set against the previous sweep's snapshot. If no new
@@ -508,6 +526,12 @@ async def run_watch(
                 last_deep = now
                 state.last_deep_sweep = now.isoformat()
                 state.save()
+                log.info(
+                    "daemon.deep_sweep_next",
+                    next_fire=compute_next_fire(
+                        deep_schedule, last_deep,
+                    ).isoformat(),
+                )
             else:
                 # Structural-only sweep
                 await run_sweep(config, state, skills_dir, structural_only=True, fix_mode=False)
