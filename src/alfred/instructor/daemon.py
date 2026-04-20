@@ -191,6 +191,8 @@ async def run(
     config: InstructorConfig,
     state: InstructorState | None = None,
     suppress_stdout: bool = False,
+    skills_dir: Path | None = None,
+    client: Any = None,
 ) -> None:
     """Run the instructor poll loop until cancelled.
 
@@ -200,13 +202,32 @@ async def run(
     suppression is done in the orchestrator runner before this
     function is called.
 
-    Commit 3 scope: the loop observes ``detect_pending`` results and
-    logs them. Commit 4 replaces the placeholder block with the
-    executor dispatch.
+    ``skills_dir`` is where ``vault-instructor/SKILL.md`` lives. Defaults
+    to ``alfred._data.get_skills_dir()`` when None — tests inject a
+    throwaway path with a minimal SKILL.
+
+    ``client`` is an ``AsyncAnthropic`` instance. When None, we build
+    one lazily from ``config.anthropic.api_key``; tests inject a fake.
     """
     if state is None:
         state = InstructorState(config.state.path)
         state.load()
+
+    if skills_dir is None:
+        from alfred._data import get_skills_dir
+        skills_dir = get_skills_dir()
+
+    # Lazy-construct the SDK client so importing this module has no
+    # Anthropic dependency at test-collection time and a missing API key
+    # doesn't blow up the poll loop until a directive actually fires.
+    if client is None:
+        from anthropic import AsyncAnthropic
+        client = AsyncAnthropic(api_key=config.anthropic.api_key)
+
+    # Late import to avoid a circular reference at module load time —
+    # the executor imports daemon.PENDING_FIELD in a future refactor,
+    # so keep this local.
+    from .executor import execute_and_record
 
     vault_path = config.vault.vault_path
     interval = config.poll_interval_seconds
@@ -228,17 +249,46 @@ async def run(
                     count=len(pending),
                     paths=sorted({p.rel_path for p in pending}),
                 )
-                # NB: actual executor dispatch lands in commit 4. For
-                # now we just refresh the cached hash so we don't
-                # re-log the same pending directives every cycle —
-                # the record content hasn't changed yet (the executor
-                # would normally edit it), so without this the next
-                # poll would detect the same hash mismatch.
-                # Commit 4 replaces this block with the real executor
-                # call, which mutates the record and naturally
-                # advances the hash.
                 for p in pending:
-                    state.record_hash(p.rel_path, p.record_hash)
+                    try:
+                        result = await execute_and_record(
+                            client=client,
+                            directive=p.directive,
+                            record_path=p.rel_path,
+                            config=config,
+                            state=state,
+                            skills_dir=skills_dir,
+                        )
+                        log.info(
+                            "instructor.daemon.executed",
+                            path=p.rel_path,
+                            status=result.status,
+                            dry_run=result.dry_run,
+                            summary=result.summary[:120],
+                        )
+                    except Exception as exc:  # noqa: BLE001 — never break the loop
+                        log.warning(
+                            "instructor.daemon.execute_failed",
+                            path=p.rel_path,
+                            error=str(exc),
+                        )
+                    finally:
+                        # Hash will have advanced because the executor
+                        # rewrote the file — re-hash and seal so the
+                        # next poll sees a cache hit. If the executor
+                        # failed before writing anything, sealing the
+                        # original hash still prevents a tight retry
+                        # loop; the state's retry counter gates the
+                        # next attempt at real progression.
+                        try:
+                            from .utils import file_hash as _fh
+                            md_path = vault_path / p.rel_path
+                            if md_path.exists():
+                                state.record_hash(p.rel_path, _fh(md_path))
+                            else:
+                                state.forget_hash(p.rel_path)
+                        except OSError:
+                            pass
             state.stamp_run()
             state.save()
         except Exception as exc:  # noqa: BLE001 — never break the loop
