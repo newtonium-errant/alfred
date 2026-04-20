@@ -30,8 +30,20 @@ class VaultRecord:
 
 
 def extract_wikilinks(text: str) -> list[str]:
-    """Extract all wikilink targets from text (frontmatter + body)."""
-    return WIKILINK_RE.findall(text)
+    """Extract all wikilink targets from text (frontmatter + body).
+
+    Targets are whitespace-normalized: YAML frontmatter folds long quoted
+    strings across physical lines when a list item's wikilink exceeds the
+    line width, so the raw regex capture can contain an embedded ``\\n``
+    plus continuation indent. We collapse any internal whitespace run to a
+    single space so such wrapped targets resolve the same as single-line
+    wikilinks. Wikilinks never contain meaningful internal whitespace
+    structure (Obsidian renders them as one token), so this is safe.
+    """
+    return [
+        re.sub(r"\s+", " ", target).strip()
+        for target in WIKILINK_RE.findall(text)
+    ]
 
 
 def parse_file(vault_path: Path, rel_path: str) -> VaultRecord:

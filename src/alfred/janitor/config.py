@@ -31,7 +31,10 @@ def _substitute_env(value: Any) -> Any:
 @dataclass
 class VaultConfig:
     path: str = ""
-    ignore_dirs: list[str] = field(default_factory=lambda: [".obsidian"])
+    # `_templates` contains placeholder wikilinks (`[[project/My Project]]`)
+    # as syntax examples; the scanner must not flag those as broken links.
+    # `_bases` holds Obsidian base view definitions with similar placeholders.
+    ignore_dirs: list[str] = field(default_factory=lambda: [".obsidian", "_templates", "_bases"])
     ignore_files: list[str] = field(default_factory=list)
 
     @property
