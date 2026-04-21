@@ -104,6 +104,62 @@ class AuthConfig:
 
 
 @dataclass
+class PeerFieldRules:
+    """Per-record-type permissions for one peer.
+
+    ``fields`` is the allowlist of frontmatter field names (supporting
+    dotted notation like ``preferences.coding``) the peer may read.
+    ``bodies`` is a belt-and-braces flag — never True in v1, never
+    honoured by the handler. Parked here so future code that wants to
+    grow body-level access doesn't require a schema change.
+    """
+
+    fields: list[str] = field(default_factory=list)
+    bodies: bool = False
+
+
+@dataclass
+class PeerEntry:
+    """One entry in ``transport.peers`` — where to reach a peer instance.
+
+    ``base_url`` is the peer's transport endpoint (e.g.
+    ``http://127.0.0.1:8892`` for KAL-LE). ``token`` is the bearer
+    secret the local client sends when reaching out. Auth direction
+    is symmetric in v1 — the same token appears in the peer's own
+    ``transport.auth.tokens`` dict keyed by our instance name, and
+    vice versa.
+    """
+
+    base_url: str = ""
+    token: str = ""
+
+
+@dataclass
+class CanonicalConfig:
+    """Per-peer canonical record permissions + audit settings.
+
+    ``owner`` is True on the instance that holds canonical records
+    (SALEM). Peers set it to False so their handler returns 404
+    ``canonical_not_owned`` for ``/canonical/*`` requests.
+
+    ``audit_log_path`` is where every canonical read (even denied
+    ones) gets logged as a JSONL line. Default matches the other
+    data/ siblings.
+
+    ``peer_permissions`` is a nested dict keyed by peer name → record
+    type → :class:`PeerFieldRules`. Default-deny: if a peer isn't
+    listed, or the type isn't listed, or fields is empty, the canonical
+    handler returns 403.
+    """
+
+    owner: bool = False
+    audit_log_path: str = "./data/canonical_audit.jsonl"
+    peer_permissions: dict[str, dict[str, PeerFieldRules]] = field(
+        default_factory=dict,
+    )
+
+
+@dataclass
 class StateConfig:
     """Where the transport state JSON lives.
 
@@ -130,6 +186,8 @@ class TransportConfig:
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     state: StateConfig = field(default_factory=StateConfig)
+    canonical: CanonicalConfig = field(default_factory=CanonicalConfig)
+    peers: dict[str, PeerEntry] = field(default_factory=dict)
 
 
 # --- Recursive builder ------------------------------------------------------
@@ -158,6 +216,45 @@ def _build_auth(data: dict[str, Any]) -> AuthConfig:
     return AuthConfig(tokens=tokens)
 
 
+def _build_canonical(data: dict[str, Any]) -> CanonicalConfig:
+    """Build ``CanonicalConfig`` + nested per-peer-type rules."""
+    peer_perms_raw = data.get("peer_permissions", {}) or {}
+    peer_perms: dict[str, dict[str, PeerFieldRules]] = {}
+    if isinstance(peer_perms_raw, dict):
+        for peer_name, types_raw in peer_perms_raw.items():
+            if not isinstance(types_raw, dict):
+                continue
+            type_map: dict[str, PeerFieldRules] = {}
+            for type_name, rules_raw in types_raw.items():
+                if not isinstance(rules_raw, dict):
+                    continue
+                type_map[str(type_name)] = PeerFieldRules(
+                    fields=list(rules_raw.get("fields", []) or []),
+                    bodies=bool(rules_raw.get("bodies", False)),
+                )
+            peer_perms[str(peer_name)] = type_map
+    return CanonicalConfig(
+        owner=bool(data.get("owner", False)),
+        audit_log_path=str(
+            data.get("audit_log_path", "./data/canonical_audit.jsonl")
+        ),
+        peer_permissions=peer_perms,
+    )
+
+
+def _build_peers(data: dict[str, Any]) -> dict[str, PeerEntry]:
+    """Build the ``peers`` dict: peer_name → :class:`PeerEntry`."""
+    out: dict[str, PeerEntry] = {}
+    for peer_name, entry_raw in (data or {}).items():
+        if not isinstance(entry_raw, dict):
+            continue
+        out[str(peer_name)] = PeerEntry(
+            base_url=str(entry_raw.get("base_url", "") or ""),
+            token=str(entry_raw.get("token", "") or ""),
+        )
+    return out
+
+
 def _build(cls: type, data: dict[str, Any]) -> Any:
     """Recursively construct a dataclass from a dict.
 
@@ -184,6 +281,10 @@ def _build(cls: type, data: dict[str, Any]) -> Any:
                 k: v for k, v in data["state"].items()
                 if k in {"path", "dead_letter_max_age_days"}
             })
+        if "canonical" in data and isinstance(data["canonical"], dict):
+            kwargs["canonical"] = _build_canonical(data["canonical"])
+        if "peers" in data and isinstance(data["peers"], dict):
+            kwargs["peers"] = _build_peers(data["peers"])
         return TransportConfig(**kwargs)
     # Fallback — not currently reached, but keeps the shape extensible.
     return cls(**data)
