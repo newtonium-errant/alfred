@@ -30,6 +30,7 @@ Non-goals
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -164,3 +165,83 @@ def compute_next_fire(config: ScheduleConfig, now: datetime) -> datetime:
         minute,
         tzinfo=tz,
     )
+
+
+# Default re-check cadence for ``sleep_until``. Each chunk costs one
+# wakeup + wall-clock read; 60s is a negligible per-day overhead
+# (~1440 chunks) and keeps early/late fires bounded to <= one chunk
+# regardless of how badly the monotonic clock drifts mid-sleep.
+_SLEEP_CHUNK_SECONDS = 60.0
+
+
+async def sleep_until(
+    target: datetime,
+    *,
+    chunk_seconds: float = _SLEEP_CHUNK_SECONDS,
+    sleeper = None,
+    clock = None,
+) -> float:
+    """Sleep until wall-clock ``target`` (tz-aware) is reached.
+
+    Why this exists
+    ---------------
+    A single ``await asyncio.sleep(N)`` over a long horizon (hours)
+    drifts when the underlying monotonic clock gets out of sync with
+    wall-clock time. On WSL2, Windows host suspend / resume and NTP
+    adjustments can push the monotonic clock forward or backward
+    relative to wall time, causing the daemon to fire many minutes
+    early or late. Observed drift in production: brief daemon fired
+    14-40 min early on consecutive days during Apr 16-21 2026, despite
+    ``compute_next_fire`` returning the correct target.
+
+    The fix is to treat the long sleep as a series of capped chunks,
+    re-reading the wall clock between each chunk. Even if one chunk's
+    monotonic duration is wildly off, the wall-clock check catches up
+    on the next iteration — so the maximum drift is bounded to roughly
+    one chunk (default 60s) regardless of suspend/resume behavior.
+
+    Parameters
+    ----------
+    target:
+        The tz-aware wall-clock time to wake at.
+    chunk_seconds:
+        Max per-iteration sleep. Shorter = tighter wall-clock bound
+        but more wakeups. 60s is the default (≈1440 wakeups/day,
+        negligible).
+    sleeper:
+        Injectable async sleep function for tests. Defaults to
+        ``asyncio.sleep``.
+    clock:
+        Injectable clock function for tests. Called with no args,
+        must return a tz-aware ``datetime``. Defaults to reading
+        ``datetime.now(target.tzinfo)``.
+
+    Returns
+    -------
+    Actual elapsed wall-clock seconds (measured by ``clock``) — caller
+    can log this and compare against the intended sleep for drift
+    diagnostics.
+    """
+    if target.tzinfo is None:
+        raise ValueError(
+            "sleep_until requires tz-aware 'target'; pass a datetime "
+            "with tzinfo set (e.g. from compute_next_fire)"
+        )
+    if chunk_seconds <= 0:
+        raise ValueError("chunk_seconds must be positive")
+
+    if sleeper is None:
+        sleeper = asyncio.sleep
+    if clock is None:
+        def clock() -> datetime:
+            return datetime.now(target.tzinfo)
+
+    start = clock()
+    while True:
+        now = clock()
+        remaining = (target - now).total_seconds()
+        if remaining <= 0:
+            break
+        await sleeper(min(remaining, chunk_seconds))
+    end = clock()
+    return (end - start).total_seconds()

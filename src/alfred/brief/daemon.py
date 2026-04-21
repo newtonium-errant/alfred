@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from alfred.common.schedule import compute_next_fire
+from alfred.common.schedule import compute_next_fire, sleep_until
 
 from .config import BriefConfig
 from .health_section import render_health_section
@@ -209,8 +209,17 @@ async def run_daemon(config: BriefConfig) -> None:
         if sleep_seconds > 0:
             log.info("brief.daemon.sleeping",
                      next_run=target.isoformat(),
+                     sleep_seconds=round(sleep_seconds, 1),
                      sleep_hours=round(sleep_seconds / 3600, 1))
-            await asyncio.sleep(sleep_seconds)
+            # Wall-clock-checked chunked sleep — defends against
+            # monotonic clock drift during long sleeps (WSL2 host
+            # suspend/resume, NTP adjustments). See
+            # ``alfred.common.schedule.sleep_until`` for the rationale.
+            actual_seconds = await sleep_until(target)
+            log.info("brief.daemon.woke",
+                     intended_seconds=round(sleep_seconds, 1),
+                     actual_seconds=round(actual_seconds, 1),
+                     drift_seconds=round(actual_seconds - sleep_seconds, 1))
 
         # Best-effort vault snapshot BEFORE brief — captures previous day's work
         try:
