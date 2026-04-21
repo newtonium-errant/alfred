@@ -493,10 +493,20 @@ def _register_health(app: web.Application) -> None:
 
 # The registry — swapping a stub for a real handler is a one-line diff.
 # Keys intentionally chosen to match the route prefix for readability.
+#
+# Stage 3.5 c3: the ``peer`` + ``canonical`` entries now point at the
+# real registrars in :mod:`peer_handlers`. The stub functions above are
+# retained for unit-test rollback scenarios — if a regression breaks
+# the real handlers, swapping two lines here reverts to 501s.
+from .peer_handlers import (
+    register_canonical_routes as _register_canonical_routes,
+    register_peer_routes as _register_peer_routes,
+)
+
 ROUTE_NAMESPACES: dict[str, Callable[[web.Application], None]] = {
     "outbound": _register_outbound_routes,
-    "peer": _register_peer_stub,
-    "canonical": _register_canonical_stub,
+    "peer": _register_peer_routes,
+    "canonical": _register_canonical_routes,
     "health": _register_health,
 }
 

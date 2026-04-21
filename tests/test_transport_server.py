@@ -317,29 +317,18 @@ async def test_status_unknown_returns_404(client):  # type: ignore[no-untyped-de
 # ---------------------------------------------------------------------------
 
 
-async def test_peer_routes_return_501(client):  # type: ignore[no-untyped-def]
-    """The /peer/* routes are registered but return 501 today.
+async def test_peer_routes_registered_not_501(client):  # type: ignore[no-untyped-def]
+    """Stage 3.5 c3: /peer/* routes are live, not 501 stubs.
 
-    This is load-bearing for the Stage 3.5 dovetail — swapping the
-    stub registrar for a real handler is a one-line change.
+    /peer/send with no inbox registered returns 501
+    ``peer_inbox_not_configured`` (distinct from the old
+    ``peer_not_implemented``) — proves the new handler ran, not the
+    stub. /peer/handshake returns 200 even without an inbox.
     """
-    for path in ("/peer/send", "/peer/query", "/peer/handshake"):
-        resp = await client.post(
-            path,
-            json={},
-            headers={
-                "Authorization": f"Bearer {DUMMY_TRANSPORT_TEST_TOKEN}",
-                "X-Alfred-Client": "scheduler",
-            },
-        )
-        assert resp.status == 501, f"{path} should be 501"
-        body = await resp.json()
-        assert body["reason"] == "peer_not_implemented"
-
-
-async def test_canonical_routes_return_501(client):  # type: ignore[no-untyped-def]
-    resp = await client.get(
-        "/canonical/person/Andrew Newton",
+    # /peer/send without inbox → 501 peer_inbox_not_configured
+    resp = await client.post(
+        "/peer/send",
+        json={"kind": "message", "from": "local", "payload": {"text": "hi"}},
         headers={
             "Authorization": f"Bearer {DUMMY_TRANSPORT_TEST_TOKEN}",
             "X-Alfred-Client": "scheduler",
@@ -347,7 +336,35 @@ async def test_canonical_routes_return_501(client):  # type: ignore[no-untyped-d
     )
     assert resp.status == 501
     body = await resp.json()
-    assert body["reason"] == "peer_not_implemented"
+    assert body["reason"] == "peer_inbox_not_configured"
+
+    # /peer/handshake always returns 200 (no authz beyond bearer).
+    resp = await client.post(
+        "/peer/handshake",
+        json={},
+        headers={
+            "Authorization": f"Bearer {DUMMY_TRANSPORT_TEST_TOKEN}",
+            "X-Alfred-Client": "scheduler",
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert "protocol_version" in body
+    assert "capabilities" in body
+
+
+async def test_canonical_route_not_owned(client):  # type: ignore[no-untyped-def]
+    """Default transport config has ``canonical.owner: False`` → 404 canonical_not_owned."""
+    resp = await client.get(
+        "/canonical/person/Andrew Newton",
+        headers={
+            "Authorization": f"Bearer {DUMMY_TRANSPORT_TEST_TOKEN}",
+            "X-Alfred-Client": "scheduler",
+        },
+    )
+    assert resp.status == 404
+    body = await resp.json()
+    assert body["reason"] == "canonical_not_owned"
 
 
 # ---------------------------------------------------------------------------
