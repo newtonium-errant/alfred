@@ -331,6 +331,75 @@ def test_cmd_tail_peer_filter(tmp_path, capsys):
     assert "stay-c" not in captured.out
 
 
+# ---------------------------------------------------------------------------
+# _run_peer_probes env substitution (2026-04-21 BIT regression fix)
+# ---------------------------------------------------------------------------
+
+
+async def test_run_peer_probes_substitutes_env_placeholders_in_token(
+    peer_server, monkeypatch: pytest.MonkeyPatch,
+):  # type: ignore[no-untyped-def]
+    """Raw config holds ``${VAR}``; the handshake probe must see the resolved value.
+
+    Regression: before this fix, ``_run_peer_probes`` read
+    ``raw["transport"]["peers"][name]["token"]`` directly, so the
+    ``Authorization: Bearer ${ALFRED_KALLE_PEER_TOKEN}`` literal would
+    hit the peer and surface as a false-negative 401 on the
+    ``peer-handshake:*`` probe — even though real-runtime code paths
+    that go through ``load_from_unified`` worked fine.
+    """
+    monkeypatch.setenv("ALFRED_KALLE_PEER_TOKEN", DUMMY_PEER_TOKEN)
+
+    raw = {
+        "transport": {
+            "peers": {
+                "kal-le": {
+                    "base_url": peer_server,
+                    "token": "${ALFRED_KALLE_PEER_TOKEN}",
+                },
+            },
+        },
+        "telegram": {"instance": {"name": "Salem"}},
+    }
+
+    results = await _run_peer_probes(raw, filter_peer="kal-le")
+    handshake = next(r for r in results if r.name == "peer-handshake:kal-le")
+    assert handshake.status == Status.OK, (
+        f"handshake should succeed with env-substituted token, "
+        f"got {handshake.status}: {handshake.detail}"
+    )
+
+
+async def test_run_peer_probes_fails_when_env_var_unset(
+    peer_server, monkeypatch: pytest.MonkeyPatch,
+):  # type: ignore[no-untyped-def]
+    """Unresolved ``${VAR}`` placeholder → handshake still attempts and auth fails.
+
+    If the env var is missing, ``_substitute_env`` leaves the raw
+    ``${VAR}`` text in place (same behaviour as the talker's config
+    loader). The peer rejects the literal placeholder as an invalid
+    token, producing a FAIL auth-rejected. This documents the
+    observable behaviour so an operator sees a real FAIL rather than
+    a silent success.
+    """
+    monkeypatch.delenv("ALFRED_KALLE_PEER_TOKEN", raising=False)
+
+    raw = {
+        "transport": {
+            "peers": {
+                "kal-le": {
+                    "base_url": peer_server,
+                    "token": "${ALFRED_KALLE_PEER_TOKEN}",
+                },
+            },
+        },
+    }
+
+    results = await _run_peer_probes(raw, filter_peer="kal-le")
+    handshake = next(r for r in results if r.name == "peer-handshake:kal-le")
+    assert handshake.status == Status.FAIL
+
+
 def test_cmd_tail_without_peer_shows_all(tmp_path, capsys):
     from alfred.transport.canonical_audit import append_audit
     from alfred.transport import cli as tcli

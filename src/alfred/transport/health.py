@@ -25,6 +25,22 @@ import httpx
 
 from alfred.health.aggregator import register_check
 from alfred.health.types import CheckResult, Status, ToolHealth
+from alfred.transport.config import PeerEntry, load_from_unified
+
+
+def _peer_attr(entry: "PeerEntry | dict[str, Any]", key: str) -> str:
+    """Read ``key`` from either a :class:`PeerEntry` dataclass or a raw dict.
+
+    The probes accept both to stay convenient for direct-test callsites
+    (which pass plain dicts) while letting :func:`_run_peer_probes`
+    hand in env-substituted dataclasses in production. Returns ``""``
+    when the attribute/key is missing or falsy — probes treat empty
+    ``base_url`` / ``token`` as a FAIL at the call site.
+    """
+    if isinstance(entry, PeerEntry):
+        return str(getattr(entry, key, "") or "")
+    # Dict fallback (legacy test callsites).
+    return str(entry.get(key) or "")
 
 
 # Warn thresholds. Exceeding these surfaces a WARN on ``alfred check``
@@ -219,7 +235,7 @@ def _check_state_depths(raw: dict[str, Any]) -> list[CheckResult]:
 
 
 async def _check_peer_reachable(
-    raw: dict[str, Any], peer_name: str, peer_entry: dict[str, Any],
+    raw: dict[str, Any], peer_name: str, peer_entry: "PeerEntry | dict[str, Any]",
 ) -> CheckResult:
     """GET <peer.base_url>/health on the named peer.
 
@@ -227,8 +243,13 @@ async def _check_peer_reachable(
     probe) so we can hit it without loading a token. WARN on
     connection refused (peer is down but that's not a FAIL); FAIL on
     non-JSON or non-200 response from a reachable port.
+
+    ``peer_entry`` may be either a :class:`PeerEntry` dataclass (the
+    production path via :func:`_run_peer_probes`, where env substitution
+    has already been applied) or a raw dict (for direct-test callsites
+    that don't care about ``${VAR}`` placeholders).
     """
-    base_url = str(peer_entry.get("base_url") or "")
+    base_url = _peer_attr(peer_entry, "base_url")
     name = f"peer-reachable:{peer_name}"
     if not base_url:
         return CheckResult(
@@ -270,19 +291,25 @@ async def _check_peer_reachable(
 
 
 async def _check_peer_handshake(
-    raw: dict[str, Any], peer_name: str, peer_entry: dict[str, Any],
+    raw: dict[str, Any], peer_name: str, peer_entry: "PeerEntry | dict[str, Any]",
 ) -> CheckResult:
     """POST <peer.base_url>/peer/handshake — validates auth + protocol version.
 
-    Requires the caller's peer token (peer_entry.token). WARN on
+    Requires the caller's peer token (``peer_entry.token``). WARN on
     version skew (caller is protocol v1, peer returned >1); FAIL on
     auth rejection or missing required capability.
+
+    ``peer_entry`` may be either a :class:`PeerEntry` dataclass or a raw
+    dict (see :func:`_check_peer_reachable`). In the production path
+    :func:`_run_peer_probes` hands us an env-substituted ``PeerEntry``,
+    so ``${ALFRED_KALLE_PEER_TOKEN}`` placeholders resolve before we
+    send them in an ``Authorization: Bearer`` header.
     """
     from .exceptions import TransportError
 
     name = f"peer-handshake:{peer_name}"
-    token = str(peer_entry.get("token") or "")
-    base_url = str(peer_entry.get("base_url") or "")
+    token = _peer_attr(peer_entry, "token")
+    base_url = _peer_attr(peer_entry, "base_url")
     if not token:
         return CheckResult(
             name=name,
@@ -429,17 +456,29 @@ async def _run_peer_probes(
     raw: dict[str, Any],
     filter_peer: str | None = None,
 ) -> list[CheckResult]:
-    """Run all peer-specific probes. Optionally filter to one peer."""
+    """Run all peer-specific probes. Optionally filter to one peer.
+
+    Loads peers via :func:`alfred.transport.config.load_from_unified`
+    so that ``${VAR}`` placeholders in ``transport.peers.*.token`` and
+    ``*.base_url`` are env-substituted BEFORE we send them as bearer
+    tokens or request URLs. Reading ``raw["transport"]["peers"]``
+    directly would leak literal placeholder strings into the
+    ``Authorization: Bearer`` header and surface as a false-negative
+    401 on the ``peer-handshake:*`` probe — the bug fixed in the
+    2026-04-21 scheduling follow-ups pass.
+    """
     results: list[CheckResult] = []
-    transport_cfg = raw.get("transport", {}) or {}
-    peers = transport_cfg.get("peers", {}) or {}
+    # Build the typed transport config — this applies _substitute_env
+    # to the full ``raw`` dict, so nested placeholders resolve. Empty
+    # ``transport`` section is tolerated by load_from_unified (returns
+    # defaults) so the ``if not peers`` short-circuit still kicks in.
+    transport_cfg = load_from_unified(raw)
+    peers = transport_cfg.peers
     if not peers:
         return results
 
     for peer_name, peer_entry in peers.items():
         if filter_peer and peer_name != filter_peer:
-            continue
-        if not isinstance(peer_entry, dict):
             continue
         results.append(await _check_peer_reachable(raw, peer_name, peer_entry))
         results.append(await _check_peer_handshake(raw, peer_name, peer_entry))
