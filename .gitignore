@@ -19,6 +19,10 @@ data/
 # Config with secrets
 .env
 config.yaml
+# Per-instance configs (config.kalle.yaml, config.stayc.yaml, etc.) —
+# each holds its own secrets/tokens and should not be checked in.
+config.*.yaml
+!config.*.yaml.example
 
 # IDE
 .vscode/
@@ -26,6 +30,8 @@ config.yaml
 
 # Claude Code local state (per-project session cache, not shared)
 .claude/projects/
+# Runtime lockfile written by the /schedule skill.
+.claude/scheduled_tasks.lock
 
 # Ink TUI
 tui-ink/node_modules/
