@@ -190,6 +190,59 @@ def test_aliases_config_roundtrip(tmp_path: Path) -> None:
 # --- Bot greeting ----------------------------------------------------------
 
 
+# --- Peer-routing addendum (Stage 3.5) ------------------------------------
+
+
+def test_skill_has_peer_routing_section(talker_config: TalkerConfig) -> None:
+    """Salem's SKILL must describe peer routing (KAL-LE handoff pattern).
+
+    The addendum lands between "Making records" and "Altering records" and
+    introduces KAL-LE by name. Without this section, Salem has no awareness
+    that other instances exist — so when the router classifies ``note`` on
+    an ambiguous coding cue, Salem answers without mentioning routing was
+    an option. Regression risk is high because prompt-tuner edits are
+    free-form markdown.
+    """
+    prompt = _load_templated(talker_config)
+
+    # Section header and the peer name both land verbatim.
+    assert "## Peer routing" in prompt, (
+        "peer-routing section header missing from Salem SKILL"
+    )
+    assert "KAL-LE" in prompt, (
+        "KAL-LE peer must be named in the routing section"
+    )
+    assert "K.A.L.L.E." in prompt, (
+        "canonical form should appear at least once for user recognition"
+    )
+    # The "router decides before your turn" line is the load-bearing contract.
+    assert "routing is decided" in prompt.lower() or "above your turn" in prompt, (
+        "SKILL must state Salem can't route manually"
+    )
+
+
+def test_skill_peer_routing_survives_salem_templating(
+    talker_config: TalkerConfig,
+) -> None:
+    """The peer-routing section templates correctly on Salem config.
+
+    The section references ``KAL-LE`` as a literal string (product name,
+    not persona). The {{instance_name}} / {{instance_canonical}}
+    substitution must not accidentally rewrite KAL-LE on either instance.
+    """
+    talker_config.instance = InstanceConfig(
+        name="Salem",
+        canonical="S.A.L.E.M.",
+        aliases=["Salem"],
+    )
+    prompt = _load_templated(talker_config)
+
+    assert "KAL-LE" in prompt, "KAL-LE must stay literal on Salem config"
+    assert "K.A.L.L.E." in prompt, "KAL-LE canonical must stay literal"
+    # Persona swap still lands.
+    assert "You are **S.A.L.E.M.**" in prompt
+
+
 @pytest.mark.asyncio
 async def test_bot_start_greeting_uses_instance_name(
     talker_config: TalkerConfig,
