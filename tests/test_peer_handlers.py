@@ -38,8 +38,10 @@ def _build_config(
     canonical_owner: bool = False,
     peer_permissions: dict[str, dict[str, PeerFieldRules]] | None = None,
     extra_peers: dict[str, PeerEntry] | None = None,
-    audit_log_path: str = "./canonical_audit.jsonl",
+    audit_log_path: str = "",
 ) -> TransportConfig:
+    # Empty audit_log_path → append_audit is a no-op. Tests that assert
+    # on audit content override the path to a tmp file.
     tokens: dict[str, AuthTokenEntry] = {
         "local": AuthTokenEntry(
             token=DUMMY_SALEM_PEER_TOKEN,

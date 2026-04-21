@@ -53,6 +53,10 @@ def append_audit(
       - Never raises; disk errors log-and-continue. Audit failures must
         not propagate to the caller and interrupt the canonical read.
     """
+    if not audit_log_path:
+        # Audit explicitly disabled — skip. Used by tests that don't
+        # care about the audit trail; prod configs always set this.
+        return
     path = Path(audit_log_path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

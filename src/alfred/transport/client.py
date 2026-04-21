@@ -295,3 +295,233 @@ async def get_status(
         "GET", f"/outbound/status/{entry_id}",
         client_name=client_name,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage 3.5 peer dispatch — talks to another Alfred instance's transport
+# ---------------------------------------------------------------------------
+
+
+async def _peer_request(
+    *,
+    base_url: str,
+    token: str,
+    method: str,
+    path: str,
+    self_name: str,
+    correlation_id: str | None,
+    json_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Peer-variant of :func:`_request`.
+
+    Same retry shape (0.5s → 2s on 5xx/connection), same error
+    taxonomy. Key differences:
+      - base URL + token come from the caller (peer-specific, not
+        read from env).
+      - ``X-Alfred-Client`` is the instance name (``salem``,
+        ``kal-le``) because the remote's ``allowed_clients`` is keyed
+        on peer names, not tool names.
+      - Correlation id travels via ``X-Correlation-Id`` when provided.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Alfred-Client": self_name,
+    }
+    if correlation_id:
+        headers["X-Correlation-Id"] = correlation_id
+
+    url = f"{base_url.rstrip('/')}{path}"
+    last_exc: Exception | None = None
+
+    for attempt_num, backoff in enumerate([0.0, *_RETRY_BACKOFFS], start=0):
+        if backoff:
+            await asyncio.sleep(backoff)
+        try:
+            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+                resp = await client.request(
+                    method, url, json=json_body, headers=headers,
+                )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            last_exc = exc
+            log.warning(
+                "transport.client.peer_connect_failed",
+                url=url,
+                attempt=attempt_num,
+                error=str(exc),
+                response_summary=f"Connect failure: {exc.__class__.__name__}",
+            )
+            continue
+        except httpx.RequestError as exc:
+            last_exc = exc
+            log.warning(
+                "transport.client.peer_request_error",
+                url=url,
+                attempt=attempt_num,
+                error=str(exc),
+                response_summary=f"Request error: {exc.__class__.__name__}: {exc}",
+            )
+            continue
+
+        if 400 <= resp.status_code < 500:
+            body_text = resp.text[:500]
+            log.warning(
+                "transport.client.peer_nonzero_response",
+                code=resp.status_code,
+                body=body_text,
+                response_summary=(
+                    f"Status {resp.status_code}: {body_text[:200] or '(no body)'}"
+                ),
+            )
+            raise TransportRejected(
+                f"HTTP {resp.status_code} from {path}: {body_text[:200]}",
+                status_code=resp.status_code,
+                body=body_text,
+            )
+
+        if 500 <= resp.status_code < 600:
+            body_text = resp.text[:500]
+            log.warning(
+                "transport.client.peer_nonzero_response",
+                code=resp.status_code,
+                body=body_text,
+                attempt=attempt_num,
+                response_summary=(
+                    f"Status {resp.status_code}: {body_text[:200] or '(no body)'}"
+                ),
+            )
+            last_exc = TransportUnavailable(
+                f"HTTP {resp.status_code} from {path}: {body_text[:200]}"
+            )
+            continue
+
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise TransportError(
+                f"non-JSON response from {path}: {resp.text[:200]}"
+            ) from exc
+
+    if isinstance(last_exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        raise TransportServerDown(
+            f"Could not reach {url} after {len(_RETRY_BACKOFFS) + 1} attempt(s): "
+            f"{last_exc}"
+        ) from last_exc
+    if isinstance(last_exc, TransportUnavailable):
+        raise last_exc
+    if last_exc is not None:
+        raise TransportUnavailable(f"{url}: {last_exc}") from last_exc
+    raise TransportUnavailable(f"{url}: no response after retries")
+
+
+def _new_correlation_id() -> str:
+    """16 hex chars — same width the server mints when none is supplied."""
+    import uuid
+    return uuid.uuid4().hex[:16]
+
+
+async def peer_send(
+    peer_name: str,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    config: "TransportConfig | None" = None,
+    self_name: str = "salem",
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /peer/send on the named peer's transport.
+
+    ``config`` is usually built from ``config.yaml`` via
+    ``load_from_unified``. Accepts ``None`` only in tests that monkey-
+    patch the request function — production callers must supply it
+    because the peer URL + token live in the caller's config.
+    """
+    from .config import TransportConfig, load_config
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = correlation_id or _new_correlation_id()
+
+    body = {
+        "kind": kind,
+        "from": self_name,
+        "payload": payload,
+        "correlation_id": cid,
+    }
+    return await _peer_request(
+        base_url=base_url,
+        token=token,
+        method="POST",
+        path="/peer/send",
+        self_name=self_name,
+        correlation_id=cid,
+        json_body=body,
+    )
+
+
+async def peer_query(
+    peer_name: str,
+    record_type: str,
+    name: str,
+    *,
+    fields: list[str] | None = None,
+    filter: dict[str, Any] | None = None,  # noqa: A002
+    config: "TransportConfig | None" = None,
+    self_name: str = "salem",
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /peer/query on the named peer — typically SALEM asking SALEM.
+
+    In a peer-federated deployment KAL-LE might call this to fetch
+    Andrew's canonical contact fields. The server applies its field-
+    level permission filter and audit-logs the call.
+    """
+    from .config import TransportConfig, load_config
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = correlation_id or _new_correlation_id()
+
+    body: dict[str, Any] = {"record_type": record_type, "name": name}
+    if fields:
+        body["fields"] = list(fields)
+    if filter:
+        body["filter"] = dict(filter)
+
+    return await _peer_request(
+        base_url=base_url,
+        token=token,
+        method="POST",
+        path="/peer/query",
+        self_name=self_name,
+        correlation_id=cid,
+        json_body=body,
+    )
+
+
+async def peer_handshake(
+    peer_name: str,
+    *,
+    config: "TransportConfig | None" = None,
+    self_name: str = "salem",
+) -> dict[str, Any]:
+    """POST /peer/handshake on the named peer — capability discovery."""
+    from .config import TransportConfig, load_config
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = _new_correlation_id()
+    return await _peer_request(
+        base_url=base_url,
+        token=token,
+        method="POST",
+        path="/peer/handshake",
+        self_name=self_name,
+        correlation_id=cid,
+        json_body={"from": self_name, "protocol_version": 1},
+    )
