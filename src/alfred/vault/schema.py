@@ -11,6 +11,16 @@ KNOWN_TYPES: set[str] = {
     "contradiction", "synthesis",
 }
 
+# Stage 3.5: record types KAL-LE uses inside ``~/aftermath-lab/``. Kept
+# in a separate set so the canonical ``KNOWN_TYPES`` (Salem's
+# operational world) stays focused. The kalle scope check (see
+# ``vault/scope.py::KALLE_CREATE_TYPES``) intersects these with its
+# own create allowlist. ``pattern`` is a reusable development pattern;
+# ``principle`` is a higher-level development principle.
+KNOWN_TYPES_KALLE: set[str] = {
+    "pattern", "principle",
+}
+
 LEARN_TYPES: set[str] = {
     "assumption", "decision", "constraint", "contradiction", "synthesis",
 }

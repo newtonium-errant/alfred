@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .schema import LEARN_TYPES
+from .schema import KNOWN_TYPES_KALLE, LEARN_TYPES
 
 
 class ScopeError(Exception):
@@ -128,6 +128,27 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # content synthesised from the voice turn — body writes stay on.
         "allow_body_writes": True,
     },
+    # Stage 3.5: KAL-LE — coding instance operating on the
+    # aftermath-lab vault. Broader than talker because curation
+    # legitimately adds pattern/principle records and edits bodies;
+    # narrower than instructor because move + delete stay denied
+    # (curation is additive — Andrew is the only one who removes
+    # canonical content).
+    "kalle": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        # KAL-LE may create its own record set — the standard
+        # talker types plus the two kalle-only types (pattern,
+        # principle). Enforced via ``kalle_types_only``.
+        "create": "kalle_types_only",
+        "edit": True,
+        "move": False,
+        "delete": False,
+        # Pattern/principle curation writes substantive bodies.
+        "allow_body_writes": True,
+    },
     # Instructor executes natural-language directives parked in the
     # ``alfred_instructions`` frontmatter field. Broader than janitor
     # (may create + move + write bodies; no frontmatter allowlist) but
@@ -158,6 +179,17 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
 TALKER_CREATE_TYPES: set[str] = {
     "task", "note", "decision", "event",
     "session", "conversation", "assumption", "synthesis",
+}
+
+
+# Stage 3.5: record types KAL-LE may create. Superset of talker
+# minus operational types (task, event) — KAL-LE is the coding
+# instance, not an operational one — plus the two kalle-only types
+# (pattern, principle) from KNOWN_TYPES_KALLE.
+KALLE_CREATE_TYPES: set[str] = {
+    "note", "session", "conversation",
+    "decision", "assumption", "synthesis",
+    "pattern", "principle",
 }
 
 
@@ -252,6 +284,14 @@ def check_scope(
             raise ScopeError(
                 f"Scope '{scope}' can only create talker types "
                 f"({', '.join(sorted(TALKER_CREATE_TYPES))}). Got: '{record_type}'"
+            )
+        return
+
+    if permission == "kalle_types_only":
+        if record_type not in KALLE_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create kalle types "
+                f"({', '.join(sorted(KALLE_CREATE_TYPES))}). Got: '{record_type}'"
             )
         return
 

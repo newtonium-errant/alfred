@@ -53,7 +53,7 @@ def _dumps(obj: Any) -> str:
 # record types (``TALKER_CREATE_TYPES``) than we expose here. The Python
 # layer will still refuse anything outside the scope set even if the prompt
 # is later loosened; this enum just keeps the LLM on rails for MVP.
-VAULT_TOOLS: list[dict[str, Any]] = [
+TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
     {
         "name": "vault_search",
         "description": (
@@ -156,6 +156,125 @@ VAULT_TOOLS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+# Legacy alias — some tests + upstream code still import ``VAULT_TOOLS``.
+# The talker's own pipeline (``run_turn``) now dispatches through
+# ``VAULT_TOOLS_BY_SET`` so KAL-LE's ``kalle`` tool-set can add
+# ``bash_exec`` without touching the talker code path.
+VAULT_TOOLS: list[dict[str, Any]] = TALKER_VAULT_TOOLS
+
+
+# Stage 3.5: KAL-LE's tool surface. Extends talker with ``bash_exec``
+# for the coding instance. The kalle ``vault_create`` tool widens the
+# type enum to include pattern + principle (kalle-only record types)
+# and drops the talker-specific task/event types — kalle doesn't
+# operate on Salem's operational vault.
+_KALLE_VAULT_CREATE_TOOL = {
+    "name": "vault_create",
+    "description": (
+        "Create a new vault record in ~/aftermath-lab/. Use when the user "
+        "explicitly asks to save, note, or record something. KAL-LE "
+        "creates curation + reflective record types; operational types "
+        "(task, event) belong to Salem's vault."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": [
+                    "note", "session", "conversation",
+                    "decision", "assumption", "synthesis",
+                    "pattern", "principle",
+                ],
+                "description": "Record type — kalle-specific subset.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Record name (becomes the filename stem).",
+            },
+            "set_fields": {
+                "type": "object",
+                "description": "Frontmatter fields to set.",
+            },
+            "body": {
+                "type": "string",
+                "description": "Markdown body for the record.",
+            },
+        },
+        "required": ["type", "name"],
+    },
+}
+
+
+# ``bash_exec`` schema — the executor module (c6) supplies the safety
+# logic; this is just the LLM-facing contract. Placeholder ``execute:
+# False`` default is the fail-closed shape — if anyone constructs the
+# schema ahead of the c6 executor wiring, calls will still be inert.
+_BASH_EXEC_TOOL_SCHEMA = {
+    "name": "bash_exec",
+    "description": (
+        "Run a shell command inside one of the four allowed repos "
+        "(~/aftermath-lab, ~/aftermath-alfred, ~/aftermath-rrts, "
+        "~/alfred). Command is split via shlex and executed via "
+        "subprocess.exec — NOT a shell. No pipes, redirects, or "
+        "expansion. First token must be in the allowlist "
+        "(pytest, npm, git [with subcommand], grep, etc.). "
+        "300s timeout. stdout/stderr truncated to 10 KB each."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": (
+                    "Single-line command, e.g. 'pytest tests/janitor -q'."
+                ),
+            },
+            "cwd": {
+                "type": "string",
+                "description": (
+                    "Absolute path to an allowed repo root. Paths outside "
+                    "the allowlist reject without running."
+                ),
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": (
+                    "If true, don't run — return the parsed argv + "
+                    "allowlist decision. Destructive-keyword commands "
+                    "force dry_run=true regardless of this flag."
+                ),
+            },
+        },
+        "required": ["command", "cwd"],
+    },
+}
+
+
+KALLE_VAULT_TOOLS: list[dict[str, Any]] = [
+    TALKER_VAULT_TOOLS[0],  # vault_search
+    TALKER_VAULT_TOOLS[1],  # vault_read
+    _KALLE_VAULT_CREATE_TOOL,
+    TALKER_VAULT_TOOLS[3],  # vault_edit
+    _BASH_EXEC_TOOL_SCHEMA,
+]
+
+
+# Tool-set registry — selected by ``telegram.instance.tool_set`` in
+# config.yaml (c1 wiring). Default ``"talker"`` preserves Salem's
+# existing behaviour; KAL-LE's ``config.kalle.yaml`` sets
+# ``tool_set: "kalle"`` to pick up bash_exec.
+VAULT_TOOLS_BY_SET: dict[str, list[dict[str, Any]]] = {
+    "talker": TALKER_VAULT_TOOLS,
+    "kalle": KALLE_VAULT_TOOLS,
+}
+
+
+def tools_for_set(set_name: str) -> list[dict[str, Any]]:
+    """Return the tool schema list for ``set_name`` (default ``talker``)."""
+    return VAULT_TOOLS_BY_SET.get(set_name) or TALKER_VAULT_TOOLS
 
 
 # tool_name -> vault scope operation name
