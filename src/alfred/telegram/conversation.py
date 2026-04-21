@@ -430,24 +430,172 @@ def _build_system_blocks(
 # --- Tool bridge ----------------------------------------------------------
 
 
+async def _dispatch_bash_exec(
+    *,
+    tool_input: dict[str, Any],
+    session: Session,
+    config: TalkerConfig | None,
+) -> str:
+    """Dispatch one ``bash_exec`` tool_use block.
+
+    Stage 3.5 — KAL-LE. Every safety guardrail lives in
+    :mod:`alfred.telegram.bash_exec`. This function is the thin adapter
+    between the Anthropic tool_use schema and the executor:
+
+    1. Tool-set gating. Only instances configured with
+       ``telegram.instance.tool_set == "kalle"`` may invoke this; Salem
+       should never see ``bash_exec`` in its tool list, but we still
+       refuse explicitly here as a second-line defence against
+       prompt-injection / classifier drift.
+    2. Config plumbing. :class:`BashExecConfig` lives on
+       ``TalkerConfig.bash_exec`` and carries the audit-log path.
+       ``None`` or missing config → structured refusal.
+    3. Executor call. ``bash_exec.execute`` is async and always returns
+       a dict — we pass its shape back to the model verbatim.
+    4. Subprocess-failure contract. Non-zero exit codes that weren't
+       produced by the executor's own refusal path (``reason=""`` means
+       the command actually ran) emit a ``talker.bash_exec.nonzero_exit``
+       event with the ``stdout_tail`` sentinel per builder.md.
+
+    Returns a JSON-stringified dict the conversation loop feeds back as
+    a ``tool_result`` block.
+    """
+    from . import bash_exec as bash_exec_mod
+
+    # --- Tool-set gating -------------------------------------------------
+    # Runs before any argument parsing so the refusal message is clean
+    # and deterministic — a Salem instance that somehow receives a
+    # bash_exec tool_use block gets a structured error, not a crash.
+    tool_set = ""
+    if config is not None:
+        tool_set = config.instance.tool_set or ""
+    if tool_set != "kalle":
+        log.warning(
+            "talker.bash_exec.wrong_tool_set",
+            tool_set=tool_set or "(none)",
+            session_id=session.session_id,
+        )
+        return _dumps({
+            "error": "bash_exec not available on this instance",
+            "tool_set": tool_set or "talker",
+        })
+
+    # --- Config presence check -------------------------------------------
+    if config is None or config.bash_exec is None:
+        log.warning(
+            "talker.bash_exec.config_missing",
+            session_id=session.session_id,
+        )
+        return _dumps({"error": "bash_exec disabled in config"})
+
+    # --- Argument parsing ------------------------------------------------
+    # Model is expected to supply ``command`` + ``cwd`` per the schema;
+    # ``dry_run`` is optional. Defensive typing — the Anthropic SDK hands
+    # us whatever the model emitted, which in rare cases may not match
+    # the schema.
+    command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+    cwd = tool_input.get("cwd", "") if isinstance(tool_input, dict) else ""
+    dry_run_raw = tool_input.get("dry_run") if isinstance(tool_input, dict) else None
+    dry_run = bool(dry_run_raw) if dry_run_raw is not None else False
+
+    if not isinstance(command, str) or not command.strip():
+        return _dumps({"error": "bash_exec requires a non-empty 'command'"})
+    if not isinstance(cwd, str) or not cwd.strip():
+        return _dumps({"error": "bash_exec requires a 'cwd' under an allowed repo root"})
+
+    # --- Execute ---------------------------------------------------------
+    log.info(
+        "talker.bash_exec.invoke",
+        session_id=session.session_id,
+        cwd=cwd,
+        dry_run=dry_run,
+        # Truncate command in logs — the audit log (bash_exec.jsonl)
+        # holds the full command; structlog lines don't need to carry
+        # arbitrarily long payloads.
+        command_preview=command[:200],
+    )
+    try:
+        result = await bash_exec_mod.execute(
+            command=command,
+            cwd=cwd,
+            dry_run=dry_run,
+            audit_path=config.bash_exec.audit_path,
+            session_id=session.session_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — tool errors must reach the model
+        log.warning(
+            "talker.bash_exec.unexpected_error",
+            session_id=session.session_id,
+            error=str(exc),
+        )
+        return _dumps({"error": f"bash_exec crashed: {exc}"})
+
+    # --- Subprocess-failure-contract logging -----------------------------
+    # Only fires when the command actually ran (``reason == ""``) and
+    # returned a non-zero code. Executor-level refusals (denylist, cwd,
+    # allowlist miss, timeout, parse error) all set ``reason`` to a
+    # non-empty gate name and emit their own ``talker.bash_exec.*``
+    # warning events inside the executor.
+    exit_code = result.get("exit_code", -1)
+    reason = result.get("reason", "") or ""
+    if exit_code != 0 and not reason:
+        stdout = result.get("stdout", "") or ""
+        stderr = result.get("stderr", "") or ""
+        # The ``stdout_tail=""`` sentinel is load-bearing — emit
+        # explicitly so the "no diagnostic output at all" signature is
+        # grep-able. See builder.md / CLAUDE.md subprocess-failure
+        # contract.
+        log.warning(
+            "talker.bash_exec.nonzero_exit",
+            chat_id=session.chat_id,
+            session_id=session.session_id,
+            command=command[:200],
+            code=exit_code,
+            stderr=stderr[:500],
+            stdout_tail=stdout[-2000:] if stdout else "",
+        )
+
+    return _dumps(result)
+
+
 async def _execute_tool(
     tool_name: str,
     tool_input: dict[str, Any],
     vault_path: str,
     state: StateManager,
     session: Session,
+    config: TalkerConfig | None = None,
 ) -> str:
     """Execute one tool_use block and return JSON-stringified result.
 
     Errors are caught and returned as ``{"error": "..."}`` so Anthropic sees
     them as tool output and can recover gracefully (apologise, ask for
     clarification, pick a different tool) rather than raising.
+
+    ``config`` (Stage 3.5) is threaded in so the ``bash_exec`` branch can
+    read :class:`BashExecConfig` + the instance tool_set off
+    :class:`TalkerConfig`. Kept optional for backwards compatibility with
+    callers that predate bash_exec; when ``None`` the bash_exec branch
+    refuses with a clear error rather than crashing.
     """
     from pathlib import Path
 
     # Local imports — ops pulls heavy deps; we only want to pay that cost
     # when a tool actually fires.
     from alfred.vault import ops, scope
+
+    # ``bash_exec`` (KAL-LE) — safety-critical subprocess path. Handled
+    # before the vault-op lookup because it isn't a vault op; the
+    # executor in bash_exec.py owns every allowlist / denylist / cwd /
+    # timeout / destructive-keyword gate. This branch is just the
+    # dispatcher glue: tool-set gating, config plumbing, structured
+    # error returns, and subprocess-failure-contract logging.
+    if tool_name == "bash_exec":
+        return await _dispatch_bash_exec(
+            tool_input=tool_input,
+            session=session,
+            config=config,
+        )
 
     op = _TOOL_TO_OP.get(tool_name)
     if op is None:
@@ -768,6 +916,11 @@ async def run_turn(
         pushback_level=pushback_level,
     )
     vault_path = config.vault.path
+    # Stage 3.5: pick the tool list per instance tool_set. Salem
+    # ("talker") gets vault-only; KAL-LE ("kalle") gets vault + bash_exec.
+    # Defaults to the talker set so any misconfigured instance can't
+    # accidentally surface bash_exec.
+    instance_tools = tools_for_set(config.instance.tool_set)
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         try:
@@ -776,7 +929,7 @@ async def run_turn(
                 "max_tokens": config.anthropic.max_tokens,
                 "system": system_blocks,
                 "messages": _messages_for_api(session.transcript),
-                "tools": VAULT_TOOLS,
+                "tools": instance_tools,
             }
             # Opus 4.x deprecated the ``temperature`` param. Omit it for
             # Opus models; keep it for Sonnet/Haiku/older Claude families.
@@ -816,6 +969,7 @@ async def run_turn(
                     vault_path,
                     state,
                     session,
+                    config=config,
                 )
                 tool_results.append({
                     "type": "tool_result",
