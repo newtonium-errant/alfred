@@ -116,6 +116,23 @@ class InstanceConfig:
 
 
 @dataclass
+class BashExecConfig:
+    """KAL-LE's ``bash_exec`` tool config.
+
+    ``audit_path`` is the JSONL log path every bash_exec invocation
+    appends to. Separate from the main talker/transport audit logs
+    because security review treats this one as high-sensitivity (code-
+    mutation history).
+    """
+
+    audit_path: str = "./data/bash_exec.jsonl"
+    # Timeout + output caps are enforced as hard-coded constants in
+    # ``bash_exec.py`` — they're invariants, not config. Putting them
+    # here would invite "let's just raise the timeout" which breaks
+    # the safety contract. Config only carries the audit path.
+
+
+@dataclass
 class TalkerConfig:
     bot_token: str = ""
     allowed_users: list[int] = field(default_factory=list)
@@ -131,6 +148,10 @@ class TalkerConfig:
     # as a default so health.py can distinguish "section missing" from
     # "section present with empty fields".
     tts: TtsConfig | None = None
+    # Stage 3.5: bash_exec — only relevant when
+    # ``instance.tool_set == "kalle"``. Absent on Salem, present on
+    # KAL-LE with a KAL-LE-specific audit path.
+    bash_exec: BashExecConfig | None = None
 
 
 # --- Recursive builder ---
@@ -143,6 +164,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "logging": LoggingConfig,
     "instance": InstanceConfig,
     "tts": TtsConfig,
+    "bash_exec": BashExecConfig,
 }
 
 
@@ -198,4 +220,7 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     })
     if isinstance(tts_raw, dict) and tts_raw:
         built.tts = _build(TtsConfig, tts_raw)
+    bash_raw = tool.get("bash_exec")
+    if isinstance(bash_raw, dict) and bash_raw:
+        built.bash_exec = _build(BashExecConfig, bash_raw)
     return built
