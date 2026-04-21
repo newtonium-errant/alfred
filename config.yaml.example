@@ -1,3 +1,28 @@
+# ---------------------------------------------------------------------------
+# Multi-instance (Stage 3.5) setup
+# ---------------------------------------------------------------------------
+# Alfred is deployable as multiple independent instances on the same host
+# — one ``config.yaml`` per instance, one ``alfred up`` per config.
+# Instance identities are hard-coded in ``telegram.instance`` (below).
+#
+# Port convention (keep these unique per instance):
+#   SALEM   → 8891  (ops / orchestrator)
+#   KAL-LE  → 8892  (coding)
+#   STAY-C  → 8893  (NP clinic, PHI-firewalled)
+#   slot 4  → 8894  (reserved — RRTS or Knowledge)
+#   slot 5  → 8895  (reserved)
+#
+# Per-instance config path convention:
+#   config.yaml         — Salem (this file)
+#   config.kalle.yaml   — KAL-LE (see config.kalle.yaml.example)
+#   config.stayc.yaml   — STAY-C (future)
+#
+# The ``daemon.pid_path`` field below is what keeps ``alfred up``/``alfred
+# down`` per-instance from colliding. Salem defaults to ``./data/alfred.pid``;
+# KAL-LE overrides to ``/home/andrew/.alfred/kalle/data/alfred.pid``.
+# daemon:
+#   pid_path: "./data/alfred.pid"  # override in config.<instance>.yaml
+
 vault:
   path: "./vault"
   ignore_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox"]
@@ -155,6 +180,15 @@ telegram:
     name: "Alfred"
     canonical: "Alfred"
     aliases: []
+    # Stage 3.5: which SKILL bundle to load at startup. Salem keeps the
+    # default ``vault-talker``; KAL-LE overrides to ``vault-kalle`` in
+    # ``config.kalle.yaml``. The bundle resolves to
+    # ``src/alfred/_bundled/skills/<skill_bundle>/SKILL.md``.
+    skill_bundle: "vault-talker"
+    # Which vault-bridge tool set to expose to the model. ``talker``
+    # (default) = vault_* only. ``kalle`` = vault_* + bash_exec for the
+    # coding instance.
+    tool_set: "talker"
   anthropic:
     api_key: "${ANTHROPIC_API_KEY}"
     model: "claude-sonnet-4-6"

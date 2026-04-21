@@ -78,11 +78,20 @@ def _missing_config_reasons(config: TalkerConfig) -> list[str]:
 # --- Prompt + context assembly --------------------------------------------
 
 
-def _load_system_prompt(skills_dir: Path) -> str:
-    """Read ``vault-talker/SKILL.md`` — placeholder content is fine for wk1."""
-    skill_path = skills_dir / "vault-talker" / "SKILL.md"
+def _load_system_prompt(skills_dir: Path, skill_bundle: str = "vault-talker") -> str:
+    """Read ``<skill_bundle>/SKILL.md`` — the per-instance prompt.
+
+    Multi-instance (Stage 3.5): the bundle name comes from
+    ``telegram.instance.skill_bundle`` in config.yaml. Salem keeps the
+    legacy default ``"vault-talker"``; KAL-LE ships with ``"vault-kalle"``.
+    """
+    skill_path = skills_dir / skill_bundle / "SKILL.md"
     if not skill_path.exists():
-        log.warning("talker.daemon.skill_missing", path=str(skill_path))
+        log.warning(
+            "talker.daemon.skill_missing",
+            path=str(skill_path),
+            skill_bundle=skill_bundle,
+        )
         return ""
     return skill_path.read_text(encoding="utf-8")
 
@@ -187,7 +196,11 @@ async def run(
 
     client = anthropic.AsyncAnthropic(api_key=config.anthropic.api_key)
     system_prompt = _apply_instance_templating(
-        _load_system_prompt(Path(skills_dir_str)), config,
+        _load_system_prompt(
+            Path(skills_dir_str),
+            skill_bundle=config.instance.skill_bundle,
+        ),
+        config,
     )
     vault_context_str = _build_vault_context_str(config)
 

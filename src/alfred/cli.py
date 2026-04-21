@@ -51,6 +51,29 @@ def _load_unified_config(config_path: str) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def _resolve_pid_path(raw: dict[str, Any]) -> Path:
+    """Return the configured PID path, honouring multi-instance overrides.
+
+    Priority (Stage 3.5 multi-instance plumbing):
+      1. ``daemon.pid_path`` top-level config field (explicit per-instance
+         override — e.g. KAL-LE ships ``/home/andrew/.alfred/kalle/data/alfred.pid``)
+      2. ``logging.dir`` + ``alfred.pid`` (legacy default — Salem keeps
+         this unchanged)
+
+    Extracting this into a helper means ``up``/``down``/``status``/``tui``
+    all read from the same code path; accidentally diverging would have
+    Salem writing a PID to one place and ``alfred down`` looking for it
+    elsewhere, which would orphan the daemon on teardown.
+    """
+    daemon_cfg = raw.get("daemon", {}) or {}
+    explicit = daemon_cfg.get("pid_path")
+    if explicit:
+        return Path(explicit)
+    log_cfg = raw.get("logging", {})
+    log_dir = log_cfg.get("dir", "./data")
+    return Path(log_dir) / "alfred.pid"
+
+
 def _setup_logging_from_config(raw: dict[str, Any], tool: str = "alfred", suppress_stdout: bool = False) -> None:
     """Set up logging from the unified config's logging section.
 
@@ -82,7 +105,7 @@ def cmd_up(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     log_cfg = raw.get("logging", {})
     log_dir = log_cfg.get("dir", "./data")
-    pid_path = Path(log_dir) / "alfred.pid"
+    pid_path = _resolve_pid_path(raw)
 
     # Check if already running
     from alfred.daemon import check_already_running
@@ -132,9 +155,7 @@ def cmd_up(args: argparse.Namespace) -> None:
 
 def cmd_down(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
-    log_cfg = raw.get("logging", {})
-    log_dir = log_cfg.get("dir", "./data")
-    pid_path = Path(log_dir) / "alfred.pid"
+    pid_path = _resolve_pid_path(raw)
 
     from alfred.daemon import stop_daemon
     if stop_daemon(pid_path):
@@ -151,9 +172,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     print("=" * 60)
 
     # Daemon status
-    log_cfg = raw.get("logging", {})
-    log_dir = log_cfg.get("dir", "./data")
-    pid_path = Path(log_dir) / "alfred.pid"
+    pid_path = _resolve_pid_path(raw)
     from alfred.daemon import check_already_running
     running_pid = check_already_running(pid_path)
     if running_pid:
@@ -534,7 +553,7 @@ def cmd_tui(args: argparse.Namespace) -> None:
     log_dir = Path(log_cfg.get("dir", "./data")).resolve()
 
     # Check if daemons are running (warn only)
-    pid_path = log_dir / "alfred.pid"
+    pid_path = _resolve_pid_path(raw)
     from alfred.daemon import check_already_running
     if not check_already_running(pid_path):
         print("Note: Alfred daemons are not running. The TUI will show last-known state.")

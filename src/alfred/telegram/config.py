@@ -95,11 +95,24 @@ class InstanceConfig:
     ``memory/project_multi_instance_design.md``) so case-insensitive
     inbound routing can accept phone-autocorrect-friendly variants
     (``"Salem"`` for ``S.A.L.E.M.``) without a code change.
+
+    ``skill_bundle`` picks which SKILL bundle the talker loads at
+    startup (e.g. ``"vault-talker"`` for Salem, ``"vault-kalle"`` for
+    KAL-LE). Stage 3.5 introduction — default preserves Salem's
+    existing behaviour. The bundle name resolves to
+    ``src/alfred/_bundled/skills/<skill_bundle>/SKILL.md``.
+
+    ``tool_set`` selects which vault-bridge tool schema the talker
+    exposes to the model. ``"talker"`` (default) uses
+    ``TALKER_VAULT_TOOLS``; ``"kalle"`` adds ``bash_exec`` for the
+    coding instance. Callers read ``conversation.VAULT_TOOLS_BY_SET``.
     """
 
     name: str = "Alfred"
     canonical: str = "Alfred"
     aliases: list[str] = field(default_factory=list)
+    skill_bundle: str = "vault-talker"
+    tool_set: str = "talker"
 
 
 @dataclass
