@@ -53,7 +53,8 @@ class RouterDecision:
     """The router's classification of one opening message.
 
     Attributes:
-        session_type: Canonical type name (``note|task|journal|article|brainstorm``).
+        session_type: Canonical type name (``note|task|journal|article|
+            brainstorm|capture|peer_route``).
         model: Anthropic model id to start the session on. Usually the
             type's default, but the router may override (e.g. "quick article
             note" → Sonnet even for article type).
@@ -62,12 +63,21 @@ class RouterDecision:
             AND a matching record was found in recent state.
         reasoning: One-line rationale the model emitted — purely for logs.
             Safe to empty.
+        target: Stage 3.5 — when ``session_type == "peer_route"``, which
+            peer should receive the forwarded message. Canonical lowercase
+            peer names (``kal-le``, ``stay-c``). ``None`` for every other
+            session type.
+        peer_route_hint: Optional — why the router thinks this routes to
+            the target. Purely informational; Salem's routing uses
+            ``target``, not the hint.
     """
 
     session_type: str
     model: str
     continues_from: str | None
     reasoning: str = ""
+    target: str | None = None
+    peer_route_hint: str = ""
 
 
 # --- Prompt ---------------------------------------------------------------
@@ -95,6 +105,14 @@ act, not converse.
 out loud", "I want to ramble", "just let me talk for a while"). The \
 user wants to dump thoughts without interruption; the assistant stays \
 silent mid-session and a structured summary is produced at /end.
+- peer_route: coding, debugging, or aftermath-lab curation work that \
+belongs on KAL-LE (the coding instance). Cues: "ask kal-le about X", \
+"why is the transport scheduler firing twice", "refactor the janitor \
+fix command", "promote this pattern to canonical", "run the tests", \
+"look at the diff on this branch", "review the last three commits". \
+When you classify peer_route, set "target" to the peer name (``kal-le`` \
+today; ``stay-c`` once that instance is live). Without a target, \
+peer_route is malformed — fall back to note.
 
 Continuation: if the user says "continue the last journal", "pick up the \
 article we were writing", "same brainstorm as yesterday", etc., AND the \
@@ -108,8 +126,10 @@ Opening message:
 {opening}
 
 Respond with ONLY a JSON object, no prose, no markdown fences:
-{{"session_type": "<one of: note, task, journal, article, brainstorm, capture>",
+{{"session_type": "<one of: note, task, journal, article, brainstorm, capture, peer_route>",
   "continues_from": "<record_path or null>",
+  "target": "<peer name or null — required when session_type is peer_route>",
+  "peer_route_hint": "<one short sentence if peer_route, else null>",
   "reasoning": "<one short sentence>"}}
 """
 
@@ -201,6 +221,10 @@ def _fallback_decision(reason: str) -> RouterDecision:
     )
 
 
+# Known peer-route targets — update when a new instance comes online.
+_VALID_PEER_TARGETS: set[str] = {"kal-le", "stay-c"}
+
+
 def _decision_from_parsed(
     parsed: dict[str, Any],
     recent: list[dict[str, Any]],
@@ -211,6 +235,10 @@ def _decision_from_parsed(
     (unknown → ``note``), and validates ``continues_from`` against the
     recent-sessions list (if the model hallucinated a record path, we
     refuse it rather than feed a phantom into the opener).
+
+    Stage 3.5 addition: when ``session_type == "peer_route"``, require
+    a valid ``target``. A missing or unknown target coerces back to
+    ``note`` — we won't forward to a phantom peer.
     """
     session_type = parsed.get("session_type") or "note"
     if session_type not in known_types():
@@ -222,6 +250,26 @@ def _decision_from_parsed(
 
     defaults: SessionTypeDefaults = defaults_for(session_type)
     model = defaults.model
+
+    # Peer-route target validation. A peer_route classification without
+    # a known target degrades to ``note`` — we'd rather fall through to
+    # Salem's normal handling than forward to nobody.
+    target: str | None = None
+    peer_route_hint: str = ""
+    if session_type == "peer_route":
+        raw_target = parsed.get("target")
+        if isinstance(raw_target, str) and raw_target.lower() in _VALID_PEER_TARGETS:
+            target = raw_target.lower()
+            peer_route_hint = str(parsed.get("peer_route_hint") or "")[:200]
+        else:
+            log.info(
+                "talker.router.peer_route_missing_target",
+                raw_target=str(raw_target)[:80],
+            )
+            # Degrade to note — no phantom forwarding.
+            session_type = "note"
+            defaults = defaults_for("note")
+            model = defaults.model
 
     # Continuation handling. Only trust ``continues_from`` if (a) the type
     # supports continuation and (b) the record path appears in our recent
@@ -253,6 +301,8 @@ def _decision_from_parsed(
         model=model,
         continues_from=continues_from,
         reasoning=reasoning[:200],  # trim for log friendliness
+        target=target,
+        peer_route_hint=peer_route_hint,
     )
 
 

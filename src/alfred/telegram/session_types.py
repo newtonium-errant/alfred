@@ -116,6 +116,19 @@ _DEFAULTS_TABLE: Final[dict[str, SessionTypeDefaults]] = {
         supports_continuation=False,
         pushback_level=0,
     ),
+    # Stage 3.5 peer routing: Salem-side session type used when the
+    # router classifies the opening cue as coding/curation intent that
+    # belongs on KAL-LE (or another peer). ``supports_continuation=True``
+    # so a follow-up "still on the transport scheduler bug?" picks up
+    # the same peer session rather than re-routing. ``pushback_level=0``
+    # because Salem is just a router for this session type — the actual
+    # pushback + challenge happens on KAL-LE's side.
+    "peer_route": SessionTypeDefaults(
+        session_type="peer_route",
+        model=_SONNET,
+        supports_continuation=True,
+        pushback_level=0,
+    ),
 }
 
 

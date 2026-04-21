@@ -36,10 +36,12 @@ def test_router_model_and_continuation_flags() -> None:
     """Sanity-check the router-model constant and continuation flags."""
     assert session_types.ROUTER_MODEL.startswith("claude-sonnet-")
 
-    # Only article / journal / brainstorm continue by design.
+    # Only article / journal / brainstorm / peer_route continue by
+    # design. Stage 3.5 added peer_route for follow-up turns on the
+    # same coding session.
     continuable = {t for t in session_types.known_types()
                    if session_types.defaults_for(t).supports_continuation}
-    assert continuable == {"journal", "article", "brainstorm"}
+    assert continuable == {"journal", "article", "brainstorm", "peer_route"}
 
 
 def test_pushback_level_defaults_by_type() -> None:

@@ -74,11 +74,17 @@ def build_app(
     anthropic_client: Any,
     system_prompt: str,
     vault_context_str: str,
+    raw_config: dict | None = None,
 ) -> Application:
     """Build a PTB :class:`Application` wired with handlers and bot_data.
 
     Callers add their own post-init hooks (gap sweeper, signal handlers) via
     :mod:`daemon`. This function only does handler registration.
+
+    ``raw_config`` — Stage 3.5 addition. The peer-route dispatcher
+    needs the full unified config dict to build a TransportConfig
+    at forward time (peer URLs + tokens live under ``transport.peers``).
+    ``None`` disables peer routing cleanly.
     """
     app = Application.builder().token(config.bot_token).build()
 
@@ -88,6 +94,7 @@ def build_app(
     app.bot_data[_KEY_SYSTEM] = system_prompt
     app.bot_data[_KEY_VAULT_CTX] = vault_context_str
     app.bot_data[_KEY_LOCKS] = {}
+    app.bot_data["raw_config"] = raw_config
 
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("end", on_end))
@@ -1008,6 +1015,176 @@ def _find_closed_session(
     return None
 
 
+# Stage 3.5: wait-ping interval when a peer-forwarded turn is in flight.
+# If the peer hasn't replied within this many seconds, send a "still
+# thinking…" message to Andrew so the silence isn't confusing.
+_PEER_MID_WAIT_PING_SECONDS: float = 20.0
+
+# Maximum time Salem will wait for KAL-LE before giving up and
+# replying with the timeout message.
+_PEER_MAX_WAIT_SECONDS: float = 45.0
+
+
+async def _dispatch_peer_route(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    target: str,
+    text: str,
+    chat_id: int,
+    originating_session_id: str,
+) -> bool:
+    """Forward a turn to ``target`` peer and relay its reply.
+
+    Returns True iff the forward + relay path completed (even if the
+    peer replied with an error). Returns False when the peer was
+    unreachable — the caller falls through to Salem's normal handling
+    so Andrew isn't left in limbo.
+
+    Flow:
+      1. Send an immediate "→ KAL-LE" acknowledgement so Andrew sees
+         something in the chat before the round-trip.
+      2. POST /peer/send to the target with the user's message.
+      3. Kick off a mid-wait ping timer (20s) alongside the response
+         wait (45s cap).
+      4. When the peer replies via its own /peer/send to us (correlation
+         id round-trip through ``await_response``), relay the reply
+         prefixed with ``[KAL-LE] ``.
+    """
+    from alfred.transport import peers as peers_module
+    from alfred.transport.client import peer_send
+    from alfred.transport.config import load_from_unified as load_transport
+    from alfred.transport.exceptions import (
+        TransportError, TransportServerDown,
+    )
+
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if update.message is None:
+        return False
+
+    try:
+        ack_msg = await update.message.reply_text(f"→ {target.upper()}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.peer_ack_failed",
+            chat_id=chat_id, error=str(exc),
+        )
+        ack_msg = None
+
+    # Build the transport config from the raw config the daemon stashed
+    # on startup. If it's missing we can't peer-route — caller falls
+    # back to normal handling.
+    raw_config = ctx.application.bot_data.get("raw_config")
+    if not raw_config:
+        log.warning(
+            "talker.bot.peer_route_no_raw_config",
+            chat_id=chat_id,
+        )
+        return False
+
+    try:
+        transport_config = load_transport(raw_config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.peer_route_config_load_failed",
+            chat_id=chat_id, error=str(exc),
+        )
+        return False
+
+    correlation_id = peers_module._prune_orphans or None  # sanity import
+    from alfred.transport.peers import _prune_orphans  # noqa: F401
+
+    import uuid
+    correlation_id = uuid.uuid4().hex[:16]
+
+    self_name = config.instance.canonical or config.instance.name or "salem"
+    self_name = self_name.lower().replace(".", "").replace(" ", "-")
+    # Default: ``salem`` if instance is the Salem default ``Alfred``.
+    if self_name in {"alfred"}:
+        self_name = "salem"
+
+    try:
+        await peer_send(
+            target,
+            kind="message",
+            payload={
+                "user_id": update.effective_user.id if update.effective_user else 0,
+                "text": text,
+                "originating_session": originating_session_id,
+                "chat_id": chat_id,
+            },
+            config=transport_config,
+            self_name=self_name,
+            correlation_id=correlation_id,
+        )
+    except TransportServerDown as exc:
+        log.warning(
+            "talker.bot.peer_unavailable",
+            target=target, chat_id=chat_id, error=str(exc),
+        )
+        await update.message.reply_text(
+            f"{target.upper()} is offline — can't route. I'll try to "
+            "answer directly but coding-specific commands won't work."
+        )
+        return False  # Fall through to Salem's own handling
+    except TransportError as exc:
+        log.warning(
+            "talker.bot.peer_route_failed",
+            target=target, chat_id=chat_id, error=str(exc),
+        )
+        await update.message.reply_text(
+            f"Couldn't reach {target.upper()}: {exc}"
+        )
+        return True  # Don't fall through — error already surfaced
+
+    # --- Wait for the peer to call back via /peer/send ----------------
+    mid_wait_ping_task: asyncio.Task | None = None
+
+    async def _mid_wait_ping() -> None:
+        try:
+            await asyncio.sleep(_PEER_MID_WAIT_PING_SECONDS)
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=f"{target.upper()} still working…",
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.info(
+                "talker.bot.peer_mid_ping_failed",
+                chat_id=chat_id, error=str(exc),
+            )
+
+    mid_wait_ping_task = asyncio.create_task(_mid_wait_ping())
+
+    from alfred.transport.peers import await_response
+    try:
+        reply = await await_response(correlation_id, timeout=_PEER_MAX_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        log.warning(
+            "talker.bot.peer_reply_timeout",
+            target=target, correlation_id=correlation_id,
+        )
+        await update.message.reply_text(
+            f"{target.upper()} didn't reply within {int(_PEER_MAX_WAIT_SECONDS)}s — "
+            "try again, or DM the bot directly."
+        )
+        return True
+    finally:
+        if mid_wait_ping_task and not mid_wait_ping_task.done():
+            mid_wait_ping_task.cancel()
+
+    reply_text = str(reply.get("text") or reply.get("reply") or "")
+    if not reply_text:
+        await update.message.reply_text(
+            f"[{target.upper()}] (empty reply)"
+        )
+        return True
+
+    await update.message.reply_text(f"[{target.upper()}] {reply_text}")
+    return True
+
+
 async def _open_routed_session(
     state_mgr: StateManager,
     config: TalkerConfig,
@@ -1079,6 +1256,12 @@ async def _open_routed_session(
 
     active = state_mgr.get_active(chat_id) or {}
     active["_calibration_snapshot"] = calibration_snapshot
+    # Stage 3.5: stash peer-route target on the active session so
+    # every subsequent turn forwards to the same peer without
+    # re-classifying. ``_dispatch_peer_route`` reads this in
+    # ``handle_message`` before it falls into the Anthropic turn.
+    if decision.session_type == "peer_route" and decision.target:
+        active["_peer_route_target"] = decision.target
     state_mgr.set_active(chat_id, active)
     state_mgr.save()
 
@@ -1286,6 +1469,32 @@ async def handle_message(
             sess = await _open_routed_session(
                 state_mgr, config, client, chat_id, text,
             )
+
+        # Stage 3.5 peer-route flow. On the first message of a
+        # peer_route session AND on every subsequent turn while
+        # ``_peer_route_target`` stays stashed on the active dict, we
+        # forward to the named peer and relay its reply. Auto-forward
+        # stops when the user says ``/end`` (session close clears the
+        # target) or starts a new opening cue after the gap timeout
+        # fires.
+        active_now = state_mgr.get_active(chat_id) or {}
+        peer_target = active_now.get("_peer_route_target")
+        if peer_target:
+            handled = await _dispatch_peer_route(
+                update, ctx,
+                target=peer_target,
+                text=text,
+                chat_id=chat_id,
+                originating_session_id=active_now.get("session_id", ""),
+            )
+            if handled:
+                return  # Peer path completed (with reply or timeout).
+            # Fall-through: peer was unreachable. Clear the target so
+            # subsequent turns don't keep hitting a dead peer, and let
+            # Salem handle the turn normally.
+            active_now.pop("_peer_route_target", None)
+            state_mgr.set_active(chat_id, active_now)
+            state_mgr.save()
 
         # Voice / text counts are tracked per-turn on the transcript
         # (``_kind`` metadata) — the state-dict counters were wk1

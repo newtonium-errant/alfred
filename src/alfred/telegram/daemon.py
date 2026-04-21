@@ -210,6 +210,7 @@ async def run(
         anthropic_client=client,
         system_prompt=system_prompt,
         vault_context_str=vault_context_str,
+        raw_config=raw,
     )
 
     # ---- Outbound-push transport --------------------------------------
