@@ -1,14 +1,24 @@
 ---
-type: run
-status: completed
-name: Alfred BIT 2026-04-20
-description: Alfred built-in test (health sweep)
-process: '[[process/Alfred BIT]]'
-trigger: scheduled
-started: '2026-04-20T05:54:54.289230-03:00'
 created: '2026-04-20'
-overall_status: skip
+description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — process/Alfred BIT target does not exist in vault; process
+  record needs to be created to match this run record process field. DIR001 deterministic
+  scanner flag (type: run belongs in run/ directory, this record is in process/).'
 mode: quick
+name: Alfred BIT 2026-04-20
+overall_status: skip
+process: '[[process/Alfred BIT]]'
+started: '2026-04-20T05:54:54.289230-03:00'
+status: completed
+tags:
+- bit
+- health
+- bit/skip
+tool_counts:
+  fail: 0
+  ok: 6
+  skip: 1
+  warn: 0
 tools_checked:
 - curator
 - janitor
@@ -17,15 +27,8 @@ tools_checked:
 - brief
 - mail
 - talker
-tool_counts:
-  ok: 6
-  warn: 0
-  fail: 0
-  skip: 1
-tags:
-- bit
-- health
-- bit/skip
+trigger: scheduled
+type: run
 ---
 
 # Alfred BIT 2026-04-20
