@@ -104,6 +104,20 @@ addresses your own instance by name (e.g., "{self_display_name}, ..."), \
 strip the address and classify the remaining content normally. Route \
 to OTHER instances only.
 
+Reply context: has_reply_context={has_reply_context}. When this is \
+true, the user's message begins with a machine-generated \
+`[You are replying to ...]` prefix quoting a specific earlier bot \
+message — they long-pressed it in Telegram and hit Reply. This is a \
+strong signal that they are continuing a prior line of thought, not \
+opening a fresh session. Strongly prefer `continues_from` against a \
+matching recent session, OR fall back to `note` (a lightweight \
+follow-up). Do NOT open `capture`, `journal`, `article`, or \
+`brainstorm` sessions on a reply unless the user's text after the \
+prefix contains an explicit opening cue for that type (e.g., \
+"capture: ..." or "let's brainstorm"). `peer_route` is still valid \
+if the reply is asking KAL-LE to do coding work; the reply signal \
+only overrides cue-driven type selection, not routing.
+
 Types:
 - note: quick capture, one-off reminders, short observations.
 - task: "create a task", "remind me to", "add a task". Assistant will \
@@ -364,6 +378,7 @@ async def classify_opening_cue(
     recent_sessions: list[dict[str, Any]],
     self_name: str = "salem",
     self_display_name: str = "Alfred",
+    has_reply_context: bool = False,
 ) -> RouterDecision:
     """Classify one opening message; return a :class:`RouterDecision`.
 
@@ -381,6 +396,14 @@ async def classify_opening_cue(
         self_display_name: The human-facing form of the instance name
             (``Alfred`` / ``Salem`` / ``K.A.L.L.E.``) — appears in the
             prompt's self-address example. Defaults to ``Alfred``.
+        has_reply_context: Reply-context consumer hint. ``True`` when the
+            incoming message is a Telegram reply to a prior bot message
+            (``update.message.reply_to_message`` was populated and
+            rendered into a ``[You are replying to ...]`` prefix in
+            ``first_message``). Tells the classifier to tip its default
+            toward continuation / note, away from fresh cue-driven
+            types. Defaults to ``False`` for legacy callers and
+            non-reply messages.
 
     Returns:
         A :class:`RouterDecision`. Any error (network, bad JSON, unknown
@@ -417,6 +440,7 @@ async def classify_opening_cue(
         opening=first_message.strip(),
         self_name=self_name,
         self_display_name=self_display_name,
+        has_reply_context=str(has_reply_context).lower(),
     )
 
     try:

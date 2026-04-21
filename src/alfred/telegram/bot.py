@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import timezone
 from pathlib import Path
 from typing import Any
 
@@ -1356,6 +1357,7 @@ async def _open_routed_session(
     client: Any,
     chat_id: int,
     first_message: str,
+    has_reply_context: bool = False,
 ) -> Session:
     """Classify the opening cue, open a new session with the right defaults.
 
@@ -1371,6 +1373,14 @@ async def _open_routed_session(
 
     Returns the opened :class:`Session`. Caller is responsible for
     appending the user's actual first message via ``run_turn``.
+
+    ``has_reply_context`` (reply-context consumer): when the incoming
+    turn is a Telegram reply to a prior bot message, pass ``True`` so
+    the classifier can tip its default away from fresh cue-driven
+    sessions (capture / journal / article) and toward continuation /
+    note. Reply-to-bot-message is a strong "this is a follow-up"
+    signal. Defaults to ``False`` for legacy callers and the rehydrate-
+    failure path when the bug that triggered it wasn't a reply.
     """
     recent = _recent_sessions_for_router(state_mgr)
     # Stage 3.5 hotfix c3: thread the local instance identity into the
@@ -1387,6 +1397,7 @@ async def _open_routed_session(
         client, first_message, recent,
         self_name=self_name,
         self_display_name=self_display_name,
+        has_reply_context=has_reply_context,
     )
 
     # Pushback level from the session-type defaults — the router doesn't
@@ -1469,6 +1480,132 @@ async def _open_routed_session(
         continues=decision.continues_from is not None,
     )
     return sess
+
+
+# --- Reply-context consumer ----------------------------------------------
+#
+# When a Telegram user long-presses a bot message and hits "Reply," the
+# Bot API attaches the full parent message via ``Message.reply_to_message``.
+# python-telegram-bot 22 exposes this as ``update.message.reply_to_message``.
+# We consume it by prepending a machine-generated context prefix to the
+# turn text BEFORE the router classifier or Anthropic turn runs, so the
+# model has explicit context about what Andrew's "book it" / "done" /
+# "explain the second failure" is replying to.
+#
+# Reply-to-bot-message is also a strong "continuation" signal for the
+# router: we pass ``has_reply_context`` to ``classify_opening_cue`` so a
+# reply to an earlier Salem message tips the default away from opening a
+# fresh cue-driven session (capture / journal / article) and toward
+# continuing the existing line of thought.
+#
+# Parent text cap: 500 characters (ElevenLabs TTS briefs and Salem
+# summaries can easily exceed this; we want the prefix to stay compact
+# enough that it doesn't dominate the turn). Truncation suffix is
+# ``... (truncated)`` so the model knows the quote is incomplete.
+
+# Maximum characters from the parent message to inline into the prefix.
+# Longer parents are truncated with `... (truncated)` so the quote stays
+# compact while still signalling there was more.
+_REPLY_CTX_QUOTE_LIMIT: int = 500
+
+# Suffix appended when the parent message is truncated. Chosen as prose
+# rather than an ellipsis-only sentinel so the LLM reading the prefix
+# knows the quote is machine-truncated (not the author's own ellipsis).
+_REPLY_CTX_TRUNCATION_SUFFIX: str = "... (truncated)"
+
+
+def _build_reply_context_prefix(
+    reply_to_message: Any,
+) -> str | None:
+    """Return a `[You are replying to ...]\\n\\n` prefix, or None.
+
+    Consumes python-telegram-bot's ``Message.reply_to_message`` and renders
+    a single-line attribution + quoted parent body. Returns ``None`` when
+    the parent has no usable text (photo-only, sticker, etc.) so the
+    caller can silently fall through to the normal flow.
+
+    Format::
+
+        [You are replying to Salem's earlier message at <ISO-time>: "<quote>"]
+
+        <blank line above separates the prefix from user's reply text>
+
+    The caller is responsible for concatenating the user's actual text
+    after the returned prefix.
+
+    Edge cases:
+
+    - Photo / sticker / voice reply with no ``text`` or ``caption`` →
+      returns ``None``; no prefix is prepended (the parent has nothing
+      to quote).
+    - Parent longer than ``_REPLY_CTX_QUOTE_LIMIT`` chars →
+      truncated to that many chars plus ``... (truncated)`` suffix.
+    - Parent from the bot itself (``from_user.is_bot == True``) →
+      attribution "Salem's earlier message"; parent from the same user
+      → "your earlier message". Multi-user chats are future work.
+    - Parent text contains literal ``"`` or other special characters →
+      rendered verbatim inside the prefix. The surrounding double quotes
+      are the JSON-safe delimiter of choice (backtick or triple-quote
+      would also work, but double-quotes match Salem's conversational
+      register and survive the Anthropic prompt round-trip — the turn
+      text is passed as a JSON string by the SDK so quote escaping is
+      handled there).
+    """
+    if reply_to_message is None:
+        return None
+    # python-telegram-bot exposes the parent body as either ``text``
+    # (regular text message) or ``caption`` (photo / video with caption).
+    # Either is fine for our purposes — we just need something to quote.
+    #
+    # ``isinstance(..., str)`` check is load-bearing: existing tests that
+    # MagicMock the whole Update object will have ``reply_to_message``
+    # auto-instantiated as a MagicMock (truthy, non-None) whose ``.text``
+    # is another MagicMock. We want those tests to behave as "no reply"
+    # (no prefix), not crash or emit a MagicMock-shaped quote. The real
+    # PTB ``Message.text`` is ``str | None``, so the type check excludes
+    # nothing legitimate.
+    raw_text = getattr(reply_to_message, "text", None)
+    raw_caption = getattr(reply_to_message, "caption", None)
+    parent_text = ""
+    if isinstance(raw_text, str) and raw_text.strip():
+        parent_text = raw_text.strip()
+    elif isinstance(raw_caption, str) and raw_caption.strip():
+        parent_text = raw_caption.strip()
+    if not parent_text:
+        return None
+
+    if len(parent_text) > _REPLY_CTX_QUOTE_LIMIT:
+        parent_text = (
+            parent_text[:_REPLY_CTX_QUOTE_LIMIT] + _REPLY_CTX_TRUNCATION_SUFFIX
+        )
+
+    # Attribution: reply-to-bot vs reply-to-own-message. Multi-user
+    # chats aren't supported today (Telegram's bot allowlist is one
+    # Andrew-shaped entry), so "your earlier message" is the only
+    # non-bot case we need to cover.
+    from_user = getattr(reply_to_message, "from_user", None)
+    is_bot = bool(from_user and getattr(from_user, "is_bot", False))
+    attribution = (
+        "Salem's earlier message" if is_bot else "your earlier message"
+    )
+
+    # Timestamp. ``Message.date`` is a tz-aware datetime per PTB's
+    # contract. Normalise to UTC and format to second precision —
+    # microseconds are noise in a human-readable prefix.
+    raw_date = getattr(reply_to_message, "date", None)
+    try:
+        iso_ts = raw_date.astimezone(timezone.utc).isoformat(
+            timespec="seconds",
+        )
+    except Exception:  # noqa: BLE001 — defensive: naive datetime edge case
+        # Fall back to str() which still produces something human-readable.
+        # Not worth crashing the turn over a timestamp format quirk.
+        iso_ts = str(raw_date) if raw_date is not None else ""
+
+    return (
+        f'[You are replying to {attribution} at {iso_ts}: '
+        f'"{parent_text}"]\n\n'
+    )
 
 
 # --- Inline-command pre-check --------------------------------------------
@@ -1608,6 +1745,22 @@ async def handle_message(
         return
     chat_id = update.effective_chat.id
 
+    # Reply-context consumer: when the user long-pressed a bot message and
+    # hit "Reply," Telegram attaches the full parent via ``reply_to_message``.
+    # Build a machine-generated context prefix and prepend it to ``text``
+    # BEFORE the inline-command check, router classifier, and Anthropic
+    # turn — so every downstream path sees the reply attribution inline
+    # with the user's actual words. Returns ``None`` for photo-only replies
+    # (no usable quoted text) in which case we fall through silently.
+    #
+    # NOTE: the inline-command detector still runs against the ORIGINAL
+    # text (no prefix) — a "/end" reply is still intended to close the
+    # session; we don't want the reply prefix to accidentally block
+    # inline-command detection by pushing the slash past the first line.
+    reply_prefix = _build_reply_context_prefix(update.message.reply_to_message)
+    has_reply_context = reply_prefix is not None
+    effective_text = f"{reply_prefix}{text}" if reply_prefix else text
+
     # Inline-command pre-check: "Good. /end" should close the session, not
     # get forwarded to Claude as prose. Runs BEFORE the lock + LLM call so
     # we don't waste tokens or mutate transcript state for a message whose
@@ -1650,12 +1803,23 @@ async def handle_message(
                 )
                 state_mgr.pop_active(chat_id)
                 state_mgr.save()
+                # Rehydrate-failure route-open: pass the effective (prefixed)
+                # text so the router sees the reply-to-bot context as the
+                # cue, and flag ``has_reply_context`` so the classifier
+                # prefers continues/note over a fresh cue-driven session.
                 sess = await _open_routed_session(
-                    state_mgr, config, client, chat_id, text,
+                    state_mgr, config, client, chat_id, effective_text,
+                    has_reply_context=has_reply_context,
                 )
         else:
+            # No active session — the router runs. When this message is a
+            # reply to a prior bot message we flag ``has_reply_context``
+            # so the classifier tips toward continuation / note rather
+            # than opening a fresh capture / journal / article session on
+            # what is almost certainly a follow-up to existing context.
             sess = await _open_routed_session(
-                state_mgr, config, client, chat_id, text,
+                state_mgr, config, client, chat_id, effective_text,
+                has_reply_context=has_reply_context,
             )
 
         # Stage 3.5 peer-route flow. On the first message of a
@@ -1671,7 +1835,11 @@ async def handle_message(
             handled = await _dispatch_peer_route(
                 update, ctx,
                 target=peer_target,
-                text=text,
+                # Forward with the reply-prefix so the peer has the same
+                # context the user is holding in their head ("explain the
+                # second failure" is meaningless without the prior
+                # [KAL-LE] pytest output it's referencing).
+                text=effective_text,
                 chat_id=chat_id,
                 originating_session_id=active_now.get("session_id", ""),
             )
@@ -1710,7 +1878,11 @@ async def handle_message(
                 client=client,
                 state=state_mgr,
                 session=sess,
-                user_message=text,
+                # Use the prefix-augmented text so the model sees the
+                # reply-to-bot context inline with the user's words.
+                # Non-reply turns are identical to before (effective_text
+                # == text when ``reply_prefix`` is None).
+                user_message=effective_text,
                 config=config,
                 vault_context_str=vault_context_str,
                 system_prompt=system_prompt,
