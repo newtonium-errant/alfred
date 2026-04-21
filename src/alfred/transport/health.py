@@ -218,12 +218,249 @@ def _check_state_depths(raw: dict[str, Any]) -> list[CheckResult]:
     return results
 
 
-async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
+async def _check_peer_reachable(
+    raw: dict[str, Any], peer_name: str, peer_entry: dict[str, Any],
+) -> CheckResult:
+    """GET <peer.base_url>/health on the named peer.
+
+    The peer's /health endpoint is unauthenticated by design (bootstrap
+    probe) so we can hit it without loading a token. WARN on
+    connection refused (peer is down but that's not a FAIL); FAIL on
+    non-JSON or non-200 response from a reachable port.
+    """
+    base_url = str(peer_entry.get("base_url") or "")
+    name = f"peer-reachable:{peer_name}"
+    if not base_url:
+        return CheckResult(
+            name=name,
+            status=Status.FAIL,
+            detail=f"peer '{peer_name}' has no base_url",
+        )
+    url = f"{base_url.rstrip('/')}/health"
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(url)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        return CheckResult(
+            name=name,
+            status=Status.WARN,
+            detail=f"{peer_name} unreachable: {exc.__class__.__name__}",
+            data={"url": url, "peer": peer_name},
+        )
+    except httpx.RequestError as exc:
+        return CheckResult(
+            name=name,
+            status=Status.FAIL,
+            detail=f"{peer_name} request error: {exc}",
+            data={"url": url, "peer": peer_name},
+        )
+    if resp.status_code != 200:
+        return CheckResult(
+            name=name,
+            status=Status.FAIL,
+            detail=f"{peer_name} HTTP {resp.status_code}",
+            data={"url": url, "peer": peer_name, "status_code": resp.status_code},
+        )
+    return CheckResult(
+        name=name,
+        status=Status.OK,
+        detail=f"{peer_name} reachable",
+        data={"url": url, "peer": peer_name},
+    )
+
+
+async def _check_peer_handshake(
+    raw: dict[str, Any], peer_name: str, peer_entry: dict[str, Any],
+) -> CheckResult:
+    """POST <peer.base_url>/peer/handshake — validates auth + protocol version.
+
+    Requires the caller's peer token (peer_entry.token). WARN on
+    version skew (caller is protocol v1, peer returned >1); FAIL on
+    auth rejection or missing required capability.
+    """
+    from .exceptions import TransportError
+
+    name = f"peer-handshake:{peer_name}"
+    token = str(peer_entry.get("token") or "")
+    base_url = str(peer_entry.get("base_url") or "")
+    if not token:
+        return CheckResult(
+            name=name,
+            status=Status.FAIL,
+            detail=f"peer '{peer_name}' has no token",
+        )
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Alfred-Client": _infer_self_name(raw),
+    }
+    url = f"{base_url.rstrip('/')}/peer/handshake"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.post(
+                url,
+                json={"from": _infer_self_name(raw), "protocol_version": 1},
+                headers=headers,
+            )
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        return CheckResult(
+            name=name,
+            status=Status.WARN,
+            detail=f"{peer_name} unreachable",
+            data={"peer": peer_name},
+        )
+    except httpx.RequestError as exc:
+        return CheckResult(
+            name=name,
+            status=Status.FAIL,
+            detail=f"{peer_name} request error: {exc}",
+            data={"peer": peer_name},
+        )
+
+    if resp.status_code == 401:
+        return CheckResult(
+            name=name,
+            status=Status.FAIL,
+            detail=f"{peer_name} auth rejected (token mismatch)",
+            data={"peer": peer_name},
+        )
+    if resp.status_code != 200:
+        return CheckResult(
+            name=name,
+            status=Status.FAIL,
+            detail=f"{peer_name} HTTP {resp.status_code}",
+            data={"peer": peer_name, "status_code": resp.status_code},
+        )
+
+    try:
+        body = resp.json()
+    except ValueError:
+        return CheckResult(
+            name=name,
+            status=Status.FAIL,
+            detail=f"{peer_name} non-JSON handshake response",
+            data={"peer": peer_name},
+        )
+
+    their_version = body.get("protocol_version")
+    status = Status.OK
+    detail = f"{peer_name} handshake ok (v{their_version})"
+    if their_version != 1:
+        status = Status.WARN
+        detail = (
+            f"{peer_name} protocol skew: ours=1, theirs={their_version}"
+        )
+
+    return CheckResult(
+        name=name,
+        status=status,
+        detail=detail,
+        data={
+            "peer": peer_name,
+            "protocol_version": their_version,
+            "capabilities": body.get("capabilities") or [],
+        },
+    )
+
+
+def _check_peer_queue_depth(
+    raw: dict[str, Any], peer_name: str,
+) -> CheckResult:
+    """Counter for peer-specific pending entries.
+
+    v1 the pending_queue isn't partitioned by peer — all scheduled
+    sends share one list. This probe inspects the local transport
+    state for entries whose ``peer`` field matches ``peer_name``
+    (Stage 3.5: scheduler writes ``peer`` onto every enqueue) and
+    reports the count. Returns OK with a 0 count when no peer-
+    specific entries exist.
+    """
+    transport_cfg = raw.get("transport", {}) or {}
+    state_cfg = transport_cfg.get("state", {}) or {}
+    state_path = Path(
+        state_cfg.get("path", "./data/transport_state.json")
+    )
+    name = f"peer-queue-depth:{peer_name}"
+    if not state_path.exists():
+        return CheckResult(
+            name=name,
+            status=Status.OK,
+            detail=f"no state file; peer queue depth = 0",
+            data={"peer": peer_name, "depth": 0},
+        )
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return CheckResult(
+            name=name,
+            status=Status.WARN,
+            detail=f"{peer_name} state unreadable",
+            data={"peer": peer_name},
+        )
+    entries = data.get("pending_queue", []) or []
+    depth = sum(1 for e in entries if e.get("peer") == peer_name)
+    threshold = 100
+    status = Status.WARN if depth > threshold else Status.OK
+    return CheckResult(
+        name=name,
+        status=status,
+        detail=f"{peer_name} depth={depth} (warn at {threshold})",
+        data={"peer": peer_name, "depth": depth, "threshold": threshold},
+    )
+
+
+def _infer_self_name(raw: dict[str, Any]) -> str:
+    """Return a peer-name-shaped identifier for this instance.
+
+    Salem defaults to ``"salem"``; KAL-LE defaults to ``"kal-le"``.
+    Reads ``telegram.instance.name`` + lowercases + strips dots.
+    """
+    tg = raw.get("telegram", {}) or {}
+    inst = tg.get("instance", {}) or {}
+    name = str(inst.get("name") or "alfred").lower().replace(".", "").replace(" ", "-")
+    # Alfred default → salem for peer purposes.
+    if name == "alfred":
+        return "salem"
+    return name
+
+
+async def _run_peer_probes(
+    raw: dict[str, Any],
+    filter_peer: str | None = None,
+) -> list[CheckResult]:
+    """Run all peer-specific probes. Optionally filter to one peer."""
+    results: list[CheckResult] = []
+    transport_cfg = raw.get("transport", {}) or {}
+    peers = transport_cfg.get("peers", {}) or {}
+    if not peers:
+        return results
+
+    for peer_name, peer_entry in peers.items():
+        if filter_peer and peer_name != filter_peer:
+            continue
+        if not isinstance(peer_entry, dict):
+            continue
+        results.append(await _check_peer_reachable(raw, peer_name, peer_entry))
+        results.append(await _check_peer_handshake(raw, peer_name, peer_entry))
+        results.append(_check_peer_queue_depth(raw, peer_name))
+    return results
+
+
+async def health_check(
+    raw: dict[str, Any],
+    mode: str = "quick",
+    filter_peer: str | None = None,
+) -> ToolHealth:
     """Run transport health probes.
 
     Returns SKIP when ``transport:`` is absent from config — the
     transport is optional (brief + scheduler are the only v1
     consumers, and both tolerate its absence).
+
+    Stage 3.5: ``filter_peer`` narrows the probes to a single peer
+    name. When set, the local (non-peer) probes are skipped too —
+    ``alfred check --peer kal-le`` only reports on KAL-LE.
     """
     if raw.get("transport") is None:
         return ToolHealth(
@@ -232,12 +469,28 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
             detail="no transport section in config",
         )
 
-    results: list[CheckResult] = [
-        _check_config_section(raw),
-        _check_token_configured(raw),
-    ]
-    results.append(await _check_port_reachable(raw))
-    results.extend(_check_state_depths(raw))
+    results: list[CheckResult] = []
+    if filter_peer is None:
+        results.extend([
+            _check_config_section(raw),
+            _check_token_configured(raw),
+        ])
+        results.append(await _check_port_reachable(raw))
+        results.extend(_check_state_depths(raw))
+
+    # Peer probes (always, unless filter_peer excludes them all).
+    results.extend(await _run_peer_probes(raw, filter_peer=filter_peer))
+
+    if not results:
+        return ToolHealth(
+            tool="transport",
+            status=Status.SKIP,
+            detail=(
+                f"no peer named {filter_peer!r}"
+                if filter_peer
+                else "no probes ran"
+            ),
+        )
 
     status = Status.worst([r.status for r in results])
     return ToolHealth(tool="transport", status=status, results=results)

@@ -215,6 +215,47 @@ def cmd_dead_letter(
     return 1
 
 
+def cmd_tail(
+    raw: dict[str, Any],
+    peer: str | None,
+    limit: int,
+    wants_json: bool,
+) -> int:
+    """Tail the canonical audit log, optionally filtered by peer."""
+    from .canonical_audit import read_audit, resolve_audit_path
+
+    audit_path = resolve_audit_path(raw)
+    entries = read_audit(audit_path)
+    if peer:
+        entries = [e for e in entries if e.get("peer") == peer]
+    tail = entries[-limit:] if limit > 0 else entries
+
+    if wants_json:
+        print(json.dumps(tail, indent=2, default=str))
+        return 0
+
+    if not tail:
+        label = f" for peer {peer!r}" if peer else ""
+        print(f"No canonical audit entries{label}.")
+        return 0
+
+    print(
+        f"Showing last {len(tail)} canonical audit entries"
+        + (f" for peer {peer!r}" if peer else "")
+        + ":"
+    )
+    for e in tail:
+        granted = ",".join(e.get("granted") or [])
+        denied = ",".join(e.get("denied") or [])
+        print(
+            f"  {e.get('ts', '?')}  peer={e.get('peer'):<10}  "
+            f"type={e.get('type'):<10} name={e.get('name')}  "
+            f"granted=[{granted}]  denied=[{denied}]  "
+            f"cid={e.get('correlation_id', '')}"
+        )
+    return 0
+
+
 def cmd_rotate(raw: dict[str, Any], env_path: str = ".env") -> int:
     """Generate a new 64-char hex token, update ``.env`` in place.
 
@@ -313,3 +354,18 @@ def build_subparser(subparsers: argparse._SubParsersAction) -> None:
         "rotate",
         help="Generate a new transport token, update .env in place",
     )
+
+    # Stage 3.5: tail peer-specific audit / correlation-id logs.
+    tail_p = t_sub.add_parser(
+        "tail",
+        help="Tail the canonical audit log (optionally filtered by peer)",
+    )
+    tail_p.add_argument(
+        "--peer", default=None,
+        help="Filter audit entries to a specific peer (e.g. --peer kal-le)",
+    )
+    tail_p.add_argument(
+        "--limit", type=int, default=50,
+        help="Number of entries to show (default: 50)",
+    )
+    tail_p.add_argument("--json", action="store_true", default=False)

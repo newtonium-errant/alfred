@@ -397,8 +397,15 @@ def cmd_transport(args: argparse.Namespace) -> None:
         ))
     if subcmd == "rotate":
         sys.exit(tcli.cmd_rotate(raw))
+    if subcmd == "tail":
+        sys.exit(tcli.cmd_tail(
+            raw,
+            peer=getattr(args, "peer", None),
+            limit=getattr(args, "limit", 50),
+            wants_json=wants_json,
+        ))
 
-    print("Usage: alfred transport {status|send-test|queue|dead-letter|rotate}")
+    print("Usage: alfred transport {status|send-test|queue|dead-letter|rotate|tail}")
     sys.exit(1)
 
 
@@ -847,15 +854,36 @@ def cmd_check(args: argparse.Namespace) -> None:
     mode = "full" if getattr(args, "full", False) else "quick"
     wants_json = bool(getattr(args, "json", False))
     filter_tools = getattr(args, "tools", None)
+    filter_peer = getattr(args, "peer", None)
     tools: list[str] | None = None
     if filter_tools:
         tools = [t.strip() for t in filter_tools.split(",") if t.strip()]
 
     from alfred.health.aggregator import run_all_checks
     from alfred.health.renderer import render_human, render_json
-    from alfred.health.types import Status
+    from alfred.health.types import Status, HealthReport
 
-    report = asyncio.run(run_all_checks(raw, mode=mode, tools=tools))
+    if filter_peer:
+        # Peer-filtered check: bypass the full aggregator and invoke
+        # the transport health-check directly with filter_peer.
+        from alfred.transport.health import health_check as transport_health
+        from datetime import datetime, timezone
+
+        started_dt = datetime.now(timezone.utc)
+        th = asyncio.run(
+            transport_health(raw, mode=mode, filter_peer=filter_peer),
+        )
+        finished_dt = datetime.now(timezone.utc)
+        report = HealthReport(
+            mode=mode,
+            started_at=started_dt.isoformat(),
+            finished_at=finished_dt.isoformat(),
+            overall_status=th.status,
+            tools=[th],
+            elapsed_ms=(finished_dt - started_dt).total_seconds() * 1000.0,
+        )
+    else:
+        report = asyncio.run(run_all_checks(raw, mode=mode, tools=tools))
 
     if wants_json:
         # Batch output — JSON is useless to stream line-by-line.
@@ -1090,6 +1118,14 @@ def build_parser() -> argparse.ArgumentParser:
     check_p.add_argument(
         "--tools", default=None,
         help="Comma-separated subset of tools to check (default: all)",
+    )
+    check_p.add_argument(
+        "--peer", default=None,
+        help=(
+            "Run only the per-peer probes for the named peer "
+            "(Stage 3.5 — e.g. --peer kal-le). Skips the local "
+            "transport probes."
+        ),
     )
 
     # curator
