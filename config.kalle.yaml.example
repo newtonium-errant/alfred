@@ -1,0 +1,129 @@
+# KAL-LE — Alfred coding instance config
+#
+# Ship one of these per multi-instance deployment. Salem stays on
+# config.yaml; KAL-LE uses this file (or the template `alfred instance
+# new kalle` scaffolds).
+#
+# Run KAL-LE with:
+#   source /home/andrew/.alfred/kalle/.venv/bin/activate
+#   alfred --config config.kalle.yaml up --only talker,transport,instructor
+#
+# Required environment variables (add to ~/alfred/.env):
+#   TELEGRAM_KALLE_BOT_TOKEN       — from @BotFather for KAL-LE's own bot
+#   ALFRED_KALLE_TRANSPORT_TOKEN   — shared secret for KAL-LE's inbound transport
+#   ALFRED_KALLE_PEER_TOKEN        — token Salem uses when reaching KAL-LE
+#   ALFRED_SALEM_PEER_TOKEN        — token KAL-LE uses when reaching Salem
+#   ANTHROPIC_API_KEY              — same as Salem's; can split later
+#   GROQ_API_KEY                   — same as Salem's (STT)
+# Generate each token with: python -c 'import secrets; print(secrets.token_hex(32))'
+
+# ---------------------------------------------------------------------------
+# Per-instance paths
+# ---------------------------------------------------------------------------
+daemon:
+  # KAL-LE's PID file lives under /home/andrew/.alfred/kalle/ so it
+  # doesn't collide with Salem's ./data/alfred.pid.
+  pid_path: "/home/andrew/.alfred/kalle/data/alfred.pid"
+
+# ---------------------------------------------------------------------------
+# Vault — aftermath-lab is KAL-LE's primary
+# ---------------------------------------------------------------------------
+vault:
+  path: "/home/andrew/aftermath-lab"
+  ignore_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox"]
+  ignore_files: [".gitkeep"]
+
+# ---------------------------------------------------------------------------
+# Logging — separate from Salem's
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  dir: "/home/andrew/.alfred/kalle/data"
+
+# ---------------------------------------------------------------------------
+# Transport — port 8892 (Salem=8891, STAY-C=8893, slot4=8894, slot5=8895)
+# ---------------------------------------------------------------------------
+transport:
+  server:
+    host: "127.0.0.1"
+    port: 8892
+  scheduler:
+    poll_interval_seconds: 30
+    stale_reminder_max_minutes: 180
+  # Inbound auth — who can POST to KAL-LE's transport.
+  auth:
+    tokens:
+      local:
+        token: "${ALFRED_KALLE_TRANSPORT_TOKEN}"
+        allowed_clients: [scheduler, brief, janitor, curator, talker]
+      # Salem's peer entry — its identity when it reaches KAL-LE.
+      salem:
+        token: "${ALFRED_KALLE_PEER_TOKEN}"
+        allowed_clients: [salem]
+  # Outbound peers — where KAL-LE can reach.
+  peers:
+    salem:
+      base_url: "http://127.0.0.1:8891"
+      token: "${ALFRED_SALEM_PEER_TOKEN}"
+  # Canonical — KAL-LE is NOT the owner (Salem holds canonical records).
+  canonical:
+    owner: false
+    audit_log_path: "/home/andrew/.alfred/kalle/data/canonical_audit.jsonl"
+    peer_permissions: {}
+  state:
+    path: "/home/andrew/.alfred/kalle/data/transport_state.json"
+    dead_letter_max_age_days: 30
+
+# ---------------------------------------------------------------------------
+# Instructor — enables natural-language self-improvement directives
+# ---------------------------------------------------------------------------
+instructor:
+  poll_interval_seconds: 60
+  max_retries: 3
+  audit_window_size: 5
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    model: "claude-sonnet-4-6"
+    max_tokens: 4096
+  state:
+    path: "/home/andrew/.alfred/kalle/data/instructor_state.json"
+
+# ---------------------------------------------------------------------------
+# Talker — KAL-LE's Telegram bot, Opus default, longer session gap
+# ---------------------------------------------------------------------------
+telegram:
+  bot_token: "${TELEGRAM_KALLE_BOT_TOKEN}"
+  # Andrew's Telegram user_id (same as Salem's allowlist).
+  allowed_users: []
+  primary_users:
+    - "person/Andrew Newton"
+  # Instance identity — loaded into SKILL.md templating.
+  instance:
+    name: "KAL-LE"
+    canonical: "K.A.L.L.E."
+    aliases: ["Kali", "Callie", "Kallie"]
+    skill_bundle: "vault-kalle"
+    tool_set: "kalle"
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    # Opus for coding — reasoning depth matters.
+    model: "claude-opus-4-7"
+    max_tokens: 4096
+    # Opus 4.x rejects temperature; conversation.py already drops it
+    # for opus models, but keep the default sane for any code path
+    # that reads it.
+    temperature: 0.7
+  stt:
+    provider: "groq"
+    api_key: "${GROQ_API_KEY}"
+    model: "whisper-large-v3"
+  # No tts on KAL-LE — no /brief, and we don't want audio replies for
+  # coding work. Leaving this block absent means /brief replies "not
+  # configured" if Andrew accidentally triggers it.
+  session:
+    # Coding sessions sprawl — 2hr vs Salem's 30min default.
+    gap_timeout_seconds: 7200
+    state_path: "/home/andrew/.alfred/kalle/data/talker_state.json"
+  # Safety-critical bash_exec audit log — separate from Salem's.
+  bash_exec:
+    audit_path: "/home/andrew/.alfred/kalle/data/bash_exec.jsonl"

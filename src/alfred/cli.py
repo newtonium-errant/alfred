@@ -869,6 +869,118 @@ def cmd_check(args: argparse.Namespace) -> None:
     sys.exit(1 if report.overall_status == Status.FAIL else 0)
 
 
+def cmd_instance(args: argparse.Namespace) -> None:
+    """Stage 3.5: scaffold a new Alfred instance (config + dirs + BotFather checklist).
+
+    Subcommand: ``alfred instance new <name>``.
+
+    Creates:
+      - ``config.<name>.yaml`` in the current directory (from the
+        bundled KAL-LE template — adjust for STAY-C etc. after).
+      - ``/home/andrew/.alfred/<name>/data/`` directory
+      - ``/home/andrew/.alfred/<name>/logs/`` directory
+
+    Prints a BotFather checklist to stdout with the exact env vars
+    that need setting. Does NOT write to .env (that's manual — the
+    user has to set real token values).
+    """
+    subcmd = getattr(args, "instance_cmd", None)
+    if subcmd != "new":
+        print("Usage: alfred instance new <name>")
+        sys.exit(1)
+
+    name = args.instance_name.strip().lower()
+    if not name or not all(c.isalnum() or c in "-_" for c in name):
+        print(
+            f"Invalid instance name {name!r} — must be lowercase "
+            "alphanumeric with -/_."
+        )
+        sys.exit(1)
+
+    # Where configs live relative to the cwd at invocation time.
+    config_path = Path(f"config.{name}.yaml")
+    if config_path.exists() and not getattr(args, "force", False):
+        print(
+            f"{config_path} already exists. Re-run with --force to overwrite, "
+            "or remove it first."
+        )
+        sys.exit(1)
+
+    instance_dir = Path(f"/home/andrew/.alfred/{name}")
+    data_dir = instance_dir / "data"
+    logs_dir = instance_dir / "logs"
+
+    # Locate the KAL-LE template — it lives next to config.yaml.example.
+    # We ship only one template today (KAL-LE); future STAY-C will
+    # either reuse this template or ship its own.
+    template_path = Path("config.kalle.yaml.example")
+    if not template_path.exists():
+        # Fallback: look in the source tree.
+        maybe = Path(__file__).resolve().parent.parent.parent / "config.kalle.yaml.example"
+        if maybe.exists():
+            template_path = maybe
+        else:
+            print(
+                "Can't find config.kalle.yaml.example — are you running from "
+                "the alfred project root?"
+            )
+            sys.exit(1)
+
+    # Load the template, substitute the name token-ish — the template
+    # is KAL-LE-shaped, so we do a light rename pass for STAY-C etc.
+    # but primarily this is "copy + rename paths".
+    template = template_path.read_text(encoding="utf-8")
+    # Naive replacement — the template uses KAL-LE/kalle literals.
+    # Good enough for scaffolding; operator tunes the identity block.
+    substituted = (
+        template
+        .replace("/home/andrew/.alfred/kalle/", f"/home/andrew/.alfred/{name}/")
+        .replace("TELEGRAM_KALLE_BOT_TOKEN", f"TELEGRAM_{name.upper().replace('-', '_')}_BOT_TOKEN")
+        .replace("ALFRED_KALLE_TRANSPORT_TOKEN", f"ALFRED_{name.upper().replace('-', '_')}_TRANSPORT_TOKEN")
+        .replace("ALFRED_KALLE_PEER_TOKEN", f"ALFRED_{name.upper().replace('-', '_')}_PEER_TOKEN")
+    )
+
+    # Create directories.
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"Couldn't create {instance_dir}: {exc}")
+        sys.exit(1)
+
+    # Write the config file.
+    try:
+        config_path.write_text(substituted, encoding="utf-8")
+    except OSError as exc:
+        print(f"Couldn't write {config_path}: {exc}")
+        sys.exit(1)
+
+    # BotFather checklist.
+    env_prefix = name.upper().replace("-", "_")
+    print(f"Scaffolded instance {name!r}:")
+    print(f"  config:     {config_path}")
+    print(f"  data dir:   {data_dir}")
+    print(f"  logs dir:   {logs_dir}")
+    print()
+    print("Next steps (manual):")
+    print("  1. BotFather: @BotFather on Telegram → /newbot → capture token.")
+    print("  2. Add to .env (generate each with")
+    print("       python -c 'import secrets; print(secrets.token_hex(32))'):")
+    print(f"       TELEGRAM_{env_prefix}_BOT_TOKEN=<BotFather token>")
+    print(f"       ALFRED_{env_prefix}_TRANSPORT_TOKEN=<64-char hex>")
+    print(f"       ALFRED_{env_prefix}_PEER_TOKEN=<64-char hex>")
+    print(f"       ALFRED_SALEM_PEER_TOKEN=<64-char hex (if not already set)>")
+    print(f"  3. Open Telegram, /start the new bot once.")
+    print(f"  4. Review and tune {config_path} — port, instance name,")
+    print(f"     allowed_users, vault.path.")
+    print(f"  5. Create a venv at {instance_dir}/.venv and install alfred:")
+    print(f"       python -m venv {instance_dir}/.venv")
+    print(f"       source {instance_dir}/.venv/bin/activate")
+    print(f"       pip install -e {Path.cwd()}")
+    print(f"  6. Launch:")
+    print(f"       alfred --config {config_path} up --only talker,transport,instructor")
+
+
 def cmd_mail(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw, tool="mail")
@@ -1143,6 +1255,21 @@ def build_parser() -> argparse.ArgumentParser:
     bit_hist.add_argument("--limit", type=int, default=10)
     bit_hist.add_argument("--json", action="store_true", default=False, help="Emit JSON")
 
+    # instance — Stage 3.5 multi-instance scaffolding
+    instance_p = sub.add_parser(
+        "instance",
+        help="Multi-instance scaffolding (new, list — Stage 3.5)",
+    )
+    instance_sub = instance_p.add_subparsers(dest="instance_cmd")
+    inst_new = instance_sub.add_parser(
+        "new", help="Scaffold a new instance (config + data dirs)",
+    )
+    inst_new.add_argument("instance_name", help="Lowercase instance name, e.g. kalle, stayc")
+    inst_new.add_argument(
+        "--force", action="store_true", default=False,
+        help="Overwrite an existing config.<name>.yaml",
+    )
+
     # mail
     mail_p = sub.add_parser("mail", help="Email fetcher subcommands")
     mail_sub = mail_p.add_subparsers(dest="mail_cmd")
@@ -1185,6 +1312,7 @@ def main() -> None:
         "tui": cmd_tui,
         "brief": cmd_brief,
         "mail": cmd_mail,
+        "instance": cmd_instance,
         "talker": cmd_talker,
         "check": cmd_check,
         "bit": cmd_bit,
