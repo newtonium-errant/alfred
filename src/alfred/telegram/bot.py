@@ -65,6 +65,34 @@ _KEY_VAULT_CTX = "vault_context_str"
 _KEY_LOCKS = "chat_locks"
 
 
+# --- Instance-name normalisation ------------------------------------------
+#
+# The router emits peer-route targets in canonical lowercase form
+# (``kal-le``, ``stay-c``). The local instance name arrives from
+# :class:`InstanceConfig` as either the casual form (``Salem``) or the
+# canonical form (``S.A.L.E.M.``). To compare the two reliably we lowercase,
+# strip dots, and map spaces to dashes — the same transform the transport
+# layer uses for peer keys in ``config.transport.peers``.
+#
+# Legacy mapping: the default ``InstanceConfig`` ships ``name="Alfred"``
+# for backwards compatibility, but the peer-name table keys off ``salem``.
+# We collapse ``alfred`` → ``salem`` here so the self-target check still
+# fires when Andrew runs a default-configured instance.
+
+
+def _normalize_instance_name(s: str) -> str:
+    """Return the canonical peer-key form of an instance name.
+
+    Lowercases, strips dots, and maps spaces to dashes. The legacy
+    ``alfred`` → ``salem`` mapping is applied so a default-configured
+    install still matches the ``salem`` peer key.
+    """
+    normalized = (s or "").lower().replace(".", "").replace(" ", "-")
+    if normalized == "alfred":
+        return "salem"
+    return normalized
+
+
 # --- Application assembly -------------------------------------------------
 
 
@@ -1062,6 +1090,31 @@ async def _dispatch_peer_route(
     if update.message is None:
         return False
 
+    # Self-target guard: if the router classified peer_route with a
+    # target matching our own instance name, there's no peer to forward
+    # to — handle the turn locally. Runs BEFORE the "→ KAL-LE" ack so
+    # Andrew doesn't see a spurious arrow followed by a "couldn't
+    # reach…" error. Returning False makes the caller fall through to
+    # Salem's normal handling, same as the TransportServerDown branch.
+    #
+    # ``name`` (not ``canonical``) is the peer-key source: ``KAL-LE``
+    # normalizes to ``kal-le`` (matches the peer key), whereas
+    # ``K.A.L.L.E.`` normalizes to ``kalle`` (no dashes — wouldn't
+    # match). This mirrors ``transport.health._infer_self_name``.
+    self_name = _normalize_instance_name(
+        config.instance.name or config.instance.canonical or "salem",
+    )
+    target_normalized = _normalize_instance_name(target)
+    if target_normalized == self_name:
+        log.info(
+            "talker.bot.peer_route_self_target",
+            chat_id=chat_id,
+            target=target,
+            self_name=self_name,
+            reason="router classified peer_route to own instance; handling locally",
+        )
+        return False
+
     try:
         ack_msg = await update.message.reply_text(f"→ {target.upper()}")
     except Exception as exc:  # noqa: BLE001
@@ -1097,11 +1150,9 @@ async def _dispatch_peer_route(
     import uuid
     correlation_id = uuid.uuid4().hex[:16]
 
-    self_name = config.instance.canonical or config.instance.name or "salem"
-    self_name = self_name.lower().replace(".", "").replace(" ", "-")
-    # Default: ``salem`` if instance is the Salem default ``Alfred``.
-    if self_name in {"alfred"}:
-        self_name = "salem"
+    # ``self_name`` already computed above for the self-target guard —
+    # reuse it verbatim so the peer_send wire protocol and the self-
+    # check agree on the same canonical form.
 
     try:
         await peer_send(
