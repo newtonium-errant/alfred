@@ -86,10 +86,23 @@ class RouterDecision:
 # the model occasionally wraps the object in prose, which we'd then have to
 # regex-extract. Failing closed to ``note`` is fine for one-off bad JSON,
 # but regular JSON noise would mean the router never routes anything.
+#
+# Stage 3.5 hotfix c3: ``{self_name}`` / ``{self_display_name}`` are
+# templated in per-call so each instance knows who it is. The classifier
+# MUST NOT route to itself — if KAL-LE's classifier sees
+# "KAL-LE, run pytest" and emits peer_route target=kal-le, that's
+# self-referential and we fall back to note at parse time (see
+# ``_decision_from_parsed``).
 _ROUTER_PROMPT = """\
 You classify the opening message of a Telegram voice/text session with \
 Alfred (a personal assistant). Pick ONE session type and (optionally) \
 flag continuation of a prior session.
+
+You are running on instance "{self_name}". NEVER classify peer_route \
+with target="{self_name}" — that would route to yourself. If the user \
+addresses your own instance by name (e.g., "{self_display_name}, ..."), \
+strip the address and classify the remaining content normally. Route \
+to OTHER instances only.
 
 Types:
 - note: quick capture, one-off reminders, short observations.
@@ -105,11 +118,23 @@ act, not converse.
 out loud", "I want to ramble", "just let me talk for a while"). The \
 user wants to dump thoughts without interruption; the assistant stays \
 silent mid-session and a structured summary is produced at /end.
-- peer_route: coding, debugging, or aftermath-lab curation work that \
-belongs on KAL-LE (the coding instance). Cues: "ask kal-le about X", \
-"why is the transport scheduler firing twice", "refactor the janitor \
-fix command", "promote this pattern to canonical", "run the tests", \
-"look at the diff on this branch", "review the last three commits". \
+- peer_route: coding, debugging, testing, or aftermath-lab curation \
+work that belongs on KAL-LE (the coding instance). Cues (expanded): \
+  * Direct addressing at start: "KAL-LE, X", "KAL-LE: X", "K.A.L.L.E., \
+X" — strongly prefer peer_route target=kal-le (after verifying it's \
+not self-address per the rule above).
+  * Test running: "run pytest", "run the tests", "check the tests", \
+"check the output of pytest", "check the output of X tests", \
+"pytest tests/X", "npm test", "npm run lint".
+  * Test debugging: "fix the broken test", "debug this test", "trace \
+the failure", "why is X test failing".
+  * Code work: "write a function", "refactor this", "add a test", \
+"review the last three commits", "look at the diff on this branch".
+  * Git inspection: "git status", "git diff", "what's on this branch", \
+"show me the log".
+  * Aftermath-lab curation: "promote this pattern to canonical", \
+"ask kal-le about X", "why is the transport scheduler firing twice".
+
 When you classify peer_route, set "target" to the peer name (``kal-le`` \
 today; ``stay-c`` once that instance is live). Without a target, \
 peer_route is malformed — fall back to note.
@@ -228,6 +253,7 @@ _VALID_PEER_TARGETS: set[str] = {"kal-le", "stay-c"}
 def _decision_from_parsed(
     parsed: dict[str, Any],
     recent: list[dict[str, Any]],
+    self_name: str = "",
 ) -> RouterDecision:
     """Build a :class:`RouterDecision` from a parsed JSON dict.
 
@@ -239,6 +265,13 @@ def _decision_from_parsed(
     Stage 3.5 addition: when ``session_type == "peer_route"``, require
     a valid ``target``. A missing or unknown target coerces back to
     ``note`` — we won't forward to a phantom peer.
+
+    Stage 3.5 hotfix c3: ``self_name`` is the local instance's peer-key
+    name (``salem``, ``kal-le``). Even though the prompt instructs the
+    classifier NOT to emit ``peer_route target=<self>``, the model can
+    still do it — so we guard at parse time too (degrade-to-note with a
+    warning log). Empty string disables the check (tests and legacy
+    callers).
     """
     session_type = parsed.get("session_type") or "note"
     if session_type not in known_types():
@@ -259,8 +292,24 @@ def _decision_from_parsed(
     if session_type == "peer_route":
         raw_target = parsed.get("target")
         if isinstance(raw_target, str) and raw_target.lower() in _VALID_PEER_TARGETS:
-            target = raw_target.lower()
-            peer_route_hint = str(parsed.get("peer_route_hint") or "")[:200]
+            candidate = raw_target.lower()
+            # c3 parse-time guard: even with the "never self-target"
+            # instruction in the prompt, the classifier can still emit
+            # target=<self>. Drop to note with a warning so we can
+            # track how often the instruction is ignored.
+            if self_name and candidate == self_name:
+                log.warning(
+                    "talker.router.peer_route_self_target_coerced",
+                    self_name=self_name,
+                    raw_target=raw_target,
+                    reason="classifier ignored self-target instruction",
+                )
+                session_type = "note"
+                defaults = defaults_for("note")
+                model = defaults.model
+            else:
+                target = candidate
+                peer_route_hint = str(parsed.get("peer_route_hint") or "")[:200]
         else:
             log.info(
                 "talker.router.peer_route_missing_target",
@@ -313,6 +362,8 @@ async def classify_opening_cue(
     client: Any,
     first_message: str,
     recent_sessions: list[dict[str, Any]],
+    self_name: str = "salem",
+    self_display_name: str = "Alfred",
 ) -> RouterDecision:
     """Classify one opening message; return a :class:`RouterDecision`.
 
@@ -322,12 +373,21 @@ async def classify_opening_cue(
         first_message: The text of the user's opening message.
         recent_sessions: Most-recent-first list of closed-session summaries
             from ``state.closed_sessions``.
+        self_name: Stage 3.5 hotfix c3 — the local instance's peer-key
+            name (``salem`` / ``kal-le``). Used to (a) tell the classifier
+            NEVER to route to self via the prompt instruction, and (b)
+            guard at parse time in case the classifier ignores the
+            instruction. Defaults to ``salem`` for legacy callers.
+        self_display_name: The human-facing form of the instance name
+            (``Alfred`` / ``Salem`` / ``K.A.L.L.E.``) — appears in the
+            prompt's self-address example. Defaults to ``Alfred``.
 
     Returns:
         A :class:`RouterDecision`. Any error (network, bad JSON, unknown
-        type, hallucinated continuation) degrades to a ``note`` / Sonnet
-        / no-continuation decision. That keeps the user-visible behaviour
-        identical to wk1 whenever the router is unreliable.
+        type, hallucinated continuation, phantom self-target) degrades to
+        a ``note`` / Sonnet / no-continuation decision. That keeps the
+        user-visible behaviour identical to wk1 whenever the router is
+        unreliable.
     """
     if not first_message:
         return _fallback_decision("empty_message")
@@ -355,6 +415,8 @@ async def classify_opening_cue(
     prompt = _ROUTER_PROMPT.format(
         recent_summary=_format_recent_summary(recent_sessions),
         opening=first_message.strip(),
+        self_name=self_name,
+        self_display_name=self_display_name,
     )
 
     try:
@@ -377,7 +439,7 @@ async def classify_opening_cue(
         log.warning("talker.router.parse_failed", raw_head=raw[:200])
         return _fallback_decision("parse_failed")
 
-    decision = _decision_from_parsed(parsed, recent_sessions)
+    decision = _decision_from_parsed(parsed, recent_sessions, self_name)
     log.info(
         "talker.router.decided",
         session_type=decision.session_type,

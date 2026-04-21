@@ -1259,8 +1259,20 @@ async def _open_routed_session(
     appending the user's actual first message via ``run_turn``.
     """
     recent = _recent_sessions_for_router(state_mgr)
+    # Stage 3.5 hotfix c3: thread the local instance identity into the
+    # router so the classifier knows who it is and can't route to self.
+    # Uses the same name-first convention the self-target guard in
+    # ``_dispatch_peer_route`` uses — see ``_normalize_instance_name``.
+    self_name = _normalize_instance_name(
+        config.instance.name or config.instance.canonical or "salem",
+    )
+    self_display_name = (
+        config.instance.canonical or config.instance.name or "Alfred"
+    )
     decision = await router.classify_opening_cue(
         client, first_message, recent,
+        self_name=self_name,
+        self_display_name=self_display_name,
     )
 
     # Pushback level from the session-type defaults — the router doesn't
