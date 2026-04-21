@@ -10,7 +10,7 @@ intended behavior per plan Part 11 Q7.
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -18,6 +18,11 @@ from zoneinfo import ZoneInfo
 import structlog
 
 from alfred.brief.renderer import serialize_record
+from alfred.common.schedule import (
+    ScheduleConfig as CommonScheduleConfig,
+    compute_next_fire,
+    sleep_until,
+)
 from alfred.health.aggregator import run_all_checks
 from alfred.health.types import Status
 
@@ -74,14 +79,17 @@ async def run_bit_once(
 
 
 def _next_run_time(schedule_time: str, tz_name: str) -> datetime:
-    """Next datetime at which to run."""
+    """Next datetime at which to run.
+
+    Thin wrapper over ``alfred.common.schedule.compute_next_fire`` kept
+    for the existing ``_next_run_time`` test surface; new callers should
+    use ``compute_next_fire`` directly.
+    """
     tz = ZoneInfo(tz_name)
-    now = datetime.now(tz)
-    hour, minute = map(int, schedule_time.split(":"))
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return target
+    return compute_next_fire(
+        CommonScheduleConfig(time=schedule_time, timezone=tz_name),
+        datetime.now(tz),
+    )
 
 
 async def run_daemon(config: BITConfig, raw: dict[str, Any]) -> None:
@@ -96,19 +104,39 @@ async def run_daemon(config: BITConfig, raw: dict[str, Any]) -> None:
     state_mgr = StateManager(config.state.path)
     state_mgr.load()
 
+    # Adapter to the shared scheduling primitive. BIT is daily-only;
+    # ``day_of_week`` stays None.
+    common_schedule = CommonScheduleConfig(
+        time=config.schedule.time,
+        timezone=config.schedule.timezone,
+    )
+
     while True:
         tz = ZoneInfo(config.schedule.timezone)
-        target = _next_run_time(config.schedule.time, config.schedule.timezone)
         now = datetime.now(tz)
+        # Clock-aligned next-fire via shared helper (see
+        # ``alfred.common.schedule``). Daily-only for BIT.
+        target = compute_next_fire(common_schedule, now)
         sleep_seconds = (target - now).total_seconds()
 
         if sleep_seconds > 0:
             log.info(
                 "bit.daemon.sleeping",
                 next_run=target.isoformat(),
+                sleep_seconds=round(sleep_seconds, 1),
                 sleep_hours=round(sleep_seconds / 3600, 2),
             )
-            await asyncio.sleep(sleep_seconds)
+            # Wall-clock-checked chunked sleep — defends against
+            # monotonic clock drift during long sleeps (WSL2 host
+            # suspend/resume, NTP adjustments). See
+            # ``alfred.common.schedule.sleep_until`` for the rationale.
+            actual_seconds = await sleep_until(target)
+            log.info(
+                "bit.daemon.woke",
+                intended_seconds=round(sleep_seconds, 1),
+                actual_seconds=round(actual_seconds, 1),
+                drift_seconds=round(actual_seconds - sleep_seconds, 1),
+            )
 
         try:
             path, status = await run_bit_once(config, raw, state_mgr)
@@ -116,5 +144,7 @@ async def run_daemon(config: BITConfig, raw: dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001
             log.exception("bit.daemon.error")
 
-        # Sleep 60s so we don't double-fire within the same minute
+        # Sleep 60s so we don't double-fire within the same minute.
+        # Short-horizon: not subject to the long-sleep drift bug, so a
+        # plain ``asyncio.sleep`` is fine here.
         await asyncio.sleep(60)
