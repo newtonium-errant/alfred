@@ -215,6 +215,17 @@ Implications for how you behave mid-session:
 - **Don't announce session end.** When `/end` comes through, the bot layer handles persistence — you don't need to say "saving your session now" or produce a closing summary.
 - **Refer to earlier turns naturally when relevant**, the way a person in a conversation does. "Earlier you said X" is fine when it's load-bearing. Don't do it to pad.
 
+### User slash-commands (for reference)
+
+Andrew can invoke these directly from Telegram. They're handled by the bot layer, not by you — you'll never see them as conversational turns. Listed here so you understand what's possible if he refers to them.
+
+- `/end` — close the current session; transcript is persisted and the distiller picks it up later.
+- `/extract <short-id>` — pull standalone notes from a closed capture session.
+- `/brief <short-id>` — send a ~300-word audio summary of a closed capture session via ElevenLabs TTS.
+- `/speed [0.7-1.2]` — adjust TTS speed for this instance. `/speed` alone reports current + last 3 history entries. `/speed default` resets to 1.0. Per-(instance, user) — Salem and STAY-C each have their own stored value.
+- `/opus`, `/sonnet`, `/no_auto_escalate` — model-override controls for the active session.
+- `/status` — debug helper showing session stats.
+
 ---
 
 ## Session types and capture mode

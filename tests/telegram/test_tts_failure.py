@@ -105,7 +105,7 @@ async def test_brief_falls_back_to_text_when_tts_api_errors(
         FakeResponse(content=[FakeBlock(type="text", text="prose text here")])
     ])
 
-    async def _boom(text: str, cfg):
+    async def _boom(text: str, cfg, *, speed=None):
         raise tts.TtsError("elevenlabs 429")
     monkeypatch.setattr(tts, "synthesize", _boom)
 
@@ -198,7 +198,7 @@ async def test_brief_runs_batch_pass_implicitly_when_summary_missing(
         FakeResponse(content=[FakeBlock(type="text", text="prose 300 words")]),
     ])
 
-    async def _fake_synth(text: str, cfg):
+    async def _fake_synth(text: str, cfg, *, speed=None):
         return b"FAKE-MP3"
     monkeypatch.setattr(tts, "synthesize", _fake_synth)
 

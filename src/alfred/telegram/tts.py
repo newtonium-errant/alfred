@@ -94,13 +94,24 @@ def resolve_voice_id(voice_id_or_name: str) -> str:
 # --- Synthesis ------------------------------------------------------------
 
 
-async def synthesize(text: str, cfg: TtsConfig) -> bytes:
+async def synthesize(
+    text: str, cfg: TtsConfig, *, speed: float | None = None,
+) -> bytes:
     """Call ElevenLabs ``text-to-speech/{voice_id}`` and return audio bytes.
 
     ``cfg`` is a populated :class:`TtsConfig`; caller must check that
     ``tts`` is present on the :class:`TalkerConfig` before calling
     this. Raises :class:`TtsError` on any HTTP failure (the caller
     turns that into a text-fallback reply).
+
+    ``speed`` — optional 0.7-1.2 float. When provided, forwarded to
+    ElevenLabs as ``voice_settings.speed``. Callers resolve the
+    preference via :func:`speed_pref.resolve_tts_speed` before calling
+    so each TTS path consistently respects the user's calibration. When
+    ``None``, the setting is omitted and ElevenLabs uses its own
+    default (currently 1.0). Range validation is the caller's
+    responsibility — this function does NOT clamp or reject out-of-
+    range values so the caller can surface meaningful errors earlier.
     """
     if not cfg.api_key:
         raise TtsNotConfigured("elevenlabs api_key is empty")
@@ -115,17 +126,20 @@ async def synthesize(text: str, cfg: TtsConfig) -> bytes:
         "accept": "audio/mpeg",
         "content-type": "application/json",
     }
-    payload: dict[str, Any] = {
-        "text": text,
-        "model_id": cfg.model,
+    voice_settings: dict[str, Any] = {
         # Default voice_settings — mid-range stability/clarity, matches
         # ElevenLabs' own defaults. Exposed config surface stays small
         # (voice, model, word target); tuning stability per-call would
         # be overkill for the wk2b /brief use case.
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75,
-        },
+        "stability": 0.5,
+        "similarity_boost": 0.75,
+    }
+    if speed is not None:
+        voice_settings["speed"] = float(speed)
+    payload: dict[str, Any] = {
+        "text": text,
+        "model_id": cfg.model,
+        "voice_settings": voice_settings,
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:

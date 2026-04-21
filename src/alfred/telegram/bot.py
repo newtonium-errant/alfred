@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from pathlib import Path
 from typing import Any
 
 import anthropic
@@ -44,6 +45,7 @@ from . import (
     router,
     session,
     session_types,
+    speed_pref,
     transcribe,
     tts as tts_mod,
 )
@@ -151,6 +153,10 @@ def build_app(
     # and sends as a Telegram voice message. Opt-in: requires telegram.tts
     # section in config; degrades gracefully to a "not configured" reply.
     app.add_handler(CommandHandler("brief", on_brief))
+    # Stage 2b+ polish: /speed — per-instance, per-user ElevenLabs TTS speed
+    # preference. Reads/writes ``preferences.voice`` on the primary-user's
+    # person record. Applies to every ElevenLabs TTS path (today: /brief).
+    app.add_handler(CommandHandler("speed", on_speed))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
@@ -774,9 +780,21 @@ async def on_brief(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Synthesize.
+    # Synthesize. Resolve the per-(instance, user) TTS speed preference
+    # before the call so Andrew's /speed calibration flows through every
+    # ElevenLabs path uniformly. Default 1.0 when unset — matches
+    # ElevenLabs' own default.
+    instance_for_speed = (
+        config.instance.name or config.instance.canonical or "Alfred"
+    )
+    user_rel_for_speed = (
+        config.primary_users[0] if config.primary_users else ""
+    )
+    speed = speed_pref.resolve_tts_speed(
+        vault_path, user_rel_for_speed, instance_for_speed,
+    )
     try:
-        audio = await tts_mod.synthesize(prose, config.tts)
+        audio = await tts_mod.synthesize(prose, config.tts, speed=speed)
     except tts_mod.TtsNotConfigured:
         await update.message.reply_text(
             "TTS is not configured. Add telegram.tts.api_key to config.yaml."
@@ -830,6 +848,99 @@ async def on_brief(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def on_speed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/speed [value | default]`` — manage per-instance TTS speed preference.
+
+    Usage:
+        * ``/speed``              → report current + last 3 history entries.
+        * ``/speed 1.2``          → set current speed (must be 0.7-1.2).
+        * ``/speed 1.2 too slow`` → set with free-text note stashed in history.
+        * ``/speed default``      → reset to 1.0 (``by=reset`` history entry).
+
+    The preference is keyed by (instance, user). Each instance carries its
+    own voice, so a speed that suits Salem's Rachel may not suit STAY-C's
+    clinical narrator — the per-instance scoping is the point.
+
+    Writes through ``ops.vault_edit`` (via :mod:`speed_pref`) so the
+    talker scope's existing person-record edit permission covers the
+    call. The allowlist-less talker scope allows the ``preferences``
+    field to be written.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+
+    chat_id = update.effective_chat.id
+    instance_name = (
+        config.instance.name or config.instance.canonical or "Alfred"
+    )
+    user_rel = config.primary_users[0] if config.primary_users else ""
+    vault_path = Path(config.vault.path)
+
+    # Parse off the raw text (supports both CommandHandler and inline paths).
+    raw_text = update.message.text or ""
+    mode, value, note = speed_pref.parse_speed_command(raw_text)
+
+    if mode == "report":
+        reply = speed_pref.format_report(vault_path, user_rel, instance_name)
+        await update.message.reply_text(reply)
+        log.info(
+            "talker.speed.report",
+            chat_id=chat_id, instance=instance_name,
+        )
+        return
+
+    if mode == "error":
+        await update.message.reply_text(
+            note or "Couldn't parse that. Try /speed 1.2 or /speed default."
+        )
+        return
+
+    if mode == "reset":
+        summary = speed_pref.set_tts_speed(
+            vault_path, user_rel, instance_name,
+            speed_pref.SPEED_DEFAULT,
+            by="reset",
+            note=note,
+        )
+        if not summary["written"]:
+            await update.message.reply_text(
+                f"Couldn't reset speed: {summary['reason']}."
+            )
+            return
+        await update.message.reply_text(
+            f"{instance_name} speed reset to {speed_pref.SPEED_DEFAULT}."
+        )
+        return
+
+    # mode == "set"
+    assert value is not None  # parse_speed_command contract
+    try:
+        validated = speed_pref.validate_speed(value)
+    except speed_pref.SpeedValidationError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    summary = speed_pref.set_tts_speed(
+        vault_path, user_rel, instance_name,
+        validated,
+        by="slash_command",
+        note=note,
+    )
+    if not summary["written"]:
+        await update.message.reply_text(
+            f"Couldn't save speed: {summary['reason']}."
+        )
+        return
+
+    suffix = f" (note saved)" if note else ""
+    await update.message.reply_text(
+        f"{instance_name} speed set to {validated}.{suffix}"
+    )
+
+
 # Inline ``/extract abc123`` detection. PTB's CommandHandler fires when
 # the message STARTS with /extract — the inline path here matches
 # ``please /extract abc123`` at end-of-line. The short-id is parsed
@@ -854,8 +965,11 @@ def _parse_short_id_arg(text: str, args: Any) -> str:
     if match:
         return match.group(1).strip()
     # Also try the with-arg regex for inline ``/extract <id>`` forms.
+    # Group 1 is the extract/brief alternation (None if the speed
+    # alternation matched instead — which is fine, we only care about
+    # extract's short-id here).
     match2 = _INLINE_CMD_WITH_ARG_RE.search(first_line)
-    if match2 and match2.group(1).lower() == "extract":
+    if match2 and (match2.group(1) or "").lower() == "extract":
         return match2.group(2).strip()
     return ""
 
@@ -1391,6 +1505,9 @@ _INLINE_COMMANDS: set[str] = {
     # to the handler so it can parse the arg via _parse_short_id_arg.
     "extract",
     "brief",
+    # /speed parses its own args inside on_speed (via speed_pref.parse_speed_command)
+    # so the inline path just forwards the full text verbatim.
+    "speed",
 }
 
 # Require whitespace or start-of-string before the slash so mid-word
@@ -1399,11 +1516,16 @@ _INLINE_COMMANDS: set[str] = {
 # ``\b`` so ``/end something`` still matches as start-form.
 _INLINE_CMD_RE = re.compile(r"(?:^|\s)/(\w+)\s*$|^/(\w+)\b")
 
-# Commands that take a short-id argument. Matched as
-# ``/extract <arg>`` at end-of-line (``please /extract abc123``) or
-# ``/extract <arg>`` at start-of-message (``/extract abc123 now``).
-# The arg is a bare word (alphanumeric + underscore).
-_INLINE_CMD_WITH_ARG_RE = re.compile(r"(?:^|\s)/(extract|brief)\s+(\w+)\b")
+# Commands that take an argument. Matched as ``/cmd <arg>`` at
+# end-of-line (``please /extract abc123``) or at start-of-message
+# (``/extract abc123 now``). ``extract`` / ``brief`` take a short-id
+# bare word. ``speed`` takes a float (or the literal ``default``) plus
+# an optional free-text note — the arg regex matches "rest of line"
+# so on_speed can re-parse via speed_pref.parse_speed_command.
+_INLINE_CMD_WITH_ARG_RE = re.compile(
+    r"(?:^|\s)/(extract|brief)\s+(\w+)\b"
+    r"|(?:^|\s)/(speed)\s+(\S.*?)\s*$"
+)
 
 
 def _detect_inline_command(text: str) -> str | None:
@@ -1421,10 +1543,13 @@ def _detect_inline_command(text: str) -> str | None:
     if not text:
         return None
     first_line = text.splitlines()[0]
-    # With-arg form has priority — it's the more specific pattern.
+    # With-arg form has priority — it's the more specific pattern. The
+    # regex has two alternations: groups (1,2) for extract/brief, groups
+    # (3,4) for speed. The matching alternation populates its pair; the
+    # other pair is None. Coalesce to pick the non-None command.
     match_arg = _INLINE_CMD_WITH_ARG_RE.search(first_line)
     if match_arg:
-        cmd_arg = match_arg.group(1).lower()
+        cmd_arg = (match_arg.group(1) or match_arg.group(3) or "").lower()
         if cmd_arg in _INLINE_COMMANDS:
             return cmd_arg
     match = _INLINE_CMD_RE.search(first_line)
@@ -1682,4 +1807,5 @@ _INLINE_HANDLERS.update({
     "no_auto_escalate": on_no_auto_escalate,
     "extract": on_extract,
     "brief": on_brief,
+    "speed": on_speed,
 })

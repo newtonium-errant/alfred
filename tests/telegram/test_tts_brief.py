@@ -216,7 +216,7 @@ async def test_brief_happy_path_sends_voice_message(
         FakeResponse(content=[FakeBlock(type="text", text="compressed prose")]),
     ])
 
-    async def _fake_synth(text: str, cfg: TtsConfig) -> bytes:
+    async def _fake_synth(text: str, cfg: TtsConfig, *, speed=None) -> bytes:
         assert text == "compressed prose"
         return b"FAKE-MP3"
     monkeypatch.setattr(tts, "synthesize", _fake_synth)
