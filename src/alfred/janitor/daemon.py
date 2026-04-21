@@ -504,6 +504,16 @@ async def run_watch(
                 new_issues = state.get_new_issues(current_issue_map)
 
                 if not new_issues and not changed_files:
+                    # Emit the fix_mode=False heartbeat so operators can
+                    # grep `deep_sweep_fix_mode` and see every deep-sweep
+                    # tick's fix-mode decision without inferring it from
+                    # the `skipped` event's absence of downstream
+                    # ``sweep.start`` / ``sweep.agent_invoke`` events.
+                    log.info(
+                        "daemon.deep_sweep_fix_mode",
+                        fix_mode=False,
+                        reason="skipped_no_new_issues_or_changes",
+                    )
                     log.info(
                         "daemon.deep_sweep_skipped",
                         msg="no new issues and no content changes; skipping fix pipeline",
@@ -511,6 +521,20 @@ async def run_watch(
                 else:
                     log.info(
                         "daemon.deep_sweep",
+                        new_issue_files=len(new_issues),
+                        changed_files=len(changed_files),
+                    )
+                    # Operator-visible heartbeat: every deep-sweep tick
+                    # that proceeds to the LLM-fix pipeline emits this
+                    # with ``fix_mode=True``. Paired with the skipped
+                    # branch's fix_mode=False event, this gives a single
+                    # grep to answer "did the deep sweep actually engage
+                    # fix mode on date X?". Previously operators had to
+                    # infer the answer from the presence/absence of
+                    # downstream ``sweep.agent_invoke`` events.
+                    log.info(
+                        "daemon.deep_sweep_fix_mode",
+                        fix_mode=True,
                         new_issue_files=len(new_issues),
                         changed_files=len(changed_files),
                     )

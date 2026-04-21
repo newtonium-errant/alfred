@@ -125,17 +125,24 @@ class SweepResult:
     @classmethod
     def from_dict(cls, d: dict) -> SweepResult:
         issues = [Issue.from_dict(i) for i in d.get("issues", [])]
+        # Coerce counter fields with ``value or 0`` rather than plain
+        # ``.get(key, 0)``. ``.get`` only applies the default when the
+        # key is MISSING; if the key exists with a ``None`` value (e.g.
+        # from a half-written earlier state file) the None would
+        # propagate and later crash status/history formatting that
+        # assumes an int. Defense in depth — the daemon always writes
+        # ints, but state loaded from disk should never surface None.
         return cls(
             sweep_id=d["sweep_id"],
             timestamp=d.get("timestamp", ""),
-            files_scanned=d.get("files_scanned", 0),
-            files_skipped=d.get("files_skipped", 0),
-            issues_found=d.get("issues_found", 0),
-            issues_by_severity=d.get("issues_by_severity", {}),
-            files_fixed=d.get("files_fixed", 0),
-            files_deleted=d.get("files_deleted", 0),
-            agent_invoked=d.get("agent_invoked", False),
-            structural_only=d.get("structural_only", False),
+            files_scanned=d.get("files_scanned") or 0,
+            files_skipped=d.get("files_skipped") or 0,
+            issues_found=d.get("issues_found") or 0,
+            issues_by_severity=d.get("issues_by_severity") or {},
+            files_fixed=d.get("files_fixed") or 0,
+            files_deleted=d.get("files_deleted") or 0,
+            agent_invoked=bool(d.get("agent_invoked", False)),
+            structural_only=bool(d.get("structural_only", False)),
             issues=issues,
         )
 
