@@ -206,6 +206,42 @@ def test_writer_appends_to_audit_log_on_relationship_write(tmp_path: Path):
     assert entry["detail"] == "relationships"
 
 
+def test_writer_relationships_written_event_emitted_on_real_write(tmp_path: Path):
+    """End-to-end: write_relationships must emit a ``writer.relationships_written``
+    structlog event that lands in the configured log file.
+
+    Mirrors ``test_writer_tags_updated_event_emitted_on_real_write`` for the
+    second write surface — the tags path was already covered, but the
+    relationships path was not. A future refactor that drops the ``log.info``
+    call in ``write_relationships`` (or breaks structlog → stdlib routing
+    only for that surface) would slip past the tags-only tests.
+    """
+    vault = tmp_path / "vault"
+    (vault / "person").mkdir(parents=True)
+    target = vault / "person" / "Alice.md"
+    target.write_text(
+        "---\ntype: person\nname: Alice\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+
+    log_file = tmp_path / "surveyor.log"
+    setup_logging(level="INFO", log_file=str(log_file), suppress_stdout=True)
+
+    state = PipelineState(tmp_path / "state.json")
+    writer = VaultWriter(vault, state)
+    writer.write_relationships(
+        "person/Alice.md",
+        [{"target": "person/Bob", "type": "knows", "confidence": 0.8}],
+    )
+
+    for h in logging.getLogger().handlers:
+        h.flush()
+
+    contents = log_file.read_text(encoding="utf-8")
+    assert "writer.relationships_written" in contents
+    assert "person/Alice.md" in contents
+
+
 def test_writer_audit_log_skipped_when_tags_unchanged(tmp_path: Path):
     """The skip-if-equal short-circuit must NOT emit an audit-log line.
 
