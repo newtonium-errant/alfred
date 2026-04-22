@@ -8,7 +8,7 @@ Covers:
       ``skipped_reason="already_extracted"``.
     * Missing session → ``skipped_reason="no_session"``.
     * Max-notes cap (default 8) trims LLM output defensively.
-    * Inline-command dispatch: ``please /extract abc123`` fires the
+    * Inline-command dispatch: ``Note: /extract abc123`` fires the
       handler, the short-id gets parsed from message text.
 """
 
@@ -309,8 +309,8 @@ async def test_extract_implicit_structuring_when_summary_missing(
 
 
 def test_inline_detect_extract_with_arg() -> None:
-    """``please /extract abc123`` fires inline detection with extract command."""
-    assert bot._detect_inline_command("please /extract abc123") == "extract"
+    """``Note: /extract abc123`` fires inline detection with extract command."""
+    assert bot._detect_inline_command("Note: /extract abc123") == "extract"
 
 
 def test_inline_detect_extract_at_end_of_line_with_arg() -> None:
@@ -325,7 +325,9 @@ def test_parse_short_id_from_command_args() -> None:
 
 def test_parse_short_id_from_inline_text() -> None:
     """Inline path: None args → regex-parse from the message text."""
-    assert bot._parse_short_id_arg("please /extract abc123", None) == "abc123"
+    assert bot._parse_short_id_arg("Note: /extract abc123", None) == "abc123"
+    # Start-of-message form also resolves through the with-arg fallback.
+    assert bot._parse_short_id_arg("/extract abc123 now", None) == "abc123"
 
 
 def test_parse_short_id_empty_when_no_arg() -> None:
@@ -338,7 +340,7 @@ def test_parse_short_id_empty_when_no_arg() -> None:
 async def test_inline_extract_dispatches_handler(
     state_mgr, talker_config, tmp_path,
 ) -> None:
-    """``please /extract abc12345`` routes to on_extract via inline dispatch."""
+    """``Note: /extract abc12345`` routes to on_extract via inline dispatch."""
     rel = _write_session_record(
         Path(talker_config.vault.path),
         "Voice Session — 2026-04-20 1004 inl12345",
@@ -355,7 +357,7 @@ async def test_inline_extract_dispatches_handler(
     update = MagicMock()
     update.effective_user.id = 1
     update.effective_chat.id = 1
-    update.message.text = "please /extract inl12345"
+    update.message.text = "Note: /extract inl12345"
     update.message.voice = None
     update.message.message_id = 99
     update.message.reply_text = AsyncMock()
@@ -374,7 +376,7 @@ async def test_inline_extract_dispatches_handler(
     ctx.bot.set_message_reaction = AsyncMock()
 
     await bot.handle_message(
-        update, ctx, text="please /extract inl12345", voice=False,
+        update, ctx, text="Note: /extract inl12345", voice=False,
     )
 
     # Handler replied with extraction outcome.

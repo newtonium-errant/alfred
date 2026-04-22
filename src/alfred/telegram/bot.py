@@ -947,7 +947,7 @@ async def on_speed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ``please /extract abc123`` at end-of-line. The short-id is parsed
 # from the text ourselves because the inline path doesn't populate
 # ``ctx.args``.
-_INLINE_EXTRACT_RE = re.compile(r"(?:^|\s)/extract\s+(\w+)\s*$")
+_INLINE_EXTRACT_RE = re.compile(r"(?:^|[.!?;:,]\s+)/extract\s+(\w+)\s*$|^/extract\s+(\w+)\b")
 
 
 def _parse_short_id_arg(text: str, args: Any) -> str:
@@ -964,14 +964,18 @@ def _parse_short_id_arg(text: str, args: Any) -> str:
     first_line = text.splitlines()[0] if text else ""
     match = _INLINE_EXTRACT_RE.search(first_line)
     if match:
-        return match.group(1).strip()
+        return (match.group(1) or match.group(2) or "").strip()
     # Also try the with-arg regex for inline ``/extract <id>`` forms.
-    # Group 1 is the extract/brief alternation (None if the speed
-    # alternation matched instead — which is fine, we only care about
-    # extract's short-id here).
+    # Group layout: (1,2)=eol extract/brief+arg, (3,4)=start extract/brief+arg,
+    # (5,6)=eol speed+arg, (7,8)=start speed+arg. Pull the short-id out of
+    # group 2 (eol form) or group 4 (start form), but only when the matching
+    # command name is "extract".
     match2 = _INLINE_CMD_WITH_ARG_RE.search(first_line)
-    if match2 and (match2.group(1) or "").lower() == "extract":
-        return match2.group(2).strip()
+    if match2:
+        if (match2.group(1) or "").lower() == "extract":
+            return match2.group(2).strip()
+        if (match2.group(3) or "").lower() == "extract":
+            return match2.group(4).strip()
     return ""
 
 
@@ -1647,21 +1651,34 @@ _INLINE_COMMANDS: set[str] = {
     "speed",
 }
 
-# Require whitespace or start-of-string before the slash so mid-word
-# tokens like ``foo/end`` don't trigger. End-of-line variant has ``\s*$``
-# so trailing whitespace is tolerated; start-of-message variant uses
-# ``\b`` so ``/end something`` still matches as start-form.
-_INLINE_CMD_RE = re.compile(r"(?:^|\s)/(\w+)\s*$|^/(\w+)\b")
+# Require either start-of-message OR sentence-terminating punctuation
+# (``.,!?;:``) plus whitespace before the slash. The earlier regex
+# `(?:^|\s)/(\w+)\s*$` was too permissive: it fired on plain prose like
+# ``Goodbye /end`` and ``the road came to a /end`` because ANY whitespace
+# token before the slash satisfied it. Anchoring to punctuation+space
+# keeps the legitimate forms (``Good. /end``, ``back to basics, /sonnet``,
+# ``Note: /extract abc``) while rejecting bare-prose mid-sentence cases.
+# End-of-line variant has ``\s*$`` so trailing whitespace is tolerated;
+# start-of-message variant uses ``\b`` so ``/end something`` still matches
+# as start-form. Mid-word tokens like ``foo/end`` still don't trigger
+# because the punctuation/start-of-line anchor disallows them.
+_INLINE_CMD_BOUNDARY = r"(?:^|[.!?;:,]\s+)"
+_INLINE_CMD_RE = re.compile(rf"{_INLINE_CMD_BOUNDARY}/(\w+)\s*$|^/(\w+)\b")
 
 # Commands that take an argument. Matched as ``/cmd <arg>`` at
-# end-of-line (``please /extract abc123``) or at start-of-message
+# end-of-line (``Note: /extract abc123``) or at start-of-message
 # (``/extract abc123 now``). ``extract`` / ``brief`` take a short-id
 # bare word. ``speed`` takes a float (or the literal ``default``) plus
 # an optional free-text note — the arg regex matches "rest of line"
-# so on_speed can re-parse via speed_pref.parse_speed_command.
+# so on_speed can re-parse via speed_pref.parse_speed_command. The
+# preceding-punctuation anchor here mirrors the no-arg regex above so
+# bare-prose mid-sentence shapes like ``the file we want to /extract abc``
+# don't false-positive.
 _INLINE_CMD_WITH_ARG_RE = re.compile(
-    r"(?:^|\s)/(extract|brief)\s+(\w+)\b"
-    r"|(?:^|\s)/(speed)\s+(\S.*?)\s*$"
+    rf"{_INLINE_CMD_BOUNDARY}/(extract|brief)\s+(\w+)\b"
+    rf"|^/(extract|brief)\s+(\w+)\b"
+    rf"|{_INLINE_CMD_BOUNDARY}/(speed)\s+(\S.*?)\s*$"
+    rf"|^/(speed)\s+(\S.*?)\s*$"
 )
 
 
@@ -1681,12 +1698,19 @@ def _detect_inline_command(text: str) -> str | None:
         return None
     first_line = text.splitlines()[0]
     # With-arg form has priority — it's the more specific pattern. The
-    # regex has two alternations: groups (1,2) for extract/brief, groups
-    # (3,4) for speed. The matching alternation populates its pair; the
-    # other pair is None. Coalesce to pick the non-None command.
+    # regex has four alternations: end-of-line and start-of-message for
+    # each of (extract|brief) and speed. Command name lands in group 1
+    # (eol extract/brief), 3 (start extract/brief), 5 (eol speed), or 7
+    # (start speed). Other groups are None. Coalesce to pick the non-None.
     match_arg = _INLINE_CMD_WITH_ARG_RE.search(first_line)
     if match_arg:
-        cmd_arg = (match_arg.group(1) or match_arg.group(3) or "").lower()
+        cmd_arg = (
+            match_arg.group(1)
+            or match_arg.group(3)
+            or match_arg.group(5)
+            or match_arg.group(7)
+            or ""
+        ).lower()
         if cmd_arg in _INLINE_COMMANDS:
             return cmd_arg
     match = _INLINE_CMD_RE.search(first_line)

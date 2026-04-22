@@ -108,6 +108,51 @@ def test_detect_just_command_as_start() -> None:
     assert bot._detect_inline_command("/end") == "end"
 
 
+# --- Regression: punctuation-anchored boundary -----------------------------
+#
+# 2026-04-21: the previous regex ``(?:^|\s)/(\w+)\s*$`` matched ANY
+# whitespace token before the slash. That false-positived on bare prose
+# like "the road came to a /end" and "Goodbye /end" — both ended in a
+# legitimate-looking ``\s/end\s*$`` shape but were clearly not commands.
+# The fix tightens the boundary to either start-of-message or a sentence-
+# terminating punctuation char (``.,!?;:``) followed by whitespace.
+
+
+def test_detect_good_period_end_fires() -> None:
+    """``Good. /end`` — the canonical inline-close shape."""
+    assert bot._detect_inline_command("Good. /end") == "end"
+
+
+def test_detect_pure_end_still_fires() -> None:
+    """Standalone ``/end`` is still detected (start-of-message form)."""
+    assert bot._detect_inline_command("/end") == "end"
+
+
+def test_detect_mid_sentence_prose_does_not_fire() -> None:
+    """``the road came to a /end`` is bare prose — no command intent."""
+    assert bot._detect_inline_command("the road came to a /end") is None
+
+
+def test_detect_goodbye_no_punctuation_does_not_fire() -> None:
+    """``Goodbye /end`` lacks sentence-terminating punctuation — stays prose."""
+    assert bot._detect_inline_command("Goodbye /end") is None
+
+
+def test_detect_note_colon_extract_with_arg_fires() -> None:
+    """``Note: /extract abc`` — colon counts as a sentence boundary."""
+    assert bot._detect_inline_command("Note: /extract abc") == "extract"
+    # And the arg is extractable through _parse_short_id_arg.
+    assert bot._parse_short_id_arg("Note: /extract abc", None) == "abc"
+
+
+def test_detect_with_arg_mid_prose_does_not_fire() -> None:
+    """Bare-prose with-arg shapes don't fire either (regression for symmetry)."""
+    assert bot._detect_inline_command(
+        "the file we want to /extract abc123",
+    ) is None
+    assert bot._detect_inline_command("go faster /speed 1.5") is None
+
+
 # --- handle_message dispatch integration -----------------------------------
 #
 # These tests exercise the wiring from ``handle_message`` through
@@ -198,13 +243,13 @@ async def test_inline_end_closes_session(
 async def test_inline_opus_switches_model(
     state_mgr, talker_config, fake_client,
 ) -> None:
-    """``please /opus`` flips the active session's model to Opus."""
+    """End-of-line ``/opus`` after sentence-terminating punctuation flips to Opus."""
     _seed_active_session(state_mgr, chat_id=2, model=bot._SONNET_MODEL)
 
-    update = _make_update("please /opus", chat_id=2, user_id=1)
+    update = _make_update("Yes please. /opus", chat_id=2, user_id=1)
     ctx = _make_ctx(talker_config, state_mgr, fake_client)
 
-    await bot.handle_message(update, ctx, text="please /opus", voice=False)
+    await bot.handle_message(update, ctx, text="Yes please. /opus", voice=False)
 
     active = state_mgr.get_active(2)
     assert active is not None
@@ -337,7 +382,7 @@ async def test_inline_case_insensitive_dispatch(
     state_mgr.set_active(8, active)
     state_mgr.save()
 
-    update = _make_update("ok /End", chat_id=8, user_id=1)
+    update = _make_update("ok. /End", chat_id=8, user_id=1)
     ctx = _make_ctx(talker_config, state_mgr, fake_client)
-    await bot.handle_message(update, ctx, text="ok /End", voice=False)
+    await bot.handle_message(update, ctx, text="ok. /End", voice=False)
     assert state_mgr.get_active(8) is None
