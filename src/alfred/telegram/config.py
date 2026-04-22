@@ -116,6 +116,24 @@ class InstanceConfig:
 
 
 @dataclass
+class IdleTickConfig:
+    """Talker idle-tick heartbeat — "intentionally left blank" liveness signal.
+
+    A periodic ``talker.idle_tick`` log event so observers can distinguish
+    *idle / healthy* from *broken*. Without it, a quiet stretch (no inbound
+    traffic) is indistinguishable from a hung daemon. See
+    ``src/alfred/telegram/heartbeat.py`` for the rationale and the cadence-
+    rationale comment block.
+
+    Defaults are deliberately on — the cost is negligible (~290 KB/day at
+    60s) and the diagnostic value compounds.
+    """
+
+    enabled: bool = True
+    interval_seconds: int = 60
+
+
+@dataclass
 class BashExecConfig:
     """KAL-LE's ``bash_exec`` tool config.
 
@@ -152,6 +170,10 @@ class TalkerConfig:
     # ``instance.tool_set == "kalle"``. Absent on Salem, present on
     # KAL-LE with a KAL-LE-specific audit path.
     bash_exec: BashExecConfig | None = None
+    # Idle-tick heartbeat — see :class:`IdleTickConfig`. Defaulted-on
+    # via the dataclass default_factory; absent block in YAML keeps
+    # ``enabled=True`` / ``interval_seconds=60``.
+    idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
 
 
 # --- Recursive builder ---
@@ -165,6 +187,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "instance": InstanceConfig,
     "tts": TtsConfig,
     "bash_exec": BashExecConfig,
+    "idle_tick": IdleTickConfig,
 }
 
 
@@ -223,4 +246,9 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     bash_raw = tool.get("bash_exec")
     if isinstance(bash_raw, dict) and bash_raw:
         built.bash_exec = _build(BashExecConfig, bash_raw)
+    # Idle-tick — defaulted-on; if the user provides a partial dict
+    # (just ``enabled: false``), merge over the dataclass default.
+    idle_raw = tool.get("idle_tick")
+    if isinstance(idle_raw, dict):
+        built.idle_tick = _build(IdleTickConfig, idle_raw)
     return built

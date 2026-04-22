@@ -280,6 +280,17 @@ telegram:
     # Implicit session-end gap: 30 minutes of silence closes the session.
     gap_timeout_seconds: 1800
     state_path: "./data/talker_state.json"
+  # Idle-tick heartbeat — emits a periodic ``talker.idle_tick`` log event
+  # so an operator scanning the tail of ``data/talker.log`` can distinguish
+  # *idle / healthy* (recent heartbeat present, low or zero
+  # ``inbound_in_window``) from *broken* (no heartbeat at all). Defaults
+  # are conservative-on; flip ``enabled`` to false to silence the
+  # heartbeat without restructuring config. See
+  # ``src/alfred/telegram/heartbeat.py`` for cadence rationale (60s ≈ 290
+  # KB/day vs 1Hz ≈ 17 MB/day for no extra diagnostic value).
+  idle_tick:
+    enabled: true
+    interval_seconds: 60
 
 # temporal:
 #   address: "127.0.0.1:7233"

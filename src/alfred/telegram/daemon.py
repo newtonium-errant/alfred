@@ -33,7 +33,7 @@ from typing import Any
 import anthropic
 from telegram import Update
 
-from . import bot, session
+from . import bot, heartbeat, session
 from .config import TalkerConfig, load_from_unified
 from .state import StateManager
 from .utils import get_logger, setup_logging
@@ -331,6 +331,27 @@ async def run(
 
     sweeper_task = asyncio.create_task(_sweeper(), name="talker-sweeper")
 
+    # ---- Idle-tick heartbeat ----------------------------------------------
+    # Periodic ``talker.idle_tick`` log event so observers can distinguish
+    # an idle daemon from a broken one. Default cadence 60s — see
+    # ``heartbeat.py`` for the cadence rationale and the
+    # "intentionally left blank" pattern background. When
+    # ``telegram.idle_tick.enabled = false`` we skip task creation entirely
+    # — no background work, no log noise.
+    heartbeat_task: asyncio.Task | None = None
+    if config.idle_tick.enabled:
+        heartbeat_task = asyncio.create_task(
+            heartbeat.run(
+                interval_seconds=config.idle_tick.interval_seconds,
+                shutdown_event=shutdown_event,
+            ),
+            name="talker-heartbeat",
+        )
+        log.info(
+            "talker.daemon.heartbeat_started",
+            interval_seconds=config.idle_tick.interval_seconds,
+        )
+
     # ---- Transport server + scheduler tasks ------------------------------
     transport_server_task: asyncio.Task | None = None
     scheduler_task: asyncio.Task | None = None
@@ -420,8 +441,9 @@ async def run(
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
 
-        # Stop the transport server + scheduler if they were started.
-        for t in (transport_server_task, scheduler_task):
+        # Stop the transport server + scheduler + heartbeat if they were
+        # started.
+        for t in (transport_server_task, scheduler_task, heartbeat_task):
             if t is None:
                 continue
             t.cancel()

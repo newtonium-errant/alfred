@@ -42,6 +42,7 @@ from . import (
     capture_batch,
     capture_extract,
     conversation,
+    heartbeat,
     model_calibration,
     router,
     session,
@@ -1169,6 +1170,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         kind="text",
         length=len(text),
     )
+    # Idle-tick heartbeat counter — paired with each ``talker.bot.inbound``
+    # event so the periodic ``talker.idle_tick`` event reports an accurate
+    # ``inbound_in_window``. See ``heartbeat.py`` for the full design.
+    heartbeat.record_inbound()
     await handle_message(update, ctx, text=text, voice=False)
 
 
@@ -1193,6 +1198,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         kind="voice",
         duration=update.message.voice.duration,
     )
+    # Idle-tick heartbeat counter — see paired call in ``on_text``.
+    heartbeat.record_inbound()
 
     try:
         tg_file = await update.message.voice.get_file()
