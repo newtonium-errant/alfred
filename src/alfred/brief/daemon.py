@@ -15,6 +15,7 @@ from .renderer import render_brief, serialize_record
 from .state import BriefRun, StateManager
 from .utils import get_logger
 from .operations import format_operations_section
+from .upcoming_events import render_upcoming_events_section
 from .weather import fetch_and_format
 
 log = get_logger(__name__)
@@ -96,15 +97,31 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         today=today,
     )
 
+    # Upcoming Events — forward-looking calendar slice. Empty string
+    # when the section is disabled in config; that signals "omit
+    # entirely from the brief". A populated string (including the
+    # "No upcoming events." sentinel) means render the header.
+    today_local = datetime.now(ZoneInfo(config.schedule.timezone)).date()
+    upcoming_md = render_upcoming_events_section(
+        config.upcoming_events,
+        config.vault_path,
+        today_local,
+    )
+
     # Section order is load-bearing: Health first (readers scan top-down;
     # critical status gets the highest priority real estate), Weather
     # second (time-sensitive but non-operational), Operations third
     # (retrospective summary — less time-sensitive than the others).
+    # Upcoming Events lives last because it's forward-looking — useful
+    # context once the reader has absorbed current state, but lower
+    # priority than health/weather/now-state summaries.
     sections = [
         ("Health", health_md),
         ("Weather", weather_md),
         ("Operations", ops_md),
     ]
+    if upcoming_md:
+        sections.append(("Upcoming Events", upcoming_md))
 
     # Render
     frontmatter, body = render_brief(today, sections, config)

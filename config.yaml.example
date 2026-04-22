@@ -224,6 +224,24 @@ telegram:
 #       skill: vault-curator
 #       scope: curator
 
+# Morning Brief — daily operational briefing assembled into the vault.
+# Schedule / weather / output knobs all default sensibly via dataclass
+# defaults; add a ``brief:`` section only when you need to override.
+# The block below shows the Phase 1 Upcoming Events sub-config.
+brief:
+  # schedule: { time: "06:00", timezone: "America/Halifax" }
+  # weather: { stations: [...] }
+  # output: { directory: "run", name_template: "Morning Brief {date}" }
+  #
+  # Upcoming Events — forward-looking calendar slice. Scans event
+  # records (frontmatter ``date``) and task records (frontmatter
+  # ``due``), buckets them as Today / This Week / Later, drops anything
+  # past ``max_days_ahead``. Filter rules will grow inline in
+  # upcoming_events.py as real-data patterns reveal what counts as noise.
+  upcoming_events:
+    enabled: true            # set false to omit the section entirely
+    max_days_ahead: 30       # window cap; events further out are dropped
+
 bit:
   # BIT (built-in test) runs before the Morning Brief so the brief can
   # report on system health. By default it fires 5 minutes before

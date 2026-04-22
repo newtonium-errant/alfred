@@ -34,12 +34,26 @@ class StateConfig:
 
 
 @dataclass
+class UpcomingEventsConfig:
+    """Phase 1 config for the Upcoming Events section.
+
+    Intentionally minimal: enable/disable + a single forward window. Filter
+    rules will grow inline in ``upcoming_events.py`` as real-data patterns
+    reveal what counts as noise — do NOT add a rule registry here.
+    """
+
+    enabled: bool = True
+    max_days_ahead: int = 30
+
+
+@dataclass
 class BriefConfig:
     vault_path: str = ""
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     state: StateConfig = field(default_factory=StateConfig)
+    upcoming_events: UpcomingEventsConfig = field(default_factory=UpcomingEventsConfig)
     log_file: str = "./data/brief.log"
 
     # Telegram user_id the post-write brief push dispatches to. v1
@@ -89,6 +103,14 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         path=state_raw.get("path", f"{log_dir}/brief_state.json"),
     )
 
+    # Upcoming Events — Phase 1: just enable/disable + window. Defaults
+    # match the dataclass defaults so omitting the block "just works".
+    ue_raw = section.get("upcoming_events", {}) or {}
+    upcoming_events = UpcomingEventsConfig(
+        enabled=ue_raw.get("enabled", True),
+        max_days_ahead=int(ue_raw.get("max_days_ahead", 30)),
+    )
+
     # Primary Telegram user for post-write brief push. Reads the
     # unified config's ``telegram.allowed_users[0]`` — single-user v1;
     # peer protocol in Stage 3.5 will widen.
@@ -107,6 +129,7 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         weather=weather,
         output=output,
         state=state,
+        upcoming_events=upcoming_events,
         log_file=f"{log_dir}/brief.log",
         primary_telegram_user_id=primary_user,
     )
