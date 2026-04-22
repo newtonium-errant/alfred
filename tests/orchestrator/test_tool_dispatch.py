@@ -22,10 +22,10 @@ import alfred.orchestrator as orchestrator
 EXPECTED_TOOLS = {
     "curator", "janitor", "distiller", "instructor",
     "surveyor", "mail", "brief", "talker",
-    "bit",
+    "bit", "daily_sync",
 }
 
-TWO_ARG_TOOLS = {"surveyor", "mail", "brief", "bit"}
+TWO_ARG_TOOLS = {"surveyor", "mail", "brief", "bit", "daily_sync"}
 THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "instructor", "talker"}
 
 

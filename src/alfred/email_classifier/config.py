@@ -155,6 +155,17 @@ class EmailClassifierConfig:
     # this value as "needs reclassification" instead of treating them
     # like a real tier. Keep this stable — c2 + c3 will look for it.
     unclassified_sentinel: str = "unclassified"
+    # c2 Phase 1 corpus → classifier feedback. When set, the classifier
+    # rotates the most recent N entries from this JSONL into its system
+    # prompt as few-shot examples. Empty string disables the rotation
+    # (classifier falls back to the cold cue lists alone). Daily Sync
+    # writes here; classifier reads. Decoupled from the daily_sync
+    # config so a deployment can disable Daily Sync but keep the
+    # accumulated corpus active.
+    calibration_corpus_path: str = ""
+    # How many corpus entries to inject as few-shot examples. 0 disables
+    # injection even if the path is set.
+    calibration_few_shot_count: int = 10
 
 
 # --- Recursive builder ------------------------------------------------------

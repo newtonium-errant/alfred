@@ -237,6 +237,54 @@ def _run_brief(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     asyncio.run(run_daemon(config))
 
 
+def _run_daily_sync(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """Daily Sync daemon process entry point.
+
+    Per-instance 09:00 ADT push channel. Reads the unified config's
+    ``daily_sync`` block (per email-surfacing c2). The orchestrator
+    only spawns this entry point when ``daily_sync`` is in raw AND
+    ``enabled: true`` — but we double-check here so a manual run via
+    ``alfred up --only daily_sync`` against a misconfigured file
+    fails fast with a clear log line instead of looping.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/daily_sync.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    # Reuse brief's setup_logging — the signature matches and Daily
+    # Sync doesn't need a bespoke logger.
+    from alfred.brief.utils import setup_logging
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    from alfred.daily_sync.config import load_from_unified as load_ds
+    from alfred.daily_sync.daemon import run_daemon as run_ds_daemon
+    config = load_ds(raw)
+    if not config.enabled:
+        # Misconfiguration — return immediately rather than spinning
+        # the loop. Matches the orchestrator's exit-78 convention so
+        # auto-restart won't keep relaunching us.
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("daily_sync.daemon.disabled_in_config")
+        sys.exit(78)
+    vault_path_str = raw.get("vault", {}).get("path", "./vault")
+    telegram_raw = raw.get("telegram", {}) or {}
+    allowed = telegram_raw.get("allowed_users") or []
+    user_id = 0
+    if allowed:
+        try:
+            user_id = int(allowed[0])
+        except (TypeError, ValueError):
+            user_id = 0
+    if not user_id:
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("daily_sync.daemon.no_telegram_user")
+        sys.exit(78)
+    asyncio.run(run_ds_daemon(config, Path(vault_path_str), user_id))
+
+
 # ---------------------------------------------------------------------------
 # Per-tool PID tracking — prevents zombie tool processes from surviving
 # across alfred down / alfred up cycles.
@@ -306,6 +354,7 @@ TOOL_RUNNERS = {
     "brief": _run_brief,
     "bit": _run_bit,
     "talker": _run_talker,
+    "daily_sync": _run_daily_sync,
 }
 
 
@@ -356,6 +405,11 @@ def run_all(
         # work with and would spin in a retry loop on every directive.
         if "instructor" in raw:
             tools.append("instructor")
+        # Daily Sync (email-surfacing c2) auto-starts when ``daily_sync:``
+        # is in config AND ``enabled: true``. KAL-LE intentionally omits
+        # the block so it doesn't fire 09:00 conversations about coding.
+        if "daily_sync" in raw and (raw.get("daily_sync") or {}).get("enabled"):
+            tools.append("daily_sync")
 
     # Validate tool names
     for tool in tools:
@@ -410,7 +464,7 @@ def run_all(
         # Tools whose runner signature is ``(raw, suppress_stdout)`` (no
         # skills_dir). BIT has no skill prompts — it drives the
         # aggregator directly — so it lives in this bucket.
-        if tool in ("surveyor", "mail", "brief", "bit"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

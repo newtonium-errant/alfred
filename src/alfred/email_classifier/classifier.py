@@ -158,13 +158,21 @@ def is_email_inbox(content: str) -> bool:
 
 
 def _build_system_prompt(config: EmailClassifierConfig) -> str:
-    """Compose the classifier system prompt from the cue groups."""
+    """Compose the classifier system prompt from the cue groups.
+
+    When ``config.calibration_corpus_path`` is set AND the file has at
+    least one entry, the most-recent N corpus entries (deduplicated and
+    diversified by tier) are appended as few-shot examples per the c2
+    Phase 1 corpus → classifier feedback loop. Failures to read the
+    corpus fall back to the cold cue lists alone — never crash the
+    classifier on a corpus parsing error.
+    """
     p = config.prompt
 
     def _bullets(items: list[str]) -> str:
         return "\n".join(f"  - {item}" for item in items)
 
-    return (
+    base = (
         "You are an email classifier for the Alfred operational instance. "
         "Read the email content and decide which priority tier it belongs to. "
         "Optionally suggest a free-text ``action_hint`` (e.g. \"calendar\", "
@@ -176,12 +184,75 @@ def _build_system_prompt(config: EmailClassifierConfig) -> str:
         f"medium:\n{_bullets(p.medium)}\n\n"
         f"low:\n{_bullets(p.low)}\n\n"
         f"spam:\n{_bullets(p.spam)}\n\n"
+    )
+
+    few_shot_block = _build_few_shot_block(config)
+    if few_shot_block:
+        base += few_shot_block + "\n\n"
+
+    base += (
         "Return ONLY a JSON object with this exact shape:\n"
         "{\"priority\": \"high|medium|low|spam\", "
         "\"action_hint\": \"<string or null>\", "
         "\"reasoning\": \"<1 sentence rationale>\"}\n\n"
         "No prose, no code fences, no commentary — just the JSON object."
     )
+    return base
+
+
+def _build_few_shot_block(config: EmailClassifierConfig) -> str:
+    """Render the calibration few-shot block from the corpus, or "".
+
+    Reads the most recent N entries (per ``calibration_few_shot_count``)
+    from ``calibration_corpus_path`` and renders them as labelled
+    examples. Returns the empty string when the corpus is unset, empty,
+    or unreadable — caller treats that as "no few-shot block".
+    """
+    if not config.calibration_corpus_path:
+        return ""
+    if config.calibration_few_shot_count <= 0:
+        return ""
+    try:
+        # Local import to keep email_classifier independent of the
+        # daily_sync module at import time — corpus is small and lives
+        # under daily_sync because that's where it's written.
+        from alfred.daily_sync.corpus import recent_corrections
+    except ImportError:
+        return ""
+    try:
+        entries = recent_corrections(
+            config.calibration_corpus_path,
+            limit=config.calibration_few_shot_count,
+            diversify_by_tier=True,
+        )
+    except Exception:  # noqa: BLE001 — corpus issues never crash classification
+        return ""
+    if not entries:
+        return ""
+
+    lines = [
+        "Recent calibration corrections from the operator (most-recent first):",
+    ]
+    for entry in reversed(entries):  # newest first for readability
+        label = entry.andrew_priority or "?"
+        was = entry.classifier_priority or "?"
+        sender = entry.sender or "(unknown)"
+        subject = entry.subject or "(no subject)"
+        snippet = entry.snippet or ""
+        reason = entry.andrew_reason or ""
+        lines.append(
+            f"  - {sender} — \"{subject}\" → operator says: {label}"
+            f" (classifier said: {was})"
+        )
+        if snippet:
+            lines.append(f"      snippet: {snippet}")
+        if reason:
+            lines.append(f"      operator reason: {reason}")
+    lines.append(
+        "Treat these as authoritative — when an incoming email matches one"
+        " of these patterns, lean toward the operator's tier."
+    )
+    return "\n".join(lines)
 
 
 def _build_user_prompt(

@@ -158,6 +158,11 @@ def build_app(
     # preference. Reads/writes ``preferences.voice`` on the primary-user's
     # person record. Applies to every ElevenLabs TTS path (today: /brief).
     app.add_handler(CommandHandler("speed", on_speed))
+    # Email-surfacing c2: Daily Sync slash commands. /calibrate fires
+    # an out-of-cycle Daily Sync sample; /calibration_ok flips per-tier
+    # confidence flags read by the (future) c3/c4/c5 surfacing layers.
+    app.add_handler(CommandHandler("calibrate", on_calibrate))
+    app.add_handler(CommandHandler("calibration_ok", on_calibration_ok))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
@@ -942,6 +947,137 @@ async def on_speed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# --- Daily Sync slash commands (email-surfacing c2) -----------------------
+
+
+async def on_calibrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/calibrate`` — fire a fresh Daily Sync sample out of cycle.
+
+    Useful when Andrew wants to validate a few classifier outputs right
+    now rather than waiting for 09:00. Bypasses the
+    ``last_fired_date`` dedup guard but reuses the same dispatch path
+    (assemble → push → persist batch) so the reply parser sees a fresh
+    set of message_ids to match against.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+
+    raw_config = ctx.application.bot_data.get("raw_config") or {}
+    try:
+        from alfred.daily_sync.config import load_from_unified as load_ds
+        from alfred.daily_sync.daemon import fire_once
+    except ImportError:
+        await update.message.reply_text(
+            "Daily Sync module not available — check install."
+        )
+        return
+
+    ds_config = load_ds(raw_config)
+    if not ds_config.enabled:
+        await update.message.reply_text(
+            "Daily Sync isn't configured. Add a `daily_sync:` block to "
+            "config.yaml and set `enabled: true`."
+        )
+        return
+
+    user_id = config.allowed_users[0] if config.allowed_users else 0
+    if not user_id:
+        await update.message.reply_text(
+            "No primary Telegram user configured — can't dispatch."
+        )
+        return
+
+    vault_path = Path(config.vault.path)
+    log.info(
+        "talker.bot.calibrate_invoked",
+        chat_id=update.effective_chat.id,
+        user_id=user_id,
+    )
+    await update.message.reply_text("Daily Sync sample firing now…")
+    try:
+        result = await fire_once(ds_config, vault_path, user_id)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("talker.bot.calibrate_failed")
+        await update.message.reply_text(
+            f"Couldn't fire Daily Sync: {exc.__class__.__name__}: {exc}"
+        )
+        return
+
+    if result["items_count"] == 0:
+        await update.message.reply_text(
+            "Daily Sync sent, but no calibratable items in the vault yet."
+        )
+    # Otherwise the dispatched batch IS the user-visible feedback —
+    # they'll see it as a separate message and can reply to it.
+
+
+async def on_calibration_ok(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/calibration_ok [tier]`` — manage per-tier surfacing confidence flags.
+
+    Usage:
+      * ``/calibration_ok``         → list current flags.
+      * ``/calibration_ok high``    → flip the ``high`` flag to True.
+
+    The flags are read by future surfacing consumers (c3 brief section,
+    c4 Obsidian view, c5 Telegram push) to gate per-tier surfacing on
+    Andrew's explicit approval. Flipping is idempotent — calling
+    ``/calibration_ok high`` when the flag is already True is a no-op
+    response that confirms the current state.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+
+    raw_config = ctx.application.bot_data.get("raw_config") or {}
+    try:
+        from alfred.daily_sync.config import load_from_unified as load_ds
+        from alfred.daily_sync.confidence import (
+            format_confidence_report,
+            list_confidence,
+            set_confidence,
+        )
+    except ImportError:
+        await update.message.reply_text(
+            "Daily Sync module not available — check install."
+        )
+        return
+
+    ds_config = load_ds(raw_config)
+    if not ds_config.enabled:
+        await update.message.reply_text(
+            "Daily Sync isn't configured. Add a `daily_sync:` block to "
+            "config.yaml and set `enabled: true`."
+        )
+        return
+
+    raw_text = (update.message.text or "").strip()
+    parts = raw_text.split()
+    arg = parts[1].lower().strip() if len(parts) > 1 else ""
+
+    if not arg:
+        flags = list_confidence(ds_config.state.path, ds_config.confidence)
+        await update.message.reply_text(format_confidence_report(flags))
+        return
+
+    try:
+        flags = set_confidence(
+            ds_config.state.path, arg, True, seed=ds_config.confidence,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    await update.message.reply_text(
+        f"Flipped `{arg}` confidence to True.\n\n"
+        + format_confidence_report(flags)
+    )
+
+
 # Inline ``/extract abc123`` detection. PTB's CommandHandler fires when
 # the message STARTS with /extract — the inline path here matches
 # ``please /extract abc123`` at end-of-line. The short-id is parsed
@@ -1612,6 +1748,101 @@ def _build_reply_context_prefix(
     )
 
 
+# --- Daily Sync reply pre-check ------------------------------------------
+#
+# Email-surfacing c2: when the user replies (Telegram reply thread) to
+# the most recent Daily Sync push, the terse reply is routed to the
+# corpus writer instead of the normal conversation pipeline. This is
+# intentional — Daily Sync replies are calibration signals, not prose
+# for Salem to respond to.
+#
+# Identification shape: ``update.message.reply_to_message.message_id``
+# matches one of the Telegram message_ids the Daily Sync daemon pushed
+# and stashed in ``daily_sync_state.json``. The bot reads config via
+# ``bot_data["raw_config"]`` so Daily Sync can be enabled / disabled
+# independently of the talker.
+
+
+def _extract_reply_message_id(reply_to_message: Any) -> int | None:
+    """Return the integer ``message_id`` of the replied-to message, or None.
+
+    Defensive against MagicMock-backed test shapes: an int check
+    rejects the auto-instantiated MagicMock ``message_id`` that
+    existing tests carry through unrelated fixtures.
+    """
+    if reply_to_message is None:
+        return None
+    raw = getattr(reply_to_message, "message_id", None)
+    if isinstance(raw, int):
+        return raw
+    return None
+
+
+async def _maybe_handle_daily_sync_reply(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    parent_msg_id: int,
+    user_text: str,
+) -> bool:
+    """Try to handle ``user_text`` as a Daily Sync reply. Returns True iff handled.
+
+    Keeps the bot module's import surface small by lazy-importing the
+    daily_sync reply dispatcher — if the module isn't available (e.g.
+    an old install) the caller falls through to the normal pipeline.
+    Never raises into the caller; logs and returns False on any error.
+    """
+    raw_config = ctx.application.bot_data.get("raw_config") or {}
+    try:
+        from alfred.daily_sync.config import load_from_unified as load_ds
+        from alfred.daily_sync.reply_dispatch import (
+            handle_daily_sync_reply,
+            reply_targets_daily_sync,
+        )
+    except ImportError:
+        return False
+
+    try:
+        ds_config = load_ds(raw_config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("talker.bot.daily_sync_config_failed", error=str(exc))
+        return False
+
+    if not ds_config.enabled:
+        return False
+
+    try:
+        if not reply_targets_daily_sync(ds_config, parent_msg_id):
+            return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("talker.bot.daily_sync_state_read_failed", error=str(exc))
+        return False
+
+    try:
+        result = handle_daily_sync_reply(ds_config, parent_msg_id, user_text)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("talker.bot.daily_sync_reply_failed", error=str(exc))
+        return False
+
+    if result is None:
+        return False
+
+    if update.message is not None:
+        try:
+            await update.message.reply_text(result.get("message", "ok."))
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "talker.bot.daily_sync_ack_failed", error=str(exc),
+            )
+    log.info(
+        "talker.bot.daily_sync_reply",
+        parent_msg_id=parent_msg_id,
+        confirmed=result.get("confirmed_count", 0),
+        all_ok=result.get("all_ok", False),
+        unparsed=len(result.get("unparsed", [])),
+    )
+    return True
+
+
 # --- Inline-command pre-check --------------------------------------------
 #
 # PTB's ``CommandHandler`` only fires when the message text *starts* with
@@ -1784,6 +2015,23 @@ async def handle_message(
     reply_prefix = _build_reply_context_prefix(update.message.reply_to_message)
     has_reply_context = reply_prefix is not None
     effective_text = f"{reply_prefix}{text}" if reply_prefix else text
+
+    # Daily Sync reply pre-check (email-surfacing c2): when the user is
+    # replying to a recent Daily Sync message (matched by Telegram
+    # message_id against the persisted batch), parse the terse reply
+    # and append corpus rows. Returns ``None`` when the reply isn't a
+    # Daily Sync match — fall through to the normal pipeline. Runs
+    # BEFORE the inline-command check so a Daily Sync reply doesn't
+    # accidentally trip a slash-command match in Andrew's free text
+    # (e.g. "2: cancel /opus next time" should write to corpus, not
+    # flip the model).
+    parent_msg_id = _extract_reply_message_id(update.message.reply_to_message)
+    if parent_msg_id is not None:
+        handled = await _maybe_handle_daily_sync_reply(
+            update, ctx, parent_msg_id, text,
+        )
+        if handled:
+            return
 
     # Inline-command pre-check: "Good. /end" should close the session, not
     # get forwarded to Claude as prose. Runs BEFORE the lock + LLM call so

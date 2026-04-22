@@ -124,6 +124,13 @@ email_classifier:
   # returns malformed JSON. Calibration in c2 picks records with this
   # value to re-classify. Keep stable — c2/c3 will look for it.
   unclassified_sentinel: "unclassified"
+  # c2 Phase 1 corpus → classifier feedback. When this points at a
+  # non-empty JSONL the classifier rotates the most recent N entries
+  # into its system prompt as few-shot examples. Match the path to
+  # ``daily_sync.corpus.path`` so Daily Sync writes and the classifier
+  # reads the same file.
+  calibration_corpus_path: "./data/email_calibration.salem.jsonl"
+  calibration_few_shot_count: 10
 
 janitor:
   sweep:
@@ -303,6 +310,45 @@ brief:
   upcoming_events:
     enabled: true            # set false to omit the section entirely
     max_days_ahead: 30       # window cap; events further out are dropped
+
+# Daily Sync — 09:00 ADT Telegram conversation channel (email-surfacing c2).
+# Salem fires a per-day OODA-loop message: today's calibration batch (5
+# email-classifier items by default) plus future friction-queue and
+# open-question sections. Andrew replies in terse forms ("✅",
+# "2 down, 4 spam", "2: actually high — Jamie was waiting"); the parser
+# routes corrections into the per-instance calibration corpus.
+#
+# Per-instance (Stage 3.5): Salem's block lives here. STAY-C will get
+# its own ``daily_sync:`` block in config.stayc.yaml when Jamie's
+# clinical instance is built. KAL-LE intentionally omits the block —
+# coding work doesn't need a 09:00 conversation channel.
+#
+# Set enabled: false to disable while keeping the rest of the config.
+# Absent block ≡ enabled: false.
+daily_sync:
+  enabled: true
+  schedule:
+    time: "09:00"
+    timezone: "America/Halifax"
+  # How many email-classifier items to surface per fire. The framework
+  # will accommodate other section providers (friction, questions) in
+  # future chunks; this knob only affects the email section.
+  batch_size: 5
+  corpus:
+    # Per-instance calibration corpus (append-only JSONL). The
+    # classifier reads the tail for few-shot rotation; Daily Sync
+    # writes here when Andrew replies.
+    path: "./data/email_calibration.salem.jsonl"
+  confidence:
+    # Per-tier surfacing confidence flags. Flipped by the Telegram
+    # /calibration_ok <tier> command. Read by future c3/c4/c5
+    # surfacing layers — nothing reads them in c2 yet.
+    high: false
+    medium: false
+    low: false
+    spam: false
+  state:
+    path: "./data/daily_sync_state.json"
 
 bit:
   # BIT (built-in test) runs before the Morning Brief so the brief can
