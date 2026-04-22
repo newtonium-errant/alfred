@@ -176,9 +176,14 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
 # Record types the talker scope is allowed to create. Kept as a module-level
 # constant so the rule handler below and any future callers share one source
 # of truth.
+#
+# ``person`` was added 2026-04-21 after Salem created a ``note`` stub for
+# "Alex Newton" instead of a ``person`` record — when Andrew names a new
+# person, the canonical record is a ``person/`` record, not a generic note.
 TALKER_CREATE_TYPES: set[str] = {
     "task", "note", "decision", "event",
     "session", "conversation", "assumption", "synthesis",
+    "person",
 }
 
 

@@ -39,6 +39,29 @@ def test_talker_create_denies_non_whitelisted_type():
         check_scope("talker", "create", record_type="project")
 
 
+def test_talker_create_allows_person():
+    # Added 2026-04-21: Salem must be able to create person records when
+    # Andrew names a new individual. Previously Salem fell back to ``note``
+    # stubs (e.g. for "Alex Newton"); widening the scope closes that gap.
+    check_scope("talker", "create", record_type="person")
+
+
+def test_talker_create_still_denies_org():
+    # Guard the narrow widening: ``person`` was added but other entity
+    # types stay denied. Org records are created by the curator from
+    # email signatures + Stage 3 enrichment, not by Salem mid-conversation.
+    with pytest.raises(ScopeError, match="talker types"):
+        check_scope("talker", "create", record_type="org")
+
+
+def test_talker_create_still_denies_project():
+    # Project records are structurally committal — the talker SKILL
+    # explicitly defers them. Confirm widening to ``person`` didn't
+    # accidentally open the gate to ``project`` as well.
+    with pytest.raises(ScopeError, match="talker types"):
+        check_scope("talker", "create", record_type="project")
+
+
 # ---- field_allowlist (janitor edit, the new Option E rule) ------------------
 
 

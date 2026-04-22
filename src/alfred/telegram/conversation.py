@@ -95,16 +95,21 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
         "name": "vault_create",
         "description": (
             "Create a new vault record. Use when the user explicitly asks to "
-            "save something (task, note, decision, event). The record name is "
-            "the filename stem."
+            "save something (task, note, decision, event) or names a new "
+            "person who doesn't yet have a person/ record. The record name "
+            "is the filename stem."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "type": {
                     "type": "string",
-                    "enum": ["task", "note", "decision", "event"],
-                    "description": "Record type — kept narrow for wk1.",
+                    "enum": ["task", "note", "decision", "event", "person"],
+                    "description": (
+                        "Record type. Use ``person`` when the user mentions "
+                        "a new individual (full name, role, relationship) "
+                        "and a ``person/`` record doesn't yet exist."
+                    ),
                 },
                 "name": {
                     "type": "string",
