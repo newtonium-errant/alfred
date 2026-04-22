@@ -15,6 +15,10 @@ import json
 import os
 import time as _time
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from alfred.email_classifier.config import EmailClassifierConfig
 
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
 
@@ -30,6 +34,12 @@ from .state import StateManager
 from .utils import get_logger
 from .watcher import InboxWatcher
 from .writer import diff_vault, mark_processed, snapshot_vault
+
+# Email classifier (per-instance, opt-in) — post-processor that adds
+# ``priority`` + ``action_hint`` frontmatter fields to email-derived
+# note records. Imported lazily inside ``_process_file`` so curator
+# tests that don't touch the classifier still work without the module
+# on the import path. See ``email_classifier/__init__.py``.
 
 log = get_logger(__name__)
 
@@ -172,8 +182,17 @@ async def _process_file(
     skill_text: str,
     config: CuratorConfig,
     state_mgr: StateManager,
+    email_classifier_config: "EmailClassifierConfig | None" = None,
 ) -> None:
-    """Process a single inbox file through the full pipeline."""
+    """Process a single inbox file through the full pipeline.
+
+    When ``email_classifier_config.enabled`` is True and the inbox file
+    looks email-derived, the classifier post-processor runs after
+    curation completes and writes ``priority`` + ``action_hint`` into
+    each newly-created ``note/*.md`` record's frontmatter. Disabled
+    or non-email files are skipped silently — the post-processor never
+    raises into the curator pipeline.
+    """
     filename = inbox_file.name
     log.info("daemon.processing", file=filename)
 
@@ -284,6 +303,28 @@ async def _process_file(
     )
     state_mgr.save()
 
+    # Email-classifier post-processor (per-instance, opt-in). Runs in
+    # a thread so the synchronous Anthropic SDK call doesn't block the
+    # asyncio loop. Failures are logged + swallowed — classification
+    # is a non-blocking post-pass; curation is already complete.
+    if (
+        email_classifier_config is not None
+        and email_classifier_config.enabled
+        and files_created
+    ):
+        try:
+            from alfred.email_classifier import classify_records_for_inbox
+
+            await asyncio.to_thread(
+                classify_records_for_inbox,
+                config.vault.vault_path,
+                inbox_content,
+                files_created,
+                email_classifier_config,
+            )
+        except Exception:  # noqa: BLE001 — must never crash the daemon
+            log.exception("daemon.email_classifier_error", file=filename)
+
     log.info(
         "daemon.completed",
         file=filename,
@@ -292,9 +333,26 @@ async def _process_file(
     )
 
 
-async def run(config: CuratorConfig, skills_dir: Path) -> None:
-    """Main daemon entry point."""
-    log.info("daemon.starting", backend=config.agent.backend)
+async def run(
+    config: CuratorConfig,
+    skills_dir: Path,
+    email_classifier_config: "EmailClassifierConfig | None" = None,
+) -> None:
+    """Main daemon entry point.
+
+    ``email_classifier_config`` is an optional per-instance config block
+    loaded by the orchestrator / CLI from the unified config dict
+    (``email_classifier:`` section). When ``None`` or
+    ``enabled=False``, the classifier post-processor is a no-op and
+    curator behaves exactly as before this hook landed.
+    """
+    log.info(
+        "daemon.starting",
+        backend=config.agent.backend,
+        email_classifier_enabled=bool(
+            email_classifier_config and email_classifier_config.enabled
+        ),
+    )
 
     # Load skill text
     skill_text = _load_skill(skills_dir)
@@ -335,7 +393,14 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
                     log.info("daemon.skip_locked", file=inbox_file.name)
                     return
                 try:
-                    await _process_file(inbox_file, backend, skill_text, config, state_mgr)
+                    await _process_file(
+                        inbox_file,
+                        backend,
+                        skill_text,
+                        config,
+                        state_mgr,
+                        email_classifier_config=email_classifier_config,
+                    )
                 except Exception:
                     log.exception("daemon.process_error", file=inbox_file.name)
                     # Always move to processed — even on failure — to prevent
@@ -401,7 +466,14 @@ async def run(config: CuratorConfig, skills_dir: Path) -> None:
                             _processing.discard(str(inbox_file))
                             return
                         try:
-                            await _process_file(inbox_file, backend, skill_text, config, state_mgr)
+                            await _process_file(
+                                inbox_file,
+                                backend,
+                                skill_text,
+                                config,
+                                state_mgr,
+                                email_classifier_config=email_classifier_config,
+                            )
                         except Exception:
                             log.exception("daemon.process_error", file=inbox_file.name)
                             # Always move to processed — even on failure — to

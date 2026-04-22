@@ -63,6 +63,68 @@ curator:
   state:
     path: "./data/curator_state.json"
 
+# Email classifier — per-instance priority + action-hint tagging on
+# email-derived note records. Hooks into the curator daemon as a
+# post-processor: after curation completes, every newly-created
+# ``note/*.md`` derived from email-shaped inbox content gets two
+# frontmatter fields written:
+#   priority:    high | medium | low | spam | unclassified
+#   action_hint: free-text recommendation (e.g. "calendar", "archive",
+#                "ignore", "file:newsletter/Tim Denning") — RECOMMENDATION
+#                ONLY, never auto-executed in c1.
+#
+# Per-instance design (Stage 3.5): this block is owned by Salem's
+# config.yaml. STAY-C will get its own ``email_classifier:`` block in
+# config.stayc.yaml when the instance is built (with clinical-urgency
+# cues for Jamie, not Andrew's contact list). KAL-LE has no email
+# pipeline so config.kalle.yaml deliberately omits the block.
+#
+# Set enabled: false to disable while keeping the rest of the config.
+# Absent block ≡ enabled: false.
+#
+# Filed under ``email-surfacing c1`` of the multi-chunk arc; c2 ships
+# the calibration loop (Daily Sync) that refines the cue lists below.
+email_classifier:
+  enabled: true
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    model: "claude-sonnet-4-6"
+    max_tokens: 1024
+    timeout_seconds: 60
+  # Cue groups — the cold-prompt seed for Salem. Each list is bullets
+  # the model treats as priority hints. Calibration in c2 grows these
+  # lists over time; today they are static.
+  prompt:
+    high:
+      - "From a named person Andrew has interacted with recently (vault-lookup for person records)"
+      - "Explicit time-pressure language (\"today\", \"by EOD\", \"urgent\", deadline within 48h)"
+      - "Reply-required signals (direct question to Andrew, RSVP request)"
+      - "Jamie Newton's messages"
+      - "RRTS customer messages"
+    medium:
+      - "Appointments / confirmations / notices with future dates"
+      - "Subscription renewals"
+      - "Financial notifications (transactions, statements)"
+      - "Family mentions (Newton family members beyond Andrew/Jamie)"
+    low:
+      - "Newsletters Andrew chose to receive"
+      - "Marketing from established relationships (vendors he uses)"
+      - "Automated notifications (system status, build emails, etc.)"
+    spam:
+      - "Unsolicited commercial"
+      - "Phishing-shape messages"
+      - "Unknown senders pitching products / services"
+  state:
+    path: "./data/email_classifier_state.json"
+  # Memoise the named-contact lookup for this many seconds during a
+  # batch run. Single-file watcher pass: this never matters. Batch
+  # runs over hundreds of files: avoids re-scanning person/ each time.
+  named_contact_cache_seconds: 60
+  # Frontmatter ``priority`` value written when the LLM call fails or
+  # returns malformed JSON. Calibration in c2 picks records with this
+  # value to re-classify. Keep stable — c2/c3 will look for it.
+  unclassified_sentinel: "unclassified"
+
 janitor:
   sweep:
     interval_seconds: 3600

@@ -37,10 +37,16 @@ def _run_curator(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = F
         _silence_stdio(log_file)
     from alfred.curator.config import load_from_unified
     from alfred.curator.utils import setup_logging
+    from alfred.email_classifier.config import load_from_unified as load_classifier
     config = load_from_unified(raw)
+    # Per-instance opt-in: when ``email_classifier:`` is absent or
+    # ``enabled: false``, this returns a disabled config and the daemon
+    # short-circuits the post-processor. KAL-LE's config.kalle.yaml
+    # leaves the block out by design.
+    classifier_config = load_classifier(raw)
     setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
     from alfred.curator.daemon import run
-    asyncio.run(run(config, Path(skills_dir)))
+    asyncio.run(run(config, Path(skills_dir), email_classifier_config=classifier_config))
 
 
 def _run_janitor(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = False) -> None:

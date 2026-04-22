@@ -279,11 +279,13 @@ def cmd_curator(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw, tool="curator")
     from alfred.curator.config import load_from_unified
+    from alfred.email_classifier.config import load_from_unified as load_classifier
     config = load_from_unified(raw)
+    classifier_config = load_classifier(raw)
     from alfred.curator.daemon import run
     from alfred._data import get_skills_dir
     try:
-        asyncio.run(run(config, get_skills_dir()))
+        asyncio.run(run(config, get_skills_dir(), email_classifier_config=classifier_config))
     except KeyboardInterrupt:
         print("\nStopped.")
 
