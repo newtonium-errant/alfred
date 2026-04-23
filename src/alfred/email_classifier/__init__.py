@@ -13,6 +13,7 @@ through ``config.stayc.yaml`` with its own clinical cold prompt — no code
 change required, the architecture is per-instance from day one.
 """
 
+from .backfill import BackfillSummary, is_email_derived_note, run_backfill
 from .classifier import (
     ClassificationResult,
     classify_record,
@@ -22,10 +23,13 @@ from .classifier import (
 from .config import EmailClassifierConfig, load_from_unified
 
 __all__ = [
+    "BackfillSummary",
     "ClassificationResult",
     "EmailClassifierConfig",
     "classify_record",
     "classify_records_for_inbox",
+    "is_email_derived_note",
     "is_email_inbox",
     "load_from_unified",
+    "run_backfill",
 ]

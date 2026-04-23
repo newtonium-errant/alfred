@@ -290,6 +290,66 @@ def cmd_curator(args: argparse.Namespace) -> None:
         print("\nStopped.")
 
 
+def cmd_email_classifier(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred email-classifier`` subcommands.
+
+    Currently exposes ``backfill`` only — runs the c1 classifier against
+    every email-derived note in ``vault/note/`` that's missing a
+    ``priority`` frontmatter field. Safe to re-run; resumable; ``--dry-run``
+    + ``--limit N`` flags for safety on first invocation.
+    """
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="email_classifier")
+
+    subcmd = getattr(args, "email_classifier_cmd", None)
+    if subcmd != "backfill":
+        print("Usage: alfred email-classifier backfill [--dry-run] [--limit N]")
+        sys.exit(1)
+
+    from alfred.email_classifier import EmailClassifierConfig, run_backfill
+    from alfred.email_classifier.config import load_from_unified as load_classifier
+    config: EmailClassifierConfig = load_classifier(raw)
+    if not config.enabled:
+        print(
+            "email_classifier is not enabled in this config "
+            "(missing/disabled email_classifier: block). Aborting backfill.",
+        )
+        sys.exit(1)
+
+    vault_cfg = raw.get("vault", {}) or {}
+    vault_path_str = vault_cfg.get("path")
+    if not vault_path_str:
+        print("vault.path not set in config. Aborting backfill.")
+        sys.exit(1)
+    vault_path = Path(vault_path_str)
+    if not vault_path.is_dir():
+        print(f"vault path does not exist: {vault_path}. Aborting backfill.")
+        sys.exit(1)
+
+    summary = run_backfill(
+        vault_path=vault_path,
+        config=config,
+        dry_run=args.dry_run,
+        limit=args.limit,
+    )
+
+    print()
+    print("=== Email-classifier backfill summary ===")
+    if args.dry_run:
+        print(f"  candidates (would classify): {summary.candidates}")
+    else:
+        print(f"  classified:                   {summary.classified}")
+    print(f"  skipped (already classified): {summary.skipped_already_done}")
+    print(f"  skipped (not email-derived):  {summary.skipped_not_email}")
+    print(f"  errors:                       {summary.errors}")
+    print(f"  elapsed seconds:              {summary.elapsed_seconds:.1f}")
+    if summary.error_paths:
+        print()
+        print("Errored paths (first 10):")
+        for p in summary.error_paths[:10]:
+            print(f"  - {p}")
+
+
 def cmd_janitor(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw, tool="janitor")
@@ -1133,6 +1193,25 @@ def build_parser() -> argparse.ArgumentParser:
     # curator
     sub.add_parser("curator", help="Start curator daemon")
 
+    # email-classifier (backfill + future operational subcommands)
+    ec = sub.add_parser(
+        "email-classifier",
+        help="Email classifier subcommands (backfill — c1.5 retroactive run)",
+    )
+    ec_sub = ec.add_subparsers(dest="email_classifier_cmd")
+    ec_backfill = ec_sub.add_parser(
+        "backfill",
+        help="Classify existing email-derived notes lacking a priority field",
+    )
+    ec_backfill.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Count candidates without making LLM calls or writing frontmatter",
+    )
+    ec_backfill.add_argument(
+        "--limit", type=int, default=None,
+        help="Cap the number of records actually classified (skips don't count)",
+    )
+
     # janitor
     jan = sub.add_parser("janitor", help="Vault janitor subcommands")
     jan_sub = jan.add_subparsers(dest="janitor_cmd")
@@ -1337,6 +1416,7 @@ def main() -> None:
         "down": cmd_down,
         "status": cmd_status,
         "curator": cmd_curator,
+        "email-classifier": cmd_email_classifier,
         "janitor": cmd_janitor,
         "distiller": cmd_distiller,
         "instructor": cmd_instructor,
