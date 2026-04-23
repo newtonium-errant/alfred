@@ -405,6 +405,28 @@ daily_sync:
     spam: false
   state:
     path: "./data/daily_sync_state.json"
+  # Attribution-audit section — Phase 2 of the calibration audit gap
+  # arc (see ``project_calibration_audit_gap.md``). Surfaces agent-
+  # inferred vault content (marked by BEGIN_INFERRED/END_INFERRED
+  # comment pairs + ``attribution_audit`` frontmatter entries) in the
+  # Daily Sync so Andrew can reply ``N confirm`` (flip the marker to
+  # confirmed) or ``N reject`` (strip the section + log).
+  #
+  # Absent block ≡ enabled (default). Set ``enabled: false`` to omit
+  # the attribution section entirely while keeping the rest of the
+  # Daily Sync running.
+  attribution:
+    enabled: true
+    batch_size: 5
+    # Vault paths to scan for attribution_audit entries. Leave empty
+    # (default) to scan the whole vault. Restrict for performance
+    # once the vault grows past ~10k records; typical values are
+    # vault-relative subpaths like ["note", "person", "process"].
+    scan_paths: []
+    # Attribution-audit corpus path (separate from the email
+    # calibration corpus above). Append-only JSONL; one row per
+    # Andrew confirm or reject action.
+    corpus_path: "./data/attribution_audit_corpus.jsonl"
 
 bit:
   # BIT (built-in test) runs before the Morning Brief so the brief can

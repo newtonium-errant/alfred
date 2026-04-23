@@ -96,6 +96,32 @@ class StateConfig:
 
 
 @dataclass
+class AttributionConfig:
+    """Attribution-audit section provider config (Phase 2 of audit arc).
+
+    The Daily Sync's attribution-audit section reads
+    ``attribution_audit`` frontmatter from across the vault and surfaces
+    unconfirmed items for Andrew's per-item ``confirm`` / ``reject``.
+    See ``src/alfred/daily_sync/attribution_section.py`` for the
+    section provider and ``src/alfred/vault/attribution.py`` for the
+    underlying primitives shipped in c1.
+
+    ``scan_paths`` is empty by default → the section walks the whole
+    vault. Restrict for performance once vault grows past ~10k records;
+    typical entries are vault-relative subpaths like ``["note", "person"]``.
+    """
+
+    enabled: bool = True
+    batch_size: int = 5
+    scan_paths: list[str] = field(default_factory=list)
+    # Audit corpus path — separate from the email calibration corpus
+    # so the two streams stay independently auditable. Append-only
+    # JSONL; one row per Andrew confirm or reject. The path is a
+    # default; the production config may override it.
+    corpus_path: str = "./data/attribution_audit_corpus.jsonl"
+
+
+@dataclass
 class DailySyncConfig:
     """Top-level Daily Sync config.
 
@@ -111,6 +137,7 @@ class DailySyncConfig:
     corpus: CorpusConfig = field(default_factory=CorpusConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     state: StateConfig = field(default_factory=StateConfig)
+    attribution: AttributionConfig = field(default_factory=AttributionConfig)
 
 
 _DATACLASS_MAP: dict[str, type] = {
@@ -118,6 +145,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "corpus": CorpusConfig,
     "confidence": ConfidenceConfig,
     "state": StateConfig,
+    "attribution": AttributionConfig,
 }
 
 

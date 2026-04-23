@@ -387,6 +387,15 @@ def consume_last_batch() -> list[BatchItem]:
     return items
 
 
+def peek_last_batch_count() -> int:
+    """Return the count of items in the most-recently-built batch.
+
+    Non-destructive — used by the assembler's ``item_count_after`` hook
+    so the next section provider's items are numbered continuously.
+    """
+    return len(_LAST_BATCH_HOLDER.get("items", []))
+
+
 def email_calibration_section(
     config: DailySyncConfig,
     today: date,
@@ -418,4 +427,5 @@ def register() -> None:
         "email_calibration",
         priority=10,
         provider=email_calibration_section,
+        item_count_after=peek_last_batch_count,
     )

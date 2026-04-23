@@ -31,7 +31,7 @@ import structlog
 
 from alfred.common.schedule import compute_next_fire, sleep_until
 
-from . import email_section
+from . import attribution_section, email_section
 from .assembler import assemble_message
 from .config import DailySyncConfig
 from .confidence import load_state, save_state
@@ -93,20 +93,29 @@ def _build_state_payload(
     today_iso: str,
     items: list[Any],
     message_ids: list[int],
+    *,
+    attribution_items: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Construct the per-fire batch payload persisted to the state file.
 
-    ``items`` is a list of :class:`email_section.BatchItem` (or any
-    other section provider's metadata in the future — the schema is
-    deliberately permissive). The reply parser reads ``items`` and
-    ``message_ids`` to resolve "item 2" against a Telegram reply.
+    ``items`` is the email-calibration batch (existing). ``attribution_items``
+    (Phase 2) is the parallel attribution-audit batch — both lists are
+    keyed off the same ``message_ids`` so the dispatcher routes a reply
+    to whichever item_number matches. The reply parser reads ``items``
+    + ``attribution_items`` + ``message_ids`` to resolve "item 6"
+    against a Telegram reply.
     """
-    return {
+    payload: dict[str, Any] = {
         "date": today_iso,
         "items": [item.to_dict() for item in items if hasattr(item, "to_dict")],
         "message_ids": message_ids,
         "fired_at": datetime.now(timezone.utc).isoformat(),
     }
+    if attribution_items:
+        payload["attribution_items"] = [
+            item.to_dict() for item in attribution_items if hasattr(item, "to_dict")
+        ]
+    return payload
 
 
 async def fire_once(
@@ -134,17 +143,23 @@ async def fire_once(
     today = today or date.today()
     today_iso = today.isoformat()
 
-    # Make sure the email section provider knows where the vault is.
+    # Make sure each section provider knows where the vault is, and
+    # that both providers are registered (idempotent — re-firing
+    # via ``/calibrate`` doesn't double-register).
     email_section.set_vault_path(vault_path)
     email_section.register()
+    attribution_section.set_vault_path(vault_path)
+    attribution_section.register()
 
     body = assemble_message(config, today)
     items = email_section.consume_last_batch()
+    attribution_items = attribution_section.consume_last_batch()
 
     log.info(
         "daily_sync.assembled",
         date=today_iso,
         items_count=len(items),
+        attribution_items_count=len(attribution_items),
         body_length=len(body),
     )
 
@@ -153,16 +168,23 @@ async def fire_once(
     # Persist the batch to the state file ONLY when we actually have
     # items + message_ids. An empty-Daily-Sync push has no items to
     # match replies against — Andrew can still chat, but there's
-    # nothing to calibrate.
+    # nothing to calibrate. Either email items OR attribution items
+    # is enough to persist the batch (the dispatcher routes per-item).
     state = load_state(config.state.path)
-    if items and message_ids:
-        state["last_batch"] = _build_state_payload(today_iso, items, message_ids)
+    if (items or attribution_items) and message_ids:
+        state["last_batch"] = _build_state_payload(
+            today_iso,
+            items,
+            message_ids,
+            attribution_items=attribution_items,
+        )
     state["last_fired_date"] = today_iso
     save_state(config.state.path, state)
 
     return {
         "ok": True,
         "items_count": len(items),
+        "attribution_items_count": len(attribution_items),
         "message_ids": message_ids,
         "body": body,
     }

@@ -32,7 +32,8 @@ from .assembler import (
     ReplyCorrection,
     EMPTY_SYNC_BODY,
 )
-from .config import DailySyncConfig, load_from_unified
+from .attribution_corpus import AttributionCorpusEntry, append_entry as append_attribution_entry
+from .config import AttributionConfig, DailySyncConfig, load_from_unified
 from .confidence import (
     list_confidence,
     set_confidence,
@@ -47,9 +48,12 @@ from .corpus import (
 )
 
 __all__ = [
+    "AttributionConfig",
+    "AttributionCorpusEntry",
     "DailySyncConfig",
     "EMPTY_SYNC_BODY",
     "SectionProvider",
+    "append_attribution_entry",
     "assemble_message",
     "load_from_unified",
     "register_provider",

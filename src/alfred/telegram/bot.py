@@ -1878,8 +1878,22 @@ async def _maybe_handle_daily_sync_reply(
         log.warning("talker.bot.daily_sync_state_read_failed", error=str(exc))
         return False
 
+    # Thread the vault path through so attribution-item confirms /
+    # rejects can read + write the affected records. Email items don't
+    # need it (the email-calibration corpus is path-agnostic), but
+    # Phase 2 attribution items operate directly on vault files.
+    talker_config = ctx.application.bot_data.get(_KEY_CONFIG)
+    vault_path: Path | None = None
+    if talker_config is not None:
+        try:
+            vault_path = Path(talker_config.vault.path)
+        except Exception:  # noqa: BLE001
+            vault_path = None
+
     try:
-        result = handle_daily_sync_reply(ds_config, parent_msg_id, user_text)
+        result = handle_daily_sync_reply(
+            ds_config, parent_msg_id, user_text, vault_path=vault_path,
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("talker.bot.daily_sync_reply_failed", error=str(exc))
         return False

@@ -20,6 +20,7 @@ The integer ``priority`` is the sort key (lower = renders first). The
 
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -30,7 +31,14 @@ from .config import DailySyncConfig
 # Type alias for the section provider callable contract. ``today`` is
 # tz-aware in the daemon but ``date.today()`` (naive) in tests; either
 # works because providers only use it for header rendering, never math.
-SectionProvider = Callable[[DailySyncConfig, date], Optional[str]]
+#
+# Providers that produce numbered items (email calibration, attribution
+# audit) accept an optional ``start_index: int = 1`` keyword so the
+# global numbering across sections stays continuous (item 1 in email →
+# item 6 in attribution if email rendered 5 items). Providers that don't
+# need it omit the kwarg; the assembler inspects the signature and
+# only forwards it when present.
+SectionProvider = Callable[..., Optional[str]]
 
 
 # Header rendered when every provider returned None. We still send a
@@ -55,6 +63,12 @@ class _ProviderEntry:
     name: str
     priority: int
     provider: SectionProvider
+    # Optional callable returning the count of items the provider
+    # rendered on its most recent call. Used by ``assemble_message`` to
+    # advance the global ``start_index`` across sections so item
+    # numbering is continuous (email items 1..5, attribution items
+    # 6..10). Providers that don't produce numbered items omit it.
+    item_count_after: Callable[[], int] | None = None
 
 
 # Module-level registry. Providers register themselves at import time
@@ -69,16 +83,27 @@ def register_provider(
     *,
     priority: int,
     provider: SectionProvider,
+    item_count_after: Callable[[], int] | None = None,
 ) -> None:
     """Add a section provider to the registry.
 
     Raises :class:`ValueError` when the same ``name`` is registered
     twice — keeps the test surface deterministic. Tests can call
     :func:`clear_providers` to reset.
+
+    ``item_count_after`` is an optional callable invoked AFTER the
+    provider returns; its int result is added to the running global
+    ``start_index`` so the next provider's items are numbered
+    continuously. Providers that don't produce numbered items omit it.
     """
     if any(entry.name == name for entry in _REGISTRY):
         raise ValueError(f"section provider {name!r} already registered")
-    _REGISTRY.append(_ProviderEntry(name=name, priority=priority, provider=provider))
+    _REGISTRY.append(_ProviderEntry(
+        name=name,
+        priority=priority,
+        provider=provider,
+        item_count_after=item_count_after,
+    ))
     _REGISTRY.sort(key=lambda e: (e.priority, e.name))
 
 
@@ -92,6 +117,20 @@ def clear_providers() -> None:
     _REGISTRY.clear()
 
 
+def _provider_accepts_start_index(provider: SectionProvider) -> bool:
+    """Return True when ``provider`` declares a ``start_index`` parameter.
+
+    Providers that produce numbered items take ``start_index`` so the
+    assembler can keep item numbers continuous across sections; older
+    providers without the parameter render unaffected.
+    """
+    try:
+        sig = inspect.signature(provider)
+    except (TypeError, ValueError):
+        return False
+    return "start_index" in sig.parameters
+
+
 def assemble_message(
     config: DailySyncConfig,
     today: date,
@@ -101,11 +140,22 @@ def assemble_message(
     Empty case (every provider returned ``None``) → returns
     :data:`EMPTY_SYNC_BODY` rendered with today's date so the operator
     still gets a daily ping. Per the memo: visibility beats silence.
+
+    Item numbering is global across sections: the assembler tracks a
+    running ``start_index`` (1-based) and forwards it to providers that
+    accept the kwarg. After each provider returns, the assembler calls
+    ``item_count_after`` (when registered) and bumps ``start_index`` by
+    that many — so email's 5 items stay 1..5 and attribution's items
+    pick up at 6.
     """
     sections: list[str] = []
+    next_index = 1
     for entry in _REGISTRY:
         try:
-            result = entry.provider(config, today)
+            if _provider_accepts_start_index(entry.provider):
+                result = entry.provider(config, today, start_index=next_index)
+            else:
+                result = entry.provider(config, today)
         except Exception as exc:  # noqa: BLE001 — provider failure never crashes the daily sync
             sections.append(
                 f"[{entry.name}] section provider failed: {exc.__class__.__name__}: {exc}"
@@ -116,6 +166,16 @@ def assemble_message(
         text = result.strip()
         if text:
             sections.append(text)
+        # Bump the running index regardless of whether the section
+        # rendered text — a provider that produced 0 items contributes
+        # 0 to the count, which is the right outcome.
+        if entry.item_count_after is not None:
+            try:
+                count = int(entry.item_count_after())
+            except (TypeError, ValueError):
+                count = 0
+            if count > 0:
+                next_index += count
 
     if not sections:
         return EMPTY_SYNC_BODY.format(date=today.isoformat())
@@ -160,7 +220,26 @@ _RELATIVE_TOKENS = {
     "up": "up",
     "down": "down",
 }
-_OK_TOKENS = {"ok", "okay", "good", "yes", "y", "confirmed"}
+_OK_TOKENS = {
+    "ok",
+    "okay",
+    "good",
+    "yes",
+    "y",
+    "confirmed",
+    # Attribution-audit verbs that semantically equal "confirm this
+    # item as-is". For email items these still mean "andrew_priority
+    # equals classifier_priority"; for attribution items the dispatcher
+    # interprets ``ok=True`` as "flip the marker to confirmed".
+    "confirm",
+    "keep",
+    "✅",
+}
+# Reject verbs — only meaningful for attribution items (email items
+# don't have a "delete the section" action). The dispatcher routes a
+# reject correction onto ``reject_marker`` for attribution items and
+# onto the unparsed bucket for email items.
+_REJECT_TOKENS = {"reject", "delete", "remove", "no"}
 
 
 # Whole-message ack tokens. Any of these alone (after stripping
@@ -180,13 +259,19 @@ class ReplyCorrection:
     is the explicit tier name when Andrew supplied one, else ``None`` and
     ``modifier`` carries the relative direction ("down"/"up"). ``ok`` is
     True when Andrew explicitly confirmed an item without changing
-    anything (e.g. "1 ok"). ``note`` carries any free-text reasoning.
+    anything (e.g. "1 ok" or "6 confirm"). ``reject`` is True for the
+    attribution-audit reject verbs (``reject``/``delete``/``remove``/
+    ``no``) which only make sense on attribution items — the dispatcher
+    routes a ``reject`` correction onto ``reject_marker`` for an
+    attribution item and onto the unparsed bucket for an email item.
+    ``note`` carries any free-text reasoning.
     """
 
     item_number: int
     new_tier: str | None = None
     modifier: str | None = None
     ok: bool = False
+    reject: bool = False
     note: str = ""
 
 
@@ -330,8 +415,8 @@ def _parse_fragment(fragment: str) -> ReplyCorrection | None:
         return None
 
     correction = ReplyCorrection(item_number=item_num, note=note)
-    # Walk the leading words once to extract the first tier/modifier/ok
-    # token; ignore "actually" and similar filler words.
+    # Walk the leading words once to extract the first tier/modifier/
+    # ok/reject token; ignore "actually" and similar filler words.
     consumed = False
     leftover_note_bits: list[str] = []
     for word in token_words:
@@ -349,6 +434,10 @@ def _parse_fragment(fragment: str) -> ReplyCorrection | None:
                 continue
             if normalized in _OK_TOKENS:
                 correction.ok = True
+                consumed = True
+                continue
+            if normalized in _REJECT_TOKENS:
+                correction.reject = True
                 consumed = True
                 continue
         # Once we've consumed the first token, the rest belongs to the
