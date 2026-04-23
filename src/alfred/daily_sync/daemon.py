@@ -22,6 +22,7 @@ replies feed back through the ``/calibrate``-aware reply parser in
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,8 +44,18 @@ async def _push_via_transport(
     body: str,
     user_id: int,
     today_iso: str,
+    *,
+    dedupe_key: str | None = None,
 ) -> list[int]:
     """Dispatch the Daily Sync as Telegram chunks via the transport.
+
+    ``dedupe_key`` is the server-side idempotency key (24h window). When
+    omitted, falls back to ``daily-sync-{today_iso}`` — the natural
+    auto-fire key, which deliberately collides on same-day re-fires so
+    a scheduling glitch can't double-push. The ``/calibrate`` slash
+    command passes a unique-per-invocation key instead so an explicit
+    out-of-cycle fire isn't short-circuited by the auto-fire's prior
+    entry in ``data/transport_state.json``.
 
     Returns the list of message IDs the server reports for the batch
     (the reply parser uses the FIRST id as the parent-thread anchor).
@@ -55,6 +66,9 @@ async def _push_via_transport(
     from alfred.transport.exceptions import TransportError
     from alfred.transport.utils import chunk_for_telegram
 
+    if dedupe_key is None:
+        dedupe_key = f"daily-sync-{today_iso}"
+
     try:
         chunks = chunk_for_telegram(body)
         if not chunks or not chunks[0]:
@@ -62,7 +76,7 @@ async def _push_via_transport(
         response = await send_outbound_batch(
             user_id=user_id,
             chunks=chunks,
-            dedupe_key=f"daily-sync-{today_iso}",
+            dedupe_key=dedupe_key,
             client_name="daily_sync",
         )
         # The server's response shape includes ``telegram_message_ids`` —
@@ -123,25 +137,43 @@ async def fire_once(
     vault_path: Path,
     user_id: int,
     today: date | None = None,
+    *,
+    manual: bool = False,
 ) -> dict[str, Any]:
     """Run one assemble + push cycle. Returns a result summary dict.
 
     Used by both the daemon loop AND the ``/calibrate`` slash command
-    (out-of-cycle fire). Idempotency: ``send_outbound_batch`` is keyed
-    by ``daily-sync-{date}`` so a same-day re-fire from ``/calibrate``
-    is server-deduped — but the talker bot today does NOT enforce
-    dedup for the slash command's manual fire (we want it to fire
-    again with a fresh sample). The daemon path is gated by the
-    ``last_fired_date`` state field.
+    (out-of-cycle fire). Two-path dedupe at the transport layer:
+
+      * ``manual=False`` (default; daemon's natural 09:00 auto-fire)
+        — uses ``daily-sync-{date}`` so a scheduling/restart glitch
+        that fires the auto-loop twice in one day is server-deduped
+        into a single Telegram push. The daemon-side
+        ``last_fired_date`` guard already prevents most re-fires;
+        this is the belt to that suspenders.
+      * ``manual=True`` (``/calibrate`` slash command) — uses
+        ``daily-sync-{date}-calibrate-{uuid8}`` so each explicit
+        out-of-cycle fire gets its own unique idempotency key. Without
+        this, the second /calibrate of a day collides with the first
+        successful send (auto OR manual), the server returns the cached
+        msg_ids without actually pushing, and Andrew sees the
+        "firing now…" ack but no batch on Telegram. The calibrate-tagged
+        prefix keeps ``data/transport_state.json`` greppable.
 
     The summary dict carries:
       - ``ok``: bool
       - ``items_count``: int (zero when empty-Daily-Sync header used)
       - ``message_ids``: list[int]
       - ``body``: str (the assembled message text — useful for testing)
+      - ``dedupe_key``: str (the key actually sent to the transport —
+        useful for tests and audit-trail correlation)
     """
     today = today or date.today()
     today_iso = today.isoformat()
+    if manual:
+        dedupe_key = f"daily-sync-{today_iso}-calibrate-{uuid.uuid4().hex[:8]}"
+    else:
+        dedupe_key = f"daily-sync-{today_iso}"
 
     # Make sure each section provider knows where the vault is, and
     # that both providers are registered (idempotent — re-firing
@@ -161,9 +193,13 @@ async def fire_once(
         items_count=len(items),
         attribution_items_count=len(attribution_items),
         body_length=len(body),
+        manual=manual,
+        dedupe_key=dedupe_key,
     )
 
-    message_ids = await _push_via_transport(body, user_id, today_iso)
+    message_ids = await _push_via_transport(
+        body, user_id, today_iso, dedupe_key=dedupe_key,
+    )
 
     # Persist the batch to the state file ONLY when we actually have
     # items + message_ids. An empty-Daily-Sync push has no items to
@@ -187,6 +223,7 @@ async def fire_once(
         "attribution_items_count": len(attribution_items),
         "message_ids": message_ids,
         "body": body,
+        "dedupe_key": dedupe_key,
     }
 
 

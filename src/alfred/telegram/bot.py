@@ -1053,7 +1053,14 @@ async def on_calibrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text("Daily Sync sample firing now…")
     try:
-        result = await fire_once(ds_config, vault_path, user_id)
+        # ``manual=True`` swaps the transport dedupe key from the
+        # date-only ``daily-sync-{date}`` (which collides with the auto
+        # 09:00 fire and any prior /calibrate today) to a unique
+        # ``daily-sync-{date}-calibrate-{uuid8}``. Without this the
+        # second /calibrate of a day silently short-circuits at the
+        # transport server's idempotency check and Andrew sees the
+        # "firing now…" ack but no second message.
+        result = await fire_once(ds_config, vault_path, user_id, manual=True)
     except Exception as exc:  # noqa: BLE001
         log.exception("talker.bot.calibrate_failed")
         await update.message.reply_text(
