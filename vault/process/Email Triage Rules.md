@@ -130,3 +130,14 @@ Edit this file directly in Obsidian. Examples of updates:
 - "New Outlook folder for medical receipts" — add a new section under Financial Document Rules
 
 **Important:** The Outlook folder rules are mirrored in the n8n workflow's "Restore Context & Categorize" Code node. When you change folder rules here, also update the n8n Code node to match. See `docs/n8n-email-filing-instructions.md` for details.
+
+
+## Sender-Specific Overrides
+
+### Substack
+Generic Substack notification emails (article published, new post, digest) → **Ignore**. Andrew reads Substack on the app; email duplicates are inbox clutter. Do NOT create vault records for these.
+
+**Exceptions (whitelist — treat as Low or higher based on content):**
+- Tim Denning — keep, file as Low
+
+When a new Substack sender appears: default Ignore unless Andrew explicitly adds them to the whitelist above.
