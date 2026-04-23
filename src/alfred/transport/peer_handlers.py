@@ -14,6 +14,14 @@ Handlers:
     POST /peer/handshake   — bootstrap: returns our identity, version,
                               capability list, and known peers. No
                               additional authz beyond bearer auth.
+    POST /peer/brief_digest
+                           — accept a brief-section digest from a
+                              named peer and stash it in the principal's
+                              vault for the brief renderer to pick up.
+                              V.E.R.A. content arc: specialist instance
+                              produces its own slide, principal renders
+                              the pushed slide alongside its own
+                              sections.
     GET  /canonical/{type}/{name}
                            — SALEM-only canonical record fetch. Peers
                               that don't hold canonical records return
@@ -38,10 +46,12 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import frontmatter
+import yaml
 from aiohttp import web
 
 from .canonical import apply_field_permissions
@@ -509,6 +519,182 @@ async def _serve_canonical(
 
 
 # ---------------------------------------------------------------------------
+# /peer/brief_digest — accept a one-slide brief section from a peer
+# ---------------------------------------------------------------------------
+
+
+# Hard cap on the digest body — protects the vault from runaway peers.
+# A normal "one-slide" digest is ~200-400 words; 50 KB is two orders of
+# magnitude larger, well beyond any plausible legitimate value.
+_MAX_DIGEST_BYTES = 50_000
+
+
+def _safe_peer_filename_part(value: str) -> str:
+    """Strip path-traversal characters from a peer-supplied string.
+
+    The peer name + date go into a vault filename (``Peer Digest {peer}
+    {date}.md``). Replace anything that could escape the directory or
+    produce a malformed name with ``-``. Belt-and-braces — auth already
+    pins the peer to the authenticated identity, but the date string is
+    operator-supplied and worth sanitising.
+    """
+    out_chars: list[str] = []
+    for ch in value:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            out_chars.append(ch)
+        else:
+            out_chars.append("-")
+    return "".join(out_chars).strip("-") or "unknown"
+
+
+async def _handle_peer_brief_digest(request: web.Request) -> web.StreamResponse:
+    """POST /peer/brief_digest — accept a brief section from a peer.
+
+    Body:
+        {
+          "peer":             "kal-le",
+          "date":             "2026-04-23",
+          "digest_markdown":  "...one-slide markdown...",
+          "correlation_id":   "<optional>"
+        }
+
+    On success, writes the digest as a vault record at
+    ``<vault_path>/run/Peer Digest {peer} {date}.md`` with frontmatter
+    capturing source + receipt metadata, and returns 202 Accepted with
+    the relative vault path.
+
+    Auth invariants (enforced by the middleware before we get here):
+      - Bearer token must match an entry in ``transport.auth.tokens``.
+      - ``X-Alfred-Client`` must be in that entry's ``allowed_clients``.
+      - The body's ``peer`` field must match the authenticated peer
+        (same anti-spoof rule as ``/peer/send``).
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        correlation_id = _ensure_correlation_id(request, None)
+        return _json_error(400, "invalid_json", correlation_id=correlation_id)
+
+    correlation_id = _ensure_correlation_id(request, body)
+
+    peer_claim = body.get("peer")
+    date_str = body.get("date")
+    digest_md = body.get("digest_markdown")
+
+    if not isinstance(peer_claim, str) or not peer_claim:
+        return _json_error(
+            400, "schema_error",
+            detail="peer must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+    if not isinstance(date_str, str) or not date_str:
+        return _json_error(
+            400, "schema_error",
+            detail="date must be a non-empty ISO date string",
+            correlation_id=correlation_id,
+        )
+    if not isinstance(digest_md, str) or not digest_md:
+        return _json_error(
+            400, "schema_error",
+            detail="digest_markdown must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+
+    encoded_len = len(digest_md.encode("utf-8"))
+    if encoded_len > _MAX_DIGEST_BYTES:
+        return _json_error(
+            400, "schema_error",
+            detail=(
+                f"digest_markdown exceeds {_MAX_DIGEST_BYTES} byte cap "
+                f"(got {encoded_len})"
+            ),
+            correlation_id=correlation_id,
+        )
+
+    auth_peer = request.get("transport_peer", "")
+    if peer_claim != auth_peer:
+        log.warning(
+            "transport.peer.brief_digest_spoofed",
+            auth_peer=auth_peer,
+            claimed=peer_claim,
+            correlation_id=correlation_id,
+        )
+        return _json_error(
+            403, "from_mismatch",
+            detail="body.peer must equal authenticated peer",
+            correlation_id=correlation_id,
+        )
+
+    vault_path = _get_vault_path(request)
+    if vault_path is None:
+        return _json_error(
+            500, "vault_not_configured",
+            detail="vault path not registered on transport server",
+            correlation_id=correlation_id,
+        )
+
+    safe_peer = _safe_peer_filename_part(peer_claim)
+    safe_date = _safe_peer_filename_part(date_str)
+    received_at = datetime.now(timezone.utc).isoformat()
+
+    # Frontmatter — the brief renderer keys off ``type: run`` + ``source:
+    # peer`` + ``peer`` + ``created`` to find today's digests.
+    frontmatter = {
+        "type": "run",
+        "name": f"Peer Digest {safe_peer} {safe_date}",
+        "source": "peer",
+        "peer": peer_claim,
+        "received_at": received_at,
+        "created": date_str,
+        "correlation_id": correlation_id,
+        "content_length": encoded_len,
+        "tags": ["peer-digest", safe_peer],
+    }
+
+    fm_str = yaml.dump(
+        frontmatter, default_flow_style=False, allow_unicode=True, sort_keys=False,
+    )
+    file_text = f"---\n{fm_str}---\n\n{digest_md.rstrip()}\n"
+
+    rel_path = f"run/Peer Digest {safe_peer} {safe_date}.md"
+    file_path = vault_path / "run" / f"Peer Digest {safe_peer} {safe_date}.md"
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(file_text, encoding="utf-8")
+    except OSError as exc:
+        log.warning(
+            "transport.peer.brief_digest_write_failed",
+            peer=peer_claim,
+            path=str(file_path),
+            error=str(exc),
+            correlation_id=correlation_id,
+        )
+        return _json_error(
+            500, "write_failed",
+            detail=str(exc),
+            correlation_id=correlation_id,
+        )
+
+    log.info(
+        "transport.peer.brief_digest_received",
+        peer=peer_claim,
+        date=date_str,
+        path=rel_path,
+        bytes=encoded_len,
+        correlation_id=correlation_id,
+    )
+
+    return web.json_response(
+        {
+            "status": "accepted",
+            "path": rel_path,
+            "correlation_id": correlation_id,
+        },
+        status=202,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registrars — consumed by ROUTE_NAMESPACES in server.py
 # ---------------------------------------------------------------------------
 
@@ -518,6 +704,7 @@ def register_peer_routes(app: web.Application) -> None:
     app.router.add_post("/peer/send", _handle_peer_send)
     app.router.add_post("/peer/query", _handle_peer_query)
     app.router.add_post("/peer/handshake", _handle_peer_handshake)
+    app.router.add_post("/peer/brief_digest", _handle_peer_brief_digest)
 
 
 def register_canonical_routes(app: web.Application) -> None:

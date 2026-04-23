@@ -479,6 +479,7 @@ def _register_peer_stub(app: web.Application) -> None:
     app.router.add_post("/peer/send", _peer_not_implemented)
     app.router.add_post("/peer/query", _peer_not_implemented)
     app.router.add_post("/peer/handshake", _peer_not_implemented)
+    app.router.add_post("/peer/brief_digest", _peer_not_implemented)
 
 
 def _register_canonical_stub(app: web.Application) -> None:
