@@ -207,16 +207,21 @@ class ReplyParseResult:
 
 
 # Match an item-level fragment. Either:
-#   "2 down" / "4: high — note" / "1 ok"
+#   "2 down" / "4: high — note" / "1 ok" / "1. down"
 # Or, for cross-item delimiters, splits on commas and semicolons and
 # the literal word " and ". The fragment regex below extracts the
 # leading item number, the modifier/tier token(s), and any trailing
 # free-text note (separated by ``:``, ``--``, or ``—``).
+#
+# The separator class includes ``.`` so numbered-list shapes like
+# ``1. Down`` parse natively — that's the form autocorrect, dictation,
+# and voice transcripts produce, alongside the bare ``1 down`` and
+# explicit ``1: down`` / ``1 - down`` Andrew already uses.
 _FRAGMENT_RE = re.compile(
     r"""
     ^\s*
     (?P<item>\d+)                     # item number
-    \s*[:\-]?\s*                      # optional separator
+    \s*[:.\-]?\s*                     # optional separator (incl. "." for "1. Down")
     (?P<rest>.*?)                     # tokens + optional note
     \s*$
     """,

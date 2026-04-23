@@ -207,6 +207,79 @@ def test_parse_reply_med_alias():
     assert result.corrections[0].new_tier == "medium"
 
 
+# --- Numbered-list reply shape (1. Down / 2. Spam / 3. up) -----------------
+#
+# Autocorrect, dictation, and voice transcripts naturally produce
+# numbered-list format with a period after the digit. The separator
+# class in _FRAGMENT_RE accepts ``.`` so these parse as first-class
+# fragments alongside ``1 down`` / ``1: down`` / ``1 - down``.
+
+
+def test_parse_reply_numbered_list_modifier():
+    result = parse_reply("1. Down")
+    assert len(result.corrections) == 1
+    c = result.corrections[0]
+    assert c.item_number == 1
+    assert c.modifier == "down"
+    assert c.new_tier is None
+    assert c.note == ""
+
+
+def test_parse_reply_numbered_list_tier_spam():
+    result = parse_reply("1. Spam")
+    assert len(result.corrections) == 1
+    c = result.corrections[0]
+    assert c.item_number == 1
+    assert c.new_tier == "spam"
+    assert c.modifier is None
+
+
+def test_parse_reply_numbered_list_modifier_up():
+    result = parse_reply("1. up")
+    assert len(result.corrections) == 1
+    c = result.corrections[0]
+    assert c.item_number == 1
+    assert c.modifier == "up"
+    assert c.new_tier is None
+
+
+def test_parse_reply_numbered_list_tier_with_note():
+    result = parse_reply("1. high — Jamie was waiting")
+    assert len(result.corrections) == 1
+    c = result.corrections[0]
+    assert c.item_number == 1
+    assert c.new_tier == "high"
+    assert "Jamie was waiting" in c.note
+
+
+def test_parse_reply_numbered_list_multi_item_newline_split():
+    result = parse_reply("1. Down\n2. Spam\n3. up")
+    assert len(result.corrections) == 3
+    assert result.corrections[0].item_number == 1
+    assert result.corrections[0].modifier == "down"
+    assert result.corrections[1].item_number == 2
+    assert result.corrections[1].new_tier == "spam"
+    assert result.corrections[2].item_number == 3
+    assert result.corrections[2].modifier == "up"
+    assert result.unparsed == []
+
+
+def test_parse_reply_existing_forms_still_pass():
+    # Sanity check: the separator-class extension to include ``.`` must
+    # not regress the bare / colon / dash forms Andrew already uses.
+    bare = parse_reply("1 down")
+    assert bare.corrections[0].item_number == 1
+    assert bare.corrections[0].modifier == "down"
+
+    colon = parse_reply("1: down")
+    assert colon.corrections[0].item_number == 1
+    assert colon.corrections[0].modifier == "down"
+
+    dash = parse_reply("1 - down")
+    assert dash.corrections[0].item_number == 1
+    assert dash.corrections[0].modifier == "down"
+
+
 # --- Modifier arithmetic ---------------------------------------------------
 
 
