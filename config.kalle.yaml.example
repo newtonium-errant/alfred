@@ -127,3 +127,31 @@ telegram:
   # Safety-critical bash_exec audit log — separate from Salem's.
   bash_exec:
     audit_path: "/home/andrew/.alfred/kalle/data/bash_exec.jsonl"
+
+# ---------------------------------------------------------------------------
+# Brief-digest pusher — V.E.R.A. content arc sender
+# ---------------------------------------------------------------------------
+# KAL-LE assembles a one-slide digest of yesterday's activity each
+# morning and pushes it to Salem's /peer/brief_digest endpoint, where
+# it lands in the 06:00 morning brief as the "### KAL-LE Update"
+# section. Fires at 05:30 ADT — 30 minutes ahead of Salem's brief so
+# the digest is always present when the brief assembles.
+#
+# Salem omits this block (Salem is the receiver, not a sender).
+# STAY-C will adopt the same shape with self_name=stay-c.
+brief_digest_push:
+  enabled: true
+  self_name: "kal-le"
+  target_peer: "salem"
+  schedule:
+    time: "05:30"
+    timezone: "America/Halifax"
+  # Repos KAL-LE scans for yesterday's commits. Add new aftermath-*
+  # repos here as they spin up.
+  repo_paths:
+    - "/home/andrew/aftermath-lab"
+    - "/home/andrew/aftermath-alfred"
+  # data_dir defaults to logging.dir when omitted; bash_exec.jsonl +
+  # instructor_state.json live there.
+  # bit_state_path is optional — KAL-LE doesn't run BIT in v1, so
+  # leaving this empty defaults posture to "green / no BIT data".

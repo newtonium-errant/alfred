@@ -244,6 +244,44 @@ def _run_brief(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     asyncio.run(run_daemon(config))
 
 
+def _run_brief_digest_push(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """Brief-digest pusher daemon entry point (V.E.R.A. content arc sender).
+
+    Runs on KAL-LE / STAY-C / future specialist instances. Auto-starts
+    when ``brief_digest_push:`` is in the unified config AND
+    ``enabled: true``. Salem intentionally omits the block — it is the
+    receiver, not a sender.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/brief_digest_push.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    # Reuse brief's setup_logging — same signature, no bespoke logger
+    # needed. Keeps log format consistent with the receiver side.
+    from alfred.brief.utils import setup_logging
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    from alfred.brief.kalle_brief_daemon import (
+        load_brief_digest_push_config,
+        run_daemon,
+    )
+    from alfred.transport.config import load_from_unified as load_transport
+    config = load_brief_digest_push_config(raw)
+    if not config.enabled:
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("kalle.brief_digest.daemon.disabled_in_config")
+        sys.exit(78)
+    if not config.self_name:
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("kalle.brief_digest.daemon.missing_self_name")
+        sys.exit(78)
+    transport_config = load_transport(raw)
+    asyncio.run(run_daemon(config, transport_config))
+
+
 def _run_daily_sync(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Daily Sync daemon process entry point.
 
@@ -362,6 +400,7 @@ TOOL_RUNNERS = {
     "bit": _run_bit,
     "talker": _run_talker,
     "daily_sync": _run_daily_sync,
+    "brief_digest_push": _run_brief_digest_push,
 }
 
 
@@ -417,6 +456,12 @@ def run_all(
         # the block so it doesn't fire 09:00 conversations about coding.
         if "daily_sync" in raw and (raw.get("daily_sync") or {}).get("enabled"):
             tools.append("daily_sync")
+        # Brief-digest pusher (V.E.R.A. content arc sender) auto-starts
+        # when ``brief_digest_push:`` is in config AND ``enabled: true``.
+        # KAL-LE turns this on; Salem leaves it absent (Salem is the
+        # principal — receiver, not sender).
+        if "brief_digest_push" in raw and (raw.get("brief_digest_push") or {}).get("enabled"):
+            tools.append("brief_digest_push")
 
     # Validate tool names
     for tool in tools:
@@ -471,7 +516,7 @@ def run_all(
         # Tools whose runner signature is ``(raw, suppress_stdout)`` (no
         # skills_dir). BIT has no skill prompts — it drives the
         # aggregator directly — so it lives in this bucket.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

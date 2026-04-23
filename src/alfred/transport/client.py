@@ -525,3 +525,65 @@ async def peer_handshake(
         correlation_id=cid,
         json_body={"from": self_name, "protocol_version": 1},
     )
+
+
+async def peer_send_brief_digest(
+    peer_name: str,
+    *,
+    digest_markdown: str,
+    digest_date: str,
+    self_name: str,
+    config: "TransportConfig | None" = None,
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /peer/brief_digest on the named peer (V.E.R.A. content arc).
+
+    Args:
+        peer_name: Outbound peer key (typically ``"salem"`` from
+            KAL-LE's perspective). Used to look up base_url + token in
+            the caller's ``transport.peers`` config block.
+        digest_markdown: The one-slide rendered digest body. The
+            principal's brief renderer uses this verbatim under
+            ``### {Sender} Update``.
+        digest_date: ISO date string (typically today's local date on
+            the sender). The principal stores the digest under that
+            date and matches it when rendering today's brief.
+        self_name: This instance's identity (``"kal-le"``,
+            ``"stay-c"``, etc.). Goes into the body's ``peer`` field
+            so the principal's anti-spoof check passes.
+        config: Pre-loaded TransportConfig. Production callers supply
+            it; tests can monkey-patch the request layer instead.
+        correlation_id: Optional caller-supplied id for tracing. The
+            sender passes ``"{self_name}-brief-{date}"`` by convention
+            so a re-fire on the same day is observable as a retry.
+
+    Returns:
+        Server's response dict — ``{"status": "accepted", "path": str,
+        "correlation_id": str}`` on the happy path. Caller logs and
+        moves on — failures should NOT be retried inline (the
+        principal's brief tolerates a missing digest via the
+        intentionally-left-blank fallback).
+    """
+    from .config import TransportConfig, load_config
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = correlation_id or f"{self_name}-brief-{digest_date}"
+
+    body: dict[str, Any] = {
+        "peer": self_name,
+        "date": digest_date,
+        "digest_markdown": digest_markdown,
+        "correlation_id": cid,
+    }
+    return await _peer_request(
+        base_url=base_url,
+        token=token,
+        method="POST",
+        path="/peer/brief_digest",
+        self_name=self_name,
+        correlation_id=cid,
+        json_body=body,
+    )

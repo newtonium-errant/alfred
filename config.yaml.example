@@ -353,6 +353,19 @@ brief:
   upcoming_events:
     enabled: true            # set false to omit the section entirely
     max_days_ahead: 30       # window cap; events further out are dropped
+  #
+  # Peer Digests — V.E.R.A. content arc receiver. Each specialist
+  # instance (KAL-LE, STAY-C, ...) pushes its own one-slide digest to
+  # this principal's /peer/brief_digest endpoint each morning. The
+  # brief renders one ``### {Peer} Update`` sub-section per peer.
+  # When a peer in ``expected_peers`` didn't push today, the section
+  # falls back to "No {Peer} update today." so absence is visible.
+  peer_digests:
+    enabled: true            # set false to omit the section entirely
+    expected_peers:          # peers whose absence should surface
+      - kal-le
+    # peer_canonical_names: # optional override for the section header
+    #   kalle: "K.A.L.L.E."  # default uppercases the peer key
 
 # Daily Sync — 09:00 ADT Telegram conversation channel (email-surfacing c2).
 # Salem fires a per-day OODA-loop message: today's calibration batch (5
