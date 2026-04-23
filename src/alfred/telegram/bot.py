@@ -1925,6 +1925,84 @@ async def _maybe_handle_daily_sync_reply(
     return True
 
 
+async def _maybe_smart_route_daily_sync_reply(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_text: str,
+) -> bool:
+    """Try to smart-route ``user_text`` as a Daily Sync reply (Option B).
+
+    Companion to :func:`_maybe_handle_daily_sync_reply` — that helper
+    requires Telegram's reply-to-message context, this one runs when
+    Andrew sent a fresh message (no reply context) that LOOKS like a
+    calibration reply AND the latest Daily Sync batch hasn't been
+    replied to yet. Returns True iff handled (caller skips the rest
+    of the conversation pipeline). Never raises into the caller.
+
+    The shape-detection heuristic + false-positive guard live in
+    ``daily_sync.reply_dispatch.maybe_smart_route_reply`` — this
+    helper is just the bot-side adapter.
+    """
+    raw_config = ctx.application.bot_data.get("raw_config") or {}
+    try:
+        from alfred.daily_sync.config import load_from_unified as load_ds
+        from alfred.daily_sync.reply_dispatch import (
+            maybe_smart_route_reply,
+        )
+    except ImportError:
+        return False
+
+    try:
+        ds_config = load_ds(raw_config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.daily_sync_smart_route_config_failed",
+            error=str(exc),
+        )
+        return False
+
+    if not ds_config.enabled:
+        return False
+
+    talker_config = ctx.application.bot_data.get(_KEY_CONFIG)
+    vault_path: Path | None = None
+    if talker_config is not None:
+        try:
+            vault_path = Path(talker_config.vault.path)
+        except Exception:  # noqa: BLE001
+            vault_path = None
+
+    try:
+        result = maybe_smart_route_reply(
+            ds_config, user_text, vault_path=vault_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.daily_sync_smart_route_failed",
+            error=str(exc),
+        )
+        return False
+
+    if result is None:
+        return False
+
+    if update.message is not None:
+        try:
+            await update.message.reply_text(result.get("message", "ok."))
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "talker.bot.daily_sync_smart_route_ack_failed",
+                error=str(exc),
+            )
+    log.info(
+        "talker.bot.daily_sync_smart_route",
+        confirmed=result.get("confirmed_count", 0),
+        all_ok=result.get("all_ok", False),
+        unparsed=len(result.get("unparsed", [])),
+    )
+    return True
+
+
 # --- Inline-command pre-check --------------------------------------------
 #
 # PTB's ``CommandHandler`` only fires when the message text *starts* with
@@ -2111,6 +2189,19 @@ async def handle_message(
     if parent_msg_id is not None:
         handled = await _maybe_handle_daily_sync_reply(
             update, ctx, parent_msg_id, text,
+        )
+        if handled:
+            return
+    else:
+        # Option B (Phase 2): smart-routing for the FIRST message
+        # after a Daily Sync push that looks like a calibration
+        # response, even when Andrew didn't use Telegram's
+        # reply-to-message context. Heuristic + false-positive guard
+        # live in ``daily_sync.reply_dispatch.maybe_smart_route_reply``.
+        # Falls through silently when the message doesn't look like a
+        # calibration reply or the latest batch was already replied to.
+        handled = await _maybe_smart_route_daily_sync_reply(
+            update, ctx, text,
         )
         if handled:
             return

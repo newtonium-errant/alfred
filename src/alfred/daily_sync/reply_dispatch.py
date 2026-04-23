@@ -29,6 +29,7 @@ arrives and Andrew replies to it.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -50,7 +51,7 @@ from .assembler import (
 )
 from .attribution_corpus import AttributionCorpusEntry, append_entry as append_attribution_entry
 from .config import DailySyncConfig
-from .confidence import load_state
+from .confidence import load_state, save_state
 from .corpus import CorpusEntry, append_correction
 
 log = structlog.get_logger(__name__)
@@ -92,6 +93,256 @@ def reply_targets_daily_sync(
 ) -> bool:
     """Return True iff ``parent_message_id`` matches the persisted batch."""
     return parent_message_id in _last_batch_message_ids(config)
+
+
+# ---------------------------------------------------------------------------
+# Option B — smart-routing reply parser (Phase 2)
+# ---------------------------------------------------------------------------
+#
+# Andrew's UX expectation (2026-04-23 voice session):
+#
+#   "If my first message after receiving the calibration data looks like
+#    a calibration response, including partial responses, treat it as
+#    such. If I need to add more detail later I will use the reply to
+#    message function, like I would in a human conversation."
+#
+# Implementation:
+#   1. The state-file ``last_batch`` carries a new ``replied: bool``
+#      field (default false). The reply dispatcher flips it to true on
+#      ANY successful Daily Sync reply (smart-routed or reply-to-message).
+#   2. ``maybe_smart_route_reply`` is called early in the bot's message
+#      handler — BEFORE the normal conversation pipeline. When the
+#      message text matches the calibration heuristic AND the latest
+#      Daily Sync hasn't been replied to yet, the dispatcher routes it
+#      through the existing reply flow.
+#   3. False-positive guard: if the parser returns zero corrections AND
+#      zero all_ok, the smart-routing was wrong — revert the flag and
+#      let the caller fall through to normal conversation.
+#
+# Once ``replied=true`` for a batch, subsequent messages route through
+# normal conversation. Andrew uses Telegram's reply-to-message for
+# follow-up clarifications, which still hits the existing
+# ``reply_targets_daily_sync`` path with explicit override semantics.
+
+# Calibration-shape heuristic patterns. Order matters — the parser
+# returns the FIRST matching shape so a pure ``✅`` short-circuits
+# without running the more expensive numbered-list regex.
+#
+# Why not just always defer to the parser? The parser will
+# enthusiastically bucket "1. tomorrow we should..." as item 1 with
+# unparsed token "tomorrow", which is a noisy false positive. The
+# heuristic is a cheap pre-filter: it only routes to the parser when
+# the message has the SHAPE of a calibration response, not just a
+# coincidental leading digit.
+
+# Whole-message ack tokens — the existing parser also recognises these
+# (via ``_ALL_OK_PATTERNS``). Duplicated here so the smart-routing
+# decision doesn't depend on importing parser internals.
+_SMART_ROUTE_ALL_OK_RE = re.compile(
+    r"^(?:✅|✔|👍|ok|okay|all good|all ok|looks good|approved)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
+# Numbered-list bullet at the start of the message: ``1.``, ``1)``,
+# ``1 ``. Lenient on whitespace + bullet style. The single-digit form
+# is intentional — Daily Sync items are 1-indexed and rarely exceed 30,
+# but ``\d+`` rather than ``\d{1,2}`` keeps the regex simple.
+_SMART_ROUTE_NUMBERED_LIST_RE = re.compile(r"^\s*\d+\s*[.\):]?\s+\S")
+
+# Multi-numbered references: ``1 down, 2 spam`` / ``1: high; 6 confirm``.
+# We require TWO matches so a single coincidental "1 hour later"
+# doesn't false-positive. The token alternation matches the email tier
+# verbs + attribution verbs the parser recognises.
+_SMART_ROUTE_NUM_REF_RE = re.compile(
+    r"\b\d+\s*[.,:\-]?\s*"
+    r"(high|medium|med|low|spam|up|down|"
+    r"confirm|keep|yes|reject|delete|remove|no|"
+    r"ok|okay|good|approved)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_calibration_reply(text: str) -> bool:
+    """Return True when ``text`` has the shape of a Daily Sync reply.
+
+    Three matching shapes (any one is sufficient):
+
+    1. A whole-message ack token (``✅``, ``ok``, ``all good``, etc.).
+    2. A leading numbered-list bullet (``1. ...`` / ``1) ...`` /
+       ``1 ...``) — caller still verifies the parser actually
+       extracts a correction (false-positive guard).
+    3. Two or more "<number> <verb>" tokens in the text — the
+       multi-item shorthand Andrew uses for batched corrections
+       (``1 down, 2 spam``).
+
+    The function is deliberately conservative on the third shape (two
+    matches required) so prose like "1 hour later, 2 questions came
+    up" doesn't smart-route. The caller's false-positive guard
+    (parser returns zero corrections) catches the residual misses.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # Strip a leading bullet so " - ✅" still matches the all-ok pattern.
+    cleaned = re.sub(r"^[-*•]\s+", "", stripped)
+    if _SMART_ROUTE_ALL_OK_RE.match(cleaned):
+        return True
+    if _SMART_ROUTE_NUMBERED_LIST_RE.match(cleaned):
+        return True
+    matches = _SMART_ROUTE_NUM_REF_RE.findall(cleaned)
+    if len(matches) >= 2:
+        return True
+    return False
+
+
+def is_latest_batch_replied(config: DailySyncConfig) -> bool:
+    """Return True when the latest persisted batch already saw a reply.
+
+    Looks up ``last_batch.replied`` from the state file. A missing
+    key (older state, no batch ever pushed) returns False — the
+    smart-routing guard treats "no batch" as "nothing to route to".
+    """
+    state = load_state(config.state.path)
+    batch = state.get("last_batch") or {}
+    return bool(batch.get("replied", False))
+
+
+def mark_batch_replied(config: DailySyncConfig) -> None:
+    """Flip ``last_batch.replied`` to True in the state file.
+
+    No-op when no batch is persisted. Tolerant of malformed state —
+    we read+rewrite via the existing ``load_state`` / ``save_state``
+    helpers so the rest of the state file is preserved verbatim.
+    """
+    state = load_state(config.state.path)
+    batch = state.get("last_batch")
+    if not isinstance(batch, dict):
+        return
+    if batch.get("replied") is True:
+        return  # idempotent
+    batch["replied"] = True
+    state["last_batch"] = batch
+    try:
+        save_state(config.state.path, state)
+    except OSError as exc:
+        log.warning(
+            "daily_sync.smart_route.flag_write_failed",
+            error=str(exc),
+        )
+
+
+def _revert_batch_replied(config: DailySyncConfig) -> None:
+    """Roll back ``last_batch.replied`` after a false-positive smart-route.
+
+    Used when ``maybe_smart_route_reply`` optimistically flips the
+    flag but the parser produces zero actionable output — we don't
+    want to lock Andrew out of the legitimate calibration window
+    because of a mis-classified message.
+    """
+    state = load_state(config.state.path)
+    batch = state.get("last_batch")
+    if not isinstance(batch, dict):
+        return
+    if batch.get("replied") is not True:
+        return
+    batch["replied"] = False
+    state["last_batch"] = batch
+    try:
+        save_state(config.state.path, state)
+    except OSError as exc:
+        log.warning(
+            "daily_sync.smart_route.flag_revert_failed",
+            error=str(exc),
+        )
+
+
+def maybe_smart_route_reply(
+    config: DailySyncConfig,
+    reply_text: str,
+    *,
+    vault_path: Path | None = None,
+) -> dict[str, Any] | None:
+    """Try to handle ``reply_text`` as a Daily Sync reply WITHOUT a
+    reply-to-message context. Returns the same shape as
+    :func:`handle_daily_sync_reply` on success, or ``None`` to fall
+    through to normal conversation.
+
+    Routing rules (Andrew's spec, 2026-04-23):
+      1. If a Daily Sync batch is persisted AND it has not yet been
+         replied to AND ``reply_text`` matches the calibration shape:
+         route through the dispatcher with the latest batch's first
+         ``message_id`` as the synthetic parent.
+      2. If the parser produces zero corrections AND zero ``all_ok``,
+         treat the route as a false positive — revert the ``replied``
+         flag and return ``None`` so the caller falls through.
+      3. Once ``replied=true``, subsequent messages always fall
+         through. Andrew uses reply-to-message for follow-ups.
+
+    The caller (bot) checks ``reply_targets_daily_sync`` first. This
+    function is the second-line dispatch for messages that DON'T have
+    a Telegram reply context — the "first-message-after-Daily-Sync
+    looks like a calibration response" UX.
+    """
+    if not reply_text or not reply_text.strip():
+        return None
+
+    if is_latest_batch_replied(config):
+        return None
+
+    if not looks_like_calibration_reply(reply_text):
+        return None
+
+    message_ids = sorted(_last_batch_message_ids(config))
+    if not message_ids:
+        # No batch persisted — nothing to route to. Don't flip the
+        # flag; nothing to flip.
+        return None
+
+    # Optimistically flip the flag BEFORE running the dispatcher so a
+    # crash mid-dispatch doesn't leave the next legitimate
+    # smart-routed message stranded behind a "not yet replied" gate.
+    # The false-positive guard below reverts the flag if needed.
+    mark_batch_replied(config)
+
+    # Use the lowest message_id as the synthetic parent — the
+    # dispatcher only checks set membership so any of the persisted
+    # IDs works.
+    synthetic_parent = message_ids[0]
+    result = handle_daily_sync_reply(
+        config,
+        parent_message_id=synthetic_parent,
+        reply_text=reply_text,
+        vault_path=vault_path,
+    )
+
+    if result is None:
+        # Defensive: shouldn't happen because we just confirmed
+        # message_ids exist, but the dispatcher could conceivably
+        # return None on a torn-state read. Revert the flag.
+        _revert_batch_replied(config)
+        return None
+
+    # False-positive guard: zero confirmed AND not all_ok means the
+    # parser couldn't extract a calibration action from this message.
+    # Revert the flag so the next legitimate calibration reply still
+    # lands.
+    if not result.get("all_ok") and not result.get("confirmed_count"):
+        _revert_batch_replied(config)
+        log.info(
+            "daily_sync.smart_route.false_positive_revert",
+            unparsed=len(result.get("unparsed", [])),
+        )
+        return None
+
+    log.info(
+        "daily_sync.smart_route.applied",
+        parent_message_id=synthetic_parent,
+        confirmed=result.get("confirmed_count", 0),
+        all_ok=result.get("all_ok", False),
+    )
+    return result
 
 
 def _attribution_corpus_path(config: DailySyncConfig) -> str:
@@ -511,6 +762,22 @@ def handle_daily_sync_reply(
         attribution_written=attribution_written,
         unparsed=len(errors),
     )
+
+    # Mark the batch as replied so subsequent messages route through
+    # normal conversation (Andrew's UX expectation: reply-to-message
+    # for follow-up clarifications, not chained smart-routes).
+    # We only flip the flag when something material happened (all_ok
+    # or at least one correction landed) — a pure-noise reply-to-
+    # message that produced zero corrections shouldn't lock out the
+    # smart-routing window for a real calibration reply later.
+    if parsed.all_ok or written_count > 0:
+        try:
+            mark_batch_replied(config)
+        except Exception as exc:  # noqa: BLE001 — flag-write failure must not crash the dispatcher
+            log.warning(
+                "daily_sync.reply_processed.flag_write_failed",
+                error=str(exc),
+            )
 
     return {
         "confirmed_count": written_count,
