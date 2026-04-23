@@ -11,6 +11,7 @@ from alfred.common.schedule import compute_next_fire, sleep_until
 
 from .config import BriefConfig
 from .health_section import render_health_section
+from .peer_digests import render_peer_digests_section
 from .renderer import render_brief, serialize_record
 from .state import BriefRun, StateManager
 from .utils import get_logger
@@ -108,13 +109,32 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         today_local,
     )
 
+    # Peer Digests — V.E.R.A. content arc. One ``### {Peer} Update``
+    # sub-section per expected peer (or per peer with a record today).
+    # Empty string when the section is disabled OR no peers configured
+    # AND nothing arrived. See peer_digests.py for the
+    # intentionally-left-blank semantics.
+    peer_digests_md = ""
+    if config.peer_digests.enabled:
+        peer_digests_md = render_peer_digests_section(
+            config.vault_path,
+            today_local.isoformat(),
+            expected_peers=config.peer_digests.expected_peers,
+            peer_canonical_names=config.peer_digests.peer_canonical_names,
+        )
+
     # Section order is load-bearing: Health first (readers scan top-down;
     # critical status gets the highest priority real estate), Weather
     # second (time-sensitive but non-operational), Operations third
     # (retrospective summary — less time-sensitive than the others).
-    # Upcoming Events lives last because it's forward-looking — useful
+    # Upcoming Events fourth because it's forward-looking — useful
     # context once the reader has absorbed current state, but lower
     # priority than health/weather/now-state summaries.
+    # Peer Digests last (before signature) because they represent OTHER
+    # instances' takes on their own state — informational, not actionable
+    # by Salem's reader on their own. Sits AFTER Upcoming Events so the
+    # principal's own forward calendar is the immediately-actionable
+    # surface and peer chatter follows.
     sections = [
         ("Health", health_md),
         ("Weather", weather_md),
@@ -122,6 +142,8 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     ]
     if upcoming_md:
         sections.append(("Upcoming Events", upcoming_md))
+    if peer_digests_md:
+        sections.append(("Peer Digests", peer_digests_md))
 
     # Render
     frontmatter, body = render_brief(today, sections, config)
