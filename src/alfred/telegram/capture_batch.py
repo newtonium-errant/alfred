@@ -344,14 +344,55 @@ async def write_summary_to_session_record(
     ``"partial"`` without a schema migration. The session record MUST
     already exist (written by session.close_session before this is
     called).
+
+    Calibration audit gap (c4): the entire ``## Structured Summary``
+    block is Sonnet-inferred output (every section is a model
+    classification of the user's monologue), so we wrap the rendered
+    markdown in BEGIN_INFERRED/END_INFERRED markers and append one
+    ``attribution_audit`` entry to the session record's frontmatter.
+    Failure-marker writes (``structured_flag="failed"``) skip the
+    wrapping — there's no inferred prose, just a human-readable error.
     """
+    set_fields: dict = {"capture_structured": structured_flag}
+    summary_to_write = summary_markdown
+
+    if structured_flag == "true":
+        # Local import to keep this module's surface tight.
+        from alfred.vault import attribution
+
+        wrapped, audit_entry = attribution.with_inferred_marker(
+            summary_markdown,
+            section_title="Structured Summary",
+            agent="salem",
+            reason=f"capture batch structuring (session={session_rel_path})",
+        )
+        summary_to_write = wrapped
+
+        # Merge into existing audit list if any.
+        existing_audit: list = []
+        try:
+            existing = ops.vault_read(vault_path, session_rel_path)
+            existing_fm = existing.get("frontmatter") or {}
+            if isinstance(existing_fm.get("attribution_audit"), list):
+                existing_audit = list(existing_fm["attribution_audit"])
+        except Exception as exc:  # noqa: BLE001 — read failure shouldn't block the write
+            log.info(
+                "talker.capture.audit_read_failed",
+                session_rel_path=session_rel_path,
+                error=str(exc),
+            )
+
+        merged_fm: dict = {"attribution_audit": existing_audit}
+        attribution.append_audit_entry(merged_fm, audit_entry)
+        set_fields["attribution_audit"] = merged_fm["attribution_audit"]
+
     def _rewrite(body: str) -> str:
-        return _insert_summary_above_transcript(body, summary_markdown)
+        return _insert_summary_above_transcript(body, summary_to_write)
 
     ops.vault_edit(
         vault_path,
         session_rel_path,
-        set_fields={"capture_structured": structured_flag},
+        set_fields=set_fields,
         body_rewriter=_rewrite,
     )
 

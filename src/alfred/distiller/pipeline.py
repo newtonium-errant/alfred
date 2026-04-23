@@ -763,6 +763,61 @@ async def _stage3_create(
     return None
 
 
+def _mark_learn_record_inferred(
+    vault_dir: Path,
+    rel_path: str,
+    spec: LearningSpec,
+) -> None:
+    """Stamp an attribution_audit entry + body marker on a freshly-
+    created learn record (calibration audit gap, c4).
+
+    The distiller agent (subprocess) wrote this record's body via
+    ``alfred vault create`` — the body IS the agent-inferred claim. We
+    post-process the file to wrap the body in BEGIN_INFERRED markers
+    and append an ``attribution_audit`` entry to the frontmatter so
+    Andrew can confirm/reject via the Daily Sync flow.
+
+    Idempotent: if the body already starts with a BEGIN_INFERRED
+    marker (e.g. the agent SKILL evolves to wrap inline later), the
+    attribution helper reuses the existing marker_id and just refreshes
+    the audit entry. Errors are logged + swallowed — the underlying
+    record write succeeded; failing to stamp the marker shouldn't roll
+    that back.
+    """
+    try:
+        import frontmatter
+
+        from alfred.vault import attribution
+
+        full = vault_dir / rel_path
+        if not full.exists():
+            return
+        post = frontmatter.load(str(full))
+        body = post.content or ""
+        if not body.strip():
+            return
+        wrapped, audit_entry = attribution.with_inferred_marker(
+            body,
+            section_title=spec.title or rel_path,
+            agent="distiller",
+            reason=(
+                f"distiller pipeline (type={spec.learn_type}, "
+                f"sources={', '.join(spec.source_links) or 'none'})"
+            ),
+        )
+        fm = post.metadata or {}
+        attribution.append_audit_entry(fm, audit_entry)
+        post.metadata = fm
+        post.content = wrapped
+        full.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        log.info(
+            "pipeline.s3_attribution_mark_failed",
+            path=rel_path,
+            error=str(exc),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Pass B — Cross-learning meta-analysis
 # ---------------------------------------------------------------------------
@@ -980,6 +1035,13 @@ async def run_pipeline(
             lt = spec.learn_type
             result.records_created[lt] = result.records_created.get(lt, 0) + 1
             created_paths.append(created_path)
+            # Calibration audit gap (c4): wrap the agent-composed body
+            # of the freshly-created learn record + append an audit
+            # entry to its frontmatter so the Daily Sync flow can
+            # surface it for Andrew's confirm/reject.
+            _mark_learn_record_inferred(
+                config.vault.vault_path, created_path, spec,
+            )
 
     # Update source records with links to created learnings.
     # Merge with existing distiller_learnings so re-processing a source does

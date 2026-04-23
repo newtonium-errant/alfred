@@ -327,12 +327,31 @@ def _dispatch_tool(
 
         if tool_name == "vault_create":
             name = tool_input.get("name", "") or ""
+            # Calibration audit gap (c4): when the instructor agent
+            # composes a body for the new record, wrap it in
+            # BEGIN_INFERRED markers + append an attribution_audit
+            # entry to frontmatter. ``body=None`` (template-default)
+            # skips wrapping — there's no inferred prose, just
+            # scaffold. Mirrors the talker's vault_create wiring.
+            from alfred.vault import attribution
+            sf_create = dict(set_fields) if isinstance(set_fields, dict) else {}
+            wrapped_body = body
+            if body and str(body).strip():
+                src = session_path or "(no session)"
+                wrapped_body, audit_entry = attribution.with_inferred_marker(
+                    str(body),
+                    section_title=name or rel_path or "instructor-write",
+                    agent="instructor",
+                    reason=f"instructor directive (source={src})",
+                )
+                attribution.append_audit_entry(sf_create, audit_entry)
+
             result = ops.vault_create(
                 vault_path,
                 record_type,
                 name,
-                set_fields=set_fields,
-                body=body,
+                set_fields=sf_create or None,
+                body=wrapped_body,
             )
             mutated_paths.append(result["path"])
             log_mutation(
@@ -347,12 +366,52 @@ def _dispatch_tool(
             append_fields = tool_input.get("append_fields") if isinstance(
                 tool_input.get("append_fields"), dict
             ) else None
+            # Calibration audit gap (c4): wrap a body_append fragment
+            # in inferred markers + carry forward any existing
+            # attribution_audit entries on the target record.
+            from alfred.vault import attribution
+            sf_edit = dict(set_fields) if isinstance(set_fields, dict) else {}
+            wrapped_append = body_append
+            if body_append and str(body_append).strip():
+                # Read existing frontmatter to merge with prior audit
+                # entries — mirrors talker._execute_tool.
+                merged_fm: dict = {}
+                try:
+                    existing = ops.vault_read(vault_path, rel_path)
+                    existing_fm = existing.get("frontmatter") or {}
+                    if isinstance(existing_fm.get("attribution_audit"), list):
+                        merged_fm["attribution_audit"] = list(
+                            existing_fm["attribution_audit"]
+                        )
+                except Exception:  # noqa: BLE001 — read failure shouldn't mask the underlying VaultError
+                    pass
+                merged_fm.update(sf_edit)
+                # Section title — first heading in fragment, falling
+                # back to file stem.
+                section_title = "instructor-write"
+                for line in str(body_append).splitlines():
+                    s = line.strip()
+                    if s.startswith("#"):
+                        section_title = s.lstrip("#").strip() or section_title
+                        break
+                if section_title == "instructor-write" and rel_path:
+                    section_title = Path(rel_path).stem or section_title
+                src = session_path or "(no session)"
+                wrapped_append, audit_entry = attribution.with_inferred_marker(
+                    str(body_append),
+                    section_title=section_title,
+                    agent="instructor",
+                    reason=f"instructor directive (source={src})",
+                )
+                attribution.append_audit_entry(merged_fm, audit_entry)
+                sf_edit = merged_fm
+
             result = ops.vault_edit(
                 vault_path,
                 rel_path,
-                set_fields=set_fields,
+                set_fields=sf_edit or None,
                 append_fields=append_fields,
-                body_append=body_append,
+                body_append=wrapped_append,
             )
             mutated_paths.append(result["path"])
             log_mutation(

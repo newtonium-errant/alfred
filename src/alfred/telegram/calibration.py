@@ -353,11 +353,72 @@ def apply_proposals(
     # and swallowed so close_session never fails on calibration mischief.
     from alfred.vault import ops  # local import to avoid cycle at module load
 
+    # Calibration audit gap (c4): every bullet under
+    # ``rendered_by_subsection`` is, by definition, agent-inferred prose
+    # synthesised by Sonnet from the session transcript. Wrap each
+    # subsection's bullets in a BEGIN_INFERRED/END_INFERRED marker pair
+    # and append one ``attribution_audit`` entry per subsection to the
+    # person record's frontmatter. The Daily Sync confirm/reject flow
+    # then surfaces each subsection's bundle to Andrew.
+    #
+    # Per-bullet markers were considered and rejected: each subsection
+    # already has a clear semantic boundary (## Heading), and one
+    # confirm/reject decision per subsection matches Andrew's mental
+    # model better than a per-bullet barrage.
+    from alfred.vault import attribution
+
+    audit_entries: list[attribution.AuditEntry] = []
+    wrapped_by_subsection: dict[str, list[str]] = {}
+    for sub, bullets in rendered_by_subsection.items():
+        joined = "\n".join(bullets)
+        # source_session_rel is per-proposal but they're all from the
+        # same session for this apply call; use the first non-empty.
+        sample_source = ""
+        for prop in summary["applied"]:
+            if prop.subsection == sub or (
+                prop.subsection not in KNOWN_SUBSECTIONS and sub == "Notes"
+            ):
+                if prop.source_session_rel:
+                    sample_source = prop.source_session_rel
+                    break
+        reason_src = sample_source or session_record_path or "(unknown session)"
+        wrapped_block, entry = attribution.with_inferred_marker(
+            joined,
+            section_title=f"Calibration — {sub}",
+            agent="salem",
+            reason=f"calibration update (source={reason_src})",
+        )
+        wrapped_by_subsection[sub] = [wrapped_block]
+        audit_entries.append(entry)
+
+    # Read existing frontmatter so we can merge our new audit entries
+    # into any list that already exists (prior calibration runs).
+    existing_audit: list = []
+    try:
+        existing = ops.vault_read(vault_path, rel)
+        existing_fm = existing.get("frontmatter") or {}
+        if isinstance(existing_fm.get("attribution_audit"), list):
+            existing_audit = list(existing_fm["attribution_audit"])
+    except Exception as exc:  # noqa: BLE001 — read failure shouldn't block writes
+        log.info(
+            "talker.calibration.audit_read_failed",
+            error=str(exc),
+        )
+
+    merged_fm: dict = {"attribution_audit": existing_audit}
+    for entry in audit_entries:
+        attribution.append_audit_entry(merged_fm, entry)
+
     def _rewriter(body: str) -> str:
-        return _insert_into_block(body, rendered_by_subsection)
+        return _insert_into_block(body, wrapped_by_subsection)
 
     try:
-        ops.vault_edit(vault_path, rel, body_rewriter=_rewriter)
+        ops.vault_edit(
+            vault_path,
+            rel,
+            set_fields={"attribution_audit": merged_fm["attribution_audit"]},
+            body_rewriter=_rewriter,
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "talker.calibration.apply_failed",

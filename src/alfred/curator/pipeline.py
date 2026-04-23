@@ -449,6 +449,32 @@ def _resolve_entities(
                 v = v.strip('"')
             set_fields[k] = v
 
+        # Calibration audit gap (c4): Stage 1's manifest body is
+        # composed by the curator agent (LLM) from the inbox content,
+        # so the body that lands here is agent-inferred. Wrap it in
+        # BEGIN_INFERRED markers and append an audit_entry to
+        # frontmatter. Only wrap when there's actual body content (a
+        # bare ``# {name}`` placeholder is template scaffold, not
+        # inference — we still wrap because the model's *choice* of
+        # name/description IS the inference, and the wrap-vs-skip
+        # decision is "did the model write prose here?").
+        from alfred.vault import attribution
+        if body and body.strip():
+            wrapped_body, audit_entry = attribution.with_inferred_marker(
+                body,
+                section_title=name or entity_key,
+                agent="curator",
+                reason=f"curator stage 2 entity create (inbox source)",
+            )
+            body = wrapped_body
+            existing_audit = set_fields.get("attribution_audit")
+            audit_list: list = (
+                list(existing_audit) if isinstance(existing_audit, list) else []
+            )
+            tmp_fm: dict = {"attribution_audit": audit_list}
+            attribution.append_audit_entry(tmp_fm, audit_entry)
+            set_fields["attribution_audit"] = tmp_fm["attribution_audit"]
+
         try:
             result = vault_create(
                 vault_path,
@@ -553,7 +579,18 @@ async def _stage4_enrich(
     config: CuratorConfig,
     session_path: str,
 ) -> list[str]:
-    """Stage 4: Enrich each entity with LLM. Returns list of enriched entity paths."""
+    """Stage 4: Enrich each entity with LLM. Returns list of enriched entity paths.
+
+    Calibration audit gap (c4): Stage 4 enrichment writes happen INSIDE
+    the curator agent (subprocess via ``_call_llm`` → ``alfred vault
+    edit``). Wrapping the agent-composed body would require either a
+    post-process pass that diffs entity records before+after this call,
+    or threading attribution-marker semantics through the ``alfred
+    vault`` CLI itself. Deferred to a follow-up — Stage 2's direct
+    ``vault_create`` (above) already wraps the body the agent has the
+    most influence over (the entity's initial composition); Stage 4's
+    refinements layer on top and inherit the existing marker pair.
+    """
     template = _load_stage_prompt("stage4_enrich.md")
     if not template:
         return []
