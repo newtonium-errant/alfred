@@ -563,6 +563,77 @@ async def _dispatch_bash_exec(
     return _dumps(result)
 
 
+# --- Attribution-marker wiring (calibration audit gap, c2) ---------------
+
+
+def _agent_slug(config: TalkerConfig | None) -> str:
+    """Return the agent slug used in attribution markers.
+
+    Derived from ``config.instance.name`` lowercased ("Salem" → "salem",
+    "KAL-LE" → "kal-le", "Alfred" → "alfred"). Defaults to ``"talker"``
+    when no config is threaded in (legacy callers, tests that skip the
+    config plumb-through). Lowercase-only because the marker_id contract
+    expects ``[\\w-]+`` and downstream surfacers will group by agent.
+    """
+    if config is None:
+        return "talker"
+    name = (config.instance.name or "").strip().lower()
+    return name or "talker"
+
+
+def _section_title_for_create(name: str, body: str | None) -> str:
+    """Pick a human-readable section title for a vault_create marker.
+
+    Preference: record name (always present on create — it's the filename
+    stem) → first ``#``/``##`` heading in body → ``"talker-write"``
+    placeholder. The talker always has the ``name`` so this is mostly the
+    record-name path; the heading fallback is here so the same helper can
+    serve future write paths that don't carry a separate name.
+    """
+    if name:
+        return name
+    if body:
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                # Strip leading '#'s and surrounding whitespace.
+                return stripped.lstrip("#").strip() or "talker-write"
+    return "talker-write"
+
+
+def _section_title_for_edit_append(body_append: str, rel_path: str) -> str:
+    """Section title for a body_append edit.
+
+    First heading inside the appended fragment if present, else the file
+    stem (e.g. ``"Email Triage Rules"``), else the placeholder. The
+    fragment-heading path is the common case when the model appends a
+    new ``## ...`` block to a living rules document.
+    """
+    for line in body_append.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip() or "talker-write"
+    if rel_path:
+        # Strip directory and extension. ``person/Andrew Newton.md`` →
+        # ``Andrew Newton``.
+        from pathlib import Path as _P
+        return _P(rel_path).stem or "talker-write"
+    return "talker-write"
+
+
+def _attribution_reason(session: Session) -> str:
+    """Short reason string for the attribution audit entry.
+
+    Just identifies the write origin — ``"talker conversation turn"`` plus
+    the session id for trace. Richer reasons (which user message triggered
+    the write, what the model claimed it was doing) are Phase 3 territory.
+    """
+    sid = getattr(session, "session_id", "") or ""
+    if sid:
+        return f"talker conversation turn (session={sid})"
+    return "talker conversation turn"
+
+
 async def _execute_tool(
     tool_name: str,
     tool_input: dict[str, Any],
@@ -586,8 +657,9 @@ async def _execute_tool(
     from pathlib import Path
 
     # Local imports — ops pulls heavy deps; we only want to pay that cost
-    # when a tool actually fires.
-    from alfred.vault import ops, scope
+    # when a tool actually fires. ``attribution`` is light (stdlib + a
+    # dataclass) so importing it alongside is essentially free.
+    from alfred.vault import attribution, ops, scope
 
     # ``bash_exec`` (KAL-LE) — safety-critical subprocess path. Handled
     # before the vault-op lookup because it isn't a vault op; the
@@ -642,11 +714,31 @@ async def _execute_tool(
         if tool_name == "vault_create":
             name = tool_input.get("name", "")
             body = tool_input.get("body")
+
+            # Attribution-marker wiring (calibration audit gap, c2). The
+            # talker invokes vault_create as a side-effect of an LLM
+            # turn — every body that lands this way is, by definition,
+            # agent-inferred prose, not Andrew-typed text. Wrap it so a
+            # future Daily Sync confirm/reject flow can surface it for
+            # explicit confirmation. No-op when ``body`` is None (the
+            # template-default-body path); the model only triggers wrapping
+            # when it composed body content itself.
+            sf = dict(set_fields) if isinstance(set_fields, dict) else {}
+            if body:
+                wrapped_body, audit_entry = attribution.with_inferred_marker(
+                    body,
+                    section_title=_section_title_for_create(name, body),
+                    agent=_agent_slug(config),
+                    reason=_attribution_reason(session),
+                )
+                attribution.append_audit_entry(sf, audit_entry)
+                body = wrapped_body
+
             result = ops.vault_create(
                 vault_path_obj,
                 record_type,
                 name,
-                set_fields=set_fields if isinstance(set_fields, dict) else None,
+                set_fields=sf or None,
                 body=body,
             )
             # Mutation is already tracked in ``session.vault_ops`` (via
@@ -661,10 +753,49 @@ async def _execute_tool(
         if tool_name == "vault_edit":
             append_fields = tool_input.get("append_fields")
             body_append = tool_input.get("body_append")
+
+            # Attribution-marker wiring (calibration audit gap, c2). For
+            # body_append, wrap ONLY the appended fragment — the existing
+            # record body is left as-is (it may contain Andrew-typed prose
+            # that already shipped). Merge the new audit entry with any
+            # entries already on the record so prior inferred sections
+            # aren't lost when this edit lands.
+            sf = dict(set_fields) if isinstance(set_fields, dict) else {}
+            if body_append:
+                # Read existing frontmatter so we can preserve prior
+                # attribution_audit entries. Read failures (file missing,
+                # malformed YAML) propagate as VaultError just like a
+                # plain edit would — the wrapping shouldn't mask a real
+                # underlying problem.
+                existing = ops.vault_read(vault_path_obj, rel_path)
+                existing_fm = existing.get("frontmatter") or {}
+                # Carry forward existing entries first, then layer this
+                # edit's set_fields on top (caller wins on real conflicts,
+                # but attribution_audit is merged below).
+                merged_fm: dict = {}
+                if isinstance(existing_fm.get("attribution_audit"), list):
+                    merged_fm["attribution_audit"] = list(
+                        existing_fm["attribution_audit"]
+                    )
+                # Caller-supplied set_fields go on top of the merged base.
+                merged_fm.update(sf)
+
+                wrapped_append, audit_entry = attribution.with_inferred_marker(
+                    body_append,
+                    section_title=_section_title_for_edit_append(
+                        body_append, rel_path,
+                    ),
+                    agent=_agent_slug(config),
+                    reason=_attribution_reason(session),
+                )
+                attribution.append_audit_entry(merged_fm, audit_entry)
+                body_append = wrapped_append
+                sf = merged_fm
+
             result = ops.vault_edit(
                 vault_path_obj,
                 rel_path,
-                set_fields=set_fields if isinstance(set_fields, dict) else None,
+                set_fields=sf or None,
                 append_fields=append_fields if isinstance(append_fields, dict) else None,
                 body_append=body_append,
             )
