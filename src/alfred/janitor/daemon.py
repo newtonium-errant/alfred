@@ -18,6 +18,7 @@ from pathlib import Path
 
 import frontmatter
 
+from alfred.common.heartbeat import Heartbeat
 from alfred.common.schedule import compute_next_fire
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
 from alfred.vault.ops import is_ignored_path
@@ -37,6 +38,14 @@ from .state import JanitorState
 from .utils import file_hash, get_logger
 
 log = get_logger(__name__)
+
+# Module-level idle-tick heartbeat — see ``alfred.common.heartbeat`` for
+# the rationale ("intentionally left blank" pattern). Counter is bumped
+# in :func:`run_sweep` after a sweep that fixed/deleted issues — the
+# meaningful signal, not noisy ``issues_found`` from clean scans. The
+# heartbeat task is spawned in :func:`run_watch` only when
+# ``config.idle_tick.enabled`` is True.
+heartbeat: Heartbeat = Heartbeat(daemon_name="janitor", log=log)
 
 
 def _use_pipeline(config: JanitorConfig) -> bool:
@@ -414,6 +423,14 @@ async def run_sweep(
         deleted=result.files_deleted,
     )
 
+    # Idle-tick counter — one issue fixed (or deleted) counts as one
+    # event. Sweeps that found nothing broken (issues_found == 0 or
+    # fix_mode disabled) add zero, so the heartbeat reflects the
+    # meaningful signal rather than scan noise.
+    fixed_or_deleted = result.files_fixed + result.files_deleted
+    for _ in range(fixed_or_deleted):
+        heartbeat.record_event()
+
     state.add_sweep(result)
     state.save()
     return result
@@ -454,6 +471,25 @@ async def run_watch(
         deep_sweep_day_of_week=deep_schedule.day_of_week,
         drift_interval_hours=drift_interval_hours,
     )
+
+    # Idle-tick heartbeat task — emits ``janitor.idle_tick`` every
+    # ``config.idle_tick.interval_seconds``. Default 60s, on by default.
+    # See ``alfred.common.heartbeat`` for the "intentionally left blank"
+    # rationale. Spawned only when enabled — disabled path is silent.
+    heartbeat_shutdown = asyncio.Event()
+    heartbeat_task: asyncio.Task | None = None
+    if config.idle_tick.enabled:
+        heartbeat_task = asyncio.create_task(
+            heartbeat.run(
+                interval_seconds=config.idle_tick.interval_seconds,
+                shutdown_event=heartbeat_shutdown,
+            ),
+            name="janitor-heartbeat",
+        )
+        log.info(
+            "daemon.heartbeat_started",
+            interval_seconds=config.idle_tick.interval_seconds,
+        )
 
     while True:
         now = datetime.now(timezone.utc)

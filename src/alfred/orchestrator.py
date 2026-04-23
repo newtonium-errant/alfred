@@ -179,7 +179,14 @@ def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> Non
     inbox_path = vault_path / config.inbox_dir
     token = os.environ.get("MAIL_WEBHOOK_TOKEN", "")
     from alfred.mail.webhook import run_webhook
-    run_webhook(inbox_path, token=token)
+    # Idle-tick heartbeat — defaulted-on; emits ``mail.idle_tick`` so
+    # the operator can distinguish "no traffic" from "daemon dead".
+    run_webhook(
+        inbox_path,
+        token=token,
+        idle_tick_enabled=config.idle_tick.enabled,
+        idle_tick_interval_seconds=config.idle_tick.interval_seconds,
+    )
 
 
 def _run_talker(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = False) -> None:

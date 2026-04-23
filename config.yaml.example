@@ -62,6 +62,15 @@ curator:
     debounce_seconds: 10
   state:
     path: "./data/curator_state.json"
+  # Idle-tick heartbeat — emits a periodic ``curator.idle_tick`` log
+  # event so operators can distinguish *idle / healthy* from *broken*.
+  # Counter semantic: one inbox file processed end-to-end = one event
+  # (see ``events_in_window`` in the emitted event). Defaults on; see
+  # ``src/alfred/common/heartbeat.py`` for rationale. Flip ``enabled``
+  # false to silence without restructuring config.
+  idle_tick:
+    enabled: true
+    interval_seconds: 60
 
 # Email classifier — per-instance priority + action-hint tagging on
 # email-derived note records. Hooks into the curator daemon as a
@@ -150,6 +159,13 @@ janitor:
   state:
     path: "./data/janitor_state.json"
     max_sweep_history: 20
+  # Idle-tick heartbeat — counter semantic: one issue fixed (or deleted)
+  # = one event. Sweeps that find nothing broken add zero to the
+  # heartbeat, so the signal reflects meaningful work, not scan noise.
+  # Defaults on; see ``src/alfred/common/heartbeat.py``.
+  idle_tick:
+    enabled: true
+    interval_seconds: 60
 
 distiller:
   extraction:
@@ -176,6 +192,11 @@ distiller:
   state:
     path: "./data/distiller_state.json"
     max_run_history: 20
+  # Idle-tick heartbeat — counter semantic: one learn record created =
+  # one event. Defaults on; see ``src/alfred/common/heartbeat.py``.
+  idle_tick:
+    enabled: true
+    interval_seconds: 60
 
 # Instructor — polls every vault record for pending ``alfred_instructions``
 # directives and executes them in-process via the Anthropic SDK. See
@@ -190,6 +211,13 @@ instructor:
     max_tokens: 4096
   state:
     path: "./data/instructor_state.json"
+  # Idle-tick heartbeat — counter semantic: one directive executed =
+  # one event. Poll ticks that find no pending work add zero, so the
+  # signal reflects actual work, not poll noise. Defaults on; see
+  # ``src/alfred/common/heartbeat.py``.
+  idle_tick:
+    enabled: true
+    interval_seconds: 60
 
 # Outbound-push transport — HTTP server hosted inside the talker daemon
 # that other tools POST to when they need to deliver a message to the
@@ -286,8 +314,12 @@ telegram:
   # ``inbound_in_window``) from *broken* (no heartbeat at all). Defaults
   # are conservative-on; flip ``enabled`` to false to silence the
   # heartbeat without restructuring config. See
-  # ``src/alfred/telegram/heartbeat.py`` for cadence rationale (60s ≈ 290
-  # KB/day vs 1Hz ≈ 17 MB/day for no extra diagnostic value).
+  # ``src/alfred/common/heartbeat.py`` for cadence rationale (60s ≈ 290
+  # KB/day vs 1Hz ≈ 17 MB/day for no extra diagnostic value). Sibling
+  # ``idle_tick:`` blocks live under curator/janitor/distiller/surveyor/
+  # instructor/mail — same shape, same defaults; brief/bit/daily_sync
+  # are deliberately excluded (clock-aligned scheduled fires, the wake
+  # event itself is the natural positive signal).
   idle_tick:
     enabled: true
     interval_seconds: 60
@@ -414,3 +446,11 @@ surveyor:
     min_relationship_confidence: 0.65
   state:
     path: "./data/surveyor_state.json"
+  # Idle-tick heartbeat — counter semantic: one record re-embedded =
+  # one event. The labeling pass is downstream of embedding and runs at
+  # most once per cluster change, so embedding is the more meaningful
+  # per-record signal. Defaults on; see
+  # ``src/alfred/common/heartbeat.py``.
+  idle_tick:
+    enabled: true
+    interval_seconds: 60

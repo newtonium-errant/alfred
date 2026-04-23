@@ -122,6 +122,24 @@ class LoggingConfig:
 
 
 @dataclass
+class IdleTickConfig:
+    """Curator idle-tick heartbeat — "intentionally left blank" liveness signal.
+
+    A periodic ``curator.idle_tick`` log event so observers can distinguish
+    *idle / healthy* from *broken*. Without it, a stretch with no inbox
+    files arriving is indistinguishable from a hung daemon. See
+    ``src/alfred/common/heartbeat.py`` for the rationale and the cadence-
+    rationale comment block.
+
+    Defaults are deliberately on — the cost is negligible (~290 KB/day at
+    60s) and the diagnostic value compounds.
+    """
+
+    enabled: bool = True
+    interval_seconds: int = 60
+
+
+@dataclass
 class CuratorConfig:
     vault: VaultConfig = field(default_factory=VaultConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
@@ -133,6 +151,10 @@ class CuratorConfig:
     # from the manifest). Re-enable by setting to False if richer entity
     # bodies are needed. Ref: ssdavidai/alfred#14
     skip_entity_enrichment: bool = True
+    # Idle-tick heartbeat — see :class:`IdleTickConfig`. Defaulted-on
+    # via the dataclass default_factory; absent block in YAML keeps
+    # ``enabled=True`` / ``interval_seconds=60``.
+    idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
 
 
 # --- Recursive builder ---
@@ -147,6 +169,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "watcher": WatcherConfig,
     "state": StateConfig,
     "logging": LoggingConfig,
+    "idle_tick": IdleTickConfig,
 }
 
 
@@ -194,4 +217,9 @@ def load_from_unified(raw: dict[str, Any]) -> CuratorConfig:
     # Pass through curator-level scalar flags (not nested dataclass sections).
     if "skip_entity_enrichment" in tool:
         top_level["skip_entity_enrichment"] = bool(tool["skip_entity_enrichment"])
+    # Idle-tick — defaulted-on; if the user provides a partial dict
+    # (just ``enabled: false``), merge over the dataclass default.
+    idle_raw = tool.get("idle_tick")
+    if isinstance(idle_raw, dict):
+        top_level["idle_tick"] = idle_raw
     return _build(CuratorConfig, top_level)

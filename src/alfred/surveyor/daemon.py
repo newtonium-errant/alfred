@@ -7,6 +7,8 @@ from pathlib import Path
 
 import structlog
 
+from alfred.common.heartbeat import Heartbeat
+
 from .clusterer import Clusterer
 from .config import PipelineConfig
 from .embedder import Embedder
@@ -36,6 +38,14 @@ class Daemon:
         self.embedder = Embedder(cfg.ollama, cfg.milvus, cfg.vault.path, self.state)
         self.clusterer = Clusterer(cfg.clustering, self.state)
         self.labeler = Labeler(cfg.openrouter, cfg.labeler)
+        # Idle-tick heartbeat — see ``alfred.common.heartbeat`` for the
+        # "intentionally left blank" rationale. Counter is bumped per
+        # record returned from ``embedder.process_diff`` (one record
+        # re-embedded = one event). Task spawn + asyncio.Event creation
+        # live in :meth:`run` so the event is bound to the right loop.
+        self.heartbeat: Heartbeat = Heartbeat(daemon_name="surveyor", log=log)
+        self._heartbeat_task: asyncio.Task | None = None
+        self._heartbeat_shutdown: asyncio.Event | None = None
         # Mirror the curator/janitor/distiller pattern: derive the unified
         # audit-log path from the state-file directory so every surveyor
         # write lands in data/vault_audit.log alongside the other tools.
@@ -53,6 +63,16 @@ class Daemon:
         """Graceful shutdown: stop watcher, close HTTP clients, save state."""
         log.info("daemon.shutting_down")
         self.watcher.stop()
+        # Stop the heartbeat task first so it doesn't keep firing
+        # post-shutdown logs.
+        if self._heartbeat_shutdown is not None:
+            self._heartbeat_shutdown.set()
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         await self.embedder.close()
         self.state.save()
         log.info("daemon.shutdown_complete")
@@ -74,6 +94,26 @@ class Daemon:
 
         # Start filesystem watcher
         self.watcher.start()
+
+        # Idle-tick heartbeat task — emits ``surveyor.idle_tick`` every
+        # ``cfg.idle_tick.interval_seconds``. Default 60s, on by default.
+        # See ``alfred.common.heartbeat`` for the "intentionally left
+        # blank" rationale. Spawned only when enabled — disabled path is
+        # silent. Event creation deferred to here so it binds to the
+        # right asyncio loop (Daemon.__init__ runs before asyncio.run()).
+        if self.cfg.idle_tick.enabled:
+            self._heartbeat_shutdown = asyncio.Event()
+            self._heartbeat_task = asyncio.create_task(
+                self.heartbeat.run(
+                    interval_seconds=self.cfg.idle_tick.interval_seconds,
+                    shutdown_event=self._heartbeat_shutdown,
+                ),
+                name="surveyor-heartbeat",
+            )
+            log.info(
+                "daemon.heartbeat_started",
+                interval_seconds=self.cfg.idle_tick.interval_seconds,
+            )
 
         # Sleep at the debounce cadence: polling faster than the debounce
         # window just spins through ticks that find nothing to do.
@@ -142,6 +182,9 @@ class Daemon:
 
         all_paths = list(hashes.keys())
         records = await self.embedder.process_diff(all_paths, [], [])
+        # Idle-tick counter — initial sync embeds count too.
+        for _ in range(len(records)):
+            self.heartbeat.record_event()
 
         # Need all records for clustering — parse any we didn't get from embedder
         all_records = dict(records)
@@ -195,6 +238,12 @@ class Daemon:
 
         # Stage 2: Embed
         records = await self.embedder.process_diff(diff.new, diff.changed, diff.deleted)
+        # Idle-tick counter — one record re-embedded = one event.
+        # ``process_diff`` returns the records that were actually
+        # embedded (parse failures + empty-text skips are not in this
+        # dict), so len(records) is the correct meaningful count.
+        for _ in range(len(records)):
+            self.heartbeat.record_event()
 
         # Parse all known records for clustering
         all_records: dict[str, VaultRecord] = {}

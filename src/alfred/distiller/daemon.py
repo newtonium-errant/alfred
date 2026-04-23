@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from alfred.common.heartbeat import Heartbeat
 from alfred.common.schedule import compute_next_fire
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
 from alfred.vault.ops import is_ignored_path
@@ -43,6 +44,14 @@ from .state import DistillerState, ExtractionLogEntry, RunResult
 from .utils import compute_md5, get_logger
 
 log = get_logger(__name__)
+
+# Module-level idle-tick heartbeat — see ``alfred.common.heartbeat`` for
+# the rationale ("intentionally left blank" pattern). Counter is bumped
+# in :func:`run_extraction` for each learn record created (both the
+# pipeline path and the legacy single-call path). The heartbeat task is
+# spawned in :func:`run_watch` only when ``config.idle_tick.enabled`` is
+# True.
+heartbeat: Heartbeat = Heartbeat(daemon_name="distiller", log=log)
 
 
 def _use_pipeline(config: DistillerConfig) -> bool:
@@ -307,6 +316,8 @@ async def run_extraction(
                         detail=f"Pipeline: {batch.project or 'ungrouped'} batch",
                     )
                 )
+                # Idle-tick counter — one learn record created = one event.
+                heartbeat.record_event()
 
             for sc in batch.source_records:
                 learn_paths = [
@@ -431,6 +442,8 @@ async def run_extraction(
                         detail=f"Extracted from {batch.project or 'ungrouped'} batch",
                     )
                 )
+                # Idle-tick counter — one learn record created = one event.
+                heartbeat.record_event()
 
             for sc in batch.source_records:
                 learn_paths = [
@@ -508,6 +521,24 @@ async def run_watch(
         consolidation_tz=consolidation_schedule.timezone,
         consolidation_day_of_week=consolidation_schedule.day_of_week,
     )
+
+    # Idle-tick heartbeat task — emits ``distiller.idle_tick`` every
+    # ``config.idle_tick.interval_seconds``. Default 60s, on by default.
+    # See ``alfred.common.heartbeat`` for the "intentionally left blank"
+    # rationale. Spawned only when enabled — disabled path is silent.
+    heartbeat_shutdown = asyncio.Event()
+    if config.idle_tick.enabled:
+        asyncio.create_task(
+            heartbeat.run(
+                interval_seconds=config.idle_tick.interval_seconds,
+                shutdown_event=heartbeat_shutdown,
+            ),
+            name="distiller-heartbeat",
+        )
+        log.info(
+            "daemon.heartbeat_started",
+            interval_seconds=config.idle_tick.interval_seconds,
+        )
 
     while True:
         now = datetime.now(timezone.utc)

@@ -13,8 +13,26 @@ out to be "no traffic since 03:36 UTC". A periodic positive idle signal
 makes the answer obvious in 5 seconds: the heartbeat is in the log →
 daemon is alive; heartbeat is missing → daemon is broken.
 
-Design
-------
+Implementation note (post-propagation refactor)
+-----------------------------------------------
+The talker was the first daemon to ship this pattern (commit 5a26d13).
+When the pattern was propagated to curator/janitor/distiller/surveyor/
+instructor/mail, the core counter+tick logic moved to
+``src/alfred/common/heartbeat.py`` as a generic :class:`Heartbeat` class.
+This module is now a thin module-level wrapper that exposes the same
+function-call surface the talker daemon and tests already used
+(``record_inbound``, ``tick``, ``reset``, ``get_count``, ``run``,
+``snapshot``) — so the migration is a no-op for talker behaviour.
+
+Event shape stays ``talker.idle_tick interval_seconds=N inbound_in_window=M``.
+The ``inbound_in_window`` field name is preserved (rather than renamed
+to the generic ``events_in_window``) so existing log-grep queries and
+operator muscle memory still work — see :func:`tick` below for the
+field translation. Other daemons emit the generic ``events_in_window``
+field directly via :class:`alfred.common.heartbeat.Heartbeat`.
+
+Design recap
+------------
 Two surfaces:
     * :func:`record_inbound` — called from ``bot.on_text`` /
       ``bot.on_voice`` immediately after each ``talker.bot.inbound`` log
@@ -23,19 +41,12 @@ Two surfaces:
       ``daemon._heartbeat`` (a sibling asyncio task). Reads the current
       counter, emits ``talker.idle_tick``, resets the counter to zero.
 
-Same asyncio loop = no thread safety required; a plain ``int`` works.
-The counter is module-level (process-global, not bound to a specific
-``Application`` instance) for two reasons:
-    1. ``bot.on_text`` / ``bot.on_voice`` already run in the talker's
-       single asyncio loop, so there is nothing to multiplex by.
-    2. Tests can pre-populate the counter via :func:`record_inbound`
-       and call :func:`tick` directly — no need to spin up a fake
-       daemon harness.
+Same asyncio loop = no thread safety required.
 
 Reset semantics
 ---------------
 ``tick`` reads-then-resets atomically (single statement, single thread).
-The "inbound_in_window" field in the emitted event is the count of
+The ``inbound_in_window`` field in the emitted event is the count of
 ``talker.bot.inbound`` events seen since the previous tick — exactly
 what an operator needs to distinguish "idle daemon" from "idle but
 recently-busy daemon".
@@ -61,16 +72,20 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from alfred.common.heartbeat import Heartbeat
+
 from .utils import get_logger
 
 log = get_logger(__name__)
 
 
-# --- Module-level counter ------------------------------------------------
-# Incremented by ``record_inbound`` from the bot's text + voice handlers.
-# Read + reset by ``tick`` from the heartbeat task. Same asyncio loop on
-# both sides, so no lock needed — see the module docstring.
-_inbound_count: int = 0
+# --- Module-level Heartbeat instance ------------------------------------
+# The talker has historically exposed a flat module-level API
+# (``record_inbound``, ``tick``, etc.) — preserved here as thin wrappers
+# around a single shared :class:`Heartbeat`. Same asyncio loop on the
+# bot handlers and the heartbeat task means a plain instance attribute
+# is correct here — no lock needed.
+_hb: Heartbeat = Heartbeat(daemon_name="talker", log=log)
 
 
 def record_inbound() -> None:
@@ -80,13 +95,12 @@ def record_inbound() -> None:
     the ``talker.bot.inbound`` log event. Cheap by design — must add
     no measurable latency to the message path.
     """
-    global _inbound_count
-    _inbound_count += 1
+    _hb.record_event()
 
 
 def get_count() -> int:
     """Return the current counter without resetting (test/debug helper)."""
-    return _inbound_count
+    return _hb.get_count()
 
 
 def reset() -> None:
@@ -96,8 +110,7 @@ def reset() -> None:
     setup can isolate cases without relying on the previous test's
     end-state.
     """
-    global _inbound_count
-    _inbound_count = 0
+    _hb.reset()
 
 
 def tick(interval_seconds: int) -> int:
@@ -113,10 +126,19 @@ def tick(interval_seconds: int) -> int:
     ``interval_seconds`` is included for forward-compat: if the cadence
     is ever made adaptive or per-instance, downstream consumers don't
     have to infer it from inter-event timestamps.
+
+    Note on field naming: the talker uses ``inbound_in_window`` (legacy
+    field name from the original commit 5a26d13) while
+    curator/janitor/etc. use ``events_in_window`` (the generic name).
+    Both encode the same thing — count of meaningful events since last
+    tick. Talker keeps the legacy name for log-grep continuity.
     """
-    global _inbound_count
-    count = _inbound_count
-    _inbound_count = 0
+    # Hand-rolled here (instead of delegating to Heartbeat.tick) so the
+    # event field is named ``inbound_in_window`` — the talker's
+    # historical contract — rather than the generic
+    # ``events_in_window``. Counter handling stays identical.
+    count = _hb.get_count()
+    _hb.reset()
     log.info(
         "talker.idle_tick",
         interval_seconds=interval_seconds,
@@ -139,6 +161,11 @@ async def run(
     Wraps :func:`tick` in a try/except so a logging-layer failure
     (FileHandler full, etc.) doesn't kill the heartbeat task — the
     whole point of the task is to keep firing through trouble.
+
+    Implemented as a local loop (not a delegate to ``Heartbeat.run``)
+    because :func:`tick` here uses the talker-specific
+    ``inbound_in_window`` field name, not the generic
+    ``events_in_window``.
     """
     while not shutdown_event.is_set():
         try:
@@ -151,9 +178,6 @@ async def run(
         try:
             tick(interval_seconds)
         except Exception:  # noqa: BLE001
-            # Swallow + log so heartbeat keeps firing. If the log call
-            # itself is broken we'll see the exception in stderr; the
-            # next tick will still fire.
             log.exception("talker.idle_tick.error")
 
 
@@ -162,4 +186,4 @@ async def run(
 
 def snapshot() -> dict[str, Any]:
     """Return a small dict of current state — useful for /status probes."""
-    return {"inbound_count": _inbound_count}
+    return {"inbound_count": _hb.get_count()}

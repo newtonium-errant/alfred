@@ -117,6 +117,26 @@ class LoggingConfig:
 
 
 @dataclass
+class IdleTickConfig:
+    """Instructor idle-tick heartbeat — "intentionally left blank" liveness signal.
+
+    A periodic ``instructor.idle_tick`` log event so observers can distinguish
+    *idle / healthy* from *broken*. Without it, a stretch with no pending
+    directives is indistinguishable from a hung daemon.
+
+    Counter semantic: one directive executed = one event. Poll ticks that
+    find no work add zero, so the heartbeat reflects meaningful work, not
+    poll noise.
+
+    Defaults are deliberately on — see ``src/alfred/common/heartbeat.py``
+    for the cadence rationale.
+    """
+
+    enabled: bool = True
+    interval_seconds: int = 60
+
+
+@dataclass
 class InstructorConfig:
     """Typed config for the instructor daemon."""
 
@@ -145,6 +165,11 @@ class InstructorConfig:
     # Case-insensitive. Kept as a tuple to prevent accidental mutation.
     destructive_keywords: tuple[str, ...] = _DEFAULT_DESTRUCTIVE_KEYWORDS
 
+    # Idle-tick heartbeat — see :class:`IdleTickConfig`. Defaulted-on
+    # via the dataclass default_factory; absent block in YAML keeps
+    # ``enabled=True`` / ``interval_seconds=60``.
+    idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
+
 
 # --- Recursive builder ------------------------------------------------------
 
@@ -155,6 +180,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "instance": InstanceConfig,
     "state": StateConfig,
     "logging": LoggingConfig,
+    "idle_tick": IdleTickConfig,
 }
 
 
@@ -213,6 +239,7 @@ def load_from_unified(raw: dict[str, Any]) -> InstructorConfig:
         "anthropic", "instance", "state",
         "poll_interval_seconds", "max_retries",
         "audit_window_size", "destructive_keywords",
+        "idle_tick",
     ):
         if key in tool:
             merged[key] = tool[key]

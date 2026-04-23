@@ -32,6 +32,7 @@ from pathlib import Path
 
 import frontmatter
 
+from alfred.common.heartbeat import Heartbeat
 from alfred.vault.ops import is_ignored_path
 from alfred.vault.schema import INSTRUCTION_FIELDS
 
@@ -40,6 +41,14 @@ from .state import InstructorState
 from .utils import file_hash, get_logger
 
 log = get_logger(__name__)
+
+# Module-level idle-tick heartbeat — see ``alfred.common.heartbeat`` for
+# the rationale ("intentionally left blank" pattern). Counter is bumped
+# in :func:`run` after each ``execute_and_record`` returns successfully —
+# poll ticks that find no pending directives don't count, only actual
+# work executed. The heartbeat task is spawned in :func:`run` only when
+# ``config.idle_tick.enabled`` is True.
+heartbeat: Heartbeat = Heartbeat(daemon_name="instructor", log=log)
 
 
 # The field on the record that carries the pending directive queue.
@@ -238,6 +247,25 @@ async def run(
         poll_interval_seconds=interval,
     )
 
+    # Idle-tick heartbeat task — emits ``instructor.idle_tick`` every
+    # ``config.idle_tick.interval_seconds``. Default 60s, on by default.
+    # See ``alfred.common.heartbeat`` for the "intentionally left blank"
+    # rationale. Spawned only when enabled — disabled path is silent.
+    heartbeat_shutdown = asyncio.Event()
+    heartbeat_task: asyncio.Task | None = None
+    if config.idle_tick.enabled:
+        heartbeat_task = asyncio.create_task(
+            heartbeat.run(
+                interval_seconds=config.idle_tick.interval_seconds,
+                shutdown_event=heartbeat_shutdown,
+            ),
+            name="instructor-heartbeat",
+        )
+        log.info(
+            "instructor.daemon.heartbeat_started",
+            interval_seconds=config.idle_tick.interval_seconds,
+        )
+
     while True:
         try:
             pending = detect_pending(
@@ -266,6 +294,15 @@ async def run(
                             dry_run=result.dry_run,
                             summary=result.summary[:120],
                         )
+                        # Idle-tick counter — one directive executed = one
+                        # event. Both ``done`` and ``dry_run`` count: the
+                        # destructive-keyword gate's plan-only path is
+                        # still meaningful work the daemon performed.
+                        # Errors don't count — they're surfaced via the
+                        # retry counter / error frontmatter, not the
+                        # heartbeat.
+                        if result.status in ("done", "dry_run"):
+                            heartbeat.record_event()
                     except Exception as exc:  # noqa: BLE001 — never break the loop
                         log.warning(
                             "instructor.daemon.execute_failed",
@@ -298,4 +335,13 @@ async def run(
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
             log.info("instructor.daemon.shutdown")
+            # Stop the heartbeat task on shutdown so it doesn't keep
+            # firing after the main loop exits.
+            if heartbeat_task is not None:
+                heartbeat_shutdown.set()
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
             raise

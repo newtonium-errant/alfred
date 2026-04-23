@@ -128,12 +128,36 @@ class LoggingConfig:
 
 
 @dataclass
+class IdleTickConfig:
+    """Janitor idle-tick heartbeat — "intentionally left blank" liveness signal.
+
+    A periodic ``janitor.idle_tick`` log event so observers can distinguish
+    *idle / healthy* from *broken*. Without it, a quiet stretch (no issues
+    fixed) is indistinguishable from a hung daemon. See
+    ``src/alfred/common/heartbeat.py`` for the rationale and cadence.
+
+    Counter semantic: one issue fixed (or deleted) = one event. Sweep
+    counts that find nothing broken don't add noise to the heartbeat.
+
+    Defaults are deliberately on — the cost is negligible (~290 KB/day at
+    60s) and the diagnostic value compounds.
+    """
+
+    enabled: bool = True
+    interval_seconds: int = 60
+
+
+@dataclass
 class JanitorConfig:
     vault: VaultConfig = field(default_factory=VaultConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     sweep: SweepConfig = field(default_factory=SweepConfig)
     state: StateConfig = field(default_factory=StateConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    # Idle-tick heartbeat — see :class:`IdleTickConfig`. Defaulted-on
+    # via the dataclass default_factory; absent block in YAML keeps
+    # ``enabled=True`` / ``interval_seconds=60``.
+    idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
 
 
 # --- Recursive builder ---
@@ -148,6 +172,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "deep_sweep_schedule": ScheduleConfig,
     "state": StateConfig,
     "logging": LoggingConfig,
+    "idle_tick": IdleTickConfig,
 }
 
 
@@ -180,10 +205,15 @@ def load_from_unified(raw: dict[str, Any]) -> JanitorConfig:
     log_dir = log_raw.pop("dir", "./data")
     if "file" not in log_raw:
         log_raw["file"] = f"{log_dir}/janitor.log"
-    return _build(JanitorConfig, {
+    built: dict[str, Any] = {
         "vault": raw.get("vault", {}),
         "agent": raw.get("agent", {}),
         "sweep": tool.get("sweep", {}),
         "state": tool.get("state", {}),
         "logging": log_raw,
-    })
+    }
+    # Idle-tick — defaulted-on; partial dict merges over dataclass default.
+    idle_raw = tool.get("idle_tick")
+    if isinstance(idle_raw, dict):
+        built["idle_tick"] = idle_raw
+    return _build(JanitorConfig, built)

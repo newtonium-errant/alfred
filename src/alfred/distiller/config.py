@@ -131,12 +131,35 @@ class LoggingConfig:
 
 
 @dataclass
+class IdleTickConfig:
+    """Distiller idle-tick heartbeat — "intentionally left blank" liveness signal.
+
+    A periodic ``distiller.idle_tick`` log event so observers can distinguish
+    *idle / healthy* from *broken*. Without it, a stretch with no learn
+    records being created is indistinguishable from a hung daemon. See
+    ``src/alfred/common/heartbeat.py`` for rationale and cadence.
+
+    Counter semantic: one learn record created = one event.
+
+    Defaults are deliberately on — the cost is negligible (~290 KB/day at
+    60s) and the diagnostic value compounds.
+    """
+
+    enabled: bool = True
+    interval_seconds: int = 60
+
+
+@dataclass
 class DistillerConfig:
     vault: VaultConfig = field(default_factory=VaultConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
     state: StateConfig = field(default_factory=StateConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    # Idle-tick heartbeat — see :class:`IdleTickConfig`. Defaulted-on
+    # via the dataclass default_factory; absent block in YAML keeps
+    # ``enabled=True`` / ``interval_seconds=60``.
+    idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
 
 
 # --- Recursive builder ---
@@ -152,6 +175,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "consolidation_schedule": ScheduleConfig,
     "state": StateConfig,
     "logging": LoggingConfig,
+    "idle_tick": IdleTickConfig,
 }
 
 
@@ -184,10 +208,15 @@ def load_from_unified(raw: dict[str, Any]) -> DistillerConfig:
     log_dir = log_raw.pop("dir", "./data")
     if "file" not in log_raw:
         log_raw["file"] = f"{log_dir}/distiller.log"
-    return _build(DistillerConfig, {
+    built: dict[str, Any] = {
         "vault": raw.get("vault", {}),
         "agent": raw.get("agent", {}),
         "extraction": tool.get("extraction", {}),
         "state": tool.get("state", {}),
         "logging": log_raw,
-    })
+    }
+    # Idle-tick — defaulted-on; partial dict merges over dataclass default.
+    idle_raw = tool.get("idle_tick")
+    if isinstance(idle_raw, dict):
+        built["idle_tick"] = idle_raw
+    return _build(DistillerConfig, built)

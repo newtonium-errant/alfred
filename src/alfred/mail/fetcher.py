@@ -129,6 +129,12 @@ def fetch_account(
                     out = inbox_path / filename
                     out.write_text(md, encoding="utf-8")
                     log.info("mail.saved", file=filename)
+                    # Idle-tick counter — one email fetched and saved =
+                    # one event. Imported lazily so importing the fetcher
+                    # doesn't drag the heartbeat module in unless someone
+                    # actually runs it.
+                    from .webhook import heartbeat as _heartbeat
+                    _heartbeat.record_event()
 
                     if account.mark_read:
                         conn.store(num, "+FLAGS", "\\Seen")

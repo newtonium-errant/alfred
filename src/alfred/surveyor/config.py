@@ -81,6 +81,28 @@ class LoggingConfig:
 
 
 @dataclass
+class IdleTickConfig:
+    """Surveyor idle-tick heartbeat — "intentionally left blank" liveness signal.
+
+    A periodic ``surveyor.idle_tick`` log event so observers can distinguish
+    *idle / healthy* (recent heartbeat present, low or zero
+    ``events_in_window``) from *broken* (no heartbeat at all). Without it,
+    a quiet stretch (no vault writes touching surveyor scope) is
+    indistinguishable from a hung daemon.
+
+    Counter semantic: one record re-embedded = one event. The labeling
+    pass is downstream of embedding and runs at most once per cluster
+    change, so embedding is the more meaningful per-record signal.
+
+    Defaults are deliberately on — see ``src/alfred/common/heartbeat.py``
+    for the cadence rationale.
+    """
+
+    enabled: bool = True
+    interval_seconds: int = 60
+
+
+@dataclass
 class PipelineConfig:
     vault: VaultConfig
     watcher: WatcherConfig
@@ -91,6 +113,7 @@ class PipelineConfig:
     labeler: LabelerConfig
     state: StateConfig
     logging: LoggingConfig
+    idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
 
 
 _ENV_PATTERN = re.compile(r"\$\{(\w+)\}")
@@ -161,6 +184,7 @@ def load_config(config_path: str | Path) -> PipelineConfig:
         labeler=_build_dataclass(LabelerConfig, raw.get("labeler")),
         state=_build_dataclass(StateConfig, raw.get("state")),
         logging=_build_dataclass(LoggingConfig, raw.get("logging")),
+        idle_tick=_build_dataclass(IdleTickConfig, raw.get("idle_tick")),
     )
 
 
@@ -178,4 +202,6 @@ def load_from_unified(raw: dict) -> PipelineConfig:
         labeler=_build_dataclass(LabelerConfig, tool.get("labeler")),
         state=_build_dataclass(StateConfig, tool.get("state")),
         logging=_build_dataclass(LoggingConfig, raw.get("logging")),
+        # Idle-tick lives under ``surveyor:``; defaulted-on if absent.
+        idle_tick=_build_dataclass(IdleTickConfig, tool.get("idle_tick")),
     )

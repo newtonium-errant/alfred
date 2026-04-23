@@ -11,7 +11,16 @@ from pathlib import Path
 
 import structlog
 
+from alfred.common.heartbeat import Heartbeat
+
 log = structlog.get_logger(__name__)
+
+# Module-level idle-tick heartbeat — see ``alfred.common.heartbeat`` for
+# the rationale ("intentionally left blank" pattern). Counter is bumped
+# in :meth:`WebhookHandler.do_POST` after each successful save, and from
+# the IMAP fetcher path (``mail/fetcher.py``). The heartbeat thread is
+# spawned in :func:`run_webhook` only when ``enabled`` is True.
+heartbeat: Heartbeat = Heartbeat(daemon_name="mail", log=log)
 
 
 def _sanitize_filename(s: str, max_len: int = 80) -> str:
@@ -124,6 +133,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         out.write_text(md, encoding="utf-8")
 
         log.info("webhook.saved", file=filename)
+        # Idle-tick counter — one webhook received and saved = one event.
+        heartbeat.record_event()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -139,14 +150,53 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
 
-def run_webhook(inbox_path: Path, host: str = "0.0.0.0", port: int = 5005, token: str = "") -> None:
+def run_webhook(
+    inbox_path: Path,
+    host: str = "0.0.0.0",
+    port: int = 5005,
+    token: str = "",
+    idle_tick_enabled: bool = True,
+    idle_tick_interval_seconds: int = 60,
+) -> None:
+    """Start the webhook HTTPServer and (optionally) the idle-tick heartbeat.
+
+    The heartbeat runs in a daemon thread because ``HTTPServer.serve_forever``
+    is sync — there's no asyncio loop to host an async tick task. Same
+    counter semantics as the asyncio daemons; see
+    ``alfred.common.heartbeat`` for rationale.
+    """
+    import threading
+
     handler = partial(WebhookHandler, inbox_path, token)
     server = HTTPServer((host, port), handler)
     log.info("webhook.started", host=host, port=port)
     print(f"Webhook listening on http://{host}:{port}/ingest")
+
+    # Idle-tick heartbeat — emits ``mail.idle_tick`` every
+    # ``idle_tick_interval_seconds``. Default 60s, on by default. Spawned
+    # only when enabled; the disabled path skips the thread entirely.
+    heartbeat_shutdown = threading.Event()
+    heartbeat_thread = None
+    if idle_tick_enabled:
+        from alfred.common.heartbeat import run_in_thread
+        heartbeat_thread = run_in_thread(
+            heartbeat,
+            interval_seconds=idle_tick_interval_seconds,
+            shutdown_event=heartbeat_shutdown,
+        )
+        log.info(
+            "webhook.heartbeat_started",
+            interval_seconds=idle_tick_interval_seconds,
+        )
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
+        # Signal the heartbeat thread to exit; thread is daemon=True so
+        # it won't block process exit even if it lingers.
+        heartbeat_shutdown.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=2)
         server.server_close()

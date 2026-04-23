@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from alfred.email_classifier.config import EmailClassifierConfig
 
+from alfred.common.heartbeat import Heartbeat
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
 
 from .backends import BaseBackend
@@ -42,6 +43,13 @@ from .writer import diff_vault, mark_processed, snapshot_vault
 # on the import path. See ``email_classifier/__init__.py``.
 
 log = get_logger(__name__)
+
+# Module-level idle-tick heartbeat — see ``alfred.common.heartbeat`` for
+# the rationale ("intentionally left blank" pattern). Counter is bumped
+# on each successful end-to-end inbox-file processing in
+# :func:`_process_file`. The heartbeat task is spawned in :func:`run`
+# only when ``config.idle_tick.enabled`` is True.
+heartbeat: Heartbeat = Heartbeat(daemon_name="curator", log=log)
 
 
 def _load_skill(skills_dir: Path) -> str:
@@ -331,6 +339,11 @@ async def _process_file(
         created=len(files_created),
         modified=len(files_modified),
     )
+    # Idle-tick counter — one inbox file processed end-to-end counts
+    # as one event for the heartbeat's ``events_in_window``. Bumping
+    # after the completed log keeps the call out of the hot path's
+    # exception handling.
+    heartbeat.record_event()
 
 
 async def run(
@@ -422,6 +435,25 @@ async def run(
     watcher.start()
     log.info("daemon.watching", inbox=str(config.vault.inbox_path))
 
+    # Idle-tick heartbeat task — emits ``curator.idle_tick`` every
+    # ``config.idle_tick.interval_seconds``. Default 60s, on by default.
+    # See ``alfred.common.heartbeat`` for the "intentionally left blank"
+    # rationale. Spawned only when enabled — disabled path is silent.
+    heartbeat_shutdown = asyncio.Event()
+    heartbeat_task: asyncio.Task | None = None
+    if config.idle_tick.enabled:
+        heartbeat_task = asyncio.create_task(
+            heartbeat.run(
+                interval_seconds=config.idle_tick.interval_seconds,
+                shutdown_event=heartbeat_shutdown,
+            ),
+            name="curator-heartbeat",
+        )
+        log.info(
+            "daemon.heartbeat_started",
+            interval_seconds=config.idle_tick.interval_seconds,
+        )
+
     import time
     last_rescan = time.monotonic()
     rescan_interval = config.watcher.rescan_interval
@@ -495,4 +527,12 @@ async def run(
                 )
     finally:
         watcher.stop()
+        # Tear down the heartbeat task if it was spawned.
+        if heartbeat_task is not None:
+            heartbeat_shutdown.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         log.info("daemon.stopped")

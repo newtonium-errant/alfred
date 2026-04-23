@@ -37,6 +37,22 @@ class _StubStateConfig:
 
 
 @dataclass
+class _StubIdleTickConfig:
+    """Stand-in for each tool's :class:`IdleTickConfig`.
+
+    The orchestrator's ``_run_mail_webhook`` reads
+    ``config.idle_tick.{enabled,interval_seconds}`` to forward to
+    ``run_webhook``. Other tools also have an ``idle_tick`` field but
+    don't read it from the orchestrator side — only mail does, because
+    mail's webhook server runs in a sync HTTPServer and needs the
+    config injected at start.
+    """
+
+    enabled: bool = True
+    interval_seconds: int = 60
+
+
+@dataclass
 class _StubConfig:
     """Minimal stand-in for every tool's Config dataclass.
 
@@ -48,6 +64,7 @@ class _StubConfig:
     state: _StubStateConfig = field(default_factory=_StubStateConfig)
     vault: Any = None
     inbox_dir: str = "inbox"
+    idle_tick: _StubIdleTickConfig = field(default_factory=_StubIdleTickConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -285,10 +302,16 @@ def test_run_mail_webhook_invokes_run_webhook(
     orch_dirs, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``_run_mail_webhook`` builds inbox_path + token and calls run_webhook."""
-    captured: dict[str, Any] = {"call_args": None}
+    captured: dict[str, Any] = {"call_args": None, "idle_tick": None}
 
-    def _run_webhook(inbox_path, token: str = "") -> None:
+    def _run_webhook(
+        inbox_path,
+        token: str = "",
+        idle_tick_enabled: bool = True,
+        idle_tick_interval_seconds: int = 60,
+    ) -> None:
         captured["call_args"] = (inbox_path, token)
+        captured["idle_tick"] = (idle_tick_enabled, idle_tick_interval_seconds)
 
     _install_stub_module(
         monkeypatch, "alfred.mail.config",
@@ -311,6 +334,9 @@ def test_run_mail_webhook_invokes_run_webhook(
     # inbox_path = vault_path / config.inbox_dir
     assert str(inbox_path).endswith("/myvault/custom_inbox")
     assert token == "secret-token-123"
+    # The idle_tick config must be forwarded to run_webhook so the
+    # heartbeat thread spawns inside the webhook server process.
+    assert captured["idle_tick"] == (True, 60)
 
 
 def test_run_talker_invokes_telegram_daemon(
