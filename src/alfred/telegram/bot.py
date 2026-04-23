@@ -34,6 +34,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -97,6 +98,52 @@ def _normalize_instance_name(s: str) -> str:
     return normalized
 
 
+# --- Application-level inbound pre-pass ----------------------------------
+#
+# The idle-tick heartbeat counter (``heartbeat.record_inbound``) lives at
+# application scope so EVERY inbound update increments it — recognised
+# commands, unrecognised commands, plain text, voice notes, edited
+# messages, callback queries, anything PTB delivers. Anything narrower
+# leaves coverage gaps.
+#
+# History: the original commit (5a26d13) called ``record_inbound`` from
+# inside ``on_text`` and ``on_voice`` only. Unrecognised commands
+# (e.g. ``/calibration`` when only ``/calibrate`` is registered) bypass
+# both — PTB's ``CommandHandler`` matches the recognised ones first and
+# the text MessageHandler is gated by ``~filters.COMMAND``, so the
+# unknown-command update fell through every handler without ever
+# bumping the counter. Result: a ``inbound_in_window=0`` heartbeat
+# emitted while Telegram had clearly delivered the message — caught
+# 2026-04-22 from a real ``/calibration`` typo. The fix moves the
+# increment to a TypeHandler at group=-1 so it observes every Update
+# before the per-handler routing fires. Same asyncio loop = no thread
+# safety required; the pre-pass returns normally so subsequent groups
+# still match exactly as before (no ``ApplicationHandlerStop``).
+#
+# PTB mechanism: ``TypeHandler(Update, …)`` matches every update and
+# group=-1 puts it ahead of the default group (0) where the real
+# handlers live. PTB only fires one handler per group, so registering
+# this in its own dedicated negative group keeps it off the routing
+# critical path.
+
+
+async def _pre_record_inbound(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Pre-pass: bump the heartbeat counter for every inbound update.
+
+    Registered at group=-1 via :class:`TypeHandler` so it fires before
+    any per-handler routing. Returns normally (does NOT raise
+    :class:`ApplicationHandlerStop`) so the rest of the handler chain
+    runs unchanged. Wraps the increment in a try/except so a counter
+    bug can never break message delivery.
+    """
+    try:
+        heartbeat.record_inbound()
+    except Exception:  # noqa: BLE001
+        log.exception("talker.bot.record_inbound_failed")
+
+
 # --- Application assembly -------------------------------------------------
 
 
@@ -127,6 +174,13 @@ def build_app(
     app.bot_data[_KEY_VAULT_CTX] = vault_context_str
     app.bot_data[_KEY_LOCKS] = {}
     app.bot_data["raw_config"] = raw_config
+
+    # Application-level pre-pass: every inbound update bumps the
+    # heartbeat counter, regardless of which handler eventually routes
+    # it (or whether nothing routes it, e.g. an unrecognised command).
+    # See the comment block above ``_pre_record_inbound`` for the
+    # coverage-gap incident this guards against.
+    app.add_handler(TypeHandler(Update, _pre_record_inbound), group=-1)
 
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("end", on_end))
@@ -1170,10 +1224,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         kind="text",
         length=len(text),
     )
-    # Idle-tick heartbeat counter — paired with each ``talker.bot.inbound``
-    # event so the periodic ``talker.idle_tick`` event reports an accurate
-    # ``inbound_in_window``. See ``heartbeat.py`` for the full design.
-    heartbeat.record_inbound()
+    # Idle-tick heartbeat counter is bumped by the application-level
+    # ``_pre_record_inbound`` pre-pass (group=-1), not here — that
+    # ensures unrecognised commands and other non-text-handler updates
+    # still count. See the pre-pass comment block above ``build_app``.
     await handle_message(update, ctx, text=text, voice=False)
 
 
@@ -1198,8 +1252,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         kind="voice",
         duration=update.message.voice.duration,
     )
-    # Idle-tick heartbeat counter — see paired call in ``on_text``.
-    heartbeat.record_inbound()
+    # Idle-tick heartbeat counter is bumped by the application-level
+    # ``_pre_record_inbound`` pre-pass (group=-1) — see ``on_text``.
 
     try:
         tg_file = await update.message.voice.get_file()
