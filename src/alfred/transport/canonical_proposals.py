@@ -173,6 +173,50 @@ def find_proposal(
     return None
 
 
+def update_proposal_state(
+    queue_path: str | Path,
+    correlation_id: str,
+    new_state: str,
+) -> bool:
+    """Flip one proposal's state in place. Returns True on success.
+
+    Re-reads the full file, rewrites every line, and atomically
+    renames a temp file over the original. Order-preserving — the
+    Daily Sync section's "proposal N" numbering stays stable across
+    state transitions so Andrew's reply-to-message doesn't drift.
+
+    Returns False when:
+      - ``correlation_id`` isn't in the file
+      - ``new_state`` isn't one of the valid states
+      - the file doesn't exist
+
+    Disk errors propagate — the dispatcher caller wraps this in
+    try/except and logs; unlike :func:`append_proposal`, losing a state
+    transition WOULD confuse the operator (re-surfacing an already-
+    approved proposal), so we don't silently swallow.
+    """
+    if new_state not in _VALID_STATES:
+        return False
+    path = Path(queue_path)
+    if not path.exists():
+        return False
+    proposals = iter_proposals(queue_path)
+    found = False
+    for p in proposals:
+        if p.correlation_id == correlation_id:
+            p.state = new_state
+            found = True
+    if not found:
+        return False
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for p in proposals:
+            f.write(json.dumps(p.to_dict(), default=str) + "\n")
+    tmp.replace(path)
+    return True
+
+
 def _now_iso() -> str:
     """Wall-clock UTC ISO-8601. Wrapped so tests can monkeypatch."""
     return datetime.now(timezone.utc).isoformat()
@@ -187,4 +231,5 @@ __all__ = [
     "find_proposal",
     "iter_proposals",
     "list_pending",
+    "update_proposal_state",
 ]
