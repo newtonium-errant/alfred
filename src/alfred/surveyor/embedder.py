@@ -191,6 +191,16 @@ class Embedder:
     ) -> dict[str, VaultRecord]:
         """Embed new/changed files, delete removed ones. Returns parsed records."""
         records: dict[str, VaultRecord] = {}
+        # Track records that never made it to Milvus, broken down by reason so
+        # operators can tell context-length trips (embed_failed) from parse
+        # errors or empty-text skips. Previously diff_processed logged
+        # upserted=len(to_embed) which counted ATTEMPTS, not successes — after
+        # an embed_failed the log line claimed the vector was upserted even
+        # though Milvus was never written, leaving state and vector store
+        # silently out of sync. See project_embedder_context_length_bug memo.
+        failed_embed: list[str] = []
+        parse_errors: list[str] = []
+        empty_skipped: list[str] = []
 
         # Upsert new + changed
         to_embed = new_paths + changed_paths
@@ -199,15 +209,18 @@ class Embedder:
                 record = parse_file(self.vault_path, rel_path)
             except Exception as e:
                 log.warning("embedder.parse_error", path=rel_path, error=str(e))
+                parse_errors.append(rel_path)
                 continue
 
             text = build_embedding_text(record)
             if not text.strip():
                 log.debug("embedder.empty_text", path=rel_path)
+                empty_skipped.append(rel_path)
                 continue
 
             embedding = await self._get_embedding(text, rel_path=rel_path)
             if embedding is None:
+                failed_embed.append(rel_path)
                 continue
 
             # Throttle between requests to reduce Ollama pressure
@@ -239,9 +252,25 @@ class Embedder:
             self.state.remove_file(rel_path)
             log.debug("embedder.deleted", path=rel_path)
 
+        # Emit a distinct event for records that tried to embed but failed, so
+        # operators auditing Milvus freshness can see which vectors are now
+        # stale and plan a targeted re-embed. Keep the event separate from the
+        # success counter rather than folding it in, so post-hoc log greps like
+        # ``grep diff_processed`` still summarize what actually landed.
+        if failed_embed:
+            log.warning(
+                "embedder.diff_failed_records",
+                count=len(failed_embed),
+                records=failed_embed,
+            )
+
         log.info(
             "embedder.diff_processed",
-            upserted=len(to_embed),
+            upserted=len(records),
+            attempted=len(to_embed),
+            embed_failed=len(failed_embed),
+            parse_errors=len(parse_errors),
+            empty_skipped=len(empty_skipped),
             deleted=len(deleted_paths),
         )
         return records
