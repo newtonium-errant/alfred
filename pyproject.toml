@@ -17,6 +17,11 @@ dependencies = [
     "watchdog>=4.0",
     "rich>=13.0",
     "textual>=0.89",
+    # Distiller rebuild (Week 1+): Pydantic validates the non-agentic
+    # extractor's JSON output before the deterministic writer runs.
+    # Already pulled in transitively by the ``voice`` extra's anthropic
+    # SDK, but the base distiller path imports it too — pin explicitly.
+    "pydantic>=2.0",
 ]
 
 [project.optional-dependencies]
