@@ -978,8 +978,14 @@ def cmd_instance(args: argparse.Namespace) -> None:
     Subcommand: ``alfred instance new <name>``.
 
     Creates:
-      - ``config.<name>.yaml`` in the current directory (from the
-        bundled KAL-LE template — adjust for STAY-C etc. after).
+      - ``config.<name>.yaml`` in the current directory, rendered from
+        the universal per-instance template
+        (``config.instance.yaml.example``). The template carries the
+        subordinate default shape (talker + transport + instructor);
+        optional blocks like ``email_classifier``, ``daily_sync``, and
+        ``brief.peer_digests`` ship commented-out and can be
+        uncommented per instance. For a primary-like instance, see
+        ``config.yaml.example`` instead.
       - ``/home/andrew/.alfred/<name>/data/`` directory
       - ``/home/andrew/.alfred/<name>/logs/`` directory
 
@@ -1079,7 +1085,9 @@ def cmd_instance(args: argparse.Namespace) -> None:
     print(f"       ALFRED_SALEM_PEER_TOKEN=<64-char hex (if not already set)>")
     print(f"  3. Open Telegram, /start the new bot once.")
     print(f"  4. Review and tune {config_path} — port, instance name,")
-    print(f"     allowed_users, vault.path.")
+    print(f"     allowed_users, vault.path. Uncomment optional blocks")
+    print(f"     at the bottom (email_classifier / daily_sync /")
+    print(f"     brief.peer_digests) if this instance needs them.")
     print(f"  5. Create a venv at {instance_dir}/.venv and install alfred:")
     print(f"       python -m venv {instance_dir}/.venv")
     print(f"       source {instance_dir}/.venv/bin/activate")
