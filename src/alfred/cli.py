@@ -466,8 +466,21 @@ def cmd_transport(args: argparse.Namespace) -> None:
             limit=getattr(args, "limit", 50),
             wants_json=wants_json,
         ))
+    if subcmd == "propose-person":
+        sys.exit(tcli.cmd_propose_person(
+            raw,
+            peer=args.peer,
+            name=args.name,
+            fields=list(getattr(args, "field", []) or []),
+            source=getattr(args, "source", ""),
+            self_name=getattr(args, "self_name", "kal-le"),
+            wants_json=wants_json,
+        ))
 
-    print("Usage: alfred transport {status|send-test|queue|dead-letter|rotate|tail}")
+    print(
+        "Usage: alfred transport "
+        "{status|send-test|queue|dead-letter|rotate|tail|propose-person}"
+    )
     sys.exit(1)
 
 
