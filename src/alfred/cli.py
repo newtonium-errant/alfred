@@ -1013,21 +1013,25 @@ def cmd_instance(args: argparse.Namespace) -> None:
     data_dir = instance_dir / "data"
     logs_dir = instance_dir / "logs"
 
-    # Locate the KAL-LE template — it lives next to config.yaml.example.
-    # We ship only one template today (KAL-LE); future STAY-C will
-    # either reuse this template or ship its own.
-    template_path = Path("config.kalle.yaml.example")
-    if not template_path.exists():
-        # Fallback: look in the source tree.
-        maybe = Path(__file__).resolve().parent.parent.parent / "config.kalle.yaml.example"
-        if maybe.exists():
-            template_path = maybe
-        else:
-            print(
-                "Can't find config.kalle.yaml.example — are you running from "
-                "the alfred project root?"
-            )
-            sys.exit(1)
+    # Locate the universal per-instance template. Ships as
+    # config.instance.yaml.example next to config.yaml.example.
+    # Accepts the legacy name config.kalle.yaml.example as a fallback so
+    # in-place upgrades don't break.
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    candidates = [
+        Path("config.instance.yaml.example"),
+        Path("config.kalle.yaml.example"),
+        repo_root / "config.instance.yaml.example",
+        repo_root / "config.kalle.yaml.example",
+    ]
+    template_path = next((p for p in candidates if p.exists()), None)
+    if template_path is None:
+        print(
+            "Can't find config.instance.yaml.example (or legacy "
+            "config.kalle.yaml.example) — are you running from the "
+            "alfred project root?"
+        )
+        sys.exit(1)
 
     # Load the template, substitute the name token-ish — the template
     # is KAL-LE-shaped, so we do a light rename pass for STAY-C etc.

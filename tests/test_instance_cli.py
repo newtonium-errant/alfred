@@ -12,12 +12,15 @@ import yaml
 def test_config_kalle_example_exists_and_is_valid_yaml():
     """The shipped template must parse."""
     # Try the repo root (test runs from there) and the project dir.
+    # Accept both the current name and the legacy one.
     candidates = [
+        Path("config.instance.yaml.example"),
+        Path(__file__).resolve().parent.parent / "config.instance.yaml.example",
         Path("config.kalle.yaml.example"),
         Path(__file__).resolve().parent.parent / "config.kalle.yaml.example",
     ]
     template = next((p for p in candidates if p.exists()), None)
-    assert template is not None, "config.kalle.yaml.example missing"
+    assert template is not None, "config.instance.yaml.example missing"
 
     raw = yaml.safe_load(template.read_text(encoding="utf-8"))
     # Key sections present.
@@ -34,6 +37,8 @@ def test_config_kalle_example_exists_and_is_valid_yaml():
 
 def test_config_kalle_example_has_bash_exec_audit_path():
     candidates = [
+        Path("config.instance.yaml.example"),
+        Path(__file__).resolve().parent.parent / "config.instance.yaml.example",
         Path("config.kalle.yaml.example"),
         Path(__file__).resolve().parent.parent / "config.kalle.yaml.example",
     ]
@@ -58,8 +63,16 @@ def test_instance_new_scaffolds_directories(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
 
     # Copy the template into the tmp dir so the CLI can find it.
-    template_src = Path(__file__).resolve().parent.parent / "config.kalle.yaml.example"
-    (tmp_path / "config.kalle.yaml.example").write_text(
+    repo_root = Path(__file__).resolve().parent.parent
+    template_src = next(
+        (repo_root / name for name in (
+            "config.instance.yaml.example",
+            "config.kalle.yaml.example",
+        ) if (repo_root / name).exists()),
+        None,
+    )
+    assert template_src is not None, "scaffold template missing in repo root"
+    (tmp_path / "config.instance.yaml.example").write_text(
         template_src.read_text(encoding="utf-8"), encoding="utf-8",
     )
 
@@ -132,7 +145,7 @@ def test_instance_new_rejects_existing_config_without_force(tmp_path, monkeypatc
 
     monkeypatch.chdir(tmp_path)
     # Create a file that would be clobbered.
-    (tmp_path / "config.kalle.yaml.example").write_text("# template\n", encoding="utf-8")
+    (tmp_path / "config.instance.yaml.example").write_text("# template\n", encoding="utf-8")
     (tmp_path / "config.existing-test.yaml").write_text("# pre-existing\n", encoding="utf-8")
 
     args = argparse.Namespace(
