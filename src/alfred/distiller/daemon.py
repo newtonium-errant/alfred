@@ -199,12 +199,13 @@ async def _run_v2_shadow(
     """Distiller rebuild (Week 1): run the non-agentic v2 path in parallel.
 
     This is the operator-diffable shadow pipeline. It:
-      - Filters the batch to sources whose ``record_type`` is in
+      - Calls the Pydantic-gated extractor on every source in the batch.
+      - Filters the extractor's ``LearningCandidate`` output to types in
         ``config.extraction.v2_types`` (default: ``assumption`` only, to
-        keep blast radius tight during Week 2 measurement).
-      - Calls the Pydantic-gated extractor per source.
-      - Writes each validated ``LearningCandidate`` to the shadow root
-        via the deterministic writer (``writer.write_learn_record``).
+        keep blast radius tight during Week 2 measurement — v2_types
+        filters OUTPUT (learning) types, not source record types).
+      - Writes each kept ``LearningCandidate`` to the shadow root via
+        the deterministic writer (``writer.write_learn_record``).
       - Does NOT update state, does NOT touch mutation log, does NOT
         write to the live vault. The legacy path owns all that; v2
         is bookkeeping-free so it can run alongside without interfering.
@@ -213,8 +214,8 @@ async def _run_v2_shadow(
     the whole batch. They propagate as structured-log warnings; the
     daemon's top-level ``try`` still catches anything that escapes.
     """
-    allowed_types = set(config.extraction.v2_types or [])
-    if not allowed_types:
+    allowed_output_types = set(config.extraction.v2_types or [])
+    if not allowed_output_types:
         # No types allow-listed → v2 effectively off even if flag is on.
         return
     shadow_root = Path(config.extraction.shadow_root)
@@ -229,22 +230,19 @@ async def _run_v2_shadow(
         if title:
             existing_titles.append((title, learn_record.record_type))
 
-    filtered = [
-        sc for sc in batch.source_records
-        if sc.record.record_type in allowed_types
-    ]
-    if not filtered:
+    if not batch.source_records:
         return
 
     log.info(
         "distiller.v2.batch_start",
         run_id=run_id,
         project=batch.project or "(ungrouped)",
-        sources=len(filtered),
+        sources=len(batch.source_records),
+        allowed_output_types=sorted(allowed_output_types),
         shadow_root=str(shadow_root),
     )
 
-    for sc in filtered:
+    for sc in batch.source_records:
         try:
             result = await v2_extract(
                 source_body=sc.record.body,
@@ -262,8 +260,17 @@ async def _run_v2_shadow(
             )
             continue
 
+        # v2_types filters OUTPUT — keep only learnings of allow-listed
+        # types before writing to shadow. An extractor producing 3
+        # learnings [assumption, decision, synthesis] with v2_types=
+        # ["assumption"] writes just the assumption; the others are
+        # dropped (not waste — extractor already paid the LLM cost, and
+        # widening v2_types later costs only re-writes, not re-extracts).
+        kept = [s for s in result.learnings if s.type in allowed_output_types]
+        skipped = len(result.learnings) - len(kept)
+
         written = 0
-        for spec in result.learnings:
+        for spec in kept:
             try:
                 write_learn_record(
                     spec=spec,
@@ -286,6 +293,7 @@ async def _run_v2_shadow(
             source=sc.record.rel_path,
             learnings=len(result.learnings),
             written=written,
+            skipped_wrong_type=skipped,
             shadow=True,
         )
 

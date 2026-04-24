@@ -119,9 +119,17 @@ class ExtractionConfig:
     # Distiller rebuild (Week 1 MVP) — feature flag for the non-agentic
     # extractor + deterministic writer path. When False (default), only
     # the legacy pipeline runs. When True, v2 runs in parallel with the
-    # legacy path for sources matching ``v2_types`` (default: assumption
-    # only, to keep blast radius tight during Week 2 measurement).
-    # v2 output lands under ``shadow_root`` — live vault is untouched.
+    # legacy path on every source; the extractor's output is then
+    # filtered so only learnings whose ``type`` is in ``v2_types``
+    # (default: ``["assumption"]`` — narrows blast radius during Week 2
+    # measurement) are written to ``shadow_root``. v2 never touches the
+    # live vault; widening ``v2_types`` later costs only shadow re-writes,
+    # not re-extractions (the extractor already paid the LLM cost on
+    # the full set).
+    # ``v2_types`` filters OUTPUT (learning) types — "assumption",
+    # "decision", "constraint", "contradiction", "synthesis". NOT source
+    # record types like "session" or "note" — sources aren't filtered at
+    # the daemon layer; the extractor decides per-source what to emit.
     # See docs/proposals/distiller-rebuild-team2-*.md for the rollout.
     use_deterministic_v2: bool = False
     shadow_root: str = "data/shadow/distiller"
