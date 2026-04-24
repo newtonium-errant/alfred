@@ -865,6 +865,19 @@ def cmd_talker(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def cmd_audit(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred audit`` subcommands.
+
+    Currently exposes only ``infer-marker`` (calibration audit gap c3
+    retroactive sweep). Future commands (``list``, etc.) plug into the
+    same dispatcher.
+    """
+    from alfred.audit import cli as audit_cli
+
+    code = audit_cli.dispatch(args)
+    sys.exit(code)
+
+
 def cmd_bit(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred bit`` subcommands (run-now / status / history)."""
     raw = _load_unified_config(args.config)
@@ -1397,6 +1410,10 @@ def build_parser() -> argparse.ArgumentParser:
     mail_webhook.add_argument("--port", type=int, default=5005, help="Port to listen on (default: 5005)")
     mail_webhook.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
 
+    # audit (calibration audit gap, c3 retroactive sweep CLI)
+    from alfred.audit import cli as audit_cli
+    audit_cli.build_parser(sub)
+
     return parser
 
 
@@ -1434,6 +1451,7 @@ def main() -> None:
         "talker": cmd_talker,
         "check": cmd_check,
         "bit": cmd_bit,
+        "audit": cmd_audit,
     }
 
     handler = handlers.get(args.command)
