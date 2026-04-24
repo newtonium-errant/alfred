@@ -290,12 +290,19 @@ async def _call_llm(
                 stdout_tail=raw_stdout[-2000:] if raw_stdout else "",
                 stderr=raw_stderr[:500],
             )
-        else:
-            log.info(
-                "pipeline.llm_completed",
-                stage=stage_label,
-                stdout_len=len(result.summary),
-            )
+            # Return raw stdout (may be empty) rather than the backend's
+            # error-summary string like "Exit code 1: ". The caller's
+            # "if not manifest and stdout" guard short-circuits parsing when
+            # stdout is empty; previously we returned "Exit code 1: " (13
+            # chars) which passed the guard and produced a noisy
+            # pipeline.manifest_parse_failed stdout_len=13 log entry with
+            # no real signal.
+            return raw_stdout
+        log.info(
+            "pipeline.llm_completed",
+            stage=stage_label,
+            stdout_len=len(result.summary),
+        )
         return result.summary
 
     elif backend_name == "openclaw":
