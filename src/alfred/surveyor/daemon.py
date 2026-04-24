@@ -296,6 +296,30 @@ class Daemon:
             if len(members) < self.cfg.labeler.min_cluster_size_to_label:
                 continue
 
+            # Membership-stability gate. HDBSCAN + Leiden re-run every tick
+            # and renumber cluster IDs non-deterministically — so
+            # ``all_changed`` (derived from ID diffs) flags clusters that
+            # often have identical member sets vs their prior ``ClusterState``
+            # snapshot. Hitting Ollama for those is wasted work:
+            # ``writer.write_alfred_tags`` logs ``tags_unchanged`` because
+            # content is stable. One vault write that triggered 19
+            # attribution-marker updates on a single record cascaded into
+            # ~80s of this pattern on 2026-04-23 22:29 ADT and OOM-killed
+            # WSL. Gate both label_cluster and suggest_relationships on a
+            # sorted-member-paths equality check against ``state.clusters``.
+            # Both calls are keyed off cluster membership, so if membership
+            # is stable neither needs re-running.
+            membership_key = tuple(sorted(members))
+            cluster_key = f"semantic_{cid}"
+            prev = self.state.clusters.get(cluster_key)
+            if prev is not None and tuple(sorted(prev.member_files)) == membership_key:
+                log.info(
+                    "daemon.membership_unchanged_skip",
+                    cid=cid,
+                    member_count=len(members),
+                )
+                continue
+
             # Label the cluster
             tags = await self.labeler.label_cluster(cid, members, records)
             if tags:
@@ -303,8 +327,9 @@ class Daemon:
                 for path in members:
                     self.writer.write_alfred_tags(path, tags)
 
-                # Update cluster state
-                cluster_key = f"semantic_{cid}"
+                # Update cluster state (cluster_key defined above in the
+                # membership-stability gate so the write uses the same key
+                # we compared against).
                 from .state import ClusterState
                 from datetime import datetime, timezone
                 self.state.clusters[cluster_key] = ClusterState(
