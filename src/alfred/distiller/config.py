@@ -131,6 +131,27 @@ class LoggingConfig:
 
 
 @dataclass
+class AnthropicConfig:
+    """Anthropic SDK config for the non-agentic distiller rebuild (Week 1+).
+
+    The rebuilt extractor calls the Messages API directly with no tools
+    (see ``distiller/backends/anthropic_sdk.py``). Mirrors the shape of
+    ``instructor/config.py::AnthropicConfig`` so config.yaml stays
+    consistent across tools. Defaults to Claude Opus 4.7 because the
+    rebuild's extraction prompt is the single expensive LLM call per
+    source — the cheaper-model path lives on the drafter (Week 3).
+
+    ``api_key`` falls back to the ``ANTHROPIC_API_KEY`` env var at call
+    time when empty (see ``call_anthropic_no_tools``). Explicit config
+    wins over env.
+    """
+
+    api_key: str = ""
+    model: str = "claude-opus-4-7"
+    max_tokens: int = 4096
+
+
+@dataclass
 class IdleTickConfig:
     """Distiller idle-tick heartbeat — "intentionally left blank" liveness signal.
 
@@ -153,6 +174,10 @@ class IdleTickConfig:
 class DistillerConfig:
     vault: VaultConfig = field(default_factory=VaultConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    # Anthropic SDK config for the non-agentic rebuild path (Week 1+).
+    # Used only when ``extraction.use_deterministic_v2`` is True;
+    # absent block in YAML keeps the legacy agent path untouched.
+    anthropic: AnthropicConfig = field(default_factory=AnthropicConfig)
     extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
     state: StateConfig = field(default_factory=StateConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
@@ -170,6 +195,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "claude": ClaudeBackendConfig,
     "zo": ZoBackendConfig,
     "openclaw": OpenClawBackendConfig,
+    "anthropic": AnthropicConfig,
     "extraction": ExtractionConfig,
     "deep_extraction_schedule": ScheduleConfig,
     "consolidation_schedule": ScheduleConfig,
@@ -215,6 +241,12 @@ def load_from_unified(raw: dict[str, Any]) -> DistillerConfig:
         "state": tool.get("state", {}),
         "logging": log_raw,
     }
+    # Anthropic SDK config for the rebuild path. Per-tool block so the
+    # distiller can use a different api_key / model than the instructor
+    # or the talker if needed. Absent block → dataclass defaults.
+    anthropic_raw = tool.get("anthropic")
+    if isinstance(anthropic_raw, dict):
+        built["anthropic"] = anthropic_raw
     # Idle-tick — defaulted-on; partial dict merges over dataclass default.
     idle_raw = tool.get("idle_tick")
     if isinstance(idle_raw, dict):
