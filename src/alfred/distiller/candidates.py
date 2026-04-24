@@ -203,13 +203,52 @@ def group_by_project(
     return groups
 
 
+def _is_ungrouped(record: VaultRecord) -> bool:
+    """True when a record has no ``project`` wikilink in its frontmatter.
+
+    Used by :func:`collect_existing_learns` to scope the dedup context
+    for ungrouped batches. A learn record is "ungrouped" iff
+    :func:`_get_project_link` returns ``None`` — either the ``project``
+    frontmatter key is absent/empty or it does not resolve to a vault
+    wikilink.
+    """
+    return _get_project_link(record) is None
+
+
 def collect_existing_learns(
     vault_path: Path,
     ignore_dirs: list[str],
     learn_types: list[str],
     project_name: str | None = None,
+    ungrouped_only: bool = False,
 ) -> list[VaultRecord]:
-    """Find existing learn records, optionally filtered by project."""
+    """Find existing learn records, scoped to the caller's batch.
+
+    Scoping modes:
+
+    - ``project_name="Eagle Farm"`` → only learns whose ``project``
+      frontmatter resolves to "Eagle Farm" (project-scoped dedup
+      context for a project-specific extraction batch).
+    - ``ungrouped_only=True`` (c9, 2026-04-24) → only learns without
+      a ``project`` wikilink. Used by the ungrouped extraction batch
+      so its dedup context is peer-ungrouped learns only, not every
+      learn record in the vault.
+    - Default (both falsy) → every learn record in the vault.
+      Used by Pass B meta-analysis and the consolidation sweep, which
+      genuinely want vault-wide scope.
+
+    The c9 change added ``ungrouped_only`` rather than overloading
+    ``project_name=None`` because Pass B / consolidation rely on
+    "all learns" as the default. The Plan-agent diagnosis 2026-04-24
+    flagged the ungrouped extraction batch pre-c9 was passing
+    ``project_name=None`` and getting 588 learns back — a firehose
+    dedup context that told the LLM "everything is already captured."
+    Callers opt into the narrower scope via the explicit flag.
+
+    Precedence: ``project_name`` wins over ``ungrouped_only`` when
+    both are set — a project-scoped batch has no reason to also
+    restrict to ungrouped learns.
+    """
     ignore_d = set(ignore_dirs)
     learns: list[VaultRecord] = []
 
@@ -228,10 +267,14 @@ def collect_existing_learns(
         if record.record_type not in learn_types:
             continue
 
-        # Filter by project if specified
         if project_name:
+            # Project-scoped: only learns tied to this project.
             proj = _get_project_link(record)
             if proj != project_name:
+                continue
+        elif ungrouped_only:
+            # Ungrouped-scoped: only learns without a project wikilink.
+            if not _is_ungrouped(record):
                 continue
 
         learns.append(record)

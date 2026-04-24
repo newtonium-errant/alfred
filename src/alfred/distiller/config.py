@@ -121,19 +121,27 @@ class ExtractionConfig:
     # the legacy pipeline runs. When True, v2 runs in parallel with the
     # legacy path on every source; the extractor's output is then
     # filtered so only learnings whose ``type`` is in ``v2_types``
-    # (default: ``["assumption"]`` — narrows blast radius during Week 2
-    # measurement) are written to ``shadow_root``. v2 never touches the
-    # live vault; widening ``v2_types`` later costs only shadow re-writes,
-    # not re-extractions (the extractor already paid the LLM cost on
+    # are written to ``shadow_root``. v2 never touches the live vault;
+    # widening ``v2_types`` later costs only shadow re-writes, not
+    # re-extractions (the extractor already paid the LLM cost on
     # the full set).
     # ``v2_types`` filters OUTPUT (learning) types — "assumption",
     # "decision", "constraint", "contradiction", "synthesis". NOT source
     # record types like "session" or "note" — sources aren't filtered at
     # the daemon layer; the extractor decides per-source what to emit.
+    # Default c9 (2026-04-24): ALL FIVE learn types (full extraction).
+    # Previously defaulted to ``["assumption"]`` as a Week-2 measurement
+    # cap, but the Plan-agent diagnosis showed the filter was silently
+    # dropping 3 of 4 extracted learnings (75% loss) — widening = ~4x
+    # baseline lift for zero extra LLM cost. Operators CAN still narrow
+    # via ``distiller.extraction.v2_types`` in config.yaml to restrict
+    # Week-2-style measurement scope.
     # See docs/proposals/distiller-rebuild-team2-*.md for the rollout.
     use_deterministic_v2: bool = False
     shadow_root: str = "data/shadow/distiller"
-    v2_types: list[str] = field(default_factory=lambda: ["assumption"])
+    v2_types: list[str] = field(default_factory=lambda: [
+        "assumption", "decision", "constraint", "contradiction", "synthesis",
+    ])
 
 
 @dataclass

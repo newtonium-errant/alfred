@@ -172,12 +172,19 @@ def _build_batches(
         # Cap batch size
         batch_candidates = group_candidates[: config.extraction.max_sources_per_batch]
 
-        # Collect existing learns for dedup
+        # Collect existing learns for dedup. When ``project_name`` is
+        # None (ungrouped batch) we explicitly restrict to ungrouped
+        # learns — otherwise the extractor sees every learn record in
+        # the vault as dedup context (~588 titles in production, c9
+        # Plan-agent diagnosis 2026-04-24) and spuriously concludes
+        # "everything is already captured." Project-scoped batches
+        # still dedup against their project's learns.
         existing = collect_existing_learns(
             vault_path,
             config.vault.ignore_dirs,
             config.extraction.learn_types,
-            project_name,
+            project_name=project_name,
+            ungrouped_only=(project_name is None),
         )
 
         batches.append(

@@ -175,7 +175,7 @@ async def extract(
     )
 
     # First attempt
-    raw = await call_anthropic_no_tools(
+    raw, meta = await call_anthropic_no_tools(
         prompt=user_prompt,
         system=SYSTEM_PROMPT,
         model=config.anthropic.model,
@@ -183,13 +183,26 @@ async def extract(
         api_key=config.anthropic.api_key or None,
     )
     cleaned = _strip_code_fences(raw)
+    stop_reason = meta.get("stop_reason")
 
     try:
         result = ExtractionResult.model_validate_json(cleaned)
+        # c9 (2026-04-24): on learnings=0 the extractor was indistinguishable
+        # from a silent "nothing to extract" vs. a truncated / refused LLM.
+        # We now log the raw preview + stop_reason when the first attempt
+        # returns empty so the next iteration can tell the three apart.
+        if len(result.learnings) == 0:
+            log.info(
+                "extractor.extract_empty",
+                attempt=1,
+                stop_reason=stop_reason,
+                raw_preview=raw[:200],
+            )
         log.info(
             "extractor.extract_complete",
             attempt=1,
             learnings=len(result.learnings),
+            stop_reason=stop_reason,
         )
         return result
     except ValidationError as exc:
@@ -197,11 +210,12 @@ async def extract(
         log.info(
             "extractor.validation_retry",
             error=first_error[:500],
+            stop_reason=stop_reason,
         )
 
     # Repair retry — give the model its own output + the exact error.
     repair_prompt = _render_repair_prompt(raw, first_error)
-    raw_repair = await call_anthropic_no_tools(
+    raw_repair, meta_repair = await call_anthropic_no_tools(
         prompt=repair_prompt,
         system=SYSTEM_PROMPT,
         model=config.anthropic.model,
@@ -209,13 +223,22 @@ async def extract(
         api_key=config.anthropic.api_key or None,
     )
     cleaned_repair = _strip_code_fences(raw_repair)
+    stop_reason_repair = meta_repair.get("stop_reason")
 
     try:
         result = ExtractionResult.model_validate_json(cleaned_repair)
+        if len(result.learnings) == 0:
+            log.info(
+                "extractor.extract_empty",
+                attempt=2,
+                stop_reason=stop_reason_repair,
+                raw_preview=raw_repair[:200],
+            )
         log.info(
             "extractor.extract_complete",
             attempt=2,
             learnings=len(result.learnings),
+            stop_reason=stop_reason_repair,
         )
         return result
     except ValidationError as exc:
@@ -225,5 +248,6 @@ async def extract(
             error=str(exc)[:500],
             raw_len=len(raw_repair),
             raw_preview=raw_repair[:500],
+            stop_reason=stop_reason_repair,
         )
         return ExtractionResult(learnings=[])

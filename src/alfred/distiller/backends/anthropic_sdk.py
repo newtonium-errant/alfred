@@ -39,12 +39,16 @@ async def call_anthropic_no_tools(
     model: str = "claude-opus-4-7",
     max_tokens: int = 4096,
     api_key: str | None = None,
-) -> str:
+) -> tuple[str, dict]:
     """Call the Anthropic Messages API without any tools.
 
-    Returns the raw text of the first ``text`` block in the response.
-    Callers (specifically ``extractor.py``) are expected to
-    ``model_validate_json`` that text against ``ExtractionResult``.
+    Returns ``(text, metadata)`` — the raw text of the first ``text``
+    block plus a metadata dict with response-level fields (currently
+    ``stop_reason``). Callers (specifically ``extractor.py``) are
+    expected to ``model_validate_json`` that text against
+    ``ExtractionResult`` and use the metadata for diagnostic logging
+    (e.g. distinguishing ``max_tokens`` truncation from genuine
+    refusals when the extractor emits zero learnings).
 
     ``api_key`` falls back to the ``ANTHROPIC_API_KEY`` environment
     variable if not given — mirrors the SDK default so unit-test
@@ -55,10 +59,16 @@ async def call_anthropic_no_tools(
         retry policy lives in ``extractor.py`` (one repair retry on
         Pydantic ValidationError), not here; we don't wrap network
         failures because they're a different failure class.
-      - Empty / non-text responses return ``""`` and log
+      - Empty / non-text responses return ``("", {...})`` and log
         ``anthropic_sdk.empty_response``. The caller's Pydantic
         validation will fail on empty string, which then triggers the
         repair-retry path — the right loop for handling garbage.
+
+    Return-shape change (c9, 2026-04-24): previously returned a bare
+    ``str``. Callers must unpack the tuple. The metadata dict is
+    intentionally thin — caller-shaped diagnostic fields live here so
+    adding more (e.g. ``usage``) later is a dict-key extension, not
+    another return-tuple slot.
     """
     resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not resolved_key:
@@ -93,6 +103,9 @@ async def call_anthropic_no_tools(
         )
         raise
 
+    stop_reason = getattr(response, "stop_reason", None)
+    metadata: dict = {"stop_reason": stop_reason}
+
     # Extract the first text block. In tool-less mode the response is
     # typically a single ``text`` block; take the first one defensively.
     text = _first_text_block(response.content)
@@ -100,9 +113,9 @@ async def call_anthropic_no_tools(
         log.info(
             "anthropic_sdk.empty_response",
             model=model,
-            stop_reason=getattr(response, "stop_reason", "unknown"),
+            stop_reason=stop_reason or "unknown",
         )
-    return text
+    return text, metadata
 
 
 def _first_text_block(content) -> str:
