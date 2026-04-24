@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
+import time
 
 import structlog
 from openai import AsyncOpenAI
@@ -124,6 +126,15 @@ class Labeler:
         self.body_preview_chars = labeler_cfg.body_preview_chars
         self.min_cluster_size = labeler_cfg.min_cluster_size_to_label
         self.min_relationship_confidence = labeler_cfg.min_relationship_confidence
+        # Sliding-window rate cap on LLM calls. Belt-and-suspenders on top
+        # of the daemon-level c1 membership gate — if anything ever defeats
+        # that gate (a future refactor, a new call site, an unforeseen
+        # cascade shape), this cap still prevents the Ollama backend from
+        # being saturated. Timestamps are monotonic seconds; we prune
+        # entries older than 60s on each call.
+        self.max_calls_per_minute = labeler_cfg.max_calls_per_minute
+        self.rate_limit_enabled = labeler_cfg.rate_limit_enabled
+        self._call_history: collections.deque[float] = collections.deque()
 
     async def label_cluster(
         self,
@@ -245,7 +256,32 @@ class Labeler:
         return "\n".join(lines)
 
     async def _llm_call(self, prompt: str) -> str | None:
-        """Make an LLM call with rate limiting and retry."""
+        """Make an LLM call with rate limiting and retry.
+
+        When ``rate_limit_enabled`` is set (default True), a sliding
+        60-second window of prior call timestamps is maintained and calls
+        beyond ``max_calls_per_minute`` are dropped with a
+        ``labeler.rate_cap_dropped`` log — the cluster goes unlabeled
+        until the next tick. Callers (``label_cluster``,
+        ``suggest_relationships``) already treat a ``None`` return as a
+        no-op, so this short-circuit is safe.
+        """
+        if self.rate_limit_enabled:
+            now = time.monotonic()
+            # Prune the window — any entry older than 60s is irrelevant
+            # to the per-minute cap.
+            cutoff = now - 60.0
+            while self._call_history and self._call_history[0] < cutoff:
+                self._call_history.popleft()
+            if len(self._call_history) >= self.max_calls_per_minute:
+                log.warning(
+                    "labeler.rate_cap_dropped",
+                    calls_in_window=len(self._call_history),
+                    cap=self.max_calls_per_minute,
+                )
+                return None
+            self._call_history.append(now)
+
         for attempt in range(MAX_RETRIES):
             try:
                 resp = await self.client.chat.completions.create(

@@ -67,6 +67,18 @@ class LabelerConfig:
     body_preview_chars: int = 200
     min_cluster_size_to_label: int = 2
     min_relationship_confidence: float = 0.65
+    # Belt-and-suspenders cap on Ollama/OpenRouter labeler calls. The c1
+    # membership-stability gate should already eliminate the wasted-call
+    # pattern that OOM-killed WSL on 2026-04-23, but a pathological burst
+    # (e.g. an unforeseen membership-invalidating cascade) shouldn't be
+    # allowed to saturate the LLM backend regardless. When
+    # ``rate_limit_enabled`` is True, ``Labeler._llm_call`` prunes a
+    # sliding 60-second window of call timestamps and drops the call
+    # (returning None) if the window is already at
+    # ``max_calls_per_minute``. Both have defaults so existing configs
+    # won't break.
+    max_calls_per_minute: int = 30
+    rate_limit_enabled: bool = True
 
 
 @dataclass
