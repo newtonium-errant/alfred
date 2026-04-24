@@ -135,8 +135,13 @@ class Embedder:
         if self._http is not None and not self._http.is_closed:
             await self._http.aclose()
 
-    async def _get_embedding(self, text: str) -> list[float] | None:
-        """Call embedding API with retry. Supports Ollama and OpenAI-compatible endpoints."""
+    async def _get_embedding(self, text: str, rel_path: str = "") -> list[float] | None:
+        """Call embedding API with retry. Supports Ollama and OpenAI-compatible endpoints.
+
+        ``rel_path`` is purely for logging — it lets the retry/failure lines name
+        the offending record so operators don't have to cross-reference batch
+        contents when a single file trips the context-length window.
+        """
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -144,6 +149,7 @@ class Embedder:
         else:
             body = {"model": self.model, "prompt": text}
 
+        text_len = len(text)
         client = await self._ensure_http()
         for attempt in range(MAX_RETRIES):
             try:
@@ -162,9 +168,22 @@ class Embedder:
                 if isinstance(e, httpx.HTTPStatusError):
                     detail = e.response.text[:200]
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
-                log.warning("embedder.embed_retry", attempt=attempt + 1, error=str(e), detail=detail, delay=delay)
+                log.warning(
+                    "embedder.embed_retry",
+                    attempt=attempt + 1,
+                    path=rel_path,
+                    embed_text_len=text_len,
+                    error=str(e),
+                    detail=detail,
+                    delay=delay,
+                )
                 await asyncio.sleep(delay)
-        log.error("embedder.embed_failed", max_retries=MAX_RETRIES)
+        log.error(
+            "embedder.embed_failed",
+            max_retries=MAX_RETRIES,
+            path=rel_path,
+            embed_text_len=text_len,
+        )
         return None
 
     async def process_diff(
@@ -187,7 +206,7 @@ class Embedder:
                 log.debug("embedder.empty_text", path=rel_path)
                 continue
 
-            embedding = await self._get_embedding(text)
+            embedding = await self._get_embedding(text, rel_path=rel_path)
             if embedding is None:
                 continue
 

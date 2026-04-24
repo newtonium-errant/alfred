@@ -10,10 +10,19 @@ import frontmatter
 
 WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
 
-# Max chars for embedding text — nomic-embed-text has 8192 token context,
-# ~1.5 chars/token for English → hard limit around 12,200 chars.
-# Use 8,000 chars to leave margin for non-English text and special tokens.
-MAX_EMBEDDING_CHARS = 8_000
+# Max chars for embedding text. Previous value (8_000) was based on a wrong
+# assumption that nomic-embed-text exposes its 8192-token native context via
+# Ollama's /api/embeddings endpoint. In practice Ollama's legacy embeddings
+# endpoint caps context at 2048 tokens regardless of model metadata, and the
+# /api/embed endpoint would require an options={"num_ctx": 8192} override this
+# codepath doesn't currently send. Empirical probe (see surveyor.log around
+# 2026-04-24T04:28 where a 31-file diff failed with HTTP 500 "the input length
+# exceeds the context length"): 7_500 chars on code-dense session notes already
+# busts the window; 6_000 chars embeds cleanly across sessions + synthesis +
+# assumption records. Keeping 6_000 leaves headroom for token-dense content
+# (wikilinks, code fences, non-English) that tokenizes worse than 3 chars/token.
+# If we ever migrate to /api/embed + num_ctx=8192, this can grow back.
+MAX_EMBEDDING_CHARS = 6_000
 
 # Frontmatter keys to include in embedding text
 EMBEDDING_FM_KEYS = ["type", "status", "name", "description", "intent", "source", "channel"]
