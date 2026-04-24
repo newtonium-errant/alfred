@@ -116,6 +116,16 @@ class ExtractionConfig:
             time="04:00", timezone="America/Halifax", day_of_week="sunday",
         )
     )
+    # Distiller rebuild (Week 1 MVP) — feature flag for the non-agentic
+    # extractor + deterministic writer path. When False (default), only
+    # the legacy pipeline runs. When True, v2 runs in parallel with the
+    # legacy path for sources matching ``v2_types`` (default: assumption
+    # only, to keep blast radius tight during Week 2 measurement).
+    # v2 output lands under ``shadow_root`` — live vault is untouched.
+    # See docs/proposals/distiller-rebuild-team2-*.md for the rollout.
+    use_deterministic_v2: bool = False
+    shadow_root: str = "data/shadow/distiller"
+    v2_types: list[str] = field(default_factory=lambda: ["assumption"])
 
 
 @dataclass

@@ -38,10 +38,12 @@ from .candidates import (
     scan_candidates,
 )
 from .config import DistillerConfig
+from .extractor import extract as v2_extract
 from .parser import parse_file
 from .pipeline import run_meta_analysis, run_pipeline
 from .state import DistillerState, ExtractionLogEntry, RunResult
 from .utils import compute_md5, get_logger
+from .writer import write_learn_record
 
 log = get_logger(__name__)
 
@@ -189,6 +191,105 @@ def _build_batches(
     return batches
 
 
+async def _run_v2_shadow(
+    batch: ExtractionBatch,
+    config: DistillerConfig,
+    run_id: str,
+) -> None:
+    """Distiller rebuild (Week 1): run the non-agentic v2 path in parallel.
+
+    This is the operator-diffable shadow pipeline. It:
+      - Filters the batch to sources whose ``record_type`` is in
+        ``config.extraction.v2_types`` (default: ``assumption`` only, to
+        keep blast radius tight during Week 2 measurement).
+      - Calls the Pydantic-gated extractor per source.
+      - Writes each validated ``LearningCandidate`` to the shadow root
+        via the deterministic writer (``writer.write_learn_record``).
+      - Does NOT update state, does NOT touch mutation log, does NOT
+        write to the live vault. The legacy path owns all that; v2
+        is bookkeeping-free so it can run alongside without interfering.
+
+    Exceptions are caught per-source so one bad source doesn't poison
+    the whole batch. They propagate as structured-log warnings; the
+    daemon's top-level ``try`` still catches anything that escapes.
+    """
+    allowed_types = set(config.extraction.v2_types or [])
+    if not allowed_types:
+        # No types allow-listed → v2 effectively off even if flag is on.
+        return
+    shadow_root = Path(config.extraction.shadow_root)
+
+    existing_titles: list[tuple[str, str]] = []
+    for learn_record in batch.existing_learns:
+        title = str(
+            learn_record.frontmatter.get("name")
+            or learn_record.frontmatter.get("title")
+            or ""
+        )
+        if title:
+            existing_titles.append((title, learn_record.record_type))
+
+    filtered = [
+        sc for sc in batch.source_records
+        if sc.record.record_type in allowed_types
+    ]
+    if not filtered:
+        return
+
+    log.info(
+        "distiller.v2.batch_start",
+        run_id=run_id,
+        project=batch.project or "(ungrouped)",
+        sources=len(filtered),
+        shadow_root=str(shadow_root),
+    )
+
+    for sc in filtered:
+        try:
+            result = await v2_extract(
+                source_body=sc.record.body,
+                source_frontmatter=sc.record.frontmatter,
+                existing_learn_titles=existing_titles,
+                signals=sc.signals,
+                config=config,
+            )
+        except Exception as exc:  # noqa: BLE001 — isolate per-source LLM/network errors
+            log.warning(
+                "distiller.v2.extract_error",
+                run_id=run_id,
+                source=sc.record.rel_path,
+                error=str(exc)[:500],
+            )
+            continue
+
+        written = 0
+        for spec in result.learnings:
+            try:
+                write_learn_record(
+                    spec=spec,
+                    body_draft="",
+                    shadow_root=shadow_root,
+                )
+                written += 1
+            except Exception as exc:  # noqa: BLE001 — isolate per-record write errors
+                log.warning(
+                    "distiller.v2.write_error",
+                    run_id=run_id,
+                    source=sc.record.rel_path,
+                    title=spec.title,
+                    error=str(exc)[:500],
+                )
+
+        log.info(
+            "distiller.v2.extract_complete",
+            run_id=run_id,
+            source=sc.record.rel_path,
+            learnings=len(result.learnings),
+            written=written,
+            shadow=True,
+        )
+
+
 def recompute_source_md5s(
     batch_source_records: list[ScoredCandidate],
     vault_path: Path,
@@ -264,6 +365,17 @@ async def run_extraction(
     # Phase 2: Build batches and extract
     batches = _build_batches(config, candidates, vault_path)
     result.batches = len(batches)
+
+    # --- Distiller rebuild (Week 1): v2 shadow pipeline -----------------
+    # When ``extraction.use_deterministic_v2`` is True, run the non-agentic
+    # extractor + deterministic writer in parallel with the legacy path.
+    # v2 writes to ``extraction.shadow_root`` (default ``data/shadow/distiller``);
+    # the live vault is untouched. Legacy continues as normal below.
+    # Week 2 plan: flip the flag for assumption-type sources only, diff
+    # shadow output against the legacy vault, decide rollout.
+    if config.extraction.use_deterministic_v2:
+        for batch in batches:
+            await _run_v2_shadow(batch, config, run_id)
 
     if _use_pipeline(config):
         # Multi-stage pipeline for OpenClaw backend
