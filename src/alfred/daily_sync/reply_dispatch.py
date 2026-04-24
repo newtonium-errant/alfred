@@ -533,6 +533,118 @@ def _resolve_attribution_correction(
     return (None, True)
 
 
+def _format_email_applied_line(
+    item: dict[str, Any],
+    andrew_priority: str,
+) -> str:
+    """Return a one-liner describing what the applier did for an email item.
+
+    Format::
+
+        "Item N: {sender} — 'Subject' → {TIER}"
+
+    c3 — Andrew asked for the feedback loop to be visible: replace the
+    opaque ``"applied N correction(s)"`` with a per-item summary of
+    what was learned. We don't invent a rule that doesn't exist — the
+    calibration corpus is still append-only and the classifier rotates
+    the tail as few-shot examples. The echo reports the ACTION
+    (tier assignment) and SCOPE (single item) the applier actually
+    performed.
+    """
+    item_number = item.get("item_number") or "?"
+    sender = str(item.get("sender") or "").strip() or "(unknown)"
+    subject = str(item.get("subject") or "").strip() or "(no subject)"
+    tier = str(andrew_priority or "").upper() or "?"
+    return f"Item {item_number}: {sender} — \"{subject}\" -> {tier}"
+
+
+def _format_attribution_applied_line(
+    item: dict[str, Any],
+    *,
+    action: str,
+) -> str:
+    """Return a one-liner describing an attribution confirm/reject.
+
+    Format::
+
+        "Item N: {agent} marker in {record_path} — confirmed"
+        "Item N: {agent} marker in {record_path} — rejected"
+    """
+    item_number = item.get("item_number") or "?"
+    agent = str(item.get("agent") or "").strip() or "(unknown agent)"
+    record_path = str(item.get("record_path") or "").strip() or "(unknown record)"
+    verb = "rejected" if action == "reject" else "confirmed"
+    return f"Item {item_number}: {agent} marker in {record_path} — {verb}"
+
+
+def _build_confirmation_body(
+    *,
+    parsed_all_ok: bool,
+    applied_lines: list[str],
+    written_count: int,
+    unparsed_item_numbers: list[int],
+    raw_errors: list[str],
+) -> str:
+    """Compose the user-facing confirmation reply.
+
+    c3 restructures this block:
+
+      * When items were applied, emit a per-item summary (up to 5 lines
+        so the Telegram bubble stays readable on mobile).
+      * When items failed to parse, render a user-facing list of item
+        numbers with a hint about the "Same" chaining shortcut — no
+        raw-token dump.
+      * Pure-ack (``✅``) keeps its short one-liner form.
+
+    Fallback (written_count == 0 AND no unparsed numbers but raw errors
+    exist) prints the raw error because the parser produced fragments
+    that don't map to item numbers — the operator still needs to see
+    them.
+    """
+    # all-ok shortcut stays terse — Andrew already knows what he confirmed.
+    if parsed_all_ok:
+        if written_count == 0:
+            return "Calibration: nothing to apply."
+        # Prefer the short form; attribution/email split is internal detail.
+        return f"Calibration: confirmed all {written_count} item(s)."
+
+    lines: list[str] = []
+    if applied_lines:
+        lines.append(f"Calibration: applied {written_count} correction(s).")
+        # Cap at 5 so the reply bubble doesn't get unwieldy on mobile.
+        for line in applied_lines[:5]:
+            lines.append(f"  {line}")
+        remaining = len(applied_lines) - 5
+        if remaining > 0:
+            lines.append(f"  ... and {remaining} more.")
+
+    if unparsed_item_numbers:
+        nums_sorted = sorted(set(unparsed_item_numbers))
+        if len(nums_sorted) == 1:
+            which = f"item {nums_sorted[0]}"
+        else:
+            which = "items " + ", ".join(str(n) for n in nums_sorted)
+        hint = (
+            " (Tip: 'Same' / 'Ditto' / 'Same as #N' are supported "
+            "for list items.)"
+        )
+        if lines:
+            lines.append(f"Didn't understand {which} — could you restate?{hint}")
+        else:
+            lines.append(f"Calibration: didn't understand {which} — could you restate?{hint}")
+    elif raw_errors and not applied_lines:
+        # Edge case: parser-level failures that never got a bucketed
+        # item number (e.g. the pre-c1 regression of orphan fragments).
+        # Render them as-is so the operator can see the raw input. This
+        # path should be very rare post-c1.
+        lines.append(f"Calibration: couldn't parse: {', '.join(raw_errors[:3])}.")
+
+    if not lines:
+        return "Calibration: nothing to apply."
+
+    return "\n".join(lines)
+
+
 def _resolve_correction(
     correction: ReplyCorrection,
     items_by_num: dict[int, dict[str, Any]],
@@ -632,7 +744,9 @@ def handle_daily_sync_reply(
 
     email_written = 0
     attribution_written = 0
+    applied_lines: list[str] = []  # c3 — one per-item summary line per accepted correction
     errors: list[str] = list(parsed.unparsed)
+    unparsed_item_numbers: list[int] = []  # c3 — numeric IDs of items that couldn't parse
     corpus_path = _attribution_corpus_path(config)
 
     # all_ok shortcut: write an email corpus row per email item AND
@@ -657,6 +771,7 @@ def handle_daily_sync_reply(
             try:
                 append_correction(config.corpus.path, entry)
                 email_written += 1
+                applied_lines.append(_format_email_applied_line(item, classifier_priority))
             except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "daily_sync.corpus_write_failed",
@@ -672,6 +787,10 @@ def handle_daily_sync_reply(
                     errors.append(
                         f"item {item.get('item_number')}: vault_path not provided"
                     )
+                    try:
+                        unparsed_item_numbers.append(int(item.get("item_number", 0)))
+                    except (TypeError, ValueError):
+                        pass
             else:
                 for item in attribution_items:
                     synthetic = ReplyCorrection(
@@ -683,8 +802,12 @@ def handle_daily_sync_reply(
                     )
                     if err is not None:
                         errors.append(err)
+                        unparsed_item_numbers.append(synthetic.item_number)
                     elif did_write:
                         attribution_written += 1
+                        applied_lines.append(
+                            _format_attribution_applied_line(item, action="confirm")
+                        )
 
     else:
         for correction in parsed.corrections:
@@ -698,15 +821,20 @@ def handle_daily_sync_reply(
                         f"item {correction.item_number}: `reject` is "
                         f"only meaningful for attribution items"
                     )
+                    unparsed_item_numbers.append(correction.item_number)
                     continue
                 entry, err = _resolve_correction(correction, email_by_num)
                 if err is not None:
                     errors.append(err)
+                    unparsed_item_numbers.append(correction.item_number)
                     continue
                 assert entry is not None
                 try:
                     append_correction(config.corpus.path, entry)
                     email_written += 1
+                    applied_lines.append(
+                        _format_email_applied_line(email_item, entry.andrew_priority)
+                    )
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "daily_sync.corpus_write_failed",
@@ -718,41 +846,42 @@ def handle_daily_sync_reply(
                     errors.append(
                         f"item {correction.item_number}: vault_path not provided"
                     )
+                    unparsed_item_numbers.append(correction.item_number)
                     continue
                 err, did_write = _resolve_attribution_correction(
                     correction, attribution_item, vault_path, corpus_path,
                 )
                 if err is not None:
                     errors.append(err)
+                    unparsed_item_numbers.append(correction.item_number)
                     continue
                 if did_write:
                     attribution_written += 1
+                    applied_lines.append(
+                        _format_attribution_applied_line(
+                            attribution_item,
+                            action="reject" if correction.reject else "confirm",
+                        )
+                    )
             else:
                 errors.append(
                     f"item {correction.item_number} not in last batch"
                 )
+                unparsed_item_numbers.append(correction.item_number)
 
     written_count = email_written + attribution_written
 
-    # Build a terse confirmation reply.
-    if parsed.all_ok:
-        body = (
-            f"Calibration: confirmed {email_written} email + "
-            f"{attribution_written} attribution item(s)."
-            if attribution_items
-            else f"Calibration: confirmed all {email_written} item(s)."
-        )
-    elif written_count and errors:
-        body = (
-            f"Calibration: applied {written_count} correction(s). "
-            f"Couldn't parse: {', '.join(errors[:3])}."
-        )
-    elif written_count:
-        body = f"Calibration: applied {written_count} correction(s)."
-    elif errors:
-        body = f"Calibration: couldn't parse: {', '.join(errors[:3])}."
-    else:
-        body = "Calibration: nothing to apply."
+    # c3 — user-facing body. Per-item summary lines go in (capped at 5
+    # so the Telegram reply stays readable on mobile), followed by a
+    # human-readable parse-failure sentence that mentions the "Same"
+    # chaining shortcut instead of dumping raw fragments.
+    body = _build_confirmation_body(
+        parsed_all_ok=parsed.all_ok,
+        applied_lines=applied_lines,
+        written_count=written_count,
+        unparsed_item_numbers=unparsed_item_numbers,
+        raw_errors=errors,
+    )
 
     log.info(
         "daily_sync.reply_processed",
