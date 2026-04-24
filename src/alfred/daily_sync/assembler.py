@@ -241,6 +241,41 @@ _OK_TOKENS = {
 # onto the unparsed bucket for email items.
 _REJECT_TOKENS = {"reject", "delete", "remove", "no"}
 
+# "Same" / "Same as above" / "Ditto" / "^" carrot — chain intent from a
+# prior item. Andrew uses these when several items share the same
+# correction (e.g. a run of routine Borrowell pings that all become
+# "spam"). The parser captures the chain reference and
+# :func:`parse_reply` resolves it by copying the source item's
+# tier/modifier/ok/reject onto this item.
+#
+# Supported forms (case-insensitive; a leading bullet/carrot is
+# stripped via :func:`_strip_bullet` before this regex runs):
+#
+#   "same"                     → prior item
+#   "same."                    → prior item
+#   "Same as above"            → prior item
+#   "ditto"                    → prior item
+#   "same as 1" / "same as #1" → explicit reference to item 1
+#
+# Trailing content after a dash/colon/em-dash/comma is preserved as
+# note content (``"Same - also, why was this ranked lower?"`` keeps
+# the question for downstream consumers even though the tier inherits).
+_SAME_CHAIN_RE = re.compile(
+    r"""
+    ^\s*
+    (?:                                       # chain token (either form)
+        same(?:\s+as(?:\s+\#?(?P<explicit>\d+)|\s+above)?)?
+      | ditto
+    )
+    \s*
+    (?:                                       # optional trailing note, any separator
+        [.!]?\s*(?:[—–\-:]+|,)\s*(?P<note>.*)
+      | [.!]?\s*$
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
 
 # Whole-message ack tokens. Any of these alone (after stripping
 # whitespace and the leading bullet) means "all items confirmed as
@@ -265,6 +300,13 @@ class ReplyCorrection:
     routes a ``reject`` correction onto ``reject_marker`` for an
     attribution item and onto the unparsed bucket for an email item.
     ``note`` carries any free-text reasoning.
+
+    ``same_as_item`` is set when the fragment used "Same" / "Ditto" /
+    "Same as #N" chaining. It is a transient marker consumed by
+    :func:`parse_reply`, which copies the referenced item's
+    tier/modifier/ok/reject fields onto this correction before handing
+    it to the dispatcher. By the time the dispatcher sees the
+    correction, ``same_as_item`` is always ``None``.
     """
 
     item_number: int
@@ -273,6 +315,7 @@ class ReplyCorrection:
     ok: bool = False
     reject: bool = False
     note: str = ""
+    same_as_item: int | None = None
 
 
 @dataclass
@@ -397,6 +440,14 @@ def parse_reply(reply_text: str) -> ReplyParseResult:
 
     Always returns a :class:`ReplyParseResult` — even an empty / fully
     unparseable reply just produces ``unparsed=[reply_text]``.
+
+    "Same" / "Ditto" / "Same as #N" chaining (c2) is resolved here: a
+    chaining fragment is parsed into a :class:`ReplyCorrection` with
+    ``same_as_item`` set, then this function copies the source
+    correction's tier/modifier/ok/reject onto it and clears
+    ``same_as_item``. Chain resolution walks left-to-right: each chain
+    fragment resolves against the accumulated ``corrections`` list as
+    it stands when that fragment is parsed.
     """
     result = ReplyParseResult()
     if not reply_text:
@@ -415,9 +466,86 @@ def parse_reply(reply_text: str) -> ReplyParseResult:
         if correction is None:
             result.unparsed.append(fragment)
             continue
+        if correction.same_as_item is not None or _is_same_chain_placeholder(correction):
+            resolved, err = _resolve_same_chain(correction, result.corrections)
+            if err is not None:
+                result.unparsed.append(f"item {correction.item_number}: {err}")
+                continue
+            result.corrections.append(resolved)
+            continue
         result.corrections.append(correction)
 
     return result
+
+
+def _is_same_chain_placeholder(correction: ReplyCorrection) -> bool:
+    """Return True when the correction was parsed as a chain reference
+    (``same_as_item`` set by :func:`_parse_fragment`).
+
+    Kept as a helper so the intent of the check in :func:`parse_reply`
+    is explicit and survives future extensions (e.g. a "no-op" correction
+    type that doesn't chain).
+    """
+    return correction.same_as_item is not None
+
+
+def _resolve_same_chain(
+    correction: ReplyCorrection,
+    prior_corrections: list[ReplyCorrection],
+) -> tuple[ReplyCorrection, str | None]:
+    """Resolve a chain reference by copying tier/modifier/ok/reject from
+    the source correction.
+
+    Source selection:
+
+      * ``same_as_item=N`` (explicit) — find the correction whose
+        ``item_number == N`` in ``prior_corrections``. If absent,
+        return an error.
+      * ``same_as_item=-1`` (implicit "same"/"ditto"/"same as above") —
+        take the LAST entry in ``prior_corrections``. If the list is
+        empty, return an error.
+
+    The resolved correction preserves this fragment's own ``note`` (the
+    chaining text after a dash/colon) so trailing content like
+    ``"Same - also, why was this ranked lower?"`` is retained. The
+    source's note is NOT inherited — only the classification intent.
+    """
+    if correction.same_as_item is None:
+        # Defensive: caller is supposed to have checked. Return the
+        # correction unchanged with no error.
+        return correction, None
+
+    explicit = correction.same_as_item
+    source: ReplyCorrection | None = None
+    if explicit == -1:
+        if not prior_corrections:
+            return correction, (
+                "no prior item to chain from — 'Same' must follow another item"
+            )
+        source = prior_corrections[-1]
+    else:
+        source = next(
+            (c for c in prior_corrections if c.item_number == explicit),
+            None,
+        )
+        if source is None:
+            return correction, (
+                f"no item {explicit} to chain from"
+            )
+
+    # Copy classification fields. Preserve THIS correction's own note
+    # so trailing content survives. ``same_as_item`` is cleared so the
+    # dispatcher sees a normal, fully-resolved correction.
+    resolved = ReplyCorrection(
+        item_number=correction.item_number,
+        new_tier=source.new_tier,
+        modifier=source.modifier,
+        ok=source.ok,
+        reject=source.reject,
+        note=correction.note,
+        same_as_item=None,
+    )
+    return resolved, None
 
 
 def _parse_fragment(fragment: str) -> ReplyCorrection | None:
@@ -426,6 +554,12 @@ def _parse_fragment(fragment: str) -> ReplyCorrection | None:
     Returns ``None`` when the fragment doesn't carry an item number
     plus at least one recognised token. The caller buckets ``None``
     returns into :attr:`ReplyParseResult.unparsed`.
+
+    "Same" / "Ditto" / "Same as #N" (c2) produces a placeholder
+    :class:`ReplyCorrection` with ``same_as_item`` set (``-1`` for
+    implicit chain-to-prior, ``N`` for explicit reference); the
+    caller (:func:`parse_reply`) resolves the chain against the
+    accumulated corrections list.
     """
     fragment = _strip_bullet(fragment)
     match = _FRAGMENT_RE.match(fragment)
@@ -440,6 +574,19 @@ def _parse_fragment(fragment: str) -> ReplyCorrection | None:
     if not rest:
         # Bare "2" with no token is ambiguous — treat as unparseable.
         return None
+
+    # "Same" / "Ditto" / "Same as #N" chaining — detect BEFORE the
+    # token walker so the chain placeholder isn't mis-parsed as an
+    # unparseable fragment (``same`` isn't in any of the token sets).
+    same_match = _SAME_CHAIN_RE.match(rest)
+    if same_match:
+        explicit = same_match.group("explicit")
+        note = (same_match.group("note") or "").strip()
+        return ReplyCorrection(
+            item_number=item_num,
+            same_as_item=int(explicit) if explicit else -1,
+            note=note,
+        )
 
     # Split the rest into "tokens" (one or two words) and the trailing
     # free-text note. Note separator is ``:``, em/en dash, or the words
