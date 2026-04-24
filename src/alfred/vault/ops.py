@@ -25,6 +25,7 @@ from .schema import (
     STATUS_BY_TYPE,
     TYPE_DIRECTORY,
 )
+from .scope import check_scope
 
 log = structlog.get_logger(__name__)
 
@@ -436,10 +437,23 @@ def vault_create(
     *,
     set_fields: dict | None = None,
     body: str | None = None,
+    scope: str | None = None,
 ) -> dict:
-    """Create a new vault record. Returns {path, warnings}."""
+    """Create a new vault record. Returns {path, warnings}.
+
+    Optional ``scope`` runs ``check_scope`` before the write; default
+    ``None`` preserves the historical unrestricted behavior.
+    """
     _validate_type(record_type)
     set_fields = set_fields or {}
+    if scope is not None:
+        check_scope(
+            scope,
+            "create",
+            record_type=record_type,
+            frontmatter=set_fields,
+            body_write=body is not None,
+        )
 
     # Determine directory and path
     directory = TYPE_DIRECTORY.get(record_type, record_type)
@@ -542,6 +556,7 @@ def vault_edit(
     append_fields: dict | None = None,
     body_append: str | None = None,
     body_rewriter: Callable[[str], str] | None = None,
+    scope: str | None = None,
 ) -> dict:
     """Edit a vault record. Returns {path, fields_changed}.
 
@@ -558,7 +573,23 @@ def vault_edit(
     rather than a calibration-specific ``body_replace`` kwarg because
     the shape generalises to any marker-fenced rewrite (dynamic briefings,
     section summaries) without another round of vault_ops surgery.
+
+    Optional ``scope`` runs ``check_scope`` before the write; default
+    ``None`` preserves historical unrestricted behavior.
     """
+    if scope is not None:
+        fields_list = (
+            list((set_fields or {}).keys()) + list((append_fields or {}).keys())
+        )
+        body_write_requested = body_append is not None or body_rewriter is not None
+        check_scope(
+            scope,
+            "edit",
+            rel_path=rel_path,
+            fields=fields_list,
+            body_write=body_write_requested,
+        )
+
     file_path = _resolve_vault_path(vault_path, rel_path)
     if not file_path.exists():
         raise VaultError(f"File not found: {rel_path}")
@@ -611,12 +642,23 @@ def vault_edit(
     return {"path": rel_path, "fields_changed": fields_changed}
 
 
-def vault_move(vault_path: Path, from_path: str, to_path: str) -> dict:
+def vault_move(
+    vault_path: Path,
+    from_path: str,
+    to_path: str,
+    *,
+    scope: str | None = None,
+) -> dict:
     """Move a vault record. Returns {from, to}.
 
     When Obsidian is running, uses the Obsidian CLI which automatically
     updates all wikilinks across the vault that reference the moved file.
+
+    Optional ``scope`` runs ``check_scope`` before the move.
     """
+    if scope is not None:
+        check_scope(scope, "move", rel_path=from_path)
+
     src = _resolve_vault_path(vault_path, from_path)
     dst = _resolve_vault_path(vault_path, to_path)
 
@@ -638,12 +680,22 @@ def vault_move(vault_path: Path, from_path: str, to_path: str) -> dict:
     return {"from": from_path, "to": to_path}
 
 
-def vault_delete(vault_path: Path, rel_path: str) -> dict:
+def vault_delete(
+    vault_path: Path,
+    rel_path: str,
+    *,
+    scope: str | None = None,
+) -> dict:
     """Delete a vault record. Returns {path, deleted}.
 
     When Obsidian is running, uses the Obsidian CLI which respects the
     configured deletion behavior (system trash, Obsidian trash, or permanent).
+
+    Optional ``scope`` runs ``check_scope`` before the delete.
     """
+    if scope is not None:
+        check_scope(scope, "delete", rel_path=rel_path)
+
     file_path = _resolve_vault_path(vault_path, rel_path)
     if not file_path.exists():
         raise VaultError(f"File not found: {rel_path}")
