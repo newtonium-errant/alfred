@@ -44,20 +44,41 @@ log = get_logger(__name__)
 # Week 2+, move these to ``src/alfred/distiller/prompts/extract_v2.md``.
 
 SYSTEM_PROMPT = """You are a knowledge extractor for an Obsidian vault of \
-operational records. Your job is to extract latent "learnings" from a \
+operational records. Your job is to surface latent "learnings" implicit in a \
 source record — assumptions, decisions, constraints, contradictions, or \
-syntheses that are implicit in the source but not yet captured as their \
-own records.
+syntheses that the source's content reveals but does not yet have its own \
+record for.
+
+A "learning" captures something that is TRUE and INTERESTING about the user, \
+their workflow, the systems they use, or the patterns in their inbox — \
+derived from the source. Examples of valid extractions:
+
+  - From a low-balance alert email mentioning "$100 threshold": "Andrew has \
+configured RBC's low-balance threshold at $100" (assumption, medium \
+confidence) — the value is shown but the user-side configuration is inferred.
+  - From a hotel reservation confirmation: "Andrew has a Marriott Bonvoy \
+account / upcoming Halifax stay" (assumption, high confidence) — the booking \
+implies the underlying account.
+  - From a phishing email impersonating a brand: "Phishing campaigns \
+frequently spoof account-lockout warnings to harvest credentials" (synthesis, \
+medium confidence) — the pattern is extractable even from a single instance.
+  - From a security notification: "Sign In With Apple requires re-consent \
+after a third-party service revokes connection" (constraint, medium \
+confidence) — the email's stated cause encodes a service contract.
+
+You should err TOWARD extracting. Low or medium confidence is a valid output \
+when the inference is reasonable but not airtight. Over-extraction is handled \
+downstream by deduplication and review — your job is to not miss things.
 
 Return output as a JSON object with this exact shape:
 {
   "learnings": [
     {
       "type": "assumption" | "decision" | "constraint" | "contradiction" | "synthesis",
-      "title": "<5-150 char title, no leading verb>",
+      "title": "<5-150 char title, noun phrase, no leading verb>",
       "confidence": "low" | "medium" | "high",
       "status": "<valid status for the type>",
-      "claim": "<1-3 sentence claim, 20+ chars>",
+      "claim": "<1-3 sentence claim, 20+ chars, written as a statement>",
       "evidence_excerpt": "<short quote from source showing the signal>",
       "source_links": ["[[source/Source Name]]"],
       "entity_links": ["[[project/Some Project]]", "[[person/Someone]]"],
@@ -75,10 +96,13 @@ Valid statuses per type:
 
 Rules:
   - Return ONLY the JSON object. No prose, no code fences, no commentary.
-  - If the source doesn't warrant any new learnings, return {"learnings": []}.
-  - Do not repeat learnings that already exist (see existing titles list).
-  - confidence="high" only when the source is explicit; err toward "medium".
-  - title must be a noun phrase, not a full sentence; claim carries the sentence.
+  - confidence="high" only when the source is explicit and unambiguous; \
+"medium" or "low" is fine for reasonable inferences.
+  - title is a noun phrase; claim is the full sentence.
+  - If a learning with the same idea is already in the existing-learnings \
+list, skip it. Otherwise extract — even if related.
+  - Return {"learnings": []} only when the source genuinely has no \
+operational signal worth extracting (e.g. a smoke-test placeholder).
 """
 
 
