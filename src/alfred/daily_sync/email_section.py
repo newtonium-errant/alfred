@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
@@ -51,6 +51,15 @@ class BatchItem:
     All fields are display-only; the bot writes them into the state
     file so the reply parser can resolve "item 2" without re-reading
     the underlying record.
+
+    c5 — when ``cluster_record_paths`` is non-empty, this item
+    represents a cluster of N near-identical records (e.g. four
+    weekly Borrowell credit-score notifications). ``record_path``
+    is the most-recent member (used for display and fallback);
+    ``cluster_record_paths`` lists EVERY member path so the
+    dispatcher fan-outs one correction to all N underlying records.
+    A singleton item has ``cluster_record_paths == []`` —
+    equivalent to the pre-c5 behavior.
     """
 
     item_number: int  # 1-indexed, matches what Andrew sees
@@ -61,6 +70,15 @@ class BatchItem:
     sender: str
     subject: str
     snippet: str
+    # c5 — cluster members (excluding ``record_path`` itself is fine
+    # but we include it so downstream consumers don't have to special-
+    # case the "primary" vs "member" distinction). Empty list means
+    # singleton — the historical behavior. Most-recent member's
+    # ISO date is passed through ``cluster_most_recent_label`` for
+    # display (e.g. ``"2026-04-11"`` → ``"(4 similar, most recent
+    # 2026-04-11)"``).
+    cluster_record_paths: list[str] = field(default_factory=list)
+    cluster_most_recent_label: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +90,8 @@ class BatchItem:
             "sender": self.sender,
             "subject": self.subject,
             "snippet": self.snippet,
+            "cluster_record_paths": list(self.cluster_record_paths),
+            "cluster_most_recent_label": self.cluster_most_recent_label,
         }
 
 
@@ -310,6 +330,154 @@ def _already_calibrated(corpus_path: str | Path) -> set[str]:
     return seen
 
 
+# ---------------------------------------------------------------------------
+# c5 — cluster candidates by (sender, subject pattern)
+# ---------------------------------------------------------------------------
+#
+# Andrew's 2026-04-24 Daily Sync had four near-identical Borrowell
+# credit-score-update weekly pings. Presenting them as four separate
+# calibration asks forces Andrew to repeat the same correction four
+# times. Cluster them into one ask, apply the correction to all four
+# underlying records.
+
+# Strip trailing date-shaped / version-shaped suffixes so
+# "Credit Score Update 2026-04-11" matches "Credit Score Update
+# 2026-04-04". Patterns are tried in order; anything that matches is
+# stripped and the loop continues (so a title ending in "April 2026 v2"
+# collapses to just the stem).
+_SUBJECT_TRAILING_PATTERNS = [
+    # ISO dates: 2026-04-11, 2026/04/11
+    re.compile(r"\s+\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*$"),
+    # Month + year: "April 2026", "Apr 2026", "April, 2026"
+    re.compile(
+        r"\s+(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|"
+        r"jul|july|aug|august|sep|september|sept|oct|october|nov|november|"
+        r"dec|december)\s*,?\s*\d{4}\s*$",
+        re.IGNORECASE,
+    ),
+    # Year alone at the very end (after an ISO or month strip): "2026"
+    re.compile(r"\s+\d{4}\s*$"),
+    # Version markers: "v2", "v1.3", "V2"
+    re.compile(r"\s+[vV]\d+(?:\.\d+)*\s*$"),
+    # Trailing #N / (N): "Weekly Digest #42", "Dispatch (3)"
+    re.compile(r"\s+#\d+\s*$"),
+    re.compile(r"\s+\(\d+\)\s*$"),
+    # Bare trailing integer: "Weekly Digest 42"
+    re.compile(r"\s+\d+\s*$"),
+    # Trailing punctuation left over from a strip
+    re.compile(r"[\s\-–—:|·]+$"),
+]
+
+
+def _normalize_subject_pattern(subject: str) -> str:
+    """Normalize a subject line into a cluster key.
+
+    Strips trailing dates, months+year, bare years, version markers,
+    ``#N``, ``(N)``, and bare trailing integers so recurring series
+    with an identifier that varies per occurrence collapse to the same
+    key. Case-folded + whitespace-collapsed. Returns an empty string
+    when the subject was empty or stripped entirely (caller treats
+    empty-key as an own cluster — no grouping).
+    """
+    if not subject:
+        return ""
+    s = subject.strip()
+    # Iterate a few times so "Credit Score Update 2026-04-11" strips
+    # the date, then again the trailing space/dash left behind. Cap at
+    # 4 rounds to avoid a regex quadratic.
+    for _ in range(4):
+        before = s
+        for pat in _SUBJECT_TRAILING_PATTERNS:
+            s = pat.sub("", s).rstrip()
+        if s == before:
+            break
+    s = " ".join(s.split()).casefold()
+    return s
+
+
+def _cluster_key_for(candidate: _CandidateRecord) -> str:
+    """Return the (sender_norm, subject_pattern) cluster key for a candidate.
+
+    The key combines the normalized sender (casefolded, whitespace-
+    collapsed) with the normalized subject pattern. A candidate whose
+    subject normalizes to empty AND has no sender returns a unique
+    per-path key so it isn't accidentally clustered with other
+    metadata-missing records.
+    """
+    sender_norm = " ".join((candidate.sender or "").split()).casefold()
+    subject_norm = _normalize_subject_pattern(candidate.subject or "")
+    if not sender_norm and not subject_norm:
+        # Fall back to a per-path key so empty-metadata records don't
+        # all clump into a single giant cluster.
+        return f"__singleton__::{candidate.rel_path}"
+    return f"{sender_norm}::{subject_norm}"
+
+
+@dataclass
+class _Cluster:
+    """Internal grouping of candidates sharing a cluster key.
+
+    ``members`` is ordered newest-first (by mtime). ``primary`` is
+    always ``members[0]`` — the most-recent member, used as the
+    display record for the collapsed ask.
+    """
+
+    key: str
+    members: list[_CandidateRecord] = field(default_factory=list)
+
+    @property
+    def primary(self) -> _CandidateRecord:
+        return self.members[0]
+
+    @property
+    def size(self) -> int:
+        return len(self.members)
+
+    def any_uncalibrated(self, seen: set[str]) -> bool:
+        """True when at least one member of the cluster is not yet in
+        the corpus — the cluster is "fresh" and worth showing."""
+        return any(m.rel_path not in seen for m in self.members)
+
+    def most_recent_date_label(self) -> str:
+        """Return a display label for the cluster's most-recent member.
+
+        We prefer an ISO date parsed out of the primary's subject (the
+        curator's titles reliably end in ``YYYY-MM-DD`` for recurring
+        emails). Falls back to an empty string when nothing date-like
+        is present — the renderer handles that gracefully.
+        """
+        m = re.search(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", self.primary.subject or "")
+        if m:
+            return m.group(0)
+        return ""
+
+
+def _group_into_clusters(
+    candidates: list[_CandidateRecord],
+) -> list[_Cluster]:
+    """Collapse a flat candidate list into clusters by cluster key.
+
+    Preserves newest-first ordering at the cluster level — the first
+    cluster in the output is the one whose primary (most-recent
+    member) has the newest mtime, which matters for the sampler's
+    "fresh first" preference.
+    """
+    by_key: dict[str, _Cluster] = {}
+    order: list[str] = []
+    # Candidates arrive newest-first; preserve that for cluster ordering.
+    for c in candidates:
+        key = _cluster_key_for(c)
+        cluster = by_key.get(key)
+        if cluster is None:
+            cluster = _Cluster(key=key, members=[c])
+            by_key[key] = cluster
+            order.append(key)
+        else:
+            cluster.members.append(c)
+    # Members arrive newest-first already; no resort needed.
+    return [by_key[k] for k in order]
+
+
 def _sample_batch(
     vault_path: Path,
     corpus_path: str | Path,
@@ -317,14 +485,20 @@ def _sample_batch(
     *,
     note_dir: str = "note",
     now_ts: float | None = None,
-) -> list[_CandidateRecord]:
-    """Return up to ``batch_size`` candidates for the next calibration batch.
+) -> list[_Cluster]:
+    """Return up to ``batch_size`` CLUSTERS for the next calibration batch.
 
-    Order of preference:
-      1. Recent (mtime newest-first), classifier-tagged, NOT in corpus.
-      2. Fallback (only if step 1 didn't fill the batch): include any
-         already-calibrated recent items, stratified across tiers so
-         Andrew sees a balanced view even on a slow week.
+    c5 — each cluster groups near-identical recurring emails (e.g. the
+    four weekly Borrowell credit-score pings collapse to one cluster
+    of size 4). :func:`build_batch` turns each cluster into one
+    :class:`BatchItem` that the dispatcher fan-outs across all
+    underlying records when Andrew corrects it.
+
+    Order of preference (applied at the cluster level):
+      1. Clusters with at least one fresh member (not yet in corpus),
+         newest-first by primary mtime.
+      2. Fallback (only if step 1 didn't fill the batch): include
+         already-fully-calibrated clusters, stratified across tiers.
     """
     note_root = vault_path / note_dir
     if not note_root.is_dir():
@@ -353,20 +527,27 @@ def _sample_batch(
     if not candidates:
         return []
 
-    fresh = [c for c in candidates if c.rel_path not in seen]
+    # c5 — collapse candidates into clusters BEFORE the batch_size
+    # slice so we don't pick five clusters' worth of individual
+    # candidates and then collapse to two asks.
+    clusters = _group_into_clusters(candidates)
+
+    fresh = [cl for cl in clusters if cl.any_uncalibrated(seen)]
     if len(fresh) >= batch_size:
         return fresh[:batch_size]
 
-    # Fallback — stratified across tiers from the full candidate pool
-    # (already-calibrated rows allowed). Walk tier-by-tier round-robin
-    # so a single tier doesn't dominate.
-    chosen: list[_CandidateRecord] = list(fresh)
-    chosen_set = {c.rel_path for c in chosen}
-    by_tier: dict[str, list[_CandidateRecord]] = {t: [] for t in _REAL_TIERS}
-    for c in candidates:
-        if c.rel_path in chosen_set:
+    # Fallback — stratified across tiers from the full cluster pool
+    # (already-calibrated clusters allowed). Walk tier-by-tier round-
+    # robin so a single tier doesn't dominate.
+    chosen: list[_Cluster] = list(fresh)
+    chosen_keys = {cl.key for cl in chosen}
+    by_tier: dict[str, list[_Cluster]] = {t: [] for t in _REAL_TIERS}
+    for cl in clusters:
+        if cl.key in chosen_keys:
             continue
-        by_tier.setdefault(c.priority, []).append(c)
+        # Cluster's tier is its primary member's tier.
+        tier = cl.primary.priority
+        by_tier.setdefault(tier, []).append(cl)
 
     while len(chosen) < batch_size:
         added_in_round = False
@@ -391,25 +572,42 @@ def build_batch(
 
     Public surface for the daemon and the ``/calibrate`` slash command.
     Returns ``[]`` when the vault has nothing classifiable.
+
+    c5 — items can now represent clusters of N near-identical records.
+    When a cluster has more than one member, ``cluster_record_paths``
+    is populated with every member path (including the primary); the
+    dispatcher fan-outs Andrew's correction to all of them. Singleton
+    clusters produce a BatchItem with ``cluster_record_paths == []``
+    — unchanged from the pre-c5 shape.
     """
-    candidates = _sample_batch(
+    clusters = _sample_batch(
         vault_path=vault_path,
         corpus_path=config.corpus.path,
         batch_size=config.batch_size,
     )
-    return [
-        BatchItem(
-            item_number=i + 1,
-            record_path=c.rel_path,
-            classifier_priority=c.priority,
-            classifier_action_hint=c.action_hint,
-            classifier_reason=c.reasoning,
-            sender=c.sender,
-            subject=c.subject,
-            snippet=c.snippet,
+    items: list[BatchItem] = []
+    for i, cluster in enumerate(clusters):
+        primary = cluster.primary
+        cluster_paths: list[str] = []
+        most_recent_label = ""
+        if cluster.size > 1:
+            cluster_paths = [m.rel_path for m in cluster.members]
+            most_recent_label = cluster.most_recent_date_label()
+        items.append(
+            BatchItem(
+                item_number=i + 1,
+                record_path=primary.rel_path,
+                classifier_priority=primary.priority,
+                classifier_action_hint=primary.action_hint,
+                classifier_reason=primary.reasoning,
+                sender=primary.sender,
+                subject=primary.subject,
+                snippet=primary.snippet,
+                cluster_record_paths=cluster_paths,
+                cluster_most_recent_label=most_recent_label,
+            )
         )
-        for i, c in enumerate(candidates)
-    ]
+    return items
 
 
 def render_batch(items: list[BatchItem]) -> str:
@@ -437,7 +635,18 @@ def render_batch(items: list[BatchItem]) -> str:
         tier_label = item.classifier_priority.upper()
         sender = item.sender or "(unknown sender)"
         subject = item.subject or "(no subject)"
-        lines.append(f'{item.item_number}. [{tier_label}] {sender} — "{subject}"')
+        header = f'{item.item_number}. [{tier_label}] {sender} — "{subject}"'
+        # c5 — cluster indicator: "(4 similar, most recent 2026-04-11)"
+        cluster_size = len(item.cluster_record_paths)
+        if cluster_size > 1:
+            if item.cluster_most_recent_label:
+                header += (
+                    f" ({cluster_size} similar, most recent "
+                    f"{item.cluster_most_recent_label})"
+                )
+            else:
+                header += f" ({cluster_size} similar)"
+        lines.append(header)
         if item.snippet:
             lines.append(f"   snippet: {item.snippet}")
         if item.classifier_action_hint:

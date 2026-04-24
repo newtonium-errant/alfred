@@ -362,12 +362,31 @@ _FRAGMENT_RE = re.compile(
 _NOTE_SEPARATOR_RE = re.compile(r"\s*(?:[—–\-]+|:|because|since|—)\s+", re.IGNORECASE)
 
 
-# Numbered-list item boundary at the start of a line. Matches:
-#   ``1.`` ``1)`` ``1:`` ``1 -`` ``1 `` at the beginning of any line.
-# Used by ``_split_fragments`` to carve multi-line replies into
-# per-item chunks WITHOUT fragmenting on sentence periods or the word
-# "and" inside an item's free-text note.
-_LIST_ITEM_BOUNDARY_RE = re.compile(r"(?:^|\n)\s*(?=\d+\s*[.\):\-]\s)")
+# Numbered-list item boundary at the start of a line. Matches any of:
+#   ``1.`` ``1)`` ``1:`` ``1 -`` at the beginning of any line (bullet
+#   form — preferred), OR
+#   ``1 <word>`` where ``<word>`` is plausibly a token/modifier/tier
+#   verb — the bare form Andrew also uses when replying by voice
+#   (dictation drops the period on short items like "2 ok").
+#
+# The second form avoids false-positives on prose like "1 hour later
+# 2 questions" by requiring the post-number token to look like a word
+# character (``\w``) AND by only running this boundary detection when
+# the reply has already been flagged as list-shaped via
+# :func:`_has_numbered_list_shape`. A reply that's pure prose stays
+# in the historical comma/semicolon/and splitter.
+_LIST_ITEM_BOUNDARY_RE = re.compile(
+    r"(?:^|\n)\s*(?=\d+\s*(?:[.\):\-]\s|\s+\w))"
+)
+
+# Strict-shape detector — a more conservative pattern used ONLY to
+# decide whether the reply is list-shaped at all. Requires at least one
+# line that starts with ``\d+[.):\-]`` (bullet form). Without the bullet
+# gate we'd false-positive on "2 questions came up yesterday" and treat
+# prose as a list. Once the bullet gate has confirmed list shape, the
+# boundary regex above (which also matches the bare ``N <word>`` form)
+# safely carves every line — bullet-or-not.
+_LIST_SHAPE_GATE_RE = re.compile(r"(?:^|\n)\s*\d+\s*[.\):\-]\s")
 
 
 def _strip_bullet(s: str) -> str:
@@ -380,17 +399,24 @@ def _strip_bullet(s: str) -> str:
 
 def _has_numbered_list_shape(text: str) -> bool:
     """Return True when the reply contains at least one line that starts
-    with a numbered-list marker (``1.``, ``2)``, ``3:``, ``4 -``).
+    with a numbered-list bullet marker (``1.``, ``2)``, ``3:``, ``4 -``).
 
     Drives :func:`_split_fragments`: when the reply has list shape we
     carve it on the list boundaries (so prose periods and the word
     "and" inside an item's note don't fragment the item). Otherwise we
     fall back to the single-line shorthand splitter (``,`` ``;``
     ``and``) — Andrew still types ``"2 down, 4 spam"`` as one line.
+
+    The gate requires the bullet form (``\\d+[.\\):\\-]``) — bare
+    ``\\d+ <word>`` is too common in prose ("2 questions came up") to
+    use as a list marker on its own. Once the gate confirms list
+    shape, :data:`_LIST_ITEM_BOUNDARY_RE` tolerates the bare form for
+    subsequent lines (so ``"1. spam\\n2 ok"`` splits correctly —
+    Andrew drops the period on short voice-dictated items).
     """
     if not text:
         return False
-    return bool(_LIST_ITEM_BOUNDARY_RE.search(text))
+    return bool(_LIST_SHAPE_GATE_RE.search(text))
 
 
 def _split_fragments(text: str) -> list[str]:

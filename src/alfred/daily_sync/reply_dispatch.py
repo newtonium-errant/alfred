@@ -536,26 +536,35 @@ def _resolve_attribution_correction(
 def _format_email_applied_line(
     item: dict[str, Any],
     andrew_priority: str,
+    *,
+    cluster_size: int = 1,
 ) -> str:
     """Return a one-liner describing what the applier did for an email item.
 
-    Format::
+    Format (singleton)::
 
-        "Item N: {sender} — 'Subject' → {TIER}"
+        "Item N: {sender} — 'Subject' -> {TIER}"
+
+    Format (cluster of size > 1, c5)::
+
+        "Item N: {sender} — 'Subject' -> {TIER} (applied to {K} records)"
 
     c3 — Andrew asked for the feedback loop to be visible: replace the
     opaque ``"applied N correction(s)"`` with a per-item summary of
     what was learned. We don't invent a rule that doesn't exist — the
     calibration corpus is still append-only and the classifier rotates
     the tail as few-shot examples. The echo reports the ACTION
-    (tier assignment) and SCOPE (single item) the applier actually
-    performed.
+    (tier assignment) and SCOPE (single item or K-record cluster) the
+    applier actually performed.
     """
     item_number = item.get("item_number") or "?"
     sender = str(item.get("sender") or "").strip() or "(unknown)"
     subject = str(item.get("subject") or "").strip() or "(no subject)"
     tier = str(andrew_priority or "").upper() or "?"
-    return f"Item {item_number}: {sender} — \"{subject}\" -> {tier}"
+    suffix = ""
+    if cluster_size > 1:
+        suffix = f" (applied to {cluster_size} records)"
+    return f"Item {item_number}: {sender} — \"{subject}\" -> {tier}{suffix}"
 
 
 def _format_attribution_applied_line(
@@ -645,15 +654,43 @@ def _build_confirmation_body(
     return "\n".join(lines)
 
 
+def _item_record_paths(item: dict[str, Any]) -> list[str]:
+    """Return every vault record path the item covers.
+
+    c5 — email items may represent a CLUSTER of N near-identical
+    records (``cluster_record_paths`` populated). In that case a
+    correction fans out to every member path. Legacy / singleton
+    items return a single-element list containing ``record_path``.
+    Empty / malformed items return ``[]``.
+    """
+    cluster = item.get("cluster_record_paths")
+    if isinstance(cluster, list) and cluster:
+        # Preserve the stored order and de-duplicate while keeping
+        # the primary (index 0) first.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for path in cluster:
+            sp = str(path or "").strip()
+            if sp and sp not in seen:
+                seen.add(sp)
+                ordered.append(sp)
+        if ordered:
+            return ordered
+    primary = str(item.get("record_path") or "").strip()
+    return [primary] if primary else []
+
+
 def _resolve_correction(
     correction: ReplyCorrection,
     items_by_num: dict[int, dict[str, Any]],
-) -> tuple[CorpusEntry | None, str | None]:
-    """Convert one :class:`ReplyCorrection` into a :class:`CorpusEntry`.
+) -> tuple[list[CorpusEntry] | None, str | None]:
+    """Convert one :class:`ReplyCorrection` into a list of :class:`CorpusEntry`.
 
-    Returns ``(entry, error)`` — exactly one is non-None. Errors are
-    short human-readable strings the caller can echo back to Andrew so
-    he knows which fragments couldn't be applied.
+    Returns ``(entries, error)`` — exactly one is non-None. The list
+    contains ONE entry per underlying record (always 1 for singleton
+    items; N for a c5 cluster). Errors are short human-readable
+    strings the caller can echo back to Andrew so he knows which
+    fragments couldn't be applied.
     """
     item = items_by_num.get(correction.item_number)
     if item is None:
@@ -679,24 +716,32 @@ def _resolve_correction(
         # bug doesn't crash the dispatcher.
         return None, f"item {correction.item_number} had no actionable token"
 
-    entry = CorpusEntry(
-        record_path=str(item.get("record_path") or ""),
-        classifier_priority=classifier_priority,
-        classifier_action_hint=(
-            classifier_action_hint
-            if isinstance(classifier_action_hint, (str, type(None)))
-            else str(classifier_action_hint)
-        ),
-        classifier_reason=classifier_reason,
-        andrew_priority=andrew_priority,
-        andrew_action_hint=None,  # c2 doesn't yet expose action-hint corrections
-        andrew_reason=correction.note,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        sender=str(item.get("sender") or ""),
-        subject=str(item.get("subject") or ""),
-        snippet=str(item.get("snippet") or ""),
-    )
-    return entry, None
+    record_paths = _item_record_paths(item)
+    if not record_paths:
+        return None, f"item {correction.item_number} has no record path"
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    entries = [
+        CorpusEntry(
+            record_path=path,
+            classifier_priority=classifier_priority,
+            classifier_action_hint=(
+                classifier_action_hint
+                if isinstance(classifier_action_hint, (str, type(None)))
+                else str(classifier_action_hint)
+            ),
+            classifier_reason=classifier_reason,
+            andrew_priority=andrew_priority,
+            andrew_action_hint=None,  # c2 doesn't yet expose action-hint corrections
+            andrew_reason=correction.note,
+            timestamp=timestamp,
+            sender=str(item.get("sender") or ""),
+            subject=str(item.get("subject") or ""),
+            snippet=str(item.get("snippet") or ""),
+        )
+        for path in record_paths
+    ]
+    return entries, None
 
 
 def handle_daily_sync_reply(
@@ -749,34 +794,49 @@ def handle_daily_sync_reply(
     unparsed_item_numbers: list[int] = []  # c3 — numeric IDs of items that couldn't parse
     corpus_path = _attribution_corpus_path(config)
 
-    # all_ok shortcut: write an email corpus row per email item AND
-    # confirm every attribution item. "✅" means "everything in the
-    # entire Daily Sync is good" — both lists.
+    # all_ok shortcut: write an email corpus row per email item (fanned
+    # out across cluster members — c5) AND confirm every attribution
+    # item. "✅" means "everything in the entire Daily Sync is good" —
+    # both lists.
     if parsed.all_ok:
         for item in email_items:
             classifier_priority = str(item.get("classifier_priority", "")).lower()
-            entry = CorpusEntry(
-                record_path=str(item.get("record_path") or ""),
-                classifier_priority=classifier_priority,
-                classifier_action_hint=item.get("classifier_action_hint"),
-                classifier_reason=str(item.get("classifier_reason") or ""),
-                andrew_priority=classifier_priority,
-                andrew_action_hint=None,
-                andrew_reason="",
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                sender=str(item.get("sender") or ""),
-                subject=str(item.get("subject") or ""),
-                snippet=str(item.get("snippet") or ""),
-            )
-            try:
-                append_correction(config.corpus.path, entry)
-                email_written += 1
-                applied_lines.append(_format_email_applied_line(item, classifier_priority))
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "daily_sync.corpus_write_failed",
-                    record_path=entry.record_path,
-                    error=str(exc),
+            timestamp = datetime.now(timezone.utc).isoformat()
+            record_paths = _item_record_paths(item)
+            if not record_paths:
+                continue
+            rows_written_this_item = 0
+            for path in record_paths:
+                entry = CorpusEntry(
+                    record_path=path,
+                    classifier_priority=classifier_priority,
+                    classifier_action_hint=item.get("classifier_action_hint"),
+                    classifier_reason=str(item.get("classifier_reason") or ""),
+                    andrew_priority=classifier_priority,
+                    andrew_action_hint=None,
+                    andrew_reason="",
+                    timestamp=timestamp,
+                    sender=str(item.get("sender") or ""),
+                    subject=str(item.get("subject") or ""),
+                    snippet=str(item.get("snippet") or ""),
+                )
+                try:
+                    append_correction(config.corpus.path, entry)
+                    rows_written_this_item += 1
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "daily_sync.corpus_write_failed",
+                        record_path=entry.record_path,
+                        error=str(exc),
+                    )
+            if rows_written_this_item > 0:
+                email_written += rows_written_this_item
+                applied_lines.append(
+                    _format_email_applied_line(
+                        item,
+                        classifier_priority,
+                        cluster_size=rows_written_this_item,
+                    )
                 )
         if attribution_items:
             if vault_path is None:
@@ -823,23 +883,36 @@ def handle_daily_sync_reply(
                     )
                     unparsed_item_numbers.append(correction.item_number)
                     continue
-                entry, err = _resolve_correction(correction, email_by_num)
+                entries, err = _resolve_correction(correction, email_by_num)
                 if err is not None:
                     errors.append(err)
                     unparsed_item_numbers.append(correction.item_number)
                     continue
-                assert entry is not None
-                try:
-                    append_correction(config.corpus.path, entry)
-                    email_written += 1
+                assert entries is not None and entries
+                # c5 — fan-out: one corpus row per cluster member.
+                # Cluster-aware summary line replaces the prior per-
+                # record line so Andrew sees "(4 records)" rather than
+                # four identical lines.
+                cluster_size = len(entries)
+                rows_written_this_item = 0
+                for entry in entries:
+                    try:
+                        append_correction(config.corpus.path, entry)
+                        rows_written_this_item += 1
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "daily_sync.corpus_write_failed",
+                            record_path=entry.record_path,
+                            error=str(exc),
+                        )
+                if rows_written_this_item > 0:
+                    email_written += rows_written_this_item
                     applied_lines.append(
-                        _format_email_applied_line(email_item, entry.andrew_priority)
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.warning(
-                        "daily_sync.corpus_write_failed",
-                        record_path=entry.record_path,
-                        error=str(exc),
+                        _format_email_applied_line(
+                            email_item,
+                            entries[0].andrew_priority,
+                            cluster_size=cluster_size,
+                        )
                     )
             elif attribution_item is not None:
                 if vault_path is None:
