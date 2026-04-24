@@ -1,8 +1,26 @@
-# KAL-LE — Alfred coding instance config
+# Universal per-instance Alfred scaffold
+#
+# This is the universal per-instance scaffold. It ships the subordinate-
+# default shape (KAL-LE-style: coding/clinic/etc. with talker +
+# transport + instructor, but no primary-owner tools like curator /
+# janitor / distiller / surveyor / mail). Optional blocks at the
+# bottom of this file are commented out — uncomment what the new
+# instance needs.
+#
+# Typical shapes:
+#   Subordinate (KAL-LE, STAY-C): the default — no optional blocks
+#     uncommented.
+#   Hybrid (subordinate + own email pipeline): uncomment email_classifier
+#     and ship a `mail` block (see config.yaml.example).
+#   Primary-like (full Salem-shape): see config.yaml.example instead —
+#     that template has curator/janitor/distiller/surveyor/mail.
+#
+# Historical note: filename used to be config.kalle.yaml.example. Renamed
+# to config.instance.yaml.example once it became the universal scaffold.
 #
 # Ship one of these per multi-instance deployment. Salem stays on
-# config.yaml; KAL-LE uses this file (or the template `alfred instance
-# new kalle` scaffolds).
+# config.yaml; subordinates use this file (or the template `alfred
+# instance new <name>` scaffolds from it).
 #
 # Run KAL-LE with:
 #   source /home/andrew/.alfred/kalle/.venv/bin/activate
@@ -55,6 +73,9 @@ transport:
     tokens:
       local:
         token: "${ALFRED_KALLE_TRANSPORT_TOKEN}"
+        # Add `cli` if this instance uses transport from CLI handlers
+        # (e.g. `alfred send ...`). Add `daily_sync` if the optional
+        # daily_sync block below is uncommented.
         allowed_clients: [scheduler, brief, janitor, curator, talker]
       # Salem's peer entry — its identity when it reaches KAL-LE.
       salem:
@@ -155,3 +176,98 @@ brief_digest_push:
   # instructor_state.json live there.
   # bit_state_path is optional — KAL-LE doesn't run BIT in v1, so
   # leaving this empty defaults posture to "green / no BIT data".
+
+# ===========================================================================
+# OPTIONAL BLOCKS — uncomment what this instance needs.
+# ===========================================================================
+# The blocks below are intentionally commented out. Each is independent
+# and has a short "uncomment if…" note. Remove the leading `# ` on every
+# line of a block (including its header) to enable it.
+
+# ---------------------------------------------------------------------------
+# email_classifier — per-instance email triage cues
+# ---------------------------------------------------------------------------
+# Uncomment if this instance ingests email. Requires a `mail` block too
+# (see config.yaml.example for the shape). Cue groups are per-instance:
+# Salem's cues are Andrew-facing; a clinic instance would seed clinical
+# signals instead.
+#
+# email_classifier:
+#   enabled: true
+#   anthropic:
+#     api_key: "${ANTHROPIC_API_KEY}"
+#     model: "claude-sonnet-4-6"
+#     max_tokens: 1024
+#     timeout_seconds: 60
+#   prompt:
+#     high:
+#       - "From a named person this instance has interacted with recently"
+#       - "Explicit time-pressure language (\"today\", \"by EOD\", \"urgent\", deadline within 48h)"
+#       - "Reply-required signals (direct question, RSVP request)"
+#     medium:
+#       - "Appointments / confirmations / notices with future dates"
+#       - "Subscription renewals"
+#       - "Financial notifications (transactions, statements)"
+#     low:
+#       - "Newsletters the user chose to receive"
+#       - "Marketing from established relationships (vendors)"
+#       - "Automated notifications (system status, build emails, etc.)"
+#     spam:
+#       - "Unsolicited commercial"
+#       - "Phishing-shape messages"
+#       - "Unknown senders pitching products / services"
+#   state:
+#     path: "/home/andrew/.alfred/kalle/data/email_classifier_state.json"
+#   named_contact_cache_seconds: 60
+#   unclassified_sentinel: "unclassified"
+#   # Point at the same file as daily_sync.corpus.path so the calibration
+#   # loop writes and the classifier reads the same JSONL.
+#   calibration_corpus_path: "/home/andrew/.alfred/kalle/data/email_calibration.jsonl"
+#   calibration_few_shot_count: 10
+
+# ---------------------------------------------------------------------------
+# daily_sync — 09:00 OODA calibration loop
+# ---------------------------------------------------------------------------
+# Uncomment for a per-instance 09:00 calibration conversation over Telegram.
+# Surfaces email-classifier items (and future signals) so Andrew can
+# correct them; corrections feed back into the classifier few-shot
+# corpus. Requires email_classifier above to be uncommented for the
+# email tier.
+# Also add `daily_sync` to transport.auth.tokens.local.allowed_clients.
+#
+# daily_sync:
+#   enabled: true
+#   schedule:
+#     time: "09:00"
+#     timezone: "America/Halifax"
+#   batch_size: 5
+#   corpus:
+#     # Must match email_classifier.calibration_corpus_path above.
+#     path: "/home/andrew/.alfred/kalle/data/email_calibration.jsonl"
+#   confidence:
+#     # Per-tier surfacing flags. Flipped by Telegram /calibration_ok <tier>.
+#     high: false
+#     medium: false
+#     low: false
+#     spam: false
+#   state:
+#     path: "/home/andrew/.alfred/kalle/data/daily_sync_state.json"
+
+# ---------------------------------------------------------------------------
+# brief.peer_digests — receive digest pushes from peers
+# ---------------------------------------------------------------------------
+# Uncomment if this instance RECEIVES peer digests (it is a primary-like
+# aggregator, e.g. Salem). Each configured peer must also appear in
+# transport.peers above, and each expected peer must match the
+# self_name the peer sends in its brief_digest_push block.
+#
+# Note: this is NOT the full Salem brief block (weather, schedule,
+# upcoming events). Subordinate instances that just want to receive a
+# peer digest into their own brief would uncomment this sub-block only;
+# full-brief shape lives in config.yaml.example.
+#
+# brief:
+#   peer_digests:
+#     enabled: true
+#     expected_peers:
+#       - kal-le
