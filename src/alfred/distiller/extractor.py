@@ -43,80 +43,18 @@ log = get_logger(__name__)
 # contract is still being validated. If prompt iteration volume spikes in
 # Week 2+, move these to ``src/alfred/distiller/prompts/extract_v2.md``.
 
-
-# Per-source-type extraction rules (c10, 2026-04-24). Ported from the
-# legacy pipeline's ``_EXTRACTION_RULES`` (see ``pipeline.py``) — the
-# text is the only piece of the legacy SKILL worth keeping; everything
-# else in ``stage1_extract.md`` either duplicates schema contracts the
-# Pydantic layer now owns, or pushes the ``cat > manifest_path`` file-
-# write protocol that v2 is eliminating. Light cleanup only; the
-# per-type framing (session vs. conversation vs. note vs. task vs.
-# project) is the critical asset.
-_V2_EXTRACTION_RULES: dict[str, str] = {
-    "conversation": (
-        "- Decisions: 'we agreed', 'let's go with', 'decided to', explicit choices.\n"
-        "- Assumptions: 'we're assuming', 'should be fine', implicit beliefs about "
-        "timelines or outcomes.\n"
-        "- Constraints: 'we can't', 'regulation requires', 'budget limit', "
-        "'deadline is'.\n"
-        "- Contradictions: disagreements between participants, conflicting "
-        "information."
-    ),
-    "session": (
-        "- Decisions: check ## Outcome sections, action items that imply choices made.\n"
-        "- Assumptions: Context sections revealing beliefs the team operates on.\n"
-        "- Synthesis: patterns across multiple sessions about the same project."
-    ),
-    "note": (
-        "- Assumptions: research notes revealing implicit beliefs.\n"
-        "- Constraints: meeting notes mentioning limits, regulations, requirements.\n"
-        "- Synthesis: ideas connecting multiple observations."
-    ),
-    "task": (
-        "- Assumptions: Context fields revealing why a task exists.\n"
-        "- Decisions: task outcomes that reflect choices made.\n"
-        "- Constraints: blockers and dependencies revealing limits."
-    ),
-    "project": (
-        "- Assumptions: `based_on` and `depends_on` fields revealing foundational "
-        "beliefs.\n"
-        "- Constraints: `blocked_by` revealing limits.\n"
-        "- Decisions: project scope and approach choices."
-    ),
-}
-
-_V2_EXTRACTION_RULES_GENERIC = (
-    "- Examine the source for implicit beliefs, choices made, limits "
-    "mentioned in passing, statements that conflict with each other, or "
-    "patterns connecting multiple observations."
-)
-
-
 SYSTEM_PROMPT = """You are a knowledge extractor for an Obsidian vault of \
-operational records. Your job is to identify latent knowledge that would be \
-lost if not captured as its own record.
-
-Look for five kinds of latent knowledge:
-
-- **Assumptions** — beliefs the team is operating on, implicit or explicit \
-("we're assuming X", budget lines that only work if Y holds, plans that \
-presume Z).
-- **Decisions** — choices made but not formally recorded elsewhere \
-("we went with X", "chose A over B", resolutions that settled a question).
-- **Constraints** — limits mentioned in passing (regulatory, budget, \
-timeline, technical, contractual). Casual mentions count — a constraint \
-named once in a meeting note is still a constraint.
-- **Contradictions** — statements that conflict with each other inside \
-this source, or against the existing learnings listed in the user prompt.
-- **Syntheses** — patterns connecting multiple observations into a \
-higher-order insight.
+operational records. Your job is to extract latent "learnings" from a \
+source record — assumptions, decisions, constraints, contradictions, or \
+syntheses that are implicit in the source but not yet captured as their \
+own records.
 
 Return output as a JSON object with this exact shape:
 {
   "learnings": [
     {
       "type": "assumption" | "decision" | "constraint" | "contradiction" | "synthesis",
-      "title": "<5-150 char noun phrase, no leading verb>",
+      "title": "<5-150 char title, no leading verb>",
       "confidence": "low" | "medium" | "high",
       "status": "<valid status for the type>",
       "claim": "<1-3 sentence claim, 20+ chars>",
@@ -135,37 +73,12 @@ Valid statuses per type:
   - contradiction: unresolved, resolved, accepted
   - synthesis: draft, active, superseded
 
-## Confidence & status calibration
-
-Use all three confidence levels; do not default to "medium" out of caution.
-
-| Signal                                                | confidence | status     |
-|-------------------------------------------------------|------------|------------|
-| Decision explicitly stated ("we decided")             | high       | final      |
-| Decision implied by action taken                      | medium     | draft      |
-| Assumption explicitly stated ("we're assuming")       | medium     | active     |
-| Assumption implied by context                         | low        | active     |
-| Constraint from regulation / contract                 | high       | active     |
-| Constraint mentioned casually                         | low        | active     |
-| Contradiction between explicit statements             | high       | unresolved |
-| Contradiction between implicit positions              | medium     | unresolved |
-| Synthesis from 3+ observations                        | medium     | draft      |
-| Synthesis from 2 observations                         | low        | draft      |
-
 Rules:
   - Return ONLY the JSON object. No prose, no code fences, no commentary.
-  - If the source contains no actionable latent knowledge, return \
-`{"learnings": []}`. Marketing emails, auto-replies, and sparse logs \
-legitimately have nothing to extract — don't hallucinate a learning to \
-fill the slot.
-  - But: if the source has genuine operational content, prefer to extract \
-at least one learning. A source rich in decision/assumption/constraint \
-keywords but scored as "learnings: []" almost always means signal was \
-missed, not that nothing was there.
+  - If the source doesn't warrant any new learnings, return {"learnings": []}.
   - Do not repeat learnings that already exist (see existing titles list).
-  - title must be a noun phrase, not a full sentence; the claim carries \
-the sentence. Every learning must trace to specific content in the source \
-— never invent.
+  - confidence="high" only when the source is explicit; err toward "medium".
+  - title must be a noun phrase, not a full sentence; claim carries the sentence.
 """
 
 
@@ -174,15 +87,8 @@ def _render_user_prompt(
     source_frontmatter: dict[str, Any],
     existing_learn_titles: list[tuple[str, str]],
     signals: CandidateSignal,
-    source_type: str | None = None,
 ) -> str:
-    """Assemble the per-source user turn.
-
-    ``source_type`` (c10, 2026-04-24) drives the per-type
-    ``_V2_EXTRACTION_RULES`` block injected under "Extraction rules for
-    this source type." Unknown/None falls back to a generic hint so
-    unseen record types still get non-empty guidance.
-    """
+    """Assemble the per-source user turn."""
     fm_json = json.dumps(source_frontmatter, default=str, indent=2)
 
     if existing_learn_titles:
@@ -203,48 +109,11 @@ def _render_user_prompt(
         f"  link_density: {signals.link_density}"
     )
 
-    rules_block = _V2_EXTRACTION_RULES.get(
-        source_type or "", _V2_EXTRACTION_RULES_GENERIC,
-    )
-    rules_header = (
-        f"Extraction rules for source type '{source_type}':"
-        if source_type and source_type in _V2_EXTRACTION_RULES
-        else "Extraction rules (generic):"
-    )
-
-    # Signal-driven nudge (c10). When the keyword pre-scan or section
-    # markers suggest the source is likely to carry latent knowledge,
-    # we remind the model to prefer extracting at least one learning
-    # unless the signals are clearly spurious. The keyword regexes
-    # (candidates.py::*_KEYWORDS) are crude — false positives happen —
-    # so this is a *nudge*, not a command. The empty-is-fine clause in
-    # SYSTEM_PROMPT still dominates when the source is genuinely sparse.
-    has_signal = (
-        signals.decision_keywords > 0
-        or signals.assumption_keywords > 0
-        or signals.constraint_keywords > 0
-        or signals.contradiction_keywords > 0
-        or signals.has_outcome
-        or signals.has_context
-    )
-    signal_nudge = (
-        "\n--- Signal-driven nudge ---\n"
-        "The pre-scan flagged signals suggesting this source likely "
-        "contains latent knowledge of the indicated types. Prefer to "
-        "extract at least one learning unless the signals are clearly "
-        "spurious (e.g. keywords inside quoted prose, boilerplate "
-        "footer text).\n"
-        if has_signal
-        else ""
-    )
-
     return (
         "Extract learnings from this source record.\n\n"
-        f"--- {rules_header} ---\n{rules_block}\n\n"
         f"--- Source frontmatter ---\n{fm_json}\n\n"
         f"--- Source body ---\n{source_body}\n\n"
-        f"--- Candidate signals (scoring hints) ---\n{signal_lines}\n"
-        f"{signal_nudge}\n"
+        f"--- Candidate signals (scoring hints) ---\n{signal_lines}\n\n"
         f"--- Existing learnings (do not duplicate) ---\n{existing_lines}\n\n"
         "Return the JSON object."
     )
@@ -285,19 +154,12 @@ async def extract(
     existing_learn_titles: list[tuple[str, str]],
     signals: CandidateSignal,
     config: DistillerConfig,
-    source_type: str | None = None,
 ) -> ExtractionResult:
     """Non-agentic LLM extraction with Pydantic validation + one repair retry.
 
     Returns a validated ``ExtractionResult``. ``ExtractionResult(learnings=[])``
     is a valid success — the caller decides what to do when empty (the
     daemon just records ``candidates_processed`` and moves on).
-
-    ``source_type`` (c10, 2026-04-24) — the vault record type of the
-    source (``session``, ``note``, ``task``, ``project``,
-    ``conversation``). Drives the per-type extraction-rules block in
-    the user prompt. Optional for backward compat and ease of unit-test
-    construction; unknown/None falls back to a generic nudge.
 
     Two failure modes are silent-by-design:
       - LLM can't produce valid JSON twice → log ``extractor.validation_failed``,
@@ -310,7 +172,6 @@ async def extract(
         source_frontmatter=source_frontmatter,
         existing_learn_titles=existing_learn_titles,
         signals=signals,
-        source_type=source_type,
     )
 
     # First attempt

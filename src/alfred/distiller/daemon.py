@@ -257,7 +257,6 @@ async def _run_v2_shadow(
                 existing_learn_titles=existing_titles,
                 signals=sc.signals,
                 config=config,
-                source_type=sc.record.record_type,
             )
         except Exception as exc:  # noqa: BLE001 — isolate per-source LLM/network errors
             log.warning(
