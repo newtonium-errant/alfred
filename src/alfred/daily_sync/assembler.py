@@ -319,6 +319,14 @@ _FRAGMENT_RE = re.compile(
 _NOTE_SEPARATOR_RE = re.compile(r"\s*(?:[—–\-]+|:|because|since|—)\s+", re.IGNORECASE)
 
 
+# Numbered-list item boundary at the start of a line. Matches:
+#   ``1.`` ``1)`` ``1:`` ``1 -`` ``1 `` at the beginning of any line.
+# Used by ``_split_fragments`` to carve multi-line replies into
+# per-item chunks WITHOUT fragmenting on sentence periods or the word
+# "and" inside an item's free-text note.
+_LIST_ITEM_BOUNDARY_RE = re.compile(r"(?:^|\n)\s*(?=\d+\s*[.\):\-]\s)")
+
+
 def _strip_bullet(s: str) -> str:
     """Remove a leading bullet, dash, or numeric marker from a line.
 
@@ -327,13 +335,52 @@ def _strip_bullet(s: str) -> str:
     return re.sub(r"^[-*•]\s+", "", s.strip())
 
 
+def _has_numbered_list_shape(text: str) -> bool:
+    """Return True when the reply contains at least one line that starts
+    with a numbered-list marker (``1.``, ``2)``, ``3:``, ``4 -``).
+
+    Drives :func:`_split_fragments`: when the reply has list shape we
+    carve it on the list boundaries (so prose periods and the word
+    "and" inside an item's note don't fragment the item). Otherwise we
+    fall back to the single-line shorthand splitter (``,`` ``;``
+    ``and``) — Andrew still types ``"2 down, 4 spam"`` as one line.
+    """
+    if not text:
+        return False
+    return bool(_LIST_ITEM_BOUNDARY_RE.search(text))
+
+
 def _split_fragments(text: str) -> list[str]:
     """Split a multi-clause reply into per-item fragments.
 
-    Recognises ``,`` ``;`` and the word ``and`` as separators.
+    Two split modes:
+
+      * **Numbered-list mode** — when the reply has at least one line
+        starting with ``\\d+[.):\\- ]``, we split on those boundaries
+        ONLY. Item bodies keep their internal periods, "and"s, and
+        commas intact (critical for multi-sentence notes like
+        ``"1. Spam - routine. Warnings only."``). This is the shape
+        produced by autocorrect, dictation, and voice transcripts.
+
+      * **Single-line shorthand mode** — when no list boundary is
+        present, fall back to the historical ``,`` ``;`` ``\\n`` ``and``
+        splitter so Andrew's terse ``"2 down, 4 spam"`` still works.
+
+    Rationale: a period inside an item body is NOT an item boundary;
+    only a newline followed by a number-marker is. See 2026-04-24 live
+    session where ``"1. Spam - routine. Warnings only."`` split on the
+    period and ``"warnings only."`` landed as an orphan fragment.
     """
     if not text:
         return []
+    if _has_numbered_list_shape(text):
+        # List-boundary split: each fragment is a number-marker followed
+        # by its body (possibly multi-line, possibly containing periods
+        # or "and"s). Leading content before the first number is treated
+        # as a preamble and dropped — Andrew's replies don't include
+        # one, but we don't want to crash on ``"ok: 1. down, 2. up"``.
+        parts = _LIST_ITEM_BOUNDARY_RE.split(text)
+        return [p.strip() for p in parts if p.strip()]
     # Convert " and " to a comma so the split below is uniform. Avoid
     # touching " and " inside notes (e.g. "Jamie and the customer") by
     # only splitting on " and " between item-prefixed tokens — but a
