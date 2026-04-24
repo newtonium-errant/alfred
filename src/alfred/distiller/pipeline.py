@@ -740,7 +740,24 @@ async def _stage3_create(
     learn_dir = vault_dir / spec.learn_type
     before_files = set(learn_dir.glob("*.md")) if learn_dir.is_dir() else set()
 
-    await _call_llm(prompt, config, session_path, stage_label)
+    # Retry once on transient Exit code 1 with empty stdout. 512 s3-*
+    # pipeline.llm_failed events since 2026-04-15 were transient Claude
+    # subprocess failures (rate-limit, auth retry, connection reset);
+    # each one was a lost learning record because Stage 3 had no retry
+    # path (unlike Stage 1's max_attempts=3). One extra dispatch per
+    # cluster is cheap relative to the write loss.
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        stdout = await _call_llm(prompt, config, session_path, stage_label)
+        if stdout:
+            break
+        if attempt < max_attempts:
+            log.warning(
+                "pipeline.s3_call_retry",
+                title=spec.title,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
 
     # Check what's new — first try the mutation log
     after_created = set(read_mutations(session_path).get("files_created", []))
