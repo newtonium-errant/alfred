@@ -35,6 +35,8 @@ config.yaml.bak.*
 .claude/projects/
 # Runtime lockfile written by the /schedule skill.
 .claude/scheduled_tasks.lock
+# Agent isolation worktrees created by the Agent tool's isolation: "worktree".
+.claude/worktrees/
 
 # Ink TUI
 tui-ink/node_modules/

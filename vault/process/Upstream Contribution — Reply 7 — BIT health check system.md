@@ -1,8 +1,8 @@
 ---
 alfred_tags:
 - process/upstream-contribution
-- system-integration
-- user-interaction
+- system-architecture
+- automation
 created: '2026-04-22'
 distiller_learnings:
 - '[[synthesis/Coding Instance Is Architectural Substrate for Other Alfred Instances]]'
@@ -60,6 +60,10 @@ distiller_learnings:
 distiller_signals: assumption:2, constraint:1, contradiction:8
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: LINK001 — synthesis/Per-Tool Health Logs Dont Aggregate target exists
+  with regular apostrophe; YAML-escaped apostrophes in distiller_learnings wikilinks
+  defeat the scanner. FM001/DIR001 — file is type=note in process/ directory; autofix
+  should relocate.
 project:
 - '[[project/Alfred]]'
 status: draft
