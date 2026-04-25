@@ -439,6 +439,8 @@ def test_render_empty_payload_has_every_section() -> None:
     assert "Last detected: never." in body
     assert "No recurring topics with sibling disagreement archives" in body
     assert "Last recurrence: never." in body
+    # Section 5 must NOT use "last N days" framing (unbounded).
+    assert "in the last 7 days. Checked:" not in body.split("## Recurrences", 1)[1]
     # Section 3 keeps its existing empty text; section 4 the LLM-TODO.
     assert "None this week." in body
     assert "<!-- TODO: LLM synthesis layer not yet implemented -->" in body
@@ -465,34 +467,58 @@ def test_render_empty_decisions_names_last_addressed(two_projects) -> None:
     assert "Last addressed: proj-a@ancient-decision.md on 2025-12-15." in body
 
 
-def test_render_empty_recurrences_names_last_recurrence(two_projects) -> None:
-    """A prior recurring topic with disagreement archive must show up
-    in the "Last recurrence" pointer when this window is quiet."""
-    p_a = two_projects["proj-a"]
-    p_b = two_projects["proj-b"]
-    # Two reviews with overlapping topics across projects, plus a
-    # sibling disagreement archive on one — ancient enough that the
-    # current 7-day window stays empty.
-    _write(p_a, "2025-11-01-throttling.md", _kalle_review(
+def test_recurrences_unbounded_ancient_topic_surfaces(two_projects) -> None:
+    """Ancient recurrence (with disagreement sibling) surfaces regardless
+    of digest window. Recurrences are now unbounded, like Open Questions.
+
+    The prior behavior gated by ``window_start``/``window_end`` would
+    have hidden a 6-month-old disagreement; this test pins the new
+    contract that timestamp doesn't matter for inclusion.
+    """
+    p = two_projects["proj-a"]
+    _write(p, "2025-11-01-throttling.md", _kalle_review(
         status="addressed",
         created="2025-11-01T00:00:00+00:00",
         addressed="2025-11-05T00:00:00+00:00",
         topic="throttling",
     ))
-    _write(p_a, "2025-11-01-throttling—claude-disagreement.md", "body")
-    _write(p_b, "2025-10-01-throttling-redux.md", _kalle_review(
-        status="addressed",
-        created="2025-10-01T00:00:00+00:00",
-        addressed="2025-10-05T00:00:00+00:00",
-        topic="throttling-redux",
-    ))
+    _write(p, "2025-11-01-throttling—claude-disagreement.md", "body")
+    today = datetime(2026, 4, 25, tzinfo=timezone.utc)
+    payload = build_payload(
+        project_paths=two_projects, today=today, window_days=7,
+    )
+    # The ancient topic must now appear in the populated section, not
+    # be punted to the "Last recurrence" empty-state pointer.
+    assert len(payload.recurrences) == 1
+    assert payload.recurrences[0].filename == "2025-11-01-throttling.md"
+    body = render(payload)
+    assert "throttling" in body
+    assert "claude-disagreement" in body
+    # Section header still present with content listed under it.
+    assert "## Recurrences" in body
+
+
+def test_render_empty_recurrences_uses_unbounded_phrasing(two_projects) -> None:
+    """Empty-state line: no "last N days" framing; "across <projects>"
+    + "Last recurrence: <X>" stays so the explicit-empty signal is
+    preserved (falls back to "never" when no recurrence on record)."""
+    # No reviews, no disagreement archives anywhere → section is empty.
     today = datetime(2026, 4, 25, tzinfo=timezone.utc)
     payload = build_payload(
         project_paths=two_projects, today=today, window_days=7,
     )
     body = render(payload)
-    assert "No recurring topics with sibling disagreement archives" in body
-    assert "Last recurrence: throttling on 2025-11-05." in body
+    # Isolate the recurrences section so we don't accidentally match
+    # phrasing from an earlier section.
+    rec_section = body.split("## Recurrences", 1)[1]
+    assert "No recurring topics with sibling disagreement archives" in rec_section
+    # Drop "in the last N days" framing entirely.
+    assert "in the last" not in rec_section
+    assert "last 7 days" not in rec_section
+    # Use "across" + project list.
+    assert "across proj-a, proj-b" in rec_section
+    # Keep "Last recurrence:" so empty-state stays explicit.
+    assert "Last recurrence: never." in rec_section
 
 
 def test_render_empty_promotions_names_last_promotion(tmp_path) -> None:

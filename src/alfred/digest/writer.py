@@ -13,13 +13,16 @@ broken):
 4. Cross-project patterns — emits a literal HTML-comment TODO marker;
    the LLM synthesis layer fills this in later.
 5. Recurrences — KAL-LE reviews whose topic resurfaces and which have
-   a sibling ``*—claude-disagreement.md`` archive.
+   a sibling ``*—claude-disagreement.md`` archive. Unbounded: a topic
+   counts as recurring regardless of timestamp, like Open Questions.
 
-Empty sections 1, 2, 5 emit an explicit "what we checked" line plus a
+Empty sections 1 and 2 emit an explicit "what we checked" line plus a
 "last detected" pointer (the unbounded-history fallback) so a quiet
-week is unambiguously distinct from a broken pipeline. Sections 3 and
-4 keep their existing empty behavior (open-questions has no window;
-cross-project is a literal LLM-TODO marker).
+week is unambiguously distinct from a broken pipeline. Section 5 also
+emits a "Last recurrence" pointer for the same reason, but without
+the "last N days" framing since recurrences are unbounded. Sections 3
+and 4 keep their existing empty behavior (open-questions has no
+window; cross-project is a literal LLM-TODO marker).
 """
 
 from __future__ import annotations
@@ -408,9 +411,6 @@ def _normalize_topic(topic: str) -> str:
 
 def collect_recurrences(
     project_paths: dict[str, Path],
-    *,
-    window_start: datetime | None = None,
-    window_end: datetime | None = None,
 ) -> list[Recurrence]:
     """Find KAL-LE reviews with a sibling ``*—claude-disagreement.md`` file.
 
@@ -418,10 +418,9 @@ def collect_recurrences(
     convention. Each match is paired with the underlying KAL-LE review
     so the digest reader knows which thread recurred.
 
-    When ``window_start``/``window_end`` are set, only reviews whose
-    ``addressed`` (or fallback ``created``) timestamp falls in the
-    window are considered. ``find_last_recurrence`` calls this with
-    no window for the unbounded "last detected" lookup.
+    Unbounded by design: a topic counts as recurring regardless of when
+    it was raised. Behaves like Open Questions — open is open, recurred
+    is recurred.
     """
     rows = list_all_kalle_reviews_with_paths(list(project_paths.values()))
     path_to_project: dict[str, str] = {
@@ -430,13 +429,6 @@ def collect_recurrences(
     out: list[Recurrence] = []
     seen: set[tuple[str, str]] = set()
     for vault_str, rec in rows:
-        if window_start is not None and window_end is not None:
-            ts = (
-                _parse_iso(rec.frontmatter.get("addressed"))
-                or _parse_iso(rec.frontmatter.get("created"))
-            )
-            if ts is None or not (window_start <= ts <= window_end):
-                continue
         project = path_to_project.get(vault_str, vault_str)
         reviews_dir = Path(vault_str) / REVIEWS_SUBPATH
         stem = rec.filename[:-3] if rec.filename.endswith(".md") else rec.filename
@@ -545,10 +537,7 @@ def build_payload(
         project_paths, window_start=window_start, window_end=window_end,
     )
     open_q, open_q_projects = collect_open_questions(project_paths)
-    recurrences = collect_recurrences(
-        project_paths,
-        window_start=window_start, window_end=window_end,
-    )
+    recurrences = collect_recurrences(project_paths)
     project_names = sorted(project_paths.keys())
 
     last_addressed = None
@@ -680,7 +669,7 @@ def render(payload: DigestPayload) -> str:
     parts.append("## Recurrences")
     parts.append("")
     if not payload.recurrences:
-        checked = _format_project_list(payload.project_names)
+        across = _format_project_list(payload.project_names)
         if payload.last_recurrence is not None:
             last = (
                 f"{payload.last_recurrence.topic} on "
@@ -689,9 +678,8 @@ def render(payload: DigestPayload) -> str:
         else:
             last = "never"
         parts.append(
-            f"No recurring topics with sibling disagreement archives in "
-            f"the last {window_days} days. Checked: {checked}. "
-            f"Last recurrence: {last}."
+            f"No recurring topics with sibling disagreement archives "
+            f"across {across}. Last recurrence: {last}."
         )
     else:
         for rec in payload.recurrences:
