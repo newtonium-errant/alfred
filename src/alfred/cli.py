@@ -484,6 +484,23 @@ def cmd_transport(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def cmd_reviews(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred reviews`` subcommands.
+
+    JSON-on-stdout — same contract as ``alfred vault``. Logs are routed
+    to the file sink so the JSON output stays clean.
+    """
+    try:
+        raw = _load_unified_config(args.config)
+        _setup_logging_from_config(raw, tool="reviews", suppress_stdout=True)
+    except SystemExit:
+        raw = {}
+    except Exception:
+        raw = {}
+    from alfred.reviews import cli as rcli
+    sys.exit(rcli.dispatch(raw, args))
+
+
 def cmd_vault(args: argparse.Namespace) -> None:
     # Route logs to a dedicated file sink. The vault CLI emits JSON on stdout
     # that calling agents parse, so logging MUST NOT leak to stdout.
@@ -1439,6 +1456,10 @@ def build_parser() -> argparse.ArgumentParser:
     from alfred.audit import cli as audit_cli
     audit_cli.build_parser(sub)
 
+    # reviews — KAL-LE per-project review files
+    from alfred.reviews import cli as reviews_cli
+    reviews_cli.build_subparser(sub)
+
     return parser
 
 
@@ -1477,6 +1498,7 @@ def main() -> None:
         "check": cmd_check,
         "bit": cmd_bit,
         "audit": cmd_audit,
+        "reviews": cmd_reviews,
     }
 
     handler = handlers.get(args.command)
