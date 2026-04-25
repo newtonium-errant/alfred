@@ -5,8 +5,9 @@ broken):
 
 1. Decisions made — KAL-LE-authored reviews with status=addressed
    whose ``addressed`` timestamp falls within the digest window.
-2. Promotions to canonical — git-log mining for renames into
-   ``stack/``, ``principles/``, ``architecture/`` paths in the window.
+2. Promotions to canonical — git-log mining for commits whose
+   subject/body matches a promotion keyword AND that add files under
+   ``architecture/``, ``stack/``, or ``principles/`` in the window.
 3. Open questions — KAL-LE-authored reviews with status=open across
    ALL configured projects (no window filter; open is open).
 4. Cross-project patterns — emits a literal HTML-comment TODO marker;
@@ -14,8 +15,11 @@ broken):
 5. Recurrences — KAL-LE reviews whose topic resurfaces and which have
    a sibling ``*—claude-disagreement.md`` archive.
 
-If a section has zero entries, it still renders with "None this week."
-text. Section header omission would conflate idle and broken.
+Empty sections 1, 2, 5 emit an explicit "what we checked" line plus a
+"last detected" pointer (the unbounded-history fallback) so a quiet
+week is unambiguously distinct from a broken pipeline. Sections 3 and
+4 keep their existing empty behavior (open-questions has no window;
+cross-project is a literal LLM-TODO marker).
 """
 
 from __future__ import annotations
@@ -42,18 +46,26 @@ from alfred.reviews.store import (
 log = structlog.get_logger(__name__)
 
 
-_PROMOTION_DEST_PREFIXES: tuple[str, ...] = (
-    "stack/", "principles/", "architecture/",
+_PROMOTION_TARGET_DIRS: tuple[str, ...] = ("architecture", "stack", "principles")
+
+# Keyword regex hits any commit whose subject/body talks about
+# promoting/canonicalizing/curating. Used as the first half of the
+# AND-gate; the second half checks that ≥1 file added by the commit
+# actually lands in a canonical target dir. Keyword-only matches (e.g.
+# "Expand standing orders" mentioning "curated context") are dropped
+# as noise.
+_PROMOTION_KEYWORD_RE = re.compile(
+    r"\b(promot\w*|canonical\w*|curat\w*)\b",
+    re.IGNORECASE,
 )
 
 
 @dataclass
 class Promotion:
     repo: str
-    sha: str
+    sha: str           # short 7-char hash
     subject: str
-    source: str
-    destination: str
+    files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -62,6 +74,28 @@ class Recurrence:
     filename: str
     topic: str
     disagreement_filename: str
+
+
+@dataclass
+class LastAddressed:
+    project: str
+    filename: str
+    date: str
+
+
+@dataclass
+class LastPromotion:
+    repo: str
+    sha: str
+    date: str
+
+
+@dataclass
+class LastRecurrence:
+    project: str
+    filename: str
+    topic: str
+    date: str
 
 
 @dataclass
@@ -75,6 +109,11 @@ class DigestPayload:
     open_questions: list[ReviewRecord] = field(default_factory=list)
     open_question_projects: dict[str, str] = field(default_factory=dict)
     recurrences: list[Recurrence] = field(default_factory=list)
+    project_names: list[str] = field(default_factory=list)
+    repo_names: list[str] = field(default_factory=list)
+    last_addressed: LastAddressed | None = None
+    last_promotion: LastPromotion | None = None
+    last_recurrence: LastRecurrence | None = None
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -151,7 +190,100 @@ def collect_open_questions(
     return [r for _, r, _ in out], project_map
 
 
-_RENAME_LINE = re.compile(r"^R\d+\s+(.+?)\s+(.+)$")
+def _is_canonical_add(file_path: str) -> bool:
+    """File path is added under one of the canonical target dirs.
+
+    The path must be repo-root-relative (no leading slash). A path of
+    ``architecture/foo.md`` matches; ``foo/architecture/x.md`` does not.
+    """
+    parts = file_path.split("/")
+    return bool(parts) and parts[0] in _PROMOTION_TARGET_DIRS
+
+
+def _git_log_keyword_commits(
+    repo_path: Path,
+    *,
+    since_arg: str | None,
+) -> list[tuple[str, str]]:
+    """Return ``[(sha, subject), ...]`` for keyword-matching commits.
+
+    ``since_arg`` is forwarded as ``--since=<value>`` if provided; pass
+    ``None`` to scan all of history (used by the "last detected"
+    fallback). The body is included in the keyword check via
+    ``--pretty=format:`` — we serialize subject and body separated by a
+    tab, with a NUL terminator between commits so multiline bodies
+    don't split the record.
+    """
+    cmd = ["git", "log", "--pretty=format:%H%x09%s%x09%b%x00"]
+    if since_arg:
+        cmd.append(f"--since={since_arg}")
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(repo_path), capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.info(
+            "digest.promotions.git_log_failed",
+            repo=str(repo_path), error=str(exc),
+        )
+        return []
+    if result.returncode != 0:
+        log.info(
+            "digest.promotions.git_log_nonzero",
+            repo=str(repo_path),
+            code=result.returncode,
+            stderr=(result.stderr or "")[:500],
+            stdout_tail=(result.stdout or "")[-2000:],
+        )
+        return []
+    out: list[tuple[str, str]] = []
+    raw = result.stdout or ""
+    for record in raw.split("\x00"):
+        record = record.strip("\n")
+        if not record.strip():
+            continue
+        parts = record.split("\t", 2)
+        if len(parts) < 2:
+            continue
+        sha = parts[0].strip()
+        subject = parts[1] if len(parts) >= 2 else ""
+        body = parts[2] if len(parts) >= 3 else ""
+        if not _PROMOTION_KEYWORD_RE.search(f"{subject}\n{body}"):
+            continue
+        out.append((sha, subject))
+    return out
+
+
+def _git_show_added_files(repo_path: Path, sha: str) -> list[str]:
+    """Files added (``--diff-filter=A``) by ``sha``, repo-root-relative."""
+    try:
+        result = subprocess.run(
+            [
+                "git", "show", "--diff-filter=A", "--name-only",
+                "--pretty=format:", sha,
+            ],
+            cwd=str(repo_path),
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.info(
+            "digest.promotions.git_show_failed",
+            repo=str(repo_path), sha=sha, error=str(exc),
+        )
+        return []
+    if result.returncode != 0:
+        log.info(
+            "digest.promotions.git_show_nonzero",
+            repo=str(repo_path), sha=sha,
+            code=result.returncode,
+            stderr=(result.stderr or "")[:500],
+            stdout_tail=(result.stdout or "")[-2000:],
+        )
+        return []
+    return [
+        ln.strip() for ln in (result.stdout or "").splitlines()
+        if ln.strip()
+    ]
 
 
 def collect_promotions(
@@ -160,82 +292,111 @@ def collect_promotions(
     window_start: datetime,
     window_end: datetime,
 ) -> list[Promotion]:
-    """Mine ``git log --diff-filter=R --name-status`` across all repos.
+    """Hybrid promotion detection: keyword AND canonical-dir ADD.
 
-    Returns one :class:`Promotion` per rename whose destination begins
-    with ``stack/``, ``principles/``, or ``architecture/``. Repos that
-    don't exist or fail to invoke git are skipped silently — the
-    digest must not crash because one repo isn't a clone.
+    Keyword-only matches and canonical-dir-only commits both fail the
+    AND-gate; only commits that satisfy both surface as promotions.
+    Repos without a ``.git`` directory or whose git invocation fails
+    are skipped silently — the digest must not crash because one repo
+    isn't a clone.
     """
     out: list[Promotion] = []
     since_iso = window_start.isoformat()
-    until_iso = window_end.isoformat()
+    until_dt = window_end
     for name, path in repo_paths.items():
-        if not (path / ".git").exists() and not path.joinpath(".git").is_file():
+        if not (path / ".git").exists() and not (path / ".git").is_file():
             continue
-        try:
-            result = subprocess.run(
-                [
-                    "git", "log",
-                    "--diff-filter=R",
-                    "--name-status",
-                    f"--since={since_iso}",
-                    f"--until={until_iso}",
-                    "--pretty=format:COMMIT %H %s",
-                ],
-                cwd=str(path),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            log.info(
-                "digest.promotions.git_log_failed",
-                repo=name,
-                error=str(exc),
-            )
-            continue
-        if result.returncode != 0:
-            log.info(
-                "digest.promotions.git_log_nonzero",
-                repo=name,
-                code=result.returncode,
-                stderr=(result.stderr or "")[:200],
-                stdout_tail=(result.stdout or "")[-200:],
-            )
-            continue
-        out.extend(_parse_rename_log(name, result.stdout or ""))
+        # We pass --since and post-filter against window_end ourselves
+        # because git log's --until rounds inconsistently for tz-aware
+        # ISO timestamps; cheaper to just keep what's in window.
+        candidates = _git_log_keyword_commits(path, since_arg=since_iso)
+        for sha, subject in candidates:
+            commit_dt = _git_commit_datetime(path, sha)
+            if commit_dt is not None and commit_dt > until_dt:
+                continue
+            files = _git_show_added_files(path, sha)
+            canonical_files = [f for f in files if _is_canonical_add(f)]
+            if not canonical_files:
+                continue
+            short_sha = sha[:7]
+            out.append(Promotion(
+                repo=name, sha=short_sha, subject=subject,
+                files=canonical_files,
+            ))
     return out
 
 
-def _parse_rename_log(repo: str, raw: str) -> list[Promotion]:
-    """Walk ``git log --diff-filter=R --name-status`` output."""
-    promotions: list[Promotion] = []
-    current_sha = ""
-    current_subject = ""
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
+def _git_commit_datetime(repo_path: Path, sha: str) -> datetime | None:
+    """Author date of ``sha`` as a UTC datetime, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["git", "show", "-s", "--format=%aI", sha],
+            cwd=str(repo_path),
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_iso((result.stdout or "").strip())
+
+
+def find_last_addressed(
+    project_paths: dict[str, Path],
+) -> LastAddressed | None:
+    """Most-recent KAL-LE review with status=addressed, all-time, all projects.
+
+    The empty-state caller uses this to print "Last addressed: <X>"
+    when the current window has no decisions — so the reader can tell
+    "we looked, found nothing this week" from "we never look".
+    """
+    rows = list_all_kalle_reviews_with_paths(list(project_paths.values()))
+    path_to_project: dict[str, str] = {
+        str(p): name for name, p in project_paths.items()
+    }
+    best: tuple[datetime, str, str, str] | None = None
+    for vault_str, rec in rows:
+        if rec.frontmatter.get("status") != STATUS_ADDRESSED:
             continue
-        if line.startswith("COMMIT "):
-            parts = line.split(" ", 2)
-            current_sha = parts[1] if len(parts) >= 2 else ""
-            current_subject = parts[2] if len(parts) >= 3 else ""
+        addressed_dt = _parse_iso(rec.frontmatter.get("addressed"))
+        if addressed_dt is None:
             continue
-        m = _RENAME_LINE.match(line)
-        if not m:
+        project = path_to_project.get(vault_str, vault_str)
+        if best is None or addressed_dt > best[0]:
+            best = (addressed_dt, project, rec.filename, addressed_dt.date().isoformat())
+    if best is None:
+        return None
+    _, project, filename, date_str = best
+    return LastAddressed(project=project, filename=filename, date=date_str)
+
+
+def find_last_promotion(
+    repo_paths: dict[str, Path],
+) -> LastPromotion | None:
+    """Most-recent commit (all-time) satisfying the promotion AND-gate.
+
+    Unbounded git history scan per repo. The digest runs weekly so the
+    cost is acceptable; if it ever isn't, a result cache lives at this
+    seam.
+    """
+    best: tuple[datetime, str, str] | None = None
+    for name, path in repo_paths.items():
+        if not (path / ".git").exists() and not (path / ".git").is_file():
             continue
-        source, destination = m.group(1), m.group(2)
-        if not destination.startswith(_PROMOTION_DEST_PREFIXES):
-            continue
-        promotions.append(Promotion(
-            repo=repo,
-            sha=current_sha,
-            subject=current_subject,
-            source=source,
-            destination=destination,
-        ))
-    return promotions
+        candidates = _git_log_keyword_commits(path, since_arg=None)
+        for sha, _subject in candidates:
+            files = _git_show_added_files(path, sha)
+            if not any(_is_canonical_add(f) for f in files):
+                continue
+            commit_dt = _git_commit_datetime(path, sha)
+            if commit_dt is None:
+                continue
+            if best is None or commit_dt > best[0]:
+                best = (commit_dt, name, sha[:7])
+    if best is None:
+        return None
+    dt, repo, short_sha = best
+    return LastPromotion(repo=repo, sha=short_sha, date=dt.date().isoformat())
 
 
 _TOPIC_NORMALIZE = re.compile(r"[^a-z0-9]+")
@@ -247,12 +408,20 @@ def _normalize_topic(topic: str) -> str:
 
 def collect_recurrences(
     project_paths: dict[str, Path],
+    *,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
 ) -> list[Recurrence]:
     """Find KAL-LE reviews with a sibling ``*—claude-disagreement.md`` file.
 
     The em-dash is the literal character per the disagreement-archive
     convention. Each match is paired with the underlying KAL-LE review
     so the digest reader knows which thread recurred.
+
+    When ``window_start``/``window_end`` are set, only reviews whose
+    ``addressed`` (or fallback ``created``) timestamp falls in the
+    window are considered. ``find_last_recurrence`` calls this with
+    no window for the unbounded "last detected" lookup.
     """
     rows = list_all_kalle_reviews_with_paths(list(project_paths.values()))
     path_to_project: dict[str, str] = {
@@ -261,6 +430,13 @@ def collect_recurrences(
     out: list[Recurrence] = []
     seen: set[tuple[str, str]] = set()
     for vault_str, rec in rows:
+        if window_start is not None and window_end is not None:
+            ts = (
+                _parse_iso(rec.frontmatter.get("addressed"))
+                or _parse_iso(rec.frontmatter.get("created"))
+            )
+            if ts is None or not (window_start <= ts <= window_end):
+                continue
         project = path_to_project.get(vault_str, vault_str)
         reviews_dir = Path(vault_str) / REVIEWS_SUBPATH
         stem = rec.filename[:-3] if rec.filename.endswith(".md") else rec.filename
@@ -286,6 +462,71 @@ def collect_recurrences(
     return out
 
 
+def find_last_recurrence(
+    project_paths: dict[str, Path],
+) -> LastRecurrence | None:
+    """Most-recent recurrence across all-time KAL-LE reviews.
+
+    Definition of "recurrence" matches :func:`collect_recurrences` plus
+    a topic-substring overlap check across the corpus: the normalized
+    topic of one review must appear inside the normalized topic of
+    another distinct review. That guards against single-occurrence
+    disagreements being labeled "recurrent".
+    """
+    rows = list_all_kalle_reviews_with_paths(list(project_paths.values()))
+    path_to_project: dict[str, str] = {
+        str(p): name for name, p in project_paths.items()
+    }
+    normalized_topics: list[tuple[str, ReviewRecord, str]] = []
+    for vault_str, rec in rows:
+        topic = str(rec.frontmatter.get("topic") or "")
+        norm = _normalize_topic(topic)
+        if not norm:
+            continue
+        normalized_topics.append((vault_str, rec, norm))
+
+    def topic_recurs(target_norm: str, self_vault: str, self_filename: str) -> bool:
+        for other_vault, other_rec, other_norm in normalized_topics:
+            if other_vault == self_vault and other_rec.filename == self_filename:
+                continue
+            if target_norm in other_norm or other_norm in target_norm:
+                return True
+        return False
+
+    best: tuple[datetime, str, str, str] | None = None
+    for vault_str, rec, norm in normalized_topics:
+        if not topic_recurs(norm, vault_str, rec.filename):
+            continue
+        reviews_dir = Path(vault_str) / REVIEWS_SUBPATH
+        stem = rec.filename[:-3] if rec.filename.endswith(".md") else rec.filename
+        siblings = [
+            reviews_dir / f"{stem}—claude-disagreement.md",
+            reviews_dir / f"{stem}--claude-disagreement.md",
+            reviews_dir / f"{stem}-claude-disagreement.md",
+        ]
+        if not any(s.is_file() for s in siblings):
+            continue
+        # Use addressed if present, else created — whatever puts it on
+        # a timeline. Files lacking both are skipped.
+        ts = (
+            _parse_iso(rec.frontmatter.get("addressed"))
+            or _parse_iso(rec.frontmatter.get("created"))
+        )
+        if ts is None:
+            continue
+        project = path_to_project.get(vault_str, vault_str)
+        topic = str(rec.frontmatter.get("topic") or rec.filename)
+        if best is None or ts > best[0]:
+            best = (ts, project, rec.filename, topic)
+    if best is None:
+        return None
+    ts, project, filename, topic = best
+    return LastRecurrence(
+        project=project, filename=filename, topic=topic,
+        date=ts.date().isoformat(),
+    )
+
+
 def build_payload(
     *,
     project_paths: dict[str, Path],
@@ -304,7 +545,22 @@ def build_payload(
         project_paths, window_start=window_start, window_end=window_end,
     )
     open_q, open_q_projects = collect_open_questions(project_paths)
-    recurrences = collect_recurrences(project_paths)
+    recurrences = collect_recurrences(
+        project_paths,
+        window_start=window_start, window_end=window_end,
+    )
+    project_names = sorted(project_paths.keys())
+
+    last_addressed = None
+    if not decisions:
+        last_addressed = find_last_addressed(project_paths)
+    last_promotion = None
+    if not promotions:
+        last_promotion = find_last_promotion(project_paths)
+    last_recurrence = None
+    if not recurrences:
+        last_recurrence = find_last_recurrence(project_paths)
+
     return DigestPayload(
         today=today,
         window_start=window_start,
@@ -315,10 +571,24 @@ def build_payload(
         open_questions=open_q,
         open_question_projects=open_q_projects,
         recurrences=recurrences,
+        project_names=project_names,
+        repo_names=project_names,
+        last_addressed=last_addressed,
+        last_promotion=last_promotion,
+        last_recurrence=last_recurrence,
     )
 
 
 _LLM_PLACEHOLDER = "<!-- TODO: LLM synthesis layer not yet implemented -->"
+
+
+def _format_project_list(names: list[str]) -> str:
+    """Comma-separated for the empty-state "Checked: ..." suffix.
+
+    A configured-but-empty deployment (zero projects) collapses to
+    ``(none configured)`` so the line still parses unambiguously.
+    """
+    return ", ".join(names) if names else "(none configured)"
 
 
 def render(payload: DigestPayload) -> str:
@@ -327,6 +597,7 @@ def render(payload: DigestPayload) -> str:
     today_iso = payload.today.date().isoformat()
     start_iso = payload.window_start.date().isoformat()
     end_iso = payload.window_end.date().isoformat()
+    window_days = max(1, (payload.window_end - payload.window_start).days)
     parts.append(f"# Weekly digest — {today_iso}")
     parts.append("")
     parts.append(f"Window: {start_iso} → {end_iso}")
@@ -335,7 +606,19 @@ def render(payload: DigestPayload) -> str:
     parts.append("## Decisions made")
     parts.append("")
     if not payload.decisions:
-        parts.append("None this week.")
+        checked = _format_project_list(payload.project_names)
+        if payload.last_addressed is not None:
+            last = (
+                f"{payload.last_addressed.project}@"
+                f"{payload.last_addressed.filename} "
+                f"on {payload.last_addressed.date}"
+            )
+        else:
+            last = "never"
+        parts.append(
+            f"No KAL-LE reviews flipped to addressed in the last "
+            f"{window_days} days. Checked: {checked}. Last addressed: {last}."
+        )
     else:
         for rec in payload.decisions:
             project = payload.decision_projects.get(rec.filename, "?")
@@ -350,14 +633,28 @@ def render(payload: DigestPayload) -> str:
     parts.append("## Promotions to canonical")
     parts.append("")
     if not payload.promotions:
-        parts.append("None this week.")
+        checked_repos = _format_project_list(payload.repo_names)
+        target_dirs = ",".join(_PROMOTION_TARGET_DIRS)
+        if payload.last_promotion is not None:
+            last = (
+                f"{payload.last_promotion.repo}@{payload.last_promotion.sha} "
+                f"on {payload.last_promotion.date}"
+            )
+        else:
+            last = "never"
+        parts.append(
+            f"No canonical promotions detected in the last {window_days} "
+            f"days. Checked: keyword /\\b(promot|canonical|curat)/i + ADDs "
+            f"in {{{target_dirs}}}/ across {checked_repos}. "
+            f"Last detected: {last}."
+        )
     else:
         for promo in payload.promotions:
-            short_sha = promo.sha[:8] if promo.sha else "?"
             parts.append(
-                f"- [{promo.repo}] {promo.source} -> {promo.destination} "
-                f"({short_sha}: {promo.subject})"
+                f"- {promo.repo}@{promo.sha} — {promo.subject}"
             )
+            for f in promo.files:
+                parts.append(f"  - {f}")
     parts.append("")
 
     parts.append("## Open questions")
@@ -383,7 +680,19 @@ def render(payload: DigestPayload) -> str:
     parts.append("## Recurrences")
     parts.append("")
     if not payload.recurrences:
-        parts.append("None this week.")
+        checked = _format_project_list(payload.project_names)
+        if payload.last_recurrence is not None:
+            last = (
+                f"{payload.last_recurrence.topic} on "
+                f"{payload.last_recurrence.date}"
+            )
+        else:
+            last = "never"
+        parts.append(
+            f"No recurring topics with sibling disagreement archives in "
+            f"the last {window_days} days. Checked: {checked}. "
+            f"Last recurrence: {last}."
+        )
     else:
         for rec in payload.recurrences:
             parts.append(
@@ -426,6 +735,9 @@ def resolve_repo_paths(raw: dict[str, Any]) -> dict[str, Path]:
 
 __all__ = [
     "DigestPayload",
+    "LastAddressed",
+    "LastPromotion",
+    "LastRecurrence",
     "Promotion",
     "Recurrence",
     "build_payload",
@@ -433,6 +745,9 @@ __all__ = [
     "collect_open_questions",
     "collect_promotions",
     "collect_recurrences",
+    "find_last_addressed",
+    "find_last_promotion",
+    "find_last_recurrence",
     "render",
     "resolve_repo_paths",
     "write_digest",
