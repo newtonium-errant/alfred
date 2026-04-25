@@ -501,6 +501,19 @@ def cmd_reviews(args: argparse.Namespace) -> None:
     sys.exit(rcli.dispatch(raw, args))
 
 
+def cmd_digest(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred digest`` subcommands."""
+    try:
+        raw = _load_unified_config(args.config)
+        _setup_logging_from_config(raw, tool="digest", suppress_stdout=True)
+    except SystemExit:
+        raw = {}
+    except Exception:
+        raw = {}
+    from alfred.digest import cli as dcli
+    sys.exit(dcli.dispatch(raw, args))
+
+
 def cmd_vault(args: argparse.Namespace) -> None:
     # Route logs to a dedicated file sink. The vault CLI emits JSON on stdout
     # that calling agents parse, so logging MUST NOT leak to stdout.
@@ -1460,6 +1473,10 @@ def build_parser() -> argparse.ArgumentParser:
     from alfred.reviews import cli as reviews_cli
     reviews_cli.build_subparser(sub)
 
+    # digest — KAL-LE cross-project weekly synthesis
+    from alfred.digest import cli as digest_cli
+    digest_cli.build_subparser(sub)
+
     return parser
 
 
@@ -1499,6 +1516,7 @@ def main() -> None:
         "bit": cmd_bit,
         "audit": cmd_audit,
         "reviews": cmd_reviews,
+        "digest": cmd_digest,
     }
 
     handler = handlers.get(args.command)

@@ -282,6 +282,36 @@ def _run_brief_digest_push(raw: dict[str, Any], suppress_stdout: bool = False) -
     asyncio.run(run_daemon(config, transport_config))
 
 
+def _run_digest(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """Digest daemon entry — KAL-LE weekly cross-project synthesis.
+
+    Fires once per week at ``digest.schedule`` (default Sunday 07:00
+    America/Halifax). Auto-skip with exit 78 when ``digest.enabled``
+    is missing or false so the orchestrator's auto-restart doesn't
+    spin a disabled daemon.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/digest.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    from alfred.brief.utils import setup_logging
+    setup_logging(
+        level=log_cfg.get("level", "INFO"),
+        log_file=log_file,
+        suppress_stdout=suppress_stdout,
+    )
+    from alfred.digest.config import load_from_unified as load_dg
+    from alfred.digest.daemon import run_daemon as run_dg_daemon
+    config = load_dg(raw)
+    if not config.enabled:
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("digest.daemon.disabled_in_config")
+        sys.exit(78)
+    asyncio.run(run_dg_daemon(config, raw))
+
+
 def _run_daily_sync(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Daily Sync daemon process entry point.
 
@@ -401,6 +431,7 @@ TOOL_RUNNERS = {
     "talker": _run_talker,
     "daily_sync": _run_daily_sync,
     "brief_digest_push": _run_brief_digest_push,
+    "digest": _run_digest,
 }
 
 
@@ -462,6 +493,11 @@ def run_all(
         # principal — receiver, not sender).
         if "brief_digest_push" in raw and (raw.get("brief_digest_push") or {}).get("enabled"):
             tools.append("brief_digest_push")
+        # KAL-LE weekly cross-project digest. Auto-starts when ``digest:``
+        # is in config AND ``enabled: true``. Default off so subordinates
+        # that don't write digests don't fire one.
+        if "digest" in raw and (raw.get("digest") or {}).get("enabled"):
+            tools.append("digest")
 
     # Validate tool names
     for tool in tools:
