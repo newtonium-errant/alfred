@@ -1,8 +1,8 @@
 ---
 alfred_tags:
 - process/upstream-contribution
-- system-integration
-- user-interaction
+- system-architecture
+- automation
 created: '2026-04-21'
 distiller_learnings:
 - '[[decision/Peer Protocol v1 Is HTTP REST JSON Localhost-Only]]'
@@ -102,8 +102,22 @@ distiller_learnings:
 distiller_signals: constraint:2, contradiction:1
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: LINK001 — scanner false positives on distiller_learnings YAML-escaped
+  apostrophes; wikilink targets exist as decision/Salem Ghostwrites External Communications
+  on Andrew Behalf and decision/extract Is Idempotent with Delete-First Re-Run Contract.
+  FM001/DIR001 deterministic — file is type:note in process/ dir, missing name field;
+  awaiting autofix.
 project:
 - '[[project/Alfred]]'
+relationships:
+- confidence: 0.7
+  context: Both mention Upstream Contribution stages.
+  source: process/Upstream Contribution — Reply 2 — Outbound transport and Stage 3.5
+    substrate.md
+  source_anchor: Stage 3.5 substrate
+  target: process/Upstream Contribution — Reply 4 — KAL-LE multi-instance MVP.md
+  target_anchor: KAL-LE multi-instance MVP
+  type: related-to
 status: draft
 subtype: draft
 tags:

@@ -310,6 +310,68 @@ def cmd_rotate(raw: dict[str, Any], env_path: str = ".env") -> int:
 # --- argparse wiring --------------------------------------------------------
 
 
+def cmd_propose_person(
+    raw: dict[str, Any],
+    *,
+    peer: str,
+    name: str,
+    fields: list[str],
+    source: str,
+    self_name: str,
+    wants_json: bool = False,
+) -> int:
+    """Run the KAL-LE-side resolve-or-propose flow against ``peer``.
+
+    Parses ``--field key=value`` into a dict, invokes
+    :func:`alfred.transport.client.resolve_or_propose_canonical_person`,
+    and prints the structured outcome. Exit code 0 regardless of
+    ``found``/``pending`` — the outcome is informational, not a failure
+    signal. Non-zero exits reserved for transport errors (401, 5xx,
+    peer unreachable).
+    """
+    from .client import resolve_or_propose_canonical_person
+    from .config import load_from_unified
+    from .exceptions import TransportError
+
+    parsed_fields: dict[str, str] = {}
+    for kv in fields:
+        if "=" not in kv:
+            print(f"--field expects key=value shape (got {kv!r})", file=sys.stderr)
+            return 2
+        k, v = kv.split("=", 1)
+        parsed_fields[k.strip()] = v.strip()
+
+    config = load_from_unified(raw)
+    try:
+        result = asyncio.run(resolve_or_propose_canonical_person(
+            peer, name,
+            proposed_fields=parsed_fields or None,
+            source=source,
+            config=config,
+            self_name=self_name,
+        ))
+    except TransportError as exc:
+        print(f"Transport error: {exc}", file=sys.stderr)
+        return 1
+
+    if wants_json:
+        print(json.dumps(result, default=str))
+    else:
+        status = result.get("status", "?")
+        print(f"status: {status}")
+        if status == "found":
+            fm = result.get("frontmatter", {})
+            granted = result.get("granted", [])
+            print(f"granted fields: {granted}")
+            for k, v in fm.items():
+                print(f"  {k}: {v}")
+        elif status == "pending":
+            cid = result.get("correlation_id", "")
+            print(f"proposal queued on {peer} — correlation_id={cid}")
+            print("Andrew will confirm or reject in the next Daily Sync.")
+    return 0
+
+
 def build_subparser(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``alfred transport ...`` subcommand tree.
 
@@ -369,3 +431,36 @@ def build_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="Number of entries to show (default: 50)",
     )
     tail_p.add_argument("--json", action="store_true", default=False)
+
+    # Propose-person c3: manual test trigger for the KAL-LE-side
+    # canonical-person resolver. Runs
+    # :func:`alfred.transport.client.resolve_or_propose_canonical_person`
+    # against a named peer (typically ``salem``) so operators can exercise
+    # the GET-then-propose flow without wiring up a full LLM tool call.
+    # TODO: replace once KAL-LE's conversation loop has a native
+    # canonical-person call site — this subcommand is the interim
+    # reachable trigger point.
+    propose_p = t_sub.add_parser(
+        "propose-person",
+        help="Query-or-propose a canonical person on a peer (c3 test trigger)",
+    )
+    propose_p.add_argument("peer", help="Peer name (e.g. salem)")
+    propose_p.add_argument("name", help="Canonical person name")
+    propose_p.add_argument(
+        "--field",
+        action="append",
+        default=[],
+        help=(
+            "key=value field to propose (repeatable). "
+            "e.g. --field description='NP colleague'"
+        ),
+    )
+    propose_p.add_argument(
+        "--source", default="",
+        help="Free-text source attribution for the proposal audit trail",
+    )
+    propose_p.add_argument(
+        "--self", dest="self_name", default="kal-le",
+        help="This instance's name (default: kal-le)",
+    )
+    propose_p.add_argument("--json", action="store_true", default=False)

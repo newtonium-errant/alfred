@@ -87,6 +87,21 @@ def _last_batch_attribution_items(config: DailySyncConfig) -> list[dict[str, Any
     return [i for i in items if isinstance(i, dict)]
 
 
+def _last_batch_proposal_items(config: DailySyncConfig) -> list[dict[str, Any]]:
+    """Return the canonical-proposals items the daemon stashed at fire time.
+
+    Each item carries ``item_number``, ``correlation_id``,
+    ``proposer``, ``record_type``, ``name``, ``proposed_fields``,
+    ``source``. Empty list when the most recent fire had no pending
+    proposals. The reply dispatcher routes a confirm/reject verb
+    against whichever items list claims the item_number.
+    """
+    state = load_state(config.state.path)
+    batch = state.get("last_batch") or {}
+    items = batch.get("proposal_items") or []
+    return [i for i in items if isinstance(i, dict)]
+
+
 def reply_targets_daily_sync(
     config: DailySyncConfig,
     parent_message_id: int,
@@ -356,6 +371,27 @@ def _attribution_corpus_path(config: DailySyncConfig) -> str:
     return getattr(block, "corpus_path", "./data/attribution_audit_corpus.jsonl")
 
 
+def _canonical_proposals_queue_path() -> str | None:
+    """Return the canonical-proposals queue path from the transport config.
+
+    The queue lives in ``transport.canonical.proposals_path``. Returns
+    ``None`` when the transport config can't be resolved — the
+    dispatcher treats a missing path as "proposals feature not wired
+    up" and buckets confirm/reject on a proposal item into unparsed.
+    """
+    try:
+        from alfred.transport.config import load_config
+        transport_config = load_config()
+    except Exception as exc:  # noqa: BLE001
+        log.info(
+            "daily_sync.proposals.transport_config_unavailable",
+            error=str(exc),
+        )
+        return None
+    path = transport_config.canonical.proposals_path
+    return path or None
+
+
 def _now_iso() -> str:
     """Wall-clock ISO-8601 UTC. Wrapped so tests can monkeypatch."""
     return datetime.now(timezone.utc).isoformat()
@@ -531,6 +567,162 @@ def _resolve_attribution_correction(
             error=str(exc),
         )
     return (None, True)
+
+
+def _resolve_proposal_correction(
+    correction: ReplyCorrection,
+    item: dict[str, Any],
+    vault_path: Path,
+    proposals_queue_path: str,
+) -> tuple[str | None, bool]:
+    """Apply one canonical-proposal confirm/reject.
+
+    Returns ``(error_str_or_None, did_write)``.
+
+    On confirm: calls :func:`vault_create` with ``scope='salem'`` and
+    the proposer's ``proposed_fields`` to create the canonical record,
+    then marks the proposal ``accepted`` in the queue JSONL.
+
+    On reject: marks the proposal ``rejected`` and does NOT create
+    any record.
+
+    Unknown verbs (modifier/tier on a proposal item) become an
+    ``unparsed`` string so Andrew sees the "couldn't parse" hint for
+    that item.
+    """
+    from alfred.transport.canonical_proposals import (
+        STATE_ACCEPTED,
+        STATE_REJECTED,
+        update_proposal_state,
+    )
+    from alfred.vault.ops import vault_create
+
+    correlation_id = str(item.get("correlation_id") or "")
+    record_type = str(item.get("record_type") or "")
+    name = str(item.get("name") or "")
+    proposed_fields = dict(item.get("proposed_fields") or {})
+
+    if not correlation_id or not record_type or not name:
+        return (
+            f"item {correction.item_number} proposal metadata missing",
+            False,
+        )
+
+    if not (correction.ok or correction.reject):
+        return (
+            f"item {correction.item_number}: canonical proposals only "
+            f"accept `confirm`/`keep`/`yes` or `reject`/`delete`/`no`",
+            False,
+        )
+
+    if correction.reject:
+        try:
+            flipped = update_proposal_state(
+                proposals_queue_path, correlation_id, STATE_REJECTED,
+            )
+        except OSError as exc:
+            log.warning(
+                "daily_sync.proposals.state_write_failed",
+                correlation_id=correlation_id,
+                action="reject",
+                error=str(exc),
+            )
+            return (f"item {correction.item_number}: queue write failed", False)
+        if not flipped:
+            # Already rejected / missing / nonexistent — idempotent no-op.
+            log.info(
+                "daily_sync.proposals.reject.no_op",
+                correlation_id=correlation_id,
+            )
+            return (None, False)
+        log.info(
+            "daily_sync.proposals.rejected",
+            correlation_id=correlation_id,
+            record_type=record_type,
+            name=name,
+        )
+        return (None, True)
+
+    # confirm path — create the canonical record under the talker scope
+    # (Salem's Telegram-driven writer identity; validated by SCOPE_RULES).
+    try:
+        result = vault_create(
+            vault_path=vault_path,
+            record_type=record_type,
+            name=name,
+            set_fields=proposed_fields or None,
+            scope="talker",
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Most common failure: record already exists on disk (race).
+        # Surface the reason so Andrew sees what happened; either way
+        # the proposal should not block the queue indefinitely, so flip
+        # it to rejected with a note in the log.
+        log.warning(
+            "daily_sync.proposals.create_failed",
+            correlation_id=correlation_id,
+            record_type=record_type,
+            name=name,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        return (
+            f"item {correction.item_number}: couldn't create "
+            f"{record_type}/{name}: {exc}",
+            False,
+        )
+
+    try:
+        update_proposal_state(
+            proposals_queue_path, correlation_id, STATE_ACCEPTED,
+        )
+    except OSError as exc:
+        log.warning(
+            "daily_sync.proposals.state_write_failed",
+            correlation_id=correlation_id,
+            action="confirm",
+            error=str(exc),
+        )
+        # The record exists now; the queue-file mark is stale. This is
+        # observability leakage not data loss — Andrew will see the
+        # same proposal again next Daily Sync and can reject it, and
+        # ``update_proposal_state`` is idempotent so the next try lands.
+
+    log.info(
+        "daily_sync.proposals.accepted",
+        correlation_id=correlation_id,
+        record_type=record_type,
+        name=name,
+        vault_path=result.get("path") if isinstance(result, dict) else None,
+    )
+    return (None, True)
+
+
+def _format_proposal_applied_line(
+    item: dict[str, Any],
+    *,
+    action: str,
+) -> str:
+    """Return a one-liner describing a proposal confirm/reject.
+
+    Format::
+
+        "Item N: created person/Elena Brighton (from KAL-LE)"
+        "Item N: rejected proposal for person/Arthur Mbeki (from KAL-LE)"
+    """
+    item_number = item.get("item_number") or "?"
+    proposer = str(item.get("proposer") or "").strip() or "(unknown proposer)"
+    record_type = str(item.get("record_type") or "record").strip()
+    name = str(item.get("name") or "(unknown)").strip()
+    if action == "reject":
+        return (
+            f"Item {item_number}: rejected proposal for "
+            f"{record_type}/{name} (from {proposer})"
+        )
+    return (
+        f"Item {item_number}: created {record_type}/{name} "
+        f"(from {proposer})"
+    )
 
 
 def _format_email_applied_line(
@@ -784,15 +976,21 @@ def handle_daily_sync_reply(
     attribution_by_num = {
         int(i.get("item_number", 0)): i for i in attribution_items
     }
+    proposal_items = _last_batch_proposal_items(config)
+    proposal_by_num = {
+        int(i.get("item_number", 0)): i for i in proposal_items
+    }
 
     parsed: ReplyParseResult = parse_reply(reply_text)
 
     email_written = 0
     attribution_written = 0
+    proposal_written = 0  # propose-person c2
     applied_lines: list[str] = []  # c3 — one per-item summary line per accepted correction
     errors: list[str] = list(parsed.unparsed)
     unparsed_item_numbers: list[int] = []  # c3 — numeric IDs of items that couldn't parse
     corpus_path = _attribution_corpus_path(config)
+    proposals_queue_path = _canonical_proposals_queue_path() if proposal_items else None
 
     # all_ok shortcut: write an email corpus row per email item (fanned
     # out across cluster members — c5) AND confirm every attribution
@@ -868,11 +1066,41 @@ def handle_daily_sync_reply(
                         applied_lines.append(
                             _format_attribution_applied_line(item, action="confirm")
                         )
+        if proposal_items:
+            if vault_path is None or proposals_queue_path is None:
+                for item in proposal_items:
+                    errors.append(
+                        f"item {item.get('item_number')}: "
+                        f"{'vault_path' if vault_path is None else 'proposals queue'}"
+                        f" not configured"
+                    )
+                    try:
+                        unparsed_item_numbers.append(int(item.get("item_number", 0)))
+                    except (TypeError, ValueError):
+                        pass
+            else:
+                for item in proposal_items:
+                    synthetic = ReplyCorrection(
+                        item_number=int(item.get("item_number", 0)),
+                        ok=True,
+                    )
+                    err, did_write = _resolve_proposal_correction(
+                        synthetic, item, vault_path, proposals_queue_path,
+                    )
+                    if err is not None:
+                        errors.append(err)
+                        unparsed_item_numbers.append(synthetic.item_number)
+                    elif did_write:
+                        proposal_written += 1
+                        applied_lines.append(
+                            _format_proposal_applied_line(item, action="confirm")
+                        )
 
     else:
         for correction in parsed.corrections:
             email_item = email_by_num.get(correction.item_number)
             attribution_item = attribution_by_num.get(correction.item_number)
+            proposal_item = proposal_by_num.get(correction.item_number)
 
             if email_item is not None:
                 # Reject verb makes no sense on an email item.
@@ -936,13 +1164,37 @@ def handle_daily_sync_reply(
                             action="reject" if correction.reject else "confirm",
                         )
                     )
+            elif proposal_item is not None:
+                if vault_path is None or proposals_queue_path is None:
+                    errors.append(
+                        f"item {correction.item_number}: "
+                        f"{'vault_path' if vault_path is None else 'proposals queue'}"
+                        f" not configured"
+                    )
+                    unparsed_item_numbers.append(correction.item_number)
+                    continue
+                err, did_write = _resolve_proposal_correction(
+                    correction, proposal_item, vault_path, proposals_queue_path,
+                )
+                if err is not None:
+                    errors.append(err)
+                    unparsed_item_numbers.append(correction.item_number)
+                    continue
+                if did_write:
+                    proposal_written += 1
+                    applied_lines.append(
+                        _format_proposal_applied_line(
+                            proposal_item,
+                            action="reject" if correction.reject else "confirm",
+                        )
+                    )
             else:
                 errors.append(
                     f"item {correction.item_number} not in last batch"
                 )
                 unparsed_item_numbers.append(correction.item_number)
 
-    written_count = email_written + attribution_written
+    written_count = email_written + attribution_written + proposal_written
 
     # c3 — user-facing body. Per-item summary lines go in (capped at 5
     # so the Telegram reply stays readable on mobile), followed by a
@@ -962,6 +1214,7 @@ def handle_daily_sync_reply(
         all_ok=parsed.all_ok,
         email_written=email_written,
         attribution_written=attribution_written,
+        proposal_written=proposal_written,
         unparsed=len(errors),
     )
 
@@ -985,6 +1238,7 @@ def handle_daily_sync_reply(
         "confirmed_count": written_count,
         "email_count": email_written,
         "attribution_count": attribution_written,
+        "proposal_count": proposal_written,
         "unparsed": errors,
         "message": body,
         "all_ok": parsed.all_ok,

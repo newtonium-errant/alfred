@@ -271,3 +271,33 @@ brief_digest_push:
 #     enabled: true
 #     expected_peers:
 #       - kal-le
+
+# ---------------------------------------------------------------------------
+# digest — KAL-LE weekly cross-project synthesis
+# ---------------------------------------------------------------------------
+# Uncomment to fire a weekly digest into ~/aftermath-lab/digests/. Off
+# by default — only KAL-LE-shape instances that own the cross-project
+# review surface should enable this.
+#
+# digest:
+#   enabled: true
+#   schedule:
+#     time: "07:00"
+#     timezone: "America/Halifax"
+#     day_of_week: "sunday"
+#   output_dir: "/home/andrew/aftermath-lab/digests"
+#   window_days: 7
+
+# ---------------------------------------------------------------------------
+# kalle.projects — project name → vault path map (used by reviews + digest)
+# ---------------------------------------------------------------------------
+# Defaults (no override needed when these match):
+#   aftermath-lab → ~/aftermath-lab
+#   alfred        → ~/aftermath-alfred
+#   rrts          → ~/aftermath-rrts
+#
+# kalle:
+#   projects:
+#     aftermath-lab: "/home/andrew/aftermath-lab"
+#     alfred:        "/home/andrew/aftermath-alfred"
+#     rrts:          "/home/andrew/aftermath-rrts"

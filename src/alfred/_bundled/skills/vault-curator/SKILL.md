@@ -1114,10 +1114,12 @@ alfred vault edit "note/My Note.md" --body-append "Additional paragraph content"
 ```
 
 ### Moving a record
-```bash
-alfred vault move "note/Old Name.md" "note/New Name.md"
-```
-**Note:** DO NOT use `vault move` on inbox files. The daemon handles moving inbox files to `inbox/processed/` automatically.
+**Curator scope does not move records.** Per `vault/scope.py`, curator's `move` permission is `inbox_only`, and within `inbox/` the daemon handles moving files to `inbox/processed/` automatically after you finish — you must never move inbox files yourself (see STEP 7 and the "Common mistakes" list).
+
+- **Renaming a record in `note/`, `person/`, `org/`, etc.** is janitor-scope or operator-manual work. If you realize a previously-created record needs a different name, leave it and flag it; do not attempt `vault move`.
+- **Near-match duplicates** are resolved by `vault edit` on the canonical path, not by renaming (see STEP 2a.1).
+
+`vault move` invocations from curator will be rejected by scope enforcement.
 
 ### Wikilink format
 Always use `"[[directory/Record Name]]"` format in frontmatter field values:

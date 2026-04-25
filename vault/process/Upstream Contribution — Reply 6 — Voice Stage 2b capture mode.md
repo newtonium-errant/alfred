@@ -98,6 +98,11 @@ distiller_learnings:
 distiller_signals: none
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: LINK001 — decision/Salem Ghostwrites External Communications on Andrews
+  Behalf and decision//extract Is Idempotent with Delete-First Re-Run Contract exist
+  with regular apostrophe; YAML-escaped apostrophes in distiller_learnings wikilinks
+  defeat the scanner. session/... is a literal placeholder, no resolvable target.
+  FM001/DIR001 — file is type=note in process/ directory; autofix should relocate.
 project:
 - '[[project/Alfred]]'
 status: draft

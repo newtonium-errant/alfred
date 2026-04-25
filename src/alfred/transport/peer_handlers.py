@@ -56,6 +56,12 @@ from aiohttp import web
 
 from .canonical import apply_field_permissions
 from .canonical_audit import append_audit
+from .canonical_proposals import (
+    Proposal,
+    append_proposal,
+    find_proposal,
+    _now_iso,
+)
 from .config import TransportConfig
 from .utils import get_logger
 
@@ -519,6 +525,198 @@ async def _serve_canonical(
 
 
 # ---------------------------------------------------------------------------
+# /canonical/{type}/propose — subordinate proposes a canonical record
+# ---------------------------------------------------------------------------
+#
+# Design ratified in ``project_kalle_propose_person.md`` (2026-04-23).
+# When KAL-LE (or STAY-C / V.E.R.A. later) queries SALEM's canonical
+# person and hits 404 ``record_not_found``, it escalates to this route
+# rather than silently fall back to a bare name string. SALEM queues
+# the proposal; Andrew confirms or rejects in the Daily Sync.
+#
+# Error taxonomy:
+#   202 Accepted — proposal queued; {"status": "pending", "correlation_id"}.
+#   409 already_exists — race: the record was created between the
+#        proposer's 404 read and its propose call. Returns the canonical
+#        path so the proposer can re-fetch via GET /canonical.
+#   403 not_allowed — reserved for a future per-peer allowlist. All
+#        authenticated peers are currently allowed; the 403 path is
+#        defined here so operators can tighten later without schema
+#        churn (TODO: per-peer allowlist).
+#   400 schema_error / invalid_json — body validation failures.
+#   404 canonical_not_owned — this instance doesn't hold canonical
+#        records (KAL-LE, STAY-C). Same shape as the GET handler for
+#        consistency.
+
+
+# Record types this route accepts. Person is the Q1 use case; we leave
+# org/location in the validator because extending later is a one-line
+# config change, but the handler still stops any other value short.
+_PROPOSE_ALLOWED_TYPES = {"person", "org", "location"}
+
+
+async def _handle_canonical_propose(request: web.Request) -> web.StreamResponse:
+    """POST /canonical/<type>/propose — accept a creation proposal.
+
+    Body::
+
+        {
+          "name": "Alex Newton",
+          "proposed_fields": {...},
+          "source": "KAL-LE observed in commit X during session Y",
+          "correlation_id": "kal-le-propose-person-1234"
+        }
+
+    See module-level docstring for the full error taxonomy.
+    """
+    record_type = request.match_info.get("type", "")
+    correlation_id = _ensure_correlation_id(request, None)
+    peer = request.get("transport_peer", "")
+    config = _get_config(request)
+
+    # 404 canonical_not_owned mirrors the GET handler's contract so a
+    # subordinate's proposer can treat "not a canonical-owner" the same
+    # way on GET and POST.
+    if not config.canonical.owner:
+        return _json_error(
+            404, "canonical_not_owned",
+            detail="this instance does not host canonical records",
+            correlation_id=correlation_id,
+        )
+
+    if record_type not in _PROPOSE_ALLOWED_TYPES:
+        return _json_error(
+            400, "schema_error",
+            detail=(
+                f"record_type '{record_type}' is not proposable; "
+                f"allowed: {sorted(_PROPOSE_ALLOWED_TYPES)}"
+            ),
+            correlation_id=correlation_id,
+        )
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _json_error(400, "invalid_json", correlation_id=correlation_id)
+    if not isinstance(body, dict):
+        return _json_error(
+            400, "schema_error",
+            detail="body must be a JSON object",
+            correlation_id=correlation_id,
+        )
+
+    # Re-derive correlation id with the body in hand so a caller-supplied
+    # ``correlation_id`` field is honoured over a fresh mint.
+    correlation_id = _ensure_correlation_id(request, body)
+
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return _json_error(
+            400, "schema_error",
+            detail="name must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+    name = name.strip()
+
+    proposed_fields_raw = body.get("proposed_fields") or {}
+    if not isinstance(proposed_fields_raw, dict):
+        return _json_error(
+            400, "schema_error",
+            detail="proposed_fields must be an object",
+            correlation_id=correlation_id,
+        )
+    source = body.get("source") or ""
+    if not isinstance(source, str):
+        return _json_error(
+            400, "schema_error",
+            detail="source must be a string",
+            correlation_id=correlation_id,
+        )
+
+    # TODO: per-peer allowlist. All authenticated peers are currently
+    # allowed to propose. When we grow a ``canonical.propose_allowlist``
+    # config block, this is where the 403 ``not_allowed`` would land.
+    # Leaving the error shape defined (in the module docstring) so the
+    # proposer-side client can handle it without a redeploy.
+
+    # 409 early-return: the record was created between the proposer's
+    # 404 read and this call. Walk the vault the same way the GET
+    # handler does so the race check matches what a fresh GET would
+    # see.
+    vault_path = _get_vault_path(request)
+    if vault_path is not None:
+        record_path = vault_path / record_type / f"{name}.md"
+        if record_path.exists():
+            rel = f"{record_type}/{name}.md"
+            log.info(
+                "transport.canonical.propose_409_already_exists",
+                peer=peer,
+                record_type=record_type,
+                name=name,
+                correlation_id=correlation_id,
+                path=rel,
+            )
+            return web.json_response(
+                {
+                    "status": "exists",
+                    "path": rel,
+                    "correlation_id": correlation_id,
+                },
+                status=409,
+            )
+
+    # Idempotency: if the same correlation_id was already queued, don't
+    # double-write. Return the original 202 shape so a proposer retry
+    # after a torn network response is safe.
+    queue_path = config.canonical.proposals_path
+    existing = find_proposal(queue_path, correlation_id)
+    if existing is not None:
+        log.info(
+            "transport.canonical.propose_idempotent_hit",
+            peer=peer,
+            correlation_id=correlation_id,
+            state=existing.state,
+        )
+        return web.json_response(
+            {
+                "status": existing.state,
+                "correlation_id": correlation_id,
+            },
+            status=202,
+        )
+
+    proposal = Proposal(
+        correlation_id=correlation_id,
+        ts=_now_iso(),
+        state="pending",
+        proposer=peer,
+        record_type=record_type,
+        name=name,
+        proposed_fields=dict(proposed_fields_raw),
+        source=source.strip(),
+    )
+    append_proposal(queue_path, proposal)
+
+    log.info(
+        "transport.canonical.propose_queued",
+        peer=peer,
+        record_type=record_type,
+        name=name,
+        correlation_id=correlation_id,
+        source_len=len(proposal.source),
+        fields=sorted(proposal.proposed_fields.keys()),
+    )
+
+    return web.json_response(
+        {
+            "status": "pending",
+            "correlation_id": correlation_id,
+        },
+        status=202,
+    )
+
+
+# ---------------------------------------------------------------------------
 # /peer/brief_digest — accept a one-slide brief section from a peer
 # ---------------------------------------------------------------------------
 
@@ -708,7 +906,15 @@ def register_peer_routes(app: web.Application) -> None:
 
 
 def register_canonical_routes(app: web.Application) -> None:
-    """Swap in real /canonical/* handlers (replaces _register_canonical_stub)."""
+    """Swap in real /canonical/* handlers (replaces _register_canonical_stub).
+
+    The POST propose route and the GET fetch route don't share a method,
+    so aiohttp routes them unambiguously by (method, path) even though
+    the URL shapes overlap (``/canonical/person/propose`` is a valid
+    ``/canonical/{type}/{name}`` by GET semantics, but we never serve
+    a GET for ``name=propose`` — the literal name is reserved).
+    """
+    app.router.add_post("/canonical/{type}/propose", _handle_canonical_propose)
     app.router.add_get("/canonical/{type}/{name}", _handle_canonical_get)
 
 

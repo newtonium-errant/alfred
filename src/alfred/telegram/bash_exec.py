@@ -79,6 +79,10 @@ _ALLOWLIST: frozenset[str] = frozenset({
     "wc", "diff", "file", "stat", "sort", "uniq", "awk", "sed",
     # git — subcommand-gated below
     "git",
+    # alfred — subcommand-gated below; admits a curated set of read +
+    # write surfaces (reviews, digest, vault read, transport propose-person)
+    # so KAL-LE can drive them without escaping bash_exec.
+    "alfred",
 })
 
 
@@ -91,6 +95,24 @@ _GIT_SUBCOMMAND_ALLOWLIST: frozenset[str] = frozenset({
     "branch", "checkout", "switch",
     "ls-files", "ls-tree", "cat-file", "rev-parse",
 })
+
+
+# Two-level allowlist for ``alfred``: the second token (top subcommand)
+# must be in the outer key set; the third token (sub-subcommand) must
+# be in the matching inner set. ``None`` as the inner value means any
+# third token is permitted (i.e. the top subcommand stands alone).
+#
+# NEVER add ``transport rotate``, ``up``, ``down``, ``vault edit``,
+# ``vault delete``, ``vault create``, or any daemon-affecting command
+# to this map — Andrew controls daemon lifecycle and canonical
+# mutations directly. Reviews + digest + propose-person + vault read
+# are the deliberate KAL-LE surfaces, nothing else.
+_ALFRED_SUBCOMMAND_ALLOWLIST: dict[str, frozenset[str] | None] = {
+    "reviews": frozenset({"write", "list", "read", "mark-addressed"}),
+    "digest": frozenset({"write", "preview"}),
+    "transport": frozenset({"propose-person"}),
+    "vault": frozenset({"read"}),
+}
 
 
 # Full-command denylist — substring scan, case-insensitive.
@@ -217,7 +239,7 @@ def _contains_destructive_keyword(command_lower: str) -> str | None:
 
 
 def _validate_first_token(argv: list[str]) -> tuple[bool, str]:
-    """First-token allowlist check, with the git-subcommand gate."""
+    """First-token allowlist check, with the git + alfred subcommand gates."""
     if not argv:
         return False, "empty_argv"
     head = argv[0]
@@ -231,6 +253,21 @@ def _validate_first_token(argv: list[str]) -> tuple[bool, str]:
         sub = argv[1]
         if sub not in _GIT_SUBCOMMAND_ALLOWLIST:
             return False, f"git_subcommand_not_allowlisted:{sub}"
+    if head_base == "alfred":
+        if len(argv) < 2:
+            return False, "alfred_requires_subcommand"
+        top_sub = argv[1]
+        if top_sub not in _ALFRED_SUBCOMMAND_ALLOWLIST:
+            return False, f"alfred_subcommand_not_allowlisted:{top_sub}"
+        inner_set = _ALFRED_SUBCOMMAND_ALLOWLIST[top_sub]
+        if inner_set is not None:
+            if len(argv) < 3:
+                return False, f"alfred_{top_sub}_requires_subcommand"
+            sub_sub = argv[2]
+            if sub_sub not in inner_set:
+                return False, (
+                    f"alfred_{top_sub}_subcommand_not_allowlisted:{sub_sub}"
+                )
     return True, "ok"
 
 

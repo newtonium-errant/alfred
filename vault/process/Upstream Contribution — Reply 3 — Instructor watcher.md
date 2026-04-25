@@ -1,8 +1,8 @@
 ---
 alfred_tags:
 - process/upstream-contribution
-- system-integration
-- user-interaction
+- system-architecture
+- automation
 created: '2026-04-21'
 distiller_learnings:
 - '[[decision/Peer Protocol v1 Is HTTP REST JSON Localhost-Only]]'
@@ -102,8 +102,23 @@ distiller_learnings:
 distiller_signals: none
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: 'LINK001 — scanner false positives: [[decision/Salem Ghostwrites External
+  Communications on Andrew''s Behalf]] target exists (YAML doubled-apostrophe confuses
+  scanner); [[decision//extract Is Idempotent with Delete-First Re-Run Contract]]
+  has stray leading slash but resolves to existing decision/extract Is Idempotent
+  with Delete-First Re-Run Contract.md — curator distiller_learnings write artifact.
+  FM001/DIR001 are separate record-type/location issues (this is a note stored in
+  process/ without a name field) awaiting operator triage.'
 project:
 - '[[project/Alfred]]'
+relationships:
+- confidence: 0.75
+  context: Both discuss Upstream Contribution process.
+  source: process/Upstream Contribution — Reply 3 — Instructor watcher.md
+  source_anchor: Instructor watcher system
+  target: process/Upstream Contribution — Reply 4 — KAL-LE multi-instance MVP.md
+  target_anchor: KAL-LE multi-instance MVP
+  type: related-to
 status: draft
 subtype: draft
 tags:

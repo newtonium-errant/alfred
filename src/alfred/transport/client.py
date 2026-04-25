@@ -527,6 +527,220 @@ async def peer_handshake(
     )
 
 
+async def peer_get_canonical_person(
+    peer_name: str,
+    name: str,
+    *,
+    config: "TransportConfig | None" = None,
+    self_name: str = "kal-le",
+    correlation_id: str | None = None,
+) -> dict[str, Any] | None:
+    """GET /canonical/person/{name} on the named peer (typically Salem).
+
+    Returns the server's response dict on 200, or ``None`` on
+    404 ``record_not_found`` / ``canonical_not_owned``. Every other
+    error propagates as a :class:`TransportError` subclass.
+
+    The ``None`` return is the signal the caller uses to decide whether
+    to escalate via :func:`peer_propose_canonical_person`. Propose-
+    person c3 shipped the pair so a subordinate instance never silently
+    fails on an unknown person.
+    """
+    from urllib.parse import quote
+
+    from .config import TransportConfig, load_config
+    from .exceptions import TransportRejected
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = correlation_id or _new_correlation_id()
+
+    path = f"/canonical/person/{quote(name, safe='')}"
+    try:
+        return await _peer_request(
+            base_url=base_url,
+            token=token,
+            method="GET",
+            path=path,
+            self_name=self_name,
+            correlation_id=cid,
+            json_body=None,
+        )
+    except TransportRejected as exc:
+        # 404 is a legitimate outcome — the person doesn't exist on
+        # the canonical owner (yet). The caller decides whether to
+        # propose. Other 4xx (401, 403) still raise so misconfig is
+        # loud.
+        if exc.status_code == 404:
+            log.info(
+                "transport.client.canonical_person_not_found",
+                peer=peer_name,
+                person=name,
+                correlation_id=cid,
+            )
+            return None
+        raise
+
+
+async def peer_propose_canonical_person(
+    peer_name: str,
+    name: str,
+    *,
+    proposed_fields: dict[str, Any] | None = None,
+    source: str = "",
+    config: "TransportConfig | None" = None,
+    self_name: str = "kal-le",
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /canonical/person/propose on the named peer.
+
+    Returns the server's response dict. The caller inspects
+    ``status`` — ``"pending"`` (HTTP 202) means queued for Andrew's
+    approval; ``"exists"`` (HTTP 409) means the record was created
+    between the proposer's 404 read and this call — the caller should
+    re-GET.
+
+    ``correlation_id`` defaults to a KAL-LE-shaped id
+    (``kal-le-propose-person-<hex6>``) so the audit trail is greppable
+    by proposer.
+    """
+    import secrets
+
+    from .config import TransportConfig, load_config
+    from .exceptions import TransportRejected
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = correlation_id or f"{self_name}-propose-person-{secrets.token_hex(3)}"
+
+    body: dict[str, Any] = {
+        "name": name,
+        "correlation_id": cid,
+    }
+    if proposed_fields:
+        body["proposed_fields"] = dict(proposed_fields)
+    if source:
+        body["source"] = source
+
+    try:
+        response = await _peer_request(
+            base_url=base_url,
+            token=token,
+            method="POST",
+            path="/canonical/person/propose",
+            self_name=self_name,
+            correlation_id=cid,
+            json_body=body,
+        )
+    except TransportRejected as exc:
+        # 409 already_exists — the race handler returns the path. The
+        # common-sense response is for the caller to re-GET so it has
+        # the fresh record. We surface that by converting the rejection
+        # into a structured return rather than an exception.
+        if exc.status_code == 409:
+            import json as _json
+            try:
+                parsed = _json.loads(exc.body) if exc.body else {}
+            except ValueError:
+                parsed = {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+            parsed.setdefault("status", "exists")
+            parsed.setdefault("correlation_id", cid)
+            log.info(
+                "transport.client.canonical_propose_409_already_exists",
+                peer=peer_name,
+                person=name,
+                correlation_id=cid,
+            )
+            return parsed
+        raise
+
+    log.info(
+        "transport.client.canonical_propose_sent",
+        peer=peer_name,
+        person=name,
+        correlation_id=cid,
+        status=response.get("status") if isinstance(response, dict) else None,
+    )
+    return response if isinstance(response, dict) else {"correlation_id": cid}
+
+
+async def resolve_or_propose_canonical_person(
+    peer_name: str,
+    name: str,
+    *,
+    proposed_fields: dict[str, Any] | None = None,
+    source: str = "",
+    config: "TransportConfig | None" = None,
+    self_name: str = "kal-le",
+) -> dict[str, Any]:
+    """High-level helper — GET, then propose on 404, handle the 409 race.
+
+    This is the call site a KAL-LE tool wrapper would invoke when it
+    wants a canonical person record without having to reason about the
+    propose flow explicitly. Returns one of:
+
+      * ``{"status": "found", "frontmatter": {...}, "granted": [...],
+           "correlation_id": "..."}`` — the record exists; ``frontmatter``
+         carries the peer-visible field subset.
+      * ``{"status": "pending", "correlation_id": "..."}`` — the record
+         didn't exist; a proposal was queued on Salem. Downstream code
+         continues with the bare name string (the design memo's
+         explicit fallback for the pending window).
+      * ``{"status": "found", "frontmatter": {...}, ...}`` — also the
+         409 race outcome, collapsed here into the same "found" shape
+         via a follow-up GET so callers don't have to branch.
+
+    Structured log events:
+      - ``canonical.propose_sent`` when the proposal goes out
+      - ``canonical.propose_409_already_exists`` when the race fires
+      - ``canonical.propose_pending`` after a 202 response lands
+    """
+    record = await peer_get_canonical_person(
+        peer_name, name,
+        config=config, self_name=self_name,
+    )
+    if record is not None:
+        return {"status": "found", **record}
+
+    proposal = await peer_propose_canonical_person(
+        peer_name, name,
+        proposed_fields=proposed_fields,
+        source=source,
+        config=config,
+        self_name=self_name,
+    )
+    status = proposal.get("status") if isinstance(proposal, dict) else None
+
+    # 409 race — re-GET and return the fresh record.
+    if status == "exists":
+        fresh = await peer_get_canonical_person(
+            peer_name, name,
+            config=config, self_name=self_name,
+            correlation_id=proposal.get("correlation_id"),
+        )
+        if fresh is not None:
+            return {"status": "found", **fresh}
+        # The 409 said "exists" but the re-GET 404'd — fall through to
+        # pending so the caller doesn't hang on a phantom record.
+
+    log.info(
+        "transport.client.canonical_propose_pending",
+        peer=peer_name,
+        person=name,
+        correlation_id=proposal.get("correlation_id") if isinstance(proposal, dict) else None,
+    )
+    return {
+        "status": "pending",
+        "correlation_id": proposal.get("correlation_id") if isinstance(proposal, dict) else None,
+    }
+
+
 async def peer_send_brief_digest(
     peer_name: str,
     *,

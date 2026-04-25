@@ -32,7 +32,7 @@ import structlog
 
 from alfred.common.schedule import compute_next_fire, sleep_until
 
-from . import attribution_section, email_section
+from . import attribution_section, canonical_proposals_section, email_section
 from .assembler import assemble_message
 from .config import DailySyncConfig
 from .confidence import load_state, save_state
@@ -109,15 +109,16 @@ def _build_state_payload(
     message_ids: list[int],
     *,
     attribution_items: list[Any] | None = None,
+    proposal_items: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Construct the per-fire batch payload persisted to the state file.
 
     ``items`` is the email-calibration batch (existing). ``attribution_items``
     (Phase 2) is the parallel attribution-audit batch — both lists are
     keyed off the same ``message_ids`` so the dispatcher routes a reply
-    to whichever item_number matches. The reply parser reads ``items``
-    + ``attribution_items`` + ``message_ids`` to resolve "item 6"
-    against a Telegram reply.
+    to whichever item_number matches. ``proposal_items`` (propose-person
+    c2) is the parallel canonical-proposals batch. The reply parser
+    reads every list to resolve item numbers against a Telegram reply.
     """
     payload: dict[str, Any] = {
         "date": today_iso,
@@ -128,6 +129,10 @@ def _build_state_payload(
     if attribution_items:
         payload["attribution_items"] = [
             item.to_dict() for item in attribution_items if hasattr(item, "to_dict")
+        ]
+    if proposal_items:
+        payload["proposal_items"] = [
+            item.to_dict() for item in proposal_items if hasattr(item, "to_dict")
         ]
     return payload
 
@@ -176,22 +181,28 @@ async def fire_once(
         dedupe_key = f"daily-sync-{today_iso}"
 
     # Make sure each section provider knows where the vault is, and
-    # that both providers are registered (idempotent — re-firing
+    # that all providers are registered (idempotent — re-firing
     # via ``/calibrate`` doesn't double-register).
     email_section.set_vault_path(vault_path)
     email_section.register()
     attribution_section.set_vault_path(vault_path)
     attribution_section.register()
+    # canonical_proposals_section reads the transport config itself
+    # (the queue path lives under transport.canonical.proposals_path),
+    # so it doesn't need set_vault_path.
+    canonical_proposals_section.register()
 
     body = assemble_message(config, today)
     items = email_section.consume_last_batch()
     attribution_items = attribution_section.consume_last_batch()
+    proposal_items = canonical_proposals_section.consume_last_batch()
 
     log.info(
         "daily_sync.assembled",
         date=today_iso,
         items_count=len(items),
         attribution_items_count=len(attribution_items),
+        proposal_items_count=len(proposal_items),
         body_length=len(body),
         manual=manual,
         dedupe_key=dedupe_key,
@@ -204,15 +215,16 @@ async def fire_once(
     # Persist the batch to the state file ONLY when we actually have
     # items + message_ids. An empty-Daily-Sync push has no items to
     # match replies against — Andrew can still chat, but there's
-    # nothing to calibrate. Either email items OR attribution items
-    # is enough to persist the batch (the dispatcher routes per-item).
+    # nothing to calibrate. Any of email / attribution / proposals is
+    # enough to persist the batch (the dispatcher routes per-item).
     state = load_state(config.state.path)
-    if (items or attribution_items) and message_ids:
+    if (items or attribution_items or proposal_items) and message_ids:
         state["last_batch"] = _build_state_payload(
             today_iso,
             items,
             message_ids,
             attribution_items=attribution_items,
+            proposal_items=proposal_items,
         )
     state["last_fired_date"] = today_iso
     save_state(config.state.path, state)
@@ -221,6 +233,7 @@ async def fire_once(
         "ok": True,
         "items_count": len(items),
         "attribution_items_count": len(attribution_items),
+        "proposal_items_count": len(proposal_items),
         "message_ids": message_ids,
         "body": body,
         "dedupe_key": dedupe_key,

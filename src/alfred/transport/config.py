@@ -150,10 +150,17 @@ class CanonicalConfig:
     type → :class:`PeerFieldRules`. Default-deny: if a peer isn't
     listed, or the type isn't listed, or fields is empty, the canonical
     handler returns 403.
+
+    ``proposals_path`` is where ``POST /canonical/<type>/propose``
+    queues creation requests from subordinate instances. The Daily Sync
+    section provider reads from this file; the dispatcher writes state
+    transitions back to it. Default sits alongside the audit log so
+    operators can grep both in one ``ls data/``.
     """
 
     owner: bool = False
     audit_log_path: str = "./data/canonical_audit.jsonl"
+    proposals_path: str = "./data/canonical_proposals.jsonl"
     peer_permissions: dict[str, dict[str, PeerFieldRules]] = field(
         default_factory=dict,
     )
@@ -237,6 +244,9 @@ def _build_canonical(data: dict[str, Any]) -> CanonicalConfig:
         owner=bool(data.get("owner", False)),
         audit_log_path=str(
             data.get("audit_log_path", "./data/canonical_audit.jsonl")
+        ),
+        proposals_path=str(
+            data.get("proposals_path", "./data/canonical_proposals.jsonl")
         ),
         peer_permissions=peer_perms,
     )
