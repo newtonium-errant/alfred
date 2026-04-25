@@ -102,6 +102,13 @@ distiller_learnings:
 distiller_signals: none
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: 'LINK001 — scanner false positives: [[decision/Salem Ghostwrites External
+  Communications on Andrew''s Behalf]] target exists (YAML doubled-apostrophe confuses
+  scanner); [[decision//extract Is Idempotent with Delete-First Re-Run Contract]]
+  has stray leading slash but resolves to existing decision/extract Is Idempotent
+  with Delete-First Re-Run Contract.md — curator distiller_learnings write artifact.
+  FM001/DIR001 are separate record-type/location issues (this is a note stored in
+  process/ without a name field) awaiting operator triage.'
 project:
 - '[[project/Alfred]]'
 status: draft

@@ -102,6 +102,11 @@ distiller_learnings:
 distiller_signals: none
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: 'LINK001 — scanner false positives: [[decision/Salem Ghostwrites External
+  Communications on Andrew''s Behalf]] and [[decision/extract Is Idempotent with Delete-First
+  Re-Run Contract]] both resolve correctly (scanner mis-parses YAML single-quote escaping
+  and the leading-slash filename). FM001/DIR001 — scanner is expected to flag these
+  deterministically; no janitor action.'
 project:
 - '[[project/Alfred]]'
 status: draft
