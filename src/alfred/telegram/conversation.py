@@ -271,9 +271,16 @@ KALLE_VAULT_TOOLS: list[dict[str, Any]] = [
 # config.yaml (c1 wiring). Default ``"talker"`` preserves Salem's
 # existing behaviour; KAL-LE's ``config.kalle.yaml`` sets
 # ``tool_set: "kalle"`` to pick up bash_exec.
+#
+# Hypatia (config.hypatia.yaml sets ``tool_set: "hypatia"``) gets the same
+# four vault tools as talker — Phase 1 MVP. The entry is registered
+# explicitly rather than relying on the unknown-set fallback so a config
+# typo or a future divergence between the two surfaces shows up as an
+# explicit registry change, not a silent fall-through to talker.
 VAULT_TOOLS_BY_SET: dict[str, list[dict[str, Any]]] = {
     "talker": TALKER_VAULT_TOOLS,
     "kalle": KALLE_VAULT_TOOLS,
+    "hypatia": TALKER_VAULT_TOOLS,
 }
 
 
