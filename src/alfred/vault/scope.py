@@ -149,6 +149,28 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # Pattern/principle curation writes substantive bodies.
         "allow_body_writes": True,
     },
+    # Hypatia — scholar/scribe instance operating on the
+    # library-alexandria vault. Mirrors curator's "create + edit but
+    # never delete" shape: drafting, editing, and zettelkasten upkeep
+    # are all additive. Move stays denied for Phase 1 — Andrew
+    # reorganises the library tree by hand; if Phase 2 wants
+    # type-internal moves we'll narrow the rule then.
+    "hypatia": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        # Restrict create to the seven Hypatia record types per
+        # ``library-alexandria/CLAUDE.md``. Enforced via
+        # ``hypatia_types_only``.
+        "create": "hypatia_types_only",
+        "edit": True,
+        "move": False,
+        "delete": False,
+        # Drafting essays, business docs, concept notes — bodies are
+        # the whole point. Body writes stay allowed.
+        "allow_body_writes": True,
+    },
     # Instructor executes natural-language directives parked in the
     # ``alfred_instructions`` frontmatter field. Broader than janitor
     # (may create + move + write bodies; no frontmatter allowlist) but
@@ -195,6 +217,19 @@ KALLE_CREATE_TYPES: set[str] = {
     "note", "session", "conversation",
     "decision", "assumption", "synthesis",
     "pattern", "principle",
+}
+
+
+# Hypatia create allowlist — the seven record types defined in
+# ``library-alexandria/CLAUDE.md``. ``note`` overlaps with talker's
+# set but lives in ``research/note/`` for Hypatia (the directory
+# routing is the writer's responsibility, not scope's); ``session``
+# overlaps too but with a different ``mode`` field shape. The other
+# five (document, concept, source, citation, template) are
+# Hypatia-specific.
+HYPATIA_CREATE_TYPES: set[str] = {
+    "document", "session", "concept", "note",
+    "source", "citation", "template",
 }
 
 
@@ -297,6 +332,14 @@ def check_scope(
             raise ScopeError(
                 f"Scope '{scope}' can only create kalle types "
                 f"({', '.join(sorted(KALLE_CREATE_TYPES))}). Got: '{record_type}'"
+            )
+        return
+
+    if permission == "hypatia_types_only":
+        if record_type not in HYPATIA_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create hypatia types "
+                f"({', '.join(sorted(HYPATIA_CREATE_TYPES))}). Got: '{record_type}'"
             )
         return
 

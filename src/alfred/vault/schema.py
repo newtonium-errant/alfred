@@ -21,6 +21,16 @@ KNOWN_TYPES_KALLE: set[str] = {
     "pattern", "principle",
 }
 
+# Hypatia operates inside ``~/library-alexandria/`` (see
+# ``library-alexandria/CLAUDE.md`` for directory layout + frontmatter
+# shapes). Like the kalle set, kept separate from ``KNOWN_TYPES`` so
+# Salem's operational vault doesn't gain Hypatia-only types. The
+# ``hypatia`` scope check (see ``vault/scope.py::HYPATIA_CREATE_TYPES``)
+# is the authoritative create allowlist.
+KNOWN_TYPES_HYPATIA: set[str] = {
+    "document", "concept", "source", "citation", "template",
+}
+
 LEARN_TYPES: set[str] = {
     "assumption", "decision", "constraint", "contradiction", "synthesis",
 }
