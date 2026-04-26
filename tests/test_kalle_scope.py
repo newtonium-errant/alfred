@@ -87,11 +87,20 @@ def test_talker_scope_rejects_principle_type():
         check_scope("talker", "create", record_type="principle")
 
 
-def test_talker_create_types_unchanged():
-    """Talker's creatable set must still match pre-c5."""
+def test_talker_create_types_shape():
+    """Talker's creatable set — refreshed 2026-04-26 to include ``person``.
+
+    ``person`` was added 2026-04-21 after Salem created a stub ``note`` for
+    a new person Andrew named, when the canonical record should have been
+    a ``person`` record. The previous version of this test still asserted
+    the pre-04-21 set and was effectively a stale snapshot — flagged in
+    ``feedback_hardcoding_and_alfred_naming.md`` as the kind of stale
+    fixture that hides real divergence.
+    """
     assert TALKER_CREATE_TYPES == {
         "task", "note", "decision", "event",
         "session", "conversation", "assumption", "synthesis",
+        "person",
     }
 
 

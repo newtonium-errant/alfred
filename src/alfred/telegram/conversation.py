@@ -691,18 +691,39 @@ async def _execute_tool(
 
     vault_path_obj = Path(vault_path)
 
+    # Per-instance scope routing. Without this, every bot (Salem, KAL-LE,
+    # Hypatia) routed through ``check_scope("talker", ...)`` and Hypatia
+    # ``document`` / KAL-LE ``pattern`` creates were rejected at
+    # ``talker_types_only`` BEFORE the scope-aware ``_validate_type`` gate
+    # in ops.py ever engaged. The config's ``instance.tool_set`` is the
+    # source of truth — it's already used to pick the tool schema in
+    # ``tools_for_set`` (KAL-LE → bash_exec, Salem/Hypatia → vault-only)
+    # so reusing it for scope dispatch keeps the contract consistent.
+    # Default ``"talker"`` preserves Salem behavior when ``config`` is
+    # ``None`` (legacy callers, tests that skip the config plumb-through).
+    active_scope = (
+        config.instance.tool_set
+        if config and config.instance and config.instance.tool_set
+        else "talker"
+    )
+
     # Scope enforcement — the scope check happens BEFORE the op so we never
     # attempt a denied mutation.
     try:
         scope.check_scope(
-            "talker",
+            active_scope,
             op,
             rel_path=rel_path,
             record_type=record_type,
             frontmatter=set_fields if isinstance(set_fields, dict) else None,
         )
     except scope.ScopeError as exc:
-        log.info("talker.tool.scope_denied", tool=tool_name, error=str(exc))
+        log.info(
+            "talker.tool.scope_denied",
+            tool=tool_name,
+            scope=active_scope,
+            error=str(exc),
+        )
         return _dumps({"error": f"scope denied: {exc}"})
 
     try:
@@ -747,6 +768,7 @@ async def _execute_tool(
                 name,
                 set_fields=sf or None,
                 body=body,
+                scope=active_scope,
             )
             # Mutation is already tracked in ``session.vault_ops`` (via
             # ``append_vault_op`` → session-record frontmatter) and in
@@ -805,6 +827,7 @@ async def _execute_tool(
                 set_fields=sf or None,
                 append_fields=append_fields if isinstance(append_fields, dict) else None,
                 body_append=body_append,
+                scope=active_scope,
             )
             append_vault_op(state, session, "edit", result["path"])
             return _dumps(result)
