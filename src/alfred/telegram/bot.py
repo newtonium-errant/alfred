@@ -1724,6 +1724,7 @@ _REPLY_CTX_TRUNCATION_SUFFIX: str = "... (truncated)"
 
 def _build_reply_context_prefix(
     reply_to_message: Any,
+    instance_name: str = "Salem",
 ) -> str | None:
     """Return a `[You are replying to ...]\\n\\n` prefix, or None.
 
@@ -1732,9 +1733,16 @@ def _build_reply_context_prefix(
     the parent has no usable text (photo-only, sticker, etc.) so the
     caller can silently fall through to the normal flow.
 
+    ``instance_name`` is the casual persona name from
+    ``TalkerConfig.instance.name`` ("Salem", "Hypatia", "KAL-LE", ...). It
+    appears verbatim in the bot-attribution branch ("Hypatia's earlier
+    message"). Default ``"Salem"`` preserves the original prefix shape
+    for direct test callers and keeps Salem-installed bots byte-for-byte
+    identical to pre-templating behaviour.
+
     Format::
 
-        [You are replying to Salem's earlier message at <ISO-time>: "<quote>"]
+        [You are replying to <instance_name>'s earlier message at <ISO-time>: "<quote>"]
 
         <blank line above separates the prefix from user's reply text>
 
@@ -1749,8 +1757,8 @@ def _build_reply_context_prefix(
     - Parent longer than ``_REPLY_CTX_QUOTE_LIMIT`` chars →
       truncated to that many chars plus ``... (truncated)`` suffix.
     - Parent from the bot itself (``from_user.is_bot == True``) →
-      attribution "Salem's earlier message"; parent from the same user
-      → "your earlier message". Multi-user chats are future work.
+      attribution "<instance_name>'s earlier message"; parent from the
+      same user → "your earlier message". Multi-user chats are future work.
     - Parent text contains literal ``"`` or other special characters →
       rendered verbatim inside the prefix. The surrounding double quotes
       are the JSON-safe delimiter of choice (backtick or triple-quote
@@ -1794,7 +1802,7 @@ def _build_reply_context_prefix(
     from_user = getattr(reply_to_message, "from_user", None)
     is_bot = bool(from_user and getattr(from_user, "is_bot", False))
     attribution = (
-        "Salem's earlier message" if is_bot else "your earlier message"
+        f"{instance_name}'s earlier message" if is_bot else "your earlier message"
     )
 
     # Timestamp. ``Message.date`` is a tz-aware datetime per PTB's
@@ -2172,7 +2180,18 @@ async def handle_message(
     # text (no prefix) — a "/end" reply is still intended to close the
     # session; we don't want the reply prefix to accidentally block
     # inline-command detection by pushing the slash past the first line.
-    reply_prefix = _build_reply_context_prefix(update.message.reply_to_message)
+    # Pass the instance name so the prefix attribution matches the bot
+    # that's actually replying ("Hypatia's earlier message" on the
+    # Hypatia bot, "Salem's earlier message" on Salem). Fall back to
+    # canonical / "Salem" so older configs without an instance block
+    # still produce a sensible prefix.
+    instance_name = (
+        config.instance.name or config.instance.canonical or "Salem"
+    )
+    reply_prefix = _build_reply_context_prefix(
+        update.message.reply_to_message,
+        instance_name=instance_name,
+    )
     has_reply_context = reply_prefix is not None
     effective_text = f"{reply_prefix}{text}" if reply_prefix else text
 

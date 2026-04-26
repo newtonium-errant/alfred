@@ -91,12 +91,42 @@ def test_no_reply_returns_none() -> None:
 
 
 def test_reply_to_bot_uses_salem_attribution() -> None:
-    """Bot-authored parent → ``Salem's earlier message`` attribution."""
+    """Bot-authored parent → ``Salem's earlier message`` attribution.
+
+    The default ``instance_name`` arg is ``"Salem"`` so existing
+    direct-call sites (and this test) keep the original prefix shape.
+    The configured-instance path is exercised separately by
+    ``test_reply_prefix_uses_instance_name_*``.
+    """
     parent = _fake_parent_message(text="Morning brief: Tuesday.", from_bot=True)
     prefix = bot._build_reply_context_prefix(parent)
     assert prefix is not None
     assert "Salem's earlier message" in prefix
     assert "your earlier message" not in prefix
+
+
+@pytest.mark.parametrize(
+    "instance_name",
+    ["Salem", "Hypatia", "KAL-LE"],
+)
+def test_reply_prefix_uses_instance_name_argument(instance_name: str) -> None:
+    """The bot-attribution branch interpolates the configured instance name.
+
+    Each multi-instance bot needs its own attribution literal so the
+    Anthropic prompt context matches who's actually replying. The pure
+    helper takes the name as an argument; the integration plumbing
+    (config.instance.name → bot.handle_message) is covered in the
+    handle_message-level case below.
+    """
+    parent = _fake_parent_message(text="hello there", from_bot=True)
+    prefix = bot._build_reply_context_prefix(
+        parent, instance_name=instance_name,
+    )
+    assert prefix is not None
+    assert f"{instance_name}'s earlier message" in prefix
+    # No other instance leaks into the prefix.
+    for other in {"Salem", "Hypatia", "KAL-LE"} - {instance_name}:
+        assert f"{other}'s earlier message" not in prefix
 
 
 def test_reply_to_own_message_uses_your_attribution() -> None:
@@ -298,10 +328,69 @@ async def test_reply_prefix_reaches_run_turn_captured(
 
     user_message = captured.get("user_message")
     assert isinstance(user_message, str)
-    assert user_message.startswith("[You are replying to Salem's earlier message at ")
+    # The default ``talker_config`` fixture uses InstanceConfig defaults
+    # (name="Alfred"); the prefix attribution mirrors the configured
+    # instance name, so we expect "Alfred's earlier message" here. The
+    # Salem / Hypatia attributions are exercised explicitly in the
+    # ``test_reply_prefix_uses_instance_name_*`` cases below.
+    assert user_message.startswith("[You are replying to Alfred's earlier message at ")
     assert 'Flight SWA2941 available at 0730 for $189' in user_message
     # The user's own text is present AFTER the prefix (trailing position).
     assert user_message.endswith("book it")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "instance_name",
+    ["Salem", "Hypatia"],
+)
+async def test_reply_prefix_threads_config_instance_name(
+    state_mgr, talker_config, fake_client, instance_name: str,
+) -> None:
+    """``handle_message`` reads ``config.instance.name`` for the prefix.
+
+    Without this plumbing the prefix would still say "Salem's earlier
+    message" on a Hypatia-configured bot — wrong attribution, wrong
+    Anthropic context. The integration shape is the contract: change
+    ``config.instance.name``, change the prefix.
+    """
+    from alfred.telegram.config import InstanceConfig
+
+    talker_config.instance = InstanceConfig(
+        name=instance_name,
+        canonical=instance_name,
+        aliases=[instance_name],
+    )
+
+    chat_id = 200 + hash(instance_name) % 100
+    _seed_active_session(state_mgr, chat_id)
+
+    update = _make_update_with_reply(
+        text="continue please",
+        parent_text="earlier output from the bot",
+        parent_from_bot=True,
+        chat_id=chat_id,
+    )
+    ctx = _make_ctx(talker_config, state_mgr, fake_client)
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_turn(**kwargs):
+        captured.update(kwargs)
+        return "ok."
+
+    original = conversation_mod.run_turn
+    try:
+        conversation_mod.run_turn = fake_run_turn
+        await bot.handle_message(
+            update, ctx, text="continue please", voice=False,
+        )
+    finally:
+        conversation_mod.run_turn = original
+
+    user_message = captured.get("user_message")
+    assert isinstance(user_message, str)
+    assert f"{instance_name}'s earlier message" in user_message
 
 
 @pytest.mark.asyncio
