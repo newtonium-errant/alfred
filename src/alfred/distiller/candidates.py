@@ -9,7 +9,7 @@ from pathlib import Path
 from alfred.vault.ops import is_ignored_path
 
 from .parser import VaultRecord, parse_file, stripped_body_length, extract_wikilinks
-from .utils import compute_md5, get_logger
+from .utils import compute_body_hash, compute_md5, get_logger
 
 log = get_logger(__name__)
 
@@ -52,6 +52,7 @@ class ScoredCandidate:
     score: float
     signals: CandidateSignal
     md5: str
+    body_hash: str = ""
 
 
 @dataclass
@@ -132,7 +133,16 @@ def scan_candidates(
     distilled_files: dict[str, str] | None = None,
     project_filter: str | None = None,
 ) -> list[ScoredCandidate]:
-    """Walk vault and identify candidate records for distillation."""
+    """Walk vault and identify candidate records for distillation.
+
+    ``distilled_files`` maps rel_path → body_hash for already-distilled
+    sources. The skip-distill gate compares the file's current body hash
+    (frontmatter stripped) against the stored value: cosmetic frontmatter
+    rewrites by janitor / surveyor don't shift body bytes, so they no
+    longer cause the candidate to re-qualify on the next scan. A file with
+    no stored body_hash (legacy state) is treated as unknown — re-extract
+    once to populate the field, then hash-gate from then on.
+    """
     ignore_d = set(ignore_dirs)
     ignore_f = set(ignore_files)
     distilled = distilled_files or {}
@@ -148,14 +158,20 @@ def scan_candidates(
         if rel.name in ignore_f:
             continue
 
-        # Compute MD5 for change detection
+        # Compute MD5 (still tracked for the legacy md5 field) and body hash
+        # (the actual skip-distill gate).
         try:
             md5 = compute_md5(md_file)
+            text = md_file.read_text(encoding="utf-8")
         except OSError:
             continue
 
-        # Skip if unchanged since last distillation
-        if rel_str in distilled and distilled[rel_str] == md5:
+        body_hash = compute_body_hash(text)
+
+        # Skip if body unchanged since last distillation. Empty/missing
+        # stored hash means legacy state — fall through to re-extract once.
+        stored = distilled.get(rel_str)
+        if stored and stored == body_hash:
             continue
 
         # Parse
@@ -184,6 +200,7 @@ def scan_candidates(
                 score=score,
                 signals=signals,
                 md5=md5,
+                body_hash=body_hash,
             ))
 
     # Sort by score descending

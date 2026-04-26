@@ -361,7 +361,7 @@ async def run_extraction(
         ignore_files=config.vault.ignore_files,
         source_types=config.extraction.source_types,
         threshold=config.extraction.candidate_threshold,
-        distilled_files=state.get_distilled_md5s(),
+        distilled_files=state.get_distilled_body_hashes(),
         project_filter=project_filter,
     )
 
@@ -452,7 +452,10 @@ async def run_extraction(
                     for f in created
                     if any(f.startswith(f"{lt}/") for lt in config.extraction.learn_types)
                 ]
-                state.update_file(sc.record.rel_path, sc.md5, learn_paths)
+                state.update_file(
+                    sc.record.rel_path, sc.md5, learn_paths,
+                    body_hash=sc.body_hash,
+                )
 
             # Refresh MD5s after pipeline may have written distiller_signals /
             # distiller_learnings back to source files (prevents re-qualify loop).
@@ -578,7 +581,10 @@ async def run_extraction(
                     for f in created
                     if any(f.startswith(f"{lt}/") for lt in config.extraction.learn_types)
                 ]
-                state.update_file(sc.record.rel_path, sc.md5, learn_paths)
+                state.update_file(
+                    sc.record.rel_path, sc.md5, learn_paths,
+                    body_hash=sc.body_hash,
+                )
 
             # Refresh MD5s after legacy agent path may have written back to source files.
             recompute_source_md5s(batch.source_records, vault_path, state)
@@ -698,7 +704,7 @@ async def run_watch(
                     ignore_files=config.vault.ignore_files,
                     source_types=config.extraction.source_types,
                     threshold=config.extraction.candidate_threshold,
-                    distilled_files=state.get_distilled_md5s(),
+                    distilled_files=state.get_distilled_body_hashes(),
                 )
                 if candidates:
                     log.info("daemon.pending_candidates", count=len(candidates))

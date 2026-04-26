@@ -30,7 +30,7 @@ def cmd_scan(config: DistillerConfig, skills_dir: Path, project: str | None = No
         ignore_files=config.vault.ignore_files,
         source_types=config.extraction.source_types,
         threshold=config.extraction.candidate_threshold,
-        distilled_files=state.get_distilled_md5s(),
+        distilled_files=state.get_distilled_body_hashes(),
         project_filter=project,
     )
 

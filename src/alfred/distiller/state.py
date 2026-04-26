@@ -18,6 +18,13 @@ class FileState:
     md5: str
     last_distilled: str = ""  # ISO timestamp of last extraction run
     learn_records_created: list[str] = field(default_factory=list)  # rel_paths
+    # SHA-256 of the body only (frontmatter stripped, trailing whitespace
+    # normalized). The skip-distill gate consults this — full-file md5
+    # changes on every cosmetic frontmatter write (alfred_tags from
+    # surveyor, attribution_audit append from janitor deep_sweep_fix), but
+    # body_hash only changes when the source's claim wording shifted,
+    # which is what should actually trigger re-extraction.
+    body_hash: str = ""
 
 
 @dataclass
@@ -77,8 +84,14 @@ class DistillerState:
         with open(self.state_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         self.version = raw.get("version", 1)
+        # Tolerate unknown legacy fields (e.g. ``last_scanned`` from an older
+        # schema). Filtering on the dataclass __dataclass_fields__ keeps
+        # state.load() forward/backward compatible — adding a field never
+        # crashes a daemon reading an older state file, and removing a field
+        # never crashes one reading a newer file.
+        known_fields = set(FileState.__dataclass_fields__.keys())
         for rel, fdata in raw.get("files", {}).items():
-            self.files[rel] = FileState(**fdata)
+            self.files[rel] = FileState(**{k: v for k, v in fdata.items() if k in known_fields})
         for rid, rdata in raw.get("runs", {}).items():
             self.runs[rid] = RunResult.from_dict(rdata)
         self.extraction_log = [
@@ -105,6 +118,7 @@ class DistillerState:
                     "md5": fs.md5,
                     "last_distilled": fs.last_distilled,
                     "learn_records_created": fs.learn_records_created,
+                    "body_hash": fs.body_hash,
                 }
                 for rel, fs in self.files.items()
             },
@@ -119,31 +133,59 @@ class DistillerState:
             json.dump(data, f, indent=2)
         os.replace(tmp_path, self.state_path)
 
-    def should_distill(self, rel_path: str, current_md5: str) -> bool:
-        """Return True if a file needs distilling (new or changed)."""
+    def should_distill(self, rel_path: str, current_body_hash: str) -> bool:
+        """Return True if a file needs distilling (new or body changed).
+
+        Gates on body_hash, not full-file md5: cosmetic frontmatter writes
+        (janitor deep_sweep_fix, surveyor alfred_tags) must NOT re-trigger
+        extraction. Legacy state with empty ``body_hash`` returns True so
+        the next scan re-extracts once and populates the field.
+        """
         if rel_path not in self.files:
             return True
-        return self.files[rel_path].md5 != current_md5
+        stored = self.files[rel_path].body_hash
+        if not stored:
+            # Legacy state pre-dating body_hash — treat as unknown,
+            # re-extract once to populate the field.
+            return True
+        return stored != current_body_hash
 
-    def get_distilled_md5s(self) -> dict[str, str]:
-        """Return {rel_path: md5} for all distilled files — used by scanner for skip logic."""
-        return {rel: fs.md5 for rel, fs in self.files.items()}
+    def get_distilled_body_hashes(self) -> dict[str, str]:
+        """Return {rel_path: body_hash} for files with a recorded body hash.
+
+        Files with empty ``body_hash`` (legacy state) are omitted so the
+        scanner treats them as unknown and re-extracts once.
+        """
+        return {rel: fs.body_hash for rel, fs in self.files.items() if fs.body_hash}
 
     def update_file(
-        self, rel_path: str, md5: str, learn_records: list[str] | None = None
+        self,
+        rel_path: str,
+        md5: str,
+        learn_records: list[str] | None = None,
+        body_hash: str | None = None,
     ) -> None:
-        """Update or create a file entry after distillation."""
+        """Update or create a file entry after distillation.
+
+        ``body_hash`` is optional so legacy callers (e.g.
+        ``recompute_source_md5s`` after pipeline writes) can refresh
+        the full-file md5 without overwriting a stored body_hash with
+        an empty one.
+        """
         now = datetime.now(timezone.utc).isoformat()
         if rel_path in self.files:
             self.files[rel_path].md5 = md5
             self.files[rel_path].last_distilled = now
             if learn_records:
                 self.files[rel_path].learn_records_created.extend(learn_records)
+            if body_hash is not None:
+                self.files[rel_path].body_hash = body_hash
         else:
             self.files[rel_path] = FileState(
                 md5=md5,
                 last_distilled=now,
                 learn_records_created=learn_records or [],
+                body_hash=body_hash or "",
             )
 
     def add_run(self, result: RunResult) -> None:
