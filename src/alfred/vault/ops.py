@@ -19,6 +19,7 @@ import yaml
 from . import obsidian
 from .schema import (
     KNOWN_TYPES,
+    KNOWN_TYPES_BY_SCOPE,
     LIST_FIELDS,
     NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS,
@@ -106,11 +107,41 @@ def _serialize_record(fm: dict, body: str) -> str:
     return frontmatter.dumps(post) + "\n"
 
 
-def _validate_type(record_type: str) -> None:
-    if record_type not in KNOWN_TYPES:
+def _validate_type(record_type: str, scope: str | None = None) -> None:
+    """Validate that ``record_type`` is known to the active scope.
+
+    Two-layer contract:
+
+    - ``scope=None`` (default) — preserve the historical behavior:
+      only the canonical ``KNOWN_TYPES`` (Salem's 20-type set) are
+      accepted. Every CLI / executor path that doesn't propagate a
+      scope through stays byte-for-byte unchanged.
+    - ``scope`` set — accept the union of canonical types plus any
+      scope-specific extension set declared in
+      ``schema.KNOWN_TYPES_BY_SCOPE`` (e.g. ``"kalle"`` unlocks
+      ``pattern`` / ``principle``; ``"hypatia"`` unlocks ``document``
+      / ``concept`` / ``source`` / ``citation`` / ``template``).
+
+    This is the **first** of two gates on ``vault_create`` — it lets
+    the type through. The **second** gate is ``check_scope``'s create
+    allowlist (``KALLE_CREATE_TYPES``, ``HYPATIA_CREATE_TYPES``,
+    ``TALKER_CREATE_TYPES``, etc.), which enforces the per-scope policy.
+    Salem-scope agents calling ``vault_create("pattern", scope="talker")``
+    will pass ``_validate_type`` here (canonical types only, no extension)
+    and then be rejected by ``check_scope``'s ``talker_types_only`` rule.
+
+    Originally this gate hardcoded ``KNOWN_TYPES`` and ran *before*
+    ``check_scope``, which silently blocked Hypatia ``document`` and
+    KAL-LE ``pattern`` creates with a misleading "Unknown type" error
+    even though the type was legal under their scope's allowlist.
+    Code-reviewer P1 #2 — release-blocker for Phase 1 Hypatia.
+    """
+    valid = KNOWN_TYPES_BY_SCOPE.get(scope, KNOWN_TYPES) if scope else KNOWN_TYPES
+    if record_type not in valid:
+        scope_hint = f" under scope '{scope}'" if scope else ""
         raise VaultError(
-            f"Unknown type: '{record_type}'. "
-            f"Valid: {', '.join(sorted(KNOWN_TYPES))}"
+            f"Unknown type: '{record_type}'{scope_hint}. "
+            f"Valid: {', '.join(sorted(valid))}"
         )
 
 
@@ -364,9 +395,17 @@ def vault_list(
     vault_path: Path,
     record_type: str,
     ignore_dirs: list[str] | None = None,
+    *,
+    scope: str | None = None,
 ) -> list[dict]:
-    """List all records of a given type. Returns list of {path, name, status}."""
-    _validate_type(record_type)
+    """List all records of a given type. Returns list of {path, name, status}.
+
+    ``scope`` (kwarg-only) widens the type-validation gate so a Hypatia
+    agent can list ``document`` records and a KAL-LE agent can list
+    ``pattern`` records. Default ``None`` preserves the canonical
+    ``KNOWN_TYPES`` gate for callers that don't propagate scope.
+    """
+    _validate_type(record_type, scope=scope)
     ignore = set(ignore_dirs or [])
     results: list[dict] = []
 
@@ -442,9 +481,14 @@ def vault_create(
     """Create a new vault record. Returns {path, warnings}.
 
     Optional ``scope`` runs ``check_scope`` before the write; default
-    ``None`` preserves the historical unrestricted behavior.
+    ``None`` preserves the historical unrestricted behavior. The same
+    ``scope`` is also threaded into ``_validate_type`` so scope-specific
+    extension types (Hypatia's ``document`` / ``concept`` / ..., KAL-LE's
+    ``pattern`` / ``principle``) pass the type gate. Without this,
+    ``_validate_type`` rejects extension types before ``check_scope``
+    ever runs — release-blocker for Phase 1 Hypatia create operations.
     """
-    _validate_type(record_type)
+    _validate_type(record_type, scope=scope)
     set_fields = set_fields or {}
     if scope is not None:
         check_scope(

@@ -31,6 +31,32 @@ KNOWN_TYPES_HYPATIA: set[str] = {
     "document", "concept", "source", "citation", "template",
 }
 
+
+# Per-scope union of known record types. ``vault.ops._validate_type``
+# uses this to gate ``vault_create`` / ``vault_list`` against the right
+# type set: a Hypatia agent legitimately creates ``document`` records
+# (canonical-vault-only ``KNOWN_TYPES`` would reject them); a Salem
+# agent must NOT be able to create ``pattern`` records (KAL-LE-only).
+#
+# Scopes not listed here fall back to the canonical ``KNOWN_TYPES``
+# only. The dict's purpose is "which extension sets does this scope
+# unlock?" — not "what may this scope create?" (that's the create
+# allowlists in ``vault.scope`` — ``KALLE_CREATE_TYPES``,
+# ``HYPATIA_CREATE_TYPES``, ``TALKER_CREATE_TYPES``). Two-layer check:
+# this gate lets the type through ``_validate_type``; the create
+# allowlist in ``check_scope`` then enforces the per-scope policy.
+#
+# Pattern-trigger note: when a future instance (V.E.R.A., STAY-C)
+# adds its own ``KNOWN_TYPES_<NAME>`` set, also add an entry here —
+# otherwise ``_validate_type`` will silently reject the new types
+# before scope enforcement gets a chance to run. See CLAUDE.md
+# "Vault Operations Layer" for the rationale.
+KNOWN_TYPES_BY_SCOPE: dict[str, set[str]] = {
+    "kalle": KNOWN_TYPES | KNOWN_TYPES_KALLE,
+    "hypatia": KNOWN_TYPES | KNOWN_TYPES_HYPATIA,
+}
+
+
 LEARN_TYPES: set[str] = {
     "assumption", "decision", "constraint", "contradiction", "synthesis",
 }

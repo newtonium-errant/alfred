@@ -25,6 +25,7 @@ from alfred.telegram.conversation import (
     tools_for_set,
 )
 from alfred.vault import schema
+from alfred.vault.ops import VaultError, vault_create
 from alfred.vault.scope import (
     HYPATIA_CREATE_TYPES,
     ScopeError,
@@ -141,3 +142,137 @@ def test_tools_for_set_hypatia_returns_four_vault_tools() -> None:
     assert names == {"vault_search", "vault_read", "vault_create", "vault_edit"}
     # Hypatia must NOT have bash_exec — that's KAL-LE only.
     assert "bash_exec" not in names
+
+
+# ---------------------------------------------------------------------------
+# vault_create end-to-end — release-blocker regression (P1 #2)
+# ---------------------------------------------------------------------------
+#
+# Before the scope-aware ``_validate_type`` fix, ``vault_create`` rejected
+# every Hypatia and KAL-LE extension type because ``_validate_type`` ran
+# *before* ``check_scope`` and gated against the canonical ``KNOWN_TYPES``
+# only. The brief's smoke-check (``alfred vault create document``,
+# ``alfred vault create pattern``) hit "Unknown type: ..." against the
+# 20-type Salem set — extension scopes never reached the scope-policy
+# check. These tests pin the contract end-to-end so the gate-ordering
+# doesn't silently regress when V.E.R.A. / STAY-C add their own
+# extension type sets.
+
+
+def test_vault_create_hypatia_document_succeeds(tmp_path) -> None:
+    """Hypatia's ``document`` type passes both gates and writes the file."""
+    (tmp_path / "document").mkdir()
+    result = vault_create(
+        tmp_path, "document", "Test Document", scope="hypatia",
+    )
+    assert result["path"] == "document/Test Document.md"
+    assert (tmp_path / result["path"]).exists()
+
+
+@pytest.mark.parametrize(
+    "record_type",
+    ["document", "concept", "source", "citation", "template"],
+)
+def test_vault_create_each_hypatia_type_succeeds(
+    tmp_path, record_type: str,
+) -> None:
+    """All five Hypatia extension types pass ``_validate_type``."""
+    (tmp_path / record_type).mkdir()
+    result = vault_create(
+        tmp_path, record_type, f"Test {record_type}", scope="hypatia",
+    )
+    assert (tmp_path / result["path"]).exists()
+
+
+def test_vault_create_kalle_pattern_succeeds(tmp_path) -> None:
+    """KAL-LE's ``pattern`` type passes ``_validate_type`` under scope='kalle'."""
+    (tmp_path / "pattern").mkdir()
+    result = vault_create(
+        tmp_path, "pattern", "Test Pattern", scope="kalle",
+    )
+    assert (tmp_path / result["path"]).exists()
+
+
+def test_vault_create_kalle_principle_succeeds(tmp_path) -> None:
+    """KAL-LE's ``principle`` type passes ``_validate_type`` under scope='kalle'."""
+    (tmp_path / "principle").mkdir()
+    result = vault_create(
+        tmp_path, "principle", "Test Principle", scope="kalle",
+    )
+    assert (tmp_path / result["path"]).exists()
+
+
+def test_vault_create_hypatia_type_under_kalle_scope_fails(tmp_path) -> None:
+    """Cross-scope leak: Hypatia's ``document`` is unknown under scope='kalle'.
+
+    Under the kalle scope, ``_validate_type`` allows ``KNOWN_TYPES |
+    KNOWN_TYPES_KALLE`` — ``document`` is in neither set. The error
+    fires at the type gate, not at ``check_scope``'s allowlist; we
+    assert on the type-error message to pin which gate caught it.
+    """
+    with pytest.raises(VaultError) as exc_info:
+        vault_create(
+            tmp_path, "document", "Test Document", scope="kalle",
+        )
+    assert "Unknown type" in str(exc_info.value)
+    assert "kalle" in str(exc_info.value)
+
+
+def test_vault_create_kalle_type_under_hypatia_scope_fails(tmp_path) -> None:
+    """Cross-scope leak: KAL-LE's ``pattern`` is unknown under scope='hypatia'."""
+    with pytest.raises(VaultError) as exc_info:
+        vault_create(
+            tmp_path, "pattern", "Test Pattern", scope="hypatia",
+        )
+    assert "Unknown type" in str(exc_info.value)
+    assert "hypatia" in str(exc_info.value)
+
+
+def test_vault_create_canonical_type_under_talker_scope_unaffected(
+    tmp_path,
+) -> None:
+    """Salem regression guard: ``note`` under scope='talker' still works.
+
+    The fix must not narrow the canonical-types behavior — every
+    Salem-scope create must still pass ``_validate_type`` exactly as
+    before.
+    """
+    (tmp_path / "note").mkdir()
+    result = vault_create(
+        tmp_path, "note", "Test Note", scope="talker",
+    )
+    assert (tmp_path / result["path"]).exists()
+
+
+def test_vault_create_extension_type_without_scope_still_fails(
+    tmp_path,
+) -> None:
+    """Default scope=None preserves canonical-only validation.
+
+    A caller that doesn't propagate scope (e.g. a manual CLI invocation
+    without ALFRED_VAULT_SCOPE set) gets the historical error so the
+    extension types stay invisible until a scope opts them in.
+    """
+    with pytest.raises(VaultError) as exc_info:
+        vault_create(tmp_path, "document", "Test Document")
+    assert "Unknown type" in str(exc_info.value)
+    # No scope hint — the error should look like the pre-fix message.
+    assert "under scope" not in str(exc_info.value)
+
+
+def test_vault_create_canonical_type_under_hypatia_scope_works(
+    tmp_path,
+) -> None:
+    """Hypatia may also create canonical types via the union (KNOWN_TYPES).
+
+    ``KNOWN_TYPES_BY_SCOPE['hypatia']`` is a union, so a canonical type
+    like ``note`` still validates under scope='hypatia'. Whether
+    Hypatia's create allowlist actually permits it is a separate gate
+    (``check_scope``'s ``hypatia_types_only``) — and ``note`` happens
+    to be in HYPATIA_CREATE_TYPES too, so this case round-trips.
+    """
+    (tmp_path / "note").mkdir()
+    result = vault_create(
+        tmp_path, "note", "Test Note", scope="hypatia",
+    )
+    assert (tmp_path / result["path"]).exists()

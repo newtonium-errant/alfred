@@ -119,7 +119,11 @@ def cmd_list(args: argparse.Namespace) -> None:
 
     vault = _vault_path()
     try:
-        results = vault_list(vault, args.type, ignore_dirs=_ignore_dirs())
+        results = vault_list(
+            vault, args.type,
+            ignore_dirs=_ignore_dirs(),
+            scope=scope,
+        )
         _output({"results": results, "count": len(results)})
     except VaultError as e:
         _error(str(e))
@@ -168,6 +172,7 @@ def cmd_create(args: argparse.Namespace) -> None:
         result = vault_create(
             vault, args.type, args.name,
             set_fields=set_fields, body=body,
+            scope=scope,
         )
         log_mutation(_session(), "create", result["path"])
         _output(result)
