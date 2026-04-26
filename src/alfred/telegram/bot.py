@@ -2182,11 +2182,12 @@ async def handle_message(
     # inline-command detection by pushing the slash past the first line.
     # Pass the instance name so the prefix attribution matches the bot
     # that's actually replying ("Hypatia's earlier message" on the
-    # Hypatia bot, "Salem's earlier message" on Salem). Fall back to
-    # canonical / "Salem" so older configs without an instance block
-    # still produce a sensible prefix.
+    # Hypatia bot, "Salem's earlier message" on Salem). Falls back to
+    # InstanceConfig's "Alfred" default if the config has no instance
+    # block; the trailing literal mirrors that default so a config with
+    # ``name: ""`` and ``canonical: ""`` still renders something sensible.
     instance_name = (
-        config.instance.name or config.instance.canonical or "Salem"
+        config.instance.name or config.instance.canonical or "Alfred"
     )
     reply_prefix = _build_reply_context_prefix(
         update.message.reply_to_message,
