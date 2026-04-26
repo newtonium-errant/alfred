@@ -328,12 +328,13 @@ async def test_reply_prefix_reaches_run_turn_captured(
 
     user_message = captured.get("user_message")
     assert isinstance(user_message, str)
-    # The default ``talker_config`` fixture uses InstanceConfig defaults
-    # (name="Alfred"); the prefix attribution mirrors the configured
-    # instance name, so we expect "Alfred's earlier message" here. The
-    # Salem / Hypatia attributions are exercised explicitly in the
-    # ``test_reply_prefix_uses_instance_name_*`` cases below.
-    assert user_message.startswith("[You are replying to Alfred's earlier message at ")
+    # The default ``talker_config`` fixture pins ``name="Salem"`` (the
+    # canonical fresh-install identity). ``InstanceConfig.name`` is a
+    # required field as of 2026-04-26 — there is no "Alfred" default
+    # anymore, and any installer that forgets ``instance.name`` raises
+    # at config-load time. Salem / Hypatia plumb-through is exercised
+    # in ``test_reply_prefix_threads_config_instance_name`` below.
+    assert user_message.startswith("[You are replying to Salem's earlier message at ")
     assert 'Flight SWA2941 available at 0730 for $189' in user_message
     # The user's own text is present AFTER the prefix (trailing position).
     assert user_message.endswith("book it")

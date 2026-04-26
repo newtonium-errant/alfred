@@ -64,12 +64,14 @@ def _load_templated(config: TalkerConfig) -> str:
 # --- Default-config (Alfred) ----------------------------------------------
 
 
-def test_default_config_is_alfred(talker_config: TalkerConfig) -> None:
-    """Without an override, the SKILL loads as ``Alfred`` everywhere.
+def test_default_config_substitutes_to_salem(talker_config: TalkerConfig) -> None:
+    """The default talker_config fixture pins Salem identity.
 
-    ``talker_config`` from conftest uses the :class:`InstanceConfig`
-    defaults (name="Alfred", canonical="Alfred"), so both placeholders
-    collapse to "Alfred" and every persona reference reads naturally.
+    Replaces ``test_default_config_is_alfred`` 2026-04-26.
+    ``InstanceConfig.name`` is required (no "Alfred" default) — see
+    ``feedback_hardcoding_and_alfred_naming.md``. The shared
+    talker_config fixture defaults to ``Salem`` / ``S.A.L.E.M.`` since
+    "Alfred" is the project name, never an instance name.
     """
     prompt = _load_templated(talker_config)
 
@@ -81,15 +83,16 @@ def test_default_config_is_alfred(talker_config: TalkerConfig) -> None:
         "instance_canonical placeholder still present after substitution"
     )
 
-    # Persona references resolve to "Alfred".
-    assert "You are **Alfred**" in prompt, (
+    # Persona references resolve to Salem identity (matches fixture).
+    assert "You are **S.A.L.E.M.**" in prompt, (
         "identity paragraph should render the canonical form"
     )
-    assert "# Alfred — Talker" in prompt, (
+    assert "# Salem — Talker" in prompt, (
         "section header should render the casual name"
     )
 
-    # Product references remain literal.
+    # Product references remain literal "Alfred" — the project /
+    # codebase name persists everywhere it appears.
     assert "[[project/Alfred]]" in prompt
     assert "Knowledge Alfred" in prompt
 
@@ -175,16 +178,18 @@ def test_aliases_config_roundtrip(tmp_path: Path) -> None:
     assert config.instance.canonical == "S.A.L.E.M."
     assert config.instance.aliases == ["Salem", "salem"]
 
-    # A config without any instance block falls back to the Alfred
-    # defaults — fresh installs keep working unchanged.
+    # A config without any instance block fails to load — required-
+    # field semantics on ``instance.name`` (see
+    # ``feedback_hardcoding_and_alfred_naming.md``). Pinned 2026-04-26
+    # to replace the prior "fall back to Alfred" assertion.
+    import pytest
+
     raw_no_instance = dict(raw)
     raw_no_instance["telegram"] = {
         k: v for k, v in raw["telegram"].items() if k != "instance"
     }
-    default_config = load_from_unified(raw_no_instance)
-    assert default_config.instance.name == "Alfred"
-    assert default_config.instance.canonical == "Alfred"
-    assert default_config.instance.aliases == []
+    with pytest.raises(TypeError):
+        load_from_unified(raw_no_instance)
 
 
 # --- Bot greeting ----------------------------------------------------------

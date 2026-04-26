@@ -19,6 +19,7 @@ import pytest
 
 from alfred.telegram.config import (
     AnthropicConfig,
+    InstanceConfig,
     LoggingConfig,
     SessionConfig,
     STTConfig,
@@ -65,6 +66,10 @@ def talker_config(tmp_path: Path) -> TalkerConfig:
         ),
         vault=VaultConfig(path=str(vault_dir)),
         logging=LoggingConfig(file=str(tmp_path / "talker.log")),
+        # ``InstanceConfig.name`` is required (no default) — Salem-shaped
+        # default for the standard fixture so most tests don't have to
+        # care about the instance identity.
+        instance=InstanceConfig(name="Salem", canonical="S.A.L.E.M."),
     )
 
 

@@ -36,6 +36,7 @@ import anthropic  # noqa: F401 — the executor imports it; keep the dep live
 from alfred.instructor import executor as exec_mod
 from alfred.instructor.config import (
     AnthropicConfig,
+    InstanceConfig,
     InstructorConfig,
     LoggingConfig,
     StateConfig,
@@ -139,6 +140,7 @@ def config(tmp_path: Path, vault: Path) -> InstructorConfig:
             model="claude-sonnet-4-6",
             max_tokens=4096,
         ),
+        instance=InstanceConfig(name="Salem", canonical="S.A.L.E.M."),
         state=StateConfig(path=str(tmp_path / "state.json")),
         logging=LoggingConfig(file=str(tmp_path / "instructor.log")),
         poll_interval_seconds=60,

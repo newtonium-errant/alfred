@@ -18,9 +18,17 @@ from alfred.instructor.config import (
 )
 
 
-def test_load_from_empty_unified_returns_defaults() -> None:
-    """An empty unified config produces a fully-defaulted InstructorConfig."""
-    cfg = load_from_unified({})
+def test_load_from_minimal_unified_returns_defaults() -> None:
+    """A unified config with only the required ``instance.name`` field
+    produces a fully-defaulted InstructorConfig.
+
+    Pinned 2026-04-26 — ``instance.name`` is a required field (no
+    "Alfred" default; see ``feedback_hardcoding_and_alfred_naming.md``)
+    so a totally-empty config raises at load time. This test asserts
+    everything else still defaults cleanly when only the required
+    instance identity is supplied.
+    """
+    cfg = load_from_unified({"instructor": {"instance": {"name": "Salem"}}})
     assert isinstance(cfg, InstructorConfig)
 
     # Core scalar defaults.
@@ -41,10 +49,30 @@ def test_load_from_empty_unified_returns_defaults() -> None:
     assert cfg.logging.level == "INFO"
 
 
+def test_load_from_unified_without_instance_name_raises() -> None:
+    """Instructor config without ``instance.name`` fails loud at load.
+
+    See ``feedback_hardcoding_and_alfred_naming.md`` — "Alfred" is the
+    project name, never an instance name. Defaulting to it silently
+    mis-attributes SKILL prose.
+    """
+    import pytest
+
+    with pytest.raises(TypeError):
+        load_from_unified({})
+
+    with pytest.raises(TypeError):
+        load_from_unified({"instructor": {}})
+
+    with pytest.raises(TypeError):
+        load_from_unified({"instructor": {"instance": {}}})
+
+
 def test_load_from_unified_applies_instructor_section_overrides() -> None:
     """Values under ``instructor:`` override dataclass defaults."""
     raw = {
         "instructor": {
+            "instance": {"name": "Salem"},
             "poll_interval_seconds": 30,
             "max_retries": 5,
             "audit_window_size": 7,
@@ -73,6 +101,7 @@ def test_load_from_unified_substitutes_env_vars(
     monkeypatch.setenv("TEST_ANTHROPIC_KEY", "DUMMY_ANTHROPIC_TEST_KEY")
     raw = {
         "instructor": {
+            "instance": {"name": "Salem"},
             "anthropic": {"api_key": "${TEST_ANTHROPIC_KEY}"},
         },
     }
@@ -93,6 +122,7 @@ def test_load_from_unified_leaves_placeholder_when_env_missing(
     monkeypatch.delenv("ABSENT_INSTRUCTOR_KEY", raising=False)
     raw = {
         "instructor": {
+            "instance": {"name": "Salem"},
             "anthropic": {"api_key": "${ABSENT_INSTRUCTOR_KEY}"},
         },
     }
@@ -102,7 +132,10 @@ def test_load_from_unified_leaves_placeholder_when_env_missing(
 
 def test_load_from_unified_maps_logging_dir_to_file() -> None:
     """The shared ``logging.dir`` key produces a per-tool log file path."""
-    raw = {"logging": {"dir": "./tmp_data", "level": "DEBUG"}}
+    raw = {
+        "logging": {"dir": "./tmp_data", "level": "DEBUG"},
+        "instructor": {"instance": {"name": "Salem"}},
+    }
     cfg = load_from_unified(raw)
     assert cfg.logging.level == "DEBUG"
     assert cfg.logging.file == "./tmp_data/instructor.log"
@@ -117,6 +150,7 @@ def test_load_from_unified_accepts_destructive_keywords_list() -> None:
     """
     raw = {
         "instructor": {
+            "instance": {"name": "Salem"},
             "destructive_keywords": ["wipe", "nuke", "trash"],
         },
     }

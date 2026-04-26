@@ -99,10 +99,15 @@ class InstanceConfig:
     ``{{instance_canonical}}`` placeholders in the SKILL.md are
     substituted at load time so a multi-instance deploy can give each
     instance its own identity without forking the skill file.
+
+    ``name`` is **required** (no default). "Alfred" is the project /
+    architecture name, never an instance name — defaulting to it
+    silently produces wrong-looking SKILL prose. See
+    ``feedback_hardcoding_and_alfred_naming.md``.
     """
 
-    name: str = "Alfred"
-    canonical: str = "Alfred"
+    name: str
+    canonical: str = ""
 
 
 @dataclass

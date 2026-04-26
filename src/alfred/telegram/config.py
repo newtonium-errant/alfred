@@ -88,28 +88,37 @@ class TtsConfig:
 class InstanceConfig:
     """Per-instance persona identity for the talker.
 
-    ``name`` is the casual, greeting-friendly form ("Alfred", "Salem").
-    ``canonical`` is the formal form used once in the SKILL's identity
-    paragraph ("Alfred", "S.A.L.E.M."). ``aliases`` is unused at this
-    stage — reserved for the multi-instance router (see
-    ``memory/project_multi_instance_design.md``) so case-insensitive
-    inbound routing can accept phone-autocorrect-friendly variants
-    (``"Salem"`` for ``S.A.L.E.M.``) without a code change.
+    ``name`` is the casual, greeting-friendly form ("Salem", "KAL-LE",
+    "Hypatia"). ``canonical`` is the formal form used once in the SKILL's
+    identity paragraph ("S.A.L.E.M.", "K.A.L.L.E.", "H.Y.P.A.T.I.A.").
+    ``aliases`` is the multi-instance router's case-insensitive accept
+    list so phone-autocorrect / voice-transcription variants still route
+    correctly (``"Salem"`` → S.A.L.E.M., ``"Pat"`` → Hypatia) without a
+    code change.
+
+    ``name`` is **required** (no default). "Alfred" is the project /
+    architecture name, never an instance name — defaulting to it
+    silently mis-attributes prose ("Alfred's earlier message" on a
+    Salem-installed bot) and silently misconfigures peer-protocol
+    identification. A config YAML without ``instance.name`` raises
+    ``TypeError`` at load time. See
+    ``feedback_hardcoding_and_alfred_naming.md``.
 
     ``skill_bundle`` picks which SKILL bundle the talker loads at
-    startup (e.g. ``"vault-talker"`` for Salem, ``"vault-kalle"`` for
-    KAL-LE). Stage 3.5 introduction — default preserves Salem's
-    existing behaviour. The bundle name resolves to
+    startup (``"vault-talker"`` for Salem, ``"vault-kalle"`` for KAL-LE,
+    ``"vault-hypatia"`` for Hypatia). The bundle name resolves to
     ``src/alfred/_bundled/skills/<skill_bundle>/SKILL.md``.
 
     ``tool_set`` selects which vault-bridge tool schema the talker
-    exposes to the model. ``"talker"`` (default) uses
-    ``TALKER_VAULT_TOOLS``; ``"kalle"`` adds ``bash_exec`` for the
-    coding instance. Callers read ``conversation.VAULT_TOOLS_BY_SET``.
+    exposes to the model AND which scope the dispatcher routes to in
+    ``conversation._execute_tool``. ``"talker"`` (default) uses
+    ``TALKER_VAULT_TOOLS``; ``"kalle"`` adds ``bash_exec``;
+    ``"hypatia"`` reuses the talker tool list with the hypatia scope.
+    Callers read ``conversation.VAULT_TOOLS_BY_SET``.
     """
 
-    name: str = "Alfred"
-    canonical: str = "Alfred"
+    name: str
+    canonical: str = ""
     aliases: list[str] = field(default_factory=list)
     skill_bundle: str = "vault-talker"
     tool_set: str = "talker"

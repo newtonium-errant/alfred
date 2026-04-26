@@ -290,8 +290,11 @@ def test_tts_config_defaults() -> None:
 
 def test_talker_config_tts_defaults_to_none() -> None:
     """tts is optional — TalkerConfig defaults to None so /brief can detect absence."""
-    from alfred.telegram.config import TalkerConfig
-    cfg = TalkerConfig()
+    from alfred.telegram.config import InstanceConfig, TalkerConfig
+    # ``InstanceConfig.name`` is required (no default) — pass an explicit
+    # name so the test stays focused on the tts default rather than
+    # tripping the instance-name guard.
+    cfg = TalkerConfig(instance=InstanceConfig(name="Salem"))
     assert cfg.tts is None
 
 
@@ -302,6 +305,9 @@ def test_load_from_unified_picks_up_tts_section() -> None:
         "vault": {"path": "/tmp/vault"},
         "telegram": {
             "bot_token": "x",
+            # ``instance.name`` is required as of 2026-04-26 — pin
+            # explicit Salem identity so the test stays focused on tts.
+            "instance": {"name": "Salem"},
             "tts": {
                 "api_key": "DUMMY_ELEVENLABS_TEST_KEY",
                 "voice_id": "Rachel",

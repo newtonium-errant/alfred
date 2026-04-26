@@ -90,15 +90,25 @@ def test_load_skill_without_config_leaves_templates(tmp_path: Path) -> None:
     assert _load_skill(skills) == "{{instance_name}}\n"
 
 
-def test_load_skill_uses_default_alfred_identity() -> None:
-    """When ``instance`` is the default (``Alfred`` / ``Alfred``), the
-    templated output carries ``Alfred`` in both slots."""
-    skills = get_skills_dir()
-    config = InstructorConfig(
-        anthropic=AnthropicConfig(api_key="DUMMY_ANTHROPIC_TEST_KEY"),
-    )
-    prompt = _load_skill(skills, config)
-    # Placeholders gone, "Alfred" appears in the header line.
-    assert "{{instance_name}}" not in prompt
-    assert "{{instance_canonical}}" not in prompt
-    assert "Alfred" in prompt
+def test_instructor_config_requires_explicit_instance_name() -> None:
+    """A config without ``instance.name`` raises at construction time.
+
+    Replaces the previous ``test_load_skill_uses_default_alfred_identity``
+    which codified the "Alfred" default — see
+    ``feedback_hardcoding_and_alfred_naming.md``: "Alfred" is the project
+    name, never an instance name. Defaulting silently mis-attributes
+    SKILL prose. Required-field semantics surface the misconfiguration
+    at config-load time instead.
+    """
+    import pytest
+
+    with pytest.raises(TypeError):
+        # No ``instance=`` arg → default_factory tries InstanceConfig()
+        # → required ``name`` field has no value → TypeError.
+        InstructorConfig(
+            anthropic=AnthropicConfig(api_key="DUMMY_ANTHROPIC_TEST_KEY"),
+        )
+
+    with pytest.raises(TypeError):
+        # Direct InstanceConfig() call also fails.
+        InstanceConfig()

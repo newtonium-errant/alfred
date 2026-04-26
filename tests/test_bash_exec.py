@@ -555,7 +555,8 @@ def test_bash_exec_config_default_absent():
     """Salem has no bash_exec section → ``config.bash_exec is None``."""
     from alfred.telegram.config import load_from_unified
 
-    config = load_from_unified({"telegram": {}})
+    # ``instance.name`` is required as of 2026-04-26 (no "Alfred" default).
+    config = load_from_unified({"telegram": {"instance": {"name": "Salem"}}})
     assert config.bash_exec is None
 
 
@@ -564,6 +565,7 @@ def test_bash_exec_config_loads_kalle_path():
 
     raw = {
         "telegram": {
+            "instance": {"name": "KAL-LE", "tool_set": "kalle"},
             "bash_exec": {
                 "audit_path": "/home/andrew/.alfred/kalle/data/bash_exec.jsonl",
             },

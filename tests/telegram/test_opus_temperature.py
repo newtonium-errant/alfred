@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 from alfred.telegram import conversation
 from alfred.telegram.config import (
     AnthropicConfig,
+    InstanceConfig,
     SessionConfig,
     STTConfig,
     TalkerConfig,
@@ -52,6 +53,7 @@ def _fake_config(tmp_path) -> TalkerConfig:
         ),
         vault=VaultConfig(path=str(tmp_path), ignore_dirs=[]),
         logging={},
+        instance=InstanceConfig(name="Salem"),
     )
 
 

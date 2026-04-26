@@ -2182,10 +2182,14 @@ async def handle_message(
     # inline-command detection by pushing the slash past the first line.
     # Pass the instance name so the prefix attribution matches the bot
     # that's actually replying ("Hypatia's earlier message" on the
-    # Hypatia bot, "Salem's earlier message" on Salem). Falls back to
-    # InstanceConfig's "Alfred" default if the config has no instance
-    # block; the trailing literal mirrors that default so a config with
-    # ``name: ""`` and ``canonical: ""`` still renders something sensible.
+    # Hypatia bot, "Salem's earlier message" on Salem).
+    # ``InstanceConfig.name`` is required (no default) since 2026-04-26
+    # — a successfully-loaded config always has a non-empty
+    # ``config.instance.name``. The ``or canonical or "Alfred"``
+    # fallback chain is dead code under the new contract; it stays as
+    # belt-and-braces in case some future config-builder path bypasses
+    # the dataclass (e.g. inline ``InstanceConfig.__init__`` with an
+    # empty ``name=""`` literal in a test).
     instance_name = (
         config.instance.name or config.instance.canonical or "Alfred"
     )

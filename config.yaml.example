@@ -267,16 +267,19 @@ telegram:
     - "person/Andrew Newton"
   # Per-instance persona identity. The talker's SKILL.md is templated
   # at load time — ``{{instance_name}}`` becomes casual greetings and
-  # ``{{instance_canonical}}`` becomes the formal identity line. Fresh
-  # installs get the neutral "Alfred" default; multi-instance deployments
-  # (e.g. Salem / STAY-C / KAL-LE) override this per instance.
-  # ``aliases`` is reserved for the multi-instance router so phone
-  # autocorrect / voice transcription variants still route correctly
-  # (unused today).
+  # ``{{instance_canonical}}`` becomes the formal identity line.
+  # ``name`` is REQUIRED — "Alfred" is the project / architecture name,
+  # never an instance name. Pick the instance identity for this deploy
+  # (Salem / KAL-LE / Hypatia / etc.). Config without ``instance.name``
+  # fails to load with a clear ``TypeError``.
+  # ``aliases`` is the multi-instance router's accept list so phone
+  # autocorrect / voice-transcription variants still route correctly
+  # ("Salem" → S.A.L.E.M., "Pat" → Hypatia).
   instance:
-    name: "Alfred"
-    canonical: "Alfred"
-    aliases: []
+    name: "Salem"
+    canonical: "S.A.L.E.M."
+    aliases:
+      - "Salem"
     # Stage 3.5: which SKILL bundle to load at startup. Salem keeps the
     # default ``vault-talker``; KAL-LE overrides to ``vault-kalle`` in
     # ``config.kalle.yaml``. The bundle resolves to
