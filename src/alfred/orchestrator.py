@@ -458,7 +458,19 @@ def run_all(
     if only:
         tools = [t.strip() for t in only.split(",")]
     else:
-        tools = ["curator", "janitor", "distiller"]
+        # Configuration-by-presence: every daemon is opt-in by the presence
+        # of its top-level config block. KAL-LE's config.kalle.yaml omits
+        # curator/janitor/distiller (no inbox, no learn extraction); Salem's
+        # config has them all. Required daemons would error loudly here, but
+        # we currently have none — every tool can be absent on at least one
+        # instance roster (see `project_multi_instance_design.md`).
+        skipped: list[tuple[str, str]] = []
+        tools = []
+        for tool in ("curator", "janitor", "distiller"):
+            if tool in raw:
+                tools.append(tool)
+            else:
+                skipped.append((tool, "no_config_block"))
         # Only add surveyor if config section exists
         if "surveyor" in raw:
             tools.append("surveyor")
@@ -498,6 +510,12 @@ def run_all(
         # that don't write digests don't fire one.
         if "digest" in raw and (raw.get("digest") or {}).get("enabled"):
             tools.append("digest")
+
+        if skipped:
+            import structlog
+            _log = structlog.get_logger(__name__)
+            for tool_name, reason in skipped:
+                _log.info("orchestrator.daemon_skipped", tool=tool_name, reason=reason)
 
     # Validate tool names
     for tool in tools:

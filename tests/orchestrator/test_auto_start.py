@@ -145,18 +145,27 @@ def install_per_tool_fakes(
     return _install
 
 
-def test_default_starts_only_required_trio_when_no_optional_sections(
+def test_no_config_blocks_starts_no_daemons(
     orchestrator_raw_config, orch_dirs, fast_sleep,
     install_per_tool_fakes, fire_sentinel_after, capsys,
 ) -> None:
-    """Config with only required keys starts ONLY curator/janitor/distiller."""
+    """Configuration-by-presence: empty config (no tool blocks) spawns nothing.
+
+    KAL-LE's ``config.kalle.yaml`` is the live consumer of this contract —
+    it omits curator/janitor/distiller because that instance has no inbox
+    and no learn extraction. Starting them anyway crashed the daemons in
+    a 5-retry loop on missing-inbox FileNotFoundError.
+    """
     raw = orchestrator_raw_config
-    # No surveyor/mail/brief/telegram/instructor sections → those should NOT spawn.
+    # No tool sections present → nothing should auto-spawn.
     assert "surveyor" not in raw
     assert "mail" not in raw
     assert "brief" not in raw
     assert "telegram" not in raw
     assert "instructor" not in raw
+    assert "curator" not in raw
+    assert "janitor" not in raw
+    assert "distiller" not in raw
 
     _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
     install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
@@ -168,10 +177,39 @@ def test_default_starts_only_required_trio_when_no_optional_sections(
         pid_path=orch_dirs["pid_path"], live_mode=False,
     )
 
-    # The three required tools should have touched their start files.
-    # (Each fake exits fast, so the touch fires as the process wakes.)
-    # Allow extra time for filesystem visibility.
-    for _ in range(20):
+    # Give the orchestrator a moment to do nothing — we want to confirm no
+    # touch files appear, not catch a race on filesystem visibility.
+    for _ in range(10):
+        time.sleep(0.05)
+    started = _read_started_tools(orch_dirs["data"])
+    assert started == set(), f"expected no daemons, got {started}"
+
+
+def test_curator_janitor_distiller_blocks_trigger_their_starts(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """Adding ``curator:``/``janitor:``/``distiller:`` opts each into auto-start.
+
+    Symmetric to the surveyor / telegram / instructor presence tests —
+    each daemon now follows the same configuration-by-presence convention.
+    """
+    raw = orchestrator_raw_config
+    raw["curator"] = {}
+    raw["janitor"] = {}
+    raw["distiller"] = {}
+
+    _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
+    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
+                            for t in ALL_FAKES})
+
+    fire_sentinel_after(0.6)
+    orchestrator.run_all(
+        raw, only=None, skills_dir=orch_dirs["skills"],
+        pid_path=orch_dirs["pid_path"], live_mode=False,
+    )
+
+    for _ in range(30):
         started = _read_started_tools(orch_dirs["data"])
         if {"curator", "janitor", "distiller"}.issubset(started):
             break
@@ -180,11 +218,6 @@ def test_default_starts_only_required_trio_when_no_optional_sections(
     assert "curator" in started
     assert "janitor" in started
     assert "distiller" in started
-    assert "surveyor" not in started
-    assert "mail" not in started
-    assert "brief" not in started
-    assert "talker" not in started
-    assert "instructor" not in started
 
 
 def test_surveyor_section_triggers_surveyor_start(
