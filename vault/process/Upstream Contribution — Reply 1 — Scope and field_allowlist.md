@@ -1,8 +1,7 @@
 ---
 alfred_tags:
 - process/upstream-contribution
-- system-architecture
-- automation
+- system-monitoring
 created: '2026-04-21'
 distiller_learnings:
 - '[[decision/Peer Protocol v1 Is HTTP REST JSON Localhost-Only]]'
@@ -99,6 +98,40 @@ distiller_learnings:
 - '[[synthesis/Phishing Template Placeholder Failures Reveal Automated Bulk Generation]]'
 - '[[synthesis/Phishing Uses Fabricated Generic Service Names Alongside Real Brand
   Impersonation]]'
+- '[[decision/Health Check Aggregator Fans Out Concurrently via asyncio.gather]]'
+- '[[decision/Missing Tool Config Section Returns SKIP From Health Check]]'
+- '[[decision/BIT Aggregator Silently Skips Tool Modules Whose Optional Dependencies
+  Are Absent]]'
+- '[[decision/Morning Brief Re-Renders Latest BIT Record as a ## Health Section]]'
+- '[[synthesis/Shared Auth Probe Reduces Secret-Logging Surface From N Tools to One]]'
+- '[[synthesis/LLM Scope Drift Produces Plausible-Looking Diffs Indistinguishable
+  From Intentional Edits]]'
+- '[[synthesis/Cross-Tool Field Ownership Violations Surface Through Drift Investigations
+  Not Live Monitoring]]'
+- '[[decision/janitor_enrich Scope Denies Create Move and Delete Operations]]'
+- '[[decision/Telegram Chunker Targets 3800 Characters Per Message]]'
+- '[[decision/Outbound Server Enforces 250ms Inter-Message Floor]]'
+- '[[decision/Transport Auth Schema Is Dict Keyed by Peer Name]]'
+- '[[decision/ROUTE_NAMESPACES Constant Toggles 501 Stubs to Live Handlers]]'
+- '[[synthesis/Telegram Operational Limits Surface Immediately on First Real Push
+  Traffic]]'
+- '[[assumption/Sharing Talker Event Loop Preferable to a Separate Transport Daemon]]'
+- '[[decision/Peer-to-Peer Response Relay Prefixes Originating Instance Name]]'
+- '[[decision/KAL-LE Creates Pattern and Principle Record Types Exclusively]]'
+- '[[decision/Each Instance Owns Config State Logs and Telegram Bot Token]]'
+- '[[synthesis/Per-Instance Type Enforcement Reuses talker_types_only Rule Shape]]'
+- '[[decision/Safety-Critical Commits Require Per-Denylist-Item Test Assertion]]'
+- '[[decision/bash_exec cwd Allowlist Restricted to Four Repository Roots]]'
+- '[[decision/Bearer Token Per Peer Pair Stored in transport.auth.tokens]]'
+- '[[decision/--config Flag Applies to All alfred Subcommands]]'
+- '[[decision/Instructor Watcher Polls Vault at Sixty-Second Cadence]]'
+- '[[decision/Instructor Watcher Hash-Gates on Full File Bytes to Skip Unchanged Records]]'
+- '[[decision/Executed Instructor Directives Archive as Rolling Window of Five Entries]]'
+- '[[decision/Blocked Destructive Directive Records Refusal Reason in Archive Entry]]'
+- '[[synthesis/Subprocess Startup Cost Becomes Material for High-Frequency Daemon
+  Backends]]'
+- '[[synthesis/Reward Phishing Pairs Big-Box Retailer With Affiliated Premium Product
+  Brand]]'
 distiller_signals: constraint:1, contradiction:2
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
@@ -112,6 +145,20 @@ relationships:
   target: process/Upstream Contribution — Reply 2 — Outbound transport and Stage 3.5
     substrate.md
   target_anchor: Outbound transport Upstream
+  type: related-to
+- confidence: 0.75
+  context: Shared process topic
+  source: process/Upstream Contribution — Reply 1 — Scope and field_allowlist.md
+  source_anchor: Reply to Upstream Contribution
+  target: process/Upstream Contribution — Reply 3 — Instructor watcher.md
+  target_anchor: Instructor watcher
+  type: related-to
+- confidence: 0.8
+  context: Both mention Upstream Contribution process.
+  source: process/Upstream Contribution — Reply 1 — Scope and field_allowlist.md
+  source_anchor: field_allowlist for Upstream Contribution
+  target: process/Upstream Contribution — Reply 7 — BIT health check system.md
+  target_anchor: BIT health checks in Upstream Contribution
   type: related-to
 status: draft
 subtype: draft

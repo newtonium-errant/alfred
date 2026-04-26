@@ -1,8 +1,7 @@
 ---
 alfred_tags:
 - process/upstream-contribution
-- system-integration
-- user-interaction
+- system-monitoring
 created: '2026-04-22'
 distiller_learnings:
 - '[[synthesis/Coding Instance Is Architectural Substrate for Other Alfred Instances]]'
@@ -60,6 +59,11 @@ distiller_learnings:
 distiller_signals: constraint:2, contradiction:5
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: LINK001 — scanner false positive on YAML-escaped apostrophe; target
+  [[synthesis/Per-Tool Health Logs Dont Aggregate — Operator Inspection Scales Poorly
+  Without Uniform Primitive]] exists in vault (apostrophe escaped as `` in YAML).
+  FM001+DIR001 reported by scanner but per SKILL §3 these should be deterministic-flagged
+  in autofix.py; logging warning.
 project:
 - '[[project/Alfred]]'
 status: draft

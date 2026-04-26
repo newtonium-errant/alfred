@@ -1,4 +1,7 @@
 ---
+alfred_tags:
+- automation/logs
+- monitoring/runtime
 created: '2026-04-22'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — broken target [[process/Alfred BIT]]: no parent process record
@@ -9,6 +12,21 @@ mode: quick
 name: Alfred BIT 2026-04-22
 overall_status: warn
 process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-22.md
+  source_anchor: run Alfred BIT 2026-04-22
+  target: process/Alfred BIT 2026-04-23.md
+  target_anchor: run Alfred BIT 2026-04-23
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-22.md
+  source_anchor: run Alfred BIT 2026-04-22
+  target: process/Alfred BIT 2026-04-25.md
+  target_anchor: run Alfred BIT 2026-04-25
+  type: related-to
 started: '2026-04-22T05:55:01.711920-03:00'
 status: completed
 tags:

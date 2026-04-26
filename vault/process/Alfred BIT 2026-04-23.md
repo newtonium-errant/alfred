@@ -1,14 +1,35 @@
 ---
-type: run
-status: completed
-name: Alfred BIT 2026-04-23
-description: Alfred built-in test (health sweep)
-process: '[[process/Alfred BIT]]'
-trigger: scheduled
-started: '2026-04-23T05:55:02.388731-03:00'
+alfred_tags:
+- automation/logs
+- monitoring/runtime
 created: '2026-04-23'
-overall_status: warn
+description: Alfred built-in test (health sweep)
+janitor_note: LINK001 — [[process/Alfred BIT]] target does not exist. Only run records
+  (Alfred BIT YYYY-MM-DD, six entries 04-20 through 04-25) exist; the parent process
+  record was never created. Create the process record or update the link.
 mode: quick
+name: Alfred BIT 2026-04-23
+overall_status: warn
+process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-23.md
+  source_anchor: run Alfred BIT 2026-04-23
+  target: process/Alfred BIT 2026-04-25.md
+  target_anchor: run Alfred BIT 2026-04-25
+  type: related-to
+started: '2026-04-23T05:55:02.388731-03:00'
+status: completed
+tags:
+- bit
+- health
+- bit/warn
+tool_counts:
+  fail: 0
+  ok: 8
+  skip: 0
+  warn: 1
 tools_checked:
 - curator
 - janitor
@@ -19,15 +40,8 @@ tools_checked:
 - mail
 - talker
 - transport
-tool_counts:
-  ok: 8
-  warn: 1
-  fail: 0
-  skip: 0
-tags:
-- bit
-- health
-- bit/warn
+trigger: scheduled
+type: run
 ---
 
 # Alfred BIT 2026-04-23

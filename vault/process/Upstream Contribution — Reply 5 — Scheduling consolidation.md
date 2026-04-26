@@ -1,8 +1,7 @@
 ---
 alfred_tags:
 - process/upstream-contribution
-- system-architecture
-- automation
+- software/architecture
 created: '2026-04-21'
 distiller_learnings:
 - '[[decision/Peer Protocol v1 Is HTTP REST JSON Localhost-Only]]'

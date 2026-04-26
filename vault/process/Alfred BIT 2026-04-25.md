@@ -1,14 +1,24 @@
 ---
-type: run
-status: completed
-name: Alfred BIT 2026-04-25
-description: Alfred built-in test (health sweep)
-process: '[[process/Alfred BIT]]'
-trigger: scheduled
-started: '2026-04-25T13:01:42.668283-03:00'
+alfred_tags:
+- automation/logs
+- monitoring/runtime
 created: '2026-04-25'
-overall_status: warn
+description: Alfred built-in test (health sweep)
 mode: quick
+name: Alfred BIT 2026-04-25
+overall_status: warn
+process: '[[process/Alfred BIT]]'
+started: '2026-04-25T13:01:42.668283-03:00'
+status: completed
+tags:
+- bit
+- health
+- bit/warn
+tool_counts:
+  fail: 0
+  ok: 8
+  skip: 0
+  warn: 1
 tools_checked:
 - curator
 - janitor
@@ -19,15 +29,8 @@ tools_checked:
 - mail
 - talker
 - transport
-tool_counts:
-  ok: 8
-  warn: 1
-  fail: 0
-  skip: 0
-tags:
-- bit
-- health
-- bit/warn
+trigger: scheduled
+type: run
 ---
 
 # Alfred BIT 2026-04-25

@@ -1,7 +1,10 @@
 ---
-type: process
+alfred_tags:
+- process/upstream-contribution
+- software/architecture
 created: '2026-04-23'
-intent: Record the verbatim text Andrew sent to David Szabostuban (ssdavidai/alfred author) on 2026-04-23 as the prefatory check-in for the long-form fork retrospective.
+intent: Record the verbatim text Andrew sent to David Szabostuban (ssdavidai/alfred
+  author) on 2026-04-23 as the prefatory check-in for the long-form fork retrospective.
 project:
 - '[[project/Alfred]]'
 related:
@@ -12,6 +15,7 @@ tags:
 - contribution
 - outreach
 - sent
+type: process
 ---
 
 # Upstream Outreach Sent 2026-04-23

@@ -1,4 +1,7 @@
 ---
+alfred_tags:
+- software/development
+- architecture/multi-instance
 created: '2026-04-21'
 distiller_learnings:
 - '[[decision/Peer Protocol v1 Is HTTP REST JSON Localhost-Only]]'
@@ -150,8 +153,31 @@ distiller_learnings:
 distiller_signals: constraint:2, contradiction:5
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: 'LINK001 — three broken wikilinks in distiller_learnings: two are YAML-escape
+  false positives ([[decision/Salem Ghostwrites External Communications on Andrew\\s
+  Behalf]] and [[synthesis/Per-Tool Health Logs Don\\t Aggregate — Operator Inspection
+  Scales Poorly Without Uniform Primitive]] — both targets exist with single apostrophe),
+  one is a leading-slash artifact from record name ([[decision//extract Is Idempotent
+  with Delete-First Re-Run Contract]] — target exists at decision/extract Is Idempotent...md).
+  FM001/DIR001 also flagged by scanner but those codes are autofix-handled.'
 project:
 - '[[project/Alfred]]'
+relationships:
+- confidence: 0.85
+  context: Shared process topic
+  source: process/Upstream Contribution Report — Top Level.md
+  source_anchor: Upstream Contribution Report
+  target: process/Upstream Contribution — Reply 1 — Scope and field_allowlist.md
+  target_anchor: Reply to Upstream Contribution
+  type: related-to
+- confidence: 0.8
+  context: Shared reference to Upstream Contribution process
+  source: process/Upstream Contribution Report — Top Level.md
+  source_anchor: Upstream Contribution Report
+  target: process/Upstream Contribution — Reply 2 — Outbound transport and Stage 3.5
+    substrate.md
+  target_anchor: Outbound transport and Stage 3.5
+  type: related-to
 status: draft
 subtype: draft
 tags:
