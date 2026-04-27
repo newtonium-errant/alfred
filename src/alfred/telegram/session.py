@@ -17,6 +17,7 @@ tool blocks into one-line summaries so session records stay human-readable.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -124,6 +125,100 @@ def _persist(state: StateManager, session: Session) -> None:
 def _slug_from_dt(dt: datetime) -> str:
     """Produce ``YYYY-MM-DD HHMM`` slug used in the session record name."""
     return dt.strftime("%Y-%m-%d %H%M")
+
+
+def _slug_from_date(dt: datetime) -> str:
+    """Produce ``YYYY-MM-DD`` slug — used in Hypatia's mode-prefixed names."""
+    return dt.strftime("%Y-%m-%d")
+
+
+# Filename-safe slug: lowercase ASCII alphanumerics + dashes.
+_TOPIC_SLUG_KEEP = re.compile(r"[^a-z0-9-]+")
+
+
+def _slug_from_topic(text: str, *, max_words: int = 5) -> str:
+    """Derive a filename-safe slug from arbitrary text.
+
+    Used by Hypatia's mode-prefixed session names: takes the first
+    ``max_words`` whitespace-delimited tokens of ``text`` (lowercased,
+    non-alphanumerics dropped) and joins them with dashes. Empty input
+    returns ``"untitled"`` so a session opened without any user text
+    still produces a valid filename.
+    """
+    if not text:
+        return "untitled"
+    s = text.strip().lower()
+    if not s:
+        return "untitled"
+    # First N whitespace-delimited tokens.
+    tokens = s.split()[:max_words]
+    joined = "-".join(tokens)
+    # Drop everything that isn't a-z/0-9/-, then collapse runs and trim.
+    joined = _TOPIC_SLUG_KEEP.sub("", joined)
+    joined = re.sub(r"-{2,}", "-", joined).strip("-")
+    return joined or "untitled"
+
+
+def _first_user_text(transcript: list[dict[str, Any]]) -> str:
+    """Extract the first user turn's text content, for slug derivation.
+
+    Tolerates both string ``content`` and list-of-blocks ``content`` (the
+    Anthropic SDK shape for tool turns). Returns empty string when no
+    user turn is present or the first user turn has no text.
+    """
+    for turn in transcript:
+        if turn.get("role") != "user":
+            continue
+        content = turn.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    return str(block.get("text") or "")
+        return ""
+    return ""
+
+
+def _build_record_name(
+    session: Session,
+    *,
+    tool_set: str,
+    mode: str,
+) -> str:
+    """Pick the session-record filename per the instance's tool_set.
+
+    Salem (``tool_set="talker"``) and KAL-LE (``tool_set="kalle"``) keep
+    the wk1 ``Voice Session — <date> <time> <short-id>`` pattern.
+
+    Hypatia (``tool_set="hypatia"``) uses
+    ``<mode>-<YYYY-MM-DD>-<slug>`` per ``vault-hypatia/SKILL.md`` and
+    ``~/library-alexandria/CLAUDE.md``. ``mode`` is ``conversation`` or
+    ``capture``; ``slug`` is derived from the first user turn (first 5
+    words). A short id is appended to the slug to disambiguate same-day
+    sessions on the same opening cue — without it, two captures opened
+    with identical opening words would collide on ``vault_create``.
+    """
+    short_id = session.session_id.split("-")[0]
+    if tool_set == "hypatia":
+        slug = _slug_from_topic(_first_user_text(session.transcript))
+        return f"{mode}-{_slug_from_date(session.started_at)}-{slug}-{short_id}"
+    return f"Voice Session — {_slug_from_dt(session.started_at)} {short_id}"
+
+
+def _mode_from_session_type(session_type: str | None) -> str:
+    """Map Salem-side ``session_type`` to Hypatia's ``mode`` field.
+
+    Capture-mode sessions (``session_type="capture"``) become
+    ``mode: capture`` with ``processed: false`` so the "Unprocessed
+    captures" Bases view can read the queue. Everything else collapses
+    to ``conversation``. Phase 1 wiring — capture-mode triggering on
+    Hypatia is Phase 1B per ``project_hypatia_mvp.md``; this just keeps
+    the schema correct for it.
+    """
+    if (session_type or "").lower() == "capture":
+        return "capture"
+    return "conversation"
 
 
 # --- Public API ---
@@ -258,6 +353,7 @@ def resolve_on_startup(
                 session_type=raw.get("_session_type", "note"),
                 continues_from=raw.get("_continues_from"),
                 pushback_level=raw.get("_pushback_level"),
+                tool_set=raw.get("_tool_set", ""),
             )
             closed_paths.append(path)
         except Exception as exc:  # noqa: BLE001 — log and continue sweep
@@ -303,6 +399,7 @@ def check_timeouts(
                 session_type=raw.get("_session_type", "note"),
                 continues_from=raw.get("_continues_from"),
                 pushback_level=raw.get("_pushback_level"),
+                tool_set=raw.get("_tool_set", ""),
             )
             closed_paths.append(path)
         except Exception as exc:  # noqa: BLE001
@@ -324,6 +421,7 @@ def close_session(
     session_type: str = "note",
     continues_from: str | None = None,
     pushback_level: int | None = None,
+    tool_set: str = "",
 ) -> str:
     """Close the active session for ``chat_id`` and write a ``session/`` record.
 
@@ -333,6 +431,15 @@ def close_session(
     ``session_type`` / ``continues_from`` default to ``"note"`` / ``None`` so
     the timeout / shutdown close paths can fall back to the wk1 behaviour when
     the active dict was written before wk2 (``get("_session_type", "note")``).
+
+    ``tool_set`` selects per-instance session-save shape (filename pattern +
+    frontmatter fields). ``""``/``"talker"``/``"kalle"`` produce the wk1
+    ``Voice Session — ...`` filename; ``"hypatia"`` produces the
+    mode-prefixed ``conversation-<date>-<slug>`` / ``capture-<date>-<slug>``
+    filename plus Hypatia-specific ``mode``/``processed``/``extracted_to``
+    frontmatter fields per ``vault-hypatia/SKILL.md``. Default ``""``
+    preserves the prior behaviour for any legacy caller not yet
+    threading the field.
     """
     # Import here to avoid a circular import at module load (ops pulls in
     # frontmatter + yaml which are heavier).
@@ -344,6 +451,7 @@ def close_session(
 
     session = Session.from_dict(active_dict)
     ended_at = _now_utc()
+    mode = _mode_from_session_type(session_type)
 
     fm = _build_session_frontmatter(
         session,
@@ -354,13 +462,15 @@ def close_session(
         session_type=session_type,
         continues_from=continues_from,
         pushback_level=pushback_level,
+        tool_set=tool_set,
+        mode=mode,
     )
     body = _build_session_body(session)
 
     # Unique record name — collisions across multiple same-minute closes would
-    # otherwise fail vault_create, so append the short session id.
-    short_id = session.session_id.split("-")[0]
-    name = f"Voice Session — {_slug_from_dt(session.started_at)} {short_id}"
+    # otherwise fail vault_create, so the per-instance helpers append a
+    # short session id.
+    name = _build_record_name(session, tool_set=tool_set, mode=mode)
 
     vault_path = Path(vault_path_root)
     result = vault_ops.vault_create(
@@ -422,6 +532,8 @@ def _build_session_frontmatter(
     session_type: str = "note",
     continues_from: str | None = None,
     pushback_level: int | None = None,
+    tool_set: str = "",
+    mode: str = "conversation",
 ) -> dict[str, Any]:
     """Produce the ``session/`` record frontmatter.
 
@@ -436,16 +548,36 @@ def _build_session_frontmatter(
       filter on ``continues_from != null``.
     - ``telegram.model`` stays as-is (not renamed to ``model_used``) so wk1
       records and wk2 records share the same telemetry schema.
+
+    Per-instance shape (``tool_set``):
+    - ``"hypatia"`` adds Hypatia's contract from ``vault-hypatia/SKILL.md``
+      and ``~/library-alexandria/CLAUDE.md``: ``mode`` (``conversation`` or
+      ``capture``), ``processed`` (``false`` for capture queue, ``true``
+      for conversation), and ``extracted_to`` (placeholder list — populated
+      post-extraction by Hypatia herself when she creates downstream
+      concept/note/draft records).
+    - Salem (``"talker"``) and KAL-LE (``"kalle"``) emit the wk1 shape
+      unchanged so existing distiller/vault-reviewer queries keep working.
     """
     voice_count, text_count = _count_message_kinds(session)
     participants = [f"[[{user_vault_path}]]"] if user_vault_path else []
     outputs = [f"[[{op['path']}]]" for op in session.vault_ops]
-    slug = _slug_from_dt(session.started_at)
 
-    return {
+    # Hypatia uses the mode-prefixed name as the display name; Salem +
+    # KAL-LE keep ``Voice Session — <date>``.
+    if tool_set == "hypatia":
+        display_name = (
+            f"{mode.capitalize()} — "
+            f"{_slug_from_date(session.started_at)} "
+            f"{_slug_from_topic(_first_user_text(session.transcript))}"
+        )
+    else:
+        display_name = f"Voice Session — {_slug_from_dt(session.started_at)}"
+
+    fm: dict[str, Any] = {
         "type": "session",
         "status": "completed",
-        "name": f"Voice Session — {slug}",
+        "name": display_name,
         "created": session.started_at.date().isoformat(),
         "description": (
             f"Telegram talker session ({len(session.transcript)} turns, "
@@ -479,6 +611,26 @@ def _build_session_frontmatter(
             "pushback_level": pushback_level,
         },
     }
+
+    if tool_set == "hypatia":
+        # Per Hypatia SKILL spec + library-alexandria/CLAUDE.md: mode +
+        # processed gate the "Unprocessed captures" Bases view; capture
+        # sessions queue at ``processed: false`` until Hypatia runs the
+        # extraction pass on /extract. Conversation sessions go straight
+        # to ``processed: true`` (the structuring pass at close time IS
+        # the processing for conversations). ``extracted_to`` is an
+        # empty list placeholder; Hypatia populates it via vault_edit
+        # set_fields when she creates downstream records.
+        # ``duration_minutes`` is rounded — the spec ships round numbers
+        # for the Bases view "Stale drafts" / "Unprocessed captures"
+        # filters, and ended_at - started_at is the canonical source.
+        fm["mode"] = mode
+        fm["processed"] = (mode != "capture")
+        fm["extracted_to"] = []
+        elapsed = (ended_at - session.started_at).total_seconds()
+        fm["duration_minutes"] = max(0, round(elapsed / 60))
+
+    return fm
 
 
 def _count_message_kinds(session: Session) -> tuple[int, int]:

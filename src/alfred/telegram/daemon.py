@@ -472,6 +472,15 @@ async def run(
                         stt_model_used=stt_model,
                         session_type=raw_sess.get("_session_type", "note"),
                         continues_from=raw_sess.get("_continues_from"),
+                        # Per-instance session-save shape — prefer the
+                        # stash, fall back to live config so a session
+                        # opened before the field was stashed still
+                        # closes with the correct shape on shutdown.
+                        tool_set=(
+                            raw_sess.get("_tool_set")
+                            or config.instance.tool_set
+                            or ""
+                        ),
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
