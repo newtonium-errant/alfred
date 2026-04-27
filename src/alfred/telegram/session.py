@@ -180,6 +180,129 @@ def _first_user_text(transcript: list[dict[str, Any]]) -> str:
     return ""
 
 
+# --- Per-instance mode registry -----------------------------------------
+#
+# Each instance picks a session "mode" at close time. The mode becomes the
+# filename prefix (``<mode>-<date>-<slug>-<id>.md``) and, for Hypatia, also
+# lands as ``mode:`` in the frontmatter. The registry below is the single
+# source of truth for which prefixes each instance is allowed to emit;
+# extending an instance's mode set is a one-line change here.
+#
+# Order matters: the FIRST entry in each list is the instance's default
+# fallback when mode-resolution can't infer anything specific.
+INSTANCE_MODE_PREFIXES: dict[str, list[str]] = {
+    "talker": ["voice", "conversation", "capture"],   # Salem
+    "hypatia": ["conversation", "capture"],
+    "kalle": ["coding", "review"],
+}
+
+
+def _has_voice_user_turn(transcript: list[dict[str, Any]]) -> bool:
+    """True if any user turn was sent as voice (``_kind="voice"``).
+
+    Salem stamps ``_kind`` on every user turn at append time. A session
+    that received at least one voice message — even if the rest were
+    typed — is classified as a ``voice`` session. The voice/text counts
+    in ``_count_message_kinds`` use the same field, so this stays in
+    sync with the telemetry summary.
+    """
+    for turn in transcript:
+        if turn.get("role") != "user":
+            continue
+        if turn.get("_kind") == "voice":
+            return True
+    return False
+
+
+def _kalle_invoked_reviews(transcript: list[dict[str, Any]]) -> bool:
+    """True if any ``bash_exec`` tool call ran ``alfred reviews ...``.
+
+    KAL-LE drives the ``alfred reviews`` CLI through the ``bash_exec``
+    tool surface. Detection is a substring scan across all tool_use
+    blocks: any block named ``bash_exec`` whose ``input.command`` starts
+    with the ``alfred reviews`` prefix flips the session into ``review``
+    mode. False positives (e.g. a code block discussing the command in
+    plain text) are ignored — only structured tool_use blocks count.
+    """
+    for turn in transcript:
+        content = turn.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_use":
+                continue
+            if block.get("name") != "bash_exec":
+                continue
+            inp = block.get("input") or {}
+            cmd = (inp.get("command") or "").strip().lower()
+            # Tolerate leading whitespace and the ``alfred reviews``
+            # subcommand variants (``write``, ``list``, ``read``,
+            # ``mark-addressed``) — substring match on the command head.
+            if cmd.startswith("alfred reviews"):
+                return True
+    return False
+
+
+def _resolve_mode_for_instance(
+    tool_set: str,
+    session: Session,
+    session_type: str | None,
+) -> str:
+    """Pick the session ``mode`` for the given instance + transcript.
+
+    Branches on ``tool_set`` to apply per-instance auto-detection:
+
+    - **Salem** (``"talker"``): ``capture`` if the bot stashed
+      ``session_type="capture"`` (the ``/capture`` opener), else
+      ``voice`` if any user turn was sent as voice, else
+      ``conversation``.
+    - **Hypatia** (``"hypatia"``): ``capture`` if ``session_type=="capture"``,
+      else ``conversation``. Same shape as wk2 ``_mode_from_session_type``
+      to keep existing Hypatia behaviour unchanged.
+    - **KAL-LE** (``"kalle"``): ``review`` if any ``bash_exec`` tool
+      call ran ``alfred reviews ...``, else ``coding``.
+    - Unknown / empty ``tool_set``: return ``""``. The caller's
+      filename builder maps this to the wk1 ``Voice Session — ...``
+      shape so legacy code paths (callers not threaded with
+      ``tool_set``) keep working.
+
+    Ambiguous cases default to the instance's first-listed prefix —
+    e.g. a Salem session with no voice turns and no ``/capture`` becomes
+    ``conversation`` (not ``voice``); detection has to *prove* the more
+    specific mode.
+    """
+    prefixes = INSTANCE_MODE_PREFIXES.get(tool_set)
+    if prefixes is None:
+        return ""
+
+    st = (session_type or "").lower()
+
+    if tool_set == "talker":
+        if st == "capture":
+            return "capture"
+        if _has_voice_user_turn(session.transcript):
+            return "voice"
+        return "conversation"
+
+    if tool_set == "hypatia":
+        if st == "capture":
+            return "capture"
+        return "conversation"
+
+    if tool_set == "kalle":
+        if _kalle_invoked_reviews(session.transcript):
+            return "review"
+        return "coding"
+
+    # Registered tool_set without a dedicated branch — fall back to the
+    # first-listed prefix so adding a new instance to the registry
+    # always produces a well-formed filename even before its
+    # detector is wired.
+    return prefixes[0]
+
+
 def _build_record_name(
     session: Session,
     *,
@@ -188,19 +311,21 @@ def _build_record_name(
 ) -> str:
     """Pick the session-record filename per the instance's tool_set.
 
-    Salem (``tool_set="talker"``) and KAL-LE (``tool_set="kalle"``) keep
-    the wk1 ``Voice Session — <date> <time> <short-id>`` pattern.
+    All instances registered in :data:`INSTANCE_MODE_PREFIXES` use the
+    mode-prefixed pattern ``<mode>-<YYYY-MM-DD>-<slug>-<short-id>``
+    (per ``vault-hypatia/SKILL.md`` and ``~/library-alexandria/CLAUDE.md``,
+    now generalized as the project-wide convention). ``slug`` is derived
+    from the first user turn (first 5 words). The short id keeps same-day
+    sessions on the same opening cue from colliding on ``vault_create``.
 
-    Hypatia (``tool_set="hypatia"``) uses
-    ``<mode>-<YYYY-MM-DD>-<slug>`` per ``vault-hypatia/SKILL.md`` and
-    ``~/library-alexandria/CLAUDE.md``. ``mode`` is ``conversation`` or
-    ``capture``; ``slug`` is derived from the first user turn (first 5
-    words). A short id is appended to the slug to disambiguate same-day
-    sessions on the same opening cue — without it, two captures opened
-    with identical opening words would collide on ``vault_create``.
+    Unknown / empty ``tool_set`` falls back to the wk1
+    ``Voice Session — <date> <time> <short-id>`` filename so legacy
+    callers (any code path not yet threaded with ``tool_set``) and
+    pre-existing vault records stay readable. Existing legacy session
+    files are NEVER renamed — backward compat is load-bearing.
     """
     short_id = session.session_id.split("-")[0]
-    if tool_set == "hypatia":
+    if tool_set in INSTANCE_MODE_PREFIXES:
         slug = _slug_from_topic(_first_user_text(session.transcript))
         return f"{mode}-{_slug_from_date(session.started_at)}-{slug}-{short_id}"
     return f"Voice Session — {_slug_from_dt(session.started_at)} {short_id}"
@@ -212,9 +337,9 @@ def _mode_from_session_type(session_type: str | None) -> str:
     Capture-mode sessions (``session_type="capture"``) become
     ``mode: capture`` with ``processed: false`` so the "Unprocessed
     captures" Bases view can read the queue. Everything else collapses
-    to ``conversation``. Phase 1 wiring — capture-mode triggering on
-    Hypatia is Phase 1B per ``project_hypatia_mvp.md``; this just keeps
-    the schema correct for it.
+    to ``conversation``. Retained as a thin shim around the
+    Hypatia-specific branch of :func:`_resolve_mode_for_instance` for
+    callers that only have a session_type string in hand (no transcript).
     """
     if (session_type or "").lower() == "capture":
         return "capture"
@@ -451,7 +576,10 @@ def close_session(
 
     session = Session.from_dict(active_dict)
     ended_at = _now_utc()
-    mode = _mode_from_session_type(session_type)
+    # Per-instance mode resolution: registered tool_sets infer mode from
+    # transcript + session_type; unknown/empty tool_set returns "" and
+    # the wk1 ``Voice Session — ...`` filename is used.
+    mode = _resolve_mode_for_instance(tool_set, session, session_type)
 
     fm = _build_session_frontmatter(
         session,
@@ -550,24 +678,32 @@ def _build_session_frontmatter(
       records and wk2 records share the same telemetry schema.
 
     Per-instance shape (``tool_set``):
-    - ``"hypatia"`` adds Hypatia's contract from ``vault-hypatia/SKILL.md``
-      and ``~/library-alexandria/CLAUDE.md``: ``mode`` (``conversation`` or
-      ``capture``), ``processed`` (``false`` for capture queue, ``true``
-      for conversation), and ``extracted_to`` (placeholder list — populated
-      post-extraction by Hypatia herself when she creates downstream
-      concept/note/draft records).
-    - Salem (``"talker"``) and KAL-LE (``"kalle"``) emit the wk1 shape
-      unchanged so existing distiller/vault-reviewer queries keep working.
+    - All registered instances (``INSTANCE_MODE_PREFIXES``) use the
+      mode-prefixed display name ``<Mode> — <date> <slug>``.
+    - ``"hypatia"`` additionally adds her ``/extract``-workflow fields
+      (``mode`` / ``processed`` / ``extracted_to`` / ``duration_minutes``)
+      per ``vault-hypatia/SKILL.md`` and ``~/library-alexandria/CLAUDE.md``.
+      Salem and KAL-LE deliberately do NOT gain those fields — they're
+      tied to Hypatia's capture queue and would cause Bases-view drift
+      on the other vaults.
+    - Unknown / empty ``tool_set`` falls back to ``Voice Session —
+      <date>`` for backward compat with wk1 records.
     """
     voice_count, text_count = _count_message_kinds(session)
     participants = [f"[[{user_vault_path}]]"] if user_vault_path else []
     outputs = [f"[[{op['path']}]]" for op in session.vault_ops]
 
-    # Hypatia uses the mode-prefixed name as the display name; Salem +
-    # KAL-LE keep ``Voice Session — <date>``.
-    if tool_set == "hypatia":
+    # Display name mirrors the filename pattern: registered instances
+    # (talker, hypatia, kalle) use ``<Mode> — <date> <slug>``; legacy /
+    # unknown tool_sets keep ``Voice Session — <date> <time>`` for
+    # backward compat with wk1 records.
+    if tool_set in INSTANCE_MODE_PREFIXES:
+        # ``mode`` may be empty if the caller passed an unregistered
+        # tool_set string by mistake — fall back to the instance's
+        # first-listed prefix so the display name stays well-formed.
+        display_mode = mode or INSTANCE_MODE_PREFIXES[tool_set][0]
         display_name = (
-            f"{mode.capitalize()} — "
+            f"{display_mode.capitalize()} — "
             f"{_slug_from_date(session.started_at)} "
             f"{_slug_from_topic(_first_user_text(session.transcript))}"
         )

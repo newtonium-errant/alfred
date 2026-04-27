@@ -1,13 +1,17 @@
 """Tests for per-instance session-save naming and frontmatter shape.
 
 The talker writes a ``session/`` record on close. The filename pattern
-and frontmatter contract differ by instance ``tool_set``:
+follows ``<mode>-<YYYY-MM-DD>-<slug>-<short-id>`` for every registered
+instance (``INSTANCE_MODE_PREFIXES`` in ``session.py``); the per-instance
+mode set is the only thing that varies. Hypatia additionally adds
+``mode``, ``processed``, ``extracted_to`` to the frontmatter — those
+fields are tied to her ``/extract`` workflow and stay Hypatia-only.
 
-- Salem (``"talker"``) and KAL-LE (``"kalle"``) keep the wk1
-  ``Voice Session — <date> <time> <short-id>`` pattern.
-- Hypatia (``"hypatia"``) uses ``<mode>-<YYYY-MM-DD>-<slug>-<short-id>``
-  per ``vault-hypatia/SKILL.md`` and ``~/library-alexandria/CLAUDE.md``,
-  and the frontmatter adds ``mode``, ``processed``, ``extracted_to``.
+Legacy / unknown ``tool_set`` (any code path not yet threaded with
+the field, plus pre-existing vault records) keeps the wk1
+``Voice Session — <date> <time> <short-id>`` pattern. Existing
+session files on disk are NEVER renamed — backward compat is
+load-bearing.
 
 These tests exercise both layers — the pure ``_build_record_name`` /
 ``_build_session_frontmatter`` helpers AND the full ``close_session``
@@ -47,25 +51,29 @@ def _make_session(**overrides) -> Session:
 # --- Filename pattern ---------------------------------------------------
 
 
-def test_salem_filename_keeps_wk1_voice_session_pattern() -> None:
-    """``tool_set="talker"`` → ``Voice Session — <date> <time> <short-id>``.
+def test_salem_filename_uses_mode_prefixed_pattern() -> None:
+    """``tool_set="talker"`` → ``<mode>-<date>-<slug>-<short-id>``.
 
-    Regression guard: Salem's existing convention must not change. Distiller
-    queries and `closed_sessions` parsing both expect this exact prefix.
+    Salem migrated off the wk1 ``Voice Session — ...`` shape when the
+    per-instance mode-prefixed pattern was generalized across all
+    registered instances. Legacy session files on disk keep their
+    original filenames — only NEW sessions follow this pattern.
     """
     sess = _make_session()
     name = talker_session._build_record_name(
         sess, tool_set="talker", mode="conversation",
     )
-    assert name == "Voice Session — 2026-04-26 2136 17cfdecd"
+    assert name == "conversation-2026-04-26-thinking-out-loud-about-the-17cfdecd"
 
 
-def test_salem_filename_default_tool_set_unchanged() -> None:
-    """Empty ``tool_set`` (legacy/no-config callers) preserves Salem shape.
+def test_salem_filename_default_tool_set_uses_legacy_pattern() -> None:
+    """Empty ``tool_set`` (legacy/no-config callers) preserves wk1 shape.
 
-    Default arg path — ``close_session`` calls without explicit ``tool_set``
-    must still produce the wk1 filename so any code path that hasn't been
-    threaded yet doesn't silently shift Salem records into Hypatia's shape.
+    Default arg path — any code path not yet threaded with ``tool_set``
+    must still produce the wk1 filename so callers don't silently shift
+    into the new pattern before they've been audited. Pre-existing
+    legacy session files (``Voice Session — ...``) on disk also stay
+    readable through this branch.
     """
     sess = _make_session()
     name = talker_session._build_record_name(
@@ -74,13 +82,17 @@ def test_salem_filename_default_tool_set_unchanged() -> None:
     assert name.startswith("Voice Session — ")
 
 
-def test_kalle_filename_uses_voice_session_pattern() -> None:
-    """KAL-LE inherits Salem's filename pattern (no separate spec)."""
+def test_kalle_filename_uses_mode_prefixed_pattern() -> None:
+    """``tool_set="kalle"`` uses her own mode set (``coding`` / ``review``)."""
     sess = _make_session()
-    name = talker_session._build_record_name(
-        sess, tool_set="kalle", mode="conversation",
+    name_coding = talker_session._build_record_name(
+        sess, tool_set="kalle", mode="coding",
     )
-    assert name == "Voice Session — 2026-04-26 2136 17cfdecd"
+    name_review = talker_session._build_record_name(
+        sess, tool_set="kalle", mode="review",
+    )
+    assert name_coding == "coding-2026-04-26-thinking-out-loud-about-the-17cfdecd"
+    assert name_review == "review-2026-04-26-thinking-out-loud-about-the-17cfdecd"
 
 
 def test_hypatia_filename_uses_mode_prefixed_slug_pattern() -> None:
@@ -142,6 +154,149 @@ def test_mode_from_session_type_other_types_are_conversation() -> None:
     """All non-capture types collapse to ``conversation``."""
     for t in ("note", "task", "journal", "article", "brainstorm", "", None):
         assert talker_session._mode_from_session_type(t) == "conversation"
+
+
+# --- Per-instance mode resolution ---------------------------------------
+
+
+def test_resolve_mode_salem_text_only_is_conversation() -> None:
+    """Salem text-only session (no voice, no capture) → ``conversation``."""
+    sess = _make_session(transcript=[
+        {"role": "user", "content": "hi", "_kind": "text"},
+    ])
+    mode = talker_session._resolve_mode_for_instance("talker", sess, "note")
+    assert mode == "conversation"
+
+
+def test_resolve_mode_salem_voice_session_is_voice() -> None:
+    """Any voice user turn flips the Salem mode to ``voice``."""
+    sess = _make_session(transcript=[
+        {"role": "user", "content": "hi", "_kind": "voice"},
+    ])
+    mode = talker_session._resolve_mode_for_instance("talker", sess, "note")
+    assert mode == "voice"
+
+
+def test_resolve_mode_salem_mixed_text_and_voice_is_voice() -> None:
+    """Even one voice user turn alongside text turns → ``voice``."""
+    sess = _make_session(transcript=[
+        {"role": "user", "content": "first", "_kind": "text"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "second", "_kind": "voice"},
+    ])
+    mode = talker_session._resolve_mode_for_instance("talker", sess, "note")
+    assert mode == "voice"
+
+
+def test_resolve_mode_salem_capture_wins_over_voice() -> None:
+    """``session_type="capture"`` short-circuits the voice check.
+
+    The ``/capture`` opener is an explicit user signal — even if the
+    capture happened to be voice-driven, the ``mode`` is ``capture``
+    (not ``voice``) so the routing/queue logic stays aligned with the
+    session_type.
+    """
+    sess = _make_session(transcript=[
+        {"role": "user", "content": "ramble", "_kind": "voice"},
+    ])
+    mode = talker_session._resolve_mode_for_instance("talker", sess, "capture")
+    assert mode == "capture"
+
+
+def test_resolve_mode_kalle_default_is_coding() -> None:
+    """KAL-LE without an ``alfred reviews`` invocation → ``coding``."""
+    sess = _make_session(transcript=[
+        {"role": "user", "content": "fix the build"},
+    ])
+    mode = talker_session._resolve_mode_for_instance("kalle", sess, "task")
+    assert mode == "coding"
+
+
+def test_resolve_mode_kalle_reviews_invocation_is_review() -> None:
+    """KAL-LE session that ran ``alfred reviews ...`` → ``review``."""
+    sess = _make_session(transcript=[
+        {"role": "user", "content": "check the PR review queue"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "running it now"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "bash_exec",
+                    "input": {
+                        "command": "alfred reviews list --project alfred",
+                        "cwd": "/home/andrew/alfred",
+                    },
+                },
+            ],
+        },
+    ])
+    mode = talker_session._resolve_mode_for_instance("kalle", sess, "task")
+    assert mode == "review"
+
+
+def test_resolve_mode_kalle_reviews_only_in_text_does_not_count() -> None:
+    """A literal mention of ``alfred reviews`` in plain text doesn't count.
+
+    Detection is anchored on ``tool_use`` blocks named ``bash_exec`` —
+    a transcript that merely *talks about* the command (e.g. KAL-LE
+    explaining the workflow) stays in ``coding`` mode.
+    """
+    sess = _make_session(transcript=[
+        {
+            "role": "assistant",
+            "content": "you can run `alfred reviews list` to check the queue",
+        },
+    ])
+    mode = talker_session._resolve_mode_for_instance("kalle", sess, "task")
+    assert mode == "coding"
+
+
+def test_resolve_mode_hypatia_default_is_conversation() -> None:
+    """Hypatia without ``capture`` session_type → ``conversation``."""
+    sess = _make_session()
+    mode = talker_session._resolve_mode_for_instance("hypatia", sess, "note")
+    assert mode == "conversation"
+
+
+def test_resolve_mode_hypatia_capture_is_capture() -> None:
+    """Hypatia ``session_type="capture"`` → ``capture``."""
+    sess = _make_session()
+    mode = talker_session._resolve_mode_for_instance(
+        "hypatia", sess, "capture",
+    )
+    assert mode == "capture"
+
+
+def test_resolve_mode_unknown_tool_set_returns_empty() -> None:
+    """Unregistered ``tool_set`` returns ``""`` so the wk1 filename is used.
+
+    This is the load-bearing escape hatch: any caller that hasn't been
+    threaded with a registered ``tool_set`` keeps writing legacy-shaped
+    records, never silently shifting to the new pattern with a wrong
+    mode.
+    """
+    sess = _make_session()
+    assert talker_session._resolve_mode_for_instance("", sess, "note") == ""
+    assert (
+        talker_session._resolve_mode_for_instance("nope", sess, "note") == ""
+    )
+
+
+def test_instance_mode_prefixes_registry_locked() -> None:
+    """Lock the per-instance prefix registry — additions need a deliberate edit.
+
+    Reading: any change here is a contract-breaking change (a new
+    instance, or a new mode prefix on an existing instance). This test
+    is the audit trail — touching it in a PR is a flag for the
+    code-reviewer to check the matching SKILL / CLAUDE.md updates.
+    """
+    assert talker_session.INSTANCE_MODE_PREFIXES == {
+        "talker": ["voice", "conversation", "capture"],
+        "hypatia": ["conversation", "capture"],
+        "kalle": ["coding", "review"],
+    }
 
 
 # --- Slug helper ---------------------------------------------------------
@@ -358,14 +513,14 @@ def test_close_session_hypatia_writes_mode_prefixed_record(
     assert post["telegram"]["model"] == "claude-opus-4-7"
 
 
-def test_close_session_salem_keeps_voice_session_filename(
+def test_close_session_salem_text_only_uses_conversation_prefix(
     state_mgr, talker_config
 ) -> None:
-    """Regression: Salem close_session still writes ``Voice Session — ...``.
+    """Salem text-only session lands at ``conversation-<date>-<slug>-<id>``.
 
-    The default ``talker_config`` fixture has ``InstanceConfig.tool_set ==
-    "talker"`` — exercise the Salem path end-to-end so a future change
-    that defaults differently fails this test loudly.
+    Mode auto-detection: no voice user turns + no ``capture`` session_type
+    → ``conversation`` (the instance's first-listed prefix after ``voice``,
+    used as the catch-all default).
     """
     chat_id = 100
     now = datetime(2026, 4, 26, 21, 36, tzinfo=timezone.utc)
@@ -376,7 +531,8 @@ def test_close_session_salem_keeps_voice_session_filename(
         "started_at": now.isoformat(),
         "last_message_at": now.isoformat(),
         "model": "claude-sonnet-4-6",
-        "transcript": [{"role": "user", "content": "hi"}],
+        # Text-only — no ``_kind="voice"`` markers anywhere.
+        "transcript": [{"role": "user", "content": "hi there old friend"}],
         "vault_ops": [],
         "_vault_path_root": talker_config.vault.path,
         "_user_vault_path": "person/Andrew Newton",
@@ -398,24 +554,108 @@ def test_close_session_salem_keeps_voice_session_filename(
         tool_set="talker",
     )
 
-    assert rel_path == "session/Voice Session — 2026-04-26 2136 deadbeef.md"
+    assert rel_path == (
+        "session/conversation-2026-04-26-hi-there-old-friend-deadbeef.md"
+    )
 
     record = Path(talker_config.vault.path) / rel_path
     post = frontmatter.load(str(record))
-    # Salem records keep wk1 shape — no Hypatia-specific fields.
+    # Salem records do NOT gain Hypatia-specific fields — those stay
+    # tied to the ``/extract`` workflow.
     assert "mode" not in post.metadata
     assert "processed" not in post.metadata
     assert "extracted_to" not in post.metadata
 
 
-def test_close_session_kalle_keeps_voice_session_filename(
+def test_close_session_salem_voice_uses_voice_prefix(
     state_mgr, talker_config
 ) -> None:
-    """KAL-LE's ``tool_set="kalle"`` also keeps the wk1 filename.
+    """Salem session with at least one voice user turn → ``voice-...``."""
+    chat_id = 110
+    now = datetime(2026, 4, 26, 21, 36, tzinfo=timezone.utc)
 
-    KAL-LE has its own bash_exec tool surface, but session naming is
-    shared with Salem — there's no KAL-LE-specific spec for it. This
-    test makes that decision explicit.
+    active = {
+        "session_id": "v0iceabc-0000-0000-0000-000000000000",
+        "chat_id": chat_id,
+        "started_at": now.isoformat(),
+        "last_message_at": now.isoformat(),
+        "model": "claude-sonnet-4-6",
+        "transcript": [
+            {
+                "role": "user",
+                "content": "rambling about the Q2 plan",
+                "_kind": "voice",
+            },
+        ],
+        "vault_ops": [],
+        "_vault_path_root": talker_config.vault.path,
+        "_user_vault_path": "person/Andrew Newton",
+        "_stt_model_used": "whisper-large-v3",
+        "_session_type": "note",
+        "_tool_set": "talker",
+    }
+    state_mgr.set_active(chat_id, active)
+    state_mgr.save()
+
+    rel_path = talker_session.close_session(
+        state_mgr,
+        vault_path_root=talker_config.vault.path,
+        chat_id=chat_id,
+        reason="explicit",
+        user_vault_path="person/Andrew Newton",
+        stt_model_used="whisper-large-v3",
+        session_type="note",
+        tool_set="talker",
+    )
+
+    assert rel_path.startswith("session/voice-2026-04-26-rambling-about-the")
+
+
+def test_close_session_salem_capture_uses_capture_prefix(
+    state_mgr, talker_config
+) -> None:
+    """Salem ``/capture`` session lands at ``capture-...``."""
+    chat_id = 111
+    now = datetime(2026, 4, 26, 21, 36, tzinfo=timezone.utc)
+
+    active = {
+        "session_id": "cap7e000-0000-0000-0000-000000000000",
+        "chat_id": chat_id,
+        "started_at": now.isoformat(),
+        "last_message_at": now.isoformat(),
+        "model": "claude-sonnet-4-6",
+        "transcript": [{"role": "user", "content": "thinking aloud now"}],
+        "vault_ops": [],
+        "_vault_path_root": talker_config.vault.path,
+        "_user_vault_path": "person/Andrew Newton",
+        "_stt_model_used": "whisper-large-v3",
+        "_session_type": "capture",
+        "_tool_set": "talker",
+    }
+    state_mgr.set_active(chat_id, active)
+    state_mgr.save()
+
+    rel_path = talker_session.close_session(
+        state_mgr,
+        vault_path_root=talker_config.vault.path,
+        chat_id=chat_id,
+        reason="explicit",
+        user_vault_path="person/Andrew Newton",
+        stt_model_used="whisper-large-v3",
+        session_type="capture",
+        tool_set="talker",
+    )
+
+    assert rel_path.startswith("session/capture-2026-04-26-")
+
+
+def test_close_session_kalle_default_uses_coding_prefix(
+    state_mgr, talker_config
+) -> None:
+    """KAL-LE without an ``alfred reviews`` call → ``coding-...``.
+
+    KAL-LE's first-listed mode is ``coding``; that's the default
+    fallback when mode-resolution can't infer a more specific mode.
     """
     chat_id = 101
     now = datetime(2026, 4, 26, 21, 36, tzinfo=timezone.utc)
@@ -426,7 +666,7 @@ def test_close_session_kalle_keeps_voice_session_filename(
         "started_at": now.isoformat(),
         "last_message_at": now.isoformat(),
         "model": "claude-opus-4-7",
-        "transcript": [{"role": "user", "content": "fix the build"}],
+        "transcript": [{"role": "user", "content": "fix the build please"}],
         "vault_ops": [],
         "_vault_path_root": talker_config.vault.path,
         "_user_vault_path": "person/Andrew Newton",
@@ -448,7 +688,67 @@ def test_close_session_kalle_keeps_voice_session_filename(
         tool_set="kalle",
     )
 
-    assert rel_path == "session/Voice Session — 2026-04-26 2136 cafe0001.md"
+    assert rel_path == (
+        "session/coding-2026-04-26-fix-the-build-please-cafe0001.md"
+    )
+
+
+def test_close_session_kalle_review_uses_review_prefix(
+    state_mgr, talker_config
+) -> None:
+    """KAL-LE session that ran ``alfred reviews`` → ``review-...``."""
+    chat_id = 112
+    now = datetime(2026, 4, 26, 21, 36, tzinfo=timezone.utc)
+
+    active = {
+        "session_id": "rev1ew00-0000-0000-0000-000000000000",
+        "chat_id": chat_id,
+        "started_at": now.isoformat(),
+        "last_message_at": now.isoformat(),
+        "model": "claude-opus-4-7",
+        # Mid-session tool_use — KAL-LE called ``alfred reviews list``
+        # via bash_exec. The block shape mirrors what the SDK actually
+        # produces for Anthropic-format tool turns.
+        "transcript": [
+            {"role": "user", "content": "check the alfred PR feedback"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "let me check"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_01",
+                        "name": "bash_exec",
+                        "input": {
+                            "command": "alfred reviews list --project alfred",
+                            "cwd": "/home/andrew/alfred",
+                        },
+                    },
+                ],
+            },
+        ],
+        "vault_ops": [],
+        "_vault_path_root": talker_config.vault.path,
+        "_user_vault_path": "person/Andrew Newton",
+        "_stt_model_used": "whisper-large-v3",
+        "_session_type": "task",
+        "_tool_set": "kalle",
+    }
+    state_mgr.set_active(chat_id, active)
+    state_mgr.save()
+
+    rel_path = talker_session.close_session(
+        state_mgr,
+        vault_path_root=talker_config.vault.path,
+        chat_id=chat_id,
+        reason="explicit",
+        user_vault_path="person/Andrew Newton",
+        stt_model_used="whisper-large-v3",
+        session_type="task",
+        tool_set="kalle",
+    )
+
+    assert rel_path.startswith("session/review-2026-04-26-")
 
 
 def test_close_session_hypatia_capture_writes_processed_false(
