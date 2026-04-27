@@ -32,6 +32,7 @@ import frontmatter
 from alfred.vault import ops
 
 from . import capture_batch
+from ._anthropic_compat import messages_create_kwargs
 from .state import StateManager
 from .utils import get_logger
 
@@ -443,7 +444,7 @@ async def _call_extract_llm(
         "a standalone note."
     )
 
-    response = await client.messages.create(
+    response = await client.messages.create(**messages_create_kwargs(
         model=model,
         max_tokens=4096,
         temperature=0.3,
@@ -457,7 +458,7 @@ async def _call_extract_llm(
         messages=[{"role": "user", "content": user_content}],
         tools=[_EXTRACT_TOOL],
         tool_choice={"type": "auto"},
-    )
+    ))
 
     content = getattr(response, "content", None) or []
     notes: list[dict[str, Any]] = []

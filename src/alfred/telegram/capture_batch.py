@@ -34,6 +34,7 @@ from typing import Any, Final
 
 from alfred.vault import ops
 
+from ._anthropic_compat import messages_create_kwargs
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -184,7 +185,7 @@ async def run_batch_structuring(
         "Emit the structured summary via the emit_structured_summary tool."
     )
 
-    response = await client.messages.create(
+    response = await client.messages.create(**messages_create_kwargs(
         model=model,
         max_tokens=2048,
         temperature=0.2,
@@ -198,7 +199,7 @@ async def run_batch_structuring(
         messages=[{"role": "user", "content": user_content}],
         tools=[_BATCH_TOOL_SCHEMA],
         tool_choice={"type": "tool", "name": "emit_structured_summary"},
-    )
+    ))
 
     content = getattr(response, "content", None) or []
     tool_input: dict[str, Any] | None = None

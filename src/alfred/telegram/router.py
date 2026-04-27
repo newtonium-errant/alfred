@@ -34,6 +34,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from ._anthropic_compat import messages_create_kwargs
 from .session_types import (
     ROUTER_MODEL,
     SessionTypeDefaults,
@@ -444,7 +445,7 @@ async def classify_opening_cue(
     )
 
     try:
-        response = await client.messages.create(
+        response = await client.messages.create(**messages_create_kwargs(
             model=ROUTER_MODEL,
             max_tokens=256,
             # Low temperature — classification, not creative writing. A
@@ -452,7 +453,7 @@ async def classify_opening_cue(
             # ("always classify as note") without the noise of ``1.0``.
             temperature=0.2,
             messages=[{"role": "user", "content": prompt}],
-        )
+        ))
     except Exception as exc:  # noqa: BLE001 — network / SDK failures mustn't crash the bot
         log.warning("talker.router.api_error", error=str(exc))
         return _fallback_decision("api_error")

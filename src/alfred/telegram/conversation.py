@@ -22,6 +22,7 @@ from typing import Any, Final
 
 import anthropic
 
+from ._anthropic_compat import messages_create_kwargs
 from .config import TalkerConfig
 from .session import Session, append_turn, append_vault_op
 from .state import StateManager
@@ -1090,17 +1091,14 @@ async def run_turn(
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         try:
-            create_kwargs: dict[str, Any] = {
-                "model": session.model,
-                "max_tokens": config.anthropic.max_tokens,
-                "system": system_blocks,
-                "messages": _messages_for_api(session.transcript),
-                "tools": instance_tools,
-            }
-            # Opus 4.x deprecated the ``temperature`` param. Omit it for
-            # Opus models; keep it for Sonnet/Haiku/older Claude families.
-            if not session.model.startswith("claude-opus-"):
-                create_kwargs["temperature"] = config.anthropic.temperature
+            create_kwargs = messages_create_kwargs(
+                model=session.model,
+                max_tokens=config.anthropic.max_tokens,
+                temperature=config.anthropic.temperature,
+                system=system_blocks,
+                messages=_messages_for_api(session.transcript),
+                tools=instance_tools,
+            )
             response = await client.messages.create(**create_kwargs)
         except anthropic.APIError:
             # Surface to caller — bot.py translates to a user-facing reply.

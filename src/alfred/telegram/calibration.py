@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
+from ._anthropic_compat import messages_create_kwargs
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -232,12 +233,12 @@ async def propose_updates(
     )
 
     try:
-        response = await client.messages.create(
+        response = await client.messages.create(**messages_create_kwargs(
             model=model,
             max_tokens=1024,
             temperature=0.2,
             messages=[{"role": "user", "content": prompt}],
-        )
+        ))
     except Exception as exc:  # noqa: BLE001
         log.warning("talker.calibration.propose_api_error", error=str(exc))
         return []

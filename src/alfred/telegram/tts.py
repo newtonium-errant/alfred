@@ -26,6 +26,7 @@ from typing import Any, Final
 
 import httpx
 
+from ._anthropic_compat import messages_create_kwargs
 from .config import TtsConfig
 from .utils import get_logger
 
@@ -264,12 +265,12 @@ async def compress_summary_for_tts(
     prompt = _COMPRESS_PROMPT.format(
         word_target=word_target, summary=summary_markdown or "(empty)"
     )
-    response = await client.messages.create(
+    response = await client.messages.create(**messages_create_kwargs(
         model=model,
         max_tokens=2048,
         temperature=0.5,
         messages=[{"role": "user", "content": prompt}],
-    )
+    ))
     content = getattr(response, "content", None) or []
     parts: list[str] = []
     for block in content:
