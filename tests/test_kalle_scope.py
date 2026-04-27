@@ -88,20 +88,41 @@ def test_talker_scope_rejects_principle_type():
 
 
 def test_talker_create_types_shape():
-    """Talker's creatable set — refreshed 2026-04-26 to include ``person``.
+    """Talker's creatable set — refreshed 2026-04-25 with five new types.
 
     ``person`` was added 2026-04-21 after Salem created a stub ``note`` for
     a new person Andrew named, when the canonical record should have been
-    a ``person`` record. The previous version of this test still asserted
-    the pre-04-21 set and was effectively a stale snapshot — flagged in
-    ``feedback_hardcoding_and_alfred_naming.md`` as the kind of stale
-    fixture that hides real divergence.
+    a ``person`` record. ``org``, ``location``, ``project``, ``constraint``,
+    and ``contradiction`` were added 2026-04-25 after Salem repeatedly hit
+    the scope wall on new businesses and addresses mid-conversation, and
+    to round out the kick-off + reflection surface. The two-gate design
+    keeps these to canonical types only — the per-instance leak guards
+    below confirm KAL-LE / Hypatia stay separate.
     """
     assert TALKER_CREATE_TYPES == {
         "task", "note", "decision", "event",
         "session", "conversation", "assumption", "synthesis",
         "person",
+        "org", "location", "project", "constraint", "contradiction",
     }
+
+
+def test_kalle_scope_still_rejects_org():
+    """Per-instance leak guard: 2026-04-25 widened Salem only.
+
+    ``org`` was added to ``TALKER_CREATE_TYPES`` so Salem stops hitting
+    the scope wall when Andrew names a new business mid-conversation.
+    KAL-LE operates on the aftermath-lab vault and has no use for org
+    records — confirm the new type didn't leak across instances.
+    """
+    with pytest.raises(ScopeError, match="kalle types"):
+        check_scope("kalle", "create", record_type="org")
+
+
+def test_kalle_scope_still_rejects_location():
+    """Per-instance leak guard: ``location`` is talker-only for now."""
+    with pytest.raises(ScopeError, match="kalle types"):
+        check_scope("kalle", "create", record_type="location")
 
 
 def test_kalle_create_types_shape():

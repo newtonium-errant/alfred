@@ -202,10 +202,21 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
 # ``person`` was added 2026-04-21 after Salem created a ``note`` stub for
 # "Alex Newton" instead of a ``person`` record — when Andrew names a new
 # person, the canonical record is a ``person/`` record, not a generic note.
+#
+# ``org`` and ``location`` were added 2026-04-25 after Salem repeatedly
+# hit the scope wall when Andrew named a new business or address mid-
+# conversation. ``project``, ``constraint``, and ``contradiction`` were
+# added in the same change as forward-looking additions: ``project`` is
+# legitimately conversational (Andrew often kicks off a new initiative
+# in voice); ``constraint`` and ``contradiction`` are learn types that
+# Salem may surface during reflection when the distiller hasn't yet
+# caught up. The two-gate design (``_validate_type`` + per-scope
+# allowlist) keeps these types canonical-only.
 TALKER_CREATE_TYPES: set[str] = {
     "task", "note", "decision", "event",
     "session", "conversation", "assumption", "synthesis",
     "person",
+    "org", "location", "project", "constraint", "contradiction",
 }
 
 

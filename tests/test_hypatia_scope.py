@@ -80,6 +80,20 @@ def test_hypatia_scope_create_denies_kalle_types() -> None:
             check_scope("hypatia", "create", record_type=t)
 
 
+def test_hypatia_scope_still_rejects_org_and_location() -> None:
+    """Per-instance leak guard: 2026-04-25 widened Salem only.
+
+    ``org`` and ``location`` were added to ``TALKER_CREATE_TYPES`` so
+    Salem stops hitting the scope wall when Andrew names a new
+    business or address mid-conversation. Hypatia operates on the
+    library-alexandria vault — entity records aren't her territory.
+    Confirm the new types didn't leak across instances.
+    """
+    for t in ("org", "location"):
+        with pytest.raises(ScopeError, match="hypatia types"):
+            check_scope("hypatia", "create", record_type=t)
+
+
 def test_hypatia_scope_edit_permitted_with_no_fields_check() -> None:
     """``edit: True`` (not a field allowlist) — passes without fields arg."""
     check_scope("hypatia", "edit")
@@ -258,6 +272,29 @@ def test_vault_create_extension_type_without_scope_still_fails(
     assert "Unknown type" in str(exc_info.value)
     # No scope hint — the error should look like the pre-fix message.
     assert "under scope" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "record_type",
+    ["org", "location", "project", "constraint", "contradiction"],
+)
+def test_vault_create_each_new_talker_type_succeeds(
+    tmp_path, record_type: str,
+) -> None:
+    """Talker-scope widening 2026-04-25: five new types succeed end-to-end.
+
+    Salem repeatedly hit the scope wall on ``org`` and ``location`` when
+    Andrew named a new business or address mid-conversation. ``project``,
+    ``constraint``, and ``contradiction`` round out the kick-off +
+    reflection surface. All five are canonical types — they pass
+    ``_validate_type`` (no extension needed) and ``check_scope``'s
+    ``talker_types_only`` allowlist (extended for this commit).
+    """
+    (tmp_path / record_type).mkdir()
+    result = vault_create(
+        tmp_path, record_type, f"Test {record_type}", scope="talker",
+    )
+    assert (tmp_path / result["path"]).exists()
 
 
 def test_vault_create_canonical_type_under_hypatia_scope_works(

@@ -34,9 +34,11 @@ def test_talker_create_allows_whitelisted_type():
 
 
 def test_talker_create_denies_non_whitelisted_type():
-    # ``project`` is intentionally NOT in TALKER_CREATE_TYPES.
+    # ``input`` is intentionally NOT in TALKER_CREATE_TYPES — those are
+    # curator-side records produced from raw inbox material, never by
+    # Salem mid-conversation.
     with pytest.raises(ScopeError, match="talker types"):
-        check_scope("talker", "create", record_type="project")
+        check_scope("talker", "create", record_type="input")
 
 
 def test_talker_create_allows_person():
@@ -46,20 +48,37 @@ def test_talker_create_allows_person():
     check_scope("talker", "create", record_type="person")
 
 
-def test_talker_create_still_denies_org():
-    # Guard the narrow widening: ``person`` was added but other entity
-    # types stay denied. Org records are created by the curator from
-    # email signatures + Stage 3 enrichment, not by Salem mid-conversation.
-    with pytest.raises(ScopeError, match="talker types"):
-        check_scope("talker", "create", record_type="org")
+def test_talker_create_allows_org():
+    # Added 2026-04-25: Salem creates org records when Andrew names a
+    # new business mid-conversation (e.g. "Re/Generate Spa"). Previously
+    # she fell back to ``note`` or hit the scope wall.
+    check_scope("talker", "create", record_type="org")
 
 
-def test_talker_create_still_denies_project():
-    # Project records are structurally committal — the talker SKILL
-    # explicitly defers them. Confirm widening to ``person`` didn't
-    # accidentally open the gate to ``project`` as well.
-    with pytest.raises(ScopeError, match="talker types"):
-        check_scope("talker", "create", record_type="project")
+def test_talker_create_allows_location():
+    # Added 2026-04-25: Salem creates location records when Andrew
+    # names a new address or place (e.g. "8736 Commercial St New
+    # Minas"). Previously she fell back to ``note`` or hit the wall.
+    check_scope("talker", "create", record_type="location")
+
+
+def test_talker_create_allows_project():
+    # Added 2026-04-25: Andrew often kicks off a new initiative in
+    # voice; Salem now creates the ``project`` record rather than
+    # parking it as a generic note.
+    check_scope("talker", "create", record_type="project")
+
+
+def test_talker_create_allows_constraint():
+    # Added 2026-04-25: ``constraint`` is a learn type Salem may surface
+    # during reflection when the distiller hasn't yet caught up.
+    check_scope("talker", "create", record_type="constraint")
+
+
+def test_talker_create_allows_contradiction():
+    # Added 2026-04-25: ``contradiction`` is a learn type Salem may
+    # surface during reflection when the distiller hasn't yet caught up.
+    check_scope("talker", "create", record_type="contradiction")
 
 
 # ---- field_allowlist (janitor edit, the new Option E rule) ------------------
