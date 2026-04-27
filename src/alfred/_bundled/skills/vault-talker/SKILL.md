@@ -101,6 +101,48 @@ For exact frontmatter shapes beyond these headline fields, trust the CLI — it 
 
 **Only save what Andrew actually said to save.** If he said "make a task to do X," create one task. Don't also create a note recapping the decision, an event for the due date, and a related-link to a project he didn't mention. One intent, one record.
 
+### Entity discrimination — default to NEW, not SAME
+
+When this session references a known entity (person, building, org, project, location), **default to treating it as a NEW reference unless Andrew explicitly identifies it as the SAME as a prior known entity.** A name that overlaps with a recently-discussed record is not the same record. Same context (a clinic move, the same partner) does not imply same entity.
+
+If the reference is ambiguous, surface the ambiguity rather than collapsing it onto the most-recent record. Either ask in chat (*"Is that the Wayne Fowler / Greenwood building, or a new property?"*) or — when the structuring pass is running over a transcript without a live channel — leave the entity reference abstract in structured output and flag it as an open question.
+
+**Worked examples**
+
+GOOD — explicit SAME signal:
+
+> Andrew: "I'm calling Wayne Fowler again about the Greenwood building."
+> Salem: links to existing `person/Wayne Fowler.md` and `[[location/Wayne Fowler Greenwood Building]]` because Andrew named both explicitly.
+
+GOOD — explicit NEW signal:
+
+> Andrew: "Looking at a new commercial property in New Minas, 8736 Commercial St, landlord Hussein Rafih."
+> Salem: creates `person/Hussein Rafih.md` and `location/8736 Commercial St New Minas.md` as NEW entities. Does NOT link to Wayne Fowler / Greenwood despite the same Jamie / clinic context running through both sessions.
+
+BAD — over-application of prior context:
+
+> Andrew: "Jamie's NP practice is moving into a commercial space, lease starts May 15."
+> Wrong: structures as *"Jamie's NP practice moving into Wayne Fowler / Greenwood building"* because that was the most recently discussed building.
+> Right: structures as *"Jamie's NP practice moving into [unspecified commercial space, lease May 15]"* — leaves the building reference abstract, surfaces the ambiguity: *"Is this the Wayne Fowler / Greenwood building, or a new property?"*
+
+The exact-name dedup rule (near-match conflicts on create) is covered in **Error recovery** below — that's a separate signal. Entity discrimination is about not *introducing* a wrong link in the first place.
+
+---
+
+## Correction attribution
+
+When you correct a record, the right move depends on **who made the original mistake**.
+
+- **User-attributed error** (Andrew gave wrong info originally): **correct in-place** with `set_fields` or a body rewrite. Wrong facts propagate to briefs, digests, surveyor relationships, distiller learnings if left in the source. Overwrite, don't preserve.
+- **LLM-attributed error** (you recorded incorrectly from accurate input): **preserve the original content + append a correction note**. The wrong content is debugging-signal data — it lets Andrew see what got mis-inferred. Don't overwrite; annotate.
+- **Either way**: the correction note explicitly states attribution. *"The error was Andrew's — original input had the wrong date"* OR *"Salem mis-inferred from accurate input."* Unattributed corrections are silent signals; future readers can't tell which case it was.
+
+If you can't tell which case applies, ask one short clarifying question: *"Was the original info wrong, or did I record it wrong?"* The transcript or source record usually resolves it without asking — compare what Andrew said to what got written.
+
+**Periodic cleanup**: when correction annotations stack up at the bottom of a record over multiple passes, drop the redundant ones once one canonical note covers them. Don't accumulate annotation cruft. Do this opportunistically as part of any other edit on the same record.
+
+The full pattern, discriminator logic, and worked examples live in `~/.claude/projects/-home-andrew-alfred/memory/feedback_correction_attribution_pattern.md`.
+
 ---
 
 ## Peer routing (Stage 3.5)

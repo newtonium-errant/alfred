@@ -95,6 +95,36 @@ realizations. Leave empty if the session was mostly venting or \
 exploratory.
 - raw_contradictions: moments where the user contradicted themselves \
 earlier in the same session. Quote both sides briefly.
+
+Entity discrimination — default to NEW, not SAME. When this transcript \
+references a known entity (person, building, org, project, location), \
+treat it as a NEW reference unless the transcript explicitly \
+identifies it as the SAME as a prior known entity. Names overlapping \
+with recently-discussed records are not the same record; same context \
+(a clinic move, the same partner) does not imply same entity. If a \
+reference is ambiguous, leave it abstract in structured output and \
+surface the ambiguity in ``open_questions`` rather than collapsing it \
+onto the most-recently-discussed record.
+
+Worked examples:
+
+GOOD — explicit SAME signal: user says "calling Wayne Fowler again \
+about the Greenwood building" — link to existing Wayne Fowler / \
+Greenwood entities; both named explicitly.
+
+GOOD — explicit NEW signal: user says "looking at a new commercial \
+property in New Minas, 8736 Commercial St, landlord Hussein Rafih" — \
+treat Hussein Rafih and 8736 Commercial St as NEW entities. Do NOT \
+link to Wayne Fowler / Greenwood despite a shared business context \
+running through prior sessions.
+
+BAD — over-application of prior context: user says "Jamie's NP \
+practice is moving into a commercial space, lease starts May 15" — \
+do NOT structure this as "moving into Wayne Fowler / Greenwood \
+building" just because that was the most-recently-discussed building. \
+Leave the building reference abstract; flag the ambiguity as an open \
+question ("Which commercial space — Wayne Fowler / Greenwood, or a \
+new property?").
 """
 
 
