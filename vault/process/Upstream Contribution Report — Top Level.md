@@ -150,7 +150,41 @@ distiller_learnings:
 - '[[decision/Andrew Uses Pen Name and Distinct Handle for Upstream Open-Source Identity]]'
 - '[[decision/sleep_until Helper Bounds Wall-Clock Schedule Drift to One Chunk]]'
 - '[[synthesis/Curator Emits Relationship Duplicates by Varying Target Path Type-Prefix]]'
-distiller_signals: constraint:2, contradiction:5
+- '[[synthesis/Frontmatter-Only Allowlist Can Be Sidestepped Via Body Write Paths]]'
+- '[[decision/Vault Edit CLI Owns Field Set Computation Before check_scope Delegation]]'
+- '[[decision/ElevenLabs Speed Preference Scoped Per Instance Per User and Tracked
+  on Person Records]]'
+- '[[decision/Telegram reply_to_message Propagated Through Router as Classifier Hint]]'
+- '[[synthesis/Three Vault-Tool Drift Sources Shared a Resampling-Disguised-As-Diff
+  Pattern]]'
+- '[[assumption/Fork Use Case Diversity Drives Stronger Upstream Signal Than Single-Instance
+  Use]]'
+- '[[synthesis/Live Handler Activation Avoids Server Refactor When Stubs Share File
+  Auth and Config]]'
+- '[[assumption/Uniform Egress Observation Required for Cross-Instance and BIT Visibility]]'
+- '[[decision/KAL-LE Sequenced Before STAY-C to Validate Multi-Instance Architecture
+  on Low-Stakes Specialist]]'
+- '[[decision/Per-Instance pid_path and skill_bundle Fields Make Orchestrator State
+  and SKILL File Instance-Local]]'
+- '[[synthesis/Path.resolve Before is_relative_to Defeats Symlink Escape From cwd
+  Allowlist]]'
+- '[[assumption/E-Transfer Programmatic Sending Requires Three to Six Months Minimum
+  Effort]]'
+- '[[synthesis/LinkedIn Connection Notifications Fragment Into Per-Instance Records
+  Despite Identical Content]]'
+- '[[synthesis/Cloud Storage Phishing Campaign Rotates Sending Infrastructure Across
+  Stable Template]]'
+- '[[synthesis/Email Preheader Teaser Survives HTML-to-Text Conversion While Body
+  Is Lost]]'
+- '[[synthesis/Phishing Sender Local-Part Uses Generic Notification Word With Random
+  Numeric Suffix]]'
+- '[[synthesis/Curator Assigns Conflicting Confidence Scores to Duplicate Relationship
+  Entries for Same Target]]'
+- '[[synthesis/Patreon Creator Post Notifications Defeat HTML-to-Text Extraction Like
+  Substack]]'
+- '[[synthesis/Curator Assigns Maximum Confidence to Demonstrably False Relationship
+  Context Claims]]'
+distiller_signals: constraint:2, contradiction:6
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
 janitor_note: 'LINK001 — three broken wikilinks in distiller_learnings: two are YAML-escape

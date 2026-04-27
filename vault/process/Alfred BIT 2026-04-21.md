@@ -1,14 +1,56 @@
 ---
-type: run
-status: completed
-name: Alfred BIT 2026-04-21
-description: Alfred built-in test (health sweep)
-process: '[[process/Alfred BIT]]'
-trigger: scheduled
-started: '2026-04-21T05:54:32.316184-03:00'
+alfred_tags:
+- alfred/bit
+- automation/logs
 created: '2026-04-21'
-overall_status: ok
+description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — broken wikilink [[process/Alfred BIT]] in process: field;
+  parent process record does not exist in vault. Either create process/Alfred BIT.md
+  (out of janitor scope — janitor cannot create) or remove the process: link.'
 mode: quick
+name: Alfred BIT 2026-04-21
+overall_status: ok
+process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-21.md
+  source_anchor: run Alfred BIT 2026-04-21
+  target: process/Alfred BIT 2026-04-22.md
+  target_anchor: run Alfred BIT 2026-04-22
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-21.md
+  source_anchor: run Alfred BIT 2026-04-21
+  target: process/Alfred BIT 2026-04-23.md
+  target_anchor: run Alfred BIT 2026-04-23
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-21.md
+  source_anchor: run Alfred BIT 2026-04-21
+  target: process/Alfred BIT 2026-04-25.md
+  target_anchor: run Alfred BIT 2026-04-25
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-21.md
+  source_anchor: run Alfred BIT 2026-04-21
+  target: process/Alfred BIT 2026-04-26.md
+  target_anchor: run Alfred BIT 2026-04-26
+  type: related-to
+started: '2026-04-21T05:54:32.316184-03:00'
+status: completed
+tags:
+- bit
+- health
+- bit/ok
+tool_counts:
+  fail: 0
+  ok: 9
+  skip: 0
+  warn: 0
 tools_checked:
 - curator
 - janitor
@@ -19,15 +61,8 @@ tools_checked:
 - mail
 - talker
 - transport
-tool_counts:
-  ok: 9
-  warn: 0
-  fail: 0
-  skip: 0
-tags:
-- bit
-- health
-- bit/ok
+trigger: scheduled
+type: run
 ---
 
 # Alfred BIT 2026-04-21
