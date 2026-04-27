@@ -596,6 +596,29 @@ async def run_watch(
                 # Structural-only sweep
                 await run_sweep(config, state, skills_dir, structural_only=True, fix_mode=False)
 
+            # SUPERSEDED-marker sweep — pure-Python, deterministic,
+            # runs after every tick regardless of whether the deep or
+            # structural-only branch fired above. Pairs Salem-style
+            # correction notes (``<!-- SUPERSEDES: inf-XXX -->``) with
+            # the referenced inferred block by adding a back-pointer
+            # marker. Only LLM-attributed corrections get marked;
+            # user-attributed corrections were fixed in-place per the
+            # memo's rule and don't need this annotation.
+            try:
+                from .superseded_marker import run_superseded_marker_sweep
+                sm_result = run_superseded_marker_sweep(config, apply=True)
+                if sm_result.marked or sm_result.orphaned:
+                    log.info(
+                        "daemon.superseded_marker_summary",
+                        marked=sm_result.marked,
+                        already_marked=sm_result.skipped_already_marked,
+                        user_attributed=sm_result.skipped_user_attributed,
+                        ambiguous=sm_result.skipped_ambiguous,
+                        orphaned=sm_result.orphaned,
+                    )
+            except Exception:
+                log.exception("daemon.superseded_marker_failed")
+
             # Drift sweep (weekly by default)
             hours_since_drift = (now - last_drift).total_seconds() / 3600
             if hours_since_drift >= drift_interval_hours:
