@@ -84,11 +84,18 @@ log = structlog.get_logger(__name__)
 # Match a SUPERSEDES reference inside an HTML comment.
 # Captures the full ``inf-YYYYMMDD-agent-hash`` ID.
 #
+# The trailing ``[\w-]+`` accepts hyphens so hyphenated agent names
+# (``kal-le``, ``stay-c``) round-trip correctly. Mirrors the canonical
+# ``_BEGIN_RE`` shape in ``alfred.vault.attribution`` (which uses
+# ``[\w-]+`` for the same reason). The two regexes drifted on day one
+# — see the regression test for ``make_marker_id("kal-le", ...)`` and
+# ``make_marker_id("stay-c", ...)`` round-tripping through this regex.
+#
 # Tolerates either end form (``-->`` may be on a separate line in the
 # wild, but the brief's spec is single-line — we keep the regex
 # single-line for now).
 _SUPERSEDES_RE = re.compile(
-    r"<!--\s*SUPERSEDES:\s*(?P<inf_id>inf-\d{8}-[\w]+-[\w]+)\s*-->"
+    r"<!--\s*SUPERSEDES:\s*(?P<inf_id>inf-\d{8}-[\w-]+)\s*-->"
 )
 
 # Match the BEGIN_INFERRED opening for a specific marker_id. We rebuild
@@ -166,7 +173,13 @@ class SupersededMarkerCandidate:
     ``correction_id`` is the back-pointer label we'll embed.
     ``attribution`` is one of ``"agent"`` (LLM-attributed → mark),
     ``"user"`` (user-attributed → skip), or ``"unknown"`` (ambiguous
-    → skip with warning).
+    → skip with warning). The orphaned-vs-located status is tracked
+    separately on ``is_orphaned`` so the attribution domain stays
+    closed at three values.
+    ``is_orphaned`` is True when the agent-attributed correction's
+    ``inf-XXX`` block can't be located in the same record (broken
+    back-reference). Counted, logged, and surfaced in
+    ``result.candidates`` for triage but no marker is written.
     """
 
     record_path: str
@@ -174,6 +187,7 @@ class SupersededMarkerCandidate:
     inf_id: str
     correction_id: str
     attribution: str
+    is_orphaned: bool = False
 
 
 @dataclass
@@ -418,8 +432,10 @@ def _scan_record(
         # this record and isn't already marked for this correction.
         begin_idx = _find_begin_inferred_line(lines, inf_id)
         if begin_idx is None:
-            # Orphaned → counted by caller after we return.
-            candidate.attribution = "orphaned"
+            # Orphaned → counted by caller after we return. Attribution
+            # stays ``"agent"`` so downstream consumers can still see
+            # *why* we'd have marked it had the block been findable.
+            candidate.is_orphaned = True
             candidates.append(candidate)
             continue
 
@@ -542,7 +558,7 @@ def run_superseded_marker_sweep(
         result.skipped_ambiguous += ambiguous
 
         for candidate in candidates:
-            if candidate.attribution == "orphaned":
+            if candidate.is_orphaned:
                 result.orphaned += 1
                 log.warning(
                     "janitor.superseded.orphaned_reference",

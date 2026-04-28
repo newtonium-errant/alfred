@@ -442,3 +442,64 @@ def test_classify_attribution_unknown_when_silent():
 
     assert _classify_attribution("see updated info below.") == "unknown"
     assert _classify_attribution("") == "unknown"
+
+
+# --- Regex contract: hyphenated agent names round-trip --------------------
+
+
+def test_supersedes_regex_matches_hyphenated_agent_marker_ids():
+    """Lock the contract between ``vault.attribution.make_marker_id`` and
+    ``janitor.superseded_marker._SUPERSEDES_RE``.
+
+    The two regexes have already drifted on day one (the janitor's
+    pre-fix shape ``inf-\\d{8}-[\\w]+-[\\w]+`` requires exactly two
+    segments after the date and silently rejects hyphenated agents
+    like ``kal-le`` and ``stay-c``). This test asserts that an ID
+    produced by the canonical builder for hyphenated agent names
+    round-trips through the janitor's SUPERSEDES regex.
+
+    If the two regexes drift again, this test fires.
+    """
+    from datetime import datetime, timezone
+
+    from alfred.janitor.superseded_marker import _SUPERSEDES_RE
+    from alfred.vault.attribution import make_marker_id
+
+    fixed_date = datetime(2026, 4, 27, tzinfo=timezone.utc)
+    for agent in ("kal-le", "stay-c", "salem", "h-y-p"):
+        marker_id = make_marker_id(agent, "fixture content body", date=fixed_date)
+        comment = f"<!-- SUPERSEDES: {marker_id} -->"
+        m = _SUPERSEDES_RE.search(comment)
+        assert m is not None, f"failed to match {marker_id!r}"
+        assert m.group("inf_id") == marker_id
+
+
+def test_hyphenated_agent_correction_adds_marker_end_to_end(tmp_vault: Path):
+    """End-to-end: a KAL-LE-attributed correction note with a SUPERSEDES
+    pointing at an inf-id whose agent slug is hyphenated must produce
+    a marker, not silently no-op.
+
+    Pre-fix this test would fail with ``marked == 0`` because the
+    SUPERSEDES regex silently rejected the hyphenated agent slug.
+    """
+    inf_id = "inf-20260427-kal-le-abc123"
+    correction = (
+        "<!-- correction 2026-04-27: Mis-inference was KAL-LE's. "
+        f"<!-- SUPERSEDES: {inf_id} --> -->"
+    )
+    rec = _write(
+        tmp_vault,
+        "person/Hyphenated Agent.md",
+        _record_with_inferred_block(
+            inf_id=inf_id,
+            name="Hyphenated Agent",
+            correction=correction,
+        ),
+    )
+
+    result = run_superseded_marker_sweep(_config_for(tmp_vault), apply=True)
+
+    assert result.marked == 1, result.summary_line()
+    assert result.orphaned == 0
+    text = rec.read_text(encoding="utf-8")
+    assert "<!-- SUPERSEDED: see correction-" in text

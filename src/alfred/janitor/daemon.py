@@ -35,6 +35,7 @@ from .parser import parse_file
 from .pipeline import run_pipeline
 from .scanner import run_structural_scan
 from .state import JanitorState
+from .superseded_marker import run_superseded_marker_sweep
 from .utils import file_hash, get_logger
 
 log = get_logger(__name__)
@@ -605,7 +606,6 @@ async def run_watch(
             # user-attributed corrections were fixed in-place per the
             # memo's rule and don't need this annotation.
             try:
-                from .superseded_marker import run_superseded_marker_sweep
                 sm_result = run_superseded_marker_sweep(config, apply=True)
                 if sm_result.marked or sm_result.orphaned:
                     log.info(
