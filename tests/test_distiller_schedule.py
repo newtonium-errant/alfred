@@ -252,3 +252,58 @@ def test_consolidation_skips_non_sunday_even_after_long_gap() -> None:
     # Wednesday). This documents the catch-up semantics: a missed
     # window fires as soon as the daemon is up again.
     assert _would_fire(schedule, last_consolidation, wed_now)
+
+
+# ---------------------------------------------------------------------------
+# Config — top-level ``enabled`` opt-out flag
+# ---------------------------------------------------------------------------
+
+
+def test_distiller_enabled_defaults_to_true() -> None:
+    """``DistillerConfig`` defaults ``enabled=True`` so existing configs
+    stay untouched. The flag is purely additive — only flipping it to
+    ``false`` skips the daemon."""
+    cfg = DistillerConfig()
+    assert cfg.enabled is True
+
+
+def test_load_from_unified_reads_enabled_false(tmp_path: Path) -> None:
+    """``distiller: { enabled: false }`` parses to ``DistillerConfig(enabled=False)``.
+
+    Used by the orchestrator's auto-start gate to opt an instance out
+    of distiller without removing the entire config block.
+    """
+    raw: dict[str, Any] = {
+        "vault": {"path": str(tmp_path)},
+        "distiller": {
+            "enabled": False,
+            "state": {"path": str(tmp_path / "state.json")},
+        },
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.enabled is False
+
+
+def test_load_from_unified_enabled_absent_defaults_to_true(tmp_path: Path) -> None:
+    """Existing configs (no ``enabled`` key) keep daemon running."""
+    raw: dict[str, Any] = {
+        "vault": {"path": str(tmp_path)},
+        "distiller": {
+            "state": {"path": str(tmp_path / "state.json")},
+        },
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.enabled is True
+
+
+def test_load_from_unified_enabled_true_explicit(tmp_path: Path) -> None:
+    """Explicit ``enabled: true`` is the same as absent."""
+    raw: dict[str, Any] = {
+        "vault": {"path": str(tmp_path)},
+        "distiller": {
+            "enabled": True,
+            "state": {"path": str(tmp_path / "state.json")},
+        },
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.enabled is True

@@ -468,12 +468,26 @@ def run_all(
         tools = []
         for tool in ("curator", "janitor", "distiller"):
             if tool in raw:
+                # Honor explicit ``enabled: false`` opt-out (currently only
+                # wired for distiller — DistillerConfig.enabled). Block
+                # present but disabled = skip cleanly with a distinct
+                # reason so observers can tell intentional-off apart from
+                # block-absent.
+                block = raw.get(tool) or {}
+                if isinstance(block, dict) and block.get("enabled") is False:
+                    skipped.append((tool, "explicitly_disabled"))
+                    continue
                 tools.append(tool)
             else:
                 skipped.append((tool, "no_config_block"))
-        # Only add surveyor if config section exists
+        # Only add surveyor if config section exists AND not explicitly
+        # disabled. Symmetric to the distiller opt-out above.
         if "surveyor" in raw:
-            tools.append("surveyor")
+            surveyor_block = raw.get("surveyor") or {}
+            if isinstance(surveyor_block, dict) and surveyor_block.get("enabled") is False:
+                skipped.append(("surveyor", "explicitly_disabled"))
+            else:
+                tools.append("surveyor")
         # Only add mail webhook if config section exists
         if "mail" in raw:
             tools.append("mail")

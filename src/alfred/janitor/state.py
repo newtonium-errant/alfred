@@ -63,8 +63,15 @@ class JanitorState:
         with open(self.state_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         self.version = raw.get("version", 1)
+        # Tolerate unknown legacy fields. Mirrors the ``distiller/state.py``
+        # and ``surveyor/state.py`` forward-compat pattern: filtering on
+        # ``__dataclass_fields__`` keeps load() compatible with older or
+        # newer schemas, and protects against accidental cross-tool path
+        # collisions (e.g. surveyor state ever landing here via a shared
+        # default path).
+        file_known = set(FileState.__dataclass_fields__.keys())
         for rel, fdata in raw.get("files", {}).items():
-            self.files[rel] = FileState(**fdata)
+            self.files[rel] = FileState(**{k: v for k, v in fdata.items() if k in file_known})
         for sid, sdata in raw.get("sweeps", {}).items():
             self.sweeps[sid] = SweepResult.from_dict(sdata)
         self.fix_log = [FixLogEntry.from_dict(e) for e in raw.get("fix_log", [])]

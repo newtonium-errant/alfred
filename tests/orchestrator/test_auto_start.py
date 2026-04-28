@@ -220,6 +220,78 @@ def test_curator_janitor_distiller_blocks_trigger_their_starts(
     assert "distiller" in started
 
 
+def test_distiller_enabled_false_skips_start(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """``distiller: { enabled: false }`` opts an instance OUT of distiller
+    auto-start even though the block is present.
+
+    Distinct from "no_config_block": this is the explicit-disable case
+    used by instances (e.g. KAL-LE before Phase 1) that want to declare
+    distiller off intentionally rather than implicitly.
+    """
+    raw = orchestrator_raw_config
+    raw["curator"] = {}      # should still start
+    raw["janitor"] = {}      # should still start
+    raw["distiller"] = {"enabled": False}  # opted out
+
+    _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
+    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
+                            for t in ALL_FAKES})
+
+    fire_sentinel_after(0.6)
+    orchestrator.run_all(
+        raw, only=None, skills_dir=orch_dirs["skills"],
+        pid_path=orch_dirs["pid_path"], live_mode=False,
+    )
+
+    # Wait for curator/janitor to start (proves the orchestrator ran),
+    # then assert distiller did NOT.
+    for _ in range(30):
+        started = _read_started_tools(orch_dirs["data"])
+        if {"curator", "janitor"}.issubset(started):
+            break
+        time.sleep(0.05)
+
+    assert "curator" in started, f"curator should start, got {started}"
+    assert "janitor" in started, f"janitor should start, got {started}"
+    assert "distiller" not in started, (
+        f"distiller should be skipped via enabled=false, got {started}"
+    )
+
+
+def test_surveyor_enabled_false_skips_start(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """``surveyor: { enabled: false }`` opts out symmetrically to distiller."""
+    raw = orchestrator_raw_config
+    raw["curator"] = {}      # should still start
+    raw["surveyor"] = {"enabled": False}
+
+    _wire_touch_files(raw, orch_dirs, list(ALL_FAKES))
+    install_per_tool_fakes({t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
+                            for t in ALL_FAKES})
+
+    fire_sentinel_after(0.5)
+    orchestrator.run_all(
+        raw, only=None, skills_dir=orch_dirs["skills"],
+        pid_path=orch_dirs["pid_path"], live_mode=False,
+    )
+
+    for _ in range(30):
+        started = _read_started_tools(orch_dirs["data"])
+        if "curator" in started:
+            break
+        time.sleep(0.05)
+
+    assert "curator" in started
+    assert "surveyor" not in started, (
+        f"surveyor should be skipped via enabled=false, got {started}"
+    )
+
+
 def test_surveyor_section_triggers_surveyor_start(
     orchestrator_raw_config, orch_dirs, fast_sleep,
     install_per_tool_fakes, fire_sentinel_after,

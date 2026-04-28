@@ -227,6 +227,103 @@ def test_surveyor_state_roundtrip(state_path: Path) -> None:
     assert reloaded.pending_writes == {"note/Three.md": "hpending"}
 
 
+def test_surveyor_state_load_tolerates_unknown_keys(state_path: Path) -> None:
+    """``PipelineState.load()`` must ignore unknown keys in ``files`` /
+    ``clusters`` records.
+
+    Reproduces the 2026-04-28 KAL-LE/Hypatia status crash: those instance
+    configs omit both ``surveyor:`` and ``janitor:``, so both tools'
+    state-path defaults collide on ``./data/state.json``. Surveyor's
+    status-load path was hitting janitor's saved file and crashing on
+    ``FileState.__init__() got an unexpected keyword argument 'last_scanned'``.
+
+    The fix mirrors ``distiller/state.py``'s forward-compat filter — load
+    must skip unknown keys, not crash.
+    """
+    import json
+
+    janitor_shaped_state = {
+        "version": 1,
+        "last_run": "2026-04-26T02:27:58.901423+00:00",
+        "files": {
+            "note/One.md": {
+                "md5": "abc123",
+                # janitor-only fields below — surveyor must ignore them
+                "last_scanned": "2026-04-26T02:27:58.901423+00:00",
+                "open_issues": ["FM001"],
+                "enrichment_attempts": 0,
+                "last_enrichment_attempt": "",
+                "enrichment_stale": False,
+            },
+        },
+        "clusters": {
+            "1": {
+                "label": ["unit-tests"],
+                "member_files": ["note/One.md"],
+                "last_labeled": "2026-04-26T02:27:58.901423+00:00",
+                # synthetic unknown key — must not crash
+                "spurious_field": "should be ignored",
+            },
+        },
+        "pending_writes": {},
+    }
+    state_path.write_text(json.dumps(janitor_shaped_state), encoding="utf-8")
+
+    from alfred.surveyor.state import PipelineState
+
+    st = PipelineState(state_path)
+    st.load()  # MUST NOT raise
+
+    # Known fields survived the filter
+    assert "note/One.md" in st.files
+    assert st.files["note/One.md"].md5 == "abc123"
+    # Cluster known fields survived
+    assert "1" in st.clusters
+    assert st.clusters["1"].label == ["unit-tests"]
+    # Unknown janitor fields silently dropped — confirms filter shape
+    assert not hasattr(st.files["note/One.md"], "last_scanned")
+    assert not hasattr(st.files["note/One.md"], "open_issues")
+
+
+def test_janitor_state_load_tolerates_unknown_keys(state_path: Path) -> None:
+    """Symmetric forward-compat tolerance for janitor.
+
+    Mirrors the surveyor test — protects against the inverse default-path
+    collision and against future schema field renames. Filtering on
+    ``__dataclass_fields__`` is the cross-tool contract for state load.
+    """
+    import json
+
+    surveyor_shaped_state = {
+        "version": 1,
+        "files": {
+            "note/One.md": {
+                "md5": "abc123",
+                # surveyor-only fields — janitor must ignore them
+                "last_embedded": "2026-04-26T02:27:58.901423+00:00",
+                "semantic_cluster_id": 5,
+                "structural_community_id": 2,
+            },
+        },
+        "sweeps": {},
+        "fix_log": [],
+        "ignored": {},
+        "pending_writes": {},
+    }
+    state_path.write_text(json.dumps(surveyor_shaped_state), encoding="utf-8")
+
+    from alfred.janitor.state import JanitorState
+
+    st = JanitorState(state_path, max_sweep_history=5)
+    st.load()  # MUST NOT raise
+
+    assert "note/One.md" in st.files
+    assert st.files["note/One.md"].md5 == "abc123"
+    # Surveyor fields silently dropped
+    assert not hasattr(st.files["note/One.md"], "last_embedded")
+    assert not hasattr(st.files["note/One.md"], "semantic_cluster_id")
+
+
 # ---------------------------------------------------------------------------
 # Talker (Telegram)
 # ---------------------------------------------------------------------------

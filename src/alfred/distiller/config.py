@@ -198,6 +198,14 @@ class IdleTickConfig:
 
 @dataclass
 class DistillerConfig:
+    # Top-level opt-out flag. Distinct from the orchestrator's
+    # configuration-by-presence gate: the orchestrator already skips
+    # distiller when the ``distiller:`` block is entirely absent. This
+    # flag adds an explicit "block present but disabled" case so an
+    # instance config can declare distiller off intentionally — useful
+    # for rosters that define a distiller block for documentation /
+    # future-enablement but want the daemon dormant today.
+    enabled: bool = True
     vault: VaultConfig = field(default_factory=VaultConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     # Anthropic SDK config for the non-agentic rebuild path (Week 1+).
@@ -267,6 +275,11 @@ def load_from_unified(raw: dict[str, Any]) -> DistillerConfig:
         "state": tool.get("state", {}),
         "logging": log_raw,
     }
+    # Top-level opt-out flag — distinct from the orchestrator's
+    # block-presence gate. ``distiller: { enabled: false }`` lets a
+    # config declare distiller off intentionally (default True).
+    if "enabled" in tool:
+        built["enabled"] = bool(tool["enabled"])
     # Anthropic SDK config for the rebuild path. Per-tool block so the
     # distiller can use a different api_key / model than the instructor
     # or the talker if needed. Absent block → dataclass defaults.

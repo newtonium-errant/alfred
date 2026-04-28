@@ -126,6 +126,12 @@ class PipelineConfig:
     state: StateConfig
     logging: LoggingConfig
     idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
+    # Top-level opt-out flag. Distinct from the orchestrator's
+    # configuration-by-presence gate: the orchestrator already skips
+    # surveyor when the ``surveyor:`` block is entirely absent. This
+    # flag adds an explicit "block present but disabled" case so an
+    # instance config can declare surveyor off intentionally.
+    enabled: bool = True
 
 
 _ENV_PATTERN = re.compile(r"\$\{(\w+)\}")
@@ -216,4 +222,6 @@ def load_from_unified(raw: dict) -> PipelineConfig:
         logging=_build_dataclass(LoggingConfig, raw.get("logging")),
         # Idle-tick lives under ``surveyor:``; defaulted-on if absent.
         idle_tick=_build_dataclass(IdleTickConfig, tool.get("idle_tick")),
+        # Top-level opt-out — defaults True if absent.
+        enabled=bool(tool.get("enabled", True)),
     )

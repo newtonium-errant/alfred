@@ -71,10 +71,22 @@ class PipelineState:
             raw = json.load(f)
         self.version = raw.get("version", 1)
         self.last_run = raw.get("last_run", "")
+        # Tolerate unknown legacy fields (e.g. ``last_scanned`` from a janitor
+        # state file accidentally loaded via a default-path collision when
+        # ``surveyor.state.path`` is unset and the CWD also hosts the
+        # janitor's ``./data/state.json``). Filtering on the dataclass
+        # ``__dataclass_fields__`` keeps ``state.load()`` forward/backward
+        # compatible — adding a field never crashes a daemon reading an
+        # older state file, and removing a field never crashes one reading
+        # a newer file. Mirrors the ``distiller/state.py`` pattern.
+        file_known = set(FileState.__dataclass_fields__.keys())
         for rel, fdata in raw.get("files", {}).items():
-            self.files[rel] = FileState(**fdata)
+            self.files[rel] = FileState(**{k: v for k, v in fdata.items() if k in file_known})
+        cluster_known = set(ClusterState.__dataclass_fields__.keys())
         for cid, cdata in raw.get("clusters", {}).items():
-            self.clusters[cid] = ClusterState(**cdata)
+            self.clusters[cid] = ClusterState(
+                **{k: v for k, v in cdata.items() if k in cluster_known}
+            )
         self.pending_writes = raw.get("pending_writes", {})
         log.info("state.loaded", files=len(self.files), clusters=len(self.clusters))
 
