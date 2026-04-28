@@ -53,7 +53,7 @@ from . import (
     tts as tts_mod,
 )
 from .config import TalkerConfig
-from .session import Session
+from .session import Session, append_outbound_failure
 from .state import StateManager
 from .utils import get_logger
 
@@ -255,6 +255,160 @@ async def _post_capture_ack(
         message_id=update.message.message_id,
         reaction=[ReactionTypeEmoji(emoji=_CAPTURE_REACTION_EMOJI)],
     )
+
+
+# --- Outbound transport (chunking + failure surfacing) --------------------
+#
+# Telegram's per-message limit is 4096 characters. Before this helper, the
+# bot called ``reply_text(response_text)`` once and logged the resulting
+# error on a 400. The user saw nothing — no Telegram delivery, no text in
+# the chat — and the session record was written as if the turn had been
+# delivered. The 2026-04-28 Hypatia incident (4852-char reply, 73 minutes of
+# user-side silence) was the trigger for this fix.
+#
+# Three layers:
+#   L1 — chunk above 3900 chars at paragraph / sentence / hard boundaries
+#        (delegated to ``alfred.transport.utils.chunk_for_telegram``).
+#   L2 — when any chunk fails to send (rare for length post-chunking; common
+#        for rate-limit / network), push a short user-visible alert that
+#        DOES fit. If the alert itself fails, log and give up.
+#   L3 — annotate the active session with an ``outbound_failures`` entry so
+#        the eventual session-record frontmatter carries the failure
+#        context. Field is omitted from frontmatter when no failures
+#        occurred — existing-shape consumers are unaffected.
+
+# Telegram per-message hard cap is 4096; 3900 leaves 196 chars of headroom
+# for MarkdownV2 escape overhead and rendering edge cases.
+_OUTBOUND_CHUNK_LIMIT = 3900
+
+
+def _format_outbound_alert(
+    session: Session,
+    error: str,
+) -> str:
+    """Compose the short, length-safe failure-alert message.
+
+    Phrasing matches the silent-drop ticket exactly. The full session
+    record path is unknown at outbound time (it's built at close), so we
+    point at the stable session id — the user can grep the vault for it
+    after session close. The alert is constructed to stay well under the
+    1000-char self-imposed cap (no chunking risk, no recursion).
+    """
+    short_id = (session.session_id or "").split("-")[0] or "unknown"
+    # Truncate the error so a verbose traceback can never push the alert
+    # past the cap. 200 chars is plenty for "Message is too long",
+    # "Too Many Requests: retry after 30", etc.
+    short_error = (str(error) or "unknown error")[:200]
+    return (
+        "⚠️ Reply failed to deliver via Telegram. "
+        f"Full text saved in vault: `session/{short_id}` "
+        f"— error: `{short_error}`"
+    )
+
+
+async def _send_outbound_chunked(
+    *,
+    update: Update,
+    state_mgr: StateManager,
+    session: Session,
+    chat_id: int,
+    response_text: str,
+) -> None:
+    """Send ``response_text`` to Telegram, chunking and surfacing failures.
+
+    Always splits at the configured threshold (paragraph → sentence →
+    hard-wrap) before any send call, then dispatches each chunk
+    sequentially. Any failed chunk aborts the loop and triggers the
+    user-visible alert (Layer 2) and the session annotation (Layer 3).
+    Successful single-chunk sends preserve the wk1 ``ok=True`` log shape;
+    multi-chunk sends emit ``talker.bot.outbound_chunked`` summarising
+    chunk count.
+    """
+    from alfred.transport.utils import chunk_for_telegram
+
+    total_length = len(response_text)
+    chunks = chunk_for_telegram(response_text, max_chars=_OUTBOUND_CHUNK_LIMIT)
+    chunks_attempted = len(chunks)
+
+    chunks_sent = 0
+    failure_error: str | None = None
+    for chunk in chunks:
+        try:
+            await update.message.reply_text(chunk)
+            chunks_sent += 1
+        except Exception as exc:  # noqa: BLE001
+            failure_error = str(exc) or exc.__class__.__name__
+            log.warning(
+                "talker.bot.outbound",
+                chat_id=chat_id,
+                length=total_length,
+                chunks_attempted=chunks_attempted,
+                chunks_sent=chunks_sent,
+                ok=False,
+                error=failure_error,
+            )
+            break
+
+    if failure_error is None:
+        # All chunks delivered. Single-chunk path retains the wk1 log
+        # shape (``length`` + ``ok=True``); multi-chunk emits the new
+        # summary log key so log scrapers can distinguish "had to chunk"
+        # from "fit in one send".
+        if chunks_attempted == 1:
+            log.info(
+                "talker.bot.outbound",
+                chat_id=chat_id,
+                length=total_length,
+                ok=True,
+            )
+        else:
+            log.info(
+                "talker.bot.outbound_chunked",
+                chat_id=chat_id,
+                length=total_length,
+                chunks_attempted=chunks_attempted,
+                chunks_sent=chunks_sent,
+                ok=True,
+            )
+        return
+
+    # Layer 3: annotate the session BEFORE attempting the user alert so
+    # the failure record survives even if the alert send also crashes.
+    # ``len(session.transcript) - 1`` is the just-appended assistant turn
+    # whose text we tried to deliver.
+    turn_index = max(0, len(session.transcript) - 1)
+    try:
+        append_outbound_failure(
+            state_mgr,
+            session,
+            turn_index=turn_index,
+            error=failure_error,
+            length=total_length,
+            chunks_attempted=chunks_attempted,
+            chunks_sent=chunks_sent,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Don't let a state-write failure mask the original outbound
+        # problem — log loudly and continue to the alert path.
+        log.warning(
+            "talker.bot.outbound_state_annotation_failed",
+            chat_id=chat_id,
+            error=str(exc),
+        )
+
+    # Layer 2: user-visible alert. Capped at 1 attempt — if the alert
+    # itself fails (pathological rate-limit or network outage) we log and
+    # give up rather than recurse.
+    alert = _format_outbound_alert(session, failure_error)
+    try:
+        await update.message.reply_text(alert)
+    except Exception as alert_exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.outbound_alert_failed",
+            chat_id=chat_id,
+            error=str(alert_exc),
+            original_error=failure_error,
+        )
 
 
 # --- Allowlist helper -----------------------------------------------------
@@ -2453,27 +2607,20 @@ async def handle_message(
                     )
             return
 
-        # Reply with Claude's text. Telegram has a 4096-char message cap;
-        # if we ever exceed it, split — but a typical voice session turn
-        # won't come close, so keep this simple for wk1.
+        # Reply with Claude's text. Telegram's per-message limit is 4096
+        # characters; we chunk above 3900 to leave headroom for MarkdownV2
+        # escapes and rendering quirks. See ``_send_outbound_chunked`` for
+        # the full layered failure path (chunk → user-visible alert →
+        # session-record annotation).
         if not response_text:
             response_text = "(no response generated)"
-        try:
-            await update.message.reply_text(response_text)
-            log.info(
-                "talker.bot.outbound",
-                chat_id=chat_id,
-                length=len(response_text),
-                ok=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "talker.bot.outbound",
-                chat_id=chat_id,
-                length=len(response_text),
-                ok=False,
-                error=str(exc),
-            )
+        await _send_outbound_chunked(
+            update=update,
+            state_mgr=state_mgr,
+            session=sess,
+            chat_id=chat_id,
+            response_text=response_text,
+        )
 
 
 # Populate the inline-command dispatch map now that the on_* handlers

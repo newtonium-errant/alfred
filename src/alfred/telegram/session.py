@@ -57,6 +57,15 @@ class Session:
     transcript: list[dict[str, Any]] = field(default_factory=list)
     vault_ops: list[dict[str, str]] = field(default_factory=list)
     opening_model: str = ""
+    # Outbound delivery failures attached to assistant turns. Each entry is a
+    # dict with ``turn_index`` (0-based index into ``transcript``),
+    # ``timestamp``, ``error``, ``length``, ``chunks_attempted``,
+    # ``chunks_sent``, and ``delivered: false``. Populated by the bot's
+    # outbound transport when ``sendMessage`` fails after chunking; surfaced
+    # in the session-record frontmatter at close time so undelivered text is
+    # never silently dropped. Empty by default — the field is omitted from
+    # the frontmatter when no failures occurred.
+    outbound_failures: list[dict[str, Any]] = field(default_factory=list)
 
     # --- serialization ---
 
@@ -70,6 +79,7 @@ class Session:
             "transcript": self.transcript,
             "vault_ops": self.vault_ops,
             "opening_model": self.opening_model or self.model,
+            "outbound_failures": self.outbound_failures,
         }
 
     @classmethod
@@ -86,6 +96,7 @@ class Session:
             # the opening snapshot. Conservative: a rehydrated wk2
             # session was opened on its ``model`` so this is correct.
             opening_model=data.get("opening_model") or data.get("model", ""),
+            outbound_failures=list(data.get("outbound_failures") or []),
         )
 
 
@@ -431,6 +442,41 @@ def append_vault_op(
     _persist(state, session)
 
 
+def append_outbound_failure(
+    state: StateManager,
+    session: Session,
+    *,
+    turn_index: int,
+    error: str,
+    length: int,
+    chunks_attempted: int,
+    chunks_sent: int,
+) -> None:
+    """Record an outbound Telegram delivery failure on the session and persist.
+
+    Each call appends one entry to ``session.outbound_failures``. ``turn_index``
+    points at the assistant turn in ``session.transcript`` whose text failed to
+    deliver — ``len(session.transcript) - 1`` at the moment the bot returns
+    from ``run_turn``. ``chunks_attempted`` / ``chunks_sent`` lets a future
+    surfacing tool (Daily Sync) tell whether the failure was the first chunk
+    or a partial-delivery mid-stream.
+
+    Surfaced in the session-record frontmatter at close time as
+    ``outbound_failures``; the field is omitted entirely when this list is
+    empty.
+    """
+    session.outbound_failures.append({
+        "turn_index": int(turn_index),
+        "timestamp": _now_utc().isoformat(),
+        "error": str(error),
+        "length": int(length),
+        "chunks_attempted": int(chunks_attempted),
+        "chunks_sent": int(chunks_sent),
+        "delivered": False,
+    })
+    _persist(state, session)
+
+
 def resolve_on_startup(
     state: StateManager,
     now: datetime,
@@ -747,6 +793,14 @@ def _build_session_frontmatter(
             "pushback_level": pushback_level,
         },
     }
+
+    # Outbound delivery failures (Layer 3 of the talker outbound-transport
+    # silent-drop fix). Field is omitted entirely when no failures
+    # occurred so existing-shape consumers are unaffected. When present,
+    # each entry carries enough context (turn_index, length, error) for a
+    # surfacing tool to locate the undelivered text in the transcript.
+    if session.outbound_failures:
+        fm["outbound_failures"] = list(session.outbound_failures)
 
     if tool_set == "hypatia":
         # Per Hypatia SKILL spec + library-alexandria/CLAUDE.md: mode +
