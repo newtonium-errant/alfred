@@ -18,8 +18,29 @@ Two write modes:
     can diff shadow against legacy output in Week 2 before any live
     rollout decision.
 
-Week 1 scope: body is passed through as-is (expect empty string or
-minimal stub). Real prose drafting ships Week 3 via ``drafter.py``.
+## Attribution-audit retrofit (2026-04-28)
+
+V2 records previously emitted bare frontmatter with no body. That made
+them incompatible with the SUPERSEDED-marker sweep
+(``janitor/superseded_marker.py``, shipped 2026-04-27) and the audit-
+trail tooling, which require a ``BEGIN_INFERRED`` HTML comment + an
+``attribution_audit`` frontmatter list to pair correction notes back
+to inferred blocks. The writer now:
+
+  - Synthesizes a structured body from the validated ``LearningCandidate``
+    (H1, Claim, Evidence Trail, optional Source Records list, base
+    embeds) when no ``body_draft`` is supplied.
+  - Wraps the entire body — base embeds included — in BEGIN/END
+    INFERRED markers via ``alfred.vault.attribution.with_inferred_marker``
+    (the canonical helper — never re-derive marker_id format per
+    ``feedback_marker_id_canonical_regex.md``).
+  - Stamps an ``attribution_audit`` frontmatter entry with the matching
+    ``marker_id`` so Phase 2's Daily Sync confirm/reject flow and the
+    janitor's SUPERSEDED-marker sweep can find the block.
+
+V2 stays in shadow mode for this work — graduation to the live vault
+is Phase A of the distiller rebuild, deliberately deferred. The
+retrofit just makes shadow records ready to graduate.
 """
 
 from __future__ import annotations
@@ -66,6 +87,125 @@ def _slugify(title: str, max_length: int = 80) -> str:
     if not cleaned:
         cleaned = "untitled"
     return cleaned[:max_length].rstrip(" -")
+
+
+# --- Body assembly ----------------------------------------------------------
+#
+# V2's extractor produces only ``claim`` + ``evidence_excerpt`` +
+# ``source_links``. We render those into a tighter body shape than
+# legacy's full Context/Options/Decision/Rationale/Consequences scaffold
+# — the V2 prompt is intentionally minimalist — but with enough
+# structure that Obsidian tag/link tooling and the SUPERSEDED-marker
+# sweep can still anchor on the file.
+#
+# Base embeds match the canonical scaffold templates
+# (``_bundled/scaffold/_templates/{type}.md``). Per-type ordering
+# preserves reading flow: depends-on/based-on/sources first, related
+# second.
+
+# Per-type base embed sections, ordered as they appear in the canonical
+# scaffold templates. Keep aligned — drift makes V2 records render
+# differently from human-authored learn records.
+_BASE_EMBEDS_BY_TYPE: dict[str, tuple[str, ...]] = {
+    "assumption": ("Depends On This", "Related"),
+    "decision": ("Based On", "Related"),
+    "constraint": ("Affected Projects", "Related"),
+    "contradiction": ("Related",),
+    "synthesis": ("Sources", "Related"),
+}
+
+
+def _audit_reason(spec: LearningCandidate) -> str:
+    """Build the ``reason`` string for the attribution_audit entry.
+
+    Shape matches the convention from the retrofit task spec:
+    ``distiller v2 (type=<type>, sources=<source_links>)``. Source
+    links are rendered as a comma-joined list (or ``none`` when empty),
+    paralleling the legacy ``_mark_learn_record_inferred`` shape so a
+    future reader scanning audit entries can't tell V1 and V2 apart
+    structurally — only by the ``v2`` token in the prefix.
+    """
+    sources = ", ".join(spec.source_links) if spec.source_links else "none"
+    return f"distiller v2 (type={spec.type}, sources={sources})"
+
+
+def _assemble_body(spec: LearningCandidate) -> str:
+    """Render a structured body from the validated spec.
+
+    Shape:
+
+      ``# <Title>``
+
+      ``## Claim``
+      <claim>
+
+      ``## Evidence Trail``
+      <evidence_excerpt>            (omitted when blank)
+      ``### Source Records``        (omitted when no source_links)
+      - [[source/Link 1]]
+      - [[source/Link 2]]
+
+      ``![[<type>.base#<Section1>]]``
+      ``![[<type>.base#<Section2>]]``
+
+    Phase 1 of body parity with legacy. Full Context/Options/Decision/
+    Rationale/Consequences sections are NOT emitted — V2's prompt is
+    intentionally minimalist. This is enough body to:
+
+      - Make the file scan visually as a learn record (not bare YAML).
+      - Anchor the SUPERSEDED-marker sweep's BEGIN_INFERRED detection.
+      - Surface base-embed views in Obsidian (Depends On This, Related,
+        etc.) so the record shows up under the entities it references.
+    """
+    parts: list[str] = []
+
+    # Title heading mirrors what the canonical templates emit
+    # ("# {{title}}"). spec.title is the validated record name and is
+    # always present (Pydantic min_length=5).
+    parts.append(f"# {spec.title}")
+    parts.append("")
+
+    # Claim — always present (Pydantic min_length=20).
+    parts.append("## Claim")
+    parts.append("")
+    parts.append(spec.claim.strip())
+    parts.append("")
+
+    # Evidence Trail — emit the section header even when the excerpt is
+    # empty, because the source_links list often lives here. If both
+    # are empty we still emit the header for shape consistency; a stub
+    # learn record with no evidence is rare but legal.
+    parts.append("## Evidence Trail")
+    parts.append("")
+    if spec.evidence_excerpt:
+        parts.append(spec.evidence_excerpt.strip())
+        parts.append("")
+    if spec.source_links:
+        parts.append("### Source Records")
+        parts.append("")
+        for link in spec.source_links:
+            # Pydantic doesn't enforce wikilink wrapping; tolerate both
+            # ``[[note/X]]`` and bare ``note/X`` shapes.
+            stripped = link.strip()
+            if stripped.startswith("[[") and stripped.endswith("]]"):
+                parts.append(f"- {stripped}")
+            else:
+                parts.append(f"- [[{stripped}]]")
+        parts.append("")
+
+    # Base embeds — per-type, copied from the canonical scaffold
+    # templates. Default to the type-only ``Related`` view if the type
+    # isn't in the lookup (defensive — Pydantic restricts ``spec.type``
+    # to ``LearnTypeLiteral``, so this branch is unreachable today, but
+    # cheap insurance against schema additions).
+    sections = _BASE_EMBEDS_BY_TYPE.get(spec.type, ("Related",))
+    for section in sections:
+        parts.append(f"![[{spec.type}.base#{section}]]")
+
+    # Trim trailing blank lines while keeping a single closing newline.
+    while parts and parts[-1] == "":
+        parts.pop()
+    return "\n".join(parts) + "\n"
 
 
 # --- Frontmatter assembly ---------------------------------------------------
@@ -140,20 +280,26 @@ def _shadow_write(
 
     fm = _assemble_frontmatter(spec)
 
-    # Wrap the body in BEGIN_INFERRED markers if it carries inferred
-    # prose — mirrors the live-path attribution contract (see
-    # ``alfred.vault.attribution``). Empty body: no marker (there's no
-    # prose to attribute).
-    body: str = body_draft or ""
-    if body.strip():
-        wrapped_body, audit_entry = attribution.with_inferred_marker(
-            body,
-            section_title=spec.title,
-            agent="distiller",
-            reason="distiller v2 extractor (shadow mode)",
-        )
-        attribution.append_audit_entry(fm, audit_entry)
-        body = wrapped_body
+    # Body: caller-supplied draft wins (Week 3 drafter path); otherwise
+    # synthesize a structured body from the spec so V2 records carry
+    # the same body shape (heading + claim + evidence trail + base
+    # embeds) that legacy emits, just tighter.
+    body = body_draft.strip() if body_draft else ""
+    if not body:
+        body = _assemble_body(spec)
+
+    # Always wrap V2 records — the body is 100% agent-inferred (the
+    # extractor is the only thing that can author it). Skipping the
+    # marker would leave the record incompatible with the SUPERSEDED-
+    # marker sweep and the Daily Sync confirm/reject flow.
+    wrapped_body, audit_entry = attribution.with_inferred_marker(
+        body,
+        section_title=spec.title,
+        agent="distiller",
+        reason=_audit_reason(spec),
+    )
+    attribution.append_audit_entry(fm, audit_entry)
+    body = wrapped_body
 
     file_path.parent.mkdir(parents=True, exist_ok=True)
     post = frontmatter.Post(body, **fm)
@@ -194,16 +340,23 @@ def _live_write(
     # from its ``record_type`` / ``name`` args; leaving those in
     # set_fields is harmless (they get overwritten to the same values).
 
-    body: str = body_draft or ""
-    if body.strip():
-        wrapped_body, audit_entry = attribution.with_inferred_marker(
-            body,
-            section_title=spec.title,
-            agent="distiller",
-            reason="distiller v2 extractor",
-        )
-        attribution.append_audit_entry(set_fields, audit_entry)
-        body = wrapped_body
+    # Same body-and-marker contract as shadow mode — see ``_shadow_write``
+    # for rationale. We only stay distinct from shadow on the
+    # ``vault_create`` integration (template merge, scope gate,
+    # mutation log) — frontmatter and body shape must match 1:1 so
+    # diffing shadow vs live is meaningful.
+    body = body_draft.strip() if body_draft else ""
+    if not body:
+        body = _assemble_body(spec)
+
+    wrapped_body, audit_entry = attribution.with_inferred_marker(
+        body,
+        section_title=spec.title,
+        agent="distiller",
+        reason=_audit_reason(spec),
+    )
+    attribution.append_audit_entry(set_fields, audit_entry)
+    body = wrapped_body
 
     result = vault_create(
         vault_path,
