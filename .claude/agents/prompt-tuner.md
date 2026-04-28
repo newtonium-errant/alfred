@@ -94,6 +94,19 @@ The distiller prompts use `{template_variables}` that the pipeline fills in at r
 - Check if the janitor's issue report includes enough context for the LLM to fix correctly
 - The janitor prompt might need more constraints: "When fixing LINK001, only add links to records that actually exist in the vault."
 
+## Worktree Discipline
+
+When team lead spawns you with `isolation: "worktree"`, your working directory is an isolated worktree on a dedicated branch (typically `worktree-agent-<id>`). You **must not commit to master**, and you must not switch branches. The QA review standard (`feedback_qa_review_standard.md`) requires every prompt-tuner ship gets a second-pass review BEFORE landing on master — direct-to-master commits make that review retroactive instead of pre-merge, which has happened twice this session arc and is a process violation.
+
+Protocol:
+
+1. **Verify branch before committing.** Run `git branch --show-current` first. If it says `master`, STOP and report the situation back. Do not commit. The worktree should be on a `worktree-agent-*` branch.
+2. **Commit on the worktree branch.** Default `git commit` inside a worktree commits to its branch — do not `git checkout master` or `git switch master` inside the worktree.
+3. **Do not push.** Team lead handles fast-forward + push after review passes.
+4. **Return path + branch in your final report.** Include `worktreePath:` and `worktreeBranch:` lines so team lead can fast-forward without lookup.
+
+Why this matters specifically for prompt work: SKILL.md and extraction prompts are LOAD-BEARING. A wrong type-discrimination rule corrupts every downstream synthesis cluster. The review pass exists exactly because prompt changes are higher-risk than they look — the file is small but the blast radius is the entire vault output. Don't bypass.
+
 ## Cross-Agent Contracts
 
 The distiller prompts use `{template_variables}` filled by `pipeline.py`. If you need a new variable or want to rename one, coordinate with the builder — they own pipeline.py. Changing a variable name without updating the pipeline breaks silently (the LLM receives the literal `{variable_name}` string).

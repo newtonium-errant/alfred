@@ -38,6 +38,12 @@ alfred status            # Per-tool status overview
 
 There are no tests, linter, or CI configured.
 
+### Worktree + editable-install gotcha
+
+`pip install -e` writes a path-pin into the active venv pointing at whatever directory you ran it from. When a builder agent runs `pip install -e .` from a git worktree under `.claude/worktrees/agent-*/`, the venv re-pins to that worktree path. After the worktree is removed, the venv's pin is broken — `import alfred` resolves to a deleted directory, all daemons crash on next restart.
+
+Fix: after any worktree-based install, re-pin to the main repo with `pip install -e /home/andrew/alfred`. Builders should avoid running `pip install -e` from a worktree unless they're testing a dependency change; for code-only edits, the existing pin works because Python resolves `alfred.*` modules via the installed egg-link, not via the worktree's source tree.
+
 ## Architecture
 
 ### Source Layout
@@ -69,6 +75,24 @@ Three pluggable backends in each tool's `backends/`: Claude Code (subprocess via
 ### Each Tool's Backend Has Its Own Prompt Builder
 
 Each tool's `backends/__init__.py` contains a different `build_*_prompt()` function tailored to that tool's needs. Curator sends inbox content + vault context. Janitor sends issue reports + affected records. Distiller sends source records + existing learning records for dedup. They are NOT shared — each tool has independent prompt assembly.
+
+### Three Layers — Code vs Config vs Prompt
+
+Behavior in this repo lives in three distinct layers. When you reach for a "rebuild," first check whether the existing layer just needs different content.
+
+- **Code** (`src/alfred/`) — how the system runs. Process orchestration, scope enforcement, vault ops, state persistence, daemon loops. Stable across instances. Changes here affect every instance.
+- **Config** (`config.yaml`, `config.<instance>.yaml`) — per-instance customization. Ports, tokens, scheduling, feature flags, vault paths, instance name. Changes here affect ONE instance without touching code.
+- **Prompt** (`src/alfred/_bundled/skills/vault-*/SKILL.md`, distiller stage prompts) — what the LLM is told to do. Extraction rules, type discrimination, voice calibration, worked examples. Changes here affect agent behavior without touching the code path that invokes the agent.
+
+Common drift: behavior that belongs in **prompt** ends up hardcoded in **code** ("if instance == X, do Y differently"); per-instance values that belong in **config** end up hardcoded in **code** (`agent="salem"` literals in writer paths). When you see either, route the fix to the right layer — prompt-tuner for prompt-layer work, builder for config/code-layer work.
+
+### Validation Gate Ordering — Vault Ops
+
+Vault writes go through two gates in order:
+1. `_validate_type` (in `vault/ops.py`) — checks the record type against `KNOWN_TYPES` / `LEARN_TYPES` registries
+2. `check_scope` (in `vault/scope.py`) — checks the calling tool's scope against `SCOPE_RULES` for the (op, type) pair
+
+When adding a new instance type, scope rule, or per-instance type registry: the scope check needs the calling instance's identity to look up the right rule. Hardcoded `agent="salem"` or `scope="talker"` literals at the call site silently route every instance through Salem's gate. Per-instance scope work should plumb the instance name through the call, not default it. See `project_hardcoding_followups.md` for the open sweep items.
 
 ### Surveyor Pipeline
 
