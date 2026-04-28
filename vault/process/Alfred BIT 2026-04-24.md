@@ -1,14 +1,27 @@
 ---
-type: run
-status: completed
-name: Alfred BIT 2026-04-24
-description: Alfred built-in test (health sweep)
-process: '[[process/Alfred BIT]]'
-trigger: scheduled
-started: '2026-04-24T05:55:01.888789-03:00'
+alfred_tags:
+- alfred/bit
+- automation/logs
 created: '2026-04-24'
-overall_status: warn
+description: Alfred built-in test (health sweep)
+janitor_note: LINK001 — frontmatter process target [[process/Alfred BIT]] does not
+  resolve; the parent process record has not been created. Cannot unambiguously fix
+  (outside janitor scope to create missing record).
 mode: quick
+name: Alfred BIT 2026-04-24
+overall_status: warn
+process: '[[process/Alfred BIT]]'
+started: '2026-04-24T05:55:01.888789-03:00'
+status: completed
+tags:
+- bit
+- health
+- bit/warn
+tool_counts:
+  fail: 0
+  ok: 8
+  skip: 0
+  warn: 1
 tools_checked:
 - curator
 - janitor
@@ -19,15 +32,8 @@ tools_checked:
 - mail
 - talker
 - transport
-tool_counts:
-  ok: 8
-  warn: 1
-  fail: 0
-  skip: 0
-tags:
-- bit
-- health
-- bit/warn
+trigger: scheduled
+type: run
 ---
 
 # Alfred BIT 2026-04-24

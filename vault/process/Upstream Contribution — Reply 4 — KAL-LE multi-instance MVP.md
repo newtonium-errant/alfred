@@ -169,6 +169,12 @@ distiller_learnings:
 distiller_signals: decision:1, constraint:1
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: 'LINK001 — scanner false positives in distiller_learnings: YAML-escaped
+  apostrophe artifact in [[decision/Salem Ghostwrites External Communications on Andrews
+  Behalf]] (target exists with single apostrophe), and leading-slash artifact in [[decision//extract
+  Is Idempotent with Delete-First Re-Run Contract]] (target exists at decision/extract
+  Is Idempotent...md). Same pattern documented in process/Upstream Contribution Report
+  — Top Level. FM001/DIR001 are autofix-handled.'
 project:
 - '[[project/Alfred]]'
 status: draft

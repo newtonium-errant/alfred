@@ -2,56 +2,23 @@
 alfred_tags:
 - alfred/bit
 - automation/logs
-created: '2026-04-22'
+created: '2026-04-28'
 description: Alfred built-in test (health sweep)
-janitor_note: 'LINK001 — broken target [[process/Alfred BIT]]: no parent process record
-  exists, only run records (process/Alfred BIT YYYY-MM-DD.md). DIR001 — type:run misfiled
-  in process/ directory; deterministic flag, autofix should handle. Both need parent
-  process/Alfred BIT.md created OR run records moved to run/.'
 mode: quick
-name: Alfred BIT 2026-04-22
-overall_status: warn
+name: Alfred BIT 2026-04-28
+overall_status: ok
 process: '[[process/Alfred BIT]]'
-relationships:
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-04-22.md
-  source_anchor: run Alfred BIT 2026-04-22
-  target: process/Alfred BIT 2026-04-23.md
-  target_anchor: run Alfred BIT 2026-04-23
-  type: related-to
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-04-22.md
-  source_anchor: run Alfred BIT 2026-04-22
-  target: process/Alfred BIT 2026-04-25.md
-  target_anchor: run Alfred BIT 2026-04-25
-  type: related-to
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-04-22.md
-  source_anchor: run Alfred BIT 2026-04-22
-  target: process/Alfred BIT 2026-04-26.md
-  target_anchor: run Alfred BIT 2026-04-26
-  type: related-to
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-04-22.md
-  source_anchor: run Alfred BIT 2026-04-22
-  target: process/Alfred BIT 2026-04-24.md
-  target_anchor: run Alfred BIT 2026-04-24
-  type: related-to
-started: '2026-04-22T05:55:01.711920-03:00'
+started: '2026-04-28T05:55:04.029963-03:00'
 status: completed
 tags:
 - bit
 - health
-- bit/warn
+- bit/ok
 tool_counts:
   fail: 0
-  ok: 8
+  ok: 9
   skip: 0
-  warn: 1
+  warn: 0
 tools_checked:
 - curator
 - janitor
@@ -66,49 +33,49 @@ trigger: scheduled
 type: run
 ---
 
-# Alfred BIT 2026-04-22
+# Alfred BIT 2026-04-28
 
 Generated at 0555 ADT.
 
 ## Summary
 
-Alfred BIT (quick) — [WARN]
-  started:  2026-04-22T08:55:00.070260+00:00
-  finished: 2026-04-22T08:55:01.711881+00:00
-  elapsed:  1642 ms
+Alfred BIT (quick) — [ OK ]
+  started:  2026-04-28T08:55:00.150788+00:00
+  finished: 2026-04-28T08:55:04.029926+00:00
+  elapsed:  3879 ms
 
-[ OK ] curator  (1374 ms)
+[ OK ] curator  (2056 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] inbox-dir — /home/andrew/alfred/vault/inbox
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (755 ms) — count_tokens ok
+    [ OK ] anthropic-auth  (1067 ms) — count_tokens ok
 
-[ OK ] janitor  (711 ms)
+[ OK ] janitor  (981 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] state-file — data/janitor_state.json
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (671 ms) — count_tokens ok
+    [ OK ] anthropic-auth  (845 ms) — count_tokens ok
 
-[ OK ] distiller  (645 ms)
+[ OK ] distiller  (820 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] state-file — data/distiller_state.json
     [ OK ] candidate-threshold — 0.3
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (634 ms) — count_tokens ok
+    [ OK ] anthropic-auth  (775 ms) — count_tokens ok
 
-[ OK ] instructor  (493 ms)
+[ OK ] instructor  (609 ms)
     [ OK ] config-section — instructor section present
     [ OK ] state-path — data/instructor_state.json
-    [ OK ] skill-file — /home/andrew/alfred/src/alfred/_bundled/skills/vault-instructor/SKILL.md
+    [ OK ] skill-file — /home/andrew/alfred/.claude/worktrees/agent-a4d60e0187c8ba81b/src/alfred/_bundled/skills/vault-instructor/SKILL.md
     [ OK ] pending-queue — pending queue length = 0
     [ OK ] retry-at-max — no records at max_retries=3
 
-[ OK ] surveyor  (117 ms)
+[ OK ] surveyor  (182 ms)
     [ OK ] ollama-reachable — HTTP 200
     [ OK ] milvus-lite — db: /home/andrew/alfred/data/milvus_lite.db
     [ OK ] openrouter-key — key set, model=qwen2.5:14b
 
-[ OK ] brief  (353 ms)
+[ OK ] brief  (1921 ms)
     [ OK ] schedule-time — 06:00
     [ OK ] schedule-timezone — America/Halifax
     [ OK ] output-dir — /home/andrew/alfred/vault/run
@@ -118,34 +85,34 @@ Alfred BIT (quick) — [WARN]
     [ OK ] account:live — andrew.newton@live.ca on imap-mail.outlook.com
     [ OK ] inbox-dir — /home/andrew/alfred/vault/inbox
 
-[ OK ] talker  (230 ms)
+[ OK ] talker  (428 ms)
     [ OK ] bot-token — token present (46 chars)
     [ OK ] allowed-users — 1 user(s) allowlisted
     [ OK ] stt-key — groq key present
     [ OK ] tts-key — elevenlabs key present (51 chars)
     [ OK ] capture-handler-registered — capture_batch + capture_extract modules importable
-    [ OK ] anthropic-auth  (224 ms) — count_tokens ok
+    [ OK ] anthropic-auth  (412 ms) — count_tokens ok
 
-[WARN] transport  (102 ms)
+[ OK ] transport  (105 ms)
     [ OK ] config-section — transport section present
     [ OK ] token-configured — token length 64
     [ OK ] port-reachable — telegram_connected=True
     [ OK ] queue-depth — pending=0 (warn at 100)
     [ OK ] dead-letter-depth — dead_letter=0 (warn at 50)
-    [WARN] peer-reachable:kal-le — kal-le unreachable: ConnectError
-    [WARN] peer-handshake:kal-le — kal-le unreachable
+    [ OK ] peer-reachable:kal-le — kal-le reachable
+    [ OK ] peer-handshake:kal-le — kal-le handshake ok (v1)
     [ OK ] peer-queue-depth:kal-le — kal-le depth=0 (warn at 100)
 
-Totals: ok=8 warn=1 fail=0 skip=0
+Totals: ok=9 warn=0 fail=0 skip=0
 
 ## Raw report (JSON)
 
 ```json
 {
   "mode": "quick",
-  "started_at": "2026-04-22T08:55:00.070260+00:00",
-  "finished_at": "2026-04-22T08:55:01.711881+00:00",
-  "overall_status": "warn",
+  "started_at": "2026-04-28T08:55:00.150788+00:00",
+  "finished_at": "2026-04-28T08:55:04.029926+00:00",
+  "overall_status": "ok",
   "tools": [
     {
       "tool": "curator",
@@ -182,7 +149,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 755.2775259973714,
+          "latency_ms": 1066.8402050214354,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -190,7 +157,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 1374.3191289977403
+      "elapsed_ms": 2055.7389669993427
     },
     {
       "tool": "janitor",
@@ -227,7 +194,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 671.0323890001746,
+          "latency_ms": 844.8409360134974,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -235,7 +202,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 710.7561019947752
+      "elapsed_ms": 980.8408789976966
     },
     {
       "tool": "distiller",
@@ -281,7 +248,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 633.8914640000439,
+          "latency_ms": 775.2365620108321,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -289,7 +256,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 645.4446389980149
+      "elapsed_ms": 819.8618789901957
     },
     {
       "tool": "instructor",
@@ -314,10 +281,10 @@ Totals: ok=8 warn=1 fail=0 skip=0
         {
           "name": "skill-file",
           "status": "ok",
-          "detail": "/home/andrew/alfred/src/alfred/_bundled/skills/vault-instructor/SKILL.md",
+          "detail": "/home/andrew/alfred/.claude/worktrees/agent-a4d60e0187c8ba81b/src/alfred/_bundled/skills/vault-instructor/SKILL.md",
           "latency_ms": null,
           "data": {
-            "path": "/home/andrew/alfred/src/alfred/_bundled/skills/vault-instructor/SKILL.md"
+            "path": "/home/andrew/alfred/.claude/worktrees/agent-a4d60e0187c8ba81b/src/alfred/_bundled/skills/vault-instructor/SKILL.md"
           }
         },
         {
@@ -339,7 +306,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 493.30053699668497
+      "elapsed_ms": 609.3775229819585
     },
     {
       "tool": "surveyor",
@@ -378,7 +345,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 117.38971899467288
+      "elapsed_ms": 182.23090399987996
     },
     {
       "tool": "brief",
@@ -424,7 +391,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 353.28400500293355
+      "elapsed_ms": 1920.7970830029808
     },
     {
       "tool": "mail",
@@ -451,7 +418,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 0.09464300092076883
+      "elapsed_ms": 0.10151302558369935
     },
     {
       "tool": "talker",
@@ -505,7 +472,7 @@ Totals: ok=8 warn=1 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 223.8393060033559,
+          "latency_ms": 412.27877701749094,
           "data": {
             "model": "claude-sonnet-4-6",
             "probe": "count_tokens"
@@ -513,11 +480,11 @@ Totals: ok=8 warn=1 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 229.5500499967602
+      "elapsed_ms": 428.1610960024409
     },
     {
       "tool": "transport",
-      "status": "warn",
+      "status": "ok",
       "results": [
         {
           "name": "config-section",
@@ -569,8 +536,8 @@ Totals: ok=8 warn=1 fail=0 skip=0
         },
         {
           "name": "peer-reachable:kal-le",
-          "status": "warn",
-          "detail": "kal-le unreachable: ConnectError",
+          "status": "ok",
+          "detail": "kal-le reachable",
           "latency_ms": null,
           "data": {
             "url": "http://127.0.0.1:8892/health",
@@ -579,11 +546,17 @@ Totals: ok=8 warn=1 fail=0 skip=0
         },
         {
           "name": "peer-handshake:kal-le",
-          "status": "warn",
-          "detail": "kal-le unreachable",
+          "status": "ok",
+          "detail": "kal-le handshake ok (v1)",
           "latency_ms": null,
           "data": {
-            "peer": "kal-le"
+            "peer": "kal-le",
+            "protocol_version": 1,
+            "capabilities": [
+              "outbound_send",
+              "peer_message",
+              "peer_query"
+            ]
           }
         },
         {
@@ -599,10 +572,10 @@ Totals: ok=8 warn=1 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 101.54010399855906
+      "elapsed_ms": 105.167257017456
     }
   ],
-  "elapsed_ms": 1641.6347089980263
+  "elapsed_ms": 3879.1492139862385
 }
 ```
 
