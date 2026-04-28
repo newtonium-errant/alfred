@@ -340,10 +340,10 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             session_type=session_type,
             continues_from=active.get("_continues_from"),
             pushback_level=active.get("_pushback_level"),
-            # Per-instance session-save shape: Hypatia uses
-            # ``conversation-/capture-<date>-<slug>``; Salem + KAL-LE
-            # keep the wk1 ``Voice Session — ...`` filename.
-            # ``InstanceConfig.tool_set`` is the contract-key.
+            # Per-instance session-save shape: all registered tool_sets
+            # emit ``<mode>-<date>-<slug>-<short-id>``; unknown / empty
+            # ``tool_set`` falls back to the wk1 ``Voice Session — ...``
+            # filename. ``InstanceConfig.tool_set`` is the contract-key.
             tool_set=config.instance.tool_set or "",
         )
     except Exception as exc:  # noqa: BLE001
@@ -1338,11 +1338,12 @@ def _open_session_with_stash(
     active["_continues_from"] = continues_from
     if pushback_level is not None:
         active["_pushback_level"] = pushback_level
-    # Per-instance session-save shape contract (Hypatia uses
-    # ``conversation-/capture-<date>-<slug>``; Salem + KAL-LE keep the
-    # wk1 ``Voice Session — ...`` filename). Stashed at open so timeout
-    # / startup-sweep close paths can route correctly even when the
-    # config object isn't accessible from the close site.
+    # Per-instance session-save shape contract: all registered tool_sets
+    # emit ``<mode>-<date>-<slug>-<short-id>``; unknown / empty
+    # ``tool_set`` falls back to the wk1 ``Voice Session — ...`` filename.
+    # Stashed at open so timeout / startup-sweep close paths can route
+    # correctly even when the config object isn't accessible from the
+    # close site.
     active["_tool_set"] = config.instance.tool_set or ""
     # Voice / text counts are derived from per-turn ``_kind`` at close
     # time by ``_count_message_kinds`` — no state-dict counter needed.

@@ -558,13 +558,13 @@ def close_session(
     the active dict was written before wk2 (``get("_session_type", "note")``).
 
     ``tool_set`` selects per-instance session-save shape (filename pattern +
-    frontmatter fields). ``""``/``"talker"``/``"kalle"`` produce the wk1
-    ``Voice Session — ...`` filename; ``"hypatia"`` produces the
-    mode-prefixed ``conversation-<date>-<slug>`` / ``capture-<date>-<slug>``
-    filename plus Hypatia-specific ``mode``/``processed``/``extracted_to``
-    frontmatter fields per ``vault-hypatia/SKILL.md``. Default ``""``
-    preserves the prior behaviour for any legacy caller not yet
-    threading the field.
+    frontmatter fields). All registered tool_sets emit the mode-prefixed
+    ``<mode>-<date>-<slug>-<short-id>`` filename; unknown / empty
+    ``tool_set`` falls back to the wk1 ``Voice Session — <date> <time> <id>``
+    filename. ``"hypatia"`` additionally writes Hypatia-specific
+    ``mode``/``processed``/``extracted_to`` frontmatter fields per
+    ``vault-hypatia/SKILL.md``. Default ``""`` preserves the legacy wk1
+    behaviour for any caller not yet threading the field.
     """
     # Import here to avoid a circular import at module load (ops pulls in
     # frontmatter + yaml which are heavier).
