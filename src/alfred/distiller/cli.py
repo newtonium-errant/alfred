@@ -31,6 +31,7 @@ def cmd_scan(config: DistillerConfig, skills_dir: Path, project: str | None = No
         source_types=config.extraction.source_types,
         threshold=config.extraction.candidate_threshold,
         distilled_files=state.get_distilled_body_hashes(),
+        distilled_last_distilled=state.get_distilled_last_distilled(),
         project_filter=project,
     )
 

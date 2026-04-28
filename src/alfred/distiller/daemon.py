@@ -362,6 +362,7 @@ async def run_extraction(
         source_types=config.extraction.source_types,
         threshold=config.extraction.candidate_threshold,
         distilled_files=state.get_distilled_body_hashes(),
+        distilled_last_distilled=state.get_distilled_last_distilled(),
         project_filter=project_filter,
     )
 
@@ -705,6 +706,7 @@ async def run_watch(
                     source_types=config.extraction.source_types,
                     threshold=config.extraction.candidate_threshold,
                     distilled_files=state.get_distilled_body_hashes(),
+                    distilled_last_distilled=state.get_distilled_last_distilled(),
                 )
                 if candidates:
                     log.info("daemon.pending_candidates", count=len(candidates))

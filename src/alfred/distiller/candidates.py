@@ -132,6 +132,7 @@ def scan_candidates(
     threshold: float,
     distilled_files: dict[str, str] | None = None,
     project_filter: str | None = None,
+    distilled_last_distilled: dict[str, str] | None = None,
 ) -> list[ScoredCandidate]:
     """Walk vault and identify candidate records for distillation.
 
@@ -142,11 +143,25 @@ def scan_candidates(
     longer cause the candidate to re-qualify on the next scan. A file with
     no stored body_hash (legacy state) is treated as unknown — re-extract
     once to populate the field, then hash-gate from then on.
+
+    ``distilled_last_distilled`` is an optional sidecar dict mapping
+    rel_path → last_distilled ISO timestamp. When present, the scanner
+    emits a ``candidates.drift_skip`` log line every time the body-hash
+    gate skips a file whose mtime has bumped since the last distillation.
+    This is the explicit "intentionally left blank" signal we need to
+    measure how often janitor/surveyor cosmetic writes would otherwise
+    have triggered a wasteful re-extraction. Aggregating these counts
+    over ~1 week tells us whether Option 3 (audit-log mutation-source
+    gate, deferred per ``project_distiller_drift_mitigation.md``) is
+    worth shipping. When the sidecar is absent the gate still works
+    silently — same behavior as before, no observability.
     """
     ignore_d = set(ignore_dirs)
     ignore_f = set(ignore_files)
     distilled = distilled_files or {}
+    last_distilled_map = distilled_last_distilled or {}
     candidates: list[ScoredCandidate] = []
+    drift_skip_count = 0
 
     for md_file in vault_path.rglob("*.md"):
         rel = md_file.relative_to(vault_path)
@@ -172,6 +187,27 @@ def scan_candidates(
         # stored hash means legacy state — fall through to re-extract once.
         stored = distilled.get(rel_str)
         if stored and stored == body_hash:
+            # Body bytes unchanged. If we have last_distilled bookkeeping
+            # AND the file's mtime has bumped since then, log a drift_skip
+            # — this is the cosmetic-frontmatter-rewrite signature we want
+            # to count. Failing the stat lookup is non-fatal: just skip
+            # silently as before.
+            last_distilled_iso = last_distilled_map.get(rel_str)
+            if last_distilled_iso:
+                try:
+                    file_mtime = md_file.stat().st_mtime
+                    last_distilled_dt = _parse_iso_to_epoch(last_distilled_iso)
+                except (OSError, ValueError, TypeError):
+                    continue
+                if last_distilled_dt is not None and file_mtime > last_distilled_dt:
+                    drift_skip_count += 1
+                    log.info(
+                        "candidates.drift_skip",
+                        path=rel_str,
+                        last_distilled=last_distilled_iso,
+                        file_mtime=file_mtime,
+                        body_hash_unchanged=True,
+                    )
             continue
 
         # Parse
@@ -205,8 +241,29 @@ def scan_candidates(
 
     # Sort by score descending
     candidates.sort(key=lambda c: c.score, reverse=True)
-    log.info("candidates.scanned", total=len(candidates))
+    log.info(
+        "candidates.scanned",
+        total=len(candidates),
+        drift_skips=drift_skip_count,
+    )
     return candidates
+
+
+def _parse_iso_to_epoch(iso_ts: str) -> float | None:
+    """Parse an ISO-8601 timestamp into a POSIX epoch float.
+
+    Tolerates the trailing-Z form ("...Z") that ``datetime.now(timezone.utc).isoformat()``
+    does not produce but external tooling sometimes does. Returns None if
+    parsing fails — caller treats that as "no comparison data, skip silently."
+    """
+    from datetime import datetime
+    try:
+        # Python 3.11+ fromisoformat handles offset suffixes like "+00:00".
+        # Replace trailing "Z" with "+00:00" for older-format compatibility.
+        normalized = iso_ts.replace("Z", "+00:00") if iso_ts.endswith("Z") else iso_ts
+        return datetime.fromisoformat(normalized).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 def group_by_project(

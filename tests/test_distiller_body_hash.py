@@ -303,3 +303,250 @@ def test_should_distill_legacy_empty_hash_re_extracts(tmp_path: Path) -> None:
     state = DistillerState(tmp_path / "state.json")
     state.files["session/Foo.md"] = FileState(md5="ignored", body_hash="")
     assert state.should_distill("session/Foo.md", "any-hash") is True
+
+
+# --- drift_skip observability --------------------------------------------
+#
+# Per ``project_distiller_drift_mitigation.md``, the body-hash gate must
+# emit an explicit "drift skip" log line every time a cosmetic frontmatter
+# rewrite (janitor deep_sweep_fix, surveyor alfred_tags) would otherwise
+# have triggered re-extraction. The signal feeds the Option 3 escalation
+# decision — without it, a silent skip leaves us unable to distinguish
+# "drift gate working" from "no drift happening."
+#
+# These tests use the file-handler logging pattern from
+# ``test_surveyor_logging.py``: structlog routes through stdlib logging
+# with cache_logger_on_first_use=True, which doesn't reliably propagate
+# to pytest's ``caplog`` but does land in a configured FileHandler.
+
+
+import logging as _logging
+import os as _os
+import time as _time
+
+import structlog as _structlog
+
+from alfred.distiller.utils import setup_logging as _setup_logging
+
+
+@pytest.fixture
+def drift_log_file(tmp_path: Path):
+    """Configure distiller logging to write to a temp file; yield the path.
+
+    Resets structlog + stdlib logging on teardown so subsequent tests
+    don't inherit the file handler. Mirrors the ``_reset_logging``
+    pattern in ``test_surveyor_logging.py`` (the silent-writer
+    regression suite).
+    """
+    log_path = tmp_path / "distiller.log"
+    _setup_logging(level="INFO", log_file=str(log_path), suppress_stdout=True)
+    yield log_path
+    _structlog.reset_defaults()
+    root = _logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+
+def _read_drift_skip_lines(log_path: Path) -> list[str]:
+    """Flush handlers and return every line emitting ``candidates.drift_skip``.
+
+    Match on the exact event name to avoid false positives from the
+    ``candidates.scanned`` summary line which carries a ``drift_skips=N``
+    counter field but is not itself a drift_skip event.
+    """
+    for h in _logging.getLogger().handlers:
+        h.flush()
+    if not log_path.exists():
+        return []
+    return [
+        line
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if "candidates.drift_skip " in line or "candidates.drift_skip\t" in line
+    ]
+
+
+def test_drift_skip_logged_when_mtime_bumped_but_body_unchanged(
+    tmp_path: Path,
+    drift_log_file: Path,
+) -> None:
+    """Frontmatter-only rewrite bumps mtime → drift_skip log + no candidate.
+
+    The core observability case. Stored last_distilled is older than the
+    file's current mtime (simulating a janitor structural fix landing
+    after the previous distillation), and the body bytes still match.
+    Scanner should skip AND emit ``candidates.drift_skip``.
+    """
+    vault = tmp_path / "vault"
+    _write_session(vault, "Foo", fm_extra="", body=_RICH_BODY)
+
+    full_text = (vault / "session" / "Foo.md").read_text(encoding="utf-8")
+    body_hash = compute_body_hash(full_text)
+
+    # Backdate last_distilled to a known-past timestamp so any current
+    # filesystem mtime is "after" without test-clock dependence.
+    last_distilled = "2026-04-25T00:00:00+00:00"
+    state = DistillerState(tmp_path / "state.json")
+    state.files["session/Foo.md"] = FileState(
+        md5="ignored", body_hash=body_hash, last_distilled=last_distilled,
+    )
+
+    # Force the file's mtime to "now" (well past last_distilled).
+    target = vault / "session" / "Foo.md"
+    now = _time.time()
+    _os.utime(target, (now, now))
+
+    candidates = scan_candidates(
+        vault_path=vault,
+        ignore_dirs=[],
+        ignore_files=[],
+        source_types=["session"],
+        threshold=0.4,
+        distilled_files=state.get_distilled_body_hashes(),
+        distilled_last_distilled=state.get_distilled_last_distilled(),
+    )
+
+    assert candidates == []
+    drift_lines = _read_drift_skip_lines(drift_log_file)
+    assert len(drift_lines) == 1, f"expected one drift_skip line; got: {drift_lines}"
+    line = drift_lines[0]
+    # Required fields per the ticket: source path, last_distilled, file_mtime,
+    # and the body_hash_unchanged marker.
+    assert "session/Foo.md" in line
+    assert "last_distilled" in line
+    assert "file_mtime" in line
+    assert "body_hash_unchanged" in line
+
+
+def test_drift_skip_not_logged_when_body_changed(
+    tmp_path: Path,
+    drift_log_file: Path,
+) -> None:
+    """Body actually shifted → no drift_skip (the file goes through to extract).
+
+    Regression guard: the drift_skip log is the body-hash-MATCHED path. A
+    body-changed file must reach the candidate path, not produce a
+    spurious drift_skip.
+    """
+    vault = tmp_path / "vault"
+    _write_session(vault, "Foo", fm_extra="", body=_RICH_BODY)
+    body_hash_before = compute_body_hash(
+        (vault / "session" / "Foo.md").read_text(encoding="utf-8")
+    )
+    new_body = _RICH_BODY + "\nLater: [[person/Andrew]] confirmed.\n"
+    _write_session(vault, "Foo", fm_extra="", body=new_body)
+
+    state = DistillerState(tmp_path / "state.json")
+    state.files["session/Foo.md"] = FileState(
+        md5="ignored", body_hash=body_hash_before,
+        last_distilled="2026-04-25T00:00:00+00:00",
+    )
+
+    candidates = scan_candidates(
+        vault_path=vault,
+        ignore_dirs=[],
+        ignore_files=[],
+        source_types=["session"],
+        threshold=0.4,
+        distilled_files=state.get_distilled_body_hashes(),
+        distilled_last_distilled=state.get_distilled_last_distilled(),
+    )
+
+    assert len(candidates) == 1
+    assert _read_drift_skip_lines(drift_log_file) == []
+
+
+def test_drift_skip_not_logged_for_legacy_state_without_last_distilled(
+    tmp_path: Path,
+    drift_log_file: Path,
+) -> None:
+    """Legacy state with body_hash but no last_distilled → no drift_skip noise.
+
+    ``get_distilled_last_distilled`` filters to entries that have a
+    last_distilled timestamp, so legacy hash-only entries simply don't
+    appear in the sidecar. The scanner falls through to its silent skip
+    on body-hash match — same behavior as before this ticket. Reason:
+    we don't want to fire drift_skip on the first scan after migration
+    when last_distilled is empty (would be misleading — there's no
+    "drift" yet, just absence of bookkeeping).
+    """
+    vault = tmp_path / "vault"
+    _write_session(vault, "Foo", fm_extra="", body=_RICH_BODY)
+    body_hash = compute_body_hash(
+        (vault / "session" / "Foo.md").read_text(encoding="utf-8")
+    )
+
+    state = DistillerState(tmp_path / "state.json")
+    # Body hash present, but last_distilled empty (legacy).
+    state.files["session/Foo.md"] = FileState(
+        md5="ignored", body_hash=body_hash, last_distilled="",
+    )
+
+    candidates = scan_candidates(
+        vault_path=vault,
+        ignore_dirs=[],
+        ignore_files=[],
+        source_types=["session"],
+        threshold=0.4,
+        distilled_files=state.get_distilled_body_hashes(),
+        distilled_last_distilled=state.get_distilled_last_distilled(),
+    )
+
+    assert candidates == []
+    assert _read_drift_skip_lines(drift_log_file) == []
+
+
+def test_get_distilled_last_distilled_filters_empty_fields(tmp_path: Path) -> None:
+    """Sidecar dict only includes entries with both body_hash AND last_distilled.
+
+    Contract for the call sites: pairing the dict with body_hashes ensures
+    we never look up a last_distilled for a key that isn't gated.
+    """
+    state = DistillerState(tmp_path / "state.json")
+    state.files["session/A.md"] = FileState(
+        md5="m", body_hash="bh-a", last_distilled="2026-04-25T00:00:00+00:00",
+    )
+    state.files["session/B.md"] = FileState(
+        md5="m", body_hash="bh-b", last_distilled="",  # legacy: no timestamp
+    )
+    state.files["session/C.md"] = FileState(
+        md5="m", body_hash="", last_distilled="2026-04-25T00:00:00+00:00",  # legacy: no hash
+    )
+
+    sidecar = state.get_distilled_last_distilled()
+    assert sidecar == {"session/A.md": "2026-04-25T00:00:00+00:00"}
+
+
+def test_drift_skip_omitted_when_sidecar_not_supplied(
+    tmp_path: Path,
+    drift_log_file: Path,
+) -> None:
+    """Backward-compat: callers that don't pass the sidecar get silent skips.
+
+    Existing tests / callers that only pass ``distilled_files`` continue
+    to work exactly as before — no drift_skip log fires (we have nothing
+    to compare against), but the body-hash gate still skips correctly.
+    """
+    vault = tmp_path / "vault"
+    _write_session(vault, "Foo", fm_extra="", body=_RICH_BODY)
+    body_hash = compute_body_hash(
+        (vault / "session" / "Foo.md").read_text(encoding="utf-8")
+    )
+
+    state = DistillerState(tmp_path / "state.json")
+    state.files["session/Foo.md"] = FileState(
+        md5="ignored", body_hash=body_hash,
+        last_distilled="2026-04-25T00:00:00+00:00",
+    )
+
+    candidates = scan_candidates(
+        vault_path=vault,
+        ignore_dirs=[],
+        ignore_files=[],
+        source_types=["session"],
+        threshold=0.4,
+        distilled_files=state.get_distilled_body_hashes(),
+        # distilled_last_distilled NOT passed
+    )
+
+    assert candidates == []
+    assert _read_drift_skip_lines(drift_log_file) == []

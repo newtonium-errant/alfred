@@ -158,6 +158,27 @@ class DistillerState:
         """
         return {rel: fs.body_hash for rel, fs in self.files.items() if fs.body_hash}
 
+    def get_distilled_last_distilled(self) -> dict[str, str]:
+        """Return {rel_path: last_distilled ISO timestamp} as a sidecar to body_hashes.
+
+        Used by ``scan_candidates`` to emit ``candidates.drift_skip`` log
+        lines when a file's mtime has bumped since the last distillation
+        but its body hash is unchanged — the signature of a cosmetic
+        frontmatter rewrite (janitor deep_sweep_fix, surveyor alfred_tags).
+        Aggregating this signal over time lets us evaluate whether
+        Option 3 (audit-log mutation-source gate) is worth the additional
+        80-100 LOC. See ``project_distiller_drift_mitigation.md``.
+
+        Filtered to files with a recorded ``body_hash`` so the keys
+        align with ``get_distilled_body_hashes()`` — entries the gate
+        would actually check.
+        """
+        return {
+            rel: fs.last_distilled
+            for rel, fs in self.files.items()
+            if fs.body_hash and fs.last_distilled
+        }
+
     def update_file(
         self,
         rel_path: str,
