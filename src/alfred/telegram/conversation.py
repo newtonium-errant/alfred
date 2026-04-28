@@ -22,6 +22,8 @@ from typing import Any, Final
 
 import anthropic
 
+from alfred.audit import agent_slug_for
+
 from ._anthropic_compat import messages_create_kwargs
 from .config import TalkerConfig
 from .session import Session, append_turn, append_vault_op
@@ -591,21 +593,13 @@ async def _dispatch_bash_exec(
 
 
 # --- Attribution-marker wiring (calibration audit gap, c2) ---------------
-
-
-def _agent_slug(config: TalkerConfig | None) -> str:
-    """Return the agent slug used in attribution markers.
-
-    Derived from ``config.instance.name`` lowercased ("Salem" → "salem",
-    "KAL-LE" → "kal-le", "Alfred" → "alfred"). Defaults to ``"talker"``
-    when no config is threaded in (legacy callers, tests that skip the
-    config plumb-through). Lowercase-only because the marker_id contract
-    expects ``[\\w-]+`` and downstream surfacers will group by agent.
-    """
-    if config is None:
-        return "talker"
-    name = (config.instance.name or "").strip().lower()
-    return name or "talker"
+#
+# The agent slug used in attribution markers comes from
+# :func:`alfred.audit.agent_slug_for` — a single canonical helper used by
+# both this module and non-talker writers (audit sweep, capture_batch,
+# calibration, Daily Sync). Keeping the slug derivation in one place
+# avoids the second-copy drift the canonical-helper pattern exists to
+# prevent.
 
 
 def _section_title_for_create(name: str, body: str | None) -> str:
@@ -776,7 +770,7 @@ async def _execute_tool(
                 wrapped_body, audit_entry = attribution.with_inferred_marker(
                     body,
                     section_title=_section_title_for_create(name, body),
-                    agent=_agent_slug(config),
+                    agent=agent_slug_for(config),
                     reason=_attribution_reason(session),
                 )
                 attribution.append_audit_entry(sf, audit_entry)
@@ -834,7 +828,7 @@ async def _execute_tool(
                     section_title=_section_title_for_edit_append(
                         body_append, rel_path,
                     ),
-                    agent=_agent_slug(config),
+                    agent=agent_slug_for(config),
                     reason=_attribution_reason(session),
                 )
                 attribution.append_audit_entry(merged_fm, audit_entry)

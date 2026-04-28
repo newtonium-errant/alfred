@@ -68,21 +68,12 @@ HISTORY_TAIL: Final[int] = 3
 # --- Instance-name normalisation ----------------------------------------
 #
 # Must agree with bot._normalize_instance_name for the (instance, user)
-# key to match between the /speed handler and the TTS call path.
-# Duplicated here to avoid a circular import (bot.py imports this module).
+# key to match between the /speed handler and the TTS call path. Both
+# import the canonical helper from ``alfred.telegram._compat`` so the
+# two paths cannot drift; ``_compat.py`` is the single source of truth
+# for the legacy ``alfred`` → ``salem`` mapping.
 
-
-def _normalize_instance_name(s: str) -> str:
-    """Return the canonical peer-key form of an instance name.
-
-    Lowercases, strips dots, maps spaces to dashes. ``alfred`` → ``salem``
-    legacy mapping preserved so default-configured installs match the
-    canonical ``salem`` key.
-    """
-    normalized = (s or "").lower().replace(".", "").replace(" ", "-")
-    if normalized == "alfred":
-        return "salem"
-    return normalized
+from ._compat import _normalize_instance_name  # noqa: E402, F401
 
 
 # --- Public API ---------------------------------------------------------

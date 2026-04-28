@@ -79,23 +79,13 @@ _KEY_LOCKS = "chat_locks"
 # strip dots, and map spaces to dashes — the same transform the transport
 # layer uses for peer keys in ``config.transport.peers``.
 #
-# Legacy mapping: the default ``InstanceConfig`` ships ``name="Alfred"``
-# for backwards compatibility, but the peer-name table keys off ``salem``.
-# We collapse ``alfred`` → ``salem`` here so the self-target check still
-# fires when Andrew runs a default-configured instance.
+# The actual normaliser lives in ``alfred.telegram._compat`` so this module
+# and ``alfred.telegram.speed_pref`` share one definition (the two used to
+# carry independent copies that risked silent divergence on the legacy
+# ``alfred`` → ``salem`` mapping). Re-exported here under the original
+# name so existing call sites and tests continue to work unchanged.
 
-
-def _normalize_instance_name(s: str) -> str:
-    """Return the canonical peer-key form of an instance name.
-
-    Lowercases, strips dots, and maps spaces to dashes. The legacy
-    ``alfred`` → ``salem`` mapping is applied so a default-configured
-    install still matches the ``salem`` peer key.
-    """
-    normalized = (s or "").lower().replace(".", "").replace(" ", "-")
-    if normalized == "alfred":
-        return "salem"
-    return normalized
+from ._compat import _normalize_instance_name  # noqa: E402, F401
 
 
 # --- Application-level inbound pre-pass ----------------------------------

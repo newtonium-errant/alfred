@@ -69,7 +69,7 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     "person": {"active", "inactive"},
     "org": {"active", "inactive"},
     "location": {"active", "inactive"},
-    "note": {"draft", "active", "review", "final"},
+    "note": {"draft", "active", "living", "review", "final"},
     "decision": {"draft", "final", "superseded", "reversed"},
     "process": {"active", "proposed", "design", "deprecated"},
     "run": {"active", "completed", "blocked", "cancelled"},

@@ -737,7 +737,16 @@ def _build_session_frontmatter(
     """
     voice_count, text_count = _count_message_kinds(session)
     participants = [f"[[{user_vault_path}]]"] if user_vault_path else []
-    outputs = [f"[[{op['path']}]]" for op in session.vault_ops]
+    # Dedup ``outputs`` while preserving first-seen insertion order. A
+    # single conversation may issue multiple ``vault_edit`` calls against
+    # the same record (e.g. a long-running task list edited 9 times in
+    # one session); the audit history lives on ``session.vault_ops`` /
+    # the ``vault_operations`` field, but the user-facing ``outputs``
+    # list should surface each touched record once. ``dict.fromkeys``
+    # gives ordered-set semantics on Python 3.7+.
+    outputs = list(dict.fromkeys(
+        f"[[{op['path']}]]" for op in session.vault_ops
+    ))
 
     # Display name mirrors the filename pattern: registered instances
     # (talker, hypatia, kalle) use ``<Mode> — <date> <slug>``; legacy /

@@ -42,3 +42,23 @@ def test_vault_search_finds_known_glob(tmp_vault: Path):
     sample = next(h for h in hits if h["path"] == "person/Sample Person.md")
     assert sample["type"] == "person"
     assert sample["name"] == "Sample Person"
+
+
+def test_vault_create_note_with_living_status(tmp_vault: Path):
+    # Hypatia QA 2026-04-28: status='living' on a note record (e.g. a
+    # permanent task list) was rejected by validation, forcing
+    # status='active' which is semantically wrong for reference
+    # material that never finishes. ``living`` is now a valid status
+    # for ``note`` records — this test guards against the regression.
+    result = vault_create(
+        tmp_vault,
+        "note",
+        "VAC Form Unit Economics Model",
+        set_fields={"status": "living"},
+    )
+    assert result["path"] == "note/VAC Form Unit Economics Model.md"
+
+    read_back = vault_read(tmp_vault, result["path"])
+    fm = read_back["frontmatter"]
+    assert fm["type"] == "note"
+    assert fm["status"] == "living"

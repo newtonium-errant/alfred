@@ -142,3 +142,83 @@ def test_telegram_pushback_level_in_record() -> None:
         stt_model_used="",
     )
     assert fm_none["telegram"]["pushback_level"] is None
+
+
+def test_outputs_dedup_same_path_appears_once() -> None:
+    """Hypatia QA 2026-04-28: a session that issues 9 ``vault_edit`` calls
+    against the same record produces a 1-element ``outputs`` list.
+
+    The full audit history still lives on ``session.vault_ops`` (and
+    surfaces in the frontmatter as ``vault_operations``); ``outputs`` is
+    the user-facing summary that should list each touched record once.
+    Insertion order is preserved across distinct paths.
+    """
+    sess = _make_session(vault_ops=[
+        # 9 edits to the same long-running task list — one conversation,
+        # multiple iterations.
+        {"op": "edit", "path": "note/VAC Form Unit Economics Model.md",
+         "ts": "2026-04-28T12:00:00+00:00"},
+        {"op": "edit", "path": "note/VAC Form Unit Economics Model.md",
+         "ts": "2026-04-28T12:01:00+00:00"},
+        {"op": "edit", "path": "note/VAC Form Unit Economics Model.md",
+         "ts": "2026-04-28T12:02:00+00:00"},
+        {"op": "edit", "path": "note/VAC Form Unit Economics Model.md",
+         "ts": "2026-04-28T12:03:00+00:00"},
+        {"op": "edit", "path": "note/VAC Form Unit Economics Model.md",
+         "ts": "2026-04-28T12:04:00+00:00"},
+        {"op": "edit", "path": "note/VAC Form Unit Economics Model.md",
+         "ts": "2026-04-28T12:05:00+00:00"},
+        {"op": "edit", "path": "note/VAC Form Unit Economics Model.md",
+         "ts": "2026-04-28T12:06:00+00:00"},
+        {"op": "edit", "path": "note/VAC Form Unit Economics Model.md",
+         "ts": "2026-04-28T12:07:00+00:00"},
+        {"op": "edit", "path": "note/VAC Form Unit Economics Model.md",
+         "ts": "2026-04-28T12:08:00+00:00"},
+    ])
+    ended = datetime(2026, 4, 28, 12, 15, tzinfo=timezone.utc)
+
+    fm = talker_session._build_session_frontmatter(
+        sess,
+        ended_at=ended,
+        reason="timeout",
+        user_vault_path="person/Andrew Newton",
+        stt_model_used="",
+    )
+
+    assert fm["outputs"] == ["[[note/VAC Form Unit Economics Model.md]]"], (
+        "9 edits to the same record should produce 1 outputs entry, "
+        f"got {fm['outputs']}"
+    )
+    # The audit trail must still carry every operation (it lives nested
+    # under the ``telegram`` block as ``vault_operations`` and the count
+    # surfaces in the description string).
+    assert len(fm["telegram"]["vault_operations"]) == 9
+    assert "9 vault ops" in fm["description"]
+
+
+def test_outputs_dedup_preserves_insertion_order_across_paths() -> None:
+    """Distinct paths keep their first-seen order; second occurrence
+    of a previously-seen path is dropped without disturbing the
+    relative order of others."""
+    sess = _make_session(vault_ops=[
+        {"op": "create", "path": "note/A.md", "ts": "2026-04-28T12:00:00Z"},
+        {"op": "create", "path": "note/B.md", "ts": "2026-04-28T12:01:00Z"},
+        {"op": "edit",   "path": "note/A.md", "ts": "2026-04-28T12:02:00Z"},
+        {"op": "create", "path": "note/C.md", "ts": "2026-04-28T12:03:00Z"},
+        {"op": "edit",   "path": "note/B.md", "ts": "2026-04-28T12:04:00Z"},
+    ])
+    ended = datetime(2026, 4, 28, 12, 15, tzinfo=timezone.utc)
+
+    fm = talker_session._build_session_frontmatter(
+        sess,
+        ended_at=ended,
+        reason="explicit",
+        user_vault_path=None,
+        stt_model_used="",
+    )
+
+    assert fm["outputs"] == [
+        "[[note/A.md]]",
+        "[[note/B.md]]",
+        "[[note/C.md]]",
+    ]

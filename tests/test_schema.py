@@ -40,3 +40,20 @@ def test_list_fields_includes_both_instruction_fields():
             f"{field!r} must be in LIST_FIELDS so instruction queues "
             f"are parsed as lists, not coerced to scalar strings."
         )
+
+
+def test_note_status_includes_living():
+    # ``status: living`` is a long-running-document marker for ``note``
+    # records (e.g. a permanent task list, an evolving reference page).
+    # Hypatia's QA flagged the gap on 2026-04-28 — the original status
+    # set rejected ``living``, forcing a fall-back to ``active`` which
+    # is semantically wrong for permanent reference material.
+    from alfred.vault.schema import STATUS_BY_TYPE
+
+    assert "living" in STATUS_BY_TYPE["note"], (
+        "note records must accept status='living' for long-running "
+        "reference docs (Hypatia QA 2026-04-28)."
+    )
+    # Other statuses must still be accepted — the addition is additive.
+    for legacy in ("draft", "active", "review", "final"):
+        assert legacy in STATUS_BY_TYPE["note"]

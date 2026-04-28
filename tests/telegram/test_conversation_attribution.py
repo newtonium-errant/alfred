@@ -299,15 +299,21 @@ def test_section_title_for_edit_append_falls_back_to_file_stem() -> None:
 
 
 def test_agent_slug_lowercases_instance_name() -> None:
+    """Integration: the canonical ``agent_slug_for`` accepts the talker's
+    ``TalkerConfig`` shape (the previous ``conversation._agent_slug`` was
+    a duplicate that has been retired in favour of this single helper).
+    """
+    from alfred.audit import agent_slug_for
     from alfred.telegram.config import InstanceConfig, TalkerConfig
     cfg = TalkerConfig(instance=InstanceConfig(name="Salem"))
-    assert conversation._agent_slug(cfg) == "salem"
+    assert agent_slug_for(cfg) == "salem"
     cfg_kalle = TalkerConfig(instance=InstanceConfig(name="KAL-LE"))
-    assert conversation._agent_slug(cfg_kalle) == "kal-le"
+    assert agent_slug_for(cfg_kalle) == "kal-le"
 
 
 def test_agent_slug_default_when_config_none() -> None:
-    assert conversation._agent_slug(None) == "talker"
+    from alfred.audit import agent_slug_for
+    assert agent_slug_for(None) == "talker"
 
 
 # --- Smoke: end-to-end shape on a fresh note ------------------------------
