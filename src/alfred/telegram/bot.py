@@ -380,12 +380,14 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if flip is not None:
             proposals.append(flip)
 
+        from alfred.audit import agent_slug_for as _agent_slug_for_calib
         result = calibration.apply_proposals(
             vault_path=Path(config.vault.path),
             user_rel_path=user_rel,
             proposals=proposals,
             session_record_path=rel_path,
             confirmation_dial=calibration.DEFAULT_CONFIRMATION_DIAL,
+            agent_slug=_agent_slug_for_calib(config),
         )
         if result["written"] and result["applied"]:
             # Surface the applied proposals inline so Andrew can react
@@ -419,6 +421,7 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         try:
             from pathlib import Path as _Path
+            from alfred.audit import agent_slug_for
             batch_model = config.anthropic.model or "claude-sonnet-4-6"
             asyncio.create_task(
                 capture_batch.process_capture_session(
@@ -429,6 +432,7 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     model=batch_model,
                     send_follow_up=_send_follow_up,
                     short_id=short_id,
+                    agent_slug=agent_slug_for(config),
                 )
             )
         except Exception as exc:  # noqa: BLE001 — scheduling shouldn't block close reply
@@ -685,12 +689,14 @@ async def on_extract(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         short_id=short_id,
     )
 
+    from alfred.audit import agent_slug_for as _agent_slug_for_extract
     result = await capture_extract.extract_notes_from_capture(
         client=client,
         state=state_mgr,
         vault_path=_Path(config.vault.path),
         short_id=short_id,
         model=model,
+        agent_slug=_agent_slug_for_extract(config),
     )
 
     if result.skipped_reason == "already_extracted":
@@ -802,6 +808,7 @@ async def on_brief(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not summary_block:
         # Implicit chain — try to structure first.
         try:
+            from alfred.audit import agent_slug_for
             transcript = capture_extract._synthetic_transcript_from_body(
                 post.content
             )
@@ -811,6 +818,7 @@ async def on_brief(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             summary_block = capture_batch.render_summary_markdown(summary)
             await capture_batch.write_summary_to_session_record(
                 vault_path, session_rel, summary_block, "true",
+                agent_slug=agent_slug_for(config),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -1911,15 +1919,29 @@ async def _maybe_handle_daily_sync_reply(
     # Phase 2 attribution items operate directly on vault files.
     talker_config = ctx.application.bot_data.get(_KEY_CONFIG)
     vault_path: Path | None = None
+    instance_scope = "talker"
     if talker_config is not None:
         try:
             vault_path = Path(talker_config.vault.path)
         except Exception:  # noqa: BLE001
             vault_path = None
+        # Mirror of conversation._execute_tool's per-instance scope
+        # routing (commit b8c843d). On a Hypatia / KAL-LE bot, a
+        # canonical-record proposal confirm must dispatch to the right
+        # SCOPE_RULES entry — "talker" denies hypatia-only types like
+        # ``document``.
+        try:
+            instance_scope = talker_config.instance.tool_set or "talker"
+        except Exception:  # noqa: BLE001
+            instance_scope = "talker"
 
     try:
         result = handle_daily_sync_reply(
-            ds_config, parent_msg_id, user_text, vault_path=vault_path,
+            ds_config,
+            parent_msg_id,
+            user_text,
+            vault_path=vault_path,
+            instance_scope=instance_scope,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("talker.bot.daily_sync_reply_failed", error=str(exc))
@@ -1986,15 +2008,23 @@ async def _maybe_smart_route_daily_sync_reply(
 
     talker_config = ctx.application.bot_data.get(_KEY_CONFIG)
     vault_path: Path | None = None
+    instance_scope = "talker"
     if talker_config is not None:
         try:
             vault_path = Path(talker_config.vault.path)
         except Exception:  # noqa: BLE001
             vault_path = None
+        try:
+            instance_scope = talker_config.instance.tool_set or "talker"
+        except Exception:  # noqa: BLE001
+            instance_scope = "talker"
 
     try:
         result = maybe_smart_route_reply(
-            ds_config, user_text, vault_path=vault_path,
+            ds_config,
+            user_text,
+            vault_path=vault_path,
+            instance_scope=instance_scope,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(

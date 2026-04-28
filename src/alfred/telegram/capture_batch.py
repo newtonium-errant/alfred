@@ -367,6 +367,8 @@ async def write_summary_to_session_record(
     session_rel_path: str,
     summary_markdown: str,
     structured_flag: str,
+    *,
+    agent_slug: str = "salem",
 ) -> None:
     """Inject the summary block + flip ``capture_structured`` frontmatter.
 
@@ -375,6 +377,13 @@ async def write_summary_to_session_record(
     ``"partial"`` without a schema migration. The session record MUST
     already exist (written by session.close_session before this is
     called).
+
+    ``agent_slug`` is the running instance's slug (lowercased
+    ``config.instance.name``); the attribution-audit entry's ``agent``
+    field carries this. Defaults to ``"salem"`` so legacy callers and
+    older tests preserve their behaviour. Pass
+    :func:`alfred.audit.agent_slug_for(config)` from production call
+    sites so Hypatia/KAL-LE captures attribute correctly.
 
     Calibration audit gap (c4): the entire ``## Structured Summary``
     block is Sonnet-inferred output (every section is a model
@@ -394,7 +403,7 @@ async def write_summary_to_session_record(
         wrapped, audit_entry = attribution.with_inferred_marker(
             summary_markdown,
             section_title="Structured Summary",
-            agent="salem",
+            agent=agent_slug,
             reason=f"capture batch structuring (session={session_rel_path})",
         )
         summary_to_write = wrapped
@@ -439,6 +448,8 @@ async def process_capture_session(
     model: str,
     send_follow_up: Any | None = None,
     short_id: str = "",
+    *,
+    agent_slug: str = "salem",
 ) -> None:
     """Top-level orchestrator — run batch pass, write summary, send follow-up.
 
@@ -451,6 +462,11 @@ async def process_capture_session(
     (typically a bound Telegram ``Bot.send_message`` call with chat_id
     pre-bound). Passed in rather than built inside so the orchestrator
     stays testable without a full bot context.
+
+    ``agent_slug`` is the running instance's slug (lowercased
+    ``config.instance.name``) — forwarded to
+    :func:`write_summary_to_session_record` so the attribution-audit
+    entry carries the right agent.
     """
     try:
         summary = await run_batch_structuring(client, transcript, model)
@@ -464,6 +480,7 @@ async def process_capture_session(
         try:
             await write_summary_to_session_record(
                 vault_path, session_rel_path, failure_md, "failed",
+                agent_slug=agent_slug,
             )
         except Exception as write_exc:  # noqa: BLE001
             log.warning(
@@ -489,6 +506,7 @@ async def process_capture_session(
     try:
         await write_summary_to_session_record(
             vault_path, session_rel_path, summary_md, "true",
+            agent_slug=agent_slug,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(

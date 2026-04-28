@@ -291,12 +291,21 @@ def apply_proposals(
     proposals: list[Proposal],
     session_record_path: str,
     confirmation_dial: int = DEFAULT_CONFIRMATION_DIAL,
+    *,
+    agent_slug: str = "salem",
 ) -> dict[str, Any]:
     """Apply the proposals to the user's calibration block.
 
     Returns a dict summarising what happened:
         {"written": bool, "applied": list[Proposal], "skipped": list[Proposal],
          "reason": str}
+
+    ``agent_slug`` is the running instance's slug (lowercased
+    ``config.instance.name``); each per-subsection attribution-audit
+    entry's ``agent`` field carries this. Defaults to ``"salem"`` so
+    legacy callers and tests that skip the plumb preserve their
+    behaviour. Pass :func:`alfred.audit.agent_slug_for(config)` from
+    production call sites.
 
     Dial behaviour:
         - 0: nothing is written (returned immediately).
@@ -386,7 +395,7 @@ def apply_proposals(
         wrapped_block, entry = attribution.with_inferred_marker(
             joined,
             section_title=f"Calibration — {sub}",
-            agent="salem",
+            agent=agent_slug,
             reason=f"calibration update (source={reason_src})",
         )
         wrapped_by_subsection[sub] = [wrapped_block]

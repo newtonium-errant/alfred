@@ -110,25 +110,29 @@ class InferMarkerResult:
         )
 
 
-def _agent_from_source(source: str) -> str:
+def _agent_from_source(source: str, default_slug: str = "salem") -> str:
     """Map a ``_source:`` annotation path to an agent slug.
 
     The convention today: ``session/...`` paths are voice / talker
-    sessions (Salem). ``memory/...`` paths are imported memory entries
-    (also classify as Salem since the inference happened in a Salem
-    turn). Anything else falls back to ``"salem"`` — the calibration
-    writer is the dominant author of these annotations.
+    sessions (the running instance — Salem on the Salem bot, Hypatia
+    on the Hypatia bot). ``memory/...`` paths are imported memory
+    entries (also classify under the running instance since the
+    inference happened in its turn). Anything else falls back to the
+    same slug — the calibration writer is the dominant author of these
+    annotations and the source path doesn't reliably carry an agent
+    identity.
+
+    ``default_slug`` is the running instance's slug (lowercased
+    ``config.instance.name``). Defaults to ``"salem"`` so legacy
+    callers that don't thread a slug through preserve their behaviour.
+    Pass ``audit.agent_slug_for(config)`` from the call site to honour
+    multi-instance attribution.
     """
-    s = source.strip().strip('"').strip("'")
-    if s.startswith("session/"):
-        return "salem"
-    if s.startswith("memory/"):
-        return "salem"
-    # Unknown shapes still attribute to Salem — the calibration writer
-    # is the only known producer of _source: annotations today, and
-    # we'd rather have a slightly imprecise agent slug on the audit
-    # entry than skip the bullet entirely.
-    return "salem"
+    # All branches use the same slug today — the source path doesn't
+    # disambiguate which agent inferred the bullet. Kept as a single
+    # function so a future heuristic (e.g. distinguishing curator
+    # imports from talker turns) lands here in one place.
+    return default_slug
 
 
 def _section_title_for(lines: list[str], idx: int, fallback: str) -> str:
@@ -166,7 +170,12 @@ def _existing_marker_spans(body: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _scan_record(rel_path: str, full_path: Path) -> tuple[
+def _scan_record(
+    rel_path: str,
+    full_path: Path,
+    *,
+    agent_slug: str = "salem",
+) -> tuple[
     list[InferMarkerCandidate], int, str | None
 ]:
     """Read one record + return (candidates, already_marked_count, error).
@@ -174,6 +183,10 @@ def _scan_record(rel_path: str, full_path: Path) -> tuple[
     ``error`` is None on success. Returns an empty candidate list when
     the record has no ``_source:`` bullets — caller buckets it as
     ``skipped_no_source``.
+
+    ``agent_slug`` is forwarded to :func:`_agent_from_source` so each
+    candidate's ``agent`` field carries the running instance's slug
+    instead of a hardcoded ``"salem"``.
     """
     try:
         post = frontmatter.load(str(full_path))
@@ -200,7 +213,7 @@ def _scan_record(rel_path: str, full_path: Path) -> tuple[
         text = m.group("text").strip()
         source = m.group("source").strip()
         section_title = _section_title_for(lines, i, file_stem)
-        agent = _agent_from_source(source)
+        agent = _agent_from_source(source, default_slug=agent_slug)
         candidates.append(
             InferMarkerCandidate(
                 record_path=rel_path,
@@ -254,6 +267,7 @@ def sweep_paths(
     rel_paths: list[str],
     *,
     apply: bool = False,
+    agent_slug: str = "salem",
 ) -> InferMarkerResult:
     """Scan ``rel_paths`` under ``vault_path`` and (optionally) apply
     attribution markers to every soft-attributed bullet.
@@ -261,6 +275,13 @@ def sweep_paths(
     ``rel_paths`` is the list of vault-relative file paths to inspect;
     the CLI defaults this to every ``person/*.md``. Pass ``apply=True``
     to write changes; the default is dry-run (collect candidates only).
+
+    ``agent_slug`` is the running instance's slug (lowercased
+    ``config.instance.name``); each generated audit entry's ``agent``
+    field carries this. Defaults to ``"salem"`` so legacy callers that
+    don't thread a slug through preserve current behaviour. The CLI
+    handler reads this from the loaded config — see
+    :func:`alfred.audit.cli.cmd_infer_marker`.
 
     Idempotent: bullets already inside a ``BEGIN_INFERRED`` block are
     counted under ``skipped_already_marked`` and not re-wrapped.
@@ -276,7 +297,9 @@ def sweep_paths(
             result.errors.append((rel, "file not found"))
             continue
 
-        candidates, already_marked, err = _scan_record(rel, full)
+        candidates, already_marked, err = _scan_record(
+            rel, full, agent_slug=agent_slug,
+        )
         if err is not None:
             result.errors.append((rel, err))
             continue

@@ -1136,7 +1136,7 @@ def cmd_instance(args: argparse.Namespace) -> None:
     print(f"       source {instance_dir}/.venv/bin/activate")
     print(f"       pip install -e {Path.cwd()}")
     print(f"  6. Launch:")
-    print(f"       alfred --config {config_path} up --only talker,transport,instructor")
+    print(f"       alfred --config {config_path} up --only talker,instructor,brief_digest_push")
 
 
 def cmd_mail(args: argparse.Namespace) -> None:

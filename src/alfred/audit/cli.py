@@ -20,6 +20,20 @@ import yaml
 from .sweep import sweep_paths
 
 
+def _agent_slug_from_raw_config(raw: dict) -> str:
+    """Read the running instance's lowercased name from raw config.
+
+    Falls back to ``"salem"`` when no ``instance.name`` is present so a
+    config-less invocation matches the historical default. Lowercased to
+    match :func:`alfred.audit.agent_slug_for`.
+    """
+    instance = (raw.get("instance") or {}) if isinstance(raw, dict) else {}
+    if not isinstance(instance, dict):
+        return "salem"
+    name = (instance.get("name") or "").strip().lower()
+    return name or "salem"
+
+
 def _vault_path_from_config(config_path: str | Path = "config.yaml") -> Path:
     """Read the configured vault path from ``config.yaml``.
 
@@ -35,6 +49,21 @@ def _vault_path_from_config(config_path: str | Path = "config.yaml") -> Path:
     vault = raw.get("vault", {}) or {}
     p = vault.get("path") or "./vault"
     return Path(p)
+
+
+def _load_raw_config(config_path: str | Path = "config.yaml") -> dict:
+    """Best-effort raw-config load. Returns ``{}`` on any failure.
+
+    The audit CLI is intentionally tolerant of missing/broken config
+    files (tests pass ``--vault-path`` and don't need a config), but
+    when a config IS present we want to read ``instance.name`` from it
+    so the sweep attributes correctly.
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
 
 
 def _gather_default_paths(vault_path: Path) -> list[str]:
@@ -58,8 +87,11 @@ def cmd_infer_marker(args: argparse.Namespace) -> int:
     Returns the process exit code (0 on success, 1 when any errors
     were recorded).
     """
+    config_path = getattr(args, "config", None) or "config.yaml"
+    raw = _load_raw_config(config_path)
+    agent_slug = _agent_slug_from_raw_config(raw)
     vault_path = (
-        Path(args.vault_path) if args.vault_path else _vault_path_from_config()
+        Path(args.vault_path) if args.vault_path else _vault_path_from_config(config_path)
     )
     if not vault_path.exists():
         print(f"vault path not found: {vault_path}", file=sys.stderr)
@@ -77,9 +109,11 @@ def cmd_infer_marker(args: argparse.Namespace) -> int:
     apply = bool(args.apply)
     print(
         f"{'APPLY' if apply else 'DRY-RUN'}: scanning {len(rel_paths)} record(s) "
-        f"under {vault_path}"
+        f"under {vault_path} (agent={agent_slug})"
     )
-    result = sweep_paths(vault_path, rel_paths, apply=apply)
+    result = sweep_paths(
+        vault_path, rel_paths, apply=apply, agent_slug=agent_slug,
+    )
 
     # Group candidates by record for a readable plan.
     by_record: dict[str, list] = {}

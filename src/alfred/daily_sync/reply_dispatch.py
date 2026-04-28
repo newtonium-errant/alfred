@@ -278,6 +278,7 @@ def maybe_smart_route_reply(
     reply_text: str,
     *,
     vault_path: Path | None = None,
+    instance_scope: str = "talker",
 ) -> dict[str, Any] | None:
     """Try to handle ``reply_text`` as a Daily Sync reply WITHOUT a
     reply-to-message context. Returns the same shape as
@@ -294,6 +295,10 @@ def maybe_smart_route_reply(
          flag and return ``None`` so the caller falls through.
       3. Once ``replied=true``, subsequent messages always fall
          through. Andrew uses reply-to-message for follow-ups.
+
+    ``instance_scope`` mirrors :func:`handle_daily_sync_reply` — the
+    running instance's scope name forwarded so canonical-record
+    proposal-confirms create under the right scope.
 
     The caller (bot) checks ``reply_targets_daily_sync`` first. This
     function is the second-line dispatch for messages that DON'T have
@@ -330,6 +335,7 @@ def maybe_smart_route_reply(
         parent_message_id=synthetic_parent,
         reply_text=reply_text,
         vault_path=vault_path,
+        instance_scope=instance_scope,
     )
 
     if result is None:
@@ -574,14 +580,19 @@ def _resolve_proposal_correction(
     item: dict[str, Any],
     vault_path: Path,
     proposals_queue_path: str,
+    *,
+    instance_scope: str = "talker",
 ) -> tuple[str | None, bool]:
     """Apply one canonical-proposal confirm/reject.
 
     Returns ``(error_str_or_None, did_write)``.
 
-    On confirm: calls :func:`vault_create` with ``scope='salem'`` and
-    the proposer's ``proposed_fields`` to create the canonical record,
-    then marks the proposal ``accepted`` in the queue JSONL.
+    On confirm: calls :func:`vault_create` with the running instance's
+    ``scope`` (read from ``config.instance.tool_set`` and threaded in
+    by :func:`handle_daily_sync_reply`) and the proposer's
+    ``proposed_fields`` to create the canonical record, then marks the
+    proposal ``accepted`` in the queue JSONL. Default ``"talker"``
+    preserves Salem's behaviour for legacy callers.
 
     On reject: marks the proposal ``rejected`` and does NOT create
     any record.
@@ -643,15 +654,18 @@ def _resolve_proposal_correction(
         )
         return (None, True)
 
-    # confirm path — create the canonical record under the talker scope
-    # (Salem's Telegram-driven writer identity; validated by SCOPE_RULES).
+    # confirm path — create the canonical record under the running
+    # instance's scope (Salem → "talker", KAL-LE → "kalle", Hypatia →
+    # "hypatia"; validated by SCOPE_RULES). Read from
+    # ``config.instance.tool_set`` and threaded in by the caller; default
+    # "talker" preserves legacy behaviour for callers that skip the plumb.
     try:
         result = vault_create(
             vault_path=vault_path,
             record_type=record_type,
             name=name,
             set_fields=proposed_fields or None,
-            scope="talker",
+            scope=instance_scope,
         )
     except Exception as exc:  # noqa: BLE001
         # Most common failure: record already exists on disk (race).
@@ -942,6 +956,7 @@ def handle_daily_sync_reply(
     reply_text: str,
     *,
     vault_path: Path | None = None,
+    instance_scope: str = "talker",
 ) -> dict[str, Any] | None:
     """Process a Daily Sync reply. Returns a result dict or ``None``.
 
@@ -957,6 +972,14 @@ def handle_daily_sync_reply(
     attribution items (so the dispatcher can read + write the affected
     record); it's a kwarg so existing email-only tests continue to
     pass without supplying it.
+
+    ``instance_scope`` is the running instance's scope name (mirror of
+    ``config.instance.tool_set``: ``"talker"`` for Salem, ``"kalle"``
+    for KAL-LE, ``"hypatia"`` for Hypatia). Forwarded to
+    :func:`_resolve_proposal_correction` so canonical-record creates on
+    proposal-confirm pass through the right scope's allowlist. Default
+    ``"talker"`` preserves Salem's behaviour for legacy callers / tests
+    that skip the plumb.
 
     On a match, the result dict carries:
       - ``confirmed_count``: int — how many entries were written
@@ -1086,6 +1109,7 @@ def handle_daily_sync_reply(
                     )
                     err, did_write = _resolve_proposal_correction(
                         synthetic, item, vault_path, proposals_queue_path,
+                        instance_scope=instance_scope,
                     )
                     if err is not None:
                         errors.append(err)
@@ -1175,6 +1199,7 @@ def handle_daily_sync_reply(
                     continue
                 err, did_write = _resolve_proposal_correction(
                     correction, proposal_item, vault_path, proposals_queue_path,
+                    instance_scope=instance_scope,
                 )
                 if err is not None:
                     errors.append(err)

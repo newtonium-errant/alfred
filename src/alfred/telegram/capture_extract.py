@@ -244,6 +244,8 @@ async def extract_notes_from_capture(
     short_id: str,
     model: str,
     max_notes: int = DEFAULT_MAX_NOTES,
+    *,
+    agent_slug: str = "salem",
 ) -> ExtractResult:
     """Extract up to ``max_notes`` standalone notes from a capture session.
 
@@ -251,6 +253,11 @@ async def extract_notes_from_capture(
     already has entries, returns the existing list with
     ``skipped_reason="already_extracted"`` — caller renders the "delete
     first to re-run" message.
+
+    ``agent_slug`` is the running instance's slug — forwarded to the
+    implicit-chain :func:`capture_batch.write_summary_to_session_record`
+    call so the attribution-audit entry carries the right agent. Default
+    ``"salem"`` preserves legacy behaviour for tests that skip the plumb.
 
     Returns an :class:`ExtractResult`. Never raises; failure modes
     degrade to empty ``created_paths`` + a populated ``skipped_reason``.
@@ -295,6 +302,7 @@ async def extract_notes_from_capture(
             summary_md = capture_batch.render_summary_markdown(summary)
             await capture_batch.write_summary_to_session_record(
                 vault_path, session_rel, summary_md, "true",
+                agent_slug=agent_slug,
             )
             # Refresh the post so the summary is visible below.
             refreshed = _load_session_record(vault_path, session_rel)
