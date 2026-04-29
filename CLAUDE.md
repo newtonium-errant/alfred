@@ -205,9 +205,22 @@ Each agent reads `.claude/agents/{name}.md` for their specific instructions.
 - **New n8n workflows:** generate importable JSON files (unless user says otherwise)
 - **Existing n8n workflows:** create instruction docs for manual UI application (workflow JSON breaks on import after UI edits). If the user asks for a complete rewrite, generate importable JSON.
 
-### Session Notes — Learnings Section
+### Session Notes — Where they live + Learnings Section
 
-Every session note in `vault/session/` must include an `## Alfred Learnings` section. This flags reusable knowledge for the distiller:
+**Convention (effective 2026-04-29)**: hand-authored **dev session notes** (the kind team-lead writes summarizing development arcs — "Phase 1 ship", "Upstream merge", "Observability arc", "BIT c1 skeleton", etc.) go to **`aftermath-lab/session/`**, not Salem's `vault/session/`.
+
+Reasoning: dev session notes are about Alfred's development. KAL-LE owns aftermath-lab and is the canonical-pattern curator. KAL-LE distiller-radar is the natural consumer. Salem's vault is for operational/personal records (RRTS, persons, projects). Dev notes are out-of-scope for Salem's distiller; they're load-bearing for KAL-LE's.
+
+| Note type | Where it lives | Authored by |
+|---|---|---|
+| Hand-authored dev session notes | `aftermath-lab/session/` | team-lead (this convention) |
+| Auto-generated talker conversation records | `<instance>/session/` (each instance's own vault) | talker daemon |
+| Auto-generated capture session records | `<instance>/session/` | capture daemon |
+| Operational session notes about Salem-domain work (RRTS, etc.) | `vault/session/` (Salem) | situational |
+
+**Historical dev session notes already in Salem's `vault/session/`** stay there as historical baseline (~50+ notes pre-2026-04-29). KAL-LE's Phase 1 backfill will do a one-time extraction pass over them but will not migrate the files.
+
+**Every dev session note must include an `## Alfred Learnings` section**. This flags reusable knowledge for the KAL-LE distiller-radar:
 
 - **New gotchas** — bugs that cost debugging time (e.g., "pymilvus 2.6.10 incompatible with milvus-lite 2.5.1")
 - **Anti-patterns confirmed** — tried something, it failed (e.g., "OpenClaw can't run local models")
@@ -215,7 +228,7 @@ Every session note in `vault/session/` must include an `## Alfred Learnings` sec
 - **Corrections** — something in agent instructions or CLAUDE.md is wrong or outdated
 - **Missing knowledge** — had to figure out something that should have been documented
 
-The distiller processes these on two levels: explicit flagged learnings first, then full session scan for implicit patterns (repeated rework, knowledge compliance gaps, undocumented standards).
+The KAL-LE distiller processes these on two levels: explicit flagged learnings first, then full session scan for implicit patterns (repeated rework, knowledge compliance gaps, undocumented standards). Output lands as `learn/` records in `aftermath-lab/`, feeding the canonical curation flow.
 
 ### Agent Knowledge Requirements
 
