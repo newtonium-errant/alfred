@@ -587,10 +587,19 @@ def _stage2_dedup_merge(
                 if candidate.get("evidence_excerpt"):
                     m["evidence_excerpts"].append(candidate["evidence_excerpt"])
                 for sl in candidate.get("source_links", []):
-                    if sl not in m["source_links"]:
+                    # Defensively flatten: LLM may return [[links]] or [links]
+                    if isinstance(sl, list):
+                        for nested in sl:
+                            if nested not in m["source_links"]:
+                                m["source_links"].append(nested)
+                    elif sl not in m["source_links"]:
                         m["source_links"].append(sl)
                 for el in candidate.get("entity_links", []):
-                    if el not in m["entity_links"]:
+                    if isinstance(el, list):
+                        for nested in el:
+                            if nested not in m["entity_links"]:
+                                m["entity_links"].append(nested)
+                    elif el not in m["entity_links"]:
                         m["entity_links"].append(el)
                 # Bump confidence when multiple sources agree
                 if m["source_count"] >= 3 and m["confidence"] == "low":
