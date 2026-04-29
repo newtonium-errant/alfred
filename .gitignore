@@ -58,6 +58,10 @@ workflows/
 !/vault/session/
 !/vault/process/
 
+# Pending Items view auto-regenerates with timestamp churn (~288/day per
+# instance). Source of truth is data/pending_items.jsonl (also gitignored).
+/vault/process/Pending Items.md
+
 # Pytest / coverage artifacts
 htmlcov/
 .coverage
