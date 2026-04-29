@@ -32,6 +32,7 @@ from .backends.anthropic_sdk import call_anthropic_no_tools
 from .candidates import CandidateSignal
 from .config import DistillerConfig
 from .contracts import ExtractionResult
+from .parser import extract_alfred_learnings_section
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -239,7 +240,15 @@ def _render_user_prompt(
     existing_learn_titles: list[tuple[str, str]],
     signals: CandidateSignal,
 ) -> str:
-    """Assemble the per-source user turn."""
+    """Assemble the per-source user turn.
+
+    When the source body contains an ``## Alfred Learnings`` section
+    (the dev-session-note convention, CLAUDE.md effective 2026-04-29),
+    that section is surfaced as ``EXPLICITLY FLAGGED LEARNINGS`` ahead
+    of the full body. Each bullet inside is the author's own flag of a
+    knowledge atom worth distilling — DIRECT extraction signal beats
+    full-body mining.
+    """
     fm_json = json.dumps(source_frontmatter, default=str, indent=2)
 
     if existing_learn_titles:
@@ -260,10 +269,23 @@ def _render_user_prompt(
         f"  link_density: {signals.link_density}"
     )
 
+    flagged_section = extract_alfred_learnings_section(source_body)
+    if flagged_section:
+        body_block = (
+            f"--- EXPLICITLY FLAGGED LEARNINGS ---\n"
+            f"(The author flagged each bullet below as a candidate learning. "
+            f"Treat these as DIRECT extraction inputs — extract one learning "
+            f"per distinct flagged item where appropriate.)\n\n"
+            f"{flagged_section}\n\n"
+            f"--- FULL CONTEXT (source body) ---\n{source_body}\n\n"
+        )
+    else:
+        body_block = f"--- Source body ---\n{source_body}\n\n"
+
     return (
         "Extract learnings from this source record.\n\n"
         f"--- Source frontmatter ---\n{fm_json}\n\n"
-        f"--- Source body ---\n{source_body}\n\n"
+        f"{body_block}"
         f"--- Candidate signals (scoring hints) ---\n{signal_lines}\n\n"
         f"--- Existing learnings (do not duplicate) ---\n{existing_lines}\n\n"
         "Return the JSON object."

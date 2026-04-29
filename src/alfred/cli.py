@@ -584,6 +584,8 @@ def cmd_distiller(args: argparse.Namespace) -> None:
         dcli.cmd_history(config, limit=args.limit)
     elif subcmd == "consolidate":
         dcli.cmd_consolidate(config, skills_dir)
+    elif subcmd == "backfill":
+        dcli.cmd_backfill(config, source=args.source, dry_run=args.dry_run)
     else:
         print(f"Unknown distiller subcommand: {subcmd}")
         sys.exit(1)
@@ -1656,6 +1658,23 @@ def build_parser() -> argparse.ArgumentParser:
     dist_sub.add_parser("consolidate", help="Consolidation sweep: merge duplicates, resolve contradictions")
     dist_hist = dist_sub.add_parser("history", help="Show run history")
     dist_hist.add_argument("--limit", type=int, default=10)
+    # One-time backfill: extract learn records from an external source dir
+    # (e.g. KAL-LE distiller-radar Phase 1 over Salem's vault/session/).
+    # Source files are read-only; learn records land in the configured
+    # vault path; processed source paths are tracked in
+    # distiller_backfill_state.json (sibling of distiller_state.json).
+    dist_backfill = dist_sub.add_parser(
+        "backfill",
+        help="One-time extraction over an external source directory",
+    )
+    dist_backfill.add_argument(
+        "--source", required=True,
+        help="Absolute path to a source directory of *.md session/note files",
+    )
+    dist_backfill.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Report eligible files + counts without extracting or writing",
+    )
 
     # instructor
     inst = sub.add_parser(

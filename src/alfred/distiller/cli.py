@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from .backfill import cmd_backfill as _cmd_backfill_inner
 from .candidates import scan_candidates, group_by_project
 from .config import DistillerConfig
 from .daemon import run_extraction, run_watch
@@ -173,6 +174,24 @@ def cmd_consolidate(config: DistillerConfig, skills_dir: Path) -> None:
     print(f"Records modified: {len(mutations.get('files_modified', []))}")
     print(f"Records created: {len(mutations.get('files_created', []))}")
     print(f"Records deleted: {len(mutations.get('files_deleted', []))}")
+
+
+def cmd_backfill(
+    config: DistillerConfig,
+    source: str,
+    dry_run: bool = False,
+) -> None:
+    """One-time backfill: extract learn records from an external source dir.
+
+    KAL-LE distiller-radar Phase 1. Walks ``source`` (typically Salem's
+    ``vault/session/``) for ``*.md`` files containing
+    ``## Alfred Learnings``, runs the v2 extractor on each, writes
+    learn records to the configured vault path. Source files are NOT
+    modified. Already-processed source paths are tracked in
+    ``distiller_backfill_state.json`` so subsequent runs are no-ops.
+    """
+    source_path = Path(source).expanduser().resolve()
+    _cmd_backfill_inner(config, source_path, dry_run=dry_run)
 
 
 def cmd_history(config: DistillerConfig, limit: int = 10) -> None:

@@ -127,13 +127,35 @@ def format_existing_learns(learns: list) -> str:
 
 
 def format_source_records(candidates: list) -> str:
-    """Format source records for the agent prompt."""
+    """Format source records for the agent prompt.
+
+    When a record's body contains an ``## Alfred Learnings`` section
+    (the dev-session-note convention, CLAUDE.md effective 2026-04-29),
+    that section is surfaced as ``EXPLICITLY FLAGGED LEARNINGS`` ahead
+    of the full body — the LLM is asked to treat each bullet as a DIRECT
+    extraction candidate rather than mining the whole record. Records
+    without the section fall back to the original full-body framing.
+    """
+    # Local import to avoid circular dependency at module load.
+    from ..parser import extract_alfred_learnings_section
+
     lines: list[str] = []
     for sc in candidates:
         rec = sc.record
         lines.append(f"### {rec.rel_path} (score: {sc.score:.2f})")
         lines.append(f"- Type: {rec.record_type}")
         lines.append(f"- Wikilinks: {', '.join(rec.wikilinks[:10])}")
+
+        flagged = extract_alfred_learnings_section(rec.body)
+        if flagged:
+            lines.append("")
+            lines.append("EXPLICITLY FLAGGED LEARNINGS (treat each bullet as a direct extraction candidate):")
+            lines.append("```")
+            lines.append(flagged[:2000])
+            lines.append("```")
+            lines.append("")
+            lines.append("FULL CONTEXT:")
+
         lines.append(f"```")
         lines.append(rec.body[:2000])  # cap body length in prompt
         lines.append(f"```")

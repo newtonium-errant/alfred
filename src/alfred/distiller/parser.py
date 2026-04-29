@@ -13,6 +13,24 @@ WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
 # Embed pattern: ![[something.base#Section]] or ![[file]]
 EMBED_RE = re.compile(r"!\[\[[^\]]+\]\]")
 
+# ``## Alfred Learnings`` section detector. The convention (CLAUDE.md
+# effective 2026-04-29) is that hand-authored dev session notes carry
+# explicitly flagged learnings under this exact heading — bullets each
+# representing a candidate knowledge atom (gotcha, anti-pattern,
+# pattern, correction, missing-knowledge). The KAL-LE distiller-radar
+# treats this section as DIRECT extraction signal — higher leverage
+# than a full-body scan.
+#
+# The match is anchored to start-of-line and stops at the next
+# ``## `` heading or end-of-document (``\Z``). Multi-paragraph
+# Learnings sections are common (one paragraph per bullet); the
+# DOTALL flag lets the body span newlines. The trailing lookahead is
+# non-consuming so the next section's heading isn't eaten.
+ALFRED_LEARNINGS_SECTION_RE = re.compile(
+    r"^##\s+Alfred Learnings\s*\n(?P<body>.*?)(?=^##\s|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
 # KEN dynamic section markers
 KEN_DYNAMIC_RE = re.compile(
     r"<!-- KEN:DYNAMIC -->.*?<!-- END KEN:DYNAMIC -->",
@@ -94,6 +112,32 @@ def parse_file(vault_path: Path, rel_path: str) -> VaultRecord:
         record_type=record_type,
         wikilinks=wikilinks,
     )
+
+
+def extract_alfred_learnings_section(body: str) -> str | None:
+    """Extract the ``## Alfred Learnings`` section content, if present.
+
+    Returns the section body (everything between the heading line and the
+    next ``## `` heading or end-of-document), with surrounding whitespace
+    stripped. Returns ``None`` when the section is absent — the caller
+    should fall back to full-body extraction.
+
+    The heading match is exact: ``## Alfred Learnings`` (two hashes,
+    single space, exact title). Trailing whitespace on the heading line
+    is tolerated. Sub-section headings inside the Learnings block (``### ``)
+    are preserved as part of the returned content.
+
+    KAL-LE distiller-radar Phase 1 uses this to surface explicitly flagged
+    learnings as DIRECT extraction candidates — each bullet inside the
+    section is a knowledge atom the author tagged for distillation. See
+    CLAUDE.md "Session Notes — Where they live + Learnings Section"
+    (effective 2026-04-29).
+    """
+    match = ALFRED_LEARNINGS_SECTION_RE.search(body)
+    if not match:
+        return None
+    section = match.group("body").strip()
+    return section if section else None
 
 
 def stripped_body_length(body: str) -> int:
