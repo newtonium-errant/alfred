@@ -377,8 +377,8 @@ async def classify_opening_cue(
     client: Any,
     first_message: str,
     recent_sessions: list[dict[str, Any]],
-    self_name: str = "salem",
-    self_display_name: str = "Alfred",
+    self_name: str = "",
+    self_display_name: str = "",
     has_reply_context: bool = False,
 ) -> RouterDecision:
     """Classify one opening message; return a :class:`RouterDecision`.
@@ -393,10 +393,15 @@ async def classify_opening_cue(
             name (``salem`` / ``kal-le``). Used to (a) tell the classifier
             NEVER to route to self via the prompt instruction, and (b)
             guard at parse time in case the classifier ignores the
-            instruction. Defaults to ``salem`` for legacy callers.
+            instruction. Defaults to ``""``; per
+            ``feedback_hardcoding_and_alfred_naming.md`` a misconfigured
+            caller produces a degraded prompt rather than silently
+            routing as Salem. The parse-time self-target guard treats
+            empty as "no check" (see ``_decision_from_parsed``).
         self_display_name: The human-facing form of the instance name
             (``Alfred`` / ``Salem`` / ``K.A.L.L.E.``) — appears in the
-            prompt's self-address example. Defaults to ``Alfred``.
+            prompt's self-address example. Defaults to ``""`` for the
+            same loud-failure reason as ``self_name``.
         has_reply_context: Reply-context consumer hint. ``True`` when the
             incoming message is a Telegram reply to a prior bot message
             (``update.message.reply_to_message`` was populated and

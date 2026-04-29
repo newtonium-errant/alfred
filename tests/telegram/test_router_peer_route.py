@@ -346,7 +346,13 @@ async def test_default_self_name_preserves_legacy_behaviour() -> None:
 
     Tests and any future in-process caller that doesn't know about
     stage-3.5 plumbing can still call the router. Default is
-    ``self_name='salem'`` so Salem-classified messages keep working.
+    ``self_name=""`` (empty) per
+    ``feedback_hardcoding_and_alfred_naming.md`` — the parse-time
+    self-target guard treats empty as "no check" so the router still
+    returns a decision, but the prompt body renders ``instance ""``
+    as a loud-failure signal for misconfigured callers (vs the prior
+    silent ``"salem"`` fallback that hid single-instance assumptions
+    on multi-instance installs).
     """
     client = FakeAnthropicClient([_note_response()])
     decision = await router.classify_opening_cue(
