@@ -146,7 +146,14 @@ class ExtractionConfig:
 
 @dataclass
 class StateConfig:
-    path: str = "./data/state.json"
+    # Tool-scoped default to prevent cross-tool state-file collisions.
+    # Multi-instance installs (Salem / KAL-LE / Hypatia) plus the four
+    # tools (curator/janitor/distiller/surveyor) previously all defaulted
+    # to ``./data/state.json``; the first tool to load whichever shape
+    # was on disk would crash or silently load wrong-tool data. Salem's
+    # legacy config explicitly overrides ``state.path``, so this default
+    # only takes effect for fresh per-instance configs that don't pin it.
+    path: str = "./data/distiller_state.json"
     max_run_history: int = 20
 
 

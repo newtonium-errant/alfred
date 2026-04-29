@@ -417,7 +417,7 @@ def _run_daily_sync(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
         log = structlog.get_logger(__name__)
         log.warning("daily_sync.daemon.no_telegram_user")
         sys.exit(78)
-    asyncio.run(run_ds_daemon(config, Path(vault_path_str), user_id))
+    asyncio.run(run_ds_daemon(config, Path(vault_path_str), user_id, raw_config=raw))
 
 
 # ---------------------------------------------------------------------------

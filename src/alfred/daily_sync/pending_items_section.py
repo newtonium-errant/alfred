@@ -83,6 +83,17 @@ def _resolve_paths(
     Reads from the Pending Items config block. Returns ``(None, None,
     0)`` when the block is absent or disabled — the section silently
     renders nothing in that case.
+
+    Resolution order:
+
+      1. Explicit per-test stash (``set_paths_for_tests``) wins.
+      2. Pre-loaded raw config (``set_raw_config`` from the daemon)
+         — production path. Avoids re-reading ``config.yaml`` from
+         the section provider every fire AND avoids the cwd-relative
+         path fragility that bit talker daemons started from a
+         non-default cwd.
+      3. Fallback: open ``config.yaml`` from cwd. Used by direct
+         test callers that haven't stashed anything.
     """
     try:
         from alfred.pending_items.config import (
@@ -91,23 +102,23 @@ def _resolve_paths(
     except ImportError:
         return None, None, 0
     try:
-        # Daily Sync gets the raw config dict from a side channel —
-        # the assembler doesn't pass it through. Re-read here from
-        # the same config.yaml the rest of the system loads.
-        import yaml
-        # ``config.yaml`` is the production path; daily_sync.config
-        # already implicitly relies on this convention via its own
-        # ``load_config``. Tests can monkeypatch via the stash hook
-        # below.
+        # 1. Test stash short-circuit (no config-load needed).
         if _TEST_STASH.get("queue_path"):
             return (
                 _TEST_STASH.get("queue_path"),
                 _TEST_STASH.get("aggregate_path"),
                 int(_TEST_STASH.get("stale_threshold_days", 7)),
             )
-        config_path = _TEST_STASH.get("config_path", "config.yaml")
-        with open(str(config_path), "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
+        # 2. Pre-loaded raw config from the daemon (production).
+        raw = _RAW_CONFIG_HOLDER.get("raw")
+        if raw is None:
+            # 3. Fallback — open from cwd. Legacy / direct test
+            # callers that exercise the provider without going
+            # through the daemon wiring still work.
+            import yaml
+            config_path = _TEST_STASH.get("config_path", "config.yaml")
+            with open(str(config_path), "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
         pi_config = load_pending(raw)
         if not pi_config.enabled:
             return None, None, 0
@@ -136,6 +147,29 @@ def _resolve_paths(
 # Test hook — set via :func:`set_paths_for_tests` so tests don't
 # need a real config.yaml on disk.
 _TEST_STASH: dict[str, Any] = {}
+
+
+# Daemon-set raw config holder. Mirrors the
+# ``email_section._VAULT_PATH_HOLDER`` pattern: the section provider's
+# ``(config, today, *, start_index)`` signature is fixed by the
+# assembler contract, but the daemon CAN stash the pre-loaded raw
+# config dict before calling ``assemble_message``. Production path.
+_RAW_CONFIG_HOLDER: dict[str, Any] = {}
+
+
+def set_raw_config(raw: dict[str, Any]) -> None:
+    """Configure the module-level raw config used by the section provider.
+
+    Daemon calls this once per fire (cheap; just a dict reference).
+    Removes the per-fire ``open("config.yaml")`` round-trip and the
+    associated cwd-relative-path fragility. Idempotent.
+    """
+    _RAW_CONFIG_HOLDER["raw"] = raw
+
+
+def clear_raw_config() -> None:
+    """Clear the daemon-set raw config holder. Test cleanup helper."""
+    _RAW_CONFIG_HOLDER.clear()
 
 
 def set_paths_for_tests(
@@ -399,10 +433,12 @@ __all__ = [
     "PendingItemEntry",
     "build_batch",
     "clear_paths_for_tests",
+    "clear_raw_config",
     "consume_last_batch",
     "peek_last_batch_count",
     "pending_items_section",
     "register",
     "render_batch",
     "set_paths_for_tests",
+    "set_raw_config",
 ]

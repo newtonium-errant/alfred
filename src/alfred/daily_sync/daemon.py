@@ -156,6 +156,7 @@ async def fire_once(
     today: date | None = None,
     *,
     manual: bool = False,
+    raw_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one assemble + push cycle. Returns a result summary dict.
 
@@ -203,8 +204,13 @@ async def fire_once(
     # (the queue path lives under transport.canonical.proposals_path),
     # so it doesn't need set_vault_path.
     canonical_proposals_section.register()
-    # pending_items_section reads its config from config.yaml directly
-    # (queue + aggregate paths); priority 5 puts it ABOVE email at 10.
+    # pending_items_section reads queue + aggregate paths from the
+    # pending_items config block. Priority 5 puts it ABOVE email at
+    # 10. When raw_config is plumbed through, stash it so the section
+    # provider skips the per-fire ``open("config.yaml")`` round-trip
+    # AND avoids the cwd-relative-path fragility.
+    if raw_config is not None:
+        pending_items_section.set_raw_config(raw_config)
     pending_items_section.register()
 
     body = assemble_message(config, today)
@@ -264,6 +270,7 @@ async def run_daemon(
     config: DailySyncConfig,
     vault_path: Path,
     user_id: int,
+    raw_config: dict[str, Any] | None = None,
 ) -> None:
     """Daily Sync daemon — fires once per ``schedule.time`` ADT day.
 
@@ -271,6 +278,11 @@ async def run_daemon(
     drift-bounded ``sleep_until`` keeps the fire wall-clock-aligned
     even on WSL2 with monotonic clock skew (same fix the brief daemon
     adopted in commit 9755ed7-ish).
+
+    ``raw_config`` is the pre-loaded unified config dict (the
+    orchestrator's ``_run_daily_sync`` already has it). Threaded
+    through to ``fire_once`` → ``pending_items_section.set_raw_config``
+    so the section provider skips the per-fire config-load round-trip.
     """
     log.info(
         "daily_sync.daemon.starting",
@@ -308,7 +320,10 @@ async def run_daemon(
             log.info("daily_sync.daemon.already_fired_today", date=today.isoformat())
         else:
             try:
-                result = await fire_once(config, vault_path, user_id, today=today)
+                result = await fire_once(
+                    config, vault_path, user_id, today=today,
+                    raw_config=raw_config,
+                )
                 log.info(
                     "daily_sync.daemon.fired",
                     date=today.isoformat(),

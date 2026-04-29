@@ -117,7 +117,8 @@ class SweepConfig:
 
 @dataclass
 class StateConfig:
-    path: str = "./data/state.json"
+    # Tool-scoped default; see ``distiller/config.py`` for rationale.
+    path: str = "./data/janitor_state.json"
     max_sweep_history: int = 20
 
 

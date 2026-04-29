@@ -567,6 +567,25 @@ def _stage2_dedup_merge(
     if not raw_candidates:
         return []
 
+    # Defensively flatten LLM-returned link lists. The model
+    # occasionally emits ``source_links=[[wikilink_string]]`` (a
+    # nested list per item) instead of the flat
+    # ``source_links=[wikilink_string]`` shape. Without flattening,
+    # ``", ".join(spec.source_links)`` raises TypeError downstream
+    # in stage 3. Cherry-pick 6e76496 added the guard on the merge-
+    # into-existing path; the new-candidate path needs the same
+    # treatment for the FIRST-candidate-of-a-title case.
+    def _flatten_links(items: list) -> list:
+        out: list = []
+        for item in items or []:
+            if isinstance(item, list):
+                for nested in item:
+                    if nested not in out:
+                        out.append(nested)
+            elif item not in out:
+                out.append(item)
+        return out
+
     # Cross-source merge: group by (type, similar title)
     merged: list[dict] = []
     for _source_path, candidate in raw_candidates:
@@ -621,8 +640,18 @@ def _stage2_dedup_merge(
                     if candidate.get("evidence_excerpt")
                     else []
                 ),
-                "source_links": list(candidate.get("source_links", [])),
-                "entity_links": list(candidate.get("entity_links", [])),
+                # Flatten on the new-candidate path too — see the
+                # ``_flatten_links`` docstring above. Without this, an
+                # LLM that emits ``source_links=[[wikilink]]`` on the
+                # FIRST candidate of a title (no prior merge target)
+                # stores the nested list verbatim and stage 3's
+                # ``", ".join(spec.source_links)`` raises TypeError.
+                "source_links": _flatten_links(
+                    list(candidate.get("source_links", []))
+                ),
+                "entity_links": _flatten_links(
+                    list(candidate.get("entity_links", []))
+                ),
                 "project": candidate.get("project"),
                 "source_count": 1,
             })

@@ -112,7 +112,8 @@ class WatcherConfig:
 
 @dataclass
 class StateConfig:
-    path: str = "./data/state.json"
+    # Tool-scoped default; see ``distiller/config.py`` for rationale.
+    path: str = "./data/curator_state.json"
 
 
 @dataclass

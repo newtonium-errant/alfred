@@ -1217,7 +1217,10 @@ async def on_calibrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # second /calibrate of a day silently short-circuits at the
         # transport server's idempotency check and Andrew sees the
         # "firing now…" ack but no second message.
-        result = await fire_once(ds_config, vault_path, user_id, manual=True)
+        result = await fire_once(
+            ds_config, vault_path, user_id,
+            manual=True, raw_config=raw_config,
+        )
     except Exception as exc:  # noqa: BLE001
         log.exception("talker.bot.calibrate_failed")
         await update.message.reply_text(
@@ -2093,6 +2096,7 @@ async def _maybe_handle_daily_sync_reply(
             vault_path=vault_path,
             instance_scope=instance_scope,
             instance_name=instance_name,
+            raw_config=raw_config,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("talker.bot.daily_sync_reply_failed", error=str(exc))
@@ -2183,6 +2187,7 @@ async def _maybe_smart_route_daily_sync_reply(
             vault_path=vault_path,
             instance_scope=instance_scope,
             instance_name=instance_name,
+            raw_config=raw_config,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(

@@ -656,3 +656,38 @@ def test_curator_state_load_tolerates_corrupt_file(state_path: Path) -> None:
     mgr = StateManager(state_path)
     state = mgr.load()
     assert state.processed == {}
+
+
+# ---------------------------------------------------------------------------
+# State-path collision regression (Item 4 / KAL-LE P0 review)
+# ---------------------------------------------------------------------------
+
+
+def test_default_state_paths_are_tool_unique() -> None:
+    """Each tool's default ``state.path`` MUST be unique across tools.
+
+    Pre-fix all four tools defaulted to ``./data/state.json`` — a per-
+    instance config that omitted some tools' blocks would let one
+    tool's state file get loaded by another tool's load() path,
+    crashing or silently mis-reporting in ``alfred status``.
+    """
+    from alfred.curator.config import StateConfig as CuratorState
+    from alfred.distiller.config import StateConfig as DistillerState
+    from alfred.janitor.config import StateConfig as JanitorState
+    from alfred.surveyor.config import StateConfig as SurveyorState
+
+    paths = {
+        "curator": CuratorState().path,
+        "janitor": JanitorState().path,
+        "distiller": DistillerState().path,
+        "surveyor": SurveyorState().path,
+    }
+    # All values must be distinct.
+    assert len(set(paths.values())) == len(paths), (
+        f"State path defaults collide: {paths}"
+    )
+    # And none should be the legacy shared default.
+    for tool, p in paths.items():
+        assert p != "./data/state.json", (
+            f"{tool} still defaults to the legacy shared path"
+        )

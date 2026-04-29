@@ -258,25 +258,39 @@ def cmd_status(args: argparse.Namespace) -> None:
     else:
         print("Daemon: not running")
 
+    # Per-tool status. Skip tools whose config block is absent —
+    # mirrors the orchestrator's auto-start gate so a per-instance
+    # config that doesn't enable a tool doesn't surface an
+    # "(unavailable: ...)" line that's actually a state-file collision
+    # against another tool's default. Item 4 from the state-path
+    # collision sweep (KAL-LE P0 review).
+    def _has_block(name: str) -> bool:
+        return isinstance(raw.get(name), dict)
+
     # Curator status
     curator_info: dict = {}
-    try:
-        from alfred.curator.config import load_from_unified as curator_cfg
-        cfg = curator_cfg(raw)
-        from alfred.curator.state import StateManager
-        sm = StateManager(cfg.state.path)
-        sm.load()
-        curator_info = {
-            "processed_files": len(sm.state.processed),
-            "last_run": sm.state.last_run or None,
-        }
-    except Exception as e:
-        curator_info = {"error": str(e)}
+    if not _has_block("curator"):
+        curator_info = {"note": "no config block"}
+    else:
+        try:
+            from alfred.curator.config import load_from_unified as curator_cfg
+            cfg = curator_cfg(raw)
+            from alfred.curator.state import StateManager
+            sm = StateManager(cfg.state.path)
+            sm.load()
+            curator_info = {
+                "processed_files": len(sm.state.processed),
+                "last_run": sm.state.last_run or None,
+            }
+        except Exception as e:
+            curator_info = {"error": str(e)}
     if as_json:
         payload["curator"] = curator_info
     else:
         print("\n--- Curator ---")
-        if "error" in curator_info:
+        if "note" in curator_info:
+            print(f"  ({curator_info['note']})")
+        elif "error" in curator_info:
             print(f"  (unavailable: {curator_info['error']})")
         else:
             print(f"  Processed files: {curator_info['processed_files']}")
@@ -284,25 +298,30 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     # Janitor status
     janitor_info: dict = {}
-    try:
-        from alfred.janitor.config import load_from_unified as janitor_cfg
-        cfg = janitor_cfg(raw)
-        from alfred.janitor.state import JanitorState
-        st = JanitorState(cfg.state.path, cfg.state.max_sweep_history)
-        st.load()
-        files_with_issues = sum(1 for fs in st.files.values() if fs.open_issues)
-        janitor_info = {
-            "tracked_files": len(st.files),
-            "files_with_issues": files_with_issues,
-            "sweeps_recorded": len(st.sweeps),
-        }
-    except Exception as e:
-        janitor_info = {"error": str(e)}
+    if not _has_block("janitor"):
+        janitor_info = {"note": "no config block"}
+    else:
+        try:
+            from alfred.janitor.config import load_from_unified as janitor_cfg
+            cfg = janitor_cfg(raw)
+            from alfred.janitor.state import JanitorState
+            st = JanitorState(cfg.state.path, cfg.state.max_sweep_history)
+            st.load()
+            files_with_issues = sum(1 for fs in st.files.values() if fs.open_issues)
+            janitor_info = {
+                "tracked_files": len(st.files),
+                "files_with_issues": files_with_issues,
+                "sweeps_recorded": len(st.sweeps),
+            }
+        except Exception as e:
+            janitor_info = {"error": str(e)}
     if as_json:
         payload["janitor"] = janitor_info
     else:
         print("\n--- Janitor ---")
-        if "error" in janitor_info:
+        if "note" in janitor_info:
+            print(f"  ({janitor_info['note']})")
+        elif "error" in janitor_info:
             print(f"  (unavailable: {janitor_info['error']})")
         else:
             print(f"  Tracked files: {janitor_info['tracked_files']}")
@@ -311,25 +330,30 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     # Distiller status
     distiller_info: dict = {}
-    try:
-        from alfred.distiller.config import load_from_unified as distiller_cfg
-        cfg = distiller_cfg(raw)
-        from alfred.distiller.state import DistillerState
-        st = DistillerState(cfg.state.path, cfg.state.max_run_history)
-        st.load()
-        total_learns = sum(len(fs.learn_records_created) for fs in st.files.values())
-        distiller_info = {
-            "tracked_source_files": len(st.files),
-            "learn_records_created": total_learns,
-            "runs_recorded": len(st.runs),
-        }
-    except Exception as e:
-        distiller_info = {"error": str(e)}
+    if not _has_block("distiller"):
+        distiller_info = {"note": "no config block"}
+    else:
+        try:
+            from alfred.distiller.config import load_from_unified as distiller_cfg
+            cfg = distiller_cfg(raw)
+            from alfred.distiller.state import DistillerState
+            st = DistillerState(cfg.state.path, cfg.state.max_run_history)
+            st.load()
+            total_learns = sum(len(fs.learn_records_created) for fs in st.files.values())
+            distiller_info = {
+                "tracked_source_files": len(st.files),
+                "learn_records_created": total_learns,
+                "runs_recorded": len(st.runs),
+            }
+        except Exception as e:
+            distiller_info = {"error": str(e)}
     if as_json:
         payload["distiller"] = distiller_info
     else:
         print("\n--- Distiller ---")
-        if "error" in distiller_info:
+        if "note" in distiller_info:
+            print(f"  ({distiller_info['note']})")
+        elif "error" in distiller_info:
             print(f"  (unavailable: {distiller_info['error']})")
         else:
             print(f"  Tracked source files: {distiller_info['tracked_source_files']}")
@@ -338,33 +362,38 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     # Surveyor status + entity-linking telemetry (#26)
     surveyor_info: dict = {}
-    try:
-        from alfred.surveyor.config import load_from_unified as surveyor_cfg
-        scfg = surveyor_cfg(raw)
-        from alfred.surveyor.state import PipelineState
-        st = PipelineState(scfg.state.path)
-        st.load()
-        surveyor_info = {
-            "tracked_files": len(st.files),
-            "clusters": len(st.clusters),
-            "last_run": st.last_run or None,
-        }
-        # Walk vault frontmatter once for coverage stats. Only run on
-        # --json or when vault is small enough that the full scan stays
-        # fast — for a 3500-record vault this is ~2s, acceptable.
-        vault_cfg = raw.get("vault", {}) or {}
-        vault_path_str = vault_cfg.get("path") or os.environ.get("ALFRED_VAULT_PATH")
-        if vault_path_str:
-            vault_path = Path(vault_path_str).expanduser().resolve()
-            if vault_path.is_dir():
-                surveyor_info["entity_linking"] = _scan_entity_linking_coverage(vault_path)
-    except Exception as e:
-        surveyor_info = {"error": str(e)}
+    if not _has_block("surveyor"):
+        surveyor_info = {"note": "no config block"}
+    else:
+        try:
+            from alfred.surveyor.config import load_from_unified as surveyor_cfg
+            scfg = surveyor_cfg(raw)
+            from alfred.surveyor.state import PipelineState
+            st = PipelineState(scfg.state.path)
+            st.load()
+            surveyor_info = {
+                "tracked_files": len(st.files),
+                "clusters": len(st.clusters),
+                "last_run": st.last_run or None,
+            }
+            # Walk vault frontmatter once for coverage stats. Only run on
+            # --json or when vault is small enough that the full scan stays
+            # fast — for a 3500-record vault this is ~2s, acceptable.
+            vault_cfg = raw.get("vault", {}) or {}
+            vault_path_str = vault_cfg.get("path") or os.environ.get("ALFRED_VAULT_PATH")
+            if vault_path_str:
+                vault_path = Path(vault_path_str).expanduser().resolve()
+                if vault_path.is_dir():
+                    surveyor_info["entity_linking"] = _scan_entity_linking_coverage(vault_path)
+        except Exception as e:
+            surveyor_info = {"error": str(e)}
     if as_json:
         payload["surveyor"] = surveyor_info
     else:
         print("\n--- Surveyor ---")
-        if "error" in surveyor_info:
+        if "note" in surveyor_info:
+            print(f"  ({surveyor_info['note']})")
+        elif "error" in surveyor_info:
             print(f"  (unavailable: {surveyor_info['error']})")
         else:
             print(f"  Tracked files: {surveyor_info['tracked_files']}")

@@ -298,6 +298,7 @@ def maybe_smart_route_reply(
     vault_path: Path | None = None,
     instance_scope: str = "talker",
     instance_name: str = "salem",
+    raw_config: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Try to handle ``reply_text`` as a Daily Sync reply WITHOUT a
     reply-to-message context. Returns the same shape as
@@ -356,6 +357,7 @@ def maybe_smart_route_reply(
         vault_path=vault_path,
         instance_scope=instance_scope,
         instance_name=instance_name,
+        raw_config=raw_config,
     )
 
     if result is None:
@@ -804,6 +806,7 @@ def _resolve_pending_item_correction(
     item: dict[str, Any],
     *,
     self_instance: str,
+    raw_config: dict[str, Any] | None = None,
 ) -> tuple[str | None, bool, str]:
     """Apply one pending-item resolution.
 
@@ -824,7 +827,30 @@ def _resolve_pending_item_correction(
     Phase 1 we use ``asyncio.run`` inside a thread when an outer loop
     is already running; in tests the dispatcher is exercised directly
     and we fall through to sync-friendly code paths.
+
+    ``raw_config`` is the pre-loaded unified config dict (passed
+    through from the bot's ``handle_message`` callback). When
+    provided, the local + peer helpers use it directly and skip
+    the per-call ``open("config.yaml")`` round-trip — important on
+    a hot path that fires for every Daily Sync reply. When ``None``,
+    helpers fall back to opening ``config.yaml`` from the current
+    working directory (legacy / test-friendly path).
+
+    ``self_instance`` MUST be a non-empty instance identity. The
+    bot wiring already plumbs ``agent_slug_for(talker_config)``
+    through; an empty value here means a config-load failure
+    silently routed Hypatia / KAL-LE items as if they were Salem.
+    Raises :class:`ValueError` rather than silently fall back.
     """
+    if not (self_instance or "").strip():
+        # Per `feedback_hardcoding_and_alfred_naming.md`: silent
+        # fallback to "salem" hides single-instance assumptions on
+        # multi-instance installs. Caller must plumb a real value.
+        raise ValueError(
+            "self_instance must be a non-empty instance identity; "
+            "got empty/None"
+        )
+
     item_id = str(item.get("id") or "")
     created_by = str(item.get("created_by_instance") or "").strip().lower()
     if not item_id:
@@ -843,12 +869,14 @@ def _resolve_pending_item_correction(
             "",
         )
 
-    # Normalize the running instance identity so "alfred" / "talker"
-    # / "salem" all match Salem-originated items.
-    self_normalized = (self_instance or "salem").strip().lower()
+    # Normalize the running instance identity. The Salem alias-set
+    # (``salem`` / ``alfred`` / ``talker``) is intentional — Salem-
+    # originated items can carry any of those legacy created_by
+    # labels. Other instances (Hypatia, KAL-LE) match strictly.
+    self_normalized = self_instance.strip().lower()
     is_local = (
         created_by in {self_normalized, "salem"}
-        if self_normalized in {"salem", "alfred", "talker", ""}
+        if self_normalized in {"salem", "alfred", "talker"}
         else created_by == self_normalized
     )
 
@@ -857,12 +885,14 @@ def _resolve_pending_item_correction(
             applied_summary = _resolve_pending_item_locally(
                 item_id=item_id,
                 resolution_id=resolution_id,
+                raw_config=raw_config,
             )
         else:
             applied_summary = _resolve_pending_item_via_peer(
                 item_id=item_id,
                 resolution_id=resolution_id,
                 peer_name=created_by,
+                raw_config=raw_config,
             )
     except _PendingItemResolveFailure as exc:
         return (
@@ -890,26 +920,40 @@ class _PendingItemResolveFailure(Exception):
     """Internal — surfaced as a per-item error string."""
 
 
+def _load_raw_config_lazy(raw_config: dict[str, Any] | None) -> dict[str, Any]:
+    """Return ``raw_config`` if provided, else open ``config.yaml`` once.
+
+    Hot-path helper. The bot now plumbs ``raw_config`` through from
+    its ``bot_data`` (loaded once at startup) so the dispatcher
+    doesn't re-read the config file per Telegram reply. The fallback
+    open-from-cwd path is preserved for legacy / direct test callers
+    that exercise the dispatcher without the bot wiring.
+    """
+    if raw_config is not None:
+        return raw_config
+    try:
+        import yaml as _yaml
+        with open("config.yaml", "r", encoding="utf-8") as f:
+            return _yaml.safe_load(f) or {}
+    except OSError as exc:
+        raise _PendingItemResolveFailure(
+            f"config.yaml not readable: {exc}"
+        ) from exc
+
+
 def _resolve_pending_item_locally(
     *,
     item_id: str,
     resolution_id: str,
+    raw_config: dict[str, Any] | None = None,
 ) -> str:
     """Resolve an item against the local queue. Sync wrapper."""
-    import asyncio as _asyncio
     from alfred.pending_items.config import (
         load_from_unified as load_pending,
     )
     from alfred.pending_items.executor import resolve_local_item
 
-    try:
-        import yaml as _yaml
-        with open("config.yaml", "r", encoding="utf-8") as f:
-            raw = _yaml.safe_load(f) or {}
-    except OSError as exc:
-        raise _PendingItemResolveFailure(
-            f"config.yaml not readable: {exc}"
-        ) from exc
+    raw = _load_raw_config_lazy(raw_config)
 
     pi_config = load_pending(raw)
     if not pi_config.enabled:
@@ -946,20 +990,14 @@ def _resolve_pending_item_via_peer(
     item_id: str,
     resolution_id: str,
     peer_name: str,
+    raw_config: dict[str, Any] | None = None,
 ) -> str:
     """Dispatch resolution to the originating peer."""
     from alfred.transport.client import peer_resolve_pending_item
     from alfred.transport.config import load_from_unified as load_transport
     from alfred.transport.exceptions import TransportError
 
-    try:
-        import yaml as _yaml
-        with open("config.yaml", "r", encoding="utf-8") as f:
-            raw = _yaml.safe_load(f) or {}
-    except OSError as exc:
-        raise _PendingItemResolveFailure(
-            f"config.yaml not readable: {exc}"
-        ) from exc
+    raw = _load_raw_config_lazy(raw_config)
 
     transport_config = load_transport(raw)
     coro = peer_resolve_pending_item(
@@ -1018,7 +1056,10 @@ def _run_coro_sync(coro: Any) -> dict[str, Any]:
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         future = ex.submit(_runner)
-        return future.result(timeout=30.0)
+        # 10s stopgap; Phase 2 native-async refactor planned. Slow /
+        # down peers shouldn't be able to freeze the bot's event loop
+        # for half a minute every Daily Sync reply.
+        return future.result(timeout=10.0)
 
 
 def _format_pending_item_applied_line(
@@ -1287,6 +1328,7 @@ def handle_daily_sync_reply(
     vault_path: Path | None = None,
     instance_scope: str = "talker",
     instance_name: str = "salem",
+    raw_config: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Process a Daily Sync reply. Returns a result dict or ``None``.
 
@@ -1318,6 +1360,12 @@ def handle_daily_sync_reply(
     ``pending_items_resolve``. Default ``"salem"`` matches the
     primary aggregator instance — peer instances should pass their
     own name.
+
+    ``raw_config`` is the pre-loaded unified config dict. When
+    supplied (the production bot wiring does this), the pending-item
+    helpers skip per-call ``open("config.yaml")`` round-trips. When
+    ``None``, helpers fall back to opening the file from cwd —
+    legacy / test-friendly path.
 
     On a match, the result dict carries:
       - ``confirmed_count``: int — how many entries were written
@@ -1476,7 +1524,9 @@ def handle_daily_sync_reply(
                     consumed_token="noted",
                 )
                 err, did_resolve, summary = _resolve_pending_item_correction(
-                    synthetic, item, self_instance=instance_name,
+                    synthetic, item,
+                    self_instance=instance_name,
+                    raw_config=raw_config,
                 )
                 if err is not None:
                     errors.append(err)
@@ -1596,7 +1646,9 @@ def handle_daily_sync_reply(
                     unparsed_item_numbers.append(correction.item_number)
                     continue
                 err, did_resolve, summary = _resolve_pending_item_correction(
-                    correction, pending_item, self_instance=instance_name,
+                    correction, pending_item,
+                    self_instance=instance_name,
+                    raw_config=raw_config,
                 )
                 if err is not None:
                     errors.append(err)
