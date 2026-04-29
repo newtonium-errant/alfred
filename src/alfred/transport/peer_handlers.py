@@ -893,6 +893,384 @@ async def _handle_peer_brief_digest(request: web.Request) -> web.StreamResponse:
 
 
 # ---------------------------------------------------------------------------
+# /peer/pending_items_push — peer → Salem (Pending Items Queue Phase 1)
+# ---------------------------------------------------------------------------
+#
+# Mirror of /peer/brief_digest. Each peer flushes its local
+# pending-items JSONL to Salem; Salem appends to its aggregate file
+# so the Daily Sync section provider has a single source. Idempotent
+# by ``item.id`` — a re-push of the same item is a no-op.
+#
+# Storage: ``transport.pending_items.aggregate_path`` app key (set by
+# the talker daemon at startup). Defaults to
+# ``./data/pending_items_aggregate.jsonl`` when unset so unit tests
+# don't need to wire up a separate file.
+
+# Hard cap on items per push — protects Salem from a runaway peer.
+# A normal flush is ~1-3 items; 100 is two orders of magnitude
+# larger, well beyond any plausible legitimate value.
+_MAX_PENDING_ITEMS_PER_PUSH = 100
+
+_KEY_PENDING_AGGREGATE_PATH = "transport.pending_items.aggregate_path"
+
+
+def _get_pending_aggregate_path(request: web.Request) -> Path:
+    """Return the aggregate JSONL path. Defaults when unset."""
+    raw = request.app.get(_KEY_PENDING_AGGREGATE_PATH)
+    if raw:
+        return Path(str(raw))
+    return Path("./data/pending_items_aggregate.jsonl")
+
+
+def _existing_aggregate_ids(path: Path) -> set[str]:
+    """Return the set of item ids already present in the aggregate file."""
+    if not path.exists():
+        return set()
+    seen: set[str] = set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    import json as _json
+                    data = _json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                item_id = data.get("id")
+                if isinstance(item_id, str) and item_id:
+                    seen.add(item_id)
+    except OSError:
+        pass
+    return seen
+
+
+def _append_aggregate_items(
+    path: Path,
+    items: list[dict[str, Any]],
+) -> tuple[int, list[dict[str, Any]]]:
+    """Append items to the aggregate JSONL, skipping duplicates by id.
+
+    Returns ``(received_count, errors)``. ``received_count`` includes
+    duplicates that were idempotently skipped — the caller advertises
+    the count of items the server "received" (not "stored").
+    """
+    import json as _json
+
+    received = 0
+    errors: list[dict[str, Any]] = []
+    existing = _existing_aggregate_ids(path)
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        for item in items:
+            errors.append({
+                "id": item.get("id"),
+                "reason": "mkdir_failed",
+                "detail": str(exc),
+            })
+        return 0, errors
+
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            for item in items:
+                item_id = item.get("id")
+                if not isinstance(item_id, str) or not item_id:
+                    errors.append({
+                        "id": None,
+                        "reason": "missing_id",
+                    })
+                    continue
+                if item_id in existing:
+                    received += 1  # idempotent — count as received
+                    continue
+                f.write(_json.dumps(item, default=str) + "\n")
+                existing.add(item_id)
+                received += 1
+    except OSError as exc:
+        errors.append({
+            "id": None,
+            "reason": "write_failed",
+            "detail": str(exc),
+        })
+
+    return received, errors
+
+
+async def _handle_peer_pending_items_push(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST /peer/pending_items_push — accept a peer's queue flush.
+
+    Body::
+
+        {
+          "from_instance": "hypatia",
+          "items": [<queue entry>, ...],
+          "correlation_id": "<optional>"
+        }
+
+    Salem appends new items to its aggregate JSONL (idempotent by
+    item.id) and returns ``{"received": <count>, "errors": [...]}``.
+
+    Auth invariants (enforced by the middleware before we get here):
+      * Bearer token must match an entry in ``transport.auth.tokens``.
+      * ``X-Alfred-Client`` must be in that entry's ``allowed_clients``.
+      * The body's ``from_instance`` must match the authenticated peer.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        correlation_id = _ensure_correlation_id(request, None)
+        return _json_error(400, "invalid_json", correlation_id=correlation_id)
+
+    correlation_id = _ensure_correlation_id(request, body)
+
+    from_instance = body.get("from_instance")
+    items = body.get("items")
+    if not isinstance(from_instance, str) or not from_instance:
+        return _json_error(
+            400, "schema_error",
+            detail="from_instance must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+    if not isinstance(items, list):
+        return _json_error(
+            400, "schema_error",
+            detail="items must be a list",
+            correlation_id=correlation_id,
+        )
+    if len(items) > _MAX_PENDING_ITEMS_PER_PUSH:
+        return _json_error(
+            400, "schema_error",
+            detail=(
+                f"items exceeds {_MAX_PENDING_ITEMS_PER_PUSH} per-push cap "
+                f"(got {len(items)})"
+            ),
+            correlation_id=correlation_id,
+        )
+
+    auth_peer = request.get("transport_peer", "")
+    if from_instance != auth_peer:
+        log.warning(
+            "transport.peer.pending_items_push_spoofed",
+            auth_peer=auth_peer,
+            claimed=from_instance,
+            correlation_id=correlation_id,
+        )
+        return _json_error(
+            403, "from_mismatch",
+            detail="body.from_instance must equal authenticated peer",
+            correlation_id=correlation_id,
+        )
+
+    # Stamp ``created_by_instance`` from the authenticated peer so a
+    # buggy peer can't pretend an item came from a different instance.
+    # Items already carrying the same value pass through; mismatches
+    # get rewritten with a debug log so the audit trail is honest.
+    normalized_items: list[dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        item_copy = dict(raw)
+        original = str(item_copy.get("created_by_instance") or "")
+        if original and original != from_instance:
+            log.info(
+                "transport.peer.pending_items_push_normalized",
+                claimed=original,
+                normalized=from_instance,
+                item_id=item_copy.get("id"),
+            )
+        item_copy["created_by_instance"] = from_instance
+        normalized_items.append(item_copy)
+
+    aggregate_path = _get_pending_aggregate_path(request)
+    received, errors = _append_aggregate_items(aggregate_path, normalized_items)
+
+    log.info(
+        "transport.peer.pending_items_push_received",
+        from_instance=from_instance,
+        received=received,
+        sent=len(items),
+        errors=len(errors),
+        path=str(aggregate_path),
+        correlation_id=correlation_id,
+    )
+
+    return web.json_response({
+        "received": received,
+        "errors": errors,
+        "correlation_id": correlation_id,
+    })
+
+
+# ---------------------------------------------------------------------------
+# /peer/pending_items_resolve — Salem → peer (NEW direction)
+# ---------------------------------------------------------------------------
+#
+# First Salem→peer consumer on the transport substrate. The peer
+# (originating instance) receives a resolution dispatch from Salem,
+# looks up the item in its local JSONL queue, runs the action plan,
+# and acknowledges. Same auth scheme as every other peer route — the
+# peer identity in ``X-Alfred-Client`` must match an
+# ``auth.tokens.<peer>`` entry on this side.
+#
+# The per-instance handler depends on the local queue path + vault
+# path + telegram user_id, so the talker daemon registers a
+# resolver-callable at startup the same way the peer-inbox is wired.
+# When the callable isn't registered, return 501 so the operator
+# sees the gap rather than a silent no-op.
+
+_KEY_PENDING_RESOLVE_CALLABLE = "transport.pending_items.resolve_callable"
+
+PendingResolveCallable = Callable[..., Awaitable[dict[str, Any]]]
+
+
+def register_pending_items_resolve_callable(
+    app: web.Application,
+    callable_: PendingResolveCallable,
+) -> None:
+    """Wire a pending-items resolver callable onto an already-built app.
+
+    Mirrors :func:`register_peer_inbox`. The callable shape is
+    ``(item_id, resolution, resolved_at, correlation_id)
+        -> awaitable[dict]``. The talker daemon registers it at
+    startup as a closure over the running PendingItemsConfig + the
+    vault path + the configured telegram user.
+    """
+    app[_KEY_PENDING_RESOLVE_CALLABLE] = callable_
+
+
+def register_pending_items_aggregate_path(
+    app: web.Application,
+    path: str | Path,
+) -> None:
+    """Tell the inbound push handler where to aggregate items.
+
+    Salem registers a path under ``./data/`` at startup so peer
+    pushes don't fall back to the localhost default.
+    """
+    app[_KEY_PENDING_AGGREGATE_PATH] = str(path)
+
+
+async def _handle_peer_pending_items_resolve(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST /peer/pending_items_resolve — accept a Salem resolution dispatch.
+
+    Body::
+
+        {
+          "item_id": "<uuid>",
+          "resolution": "<resolution_option_id>",
+          "resolved_at": "<iso8601, optional>",
+          "correlation_id": "<optional>"
+        }
+
+    Response::
+
+        {
+          "executed": <bool>,
+          "summary": "<user-facing text>",
+          "error": "<str or null>",
+          "correlation_id": "<echo>"
+        }
+
+    501 ``pending_resolver_not_configured`` when the resolver callable
+    isn't registered (e.g. the peer doesn't have a ``pending_items``
+    block enabled). 401/403 from the auth middleware as usual.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        correlation_id = _ensure_correlation_id(request, None)
+        return _json_error(400, "invalid_json", correlation_id=correlation_id)
+
+    correlation_id = _ensure_correlation_id(request, body)
+
+    item_id = body.get("item_id")
+    resolution = body.get("resolution")
+    resolved_at = body.get("resolved_at")
+
+    if not isinstance(item_id, str) or not item_id:
+        return _json_error(
+            400, "schema_error",
+            detail="item_id must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+    if not isinstance(resolution, str) or not resolution:
+        return _json_error(
+            400, "schema_error",
+            detail="resolution must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+    if resolved_at is not None and not isinstance(resolved_at, str):
+        return _json_error(
+            400, "schema_error",
+            detail="resolved_at must be an ISO 8601 string when present",
+            correlation_id=correlation_id,
+        )
+
+    resolver: PendingResolveCallable | None = request.app.get(
+        _KEY_PENDING_RESOLVE_CALLABLE,
+    )
+    if resolver is None:
+        return _json_error(
+            501, "pending_resolver_not_configured",
+            detail=(
+                "this instance has no Pending Items resolver registered "
+                "(likely no pending_items config block)"
+            ),
+            correlation_id=correlation_id,
+        )
+
+    try:
+        result = await resolver(
+            item_id=item_id,
+            resolution=resolution,
+            resolved_at=resolved_at,
+            correlation_id=correlation_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "transport.peer.pending_items_resolver_error",
+            item_id=item_id,
+            resolution=resolution,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            correlation_id=correlation_id,
+        )
+        return _json_error(
+            502, "pending_resolver_error",
+            detail=str(exc),
+            correlation_id=correlation_id,
+        )
+
+    response: dict[str, Any] = {
+        "executed": bool(result.get("executed", False)) if isinstance(result, dict) else False,
+        "summary": str(result.get("summary", "")) if isinstance(result, dict) else "",
+        "error": (
+            result.get("error")
+            if isinstance(result, dict) and result.get("error") is not None
+            else None
+        ),
+        "correlation_id": correlation_id,
+    }
+    log.info(
+        "transport.peer.pending_items_resolved",
+        item_id=item_id,
+        resolution=resolution,
+        executed=response["executed"],
+        correlation_id=correlation_id,
+    )
+    return web.json_response(response)
+
+
+# ---------------------------------------------------------------------------
 # Registrars — consumed by ROUTE_NAMESPACES in server.py
 # ---------------------------------------------------------------------------
 
@@ -903,6 +1281,8 @@ def register_peer_routes(app: web.Application) -> None:
     app.router.add_post("/peer/query", _handle_peer_query)
     app.router.add_post("/peer/handshake", _handle_peer_handshake)
     app.router.add_post("/peer/brief_digest", _handle_peer_brief_digest)
+    app.router.add_post("/peer/pending_items_push", _handle_peer_pending_items_push)
+    app.router.add_post("/peer/pending_items_resolve", _handle_peer_pending_items_resolve)
 
 
 def register_canonical_routes(app: web.Application) -> None:

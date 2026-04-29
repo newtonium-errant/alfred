@@ -431,6 +431,41 @@ daily_sync:
     # Andrew confirm or reject action.
     corpus_path: "./data/attribution_audit_corpus.jsonl"
 
+# Pending Items Queue (Phase 1) — items only Andrew can answer.
+# Per-instance JSONL queue (data/pending_items.jsonl) + auto-
+# regenerated vault markdown view (vault/process/Pending Items.md).
+# Salem aggregates cross-instance queues via /peer/pending_items_push;
+# resolutions route back to the originator via /peer/pending_items_resolve.
+#
+# Phase 1 surfaces ``outbound_failure`` items (auto-emitted from
+# session frontmatter). Phase 2 will add unanswered_clarification
+# and fuzzy_match. Phase 3 implements the full action plan executor.
+#
+# Per-instance config: every instance with a talker daemon writes
+# to its local queue. Salem aggregates from peers; peer instances
+# (Hypatia, KAL-LE) set ``push.target_peer: "salem"`` so the pusher
+# daemon flushes their local queue to Salem on a periodic cadence.
+pending_items:
+  enabled: true
+  queue_path: "./data/pending_items.jsonl"
+  view_path: "process/Pending Items.md"
+  view_debounce_seconds: 30
+  push:
+    # Salem leaves target_peer empty — it aggregates inbound pushes
+    # rather than pushing outbound. Hypatia / KAL-LE override:
+    #   target_peer: "salem"
+    #   self_name: "hypatia"
+    target_peer: ""
+    self_name: ""
+    interval_seconds: 300       # 5-minute periodic flush
+  expiry:
+    stale_days: 7               # items older than this render as "(stale)"
+    expire_days: 14             # auto-expired after this
+  outbound_failure_detector:
+    enabled: true
+    state_path: "./data/pending_items_outbound_failure_state.json"
+    session_subpath: "session"
+
 bit:
   # BIT (built-in test) runs before the Morning Brief so the brief can
   # report on system health. By default it fires 5 minutes before

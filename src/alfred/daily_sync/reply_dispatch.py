@@ -102,6 +102,22 @@ def _last_batch_proposal_items(config: DailySyncConfig) -> list[dict[str, Any]]:
     return [i for i in items if isinstance(i, dict)]
 
 
+def _last_batch_pending_items(config: DailySyncConfig) -> list[dict[str, Any]]:
+    """Return the pending-items entries the daemon stashed at fire time.
+
+    Each item carries ``item_number``, ``id`` (queue uuid),
+    ``category``, ``created_by_instance``, ``session_id``,
+    ``context``, ``resolution_options`` (list of ``{id, label}``).
+    Empty list when the most recent fire had no pending items. The
+    reply dispatcher routes ``noted`` / ``show me`` verbs against
+    whichever items list claims the item_number.
+    """
+    state = load_state(config.state.path)
+    batch = state.get("last_batch") or {}
+    items = batch.get("pending_items") or []
+    return [i for i in items if isinstance(i, dict)]
+
+
 def reply_targets_daily_sync(
     config: DailySyncConfig,
     parent_message_id: int,
@@ -172,7 +188,9 @@ _SMART_ROUTE_NUM_REF_RE = re.compile(
     r"\b\d+\s*[.,:\-]?\s*"
     r"(high|medium|med|low|spam|up|down|"
     r"confirm|keep|yes|reject|delete|remove|no|"
-    r"ok|okay|good|approved)\b",
+    r"ok|okay|good|approved|"
+    # Pending Items Queue Phase 1 verbs.
+    r"noted|show)\b",
     re.IGNORECASE,
 )
 
@@ -279,6 +297,7 @@ def maybe_smart_route_reply(
     *,
     vault_path: Path | None = None,
     instance_scope: str = "talker",
+    instance_name: str = "salem",
 ) -> dict[str, Any] | None:
     """Try to handle ``reply_text`` as a Daily Sync reply WITHOUT a
     reply-to-message context. Returns the same shape as
@@ -336,6 +355,7 @@ def maybe_smart_route_reply(
         reply_text=reply_text,
         vault_path=vault_path,
         instance_scope=instance_scope,
+        instance_name=instance_name,
     )
 
     if result is None:
@@ -712,6 +732,315 @@ def _resolve_proposal_correction(
     return (None, True)
 
 
+def _resolution_id_from_correction(
+    correction: ReplyCorrection,
+    item: dict[str, Any],
+) -> str | None:
+    """Map Andrew's terse reply token to a resolution_option id.
+
+    Inputs::
+
+        correction.consumed_token = "noted" | "show" | "ok" | ...
+        item["resolution_options"]  = [{"id": "noted", "label": ...}, ...]
+
+    Logic:
+
+      * ``noted`` matches any option whose ``id`` is exactly
+        ``"noted"`` OR whose label starts with the word "noted".
+      * ``show`` (the leading verb of ``"show me"``) matches any
+        option whose ``id`` starts with ``"show"`` (covers
+        ``show_me``, ``show_text``, etc.) OR whose label starts with
+        the word "show".
+      * ``ok`` / ``yes`` / ``confirm`` map to the first option whose
+        ``id`` is ``"noted"`` (legacy default for "no action needed").
+        This covers the all-ok shortcut path.
+
+    Returns ``None`` when no option matches — the dispatcher buckets
+    that as unparsed.
+    """
+    options = item.get("resolution_options") or []
+    if not isinstance(options, list):
+        return None
+    token = (correction.consumed_token or "").strip().lower()
+    if not token and correction.ok:
+        # Synthetic all-ok path or untokenized confirm.
+        token = "noted"
+
+    def _option_id(o: dict[str, Any]) -> str:
+        return str(o.get("id") or "").strip().lower()
+
+    def _option_label(o: dict[str, Any]) -> str:
+        return str(o.get("label") or "").strip().lower()
+
+    # Direct id match wins.
+    for o in options:
+        if isinstance(o, dict) and _option_id(o) == token:
+            return _option_id(o)
+
+    # ``show`` prefix.
+    if token == "show":
+        for o in options:
+            if isinstance(o, dict) and _option_id(o).startswith("show"):
+                return _option_id(o)
+            if isinstance(o, dict) and _option_label(o).startswith("show"):
+                return _option_id(o)
+
+    # ``noted`` / generic ok → first option with id "noted".
+    if token in {"noted", "ok", "okay", "yes", "y", "confirm", "confirmed", "keep"}:
+        for o in options:
+            if isinstance(o, dict) and _option_id(o) == "noted":
+                return _option_id(o)
+        # Fallback: first option id (better than failing — ``"noted"``
+        # by Daily Sync convention is always option 0 of an
+        # outbound_failure entry).
+        if options and isinstance(options[0], dict):
+            return _option_id(options[0])
+
+    return None
+
+
+def _resolve_pending_item_correction(
+    correction: ReplyCorrection,
+    item: dict[str, Any],
+    *,
+    self_instance: str,
+) -> tuple[str | None, bool, str]:
+    """Apply one pending-item resolution.
+
+    Returns ``(error_str_or_None, did_resolve, applied_summary)``.
+
+    Routing logic:
+
+      * If ``item.created_by_instance`` is the running instance (or
+        an alias like ``"talker"`` / ``"alfred"``), resolve locally
+        via :func:`alfred.pending_items.executor.resolve_local_item`.
+      * Otherwise dispatch via the
+        :func:`pending_items_resolve` peer call to the originating
+        instance.
+
+    The peer dispatch is async — we run it in a fresh event loop
+    when the dispatcher is called from a sync context (the bot's
+    ``handle_daily_sync_reply`` path is sync wrt the parser). For
+    Phase 1 we use ``asyncio.run`` inside a thread when an outer loop
+    is already running; in tests the dispatcher is exercised directly
+    and we fall through to sync-friendly code paths.
+    """
+    item_id = str(item.get("id") or "")
+    created_by = str(item.get("created_by_instance") or "").strip().lower()
+    if not item_id:
+        return (
+            f"item {correction.item_number}: pending item id missing",
+            False,
+            "",
+        )
+
+    resolution_id = _resolution_id_from_correction(correction, item)
+    if resolution_id is None:
+        return (
+            f"item {correction.item_number}: pending items only "
+            f"accept `noted` or `show me`",
+            False,
+            "",
+        )
+
+    # Normalize the running instance identity so "alfred" / "talker"
+    # / "salem" all match Salem-originated items.
+    self_normalized = (self_instance or "salem").strip().lower()
+    is_local = (
+        created_by in {self_normalized, "salem"}
+        if self_normalized in {"salem", "alfred", "talker", ""}
+        else created_by == self_normalized
+    )
+
+    try:
+        if is_local:
+            applied_summary = _resolve_pending_item_locally(
+                item_id=item_id,
+                resolution_id=resolution_id,
+            )
+        else:
+            applied_summary = _resolve_pending_item_via_peer(
+                item_id=item_id,
+                resolution_id=resolution_id,
+                peer_name=created_by,
+            )
+    except _PendingItemResolveFailure as exc:
+        return (
+            f"item {correction.item_number}: {exc}",
+            False,
+            "",
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        log.warning(
+            "daily_sync.pending_items.resolve_unexpected",
+            item_id=item_id,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        return (
+            f"item {correction.item_number}: unexpected error: {exc}",
+            False,
+            "",
+        )
+
+    return (None, True, applied_summary)
+
+
+class _PendingItemResolveFailure(Exception):
+    """Internal — surfaced as a per-item error string."""
+
+
+def _resolve_pending_item_locally(
+    *,
+    item_id: str,
+    resolution_id: str,
+) -> str:
+    """Resolve an item against the local queue. Sync wrapper."""
+    import asyncio as _asyncio
+    from alfred.pending_items.config import (
+        load_from_unified as load_pending,
+    )
+    from alfred.pending_items.executor import resolve_local_item
+
+    try:
+        import yaml as _yaml
+        with open("config.yaml", "r", encoding="utf-8") as f:
+            raw = _yaml.safe_load(f) or {}
+    except OSError as exc:
+        raise _PendingItemResolveFailure(
+            f"config.yaml not readable: {exc}"
+        ) from exc
+
+    pi_config = load_pending(raw)
+    if not pi_config.enabled:
+        raise _PendingItemResolveFailure(
+            "pending_items not enabled on this instance"
+        )
+
+    vault_path_str = (raw.get("vault") or {}).get("path", "./vault")
+    telegram_users = (raw.get("telegram") or {}).get("allowed_users") or []
+    user_id = 0
+    if telegram_users:
+        try:
+            user_id = int(telegram_users[0])
+        except (TypeError, ValueError):
+            user_id = 0
+
+    coro = resolve_local_item(
+        queue_path=pi_config.queue_path,
+        item_id=item_id,
+        resolution_id=resolution_id,
+        vault_path=Path(vault_path_str),
+        user_id=user_id,
+    )
+    result = _run_coro_sync(coro)
+    if not result.get("ok"):
+        raise _PendingItemResolveFailure(
+            result.get("summary") or result.get("error") or "resolve failed"
+        )
+    return str(result.get("summary") or "resolved")
+
+
+def _resolve_pending_item_via_peer(
+    *,
+    item_id: str,
+    resolution_id: str,
+    peer_name: str,
+) -> str:
+    """Dispatch resolution to the originating peer."""
+    from alfred.transport.client import peer_resolve_pending_item
+    from alfred.transport.config import load_from_unified as load_transport
+    from alfred.transport.exceptions import TransportError
+
+    try:
+        import yaml as _yaml
+        with open("config.yaml", "r", encoding="utf-8") as f:
+            raw = _yaml.safe_load(f) or {}
+    except OSError as exc:
+        raise _PendingItemResolveFailure(
+            f"config.yaml not readable: {exc}"
+        ) from exc
+
+    transport_config = load_transport(raw)
+    coro = peer_resolve_pending_item(
+        peer_name,
+        item_id=item_id,
+        resolution=resolution_id,
+        config=transport_config,
+    )
+    try:
+        response = _run_coro_sync(coro)
+    except TransportError as exc:
+        raise _PendingItemResolveFailure(
+            f"peer dispatch failed: {exc}"
+        ) from exc
+    if not isinstance(response, dict):
+        raise _PendingItemResolveFailure("peer returned non-dict response")
+    if not response.get("executed"):
+        raise _PendingItemResolveFailure(
+            response.get("summary") or response.get("error") or "peer rejected"
+        )
+    return f"{response.get('summary') or 'resolved'} (via {peer_name})"
+
+
+def _run_coro_sync(coro: Any) -> dict[str, Any]:
+    """Run an awaitable from a sync caller, regardless of event-loop context.
+
+    The Daily Sync reply dispatcher is invoked from the bot's sync
+    handler (PTB's ``handle_message`` callback) — there's already a
+    running event loop. ``asyncio.run`` would refuse. We use
+    ``asyncio.new_event_loop`` + ``loop.run_until_complete`` inside a
+    short-lived thread to avoid blocking the bot's loop.
+
+    Phase 2 will refactor the dispatcher to be natively async; for
+    now this scaffolding keeps the smart-routing path unchanged.
+    """
+    import asyncio as _asyncio
+    import concurrent.futures
+
+    try:
+        running = _asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+
+    if running is None:
+        # Sync caller — run directly.
+        return _asyncio.run(coro)
+
+    # We're inside an event loop already (bot's). Run the coroutine
+    # in a separate thread with its own loop.
+    def _runner():
+        loop = _asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(_runner)
+        return future.result(timeout=30.0)
+
+
+def _format_pending_item_applied_line(
+    item: dict[str, Any],
+    *,
+    resolution_id: str,
+    summary: str,
+) -> str:
+    """One-liner describing a pending-item resolution.
+
+    Format::
+
+        "Item N: [hypatia] outbound_failure → noted"
+        "Item N: [salem]   outbound_failure → show_me — delivered..."
+    """
+    item_number = item.get("item_number") or "?"
+    instance = str(item.get("created_by_instance") or "?").lower()
+    category = str(item.get("category") or "pending_item")
+    tail = f" — {summary}" if summary and resolution_id != "noted" else ""
+    return f"Item {item_number}: [{instance}] {category} → {resolution_id}{tail}"
+
+
 def _format_proposal_applied_line(
     item: dict[str, Any],
     *,
@@ -957,6 +1286,7 @@ def handle_daily_sync_reply(
     *,
     vault_path: Path | None = None,
     instance_scope: str = "talker",
+    instance_name: str = "salem",
 ) -> dict[str, Any] | None:
     """Process a Daily Sync reply. Returns a result dict or ``None``.
 
@@ -981,14 +1311,24 @@ def handle_daily_sync_reply(
     ``"talker"`` preserves Salem's behaviour for legacy callers / tests
     that skip the plumb.
 
+    ``instance_name`` (Phase 1 Pending Items) is the running
+    instance's identity (``"salem"``, ``"hypatia"``, ``"kalle"``).
+    Used by :func:`_resolve_pending_item_correction` to decide
+    whether to resolve locally or dispatch to a peer via
+    ``pending_items_resolve``. Default ``"salem"`` matches the
+    primary aggregator instance — peer instances should pass their
+    own name.
+
     On a match, the result dict carries:
       - ``confirmed_count``: int — how many entries were written
-        (sum across email + attribution)
+        (sum across email + attribution + proposal + pending)
       - ``unparsed``: list[str] — fragments the parser couldn't resolve
       - ``message``: str — confirmation text to reply with
       - ``all_ok``: bool
       - ``email_count``: int — email rows written
       - ``attribution_count``: int — attribution actions applied
+      - ``proposal_count``: int — canonical-proposal actions applied
+      - ``pending_count``: int — pending-item resolutions executed
     """
     if not reply_targets_daily_sync(config, parent_message_id):
         return None
@@ -1003,12 +1343,17 @@ def handle_daily_sync_reply(
     proposal_by_num = {
         int(i.get("item_number", 0)): i for i in proposal_items
     }
+    pending_items = _last_batch_pending_items(config)
+    pending_by_num = {
+        int(i.get("item_number", 0)): i for i in pending_items
+    }
 
     parsed: ReplyParseResult = parse_reply(reply_text)
 
     email_written = 0
     attribution_written = 0
     proposal_written = 0  # propose-person c2
+    pending_written = 0  # Pending Items Queue Phase 1
     applied_lines: list[str] = []  # c3 — one per-item summary line per accepted correction
     errors: list[str] = list(parsed.unparsed)
     unparsed_item_numbers: list[int] = []  # c3 — numeric IDs of items that couldn't parse
@@ -1119,12 +1464,37 @@ def handle_daily_sync_reply(
                         applied_lines.append(
                             _format_proposal_applied_line(item, action="confirm")
                         )
+        # Pending Items Queue Phase 1 — all_ok shortcut maps to the
+        # ``noted`` resolution on every pending item. ``show me``
+        # never fires from a pure-ack token; Andrew only triggers
+        # delivery via an explicit per-item reply.
+        if pending_items:
+            for item in pending_items:
+                synthetic = ReplyCorrection(
+                    item_number=int(item.get("item_number", 0)),
+                    ok=True,
+                    consumed_token="noted",
+                )
+                err, did_resolve, summary = _resolve_pending_item_correction(
+                    synthetic, item, self_instance=instance_name,
+                )
+                if err is not None:
+                    errors.append(err)
+                    unparsed_item_numbers.append(synthetic.item_number)
+                elif did_resolve:
+                    pending_written += 1
+                    applied_lines.append(
+                        _format_pending_item_applied_line(
+                            item, resolution_id="noted", summary=summary,
+                        )
+                    )
 
     else:
         for correction in parsed.corrections:
             email_item = email_by_num.get(correction.item_number)
             attribution_item = attribution_by_num.get(correction.item_number)
             proposal_item = proposal_by_num.get(correction.item_number)
+            pending_item = pending_by_num.get(correction.item_number)
 
             if email_item is not None:
                 # Reject verb makes no sense on an email item.
@@ -1213,13 +1583,46 @@ def handle_daily_sync_reply(
                             action="reject" if correction.reject else "confirm",
                         )
                     )
+            elif pending_item is not None:
+                # Pending Items Queue Phase 1 — ``noted`` / ``show me``.
+                # Reject verbs make no sense here (use ``noted`` for
+                # "no action needed"). Tier / modifier likewise.
+                if correction.reject:
+                    errors.append(
+                        f"item {correction.item_number}: "
+                        f"`reject` not meaningful — use `noted` to "
+                        f"close without action"
+                    )
+                    unparsed_item_numbers.append(correction.item_number)
+                    continue
+                err, did_resolve, summary = _resolve_pending_item_correction(
+                    correction, pending_item, self_instance=instance_name,
+                )
+                if err is not None:
+                    errors.append(err)
+                    unparsed_item_numbers.append(correction.item_number)
+                    continue
+                if did_resolve:
+                    pending_written += 1
+                    resolution_id = _resolution_id_from_correction(
+                        correction, pending_item,
+                    ) or "noted"
+                    applied_lines.append(
+                        _format_pending_item_applied_line(
+                            pending_item,
+                            resolution_id=resolution_id,
+                            summary=summary,
+                        )
+                    )
             else:
                 errors.append(
                     f"item {correction.item_number} not in last batch"
                 )
                 unparsed_item_numbers.append(correction.item_number)
 
-    written_count = email_written + attribution_written + proposal_written
+    written_count = (
+        email_written + attribution_written + proposal_written + pending_written
+    )
 
     # c3 — user-facing body. Per-item summary lines go in (capped at 5
     # so the Telegram reply stays readable on mobile), followed by a
@@ -1240,6 +1643,7 @@ def handle_daily_sync_reply(
         email_written=email_written,
         attribution_written=attribution_written,
         proposal_written=proposal_written,
+        pending_written=pending_written,
         unparsed=len(errors),
     )
 
@@ -1264,6 +1668,7 @@ def handle_daily_sync_reply(
         "email_count": email_written,
         "attribution_count": attribution_written,
         "proposal_count": proposal_written,
+        "pending_count": pending_written,
         "unparsed": errors,
         "message": body,
         "all_ok": parsed.all_ok,

@@ -801,3 +801,130 @@ async def peer_send_brief_digest(
         correlation_id=cid,
         json_body=body,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pending Items Queue — peer ↔ Salem (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+async def peer_push_pending_items(
+    peer_name: str,
+    *,
+    items: list[dict[str, Any]],
+    self_name: str,
+    config: "TransportConfig | None" = None,
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /peer/pending_items_push on the named peer (peer → Salem).
+
+    First-direction call for the Pending Items Queue Phase 1. Each
+    non-Salem instance flushes its local queue to Salem so Salem's
+    Daily Sync can surface a cross-instance aggregate.
+
+    Args:
+        peer_name: Outbound peer key (typically ``"salem"``).
+        items: List of pending-item dicts (already serialized via
+            :meth:`PendingItem.to_dict`). The Salem handler appends
+            new ids and silently drops duplicates by id (idempotent).
+        self_name: This instance's identity. Goes into the body's
+            ``from_instance`` field so Salem's anti-spoof check passes.
+        config: Pre-loaded TransportConfig.
+        correlation_id: Optional tracing id. Defaults to a
+            ``"{self_name}-pending-{count}-{hex}"`` form.
+
+    Returns:
+        Server's response dict —
+        ``{"received": <count>, "errors": [...]}`` on the happy path.
+    """
+    import secrets
+
+    from .config import TransportConfig, load_config
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = (
+        correlation_id
+        or f"{self_name}-pending-{len(items)}-{secrets.token_hex(3)}"
+    )
+
+    body: dict[str, Any] = {
+        "from_instance": self_name,
+        "items": list(items),
+        "correlation_id": cid,
+    }
+    return await _peer_request(
+        base_url=base_url,
+        token=token,
+        method="POST",
+        path="/peer/pending_items_push",
+        self_name=self_name,
+        correlation_id=cid,
+        json_body=body,
+    )
+
+
+async def peer_resolve_pending_item(
+    peer_name: str,
+    *,
+    item_id: str,
+    resolution: str,
+    self_name: str = "salem",
+    resolved_at: str | None = None,
+    config: "TransportConfig | None" = None,
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /peer/pending_items_resolve on the named peer (Salem → peer).
+
+    First Salem→peer consumer on the transport substrate. Existing
+    consumers (brief_digest_push, propose-person) are all peer→Salem.
+
+    Args:
+        peer_name: Outbound peer key (the originating instance from
+            the Pending Item's ``created_by_instance`` field).
+        item_id: The Pending Item's UUID — looked up in the peer's
+            local JSONL queue.
+        resolution: The chosen resolution_option's id (``"noted"``,
+            ``"show_me"``, etc.).
+        self_name: Salem's identity (default ``"salem"``).
+        resolved_at: Optional caller-supplied iso8601 timestamp;
+            defaults to "now" on the receiving side.
+        config: Pre-loaded TransportConfig.
+        correlation_id: Optional tracing id.
+
+    Returns:
+        Server's response dict — ``{"executed": <bool>, "summary":
+        "...", "error": "..."}``. The caller (Salem's Daily Sync
+        dispatcher) surfaces the summary text back to Andrew.
+    """
+    import secrets
+
+    from .config import TransportConfig, load_config
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = (
+        correlation_id
+        or f"salem-resolve-pending-{item_id[:8]}-{secrets.token_hex(2)}"
+    )
+
+    body: dict[str, Any] = {
+        "item_id": item_id,
+        "resolution": resolution,
+        "correlation_id": cid,
+    }
+    if resolved_at:
+        body["resolved_at"] = resolved_at
+    return await _peer_request(
+        base_url=base_url,
+        token=token,
+        method="POST",
+        path="/peer/pending_items_resolve",
+        self_name=self_name,
+        correlation_id=cid,
+        json_body=body,
+    )

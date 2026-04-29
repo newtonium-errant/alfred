@@ -234,6 +234,15 @@ _OK_TOKENS = {
     "confirm",
     "keep",
     "✅",
+    # Pending Items Queue verbs (Phase 1). ``noted`` resolves a
+    # pending item without action; ``show`` is the leading verb of
+    # the multi-word ``"show me"`` form (the parser only consumes
+    # the first token, so ``"3 show me"`` matches ``show`` here +
+    # ``me`` lands in the note). The dispatcher distinguishes
+    # ``noted`` vs ``show me`` via the ``correction.note`` content
+    # AND the resolution_option labels on the item.
+    "noted",
+    "show",
 }
 # Reject verbs — only meaningful for attribution items (email items
 # don't have a "delete the section" action). The dispatcher routes a
@@ -301,6 +310,14 @@ class ReplyCorrection:
     attribution item and onto the unparsed bucket for an email item.
     ``note`` carries any free-text reasoning.
 
+    ``consumed_token`` (Phase 1 Pending Items) records the literal
+    token the parser matched for this correction (``"noted"``,
+    ``"show"``, ``"ok"``, ``"high"``, etc.). The pending-items
+    dispatcher routes on this so ``"3 noted"`` and ``"3 show me"``
+    both produce ``ok=True`` corrections but resolve to different
+    resolution_option ids on the queue item. Empty string when the
+    correction came via a tier name / modifier / synthetic all-ok.
+
     ``same_as_item`` is set when the fragment used "Same" / "Ditto" /
     "Same as #N" chaining. It is a transient marker consumed by
     :func:`parse_reply`, which copies the referenced item's
@@ -316,6 +333,7 @@ class ReplyCorrection:
     reject: bool = False
     note: str = ""
     same_as_item: int | None = None
+    consumed_token: str = ""
 
 
 @dataclass
@@ -570,6 +588,7 @@ def _resolve_same_chain(
         reject=source.reject,
         note=correction.note,
         same_as_item=None,
+        consumed_token=source.consumed_token,
     )
     return resolved, None
 
@@ -646,18 +665,22 @@ def _parse_fragment(fragment: str) -> ReplyCorrection | None:
         if not consumed:
             if normalized in _TIER_TOKENS:
                 correction.new_tier = _TIER_TOKENS[normalized]
+                correction.consumed_token = normalized
                 consumed = True
                 continue
             if normalized in _RELATIVE_TOKENS:
                 correction.modifier = _RELATIVE_TOKENS[normalized]
+                correction.consumed_token = normalized
                 consumed = True
                 continue
             if normalized in _OK_TOKENS:
                 correction.ok = True
+                correction.consumed_token = normalized
                 consumed = True
                 continue
             if normalized in _REJECT_TOKENS:
                 correction.reject = True
+                correction.consumed_token = normalized
                 consumed = True
                 continue
         # Once we've consumed the first token, the rest belongs to the

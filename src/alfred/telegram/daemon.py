@@ -275,6 +275,91 @@ async def run(
             port=transport_config.server.port,
             peers=list(transport_config.auth.tokens.keys()),
         )
+
+        # ---- Pending Items Queue (Phase 1) wiring --------------------
+        # Aggregate path is needed on Salem (the receiver) so peer
+        # pushes land in the right JSONL. Resolver callable is needed
+        # on every instance with a ``pending_items`` block enabled so
+        # Salem→peer dispatch can locate + execute. Both registrations
+        # are no-ops on an instance whose ``pending_items`` block is
+        # absent / disabled — the inbound handler returns 501 (no
+        # resolver registered) which the Daily Sync dispatcher treats
+        # as a terminal error rather than a retry.
+        try:
+            from alfred.pending_items.config import (
+                load_from_unified as load_pending_items,
+            )
+            pending_items_config = load_pending_items(raw)
+        except Exception:  # noqa: BLE001
+            pending_items_config = None
+        if pending_items_config is not None and pending_items_config.enabled:
+            try:
+                from alfred.transport.peer_handlers import (
+                    register_pending_items_aggregate_path,
+                    register_pending_items_resolve_callable,
+                )
+                # Aggregate path lives next to the local queue file —
+                # Salem's queue + Salem's aggregate are different
+                # files (the aggregate gets peer-pushed entries, the
+                # queue gets Salem's own emissions); the Daily Sync
+                # section provider reads BOTH and unions by id.
+                aggregate_path = str(
+                    Path(pending_items_config.queue_path).with_name(
+                        "pending_items_aggregate.jsonl"
+                    )
+                )
+                register_pending_items_aggregate_path(transport_app, aggregate_path)
+                log.info(
+                    "talker.daemon.pending_items_aggregate_registered",
+                    path=aggregate_path,
+                )
+
+                # Resolver callable — closure over local queue + vault
+                # + telegram user. Receives Salem→peer resolution
+                # dispatches and runs the action plan locally.
+                from alfred.pending_items.executor import resolve_local_item
+                resolver_user_id = (
+                    config.allowed_users[0] if config.allowed_users else 0
+                )
+                _pending_queue_path = pending_items_config.queue_path
+                _pending_vault_path = Path(config.vault.path)
+
+                async def _pending_items_resolver(
+                    *,
+                    item_id: str,
+                    resolution: str,
+                    resolved_at: str | None = None,
+                    correlation_id: str = "",
+                ) -> dict[str, Any]:
+                    """Adapter: peer resolve → local executor.
+
+                    The transport handler hands us the parsed body;
+                    we run :func:`resolve_local_item` against the
+                    instance's own queue and return the executor's
+                    result dict. ``resolved_at`` is unused in Phase 1
+                    (the executor stamps "now") but retained for the
+                    Phase 3 audit trail.
+                    """
+                    return await resolve_local_item(
+                        queue_path=_pending_queue_path,
+                        item_id=item_id,
+                        resolution_id=resolution,
+                        vault_path=_pending_vault_path,
+                        user_id=resolver_user_id,
+                    )
+
+                register_pending_items_resolve_callable(
+                    transport_app, _pending_items_resolver,
+                )
+                log.info(
+                    "talker.daemon.pending_items_resolver_registered",
+                    queue_path=_pending_queue_path,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "talker.daemon.pending_items_setup_failed"
+                )
+
     except Exception:  # noqa: BLE001
         # Missing transport config is non-fatal — the talker still
         # handles Telegram chat even without the outbound push server.

@@ -23,11 +23,16 @@ EXPECTED_TOOLS = {
     "curator", "janitor", "distiller", "instructor",
     "surveyor", "mail", "brief", "talker",
     "bit", "daily_sync", "brief_digest_push", "digest",
+    # Pending Items Queue Phase 1 — periodic flush + outbound-failure
+    # detector. Auto-starts on instances with a ``pending_items`` block
+    # + ``enabled: true``.
+    "pending_items_pusher",
 }
 
 TWO_ARG_TOOLS = {
     "surveyor", "mail", "brief", "bit",
     "daily_sync", "brief_digest_push", "digest",
+    "pending_items_pusher",
 }
 THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "instructor", "talker"}
 

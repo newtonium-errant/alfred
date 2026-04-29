@@ -312,6 +312,66 @@ def _run_digest(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     asyncio.run(run_dg_daemon(config, raw))
 
 
+def _run_pending_items_pusher(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """Pending Items Queue periodic-flush daemon.
+
+    Per-instance auto-start: any instance with a ``pending_items``
+    block + ``enabled: true`` runs this daemon. Salem may also run
+    it (with ``push.target_peer == ""``) to drive the local
+    outbound-failure detector + view regeneration on its own queue;
+    only the push step short-circuits when target_peer is empty.
+
+    Exit code 78 (orchestrator's "not configured" convention) when
+    the block is absent / disabled so auto-restart skips us.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/pending_items_pusher.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    from alfred.brief.utils import setup_logging
+    setup_logging(
+        level=log_cfg.get("level", "INFO"),
+        log_file=log_file,
+        suppress_stdout=suppress_stdout,
+    )
+    from alfred.pending_items.config import (
+        load_from_unified as load_pending,
+    )
+    from alfred.pending_items.pusher import run_daemon as run_pi_daemon
+    from alfred.transport.config import load_from_unified as load_transport
+    pi_config = load_pending(raw)
+    if not pi_config.enabled:
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("pending_items.pusher.disabled_in_config")
+        sys.exit(78)
+    transport_config = load_transport(raw)
+    vault_path_str = (raw.get("vault") or {}).get("path", "./vault")
+    # Resolve instance name — the talker's ``instance.name`` lives
+    # under the ``telegram`` block. Fall back to ``"salem"`` to
+    # match the agent_slug_for default behaviour. Normalise via
+    # the shared compat helper so spaces / dots / the legacy
+    # ``alfred → salem`` mapping work uniformly.
+    from alfred.telegram._compat import _normalize_instance_name
+    instance_name = "salem"
+    telegram_raw = raw.get("telegram") or {}
+    instance_raw = telegram_raw.get("instance") or {}
+    if isinstance(instance_raw, dict):
+        raw_name = str(instance_raw.get("name") or "")
+        normalized = _normalize_instance_name(raw_name)
+        if normalized:
+            instance_name = normalized
+    asyncio.run(
+        run_pi_daemon(
+            pi_config,
+            transport_config,
+            Path(vault_path_str),
+            instance_name=instance_name,
+        )
+    )
+
+
 def _run_daily_sync(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Daily Sync daemon process entry point.
 
@@ -432,6 +492,7 @@ TOOL_RUNNERS = {
     "daily_sync": _run_daily_sync,
     "brief_digest_push": _run_brief_digest_push,
     "digest": _run_digest,
+    "pending_items_pusher": _run_pending_items_pusher,
 }
 
 
@@ -524,6 +585,14 @@ def run_all(
         # that don't write digests don't fire one.
         if "digest" in raw and (raw.get("digest") or {}).get("enabled"):
             tools.append("digest")
+        # Pending Items Queue periodic flush + outbound-failure
+        # detector daemon. Auto-starts when ``pending_items:`` is in
+        # config AND ``enabled: true``. Salem runs it locally to drive
+        # the outbound-failure scanner (push.target_peer empty); peer
+        # instances run it with target_peer="salem" to flush their
+        # local queue to Salem's aggregate.
+        if "pending_items" in raw and (raw.get("pending_items") or {}).get("enabled"):
+            tools.append("pending_items_pusher")
 
         if skipped:
             import structlog
@@ -584,7 +653,7 @@ def run_all(
         # Tools whose runner signature is ``(raw, suppress_stdout)`` (no
         # skills_dir). BIT has no skill prompts — it drives the
         # aggregator directly — so it lives in this bucket.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "pending_items_pusher"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

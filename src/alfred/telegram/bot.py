@@ -2064,6 +2064,7 @@ async def _maybe_handle_daily_sync_reply(
     talker_config = ctx.application.bot_data.get(_KEY_CONFIG)
     vault_path: Path | None = None
     instance_scope = "talker"
+    instance_name = "salem"
     if talker_config is not None:
         try:
             vault_path = Path(talker_config.vault.path)
@@ -2078,6 +2079,11 @@ async def _maybe_handle_daily_sync_reply(
             instance_scope = talker_config.instance.tool_set or "talker"
         except Exception:  # noqa: BLE001
             instance_scope = "talker"
+        try:
+            from alfred.audit import agent_slug_for
+            instance_name = agent_slug_for(talker_config) or "salem"
+        except Exception:  # noqa: BLE001
+            instance_name = "salem"
 
     try:
         result = handle_daily_sync_reply(
@@ -2086,6 +2092,7 @@ async def _maybe_handle_daily_sync_reply(
             user_text,
             vault_path=vault_path,
             instance_scope=instance_scope,
+            instance_name=instance_name,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("talker.bot.daily_sync_reply_failed", error=str(exc))
@@ -2153,6 +2160,7 @@ async def _maybe_smart_route_daily_sync_reply(
     talker_config = ctx.application.bot_data.get(_KEY_CONFIG)
     vault_path: Path | None = None
     instance_scope = "talker"
+    instance_name = "salem"
     if talker_config is not None:
         try:
             vault_path = Path(talker_config.vault.path)
@@ -2162,6 +2170,11 @@ async def _maybe_smart_route_daily_sync_reply(
             instance_scope = talker_config.instance.tool_set or "talker"
         except Exception:  # noqa: BLE001
             instance_scope = "talker"
+        try:
+            from alfred.audit import agent_slug_for
+            instance_name = agent_slug_for(talker_config) or "salem"
+        except Exception:  # noqa: BLE001
+            instance_name = "salem"
 
     try:
         result = maybe_smart_route_reply(
@@ -2169,6 +2182,7 @@ async def _maybe_smart_route_daily_sync_reply(
             user_text,
             vault_path=vault_path,
             instance_scope=instance_scope,
+            instance_name=instance_name,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(
