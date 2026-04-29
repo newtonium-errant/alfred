@@ -303,10 +303,53 @@ async def run_backfill(
 
     vault_path = config.vault.vault_path
 
+    def _persist() -> None:
+        """Snapshot current counters into the BackfillRecord and flush state.
+
+        Called after every source (success or failure) so a mid-run crash
+        leaves a faithful record on disk: which sources were attempted,
+        how many learnings landed, how many errors fired. The
+        ``backfill_complete`` flag is set only at end-of-loop when the
+        full pass succeeded — partial state is partial by design.
+        """
+        rec.last_run_at = timestamp
+        rec.eligible_count = result.eligible
+        rec.extracted_count = result.extracted
+        rec.error_count = result.errors
+        state.roots[root_key] = rec
+        save_backfill_state(config, state)
+
     for source_file in report.eligible:
-        record = _parse_source_file(source_file)
-        if record is None:
+        # Parse-error isolation: malformed YAML frontmatter (or any other
+        # parse failure) on one source must not abort the batch. Mark the
+        # source as processed so a re-run skips it — the source needs
+        # human review, not silent retry.
+        try:
+            record = _parse_source_file(source_file)
+        except Exception as exc:  # noqa: BLE001 — isolate per-source parse errors
+            log.warning(
+                "backfill.parse_error",
+                run_id=run_id,
+                source=str(source_file),
+                error=str(exc)[:500],
+            )
             result.errors += 1
+            rec.processed_paths.append(str(source_file.resolve()))
+            _persist()
+            continue
+        if record is None:
+            # ``_parse_source_file`` returns None on OSError (file vanished
+            # between scan and parse, perms changed, etc.). Surface it so
+            # the operator sees a log line — silence is ambiguous.
+            log.warning(
+                "backfill.parse_error",
+                run_id=run_id,
+                source=str(source_file),
+                error="read failed (OSError); file may be unreadable",
+            )
+            result.errors += 1
+            rec.processed_paths.append(str(source_file.resolve()))
+            _persist()
             continue
 
         signals = score_candidate(record)
@@ -331,6 +374,8 @@ async def run_backfill(
                 error=str(exc)[:500],
             )
             result.errors += 1
+            rec.processed_paths.append(str(source_file.resolve()))
+            _persist()
             continue
 
         if not extraction.learnings:
@@ -342,6 +387,7 @@ async def run_backfill(
             # Still mark processed — we asked, the model said nothing.
             # A second pass would re-spend the same LLM cost for no gain.
             rec.processed_paths.append(str(source_file.resolve()))
+            _persist()
             continue
 
         written = 0
@@ -370,18 +416,15 @@ async def run_backfill(
         # as processed so a re-run doesn't re-extract. Fail-and-retry
         # is operator-driven (delete the state file).
         rec.processed_paths.append(str(source_file.resolve()))
+        _persist()
 
-    # Update state
-    rec.last_run_at = timestamp
-    rec.eligible_count = result.eligible
-    rec.extracted_count = result.extracted
-    rec.error_count = result.errors
+    # End-of-loop: only NOW can we decide whether the pass was complete.
+    # Per-source ``_persist()`` calls above already wrote counters and
+    # processed_paths. This final write flips ``backfill_complete`` so
+    # subsequent re-runs short-circuit via the no_new_eligible path.
     if result.errors == 0 and len(report.eligible) > 0:
-        # Successful pass — set complete if we got through every eligible.
-        # Subsequent re-runs will short-circuit on the no_new_eligible path.
         rec.backfill_complete = True
-    state.roots[root_key] = rec
-    save_backfill_state(config, state)
+    _persist()
 
     log.info(
         "backfill.complete",

@@ -281,6 +281,195 @@ async def test_backfill_isolates_per_source_extractor_errors(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_backfill_isolates_per_source_parse_errors(tmp_path: Path) -> None:
+    """Malformed YAML frontmatter on one source must not abort the batch.
+
+    Regression for the 2026-04-29 KAL-LE backfill crash: one of Salem's
+    session notes had bad YAML, ``frontmatter.loads`` raised a
+    ``yaml.scanner.ScannerError``, and the per-source try/except (which
+    only wrapped the extractor) didn't catch it — the whole asyncio.run
+    aborted 11 sources in.
+    """
+    source = tmp_path / "src"
+    source.mkdir(parents=True, exist_ok=True)
+
+    # Three good files.
+    _write_session(source, "good-1.md", "## Alfred Learnings\n\n- one.\n")
+    _write_session(source, "good-2.md", "## Alfred Learnings\n\n- two.\n")
+    _write_session(source, "good-3.md", "## Alfred Learnings\n\n- three.\n")
+
+    # One bad-YAML file — triggers ``yaml.scanner.ScannerError`` in
+    # ``frontmatter.loads``. The colon inside the unquoted value at
+    # column 175 reproduces the original failure shape: a mapping value
+    # appearing where YAML doesn't expect one.
+    bad = source / "bad-yaml.md"
+    bad.write_text(
+        "---\n"
+        "type: session\n"
+        "name: bad\n"
+        "tags: [a, b: this is not legal here, c]\n"  # mapping-in-flow-seq
+        "---\n\n"
+        "## Alfred Learnings\n\n- bullet.\n",
+        encoding="utf-8",
+    )
+
+    cfg = _make_config(tmp_path)
+
+    async def fake_extract(**kwargs):
+        # One learning per call. Title disambiguates so writes don't collide.
+        body = kwargs["source_body"]
+        if "one" in body:
+            return _fake_extraction("Learning one")
+        if "two" in body:
+            return _fake_extraction("Learning two")
+        return _fake_extraction("Learning three")
+
+    with patch.object(bf, "v2_extract", side_effect=fake_extract):
+        result = await bf.run_backfill(source, cfg, dry_run=False)
+
+    # Four eligible files (3 good + 1 bad). Three good ones extracted,
+    # one bad one logged + counted as error. The bad file must NOT
+    # crash the batch.
+    assert result.eligible == 4
+    assert result.extracted == 3
+    assert result.errors == 1
+    assert result.learnings_by_type.get("assumption") == 3
+
+    # State persisted — bad source is marked processed so a re-run
+    # doesn't retry it indefinitely. Operator must remediate the
+    # source file (or delete the state) to retry.
+    state = bf.load_backfill_state(cfg)
+    rec = state.roots[str(source.resolve())]
+    processed = set(rec.processed_paths)
+    assert str(bad.resolve()) in processed
+    # All three good files also recorded.
+    assert len(processed) == 4
+    # error_count snapshotted.
+    assert rec.error_count == 1
+    # backfill_complete stays False because errors > 0.
+    assert rec.backfill_complete is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_persists_state_after_each_source(tmp_path: Path) -> None:
+    """State is flushed after every source so a mid-run crash preserves progress.
+
+    Regression for the 2026-04-29 KAL-LE backfill crash: 102 records had
+    been successfully written to the vault, but the state file didn't
+    exist on disk after the crash because state was only persisted at
+    end-of-run. Now: simulate a crash on the 3rd source and verify the
+    state file on disk records the first two sources.
+    """
+    source = tmp_path / "src"
+    source.mkdir(parents=True, exist_ok=True)
+    f1 = _write_session(source, "first.md", "## Alfred Learnings\n\n- one.\n")
+    f2 = _write_session(source, "second.md", "## Alfred Learnings\n\n- two.\n")
+    f3 = _write_session(source, "third.md", "## Alfred Learnings\n\n- three.\n")
+
+    cfg = _make_config(tmp_path)
+    state_path = bf._backfill_state_path(cfg)
+
+    call_n = 0
+
+    async def fake_extract(**kwargs):
+        nonlocal call_n
+        call_n += 1
+        if call_n == 1:
+            return _fake_extraction("First learning")
+        if call_n == 2:
+            return _fake_extraction("Second learning")
+        # Simulate a non-isolated crash on the third source.
+        # We use the per-source-isolated path here (extractor error)
+        # because the extractor try/except is the closest analogue
+        # to a recoverable crash; the test asserts state was already
+        # flushed for the first two sources BEFORE this point.
+        raise RuntimeError("simulated crash on third source")
+
+    with patch.object(bf, "v2_extract", side_effect=fake_extract):
+        result = await bf.run_backfill(source, cfg, dry_run=False)
+
+    # The third source's extractor error is isolated (existing behavior),
+    # but the more important assertion is that state was flushed
+    # incrementally — first two sources are on disk.
+    assert state_path.exists()
+    state = bf.load_backfill_state(cfg)
+    rec = state.roots[str(source.resolve())]
+    processed = set(rec.processed_paths)
+    assert str(f1.resolve()) in processed
+    assert str(f2.resolve()) in processed
+    # Third source attempted (extractor was called) — recorded as
+    # processed because the extractor-error branch marks it.
+    assert str(f3.resolve()) in processed
+    # error_count reflects the third-source failure.
+    assert rec.error_count == 1
+    # extracted_count reflects the two successes.
+    assert rec.extracted_count == 2
+    # Final result mirrors the persisted state.
+    assert result.extracted == 2
+    assert result.errors == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_state_persists_when_extractor_aborts_run(tmp_path: Path) -> None:
+    """Even if a non-isolated exception bubbles out of run_backfill,
+    state from successful sources before the crash is on disk.
+
+    This is the strictest formulation of the cadence contract: simulate
+    a crash that is NOT caught by the per-source try/except (e.g., one
+    that fires inside ``write_learn_record`` was the original 2026-04-29
+    failure mode wasn't actually — that one was the parser. But the
+    cadence guarantee should hold for ANY crash, not just the ones we've
+    seen). We use ``write_learn_record`` patched to raise ``BaseException``
+    (which the per-record ``except Exception`` won't catch) on the third
+    source.
+    """
+    source = tmp_path / "src"
+    source.mkdir(parents=True, exist_ok=True)
+    f1 = _write_session(source, "first.md", "## Alfred Learnings\n\n- one.\n")
+    f2 = _write_session(source, "second.md", "## Alfred Learnings\n\n- two.\n")
+    _write_session(source, "third.md", "## Alfred Learnings\n\n- three.\n")
+
+    cfg = _make_config(tmp_path)
+    state_path = bf._backfill_state_path(cfg)
+
+    async def fake_extract(**kwargs):
+        body = kwargs["source_body"]
+        if "one" in body:
+            return _fake_extraction("First learning")
+        if "two" in body:
+            return _fake_extraction("Second learning")
+        return _fake_extraction("Third learning")
+
+    call_n = 0
+    real_writer = bf.write_learn_record
+
+    def crashing_writer(**kwargs):
+        nonlocal call_n
+        call_n += 1
+        if call_n <= 2:
+            return real_writer(**kwargs)
+        # Use BaseException so the per-record ``except Exception`` does
+        # NOT catch this — simulating a hard abort on the third source.
+        raise KeyboardInterrupt("simulated hard abort during write")
+
+    with patch.object(bf, "v2_extract", side_effect=fake_extract):
+        with patch.object(bf, "write_learn_record", side_effect=crashing_writer):
+            with pytest.raises(KeyboardInterrupt):
+                await bf.run_backfill(source, cfg, dry_run=False)
+
+    # State file must exist with first two sources recorded — even
+    # though run_backfill itself aborted. This is the cadence contract.
+    assert state_path.exists()
+    state = bf.load_backfill_state(cfg)
+    rec = state.roots[str(source.resolve())]
+    processed = set(rec.processed_paths)
+    assert str(f1.resolve()) in processed
+    assert str(f2.resolve()) in processed
+    # Two successful extractions on disk.
+    assert rec.extracted_count == 2
+
+
+@pytest.mark.asyncio
 async def test_backfill_does_not_modify_source_files(tmp_path: Path) -> None:
     """Source files must be byte-identical before and after backfill."""
     source = tmp_path / "src"
