@@ -118,6 +118,21 @@ Each tool has its own `config.py` with typed dataclasses. All follow the same pa
 - `_build()` recursively constructs dataclasses from nested dicts
 - Config is loaded lazily in CLI handlers (not at import time)
 
+### State persistence — load() schema-tolerance contract
+
+Every tool's `state.py` `load()` MUST filter incoming JSONL/JSON data against the dataclass's known fields before constructing instances. The pattern, validated across distiller, surveyor, janitor, and curator:
+
+```python
+@classmethod
+def from_dict(cls, data: dict) -> "FileState":
+    known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+    return cls(**known)
+```
+
+This is the **load-time schema-tolerance contract**. It enforces forward-compatibility: a state file written by an older version of the tool that has an extra field doesn't crash the loader; a state file written by a newer version with extra fields silently ignores them on rollback. Without this filter, schema drift between tool versions becomes a deployment-blocking failure.
+
+**Default state paths must be tool-scoped** to avoid collision when an instance config omits a tool's block. Each tool's `StateConfig.path` defaults to `./data/<tool>_state.json` (e.g., `./data/distiller_state.json`). Sharing the same default `./data/state.json` across tools would let one tool silently load another tool's state file and present misleading status info — the schema-tolerance filter prevents the crash but not the wrong-source-of-truth.
+
 ### Vault Operations Layer (`src/alfred/vault/`)
 
 - `ops.py` — CRUD operations (`vault_create`, `vault_read`, `vault_edit`, `vault_move`, `vault_delete`, `vault_search`, `vault_list`, `vault_context`). Integrates with Obsidian CLI (1.12+) when available for search and moves.

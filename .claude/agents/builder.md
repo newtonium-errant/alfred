@@ -123,3 +123,14 @@ After completing work, report using this format:
 ## Pattern Discovery
 
 If you fix the same type of bug twice, that's a documentation trigger — not just a point fix. Flag it so it gets added to the agent instructions or project CLAUDE.md as a known gotcha.
+
+## Merge conflict resolution — TAKE OURS hunk-walk
+
+When resolving an upstream merge with "TAKE OURS" on a file (because ours is a superset of upstream's changes for that file), DO NOT rely on a headline-feature spot check. Walk every hunk:
+
+1. List every upstream commit that modified the file: `git log <merge-base>..upstream/master --oneline -- <path>`
+2. For each commit: `git show <sha> -- <path>` and read the full diff
+3. For each hunk in each commit: confirm the equivalent change exists in our version (same function, same logic, possibly different surrounding code) OR flag it as a deliberate decision to skip
+4. Particularly watch for **defensive guards** (input validation, type coercion, fallback paths) — these are small additions easily missed in a "ours is a superset" assertion because they don't show up as named features
+
+Reason: 2026-04-29 upstream merge (43 commits, 17 conflicts). "TAKE OURS" on `distiller/pipeline.py` was correct — ours had upstream's headline fixes via prior shipped code. But upstream commit `40f3df4`'s 8-line nested-list flatten guard slipped through the headline-feature audit because it wasn't a named feature, just a defensive coercion. Code-reviewer caught it post-merge; required a 2-minute cherry-pick (`6e76496`). Per-hunk walk would have caught it in the original merge.
