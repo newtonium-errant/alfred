@@ -79,6 +79,29 @@ class LabelerConfig:
     # won't break.
     max_calls_per_minute: int = 30
     rate_limit_enabled: bool = True
+    # Max LLM calls in flight during the cluster-labeling pass. Each cluster
+    # fires 2 sequential calls (label_cluster + suggest_relationships), and
+    # we fan out across clusters. 8 keeps well under OpenRouter's default
+    # rate limits for the fast-tier models while shortening full-vault
+    # labeling from tens of minutes to single digits.
+    max_concurrent: int = 8
+
+
+@dataclass
+class EntityLinkConfig:
+    """Structured entity-link writeback — when a cluster contains entity
+    records (matter/person/org/project), non-entity members with cosine
+    similarity above threshold get the entity's vault path written into
+    a typed frontmatter field (related_matters / related_persons / etc).
+    """
+    threshold: float = 0.75
+    max_per_record: int = 5
+    # When a new entity record (matter/person/org/project) is created, run
+    # a reverse scan across the vault and add it to matching records'
+    # related_<type> frontmatter. Without this, brand-new matters show up
+    # as structurally disconnected until the next clustering pass happens
+    # to co-cluster them with something.
+    backfill_enabled: bool = True
 
 
 @dataclass
@@ -126,6 +149,7 @@ class PipelineConfig:
     state: StateConfig
     logging: LoggingConfig
     idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
+    entity_link: EntityLinkConfig = field(default_factory=EntityLinkConfig)
     # Top-level opt-out flag. Distinct from the orchestrator's
     # configuration-by-presence gate: the orchestrator already skips
     # surveyor when the ``surveyor:`` block is entirely absent. This
@@ -203,6 +227,7 @@ def load_config(config_path: str | Path) -> PipelineConfig:
         state=_build_dataclass(StateConfig, raw.get("state")),
         logging=_build_dataclass(LoggingConfig, raw.get("logging")),
         idle_tick=_build_dataclass(IdleTickConfig, raw.get("idle_tick")),
+        entity_link=_build_dataclass(EntityLinkConfig, raw.get("entity_link")),
     )
 
 
@@ -222,6 +247,7 @@ def load_from_unified(raw: dict) -> PipelineConfig:
         logging=_build_dataclass(LoggingConfig, raw.get("logging")),
         # Idle-tick lives under ``surveyor:``; defaulted-on if absent.
         idle_tick=_build_dataclass(IdleTickConfig, tool.get("idle_tick")),
+        entity_link=_build_dataclass(EntityLinkConfig, tool.get("entity_link")),
         # Top-level opt-out — defaults True if absent.
         enabled=bool(tool.get("enabled", True)),
     )

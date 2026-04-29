@@ -57,6 +57,7 @@ dev = [
     # (``aiohttp_client``) used in tests/test_transport_server.py.
     "pytest-aiohttp>=1.0",
 ]
+test = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 all = ["alfred-vault[surveyor]", "alfred-vault[temporal]", "alfred-vault[voice]"]
 
 [project.urls]

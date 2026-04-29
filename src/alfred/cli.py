@@ -164,37 +164,126 @@ def cmd_down(args: argparse.Namespace) -> None:
         print("Alfred is not running.")
 
 
+def _scan_entity_linking_coverage(vault_path: Path) -> dict:
+    """Walk the vault once, tally related_* frontmatter coverage.
+
+    Returns a summary dict suitable for both human-readable status
+    output and machine-readable JSON telemetry. Groups matter counts
+    by slug so a tenant can see per-matter link density at a glance.
+    """
+    from collections import Counter
+
+    try:
+        import frontmatter  # only imported here so `alfred status` still
+                            # works in environments where frontmatter is
+                            # not installed — they just lose the breakdown.
+    except Exception:
+        return {"available": False}
+
+    totals = {
+        "records_with_related_matters": 0,
+        "records_with_related_persons": 0,
+        "records_with_related_orgs": 0,
+        "records_with_related_projects": 0,
+        "records_with_any_related": 0,
+        "unlinked_non_entity_records": 0,
+        "total_records_scanned": 0,
+    }
+    per_matter: Counter = Counter()
+    ENTITY_TYPES = {"matter", "person", "org", "project"}
+
+    for md_path in vault_path.rglob("*.md"):
+        if ".git" in md_path.parts:
+            continue
+        try:
+            post = frontmatter.load(md_path)
+        except Exception:
+            continue
+        md = post.metadata
+        totals["total_records_scanned"] += 1
+        record_type = md.get("type")
+        if isinstance(record_type, list):
+            record_type = record_type[0] if record_type else None
+
+        touched_any = False
+        for field, key in [
+            ("related_matters", "records_with_related_matters"),
+            ("related_persons", "records_with_related_persons"),
+            ("related_orgs", "records_with_related_orgs"),
+            ("related_projects", "records_with_related_projects"),
+        ]:
+            v = md.get(field)
+            if isinstance(v, list) and v:
+                totals[key] += 1
+                touched_any = True
+                if field == "related_matters":
+                    for p in v:
+                        if isinstance(p, str):
+                            slug = p.rsplit("/", 1)[-1].removesuffix(".md")
+                            per_matter[slug] += 1
+
+        if touched_any:
+            totals["records_with_any_related"] += 1
+        elif record_type not in ENTITY_TYPES:
+            totals["unlinked_non_entity_records"] += 1
+
+    return {
+        "available": True,
+        **totals,
+        "per_matter": dict(per_matter.most_common(20)),
+    }
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
 
-    print("=" * 60)
-    print("ALFRED STATUS")
-    print("=" * 60)
+    # --json: emit a single machine-readable blob instead of the
+    # printed status. Used by `alfred status --json | jq .surveyor…`.
+    as_json = bool(getattr(args, "json", False))
+    payload: dict[str, Any] = {}
+
+    if not as_json:
+        print("=" * 60)
+        print("ALFRED STATUS")
+        print("=" * 60)
 
     # Daemon status
     pid_path = _resolve_pid_path(raw)
     from alfred.daemon import check_already_running
     running_pid = check_already_running(pid_path)
-    if running_pid:
+    if as_json:
+        payload["daemon"] = {"running": bool(running_pid), "pid": running_pid}
+    elif running_pid:
         print(f"Daemon: running (pid {running_pid})")
     else:
         print("Daemon: not running")
 
     # Curator status
-    print("\n--- Curator ---")
+    curator_info: dict = {}
     try:
         from alfred.curator.config import load_from_unified as curator_cfg
         cfg = curator_cfg(raw)
         from alfred.curator.state import StateManager
         sm = StateManager(cfg.state.path)
         sm.load()
-        print(f"  Processed files: {len(sm.state.processed)}")
-        print(f"  Last run: {sm.state.last_run or 'never'}")
+        curator_info = {
+            "processed_files": len(sm.state.processed),
+            "last_run": sm.state.last_run or None,
+        }
     except Exception as e:
-        print(f"  (unavailable: {e})")
+        curator_info = {"error": str(e)}
+    if as_json:
+        payload["curator"] = curator_info
+    else:
+        print("\n--- Curator ---")
+        if "error" in curator_info:
+            print(f"  (unavailable: {curator_info['error']})")
+        else:
+            print(f"  Processed files: {curator_info['processed_files']}")
+            print(f"  Last run: {curator_info['last_run'] or 'never'}")
 
     # Janitor status
-    print("\n--- Janitor ---")
+    janitor_info: dict = {}
     try:
         from alfred.janitor.config import load_from_unified as janitor_cfg
         cfg = janitor_cfg(raw)
@@ -202,14 +291,26 @@ def cmd_status(args: argparse.Namespace) -> None:
         st = JanitorState(cfg.state.path, cfg.state.max_sweep_history)
         st.load()
         files_with_issues = sum(1 for fs in st.files.values() if fs.open_issues)
-        print(f"  Tracked files: {len(st.files)}")
-        print(f"  Files with issues: {files_with_issues}")
-        print(f"  Sweeps recorded: {len(st.sweeps)}")
+        janitor_info = {
+            "tracked_files": len(st.files),
+            "files_with_issues": files_with_issues,
+            "sweeps_recorded": len(st.sweeps),
+        }
     except Exception as e:
-        print(f"  (unavailable: {e})")
+        janitor_info = {"error": str(e)}
+    if as_json:
+        payload["janitor"] = janitor_info
+    else:
+        print("\n--- Janitor ---")
+        if "error" in janitor_info:
+            print(f"  (unavailable: {janitor_info['error']})")
+        else:
+            print(f"  Tracked files: {janitor_info['tracked_files']}")
+            print(f"  Files with issues: {janitor_info['files_with_issues']}")
+            print(f"  Sweeps recorded: {janitor_info['sweeps_recorded']}")
 
     # Distiller status
-    print("\n--- Distiller ---")
+    distiller_info: dict = {}
     try:
         from alfred.distiller.config import load_from_unified as distiller_cfg
         cfg = distiller_cfg(raw)
@@ -217,29 +318,77 @@ def cmd_status(args: argparse.Namespace) -> None:
         st = DistillerState(cfg.state.path, cfg.state.max_run_history)
         st.load()
         total_learns = sum(len(fs.learn_records_created) for fs in st.files.values())
-        print(f"  Tracked source files: {len(st.files)}")
-        print(f"  Learn records created: {total_learns}")
-        print(f"  Runs recorded: {len(st.runs)}")
+        distiller_info = {
+            "tracked_source_files": len(st.files),
+            "learn_records_created": total_learns,
+            "runs_recorded": len(st.runs),
+        }
     except Exception as e:
-        print(f"  (unavailable: {e})")
+        distiller_info = {"error": str(e)}
+    if as_json:
+        payload["distiller"] = distiller_info
+    else:
+        print("\n--- Distiller ---")
+        if "error" in distiller_info:
+            print(f"  (unavailable: {distiller_info['error']})")
+        else:
+            print(f"  Tracked source files: {distiller_info['tracked_source_files']}")
+            print(f"  Learn records created: {distiller_info['learn_records_created']}")
+            print(f"  Runs recorded: {distiller_info['runs_recorded']}")
 
-    # Surveyor status
-    print("\n--- Surveyor ---")
+    # Surveyor status + entity-linking telemetry (#26)
+    surveyor_info: dict = {}
     try:
         from alfred.surveyor.config import load_from_unified as surveyor_cfg
-        cfg = surveyor_cfg(raw)
+        scfg = surveyor_cfg(raw)
         from alfred.surveyor.state import PipelineState
-        st = PipelineState(cfg.state.path)
+        st = PipelineState(scfg.state.path)
         st.load()
-        print(f"  Tracked files: {len(st.files)}")
-        print(f"  Clusters: {len(st.clusters)}")
-        print(f"  Last run: {st.last_run or 'never'}")
+        surveyor_info = {
+            "tracked_files": len(st.files),
+            "clusters": len(st.clusters),
+            "last_run": st.last_run or None,
+        }
+        # Walk vault frontmatter once for coverage stats. Only run on
+        # --json or when vault is small enough that the full scan stays
+        # fast — for a 3500-record vault this is ~2s, acceptable.
+        vault_cfg = raw.get("vault", {}) or {}
+        vault_path_str = vault_cfg.get("path") or os.environ.get("ALFRED_VAULT_PATH")
+        if vault_path_str:
+            vault_path = Path(vault_path_str).expanduser().resolve()
+            if vault_path.is_dir():
+                surveyor_info["entity_linking"] = _scan_entity_linking_coverage(vault_path)
     except Exception as e:
-        print(f"  (unavailable: {e})")
+        surveyor_info = {"error": str(e)}
+    if as_json:
+        payload["surveyor"] = surveyor_info
+    else:
+        print("\n--- Surveyor ---")
+        if "error" in surveyor_info:
+            print(f"  (unavailable: {surveyor_info['error']})")
+        else:
+            print(f"  Tracked files: {surveyor_info['tracked_files']}")
+            print(f"  Clusters: {surveyor_info['clusters']}")
+            print(f"  Last run: {surveyor_info['last_run'] or 'never'}")
+            el = surveyor_info.get("entity_linking", {})
+            if el.get("available"):
+                print(f"  Entity linking:")
+                print(f"    Records scanned:       {el['total_records_scanned']}")
+                print(f"    Any related_* field:   {el['records_with_any_related']}")
+                print(f"    related_matters:       {el['records_with_related_matters']}")
+                print(f"    related_persons:       {el['records_with_related_persons']}")
+                print(f"    related_orgs:          {el['records_with_related_orgs']}")
+                print(f"    related_projects:      {el['records_with_related_projects']}")
+                print(f"    Non-entity unlinked:   {el['unlinked_non_entity_records']}")
+                top = el.get("per_matter", {})
+                if top:
+                    print(f"  Top matters by link count:")
+                    for slug, n in list(top.items())[:10]:
+                        print(f"    {slug:<50} {n:>4}")
 
     # Instructor status — only show if config section exists, mirroring
     # the orchestrator's auto-start gate.
-    if "instructor" in raw:
+    if "instructor" in raw and not as_json:
         print("\n--- Instructor ---")
         try:
             from alfred.instructor.config import load_from_unified as instructor_cfg
@@ -256,7 +405,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     # Talker status — only show if config section exists, mirroring the
     # orchestrator's auto-start gate.
-    if "telegram" in raw:
+    if "telegram" in raw and not as_json:
         print("\n--- Talker ---")
         try:
             from alfred.telegram.config import load_from_unified as talker_cfg
@@ -271,7 +420,10 @@ def cmd_status(args: argparse.Namespace) -> None:
         except Exception as e:
             print(f"  (unavailable: {e})")
 
-    print()
+    if as_json:
+        print(json.dumps(payload, indent=2, default=str))
+    else:
+        print()
 
 
 def cmd_curator(args: argparse.Namespace) -> None:
@@ -733,6 +885,16 @@ def cmd_temporal(args: argparse.Namespace) -> None:
 
 
 def cmd_surveyor(args: argparse.Namespace) -> None:
+    # Dispatch to relink subcommand if specified; otherwise default to
+    # running the daemon (preserves `alfred surveyor` legacy behaviour).
+    subcmd = getattr(args, "surveyor_cmd", None)
+    if subcmd == "relink":
+        return cmd_surveyor_relink(args)
+    # `run` and None both start the daemon.
+    return cmd_surveyor_run(args)
+
+
+def cmd_surveyor_run(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw, tool="surveyor")
 
@@ -1186,6 +1348,161 @@ def cmd_mail(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_surveyor_relink(args: argparse.Namespace) -> None:
+    """One-off entity-link pass across ALL clusters + noise points.
+
+    Rebuilds cluster membership from the current Milvus embeddings, then
+    runs the same entity-linking logic the daemon would run — but across
+    every semantic cluster instead of only the `changed_semantic` subset.
+
+    No re-embedding, no re-clustering (in the sense of recomputing labels),
+    no LLM calls. Pure numpy cosine + VaultWriter frontmatter appends.
+    Existing links are preserved — the writer appends new entries to the
+    related_* lists, it never removes.
+
+    Intended for one-time use after surveyor v2 rollout to densify link
+    coverage on a vault whose state shows most clusters unlabeled because
+    only the `changed` subset ever got processed.
+    """
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw)
+
+    try:
+        from alfred.surveyor.config import load_from_unified
+        from alfred.surveyor.daemon import Daemon
+        from alfred.surveyor.parser import parse_file
+    except ImportError as e:
+        print(f"Surveyor dependencies not installed: {e}")
+        sys.exit(1)
+
+    import asyncio
+
+    async def _run() -> int:
+        config = load_from_unified(raw)
+        daemon = Daemon(config)
+        daemon.state.load()
+
+        # Pull every embedding currently in Milvus.
+        embedding_data = daemon.embedder.get_all_embeddings()
+        if embedding_data is None:
+            print("No embeddings found — run `alfred surveyor run` first to embed the vault.")
+            return 1
+        paths, vectors = embedding_data
+        print(f"Loaded {len(paths)} embeddings from Milvus.")
+
+        # Parse every record so we know record_type for each path. We need
+        # this to tell entities from regulars in the link pass.
+        records = {}
+        for rel in paths:
+            try:
+                records[rel] = parse_file(config.vault.path, rel)
+            except Exception:
+                continue
+        print(f"Parsed {len(records)} records.")
+
+        # Reconstruct cluster membership purely from embeddings — we can't
+        # rely on state.files[rel].semantic_cluster_id alone because fresh
+        # tenants or post-migration vaults may not have those set. So run
+        # the clusterer against the current embeddings. HDBSCAN is cheap
+        # (~1-3s on 3500 vectors) and we need a valid cluster map anyway.
+        result = daemon.clusterer.run(paths, vectors, records)
+        cluster_members: dict[int, list[str]] = {}
+        for p, cid in result.semantic.items():
+            if cid == -1:
+                continue
+            cluster_members.setdefault(cid, []).append(p)
+        noise_paths = [p for p, cid in result.semantic.items() if cid == -1]
+
+        total_clusters = len(cluster_members)
+        print(
+            f"Clustering: {total_clusters} semantic clusters, "
+            f"{len(noise_paths)} noise points."
+        )
+
+        if getattr(args, "dry_run", False):
+            # Tally how many would be touched without actually writing.
+            from alfred.surveyor.labeler import ENTITY_RECORD_TYPES
+            with_entities = 0
+            with_regulars = 0
+            for cid, members in cluster_members.items():
+                has_e = any(
+                    records[m].record_type in ENTITY_RECORD_TYPES
+                    for m in members if m in records
+                )
+                has_r = any(
+                    records[m].record_type not in ENTITY_RECORD_TYPES
+                    for m in members if m in records
+                )
+                if has_e: with_entities += 1
+                if has_r and has_e: with_regulars += 1
+            print(
+                f"[dry-run] {with_entities} clusters contain >=1 entity record; "
+                f"{with_regulars} of those would have links written."
+            )
+            return 0
+
+        # Optional threshold override: some vaults benefit from 0.65 over
+        # the default 0.75, especially when matter records are short
+        # (structured frontmatter + one-paragraph description) vs.
+        # long-form events + transcripts they should link to.
+        if getattr(args, "threshold", None) is not None:
+            daemon.cfg.entity_link.threshold = float(args.threshold)
+            print(f"Threshold override: {daemon.cfg.entity_link.threshold}")
+
+        # Process ALL semantic clusters (not just changed_semantic).
+        all_cluster_ids = set(cluster_members.keys())
+        print(f"Running entity linking across {total_clusters} clusters…")
+        daemon._link_entities_in_clusters(
+            all_cluster_ids, cluster_members, records, paths, vectors,
+        )
+
+        # And every noise point.
+        if noise_paths:
+            print(f"Running noise-point linking across {len(noise_paths)} records…")
+            daemon._link_noise_points_to_entities(
+                noise_paths, records, paths, vectors,
+            )
+
+        # Full-vault entity backfill. This is the critical densification
+        # pass: for each existing entity (not just new ones from diff.new
+        # like #25 does in steady state), walk every non-entity record in
+        # the vault and link above threshold regardless of cluster. Catches
+        # the common case where a matter M is topically close to a cluster
+        # C it isn't actually a member of — cluster-scoped linking misses
+        # that relationship forever.
+        if not getattr(args, "no_backfill", False):
+            from alfred.surveyor.labeler import ENTITY_RECORD_TYPES
+            all_entity_paths = [
+                p for p, r in records.items()
+                if r.record_type in ENTITY_RECORD_TYPES
+            ]
+            by_type: dict[str, int] = {}
+            for p in all_entity_paths:
+                t = records[p].record_type
+                by_type[t] = by_type.get(t, 0) + 1
+            print(
+                f"Running full-vault backfill across {len(all_entity_paths)} entities "
+                f"({', '.join(f'{v} {k}s' for k, v in sorted(by_type.items()))})…"
+            )
+            daemon._backfill_new_entities(
+                all_entity_paths, records, paths, vectors,
+            )
+
+        # Persist updated state (the writer marked frontmatter writes in
+        # state.pending_writes; save so the watcher ignores them).
+        daemon.state.save()
+
+        print("\nDone. Check `alfred status --json | jq .surveyor.entity_linking`.")
+        return 0
+
+    try:
+        rc = asyncio.run(_run())
+        sys.exit(rc)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(130)
+
+
 # --- Argument parser ---
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1230,7 +1547,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("down", help="Stop the background daemon")
 
     # status
-    sub.add_parser("status", help="Show status from all tools")
+    status_p = sub.add_parser("status", help="Show status from all tools")
+    status_p.add_argument(
+        "--json", action="store_true", default=False,
+        help="Emit a machine-readable JSON blob instead of printed output.",
+    )
 
     # check — run BIT (built-in test) across every tool
     check_p = sub.add_parser(
@@ -1387,7 +1708,28 @@ def build_parser() -> argparse.ArgumentParser:
     temp_sub.add_parser("list", help="List discovered workflows")
 
     # surveyor
-    sub.add_parser("surveyor", help="Start surveyor pipeline")
+    surv = sub.add_parser("surveyor", help="Surveyor pipeline operations")
+    surv_sub = surv.add_subparsers(dest="surveyor_cmd")
+    surv_sub.add_parser("run", help="Start surveyor daemon (same as bare `surveyor`)")
+    surv_relink = surv_sub.add_parser(
+        "relink",
+        help="One-off re-run of entity linking across ALL semantic clusters + noise points "
+             "+ full-vault entity backfill, using current embeddings. Does NOT re-embed, "
+             "re-cluster, or re-label — only writes related_* frontmatter. Preserves "
+             "existing links (writer appends).",
+    )
+    surv_relink.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Scan + report, don't write frontmatter",
+    )
+    surv_relink.add_argument(
+        "--no-backfill", action="store_true", default=False,
+        help="Skip the full-vault backfill pass (only walk clusters + noise)",
+    )
+    surv_relink.add_argument(
+        "--threshold", type=float, default=None,
+        help="Override entity_link.threshold for this run only (e.g. 0.65 for denser links)",
+    )
 
     # tui
     sub.add_parser("tui", help="Launch interactive Ink TUI dashboard (requires Node.js)")
