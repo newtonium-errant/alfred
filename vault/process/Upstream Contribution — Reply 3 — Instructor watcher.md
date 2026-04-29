@@ -132,6 +132,11 @@ distiller_learnings:
   Backends]]'
 - '[[synthesis/Reward Phishing Pairs Big-Box Retailer With Affiliated Premium Product
   Brand]]'
+- '[[decision/Instructor Logs Errors to Frontmatter Only After Max Retry Exhaustion]]'
+- '[[synthesis/Reward Phishing Lures Use Retailer House Brands Not Only Third-Party
+  Affiliated Brands]]'
+- '[[synthesis/Phishing Sender Local-Part Encodes Scam Topic With Sequential Numeric
+  Index]]'
 distiller_signals: contradiction:1
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
