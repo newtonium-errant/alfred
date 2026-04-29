@@ -1592,7 +1592,7 @@ async def _dispatch_peer_route(
     # ``K.A.L.L.E.`` normalizes to ``kalle`` (no dashes — wouldn't
     # match). This mirrors ``transport.health._infer_self_name``.
     self_name = _normalize_instance_name(
-        config.instance.name or config.instance.canonical or "salem",
+        config.instance.name or config.instance.canonical or "",
     )
     target_normalized = _normalize_instance_name(target)
     if target_normalized == self_name:
@@ -1763,7 +1763,7 @@ async def _open_routed_session(
     # Uses the same name-first convention the self-target guard in
     # ``_dispatch_peer_route`` uses — see ``_normalize_instance_name``.
     self_name = _normalize_instance_name(
-        config.instance.name or config.instance.canonical or "salem",
+        config.instance.name or config.instance.canonical or "",
     )
     self_display_name = (
         config.instance.canonical or config.instance.name or "Alfred"
@@ -2067,7 +2067,7 @@ async def _maybe_handle_daily_sync_reply(
     talker_config = ctx.application.bot_data.get(_KEY_CONFIG)
     vault_path: Path | None = None
     instance_scope = "talker"
-    instance_name = "salem"
+    instance_name = ""
     if talker_config is not None:
         try:
             vault_path = Path(talker_config.vault.path)
@@ -2084,9 +2084,10 @@ async def _maybe_handle_daily_sync_reply(
             instance_scope = "talker"
         try:
             from alfred.audit import agent_slug_for
-            instance_name = agent_slug_for(talker_config) or "salem"
-        except Exception:  # noqa: BLE001
-            instance_name = "salem"
+            instance_name = agent_slug_for(talker_config)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("talker.bot.agent_slug_for_failed", error=str(exc))
+            instance_name = ""
 
     try:
         result = handle_daily_sync_reply(
@@ -2164,7 +2165,7 @@ async def _maybe_smart_route_daily_sync_reply(
     talker_config = ctx.application.bot_data.get(_KEY_CONFIG)
     vault_path: Path | None = None
     instance_scope = "talker"
-    instance_name = "salem"
+    instance_name = ""
     if talker_config is not None:
         try:
             vault_path = Path(talker_config.vault.path)
@@ -2176,9 +2177,10 @@ async def _maybe_smart_route_daily_sync_reply(
             instance_scope = "talker"
         try:
             from alfred.audit import agent_slug_for
-            instance_name = agent_slug_for(talker_config) or "salem"
-        except Exception:  # noqa: BLE001
-            instance_name = "salem"
+            instance_name = agent_slug_for(talker_config)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("talker.bot.agent_slug_for_failed", error=str(exc))
+            instance_name = ""
 
     try:
         result = maybe_smart_route_reply(
