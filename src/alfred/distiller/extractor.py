@@ -180,10 +180,12 @@ Valid statuses per type:
 
 Rules:
   - Return ONLY the JSON object. No prose, no code fences, no commentary.
-  - confidence="high" requires either (a) an explicit, unambiguous source \
-statement, OR (b) for empirical patterns, ≥2 corroborating observations \
-across separate instances. See "Confidence calibration" below. Default to \
-"medium" for reasonable inferences from a single source.
+  - Confidence defaults to MEDIUM. Move to HIGH only when the type-specific \
+HIGH criteria below are met. Move to LOW when the LOW criteria below are met. \
+If unsure between medium and high, choose medium. If unsure between low and \
+medium, choose low. Anchoring on high without explicit grounding is the most \
+common error this prompt has corrected for. See "Confidence calibration" \
+below.
   - title is a noun phrase; claim is the full sentence.
   - If a learning with the same idea is already in the existing-learnings \
 list, skip it. Otherwise extract — even if related.
@@ -192,17 +194,57 @@ operational signal worth extracting (e.g. a smoke-test placeholder).
 
 --- Confidence calibration ---
 
-Two common shapes get confidence-graded differently:
+Treat MEDIUM as the default prior. The historical failure mode of this \
+extractor has been over-calling HIGH on single-source inferences and \
+under-calling LOW on hedged or ambiguous signals. Empirical audit (8-day \
+shadow run vs the legacy distiller) showed HIGH was emitted ~1.8x too often \
+and LOW was emitted ~8x too rarely. This section exists to correct that \
+distribution.
 
-  - Architectural / ratified-once decisions — a single ratification event \
-warrants high confidence. Example: "Salem chose message-level routing over \
-tool-level for peer dispatch" — high confidence is correct from one decision \
-session because the decision IS the artifact.
-  - Empirical patterns (claims about behavior, frequency, stability, \
-recurrence) — require N+ observations to claim "stable," "confirmed," \
-"sustained," "recurring," or "consistent." A single data point does not \
-support a stability claim; use medium and word the claim to match what the \
-single observation actually shows.
+The five learn types have DIFFERENT bars for HIGH:
+
+  - decision — a single ratification event is sufficient. The decision IS \
+the artifact being recorded; one session note showing the choice + rejected \
+alternative + decision-maker warrants HIGH. Example: "Salem chose \
+message-level routing over tool-level for peer dispatch."
+  - assumption — HIGH requires an explicit source statement of the inferred \
+state, not just a plausible derivation. If you are inferring the state from \
+indirect signals (an email's wording, a UI element, a billing line item), \
+the bar is MEDIUM at most. Empirical patterns about behavior, frequency, \
+stability, or recurrence require ≥2 corroborating observations across \
+separate instances to claim "stable," "confirmed," "sustained," "recurring," \
+or "consistent."
+  - constraint — HIGH requires the source to explicitly state the limit \
+(e.g., a published API doc, a CRA notice, a rate-limit table). If the \
+constraint is inferred from a single failure or a single observed boundary, \
+that is MEDIUM at most.
+  - contradiction — HIGH requires BOTH contradicting positions to be \
+explicit and cited (both source_links present, both excerpts quoteable). A \
+contradiction inferred from one position + a remembered/assumed counter is \
+MEDIUM at most.
+  - synthesis — HIGH requires evidence from ≥2 DISTINCT sources. This \
+enforces the cross-source nature of synthesis. A single-source observation \
+is not a synthesis; emit it as an assumption instead. If you have 2+ \
+sources but the pattern feels noisy or weakly corroborated, MEDIUM.
+
+LOW criteria (use LOW or skip — currently UNDER-emitted, learn to recognize):
+
+  - The source explicitly hedges the claim — words like "might," \
+"possibly," "appears to," "we think," "could be," "seems," "may have," \
+"if I'm reading this right" — at most LOW. The source itself is signaling \
+uncertainty; the extraction must not strip that hedge.
+  - A single ambiguous data point that could be noise. The classic shape: \
+generic marketing/transactional wording ("your account," "based on your \
+preferences," "we noticed your activity") is templated copy, not a \
+confirmation of any underlying state. If your inference depends on \
+treating boilerplate as evidence of a specific configuration, LOW or skip.
+  - An inference about user behavior or a system pattern with N=1 \
+observations. "Andrew prefers X" / "the daemon does Y under load" / \
+"this tool always Z" — LOW or skip until N≥2 corroborates. Word the claim \
+to match: "observed once that…" rather than "Andrew prefers…".
+  - A claim where the underlying signal could equally support an opposite \
+or unrelated conclusion (genuinely ambiguous frame). LOW or skip; consider \
+emitting a contradiction or pair of competing assumptions instead.
 
 Worked examples (confidence calibration):
 
@@ -214,11 +256,13 @@ period." NOT "Stable at $12/month" — one invoice is one data point.
 "DigitalOcean monthly spend has held at $12 across April–June." Three \
 corroborating observations support the stability framing.
 
-  GOOD — single ratification event = high:
+  GOOD — single ratification event = high (decision only):
     Source: architecture-debate session note showing Andrew approved \
 message-level routing. → decision (confidence: high) "Salem uses message-\
 level routing for peer dispatch." Single event is sufficient because the \
-decision IS the artifact being recorded.
+decision IS the artifact being recorded. NOTE: this rule is decision-only. \
+A single session note that "Andrew finds X useful" is NOT a high-confidence \
+assumption; assumptions need explicit grounding, not a single observation.
 
   BAD — over-call shape (do NOT emit):
     Source: one invoice in a series where plaintext rendered correctly and \
@@ -228,9 +272,36 @@ Correct emission: assumption (confidence: medium) "Plaintext path observed \
 working in this invoice; HTML path observed failing in the same invoice; \
 broader confirmation requires more cases."
 
+  GOOD — LOW on marketing-copy inference (the AIR MILES shape):
+    Source: an AIR MILES marketing email opens with "Based on your account \
+activity, here are offers for you." → DO NOT emit assumption (confidence: \
+medium/high) "Andrew has an active AIR MILES account." Generic "your \
+account" wording is templated copy on a marketing send list — it is not \
+evidence of an active account, only of being on the mailing list. Correct \
+emission: assumption (confidence: low) "Andrew may be on the AIR MILES \
+marketing list (account-active state not confirmed by this email alone)" — \
+or skip the extraction entirely. Treating boilerplate as evidence is the \
+canonical over-call.
+
+  GOOD — LOW on author-hedged claim:
+    Source: a session note where Andrew writes "I think the burst-replay \
+edge might have broken capture session ec1db330, but I'm not sure — need \
+to test." → assumption (confidence: low) "Burst-replay handling may have \
+broken capture session ec1db330; verification pending." The author \
+explicitly hedged; the extraction MUST preserve the hedge. NOT \
+"Burst-replay broke capture session ec1db330" (high) — that strips the \
+"might" / "not sure" the source itself is flagging.
+
+  GOOD — LOW on N=1 behavior claim:
+    Source: a single Telegram exchange where Andrew used voice over text. \
+→ DO NOT emit assumption (confidence: medium) "Andrew prefers voice over \
+text." One usage is not a preference. Correct emission: skip, OR \
+assumption (confidence: low) "Andrew used voice in one observed Telegram \
+exchange (preference not established by single observation)."
+
 Word the claim to match the evidence available. If the source supports only \
-"observed once," do NOT escalate the language to "stable," "confirmed," or \
-"recurring."
+"observed once" or "the author hedges this," do NOT escalate the language \
+to "stable," "confirmed," "recurring," or strip the hedge.
 """
 
 
