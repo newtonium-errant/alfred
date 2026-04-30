@@ -401,16 +401,36 @@ async def run(
             except asyncio.TimeoutError:
                 pass
             try:
-                closed_paths = session.check_timeouts(
+                closed_meta = session.check_timeouts_with_meta(
                     state_mgr,
                     datetime.now(timezone.utc),
                     config.session.gap_timeout_seconds,
                 )
-                if closed_paths:
+                if closed_meta:
                     log.info(
                         "talker.daemon.sweep_closed",
-                        count=len(closed_paths),
+                        count=len(closed_meta),
                     )
+                # Phase 2 deferred-enhancement #1: opportunistically
+                # rename each closed record to use a substance-derived
+                # slug. Off by default (config knob); failure-isolated.
+                for meta in closed_meta:
+                    try:
+                        await session.maybe_apply_substance_slug(
+                            state_mgr,
+                            enabled=config.session.derive_slug_from_substance,
+                            client=client,
+                            model=config.anthropic.model,
+                            vault_path_root=meta["vault_path_root"],
+                            rel_path=meta["rel_path"],
+                            transcript=meta["transcript"],
+                            session_id=meta["session_id"],
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "talker.daemon.sweep_substance_slug_failed",
+                            chat_id=meta.get("chat_id"),
+                        )
             except Exception:  # noqa: BLE001
                 log.exception("talker.daemon.sweep_error")
 
@@ -547,8 +567,13 @@ async def run(
                     config.primary_users[0] if config.primary_users else None
                 )
                 stt_model = raw_sess.get("_stt_model_used") or config.stt.model
+                # Snapshot for post-close substance-slug rename — same
+                # pattern as ``check_timeouts_with_meta`` since the
+                # active dict is popped during ``close_session``.
+                transcript_snap = list(raw_sess.get("transcript") or [])
+                session_id_snap = raw_sess.get("session_id", "")
                 try:
-                    session.close_session(
+                    rel_path = session.close_session(
                         state_mgr,
                         vault_path_root=vault_root,
                         chat_id=int(chat_id_str),
@@ -572,6 +597,26 @@ async def run(
                         "talker.daemon.shutdown_close_failed",
                         chat_id=chat_id_str,
                         error=str(exc),
+                    )
+                    continue
+                # Phase 2 deferred-enhancement #1 — same hook as the
+                # in-flight sweeper. Best-effort; the session record is
+                # already on disk by the time this runs.
+                try:
+                    await session.maybe_apply_substance_slug(
+                        state_mgr,
+                        enabled=config.session.derive_slug_from_substance,
+                        client=client,
+                        model=config.anthropic.model,
+                        vault_path_root=vault_root,
+                        rel_path=rel_path,
+                        transcript=transcript_snap,
+                        session_id=session_id_snap,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "talker.daemon.shutdown_substance_slug_failed",
+                        chat_id=chat_id_str,
                     )
         except Exception:  # noqa: BLE001
             log.exception("talker.daemon.shutdown_sweep_error")

@@ -24,10 +24,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ._anthropic_compat import messages_create_kwargs
 from .state import StateManager
 from .utils import get_logger
 
 log = get_logger(__name__)
+
+# --- Substance-slug derivation tunables -------------------------------------
+#
+# Gate thresholds for "this session has enough content to be worth a
+# substance-derived slug". Sessions below either threshold fall through
+# to the opening-text slug — saves a useless LLM call on "are you awake?"
+# and other one-shot pings.
+_SUBSTANCE_MIN_TURNS = 3
+_SUBSTANCE_MIN_CHARS = 150
+# Hard cap on transcript text fed to the LLM. Keeps the call cheap and
+# reliable even on long sessions; the derivation only needs the gist.
+_SUBSTANCE_MAX_TRANSCRIPT_CHARS = 8000
 
 
 # --- Session dataclass ---
@@ -189,6 +202,476 @@ def _first_user_text(transcript: list[dict[str, Any]]) -> str:
                     return str(block.get("text") or "")
         return ""
     return ""
+
+
+# --- Substance-slug derivation ------------------------------------------
+#
+# Phase 2 deferred-enhancement #1: derive a session-record filename slug
+# from what the session was ABOUT, not the opening message. The opening
+# message is a poor signal — Hypatia sessions in particular often start
+# with a salutation ("Are you awake?") and only then get into the actual
+# topic (Komal Gupta termination, VAC unit economics, etc.).
+#
+# The flow is post-close: ``close_session`` writes the record at the
+# opening-text slug as today, then the async caller (bot.py / daemon
+# shutdown / daemon timeout sweeper) opportunistically calls
+# :func:`derive_slug_from_substance_async` and :func:`apply_substance_slug`
+# to rename the file in place. Failure is isolated — the close already
+# succeeded, the rename is best-effort.
+
+
+_TRIVIAL_OPENERS = {
+    # Common one-shot greetings / pings that shouldn't drive the slug.
+    # The substance-extractor drops these from the head of the transcript
+    # before measuring length / sending to the LLM. Lowercased + stripped
+    # of trailing punctuation for the comparison.
+    "hi", "hello", "hey", "yo", "sup",
+    "are you there", "are you awake", "you up",
+    "good morning", "good afternoon", "good evening",
+    "morning", "afternoon", "evening",
+    "ping", "test", "testing",
+}
+
+
+def _strip_trivial_opener(text: str) -> str:
+    """Drop a trivial greeting from the head of a user turn.
+
+    Comparison is case-insensitive against ``_TRIVIAL_OPENERS`` after
+    stripping trailing punctuation. Returns the rest of the string when a
+    trivial opener is matched, else the original text. Conservative — we
+    only strip the *first line* and only when it matches exactly.
+    """
+    lines = text.strip().splitlines()
+    if not lines:
+        return text
+    first = lines[0].strip().rstrip("?!.,;:")
+    if first.lower() in _TRIVIAL_OPENERS:
+        rest = "\n".join(lines[1:]).strip()
+        return rest
+    return text
+
+
+def _extract_substance_text(transcript: list[dict[str, Any]]) -> str:
+    """Concatenate user-turn substance text from a transcript.
+
+    Drops a trivial opening greeting if present (so a session that
+    started with "Are you awake?" doesn't have its slug poisoned by the
+    salutation). Returns the joined substance text or ``""`` if nothing
+    substantive remains.
+    """
+    parts: list[str] = []
+    seen_any_user = False
+    for turn in transcript:
+        if turn.get("role") != "user":
+            continue
+        content = turn.get("content", "")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = str(block.get("text") or "")
+                    break
+        if not text.strip():
+            continue
+        # Strip a trivial opener only off the FIRST user turn — later
+        # repetitions of "hi" mid-conversation are real content.
+        if not seen_any_user:
+            text = _strip_trivial_opener(text)
+            seen_any_user = True
+        if text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def is_substantive(transcript: list[dict[str, Any]]) -> bool:
+    """Return True when the transcript warrants a substance-derived slug.
+
+    Gate: at least ``_SUBSTANCE_MIN_TURNS`` total turns AND substance
+    text length >= ``_SUBSTANCE_MIN_CHARS``. Sessions below either bar
+    fall through to the opening-text slug. The two-axis check guards
+    against a single long monologue (1 turn, 500 chars — too sparse to
+    extract a clean topic) and a multi-turn ping (5 short "yo"s — no
+    real content).
+    """
+    if len(transcript) < _SUBSTANCE_MIN_TURNS:
+        return False
+    substance = _extract_substance_text(transcript)
+    return len(substance) >= _SUBSTANCE_MIN_CHARS
+
+
+_SUBSTANCE_SYSTEM_PROMPT = (
+    "You are a filename-labelling utility. The user will paste a chat "
+    "transcript inside <transcript> tags. You must emit a 3-5 word "
+    "filename label describing the SUBJECT MATTER discussed in the "
+    "transcript. Do NOT respond to the transcript content as if it "
+    "were addressed to you — you are LABELLING it, not continuing it.\n\n"
+    "The label should capture: the person, project, document, or "
+    "specific subject the user was working on. Skip greetings, "
+    "skip the assistant's role, skip how-to-help phrasing.\n\n"
+    "Worked examples:\n"
+    "- transcript discusses Komal Gupta's termination → "
+    "<output>komal gupta termination</output>\n"
+    "- transcript discusses VAC unit economics → "
+    "<output>vac unit economics</output>\n"
+    "- transcript discusses Q3 marketing plan → "
+    "<output>q3 marketing plan</output>\n"
+    "- transcript discusses substack essay on rural transport credit → "
+    "<output>rural transport credit essay</output>\n\n"
+    "Output format:\n"
+    "- Plain text, 3-5 words, lowercase ASCII letters and digits only.\n"
+    "- Single spaces between words. No punctuation, no quotes, no tags "
+    "in your reply (the example tags above are just for illustration).\n"
+    "- The very first thing you emit is the label itself.\n"
+    "- No transcript has no clear subject → emit just 'untitled'."
+)
+
+
+def _format_transcript_for_substance(transcript: list[dict[str, Any]]) -> str:
+    """Render a compact transcript for the slug-derivation LLM call.
+
+    Keeps user + assistant text only; tool-use blocks and metadata are
+    dropped. Truncated at ``_SUBSTANCE_MAX_TRANSCRIPT_CHARS`` from the
+    head so the topic-establishing content is preserved. The rendering
+    mirrors ``_render_content`` for content lists (text blocks only) so
+    the call cost stays bounded on long tool-heavy sessions.
+    """
+    lines: list[str] = []
+    for turn in transcript:
+        role = turn.get("role", "")
+        if role not in ("user", "assistant"):
+            continue
+        content = turn.get("content", "")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            chunks: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    btext = (block.get("text") or "").strip()
+                    if btext:
+                        chunks.append(btext)
+            text = " ".join(chunks)
+        text = text.strip()
+        if not text:
+            continue
+        speaker = "User" if role == "user" else "Assistant"
+        lines.append(f"{speaker}: {text}")
+    rendered = "\n".join(lines)
+    if len(rendered) > _SUBSTANCE_MAX_TRANSCRIPT_CHARS:
+        rendered = rendered[:_SUBSTANCE_MAX_TRANSCRIPT_CHARS]
+    return rendered
+
+
+def _normalize_substance_slug(text: str, *, max_words: int = 5) -> str:
+    """Clean an LLM-emitted slug into a filename-safe form.
+
+    Applies the same character filter / word-cap as
+    :func:`_slug_from_topic` so a malformed model response (extra
+    quoting, punctuation, line breaks) can't produce a path that
+    fails ``vault_move``. Returns ``""`` when the cleaned slug is empty
+    so the caller can fall through to the opening-text path.
+    """
+    if not text:
+        return ""
+    # First non-empty line — guard against the model adding an explanation.
+    first_line = ""
+    for line in text.splitlines():
+        if line.strip():
+            first_line = line.strip()
+            break
+    if not first_line:
+        return ""
+    slug = _slug_from_topic(first_line, max_words=max_words)
+    if slug == "untitled":
+        return ""
+    return slug
+
+
+async def derive_slug_from_substance_async(
+    client: Any,
+    model: str,
+    transcript: list[dict[str, Any]],
+    *,
+    max_tokens: int = 60,
+) -> str:
+    """Call Anthropic to extract a 3-5 word topic slug from ``transcript``.
+
+    Returns the cleaned slug on success, or ``""`` on any failure (LLM
+    error, empty/malformed response, gate-fail). Failure is silent —
+    the caller treats ``""`` as "fall through to opening-text slug".
+
+    ``client`` is an ``anthropic.AsyncAnthropic`` instance (or any
+    object exposing ``messages.create``). ``model`` follows the talker's
+    Anthropic config; the slug-derivation call uses the same model
+    family so the temperature-quirk shim stays consistent across sites.
+    """
+    if not is_substantive(transcript):
+        return ""
+    rendered = _format_transcript_for_substance(transcript)
+    if not rendered:
+        return ""
+    # Wrap the transcript in tags so the model treats it as data to
+    # label, not as a conversation to continue. Without this framing,
+    # Opus tends to "respond" to the transcript content instead of
+    # emitting a label.
+    user_msg = (
+        "Label the following transcript with a 3-5 word filename slug. "
+        "Emit ONLY the label, nothing else.\n\n"
+        f"<transcript>\n{rendered}\n</transcript>"
+    )
+    try:
+        response = await client.messages.create(**messages_create_kwargs(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            system=[
+                {
+                    "type": "text",
+                    "text": _SUBSTANCE_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[{"role": "user", "content": user_msg}],
+        ))
+    except Exception as exc:  # noqa: BLE001 — LLM errors must not break close
+        log.warning(
+            "talker.session.substance_slug_failed",
+            stage="llm_call",
+            error=str(exc),
+        )
+        return ""
+
+    raw = ""
+    content = getattr(response, "content", None) or []
+    for block in content:
+        btype = getattr(block, "type", None) or (
+            block.get("type") if isinstance(block, dict) else None
+        )
+        if btype != "text":
+            continue
+        bt = getattr(block, "text", None)
+        if bt is None and isinstance(block, dict):
+            bt = block.get("text")
+        if bt:
+            raw = str(bt)
+            break
+
+    slug = _normalize_substance_slug(raw)
+    if not slug:
+        log.warning(
+            "talker.session.substance_slug_failed",
+            stage="parse",
+            raw=raw[:120],
+        )
+    return slug
+
+
+def apply_substance_slug(
+    state: StateManager,
+    vault_path_root: str,
+    rel_path: str,
+    new_slug: str,
+    session_id: str,
+    *,
+    short_id_suffix: str | None = None,
+) -> str:
+    """Rename a just-closed session record to use ``new_slug``.
+
+    ``rel_path`` is the record path returned by :func:`close_session`
+    (e.g. ``session/conversation-2026-04-27-are-you-awake-73fe87fa.md``).
+    ``new_slug`` replaces the slug portion between the date and the
+    short-id suffix, producing
+    ``session/conversation-2026-04-27-<new_slug>-73fe87fa.md``. The
+    file's frontmatter ``name`` field is rewritten to match.
+
+    Updates the matching ``closed_sessions`` state entry's
+    ``record_path`` so downstream consumers (Daily Sync surfacing,
+    distiller backlog) follow the new path.
+
+    Returns the new ``rel_path`` on success. On any failure the
+    original path is preserved, a warning is logged, and the original
+    ``rel_path`` is returned.
+    """
+    if not new_slug:
+        return rel_path
+
+    try:
+        import frontmatter  # local import — heavy + only needed on this branch
+    except ImportError:
+        log.warning(
+            "talker.session.substance_slug_failed",
+            stage="frontmatter_import",
+            rel_path=rel_path,
+        )
+        return rel_path
+
+    # Parse the existing rel_path: ``session/<mode>-<date>-<old_slug>-<short>.md``.
+    # The mode + date prefix and the short-id suffix are preserved; only
+    # the middle slug segment is replaced. Legacy "Voice Session — ..."
+    # paths don't follow this shape and are skipped (they don't get the
+    # new slug — backward compat trumps consistency).
+    name = Path(rel_path).name
+    if not name.endswith(".md"):
+        return rel_path
+    stem = name[:-3]
+    parts = stem.split("-")
+    # Minimum viable shape: <mode>-YYYY-MM-DD-<at-least-one-slug-token>-<short>.
+    # That's at least 6 dash-separated tokens (mode, year, month, day,
+    # slug, short) — anything shorter doesn't match the per-instance
+    # filename pattern and we leave it alone.
+    if len(parts) < 6:
+        return rel_path
+    mode_token = parts[0]
+    date_tokens = parts[1:4]
+    short_token = short_id_suffix or parts[-1]
+    # Sanity: the date tokens should be all-digit YYYY/MM/DD.
+    if not all(p.isdigit() for p in date_tokens):
+        return rel_path
+
+    new_stem = f"{mode_token}-{'-'.join(date_tokens)}-{new_slug}-{short_token}"
+    new_name = f"{new_stem}.md"
+    new_rel_path = f"{Path(rel_path).parent.as_posix()}/{new_name}"
+
+    if new_rel_path == rel_path:
+        return rel_path
+
+    src = Path(vault_path_root) / rel_path
+    dst = Path(vault_path_root) / new_rel_path
+    if not src.exists():
+        log.warning(
+            "talker.session.substance_slug_failed",
+            stage="src_missing",
+            rel_path=rel_path,
+        )
+        return rel_path
+    if dst.exists():
+        # Collision — extremely unlikely (would require a second session
+        # with the same date + short id + derived slug) but be defensive.
+        log.warning(
+            "talker.session.substance_slug_failed",
+            stage="dst_exists",
+            rel_path=rel_path,
+            new_rel_path=new_rel_path,
+        )
+        return rel_path
+
+    # Update frontmatter ``name`` so the display name in the record
+    # matches the renamed file. We rewrite the source file in place
+    # BEFORE rename so the disk is consistent if the rename fails.
+    try:
+        post = frontmatter.load(str(src))
+        existing_name = str(post.metadata.get("name") or "")
+        # Only touch the slug portion of the display name. Display name
+        # shape: ``<Mode> — <date> <slug>`` per
+        # ``_build_session_frontmatter``. Splitting on the last
+        # dash-bound separator keeps the prefix intact.
+        new_display = ""
+        if existing_name:
+            sep = " — "
+            if sep in existing_name:
+                head, tail = existing_name.split(sep, 1)
+                # tail = "<date> <old-slug>" — replace everything after
+                # the first space (the date) with the new slug.
+                tail_parts = tail.split(" ", 1)
+                if len(tail_parts) == 2 and tail_parts[0]:
+                    new_display = f"{head}{sep}{tail_parts[0]} {new_slug}"
+        if new_display:
+            post.metadata["name"] = new_display
+        post.metadata["substance_slug_derived"] = True
+        src.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.session.substance_slug_failed",
+            stage="frontmatter_rewrite",
+            rel_path=rel_path,
+            error=str(exc),
+        )
+        return rel_path
+
+    # Atomic on the same filesystem (``Path.rename``).
+    try:
+        src.rename(dst)
+    except OSError as exc:
+        log.warning(
+            "talker.session.substance_slug_failed",
+            stage="rename",
+            rel_path=rel_path,
+            new_rel_path=new_rel_path,
+            error=str(exc),
+        )
+        return rel_path
+
+    # Update the closed_sessions state entry so surfacing tools follow
+    # the new path. Match on session_id (uuid) — chat_id is not unique
+    # across closes, but session_id is.
+    try:
+        for entry in state.state.get("closed_sessions", []) or []:
+            if entry.get("session_id") == session_id:
+                entry["record_path"] = new_rel_path
+                # Carry the substance flag through so downstream
+                # consumers can tell when a slug was substance-derived
+                # without re-parsing the filename.
+                entry["substance_slug_derived"] = True
+                break
+        state.save()
+    except Exception:  # noqa: BLE001 — file rename already committed
+        log.warning(
+            "talker.session.substance_slug_state_update_failed",
+            rel_path=rel_path,
+            new_rel_path=new_rel_path,
+        )
+
+    log.info(
+        "talker.session.substance_slug_applied",
+        rel_path=rel_path,
+        new_rel_path=new_rel_path,
+        slug=new_slug,
+    )
+    return new_rel_path
+
+
+async def maybe_apply_substance_slug(
+    state: StateManager,
+    *,
+    enabled: bool,
+    client: Any,
+    model: str,
+    vault_path_root: str,
+    rel_path: str,
+    transcript: list[dict[str, Any]],
+    session_id: str,
+) -> str:
+    """Optionally derive + apply a substance-derived slug to a closed session.
+
+    Single entry point for callers (bot.py, daemon shutdown sweep,
+    daemon timeout sweeper). Does nothing and returns ``rel_path``
+    unchanged when:
+
+    - ``enabled`` is False (config knob off).
+    - ``client`` is None (e.g. legacy callers without an Anthropic client).
+    - ``transcript`` doesn't pass :func:`is_substantive`.
+    - The LLM call fails or returns an unparseable slug.
+    - The path doesn't match the per-instance filename pattern (legacy
+      ``Voice Session — ...`` records pass through unchanged).
+
+    Returns the (possibly new) ``rel_path``. Failure paths are logged
+    via :func:`apply_substance_slug` / :func:`derive_slug_from_substance_async`.
+    """
+    if not enabled or client is None:
+        return rel_path
+    slug = await derive_slug_from_substance_async(client, model, transcript)
+    if not slug:
+        return rel_path
+    return apply_substance_slug(
+        state,
+        vault_path_root=vault_path_root,
+        rel_path=rel_path,
+        new_slug=slug,
+        session_id=session_id,
+    )
 
 
 # --- Per-instance mode registry -----------------------------------------
@@ -546,8 +1029,30 @@ def check_timeouts(
     Returns vault paths of just-closed sessions. Relies on the daemon having
     stashed vault-path metadata onto each active session dict when it was
     created; sessions without that metadata are left alone and logged.
+
+    Backward-compatible thin wrapper around
+    :func:`check_timeouts_with_meta` — returns only the path list so the
+    legacy single-return-value contract stays intact.
     """
-    closed_paths: list[str] = []
+    return [meta["rel_path"] for meta in check_timeouts_with_meta(
+        state, now, gap_seconds,
+    )]
+
+
+def check_timeouts_with_meta(
+    state: StateManager,
+    now: datetime,
+    gap_seconds: int,
+) -> list[dict[str, Any]]:
+    """Like :func:`check_timeouts` but returns per-session close metadata.
+
+    Each list entry is a dict with ``chat_id``, ``session_id``,
+    ``rel_path``, ``transcript``, and ``vault_path_root`` — enough for
+    a post-close hook (e.g. Phase 2 substance-slug rename) to re-derive
+    paths and rename without re-reading state. Used by the daemon's
+    async sweeper which has the Anthropic client in scope.
+    """
+    closed_meta: list[dict[str, Any]] = []
     active = dict(state.state.get("active_sessions", {}))
     for chat_id_str, raw in active.items():
         try:
@@ -559,6 +1064,11 @@ def check_timeouts(
         vault_path_root = raw.get("_vault_path_root", "")
         if not vault_path_root:
             continue
+        # Snapshot transcript + session_id BEFORE close_session pops
+        # the active dict, so the post-close hook can run substance-slug
+        # derivation without re-reading state.
+        transcript_snap = list(raw.get("transcript") or [])
+        session_id_snap = raw.get("session_id", "")
         try:
             path = close_session(
                 state,
@@ -572,14 +1082,21 @@ def check_timeouts(
                 pushback_level=raw.get("_pushback_level"),
                 tool_set=raw.get("_tool_set", ""),
             )
-            closed_paths.append(path)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "talker.session.timeout_close_failed",
                 chat_id=chat_id_str,
                 error=str(exc),
             )
-    return closed_paths
+            continue
+        closed_meta.append({
+            "chat_id": int(chat_id_str),
+            "session_id": session_id_snap,
+            "rel_path": path,
+            "transcript": transcript_snap,
+            "vault_path_root": vault_path_root,
+        })
+    return closed_meta
 
 
 def close_session(

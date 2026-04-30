@@ -469,6 +469,10 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
     session_type = active.get("_session_type", "note")
     calibration_snapshot = active.get("_calibration_snapshot")
+    # Captured for the post-close substance-slug rename (Phase 2
+    # deferred-enhancement #1). The active dict is popped during
+    # close_session so this is the only chance to read session_id.
+    session_id_snapshot = active.get("session_id", "")
 
     try:
         rel_path = session.close_session(
@@ -496,6 +500,27 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     log.info("talker.bot.session_closed", chat_id=chat_id, record=rel_path)
+
+    # --- Substance-slug rename (Phase 2 deferred-enhancement #1) --------
+    # When ``telegram.session.derive_slug_from_substance`` is enabled (off
+    # by default; on for Hypatia), the just-closed session record is
+    # renamed to use a topic-derived slug instead of the opening-text
+    # slug. Failure-isolated: any error keeps the original filename.
+    try:
+        rel_path = await session.maybe_apply_substance_slug(
+            state_mgr,
+            enabled=config.session.derive_slug_from_substance,
+            client=client,
+            model=config.anthropic.model,
+            vault_path_root=active.get("_vault_path_root") or config.vault.path,
+            rel_path=rel_path,
+            transcript=transcript_snapshot,
+            session_id=session_id_snapshot,
+        )
+    except Exception:  # noqa: BLE001 — never break the close flow
+        log.exception(
+            "talker.bot.substance_slug_unhandled", chat_id=chat_id,
+        )
 
     # --- Calibration writes (wk3 commits 7 + 8) --------------------------
     # Runs after the session record is persisted so even a calibration

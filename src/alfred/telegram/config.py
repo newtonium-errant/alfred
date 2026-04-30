@@ -57,6 +57,15 @@ class STTConfig:
 class SessionConfig:
     gap_timeout_seconds: int = 1800
     state_path: str = "./data/talker_state.json"
+    # Phase 2 deferred-enhancement #1 (per ``project_hypatia_phase2_followups.md``):
+    # when true, after a substantive session closes, the talker invokes a
+    # short LLM call to derive a 3-5 word topic slug from the transcript
+    # and renames the session record so the filename reflects what the
+    # session was *about* (not the opening greeting). Defaults OFF for
+    # safety — only opt-in instances (Hypatia in Phase 2) flip it. Failure
+    # is isolated: if derivation errors, the original opening-text slug
+    # is preserved and a warning is logged.
+    derive_slug_from_substance: bool = False
 
 
 @dataclass
