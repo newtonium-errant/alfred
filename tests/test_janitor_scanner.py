@@ -529,3 +529,142 @@ class TestScannerYamlDoubledApostrophe:
         assert target_orphans == [], (
             f"Inbound index should resolve apostrophe-decoded target, got: {target_orphans}"
         )
+
+
+# --- ORPHAN001 leaf-type policy -----------------------------------------
+#
+# Note and run records are terminal-by-design — nothing in the vault
+# is expected to wikilink at a captured email or a Morning Brief, so
+# zero inbound is the norm, not a defect. The 2026-04-30 categorization
+# showed 258 of 360 ORPHAN001 entries lived under ``note/`` and 15 more
+# under ``run/`` — 273 of 360 were correct-by-design noise.
+
+
+def _orphan_issues(issues: list, rel: str) -> list:
+    return [i for i in issues if i.file == rel and i.code == IssueCode.ORPHANED_RECORD]
+
+
+class TestScannerOrphanLeafTypes:
+    """ORPHAN001 must not fire for leaf-by-design types."""
+
+    def test_note_with_no_inbound_skips_orphan(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # A standalone note — nothing links to it, but notes are
+        # leaf-by-design so the scanner must not flag it.
+        _write_record(
+            tmp_vault,
+            "note/Standalone Capture.md",
+            dedent(
+                """\
+                type: note
+                name: Standalone Capture
+                created: '2026-04-30'
+                status: active
+                tags: []
+                related: []
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        assert _orphan_issues(issues, "note/Standalone Capture.md") == []
+
+    def test_run_with_no_inbound_skips_orphan(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # Morning Briefs, daily-output records — nothing links to them.
+        _write_record(
+            tmp_vault,
+            "run/Morning Brief 2026-04-30.md",
+            dedent(
+                """\
+                type: run
+                name: Morning Brief 2026-04-30
+                created: '2026-04-30'
+                status: completed
+                tags: []
+                related: []
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        assert _orphan_issues(issues, "run/Morning Brief 2026-04-30.md") == []
+
+    def test_non_leaf_type_still_flagged(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # ``person`` is NOT a leaf type — orphaned persons should still
+        # surface as a janitor issue. The leaf-type rule must be a
+        # precise exclusion, not a blanket "no inbound is fine".
+        _write_record(
+            tmp_vault,
+            "person/Lonely Person.md",
+            dedent(
+                """\
+                type: person
+                name: Lonely Person
+                created: '2026-04-30'
+                status: active
+                tags: []
+                related: []
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        assert len(_orphan_issues(issues, "person/Lonely Person.md")) == 1
+
+    def test_task_still_flagged_pending_separate_policy(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # Pin: ``task`` is NOT in LEAF_TYPES (the 2026-04-30 spec
+        # explicitly deferred it). A different policy may eventually
+        # cover terminal tasks, but until then they keep firing
+        # ORPHAN001 — and this test guards against a sloppy expansion
+        # of LEAF_TYPES that quietly drops them.
+        _write_record(
+            tmp_vault,
+            "task/Lonely Task.md",
+            dedent(
+                """\
+                type: task
+                name: Lonely Task
+                created: '2026-04-30'
+                status: todo
+                tags: []
+                related: []
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        assert len(_orphan_issues(issues, "task/Lonely Task.md")) == 1
+
+    def test_leaf_types_set_pinned(self) -> None:
+        # Pin the conservative starting set. Expansion requires data
+        # (per the schema.py docstring) — bumping this assertion is
+        # a deliberate signal, not a slip.
+        from alfred.vault.schema import LEAF_TYPES
+        assert LEAF_TYPES == {"note", "run"}

@@ -9,6 +9,7 @@ from pathlib import Path
 from alfred.vault.ops import is_ignored_path
 from alfred.vault.schema import (
     KNOWN_TYPES,
+    LEAF_TYPES,
     LIST_FIELDS,
     NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS,
@@ -349,10 +350,14 @@ def _check_record(
         ))
 
     # ORPHAN001: Orphaned record (no inbound links)
+    # Skip leaf-by-design types (note, run) — these are terminal records
+    # nothing is expected to point at, so zero inbound is the norm, not
+    # a defect. See ``vault/schema.py::LEAF_TYPES`` for the rationale +
+    # the 2026-04-30 residual categorization that backs the set.
     exempt_dirs = set(config.sweep.orphan_exempt_dirs)
     parts = rel_path.replace("\\", "/").split("/")
     first_dir = parts[0] if len(parts) > 1 else ""
-    if first_dir not in exempt_dirs:
+    if first_dir not in exempt_dirs and rec_type not in LEAF_TYPES:
         inbound = inbound_index.get(rel_path, set())
         if not inbound and rec_type:
             issues.append(Issue(

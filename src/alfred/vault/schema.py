@@ -155,3 +155,32 @@ NAME_FIELD_BY_TYPE: dict[str, str] = {
     "conversation": "subject",
     "input": "subject",
 }
+
+# Record types that are terminal-by-design — no other record is
+# expected to point at them, so they should NOT fire ORPHAN001 just
+# for having zero inbound wikilinks.
+#
+# Conservative starting set, validated against the 2026-04-30 residual
+# categorization (`project_distiller_janitor_sweep_log.md` "Janitor
+# 1182 residual categorization"):
+#
+#   - ``note``: 258 of the 360 ORPHAN001 entries lived under ``note/``.
+#     Notes are mostly captured emails / one-off jottings — orphan-
+#     by-nature. The few that DO get linked already register inbound;
+#     this rule just stops surfacing the rest as actionable issues.
+#   - ``run``: 15 entries; all Morning Briefs / daily-output records.
+#     Terminal by design — nothing in the vault is expected to link
+#     to a specific run.
+#
+# Deliberately omitted (separate policy decisions):
+#   - ``task``: 34 entries, mixed bag. Some real (sub-task hierarchies),
+#     some terminal — needs a different rule (link-by-status?).
+#   - ``synthesis``: 35 entries. Andrew may want to see these flagged
+#     so they get woven into project narratives. Defer.
+#
+# Adding a new type here should be backed by data showing the type is
+# overwhelmingly terminal — don't generalize from one example.
+LEAF_TYPES: set[str] = {
+    "note",
+    "run",
+}
