@@ -31,6 +31,38 @@ def _frontmatter_text(fm: dict) -> str:
     return yaml.dump(fm, default_flow_style=False, allow_unicode=True)
 
 
+def _decode_yaml_apostrophe(target: str) -> str:
+    """Decode YAML single-quote-doubled apostrophes for stem_index lookup.
+
+    YAML's single-quoted scalar form escapes a literal apostrophe by
+    doubling it (``''``). When the distiller's writer emits a wikilink
+    target containing an apostrophe — e.g. ``[[constraint/Andrew's
+    Note]]`` — and that wikilink lands inside a single-quoted YAML
+    list item:
+
+        related:
+        - '[[constraint/Andrew''s Note]]'
+
+    the wikilink regex captures the literal text ``Andrew''s`` (the YAML
+    layer hasn't decoded yet at extraction time), and the resulting
+    target misses the on-disk file ``Andrew's.md`` in stem_index
+    lookups.
+
+    The fix normalizes ``''`` → ``'`` at lookup time so we resolve to
+    the same file Obsidian would. Applied only to the lookup string —
+    the original raw target is preserved in the user-visible LINK001
+    message so reviewers see what the source file actually contained.
+
+    Safe in practice: filenames never contain literal ``''`` (Obsidian
+    forbids it on most filesystems), so the normalization can't mask a
+    real broken link. See the 2026-04-30 categorization investigation
+    in the distiller-janitor sweep log: 252 of 761 LINK001 were this
+    exact pattern, plus the constraint record documenting the bug
+    itself appearing 20 times as its own broken target.
+    """
+    return target.replace("''", "'") if "''" in target else target
+
+
 def _build_stem_index(vault_path: Path, ignore_dirs: set[str]) -> dict[str, set[str]]:
     """Map stem names to file relative paths for wikilink resolution.
 
@@ -75,8 +107,12 @@ def _build_inbound_index(
 
         links = extract_wikilinks(raw)
         for target in links:
-            # Resolve target to actual files
-            resolved = stem_index.get(target, set())
+            # Resolve target to actual files. Decode YAML single-quote-
+            # doubled apostrophes (``Andrew''s`` → ``Andrew's``) so the
+            # inbound index sees the same key the on-disk file uses;
+            # otherwise records that link via apostrophe-bearing names
+            # never register inbound, inflating ORPHAN001.
+            resolved = stem_index.get(_decode_yaml_apostrophe(target), set())
             for resolved_path in resolved:
                 inbound.setdefault(resolved_path, set()).add(rel_path)
 
@@ -260,7 +296,12 @@ def _check_record(
         # Skip Dataview base view references (e.g. "person.base#Decisions")
         if ".base" in target:
             continue
-        resolved = stem_index.get(target, set())
+        # Look up via the YAML-decoded form (``Andrew''s`` → ``Andrew's``)
+        # so apostrophe-bearing wikilinks emitted inside single-quoted
+        # YAML scalars resolve to the actual on-disk file. The raw
+        # ``target`` is kept for the user-visible LINK001 message so
+        # reviewers see exactly what the source file contained.
+        resolved = stem_index.get(_decode_yaml_apostrophe(target), set())
         if not resolved:
             issues.append(Issue(
                 code=IssueCode.BROKEN_WIKILINK,
@@ -273,10 +314,16 @@ def _check_record(
     # LINK002: Entity wikilinks in body but not in any frontmatter field
     # Obsidian Bases' file.hasLink(this.file) only checks frontmatter links,
     # so body-only entity links won't appear in base view tables.
+    #
+    # Both sides of the body/frontmatter set difference go through
+    # ``_decode_yaml_apostrophe`` so apostrophe-bearing wikilinks aren't
+    # falsely flagged as body-only: the body shows ``Andrew's`` but the
+    # YAML re-serialization of frontmatter shows ``Andrew''s``, which
+    # would otherwise look like two distinct targets.
     _entity_dirs = set(TYPE_DIRECTORY.values())
     fm_text = _frontmatter_text(record.frontmatter)
-    fm_link_targets = set(extract_wikilinks(fm_text))
-    body_links = set(extract_wikilinks(record.body))
+    fm_link_targets = {_decode_yaml_apostrophe(t) for t in extract_wikilinks(fm_text)}
+    body_links = {_decode_yaml_apostrophe(t) for t in extract_wikilinks(record.body)}
     missing_from_fm = []
     for link in body_links - fm_link_targets:
         if "/" not in link:

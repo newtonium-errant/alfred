@@ -372,3 +372,160 @@ class TestScannerSkipsTemplatesDir:
         assert "_templates" in cfg.ignore_dirs
         assert "_bases" in cfg.ignore_dirs
         assert ".obsidian" in cfg.ignore_dirs
+
+
+# --- LINK001 false-positive: YAML-doubled apostrophes -------------------
+#
+# YAML serializes ``Andrew's`` inside a single-quoted scalar as
+# ``Andrew''s`` (apostrophe doubling is YAML's escape for that quote
+# style). The wikilink regex grabs the literal characters between
+# ``[[`` and ``]]``, so a doubled-apostrophe target lands in the
+# scanner as ``Andrew''s`` and misses the on-disk file ``Andrew's.md``.
+# 252 of 761 LINK001 entries on 2026-04-30 were this exact pattern;
+# the constraint record documenting the bug also showed up 20 times as
+# its own broken-link target.
+
+
+class TestScannerYamlDoubledApostrophe:
+    """LINK001 must not fire when the target's apostrophe is YAML-escaped."""
+
+    def test_doubled_apostrophe_resolves_to_real_file(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # Target file uses a real apostrophe in its on-disk name.
+        target_name = "Andrew's Notes on Apostrophes"
+        _write_record(
+            tmp_vault,
+            f"constraint/{target_name}.md",
+            dedent(
+                f"""\
+                type: constraint
+                name: {target_name}
+                created: '2026-04-30'
+                tags: []
+                related: []
+                """
+            ).rstrip(),
+        )
+
+        # Source record's frontmatter contains the wikilink inside a
+        # single-quoted YAML list item — exactly the shape ``yaml.dump``
+        # emits when Python's value is the literal ``[[...Andrew's...]]``.
+        # The doubled ``''`` is YAML's escape for a single apostrophe.
+        _write_record(
+            tmp_vault,
+            "decision/Some Decision.md",
+            dedent(
+                """\
+                type: decision
+                name: Some Decision
+                created: '2026-04-30'
+                status: final
+                tags: []
+                related:
+                - '[[constraint/Andrew''s Notes on Apostrophes]]'
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+
+        issues = run_structural_scan(config, state)
+
+        src_links = _link_issues(issues, "decision/Some Decision.md")
+        assert src_links == [], (
+            f"YAML-doubled apostrophe should resolve to real file, got: {src_links}"
+        )
+
+    def test_genuinely_broken_apostrophe_link_still_flagged(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # Same shape, but the target file does NOT exist. The decode
+        # cannot be so permissive that a real broken link slips through.
+        _write_record(
+            tmp_vault,
+            "decision/Lonely Decision.md",
+            dedent(
+                """\
+                type: decision
+                name: Lonely Decision
+                created: '2026-04-30'
+                status: final
+                tags: []
+                related:
+                - '[[constraint/Nobody''s Constraint Record]]'
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+
+        issues = run_structural_scan(config, state)
+
+        src_links = _link_issues(issues, "decision/Lonely Decision.md")
+        assert len(src_links) == 1, (
+            f"Broken apostrophe-bearing wikilink must still flag, got: {src_links}"
+        )
+        # The displayed message keeps the raw doubled form so reviewers
+        # see exactly what the source file contains — only the lookup
+        # is normalized, not the report.
+        assert "Nobody''s Constraint Record" in src_links[0].message
+
+    def test_apostrophe_link_registers_inbound_so_target_not_orphan(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # Bonus: the inbound index also runs through the decoder, so
+        # an apostrophe-bearing target with one inbound linker should
+        # NOT fire ORPHAN001 just because the linker's YAML doubled
+        # the apostrophe. This was the second-order win of the fix.
+        target_name = "Andrew's Other Note"
+        _write_record(
+            tmp_vault,
+            f"constraint/{target_name}.md",
+            dedent(
+                f"""\
+                type: constraint
+                name: {target_name}
+                created: '2026-04-30'
+                tags: []
+                related: []
+                """
+            ).rstrip(),
+        )
+        _write_record(
+            tmp_vault,
+            "decision/Linker.md",
+            dedent(
+                """\
+                type: decision
+                name: Linker
+                created: '2026-04-30'
+                status: final
+                tags: []
+                related:
+                - '[[constraint/Andrew''s Other Note]]'
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+
+        issues = run_structural_scan(config, state)
+
+        target_orphans = [
+            i for i in issues
+            if i.file == f"constraint/{target_name}.md"
+            and i.code == IssueCode.ORPHANED_RECORD
+        ]
+        assert target_orphans == [], (
+            f"Inbound index should resolve apostrophe-decoded target, got: {target_orphans}"
+        )
