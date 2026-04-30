@@ -1766,7 +1766,7 @@ async def _open_routed_session(
         config.instance.name or config.instance.canonical or "",
     )
     self_display_name = (
-        config.instance.canonical or config.instance.name or "Alfred"
+        config.instance.canonical or config.instance.name or ""
     )
     decision = await router.classify_opening_cue(
         client, first_message, recent,
