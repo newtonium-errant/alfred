@@ -3,7 +3,10 @@ type: session
 status: completed
 name: Curator SKILL L1118 drift fix
 created: 2026-04-24
-description: Fix the SKILL drift caught by `scripts/smoke_curator_scope.py` on its first run — the "Moving a record" example showed a non-inbox path move that curator's `move: inbox_only` scope rejects. Prompt-tuner task.
+description: |-
+  Fix the SKILL drift caught by `scripts/smoke_curator_scope.py` on its first
+  run — the "Moving a record" example showed a non-inbox path move that
+  curator's `move: inbox_only` scope rejects. Prompt-tuner task.
 intent: Close the SKILL/scope mismatch so the smoke script exits 0 and the 33→32 accepted-invocation count reflects all-clean state. Prove that the smoke pattern catches real drift at commit time.
 participants:
 - '[[person/Andrew Newton]]'
