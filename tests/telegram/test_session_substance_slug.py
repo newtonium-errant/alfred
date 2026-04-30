@@ -227,6 +227,42 @@ def test_derive_slug_from_substance_async_returns_clean_slug() -> None:
     assert "temperature" in call
 
 
+def test_derive_slug_from_substance_async_uses_transcript_framing() -> None:
+    """The user message wraps content in <transcript> tags, system labels-not-continues.
+
+    Load-bearing fix: without the ``<transcript>`` tag wrapping +
+    "you are LABELLING it, not continuing it" instruction, Opus tends
+    to respond to the transcript content as if it were addressed to
+    it. This test asserts both pieces of the framing are present so
+    a future refactor doesn't quietly drop them.
+    """
+    client = _FakeClient(response_text="komal gupta termination response")
+    transcript = [
+        {
+            "role": "user",
+            "content": (
+                "I want to draft the Komal Gupta termination response letter today. "
+                "She is challenging the dismissal under EI provisions. "
+                "I need to think through the chronology carefully and then "
+                "structure the response around the documented warnings."
+            ),
+        },
+        {"role": "assistant", "content": "ok let's start with the chronology"},
+        {"role": "user", "content": "the dismissal happened on April 1 2026"},
+    ]
+    asyncio.run(talker_session.derive_slug_from_substance_async(
+        client, "claude-sonnet-4-6", transcript,
+    ))
+    call = client.messages.calls[0]
+    user_message = call["messages"][0]["content"]
+    assert "<transcript>" in user_message
+    assert "</transcript>" in user_message
+    # System-prompt instruction: model must label, not continue.
+    system_blocks = call["system"]
+    system_text = "".join(b.get("text", "") for b in system_blocks)
+    assert "LABELLING" in system_text
+
+
 def test_derive_slug_from_substance_async_below_gate_skips_llm() -> None:
     """Non-substantive transcript short-circuits — no LLM call made."""
     client = _FakeClient(response_text="should not be used")
@@ -447,6 +483,49 @@ def test_apply_substance_slug_missing_source_passthrough(
         session_id="73fe87fa-0000",
     )
     assert new_rel == old_rel
+
+
+def test_apply_substance_slug_frontmatter_rewrite_failure_passthrough(
+    state_mgr, talker_config, monkeypatch, capsys,
+) -> None:
+    """Frontmatter rewrite failure → original file preserved, warning logged.
+
+    Exercises the ``stage="frontmatter_rewrite"`` branch in
+    ``apply_substance_slug``: ``frontmatter.dumps`` raising forces the
+    function to bail BEFORE the rename step. The original file must
+    stay on disk at the original path, the function must return the
+    original ``rel_path``, and the warning must surface stage info so
+    operators can grep for it in the talker log.
+    """
+    vault = Path(talker_config.vault.path)
+    old_rel = "session/conversation-2026-04-27-are-you-awake-73fe87fa.md"
+    _write_session_record(vault, old_rel)
+
+    def _boom(*args: Any, **kwargs: Any) -> str:
+        raise RuntimeError("synthetic frontmatter dumps failure")
+
+    monkeypatch.setattr("frontmatter.dumps", _boom)
+
+    new_rel = talker_session.apply_substance_slug(
+        state_mgr,
+        vault_path_root=str(vault),
+        rel_path=old_rel,
+        new_slug="komal-gupta-termination-response",
+        session_id="73fe87fa-0000",
+    )
+
+    # No rename occurred — original path returned, original file still on disk.
+    assert new_rel == old_rel
+    assert (vault / old_rel).exists()
+    assert not (
+        vault / "session/conversation-2026-04-27-komal-gupta-termination-response-73fe87fa.md"
+    ).exists()
+    # Warning fired with the right stage tag — structlog routes warnings
+    # to stdout in test config; we grep the captured output.
+    captured = capsys.readouterr()
+    log_text = captured.out + captured.err
+    assert "talker.session.substance_slug_failed" in log_text
+    assert "stage=frontmatter_rewrite" in log_text
 
 
 # ---------------------------------------------------------------------------

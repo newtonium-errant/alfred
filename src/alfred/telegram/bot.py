@@ -461,18 +461,19 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Snapshot transcript + user path BEFORE close_session pops the
     # active session — close_session removes the active dict, so anything
-    # we want from it must be copied out first.
-    transcript_snapshot = list(active.get("transcript") or [])
+    # we want from it must be copied out first. The post-close hook
+    # (substance-slug rename) reads transcript + session_id; the helper
+    # encodes that contract centrally so it stays in sync across all
+    # three close paths (bot /end, daemon shutdown, timeout sweeper).
+    post_close_snap = session._snapshot_for_post_close(active)
+    transcript_snapshot = post_close_snap["transcript"]
+    session_id_snapshot = post_close_snap["session_id"]
     user_rel = (
         active.get("_user_vault_path")
         or (config.primary_users[0] if config.primary_users else "")
     )
     session_type = active.get("_session_type", "note")
     calibration_snapshot = active.get("_calibration_snapshot")
-    # Captured for the post-close substance-slug rename (Phase 2
-    # deferred-enhancement #1). The active dict is popped during
-    # close_session so this is the only chance to read session_id.
-    session_id_snapshot = active.get("session_id", "")
 
     try:
         rel_path = session.close_session(

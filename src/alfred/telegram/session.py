@@ -5,9 +5,9 @@ and Alfred via the Anthropic API. State lives in the :class:`StateManager`
 (persisted JSON on disk); this module is pure logic.
 
 Session records are written to the vault at close time via the ``talker`` scope.
-Timeouts are checked on two axes: a periodic tick (``check_timeouts``) and a
-one-shot startup sweep (``resolve_on_startup``) that recovers sessions orphaned
-across a daemon restart.
+Timeouts are checked on two axes: a periodic tick (``check_timeouts_with_meta``)
+and a one-shot startup sweep (``resolve_on_startup``) that recovers sessions
+orphaned across a daemon restart.
 
 The transcript is a list of Anthropic-style message dicts — ``role`` is
 ``"user"`` or ``"assistant"``, and ``content`` is either a string or a list of
@@ -633,6 +633,29 @@ def apply_substance_slug(
     return new_rel_path
 
 
+def _snapshot_for_post_close(active: dict[str, Any]) -> dict[str, Any]:
+    """Snapshot the fields the post-close hook needs BEFORE close pops the dict.
+
+    :func:`close_session` pops the active-session dict from state, so the
+    three call sites that run a post-close hook (bot ``/end`` handler,
+    daemon shutdown sweep, daemon timeout sweeper) must copy out the
+    fields the hook reads before invoking close. This helper is the one
+    place that contract is encoded — adding a new field to
+    :func:`maybe_apply_substance_slug` becomes a one-line change here
+    instead of three.
+
+    Returns a dict with ``transcript`` (list copy, never None),
+    ``session_id`` (string, may be empty), and ``vault_path_root``
+    (string, may be empty — caller resolves the fallback). The caller
+    threads these directly into :func:`maybe_apply_substance_slug`.
+    """
+    return {
+        "transcript": list(active.get("transcript") or []),
+        "session_id": active.get("session_id", ""),
+        "vault_path_root": active.get("_vault_path_root", ""),
+    }
+
+
 async def maybe_apply_substance_slug(
     state: StateManager,
     *,
@@ -972,6 +995,10 @@ def resolve_on_startup(
     Active sessions that have NOT exceeded the gap are left in place — the
     next user message reuses them.
     """
+    # Substance-slug rename intentionally not applied here — runs before
+    # the Anthropic client is constructed, so the substance-derivation LLM
+    # call can't fire. Sessions orphaned across daemon restart keep their
+    # opening-text slug. See project_hypatia_phase2_followups.md Phase 2.x #1.
     closed_paths: list[str] = []
     active = dict(state.state.get("active_sessions", {}))
     for chat_id_str, raw in active.items():
@@ -988,7 +1015,7 @@ def resolve_on_startup(
 
         vault_path_root = raw.get("_vault_path_root", "")
         # Caller didn't stash vault path — skip gracefully; daemon will
-        # retry via check_timeouts once it has a config handle.
+        # retry via check_timeouts_with_meta once it has a config handle.
         if not vault_path_root:
             log.info(
                 "talker.session.timeout_deferred",
@@ -1019,38 +1046,22 @@ def resolve_on_startup(
     return closed_paths
 
 
-def check_timeouts(
-    state: StateManager,
-    now: datetime,
-    gap_seconds: int,
-) -> list[str]:
-    """Periodic tick: close any sessions that have exceeded the gap.
-
-    Returns vault paths of just-closed sessions. Relies on the daemon having
-    stashed vault-path metadata onto each active session dict when it was
-    created; sessions without that metadata are left alone and logged.
-
-    Backward-compatible thin wrapper around
-    :func:`check_timeouts_with_meta` — returns only the path list so the
-    legacy single-return-value contract stays intact.
-    """
-    return [meta["rel_path"] for meta in check_timeouts_with_meta(
-        state, now, gap_seconds,
-    )]
-
-
 def check_timeouts_with_meta(
     state: StateManager,
     now: datetime,
     gap_seconds: int,
 ) -> list[dict[str, Any]]:
-    """Like :func:`check_timeouts` but returns per-session close metadata.
+    """Periodic tick: close any sessions that have exceeded the gap.
 
-    Each list entry is a dict with ``chat_id``, ``session_id``,
-    ``rel_path``, ``transcript``, and ``vault_path_root`` — enough for
-    a post-close hook (e.g. Phase 2 substance-slug rename) to re-derive
-    paths and rename without re-reading state. Used by the daemon's
-    async sweeper which has the Anthropic client in scope.
+    Returns one dict per just-closed session with ``chat_id``,
+    ``session_id``, ``rel_path``, ``transcript``, and ``vault_path_root``
+    — enough for a post-close hook (e.g. Phase 2 substance-slug rename)
+    to re-derive paths and rename without re-reading state. Used by the
+    daemon's async sweeper which has the Anthropic client in scope.
+
+    Relies on the daemon having stashed vault-path metadata onto each
+    active session dict when it was created; sessions without that
+    metadata are skipped silently.
     """
     closed_meta: list[dict[str, Any]] = []
     active = dict(state.state.get("active_sessions", {}))
@@ -1067,8 +1078,9 @@ def check_timeouts_with_meta(
         # Snapshot transcript + session_id BEFORE close_session pops
         # the active dict, so the post-close hook can run substance-slug
         # derivation without re-reading state.
-        transcript_snap = list(raw.get("transcript") or [])
-        session_id_snap = raw.get("session_id", "")
+        snap = _snapshot_for_post_close(raw)
+        transcript_snap = snap["transcript"]
+        session_id_snap = snap["session_id"]
         try:
             path = close_session(
                 state,

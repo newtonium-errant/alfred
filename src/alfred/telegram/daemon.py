@@ -569,9 +569,11 @@ async def run(
                 stt_model = raw_sess.get("_stt_model_used") or config.stt.model
                 # Snapshot for post-close substance-slug rename — same
                 # pattern as ``check_timeouts_with_meta`` since the
-                # active dict is popped during ``close_session``.
-                transcript_snap = list(raw_sess.get("transcript") or [])
-                session_id_snap = raw_sess.get("session_id", "")
+                # active dict is popped during ``close_session``. The
+                # helper encodes the fields the hook needs in one place.
+                post_close_snap = session._snapshot_for_post_close(raw_sess)
+                transcript_snap = post_close_snap["transcript"]
+                session_id_snap = post_close_snap["session_id"]
                 try:
                     rel_path = session.close_session(
                         state_mgr,

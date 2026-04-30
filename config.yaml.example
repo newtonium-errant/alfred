@@ -311,6 +311,12 @@ telegram:
     # Implicit session-end gap: 30 minutes of silence closes the session.
     gap_timeout_seconds: 1800
     state_path: "./data/talker_state.json"
+    # Per-instance opt-in: when true, the post-close hook runs an LLM
+    # call to derive a 3-5 word topic slug from session content and
+    # renames the session record file. Default false (Salem/KAL-LE
+    # style: opening-message slug). Hypatia-style instances should
+    # enable this for substantive-filename navigation.
+    derive_slug_from_substance: false
   # Idle-tick heartbeat — emits a periodic ``talker.idle_tick`` log event
   # so an operator scanning the tail of ``data/talker.log`` can distinguish
   # *idle / healthy* (recent heartbeat present, low or zero
