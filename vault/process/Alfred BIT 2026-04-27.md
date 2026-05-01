@@ -4,10 +4,70 @@ alfred_tags:
 - logging/run
 created: '2026-04-27'
 description: Alfred built-in test (health sweep)
+janitor_note: LINK001 — frontmatter process target [[process/Alfred BIT]] does not
+  resolve; the parent process record has not been created. Cannot unambiguously fix
+  (outside janitor scope to create missing record).
 mode: quick
 name: Alfred BIT 2026-04-27
 overall_status: ok
 process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-27.md
+  source_anchor: run Alfred BIT 2026-04-27
+  target: process/Alfred BIT 2026-04-29.md
+  target_anchor: run Alfred BIT 2026-04-29
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-27.md
+  source_anchor: run Alfred BIT 2026-04-27
+  target: process/Alfred BIT 2026-04-21.md
+  target_anchor: run Alfred BIT 2026-04-21
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-27.md
+  source_anchor: run Alfred BIT 2026-04-27
+  target: process/Alfred BIT 2026-04-22.md
+  target_anchor: run Alfred BIT 2026-04-22
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-27.md
+  source_anchor: run Alfred BIT 2026-04-27
+  target: process/Alfred BIT 2026-04-23.md
+  target_anchor: run Alfred BIT 2026-04-23
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-27.md
+  source_anchor: run Alfred BIT 2026-04-27
+  target: process/Alfred BIT 2026-04-24.md
+  target_anchor: run Alfred BIT 2026-04-24
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-27.md
+  source_anchor: run Alfred BIT 2026-04-27
+  target: process/Alfred BIT 2026-04-25.md
+  target_anchor: run Alfred BIT 2026-04-25
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-27.md
+  source_anchor: run Alfred BIT 2026-04-27
+  target: process/Alfred BIT 2026-04-26.md
+  target_anchor: run Alfred BIT 2026-04-26
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-04-27.md
+  source_anchor: run Alfred BIT 2026-04-27
+  target: process/Alfred BIT 2026-04-28.md
+  target_anchor: run Alfred BIT 2026-04-28
+  type: related-to
 started: '2026-04-27T05:55:02.865761-03:00'
 status: completed
 tags:

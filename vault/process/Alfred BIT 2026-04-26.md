@@ -4,6 +4,10 @@ alfred_tags:
 - logging/run
 created: '2026-04-26'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — broken target [[process/Alfred BIT]]: no parent process record
+  exists, only run records (process/Alfred BIT YYYY-MM-DD.md). DIR001 — type:run misfiled
+  in process/ directory; deterministic flag, autofix should handle. Both need parent
+  process/Alfred BIT.md created OR run records moved to run/.'
 mode: quick
 name: Alfred BIT 2026-04-26
 overall_status: ok
