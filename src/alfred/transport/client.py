@@ -860,6 +860,99 @@ async def resolve_or_propose_canonical_person(
     )
 
 
+async def peer_propose_event(
+    peer_name: str,
+    *,
+    title: str,
+    start: str,
+    end: str,
+    summary: str = "",
+    origin_context: str = "",
+    config: "TransportConfig | None" = None,
+    self_name: str = "hypatia",
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /canonical/event/propose-create on the named peer (sync create).
+
+    Architecturally distinct from the queued person/org/location flow:
+    the proposing instance is mid-conversation with Andrew and needs an
+    immediate response to keep the conversation moving. Salem either
+    creates the event record (returns ``{"status": "created", "path":
+    ...}``, HTTP 201) or detects a vault conflict and returns
+    ``{"status": "conflict", "conflicts": [...]}`` (HTTP 200) without
+    creating.
+
+    Args:
+        peer_name: Outbound peer key (typically ``"salem"`` from
+            Hypatia / KAL-LE).
+        title: Event title — becomes the filename stem + ``title``
+            frontmatter field.
+        start: ISO 8601 start datetime with timezone offset (e.g.
+            ``"2026-05-04T14:00:00-03:00"``).
+        end: ISO 8601 end datetime with timezone offset.
+        summary: Optional summary — populates the body and the
+            ``summary`` frontmatter field.
+        origin_context: Optional origin-context note (which session /
+            conversation produced this proposal). Stored as
+            ``origin_context`` frontmatter for traceability.
+        config: Pre-loaded TransportConfig.
+        self_name: This instance's identity (``"hypatia"``,
+            ``"kal-le"``). Goes into the body's ``origin_instance``
+            field so Salem's anti-spoof check passes.
+        correlation_id: Optional tracing id. Defaults to
+            ``"{self_name}-propose-event-<hex6>"``.
+
+    Returns:
+        Server's response dict —
+        ``{"status": "created", "path": ..., "correlation_id": ...}``
+        on the happy path, or
+        ``{"status": "conflict", "conflicts": [...], "correlation_id": ...}``
+        when an overlap is detected. Caller surfaces the conflict
+        inline to Andrew.
+    """
+    import secrets
+
+    from .config import TransportConfig, load_config
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = (
+        correlation_id
+        or f"{self_name}-propose-event-{secrets.token_hex(3)}"
+    )
+
+    body: dict[str, Any] = {
+        "title": title,
+        "start": start,
+        "end": end,
+        "summary": summary,
+        "origin_instance": self_name,
+        "origin_context": origin_context,
+        "correlation_id": cid,
+    }
+
+    response = await _peer_request(
+        base_url=base_url,
+        token=token,
+        method="POST",
+        path="/canonical/event/propose-create",
+        self_name=self_name,
+        correlation_id=cid,
+        json_body=body,
+    )
+
+    log.info(
+        "transport.client.event_propose_response",
+        peer=peer_name,
+        title=title[:80],
+        correlation_id=cid,
+        status=response.get("status") if isinstance(response, dict) else None,
+    )
+    return response if isinstance(response, dict) else {"correlation_id": cid}
+
+
 async def peer_send_brief_digest(
     peer_name: str,
     *,

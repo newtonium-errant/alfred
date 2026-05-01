@@ -26,6 +26,20 @@ Handlers:
                            — SALEM-only canonical record fetch. Peers
                               that don't hold canonical records return
                               404 ``canonical_not_owned``.
+    POST /canonical/{type}/propose
+                           — queued shape for ``person`` / ``org`` /
+                              ``location``. Salem stores the proposal
+                              in the JSONL queue; Andrew confirms via
+                              the Daily Sync. Async by design.
+    POST /canonical/event/propose-create
+                           — synchronous create with conflict-check.
+                              The proposing instance is mid-conversation
+                              with Andrew and needs immediate response;
+                              Salem either creates the record (and
+                              returns the path) or returns the
+                              conflicting events. NO operator approval
+                              gate — Andrew is right there talking to
+                              the agent.
 
 Error taxonomy (aligned with the outbound contract):
     401 missing_bearer / invalid_token / client_not_allowed
@@ -44,9 +58,10 @@ Correlation IDs:
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1271,6 +1286,466 @@ async def _handle_peer_pending_items_resolve(
 
 
 # ---------------------------------------------------------------------------
+# /canonical/event/propose-create — synchronous create with conflict-check
+# ---------------------------------------------------------------------------
+#
+# Architecturally distinct from the queued ``/canonical/{type}/propose``
+# flow. When a proposing instance (Hypatia, KAL-LE) is mid-conversation
+# with Andrew and asks to schedule something, Andrew needs the response
+# inline — he's right there talking to the agent. There's no operator-
+# approval gate; the proposing instance is the operator's surface for
+# this turn.
+#
+# Salem either:
+#   * creates the event record and returns ``{status: created, path}``,
+#     OR
+#   * detects a time conflict against existing vault events and returns
+#     ``{status: conflict, conflicts: [...]}`` without creating.
+#
+# The proposing instance surfaces conflicts inline ("Salem flagged a
+# conflict — you have an X at 14:00. Reschedule, or override?"). v1
+# does NOT support override; if it surfaces in usage we add an
+# ``override_conflict`` flag in v1.1.
+#
+# Conflict-check semantics: any time-overlap counts. ``[start_a, end_a]``
+# overlaps ``[start_b, end_b]`` iff ``start_a < end_b AND end_a >
+# start_b`` (half-open ranges, exclusive end). Same-instant boundaries
+# (event ends at 14:00, next starts at 14:00) do NOT count as conflicts
+# — that's adjacency, not overlap. v1 is vault-only; Phase A+ extends
+# to GCal.
+
+# Maximum size of the proposed-event title / summary fields. Belt-and-
+# braces — protects the vault from a runaway peer writing megabyte
+# strings.
+_EVENT_TITLE_MAX_LEN = 240
+_EVENT_SUMMARY_MAX_LEN = 4_000
+_EVENT_CONTEXT_MAX_LEN = 2_000
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    """Parse ``value`` into a tz-aware UTC datetime, or return ``None``.
+
+    Accepts:
+      * datetime instances (returned as-is, naive datetimes assumed UTC).
+      * date instances (converted to midnight UTC start-of-day).
+      * ISO 8601 strings (``2026-05-04T14:00:00-03:00``,
+        ``2026-05-04T18:00:00Z``, ``2026-05-04`` for date-only).
+
+    Returns ``None`` for unparseable values; the caller's contract is
+    "treat as no time" (event with no time can't conflict with anything,
+    only the propose path validates that times are present).
+
+    Naive datetimes (no timezone) are interpreted as UTC. The propose
+    path requires both start + end with timezone offsets so this is
+    primarily for vault-side records that may carry a bare
+    ``date: 2026-05-04`` field.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time(), tzinfo=timezone.utc)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        # Z suffix → UTC.
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(s)
+        except ValueError:
+            # Date-only ``2026-05-04`` — fall back to date parsing.
+            try:
+                d = date.fromisoformat(s[:10])
+            except ValueError:
+                return None
+            return datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
+
+
+def _event_window(fm: dict[str, Any]) -> tuple[datetime, datetime] | None:
+    """Extract the ``[start, end]`` window for an existing event record.
+
+    Field resolution order:
+      * ``start`` + ``end`` (preferred — the propose-create flow writes
+        both).
+      * ``start`` alone (treat ``end`` as ``start + 1h`` so single-time
+        events still produce a meaningful window for overlap detection).
+      * ``date`` alone (treat as full-day window: midnight UTC start →
+        midnight UTC next day). Most existing vault events shipped
+        before this route use only ``date``; we want them to participate
+        in conflict-check.
+
+    Returns ``None`` when no time fields are parseable. The caller
+    skips records with no extractable window.
+    """
+    start = _parse_iso_datetime(fm.get("start"))
+    end = _parse_iso_datetime(fm.get("end"))
+    if start is not None and end is not None:
+        return start, end
+    if start is not None:
+        # No explicit end — assume 1h block. Better than treating as
+        # zero-duration (which would never conflict with anything).
+        from datetime import timedelta
+        return start, start + timedelta(hours=1)
+    # Fallback to date-only: full-day window.
+    d = _parse_iso_datetime(fm.get("date"))
+    if d is not None:
+        from datetime import timedelta
+        return d, d + timedelta(days=1)
+    return None
+
+
+def _ranges_overlap(
+    a_start: datetime, a_end: datetime,
+    b_start: datetime, b_end: datetime,
+) -> bool:
+    """Half-open range overlap. Adjacency (touch but not cross) is NOT a conflict."""
+    return a_start < b_end and a_end > b_start
+
+
+def _scan_event_conflicts(
+    vault_path: Path,
+    proposed_start: datetime,
+    proposed_end: datetime,
+) -> list[dict[str, Any]]:
+    """Walk ``vault_path/event/`` and return overlapping records.
+
+    Returns a list of ``{title, start, end, path}`` dicts (one per
+    conflicting event), oldest-conflict-first. Empty list ⇒ no conflicts.
+
+    Defensive: skips files that fail frontmatter parse rather than
+    raising — the conflict-check path must never crash because one
+    record has malformed YAML.
+    """
+    conflicts: list[dict[str, Any]] = []
+    event_dir = vault_path / "event"
+    if not event_dir.is_dir():
+        return conflicts
+    for md_file in sorted(event_dir.glob("*.md")):
+        try:
+            post = frontmatter.load(str(md_file))
+        except Exception:  # noqa: BLE001
+            continue
+        fm = dict(post.metadata or {})
+        window = _event_window(fm)
+        if window is None:
+            continue
+        ev_start, ev_end = window
+        if not _ranges_overlap(proposed_start, proposed_end, ev_start, ev_end):
+            continue
+        title = (
+            fm.get("title")
+            or fm.get("name")
+            or md_file.stem
+        )
+        rel_path = f"event/{md_file.name}"
+        conflicts.append({
+            "title": str(title),
+            "start": ev_start.isoformat(),
+            "end": ev_end.isoformat(),
+            "path": rel_path,
+        })
+    return conflicts
+
+
+# Filename slug builder. Event filenames are the title plus an ISO date
+# suffix so the brief renderer (which sorts events by ``date``) and
+# Obsidian's filename-based dedup both have something stable to key on.
+_FILENAME_BAD_CHARS = re.compile(r'[\\/:*?"<>|\t\n\r]+')
+
+
+def _safe_event_filename(title: str, start: datetime) -> str:
+    """Build a filesystem-safe ``<title> <YYYY-MM-DD>.md`` filename.
+
+    The title is sanitised (path separators, colons, asterisks, etc.
+    replaced with spaces; collapsed runs trimmed). Start date is
+    formatted as the local-time ISO date so the filename matches the
+    user-visible day of the event.
+    """
+    cleaned = _FILENAME_BAD_CHARS.sub(" ", title).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned) or "Event"
+    if len(cleaned) > 120:
+        cleaned = cleaned[:117].rstrip() + "..."
+    # Local-time date for the suffix — reads more naturally than UTC.
+    local_date = start.astimezone().date().isoformat()
+    return f"{cleaned} {local_date}.md"
+
+
+async def _handle_canonical_event_propose_create(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST /canonical/event/propose-create — synchronous, with conflict-check.
+
+    Body::
+
+        {
+          "correlation_id": "hypatia-propose-event-<hex6>",
+          "start": "2026-05-04T14:00:00-03:00",
+          "end":   "2026-05-04T15:00:00-03:00",
+          "title": "VAC marketing call follow-up",
+          "summary": "Follow-up on Q2 outreach plan",
+          "origin_instance": "hypatia",
+          "origin_context": "Discussed during marketing strategy session 2026-04-30 17:00"
+        }
+
+    Response shapes:
+      * 201 Created on a clean create:
+        ``{"status": "created", "path": "event/...md", "correlation_id": "..."}``
+      * 200 with ``{"status": "conflict", "conflicts": [...]}`` when
+        overlap detected.
+      * 404 ``canonical_not_owned`` when this instance isn't a canonical
+        owner.
+      * 400 ``schema_error`` for malformed bodies (missing fields,
+        unparseable times, end <= start).
+      * 409 ``already_exists`` when the target file already exists on
+        disk (filename collision — different correlation, same title +
+        date). Caller should pivot to :func:`vault_edit`.
+
+    Audit: every outcome (created OR conflict) appends one entry to
+    ``canonical_audit.jsonl``. Conflicts surface in the audit as
+    ``denied=["conflict"]`` so an operator can grep the audit log for
+    ``conflict`` to spot proposing-side calibration drift (instance
+    keeps trying to schedule into Andrew's busy slots).
+    """
+    correlation_id = _ensure_correlation_id(request, None)
+    peer = request.get("transport_peer", "")
+    config = _get_config(request)
+    audit_path = config.canonical.audit_log_path
+
+    if not config.canonical.owner:
+        append_audit(
+            audit_path,
+            peer=peer, record_type="event", name="(propose-create)",
+            requested=[], granted=[], denied=["canonical_not_owned"],
+            correlation_id=correlation_id,
+        )
+        return _json_error(
+            404, "canonical_not_owned",
+            detail="this instance does not host canonical records",
+            correlation_id=correlation_id,
+        )
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _json_error(400, "invalid_json", correlation_id=correlation_id)
+    if not isinstance(body, dict):
+        return _json_error(
+            400, "schema_error",
+            detail="body must be a JSON object",
+            correlation_id=correlation_id,
+        )
+
+    correlation_id = _ensure_correlation_id(request, body)
+
+    # --- Schema validation --------------------------------------------------
+    title = body.get("title")
+    summary = body.get("summary") or ""
+    origin_instance = body.get("origin_instance") or peer or ""
+    origin_context = body.get("origin_context") or ""
+    start_raw = body.get("start")
+    end_raw = body.get("end")
+
+    if not isinstance(title, str) or not title.strip():
+        return _json_error(
+            400, "schema_error",
+            detail="title must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+    if len(title) > _EVENT_TITLE_MAX_LEN:
+        return _json_error(
+            400, "schema_error",
+            detail=f"title exceeds {_EVENT_TITLE_MAX_LEN}-char cap",
+            correlation_id=correlation_id,
+        )
+    if not isinstance(summary, str) or len(summary) > _EVENT_SUMMARY_MAX_LEN:
+        return _json_error(
+            400, "schema_error",
+            detail=f"summary must be a string under {_EVENT_SUMMARY_MAX_LEN} chars",
+            correlation_id=correlation_id,
+        )
+    if not isinstance(origin_instance, str):
+        return _json_error(
+            400, "schema_error",
+            detail="origin_instance must be a string",
+            correlation_id=correlation_id,
+        )
+    if not isinstance(origin_context, str) or len(origin_context) > _EVENT_CONTEXT_MAX_LEN:
+        return _json_error(
+            400, "schema_error",
+            detail=f"origin_context must be a string under {_EVENT_CONTEXT_MAX_LEN} chars",
+            correlation_id=correlation_id,
+        )
+
+    start_dt = _parse_iso_datetime(start_raw)
+    end_dt = _parse_iso_datetime(end_raw)
+    if start_dt is None or end_dt is None:
+        return _json_error(
+            400, "schema_error",
+            detail="start and end must be ISO 8601 datetime strings with timezone",
+            correlation_id=correlation_id,
+        )
+    if end_dt <= start_dt:
+        return _json_error(
+            400, "schema_error",
+            detail="end must be strictly after start",
+            correlation_id=correlation_id,
+        )
+
+    # Same anti-spoof rule as /peer/send + /peer/brief_digest: if
+    # ``origin_instance`` is supplied, it must match the authenticated
+    # peer. Empty value defaults to ``peer`` (already done above) — no
+    # mismatch path.
+    if origin_instance and peer and origin_instance != peer:
+        log.warning(
+            "transport.canonical.event_propose_spoofed_origin",
+            auth_peer=peer,
+            claimed=origin_instance,
+            correlation_id=correlation_id,
+        )
+        return _json_error(
+            403, "from_mismatch",
+            detail="origin_instance must equal authenticated peer",
+            correlation_id=correlation_id,
+        )
+
+    vault_path = _get_vault_path(request)
+    if vault_path is None:
+        return _json_error(
+            500, "vault_not_configured",
+            detail="vault path not registered on transport server",
+            correlation_id=correlation_id,
+        )
+
+    # --- Conflict-check -----------------------------------------------------
+    conflicts = _scan_event_conflicts(vault_path, start_dt, end_dt)
+    if conflicts:
+        append_audit(
+            audit_path,
+            peer=peer, record_type="event", name=title.strip(),
+            requested=["create"], granted=[], denied=["conflict"],
+            correlation_id=correlation_id,
+        )
+        log.info(
+            "transport.canonical.event_propose_conflict",
+            peer=peer,
+            title=title[:80],
+            conflict_count=len(conflicts),
+            correlation_id=correlation_id,
+        )
+        return web.json_response({
+            "status": "conflict",
+            "conflicts": conflicts,
+            "correlation_id": correlation_id,
+        })
+
+    # --- Create the record --------------------------------------------------
+    safe_filename = _safe_event_filename(title.strip(), start_dt)
+    rel_path = f"event/{safe_filename}"
+    file_path = vault_path / "event" / safe_filename
+    if file_path.exists():
+        # Same correlation race window as the queued-propose 409: two
+        # propose-creates for the same title + date land back-to-back.
+        log.info(
+            "transport.canonical.event_propose_409_already_exists",
+            peer=peer,
+            title=title[:80],
+            path=rel_path,
+            correlation_id=correlation_id,
+        )
+        append_audit(
+            audit_path,
+            peer=peer, record_type="event", name=title.strip(),
+            requested=["create"], granted=[], denied=["already_exists"],
+            correlation_id=correlation_id,
+        )
+        return web.json_response(
+            {
+                "status": "exists",
+                "path": rel_path,
+                "correlation_id": correlation_id,
+            },
+            status=409,
+        )
+
+    # Build the frontmatter. ``date`` is the local-time ISO date so the
+    # brief renderer's existing ``_coerce_date(fm.get("date"))`` lookup
+    # surfaces the new event without any brief-side changes (Phase 1
+    # SHIPPED 2026-04-21 wires off ``date``). ``start`` + ``end`` carry
+    # the precise window for downstream conflict-check.
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    local_date_iso = start_dt.astimezone().date().isoformat()
+    fm = {
+        "type": "event",
+        "name": file_path.stem,
+        "title": title.strip(),
+        "date": local_date_iso,
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
+        "summary": summary.strip(),
+        "origin_instance": origin_instance,
+        "origin_context": origin_context.strip(),
+        "created": today_iso,
+        "correlation_id": correlation_id,
+        "tags": [],
+    }
+    fm_str = yaml.dump(
+        fm, default_flow_style=False, allow_unicode=True, sort_keys=False,
+    )
+    body_text = (summary.strip() + "\n") if summary.strip() else ""
+    file_text = f"---\n{fm_str}---\n\n{body_text}"
+
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(file_text, encoding="utf-8")
+    except OSError as exc:
+        log.warning(
+            "transport.canonical.event_propose_write_failed",
+            peer=peer,
+            path=str(file_path),
+            error=str(exc),
+            correlation_id=correlation_id,
+        )
+        return _json_error(
+            500, "write_failed",
+            detail=str(exc),
+            correlation_id=correlation_id,
+        )
+
+    append_audit(
+        audit_path,
+        peer=peer, record_type="event", name=title.strip(),
+        requested=["create"], granted=["create"], denied=[],
+        correlation_id=correlation_id,
+    )
+    log.info(
+        "transport.canonical.event_propose_created",
+        peer=peer,
+        title=title[:80],
+        path=rel_path,
+        start=start_dt.isoformat(),
+        end=end_dt.isoformat(),
+        correlation_id=correlation_id,
+    )
+    return web.json_response(
+        {
+            "status": "created",
+            "path": rel_path,
+            "correlation_id": correlation_id,
+        },
+        status=201,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registrars — consumed by ROUTE_NAMESPACES in server.py
 # ---------------------------------------------------------------------------
 
@@ -1293,7 +1768,17 @@ def register_canonical_routes(app: web.Application) -> None:
     the URL shapes overlap (``/canonical/person/propose`` is a valid
     ``/canonical/{type}/{name}`` by GET semantics, but we never serve
     a GET for ``name=propose`` — the literal name is reserved).
+
+    The ``/canonical/event/propose-create`` route is registered before
+    the generic ``{type}/propose`` route so aiohttp's first-match
+    semantics route it to the synchronous-create handler. ``event``
+    proposes don't go through the queued shape — they're synchronous
+    with conflict-check by design.
     """
+    app.router.add_post(
+        "/canonical/event/propose-create",
+        _handle_canonical_event_propose_create,
+    )
     app.router.add_post("/canonical/{type}/propose", _handle_canonical_propose)
     app.router.add_get("/canonical/{type}/{name}", _handle_canonical_get)
 

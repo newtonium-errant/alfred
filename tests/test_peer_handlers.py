@@ -667,3 +667,422 @@ async def test_canonical_propose_org_409_when_record_exists(salem_propose_app): 
     body = await resp.json()
     assert body["status"] == "exists"
     assert body["path"] == "org/Existing Org.md"
+
+
+# ---------------------------------------------------------------------------
+# /canonical/event/propose-create — synchronous create with conflict-check
+# ---------------------------------------------------------------------------
+#
+# Architecturally distinct from /canonical/{type}/propose: events are
+# synchronous (Andrew is mid-conversation with the proposing instance).
+# Salem either creates the record + returns 201, or detects a time
+# overlap with existing vault events + returns 200 with conflict list.
+
+
+@pytest.fixture
+async def salem_event_app(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """Salem-style app with vault root primed for event propose-create tests."""
+    audit_path = tmp_path / "canonical_audit.jsonl"
+    config = TransportConfig(
+        server=ServerConfig(),
+        scheduler=SchedulerConfig(),
+        auth=AuthConfig(tokens={
+            "kal-le": AuthTokenEntry(
+                token=DUMMY_KALLE_PEER_TOKEN,
+                allowed_clients=["kal-le", "salem"],
+            ),
+        }),
+        state=StateConfig(),
+        canonical=CanonicalConfig(
+            owner=True,
+            audit_log_path=str(audit_path),
+            peer_permissions={
+                "kal-le": {
+                    "event": PeerFieldRules(fields=["name", "title", "start", "end"]),
+                },
+            },
+        ),
+        peers={},
+    )
+    state = TransportState.create(tmp_path / "transport_state.json")
+
+    vault_root = tmp_path / "vault"
+    (vault_root / "event").mkdir(parents=True)
+
+    app = build_app(config, state)
+    register_vault_path(app, vault_root)
+    register_instance_identity(app, name="S.A.L.E.M.", alias="Salem")
+    app["_vault_root"] = vault_root
+    app["_audit_path"] = audit_path
+
+    tc: TestClient = await aiohttp_client(app)
+    return tc
+
+
+def _seed_event(vault_root, *, filename: str, fields: dict) -> None:  # type: ignore[no-untyped-def]
+    """Helper: write a vault event record with the given frontmatter."""
+    import yaml as _yaml
+    fm = {"type": "event", "name": filename.removesuffix(".md")}
+    fm.update(fields)
+    text = "---\n" + _yaml.dump(fm, default_flow_style=False) + "---\n\nbody\n"
+    (vault_root / "event" / filename).write_text(text, encoding="utf-8")
+
+
+async def test_event_propose_create_happy_path(salem_event_app):  # type: ignore[no-untyped-def]
+    """No conflict → record created, 201, path returned, file on disk."""
+    resp = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "kal-le-propose-event-happy1",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+            "title": "VAC marketing call follow-up",
+            "summary": "Follow-up on Q2 outreach plan",
+            "origin_instance": "kal-le",
+            "origin_context": "marketing strategy session 2026-04-30",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 201
+    body = await resp.json()
+    assert body["status"] == "created"
+    assert body["path"].startswith("event/VAC marketing call follow-up ")
+    assert body["path"].endswith(".md")
+    assert body["correlation_id"] == "kal-le-propose-event-happy1"
+
+    vault_root = salem_event_app.server.app["_vault_root"]
+    written = vault_root / body["path"]
+    assert written.exists()
+    text = written.read_text(encoding="utf-8")
+    assert "type: event" in text
+    assert "title: VAC marketing call follow-up" in text
+    assert "start: '2026-05-04T17:00:00+00:00'" in text  # converted to UTC
+    assert "origin_instance: kal-le" in text
+    assert "origin_context: marketing strategy session 2026-04-30" in text
+
+
+async def test_event_propose_create_conflict_with_start_end(salem_event_app):  # type: ignore[no-untyped-def]
+    """Existing event with start+end overlapping → 200 conflict, no create."""
+    vault_root = salem_event_app.server.app["_vault_root"]
+    _seed_event(
+        vault_root,
+        filename="EI Call 2026-05-04.md",
+        fields={
+            "title": "EI Call",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T14:30:00-03:00",
+            "date": "2026-05-04",
+        },
+    )
+
+    resp = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "test-conflict-1",
+            "start": "2026-05-04T14:15:00-03:00",  # overlaps EI call
+            "end": "2026-05-04T15:00:00-03:00",
+            "title": "VAC marketing call",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["status"] == "conflict"
+    assert len(body["conflicts"]) == 1
+    c = body["conflicts"][0]
+    assert c["title"] == "EI Call"
+    assert c["path"] == "event/EI Call 2026-05-04.md"
+    # No new file should have landed.
+    files = list((vault_root / "event").glob("VAC marketing*.md"))
+    assert files == []
+
+
+async def test_event_propose_create_conflict_multiple(salem_event_app):  # type: ignore[no-untyped-def]
+    """Proposed window overlaps multiple existing events → all returned."""
+    vault_root = salem_event_app.server.app["_vault_root"]
+    _seed_event(
+        vault_root, filename="Morning Standup.md",
+        fields={
+            "title": "Morning Standup",
+            "start": "2026-05-04T13:00:00-03:00",
+            "end": "2026-05-04T14:30:00-03:00",
+        },
+    )
+    _seed_event(
+        vault_root, filename="Lunch.md",
+        fields={
+            "title": "Lunch",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+        },
+    )
+    _seed_event(
+        vault_root, filename="Far Future.md",
+        fields={
+            "title": "Far Future",
+            "start": "2026-12-04T14:00:00-03:00",
+            "end": "2026-12-04T15:00:00-03:00",
+        },
+    )
+
+    resp = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "test-multi-conflict",
+            "start": "2026-05-04T13:30:00-03:00",
+            "end": "2026-05-04T14:45:00-03:00",
+            "title": "Big meeting",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["status"] == "conflict"
+    titles = {c["title"] for c in body["conflicts"]}
+    assert titles == {"Morning Standup", "Lunch"}
+
+
+async def test_event_propose_create_adjacent_no_conflict(salem_event_app):  # type: ignore[no-untyped-def]
+    """Same-instant boundary (event_end == proposed_start) is NOT a conflict."""
+    vault_root = salem_event_app.server.app["_vault_root"]
+    _seed_event(
+        vault_root, filename="Coffee.md",
+        fields={
+            "title": "Coffee",
+            "start": "2026-05-04T13:00:00-03:00",
+            "end": "2026-05-04T14:00:00-03:00",
+        },
+    )
+
+    resp = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "test-adjacent",
+            "start": "2026-05-04T14:00:00-03:00",  # touches but doesn't overlap
+            "end": "2026-05-04T15:00:00-03:00",
+            "title": "Next meeting",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 201
+    body = await resp.json()
+    assert body["status"] == "created"
+
+
+async def test_event_propose_create_conflict_with_date_only_event(salem_event_app):  # type: ignore[no-untyped-def]
+    """Existing event with only ``date`` (no start/end) → treated as full-day window."""
+    vault_root = salem_event_app.server.app["_vault_root"]
+    _seed_event(
+        vault_root, filename="All Day Conf 2026-05-04.md",
+        fields={
+            "title": "All Day Conf",
+            "date": "2026-05-04",
+        },
+    )
+
+    resp = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "test-dateonly-conflict",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+            "title": "Sub meeting",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["status"] == "conflict"
+    assert body["conflicts"][0]["title"] == "All Day Conf"
+
+
+async def test_event_propose_create_schema_error_missing_times(salem_event_app):  # type: ignore[no-untyped-def]
+    resp = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "test-bad-1",
+            "title": "no times",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["reason"] == "schema_error"
+
+
+async def test_event_propose_create_schema_error_end_before_start(salem_event_app):  # type: ignore[no-untyped-def]
+    resp = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "test-bad-2",
+            "start": "2026-05-04T15:00:00-03:00",
+            "end": "2026-05-04T14:00:00-03:00",  # before start
+            "title": "reversed",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["reason"] == "schema_error"
+
+
+async def test_event_propose_create_spoofed_origin_403(salem_event_app):  # type: ignore[no-untyped-def]
+    """origin_instance must match authenticated peer (anti-spoof)."""
+    resp = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "test-spoof",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+            "title": "spoofed",
+            "origin_instance": "stay-c",  # lying — auth is kal-le
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 403
+    body = await resp.json()
+    assert body["reason"] == "from_mismatch"
+
+
+async def test_event_propose_create_not_owner_404(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """Non-canonical-owner returns 404 canonical_not_owned (KAL-LE/Hypatia)."""
+    config = _build_config(canonical_owner=False)
+    state = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(config, state)
+    tc: TestClient = await aiohttp_client(app)
+
+    resp = await tc.post(
+        "/canonical/event/propose-create",
+        json={
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+            "title": "x",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 404
+    body = await resp.json()
+    assert body["reason"] == "canonical_not_owned"
+
+
+async def test_event_propose_create_audit_records_outcome(salem_event_app):  # type: ignore[no-untyped-def]
+    """Created + conflict outcomes both append audit entries."""
+    from alfred.transport.canonical_audit import read_audit
+
+    audit_path = salem_event_app.server.app["_audit_path"]
+
+    # Happy path → granted=["create"]
+    await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "audit-test-1",
+            "start": "2026-06-01T10:00:00-03:00",
+            "end": "2026-06-01T11:00:00-03:00",
+            "title": "Audit happy",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+
+    # Same window again → conflict; denied=["conflict"].
+    await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "audit-test-2",
+            "start": "2026-06-01T10:30:00-03:00",
+            "end": "2026-06-01T11:30:00-03:00",
+            "title": "Audit clash",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+
+    entries = read_audit(audit_path)
+    by_cid = {e["correlation_id"]: e for e in entries}
+    assert "audit-test-1" in by_cid
+    assert by_cid["audit-test-1"]["granted"] == ["create"]
+    assert by_cid["audit-test-1"]["denied"] == []
+    assert "audit-test-2" in by_cid
+    assert by_cid["audit-test-2"]["denied"] == ["conflict"]
+
+
+async def test_event_propose_create_409_when_filename_collides(salem_event_app):  # type: ignore[no-untyped-def]
+    """Same title + same date but different correlation → 409 already_exists."""
+    resp1 = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "first",
+            "start": "2026-07-01T10:00:00-03:00",
+            "end": "2026-07-01T11:00:00-03:00",
+            "title": "Recurring Standup",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp1.status == 201
+
+    # Same title + same date, but a non-overlapping (later) time slot —
+    # the conflict-check passes (no overlap with the first event's
+    # 10:00-11:00 window), so we reach the filename collision branch
+    # downstream of the conflict-scan and the route returns 409.
+    resp2 = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "second",
+            "start": "2026-07-01T13:00:00-03:00",
+            "end": "2026-07-01T14:00:00-03:00",
+            "title": "Recurring Standup",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp2.status == 409
+    body = await resp2.json()
+    assert body["status"] == "exists"
+    assert body["path"] == "event/Recurring Standup 2026-07-01.md"
