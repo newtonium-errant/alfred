@@ -28,13 +28,17 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-# Track which loaded configs already produced a deprecation warning. Keyed
-# by ``id(raw_dict)`` so a single normalize call doesn't fire multiple times
-# (we may be called per-tool with the same dict). The set persists for the
-# lifetime of the process. Reason: every tool's ``load_from_unified`` calls
-# this helper independently — without dedup, a single ``alfred up`` boot
-# would log the deprecation 6+ times (once per tool).
-_DEPRECATION_LOGGED: set[int] = set()
+# Process-wide flag: have we already emitted the legacy-key deprecation
+# warning this process? Set on first emission, never re-fires until a test
+# calls ``reset_deprecation_log()``.
+#
+# Why a plain bool and not an id-keyed set: every tool's ``load_from_unified``
+# runs ``_substitute_env(raw)`` first, which deep-copies the config tree.
+# So ``raw["vault"]`` has a different ``id()`` per tool, and an id-keyed set
+# would fire once per tool (5 tools = 4 redundant warnings observed during
+# a single ``alfred up`` boot). The docstring contract is "once per process"
+# — a module-level bool matches the contract and removes the footgun.
+_DEPRECATION_LOGGED: bool = False
 
 
 def normalize_vault_block(vault_raw: dict[str, Any]) -> dict[str, Any]:
@@ -73,12 +77,11 @@ def normalize_vault_block(vault_raw: dict[str, Any]) -> dict[str, Any]:
         out["ignore_dirs"] = list(out["dont_scan_dirs"])
     elif has_legacy:
         # Legacy-only config: log a one-time deprecation hint per process.
-        # Use ``id`` of the input dict to dedup — the same raw config is
-        # passed to every tool's ``load_from_unified``, so without this the
-        # warning fires N times per ``alfred up`` boot.
-        key = id(vault_raw)
-        if key not in _DEPRECATION_LOGGED:
-            _DEPRECATION_LOGGED.add(key)
+        # Process-wide bool dedup — see _DEPRECATION_LOGGED docstring above
+        # for why we don't key by id(vault_raw).
+        global _DEPRECATION_LOGGED
+        if not _DEPRECATION_LOGGED:
+            _DEPRECATION_LOGGED = True
             log = logging.getLogger("alfred.vault.config")
             log.warning(
                 "vault.ignore_dirs_deprecated: 'vault.ignore_dirs' is "
@@ -100,10 +103,11 @@ def normalize_vault_block(vault_raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def reset_deprecation_log() -> None:
-    """Clear the dedup tracking set. Test-only helper.
+    """Reset the once-per-process flag. Test-only helper.
 
     Process-wide module state means the deprecation log fires at most once
     per process, but tests that exercise multiple legacy-config loads in
     the same process need a way to verify the warning fires at all.
     """
-    _DEPRECATION_LOGGED.clear()
+    global _DEPRECATION_LOGGED
+    _DEPRECATION_LOGGED = False

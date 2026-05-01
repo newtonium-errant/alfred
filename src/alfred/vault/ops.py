@@ -332,15 +332,25 @@ def vault_search(
     When Obsidian is running, content searches (grep) use Obsidian's live
     index for faster, more accurate results. Falls back to filesystem search.
     """
+    # Both branches below filter via ``is_ignored_path`` so callers can
+    # use single-component entries (``"_templates"``) AND nested-path
+    # entries (``"inbox/processed"``) — matching the public contract
+    # documented on ``is_ignored_path``. Pre-2026-05-01 the filter used
+    # an inline ``part in ignore`` check that silently dropped slash
+    # entries, which made callers think they were filtering ``inbox/processed``
+    # while actually filtering nothing. The pipeline-stage constant
+    # (``STAGE_LOOKUP_NEVER_INDEX`` in janitor/pipeline.py) relies on
+    # the slash entry working.
+    ignore = ignore_dirs or []
+
     # Try Obsidian CLI for content search (grep without glob filter)
     if grep_pattern and not glob_pattern and obsidian.is_available():
         obs_results = obsidian.search_content(grep_pattern)
         if obs_results is not None:
-            ignore = set(ignore_dirs or [])
             results: list[dict] = []
             for item in obs_results:
                 path = item.get("path", item.get("file", ""))
-                if any(part in ignore for part in Path(path).parts):
+                if is_ignored_path(path, ignore):
                     continue
                 results.append({
                     "path": path,
@@ -351,7 +361,6 @@ def vault_search(
             return results
 
     # Filesystem fallback
-    ignore = set(ignore_dirs or [])
     results: list[dict] = []
 
     if glob_pattern:
@@ -361,7 +370,7 @@ def vault_search(
 
     for md_file in sorted(matches):
         rel = md_file.relative_to(vault_path)
-        if any(part in ignore for part in rel.parts):
+        if is_ignored_path(rel, ignore):
             continue
 
         # If grep, check content

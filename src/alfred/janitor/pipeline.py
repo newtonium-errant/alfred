@@ -37,6 +37,48 @@ from .utils import get_logger
 log = get_logger(__name__)
 
 
+# Vault-system infrastructure dirs that Stage 2 candidate search and
+# Stage 3 inbound-context lookup MUST always skip, regardless of the
+# operator's ``dont_index_dirs`` config:
+#
+# - ``_templates`` / ``_bases`` / ``_docs`` — scaffold + Dataview views,
+#   not real records. A stub's stem may collide with a placeholder
+#   (e.g. ``Sample Person``) and pollute the LLM context.
+# - ``.obsidian`` — Obsidian app config (workspace.json, plugins/...) is
+#   not a record source.
+# - ``inbox/processed`` — raw email bodies stored as the audit trail of
+#   what curator already consumed. A stub's stem can show up in raw
+#   email body text without being a meaningful inbound link.
+#
+# These are union'd with ``config.vault.dont_index_dirs`` at the call
+# sites below. The scanner's ``_build_stem_index`` / ``_build_inbound_index``
+# (in scanner.py) intentionally do NOT use this constant — those indexes
+# define "what counts as a valid record" and the operator config is the
+# single source of truth there. Pipeline-stage lookup is the narrower
+# context-enrichment use case where these system dirs are never
+# legitimate linkers.
+#
+# Precedent: ``merge.py::_IGNORE_DIRS`` and ``vault/cli.py::_ignore_dirs()``
+# follow the same pattern — system dirs that bypass user config because
+# they're never legitimate sources for the operation in question.
+STAGE_LOOKUP_NEVER_INDEX: tuple[str, ...] = (
+    "_templates",
+    "_bases",
+    "_docs",
+    ".obsidian",
+    "inbox/processed",
+)
+
+
+def _stage_lookup_ignore_dirs(config: JanitorConfig) -> list[str]:
+    """Return the union of ``config.vault.dont_index_dirs`` and
+    ``STAGE_LOOKUP_NEVER_INDEX``, preserving operator-config order and
+    appending only the system dirs the operator hasn't already listed.
+    """
+    operator = list(config.vault.dont_index_dirs)
+    return operator + [d for d in STAGE_LOOKUP_NEVER_INDEX if d not in operator]
+
+
 @dataclass
 class PipelineResult:
     """Result from the 3-stage janitor pipeline."""
@@ -314,7 +356,10 @@ async def _stage2_link_repair(
     # records under dont_scan_dirs (session/, note/, etc.). The legacy
     # ``ignore_dirs`` reading would skip those — silently widening the
     # "no candidate found" outcome and leaving real candidates unresolved.
-    ignore_dirs = config.vault.dont_index_dirs
+    # Union with STAGE_LOOKUP_NEVER_INDEX so vault-system infrastructure
+    # dirs (_templates, .obsidian, inbox/processed, ...) are never
+    # offered as link candidates, regardless of operator config.
+    ignore_dirs = _stage_lookup_ignore_dirs(config)
     template = _load_stage_prompt("stage2_link_repair.md")
     repaired = 0
     unresolved: list[Issue] = []
@@ -528,7 +573,10 @@ async def _stage3_enrich(
     # context should include EVERY record that links to it, including
     # records under dont_scan_dirs (which are still legitimate linkers).
     # See _collect_linked_records docstring for the split rationale.
-    ignore_dirs = config.vault.dont_index_dirs
+    # Union with STAGE_LOOKUP_NEVER_INDEX so raw email bodies under
+    # inbox/processed/ and template placeholders never pollute the
+    # enrichment context.
+    ignore_dirs = _stage_lookup_ignore_dirs(config)
     max_stubs = config.sweep.max_stubs_per_sweep
     max_attempts = config.sweep.max_enrichment_attempts
     template = _load_stage_prompt("stage3_enrich.md")
