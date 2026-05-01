@@ -1378,14 +1378,27 @@ def _event_window(fm: dict[str, Any]) -> tuple[datetime, datetime] | None:
         both).
       * ``start`` alone (treat ``end`` as ``start + 1h`` so single-time
         events still produce a meaningful window for overlap detection).
-      * ``date`` alone (treat as full-day window: midnight UTC start →
-        midnight UTC next day). Most existing vault events shipped
-        before this route use only ``date``; we want them to participate
-        in conflict-check.
+      * ``date`` alone — symmetric expansion around UTC midnight to
+        cover any plausible local-tz interpretation of "all day on date
+        d". A date-only record really means "the whole local day" but
+        we don't know which timezone the author meant. Expanding to
+        ``[d-1 day @ 12:00 UTC, d+1 day @ 12:00 UTC)`` brackets every
+        timezone offset between roughly UTC-12 and UTC+12, so a
+        proposed Halifax-evening (UTC-3) event no longer slips past a
+        date-only all-day record. The cost is over-conflicting events
+        that are legitimately on adjacent days but in different
+        timezones — rare in practice for a single-tz vault.
+
+        v2: read ``vault.timezone`` from config and expand the date in
+        that timezone explicitly. That removes the over-conflict
+        possibility but pulls in config-loading complexity we don't
+        need here yet.
 
     Returns ``None`` when no time fields are parseable. The caller
     skips records with no extractable window.
     """
+    from datetime import time, timedelta
+
     start = _parse_iso_datetime(fm.get("start"))
     end = _parse_iso_datetime(fm.get("end"))
     if start is not None and end is not None:
@@ -1393,13 +1406,18 @@ def _event_window(fm: dict[str, Any]) -> tuple[datetime, datetime] | None:
     if start is not None:
         # No explicit end — assume 1h block. Better than treating as
         # zero-duration (which would never conflict with anything).
-        from datetime import timedelta
         return start, start + timedelta(hours=1)
-    # Fallback to date-only: full-day window.
-    d = _parse_iso_datetime(fm.get("date"))
-    if d is not None:
-        from datetime import timedelta
-        return d, d + timedelta(days=1)
+    # Fallback to date-only: symmetric ±12h expansion around UTC midnight.
+    d_dt = _parse_iso_datetime(fm.get("date"))
+    if d_dt is not None:
+        d = d_dt.date()
+        expanded_start = datetime.combine(
+            d - timedelta(days=1), time(12, 0), tzinfo=timezone.utc,
+        )
+        expanded_end = datetime.combine(
+            d + timedelta(days=1), time(12, 0), tzinfo=timezone.utc,
+        )
+        return expanded_start, expanded_end
     return None
 
 

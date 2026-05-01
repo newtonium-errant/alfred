@@ -915,6 +915,44 @@ async def test_event_propose_create_conflict_with_date_only_event(salem_event_ap
     assert body["conflicts"][0]["title"] == "All Day Conf"
 
 
+async def test_event_propose_create_conflict_with_date_only_late_evening_halifax(  # type: ignore[no-untyped-def]
+    salem_event_app,
+):
+    """Halifax late-evening event (22:00 UTC-3 = 01:00 UTC next day) must
+    still conflict with a date-only all-day record on the same Halifax
+    day. Pre-fix this slipped past a UTC-midnight window because the
+    proposed UTC range was past the next-day midnight bound; with the
+    symmetric ±12h expansion it lands inside the bracketed window.
+    """
+    vault_root = salem_event_app.server.app["_vault_root"]
+    _seed_event(
+        vault_root, filename="All Day Halifax 2026-05-04.md",
+        fields={
+            "title": "All Day Halifax",
+            "date": "2026-05-04",
+        },
+    )
+
+    resp = await salem_event_app.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "test-dateonly-late-evening",
+            "start": "2026-05-04T22:00:00-03:00",  # = 2026-05-05T01:00 UTC
+            "end": "2026-05-04T23:00:00-03:00",   # = 2026-05-05T02:00 UTC
+            "title": "Late dinner",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["status"] == "conflict"
+    assert body["conflicts"][0]["title"] == "All Day Halifax"
+
+
 async def test_event_propose_create_schema_error_missing_times(salem_event_app):  # type: ignore[no-untyped-def]
     resp = await salem_event_app.post(
         "/canonical/event/propose-create",

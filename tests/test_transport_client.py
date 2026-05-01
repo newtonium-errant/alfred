@@ -287,3 +287,117 @@ async def test_failure_log_has_subprocess_contract_fields(
     assert "code=400" in output
     assert "Status 400" in output
     assert "response_summary" in output
+
+
+# ---------------------------------------------------------------------------
+# 409 collapse — peer_propose_event mirrors peer_propose_canonical_record
+# ---------------------------------------------------------------------------
+
+
+async def test_peer_propose_event_409_collapses_to_structured_return(
+    monkeypatch: pytest.MonkeyPatch, patch_httpx,  # type: ignore[no-untyped-def]
+) -> None:
+    """A 409 from /canonical/event/propose-create must NOT raise — the
+    handler returns ``{"status": "exists", "path": ..., "correlation_id":
+    ...}`` so the dispatcher can surface ``path`` to Andrew. Mirrors the
+    sister handling in ``peer_propose_canonical_record``.
+    """
+    from alfred.transport.config import PeerEntry, TransportConfig
+
+    cfg = TransportConfig()
+    cfg.peers["salem"] = PeerEntry(
+        base_url="http://127.0.0.1:8891",
+        token=DUMMY_TRANSPORT_TEST_TOKEN,
+    )
+
+    handlers, _ = patch_httpx
+    handlers.append(
+        lambda req: httpx.Response(
+            409,
+            json={
+                "status": "exists",
+                "path": "event/Recurring Standup 2026-07-01.md",
+                "correlation_id": "test-cid-event-409",
+            },
+        ),
+    )
+
+    result = await client_mod.peer_propose_event(
+        peer_name="salem",
+        title="Recurring Standup",
+        start="2026-07-01T13:00:00-03:00",
+        end="2026-07-01T14:00:00-03:00",
+        config=cfg,
+        self_name="hypatia",
+        correlation_id="test-cid-event-409",
+    )
+
+    # Did NOT raise — instead, returned the parsed body verbatim.
+    assert result["status"] == "exists"
+    assert result["path"] == "event/Recurring Standup 2026-07-01.md"
+    assert result["correlation_id"] == "test-cid-event-409"
+
+
+async def test_peer_propose_event_409_with_unparseable_body_still_returns_dict(
+    patch_httpx,  # type: ignore[no-untyped-def]
+) -> None:
+    """Defensive: if the 409 body is not valid JSON, still return a dict
+    with ``status=exists`` + the correlation id rather than raising.
+    """
+    from alfred.transport.config import PeerEntry, TransportConfig
+
+    cfg = TransportConfig()
+    cfg.peers["salem"] = PeerEntry(
+        base_url="http://127.0.0.1:8891",
+        token=DUMMY_TRANSPORT_TEST_TOKEN,
+    )
+
+    handlers, _ = patch_httpx
+    handlers.append(
+        lambda req: httpx.Response(409, content=b"not json"),
+    )
+
+    result = await client_mod.peer_propose_event(
+        peer_name="salem",
+        title="Some title",
+        start="2026-07-01T13:00:00-03:00",
+        end="2026-07-01T14:00:00-03:00",
+        config=cfg,
+        self_name="hypatia",
+        correlation_id="test-cid-event-409-bad",
+    )
+
+    assert result["status"] == "exists"
+    assert result["correlation_id"] == "test-cid-event-409-bad"
+
+
+async def test_peer_propose_event_4xx_other_than_409_still_raises(
+    patch_httpx,  # type: ignore[no-untyped-def]
+) -> None:
+    """Only 409 is collapsed — other 4xx (e.g. 400 schema_error, 403
+    spoofed origin) still raise TransportRejected so the caller sees the
+    failure surface.
+    """
+    from alfred.transport.config import PeerEntry, TransportConfig
+
+    cfg = TransportConfig()
+    cfg.peers["salem"] = PeerEntry(
+        base_url="http://127.0.0.1:8891",
+        token=DUMMY_TRANSPORT_TEST_TOKEN,
+    )
+
+    handlers, _ = patch_httpx
+    handlers.append(
+        lambda req: httpx.Response(400, json={"reason": "schema_error"}),
+    )
+
+    with pytest.raises(TransportRejected) as exc:
+        await client_mod.peer_propose_event(
+            peer_name="salem",
+            title="Some title",
+            start="2026-07-01T13:00:00-03:00",
+            end="2026-07-01T14:00:00-03:00",
+            config=cfg,
+            self_name="hypatia",
+        )
+    assert exc.value.status_code == 400

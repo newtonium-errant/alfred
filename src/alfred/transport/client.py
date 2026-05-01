@@ -913,6 +913,7 @@ async def peer_propose_event(
     import secrets
 
     from .config import TransportConfig, load_config
+    from .exceptions import TransportRejected
     from .peers import _resolve_peer
 
     if config is None:
@@ -933,15 +934,43 @@ async def peer_propose_event(
         "correlation_id": cid,
     }
 
-    response = await _peer_request(
-        base_url=base_url,
-        token=token,
-        method="POST",
-        path="/canonical/event/propose-create",
-        self_name=self_name,
-        correlation_id=cid,
-        json_body=body,
-    )
+    try:
+        response = await _peer_request(
+            base_url=base_url,
+            token=token,
+            method="POST",
+            path="/canonical/event/propose-create",
+            self_name=self_name,
+            correlation_id=cid,
+            json_body=body,
+        )
+    except TransportRejected as exc:
+        # 409 already_exists (filename collision: same title + same date,
+        # non-overlapping window). Mirror peer_propose_canonical_record's
+        # 409 handling — collapse into a structured return so the caller
+        # still gets the ``path`` field that the dispatcher surfaces back
+        # to Andrew. Without this collapse, the outer TransportError
+        # catch turns it into a bare ``{"error": ...}`` and ``path`` is
+        # lost.
+        if exc.status_code == 409:
+            import json as _json
+            try:
+                parsed = _json.loads(exc.body) if exc.body else {}
+            except ValueError:
+                parsed = {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+            parsed.setdefault("status", "exists")
+            parsed.setdefault("correlation_id", cid)
+            log.info(
+                "transport.client.event_propose_409_already_exists",
+                peer=peer_name,
+                title=title[:80],
+                correlation_id=cid,
+                path=parsed.get("path"),
+            )
+            return parsed
+        raise
 
     log.info(
         "transport.client.event_propose_response",
