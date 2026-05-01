@@ -859,10 +859,22 @@ async def _dispatch_peer_inter_instance_tool(
     # Lazy import + lazy load so test fixtures that don't ship a config
     # file still let the model see the failure as a tool error rather
     # than a startup crash.
+    #
+    # P0 fix (2026-05-01): use the path the daemon was started with
+    # (``config.config_path``), NOT the default ``config.yaml``. Without
+    # this, a Hypatia daemon launched with ``--config config.hypatia.yaml``
+    # would silently re-read Salem's config here and report
+    # ``transport_error: unknown peer 'salem'`` — Salem doesn't list
+    # itself as a peer. See commit message for repro.
     from alfred.transport.exceptions import TransportError
     try:
         from alfred.transport.config import load_config as load_transport_config
-        transport_config = load_transport_config()
+        transport_config_path = (
+            config.config_path
+            if config is not None and config.config_path
+            else "config.yaml"
+        )
+        transport_config = load_transport_config(transport_config_path)
     except FileNotFoundError as exc:
         log.warning(
             "talker.peer_tool.config_missing",

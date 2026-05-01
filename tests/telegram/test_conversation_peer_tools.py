@@ -74,10 +74,17 @@ def _session(chat_id: int = 1, session_id: str = "sess-peer-1") -> Session:
 
 
 def _stub_transport_config(monkeypatch):
-    """Stub out the transport config loader (peer dispatcher loads lazily)."""
+    """Stub out the transport config loader (peer dispatcher loads lazily).
+
+    Accepts ``*args`` because the dispatcher (post-2026-05-01 P0 fix)
+    threads a config path through to ``load_config(path)``; the stub
+    ignores it because tests don't exercise the path-routing here —
+    that's covered separately in
+    ``test_peer_dispatcher_uses_config_path``.
+    """
     monkeypatch.setattr(
         "alfred.transport.config.load_config",
-        lambda: object(),  # opaque sentinel — the dispatcher passes it through
+        lambda *args, **kwargs: object(),  # opaque sentinel
     )
 
 
@@ -461,3 +468,160 @@ def test_talker_tool_set_excludes_inter_instance_tools():
     assert "propose_org" not in names
     assert "propose_location" not in names
     assert "propose_event" not in names
+
+
+# --- P0 regression: dispatcher routes load_transport_config to the correct path
+# Before the 2026-05-01 fix, the dispatcher called ``load_transport_config()``
+# with no path, defaulting to ``"config.yaml"`` regardless of which config
+# file the daemon was started with. A Hypatia daemon launched with
+# ``--config config.hypatia.yaml`` silently re-read Salem's config and
+# returned ``transport_error: unknown peer 'salem'`` for every peer tool
+# call. The fix stamps the resolved path onto ``TalkerConfig.config_path``
+# at load time and the dispatcher threads it into ``load_transport_config``.
+
+
+@pytest.mark.asyncio
+async def test_peer_dispatcher_uses_config_path_from_talker_config(
+    tmp_path, monkeypatch,
+):
+    """Dispatcher must load transport config from ``TalkerConfig.config_path``,
+    NOT from the default ``config.yaml``. P0 regression — see commit log."""
+    # Build a TalkerConfig pointing at a NON-default path.
+    fake_config_path = str(tmp_path / "config.hypatia.yaml")
+    config = _peer_config(tmp_path, tool_set="hypatia", name="Hypatia")
+    config.config_path = fake_config_path
+
+    captured_paths: list = []
+
+    def fake_load_transport_config(path="config.yaml"):
+        captured_paths.append(path)
+        # Return a transport-config-shaped object — we never actually
+        # call into the transport layer because we stub the client too.
+        return object()
+
+    monkeypatch.setattr(
+        "alfred.transport.config.load_config",
+        fake_load_transport_config,
+    )
+
+    async def fake_get_record(peer_name, record_type, name, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "alfred.transport.client.peer_get_canonical_record",
+        fake_get_record,
+    )
+
+    await conversation._execute_tool(
+        tool_name="query_canonical",
+        tool_input={"record_type": "person", "name": "Andrew Newton"},
+        vault_path=str(tmp_path / "vault"),
+        state=None,
+        session=_session(),
+        config=config,
+    )
+
+    assert len(captured_paths) == 1, (
+        "load_transport_config called wrong number of times"
+    )
+    assert captured_paths[0] == fake_config_path, (
+        f"dispatcher passed {captured_paths[0]!r} — expected the "
+        f"TalkerConfig.config_path {fake_config_path!r}; the P0 "
+        f"'unknown peer salem' bug is back"
+    )
+
+
+@pytest.mark.asyncio
+async def test_peer_dispatcher_falls_back_to_default_when_config_path_unset(
+    tmp_path, monkeypatch,
+):
+    """If ``TalkerConfig.config_path`` is None (e.g. test fixtures that
+    don't go through the CLI), the dispatcher falls back to the legacy
+    default ``"config.yaml"``. Backward-compat guard."""
+    config = _peer_config(tmp_path, tool_set="hypatia", name="Hypatia")
+    # Default — no path stamped.
+    assert config.config_path is None
+
+    captured_paths: list = []
+
+    def fake_load_transport_config(path="config.yaml"):
+        captured_paths.append(path)
+        return object()
+
+    monkeypatch.setattr(
+        "alfred.transport.config.load_config",
+        fake_load_transport_config,
+    )
+
+    async def fake_get_record(peer_name, record_type, name, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "alfred.transport.client.peer_get_canonical_record",
+        fake_get_record,
+    )
+
+    await conversation._execute_tool(
+        tool_name="query_canonical",
+        tool_input={"record_type": "person", "name": "Andrew Newton"},
+        vault_path=str(tmp_path / "vault"),
+        state=None,
+        session=_session(),
+        config=config,
+    )
+
+    assert captured_paths == ["config.yaml"]
+
+
+def test_talker_config_load_config_stamps_path(tmp_path):
+    """``load_config(path)`` populates ``TalkerConfig.config_path`` with
+    the resolved absolute path. Tests the load-side half of the fix."""
+    from alfred.telegram.config import load_config
+
+    config_file = tmp_path / "config.test.yaml"
+    config_file.write_text(
+        "telegram:\n"
+        "  bot_token: 'DUMMY_TEST_TOKEN'\n"
+        "  instance:\n"
+        "    name: TestBot\n"
+        "vault:\n"
+        "  path: /tmp/v\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_config(config_file)
+    assert cfg.config_path == str(config_file.resolve())
+
+
+def test_talker_config_load_from_unified_picks_up_synthetic_path():
+    """``load_from_unified`` reads ``_config_path`` from the raw dict —
+    set by the CLI before handing raw to the orchestrator. Tests the
+    multiprocessing-pickle path where the path can't be a function arg."""
+    from alfred.telegram.config import load_from_unified
+
+    raw = {
+        "_config_path": "/etc/alfred/config.hypatia.yaml",
+        "telegram": {
+            "bot_token": "DUMMY_TEST_TOKEN",
+            "instance": {"name": "Hypatia"},
+        },
+        "vault": {"path": "/tmp/v"},
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.config_path == "/etc/alfred/config.hypatia.yaml"
+
+
+def test_talker_config_load_from_unified_no_synthetic_path_keeps_none():
+    """Without ``_config_path`` in raw, ``config_path`` stays None —
+    backward compat for tests that build raw dicts manually."""
+    from alfred.telegram.config import load_from_unified
+
+    raw = {
+        "telegram": {
+            "bot_token": "DUMMY_TEST_TOKEN",
+            "instance": {"name": "TestBot"},
+        },
+        "vault": {"path": "/tmp/v"},
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.config_path is None

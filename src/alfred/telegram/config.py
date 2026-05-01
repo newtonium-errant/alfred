@@ -198,6 +198,19 @@ class TalkerConfig:
     # via the dataclass default_factory; absent block in YAML keeps
     # ``enabled=True`` / ``interval_seconds=60``.
     idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
+    # Path to the config file this TalkerConfig was loaded from. Carried
+    # so lazy/late loaders (notably the inter-instance peer-tool dispatcher
+    # in ``conversation._dispatch_peer_inter_instance_tool``) can re-read
+    # the SAME config file at call time rather than defaulting to
+    # ``config.yaml``. Without this, a Hypatia daemon started with
+    # ``--config config.hypatia.yaml`` would see its peer-tool dispatcher
+    # silently fall back to Salem's config and report ``unknown peer
+    # 'salem'`` for any propose_*/query_canonical call. ``None`` is the
+    # backward-compat default — populated by :func:`load_config` (path
+    # arg known directly) and by :func:`load_from_unified` when the raw
+    # dict carries the synthetic ``_config_path`` key (set by ``alfred
+    # cli`` before handing ``raw`` to the orchestrator).
+    config_path: str | None = None
 
 
 # --- Recursive builder ---
@@ -232,7 +245,12 @@ def load_config(path: str | Path = "config.yaml") -> TalkerConfig:
     with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     raw = _substitute_env(raw or {})
-    return load_from_unified(raw)
+    cfg = load_from_unified(raw)
+    # Stamp the resolved path onto the config so lazy loaders (the
+    # inter-instance peer-tool dispatcher) re-read the SAME file we
+    # just loaded — see ``TalkerConfig.config_path`` for the rationale.
+    cfg.config_path = str(config_path.resolve())
+    return cfg
 
 
 def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
@@ -277,4 +295,11 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     idle_raw = tool.get("idle_tick")
     if isinstance(idle_raw, dict):
         built.idle_tick = _build(IdleTickConfig, idle_raw)
+    # Synthetic ``_config_path`` key — set by the CLI in ``cmd_up`` /
+    # other entry points before handing ``raw`` to the orchestrator,
+    # carried through ``multiprocessing`` pickling to subprocess
+    # daemons. See ``TalkerConfig.config_path`` for the rationale.
+    raw_path = raw.get("_config_path")
+    if isinstance(raw_path, str) and raw_path:
+        built.config_path = raw_path
     return built

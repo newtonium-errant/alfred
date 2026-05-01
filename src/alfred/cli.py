@@ -41,14 +41,25 @@ def _load_env_file(env_path: Path | None = None) -> None:
 
 
 def _load_unified_config(config_path: str) -> dict[str, Any]:
-    """Load and return raw unified config dict."""
+    """Load and return raw unified config dict.
+
+    The resolved absolute path is stamped onto the dict as a synthetic
+    ``_config_path`` key so subprocess daemons (talker etc.) can re-read
+    the SAME file when they need to lazy-load a sibling config block
+    (e.g. ``transport`` from inside the talker conversation loop). Without
+    this, lazy loaders default to ``config.yaml`` and a Hypatia daemon
+    launched with ``--config config.hypatia.yaml`` silently picks up
+    Salem's config — see ``TalkerConfig.config_path`` for the rationale.
+    """
     path = Path(config_path)
     if not path.exists():
         print(f"Config file not found: {path}")
         print("Run `alfred quickstart` to create one.")
         sys.exit(1)
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        raw = yaml.safe_load(f) or {}
+    raw["_config_path"] = str(path.resolve())
+    return raw
 
 
 def _resolve_pid_path(raw: dict[str, Any]) -> Path:
