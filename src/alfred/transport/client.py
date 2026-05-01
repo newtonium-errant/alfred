@@ -584,8 +584,66 @@ async def peer_get_canonical_person(
         raise
 
 
-async def peer_propose_canonical_person(
+async def peer_get_canonical_record(
     peer_name: str,
+    record_type: str,
+    name: str,
+    *,
+    config: "TransportConfig | None" = None,
+    self_name: str = "kal-le",
+    correlation_id: str | None = None,
+) -> dict[str, Any] | None:
+    """GET /canonical/{type}/{name} on the named peer (typically Salem).
+
+    Generic counterpart to :func:`peer_get_canonical_person` — works for
+    any canonical record type the peer permits. Returns the server's
+    response dict on 200, or ``None`` on 404 (``record_not_found`` /
+    ``canonical_not_owned``). Other 4xx (401, 403) propagate as
+    :class:`TransportRejected` so misconfig is loud.
+
+    The 403 ``no_permitted_fields`` case (peer has no allowlist for this
+    type) propagates rather than collapsing to ``None`` because the
+    caller's UX is different — "you're not allowed to see this" vs
+    "it doesn't exist".
+    """
+    from urllib.parse import quote
+
+    from .config import TransportConfig, load_config
+    from .exceptions import TransportRejected
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = correlation_id or _new_correlation_id()
+
+    path = f"/canonical/{quote(record_type, safe='')}/{quote(name, safe='')}"
+    try:
+        return await _peer_request(
+            base_url=base_url,
+            token=token,
+            method="GET",
+            path=path,
+            self_name=self_name,
+            correlation_id=cid,
+            json_body=None,
+        )
+    except TransportRejected as exc:
+        if exc.status_code == 404:
+            log.info(
+                "transport.client.canonical_record_not_found",
+                peer=peer_name,
+                record_type=record_type,
+                name=name,
+                correlation_id=cid,
+            )
+            return None
+        raise
+
+
+async def peer_propose_canonical_record(
+    peer_name: str,
+    record_type: str,
     name: str,
     *,
     proposed_fields: dict[str, Any] | None = None,
@@ -594,17 +652,22 @@ async def peer_propose_canonical_person(
     self_name: str = "kal-le",
     correlation_id: str | None = None,
 ) -> dict[str, Any]:
-    """POST /canonical/person/propose on the named peer.
+    """POST /canonical/{type}/propose on the named peer (queued shape).
 
-    Returns the server's response dict. The caller inspects
-    ``status`` — ``"pending"`` (HTTP 202) means queued for Andrew's
-    approval; ``"exists"`` (HTTP 409) means the record was created
-    between the proposer's 404 read and this call — the caller should
-    re-GET.
+    Generalization of the original ``peer_propose_canonical_person``
+    contract to ``person`` / ``org`` / ``location`` — types whose
+    creation needs operator judgment about identity / duplication,
+    queued via the Daily Sync. Returns the server's response dict.
+    Caller inspects ``status`` — ``"pending"`` (HTTP 202) means queued;
+    ``"exists"`` (HTTP 409) means a record landed between the
+    proposer's 404 read and this call.
 
-    ``correlation_id`` defaults to a KAL-LE-shaped id
-    (``kal-le-propose-person-<hex6>``) so the audit trail is greppable
-    by proposer.
+    Note: ``event`` is not eligible — events go through the synchronous
+    ``POST /canonical/event/propose-create`` route with conflict-check.
+    See :func:`peer_propose_event`.
+
+    ``correlation_id`` defaults to ``{self_name}-propose-{type}-<hex6>``
+    so the audit trail is greppable by proposer + type.
     """
     import secrets
 
@@ -615,7 +678,10 @@ async def peer_propose_canonical_person(
     if config is None:
         config = load_config()
     base_url, token = _resolve_peer(config, peer_name)
-    cid = correlation_id or f"{self_name}-propose-person-{secrets.token_hex(3)}"
+    cid = (
+        correlation_id
+        or f"{self_name}-propose-{record_type}-{secrets.token_hex(3)}"
+    )
 
     body: dict[str, Any] = {
         "name": name,
@@ -631,16 +697,14 @@ async def peer_propose_canonical_person(
             base_url=base_url,
             token=token,
             method="POST",
-            path="/canonical/person/propose",
+            path=f"/canonical/{record_type}/propose",
             self_name=self_name,
             correlation_id=cid,
             json_body=body,
         )
     except TransportRejected as exc:
-        # 409 already_exists — the race handler returns the path. The
-        # common-sense response is for the caller to re-GET so it has
-        # the fresh record. We surface that by converting the rejection
-        # into a structured return rather than an exception.
+        # 409 already_exists — collapse into a structured return so the
+        # caller (re-GET on the canonical record) has one less branch.
         if exc.status_code == 409:
             import json as _json
             try:
@@ -654,7 +718,8 @@ async def peer_propose_canonical_person(
             log.info(
                 "transport.client.canonical_propose_409_already_exists",
                 peer=peer_name,
-                person=name,
+                record_type=record_type,
+                name=name,
                 correlation_id=cid,
             )
             return parsed
@@ -663,11 +728,108 @@ async def peer_propose_canonical_person(
     log.info(
         "transport.client.canonical_propose_sent",
         peer=peer_name,
-        person=name,
+        record_type=record_type,
+        name=name,
         correlation_id=cid,
         status=response.get("status") if isinstance(response, dict) else None,
     )
     return response if isinstance(response, dict) else {"correlation_id": cid}
+
+
+async def peer_propose_canonical_person(
+    peer_name: str,
+    name: str,
+    *,
+    proposed_fields: dict[str, Any] | None = None,
+    source: str = "",
+    config: "TransportConfig | None" = None,
+    self_name: str = "kal-le",
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /canonical/person/propose on the named peer.
+
+    Backwards-compat wrapper around
+    :func:`peer_propose_canonical_record` pinned to ``record_type =
+    "person"``. Existing callers (KAL-LE propose-person, the
+    ``alfred transport propose-person`` CLI) are unaffected by the
+    generalization to org / location.
+    """
+    return await peer_propose_canonical_record(
+        peer_name,
+        "person",
+        name,
+        proposed_fields=proposed_fields,
+        source=source,
+        config=config,
+        self_name=self_name,
+        correlation_id=correlation_id,
+    )
+
+
+async def resolve_or_propose_canonical_record(
+    peer_name: str,
+    record_type: str,
+    name: str,
+    *,
+    proposed_fields: dict[str, Any] | None = None,
+    source: str = "",
+    config: "TransportConfig | None" = None,
+    self_name: str = "kal-le",
+) -> dict[str, Any]:
+    """Generic high-level helper — GET, propose on 404, handle 409 race.
+
+    Generalization of :func:`resolve_or_propose_canonical_person` to
+    ``person`` / ``org`` / ``location``. Returns one of:
+
+      * ``{"status": "found", "frontmatter": {...}, ...}`` — record
+        exists; ``frontmatter`` carries the peer-visible subset.
+      * ``{"status": "pending", "correlation_id": "..."}`` — record
+        didn't exist; proposal queued for Andrew's Daily Sync review.
+      * ``{"status": "found", ...}`` — also the 409 race outcome,
+        collapsed via a follow-up GET so callers don't have to branch.
+
+    NOT eligible for ``record_type="event"`` — events go through the
+    synchronous ``propose-create`` flow with conflict-check.
+    """
+    record = await peer_get_canonical_record(
+        peer_name, record_type, name,
+        config=config, self_name=self_name,
+    )
+    if record is not None:
+        return {"status": "found", **record}
+
+    proposal = await peer_propose_canonical_record(
+        peer_name, record_type, name,
+        proposed_fields=proposed_fields,
+        source=source,
+        config=config,
+        self_name=self_name,
+    )
+    status = proposal.get("status") if isinstance(proposal, dict) else None
+
+    # 409 race — re-GET and return the fresh record.
+    if status == "exists":
+        fresh = await peer_get_canonical_record(
+            peer_name, record_type, name,
+            config=config, self_name=self_name,
+            correlation_id=proposal.get("correlation_id"),
+        )
+        if fresh is not None:
+            return {"status": "found", **fresh}
+        # The 409 said "exists" but the re-GET 404'd — fall through to
+        # pending so the caller doesn't hang on a phantom record.
+
+    log.info(
+        "transport.client.canonical_propose_pending",
+        peer=peer_name,
+        record_type=record_type,
+        name=name,
+        correlation_id=proposal.get("correlation_id") if isinstance(proposal, dict) else None,
+    )
+    return {
+        "status": "pending",
+        "correlation_id": proposal.get("correlation_id") if isinstance(proposal, dict) else None,
+    }
 
 
 async def resolve_or_propose_canonical_person(
@@ -681,64 +843,21 @@ async def resolve_or_propose_canonical_person(
 ) -> dict[str, Any]:
     """High-level helper — GET, then propose on 404, handle the 409 race.
 
-    This is the call site a KAL-LE tool wrapper would invoke when it
-    wants a canonical person record without having to reason about the
-    propose flow explicitly. Returns one of:
-
-      * ``{"status": "found", "frontmatter": {...}, "granted": [...],
-           "correlation_id": "..."}`` — the record exists; ``frontmatter``
-         carries the peer-visible field subset.
-      * ``{"status": "pending", "correlation_id": "..."}`` — the record
-         didn't exist; a proposal was queued on Salem. Downstream code
-         continues with the bare name string (the design memo's
-         explicit fallback for the pending window).
-      * ``{"status": "found", "frontmatter": {...}, ...}`` — also the
-         409 race outcome, collapsed here into the same "found" shape
-         via a follow-up GET so callers don't have to branch.
-
-    Structured log events:
-      - ``canonical.propose_sent`` when the proposal goes out
-      - ``canonical.propose_409_already_exists`` when the race fires
-      - ``canonical.propose_pending`` after a 202 response lands
+    Backwards-compat wrapper around
+    :func:`resolve_or_propose_canonical_record` pinned to
+    ``record_type="person"``. The ``alfred transport propose-person``
+    CLI subcommand still calls this directly; KAL-LE's interactive
+    propose-person flow is unchanged.
     """
-    record = await peer_get_canonical_person(
-        peer_name, name,
-        config=config, self_name=self_name,
-    )
-    if record is not None:
-        return {"status": "found", **record}
-
-    proposal = await peer_propose_canonical_person(
-        peer_name, name,
+    return await resolve_or_propose_canonical_record(
+        peer_name,
+        "person",
+        name,
         proposed_fields=proposed_fields,
         source=source,
         config=config,
         self_name=self_name,
     )
-    status = proposal.get("status") if isinstance(proposal, dict) else None
-
-    # 409 race — re-GET and return the fresh record.
-    if status == "exists":
-        fresh = await peer_get_canonical_person(
-            peer_name, name,
-            config=config, self_name=self_name,
-            correlation_id=proposal.get("correlation_id"),
-        )
-        if fresh is not None:
-            return {"status": "found", **fresh}
-        # The 409 said "exists" but the re-GET 404'd — fall through to
-        # pending so the caller doesn't hang on a phantom record.
-
-    log.info(
-        "transport.client.canonical_propose_pending",
-        peer=peer_name,
-        person=name,
-        correlation_id=proposal.get("correlation_id") if isinstance(proposal, dict) else None,
-    )
-    return {
-        "status": "pending",
-        "correlation_id": proposal.get("correlation_id") if isinstance(proposal, dict) else None,
-    }
 
 
 async def peer_send_brief_digest(

@@ -477,3 +477,193 @@ async def test_peer_query_not_owner_returns_404(aiohttp_client, tmp_path):  # ty
     assert resp.status == 404
     body = await resp.json()
     assert body["reason"] == "canonical_not_owned"
+
+
+# ---------------------------------------------------------------------------
+# /canonical/{type}/propose — generalized to person / org / location
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def salem_propose_app(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """Salem-style app with proposals queue path wired up.
+
+    Same shape as ``salem_app`` but configured with a ``proposals_path``
+    so the propose route can persist queued entries.
+    """
+    audit_path = tmp_path / "canonical_audit.jsonl"
+    proposals_path = tmp_path / "canonical_proposals.jsonl"
+    config = TransportConfig(
+        server=ServerConfig(),
+        scheduler=SchedulerConfig(),
+        auth=AuthConfig(tokens={
+            "local": AuthTokenEntry(
+                token=DUMMY_SALEM_PEER_TOKEN,
+                allowed_clients=["scheduler", "brief", "kal-le"],
+            ),
+            "kal-le": AuthTokenEntry(
+                token=DUMMY_KALLE_PEER_TOKEN,
+                allowed_clients=["kal-le", "salem"],
+            ),
+        }),
+        state=StateConfig(),
+        canonical=CanonicalConfig(
+            owner=True,
+            audit_log_path=str(audit_path),
+            proposals_path=str(proposals_path),
+            peer_permissions={
+                "kal-le": {
+                    "person": PeerFieldRules(fields=["name", "email"]),
+                    "org": PeerFieldRules(fields=["name", "type"]),
+                    "location": PeerFieldRules(fields=["name", "address"]),
+                },
+            },
+        ),
+        peers={},
+    )
+    state = TransportState.create(tmp_path / "transport_state.json")
+
+    vault_root = tmp_path / "vault"
+    (vault_root / "person").mkdir(parents=True)
+    (vault_root / "org").mkdir()
+    (vault_root / "location").mkdir()
+    (vault_root / "event").mkdir()
+
+    app = build_app(config, state)
+    register_vault_path(app, vault_root)
+    register_instance_identity(app, name="S.A.L.E.M.", alias="Salem")
+    app["_proposals_path"] = proposals_path
+    app["_vault_root"] = vault_root
+    app["_audit_path"] = audit_path
+
+    tc: TestClient = await aiohttp_client(app)
+    return tc
+
+
+async def test_canonical_propose_person_queues(salem_propose_app):  # type: ignore[no-untyped-def]
+    """Backwards-compat: person propose still queues as before."""
+    resp = await salem_propose_app.post(
+        "/canonical/person/propose",
+        json={
+            "name": "Elena Brighton",
+            "proposed_fields": {"description": "NP colleague"},
+            "source": "KAL-LE coding session 2026-04-30",
+            "correlation_id": "kal-le-propose-person-test1",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 202
+    body = await resp.json()
+    assert body["status"] == "pending"
+    assert body["correlation_id"] == "kal-le-propose-person-test1"
+
+
+async def test_canonical_propose_org_queues(salem_propose_app):  # type: ignore[no-untyped-def]
+    """org is in _PROPOSE_ALLOWED_TYPES — the propose route accepts it."""
+    from alfred.transport.canonical_proposals import iter_proposals
+
+    resp = await salem_propose_app.post(
+        "/canonical/org/propose",
+        json={
+            "name": "Aftermath Labs Inc",
+            "proposed_fields": {
+                "type": "company",
+                "description": "Andrew's consulting practice",
+            },
+            "source": "KAL-LE observed in commit message 2026-04-30",
+            "correlation_id": "kal-le-propose-org-abc123",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 202
+    body = await resp.json()
+    assert body["status"] == "pending"
+    assert body["correlation_id"] == "kal-le-propose-org-abc123"
+
+    # Verify the proposal landed in the queue with record_type="org".
+    proposals = iter_proposals(salem_propose_app.server.app["_proposals_path"])
+    matching = [p for p in proposals if p.correlation_id == "kal-le-propose-org-abc123"]
+    assert len(matching) == 1
+    assert matching[0].record_type == "org"
+    assert matching[0].name == "Aftermath Labs Inc"
+    assert matching[0].proposed_fields["type"] == "company"
+
+
+async def test_canonical_propose_location_queues(salem_propose_app):  # type: ignore[no-untyped-def]
+    """location is in _PROPOSE_ALLOWED_TYPES — the propose route accepts it."""
+    from alfred.transport.canonical_proposals import iter_proposals
+
+    resp = await salem_propose_app.post(
+        "/canonical/location/propose",
+        json={
+            "name": "Halifax Convention Centre",
+            "proposed_fields": {
+                "address": "1650 Argyle St, Halifax NS",
+            },
+            "source": "Hypatia conversation 2026-05-01",
+            "correlation_id": "hypatia-propose-location-zzz999",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 202
+    body = await resp.json()
+    assert body["status"] == "pending"
+
+    proposals = iter_proposals(salem_propose_app.server.app["_proposals_path"])
+    matching = [p for p in proposals if p.correlation_id == "hypatia-propose-location-zzz999"]
+    assert len(matching) == 1
+    assert matching[0].record_type == "location"
+
+
+async def test_canonical_propose_unknown_type_400(salem_propose_app):  # type: ignore[no-untyped-def]
+    """Types not in _PROPOSE_ALLOWED_TYPES return 400 schema_error.
+
+    ``event`` is intentionally NOT proposable via the queued shape —
+    events go through ``/canonical/event/propose-create`` (synchronous
+    with conflict-check). A queued propose for ``event`` rejects.
+    """
+    resp = await salem_propose_app.post(
+        "/canonical/event/propose",
+        json={"name": "x", "correlation_id": "test-event-bad"},
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["reason"] == "schema_error"
+
+
+async def test_canonical_propose_org_409_when_record_exists(salem_propose_app):  # type: ignore[no-untyped-def]
+    """409 race: org record was created between the proposer's 404 + propose."""
+    vault_root = salem_propose_app.server.app["_vault_root"]
+    (vault_root / "org" / "Existing Org.md").write_text(
+        "---\ntype: org\nname: Existing Org\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    resp = await salem_propose_app.post(
+        "/canonical/org/propose",
+        json={
+            "name": "Existing Org",
+            "correlation_id": "test-org-409",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["status"] == "exists"
+    assert body["path"] == "org/Existing Org.md"
