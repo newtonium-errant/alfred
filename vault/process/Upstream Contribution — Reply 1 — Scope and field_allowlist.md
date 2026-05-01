@@ -79,7 +79,7 @@ distiller_learnings:
 - '[[decision/Deterministic Prefix Short-Circuits LLM Classifier for Session Routing]]'
 - '[[decision/Brief Audio Delivery Falls Back to Text and Document Upload on API or
   Size Failure]]'
-- '[[decision//extract Is Idempotent with Delete-First Re-Run Contract]]'
+- '[[decision/extract Is Idempotent with Delete-First Re-Run Contract]]'
 - '[[decision/Wall-Clock Scheduling Replaces Rolling 24h Intervals for Heavy Daily
   Passes]]'
 - '[[decision/Shared Schedule Helper Instead of a Central Scheduler Daemon]]'
@@ -171,6 +171,20 @@ intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting An
   review
 project:
 - '[[project/Alfred]]'
+related_orgs:
+- org/DigitalOcean.md
+- org/Duolingo.md
+- org/Blue Cross.md
+- org/Anthropic.md
+- org/Patreon Ireland Limited.md
+related_persons:
+- person/Magdalena Ponurska.md
+- person/Benjamin Todd.md
+- person/Kristine McNeil.md
+- person/Brenna McGowan.md
+- person/Jamie Sweetland.md
+related_projects:
+- project/Alfred.md
 relationships:
 - confidence: 0.9
   context: Upstream Contribution process

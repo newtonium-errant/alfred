@@ -1,7 +1,7 @@
 ---
 alfred_tags:
 - alfred/bit
-- automation/logs
+- logging/run
 created: '2026-04-24'
 description: Alfred built-in test (health sweep)
 janitor_note: LINK001 — frontmatter process target [[process/Alfred BIT]] does not

@@ -1,6 +1,6 @@
 ---
 alfred_tags:
-- software/development
+- process/upstream-contribution
 - architecture/multi-instance
 created: '2026-04-21'
 distiller_learnings:
@@ -79,7 +79,7 @@ distiller_learnings:
 - '[[decision/Deterministic Prefix Short-Circuits LLM Classifier for Session Routing]]'
 - '[[decision/Brief Audio Delivery Falls Back to Text and Document Upload on API or
   Size Failure]]'
-- '[[decision//extract Is Idempotent with Delete-First Re-Run Contract]]'
+- '[[decision/extract Is Idempotent with Delete-First Re-Run Contract]]'
 - '[[decision/Wall-Clock Scheduling Replaces Rolling 24h Intervals for Heavy Daily
   Passes]]'
 - '[[decision/Shared Schedule Helper Instead of a Central Scheduler Daemon]]'
@@ -191,7 +191,7 @@ janitor_note: 'LINK001 — three broken wikilinks in distiller_learnings: two ar
   false positives ([[decision/Salem Ghostwrites External Communications on Andrew\\s
   Behalf]] and [[synthesis/Per-Tool Health Logs Don\\t Aggregate — Operator Inspection
   Scales Poorly Without Uniform Primitive]] — both targets exist with single apostrophe),
-  one is a leading-slash artifact from record name ([[decision//extract Is Idempotent
+  one is a leading-slash artifact from record name ([[decision/extract Is Idempotent
   with Delete-First Re-Run Contract]] — target exists at decision/extract Is Idempotent...md).
   FM001/DIR001 also flagged by scanner but those codes are autofix-handled.'
 project:

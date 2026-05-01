@@ -12,6 +12,20 @@ name: Email Triage Rules
 owner: '[[person/Andrew Newton]]'
 related:
 - '[[project/Alfred]]'
+related_orgs:
+- org/Daily Stoic.md
+- org/AIR MILES.md
+- org/Intuit Canada.md
+- org/Capital One.md
+- org/Patreon Ireland Limited.md
+related_persons:
+- person/Magdalena Ponurska.md
+- person/P Chudnovsky.md
+- person/Tim Denning.md
+- person/Jamie Sweetland.md
+- person/Mark Johnston.md
+related_projects:
+- project/Alfred.md
 relationships: []
 status: active
 tags:

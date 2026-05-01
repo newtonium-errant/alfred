@@ -79,7 +79,7 @@ distiller_learnings:
 - '[[decision/Deterministic Prefix Short-Circuits LLM Classifier for Session Routing]]'
 - '[[decision/Brief Audio Delivery Falls Back to Text and Document Upload on API or
   Size Failure]]'
-- '[[decision//extract Is Idempotent with Delete-First Re-Run Contract]]'
+- '[[decision/extract Is Idempotent with Delete-First Re-Run Contract]]'
 - '[[decision/Wall-Clock Scheduling Replaces Rolling 24h Intervals for Heavy Daily
   Passes]]'
 - '[[decision/Shared Schedule Helper Instead of a Central Scheduler Daemon]]'
@@ -142,11 +142,11 @@ intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting An
   review
 janitor_note: 'LINK001 — scanner false positives: [[decision/Salem Ghostwrites External
   Communications on Andrew''s Behalf]] target exists (YAML doubled-apostrophe confuses
-  scanner); [[decision//extract Is Idempotent with Delete-First Re-Run Contract]]
-  has stray leading slash but resolves to existing decision/extract Is Idempotent
-  with Delete-First Re-Run Contract.md — curator distiller_learnings write artifact.
-  FM001/DIR001 are separate record-type/location issues (this is a note stored in
-  process/ without a name field) awaiting operator triage.'
+  scanner); [[decision/extract Is Idempotent with Delete-First Re-Run Contract]] has
+  stray leading slash but resolves to existing decision/extract Is Idempotent with
+  Delete-First Re-Run Contract.md — curator distiller_learnings write artifact. FM001/DIR001
+  are separate record-type/location issues (this is a note stored in process/ without
+  a name field) awaiting operator triage.'
 project:
 - '[[project/Alfred]]'
 relationships:

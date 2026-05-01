@@ -9,6 +9,20 @@ project:
 - '[[project/Alfred]]'
 related:
 - '[[process/Upstream Contribution Report — Top Level]]'
+related_orgs:
+- org/Impulse.md
+- org/Marco Polo.md
+- org/Raptitude.md
+- org/Daily Stoic.md
+- org/Yarbo.md
+related_persons:
+- person/Magdalena Ponurska.md
+- person/Benjamin Todd.md
+- person/Tim Denning.md
+- person/Mark Johnston.md
+- person/David Cain.md
+related_projects:
+- project/Alfred.md
 status: sent
 tags:
 - upstream

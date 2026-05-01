@@ -1,6 +1,6 @@
 ---
 alfred_tags:
-- software/development
+- process/upstream-contribution
 - architecture/multi-instance
 created: '2026-04-21'
 distiller_learnings:
@@ -79,7 +79,7 @@ distiller_learnings:
 - '[[decision/Deterministic Prefix Short-Circuits LLM Classifier for Session Routing]]'
 - '[[decision/Brief Audio Delivery Falls Back to Text and Document Upload on API or
   Size Failure]]'
-- '[[decision//extract Is Idempotent with Delete-First Re-Run Contract]]'
+- '[[decision/extract Is Idempotent with Delete-First Re-Run Contract]]'
 - '[[decision/Wall-Clock Scheduling Replaces Rolling 24h Intervals for Heavy Daily
   Passes]]'
 - '[[decision/Shared Schedule Helper Instead of a Central Scheduler Daemon]]'
@@ -170,13 +170,21 @@ distiller_signals: decision:1, constraint:1
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
 janitor_note: 'LINK001 — scanner false positives in distiller_learnings: YAML-escaped
-  apostrophe artifact in [[decision/Salem Ghostwrites External Communications on Andrews
-  Behalf]] (target exists with single apostrophe), and leading-slash artifact in [[decision//extract
+  apostrophe artifact in [[decision/Salem Ghostwrites External Communications on Andrew''s
+  Behalf]] (target exists with single apostrophe), and leading-slash artifact in [[decision/extract
   Is Idempotent with Delete-First Re-Run Contract]] (target exists at decision/extract
   Is Idempotent...md). Same pattern documented in process/Upstream Contribution Report
   — Top Level. FM001/DIR001 are autofix-handled.'
 project:
 - '[[project/Alfred]]'
+relationships:
+- confidence: 0.75
+  context: Shared process Upstream Contribution
+  source: process/Upstream Contribution — Reply 4 — KAL-LE multi-instance MVP.md
+  source_anchor: KAL-LE multi-instance MVP
+  target: process/Upstream Contribution Report — Top Level.md
+  target_anchor: Top Level Upstream Contribution
+  type: related-to
 status: draft
 subtype: draft
 tags:

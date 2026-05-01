@@ -1,6 +1,6 @@
 ---
 alfred_tags:
-- software/development
+- process/upstream-contribution
 - architecture/multi-instance
 created: '2026-04-21'
 distiller_learnings:
@@ -79,7 +79,7 @@ distiller_learnings:
 - '[[decision/Deterministic Prefix Short-Circuits LLM Classifier for Session Routing]]'
 - '[[decision/Brief Audio Delivery Falls Back to Text and Document Upload on API or
   Size Failure]]'
-- '[[decision//extract Is Idempotent with Delete-First Re-Run Contract]]'
+- '[[decision/extract Is Idempotent with Delete-First Re-Run Contract]]'
 - '[[decision/Wall-Clock Scheduling Replaces Rolling 24h Intervals for Heavy Daily
   Passes]]'
 - '[[decision/Shared Schedule Helper Instead of a Central Scheduler Daemon]]'
@@ -184,6 +184,14 @@ relationships:
   source_anchor: Stage 3.5 substrate
   target: process/Upstream Contribution — Reply 4 — KAL-LE multi-instance MVP.md
   target_anchor: KAL-LE multi-instance MVP
+  type: related-to
+- confidence: 0.8
+  context: Shared process Upstream Contribution
+  source: process/Upstream Contribution — Reply 2 — Outbound transport and Stage 3.5
+    substrate.md
+  source_anchor: Outbound transport and Stage 3.5 substrate
+  target: process/Upstream Contribution Report — Top Level.md
+  target_anchor: Top Level Upstream Contribution
   type: related-to
 status: draft
 subtype: draft

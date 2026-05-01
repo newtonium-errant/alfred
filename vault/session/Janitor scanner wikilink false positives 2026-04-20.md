@@ -109,7 +109,7 @@ were hidden under the false-positive noise:
 - `[[_docs/alfred-instructions]]`, `[[_docs/architecture]]`, etc. —
   references to a `_docs/` tree that doesn't exist in the vault
   (possibly a legacy scaffold reference).
-- `[[note/Start Here]]`, `[[note/PocketPills Prescription Refill Reminder 2026-04-15]]`
+- `[[Start Here]]`, `[[note/Pocketpills Prescription Refill Reminder 2026-04-15]]`
   — renamed or missing records.
 - `[[org/Rural Route Transportation]]` — likely canonical name drift.
 - `[[...]]` — literal ellipsis wikilink somewhere (prompt template

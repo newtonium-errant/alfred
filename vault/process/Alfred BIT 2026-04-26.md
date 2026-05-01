@@ -1,7 +1,7 @@
 ---
 alfred_tags:
 - alfred/bit
-- automation/logs
+- logging/run
 created: '2026-04-26'
 description: Alfred built-in test (health sweep)
 mode: quick

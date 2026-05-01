@@ -76,7 +76,7 @@ distiller_learnings:
 - '[[decision/Deterministic Prefix Short-Circuits LLM Classifier for Session Routing]]'
 - '[[decision/Brief Audio Delivery Falls Back to Text and Document Upload on API or
   Size Failure]]'
-- '[[decision//extract Is Idempotent with Delete-First Re-Run Contract]]'
+- '[[decision/extract Is Idempotent with Delete-First Re-Run Contract]]'
 - '[[decision/Wall-Clock Scheduling Replaces Rolling 24h Intervals for Heavy Daily
   Passes]]'
 - '[[decision/Shared Schedule Helper Instead of a Central Scheduler Daemon]]'
@@ -105,6 +105,20 @@ janitor_note: LINK001 — decision/Salem Ghostwrites External Communications on 
   FM001/DIR001 — file is type=note in process/ directory; autofix should relocate.
 project:
 - '[[project/Alfred]]'
+related_orgs:
+- org/Impulse.md
+- org/Duolingo.md
+- org/Raptitude.md
+- org/Marco Polo.md
+- org/Daily Stoic.md
+related_persons:
+- person/Magdalena Ponurska.md
+- person/Benjamin Todd.md
+- person/Jamie Sweetland.md
+- person/Brenna McGowan.md
+- person/Andrew Newton.md
+related_projects:
+- project/Alfred.md
 status: draft
 subtype: draft
 tags:

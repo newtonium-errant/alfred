@@ -79,7 +79,7 @@ distiller_learnings:
 - '[[decision/Deterministic Prefix Short-Circuits LLM Classifier for Session Routing]]'
 - '[[decision/Brief Audio Delivery Falls Back to Text and Document Upload on API or
   Size Failure]]'
-- '[[decision//extract Is Idempotent with Delete-First Re-Run Contract]]'
+- '[[decision/extract Is Idempotent with Delete-First Re-Run Contract]]'
 - '[[decision/Wall-Clock Scheduling Replaces Rolling 24h Intervals for Heavy Daily
   Passes]]'
 - '[[decision/Shared Schedule Helper Instead of a Central Scheduler Daemon]]'
@@ -108,6 +108,20 @@ janitor_note: 'LINK001 — scanner false positives: [[decision/Salem Ghostwrites
   deterministically; no janitor action.'
 project:
 - '[[project/Alfred]]'
+related_orgs:
+- org/Raptitude.md
+- org/Duolingo.md
+- org/Daily Stoic.md
+- org/Kit.co.md
+- org/True North Professional Services.md
+related_persons:
+- person/Veronique.md
+- person/Benjamin Todd.md
+- person/Magdalena Ponurska.md
+- person/Brenna McGowan.md
+- person/Kristine McNeil.md
+related_projects:
+- project/Alfred.md
 status: draft
 subtype: draft
 tags:

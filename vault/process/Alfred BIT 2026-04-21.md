@@ -1,7 +1,7 @@
 ---
 alfred_tags:
 - alfred/bit
-- automation/logs
+- logging/run
 created: '2026-04-21'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — broken wikilink [[process/Alfred BIT]] in process: field;
