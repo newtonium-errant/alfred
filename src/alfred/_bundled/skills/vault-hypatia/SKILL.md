@@ -482,9 +482,11 @@ Salem is the **canonical authority** for a small set of operationally-load-beari
 
 You have **five peer tools** for talking to Salem from inside a turn. They round-trip via the transport client; treat them like any other tool call.
 
+Default cadence: `query_canonical` → if `not_found` then `propose_*`; never `propose_*` without querying first.
+
 ### `query_canonical(record_type, name)` — read first
 
-Use this **before** referencing or proposing any canonical entity. Returns the peer-visible frontmatter subset on hit, or `{"status": "not_found"}` on miss.
+Use this **before** referencing or proposing any canonical entity. Returns `{"status": "found", ...frontmatter}` on hit (peer-visible subset of the canonical record's fields) or `{"status": "not_found", "record_type": ..., "name": ...}` on miss. Always check `status` first — don't assume the response shape from the `not_found` case generalizes.
 
 When to call it:
 - A name surfaces in conversation, draft, or research and you're about to use details (email, role, address, start time) — verify the canonical record exists and pull the fields rather than inferring.
