@@ -32,6 +32,29 @@ def _frontmatter_text(fm: dict) -> str:
     return yaml.dump(fm, default_flow_style=False, allow_unicode=True)
 
 
+def _is_scaffold_doc(rel_str: str) -> bool:
+    """Return True for vault-root markdown files (CLAUDE.md, README.md, etc).
+
+    Root-level ``.md`` files in the vault are scaffold/documentation —
+    ``CLAUDE.md``, ``README.md``, ``Start Here.md`` — not records. They
+    have no ``type`` frontmatter, contain illustrative wikilinks like
+    ``[[wikilinks]]`` or ``[[person/Your Name]]``, and exist outside
+    the typed-directory record model. Running record-validation
+    against them generates noise (LINK001 on placeholders, FM001 on
+    missing required fields, etc.) without surfacing real issues.
+
+    The convention: a record lives under ``<type>/<name>.md``; anything
+    at the vault root with no parent directory is documentation.
+
+    Note: scaffold files are still kept in ``all_files`` (so they
+    participate in the inbound-link index and stem-index) — Start
+    Here.md is a hand-curated dashboard whose wikilinks count toward
+    the linked records' inbound visibility. Only the per-record
+    validation pass skips them.
+    """
+    return "/" not in rel_str
+
+
 def _decode_yaml_apostrophe(target: str) -> str:
     """Decode YAML single-quote-doubled apostrophes for stem_index lookup.
 
@@ -145,10 +168,23 @@ def run_structural_scan(
         except OSError:
             continue
 
-    # 2. Determine which files to scan (changed or have open issues)
+    # 2. Determine which files to scan (changed or have open issues).
+    # Root-level ``.md`` files are scaffold/docs (CLAUDE.md, README.md,
+    # Start Here.md) — skip per-record validation but keep them in
+    # ``all_files`` so they still participate in the inbound-link index
+    # (Start Here.md is a hand-curated dashboard whose links count
+    # toward referenced records' inbound visibility). If a scaffold
+    # file currently has stale ``open_issues`` in state from pre-fix
+    # scans, clear them so the issue list converges.
     files_to_scan: list[str] = []
     skipped = 0
+    skipped_scaffold = 0
     for rel_path, md5 in all_files.items():
+        if _is_scaffold_doc(rel_path):
+            if rel_path in state.files and state.files[rel_path].open_issues:
+                state.update_file(rel_path, md5, [])
+            skipped_scaffold += 1
+            continue
         if state.should_scan(rel_path, md5):
             files_to_scan.append(rel_path)
         else:
@@ -159,6 +195,7 @@ def run_structural_scan(
         total_files=len(all_files),
         to_scan=len(files_to_scan),
         skipped=skipped,
+        scaffold_skipped=skipped_scaffold,
     )
 
     # 3. Build indexes

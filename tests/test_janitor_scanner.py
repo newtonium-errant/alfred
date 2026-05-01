@@ -668,3 +668,165 @@ class TestScannerOrphanLeafTypes:
         # a deliberate signal, not a slip.
         from alfred.vault.schema import LEAF_TYPES
         assert LEAF_TYPES == {"note", "run"}
+
+
+# --- Scaffold/docs exclusion (vault-root files) -------------------------
+#
+# Root-level markdown files in the vault are scaffold/documentation —
+# CLAUDE.md, README.md, Start Here.md — not records. They have no
+# ``type`` frontmatter and contain illustrative wikilinks like
+# ``[[wikilinks]]`` or ``[[person/Your Name]]`` that are syntax
+# examples, not real targets. Per-record validation generates noise
+# without surfacing real issues.
+#
+# Convention: a record lives under ``<type>/<name>.md``; anything at
+# the vault root with no parent directory is documentation. Root
+# files stay in the inbound-link index so hand-curated dashboards
+# (Start Here.md) still count toward referenced records' inbound
+# visibility — only the record-validation pass skips them.
+
+
+class TestScannerSkipsRootScaffold:
+    """LINK001/ORPHAN001/FM001 don't fire on vault-root scaffold files."""
+
+    def test_root_claude_md_skipped(self, tmp_vault: Path, tmp_path: Path) -> None:
+        # CLAUDE.md at vault root contains placeholder wikilinks and
+        # has no record frontmatter. Scanner must skip it entirely.
+        (tmp_vault / "CLAUDE.md").write_text(
+            dedent(
+                """\
+                # CLAUDE.md
+
+                Placeholder docs. Records use wikilinks like
+                [[person/Your Name]] and [[project/Example Project]].
+                Body-only example: [[wikilinks]].
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        root_issues = [i for i in issues if i.file == "CLAUDE.md"]
+        assert root_issues == [], (
+            f"Vault-root scaffold should not generate issues, got: {root_issues}"
+        )
+
+    def test_root_readme_and_start_here_also_skipped(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # README.md and Start Here.md are also root-level scaffold/docs.
+        (tmp_vault / "README.md").write_text("# README\n[[broken]]\n", encoding="utf-8")
+        (tmp_vault / "Start Here.md").write_text(
+            "# Start Here\n[[person/Your Name]] [[project/My Project]]\n",
+            encoding="utf-8",
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        assert [i for i in issues if i.file == "README.md"] == []
+        assert [i for i in issues if i.file == "Start Here.md"] == []
+
+    def test_typed_subdirectory_records_still_validated(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # Sanity: the scaffold-skip rule must NOT extend to actual
+        # records under typed subdirectories. A broken wikilink in
+        # ``project/Example.md`` must still flag.
+        _write_record(
+            tmp_vault,
+            "project/Example.md",
+            dedent(
+                """\
+                type: project
+                name: Example
+                created: '2026-04-30'
+                status: active
+                tags: []
+                related:
+                - '[[project/Nonexistent]]'
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        link_issues = _link_issues(issues, "project/Example.md")
+        assert len(link_issues) == 1
+
+    def test_root_scaffold_links_still_count_toward_inbound(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # Start Here.md is a hand-curated dashboard. Its wikilinks must
+        # still register the linked records as having inbound — that
+        # was the explicit design decision (skip validation, keep
+        # link-graph participation). A linked record should NOT fire
+        # ORPHAN001 just because its only inbound is from a root file.
+        _write_record(
+            tmp_vault,
+            "person/Linked Person.md",
+            dedent(
+                """\
+                type: person
+                name: Linked Person
+                created: '2026-04-30'
+                status: active
+                tags: []
+                related: []
+                """
+            ).rstrip(),
+        )
+        (tmp_vault / "Start Here.md").write_text(
+            "Dashboard:\n[[person/Linked Person]] is here.\n",
+            encoding="utf-8",
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        # Record with inbound from scaffold file: NOT orphaned.
+        target_orphans = _orphan_issues(issues, "person/Linked Person.md")
+        assert target_orphans == [], (
+            f"Inbound from scaffold file should still count, got: {target_orphans}"
+        )
+
+    def test_stale_state_open_issues_cleared_for_scaffold(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # Edge case: pre-fix scans recorded LINK001 / FM001 on root
+        # scaffold files in state. After the fix lands, those open
+        # issues should be cleared on the first scan so the count
+        # converges instead of dragging stale entries forward.
+        (tmp_vault / "CLAUDE.md").write_text("# CLAUDE\n[[wikilinks]]\n", encoding="utf-8")
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+
+        # Simulate stale state from a pre-fix scan: file present with
+        # open_issues populated, md5 matches current content.
+        from alfred.janitor.utils import compute_md5
+        stale_md5 = compute_md5(tmp_vault / "CLAUDE.md")
+        state.update_file("CLAUDE.md", stale_md5, ["LINK001", "FM001"])
+        assert state.files["CLAUDE.md"].open_issues == ["LINK001", "FM001"]
+
+        run_structural_scan(config, state)
+
+        # State for the scaffold file is cleared on first post-fix scan.
+        assert state.files["CLAUDE.md"].open_issues == []
