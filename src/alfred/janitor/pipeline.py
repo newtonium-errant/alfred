@@ -163,7 +163,14 @@ def _find_link_candidates(
     vault_path: Path,
     ignore_dirs: list[str],
 ) -> list[dict]:
-    """Search the vault for records that might match a broken wikilink target."""
+    """Search the vault for records that might match a broken wikilink target.
+
+    ``ignore_dirs`` is sourced from ``config.vault.dont_index_dirs`` (NOT
+    ``dont_scan_dirs``). A broken wikilink might legitimately resolve to a
+    record under ``session/`` or any other dont-scan dir; the candidate
+    search must consider those records. See ``alfred.vault.config_helpers``
+    for the split rationale.
+    """
     candidates: list[dict] = []
 
     # Strategy 1: search by stem name (the last component of the target)
@@ -302,7 +309,12 @@ async def _stage2_link_repair(
         link_issues = link_issues[:MAX_ISSUES_PER_SWEEP]
 
     vault_path = config.vault.vault_path
-    ignore_dirs = config.vault.ignore_dirs
+    # Use dont_index_dirs for candidate-search scope: link repair must
+    # consider every record that *could* be a valid target, including
+    # records under dont_scan_dirs (session/, note/, etc.). The legacy
+    # ``ignore_dirs`` reading would skip those — silently widening the
+    # "no candidate found" outcome and leaving real candidates unresolved.
+    ignore_dirs = config.vault.dont_index_dirs
     template = _load_stage_prompt("stage2_link_repair.md")
     repaired = 0
     unresolved: list[Issue] = []
@@ -422,6 +434,12 @@ def _collect_linked_records(
     """Read all records that link to or from the given file.
 
     Returns a formatted text block with the content of linked records.
+
+    ``ignore_dirs`` should be sourced from ``config.vault.dont_index_dirs``
+    (NOT ``dont_scan_dirs``). The Stage 3 enrichment pass needs the full
+    set of records that link TO the stub for context — including records
+    in dont_scan_dirs which are still legitimate inbound linkers. See
+    ``alfred.vault.config_helpers`` for the split rationale.
     """
     # Read the stub record to find outbound links
     try:
@@ -506,7 +524,11 @@ async def _stage3_enrich(
         return 0, []
 
     vault_path = config.vault.vault_path
-    ignore_dirs = config.vault.ignore_dirs
+    # Use dont_index_dirs for Stage 3 inbound-context lookup: a stub's
+    # context should include EVERY record that links to it, including
+    # records under dont_scan_dirs (which are still legitimate linkers).
+    # See _collect_linked_records docstring for the split rationale.
+    ignore_dirs = config.vault.dont_index_dirs
     max_stubs = config.sweep.max_stubs_per_sweep
     max_attempts = config.sweep.max_enrichment_attempts
     template = _load_stage_prompt("stage3_enrich.md")

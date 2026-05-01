@@ -33,7 +33,14 @@ class VaultConfig:
     path: str = ""
     inbox_dir: str = "inbox"
     processed_dir: str = "inbox/processed"
+    # See ``alfred.vault.config_helpers`` for the dont_scan/dont_index split.
+    # ``ignore_dirs`` is the legacy field, semantically equivalent to
+    # ``dont_scan_dirs`` (outbound scan exclusion). New code should prefer
+    # ``dont_scan_dirs``; both are kept in sync by ``normalize_vault_block``.
     ignore_dirs: list[str] = field(default_factory=lambda: [".obsidian"])
+    # New (2026-05-01) — see vault/config_helpers.py for the rationale.
+    dont_scan_dirs: list[str] | None = None
+    dont_index_dirs: list[str] = field(default_factory=list)
 
     @property
     def vault_path(self) -> Path:
@@ -187,18 +194,24 @@ def _build(cls: type, data: dict[str, Any]) -> Any:
 
 def load_config(path: str | Path = "config.yaml") -> CuratorConfig:
     """Load and parse config.yaml into CuratorConfig."""
+    from alfred.vault.config_helpers import normalize_vault_block
+
     config_path = Path(path)
     with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     raw = _substitute_env(raw or {})
+    if "vault" in raw:
+        raw["vault"] = normalize_vault_block(raw["vault"])
     return _build(CuratorConfig, raw)
 
 
 def load_from_unified(raw: dict[str, Any]) -> CuratorConfig:
     """Build CuratorConfig from a pre-loaded unified config dict."""
+    from alfred.vault.config_helpers import normalize_vault_block
+
     raw = _substitute_env(raw)
     tool = raw.get("curator", {})
-    vault_raw = dict(raw.get("vault", {}))
+    vault_raw = normalize_vault_block(raw.get("vault", {}))
     vault_raw["inbox_dir"] = tool.get("inbox_dir", "inbox")
     vault_raw["processed_dir"] = tool.get("processed_dir", "inbox/processed")
     # Strip keys that don't exist in our VaultConfig

@@ -25,7 +25,27 @@
 
 vault:
   path: "./vault"
-  ignore_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox"]
+  # Two semantically distinct exclusion fields (split 2026-05-01):
+  #
+  # ``dont_scan_dirs`` — directories whose records should NOT be scanned
+  #   for issues by janitor/curator/distiller. Examples: ``view`` (Dataview
+  #   base outputs), ``inbox`` (raw / processed email bodies), ``session``
+  #   (voice transcripts that aren't validated as records).
+  #
+  # ``dont_index_dirs`` — directories whose records should NOT be valid
+  #   wikilink targets in janitor's link-resolution index. Default
+  #   empty: a record is a valid link target unless the operator
+  #   explicitly opts out (e.g. archive/, deprecated/).
+  #
+  # Pre-2026-05-01 the two were conflated into a single ``ignore_dirs``
+  # field, which silently flagged valid wikilinks to records under
+  # ``session/`` as LINK001. The legacy key still works — set ONLY
+  # ``ignore_dirs`` and it's treated as ``dont_scan_dirs`` (with
+  # ``dont_index_dirs`` defaulting to empty, i.e. the bug fix).
+  # Configs that set BOTH legacy + new should prefer the new keys —
+  # ``dont_scan_dirs`` wins when both are present.
+  dont_scan_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox"]
+  dont_index_dirs: []
   ignore_files: [".gitkeep"]
 
 agent:

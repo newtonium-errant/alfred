@@ -92,6 +92,15 @@ def _build_stem_index(vault_path: Path, ignore_dirs: set[str]) -> dict[str, set[
 
     E.g. "Eagle Farm" -> {"project/Eagle Farm.md"}
     Also maps full rel_path without .md: "project/Eagle Farm" -> {"project/Eagle Farm.md"}
+
+    The ``ignore_dirs`` argument should be sourced from
+    ``config.vault.dont_index_dirs`` — NOT from ``ignore_dirs`` /
+    ``dont_scan_dirs``. A record can be excluded from outbound issue
+    scanning (e.g. ``session/`` is full of voice-transcript records that
+    shouldn't be flagged for STUB001) yet still be a perfectly valid
+    wikilink target. Conflating the two used to produce ~38 false-positive
+    LINK001 reports on legitimate session wikilinks. See
+    ``alfred.vault.config_helpers`` for the split rationale.
     """
     index: dict[str, set[str]] = {}
     for md_file in vault_path.rglob("*.md"):
@@ -147,9 +156,26 @@ def run_structural_scan(
     config: JanitorConfig,
     state: JanitorState,
 ) -> list[Issue]:
-    """Run Phase 1 structural scan. Returns list of issues found."""
+    """Run Phase 1 structural scan. Returns list of issues found.
+
+    Two ignore-set semantics in play here, since 2026-05-01:
+
+    - ``ignore_dirs`` (= ``dont_scan_dirs``) — directories whose records
+      should NOT be scanned for issues. Used by the outer file-walk
+      filter to decide which records get validated.
+    - ``index_ignore_dirs`` (= ``dont_index_dirs``) — directories that
+      should NOT contribute to the valid-wikilink-target stem index.
+      Default empty: a record is a valid target unless explicitly
+      excluded. Passed to ``_build_stem_index`` and ``_build_inbound_index``.
+
+    Conflating the two (the pre-2026-05-01 behavior) caused ~38 false-
+    positive LINK001 reports on valid session wikilinks because
+    ``session/`` was in ``ignore_dirs`` for legitimate scan exclusion
+    and silently fell out of the index too.
+    """
     vault_path = config.vault.vault_path
     ignore_dirs = set(config.vault.ignore_dirs)
+    index_ignore_dirs = set(config.vault.dont_index_dirs)
     ignore_files = set(config.vault.ignore_files)
 
     # 1. Hash all .md files
@@ -198,9 +224,12 @@ def run_structural_scan(
         scaffold_skipped=skipped_scaffold,
     )
 
-    # 3. Build indexes
-    stem_index = _build_stem_index(vault_path, ignore_dirs)
-    inbound_index = _build_inbound_index(vault_path, all_files, ignore_dirs)
+    # 3. Build indexes — uses dont_index_dirs (NOT dont_scan_dirs).
+    # Records under dont_scan_dirs are still valid wikilink targets;
+    # the index builder must see them. See helper module + the docstring
+    # on _build_stem_index for the full rationale.
+    stem_index = _build_stem_index(vault_path, index_ignore_dirs)
+    inbound_index = _build_inbound_index(vault_path, all_files, index_ignore_dirs)
 
     # 4. Build name index for duplicate detection
     name_by_type_dir: dict[str, list[tuple[str, str]]] = {}  # type_dir -> [(name, rel_path)]
@@ -563,9 +592,14 @@ def run_drift_scan(
     config: JanitorConfig,
     state: JanitorState,
 ) -> list[Issue]:
-    """Run semantic drift scan — stale/orphaned record detection."""
+    """Run semantic drift scan — stale/orphaned record detection.
+
+    See ``run_structural_scan`` docstring for the dont_scan/dont_index
+    split rationale.
+    """
     vault_path = config.vault.vault_path
     ignore_dirs = set(config.vault.ignore_dirs)
+    index_ignore_dirs = set(config.vault.dont_index_dirs)
     ignore_files = set(config.vault.ignore_files)
 
     # Collect all vault files
@@ -584,8 +618,9 @@ def run_drift_scan(
         except OSError:
             continue
 
-    # Build inbound link index
-    inbound_index = _build_inbound_index(vault_path, all_files, ignore_dirs)
+    # Build inbound link index — uses dont_index_dirs (NOT dont_scan_dirs).
+    # See run_structural_scan + _build_stem_index docstrings for rationale.
+    inbound_index = _build_inbound_index(vault_path, all_files, index_ignore_dirs)
 
     # Only check types that have drift rules
     drift_types = {"project", "task", "conversation", "person"}

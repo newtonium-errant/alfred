@@ -31,7 +31,13 @@ def _substitute_env(value: Any) -> Any:
 @dataclass
 class VaultConfig:
     path: str = ""
+    # See ``alfred.vault.config_helpers`` for the dont_scan/dont_index split.
+    # Talker only uses ``ignore_dirs`` for build_vault_context (a scanning
+    # concern). ``dont_index_dirs`` is carried for config-shape consistency.
     ignore_dirs: list[str] = field(default_factory=lambda: [".obsidian"])
+    # New (2026-05-01) — see vault/config_helpers.py for the rationale.
+    dont_scan_dirs: list[str] | None = None
+    dont_index_dirs: list[str] = field(default_factory=list)
 
     @property
     def vault_path(self) -> Path:
@@ -231,9 +237,11 @@ def load_config(path: str | Path = "config.yaml") -> TalkerConfig:
 
 def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     """Build TalkerConfig from a pre-loaded unified config dict."""
+    from alfred.vault.config_helpers import normalize_vault_block
+
     raw = _substitute_env(raw)
     tool = dict(raw.get("telegram", {}) or {})
-    vault_raw = dict(raw.get("vault", {}) or {})
+    vault_raw = normalize_vault_block(raw.get("vault", {}) or {})
     # Strip vault keys that don't exist on our trimmed VaultConfig.
     vault_raw.pop("inbox_dir", None)
     vault_raw.pop("processed_dir", None)

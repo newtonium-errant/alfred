@@ -1,11 +1,20 @@
 vault:
   path: "./vault"
-  # Top-level directories excluded from ALL processing tools.
-  # `inbox/processed` entry (with slash) is a path prefix — it matches
-  # `inbox/processed/*` but not `inbox/*` so the curator can still see
-  # fresh inbox items. Single-component entries (`_templates`, `.obsidian`)
-  # match any path component anywhere in the tree.
-  ignore_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "inbox/processed"]
+  # Two semantically distinct exclusion fields (split 2026-05-01):
+  #
+  # ``dont_scan_dirs`` — directories whose records should NOT be scanned
+  #   for issues. Top-level entries match any path component (.obsidian
+  #   anywhere); nested entries (``inbox/processed``) match a path prefix
+  #   (so the curator's processed audit is excluded but fresh ``inbox/``
+  #   items are still visible). Replaces legacy ``ignore_dirs`` — same
+  #   meaning. Set ONLY the legacy key and it works as a back-compat
+  #   shim, but ``dont_index_dirs`` then defaults to empty (the bug fix).
+  #
+  # ``dont_index_dirs`` — directories that should NOT contribute records
+  #   to janitor's valid-wikilink-target stem index. Default empty: any
+  #   on-disk record is a valid link target unless explicitly excluded.
+  dont_scan_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "inbox/processed"]
+  dont_index_dirs: []
   ignore_files: [".gitkeep"]
 
 agent:

@@ -65,10 +65,17 @@ class VaultConfig:
     """Vault section — same shape as other tools' VaultConfig."""
 
     path: str = ""
+    # See ``alfred.vault.config_helpers`` for the dont_scan/dont_index split.
+    # Instructor only uses ``ignore_dirs`` for outbound vault scans (the
+    # detect-pending walker), a scanning concern. ``dont_index_dirs`` is
+    # carried for config-shape consistency.
     ignore_dirs: list[str] = field(
         default_factory=lambda: [".obsidian", "_templates", "_bases"],
     )
     ignore_files: list[str] = field(default_factory=list)
+    # New (2026-05-01) — see vault/config_helpers.py for the rationale.
+    dont_scan_dirs: list[str] | None = None
+    dont_index_dirs: list[str] = field(default_factory=list)
 
     @property
     def vault_path(self) -> Path:
@@ -226,6 +233,8 @@ def load_from_unified(raw: dict[str, Any]) -> InstructorConfig:
     and ``logging`` sections with the other tools (matches the
     established pattern in curator/janitor/distiller).
     """
+    from alfred.vault.config_helpers import normalize_vault_block
+
     raw = _substitute_env(raw)
     tool = raw.get("instructor", {}) or {}
 
@@ -236,7 +245,7 @@ def load_from_unified(raw: dict[str, Any]) -> InstructorConfig:
         log_raw["file"] = f"{log_dir}/instructor.log"
 
     merged: dict[str, Any] = {
-        "vault": raw.get("vault", {}) or {},
+        "vault": normalize_vault_block(raw.get("vault", {}) or {}),
         "logging": log_raw,
     }
     # Copy instructor-specific subsections/scalars through to _build.

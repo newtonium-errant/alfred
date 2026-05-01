@@ -48,7 +48,14 @@ daemon:
 # ---------------------------------------------------------------------------
 vault:
   path: "/home/andrew/aftermath-lab"
-  ignore_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox"]
+  # Two semantically distinct exclusion fields (see config.yaml.example
+  # for the full rationale + the 2026-05-01 split):
+  # - ``dont_scan_dirs`` — outbound issue scanning exclusion (replaces
+  #   legacy ``ignore_dirs`` — same meaning).
+  # - ``dont_index_dirs`` — valid-link-target index exclusion. Default
+  #   empty: any record is a valid wikilink target.
+  dont_scan_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox"]
+  dont_index_dirs: []
   ignore_files: [".gitkeep"]
 
 # ---------------------------------------------------------------------------

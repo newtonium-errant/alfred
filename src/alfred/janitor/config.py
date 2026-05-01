@@ -41,8 +41,31 @@ class VaultConfig:
     # so janitor must not flag FM001 / LINK001 on raw email bodies. This
     # matches surveyor's policy (which excludes all of `inbox`) and keeps
     # the curator's fresh inbox visible for its own watcher.
+    #
+    # ``ignore_dirs`` is the legacy field, semantically equivalent to
+    # ``dont_scan_dirs``: directories excluded from outbound issue scanning.
+    # Every scanner / snapshot / walker in the codebase still reads this
+    # field; ``normalize_vault_block`` keeps it in sync with
+    # ``dont_scan_dirs`` for back-compat. NEW code should prefer
+    # ``dont_scan_dirs`` (clearer semantics) but reading from
+    # ``ignore_dirs`` still works.
     ignore_dirs: list[str] = field(default_factory=lambda: [".obsidian", "_templates", "_bases", "inbox/processed"])
     ignore_files: list[str] = field(default_factory=list)
+    # New (2026-05-01): split ignore_dirs into two semantically distinct
+    # fields. ``dont_scan_dirs`` is identical to ``ignore_dirs`` — included
+    # so configs can use the new key without breaking compat. The helper
+    # ``normalize_vault_block`` mirrors them. Defaults to None so
+    # back-compat configs (only ``ignore_dirs`` set) leave it untouched.
+    dont_scan_dirs: list[str] | None = None
+    # ``dont_index_dirs`` controls the janitor's valid-link-target stem
+    # index. A wikilink to a record under one of these dirs reports
+    # LINK001 (the target is invisible to the index). Default EMPTY:
+    # every record in the vault is a valid link target unless the
+    # operator explicitly opts out. Fixes the historical bug where
+    # ``session/`` (in ``ignore_dirs`` for outbound scan exclusion) also
+    # silently fell out of the index, falsely flagging ~38 valid
+    # voice-session wikilinks.
+    dont_index_dirs: list[str] = field(default_factory=list)
 
     @property
     def vault_path(self) -> Path:
@@ -190,15 +213,21 @@ def _build(cls: type, data: dict[str, Any]) -> Any:
 
 def load_config(path: str | Path = "config.yaml") -> JanitorConfig:
     """Load and parse config.yaml into JanitorConfig."""
+    from alfred.vault.config_helpers import normalize_vault_block
+
     config_path = Path(path)
     with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     raw = _substitute_env(raw or {})
+    if "vault" in raw:
+        raw["vault"] = normalize_vault_block(raw["vault"])
     return _build(JanitorConfig, raw)
 
 
 def load_from_unified(raw: dict[str, Any]) -> JanitorConfig:
     """Build JanitorConfig from a pre-loaded unified config dict."""
+    from alfred.vault.config_helpers import normalize_vault_block
+
     raw = _substitute_env(raw)
     tool = raw.get("janitor", {})
     # Map unified logging.dir -> logging.file
@@ -207,7 +236,7 @@ def load_from_unified(raw: dict[str, Any]) -> JanitorConfig:
     if "file" not in log_raw:
         log_raw["file"] = f"{log_dir}/janitor.log"
     built: dict[str, Any] = {
-        "vault": raw.get("vault", {}),
+        "vault": normalize_vault_block(raw.get("vault", {})),
         "agent": raw.get("agent", {}),
         "sweep": tool.get("sweep", {}),
         "state": tool.get("state", {}),

@@ -13,8 +13,16 @@ import yaml
 @dataclass
 class VaultConfig:
     path: Path
+    # See ``alfred.vault.config_helpers`` for the dont_scan/dont_index split.
+    # Surveyor only consumes ``ignore_dirs`` for embedding-scope exclusion
+    # (a scanning concern, semantically ``dont_scan_dirs``). It does not
+    # build a wikilink target index, so ``dont_index_dirs`` is carried for
+    # config-shape consistency only.
     ignore_dirs: list[str] = field(default_factory=lambda: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox"])
     ignore_files: list[str] = field(default_factory=lambda: [".gitkeep"])
+    # New (2026-05-01) — see vault/config_helpers.py for the rationale.
+    dont_scan_dirs: list[str] | None = None
+    dont_index_dirs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -208,6 +216,8 @@ def _build_dataclass(cls, data: dict | None):
 
 def load_config(config_path: str | Path) -> PipelineConfig:
     """Load config.yaml, substitute env vars, return typed PipelineConfig."""
+    from alfred.vault.config_helpers import normalize_vault_block
+
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -217,8 +227,12 @@ def load_config(config_path: str | Path) -> PipelineConfig:
 
     raw = _walk_and_substitute(raw)
 
+    vault_raw = raw.get("vault")
+    if isinstance(vault_raw, dict):
+        vault_raw = normalize_vault_block(vault_raw)
+
     return PipelineConfig(
-        vault=_build_dataclass(VaultConfig, raw.get("vault")),
+        vault=_build_dataclass(VaultConfig, vault_raw),
         watcher=_build_dataclass(WatcherConfig, raw.get("watcher")),
         ollama=_build_dataclass(OllamaConfig, raw.get("ollama")),
         milvus=_build_dataclass(MilvusConfig, raw.get("milvus")),
@@ -234,10 +248,15 @@ def load_config(config_path: str | Path) -> PipelineConfig:
 
 def load_from_unified(raw: dict) -> PipelineConfig:
     """Build PipelineConfig from a pre-loaded unified config dict."""
+    from alfred.vault.config_helpers import normalize_vault_block
+
     raw = _walk_and_substitute(raw)
     tool = raw.get("surveyor", {})
+    vault_raw = raw.get("vault")
+    if isinstance(vault_raw, dict):
+        vault_raw = normalize_vault_block(vault_raw)
     return PipelineConfig(
-        vault=_build_dataclass(VaultConfig, raw.get("vault")),
+        vault=_build_dataclass(VaultConfig, vault_raw),
         watcher=_build_dataclass(WatcherConfig, tool.get("watcher")),
         ollama=_build_dataclass(OllamaConfig, tool.get("ollama")),
         milvus=_build_dataclass(MilvusConfig, tool.get("milvus")),

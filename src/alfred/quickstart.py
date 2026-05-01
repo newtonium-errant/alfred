@@ -252,11 +252,14 @@ def run_quickstart() -> None:
 
         print(f"  Copied scaffold (entity dirs, templates, bases, .obsidian config)")
 
-    # Build config.yaml
+    # Build config.yaml — uses the new dont_scan_dirs / dont_index_dirs
+    # keys (split 2026-05-01). Legacy ``ignore_dirs`` still works for
+    # existing configs but fresh installs adopt the split shape.
     config = {
         "vault": {
             "path": vault_path,
-            "ignore_dirs": ["_templates", "_bases", "_docs", ".obsidian", "view", "inbox/processed"],
+            "dont_scan_dirs": ["_templates", "_bases", "_docs", ".obsidian", "view", "inbox/processed"],
+            "dont_index_dirs": [],
             "ignore_files": [".gitkeep"],
         },
         "agent": {
