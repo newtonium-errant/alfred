@@ -275,6 +275,31 @@ transport:
     path: "./data/transport_state.json"
     dead_letter_max_age_days: 30
 
+  # Salem-only: per-peer canonical record permissions (Phase A inter-
+  # instance comms). Each peer gets a per-record-type field allowlist.
+  # Empty / missing peer = denied. Empty / missing fields within a
+  # peer's type = denied. The propose flow's payload schema defines
+  # what's writable; these allowlists govern READS only.
+  #
+  # Conservative defaults below; tighten / loosen per policy.
+  # canonical:
+  #   owner: true
+  #   audit_log_path: "./data/canonical_audit.jsonl"
+  #   proposals_path: "./data/canonical_proposals.jsonl"
+  #   peer_permissions:
+  #     kal-le:
+  #       person:   { fields: [name, email, timezone, aliases, preferences.coding] }
+  #       project:  { fields: [name, status, description] }
+  #       org:      { fields: [name, type, status, alfred_tags] }
+  #       location: { fields: [name, type, address, alfred_tags] }
+  #       event:    { fields: [name, type, title, start, end, status, alfred_tags] }
+  #     hypatia:
+  #       person:   { fields: [name, email, timezone, aliases] }
+  #       project:  { fields: [name, status, description] }
+  #       org:      { fields: [name, type, status, alfred_tags] }
+  #       location: { fields: [name, type, address, alfred_tags] }
+  #       event:    { fields: [name, type, title, start, end, status, alfred_tags] }
+
 telegram:
   # Telegram bot token from @BotFather
   bot_token: "${TELEGRAM_BOT_TOKEN}"

@@ -280,29 +280,237 @@ _BASH_EXEC_TOOL_SCHEMA = {
 }
 
 
+# Stage 3.5 / inter-instance Phase A: peer instances (KAL-LE, Hypatia)
+# need to read + propose canonical records on Salem. These tools live
+# alongside the vault-bridge tools and fan out via the transport client
+# rather than the local vault layer.
+#
+# - ``query_canonical(type, name)``: GET /canonical/{type}/{name} on
+#   Salem. Returns the peer-visible frontmatter subset, or 404
+#   structured response. The Pattern 1 read primitive.
+# - ``propose_event(...)``: synchronous /canonical/event/propose-create
+#   with conflict-check. Mid-conversation create — Andrew gets the
+#   answer inline.
+# - ``propose_org(name, fields)``: queued /canonical/org/propose. Andrew
+#   confirms in next Daily Sync.
+# - ``propose_location(name, fields)``: queued /canonical/location/propose.
+#
+# Salem (talker scope) does NOT get these tools — Salem is the canonical
+# authority and creates these records directly via vault_create.
+
+_QUERY_CANONICAL_TOOL = {
+    "name": "query_canonical",
+    "description": (
+        "Look up a canonical record on Salem (the canonical authority "
+        "for person/org/location/event records). Use this to fetch a "
+        "person's email/timezone, an event's start/end, an org's "
+        "address, etc. before composing a reply. Returns the "
+        "peer-visible frontmatter subset on hit, or "
+        "``{\"status\": \"not_found\"}`` on miss."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "record_type": {
+                "type": "string",
+                "enum": ["person", "org", "location", "event", "project"],
+                "description": "Canonical record type.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Record name (filename stem on Salem).",
+            },
+        },
+        "required": ["record_type", "name"],
+    },
+}
+
+
+_PROPOSE_PERSON_TOOL = {
+    "name": "propose_person",
+    "description": (
+        "Propose a new canonical person record on Salem (queued — "
+        "Andrew confirms or rejects in the next Daily Sync). Use when "
+        "Andrew names a new individual mid-conversation. "
+        "Do NOT use for someone who already has a record; query "
+        "canonical first."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Canonical full name (becomes Salem's filename stem).",
+            },
+            "fields": {
+                "type": "object",
+                "description": (
+                    "Optional frontmatter fields Salem may set on "
+                    "creation (e.g. email, role, description)."
+                ),
+            },
+            "source": {
+                "type": "string",
+                "description": (
+                    "Brief origin note: which session / commit / "
+                    "context triggered this proposal."
+                ),
+            },
+        },
+        "required": ["name"],
+    },
+}
+
+
+_PROPOSE_ORG_TOOL = {
+    "name": "propose_org",
+    "description": (
+        "Propose a new canonical org record on Salem (queued — "
+        "Andrew confirms in the next Daily Sync). Use when a new "
+        "company / NGO / agency surfaces in conversation."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Org canonical name.",
+            },
+            "fields": {
+                "type": "object",
+                "description": "Optional frontmatter fields (type, description, ...).",
+            },
+            "source": {
+                "type": "string",
+                "description": "Origin context for the proposal.",
+            },
+        },
+        "required": ["name"],
+    },
+}
+
+
+_PROPOSE_LOCATION_TOOL = {
+    "name": "propose_location",
+    "description": (
+        "Propose a new canonical location record on Salem (queued — "
+        "Andrew confirms in the next Daily Sync). Use for "
+        "addresses / venues / places mentioned mid-conversation."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Location canonical name.",
+            },
+            "fields": {
+                "type": "object",
+                "description": (
+                    "Optional frontmatter (address, description, ...)."
+                ),
+            },
+            "source": {
+                "type": "string",
+                "description": "Origin context for the proposal.",
+            },
+        },
+        "required": ["name"],
+    },
+}
+
+
+_PROPOSE_EVENT_TOOL = {
+    "name": "propose_event",
+    "description": (
+        "Synchronously propose-create a calendar event on Salem. "
+        "Salem either creates the event (returns ``{status: created, "
+        "path}``) or detects a vault time-conflict and returns "
+        "``{status: conflict, conflicts: [...]}``. Use when Andrew "
+        "asks to schedule something mid-conversation. If Salem flags "
+        "a conflict, surface it inline ('you have an X at 14:00 — "
+        "reschedule to 16:00?'). Times must be ISO 8601 with "
+        "timezone (e.g. '2026-05-04T14:00:00-03:00')."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "Event title (becomes the filename + title field).",
+            },
+            "start": {
+                "type": "string",
+                "description": "ISO 8601 start datetime with timezone offset.",
+            },
+            "end": {
+                "type": "string",
+                "description": "ISO 8601 end datetime with timezone offset.",
+            },
+            "summary": {
+                "type": "string",
+                "description": "Optional summary / agenda.",
+            },
+            "origin_context": {
+                "type": "string",
+                "description": (
+                    "Brief context for traceability (which session / "
+                    "conversation produced this proposal)."
+                ),
+            },
+        },
+        "required": ["title", "start", "end"],
+    },
+}
+
+
+# Inter-instance peer tools — added to peer instances' tool sets only.
+# Salem (talker scope) does not get these tools because Salem IS the
+# canonical authority — it creates these records directly via
+# vault_create rather than proposing them to itself.
+_PEER_INTER_INSTANCE_TOOLS: list[dict[str, Any]] = [
+    _QUERY_CANONICAL_TOOL,
+    _PROPOSE_PERSON_TOOL,
+    _PROPOSE_ORG_TOOL,
+    _PROPOSE_LOCATION_TOOL,
+    _PROPOSE_EVENT_TOOL,
+]
+
+
 KALLE_VAULT_TOOLS: list[dict[str, Any]] = [
     TALKER_VAULT_TOOLS[0],  # vault_search
     TALKER_VAULT_TOOLS[1],  # vault_read
     _KALLE_VAULT_CREATE_TOOL,
     TALKER_VAULT_TOOLS[3],  # vault_edit
     _BASH_EXEC_TOOL_SCHEMA,
+    *_PEER_INTER_INSTANCE_TOOLS,
+]
+
+
+# Hypatia gets the talker-style vault tools (vault_search/read/create/edit
+# with hypatia create allowlist enforced at scope.py) plus the inter-
+# instance peer tools so the scribe can ask Salem to register people,
+# orgs, locations, and events mentioned in research/business sessions.
+HYPATIA_VAULT_TOOLS: list[dict[str, Any]] = [
+    *TALKER_VAULT_TOOLS,
+    *_PEER_INTER_INSTANCE_TOOLS,
 ]
 
 
 # Tool-set registry — selected by ``telegram.instance.tool_set`` in
 # config.yaml (c1 wiring). Default ``"talker"`` preserves Salem's
 # existing behaviour; KAL-LE's ``config.kalle.yaml`` sets
-# ``tool_set: "kalle"`` to pick up bash_exec.
+# ``tool_set: "kalle"`` to pick up bash_exec + inter-instance tools;
+# Hypatia (config.hypatia.yaml ``tool_set: "hypatia"``) gets the
+# vault-only set + inter-instance tools.
 #
-# Hypatia (config.hypatia.yaml sets ``tool_set: "hypatia"``) gets the same
-# four vault tools as talker — Phase 1 MVP. The entry is registered
-# explicitly rather than relying on the unknown-set fallback so a config
-# typo or a future divergence between the two surfaces shows up as an
-# explicit registry change, not a silent fall-through to talker.
+# Salem must NOT get the inter-instance tools — Salem IS the canonical
+# authority. Routing Salem through ``propose_*`` would cause every
+# vault_create to round-trip through the transport against itself.
 VAULT_TOOLS_BY_SET: dict[str, list[dict[str, Any]]] = {
     "talker": TALKER_VAULT_TOOLS,
     "kalle": KALLE_VAULT_TOOLS,
-    "hypatia": TALKER_VAULT_TOOLS,
+    "hypatia": HYPATIA_VAULT_TOOLS,
 }
 
 
@@ -592,6 +800,222 @@ async def _dispatch_bash_exec(
     return _dumps(result)
 
 
+# --- Inter-instance peer tool dispatch (Phase A) -------------------------
+#
+# KAL-LE and Hypatia route ``query_canonical`` + the four ``propose_*``
+# tools through the transport's outbound peer client against the
+# ``salem`` peer entry. The dispatcher is structured the same way as
+# ``_dispatch_bash_exec``: tool-set gating up-front, config plumbing,
+# tool-input validation, an awaited transport call, and a JSON-serialised
+# return that the conversation loop hands back to the model as a
+# ``tool_result``. All transport errors are caught and returned as
+# ``{"error": "..."}`` payloads — the model can apologise / retry / pivot
+# rather than crash the turn.
+
+
+_PEER_TARGET = "salem"  # The canonical authority. Hardcoded by design.
+
+
+async def _dispatch_peer_inter_instance_tool(
+    *,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    session: Session,
+    config: TalkerConfig | None,
+) -> str:
+    """Dispatch one of {query_canonical, propose_*} → Salem.
+
+    All five tools share the same shape:
+      * tool-set gating (only ``kalle`` / ``hypatia`` may invoke).
+      * load TransportConfig from raw config.yaml — the talker daemon
+        doesn't carry one on TalkerConfig directly, so we re-load lazily.
+      * call the matching client helper.
+      * return ``_dumps(result)`` for the model.
+    """
+    # --- Tool-set gating -------------------------------------------------
+    tool_set = ""
+    if config is not None and config.instance is not None:
+        tool_set = config.instance.tool_set or ""
+    if tool_set not in {"kalle", "hypatia"}:
+        log.warning(
+            "talker.peer_tool.wrong_tool_set",
+            tool=tool_name,
+            tool_set=tool_set or "(none)",
+            session_id=session.session_id,
+        )
+        return _dumps({
+            "error": (
+                f"{tool_name} not available on this instance — "
+                f"only peer instances (kal-le, hypatia) may call it"
+            ),
+            "tool_set": tool_set or "talker",
+        })
+
+    self_name = tool_set  # ``"kalle"`` or ``"hypatia"`` — matches the
+    # auth.tokens key on Salem's side and the propose-record correlation
+    # id prefix.
+
+    # --- Transport config load ------------------------------------------
+    # Lazy import + lazy load so test fixtures that don't ship a config
+    # file still let the model see the failure as a tool error rather
+    # than a startup crash.
+    from alfred.transport.exceptions import TransportError
+    try:
+        from alfred.transport.config import load_config as load_transport_config
+        transport_config = load_transport_config()
+    except FileNotFoundError as exc:
+        log.warning(
+            "talker.peer_tool.config_missing",
+            tool=tool_name,
+            error=str(exc),
+        )
+        return _dumps({
+            "error": "transport config unavailable for inter-instance call",
+            "detail": str(exc),
+        })
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.peer_tool.config_error",
+            tool=tool_name,
+            error=str(exc),
+        )
+        return _dumps({"error": f"transport config load failed: {exc}"})
+
+    # --- Per-tool dispatch -----------------------------------------------
+    try:
+        if tool_name == "query_canonical":
+            return await _peer_tool_query_canonical(
+                tool_input, transport_config, self_name,
+            )
+        if tool_name == "propose_person":
+            return await _peer_tool_propose_record(
+                "person", tool_input, transport_config, self_name,
+            )
+        if tool_name == "propose_org":
+            return await _peer_tool_propose_record(
+                "org", tool_input, transport_config, self_name,
+            )
+        if tool_name == "propose_location":
+            return await _peer_tool_propose_record(
+                "location", tool_input, transport_config, self_name,
+            )
+        if tool_name == "propose_event":
+            return await _peer_tool_propose_event(
+                tool_input, transport_config, self_name,
+            )
+        return _dumps({"error": f"unhandled peer tool: {tool_name}"})
+    except TransportError as exc:
+        log.warning(
+            "talker.peer_tool.transport_error",
+            tool=tool_name,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        return _dumps({
+            "error": f"transport error: {exc}",
+            "error_type": exc.__class__.__name__,
+        })
+    except Exception as exc:  # noqa: BLE001 — tool errors must reach the model
+        log.warning(
+            "talker.peer_tool.unexpected_error",
+            tool=tool_name,
+            error=str(exc),
+        )
+        return _dumps({"error": f"unexpected error: {exc}"})
+
+
+async def _peer_tool_query_canonical(
+    tool_input: dict[str, Any],
+    transport_config: Any,
+    self_name: str,
+) -> str:
+    from alfred.transport.client import peer_get_canonical_record
+
+    record_type = tool_input.get("record_type") if isinstance(tool_input, dict) else None
+    name = tool_input.get("name") if isinstance(tool_input, dict) else None
+    if not isinstance(record_type, str) or not record_type:
+        return _dumps({"error": "query_canonical requires a 'record_type'"})
+    if not isinstance(name, str) or not name:
+        return _dumps({"error": "query_canonical requires a 'name'"})
+
+    record = await peer_get_canonical_record(
+        _PEER_TARGET,
+        record_type,
+        name,
+        config=transport_config,
+        self_name=self_name,
+    )
+    if record is None:
+        return _dumps({"status": "not_found", "record_type": record_type, "name": name})
+    return _dumps({"status": "found", **record})
+
+
+async def _peer_tool_propose_record(
+    record_type: str,
+    tool_input: dict[str, Any],
+    transport_config: Any,
+    self_name: str,
+) -> str:
+    from alfred.transport.client import peer_propose_canonical_record
+
+    name = tool_input.get("name") if isinstance(tool_input, dict) else None
+    if not isinstance(name, str) or not name.strip():
+        return _dumps({"error": f"propose_{record_type} requires a 'name'"})
+    fields_raw = tool_input.get("fields") if isinstance(tool_input, dict) else None
+    fields = dict(fields_raw) if isinstance(fields_raw, dict) else None
+    source = tool_input.get("source") if isinstance(tool_input, dict) else None
+    if source is not None and not isinstance(source, str):
+        return _dumps({"error": "source must be a string"})
+
+    response = await peer_propose_canonical_record(
+        _PEER_TARGET,
+        record_type,
+        name.strip(),
+        proposed_fields=fields,
+        source=source or "",
+        config=transport_config,
+        self_name=self_name,
+    )
+    return _dumps(response)
+
+
+async def _peer_tool_propose_event(
+    tool_input: dict[str, Any],
+    transport_config: Any,
+    self_name: str,
+) -> str:
+    from alfred.transport.client import peer_propose_event
+
+    title = tool_input.get("title") if isinstance(tool_input, dict) else None
+    start = tool_input.get("start") if isinstance(tool_input, dict) else None
+    end = tool_input.get("end") if isinstance(tool_input, dict) else None
+    summary = tool_input.get("summary") if isinstance(tool_input, dict) else ""
+    origin_context = tool_input.get("origin_context") if isinstance(tool_input, dict) else ""
+
+    if not isinstance(title, str) or not title.strip():
+        return _dumps({"error": "propose_event requires a 'title'"})
+    if not isinstance(start, str) or not start.strip():
+        return _dumps({"error": "propose_event requires a 'start' ISO datetime"})
+    if not isinstance(end, str) or not end.strip():
+        return _dumps({"error": "propose_event requires an 'end' ISO datetime"})
+    if not isinstance(summary, str):
+        summary = ""
+    if not isinstance(origin_context, str):
+        origin_context = ""
+
+    response = await peer_propose_event(
+        _PEER_TARGET,
+        title=title.strip(),
+        start=start.strip(),
+        end=end.strip(),
+        summary=summary,
+        origin_context=origin_context,
+        config=transport_config,
+        self_name=self_name,
+    )
+    return _dumps(response)
+
+
 # --- Attribution-marker wiring (calibration audit gap, c2) ---------------
 #
 # The agent slug used in attribution markers comes from
@@ -690,6 +1114,26 @@ async def _execute_tool(
     # error returns, and subprocess-failure-contract logging.
     if tool_name == "bash_exec":
         return await _dispatch_bash_exec(
+            tool_input=tool_input,
+            session=session,
+            config=config,
+        )
+
+    # Inter-instance Phase A peer tools (KAL-LE, Hypatia → Salem). Each
+    # of these routes via :mod:`alfred.transport.client` against the
+    # configured ``salem`` peer. Salem (talker scope) must NOT see these
+    # tools in its tool list — verified upstream in ``VAULT_TOOLS_BY_SET``
+    # — but we still tool-set-gate inside the dispatcher as a second
+    # line of defence (same shape as bash_exec).
+    if tool_name in {
+        "query_canonical",
+        "propose_person",
+        "propose_org",
+        "propose_location",
+        "propose_event",
+    }:
+        return await _dispatch_peer_inter_instance_tool(
+            tool_name=tool_name,
             tool_input=tool_input,
             session=session,
             config=config,

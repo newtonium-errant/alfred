@@ -272,3 +272,61 @@ def test_instructor_denies_delete():
             "instructor", "delete",
             rel_path="task/Some Task.md",
         )
+
+
+# ---- canonical-type guard on KAL-LE / Hypatia (Phase A inter-instance) -----
+
+
+def test_kalle_create_denies_canonical_person_with_propose_hint():
+    """KAL-LE may NOT create local person/ — Salem's canonical authority.
+
+    The error message points at ``propose_person`` so the agent prompt
+    can route the create through the correct tool.
+    """
+    with pytest.raises(ScopeError, match="propose_person"):
+        check_scope("kalle", "create", record_type="person")
+
+
+def test_kalle_create_denies_canonical_event_with_propose_hint():
+    with pytest.raises(ScopeError, match="propose_event"):
+        check_scope("kalle", "create", record_type="event")
+
+
+def test_kalle_create_denies_canonical_org_with_propose_hint():
+    with pytest.raises(ScopeError, match="propose_org"):
+        check_scope("kalle", "create", record_type="org")
+
+
+def test_kalle_create_denies_canonical_location_with_propose_hint():
+    with pytest.raises(ScopeError, match="propose_location"):
+        check_scope("kalle", "create", record_type="location")
+
+
+def test_hypatia_create_denies_canonical_person_with_propose_hint():
+    with pytest.raises(ScopeError, match="propose_person"):
+        check_scope("hypatia", "create", record_type="person")
+
+
+def test_hypatia_create_denies_canonical_event_with_propose_hint():
+    with pytest.raises(ScopeError, match="propose_event"):
+        check_scope("hypatia", "create", record_type="event")
+
+
+def test_kalle_canonical_guard_does_not_break_legal_kalle_create():
+    """The canonical guard must not break legal KAL-LE creates."""
+    check_scope("kalle", "create", record_type="pattern")
+    check_scope("kalle", "create", record_type="note")
+
+
+def test_hypatia_canonical_guard_does_not_break_legal_hypatia_create():
+    """The canonical guard must not break legal Hypatia creates."""
+    check_scope("hypatia", "create", record_type="document")
+    check_scope("hypatia", "create", record_type="note")
+
+
+def test_talker_canonical_types_still_allowed_on_salem():
+    """Salem (talker scope) IS the canonical owner — must still create directly."""
+    check_scope("talker", "create", record_type="person")
+    check_scope("talker", "create", record_type="org")
+    check_scope("talker", "create", record_type="location")
+    check_scope("talker", "create", record_type="event")

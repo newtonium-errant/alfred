@@ -66,8 +66,18 @@ def test_hypatia_scope_create_allows_each_hypatia_type() -> None:
 
 
 def test_hypatia_scope_create_denies_salem_types() -> None:
-    """Operational types (task, event, project) are Salem's territory."""
-    for t in ("task", "event", "project"):
+    """Operational types are Salem's territory.
+
+    Phase A inter-instance comms differentiates the rejection messages:
+      * ``event`` is canonical → "propose_event" suggestion.
+      * ``task`` and ``project`` are non-canonical Salem types → still
+        emit the generic "hypatia types" message.
+    """
+    # Canonical event → propose suggestion.
+    with pytest.raises(ScopeError, match="propose_event"):
+        check_scope("hypatia", "create", record_type="event")
+    # Non-canonical Salem types → generic hypatia-types rejection.
+    for t in ("task", "project"):
         with pytest.raises(ScopeError) as exc_info:
             check_scope("hypatia", "create", record_type=t)
         assert "hypatia types" in str(exc_info.value).lower()
@@ -81,17 +91,17 @@ def test_hypatia_scope_create_denies_kalle_types() -> None:
 
 
 def test_hypatia_scope_still_rejects_org_and_location() -> None:
-    """Per-instance leak guard: 2026-04-25 widened Salem only.
+    """Per-instance leak guard: ``org`` / ``location`` are canonical → propose.
 
-    ``org`` and ``location`` were added to ``TALKER_CREATE_TYPES`` so
-    Salem stops hitting the scope wall when Andrew names a new
-    business or address mid-conversation. Hypatia operates on the
-    library-alexandria vault — entity records aren't her territory.
-    Confirm the new types didn't leak across instances.
+    Phase A inter-instance comms (2026-05-01): both types are now
+    canonical-authority records routed through Salem via
+    ``propose_org`` / ``propose_location`` tools rather than local
+    create. The rejection still fires; the message shape changed.
     """
-    for t in ("org", "location"):
-        with pytest.raises(ScopeError, match="hypatia types"):
-            check_scope("hypatia", "create", record_type=t)
+    with pytest.raises(ScopeError, match="propose_org"):
+        check_scope("hypatia", "create", record_type="org")
+    with pytest.raises(ScopeError, match="propose_location"):
+        check_scope("hypatia", "create", record_type="location")
 
 
 def test_hypatia_scope_edit_permitted_with_no_fields_check() -> None:
@@ -143,19 +153,32 @@ def test_hypatia_tool_set_registered_explicitly() -> None:
     talker default — the same answer, but a debugging trap. Future Phase 2
     divergence shows up as an explicit registry change, not a silent
     fall-through.
+
+    Phase A inter-instance comms (2026-05-01) added the 5 peer tools to
+    Hypatia's set, so the registry no longer aliases TALKER_VAULT_TOOLS
+    by identity — it's now a distinct list ``HYPATIA_VAULT_TOOLS``.
     """
     assert "hypatia" in VAULT_TOOLS_BY_SET
-    # Phase 1: identical to talker's tool set.
-    assert VAULT_TOOLS_BY_SET["hypatia"] is TALKER_VAULT_TOOLS
+    # The four talker vault tools are still present, plus 5 peer tools.
+    talker_names = {t["name"] for t in TALKER_VAULT_TOOLS}
+    hypatia_names = {t["name"] for t in VAULT_TOOLS_BY_SET["hypatia"]}
+    assert talker_names.issubset(hypatia_names)
 
 
 def test_tools_for_set_hypatia_returns_four_vault_tools() -> None:
-    """The four vault tools — search, read, create, edit — are exposed."""
+    """The four vault tools — search, read, create, edit — are exposed.
+
+    Phase A inter-instance comms also exposes the 5 peer tools
+    (query_canonical + 4 propose_*) on top. Hypatia must NOT have
+    bash_exec — that's KAL-LE only.
+    """
     tools = tools_for_set("hypatia")
     names = {t["name"] for t in tools}
-    assert names == {"vault_search", "vault_read", "vault_create", "vault_edit"}
-    # Hypatia must NOT have bash_exec — that's KAL-LE only.
+    assert {"vault_search", "vault_read", "vault_create", "vault_edit"}.issubset(names)
     assert "bash_exec" not in names
+    # Phase A peer tools.
+    assert {"query_canonical", "propose_person", "propose_org",
+            "propose_location", "propose_event"}.issubset(names)
 
 
 # ---------------------------------------------------------------------------

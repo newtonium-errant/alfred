@@ -114,14 +114,20 @@ def test_kalle_scope_still_rejects_org():
     the scope wall when Andrew names a new business mid-conversation.
     KAL-LE operates on the aftermath-lab vault and has no use for org
     records — confirm the new type didn't leak across instances.
+
+    Phase A inter-instance comms (2026-05-01) reshapes the rejection
+    message: org is now a canonical type whose creation must route
+    through Salem's ``propose_org`` tool. The match string was updated
+    from "kalle types" to "propose_org" — the rejection still fires,
+    just with a more actionable message.
     """
-    with pytest.raises(ScopeError, match="kalle types"):
+    with pytest.raises(ScopeError, match="propose_org"):
         check_scope("kalle", "create", record_type="org")
 
 
 def test_kalle_scope_still_rejects_location():
-    """Per-instance leak guard: ``location`` is talker-only for now."""
-    with pytest.raises(ScopeError, match="kalle types"):
+    """Per-instance leak guard: ``location`` is canonical → propose, not local create."""
+    with pytest.raises(ScopeError, match="propose_location"):
         check_scope("kalle", "create", record_type="location")
 
 

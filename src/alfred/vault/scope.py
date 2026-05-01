@@ -244,6 +244,37 @@ HYPATIA_CREATE_TYPES: set[str] = {
 }
 
 
+# Canonical record types — the ones Salem owns as authoritative source-
+# of-truth for entity identity + time. Phase A inter-instance comms
+# (2026-05-01) explicitly carves these out from peer-instance
+# ``vault_create`` paths: KAL-LE and Hypatia must NEVER create local
+# person/org/location/event records — they propose to Salem via the
+# transport's propose-create or queued-propose flows instead.
+#
+# The check runs INSIDE the per-scope ``*_types_only`` handler so the
+# error message can name the appropriate propose tool. Keeping it in
+# scope.py rather than in ops.py means a future scope (V.E.R.A.,
+# STAY-C) inherits the same guard the moment it routes through the
+# canonical guard rather than having to be re-added at every type-
+# allowlist site.
+CANONICAL_RECORD_TYPES: set[str] = {
+    "person", "org", "location", "event",
+}
+
+
+# Per-scope hint mapping: when a peer instance attempts vault_create on
+# a canonical type, the error message points at the right propose tool.
+# Salem (talker scope) is the canonical owner — it creates these types
+# directly via vault_create and does NOT route through propose. The
+# guard below skips the talker scope entirely.
+_PROPOSE_TOOL_HINT: dict[str, str] = {
+    "person":   "propose_person",
+    "org":      "propose_org",
+    "location": "propose_location",
+    "event":    "propose_event",
+}
+
+
 def check_scope(
     scope: str | None,
     operation: str,
@@ -339,6 +370,20 @@ def check_scope(
         return
 
     if permission == "kalle_types_only":
+        # Canonical-type guard (Phase A inter-instance comms 2026-05-01).
+        # KAL-LE must not create local person/org/location/event
+        # records — those are Salem's canonical authority and route
+        # through the transport propose flows. Surface a hint rather
+        # than a generic "scope mismatch" so the agent prompt knows
+        # which tool to use instead.
+        if record_type in CANONICAL_RECORD_TYPES:
+            tool_hint = _PROPOSE_TOOL_HINT.get(record_type, "propose tool")
+            raise ScopeError(
+                f"Scope '{scope}' may not create local '{record_type}' "
+                f"records — those are Salem's canonical authority. "
+                f"Use the '{tool_hint}' tool to propose creation on "
+                f"Salem instead."
+            )
         if record_type not in KALLE_CREATE_TYPES:
             raise ScopeError(
                 f"Scope '{scope}' can only create kalle types "
@@ -347,6 +392,15 @@ def check_scope(
         return
 
     if permission == "hypatia_types_only":
+        # Same canonical-type guard for Hypatia. See kalle branch above.
+        if record_type in CANONICAL_RECORD_TYPES:
+            tool_hint = _PROPOSE_TOOL_HINT.get(record_type, "propose tool")
+            raise ScopeError(
+                f"Scope '{scope}' may not create local '{record_type}' "
+                f"records — those are Salem's canonical authority. "
+                f"Use the '{tool_hint}' tool to propose creation on "
+                f"Salem instead."
+            )
         if record_type not in HYPATIA_CREATE_TYPES:
             raise ScopeError(
                 f"Scope '{scope}' can only create hypatia types "
