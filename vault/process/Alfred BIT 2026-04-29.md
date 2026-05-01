@@ -4,6 +4,10 @@ alfred_tags:
 - logging/run
 created: '2026-04-29'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — [[process/Alfred BIT]] target does not exist in vault; parent
+  process record for the Alfred BIT pipeline not yet created. Human action: create
+  the process record or retarget the wikilink. (DIR001 also reported by scanner —
+  record has type=run but lives in process/; expected autofix.py to handle deterministically.)'
 mode: quick
 name: Alfred BIT 2026-04-29
 overall_status: ok
