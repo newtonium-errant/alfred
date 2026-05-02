@@ -134,3 +134,33 @@ When resolving an upstream merge with "TAKE OURS" on a file (because ours is a s
 4. Particularly watch for **defensive guards** (input validation, type coercion, fallback paths) — these are small additions easily missed in a "ours is a superset" assertion because they don't show up as named features
 
 Reason: 2026-04-29 upstream merge (43 commits, 17 conflicts). "TAKE OURS" on `distiller/pipeline.py` was correct — ours had upstream's headline fixes via prior shipped code. But upstream commit `40f3df4`'s 8-line nested-list flatten guard slipped through the headline-feature audit because it wasn't a named feature, just a defensive coercion. Code-reviewer caught it post-merge; required a 2-minute cherry-pick (`6e76496`). Per-hunk walk would have caught it in the original merge.
+
+## Pre-commit checklist
+
+Before staging changes for commit, run through this checklist:
+
+1. **Rename grep** — if your commit involves a rename (section header, function, variable, config field, CLI command), run `git grep -i "<old-name>"` across touched modules + adjacent files and sweep stale docstrings, comments, CLI help strings, example configs. Per `feedback_rename_grep_discipline.md`. Cheap to do at build time; expensive to discover at code-reviewer pass.
+2. **Empty-state messages** — any code path that could produce silent absence (empty section, no records, no traffic, idle daemon) must emit an explicit "ran, nothing to do" line. Per `feedback_intentionally_left_blank.md`. Silence is indistinguishable from broken.
+3. **Pytest under timeout** — wrap every pytest invocation in `timeout` (e.g., `timeout 60 python -m pytest ...`). Per `feedback_pytest_wsl_hang.md` — OOM has crashed WSL multiple times this project.
+4. **Worktree venv pin** — don't `pip install -e` from a worktree (it re-pins the venv to the worktree path, which breaks after worktree cleanup). Use `PYTHONPATH=<worktree>/src python -m pytest …` to test from worktree. Per CLAUDE.md "Worktree + editable-install gotcha".
+5. **Per-instance defaults** — any default value, fallback string, or config path you add: ask "would this be wrong on a different instance?" If yes, parameterize or fail-loud-on-empty rather than ship a single-instance literal. Per `feedback_hardcoding_and_alfred_naming.md`.
+
+## Standing memos worth knowing
+
+These memos live in team-lead's memory at `~/.claude/projects/-home-andrew-alfred/memory/`. Team-lead surfaces the relevant ones in dispatch prompts; you don't need to read all of them, but recognize the names so you can request the full content when a context cue suggests one applies.
+
+| Memo | When it applies |
+|---|---|
+| `feedback_rename_grep_discipline.md` | Any commit that renames a section header, function, variable, config field, or CLI command |
+| `feedback_intentionally_left_blank.md` | Any code path that could produce silent absence (empty list, no traffic, idle daemon, empty section) |
+| `feedback_pytest_wsl_hang.md` | Any pytest invocation — wrap in `timeout` |
+| `feedback_marker_id_canonical_regex.md` | Anything touching `inf-YYYYMMDD-<agent>-<hash>` attribution markers — import canonical regex, don't re-derive |
+| `feedback_sdk_quirk_centralization.md` | Anthropic SDK / model-family parameter quirks (e.g., Opus rejecting `temperature`) — centralize in shared helper from FIRST call site, not the second |
+| `feedback_per_peer_token_uniqueness.md` | Cross-instance auth / config — each peer pair needs its own dedicated token |
+| `feedback_multi_instance_wiring_pattern.md` | Adding a new HTTP endpoint, daemon registration, per-instance config field, or `register_*` helper |
+| `feedback_hardcoding_and_alfred_naming.md` | Any default value, fallback string, or scope identifier that mentions a specific instance ("salem", "Alfred", etc.) |
+| `feedback_team_lead_direct_commits.md` | Why you must commit on the worktree branch, not push, not fast-forward |
+| `feedback_session_notes_per_commit.md` | Pair every non-trivial commit with a session note (team-lead writes; you don't need to write them but know the convention exists) |
+| `feedback_surveyor_cascade_oom.md` | High-fan-out vault writes can trigger surveyor relabel cascade (already mitigated, but adjacent code still needs care) |
+
+If you're uncertain whether a memo applies to your task, ask team-lead — don't guess.

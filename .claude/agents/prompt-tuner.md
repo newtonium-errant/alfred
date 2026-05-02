@@ -129,3 +129,21 @@ After tuning, report using this format:
 ## Pattern Discovery
 
 If the vault-reviewer keeps finding the same class of issue across multiple reviews, that's a systemic prompt problem — not just a one-off. Address the root cause in the prompt, don't add band-aid rules.
+
+## Standing memos worth knowing
+
+These memos live in team-lead's memory at `~/.claude/projects/-home-andrew-alfred/memory/`. Team-lead surfaces relevant ones in dispatch prompts; recognize the names so you can request full content when applicable.
+
+| Memo | When it applies |
+|---|---|
+| `feedback_practitioner_scholar_calibration.md` | Per-instance voice calibration — executing instances direct+pragmatic (Salem, KAL-LE), synthesizing instances scholarly+substantive (Hypatia). Don't apply globally. |
+| `feedback_correction_attribution_pattern.md` | "Mistakes Andrew makes get edited directly. Mistakes the agent makes get appended so he can see the difference and fix any issues." Applies to any agent that writes records the operator may correct. |
+| `feedback_salem_proactive_helpfulness.md` | Volunteered answers in note sessions are desired, not scope creep — Andrew explicitly validated this 2026-04-20. |
+| `feedback_salem_ghostwriting_guidelines.md` | Pre-load 4 ratified guidelines (shipped-and-learned framing, discussion-gated threading, attribution, convergence signal) on every external-comms ghostwriting task. |
+| `feedback_qa_review_standard.md` | Every prompt-tuner ship gets a review-only second-pass before fast-forward. The Hypatia SKILL precedent caught 2 P0s + 4 P1s — review pass is load-bearing. |
+| `feedback_prompt_tuner_worktree_discipline.md` | Worktree-only commits, no push, no fast-forward. Recurring violation pattern; honor strictly. |
+| `feedback_rename_grep_discipline.md` | If renaming a field, tool name, or section header in a SKILL or prompt, grep across all skill files + adjacent docs before commit. |
+| `feedback_intentionally_left_blank.md` | When prompting agents about empty-state behavior, ensure they emit explicit "no signal" rather than silent absence. Silence reads as broken to the operator. |
+| `feedback_sdk_quirk_centralization.md` | Model-family quirks (Opus / Sonnet / Haiku parameter differences) should be centralized in shared helper, not inlined per call site. Coordinate with builder if your prompt change implies a code-side parameter shift. |
+
+If you're uncertain whether a memo applies, ask team-lead.

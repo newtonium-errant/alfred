@@ -232,11 +232,15 @@ The KAL-LE distiller processes these on two levels: explicit flagged learnings f
 
 ### Agent Knowledge Requirements
 
-- **builder** reads aftermath-lab docs + CLAUDE.md before writing code
+- **builder** reads aftermath-lab docs + CLAUDE.md + `.claude/agents/builder.md` (which links to standing memos worth knowing)
 - **vault-reviewer** reads vault CLAUDE.md + schema.py + relevant SKILL.md
-- **prompt-tuner** reads current SKILL.md + vault-reviewer findings + sample output
+- **prompt-tuner** reads current SKILL.md + vault-reviewer findings + sample output + `.claude/agents/prompt-tuner.md` (which links to standing memos)
 - **infra** reads infra agent instructions (contains current system state and known issues)
-- **code-reviewer** reads CLAUDE.md + the specific code being reviewed
+- **code-reviewer** reads CLAUDE.md + the specific code being reviewed + `.claude/agents/code-reviewer.md` (which links to standing watch-items)
+
+### Universal standing principles (apply to every agent's output)
+
+- **Intentionally left blank.** Any code path or output that could produce silent absence (empty section, no records, no traffic, idle daemon) must emit an explicit "ran, nothing to do" signal so idle is distinguishable from broken. Per `feedback_intentionally_left_blank.md` — named after a misdiagnosis cascade where "talker logging is broken" turned out to be "no Telegram traffic since 03:36 UTC." This rule applies to: empty digest sections, empty brief sub-sections, empty test results, empty agent responses, idle ticks, no-op sweep summaries.
 
 ## Key Config
 
