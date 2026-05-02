@@ -599,6 +599,8 @@ def wire_transport_app(
     pending_items_aggregate_path: str | Path | None = None,
     pending_items_resolve_callable: _PendingItemsResolveCallable | None = None,
     peer_inbox_callable: _PeerInboxCallable | None = None,
+    gcal_client: Any | None = None,
+    gcal_config: Any | None = None,
 ) -> None:
     """Wire all transport-app dependencies in one place.
 
@@ -638,6 +640,15 @@ def wire_transport_app(
             ``pending_items`` config block.
         peer_inbox_callable: Talker-side handler for inbound /peer/send
             relays. Wired via :func:`peer_handlers.register_peer_inbox`.
+        gcal_client: Constructed
+            :class:`alfred.integrations.gcal.GCalClient`. Required only on
+            instances that opt into the Phase A+ GCal integration (Salem;
+            future V.E.R.A. for RRTS). Pass with ``gcal_config`` together
+            or omit both — the conflict-check / sync paths short-circuit
+            when either is missing.
+        gcal_config: Typed
+            :class:`alfred.integrations.gcal_config.GCalConfig`. Carries
+            the Alfred + primary calendar IDs the handler scans.
 
     Logging: emits one info event per registered resource so a
     misconfigured instance has a single grep target
@@ -647,6 +658,7 @@ def wire_transport_app(
     # Late imports break the circular: peer_handlers imports from
     # server (config storage key constants) at module-load time.
     from .peer_handlers import (
+        register_gcal_client,
         register_instance_identity,
         register_peer_inbox,
         register_pending_items_aggregate_path,
@@ -693,6 +705,29 @@ def wire_transport_app(
     if peer_inbox_callable is not None:
         register_peer_inbox(app, peer_inbox_callable)
         log.info("transport.wire_transport_app.peer_inbox_registered")
+
+    # GCal: client + config must be paired. Either-but-not-both is a
+    # configuration error — log + skip rather than crash, but the
+    # explicit warning surfaces the half-wired state.
+    if gcal_client is not None and gcal_config is not None:
+        register_gcal_client(app, gcal_client, gcal_config)
+        log.info(
+            "transport.wire_transport_app.gcal_registered",
+            alfred_calendar_id=getattr(gcal_config, "alfred_calendar_id", ""),
+            primary_calendar_id_set=bool(
+                getattr(gcal_config, "primary_calendar_id", "")
+            ),
+        )
+    elif gcal_client is not None or gcal_config is not None:
+        log.warning(
+            "transport.wire_transport_app.gcal_partial_wiring",
+            client_set=gcal_client is not None,
+            config_set=gcal_config is not None,
+            detail=(
+                "GCal client and config must be wired together; "
+                "skipping GCal registration"
+            ),
+        )
 
 
 async def run_server(

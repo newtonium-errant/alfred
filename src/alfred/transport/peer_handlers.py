@@ -92,6 +92,17 @@ _KEY_PEER_INBOX = "transport.peer_inbox"
 # Application-storage key for the vault path (needed for /canonical).
 _KEY_VAULT_PATH = "transport.vault_path"
 
+# Application-storage keys for the GCal integration (Phase A+).
+# ``_KEY_GCAL_CLIENT`` holds a constructed
+# :class:`alfred.integrations.gcal.GCalClient` — ``None`` / unset means
+# GCal is disabled for this instance and conflict-check / sync skip the
+# GCal code paths entirely.
+# ``_KEY_GCAL_CONFIG`` holds the typed
+# :class:`alfred.integrations.gcal_config.GCalConfig` so handlers can
+# read the calendar IDs without re-loading config.yaml.
+_KEY_GCAL_CLIENT = "transport.gcal_client"
+_KEY_GCAL_CONFIG = "transport.gcal_config"
+
 
 PeerInboxCallable = Callable[..., Awaitable[dict[str, Any]]]
 
@@ -1465,13 +1476,116 @@ def _scan_event_conflicts(
             or md_file.stem
         )
         rel_path = f"event/{md_file.name}"
-        conflicts.append({
+        entry: dict[str, Any] = {
             "title": str(title),
             "start": ev_start.isoformat(),
             "end": ev_end.isoformat(),
+            "source": "vault",
             "path": rel_path,
-        })
+        }
+        # Phase A+: vault records that were synced to GCal carry the
+        # remote event ID in frontmatter. Surface it so the merged
+        # conflict-list dedup can drop the corresponding gcal_alfred
+        # mirror — without this, the same logical event shows up twice.
+        gcal_event_id = fm.get("gcal_event_id")
+        if isinstance(gcal_event_id, str) and gcal_event_id:
+            entry["gcal_event_id"] = gcal_event_id
+        conflicts.append(entry)
     return conflicts
+
+
+def _scan_gcal_conflicts(
+    request: web.Request,
+    proposed_start: datetime,
+    proposed_end: datetime,
+    correlation_id: str,
+) -> list[dict[str, Any]]:
+    """Query Andrew's GCal for events overlapping the proposed window.
+
+    Phase A+ inter-instance comms. Salem maintains a vault-only conflict
+    map by default (see :func:`_scan_event_conflicts`). When GCal is
+    enabled, we additionally query:
+
+      * **Alfred Calendar** (R/W) — the dedicated calendar Salem writes
+        to. Anything Salem has previously synced lands here. Source
+        tagged ``gcal_alfred``.
+      * **Primary calendar** (R/O by application policy) — Andrew's own
+        meetings he scheduled directly. Source tagged ``gcal_primary``.
+
+    The proposing instance + Andrew get the source tag in each conflict
+    entry so "you have a primary-calendar meeting at this time" reads
+    better than just "you have a meeting".
+
+    Defensive: any GCal API failure is logged + dropped — the conflict
+    check falls back to vault-only rather than failing the whole event
+    proposal. The trade-off: under a Google outage, Salem might
+    successfully create a vault event that conflicts with a real
+    primary-calendar meeting. The alternative (fail-closed) would block
+    every event proposal during any GCal hiccup. Vault-and-Alfred-cal
+    sync still catches the case for next time once GCal recovers.
+    Returning the empty-list-with-warning shape lets the operator grep
+    ``transport.canonical.event_propose_gcal_failed`` to spot the gap.
+    """
+    client = request.app.get(_KEY_GCAL_CLIENT)
+    config = request.app.get(_KEY_GCAL_CONFIG)
+    if client is None or config is None or not config.enabled:
+        # GCal not configured for this instance — explicit "did nothing"
+        # signal so the caller knows the empty list is "vault-only by
+        # design", not "GCal silently misbehaved" (per
+        # ``feedback_intentionally_left_blank.md``).
+        log.debug(
+            "transport.canonical.event_propose_gcal_skipped",
+            reason="not_configured",
+            correlation_id=correlation_id,
+        )
+        return []
+
+    from alfred.integrations.gcal import (
+        GCalError,
+        event_to_conflict_dict,
+    )
+
+    out: list[dict[str, Any]] = []
+
+    # Alfred calendar — Salem's writable target.
+    if config.alfred_calendar_id:
+        try:
+            events = client.list_events(
+                config.alfred_calendar_id,
+                proposed_start,
+                proposed_end,
+            )
+        except GCalError as exc:
+            log.warning(
+                "transport.canonical.event_propose_gcal_failed",
+                calendar="alfred",
+                error=str(exc),
+                correlation_id=correlation_id,
+            )
+            events = []
+        for ev in events:
+            out.append(event_to_conflict_dict(ev, source="gcal_alfred"))
+
+    # Primary calendar — read-only by policy.
+    if config.primary_calendar_id:
+        try:
+            events = client.list_events(
+                config.primary_calendar_id,
+                proposed_start,
+                proposed_end,
+            )
+        except GCalError as exc:
+            log.warning(
+                "transport.canonical.event_propose_gcal_failed",
+                calendar="primary",
+                error=str(exc),
+                correlation_id=correlation_id,
+            )
+            events = []
+        for ev in events:
+            out.append(event_to_conflict_dict(ev, source="gcal_primary"))
+
+    return out
 
 
 # Filename slug builder. Event filenames are the title plus an ISO date
@@ -1644,7 +1758,38 @@ async def _handle_canonical_event_propose_create(
         )
 
     # --- Conflict-check -----------------------------------------------------
-    conflicts = _scan_event_conflicts(vault_path, start_dt, end_dt)
+    # Vault is the local source of truth. GCal (when configured) extends
+    # the visibility to Andrew's actual schedule on his phone — without
+    # it, Salem can happily schedule an Alfred event into the same hour
+    # as a real primary-calendar work meeting. Each entry in the merged
+    # list carries a ``source`` field so the caller can render the
+    # right context ("you have a primary-calendar meeting" vs "you have
+    # a vault event").
+    #
+    # GCal failures degrade gracefully: a Google API outage falls back
+    # to vault-only conflict-check rather than blocking every event
+    # proposal. See ``_scan_gcal_conflicts`` for the trade-off note.
+    vault_conflicts = _scan_event_conflicts(vault_path, start_dt, end_dt)
+    gcal_conflicts = _scan_gcal_conflicts(
+        request, start_dt, end_dt, correlation_id,
+    )
+    # Dedup vault-already-synced-to-gcal-alfred records: when commit 3
+    # ships, every vault event has a ``gcal_event_id`` in frontmatter
+    # pointing at its mirror on the Alfred calendar. The same logical
+    # event would otherwise show up twice (once vault, once gcal_alfred)
+    # in the conflict list. Filter gcal_alfred entries whose ID matches
+    # any vault entry's gcal_event_id.
+    vault_synced_ids = {
+        c["gcal_event_id"]
+        for c in vault_conflicts
+        if c.get("gcal_event_id")
+    }
+    if vault_synced_ids:
+        gcal_conflicts = [
+            c for c in gcal_conflicts
+            if c.get("gcal_event_id") not in vault_synced_ids
+        ]
+    conflicts = vault_conflicts + gcal_conflicts
     if conflicts:
         append_audit(
             audit_path,
@@ -1657,6 +1802,8 @@ async def _handle_canonical_event_propose_create(
             peer=peer,
             title=title[:80],
             conflict_count=len(conflicts),
+            vault_conflicts=len(vault_conflicts),
+            gcal_conflicts=len(gcal_conflicts),
             correlation_id=correlation_id,
         )
         return web.json_response({
@@ -1828,3 +1975,28 @@ def register_instance_identity(
     """Stash the instance identity for /peer/handshake responses."""
     app["transport.instance_name"] = name
     app["transport.instance_alias"] = alias
+
+
+def register_gcal_client(
+    app: web.Application,
+    client: Any,
+    config: Any,
+) -> None:
+    """Wire a Google Calendar client + config onto the transport app.
+
+    Phase A+ inter-instance comms. The conflict-check + sync-on-create
+    paths in :func:`_handle_canonical_event_propose_create` look up
+    these two app keys; either being absent / ``None`` makes those
+    paths skip the GCal code (vault-only behaviour, same as before
+    Phase A+ shipped).
+
+    ``client`` is an :class:`alfred.integrations.gcal.GCalClient` (or
+    a stub for tests). ``config`` is the typed
+    :class:`alfred.integrations.gcal_config.GCalConfig`.
+
+    Loose typing on the params avoids importing from
+    ``alfred.integrations`` at module load — the transport module
+    needs to load on instances that didn't pip-install ``[gcal]``.
+    """
+    app[_KEY_GCAL_CLIENT] = client
+    app[_KEY_GCAL_CONFIG] = config
