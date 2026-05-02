@@ -177,8 +177,10 @@ Each agent reads `.claude/agents/{name}.md` for their specific instructions.
 
 ### Agent Lifecycle
 
-- **Persistent agents** — spawn vault-reviewer and builder at session start. Keep alive via SendMessage. Don't respawn per task.
-- **On-demand agents** — spawn prompt-tuner, infra, code-reviewer when needed.
+- **Spawn at session start** — vault-reviewer and builder. These two are consistently used in nearly every session; the cold-start cost is justified by guaranteed activity. Don't preemptively spawn the others.
+- **On-demand spawn for the rest** — prompt-tuner, infra, code-reviewer. Spawn only when the session needs them. Many sessions don't.
+- **Persist any spawned agent for the rest of the session.** Once an agent is alive (whether session-start or on-demand), keep it alive via `SendMessage` for ALL follow-up work, even when the next task is unrelated to the original. **Do NOT respawn agents during a session.** Per `feedback_sendmessage_persistence_value.md` (Andrew observation 2026-05-02): agents self-curate context on each reset (keep what helps, drop what doesn't); the accumulated codebase familiarity / pattern recognition / recent decisions net-positive on subsequent SendMessages even when the new task differs from the original. The naive "fresh-spawn for unrelated work" instinct is wrong.
+- **Reserve fresh-spawn for**: (a) genuinely new agent role (no existing agent of that type alive), (b) cross-cutting work where context contamination would actively harm output (rare), (c) when the existing agent reports being stuck/wedged. Default is SendMessage to existing agent.
 - **Concurrent reviews** — vault-reviewer reviews each piece of work as it's completed, not batched at session end.
 - **Feedback loop** — vault-reviewer findings inform prompt-tuner changes, which the builder may need to support with code changes. This cycle is how Alfred improves.
 
