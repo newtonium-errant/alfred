@@ -51,9 +51,10 @@ from . import (
     speed_pref,
     transcribe,
     tts as tts_mod,
+    vision,
 )
 from .config import TalkerConfig
-from .session import Session, append_outbound_failure
+from .session import Session, append_image, append_outbound_failure
 from .state import StateManager
 from .utils import get_logger
 
@@ -210,6 +211,14 @@ def build_app(
     app.add_handler(CommandHandler("calibration_ok", on_calibration_ok))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
+    # Vision phase 2: photo handler. ``filters.PHOTO`` matches Telegram
+    # ``photo`` updates (multi-resolution screenshots / camera-roll
+    # uploads). Forwarded documents (any image attached as a file rather
+    # than a Telegram-compressed photo) take a separate ``filters.Document
+    # .IMAGE`` path which is out-of-scope for this commit — Andrew's
+    # screenshot-share workflow goes through the photo path. Per-instance
+    # ``vision.enabled=false`` short-circuits with a user-facing reply.
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
 
     return app
 
@@ -1476,6 +1485,120 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_message(update, ctx, text=text, voice=True)
 
 
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Photo message entry point — gate, download, save, dispatch.
+
+    Mirrors the ``on_voice`` shape: allowlist check, log inbound, fetch
+    bytes, then hand off to :func:`handle_message` with the multimodal
+    ``image_blocks`` list. Per-instance ``vision.enabled`` gates the
+    whole path so a PHI-sensitive instance with vision disabled never
+    downloads, never persists, and never reaches Anthropic — the user
+    gets the configured ``disabled_reply`` text instead.
+
+    Caption text (or a default placeholder when the user sent the photo
+    bare) becomes the user-message text; the image block(s) are paired
+    with it via ``vision.build_user_content`` inside ``run_turn``.
+
+    Per ``feedback_intentionally_left_blank.md`` — every failure path
+    here emits an explicit user-facing reply, never silent drop.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        log.info(
+            "talker.bot.unauthorized",
+            user_id=update.effective_user.id if update.effective_user else None,
+            kind="photo",
+        )
+        return
+    if update.message is None or not update.message.photo:
+        return
+
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    photo_count = len(update.message.photo)
+    log.info(
+        "talker.bot.inbound",
+        chat_id=chat_id,
+        user_id=update.effective_user.id if update.effective_user else None,
+        kind="photo",
+        photo_sizes=photo_count,
+        has_caption=bool(update.message.caption),
+    )
+    # Idle-tick heartbeat counter is bumped by the application-level
+    # ``_pre_record_inbound`` pre-pass (group=-1) — see ``on_text``.
+
+    # Vision-disabled gate. ``vision.enabled=false`` (or ``vision``
+    # missing in config — defaulted-on dataclass keeps it true) replies
+    # with the configured user-visible text so the user knows the photo
+    # was received and ignored, not silently dropped.
+    if not config.vision.enabled:
+        log.info(
+            "talker.bot.vision_disabled_drop",
+            chat_id=chat_id,
+            instance=config.instance.name,
+        )
+        await update.message.reply_text(config.vision.disabled_reply)
+        return
+
+    # Pick the largest resolution and download bytes. Wrapped in one
+    # try/except so any download / decoding failure produces one clear
+    # user-facing reply instead of a stack trace.
+    try:
+        chosen = vision.select_largest_photo(list(update.message.photo))
+        image_bytes = await vision.download_photo_bytes(chosen)
+    except vision.VisionDownloadError as exc:
+        log.warning("talker.bot.photo_download_failed", error=str(exc))
+        await update.message.reply_text(
+            "sorry, couldn't fetch the screenshot — try sending it again?"
+        )
+        return
+
+    # Persist to <vault>/inbox/ for audit trail. Persistence failure is
+    # treated as recoverable: the model can still see the image (we have
+    # the bytes in memory). We log the failure and continue rather than
+    # block the conversation — the user-visible behaviour (Andrew gets a
+    # reply about his screenshot) matters more than the audit trail
+    # being complete on every single message.
+    file_unique_id = getattr(chosen, "file_unique_id", "") or ""
+    saved_path: str | None = None
+    try:
+        saved = vision.save_image_to_inbox(
+            image_bytes,
+            config.vault.path,
+            file_unique_id,
+        )
+        saved_path = str(saved)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.photo_save_failed",
+            error=str(exc),
+            vault_path=config.vault.path,
+        )
+        # Continue — image is still in memory and will reach the model.
+
+    # Build the Anthropic content block from the in-memory bytes.
+    image_block = vision.build_image_block(image_bytes)
+
+    # Caption text: use the user's caption verbatim, or a neutral
+    # placeholder when none was provided. The placeholder is short and
+    # explicit — better than feeding the model an empty string (which
+    # Anthropic accepts but produces meandering replies).
+    caption = (update.message.caption or "").strip()
+    if not caption:
+        caption = "(image attached, no caption)"
+
+    await handle_message(
+        update, ctx,
+        text=caption,
+        voice=False,
+        image_blocks=[image_block],
+        image_metadata=[{
+            "path": saved_path,
+            "file_unique_id": file_unique_id,
+            "bytes": len(image_bytes),
+        }] if saved_path else [],
+    )
+
+
 # --- Shared pipeline ------------------------------------------------------
 
 
@@ -2383,12 +2506,24 @@ async def handle_message(
     ctx: ContextTypes.DEFAULT_TYPE,
     text: str,
     voice: bool = False,
+    image_blocks: list[dict[str, Any]] | None = None,
+    image_metadata: list[dict[str, Any]] | None = None,
 ) -> None:
     """Shared pipeline — open/reuse session, run Anthropic turn, reply.
 
     Serialises calls per chat_id via a shared asyncio.Lock: two messages
     from the same chat must not hit Anthropic in parallel because they'd
     race on the session transcript and double-increment counters.
+
+    ``image_blocks`` (vision phase 2) is a list of pre-built Anthropic
+    image content blocks. When non-empty, the user turn is composed as
+    a multimodal content list (image-then-text) and threaded through
+    ``run_turn`` via the ``image_blocks`` kwarg. ``image_metadata`` is
+    the parallel list of ``{path, file_unique_id, bytes}`` dicts; we
+    record one ``append_image`` row per entry against the active session
+    so the saved-file paths land on the session-record frontmatter at
+    close time. ``None`` / empty preserves the wk1 single-modal flow
+    byte-for-byte.
     """
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
     state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
@@ -2575,6 +2710,24 @@ async def handle_message(
         calibration_str = active_for_turn.get("_calibration_snapshot")
         active_session_type = active_for_turn.get("_session_type", "note")
 
+        # Vision: record image-attachment metadata against the session
+        # BEFORE ``run_turn`` is called. ``append_image`` uses
+        # ``len(transcript)`` as the would-be turn_index, which will
+        # match the user turn that ``run_turn`` is about to append next.
+        # Doing this before the LLM call means the saved-path lands in
+        # state even if the API call fails — the audit trail is preserved.
+        if image_metadata:
+            for meta in image_metadata:
+                if not meta.get("path"):
+                    continue
+                append_image(
+                    state_mgr,
+                    sess,
+                    path=meta["path"],
+                    file_unique_id=meta.get("file_unique_id", ""),
+                    bytes_size=int(meta.get("bytes", 0) or 0),
+                )
+
         try:
             response_text = await conversation.run_turn(
                 client=client,
@@ -2592,6 +2745,7 @@ async def handle_message(
                 calibration_str=calibration_str,
                 pushback_level=pushback_level,
                 session_type=active_session_type,
+                image_blocks=image_blocks,
             )
         except anthropic.APIError as exc:
             log.warning(

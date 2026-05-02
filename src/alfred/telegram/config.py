@@ -158,6 +158,35 @@ class IdleTickConfig:
 
 
 @dataclass
+class VisionConfig:
+    """Per-instance vision (image-message) gate for the Telegram bot.
+
+    When ``enabled=True`` (the default for Salem / Hypatia / KAL-LE — all on
+    Claude 4.x with native vision), Telegram ``photo`` messages download,
+    save to ``<vault.path>/inbox/screenshot-<...>.jpg``, and pass into the
+    Anthropic Messages API as a multimodal user content block.
+
+    When ``enabled=False`` the photo handler short-circuits with a
+    user-facing reply explaining vision is off. Gating exists so future
+    PHI-sensitive instances (V.E.R.A. / STAY-C) can default to ``false``
+    until a PHI-firewall design lands. Per
+    ``feedback_intentionally_left_blank.md``: never silently drop — always
+    tell the user what happened.
+
+    See ``project_image_vision_support.md`` for the deferred-Phase-2 plan
+    this implements.
+    """
+
+    enabled: bool = True
+    # User-facing reply when ``enabled=False``. Operator-tunable so the
+    # PHI-firewall instances can phrase the gate in their own voice.
+    disabled_reply: str = (
+        "Sorry — image messages aren't enabled for this instance. "
+        "Please describe the screenshot in text and I'll help."
+    )
+
+
+@dataclass
 class BashExecConfig:
     """KAL-LE's ``bash_exec`` tool config.
 
@@ -198,6 +227,11 @@ class TalkerConfig:
     # via the dataclass default_factory; absent block in YAML keeps
     # ``enabled=True`` / ``interval_seconds=60``.
     idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
+    # Vision (image-message) gate — see :class:`VisionConfig`. Default-on
+    # for current 3 live instances (all Claude 4.x); absent block keeps
+    # ``enabled=True``. Future PHI-sensitive instances flip to false in
+    # config until a PHI-firewall design lands.
+    vision: VisionConfig = field(default_factory=VisionConfig)
     # Path to the config file this TalkerConfig was loaded from. Carried
     # so lazy/late loaders (notably the inter-instance peer-tool dispatcher
     # in ``conversation._dispatch_peer_inter_instance_tool``) can re-read
@@ -225,6 +259,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "tts": TtsConfig,
     "bash_exec": BashExecConfig,
     "idle_tick": IdleTickConfig,
+    "vision": VisionConfig,
 }
 
 
@@ -295,6 +330,12 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     idle_raw = tool.get("idle_tick")
     if isinstance(idle_raw, dict):
         built.idle_tick = _build(IdleTickConfig, idle_raw)
+    # Vision — defaulted-on; partial-dict merge mirrors idle_tick. A
+    # YAML block of ``vision: {enabled: false}`` preserves the default
+    # ``disabled_reply`` text without forcing the operator to copy it.
+    vision_raw = tool.get("vision")
+    if isinstance(vision_raw, dict):
+        built.vision = _build(VisionConfig, vision_raw)
     # Synthetic ``_config_path`` key — set by the CLI in ``cmd_up`` /
     # other entry points before handing ``raw`` to the orchestrator,
     # carried through ``multiprocessing`` pickling to subprocess
