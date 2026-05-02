@@ -321,6 +321,10 @@ _ACCEPTABLE_STATUSES = {
     405, 409, 415, 422,      # method/conflict/media/schema
     501, 503,                # not-implemented / not-configured
 }
+# 502 deliberately omitted — it means a wired callable raised
+# (peer_inbox_error, pending_resolver_error, etc.). The smoke stubs
+# above always succeed, so a 502 here means a stub regression that
+# deserves smoke failure rather than silent acceptance.
 
 
 async def test_no_route_returns_500_with_full_wiring(  # type: ignore[no-untyped-def]
@@ -476,6 +480,50 @@ async def test_smoke_catches_missing_vault_path_wiring(  # type: ignore[no-untyp
     )
     assert "vault_not_configured" in body, (
         f"500 returned but body lacked vault_not_configured marker: {body!r}"
+    )
+
+    # Positive control: the SAME route on a fully-wired app returns
+    # non-500. Without this half, the test would still pass if a future
+    # change removed /peer/brief_digest entirely from the route surface
+    # (the negative case proves "without vault_path → 500" but says
+    # nothing about whether vault_path is the actual remedy). Pinning
+    # both halves keeps the regression class self-contained: this one
+    # test proves the bug class exists AND is fixed by the right wiring.
+    config_wired = _build_full_config()
+    state_wired = _build_state(tmp_path / "wired")
+    aggregate_wired = tmp_path / "aggregate_wired.jsonl"
+    aggregate_wired.write_text("", encoding="utf-8")
+    vault_wired = tmp_path / "vault_wired"
+    (vault_wired / "person").mkdir(parents=True)
+    (vault_wired / "event").mkdir(parents=True)
+
+    app_wired = build_app(config_wired, state_wired)
+    wire_transport_app(
+        app_wired,
+        config_wired,
+        instance_name="smoke-instance",
+        vault_path=vault_wired,
+        send_fn=_stub_send,
+        pending_items_aggregate_path=str(aggregate_wired),
+        pending_items_resolve_callable=_stub_resolver,
+        peer_inbox_callable=_stub_peer_inbox,
+    )
+    client_wired = await aiohttp_client(app_wired)
+    resp_wired = await client_wired.post(
+        "/peer/brief_digest",
+        headers=headers,
+        data=json.dumps({
+            "peer": "smoke-peer",
+            "date": "2026-05-02",
+            "digest_markdown": "smoke digest body content",
+        }),
+    )
+    body_wired = await resp_wired.text()
+    assert resp_wired.status != 500, (
+        f"With vault_path wired, /peer/brief_digest must NOT 500. "
+        f"Got status={resp_wired.status} body={body_wired[:300]!r}. "
+        f"If this fires, the structural fix has regressed and the "
+        f"negative-control half above is no longer a meaningful proof."
     )
 
 

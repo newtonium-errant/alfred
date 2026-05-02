@@ -363,7 +363,13 @@ async def run(
             transport_app,
             transport_config,
             instance_name=config.instance.name,
-            instance_alias=(config.instance.aliases[0] if config.instance.aliases else ""),
+            # instance_alias deliberately omitted — InstanceConfig.aliases is a
+            # router accept-list (case-insensitive variant matching like
+            # "Salem"→S.A.L.E.M., "Pat"→Hypatia), not a display alias.
+            # Picking aliases[0] would advertise a router variant as a primary
+            # name (e.g. "Kali" for KAL-LE). When a real consumer needs a
+            # display alias, add an explicit InstanceConfig.display_alias
+            # field rather than repurposing aliases[0].
             vault_path=Path(config.vault.path),
             send_fn=_send_via_telegram,
             pending_items_aggregate_path=pending_items_aggregate_path,
