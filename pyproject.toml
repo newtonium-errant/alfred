@@ -58,7 +58,25 @@ dev = [
     "pytest-aiohttp>=1.0",
 ]
 test = ["pytest>=8.0", "pytest-asyncio>=0.23"]
-all = ["alfred-vault[surveyor]", "alfred-vault[temporal]", "alfred-vault[voice]"]
+# Phase A+ inter-instance comms: Salem queries Andrew's Google Calendar
+# (Alfred + primary) for event conflict-check and pushes accepted events
+# to the Alfred calendar so they land on his phone. The official Google
+# libraries are bulky but well-maintained — better than rolling raw REST
+# + custom OAuth refresh. Default-disabled in config; only Salem (or
+# future calendar-aware instances like V.E.R.A.) opt in. The ``gcal``
+# block in config.yaml is gate-checked before any of these are imported,
+# so an instance that doesn't enable GCal pays no import cost.
+gcal = [
+    "google-auth>=2.30",
+    "google-auth-oauthlib>=1.2",
+    "google-api-python-client>=2.140",
+]
+all = [
+    "alfred-vault[surveyor]",
+    "alfred-vault[temporal]",
+    "alfred-vault[voice]",
+    "alfred-vault[gcal]",
+]
 
 [project.urls]
 Homepage = "https://github.com/ssdavidai/alfred"
