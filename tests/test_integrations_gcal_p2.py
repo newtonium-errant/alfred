@@ -17,7 +17,6 @@ Coverage:
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -378,27 +377,35 @@ def test_register_gcal_intended_on_sets_storage_key(tmp_path):
 
 
 async def test_intended_on_skip_logs_warning_in_conflict_check(  # type: ignore[no-untyped-def]
-    app_factory, caplog,
+    app_factory,
 ):
-    """Conflict-check skip with sentinel set → WARNING log; without → no warning.
+    """Conflict-check skip with sentinel set → warning event; without → no warning.
 
     The handler still returns a clean 201 (vault-only flow); only the
     log signal differs. This is the operator-visibility fix.
 
-    Uses the canonical structlog+caplog pattern from
-    ``tests/test_vault_dont_scan_index_split.py``:
-      * ``caplog.at_level(logging.WARNING, logger=...)`` scopes capture
-        to the right logger.
-      * ``r.getMessage()`` formats record.msg % record.args — necessary
-        because structlog routes the rendered event name through
-        ``record.args`` (or the formatter), not ``record.message``,
-        which holds only the unrendered template.
+    Uses :func:`structlog.testing.capture_logs` rather than pytest's
+    ``caplog`` because the warning fires from inside aiohttp's request
+    handler (event-loop coroutine). Pytest's ``caplog`` intercepts via
+    the root stdlib logger's handler chain, but this codebase's
+    ``alfred.transport.utils.get_logger`` returns a structlog
+    BoundLogger configured with ``LoggerFactory()`` + ``ConsoleRenderer``
+    — the rendered output reaches stdout via the formatter but the
+    intermediate ``LogRecord`` doesn't reliably propagate up to
+    caplog's handler when emit happens off the test thread (aiohttp
+    request handlers run in the test client's task).
+
+    ``capture_logs`` hooks structlog's processor pipeline directly, so
+    it sees every event structlog emits regardless of stdlib's
+    plumbing or which thread/task does the emit. Each captured entry
+    is a dict with keys like ``event`` (the first positional arg to
+    ``log.warning(...)``), ``log_level``, plus every bound kwarg.
     """
+    from structlog.testing import capture_logs
+
     # Sentinel set, no client wired (simulates startup-failure state).
     client = await app_factory(gcal_intended_on=True)
-    with caplog.at_level(
-        logging.WARNING, logger="alfred.transport.peer_handlers",
-    ):
+    with capture_logs() as captured:
         resp = await client.post(
             "/canonical/event/propose-create",
             json={
@@ -414,30 +421,39 @@ async def test_intended_on_skip_logs_warning_in_conflict_check(  # type: ignore[
             },
         )
     assert resp.status == 201
-    # Warning log emitted for both phases (conflict_check + sync).
-    warning_messages = [
-        r.getMessage() for r in caplog.records
-        if r.levelno >= logging.WARNING
-        and "skipped_but_intended_on" in r.getMessage()
+    # Warning event emitted for both phases (conflict_check + sync).
+    warnings = [
+        c for c in captured
+        if c.get("log_level") == "warning"
+        and "skipped_but_intended_on" in c.get("event", "")
     ]
-    # At least one warning across the two skip sites.
-    assert len(warning_messages) >= 1, (
-        f"expected ≥1 'skipped_but_intended_on' warning, got 0. "
-        f"Captured records: {[r.getMessage() for r in caplog.records]}"
+    assert len(warnings) >= 1, (
+        f"expected >=1 'skipped_but_intended_on' warning, got 0. "
+        f"Captured events: {[c.get('event') for c in captured]}"
     )
+    # Bonus: confirm the structured fields the operator hint relies on
+    # actually made it onto the event (catches a regression where the
+    # hint kwarg gets renamed or dropped).
+    first = warnings[0]
+    assert "hint" in first, f"missing hint kwarg on warning: {first}"
+    assert "alfred gcal status" in first["hint"]
 
 
-async def test_no_sentinel_skip_stays_quiet(app_factory, caplog):  # type: ignore[no-untyped-def]
-    """No sentinel + no client → DEBUG-only skip (no warning spam).
+async def test_no_sentinel_skip_stays_quiet(app_factory):  # type: ignore[no-untyped-def]
+    """No sentinel + no client → no ``skipped_but_intended_on`` warning.
 
-    Same canonical structlog+caplog pattern as the test above —
-    ``r.getMessage()`` rather than ``r.message`` so the assertion
-    actually inspects rendered output.
+    Same ``capture_logs`` pattern as the sibling test — pytest
+    ``caplog`` doesn't see structlog events emitted from aiohttp
+    request handlers in this codebase (see sibling test's docstring
+    for the full diagnosis). Asserting absence is even more sensitive
+    to the capture mechanism than asserting presence, because a
+    coincidentally-empty ``caplog.records`` would pass the test for
+    the wrong reason.
     """
+    from structlog.testing import capture_logs
+
     client = await app_factory()  # no client, no sentinel
-    with caplog.at_level(
-        logging.DEBUG, logger="alfred.transport.peer_handlers",
-    ):
+    with capture_logs() as captured:
         resp = await client.post(
             "/canonical/event/propose-create",
             json={
@@ -455,14 +471,14 @@ async def test_no_sentinel_skip_stays_quiet(app_factory, caplog):  # type: ignor
     assert resp.status == 201
     # No "intended_on" warning emitted.
     intended_warnings = [
-        r for r in caplog.records
-        if r.levelno >= logging.WARNING
-        and "skipped_but_intended_on" in r.getMessage()
+        c for c in captured
+        if c.get("log_level") == "warning"
+        and "skipped_but_intended_on" in c.get("event", "")
     ]
     assert intended_warnings == [], (
         f"expected 0 'skipped_but_intended_on' warnings (sentinel "
         f"not set), got {len(intended_warnings)}: "
-        f"{[r.getMessage() for r in intended_warnings]}"
+        f"{[c.get('event') for c in intended_warnings]}"
     )
 
 
