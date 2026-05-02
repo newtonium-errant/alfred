@@ -12,6 +12,9 @@ mode: quick
 name: Alfred BIT 2026-04-25
 overall_status: warn
 process: '[[process/Alfred BIT]]'
+related_orgs:
+- org/TIXR.md
+- org/Halifax Music Fest.md
 relationships:
 - confidence: 1
   context: Same Alfred BIT run series

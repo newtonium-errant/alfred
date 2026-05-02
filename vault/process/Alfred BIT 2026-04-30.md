@@ -12,6 +12,9 @@ mode: quick
 name: Alfred BIT 2026-04-30
 overall_status: ok
 process: '[[process/Alfred BIT]]'
+related_orgs:
+- org/TIXR.md
+- org/Halifax Music Fest.md
 relationships:
 - confidence: 1
   context: Shared date range and Alfred BIT process

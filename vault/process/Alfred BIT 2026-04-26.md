@@ -12,6 +12,9 @@ mode: quick
 name: Alfred BIT 2026-04-26
 overall_status: ok
 process: '[[process/Alfred BIT]]'
+related_orgs:
+- org/TIXR.md
+- org/Halifax Music Fest.md
 started: '2026-04-26T05:55:02.200569-03:00'
 status: completed
 tags:

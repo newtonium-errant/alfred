@@ -67,6 +67,9 @@ janitor_note: LINK001 — scanner false positive on YAML-escaped apostrophe; tar
   in autofix.py; logging warning.
 project:
 - '[[project/Alfred]]'
+related_orgs:
+- org/TIXR.md
+- org/Halifax Music Fest.md
 status: draft
 subtype: draft
 tags:

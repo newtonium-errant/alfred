@@ -207,6 +207,9 @@ janitor_note: 'LINK001 — three broken wikilinks in distiller_learnings: two ar
   FM001/DIR001 also flagged by scanner but those codes are autofix-handled.'
 project:
 - '[[project/Alfred]]'
+related_orgs:
+- org/TIXR.md
+- org/Halifax Music Fest.md
 relationships:
 - confidence: 0.85
   context: Shared process topic

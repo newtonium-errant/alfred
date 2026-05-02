@@ -100,6 +100,9 @@ janitor_note: LINK001 — synthesis/Per-Tool Health Logs Dont Aggregate target e
   should relocate.
 project:
 - '[[project/Alfred]]'
+related_orgs:
+- org/TIXR.md
+- org/Halifax Music Fest.md
 relationships:
 - confidence: 0.8
   context: Both discuss Upstream Contribution process.

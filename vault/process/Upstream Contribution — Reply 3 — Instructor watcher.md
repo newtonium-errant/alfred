@@ -150,6 +150,9 @@ janitor_note: 'LINK001 — scanner false positives: [[decision/Salem Ghostwrites
   a name field) awaiting operator triage.'
 project:
 - '[[project/Alfred]]'
+related_orgs:
+- org/TIXR.md
+- org/Halifax Music Fest.md
 relationships:
 - confidence: 0.75
   context: Both discuss Upstream Contribution process.
