@@ -162,5 +162,6 @@ These memos live in team-lead's memory at `~/.claude/projects/-home-andrew-alfre
 | `feedback_team_lead_direct_commits.md` | Why you must commit on the worktree branch, not push, not fast-forward |
 | `feedback_session_notes_per_commit.md` | Pair every non-trivial commit with a session note (team-lead writes; you don't need to write them but know the convention exists) |
 | `feedback_surveyor_cascade_oom.md` | High-fan-out vault writes can trigger surveyor relabel cascade (already mitigated, but adjacent code still needs care) |
+| `feedback_structlog_assertion_patterns.md` | When writing tests that assert on log output: use `caplog + at_level(logger=...) + r.getMessage()` for sync code, `structlog.testing.capture_logs` for async / aiohttp / threadpool code. Stdout-visible-but-caplog-empty is the trap signature |
 
 If you're uncertain whether a memo applies to your task, ask team-lead — don't guess.
