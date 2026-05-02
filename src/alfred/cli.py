@@ -685,6 +685,42 @@ def cmd_transport(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def cmd_gcal(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred gcal`` subcommands.
+
+    Phase A+ inter-instance comms: Google Calendar integration. The
+    three subcommands (authorize / status / test-write) are operator
+    tools — Salem's daemon doesn't invoke them. They live behind the
+    main CLI so the operator setup flow is uniform with every other
+    Alfred capability.
+
+    JSON output is supported for ``status`` and ``test-write`` so a
+    setup script can pipe the result through ``jq`` for validation.
+    """
+    raw = _load_unified_config(args.config)
+    wants_json = bool(getattr(args, "json", False))
+    _setup_logging_from_config(
+        raw, tool="gcal", suppress_stdout=wants_json,
+    )
+
+    from alfred.integrations import gcal_cli
+
+    subcmd = getattr(args, "gcal_cmd", None)
+    if subcmd == "authorize":
+        sys.exit(gcal_cli.cmd_authorize(raw))
+    if subcmd == "status":
+        sys.exit(gcal_cli.cmd_status(raw, wants_json=wants_json))
+    if subcmd == "test-write":
+        sys.exit(gcal_cli.cmd_test_write(
+            raw,
+            cleanup=not getattr(args, "no_cleanup", False),
+            wants_json=wants_json,
+        ))
+
+    print("Usage: alfred gcal {authorize|status|test-write}")
+    sys.exit(1)
+
+
 def cmd_reviews(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred reviews`` subcommands.
 
@@ -1894,6 +1930,37 @@ def build_parser() -> argparse.ArgumentParser:
     mail_webhook.add_argument("--port", type=int, default=5005, help="Port to listen on (default: 5005)")
     mail_webhook.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
 
+    # gcal (Phase A+ inter-instance comms — Google Calendar integration)
+    gcal_p = sub.add_parser(
+        "gcal",
+        help="Google Calendar integration (authorize / status / test-write)",
+    )
+    gcal_sub = gcal_p.add_subparsers(dest="gcal_cmd")
+    gcal_sub.add_parser(
+        "authorize",
+        help="One-time OAuth flow — opens browser, saves token to disk",
+    )
+    gcal_status_p = gcal_sub.add_parser(
+        "status",
+        help="Show GCal config + token state + next-24h event counts",
+    )
+    gcal_status_p.add_argument(
+        "--json", action="store_true", default=False,
+        help="Emit machine-readable JSON instead of human-readable output",
+    )
+    gcal_test_p = gcal_sub.add_parser(
+        "test-write",
+        help="Create a throwaway test event on the Alfred calendar",
+    )
+    gcal_test_p.add_argument(
+        "--no-cleanup", action="store_true", default=False,
+        help="Leave the test event in place (visible on your phone)",
+    )
+    gcal_test_p.add_argument(
+        "--json", action="store_true", default=False,
+        help="Emit machine-readable JSON instead of human-readable output",
+    )
+
     # audit (calibration audit gap, c3 retroactive sweep CLI)
     from alfred.audit import cli as audit_cli
     audit_cli.build_parser(sub)
@@ -1946,6 +2013,7 @@ def main() -> None:
         "audit": cmd_audit,
         "reviews": cmd_reviews,
         "digest": cmd_digest,
+        "gcal": cmd_gcal,
     }
 
     handler = handlers.get(args.command)
