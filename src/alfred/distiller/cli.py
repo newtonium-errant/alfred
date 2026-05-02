@@ -194,6 +194,65 @@ def cmd_backfill(
     _cmd_backfill_inner(config, source_path, dry_run=dry_run)
 
 
+def cmd_rank_week(
+    config: DistillerConfig,
+    *,
+    top_n: int = 12,
+    window_days: int = 7,
+    dry_run: bool = False,
+) -> None:
+    """Print the synthesis ranker's top-N for the configured vault.
+
+    KAL-LE distiller-radar Phase 2 inspection tool. Reads
+    ``synthesis/`` + ``decision/`` + ``contradiction/`` under
+    ``config.vault.path`` and prints each ranked record with the per-
+    term breakdown so the operator can tune the score formula. The
+    command is read-only by design; ``--dry-run`` is accepted for
+    symmetry with ``backfill`` but doesn't change behavior.
+    """
+    from .synthesis_ranker import rank_synthesis_records
+
+    vault_path = config.vault.vault_path
+    if not vault_path.is_dir():
+        print(f"Vault path does not exist: {vault_path}")
+        return
+
+    results = rank_synthesis_records(
+        vault_path, window_days=window_days, top_n=top_n,
+    )
+
+    print(f"=== Synthesis Ranker — vault={vault_path} ===")
+    print(
+        f"window_days={window_days}  top_n={top_n}  "
+        f"dry_run={dry_run}  results={len(results)}"
+    )
+    if not results:
+        print("\nNo records ranked.")
+        return
+
+    print(
+        f"\n{'Rank':<5} {'Score':<8} {'Type':<14} {'Src':<5} "
+        f"{'Ent':<5} {'Age(d)':<8} {'Path'}"
+    )
+    print("-" * 110)
+    for i, r in enumerate(results, start=1):
+        age = "-" if r.age_days is None else f"{r.age_days:.2f}"
+        print(
+            f"{i:<5} {r.score:<8.2f} {r.record_type:<14} "
+            f"{r.source_count:<5} {r.entity_count:<5} {age:<8} {r.path.name}"
+        )
+
+    print("\n=== Score breakdowns ===")
+    for i, r in enumerate(results, start=1):
+        b = r.breakdown
+        print(
+            f"  #{i} {r.path.stem[:80]}\n"
+            f"      cross_source={b.cross_source:.2f}  "
+            f"entity_diversity={b.entity_diversity:.2f}  "
+            f"recency={b.recency:.2f}  type_weight={b.type_weight:.2f}"
+        )
+
+
 def cmd_history(config: DistillerConfig, limit: int = 10) -> None:
     """Show past extraction runs."""
     state = _init_state(config)

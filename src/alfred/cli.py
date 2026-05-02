@@ -597,6 +597,13 @@ def cmd_distiller(args: argparse.Namespace) -> None:
         dcli.cmd_consolidate(config, skills_dir)
     elif subcmd == "backfill":
         dcli.cmd_backfill(config, source=args.source, dry_run=args.dry_run)
+    elif subcmd == "rank-week":
+        dcli.cmd_rank_week(
+            config,
+            top_n=args.top_n,
+            window_days=args.window_days,
+            dry_run=args.dry_run,
+        )
     else:
         print(f"Unknown distiller subcommand: {subcmd}")
         sys.exit(1)
@@ -1685,6 +1692,27 @@ def build_parser() -> argparse.ArgumentParser:
     dist_backfill.add_argument(
         "--dry-run", action="store_true", default=False,
         help="Report eligible files + counts without extracting or writing",
+    )
+
+    # KAL-LE distiller-radar Phase 2 — manual inspection of the
+    # synthesis ranker's top-N. Read-only; useful for tuning the score
+    # formula post-deploy. Reads from ``distiller.vault.path`` (so for
+    # KAL-LE this picks up aftermath-lab/synthesis|decision|contradiction).
+    dist_rank_week = dist_sub.add_parser(
+        "rank-week",
+        help="Print synthesis ranker top-N for tuning (read-only)",
+    )
+    dist_rank_week.add_argument(
+        "--top-n", type=int, default=12,
+        help="Show this many ranked records (default 12)",
+    )
+    dist_rank_week.add_argument(
+        "--window-days", type=int, default=7,
+        help="Recency cliff in days (default 7); records older lose only the recency term",
+    )
+    dist_rank_week.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Accepted for symmetry; the command is read-only either way",
     )
 
     # instructor
