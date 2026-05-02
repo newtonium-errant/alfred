@@ -450,3 +450,112 @@ async def test_on_photo_unauthorized_user_silent(talker_config) -> None:
     await bot.on_photo(update, ctx)
     # Silent — no reply at all (matches the voice / text unauthorized path).
     reply.assert_not_awaited()
+
+
+# --- Save-failure non-fatal contract --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_on_photo_save_failure_continues_to_llm(
+    talker_config, monkeypatch, capsys,
+) -> None:
+    """Save-to-inbox failure is non-fatal: image still reaches the LLM.
+
+    Locks the contract claimed in the builder report + verified by the
+    code-reviewer pass — without this regression test, a future refactor
+    could silently flip the "save failure aborts conversation" decision
+    and the only signal would be Andrew not getting replies on
+    screenshots when the disk is full.
+
+    Asserts:
+        (a) ``handle_message`` is called despite the ``save_image_to_inbox``
+            failure (conversation proceeds, not aborted).
+        (b) ``image_blocks`` reaches ``handle_message`` populated — the
+            in-memory bytes still become a vision content block.
+        (c) ``image_metadata`` is empty — no audit-trail row is written
+            for an image we couldn't save (avoids dangling-path entries
+            on the session record).
+        (d) The ``talker.bot.photo_save_failed`` log line carries the
+            new ``action=continuing_to_llm_in_memory_only`` field so an
+            operator tailing logs can grep the policy decision without
+            re-reading source.
+    """
+    from alfred.telegram import bot, vision as vision_mod
+
+    # 1. Stub vision.save_image_to_inbox to raise — simulates disk full,
+    # permission error, vault-path-doesn't-exist, etc. Any exception
+    # must hit the except branch in on_photo.
+    def _boom(*_args: Any, **_kwargs: Any) -> Path:
+        raise OSError("synthetic disk full")
+    monkeypatch.setattr(vision_mod, "save_image_to_inbox", _boom)
+
+    # 2. Capture the kwargs handle_message receives. We don't need the
+    # downstream Anthropic + state work to actually run — the contract
+    # we care about is "on_photo invoked handle_message with the right
+    # kwargs after the save failure." Replacing the symbol on the
+    # module is the cleanest way to isolate the on_photo slice.
+    captured_kwargs: dict[str, Any] = {}
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        captured_kwargs["args"] = args
+        captured_kwargs["kwargs"] = kwargs
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    # 3. Build a photo update with a fake file the download path can use.
+    photo = _FakePhoto(1280, 720, file_unique_id="abc123xy")
+    photo._file = _FakeFile(b"\x89PNG\r\n\x1a\n payload bytes")
+
+    reply = AsyncMock()
+    update = type("U", (), {})()
+    update.message = type("M", (), {})()
+    update.message.photo = [photo]
+    update.message.reply_text = reply
+    update.message.caption = "what's in this screenshot?"
+    update.effective_chat = type("C", (), {"id": 1})()
+    update.effective_user = type("EU", (), {"id": 1})()
+
+    ctx = type("Ctx", (), {})()
+    ctx.application = type("App", (), {"bot_data": {
+        "config": talker_config,
+        "state_mgr": None,
+        "anthropic_client": None,
+        "system_prompt": "",
+        "vault_context_str": "",
+        "chat_locks": {},
+    }})()
+    ctx.bot = type("B", (), {})()
+
+    await bot.on_photo(update, ctx)
+
+    # (a) handle_message reached — save failure did NOT abort.
+    assert captured_kwargs, "handle_message was never invoked — save failure aborted the conversation"
+
+    # (b) image_blocks present and well-formed; the in-memory bytes are
+    # intact even though disk persistence failed.
+    image_blocks = captured_kwargs["kwargs"].get("image_blocks")
+    assert image_blocks is not None
+    assert len(image_blocks) == 1
+    assert image_blocks[0]["type"] == "image"
+    assert image_blocks[0]["source"]["type"] == "base64"
+    # Round-trip the base64 to confirm the original bytes survived.
+    decoded = base64.standard_b64decode(image_blocks[0]["source"]["data"])
+    assert decoded == b"\x89PNG\r\n\x1a\n payload bytes"
+
+    # (c) image_metadata is empty — no audit-trail row written when
+    # the file isn't actually on disk. (append_image is called inside
+    # handle_message based on this list; an empty list means no
+    # append_image call for this turn.)
+    image_metadata = captured_kwargs["kwargs"].get("image_metadata")
+    assert image_metadata == []
+
+    # Caption forwarded as text.
+    assert captured_kwargs["kwargs"].get("text") == "what's in this screenshot?"
+
+    # (d) The "continuing" log line was emitted. structlog is configured
+    # to write to stdout in tests so capsys catches it.
+    captured = capsys.readouterr()
+    log_text = captured.out + captured.err
+    assert "talker.bot.photo_save_failed" in log_text
+    assert "action=continuing_to_llm_in_memory_only" in log_text
+    assert "synthetic disk full" in log_text

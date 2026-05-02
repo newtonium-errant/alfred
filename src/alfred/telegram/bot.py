@@ -1568,10 +1568,20 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         saved_path = str(saved)
     except Exception as exc:  # noqa: BLE001
+        # Per ``feedback_intentionally_left_blank.md`` + the universal
+        # "intentionally left blank" rule in CLAUDE.md: the decision NOT
+        # to abort the conversation lives in the code (we fall through
+        # below) but must also live in the LOG so an operator tailing
+        # ``data/talker.log`` can grep ``action=continuing_to_llm_in_memory_only``
+        # and see the policy without re-reading source. Without this
+        # field the log line answers "save failed" but not "did the
+        # turn proceed?" — which is the question that matters when
+        # diagnosing a complaint like "Hypatia ignored my screenshot."
         log.warning(
             "talker.bot.photo_save_failed",
             error=str(exc),
             vault_path=config.vault.path,
+            action="continuing_to_llm_in_memory_only",
         )
         # Continue — image is still in memory and will reach the model.
 
