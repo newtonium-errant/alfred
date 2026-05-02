@@ -65,6 +65,36 @@ def _make_raw(
     }
 
 
+def _parse_json_payload(captured_stdout: str) -> dict:
+    """Pull the JSON object out of captured stdout, ignoring leading log lines.
+
+    The gcal sync path (``gcal_sync.sync_event_create_to_gcal``) emits
+    ``log.info("gcal.sync_created", ...)`` etc. via structlog with the
+    default ``ConsoleRenderer`` sink, which lands on stdout — same
+    sink as the ``--json`` output. Tests that exercise live sync see
+    log lines BEFORE the JSON object and ``json.loads`` chokes on the
+    leading non-JSON content.
+
+    Find the first line whose stripped form starts with ``{`` and parse
+    from there. Robust against any number of leading log lines because
+    structlog's ConsoleRenderer never emits lines that start with ``{``
+    (they start with a timestamp).
+
+    Tests that DON'T trigger sync (dry-run / empty / pre-flight error
+    paths) get a clean stdout where the JSON is the only content;
+    those tests can keep using ``json.loads`` directly. This helper is
+    only needed for the live-sync tests.
+    """
+    lines = captured_stdout.splitlines(keepends=True)
+    for idx, line in enumerate(lines):
+        if line.lstrip().startswith("{"):
+            return json.loads("".join(lines[idx:]))
+    raise AssertionError(
+        f"no JSON object found in captured stdout. "
+        f"Captured: {captured_stdout!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Disabled / mis-configured short-circuits
 # ---------------------------------------------------------------------------
@@ -261,7 +291,10 @@ def test_backfill_live_sync_writes_back_id(tmp_path, capsys):
             wants_json=True,
         )
     assert rc == 0
-    payload = json.loads(capsys.readouterr().out)
+    # Live sync emits structlog ``gcal.sync_created`` lines on stdout
+    # before the JSON payload — use the parser helper that skips
+    # leading log lines.
+    payload = _parse_json_payload(capsys.readouterr().out)
     assert payload["synced_count"] == 1
     assert payload["failed_count"] == 0
     # Vault frontmatter has the writeback (the sync function does it
@@ -292,7 +325,10 @@ def test_backfill_records_failures(tmp_path, capsys):
         )
     # Failure → exit 1.
     assert rc == 1
-    payload = json.loads(capsys.readouterr().out)
+    # Live sync emits ``gcal.sync_create_failed`` warnings on stdout
+    # before the JSON payload — use the parser helper that skips
+    # leading log lines.
+    payload = _parse_json_payload(capsys.readouterr().out)
     assert payload["ok"] is False
     assert payload["failed_count"] == 1
     assert payload["failed"][0]["code"] == "api_error"
