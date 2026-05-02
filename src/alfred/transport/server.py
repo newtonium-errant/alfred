@@ -601,6 +601,7 @@ def wire_transport_app(
     peer_inbox_callable: _PeerInboxCallable | None = None,
     gcal_client: Any | None = None,
     gcal_config: Any | None = None,
+    gcal_intended_on: bool = False,
 ) -> None:
     """Wire all transport-app dependencies in one place.
 
@@ -649,6 +650,12 @@ def wire_transport_app(
         gcal_config: Typed
             :class:`alfred.integrations.gcal_config.GCalConfig`. Carries
             the Alfred + primary calendar IDs the handler scans.
+        gcal_intended_on: P2-4 sentinel. ``True`` iff ``gcal.enabled``
+            was set in config but client construction failed at daemon
+            startup. Causes the conflict-check + sync skip sites to
+            log at ``warning`` instead of ``debug`` so the operator
+            spots the silent feature-degradation. Default ``False``
+            for instances that legitimately disabled GCal.
 
     Logging: emits one info event per registered resource so a
     misconfigured instance has a single grep target
@@ -659,6 +666,7 @@ def wire_transport_app(
     # server (config storage key constants) at module-load time.
     from .peer_handlers import (
         register_gcal_client,
+        register_gcal_intended_on,
         register_instance_identity,
         register_peer_inbox,
         register_pending_items_aggregate_path,
@@ -717,6 +725,8 @@ def wire_transport_app(
             primary_calendar_id_set=bool(
                 getattr(gcal_config, "primary_calendar_id", "")
             ),
+            calendar_label=getattr(gcal_config, "alfred_calendar_label", ""),
+            time_zone=getattr(gcal_config, "default_time_zone", ""),
         )
     elif gcal_client is not None or gcal_config is not None:
         log.warning(
@@ -728,6 +738,16 @@ def wire_transport_app(
                 "skipping GCal registration"
             ),
         )
+
+    # P2-4 sentinel: ``gcal_intended_on=True`` flags the
+    # "operator wanted GCal but setup failed" state so the conflict-
+    # check + sync skip sites log at warning level instead of debug.
+    # Wiring this is independent of (gcal_client, gcal_config) — the
+    # daemon sets the flag BEFORE attempting client construction so
+    # the sentinel survives a setup failure that left the client unset.
+    if gcal_intended_on:
+        register_gcal_intended_on(app)
+        log.info("transport.wire_transport_app.gcal_intended_on_registered")
 
 
 async def run_server(

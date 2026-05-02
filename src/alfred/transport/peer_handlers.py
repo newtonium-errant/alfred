@@ -100,8 +100,55 @@ _KEY_VAULT_PATH = "transport.vault_path"
 # ``_KEY_GCAL_CONFIG`` holds the typed
 # :class:`alfred.integrations.gcal_config.GCalConfig` so handlers can
 # read the calendar IDs without re-loading config.yaml.
+# ``_KEY_GCAL_INTENDED_ON`` is a sentinel: True iff ``gcal.enabled``
+# was true in config but client construction failed at daemon startup.
+# Distinguishes "gcal intentionally off, skip silently" from "gcal
+# meant to be on but setup broke, surface to operator". See
+# :func:`_scan_gcal_conflicts` / :func:`_sync_event_to_gcal`.
 _KEY_GCAL_CLIENT = "transport.gcal_client"
 _KEY_GCAL_CONFIG = "transport.gcal_config"
+_KEY_GCAL_INTENDED_ON = "transport.gcal_intended_on"
+
+
+# ---------------------------------------------------------------------------
+# Conflict-source enum (Phase A+)
+# ---------------------------------------------------------------------------
+#
+# The ``source`` field on every conflict-list entry tells the proposing
+# instance + Andrew where the conflict came from. Codifying the string
+# values here gives consumers (peer_handlers, gcal helpers, future
+# downstream renderers) a single source of truth — typo-divergence as
+# new sources land (e.g. V.E.R.A. RRTS calendar, STAY-C client calendar)
+# can't silently slip in.
+#
+# Plain class with class-level string constants (not Enum) so the
+# values are still raw strings at the JSON boundary — no
+# ``.value`` boilerplate at every emit site, no JSON-encoder coupling.
+
+
+class ConflictSource:
+    """String constants for the ``source`` field on conflict entries.
+
+    Each entry in the ``conflicts`` list returned by
+    ``/canonical/event/propose-create`` carries one of these values so
+    the proposing instance can render appropriately ("you have a
+    primary-calendar meeting" vs "you have a vault event"). Stable
+    contract — additions (e.g. ``GCAL_RRTS`` when V.E.R.A. ships)
+    stay backward-compatible because consumers ignore unknown values
+    rather than crash.
+    """
+
+    # The proposing instance's local vault has an overlapping
+    # ``event/`` record. Source for :func:`_scan_event_conflicts`.
+    VAULT = "vault"
+
+    # The instance's writable GCal target (Salem's "Alfred" calendar).
+    # Source for the alfred-calendar leg of :func:`_scan_gcal_conflicts`.
+    GCAL_ALFRED = "gcal_alfred"
+
+    # The user's primary GCal (read-only by application policy).
+    # Source for the primary-calendar leg of :func:`_scan_gcal_conflicts`.
+    GCAL_PRIMARY = "gcal_primary"
 
 
 PeerInboxCallable = Callable[..., Awaitable[dict[str, Any]]]
@@ -1480,7 +1527,7 @@ def _scan_event_conflicts(
             "title": str(title),
             "start": ev_start.isoformat(),
             "end": ev_end.isoformat(),
-            "source": "vault",
+            "source": ConflictSource.VAULT,
             "path": rel_path,
         }
         # Phase A+: vault records that were synced to GCal carry the
@@ -1533,11 +1580,29 @@ def _scan_gcal_conflicts(
         # signal so the caller knows the empty list is "vault-only by
         # design", not "GCal silently misbehaved" (per
         # ``feedback_intentionally_left_blank.md``).
-        log.debug(
-            "transport.canonical.event_propose_gcal_skipped",
-            reason="not_configured",
-            correlation_id=correlation_id,
-        )
+        #
+        # Sentinel-aware skip: if the operator INTENDED gcal on but
+        # client construction failed at startup, surface the gap at
+        # warning level so they spot the silent feature-degradation.
+        # The "intended on" gate keeps the log signal clean — instances
+        # that legitimately disabled gcal still log at debug.
+        if request.app.get(_KEY_GCAL_INTENDED_ON):
+            log.warning(
+                "transport.canonical.event_propose_gcal_skipped_but_intended_on",
+                phase="conflict_check",
+                correlation_id=correlation_id,
+                hint=(
+                    "gcal.enabled is true in config but client setup failed "
+                    "at daemon startup. Run `alfred gcal status` and "
+                    "check daemon log for talker.daemon.gcal_setup_failed."
+                ),
+            )
+        else:
+            log.debug(
+                "transport.canonical.event_propose_gcal_skipped",
+                reason="not_configured",
+                correlation_id=correlation_id,
+            )
         return []
 
     from alfred.integrations.gcal import (
@@ -1564,7 +1629,9 @@ def _scan_gcal_conflicts(
             )
             events = []
         for ev in events:
-            out.append(event_to_conflict_dict(ev, source="gcal_alfred"))
+            out.append(
+                event_to_conflict_dict(ev, source=ConflictSource.GCAL_ALFRED)
+            )
 
     # Primary calendar — read-only by policy.
     if config.primary_calendar_id:
@@ -1583,7 +1650,9 @@ def _scan_gcal_conflicts(
             )
             events = []
         for ev in events:
-            out.append(event_to_conflict_dict(ev, source="gcal_primary"))
+            out.append(
+                event_to_conflict_dict(ev, source=ConflictSource.GCAL_PRIMARY)
+            )
 
     return out
 
@@ -1937,7 +2006,14 @@ async def _handle_canonical_event_propose_create(
     )
     if sync_result.get("event_id"):
         response_payload["gcal_event_id"] = sync_result["event_id"]
-        response_payload["gcal_calendar"] = "alfred"
+        # Calendar-kind label is config-driven (per-instance) — Salem
+        # ships ``"alfred"``; V.E.R.A. RRTS would set ``"rrts"``;
+        # STAY-C client cal would set ``"stayc"``. Defensive fallback
+        # to ``"alfred"`` keeps the field present for callers that
+        # still parse it as a fixed string.
+        response_payload["gcal_calendar"] = sync_result.get(
+            "calendar_label", "alfred",
+        )
     elif sync_result.get("error"):
         response_payload["gcal_sync_error"] = sync_result["error"]
     # When sync_result is empty (GCal not configured), neither key is
@@ -2001,8 +2077,10 @@ def _sync_event_to_gcal(
 
     Returns a dict with one of:
       * ``{}`` — GCal not configured for this instance (silent skip).
-      * ``{"event_id": "<gcal-id>"}`` — sync succeeded; vault frontmatter
-        has been updated to include ``gcal_event_id`` + ``gcal_calendar``.
+      * ``{"event_id": "<gcal-id>", "calendar_label": "<label>"}`` — sync
+        succeeded; vault frontmatter has been updated to include
+        ``gcal_event_id`` + ``gcal_calendar`` (the label is config-driven
+        per :attr:`GCalConfig.alfred_calendar_label`).
       * ``{"error": {"code": "<code>", "detail": "<msg>"}}`` — sync
         failed; vault stays intact. The ``code`` is one of
         ``calendar_id_missing`` / ``auth_failed`` / ``missing_dependency``
@@ -2024,11 +2102,29 @@ def _sync_event_to_gcal(
     client = request.app.get(_KEY_GCAL_CLIENT)
     config = request.app.get(_KEY_GCAL_CONFIG)
     if client is None or config is None or not config.enabled:
-        log.debug(
-            "transport.canonical.event_propose_gcal_sync_skipped",
-            reason="not_configured",
-            correlation_id=correlation_id,
-        )
+        # Sentinel-aware skip: if the operator INTENDED gcal on but
+        # client construction failed at startup, surface the gap at
+        # warning level so they spot the silent feature-degradation.
+        # Without the sentinel, every event proposal would emit a
+        # noisy warning even on instances that legitimately disabled
+        # gcal — the "intended on" gate keeps the log signal clean.
+        if request.app.get(_KEY_GCAL_INTENDED_ON):
+            log.warning(
+                "transport.canonical.event_propose_gcal_skipped_but_intended_on",
+                phase="sync",
+                correlation_id=correlation_id,
+                hint=(
+                    "gcal.enabled is true in config but client setup failed "
+                    "at daemon startup. Run `alfred gcal status` and "
+                    "check daemon log for talker.daemon.gcal_setup_failed."
+                ),
+            )
+        else:
+            log.debug(
+                "transport.canonical.event_propose_gcal_sync_skipped",
+                reason="not_configured",
+                correlation_id=correlation_id,
+            )
         return {}
     if not config.alfred_calendar_id:
         log.warning(
@@ -2045,13 +2141,23 @@ def _sync_event_to_gcal(
 
     from alfred.integrations.gcal import GCalError
 
+    # P2-2: pass time_zone through when configured. When empty (default),
+    # GCalClient.create_event omits the timeZone field from the body and
+    # GCal falls back to the calendar's own default zone for display.
+    # The dateTime offset still pins the absolute time unambiguously.
+    create_kwargs: dict[str, Any] = {
+        "start": start_dt,
+        "end": end_dt,
+        "title": title,
+        "description": description,
+    }
+    if getattr(config, "default_time_zone", ""):
+        create_kwargs["time_zone"] = config.default_time_zone
+
     try:
         event_id = client.create_event(
             config.alfred_calendar_id,
-            start=start_dt,
-            end=end_dt,
-            title=title,
-            description=description,
+            **create_kwargs,
         )
     except GCalError as exc:
         # Per spec: do NOT roll back the vault create. Vault is canonical;
@@ -2066,6 +2172,12 @@ def _sync_event_to_gcal(
         )
         return {"error": {"code": code, "detail": str(exc)}}
 
+    # P2-1: calendar-kind label is config-driven so V.E.R.A.'s RRTS
+    # calendar can write ``"rrts"``, STAY-C client cal ``"stayc"``, etc.
+    # Fallback to ``"alfred"`` covers the default-config case and any
+    # operator who omits the field.
+    calendar_label = getattr(config, "alfred_calendar_label", "") or "alfred"
+
     # Success: write gcal_event_id + gcal_calendar back into the vault
     # record's frontmatter. We re-load the file we just wrote rather
     # than reusing the in-memory dict so any changes a parallel writer
@@ -2074,7 +2186,7 @@ def _sync_event_to_gcal(
     try:
         post = frontmatter.load(str(file_path))
         post["gcal_event_id"] = event_id
-        post["gcal_calendar"] = "alfred"
+        post["gcal_calendar"] = calendar_label
         # Preserve trailing-newline behaviour matching the original write.
         new_text = frontmatter.dumps(post)
         if not new_text.endswith("\n"):
@@ -2096,9 +2208,10 @@ def _sync_event_to_gcal(
         "transport.canonical.event_propose_gcal_synced",
         event_id=event_id,
         calendar_id=config.alfred_calendar_id,
+        calendar_label=calendar_label,
         correlation_id=correlation_id,
     )
-    return {"event_id": event_id}
+    return {"event_id": event_id, "calendar_label": calendar_label}
 
 
 # ---------------------------------------------------------------------------
@@ -2191,3 +2304,25 @@ def register_gcal_client(
     """
     app[_KEY_GCAL_CLIENT] = client
     app[_KEY_GCAL_CONFIG] = config
+
+
+def register_gcal_intended_on(app: web.Application) -> None:
+    """Mark the app as "operator wanted GCal on, but client setup failed".
+
+    P2-4 sentinel. Daemon calls this when ``gcal.enabled`` is true in
+    config but :class:`GCalClient` construction failed at startup
+    (e.g. credentials file missing, scopes malformed). Without the
+    sentinel, every conflict-check + sync attempt would emit
+    ``transport.canonical.event_propose_gcal_skipped`` at ``debug``
+    level — the operator sees nothing, but the system is in
+    "intended-on, actually-off" state.
+
+    With the sentinel set, those skip sites log at ``warning`` instead,
+    pointing the operator to ``alfred gcal status`` + the
+    ``talker.daemon.gcal_setup_failed`` log line. Instances that
+    legitimately disabled GCal don't call this helper, so their skips
+    stay quiet (debug-level).
+
+    Idempotent: calling multiple times is safe (sets the same flag).
+    """
+    app[_KEY_GCAL_INTENDED_ON] = True

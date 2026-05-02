@@ -85,6 +85,23 @@ class GCalConfig:
     # ``calendar`` not ``calendar.events``).
     scopes: list[str] = field(default_factory=lambda: list(DEFAULT_SCOPES))
 
+    # Per-instance label for the writable calendar. Surfaced as the
+    # ``gcal_calendar`` value in vault frontmatter + the create-event
+    # response payload. Salem defaults to ``"alfred"`` (the dedicated
+    # "Alfred" calendar). When V.E.R.A. ships an RRTS calendar it would
+    # set this to ``"rrts"``; STAY-C client calendar would set ``"stayc"``,
+    # etc. The label is descriptive metadata, not a calendar lookup —
+    # the actual write target is always ``alfred_calendar_id``.
+    alfred_calendar_label: str = "alfred"
+
+    # Optional IANA timezone name (e.g. ``"America/Halifax"``). When set,
+    # passed through to ``GCalClient.create_event`` as ``time_zone`` so
+    # GCal's display semantics match Andrew's local time. When empty
+    # (default), GCal falls back to the calendar's own default zone for
+    # display — actual time is unambiguous either way (the dateTime
+    # carries the offset), only the per-event display label differs.
+    default_time_zone: str = ""
+
 
 # --- Builder ---------------------------------------------------------------
 
@@ -107,6 +124,8 @@ def _build(data: dict[str, Any]) -> GCalConfig:
         "alfred_calendar_id",
         "primary_calendar_id",
         "scopes",
+        "alfred_calendar_label",
+        "default_time_zone",
     }
     kwargs: dict[str, Any] = {k: v for k, v in data.items() if k in known}
     # Coerce bool-ish values; default False.
@@ -120,6 +139,16 @@ def _build(data: dict[str, Any]) -> GCalConfig:
     for id_key in ("alfred_calendar_id", "primary_calendar_id"):
         val = kwargs.get(id_key, "")
         kwargs[id_key] = "" if val is None else str(val)
+    # Coerce label + timezone to str; null defaults to label="alfred",
+    # tz="" so the dataclass defaults govern downstream behaviour.
+    if "alfred_calendar_label" in kwargs:
+        val = kwargs["alfred_calendar_label"]
+        # Empty string is a valid override (label-suppression) so we
+        # only fall back to "alfred" when the user gave us None.
+        kwargs["alfred_calendar_label"] = "alfred" if val is None else str(val)
+    if "default_time_zone" in kwargs:
+        val = kwargs["default_time_zone"]
+        kwargs["default_time_zone"] = "" if val is None else str(val)
     # Scopes: list of strings; tolerate scalar.
     if "scopes" in kwargs:
         scopes = kwargs["scopes"]

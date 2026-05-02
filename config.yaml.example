@@ -331,6 +331,17 @@ transport:
 #   primary_calendar_id: "${ALFRED_GCAL_PRIMARY_ID}"
 #   scopes:
 #     - "https://www.googleapis.com/auth/calendar.events"
+#   # Per-instance label for the writable calendar. Surfaces as the
+#   # ``gcal_calendar`` value in vault frontmatter + create-event response.
+#   # Salem ships ``"alfred"``; V.E.R.A. would set ``"rrts"``; STAY-C
+#   # client cal would set ``"stayc"``. Descriptive metadata only — the
+#   # actual write target is always ``alfred_calendar_id``.
+#   alfred_calendar_label: "alfred"
+#   # Optional IANA timezone name (e.g. "America/Halifax"). When set,
+#   # passed to GCal create-event so display semantics match Andrew's
+#   # local time. When empty (default), GCal uses the calendar's own
+#   # default zone for display — actual time is unambiguous either way.
+#   default_time_zone: ""
 #   # Future: V.E.R.A. (RRTS calendar) and STAY-C (client calendar) will
 #   # each define their own gcal block in their own config.<instance>.yaml.
 

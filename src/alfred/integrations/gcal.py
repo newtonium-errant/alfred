@@ -126,10 +126,13 @@ def event_to_conflict_dict(
     ``transport.peer_handlers._scan_event_conflicts``, with two GCal-
     specific fields:
 
-      * ``source`` — caller-supplied string ("gcal_alfred" or
-        "gcal_primary") so the proposing instance / Andrew can read
-        "you have a primary-calendar meeting" rather than just "you
-        have a meeting".
+      * ``source`` — caller-supplied string. Canonical values defined
+        in :class:`alfred.transport.peer_handlers.ConflictSource`
+        (``GCAL_ALFRED`` / ``GCAL_PRIMARY``) so the proposing instance
+        / Andrew can read "you have a primary-calendar meeting" rather
+        than just "you have a meeting". This helper is calendar-source
+        agnostic — future sources (RRTS, STAY-C client cal) extend the
+        enum, no change needed here.
       * ``gcal_event_id`` — opaque GCal ID, usable to delete or fetch
         the event via this adapter later.
     """

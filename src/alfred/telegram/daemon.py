@@ -359,12 +359,23 @@ async def run(
         # check + sync paths handle with graceful degradation.
         gcal_client = None
         gcal_config = None
+        # P2-4: sentinel flag — flips True the moment we see
+        # ``gcal.enabled: true`` in config, BEFORE client construction.
+        # If construction then raises, the flag survives so the
+        # transport handler can log warnings (not debug) at every skip
+        # site, surfacing the silent feature-degradation to the operator.
+        gcal_intended_on = False
         try:
             from alfred.integrations.gcal_config import (
                 load_from_unified as load_gcal,
             )
             gcal_config_candidate = load_gcal(raw)
             if gcal_config_candidate.enabled:
+                # Flag the intent FIRST. Client construction below can
+                # still fail (missing creds, malformed scopes); the
+                # sentinel persists so handlers know the operator opted
+                # in even when the wiring is half-up.
+                gcal_intended_on = True
                 from alfred.integrations.gcal import GCalClient
                 gcal_client = GCalClient(
                     credentials_path=gcal_config_candidate.credentials_path,
@@ -380,10 +391,15 @@ async def run(
                     primary_calendar_id_set=bool(
                         gcal_config.primary_calendar_id
                     ),
+                    calendar_label=gcal_config.alfred_calendar_label,
+                    time_zone=gcal_config.default_time_zone or "(calendar default)",
                 )
             else:
                 log.info("talker.daemon.gcal_disabled")
         except Exception:  # noqa: BLE001
+            # ``gcal_intended_on`` may already be True (failure happened
+            # AFTER load_gcal returned enabled=True) — that's the case
+            # the sentinel exists for. Don't reset it.
             log.exception("talker.daemon.gcal_setup_failed")
 
         # ---- Centralized wiring --------------------------------------
@@ -417,6 +433,7 @@ async def run(
             pending_items_resolve_callable=pending_items_resolver_fn,
             gcal_client=gcal_client,
             gcal_config=gcal_config,
+            gcal_intended_on=gcal_intended_on,
         )
         log.info(
             "talker.daemon.transport_configured",
