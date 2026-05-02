@@ -34,6 +34,7 @@ import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -552,6 +553,146 @@ def register_send_callable(
     ``Bot`` instance, then hand the app to :func:`run_server`.
     """
     app[_KEY_SEND_FN] = send_fn
+
+
+# ---------------------------------------------------------------------------
+# Centralized wiring — `wire_transport_app`
+# ---------------------------------------------------------------------------
+#
+# Background: each new transport-app dependency historically shipped as
+# its own ``register_*`` helper that the daemon had to remember to call
+# at startup. By 2026-05-01 there were 6 such helpers and the daemon was
+# missing one (``register_vault_path``), causing every /canonical/* and
+# /peer/brief_digest request to 500 with ``vault_not_configured`` for
+# the entire lifetime of the talker daemon. Hotfix in commit f0f8a03.
+#
+# ``wire_transport_app`` consolidates every register call behind one
+# function. The signature lists every wireable resource as an explicit
+# kwarg — the daemon must opt OUT by omission, which surfaces "do I
+# need this?" at every call site rather than letting a silent miss ship.
+#
+# Why not move wiring INTO ``build_app``? Because send_fn / pending
+# callables / instance identity all need closures over runtime objects
+# (PTB Bot, executor module, config dataclass) that exist after the
+# daemon has done its own setup. ``build_app`` runs early; ``wire_*``
+# runs after the daemon has constructed those closures.
+#
+# The individual ``register_*`` helpers stay public because tests use
+# them directly to wire only the surface they're exercising. This is a
+# convenience-and-discipline layer ON TOP, not a replacement.
+
+# Type alias for the pending-items resolver callable — kept here so the
+# wiring function can be type-checked without importing peer_handlers
+# eagerly (avoids a circular import at module load).
+_PendingItemsResolveCallable = Callable[..., Awaitable[dict[str, Any]]]
+_PeerInboxCallable = Callable[..., Awaitable[dict[str, Any]]]
+
+
+def wire_transport_app(
+    app: web.Application,
+    config: TransportConfig,  # noqa: ARG001 — present for forward-compat
+    *,
+    instance_name: str,
+    instance_alias: str = "",
+    vault_path: Path | None = None,
+    send_fn: SendCallable | None = None,
+    pending_items_aggregate_path: str | Path | None = None,
+    pending_items_resolve_callable: _PendingItemsResolveCallable | None = None,
+    peer_inbox_callable: _PeerInboxCallable | None = None,
+) -> None:
+    """Wire all transport-app dependencies in one place.
+
+    Daemon startup invokes this once instead of orchestrating N
+    separate ``register_*`` calls. Each kwarg corresponds to one
+    registrar; passing ``None`` (the default) skips that registrar.
+
+    The function is non-magical on purpose: a daemon that doesn't pass
+    ``vault_path`` will still see canonical handlers 500 with
+    ``vault_not_configured``. The opt-out is explicit-by-omission,
+    which surfaces "do I need this?" at every call site.
+
+    Args:
+        app: The aiohttp application returned by :func:`build_app`.
+        config: The transport config (reserved for future wiring needs;
+            unused today but kept in the signature so daemons don't
+            have to refactor their call site when a future helper
+            needs config-derived state).
+        instance_name: This instance's persona name
+            ("Salem", "KAL-LE", ...). Wired via
+            :func:`peer_handlers.register_instance_identity` so
+            ``/peer/handshake`` responses identify correctly. Required
+            because every instance has one — no sensible default.
+        instance_alias: Casual / display alias for the instance.
+            Defaults to empty string, matching the helper's default.
+        vault_path: Filesystem path to the instance's vault. Required
+            for every ``/canonical/*`` handler, ``/peer/brief_digest``,
+            and the pending-items resolvers. Pass ``None`` only if the
+            instance is genuinely vault-less.
+        send_fn: Outbound send callable (talker → Telegram). Required
+            for ``/outbound/send`` to do anything other than 503.
+        pending_items_aggregate_path: Salem's aggregate JSONL path.
+            Required only on the instance that aggregates peer pushes
+            (Salem). KAL-LE / Hypatia leave this ``None``.
+        pending_items_resolve_callable: Per-instance resolver callable
+            for Salem→peer dispatch. Required on every instance with a
+            ``pending_items`` config block.
+        peer_inbox_callable: Talker-side handler for inbound /peer/send
+            relays. Wired via :func:`peer_handlers.register_peer_inbox`.
+
+    Logging: emits one info event per registered resource so a
+    misconfigured instance has a single grep target
+    (``transport.wire_transport_app.*``) rather than spelunking
+    through six different daemon paths.
+    """
+    # Late imports break the circular: peer_handlers imports from
+    # server (config storage key constants) at module-load time.
+    from .peer_handlers import (
+        register_instance_identity,
+        register_peer_inbox,
+        register_pending_items_aggregate_path,
+        register_pending_items_resolve_callable,
+        register_vault_path,
+    )
+
+    # Identity is unconditional — every instance has a name.
+    register_instance_identity(app, name=instance_name, alias=instance_alias)
+    log.info(
+        "transport.wire_transport_app.instance_identity_registered",
+        name=instance_name,
+        alias=instance_alias,
+    )
+
+    if vault_path is not None:
+        register_vault_path(app, Path(vault_path))
+        log.info(
+            "transport.wire_transport_app.vault_path_registered",
+            vault_path=str(vault_path),
+        )
+
+    if send_fn is not None:
+        register_send_callable(app, send_fn)
+        log.info("transport.wire_transport_app.send_fn_registered")
+
+    if pending_items_aggregate_path is not None:
+        register_pending_items_aggregate_path(
+            app, pending_items_aggregate_path,
+        )
+        log.info(
+            "transport.wire_transport_app.pending_items_aggregate_registered",
+            path=str(pending_items_aggregate_path),
+        )
+
+    if pending_items_resolve_callable is not None:
+        register_pending_items_resolve_callable(
+            app, pending_items_resolve_callable,
+        )
+        log.info(
+            "transport.wire_transport_app.pending_items_resolver_registered",
+        )
+
+    if peer_inbox_callable is not None:
+        register_peer_inbox(app, peer_inbox_callable)
+        log.info("transport.wire_transport_app.peer_inbox_registered")
 
 
 async def run_server(

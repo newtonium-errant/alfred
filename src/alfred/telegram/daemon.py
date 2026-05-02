@@ -225,7 +225,10 @@ async def run(
     send_lock_map: dict[int, asyncio.Lock] = {}
     try:
         from alfred.transport.config import load_from_unified as load_transport
-        from alfred.transport.server import build_app as build_transport_app
+        from alfred.transport.server import (
+            build_app as build_transport_app,
+            wire_transport_app,
+        )
         from alfred.transport.state import TransportState
         from alfred.transport import scheduler as transport_scheduler
         from alfred.transport import server as transport_server_mod
@@ -264,42 +267,24 @@ async def run(
                 await asyncio.sleep(0.25)
                 return [msg.message_id]
 
+        # Build the bare app — no resources wired yet.
         transport_app = build_transport_app(
             transport_config,
             transport_state,
-            send_fn=_send_via_telegram,
-        )
-        log.info(
-            "talker.daemon.transport_configured",
-            host=transport_config.server.host,
-            port=transport_config.server.port,
-            peers=list(transport_config.auth.tokens.keys()),
         )
 
-        # ---- Vault path wiring ---------------------------------------
-        # Required by every /canonical/* handler (and brief_digest,
-        # pending-items resolvers) so they can locate the vault. Without
-        # this, _get_vault_path returns None and handlers 500 with
-        # ``vault_not_configured``. Same shape as the pending_items
-        # registrations below — register on the app object before any
-        # request hits the server. Applies to every instance (Salem,
-        # KAL-LE, Hypatia, ...) since they all run this daemon path.
-        from alfred.transport.peer_handlers import register_vault_path
-        register_vault_path(transport_app, Path(config.vault.path))
-        log.info(
-            "talker.daemon.transport_vault_path_registered",
-            vault_path=config.vault.path,
-        )
-
-        # ---- Pending Items Queue (Phase 1) wiring --------------------
+        # ---- Pending Items Queue (Phase 1) wiring inputs -------------
         # Aggregate path is needed on Salem (the receiver) so peer
         # pushes land in the right JSONL. Resolver callable is needed
         # on every instance with a ``pending_items`` block enabled so
-        # Salem→peer dispatch can locate + execute. Both registrations
-        # are no-ops on an instance whose ``pending_items`` block is
-        # absent / disabled — the inbound handler returns 501 (no
-        # resolver registered) which the Daily Sync dispatcher treats
-        # as a terminal error rather than a retry.
+        # Salem→peer dispatch can locate + execute. Both inputs default
+        # to ``None`` on an instance whose ``pending_items`` block is
+        # absent / disabled — wire_transport_app skips that registrar
+        # and the inbound handler returns 501 (no resolver registered)
+        # which the Daily Sync dispatcher treats as a terminal error
+        # rather than a retry.
+        pending_items_aggregate_path: str | None = None
+        pending_items_resolver_fn = None
         try:
             from alfred.pending_items.config import (
                 load_from_unified as load_pending_items,
@@ -309,24 +294,15 @@ async def run(
             pending_items_config = None
         if pending_items_config is not None and pending_items_config.enabled:
             try:
-                from alfred.transport.peer_handlers import (
-                    register_pending_items_aggregate_path,
-                    register_pending_items_resolve_callable,
-                )
                 # Aggregate path lives next to the local queue file —
                 # Salem's queue + Salem's aggregate are different
                 # files (the aggregate gets peer-pushed entries, the
                 # queue gets Salem's own emissions); the Daily Sync
                 # section provider reads BOTH and unions by id.
-                aggregate_path = str(
+                pending_items_aggregate_path = str(
                     Path(pending_items_config.queue_path).with_name(
                         "pending_items_aggregate.jsonl"
                     )
-                )
-                register_pending_items_aggregate_path(transport_app, aggregate_path)
-                log.info(
-                    "talker.daemon.pending_items_aggregate_registered",
-                    path=aggregate_path,
                 )
 
                 # Resolver callable — closure over local queue + vault
@@ -363,17 +339,42 @@ async def run(
                         user_id=resolver_user_id,
                     )
 
-                register_pending_items_resolve_callable(
-                    transport_app, _pending_items_resolver,
-                )
-                log.info(
-                    "talker.daemon.pending_items_resolver_registered",
-                    queue_path=_pending_queue_path,
-                )
+                pending_items_resolver_fn = _pending_items_resolver
             except Exception:  # noqa: BLE001
                 log.exception(
                     "talker.daemon.pending_items_setup_failed"
                 )
+
+        # ---- Centralized wiring --------------------------------------
+        # ``wire_transport_app`` calls every register_* helper
+        # conditionally based on what we pass in. This is the single
+        # call site for transport-app dependencies — adding a new
+        # resource means adding a kwarg here AND in the helper, not
+        # threading another register call through this daemon.
+        #
+        # Vault path is required by every /canonical/* handler, the
+        # /peer/brief_digest handler, and the pending-items resolvers.
+        # Without it, those handlers 500 with ``vault_not_configured``.
+        # Salem hotfix 2026-05-01 (commit f0f8a03) plumbed
+        # register_vault_path here after a 1-day production outage;
+        # wire_transport_app is the structural fix that prevents the
+        # next instance from re-discovering the same gap.
+        wire_transport_app(
+            transport_app,
+            transport_config,
+            instance_name=config.instance.name,
+            instance_alias=(config.instance.aliases[0] if config.instance.aliases else ""),
+            vault_path=Path(config.vault.path),
+            send_fn=_send_via_telegram,
+            pending_items_aggregate_path=pending_items_aggregate_path,
+            pending_items_resolve_callable=pending_items_resolver_fn,
+        )
+        log.info(
+            "talker.daemon.transport_configured",
+            host=transport_config.server.host,
+            port=transport_config.server.port,
+            peers=list(transport_config.auth.tokens.keys()),
+        )
 
     except Exception:  # noqa: BLE001
         # Missing transport config is non-fatal — the talker still

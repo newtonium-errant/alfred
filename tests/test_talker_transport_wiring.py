@@ -14,15 +14,22 @@ from the daemon. Result: every canonical request 500'd with
 ``vault_not_configured``. Repro confirmed 2026-05-01 when Hypatia's
 ``/canonical/event/propose-create`` push hit Salem.
 
+The structural fix is :func:`alfred.transport.server.wire_transport_app`,
+the single consolidation point that calls every ``register_*`` helper
+conditionally based on what the daemon passes in. Adding a new
+transport-app dependency means adding a kwarg there AND in the helper,
+not threading another register call through this daemon.
+
 These tests pin the wiring contract:
 
 * ``register_vault_path`` correctly stashes the path under the storage
   key the handlers read from (sanity check on the helper itself).
-* The daemon module's transport-setup block actually invokes
-  ``register_vault_path`` against ``transport_app`` with the configured
-  vault path. Source-text inspection is brittle-by-design: a refactor
-  that removes the call must replace it with an equivalent wiring
-  step, or this test fails and forces re-evaluation.
+* The daemon module's transport-setup block invokes
+  :func:`wire_transport_app` and passes every kwarg the daemon
+  legitimately needs (vault_path, send_fn, instance_name, ...). Source-
+  text inspection is brittle-by-design: a refactor that removes the
+  call must replace it with an equivalent wiring step, or this test
+  fails and forces re-evaluation.
 """
 
 from __future__ import annotations
@@ -64,37 +71,43 @@ def test_register_vault_path_sets_storage_key(tmp_path):
 
 
 def test_talker_daemon_wires_vault_path_into_transport_app():
-    """Daemon must call register_vault_path on the transport app at startup.
+    """Daemon must wire the vault path onto the transport app at startup.
 
-    Without this call, every /canonical/* handler returns 500
-    ``vault_not_configured`` because ``_get_vault_path`` reads the same
-    key the helper sets. Source-text assertion catches refactors that
-    accidentally drop the wiring; the equivalent wiring (whatever
-    helper or builder is used) must restore the storage key, in which
-    case this test should be updated to assert against the new shape.
+    Without this wiring, every /canonical/* handler returns 500
+    ``vault_not_configured`` because ``_get_vault_path`` reads the
+    storage key that ``register_vault_path`` (called from
+    ``wire_transport_app``) sets.
+
+    As of the centralized-wiring refactor, the daemon calls
+    :func:`alfred.transport.server.wire_transport_app` exactly once,
+    passing every wireable resource (vault_path, send_fn, pending-items
+    callables, instance identity) as kwargs. The assertions below
+    catch the "silently-dropped wiring" failure mode by pinning that
+    the daemon source still routes through that single function.
     """
     source = _daemon_source()
 
-    # The import path is the canonical surface — anyone refactoring is
-    # likely to either keep this exact string or replace it with an
-    # equivalent helper. The assertion below catches the
-    # "silently-dropped wiring" failure mode.
-    assert "register_vault_path" in source, (
-        "alfred.telegram.daemon must call register_vault_path on the "
+    # The wire_transport_app call is the single consolidation point —
+    # if it disappears, every per-resource registration disappears with
+    # it. Pin it explicitly.
+    assert "wire_transport_app" in source, (
+        "alfred.telegram.daemon must call wire_transport_app on the "
         "transport app at startup; without it every /canonical/* "
-        "handler 500s with vault_not_configured. If you've replaced "
-        "this helper with an equivalent wiring path, update this test "
-        "to assert the new shape."
+        "handler 500s with vault_not_configured (vault_path is one "
+        "of several resources wire_transport_app registers). If "
+        "you've replaced this helper with an equivalent wiring path, "
+        "update this test to assert the new shape."
     )
 
-    # Strengthen the assertion: the call must reference the transport
-    # app object built earlier in the same scope. Catches a partial
-    # refactor that leaves a dangling import.
-    assert "register_vault_path(transport_app" in source, (
-        "register_vault_path must be invoked against transport_app "
-        "(the aiohttp.Application built by build_transport_app), not "
-        "some other app object. Without this, the canonical handlers "
-        "served by transport_app see no vault path."
+    # Strengthen the assertion: the call must explicitly pass
+    # vault_path as a kwarg. A daemon that calls wire_transport_app
+    # but omits vault_path still 500s on /canonical/* — the helper is
+    # explicit-by-omission for exactly this reason.
+    assert "vault_path=Path(config.vault.path)" in source, (
+        "wire_transport_app must receive vault_path=Path(config.vault.path), "
+        "not a hardcoded default and not omission. Each instance has its "
+        "own vault path; hardcoding routes every instance through Salem's "
+        "vault, and omission causes every /canonical/* handler to 500."
     )
 
 
@@ -109,7 +122,40 @@ def test_talker_daemon_wires_vault_path_with_configured_value():
     """
     source = _daemon_source()
     assert "Path(config.vault.path)" in source, (
-        "register_vault_path must receive Path(config.vault.path), not "
+        "wire_transport_app must receive Path(config.vault.path), not "
         "a hardcoded default. Each instance has its own vault path; "
         "hardcoding routes every instance through Salem's vault."
+    )
+
+
+def test_talker_daemon_wires_send_fn_into_transport_app():
+    """Daemon must wire the send callable through wire_transport_app.
+
+    Without ``send_fn`` wired, /outbound/send returns 503
+    ``telegram_not_configured`` for every immediate-send request.
+    Adjacent regression to the vault_path bug — the structural fix
+    deserves the same explicit pin as vault_path.
+    """
+    source = _daemon_source()
+    assert "send_fn=_send_via_telegram" in source, (
+        "wire_transport_app must receive send_fn=_send_via_telegram. "
+        "Without it, /outbound/send returns 503 telegram_not_configured "
+        "for every immediate-send request (the closure has the PTB Bot "
+        "reference; nothing else can deliver)."
+    )
+
+
+def test_talker_daemon_wires_instance_identity():
+    """Daemon must wire instance_name through wire_transport_app.
+
+    Without ``instance_name`` wired, /peer/handshake responses return an
+    empty ``instance`` field (handler defaults the missing app key to
+    ""). Peers that depend on the handshake's ``instance`` field for
+    routing decisions silently misbehave rather than fail loudly.
+    """
+    source = _daemon_source()
+    assert "instance_name=config.instance.name" in source, (
+        "wire_transport_app must receive instance_name=config.instance.name. "
+        "Without it, /peer/handshake returns an empty 'instance' field "
+        "and peers that route by instance silently misbehave."
     )
