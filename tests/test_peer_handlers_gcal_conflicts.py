@@ -123,6 +123,10 @@ def _make_gcal_client_mock(
         return []
 
     client.list_events.side_effect = _list
+    # Sync path (commit 3) calls create_event after a successful conflict-
+    # check. Default to a stringy event ID so any test that hits the
+    # success path doesn't trip the JSON encoder on a leaked MagicMock.
+    client.create_event.return_value = "test-mock-event-id"
     return client
 
 

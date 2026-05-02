@@ -1900,14 +1900,139 @@ async def _handle_canonical_event_propose_create(
         end=end_dt.isoformat(),
         correlation_id=correlation_id,
     )
-    return web.json_response(
-        {
-            "status": "created",
-            "path": rel_path,
-            "correlation_id": correlation_id,
-        },
-        status=201,
+
+    # --- Sync to GCal (Phase A+) -------------------------------------------
+    # Vault is canonical; the Alfred Calendar entry is a projection so
+    # Andrew sees the event on his phone. Sync failure does NOT roll
+    # back the vault create — operator can manually re-sync (or a
+    # future Phase D sync loop will do it). The response carries a
+    # ``gcal_sync_error`` field so the proposing instance can tell
+    # Andrew "saved to vault but GCal sync failed".
+    response_payload: dict[str, Any] = {
+        "status": "created",
+        "path": rel_path,
+        "correlation_id": correlation_id,
+    }
+    sync_result = _sync_event_to_gcal(
+        request,
+        file_path=file_path,
+        title=title.strip(),
+        description=summary.strip(),
+        start_dt=start_dt,
+        end_dt=end_dt,
+        correlation_id=correlation_id,
     )
+    if sync_result.get("event_id"):
+        response_payload["gcal_event_id"] = sync_result["event_id"]
+        response_payload["gcal_calendar"] = "alfred"
+    elif sync_result.get("error"):
+        response_payload["gcal_sync_error"] = sync_result["error"]
+    # When sync_result is empty (GCal not configured), neither key is
+    # added — the proposing instance's silence on the GCal field is
+    # the same signal as "this instance doesn't sync to GCal".
+
+    return web.json_response(response_payload, status=201)
+
+
+def _sync_event_to_gcal(
+    request: web.Request,
+    *,
+    file_path: Path,
+    title: str,
+    description: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    correlation_id: str,
+) -> dict[str, str]:
+    """Mirror a freshly-created vault event to the Alfred Calendar.
+
+    Returns a dict with one of:
+      * ``{}`` — GCal not configured for this instance (silent skip).
+      * ``{"event_id": "<gcal-id>"}`` — sync succeeded; vault frontmatter
+        has been updated to include ``gcal_event_id`` + ``gcal_calendar``.
+      * ``{"error": "<reason>"}`` — sync failed; vault stays intact.
+
+    Per architecture:
+      * Salem ONLY writes to the configured Alfred Calendar ID — never
+        primary. This function enforces that policy by reading the ID
+        from config and refusing to act on anything else.
+      * Vault is canonical. We re-write the markdown frontmatter on
+        success because the vault record's ``gcal_event_id`` is what
+        the next conflict-check cycle uses for dedup. Without that
+        write-back, every subsequent propose-create would see the same
+        event on both vault and gcal_alfred and double-count.
+    """
+    client = request.app.get(_KEY_GCAL_CLIENT)
+    config = request.app.get(_KEY_GCAL_CONFIG)
+    if client is None or config is None or not config.enabled:
+        log.debug(
+            "transport.canonical.event_propose_gcal_sync_skipped",
+            reason="not_configured",
+            correlation_id=correlation_id,
+        )
+        return {}
+    if not config.alfred_calendar_id:
+        log.warning(
+            "transport.canonical.event_propose_gcal_sync_skipped",
+            reason="alfred_calendar_id_empty",
+            correlation_id=correlation_id,
+        )
+        return {"error": "gcal alfred_calendar_id not configured"}
+
+    from alfred.integrations.gcal import GCalError
+
+    try:
+        event_id = client.create_event(
+            config.alfred_calendar_id,
+            start=start_dt,
+            end=end_dt,
+            title=title,
+            description=description,
+        )
+    except GCalError as exc:
+        # Per spec: do NOT roll back the vault create. Vault is canonical;
+        # GCal is the projection. Surface the error so Hypatia / KAL-LE
+        # can tell Andrew "saved to vault but GCal sync failed".
+        log.warning(
+            "transport.canonical.event_propose_gcal_sync_failed",
+            error=str(exc),
+            correlation_id=correlation_id,
+        )
+        return {"error": f"gcal sync failed: {exc}"}
+
+    # Success: write gcal_event_id + gcal_calendar back into the vault
+    # record's frontmatter. We re-load the file we just wrote rather
+    # than reusing the in-memory dict so any changes a parallel writer
+    # made between our write and now are preserved (defensive — there
+    # shouldn't be a parallel writer but cheap insurance).
+    try:
+        post = frontmatter.load(str(file_path))
+        post["gcal_event_id"] = event_id
+        post["gcal_calendar"] = "alfred"
+        # Preserve trailing-newline behaviour matching the original write.
+        new_text = frontmatter.dumps(post)
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+        file_path.write_text(new_text, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        # Frontmatter rewrite failure is a soft error — the GCal event
+        # exists, but our dedup loses its anchor. Log + keep going so
+        # the caller still gets the success path.
+        log.warning(
+            "transport.canonical.event_propose_gcal_writeback_failed",
+            error=str(exc),
+            event_id=event_id,
+            path=str(file_path),
+            correlation_id=correlation_id,
+        )
+
+    log.info(
+        "transport.canonical.event_propose_gcal_synced",
+        event_id=event_id,
+        calendar_id=config.alfred_calendar_id,
+        correlation_id=correlation_id,
+    )
+    return {"event_id": event_id}
 
 
 # ---------------------------------------------------------------------------
