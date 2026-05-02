@@ -40,6 +40,9 @@ async def fire_once(
         project_paths=project_paths,
         today=now,
         window_days=config.window_days,
+        synthesis_vault=Path(config.synthesis_vault),
+        synthesis_top_n=config.synthesis_top_n,
+        synthesis_weights=config.synthesis_weights or None,
     )
     log.info(
         "digest.fired",
@@ -48,6 +51,7 @@ async def fire_once(
         promotions=len(payload.promotions),
         open_questions=len(payload.open_questions),
         recurrences=len(payload.recurrences),
+        cross_arc_patterns=len(payload.cross_arc_patterns),
         byte_count=len(body.encode("utf-8")),
     )
     return {
@@ -57,6 +61,7 @@ async def fire_once(
         "promotions_count": len(payload.promotions),
         "open_questions_count": len(payload.open_questions),
         "recurrences_count": len(payload.recurrences),
+        "cross_arc_patterns_count": len(payload.cross_arc_patterns),
     }
 
 

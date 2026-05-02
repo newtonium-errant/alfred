@@ -430,7 +430,12 @@ def test_render_empty_payload_has_every_section() -> None:
     assert "## Decisions made" in body
     assert "## Promotions to canonical" in body
     assert "## Open questions" in body
-    assert "## Cross-project patterns" in body
+    # Section 4 renamed from "Cross-project patterns" to "Cross-arc
+    # patterns" 2026-05-01 — the corpus is single-project-dominant, so
+    # cross-PROJECT framing is wrong v1. Cross-PROJECT returns when
+    # V.E.R.A./STAY-C launch.
+    assert "## Cross-arc patterns" in body
+    assert "## Cross-project patterns" not in body
     assert "## Recurrences" in body
     # Empty-state strings (sections 1, 2, 5) — explicit "checked X, last Y".
     assert "No KAL-LE reviews flipped to addressed" in body
@@ -441,10 +446,117 @@ def test_render_empty_payload_has_every_section() -> None:
     assert "Last recurrence: never." in body
     # Section 5 must NOT use "last N days" framing (unbounded).
     assert "in the last 7 days. Checked:" not in body.split("## Recurrences", 1)[1]
-    # Section 3 keeps its existing empty text; section 4 the LLM-TODO.
+    # Section 3 keeps its existing empty text; section 4 now renders an
+    # explicit empty-state line (was a literal LLM-TODO marker before
+    # Phase 2 wired the synthesis ranker).
     assert "None this week." in body
-    assert "<!-- TODO: LLM synthesis layer not yet implemented -->" in body
+    assert "No cross-arc patterns surfaced this week." in body
+    assert "<!-- TODO: LLM synthesis layer not yet implemented -->" not in body
     assert body.endswith("\n")
+
+
+def _write_synthesis_record(
+    vault: Path,
+    *,
+    record_type: str,
+    name: str,
+    created: str,
+    sources: list[str],
+    entities: list[str],
+    claim: str = "Some claim text.",
+) -> Path:
+    """Write a minimal synthesis-shaped record into ``vault/<type>/<name>.md``."""
+    type_dir = vault / record_type
+    type_dir.mkdir(parents=True, exist_ok=True)
+    head = ["---", f"name: {name}", f"type: {record_type}", f"claim: {claim}",
+            f"created: '{created}'"]
+    if sources:
+        head.append("source_links:")
+        for s in sources:
+            head.append(f"  - '{s}'")
+    if entities:
+        head.append("entity_links:")
+        for e in entities:
+            head.append(f"  - '{e}'")
+    head.append("---")
+    path = type_dir / f"{name}.md"
+    path.write_text("\n".join(head) + "\n\nbody\n", encoding="utf-8")
+    return path
+
+
+def test_render_section_4_emits_ranker_bullets(tmp_path: Path) -> None:
+    """When the synthesis ranker returns records, section 4 renders one
+    bullet per record with the title, source list, and claim summary."""
+    vault = tmp_path / "vault"
+    today = datetime(2026, 4, 25, tzinfo=timezone.utc)
+    _write_synthesis_record(
+        vault, record_type="synthesis", name="Pattern Alpha",
+        created="2026-04-24",
+        sources=["[[session/Source A]]", "[[session/Source B]]"],
+        entities=["[[project/Alfred]]"],
+        claim="Cross-source pattern carries the most signal.",
+    )
+    _write_synthesis_record(
+        vault, record_type="decision", name="Decision Beta",
+        created="2026-04-23",
+        sources=["[[session/Source C]]"],
+        entities=["[[project/Alfred]]"],
+        claim="Single-source decision lower signal.",
+    )
+    payload = build_payload(
+        project_paths={}, today=today, window_days=7,
+        synthesis_vault=vault, synthesis_top_n=5,
+    )
+    body = render(payload)
+
+    # Section 4 header renamed; empty-state line absent because we have
+    # ranked records.
+    assert "## Cross-arc patterns" in body
+    assert "No cross-arc patterns surfaced this week." not in body
+    # Both records render as bullets with **title** prefix.
+    assert "- **Pattern Alpha**" in body
+    assert "- **Decision Beta**" in body
+    # Source wikilinks are emitted in the bullet's parenthesized list.
+    assert "[[session/Source A]]" in body
+    assert "[[session/Source B]]" in body
+    # Claim falls into the post-em-dash slot.
+    assert "Cross-source pattern carries the most signal." in body
+    # Pattern Alpha (synthesis, 2 sources) outranks Decision Beta
+    # (decision, 1 source) — verify ordering by index.
+    section4 = body.split("## Cross-arc patterns", 1)[1].split(
+        "## Recurrences", 1,
+    )[0]
+    assert section4.index("Pattern Alpha") < section4.index("Decision Beta")
+
+
+def test_render_section_4_top_n_zero_disables_ranker(tmp_path: Path) -> None:
+    """``synthesis_top_n=0`` skips the ranker call → empty-state line."""
+    vault = tmp_path / "vault"
+    _write_synthesis_record(
+        vault, record_type="synthesis", name="Would Rank",
+        created="2026-04-24",
+        sources=["[[session/x]]"],
+        entities=["[[project/Alfred]]"],
+        claim="Should not appear.",
+    )
+    today = datetime(2026, 4, 25, tzinfo=timezone.utc)
+    payload = build_payload(
+        project_paths={}, today=today, window_days=7,
+        synthesis_vault=vault, synthesis_top_n=0,
+    )
+    body = render(payload)
+    assert "No cross-arc patterns surfaced this week." in body
+    assert "Would Rank" not in body
+    assert payload.cross_arc_patterns == []
+
+
+def test_render_section_4_no_synthesis_vault_empty_state(tmp_path: Path) -> None:
+    """``synthesis_vault=None`` (default) → empty-state line, ranker not called."""
+    today = datetime(2026, 4, 25, tzinfo=timezone.utc)
+    payload = build_payload(project_paths={}, today=today, window_days=7)
+    assert payload.cross_arc_patterns == []
+    body = render(payload)
+    assert "No cross-arc patterns surfaced this week." in body
 
 
 def test_render_empty_decisions_names_last_addressed(two_projects) -> None:
@@ -591,7 +703,10 @@ def test_render_populated_payload(two_projects) -> None:
     assert "An open question" in body
     assert "decision.md" in body
     assert "open-q.md" in body
-    assert "<!-- TODO: LLM synthesis layer not yet implemented -->" in body
+    # Section 4 was the literal LLM-TODO marker pre-Phase-2; now it
+    # renders the empty-state line because no synthesis_vault was passed.
+    assert "## Cross-arc patterns" in body
+    assert "No cross-arc patterns surfaced this week." in body
 
 
 def test_render_recurrence_section_lists_disagreement(two_projects) -> None:

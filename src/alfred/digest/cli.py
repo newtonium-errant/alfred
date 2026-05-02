@@ -36,6 +36,9 @@ def cmd_write(raw: dict[str, Any], args: argparse.Namespace) -> int:
         project_paths=project_paths,
         today=today,
         window_days=window_days,
+        synthesis_vault=Path(config.synthesis_vault),
+        synthesis_top_n=config.synthesis_top_n,
+        synthesis_weights=config.synthesis_weights or None,
     )
     print(json.dumps({
         "ok": True,
@@ -46,6 +49,7 @@ def cmd_write(raw: dict[str, Any], args: argparse.Namespace) -> int:
         "promotions_count": len(payload.promotions),
         "open_questions_count": len(payload.open_questions),
         "recurrences_count": len(payload.recurrences),
+        "cross_arc_patterns_count": len(payload.cross_arc_patterns),
         "byte_count": len(body.encode("utf-8")),
     }, default=str))
     return 0
@@ -57,7 +61,12 @@ def cmd_preview(raw: dict[str, Any], args: argparse.Namespace) -> int:
     window_days = int(args.window_days or config.window_days)
     today = _now_utc()
     payload = build_payload(
-        project_paths=project_paths, today=today, window_days=window_days,
+        project_paths=project_paths,
+        today=today,
+        window_days=window_days,
+        synthesis_vault=Path(config.synthesis_vault),
+        synthesis_top_n=config.synthesis_top_n,
+        synthesis_weights=config.synthesis_weights or None,
     )
     print(render(payload), end="")
     return 0

@@ -10,8 +10,12 @@ broken):
    ``architecture/``, ``stack/``, or ``principles/`` in the window.
 3. Open questions — KAL-LE-authored reviews with status=open across
    ALL configured projects (no window filter; open is open).
-4. Cross-project patterns — emits a literal HTML-comment TODO marker;
-   the LLM synthesis layer fills this in later.
+4. Cross-arc patterns — top N records from the synthesis ranker over
+   the configured vault's ``synthesis/`` + ``decision/`` +
+   ``contradiction/`` directories. Renamed from "Cross-project
+   patterns" 2026-05-01 because the corpus is single-project-dominant
+   (74% Alfred-tagged) — cross-PROJECT framing returns when
+   V.E.R.A./STAY-C launch.
 5. Recurrences — KAL-LE reviews whose topic resurfaces and which have
    a sibling ``*—claude-disagreement.md`` archive. Unbounded: a topic
    counts as recurring regardless of timestamp, like Open Questions.
@@ -22,7 +26,8 @@ week is unambiguously distinct from a broken pipeline. Section 5 also
 emits a "Last recurrence" pointer for the same reason, but without
 the "last N days" framing since recurrences are unbounded. Sections 3
 and 4 keep their existing empty behavior (open-questions has no
-window; cross-project is a literal LLM-TODO marker).
+window; cross-arc renders an explicit "no patterns surfaced" line so
+silence stays distinguishable from a broken ranker).
 """
 
 from __future__ import annotations
@@ -36,6 +41,11 @@ from typing import Any
 
 import structlog
 
+from alfred.distiller.synthesis_ranker import (
+    RankedRecord,
+    rank_synthesis_records,
+    summary_from_record,
+)
 from alfred.reviews.config import resolve_projects
 from alfred.reviews.store import (
     KALLE_AUTHOR,
@@ -117,6 +127,10 @@ class DigestPayload:
     last_addressed: LastAddressed | None = None
     last_promotion: LastPromotion | None = None
     last_recurrence: LastRecurrence | None = None
+    # Phase 2 — section 4 ("Cross-arc patterns") top-N from the
+    # mechanical synthesis ranker. Empty list = ranker disabled
+    # (synthesis_top_n=0) or zero records in the configured vault.
+    cross_arc_patterns: list[RankedRecord] = field(default_factory=list)
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -524,8 +538,17 @@ def build_payload(
     project_paths: dict[str, Path],
     today: datetime,
     window_days: int = 7,
+    synthesis_vault: Path | None = None,
+    synthesis_top_n: int = 12,
+    synthesis_weights: dict[str, Any] | None = None,
 ) -> DigestPayload:
-    """Gather every section's data for ``today`` minus ``window_days``."""
+    """Gather every section's data for ``today`` minus ``window_days``.
+
+    Section 4 (cross-arc patterns) is populated by calling the
+    synthesis ranker over ``synthesis_vault`` when provided AND
+    ``synthesis_top_n > 0``. Defaults to the ranker disabled so callers
+    that haven't migrated keep the legacy empty-state behavior.
+    """
     if today.tzinfo is None:
         today = today.replace(tzinfo=timezone.utc)
     window_end = today
@@ -550,6 +573,22 @@ def build_payload(
     if not recurrences:
         last_recurrence = find_last_recurrence(project_paths)
 
+    cross_arc: list[RankedRecord] = []
+    if synthesis_vault is not None and synthesis_top_n > 0:
+        try:
+            cross_arc = rank_synthesis_records(
+                Path(synthesis_vault),
+                window_days=window_days,
+                top_n=synthesis_top_n,
+                weights=synthesis_weights,
+                now=today,
+            )
+        except Exception:  # noqa: BLE001 — ranker failure must not kill digest
+            log.exception(
+                "digest.cross_arc_patterns.ranker_failed",
+                vault=str(synthesis_vault),
+            )
+
     return DigestPayload(
         today=today,
         window_start=window_start,
@@ -565,10 +604,38 @@ def build_payload(
         last_addressed=last_addressed,
         last_promotion=last_promotion,
         last_recurrence=last_recurrence,
+        cross_arc_patterns=cross_arc,
     )
 
 
+# Retained for backward-compat with callers that still grep for the
+# legacy placeholder string. Section 4 no longer renders this when the
+# synthesis ranker is wired up — see :func:`render`.
 _LLM_PLACEHOLDER = "<!-- TODO: LLM synthesis layer not yet implemented -->"
+
+
+def _render_cross_arc_bullet(record: RankedRecord) -> str:
+    """One bullet per ranked record. Format::
+
+        - **{title}** (sources: [[X]], [[Y]]) — {claim_or_summary}
+
+    The wikilink list mirrors the record's ``source_links`` field; the
+    summary falls back to the body's first paragraph if neither
+    ``claim`` nor ``summary`` is in frontmatter.
+    """
+    fm = record.frontmatter
+    title = fm.get("name") or fm.get("title") or record.path.stem
+    summary = summary_from_record(fm, record.body) or "(no summary)"
+    sources = fm.get("source_links") if isinstance(
+        fm.get("source_links"), list,
+    ) else []
+    sources_clean = [
+        s.strip() for s in sources if isinstance(s, str) and s.strip()
+    ]
+    if sources_clean:
+        sources_str = ", ".join(sources_clean)
+        return f"- **{title}** (sources: {sources_str}) — {summary}"
+    return f"- **{title}** — {summary}"
 
 
 def _format_project_list(names: list[str]) -> str:
@@ -661,9 +728,20 @@ def render(payload: DigestPayload) -> str:
             )
     parts.append("")
 
-    parts.append("## Cross-project patterns")
+    parts.append("## Cross-arc patterns")
     parts.append("")
-    parts.append(_LLM_PLACEHOLDER)
+    if not payload.cross_arc_patterns:
+        # Empty-state mirrors sections 1/2/5 — explicit "ran, nothing to
+        # surface" line so a quiet week is distinguishable from a broken
+        # ranker. Per ``feedback_intentionally_left_blank.md``.
+        parts.append(
+            f"No cross-arc patterns surfaced this week. "
+            f"Checked: synthesis/, decision/, contradiction/ over the "
+            f"last {window_days} days."
+        )
+    else:
+        for ranked in payload.cross_arc_patterns:
+            parts.append(_render_cross_arc_bullet(ranked))
     parts.append("")
 
     parts.append("## Recurrences")
@@ -698,10 +776,25 @@ def write_digest(
     project_paths: dict[str, Path],
     today: datetime,
     window_days: int = 7,
+    synthesis_vault: Path | None = None,
+    synthesis_top_n: int = 12,
+    synthesis_weights: dict[str, Any] | None = None,
 ) -> tuple[Path, str, DigestPayload]:
-    """Build and persist the digest file. Returns (path, body, payload)."""
+    """Build and persist the digest file. Returns (path, body, payload).
+
+    ``synthesis_vault`` / ``synthesis_top_n`` / ``synthesis_weights`` are
+    forwarded to :func:`build_payload` for section 4 (cross-arc
+    patterns). Defaults keep the ranker disabled so callers that haven't
+    migrated render the empty-state line — which is itself a behavior
+    change from the legacy LLM-TODO marker. See module docstring.
+    """
     payload = build_payload(
-        project_paths=project_paths, today=today, window_days=window_days,
+        project_paths=project_paths,
+        today=today,
+        window_days=window_days,
+        synthesis_vault=synthesis_vault,
+        synthesis_top_n=synthesis_top_n,
+        synthesis_weights=synthesis_weights,
     )
     body = render(payload)
     output_dir.mkdir(parents=True, exist_ok=True)
