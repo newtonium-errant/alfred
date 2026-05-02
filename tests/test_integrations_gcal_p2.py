@@ -384,61 +384,86 @@ async def test_intended_on_skip_logs_warning_in_conflict_check(  # type: ignore[
 
     The handler still returns a clean 201 (vault-only flow); only the
     log signal differs. This is the operator-visibility fix.
+
+    Uses the canonical structlog+caplog pattern from
+    ``tests/test_vault_dont_scan_index_split.py``:
+      * ``caplog.at_level(logging.WARNING, logger=...)`` scopes capture
+        to the right logger.
+      * ``r.getMessage()`` formats record.msg % record.args — necessary
+        because structlog routes the rendered event name through
+        ``record.args`` (or the formatter), not ``record.message``,
+        which holds only the unrendered template.
     """
-    caplog.set_level(logging.WARNING)
     # Sentinel set, no client wired (simulates startup-failure state).
     client = await app_factory(gcal_intended_on=True)
-    resp = await client.post(
-        "/canonical/event/propose-create",
-        json={
-            "correlation_id": "intended-on-no-client-test",
-            "start": "2026-05-04T14:00:00-03:00",
-            "end": "2026-05-04T15:00:00-03:00",
-            "title": "GCal intended on but broken",
-            "origin_instance": "kal-le",
-        },
-        headers={
-            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
-            "X-Alfred-Client": "kal-le",
-        },
-    )
+    with caplog.at_level(
+        logging.WARNING, logger="alfred.transport.peer_handlers",
+    ):
+        resp = await client.post(
+            "/canonical/event/propose-create",
+            json={
+                "correlation_id": "intended-on-no-client-test",
+                "start": "2026-05-04T14:00:00-03:00",
+                "end": "2026-05-04T15:00:00-03:00",
+                "title": "GCal intended on but broken",
+                "origin_instance": "kal-le",
+            },
+            headers={
+                "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+                "X-Alfred-Client": "kal-le",
+            },
+        )
     assert resp.status == 201
     # Warning log emitted for both phases (conflict_check + sync).
     warning_messages = [
-        r.message for r in caplog.records
+        r.getMessage() for r in caplog.records
         if r.levelno >= logging.WARNING
-        and "skipped_but_intended_on" in r.message
+        and "skipped_but_intended_on" in r.getMessage()
     ]
     # At least one warning across the two skip sites.
-    assert len(warning_messages) >= 1
+    assert len(warning_messages) >= 1, (
+        f"expected ≥1 'skipped_but_intended_on' warning, got 0. "
+        f"Captured records: {[r.getMessage() for r in caplog.records]}"
+    )
 
 
 async def test_no_sentinel_skip_stays_quiet(app_factory, caplog):  # type: ignore[no-untyped-def]
-    """No sentinel + no client → DEBUG-only skip (no warning spam)."""
-    caplog.set_level(logging.DEBUG)
+    """No sentinel + no client → DEBUG-only skip (no warning spam).
+
+    Same canonical structlog+caplog pattern as the test above —
+    ``r.getMessage()`` rather than ``r.message`` so the assertion
+    actually inspects rendered output.
+    """
     client = await app_factory()  # no client, no sentinel
-    resp = await client.post(
-        "/canonical/event/propose-create",
-        json={
-            "correlation_id": "no-sentinel-test",
-            "start": "2026-05-04T14:00:00-03:00",
-            "end": "2026-05-04T15:00:00-03:00",
-            "title": "Vault-only by design",
-            "origin_instance": "kal-le",
-        },
-        headers={
-            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
-            "X-Alfred-Client": "kal-le",
-        },
-    )
+    with caplog.at_level(
+        logging.DEBUG, logger="alfred.transport.peer_handlers",
+    ):
+        resp = await client.post(
+            "/canonical/event/propose-create",
+            json={
+                "correlation_id": "no-sentinel-test",
+                "start": "2026-05-04T14:00:00-03:00",
+                "end": "2026-05-04T15:00:00-03:00",
+                "title": "Vault-only by design",
+                "origin_instance": "kal-le",
+            },
+            headers={
+                "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+                "X-Alfred-Client": "kal-le",
+            },
+        )
     assert resp.status == 201
     # No "intended_on" warning emitted.
     intended_warnings = [
         r for r in caplog.records
         if r.levelno >= logging.WARNING
-        and "skipped_but_intended_on" in r.message
+        and "skipped_but_intended_on" in r.getMessage()
     ]
-    assert intended_warnings == []
+    assert intended_warnings == [], (
+        f"expected 0 'skipped_but_intended_on' warnings (sentinel "
+        f"not set), got {len(intended_warnings)}: "
+        f"{[r.getMessage() for r in intended_warnings]}"
+    )
 
 
 def test_talker_daemon_sets_intended_on_before_client_construction():
