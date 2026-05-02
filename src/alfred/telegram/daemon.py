@@ -276,6 +276,21 @@ async def run(
             peers=list(transport_config.auth.tokens.keys()),
         )
 
+        # ---- Vault path wiring ---------------------------------------
+        # Required by every /canonical/* handler (and brief_digest,
+        # pending-items resolvers) so they can locate the vault. Without
+        # this, _get_vault_path returns None and handlers 500 with
+        # ``vault_not_configured``. Same shape as the pending_items
+        # registrations below — register on the app object before any
+        # request hits the server. Applies to every instance (Salem,
+        # KAL-LE, Hypatia, ...) since they all run this daemon path.
+        from alfred.transport.peer_handlers import register_vault_path
+        register_vault_path(transport_app, Path(config.vault.path))
+        log.info(
+            "talker.daemon.transport_vault_path_registered",
+            vault_path=config.vault.path,
+        )
+
         # ---- Pending Items Queue (Phase 1) wiring --------------------
         # Aggregate path is needed on Salem (the receiver) so peer
         # pushes land in the right JSONL. Resolver callable is needed
