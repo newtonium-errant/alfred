@@ -8,6 +8,6 @@ read / mark-addressed never touches a human-authored file.
 Disagreement archive convention (no automation in this module): when
 project-Claude disagrees with a KAL-LE review, project-Claude writes a
 sibling ``<same-name>—claude-disagreement.md`` or appends a
-``## Claude Code Response`` section to the original. The cross-project
-digest surfaces these later (see :mod:`alfred.digest`).
+``## Claude Code Response`` section to the original. The cross-arc
+weekly digest surfaces these later (see :mod:`alfred.digest`).
 """

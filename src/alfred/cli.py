@@ -1902,7 +1902,7 @@ def build_parser() -> argparse.ArgumentParser:
     from alfred.reviews import cli as reviews_cli
     reviews_cli.build_subparser(sub)
 
-    # digest — KAL-LE cross-project weekly synthesis
+    # digest — KAL-LE cross-arc weekly synthesis
     from alfred.digest import cli as digest_cli
     digest_cli.build_subparser(sub)
 

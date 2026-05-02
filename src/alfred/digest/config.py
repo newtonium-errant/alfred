@@ -53,11 +53,15 @@ def _default_output_dir() -> str:
 def _default_synthesis_vault() -> str:
     """Where the synthesis ranker reads distilled records from.
 
-    Defaults to KAL-LE's vault root (``~/aftermath-lab``). The ranker
-    walks ``synthesis/``, ``decision/``, and ``contradiction/`` under
-    this root for the digest's section 4 ("Cross-arc patterns").
+    Defaults to ``""`` (disabled) — every instance must opt in
+    explicitly so subordinate instances don't silently inherit
+    KAL-LE's vault and publish KAL-LE's syntheses in their own
+    digest. Set ``digest.synthesis_vault`` in the per-instance
+    config to point at the vault whose ``synthesis/``,
+    ``decision/``, and ``contradiction/`` directories should feed
+    section 4 ("Cross-arc patterns").
     """
-    return str(Path.home() / "aftermath-lab")
+    return ""
 
 
 @dataclass
@@ -74,8 +78,9 @@ class DigestConfig:
     window_days: int = 7
     # Phase 2 — synthesis ranker source vault. Distinct from
     # ``output_dir`` because the ranker reads distilled-learn records,
-    # not the digest's own output. Defaults to the canonical KAL-LE
-    # vault (``~/aftermath-lab``).
+    # not the digest's own output. Defaults to ``""`` (ranker
+    # disabled); every instance must opt in via per-instance config to
+    # avoid silently inheriting another instance's vault.
     synthesis_vault: str = field(default_factory=_default_synthesis_vault)
     # Top N records the ranker surfaces into section 4. 0 disables the
     # ranker call entirely (section renders the empty-state message).

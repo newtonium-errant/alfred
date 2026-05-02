@@ -3,11 +3,10 @@
 Each section must render even when empty. Sections 1, 2, and 5 emit an
 explicit "what we checked" line plus a "last detected" pointer when
 empty so a quiet week is unambiguously distinct from a broken pipeline.
-Sections 3 and 4 keep their existing empty behavior (open-questions
-has no window; cross-project is a literal LLM-TODO marker).
-
-The cross-project patterns section must always emit the LLM-TODO HTML
-comment so the future synthesis layer has its slot.
+Section 3 (open questions) has no window. Section 4 (cross-arc
+patterns) is populated by the synthesis ranker; when ranker-disabled or
+zero records, it renders an explicit "no patterns surfaced" line so
+silence stays distinguishable from a broken ranker.
 """
 
 from __future__ import annotations
@@ -771,3 +770,134 @@ def test_find_last_recurrence_returns_none_when_no_disagreement(two_projects) ->
     ))
     # Topic recurs but no sibling disagreement archive → no recurrence.
     assert find_last_recurrence(two_projects) is None
+
+
+def test_digest_config_synthesis_vault_disabled_by_default(tmp_path) -> None:
+    """A fresh DigestConfig with no synthesis_vault must NOT silently
+    inherit another instance's vault. The default is "" (disabled), and
+    section 4 renders the empty-state line — even if KAL-LE's vault
+    happens to live at the historical default path.
+
+    Pins the multi-instance fragility flagged by code review (Pattern 1
+    in feedback_hardcoding_and_alfred_naming.md): every instance must
+    opt in explicitly via per-instance config.
+    """
+    from alfred.digest.config import DigestConfig, load_from_unified
+
+    # 1. Fresh dataclass: synthesis_vault is empty.
+    fresh = DigestConfig()
+    assert fresh.synthesis_vault == ""
+
+    # 2. load_from_unified with NO digest section → synthesis_vault empty.
+    cfg_no_section = load_from_unified({})
+    assert cfg_no_section.synthesis_vault == ""
+
+    # 3. load_from_unified with a digest section but no synthesis_vault
+    # key → still empty (no implicit inheritance from any default path).
+    cfg_partial = load_from_unified({
+        "digest": {"enabled": True, "window_days": 7},
+    })
+    assert cfg_partial.synthesis_vault == ""
+
+    # 4. End-to-end: even if a populated synthesis-shaped vault happens
+    # to exist on disk, an instance that didn't set synthesis_vault must
+    # render the empty-state line — because the call site only forwards
+    # synthesis_vault when truthy.
+    other_instance_vault = tmp_path / "other-instance"
+    _write_synthesis_record(
+        other_instance_vault, record_type="synthesis", name="Borrowed Pattern",
+        created="2026-04-24",
+        sources=["[[session/x]]"],
+        entities=["[[project/Other]]"],
+        claim="This must NOT appear in this instance's digest.",
+    )
+    today = datetime(2026, 4, 25, tzinfo=timezone.utc)
+    # Mirror the call-site idiom from cmd_write/fire_once: pass None
+    # when the configured synthesis_vault is empty.
+    synthesis_vault = (
+        Path(cfg_partial.synthesis_vault) if cfg_partial.synthesis_vault else None
+    )
+    payload = build_payload(
+        project_paths={}, today=today, window_days=7,
+        synthesis_vault=synthesis_vault,
+        synthesis_top_n=cfg_partial.synthesis_top_n,
+    )
+    body = render(payload)
+    assert payload.cross_arc_patterns == []
+    assert "No cross-arc patterns surfaced this week." in body
+    assert "Borrowed Pattern" not in body
+
+
+def test_render_cross_arc_bullet_truncates_long_claim(tmp_path: Path) -> None:
+    """Real distiller corpus produces 250-300 char folded-scalar claims.
+
+    The bullet renderer caps summaries at 240 chars with a "..." suffix
+    so long claims don't blow up the digest's readability. The boundary
+    is asserted explicitly: 240 chars passes through verbatim, 250 chars
+    truncates with the ellipsis tail.
+    """
+    today = datetime(2026, 4, 25, tzinfo=timezone.utc)
+    vault = tmp_path / "vault"
+
+    short_claim = "x" * 240  # exactly at boundary — passes through
+    long_claim = "y" * 250   # over boundary — truncates
+
+    _write_synthesis_record(
+        vault, record_type="synthesis", name="Short Boundary",
+        created="2026-04-24",
+        sources=["[[session/a]]"],
+        entities=["[[project/Alfred]]"],
+        claim=short_claim,
+    )
+    _write_synthesis_record(
+        vault, record_type="synthesis", name="Long Claim",
+        created="2026-04-24",
+        sources=["[[session/b]]"],
+        entities=["[[project/Alfred]]"],
+        claim=long_claim,
+    )
+    payload = build_payload(
+        project_paths={}, today=today, window_days=7,
+        synthesis_vault=vault, synthesis_top_n=5,
+    )
+    body = render(payload)
+
+    # 240-char claim passes through verbatim — no ellipsis suffix.
+    assert short_claim in body
+    # 250-char claim truncates: 237 chars of y + "..." (240 chars total
+    # in the rendered summary). The full 250 y's must NOT appear.
+    assert long_claim not in body
+    assert ("y" * 237) + "..." in body
+
+
+def test_render_cross_arc_bullet_handles_non_string_title(tmp_path: Path) -> None:
+    """If frontmatter ``name`` is a non-string (YAML quirk), bullet must
+    not render as ``- **['Some Title']**``. Falls back to ``title`` then
+    to the file stem."""
+    vault = tmp_path / "vault"
+    type_dir = vault / "synthesis"
+    type_dir.mkdir(parents=True)
+    # YAML list as the ``name`` value — a real malformed-frontmatter
+    # shape that occurred during the Phase 1 backfill.
+    (type_dir / "fallback-stem.md").write_text(
+        "---\n"
+        "name:\n"
+        "  - List value not a string\n"
+        "type: synthesis\n"
+        "claim: A reasonable claim.\n"
+        "created: '2026-04-24'\n"
+        "source_links:\n"
+        "  - '[[session/x]]'\n"
+        "---\n\nbody\n",
+        encoding="utf-8",
+    )
+    today = datetime(2026, 4, 25, tzinfo=timezone.utc)
+    payload = build_payload(
+        project_paths={}, today=today, window_days=7,
+        synthesis_vault=vault, synthesis_top_n=5,
+    )
+    body = render(payload)
+    # Bullet uses the file stem as the title — not the YAML list repr.
+    assert "- **fallback-stem**" in body
+    assert "List value not a string" not in body
+    assert "['List value not a string']" not in body

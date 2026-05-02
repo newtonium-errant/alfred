@@ -40,7 +40,9 @@ async def fire_once(
         project_paths=project_paths,
         today=now,
         window_days=config.window_days,
-        synthesis_vault=Path(config.synthesis_vault),
+        synthesis_vault=(
+            Path(config.synthesis_vault) if config.synthesis_vault else None
+        ),
         synthesis_top_n=config.synthesis_top_n,
         synthesis_weights=config.synthesis_weights or None,
     )

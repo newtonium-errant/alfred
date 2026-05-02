@@ -280,10 +280,10 @@ brief_digest_push:
 #       - kal-le
 
 # ---------------------------------------------------------------------------
-# digest — KAL-LE weekly cross-project synthesis
+# digest — KAL-LE weekly cross-arc synthesis
 # ---------------------------------------------------------------------------
 # Uncomment to fire a weekly digest into ~/aftermath-lab/digests/. Off
-# by default — only KAL-LE-shape instances that own the cross-project
+# by default — only KAL-LE-shape instances that own the cross-arc
 # review surface should enable this.
 #
 # digest:
@@ -294,6 +294,12 @@ brief_digest_push:
 #     day_of_week: "sunday"
 #   output_dir: "/home/andrew/aftermath-lab/digests"
 #   window_days: 7
+#   # synthesis_vault is REQUIRED for section 4 ("Cross-arc patterns")
+#   # to populate. Defaults to "" (ranker disabled, empty-state line
+#   # rendered) — every instance must opt in explicitly so subordinate
+#   # instances don't silently inherit another instance's vault.
+#   synthesis_vault: "/home/andrew/aftermath-lab"
+#   synthesis_top_n: 12
 
 # ---------------------------------------------------------------------------
 # kalle.projects — project name → vault path map (used by reviews + digest)

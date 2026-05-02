@@ -608,12 +608,6 @@ def build_payload(
     )
 
 
-# Retained for backward-compat with callers that still grep for the
-# legacy placeholder string. Section 4 no longer renders this when the
-# synthesis ranker is wired up — see :func:`render`.
-_LLM_PLACEHOLDER = "<!-- TODO: LLM synthesis layer not yet implemented -->"
-
-
 def _render_cross_arc_bullet(record: RankedRecord) -> str:
     """One bullet per ranked record. Format::
 
@@ -621,11 +615,21 @@ def _render_cross_arc_bullet(record: RankedRecord) -> str:
 
     The wikilink list mirrors the record's ``source_links`` field; the
     summary falls back to the body's first paragraph if neither
-    ``claim`` nor ``summary`` is in frontmatter.
+    ``claim`` nor ``summary`` is in frontmatter. Long summaries are
+    truncated at 240 chars with an ellipsis suffix — real distiller
+    corpus produces 250-300 char folded-scalar claims that render
+    awkwardly in a bullet list.
     """
     fm = record.frontmatter
-    title = fm.get("name") or fm.get("title") or record.path.stem
+    # ``fm`` values can be non-strings (YAML ints, bools, lists) when the
+    # source record's frontmatter is malformed; isinstance gates keep the
+    # bullet readable instead of rendering ``- **['Some Title']**``.
+    title = fm.get("name") if isinstance(fm.get("name"), str) else None
+    title = title or (fm.get("title") if isinstance(fm.get("title"), str) else None)
+    title = title or record.path.stem
     summary = summary_from_record(fm, record.body) or "(no summary)"
+    if len(summary) > 240:
+        summary = summary[:237].rstrip() + "..."
     sources = fm.get("source_links") if isinstance(
         fm.get("source_links"), list,
     ) else []

@@ -327,6 +327,9 @@ def rank_synthesis_records(
         now = datetime.now(timezone.utc)
     elif now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
+    # Defensive: ``candidates[:-5]`` returns all-but-last-5 instead of
+    # erroring, so a negative ``top_n`` would silently mangle output.
+    top_n = max(0, top_n)
     w = _normalize_weights(weights)
 
     candidates: list[RankedRecord] = []

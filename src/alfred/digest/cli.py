@@ -36,7 +36,9 @@ def cmd_write(raw: dict[str, Any], args: argparse.Namespace) -> int:
         project_paths=project_paths,
         today=today,
         window_days=window_days,
-        synthesis_vault=Path(config.synthesis_vault),
+        synthesis_vault=(
+            Path(config.synthesis_vault) if config.synthesis_vault else None
+        ),
         synthesis_top_n=config.synthesis_top_n,
         synthesis_weights=config.synthesis_weights or None,
     )
@@ -64,7 +66,9 @@ def cmd_preview(raw: dict[str, Any], args: argparse.Namespace) -> int:
         project_paths=project_paths,
         today=today,
         window_days=window_days,
-        synthesis_vault=Path(config.synthesis_vault),
+        synthesis_vault=(
+            Path(config.synthesis_vault) if config.synthesis_vault else None
+        ),
         synthesis_top_n=config.synthesis_top_n,
         synthesis_weights=config.synthesis_weights or None,
     )
@@ -75,7 +79,7 @@ def cmd_preview(raw: dict[str, Any], args: argparse.Namespace) -> int:
 def build_subparser(subparsers: argparse._SubParsersAction) -> None:
     digest_p = subparsers.add_parser(
         "digest",
-        help="KAL-LE cross-project weekly synthesis",
+        help="KAL-LE cross-arc weekly synthesis",
     )
     sub = digest_p.add_subparsers(dest="digest_cmd")
 

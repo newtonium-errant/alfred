@@ -283,7 +283,7 @@ def _run_brief_digest_push(raw: dict[str, Any], suppress_stdout: bool = False) -
 
 
 def _run_digest(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
-    """Digest daemon entry — KAL-LE weekly cross-project synthesis.
+    """Digest daemon entry — KAL-LE weekly cross-arc synthesis.
 
     Fires once per week at ``digest.schedule`` (default Sunday 07:00
     America/Halifax). Auto-skip with exit 78 when ``digest.enabled``
@@ -580,7 +580,7 @@ def run_all(
         # principal — receiver, not sender).
         if "brief_digest_push" in raw and (raw.get("brief_digest_push") or {}).get("enabled"):
             tools.append("brief_digest_push")
-        # KAL-LE weekly cross-project digest. Auto-starts when ``digest:``
+        # KAL-LE weekly cross-arc digest. Auto-starts when ``digest:``
         # is in config AND ``enabled: true``. Default off so subordinates
         # that don't write digests don't fire one.
         if "digest" in raw and (raw.get("digest") or {}).get("enabled"):

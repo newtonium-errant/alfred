@@ -404,3 +404,20 @@ def test_score_breakdown_total_sums() -> None:
         cross_source=1.0, entity_diversity=2.0, recency=3.0, type_weight=4.0,
     )
     assert sb.total() == 10.0
+
+
+def test_negative_top_n_returns_empty_not_mangled(empty_vault: Path) -> None:
+    """Negative ``top_n`` must clamp to 0, not return ``candidates[:-N]``.
+
+    Without the ``max(0, top_n)`` guard, ``rank_synthesis_records(..., top_n=-5)``
+    would return all-but-last-5 records (silent corruption of the digest).
+    """
+    for i in range(5):
+        _write(empty_vault, "synthesis", f"rec{i}", _record(
+            name=f"rec{i}",
+            record_type="synthesis",
+            source_links=[f"[[s/{j}]]" for j in range(i + 1)],
+            created=NOW.date().isoformat(),
+        ))
+    out = rank_synthesis_records(empty_vault, top_n=-5, now=NOW)
+    assert out == []
