@@ -689,13 +689,14 @@ def cmd_gcal(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred gcal`` subcommands.
 
     Phase A+ inter-instance comms: Google Calendar integration. The
-    three subcommands (authorize / status / test-write) are operator
-    tools — Salem's daemon doesn't invoke them. They live behind the
-    main CLI so the operator setup flow is uniform with every other
-    Alfred capability.
+    four subcommands (authorize / status / test-write / backfill) are
+    operator tools — Salem's daemon doesn't invoke them directly.
+    They live behind the main CLI so the operator setup flow is
+    uniform with every other Alfred capability.
 
-    JSON output is supported for ``status`` and ``test-write`` so a
-    setup script can pipe the result through ``jq`` for validation.
+    JSON output is supported for ``status`` / ``test-write`` /
+    ``backfill`` so a setup script can pipe the result through ``jq``
+    for validation.
     """
     raw = _load_unified_config(args.config)
     wants_json = bool(getattr(args, "json", False))
@@ -716,8 +717,15 @@ def cmd_gcal(args: argparse.Namespace) -> None:
             cleanup=not getattr(args, "no_cleanup", False),
             wants_json=wants_json,
         ))
+    if subcmd == "backfill":
+        sys.exit(gcal_cli.cmd_backfill(
+            raw,
+            dry_run=bool(getattr(args, "dry_run", False)),
+            from_date=getattr(args, "from_date", None),
+            wants_json=wants_json,
+        ))
 
-    print("Usage: alfred gcal {authorize|status|test-write}")
+    print("Usage: alfred gcal {authorize|status|test-write|backfill}")
     sys.exit(1)
 
 
@@ -1957,6 +1965,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Leave the test event in place (visible on your phone)",
     )
     gcal_test_p.add_argument(
+        "--json", action="store_true", default=False,
+        help="Emit machine-readable JSON instead of human-readable output",
+    )
+    gcal_backfill_p = gcal_sub.add_parser(
+        "backfill",
+        help=(
+            "Push existing vault event records (without gcal_event_id) "
+            "to the Alfred calendar; writes back the GCal IDs"
+        ),
+    )
+    gcal_backfill_p.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Report what would happen without making API calls or vault writes",
+    )
+    gcal_backfill_p.add_argument(
+        "--from-date", default=None,
+        help=(
+            "ISO YYYY-MM-DD cutoff — events with start.date() before this "
+            "are skipped (default: today; pass an earlier date to backfill "
+            "historical events)"
+        ),
+    )
+    gcal_backfill_p.add_argument(
         "--json", action="store_true", default=False,
         help="Emit machine-readable JSON instead of human-readable output",
     )

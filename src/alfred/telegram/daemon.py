@@ -394,6 +394,133 @@ async def run(
                     calendar_label=gcal_config.alfred_calendar_label,
                     time_zone=gcal_config.default_time_zone or "(calendar default)",
                 )
+
+                # ---- Vault-ops event hooks (Phase A+ commit 2/3) -----
+                # Register sync closures so vault_create / vault_edit /
+                # vault_delete on event records mirror to GCal regardless
+                # of caller (Telegram chat, instructor executor,
+                # daily-sync dispatcher, future agents). The cross-
+                # instance event-propose handler doesn't go through
+                # vault_create — it writes files directly — so its sync
+                # path is unchanged (still uses the shared
+                # ``sync_event_create_to_gcal`` via the
+                # ``_sync_event_to_gcal`` shim, no double-fire).
+                from alfred.integrations.gcal_sync import (
+                    sync_event_create_to_gcal,
+                    sync_event_delete_to_gcal,
+                    sync_event_update_to_gcal,
+                )
+                from alfred.vault.ops import (
+                    register_event_create_hook,
+                    register_event_delete_hook,
+                    register_event_update_hook,
+                )
+
+                # Capture the daemon-bound client + config + sentinel
+                # in closure scope so the hook signature stays
+                # registry-friendly (no per-fire kwarg threading).
+                _bound_client = gcal_client
+                _bound_config = gcal_config
+                _bound_intended_on = gcal_intended_on
+
+                def _on_event_created(vault_path_, rel_path, fm):
+                    """Vault-create hook → push event to GCal + writeback ID."""
+                    from datetime import datetime as _dt
+                    start_raw = fm.get("start")
+                    end_raw = fm.get("end")
+                    if not start_raw or not end_raw:
+                        # No times → can't push to GCal. The sync
+                        # function would also reject this, but bail
+                        # early to skip the import + mock-API roundtrip.
+                        log.debug(
+                            "talker.daemon.gcal_create_hook_skipped",
+                            reason="no_start_or_end",
+                            rel_path=rel_path,
+                        )
+                        return
+                    try:
+                        start_dt = _dt.fromisoformat(str(start_raw))
+                        end_dt = _dt.fromisoformat(str(end_raw))
+                    except Exception:  # noqa: BLE001
+                        log.warning(
+                            "talker.daemon.gcal_create_hook_bad_time",
+                            rel_path=rel_path,
+                            start=str(start_raw)[:40],
+                            end=str(end_raw)[:40],
+                        )
+                        return
+                    file_path = Path(vault_path_) / rel_path
+                    sync_event_create_to_gcal(
+                        client=_bound_client,
+                        config=_bound_config,
+                        intended_on=_bound_intended_on,
+                        file_path=file_path,
+                        title=str(fm.get("title") or fm.get("name") or ""),
+                        description=str(fm.get("summary") or ""),
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                        correlation_id=str(fm.get("correlation_id") or ""),
+                    )
+
+                def _on_event_updated(vault_path_, rel_path, fm, fields_changed):
+                    """Vault-edit hook → patch GCal event with changed fields."""
+                    from datetime import datetime as _dt
+                    gcal_event_id = str(fm.get("gcal_event_id") or "")
+                    # Only patch fields that actually changed AND are
+                    # GCal-relevant. ``fields_changed`` is a flat list
+                    # of frontmatter keys + possibly "body" — the GCal
+                    # patch surface is title / description / start / end.
+                    title = (
+                        str(fm.get("title") or fm.get("name") or "")
+                        if "title" in fields_changed or "name" in fields_changed
+                        else None
+                    )
+                    description = (
+                        str(fm.get("summary") or "")
+                        if "summary" in fields_changed
+                        else None
+                    )
+                    start_dt = None
+                    end_dt = None
+                    if "start" in fields_changed and fm.get("start"):
+                        try:
+                            start_dt = _dt.fromisoformat(str(fm["start"]))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if "end" in fields_changed and fm.get("end"):
+                        try:
+                            end_dt = _dt.fromisoformat(str(fm["end"]))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    sync_event_update_to_gcal(
+                        client=_bound_client,
+                        config=_bound_config,
+                        intended_on=_bound_intended_on,
+                        gcal_event_id=gcal_event_id,
+                        title=title,
+                        description=description,
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                        correlation_id=str(fm.get("correlation_id") or ""),
+                    )
+
+                def _on_event_deleted(vault_path_, rel_path, pre_delete_fm):
+                    """Vault-delete hook → remove the GCal mirror."""
+                    gcal_event_id = str(pre_delete_fm.get("gcal_event_id") or "")
+                    sync_event_delete_to_gcal(
+                        client=_bound_client,
+                        config=_bound_config,
+                        intended_on=_bound_intended_on,
+                        gcal_event_id=gcal_event_id,
+                        correlation_id=str(
+                            pre_delete_fm.get("correlation_id") or ""
+                        ),
+                    )
+
+                register_event_create_hook(_on_event_created)
+                register_event_update_hook(_on_event_updated)
+                register_event_delete_hook(_on_event_deleted)
+                log.info("talker.daemon.gcal_event_hooks_registered")
             else:
                 log.info("talker.daemon.gcal_disabled")
         except Exception:  # noqa: BLE001

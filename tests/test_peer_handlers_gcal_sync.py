@@ -408,13 +408,17 @@ async def test_frontmatter_writeback_failure_is_soft(app_factory, monkeypatch): 
 
     client = await app_factory(gcal_client=gcal_client, gcal_config=gcal_config)
 
-    # Force the frontmatter.dumps to raise.
-    import alfred.transport.peer_handlers as ph_mod
+    # Force the frontmatter.dumps to raise. Post-refactor (vault-ops
+    # hook ship), the writeback lives in
+    # ``alfred.integrations.gcal_sync`` — patching ``peer_handlers``'s
+    # frontmatter no longer affects the path. Patch the actual module
+    # that owns the writeback now.
+    import alfred.integrations.gcal_sync as sync_mod
 
     def _boom(*args, **kwargs):
         raise RuntimeError("simulated dumps failure")
 
-    monkeypatch.setattr(ph_mod.frontmatter, "dumps", _boom)
+    monkeypatch.setattr(sync_mod.frontmatter, "dumps", _boom)
 
     resp = await client.post(
         "/canonical/event/propose-create",

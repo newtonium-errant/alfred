@@ -2024,43 +2024,14 @@ async def _handle_canonical_event_propose_create(
 
 
 def _classify_gcal_error(exc: BaseException) -> str:
-    """Map a GCal-side exception to a stable code for downstream renderers.
+    """Backward-compat shim — :func:`alfred.integrations.gcal_sync.classify_gcal_error`
+    is the canonical implementation since the hook refactor.
 
-    The ``gcal_sync_error`` field on the ``/canonical/event/propose-create``
-    response carries a ``code`` so Hypatia / KAL-LE can switch on it
-    without parsing free-form ``detail`` text. Codes are intentionally
-    coarse for v1 — future refinements (e.g. splitting ``api_error``
-    into ``quota_exceeded`` / ``rate_limited`` / ``server_error``) can
-    add codes without breaking consumers that already handle the
-    coarse value.
-
-    Lazy-imports the ``GCalError`` hierarchy because this module loads
-    on instances that don't have the optional ``[gcal]`` deps installed
-    — eager import would crash KAL-LE / Hypatia at startup.
+    Kept here so external callers / tests that imported the symbol
+    from ``peer_handlers`` keep working without code changes.
     """
-    try:
-        from alfred.integrations.gcal import (
-            GCalAPIError,
-            GCalNotAuthorized,
-            GCalNotInstalled,
-        )
-    except ImportError:
-        # Optional dep absent — caller hit a non-GCal exception path.
-        return "unknown"
-
-    if isinstance(exc, GCalNotAuthorized):
-        # Token refresh failed OR no token on disk. Operator-fixable
-        # (run ``alfred gcal authorize``); transient network failures
-        # also surface here per the GCalClient docstring.
-        return "auth_failed"
-    if isinstance(exc, GCalNotInstalled):
-        # google-* libs missing; operator must ``pip install '.[gcal]'``.
-        return "missing_dependency"
-    if isinstance(exc, GCalAPIError):
-        # Catch-all for HTTP / quota / API surface failures. Future
-        # refinement can split on HTTP status if cheaply available.
-        return "api_error"
-    return "unknown"
+    from alfred.integrations.gcal_sync import classify_gcal_error
+    return classify_gcal_error(exc)
 
 
 def _sync_event_to_gcal(
@@ -2075,6 +2046,12 @@ def _sync_event_to_gcal(
 ) -> dict[str, Any]:
     """Mirror a freshly-created vault event to the Alfred Calendar.
 
+    Thin shim around
+    :func:`alfred.integrations.gcal_sync.sync_event_create_to_gcal` —
+    pulls client/config/sentinel out of the aiohttp app context and
+    delegates the actual API + writeback work to the shared module
+    that the in-process vault hooks also use.
+
     Returns a dict with one of:
       * ``{}`` — GCal not configured for this instance (silent skip).
       * ``{"event_id": "<gcal-id>", "calendar_label": "<label>"}`` — sync
@@ -2082,137 +2059,32 @@ def _sync_event_to_gcal(
         ``gcal_event_id`` + ``gcal_calendar`` (the label is config-driven
         per :attr:`GCalConfig.alfred_calendar_label`).
       * ``{"error": {"code": "<code>", "detail": "<msg>"}}`` — sync
-        failed; vault stays intact. The ``code`` is one of
+        failed; vault stays intact. ``code`` is one of
         ``calendar_id_missing`` / ``auth_failed`` / ``missing_dependency``
-        / ``api_error`` / ``unknown`` — see :func:`_classify_gcal_error`.
-        Downstream renderers (Hypatia / KAL-LE) switch on ``code`` to
-        produce calibrated user-facing messages without parsing free-form
-        ``detail`` text.
+        / ``api_error`` / ``unknown`` — see
+        :func:`alfred.integrations.gcal_sync.classify_gcal_error`.
 
     Per architecture:
       * Salem ONLY writes to the configured Alfred Calendar ID — never
-        primary. This function enforces that policy by reading the ID
-        from config and refusing to act on anything else.
-      * Vault is canonical. We re-write the markdown frontmatter on
-        success because the vault record's ``gcal_event_id`` is what
-        the next conflict-check cycle uses for dedup. Without that
-        write-back, every subsequent propose-create would see the same
-        event on both vault and gcal_alfred and double-count.
+        primary. The shared sync function enforces this by reading the
+        ID from config and refusing to act on anything else.
+      * Vault is canonical. The sync function re-writes the markdown
+        frontmatter on success so the next conflict-check cycle's
+        dedup has its anchor.
     """
-    client = request.app.get(_KEY_GCAL_CLIENT)
-    config = request.app.get(_KEY_GCAL_CONFIG)
-    if client is None or config is None or not config.enabled:
-        # Sentinel-aware skip: if the operator INTENDED gcal on but
-        # client construction failed at startup, surface the gap at
-        # warning level so they spot the silent feature-degradation.
-        # Without the sentinel, every event proposal would emit a
-        # noisy warning even on instances that legitimately disabled
-        # gcal — the "intended on" gate keeps the log signal clean.
-        if request.app.get(_KEY_GCAL_INTENDED_ON):
-            log.warning(
-                "transport.canonical.event_propose_gcal_skipped_but_intended_on",
-                phase="sync",
-                correlation_id=correlation_id,
-                hint=(
-                    "gcal.enabled is true in config but client setup failed "
-                    "at daemon startup. Run `alfred gcal status` and "
-                    "check daemon log for talker.daemon.gcal_setup_failed."
-                ),
-            )
-        else:
-            log.debug(
-                "transport.canonical.event_propose_gcal_sync_skipped",
-                reason="not_configured",
-                correlation_id=correlation_id,
-            )
-        return {}
-    if not config.alfred_calendar_id:
-        log.warning(
-            "transport.canonical.event_propose_gcal_sync_skipped",
-            reason="alfred_calendar_id_empty",
-            correlation_id=correlation_id,
-        )
-        return {
-            "error": {
-                "code": "calendar_id_missing",
-                "detail": "gcal alfred_calendar_id not configured",
-            }
-        }
+    from alfred.integrations.gcal_sync import sync_event_create_to_gcal
 
-    from alfred.integrations.gcal import GCalError
-
-    # P2-2: pass time_zone through when configured. When empty (default),
-    # GCalClient.create_event omits the timeZone field from the body and
-    # GCal falls back to the calendar's own default zone for display.
-    # The dateTime offset still pins the absolute time unambiguously.
-    create_kwargs: dict[str, Any] = {
-        "start": start_dt,
-        "end": end_dt,
-        "title": title,
-        "description": description,
-    }
-    if getattr(config, "default_time_zone", ""):
-        create_kwargs["time_zone"] = config.default_time_zone
-
-    try:
-        event_id = client.create_event(
-            config.alfred_calendar_id,
-            **create_kwargs,
-        )
-    except GCalError as exc:
-        # Per spec: do NOT roll back the vault create. Vault is canonical;
-        # GCal is the projection. Surface the error so Hypatia / KAL-LE
-        # can tell Andrew "saved to vault but GCal sync failed".
-        code = _classify_gcal_error(exc)
-        log.warning(
-            "transport.canonical.event_propose_gcal_sync_failed",
-            error=str(exc),
-            error_code=code,
-            correlation_id=correlation_id,
-        )
-        return {"error": {"code": code, "detail": str(exc)}}
-
-    # P2-1: calendar-kind label is config-driven so V.E.R.A.'s RRTS
-    # calendar can write ``"rrts"``, STAY-C client cal ``"stayc"``, etc.
-    # Fallback to ``"alfred"`` covers the default-config case and any
-    # operator who omits the field.
-    calendar_label = getattr(config, "alfred_calendar_label", "") or "alfred"
-
-    # Success: write gcal_event_id + gcal_calendar back into the vault
-    # record's frontmatter. We re-load the file we just wrote rather
-    # than reusing the in-memory dict so any changes a parallel writer
-    # made between our write and now are preserved (defensive — there
-    # shouldn't be a parallel writer but cheap insurance).
-    try:
-        post = frontmatter.load(str(file_path))
-        post["gcal_event_id"] = event_id
-        post["gcal_calendar"] = calendar_label
-        # Preserve trailing-newline behaviour matching the original write.
-        new_text = frontmatter.dumps(post)
-        if not new_text.endswith("\n"):
-            new_text += "\n"
-        file_path.write_text(new_text, encoding="utf-8")
-    except Exception as exc:  # noqa: BLE001
-        # Frontmatter rewrite failure is a soft error — the GCal event
-        # exists, but our dedup loses its anchor. Log + keep going so
-        # the caller still gets the success path.
-        log.warning(
-            "transport.canonical.event_propose_gcal_writeback_failed",
-            error=str(exc),
-            event_id=event_id,
-            path=str(file_path),
-            correlation_id=correlation_id,
-        )
-
-    log.info(
-        "transport.canonical.event_propose_gcal_synced",
-        event_id=event_id,
-        calendar_id=config.alfred_calendar_id,
-        calendar_label=calendar_label,
+    return sync_event_create_to_gcal(
+        client=request.app.get(_KEY_GCAL_CLIENT),
+        config=request.app.get(_KEY_GCAL_CONFIG),
+        intended_on=bool(request.app.get(_KEY_GCAL_INTENDED_ON)),
+        file_path=file_path,
+        title=title,
+        description=description,
+        start_dt=start_dt,
+        end_dt=end_dt,
         correlation_id=correlation_id,
     )
-    return {"event_id": event_id, "calendar_label": calendar_label}
-
 
 # ---------------------------------------------------------------------------
 # Registrars — consumed by ROUTE_NAMESPACES in server.py

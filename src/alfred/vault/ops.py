@@ -31,6 +31,145 @@ from .scope import check_scope
 log = structlog.get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Event hooks (Phase A+ — vault-ops integration with external syncers)
+# ---------------------------------------------------------------------------
+#
+# Three registries fire after successful vault operations on
+# ``event/`` records. The talker daemon registers a GCal sync function
+# as the implementation of all three at startup, so a Salem-authored
+# event from any source (Telegram chat, instructor executor, daily-sync
+# dispatcher, future agents) mirrors to GCal automatically without each
+# call site duplicating the sync logic.
+#
+# Hook signatures:
+#   create: (vault_path: Path, rel_path: str, frontmatter: dict) -> None
+#   update: (vault_path: Path, rel_path: str, frontmatter: dict,
+#            fields_changed: list[str]) -> None
+#   delete: (vault_path: Path, rel_path: str,
+#            pre_delete_frontmatter: dict) -> None
+#
+# Hooks MUST NOT raise — exceptions are caught and logged so a broken
+# hook can never break vault_create / vault_edit / vault_delete (the
+# vault is canonical; external sync is a projection). Hooks SHOULD be
+# fast (no blocking I/O on the request hot path) — the GCal sync
+# function uses synchronous googleapiclient under the hood, which is
+# acceptable for v1 single-user scale.
+#
+# The update hook only fires when the post-edit frontmatter has a
+# ``gcal_event_id`` field — there's nothing to patch otherwise. The
+# delete hook reads frontmatter BEFORE the file is removed so it has
+# access to ``gcal_event_id`` for the GCal-side delete.
+
+EventCreateHook = Callable[[Path, str, dict], None]
+EventUpdateHook = Callable[[Path, str, dict, list], None]
+EventDeleteHook = Callable[[Path, str, dict], None]
+
+_EVENT_CREATE_HOOKS: list[EventCreateHook] = []
+_EVENT_UPDATE_HOOKS: list[EventUpdateHook] = []
+_EVENT_DELETE_HOOKS: list[EventDeleteHook] = []
+
+
+def register_event_create_hook(func: EventCreateHook) -> None:
+    """Register a callable to fire after every successful vault_create on
+    an ``event/`` record.
+
+    Idempotent on (function-identity); registering the same callable
+    twice is a no-op so daemon restarts that re-import this module
+    don't double-fire.
+    """
+    if func not in _EVENT_CREATE_HOOKS:
+        _EVENT_CREATE_HOOKS.append(func)
+
+
+def register_event_update_hook(func: EventUpdateHook) -> None:
+    """Register a callable to fire after vault_edit on event records
+    whose post-edit frontmatter carries a ``gcal_event_id``.
+
+    Edits on event records WITHOUT a ``gcal_event_id`` (never synced)
+    skip the hook entirely — there's nothing for downstream to patch.
+    """
+    if func not in _EVENT_UPDATE_HOOKS:
+        _EVENT_UPDATE_HOOKS.append(func)
+
+
+def register_event_delete_hook(func: EventDeleteHook) -> None:
+    """Register a callable to fire after vault_delete on event records.
+
+    The pre-delete frontmatter is captured BEFORE the file is removed
+    and passed to the hook so it has access to ``gcal_event_id``
+    (needed for the GCal-side delete; can't read it after the file
+    is gone).
+    """
+    if func not in _EVENT_DELETE_HOOKS:
+        _EVENT_DELETE_HOOKS.append(func)
+
+
+def clear_event_hooks() -> None:
+    """Test helper — wipe all three registries.
+
+    Production code never calls this; tests use it to isolate per-test
+    hook state when the registries are otherwise process-global.
+    """
+    _EVENT_CREATE_HOOKS.clear()
+    _EVENT_UPDATE_HOOKS.clear()
+    _EVENT_DELETE_HOOKS.clear()
+
+
+def _fire_create_hooks(
+    vault_path: Path, rel_path: str, fm: dict,
+) -> None:
+    """Iterate registered create hooks; each exception is logged + swallowed."""
+    for hook in list(_EVENT_CREATE_HOOKS):
+        try:
+            hook(vault_path, rel_path, fm)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "vault.event_create_hook_failed",
+                hook=getattr(hook, "__name__", repr(hook)),
+                rel_path=rel_path,
+                error=str(exc),
+            )
+
+
+def _fire_update_hooks(
+    vault_path: Path, rel_path: str, fm: dict, fields_changed: list,
+) -> None:
+    """Iterate registered update hooks; each exception is logged + swallowed.
+
+    Skipped entirely if the post-edit frontmatter has no
+    ``gcal_event_id`` — see :func:`register_event_update_hook`.
+    """
+    if not fm.get("gcal_event_id"):
+        return
+    for hook in list(_EVENT_UPDATE_HOOKS):
+        try:
+            hook(vault_path, rel_path, fm, list(fields_changed))
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "vault.event_update_hook_failed",
+                hook=getattr(hook, "__name__", repr(hook)),
+                rel_path=rel_path,
+                error=str(exc),
+            )
+
+
+def _fire_delete_hooks(
+    vault_path: Path, rel_path: str, pre_delete_fm: dict,
+) -> None:
+    """Iterate registered delete hooks; each exception is logged + swallowed."""
+    for hook in list(_EVENT_DELETE_HOOKS):
+        try:
+            hook(vault_path, rel_path, pre_delete_fm)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "vault.event_delete_hook_failed",
+                hook=getattr(hook, "__name__", repr(hook)),
+                rel_path=rel_path,
+                error=str(exc),
+            )
+
+
 class VaultError(Exception):
     """Raised when a vault operation fails validation.
 
@@ -598,6 +737,12 @@ def vault_create(
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(_serialize_record(fm, final_body), encoding="utf-8")
 
+    # Fire create hooks for event records (Phase A+ vault-ops integration).
+    # Anything else (person, project, task, learn types) is a no-op since
+    # no hooks are registered for those types in the v1 hook surface.
+    if record_type == "event":
+        _fire_create_hooks(vault_path, rel_path, dict(fm))
+
     return {"path": rel_path, "warnings": warnings}
 
 
@@ -692,6 +837,15 @@ def vault_edit(
     # Write back
     file_path.write_text(_serialize_record(fm, body), encoding="utf-8")
 
+    # Fire update hooks for event records (Phase A+ vault-ops integration).
+    # The hook is gated on ``gcal_event_id`` being present in the
+    # post-edit frontmatter (set during the original create's GCal sync
+    # writeback) — events that were never synced have nothing to patch.
+    # Pass the post-edit ``fm`` so the hook sees what the file now holds,
+    # not the pre-edit state.
+    if record_type == "event":
+        _fire_update_hooks(vault_path, rel_path, dict(fm), list(fields_changed))
+
     return {"path": rel_path, "fields_changed": fields_changed}
 
 
@@ -753,12 +907,33 @@ def vault_delete(
     if not file_path.exists():
         raise VaultError(f"File not found: {rel_path}")
 
+    # Capture frontmatter BEFORE the delete so the event-delete hook
+    # has access to ``gcal_event_id`` (needed for the GCal-side delete;
+    # can't read it once the file is gone). Defensive try/except — a
+    # malformed file shouldn't block the delete; we just skip the hook
+    # for that record.
+    pre_delete_fm: dict = {}
+    try:
+        pre_delete_fm, _ = _parse_record(file_path)
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "vault_delete.pre_delete_fm_parse_failed",
+            rel_path=rel_path,
+            error=str(exc),
+        )
+
+    record_type = pre_delete_fm.get("type", "")
+
     # Try Obsidian CLI — respects user's trash settings
     if obsidian.is_available():
         file_name = rel_path.removesuffix(".md")
         if obsidian.delete_file(file_name):
+            if record_type == "event":
+                _fire_delete_hooks(vault_path, rel_path, dict(pre_delete_fm))
             return {"path": rel_path, "deleted": True}
 
     # Filesystem fallback — permanent delete
     file_path.unlink()
+    if record_type == "event":
+        _fire_delete_hooks(vault_path, rel_path, dict(pre_delete_fm))
     return {"path": rel_path, "deleted": True}

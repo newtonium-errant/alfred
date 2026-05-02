@@ -537,6 +537,104 @@ class GCalClient:
         )
         return event_id
 
+    def update_event(
+        self,
+        calendar_id: str,
+        event_id: str,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        time_zone: str | None = None,
+    ) -> GCalEvent | None:
+        """Patch an existing event. Returns the updated :class:`GCalEvent`.
+
+        Only the fields you pass non-None are sent to GCal — Google's
+        ``events.patch`` is partial-update by design. Pass ``description=""``
+        to explicitly clear the description (None means "leave as-is").
+
+        Returns ``None`` if GCal answers 404 / 410 (the event was already
+        deleted on the calendar — caller should treat as "stale ID, log
+        + move on" per the hook spec).
+
+        ``start`` / ``end`` must be tz-aware when provided. ``time_zone``
+        is optional — when set, applied to both start + end blocks (only
+        the ones being patched).
+        """
+        if start is not None and start.tzinfo is None:
+            raise GCalAPIError(
+                "update_event: start must be timezone-aware when provided",
+            )
+        if end is not None and end.tzinfo is None:
+            raise GCalAPIError(
+                "update_event: end must be timezone-aware when provided",
+            )
+        if start is not None and end is not None and end <= start:
+            raise GCalAPIError(
+                "update_event: end must be strictly after start",
+            )
+
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["summary"] = title
+        if description is not None:
+            body["description"] = description
+        if start is not None:
+            body["start"] = {"dateTime": start.isoformat()}
+            if time_zone:
+                body["start"]["timeZone"] = time_zone
+        if end is not None:
+            body["end"] = {"dateTime": end.isoformat()}
+            if time_zone:
+                body["end"]["timeZone"] = time_zone
+        if not body:
+            # Nothing to patch — caller passed all-None. Return current
+            # state so the hook layer can short-circuit without an API
+            # round-trip + log a no-op event.
+            log.debug(
+                "gcal.event_patch_noop",
+                calendar_id=calendar_id,
+                event_id=event_id,
+            )
+            return self.get_event(calendar_id, event_id)
+
+        service = self._service_obj()
+        try:
+            updated = (
+                service.events()
+                .patch(calendarId=calendar_id, eventId=event_id, body=body)
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Same 404/410 string-match as get_event/delete_event — the
+            # SDK exception type is googleapiclient.errors.HttpError but
+            # importing it here would force the optional dep to load
+            # eagerly on instances that don't have ``[gcal]`` installed.
+            msg = str(exc)
+            if "404" in msg or "410" in msg or "Not Found" in msg:
+                log.warning(
+                    "gcal.event_patch_not_found",
+                    calendar_id=calendar_id,
+                    event_id=event_id,
+                    detail=(
+                        "stale gcal_event_id — event was deleted on "
+                        "the calendar side. Hook layer logs + moves on."
+                    ),
+                )
+                return None
+            raise GCalAPIError(
+                f"events.patch failed for {calendar_id}/{event_id}: {exc}"
+            ) from exc
+
+        log.info(
+            "gcal.event_updated",
+            calendar_id=calendar_id,
+            event_id=event_id,
+            patched_fields=sorted(body.keys()),
+        )
+        return _normalize_event(updated, calendar_id)
+
     def get_event(self, calendar_id: str, event_id: str) -> GCalEvent | None:
         """Fetch one event by ID. Returns None if the event was deleted."""
         service = self._service_obj()
