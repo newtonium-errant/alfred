@@ -77,10 +77,18 @@ def _proposals_queue_path(config: DailySyncConfig) -> str | None:
     ``config.yaml`` via :func:`alfred.transport.config.load_config` and
     pick out the path. Returns ``None`` when the transport config can't
     be resolved (treated as "no proposals to surface").
+
+    Threads ``config.config_path`` through to ``load_config(path)`` so
+    a per-instance daily_sync daemon (Hypatia, KAL-LE) reads ITS OWN
+    config file instead of silently defaulting to Salem's
+    ``config.yaml``. Falls back to ``"config.yaml"`` when
+    ``config.config_path`` is unset (backward compat for test fixtures
+    that build a DailySyncConfig directly without going through the
+    CLI's ``_load_unified_config``). Mirrors commit 420364b's pattern.
     """
     try:
         from alfred.transport.config import load_config
-        transport_config = load_config()
+        transport_config = load_config(config.config_path or "config.yaml")
     except (FileNotFoundError, Exception) as exc:  # noqa: BLE001
         log.info(
             "daily_sync.proposals.config_unavailable",

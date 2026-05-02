@@ -101,10 +101,15 @@ def _seed_proposals_queue(
 
 
 def _patch_proposals_queue_path(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
-    """Override the transport-config lookup so the dispatcher uses our queue."""
+    """Override the transport-config lookup so the dispatcher uses our queue.
+
+    The stub accepts ``*args, **kwargs`` to tolerate the c8 signature
+    change that added an optional ``config`` parameter for per-instance
+    config-path threading.
+    """
     import alfred.daily_sync.reply_dispatch as rd
     monkeypatch.setattr(
-        rd, "_canonical_proposals_queue_path", lambda: str(path),
+        rd, "_canonical_proposals_queue_path", lambda *a, **kw: str(path),
     )
 
 

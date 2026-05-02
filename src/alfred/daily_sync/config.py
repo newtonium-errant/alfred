@@ -138,6 +138,21 @@ class DailySyncConfig:
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     state: StateConfig = field(default_factory=StateConfig)
     attribution: AttributionConfig = field(default_factory=AttributionConfig)
+    # Path to the config file this DailySyncConfig was loaded from.
+    # Carried so lazy/late loaders (the canonical-proposals queue-path
+    # helpers in ``canonical_proposals_section`` and ``reply_dispatch``)
+    # can re-read the SAME config file at call time rather than
+    # defaulting to ``config.yaml``. Without this, a Hypatia daily_sync
+    # daemon (started with ``--config config.hypatia.yaml``) would have
+    # its queue-path helpers silently fall back to Salem's transport
+    # config and look up the wrong proposals JSONL. ``None`` is the
+    # backward-compat default — populated by :func:`load_config` (path
+    # arg known directly) and by :func:`load_from_unified` when the raw
+    # dict carries the synthetic ``_config_path`` key (set by the CLI in
+    # ``_load_unified_config`` before handing ``raw`` to the
+    # orchestrator). Mirrors ``TalkerConfig.config_path`` shipped in
+    # commit 420364b — same bug class, two more sites.
+    config_path: str | None = None
 
 
 _DATACLASS_MAP: dict[str, type] = {
@@ -178,12 +193,31 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
     raw = _substitute_env(raw)
     section = raw.get("daily_sync", {}) or {}
     if not section:
-        return DailySyncConfig(enabled=False)
-    return _build(DailySyncConfig, section)
+        cfg = DailySyncConfig(enabled=False)
+    else:
+        cfg = _build(DailySyncConfig, section)
+    # Synthetic ``_config_path`` key — set by the CLI in
+    # ``_load_unified_config`` before handing ``raw`` to the
+    # orchestrator, carried through ``multiprocessing`` pickling to
+    # subprocess daemons. See ``DailySyncConfig.config_path`` for the
+    # rationale (mirrors TalkerConfig.config_path shipped in 420364b).
+    raw_path = raw.get("_config_path")
+    if isinstance(raw_path, str) and raw_path:
+        cfg.config_path = raw_path
+    return cfg
 
 
 def load_config(path: str | Path = "config.yaml") -> DailySyncConfig:
-    """Load and parse a config file (test helper)."""
-    with open(Path(path), "r", encoding="utf-8") as f:
+    """Load and parse a config file (test helper).
+
+    Stamps the resolved absolute path onto ``cfg.config_path`` so lazy
+    loaders (the canonical-proposals queue-path helpers) re-read the
+    SAME file we just loaded — see ``DailySyncConfig.config_path`` for
+    the rationale.
+    """
+    config_path = Path(path)
+    with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
-    return load_from_unified(raw or {})
+    cfg = load_from_unified(raw or {})
+    cfg.config_path = str(config_path.resolve())
+    return cfg

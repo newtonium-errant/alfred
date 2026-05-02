@@ -399,17 +399,30 @@ def _attribution_corpus_path(config: DailySyncConfig) -> str:
     return getattr(block, "corpus_path", "./data/attribution_audit_corpus.jsonl")
 
 
-def _canonical_proposals_queue_path() -> str | None:
+def _canonical_proposals_queue_path(
+    config: DailySyncConfig | None = None,
+) -> str | None:
     """Return the canonical-proposals queue path from the transport config.
 
     The queue lives in ``transport.canonical.proposals_path``. Returns
     ``None`` when the transport config can't be resolved — the
     dispatcher treats a missing path as "proposals feature not wired
     up" and buckets confirm/reject on a proposal item into unparsed.
+
+    Threads ``config.config_path`` through to ``load_config(path)`` so
+    a per-instance daily_sync daemon (Hypatia, KAL-LE) reads ITS OWN
+    config file instead of silently defaulting to Salem's
+    ``config.yaml``. ``config=None`` and ``config.config_path is None``
+    both fall back to ``"config.yaml"`` for backward compat with
+    existing test fixtures that didn't thread the path. Mirrors
+    commit 420364b's pattern.
     """
+    config_path = "config.yaml"
+    if config is not None and config.config_path:
+        config_path = config.config_path
     try:
         from alfred.transport.config import load_config
-        transport_config = load_config()
+        transport_config = load_config(config_path)
     except Exception as exc:  # noqa: BLE001
         log.info(
             "daily_sync.proposals.transport_config_unavailable",
@@ -1406,7 +1419,9 @@ def handle_daily_sync_reply(
     errors: list[str] = list(parsed.unparsed)
     unparsed_item_numbers: list[int] = []  # c3 — numeric IDs of items that couldn't parse
     corpus_path = _attribution_corpus_path(config)
-    proposals_queue_path = _canonical_proposals_queue_path() if proposal_items else None
+    proposals_queue_path = (
+        _canonical_proposals_queue_path(config) if proposal_items else None
+    )
 
     # all_ok shortcut: write an email corpus row per email item (fanned
     # out across cluster members — c5) AND confirm every attribution
