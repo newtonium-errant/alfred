@@ -350,11 +350,189 @@ def _parse_event_window_from_fm(fm: dict) -> tuple[datetime, datetime] | None:
     return start_dt, end_dt
 
 
+# ---------------------------------------------------------------------------
+# --infer-times helpers (legacy-record promotion)
+# ---------------------------------------------------------------------------
+#
+# 12 vault events landed before Salem's SKILL update for ISO start/end
+# (commit a923c1b). They have ``date: 'YYYY-MM-DD'`` + ``time: '4:00 PM'``
+# style fields but no ISO start/end, so backfill SKIPs them by default.
+# ``--infer-times`` opts in to combining date+time into ISO datetimes
+# in America/Halifax timezone, applying duration heuristics on the
+# event title, and writing back to vault BEFORE the GCal sync.
+
+import re as _re
+
+_TIME_RE = _re.compile(
+    r"""
+    ^\s*
+    (?P<hour>\d{1,2})
+    (?: [:\.](?P<minute>\d{2}) )?
+    \s*
+    (?P<ampm> a\.?m\.? | p\.?m\.? )?
+    \s*$
+    """,
+    _re.IGNORECASE | _re.VERBOSE,
+)
+
+
+def _parse_time_string(time_str: str) -> tuple[int, int] | None:
+    """Parse a wall-clock time string. Returns (hour, minute) 0-23/0-59, or None.
+
+    Handles common shapes:
+      * ``"4:00 PM"`` / ``"4 PM"`` / ``"4:00PM"`` / ``"4pm"`` → (16, 0)
+      * ``"9 a.m."`` / ``"9:00 AM"`` / ``"9am"`` → (9, 0)
+      * ``"14:30"`` / ``"16:00"`` (24-hour) → (14, 30) / (16, 0)
+      * ``"noon"`` → (12, 0); ``"midnight"`` → (0, 0)
+      * Unparseable garbage → None (caller skips the record)
+
+    The 24-hour vs 12-hour disambiguation: if the AM/PM suffix is
+    absent AND the hour is >= 13, treat as 24-hour. Otherwise the
+    suffix governs (or assume AM if absent and hour < 13 — which
+    matches the "9" → 09:00 convention).
+    """
+    if time_str is None:
+        return None
+    s = str(time_str).strip().lower()
+    if not s:
+        return None
+    if s == "noon":
+        return (12, 0)
+    if s == "midnight":
+        return (0, 0)
+    m = _TIME_RE.match(s)
+    if not m:
+        return None
+    hour = int(m.group("hour"))
+    minute_str = m.group("minute")
+    minute = int(minute_str) if minute_str else 0
+    ampm = (m.group("ampm") or "").replace(".", "")
+    if ampm == "pm":
+        if hour < 12:
+            hour += 12
+        # 12 PM stays 12 (noon).
+    elif ampm == "am":
+        if hour == 12:
+            hour = 0  # 12 AM = midnight
+    # else: no suffix — use hour as-is (24-hour interpretation).
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return (hour, minute)
+
+
+# Duration heuristics — match Salem's SKILL guidance. Order matters:
+# more specific / longer-duration keywords first so a "concert
+# appointment" lands at 2.5h not 1h.
+_DURATION_HEURISTICS: list[tuple[str, int, str]] = [
+    # (keyword, minutes, label) — matched against title case-insensitively
+    ("concert", 150, "concert/show → 2.5h"),
+    ("show", 150, "concert/show → 2.5h"),
+    ("ticket", 150, "concert/show → 2.5h"),
+    ("festival", 150, "concert/show → 2.5h"),
+    ("fest", 150, "concert/show → 2.5h"),
+    ("appointment", 60, "appointment → 1h"),
+    ("consult", 60, "appointment → 1h"),
+    ("exam", 60, "appointment → 1h"),
+    ("physio", 60, "appointment → 1h"),
+    ("dinner", 60, "meal/meeting → 1h"),
+    ("lunch", 60, "meal/meeting → 1h"),
+    ("meeting", 60, "meal/meeting → 1h"),
+]
+
+
+def _infer_duration_minutes(title: str) -> tuple[int, str]:
+    """Return (minutes, label). Default 1h with 'no match → 1h default' label."""
+    if not title:
+        return (60, "no title → 1h default")
+    needle = title.lower()
+    for keyword, minutes, label in _DURATION_HEURISTICS:
+        if keyword in needle:
+            return (minutes, f"matched '{keyword}' → {label}")
+    return (60, "no match → 1h default")
+
+
+def _halifax_offset_for_date(d: date) -> str:
+    """Approximate Atlantic timezone offset for a given date.
+
+    DST window: roughly second Sunday of March through first Sunday of
+    November (US/Canadian rule). Approximation: months April–October
+    inclusive get ADT (``-03:00``); months November–March inclusive
+    get AST (``-04:00``). Mid-March + early-November transition weeks
+    may end up on the wrong side of the boundary by a few days, but
+    GCal normalizes on display since the dateTime carries the offset
+    explicitly. Per spec call-out, "rule-of-thumb is fine".
+    """
+    return "-03:00" if 4 <= d.month <= 10 else "-04:00"
+
+
+def _infer_times_for_record(fm: dict) -> dict[str, Any] | None:
+    """Try to construct ISO start/end from frontmatter ``date`` + ``time`` fields.
+
+    Returns one of:
+      * ``None`` — no inference attempted (record is already
+        well-shaped or has no date-only state to promote)
+      * ``{"reason": "<code>"}`` — inference rejected; ``code`` is
+        ``no_time_string`` / ``no_date`` / ``unparseable_time``
+      * ``{"start": "<iso>", "end": "<iso>", "duration_min": int,
+         "heuristic": "<label>"}`` — inference succeeded
+
+    Caller is responsible for writing the returned start/end back to
+    frontmatter + then running the normal sync.
+    """
+    # Already has start/end → no inference needed (handled by the
+    # normal path).
+    if fm.get("start") or fm.get("end"):
+        return None
+
+    date_raw = fm.get("date")
+    time_raw = fm.get("time")
+
+    if not date_raw:
+        # Without a date we can't ground the event. Don't try.
+        return {"reason": "no_date"}
+    if not time_raw:
+        # Date-only record. Salem's SKILL (post-update) shouldn't
+        # produce these for events with a known time; legacy records
+        # whose raw input had no time mention shouldn't get a wall-
+        # clock guessed for them.
+        return {"reason": "no_time_string"}
+
+    parsed = _parse_time_string(str(time_raw))
+    if parsed is None:
+        return {"reason": "unparseable_time", "raw_time": str(time_raw)}
+    hour, minute = parsed
+
+    try:
+        d = date.fromisoformat(str(date_raw)[:10])
+    except ValueError:
+        return {"reason": "unparseable_date", "raw_date": str(date_raw)}
+
+    title = str(fm.get("title") or fm.get("name") or "")
+    duration_min, heuristic = _infer_duration_minutes(title)
+
+    offset = _halifax_offset_for_date(d)
+    start_iso = (
+        f"{d.isoformat()}T{hour:02d}:{minute:02d}:00{offset}"
+    )
+    end_dt = datetime.fromisoformat(start_iso) + timedelta(minutes=duration_min)
+    end_iso = end_dt.isoformat()
+
+    return {
+        "start": start_iso,
+        "end": end_iso,
+        "duration_min": duration_min,
+        "heuristic": heuristic,
+        "raw_date": str(date_raw),
+        "raw_time": str(time_raw),
+    }
+
+
 def cmd_backfill(
     raw: dict[str, Any],
     *,
     dry_run: bool = False,
     from_date: str | None = None,
+    infer_times: bool = False,
     wants_json: bool = False,
 ) -> int:
     """Iterate vault event records; push unsynced ones to GCal.
@@ -362,6 +540,8 @@ def cmd_backfill(
     Per record decision tree:
       * Already has ``gcal_event_id`` in frontmatter → SKIP (already synced)
       * Missing or unparseable ``start``/``end`` → SKIP (no_time)
+        UNLESS ``infer_times`` is True AND the record has parseable
+        ``date`` + ``time`` fields → INFER + WRITE BACK + sync
       * ``start`` date < ``from_date`` cutoff → SKIP (before_cutoff)
       * Otherwise → push to GCal via ``sync_event_create_to_gcal``,
         which writes back ``gcal_event_id`` + ``gcal_calendar`` on
@@ -370,8 +550,17 @@ def cmd_backfill(
     ``from_date`` (ISO YYYY-MM-DD): default = today. Operator can
     pass an earlier date to include historical events.
 
+    ``infer_times`` (default False): opt-in flag for legacy-record
+    rescue. When True, records with ``date`` + ``time`` (but no ISO
+    start/end) get times constructed from those fields + a duration
+    heuristic on the title, written back to vault frontmatter, then
+    pushed normally. Default-off preserves the "refuse to fabricate
+    timestamps" safety. See :func:`_infer_times_for_record` for the
+    exact rules.
+
     Dry-run: makes no API calls, no vault writes; just reports what
-    would happen.
+    would happen. With ``infer_times=True`` + ``dry_run=True``, the
+    inferred (start, end) are reported but not written to vault.
     """
     import frontmatter
 
@@ -430,8 +619,11 @@ def cmd_backfill(
         )
 
     synced: list[dict[str, str]] = []
+    inferred: list[dict[str, Any]] = []
     skipped_already_synced: list[str] = []
     skipped_no_time: list[str] = []
+    skipped_no_time_string: list[str] = []
+    skipped_unparseable_time: list[dict[str, str]] = []
     skipped_before_cutoff: list[str] = []
     failed: list[dict[str, str]] = []
 
@@ -452,6 +644,95 @@ def cmd_backfill(
             continue
 
         window = _parse_event_window_from_fm(fm)
+
+        # Inference path — only when --infer-times is set AND the record
+        # is missing ISO start/end. Mutates ``fm`` in-place + writes back
+        # to vault (unless dry-run). The window result is then re-derived
+        # from the new fm before falling through to the normal sync path.
+        if window is None and infer_times:
+            inference = _infer_times_for_record(fm)
+            if inference is None:
+                # Should never happen given window is None — defensive.
+                skipped_no_time.append(rel_path)
+                continue
+            if "reason" in inference:
+                # Inference rejected — bucket by sub-reason.
+                reason = inference["reason"]
+                if reason == "no_time_string" or reason == "no_date":
+                    skipped_no_time_string.append(rel_path)
+                elif reason in ("unparseable_time", "unparseable_date"):
+                    skipped_unparseable_time.append({
+                        "path": rel_path,
+                        "reason": reason,
+                        "raw": inference.get("raw_time")
+                            or inference.get("raw_date", ""),
+                    })
+                else:
+                    skipped_no_time.append(rel_path)
+                log.debug(
+                    "gcal.backfill_inference_rejected",
+                    path=rel_path,
+                    reason=reason,
+                )
+                continue
+            # Inference succeeded — log + (unless dry-run) write back.
+            log.info(
+                "gcal.backfill_inferred_times",
+                path=rel_path,
+                raw_date=inference["raw_date"],
+                raw_time=inference["raw_time"],
+                inferred_start=inference["start"],
+                inferred_end=inference["end"],
+                duration_min=inference["duration_min"],
+                heuristic=inference["heuristic"],
+            )
+            inferred.append({
+                "path": rel_path,
+                "title": str(fm.get("title") or fm.get("name") or md_file.stem),
+                "start": inference["start"],
+                "end": inference["end"],
+                "duration_min": inference["duration_min"],
+                "heuristic": inference["heuristic"],
+                "raw_date": inference["raw_date"],
+                "raw_time": inference["raw_time"],
+            })
+            fm["start"] = inference["start"]
+            fm["end"] = inference["end"]
+            if not dry_run:
+                try:
+                    post["start"] = inference["start"]
+                    post["end"] = inference["end"]
+                    new_text = frontmatter.dumps(post)
+                    if not new_text.endswith("\n"):
+                        new_text += "\n"
+                    md_file.write_text(new_text, encoding="utf-8")
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "gcal.backfill_infer_writeback_failed",
+                        path=rel_path,
+                        error=str(exc),
+                    )
+                    failed.append({
+                        "path": rel_path,
+                        "code": "infer_writeback_failed",
+                        "detail": str(exc),
+                    })
+                    continue
+            window = _parse_event_window_from_fm(fm)
+            if window is None:
+                # Inferred ISO strings should always re-parse — if not,
+                # something's deeply wrong. Bucket as failure.
+                failed.append({
+                    "path": rel_path,
+                    "code": "inferred_unparseable",
+                    "detail": (
+                        f"inferred start/end did not re-parse: "
+                        f"{inference.get('start')!r} / "
+                        f"{inference.get('end')!r}"
+                    ),
+                })
+                continue
+
         if window is None:
             skipped_no_time.append(rel_path)
             continue
@@ -515,33 +796,61 @@ def cmd_backfill(
     summary: dict[str, Any] = {
         "ok": len(failed) == 0,
         "dry_run": dry_run,
+        "infer_times": infer_times,
         "from_date": cutoff.isoformat(),
         "vault_path": str(vault_path),
         "synced_count": len(synced),
+        "inferred_count": len(inferred),
         "skipped_already_synced": len(skipped_already_synced),
         "skipped_no_time": len(skipped_no_time),
+        "skipped_no_time_string": len(skipped_no_time_string),
+        "skipped_unparseable_time": len(skipped_unparseable_time),
         "skipped_before_cutoff": len(skipped_before_cutoff),
         "failed_count": len(failed),
         "synced": synced,
+        "inferred": inferred,
         "failed": failed,
         # Verbose lists kept under separate keys so a JSON consumer can
         # tell "skipped because already synced" from "skipped because
         # the operator's --from-date filtered them out".
         "skipped_no_time_paths": skipped_no_time,
+        "skipped_no_time_string_paths": skipped_no_time_string,
+        "skipped_unparseable_time_records": skipped_unparseable_time,
         "skipped_before_cutoff_paths": skipped_before_cutoff,
     }
+
+    total_records = (
+        len(synced) + len(failed) + len(skipped_already_synced)
+        + len(skipped_no_time) + len(skipped_no_time_string)
+        + len(skipped_unparseable_time) + len(skipped_before_cutoff)
+    )
 
     if wants_json:
         _print(json.dumps(summary, indent=2, sort_keys=True))
     else:
         verb = "Would sync" if dry_run else "Synced"
-        _print(f"GCal backfill — {'DRY RUN' if dry_run else 'LIVE'}")
+        _print(f"GCal backfill — {'DRY RUN' if dry_run else 'LIVE'}"
+               + (" (--infer-times)" if infer_times else ""))
         _print(f"  Vault:      {vault_path}")
         _print(f"  Cutoff:     {cutoff.isoformat()} (events before are skipped)")
         _print(f"  {verb}:     {len(synced)}")
-        _print(f"  Skipped:    {len(skipped_already_synced)} already synced, "
-               f"{len(skipped_no_time)} no time, "
-               f"{len(skipped_before_cutoff)} before cutoff")
+        if infer_times:
+            inferred_verb = "Would infer" if dry_run else "Inferred"
+            _print(f"  {inferred_verb}:   {len(inferred)} "
+                   f"(--infer-times wrote start/end before sync)")
+        skip_parts = [
+            f"{len(skipped_already_synced)} already synced",
+            f"{len(skipped_no_time)} no time",
+        ]
+        if infer_times:
+            skip_parts.append(
+                f"{len(skipped_no_time_string)} no time-string"
+            )
+            skip_parts.append(
+                f"{len(skipped_unparseable_time)} unparseable time"
+            )
+        skip_parts.append(f"{len(skipped_before_cutoff)} before cutoff")
+        _print(f"  Skipped:    {', '.join(skip_parts)}")
         _print(f"  Failed:     {len(failed)}")
         if synced:
             _print("")
@@ -551,14 +860,30 @@ def cmd_backfill(
                     _print(f"    [would sync]  {s['path']}  ({s['title']})")
                 else:
                     _print(f"    [synced]      {s['path']}  → {s['gcal_event_id']}")
+        if inferred:
+            _print("")
+            _print("  Inferred (--infer-times):")
+            for i in inferred:
+                _print(
+                    f"    [inferred]    {i['path']}  "
+                    f"({i['raw_date']} {i['raw_time']} → "
+                    f"{i['start']} → {i['end']}; {i['heuristic']})"
+                )
+        if skipped_unparseable_time:
+            _print("")
+            _print("  Skipped (unparseable time):")
+            for u in skipped_unparseable_time:
+                _print(
+                    f"    [skip]        {u['path']}  "
+                    f"(raw {u.get('raw', '')!r} could not be parsed)"
+                )
         if failed:
             _print("")
             _print("  Failures:")
             for f in failed:
                 _print(f"    [FAILED]      {f['path']}  "
                        f"({f.get('code', 'unknown')}: {f.get('detail', '')})")
-        if not synced and not failed and not skipped_already_synced \
-                and not skipped_no_time and not skipped_before_cutoff:
+        if total_records == 0:
             # Per ``feedback_intentionally_left_blank.md`` — explicit
             # "ran, nothing to do" so silence is distinguishable from
             # broken.

@@ -56,10 +56,18 @@ log = structlog.get_logger(__name__)
 # function uses synchronous googleapiclient under the hood, which is
 # acceptable for v1 single-user scale.
 #
-# The update hook only fires when the post-edit frontmatter has a
-# ``gcal_event_id`` field — there's nothing to patch otherwise. The
-# delete hook reads frontmatter BEFORE the file is removed so it has
-# access to ``gcal_event_id`` for the GCal-side delete.
+# The update hook fires after every successful vault_edit on event
+# records — the hook closure decides what to do based on post-edit
+# frontmatter. Two relevant states:
+#   * ``gcal_event_id`` present → patch the existing GCal mirror
+#   * ``gcal_event_id`` absent BUT ``start`` + ``end`` present →
+#     "first-sync promotion": the record just became GCal-eligible,
+#     push as if it were a fresh create
+# The earlier registry-level gate on ``gcal_event_id`` blocked the
+# promotion path and silently no-op'd. Decision authority lives in
+# the hook now (it has the full picture; the registry doesn't).
+# The delete hook reads frontmatter BEFORE the file is removed so it
+# has access to ``gcal_event_id`` for the GCal-side delete.
 
 EventCreateHook = Callable[[Path, str, dict], None]
 EventUpdateHook = Callable[[Path, str, dict, list], None]
@@ -83,11 +91,15 @@ def register_event_create_hook(func: EventCreateHook) -> None:
 
 
 def register_event_update_hook(func: EventUpdateHook) -> None:
-    """Register a callable to fire after vault_edit on event records
-    whose post-edit frontmatter carries a ``gcal_event_id``.
+    """Register a callable to fire after every successful vault_edit
+    on an ``event/`` record.
 
-    Edits on event records WITHOUT a ``gcal_event_id`` (never synced)
-    skip the hook entirely — there's nothing for downstream to patch.
+    Decision authority lives in the hook — it sees the post-edit
+    frontmatter + the list of changed fields and decides:
+      * ``gcal_event_id`` present → patch the GCal mirror
+      * ``gcal_event_id`` absent AND ``start``/``end`` now set →
+        first-sync promotion (push as a fresh create + writeback ID)
+      * anything else → no-op (no datetimes yet; nothing to sync)
     """
     if func not in _EVENT_UPDATE_HOOKS:
         _EVENT_UPDATE_HOOKS.append(func)
@@ -137,11 +149,18 @@ def _fire_update_hooks(
 ) -> None:
     """Iterate registered update hooks; each exception is logged + swallowed.
 
-    Skipped entirely if the post-edit frontmatter has no
-    ``gcal_event_id`` — see :func:`register_event_update_hook`.
+    Fires unconditionally on event records (post-refactor). The hook
+    itself decides whether the post-edit state warrants a GCal call —
+    see :func:`register_event_update_hook` for the three states the
+    hook discriminates between (patch / promote-to-create / no-op).
+
+    Pre-refactor this function gated on ``fm.get("gcal_event_id")`` and
+    silently no-op'd otherwise. That gate blocked the "vault_edit adds
+    start+end to a previously-no-time event" promotion path: vault
+    record gained datetimes, but GCal never got the event because the
+    hook never fired. User-visible misleading: Salem said "will appear
+    on your phone shortly" but nothing happened.
     """
-    if not fm.get("gcal_event_id"):
-        return
     for hook in list(_EVENT_UPDATE_HOOKS):
         try:
             hook(vault_path, rel_path, fm, list(fields_changed))

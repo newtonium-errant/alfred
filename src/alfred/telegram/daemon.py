@@ -463,9 +463,82 @@ async def run(
                     )
 
                 def _on_event_updated(vault_path_, rel_path, fm, fields_changed):
-                    """Vault-edit hook → patch GCal event with changed fields."""
+                    """Vault-edit hook — three branches:
+
+                      * gcal_event_id present → PATCH (existing path)
+                      * gcal_event_id absent BUT start+end present →
+                        PROMOTE: push as fresh create, writeback ID
+                        (the "first-sync via edit" case — common when
+                        Salem back-fills datetimes onto an event that
+                        predates Phase A+, or when a vault_create
+                        landed a record without times that subsequently
+                        got them via vault_edit)
+                      * otherwise (no datetimes) → no-op; the GCal sync
+                        functions short-circuit on missing fields too,
+                        but bailing here saves the import + log noise
+
+                    The promotion branch invokes
+                    ``sync_event_create_to_gcal`` rather than the update
+                    function. ``sync_event_create_to_gcal`` is safe to
+                    call from a non-create context: the only side
+                    effects are (1) ``client.create_event`` (which has
+                    no risk of duplicate since by definition no
+                    gcal_event_id was set, so no prior mirror exists)
+                    and (2) frontmatter writeback of the new ID
+                    (which is exactly what we want).
+                    """
                     from datetime import datetime as _dt
                     gcal_event_id = str(fm.get("gcal_event_id") or "")
+                    start_raw = fm.get("start")
+                    end_raw = fm.get("end")
+
+                    # Promotion path — first-sync via edit.
+                    if not gcal_event_id and start_raw and end_raw:
+                        try:
+                            start_dt = _dt.fromisoformat(str(start_raw))
+                            end_dt = _dt.fromisoformat(str(end_raw))
+                        except Exception:  # noqa: BLE001
+                            log.warning(
+                                "talker.daemon.gcal_promote_hook_bad_time",
+                                rel_path=rel_path,
+                                start=str(start_raw)[:40],
+                                end=str(end_raw)[:40],
+                            )
+                            return
+                        log.info(
+                            "gcal.sync_promoted_to_create",
+                            rel_path=rel_path,
+                            reason=(
+                                "vault_edit added start+end to a record "
+                                "that had no gcal_event_id — first-sync "
+                                "via edit"
+                            ),
+                            correlation_id=str(fm.get("correlation_id") or ""),
+                        )
+                        file_path = Path(vault_path_) / rel_path
+                        sync_event_create_to_gcal(
+                            client=_bound_client,
+                            config=_bound_config,
+                            intended_on=_bound_intended_on,
+                            file_path=file_path,
+                            title=str(fm.get("title") or fm.get("name") or ""),
+                            description=str(fm.get("summary") or ""),
+                            start_dt=start_dt,
+                            end_dt=end_dt,
+                            correlation_id=str(fm.get("correlation_id") or ""),
+                        )
+                        return
+
+                    # No-op path — never synced AND still no datetimes.
+                    if not gcal_event_id:
+                        log.debug(
+                            "talker.daemon.gcal_update_hook_skipped",
+                            reason="no_gcal_event_id_and_no_times",
+                            rel_path=rel_path,
+                        )
+                        return
+
+                    # PATCH path — existing GCal mirror, normal update.
                     # Only patch fields that actually changed AND are
                     # GCal-relevant. ``fields_changed`` is a flat list
                     # of frontmatter keys + possibly "body" — the GCal

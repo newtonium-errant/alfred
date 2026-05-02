@@ -722,6 +722,7 @@ def cmd_gcal(args: argparse.Namespace) -> None:
             raw,
             dry_run=bool(getattr(args, "dry_run", False)),
             from_date=getattr(args, "from_date", None),
+            infer_times=bool(getattr(args, "infer_times", False)),
             wants_json=wants_json,
         ))
 
@@ -1985,6 +1986,17 @@ def build_parser() -> argparse.ArgumentParser:
             "ISO YYYY-MM-DD cutoff — events with start.date() before this "
             "are skipped (default: today; pass an earlier date to backfill "
             "historical events)"
+        ),
+    )
+    gcal_backfill_p.add_argument(
+        "--infer-times", dest="infer_times",
+        action="store_true", default=False,
+        help=(
+            "Opt-in: for legacy records with date+time fields but no ISO "
+            "start/end, combine into ISO datetimes (Halifax tz) using a "
+            "duration heuristic on the title, write back to vault, then "
+            "sync. Default-off preserves the 'refuse to fabricate "
+            "timestamps' safety."
         ),
     )
     gcal_backfill_p.add_argument(

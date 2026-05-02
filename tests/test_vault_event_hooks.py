@@ -264,8 +264,16 @@ def test_vault_edit_event_with_gcal_id_fires_update_hook(tmp_vault):
     assert "start" in fired[0]["fields_changed"]
 
 
-def test_vault_edit_event_without_gcal_id_skips_update_hook(tmp_vault):
-    """Event has no gcal_event_id (never synced) → hook is no-op."""
+def test_vault_edit_event_without_gcal_id_still_fires_hook(tmp_vault):
+    """Event has no gcal_event_id → hook STILL fires (decision authority
+    moved into the closure post-promotion fix).
+
+    Pre-promotion this asserted ``fired == []`` (registry-level gate).
+    The gate blocked the "vault_edit adds start+end to a previously-no-
+    time event" promotion path: the hook never fired so the GCal create
+    never happened. Now the hook fires unconditionally on event-edits
+    and the closure decides what to do based on post-edit state.
+    """
     from alfred.vault.ops import register_event_update_hook, vault_edit
 
     rel_path = _seed_event_record(
@@ -275,15 +283,61 @@ def test_vault_edit_event_without_gcal_id_skips_update_hook(tmp_vault):
     )
     fired = []
 
-    def hook(*args, **kwargs):
-        fired.append(args)
+    def hook(vault_path, rel_path_arg, fm, fields_changed):
+        fired.append({
+            "rel_path": rel_path_arg,
+            "fm_gcal_id": fm.get("gcal_event_id"),
+            "fm_start": fm.get("start"),
+            "fields_changed": list(fields_changed),
+        })
 
     register_event_update_hook(hook)
     vault_edit(
         tmp_vault, rel_path,
         set_fields={"start": "2026-06-01T15:00:00-03:00"},
     )
-    assert fired == []
+    # Hook fires; closure sees no gcal_event_id and decides what to do
+    # (the production closure promotes if start+end present).
+    assert len(fired) == 1
+    assert fired[0]["fm_gcal_id"] is None
+    assert "start" in fired[0]["fields_changed"]
+
+
+def test_vault_edit_event_with_promotion_eligible_state_fires_hook(tmp_vault):
+    """Specifically test the gap that surfaced live: an event is created
+    without start/end (e.g., predates Phase A+ or was a date-only stub),
+    a subsequent vault_edit adds start+end → hook MUST fire so a
+    closure can promote it to a GCal create.
+    """
+    from alfred.vault.ops import register_event_update_hook, vault_edit
+
+    rel_path = _seed_event_record(
+        tmp_vault, name="Predates Phase A+",
+        fields={"date": "2026-06-27"},  # date-only, no start/end, no gcal_event_id
+    )
+    fired = []
+    register_event_update_hook(
+        lambda v, r, fm, fc: fired.append({
+            "gcal_event_id": fm.get("gcal_event_id"),
+            "start": fm.get("start"),
+            "end": fm.get("end"),
+            "fields_changed": list(fc),
+        })
+    )
+    vault_edit(
+        tmp_vault, rel_path,
+        set_fields={
+            "start": "2026-06-27T19:00:00-03:00",
+            "end": "2026-06-27T22:00:00-03:00",
+        },
+    )
+    assert len(fired) == 1
+    # Promotion-eligible state: no ID, but both start + end now present.
+    assert fired[0]["gcal_event_id"] is None
+    assert fired[0]["start"] == "2026-06-27T19:00:00-03:00"
+    assert fired[0]["end"] == "2026-06-27T22:00:00-03:00"
+    assert "start" in fired[0]["fields_changed"]
+    assert "end" in fired[0]["fields_changed"]
 
 
 def test_vault_edit_non_event_does_not_fire_update_hook(tmp_vault):
