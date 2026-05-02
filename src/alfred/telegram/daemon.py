@@ -345,6 +345,47 @@ async def run(
                     "talker.daemon.pending_items_setup_failed"
                 )
 
+        # ---- GCal integration (Phase A+) -----------------------------
+        # The Google Calendar adapter is opt-in per instance via the
+        # top-level ``gcal:`` config block. Default-disabled — Hypatia /
+        # KAL-LE leave it off; Salem (or future V.E.R.A.) opt in.
+        #
+        # Both client + config must be wired together. Loading the
+        # config is cheap; constructing the GCalClient is also cheap
+        # (no network, no token-load until first API call). If the
+        # google-* libs aren't installed, the client construction
+        # itself succeeds — the failure surfaces on first list_events
+        # / create_event call as GCalNotInstalled, which the conflict-
+        # check + sync paths handle with graceful degradation.
+        gcal_client = None
+        gcal_config = None
+        try:
+            from alfred.integrations.gcal_config import (
+                load_from_unified as load_gcal,
+            )
+            gcal_config_candidate = load_gcal(raw)
+            if gcal_config_candidate.enabled:
+                from alfred.integrations.gcal import GCalClient
+                gcal_client = GCalClient(
+                    credentials_path=gcal_config_candidate.credentials_path,
+                    token_path=gcal_config_candidate.token_path,
+                    scopes=gcal_config_candidate.scopes,
+                )
+                gcal_config = gcal_config_candidate
+                log.info(
+                    "talker.daemon.gcal_enabled",
+                    alfred_calendar_id_set=bool(
+                        gcal_config.alfred_calendar_id
+                    ),
+                    primary_calendar_id_set=bool(
+                        gcal_config.primary_calendar_id
+                    ),
+                )
+            else:
+                log.info("talker.daemon.gcal_disabled")
+        except Exception:  # noqa: BLE001
+            log.exception("talker.daemon.gcal_setup_failed")
+
         # ---- Centralized wiring --------------------------------------
         # ``wire_transport_app`` calls every register_* helper
         # conditionally based on what we pass in. This is the single
@@ -374,6 +415,8 @@ async def run(
             send_fn=_send_via_telegram,
             pending_items_aggregate_path=pending_items_aggregate_path,
             pending_items_resolve_callable=pending_items_resolver_fn,
+            gcal_client=gcal_client,
+            gcal_config=gcal_config,
         )
         log.info(
             "talker.daemon.transport_configured",

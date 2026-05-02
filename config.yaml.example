@@ -300,6 +300,40 @@ transport:
   #       location: { fields: [name, type, address, alfred_tags] }
   #       event:    { fields: [name, type, title, start, end, status, alfred_tags] }
 
+# ---------------------------------------------------------------------------
+# Google Calendar integration (Phase A+ inter-instance comms — Salem-only)
+# ---------------------------------------------------------------------------
+# When enabled on the canonical-owning instance (Salem), the
+# /canonical/event/propose-create handler queries:
+#   * Alfred Calendar (R/W) — a dedicated Google Calendar Salem writes to
+#   * Primary calendar (R/O by application policy) — Andrew's own meetings
+# for conflict-check, then pushes accepted events to the Alfred Calendar
+# so they land on Andrew's phone.
+#
+# Default: disabled. Hypatia / KAL-LE leave this block out (or
+# enabled: false) so they never try to talk to Google.
+#
+# Operator setup (one-time):
+#   1. In Google Cloud Console: create a "Desktop app" OAuth 2.0 Client
+#      ID. Download credentials.json, save to credentials_path below.
+#   2. Create a dedicated "Alfred" calendar on your Google account.
+#      Note its Calendar ID (Settings → Integrate calendar → Calendar ID).
+#   3. Note your primary calendar ID too (usually your email address).
+#   4. Set ALFRED_GCAL_CALENDAR_ID + ALFRED_GCAL_PRIMARY_ID in .env.
+#   5. Run `alfred gcal authorize` — opens browser for consent.
+#   6. Run `alfred gcal status` to confirm wiring.
+#   7. Run `alfred gcal test-write` to validate end-to-end.
+# gcal:
+#   enabled: false
+#   credentials_path: "~/alfred/data/secrets/gcal_credentials.json"
+#   token_path: "~/alfred/data/secrets/gcal_token.json"
+#   alfred_calendar_id: "${ALFRED_GCAL_CALENDAR_ID}"
+#   primary_calendar_id: "${ALFRED_GCAL_PRIMARY_ID}"
+#   scopes:
+#     - "https://www.googleapis.com/auth/calendar.events"
+#   # Future: V.E.R.A. (RRTS calendar) and STAY-C (client calendar) will
+#   # each define their own gcal block in their own config.<instance>.yaml.
+
 telegram:
   # Telegram bot token from @BotFather
   bot_token: "${TELEGRAM_BOT_TOKEN}"

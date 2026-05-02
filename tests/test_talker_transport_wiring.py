@@ -159,3 +159,37 @@ def test_talker_daemon_wires_instance_identity():
         "Without it, /peer/handshake returns an empty 'instance' field "
         "and peers that route by instance silently misbehave."
     )
+
+
+def test_talker_daemon_wires_gcal_client_when_enabled():
+    """Daemon must construct + wire GCal client when ``gcal.enabled`` is true.
+
+    Phase A+ inter-instance comms: without these wiring lines, even an
+    instance that opted into ``gcal:`` in config.yaml would silently
+    skip the GCal conflict-check + sync paths because the transport
+    handler has no client to call. Default-disabled is the right
+    behaviour, but config-enabled-but-not-wired is a silent failure.
+
+    The pinned shape:
+      * Daemon imports ``load_from_unified`` from gcal_config
+      * Constructs ``GCalClient`` with the config's paths + scopes
+      * Passes ``gcal_client=`` and ``gcal_config=`` to
+        ``wire_transport_app``
+    """
+    source = _daemon_source()
+    assert "from alfred.integrations.gcal_config import" in source, (
+        "talker daemon must import gcal_config to read the GCal block"
+    )
+    assert "GCalClient" in source, (
+        "talker daemon must construct a GCalClient when gcal.enabled "
+        "(otherwise the conflict-check + sync paths silently skip)"
+    )
+    assert "gcal_client=gcal_client" in source, (
+        "wire_transport_app must receive gcal_client=gcal_client; "
+        "without it the transport handler has no client to call and "
+        "GCal integration silently no-ops despite enabled config"
+    )
+    assert "gcal_config=gcal_config" in source, (
+        "wire_transport_app must receive gcal_config=gcal_config; "
+        "the handler reads calendar IDs from the typed config dataclass"
+    )
