@@ -681,7 +681,10 @@ def test_backfill_with_infer_times_dry_run_inferred(tmp_path, capsys):
         wants_json=True,
     )
     assert rc == 0
-    payload = json.loads(capsys.readouterr().out)
+    # Successful inference emits ``gcal.backfill_inferred_times`` info
+    # log on stdout before the JSON payload — strip leading log lines
+    # via the helper (same pattern as live-sync tests).
+    payload = _parse_json_payload(capsys.readouterr().out)
     # Inferred bucket populated; not synced (dry-run).
     assert payload["inferred_count"] == 1
     assert payload["synced_count"] == 1  # would-sync after inference
@@ -741,7 +744,9 @@ def test_backfill_with_infer_times_unparseable_time_skipped(tmp_path, capsys):
         infer_times=True,
         wants_json=True,
     )
-    payload = json.loads(capsys.readouterr().out)
+    # Inference rejection emits ``gcal.backfill_inference_rejected``
+    # log on stdout — strip leading log lines via the helper.
+    payload = _parse_json_payload(capsys.readouterr().out)
     assert payload["inferred_count"] == 0
     assert payload["skipped_unparseable_time"] == 1
     assert (
@@ -764,7 +769,9 @@ def test_backfill_with_infer_times_no_time_string_skipped(tmp_path, capsys):
         infer_times=True,
         wants_json=True,
     )
-    payload = json.loads(capsys.readouterr().out)
+    # Inference rejection (no time string) emits a log on stdout —
+    # strip leading log lines via the helper.
+    payload = _parse_json_payload(capsys.readouterr().out)
     assert payload["skipped_no_time_string"] == 1
     assert payload["inferred_count"] == 0
 
@@ -784,7 +791,9 @@ def test_backfill_infer_times_respects_from_date(tmp_path, capsys):
         from_date="2024-01-01",
         wants_json=True,
     )
-    payload = json.loads(capsys.readouterr().out)
+    # Successful inference emits ``gcal.backfill_inferred_times`` info
+    # log on stdout — strip leading log lines via the helper.
+    payload = _parse_json_payload(capsys.readouterr().out)
     # Inference happened (record had date+time), but the cutoff filtered it.
     assert payload["inferred_count"] == 1
     assert payload["skipped_before_cutoff"] == 1
