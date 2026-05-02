@@ -1499,6 +1499,7 @@ async def run_turn(
     calibration_str: str | None = None,
     pushback_level: int | None = None,
     session_type: str | None = None,
+    image_blocks: list[dict[str, Any]] | None = None,
 ) -> str:
     """Run one user turn through the model, handling tool_use internally.
 
@@ -1514,6 +1515,14 @@ async def run_turn(
     0-5 that tunes how aggressively Alfred challenges the user. ``None``
     skips the directive block for backwards compat.
 
+    ``image_blocks`` (vision phase 2) is a list of pre-built Anthropic
+    image content blocks (``{"type": "image", "source": {...}}``) to
+    prepend to the user turn. ``None`` / empty preserves the wk1 plain-
+    string transcript shape so existing tests + render paths stay
+    byte-identical. When present, the user turn is stored as a content-
+    block list (image blocks first, then text) — the SDK accepts either
+    shape on subsequent turns so the round-trip stays clean.
+
     Returns the final assistant text. Tool-use blocks and their results are
     appended to the session transcript (so the next turn sees the full
     context) and vault mutations are recorded against the session.
@@ -1527,7 +1536,12 @@ async def run_turn(
     ``tests/telegram/test_run_turn_session_model.py``.
     """
     # Append the user's message first so it's visible inside the loop.
-    append_turn(state, session, "user", user_message, kind=user_kind)
+    # Vision: when image blocks are attached we store the user turn as a
+    # content-block list (image-then-text per Anthropic best-practice
+    # ordering); otherwise the wk1 bare-string shape is preserved.
+    from .vision import build_user_content
+    user_content = build_user_content(user_message, image_blocks)
+    append_turn(state, session, "user", user_content, kind=user_kind)
 
     # wk2b c2: capture-mode short-circuit. A ``capture`` session is silent
     # mid-session — the user's message has been appended to the transcript

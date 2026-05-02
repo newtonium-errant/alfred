@@ -79,6 +79,16 @@ class Session:
     # never silently dropped. Empty by default — the field is omitted from
     # the frontmatter when no failures occurred.
     outbound_failures: list[dict[str, Any]] = field(default_factory=list)
+    # Vision (image-message) attachments. Each entry is a dict with
+    # ``path`` (vault-relative or absolute string), ``turn_index`` (0-based
+    # into ``transcript``), ``timestamp``, ``bytes``, and the Telegram
+    # ``file_unique_id`` for cross-reference. Populated by the bot's
+    # photo handler when an image is downloaded + saved to inbox/.
+    # Surfaced in the session-record frontmatter as ``images: [...]`` so
+    # the distiller and any retroactive analysis can pull the saved
+    # paths. Empty by default — field omitted from frontmatter when no
+    # images attached.
+    images: list[dict[str, Any]] = field(default_factory=list)
 
     # --- serialization ---
 
@@ -93,6 +103,7 @@ class Session:
             "vault_ops": self.vault_ops,
             "opening_model": self.opening_model or self.model,
             "outbound_failures": self.outbound_failures,
+            "images": self.images,
         }
 
     @classmethod
@@ -110,6 +121,9 @@ class Session:
             # session was opened on its ``model`` so this is correct.
             opening_model=data.get("opening_model") or data.get("model", ""),
             outbound_failures=list(data.get("outbound_failures") or []),
+            # Vision: missing on pre-vision rehydrated sessions. Defaults
+            # to empty list so old state files load cleanly.
+            images=list(data.get("images") or []),
         )
 
 
@@ -983,6 +997,37 @@ def append_outbound_failure(
     _persist(state, session)
 
 
+def append_image(
+    state: StateManager,
+    session: Session,
+    *,
+    path: str,
+    file_unique_id: str,
+    bytes_size: int,
+) -> None:
+    """Record a saved-image attachment on the session and persist.
+
+    Called by the bot's photo handler after the image has been
+    downloaded, saved to ``<vault>/inbox/`` and converted to a content
+    block. ``turn_index`` points at the user turn the image arrived
+    on — ``len(session.transcript)`` at the moment of call (the user
+    turn is appended *next* by ``run_turn`` / ``append_turn``, so the
+    index is the would-be position).
+
+    Surfaced in the session-record frontmatter as ``images: [...]`` at
+    close time. Field omitted entirely when empty so wk1 / pre-vision
+    record consumers see no shape change.
+    """
+    session.images.append({
+        "path": str(path),
+        "file_unique_id": str(file_unique_id),
+        "bytes": int(bytes_size),
+        "turn_index": len(session.transcript),
+        "timestamp": _now_utc().isoformat(),
+    })
+    _persist(state, session)
+
+
 def resolve_on_startup(
     state: StateManager,
     now: datetime,
@@ -1340,6 +1385,14 @@ def _build_session_frontmatter(
     if session.outbound_failures:
         fm["outbound_failures"] = list(session.outbound_failures)
 
+    # Vision (image attachments). Field omitted when empty so pre-vision
+    # session records / consumers see no shape drift. Each entry carries
+    # the saved vault path so the distiller / future tools can locate
+    # the file (the base64 payload itself never lands in frontmatter —
+    # it would inflate every record by MB and break Obsidian indexing).
+    if session.images:
+        fm["images"] = list(session.images)
+
     if tool_set == "hypatia":
         # Per Hypatia SKILL spec + library-alexandria/CLAUDE.md: mode +
         # processed gate the "Unprocessed captures" Bases view; capture
@@ -1453,6 +1506,15 @@ def _render_content(content: str | list[dict[str, Any]]) -> str:
             tid = block.get("tool_use_id", "")
             err = " error" if block.get("is_error") else ""
             parts.append(f"[tool_result{err}: {tid[:8]}…]")
+        elif btype == "image":
+            # Vision: render as a compact ``[image]`` marker in the
+            # transcript body. The base64 payload would balloon the
+            # session record by ~MB per screenshot — useless to a
+            # reader and harmful to git diffs / Obsidian indexing. The
+            # canonical record of *which* image is on the session's
+            # ``images`` field (frontmatter), populated at handle_message
+            # time by the bot layer when it persists the file to inbox/.
+            parts.append("[image]")
         else:
             parts.append(f"[{btype}]")
     return " ".join(parts)
