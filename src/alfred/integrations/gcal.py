@@ -355,9 +355,22 @@ class GCalClient:
                 try:
                     creds.refresh(Request())
                 except Exception as exc:  # noqa: BLE001
+                    # The same generic Exception catches both terminal
+                    # auth failure (refresh token revoked / expired) AND
+                    # transient transport errors (DNS hiccup, TLS handshake,
+                    # 5xx from Google). Telling the operator to re-auth on
+                    # a transient failure burns an OAuth flow they don't
+                    # need. The message acknowledges both — operators
+                    # should re-try once before re-authorizing. A tighter
+                    # fix would distinguish ``google.auth.exceptions.
+                    # RefreshError`` from generic transport failures, but
+                    # the import-coupling cost isn't justified for v1.
                     raise GCalNotAuthorized(
                         f"GCal token refresh failed: {exc}. "
-                        f"Run `alfred gcal authorize` to mint a fresh one."
+                        f"If this persists, run `alfred gcal authorize` to "
+                        f"mint a fresh token. (Transient network errors "
+                        f"during refresh also surface here — re-try before "
+                        f"re-authorizing.)"
                     ) from exc
                 # Persist the refreshed access token + new expiry.
                 self._save_credentials(creds)

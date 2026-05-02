@@ -227,13 +227,85 @@ async def test_gcal_sync_failure_preserves_vault_record(app_factory):  # type: i
     body = await resp.json()
     assert body["status"] == "created"
     assert "gcal_event_id" not in body
+    # gcal_sync_error is a structured dict so downstream renderers can
+    # switch on ``code`` without parsing free-form ``detail`` text.
     assert "gcal_sync_error" in body
-    assert "quota" in body["gcal_sync_error"].lower()
+    err = body["gcal_sync_error"]
+    assert isinstance(err, dict)
+    assert err["code"] == "api_error"  # GCalAPIError → api_error
+    assert "quota" in err["detail"].lower()
 
     # Vault file exists, no gcal_event_id field.
     vault_root = client.server.app["_vault_root"]
     fm = frontmatter.load(str(vault_root / body["path"]))
     assert "gcal_event_id" not in fm.metadata
+
+
+async def test_gcal_sync_failure_classifies_auth_failed(app_factory):  # type: ignore[no-untyped-def]
+    """GCalNotAuthorized → ``code: "auth_failed"`` in the error dict."""
+    from alfred.integrations.gcal import GCalNotAuthorized
+
+    gcal_client = MagicMock()
+    gcal_client.list_events.return_value = []
+    gcal_client.create_event.side_effect = GCalNotAuthorized(
+        "token expired and refresh failed",
+    )
+    gcal_config = _make_gcal_config()
+
+    client = await app_factory(gcal_client=gcal_client, gcal_config=gcal_config)
+    resp = await client.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "auth-fail-test",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+            "title": "Auth-blocked event",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 201
+    body = await resp.json()
+    err = body["gcal_sync_error"]
+    assert isinstance(err, dict)
+    assert err["code"] == "auth_failed"
+    assert "token expired" in err["detail"]
+
+
+async def test_gcal_sync_failure_classifies_missing_dependency(app_factory):  # type: ignore[no-untyped-def]
+    """GCalNotInstalled → ``code: "missing_dependency"``."""
+    from alfred.integrations.gcal import GCalNotInstalled
+
+    gcal_client = MagicMock()
+    gcal_client.list_events.return_value = []
+    gcal_client.create_event.side_effect = GCalNotInstalled(
+        "google-auth not installed",
+    )
+    gcal_config = _make_gcal_config()
+
+    client = await app_factory(gcal_client=gcal_client, gcal_config=gcal_config)
+    resp = await client.post(
+        "/canonical/event/propose-create",
+        json={
+            "correlation_id": "missing-dep-test",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+            "title": "Dep-missing event",
+            "origin_instance": "kal-le",
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 201
+    body = await resp.json()
+    err = body["gcal_sync_error"]
+    assert isinstance(err, dict)
+    assert err["code"] == "missing_dependency"
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +339,14 @@ async def test_gcal_sync_skipped_when_calendar_id_empty(app_factory):  # type: i
     assert body["status"] == "created"
     # No create_event call attempted.
     assert gcal_client.create_event.called is False
-    # Error surfaced in response.
+    # Error surfaced in response — structured dict with calendar_id_missing
+    # code so a Hypatia/KAL-LE renderer can switch on the code rather
+    # than parsing free-form ``detail`` text.
     assert "gcal_sync_error" in body
-    assert "alfred_calendar_id" in body["gcal_sync_error"]
+    err = body["gcal_sync_error"]
+    assert isinstance(err, dict)
+    assert err["code"] == "calendar_id_missing"
+    assert "alfred_calendar_id" in err["detail"]
 
 
 # ---------------------------------------------------------------------------

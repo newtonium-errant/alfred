@@ -238,6 +238,52 @@ def test_load_credentials_refreshes_expired_token(tmp_path):
         assert creds is fake_creds
 
 
+def test_load_credentials_refresh_failure_message_acknowledges_transient(tmp_path):
+    """Refresh failure message must acknowledge the transient-network case.
+
+    The same generic Exception catches terminal auth failure (refresh
+    token revoked) AND transient transport errors (DNS, TLS, 5xx from
+    Google). Telling the operator to immediately re-auth on a transient
+    failure burns an OAuth flow they don't need. Pin that the error
+    message tells them to re-try first.
+    """
+    from alfred.integrations.gcal import GCalClient, GCalNotAuthorized
+
+    token_path = tmp_path / "token.json"
+    token_path.write_text(json.dumps({
+        "token": "old", "refresh_token": "rt",
+        "client_id": "id", "client_secret": "sec",
+    }), encoding="utf-8")
+
+    fake_creds = MagicMock()
+    fake_creds.valid = False
+    fake_creds.expired = True
+    fake_creds.refresh_token = "rt"
+    fake_creds.refresh.side_effect = ConnectionError("simulated DNS failure")
+
+    Credentials = MagicMock()
+    Credentials.from_authorized_user_file.return_value = fake_creds
+    Request = MagicMock()
+
+    with patch(
+        "alfred.integrations.gcal._import_google",
+        return_value=(Credentials, Request, MagicMock(), MagicMock()),
+    ):
+        client = GCalClient(
+            credentials_path=tmp_path / "creds.json",
+            token_path=token_path,
+        )
+        with pytest.raises(GCalNotAuthorized) as excinfo:
+            client._load_credentials()
+    msg = str(excinfo.value)
+    # Underlying error surfaces.
+    assert "simulated DNS failure" in msg
+    # Message acknowledges transient case so operator re-tries before re-auth.
+    assert "re-try" in msg.lower() or "retry" in msg.lower() or "transient" in msg.lower()
+    # The re-auth instruction is still present, just gated on persistence.
+    assert "alfred gcal authorize" in msg
+
+
 # ---------------------------------------------------------------------------
 # list_events
 # ---------------------------------------------------------------------------

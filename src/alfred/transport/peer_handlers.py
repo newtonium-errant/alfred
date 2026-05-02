@@ -1631,8 +1631,21 @@ async def _handle_canonical_event_propose_create(
     Response shapes:
       * 201 Created on a clean create:
         ``{"status": "created", "path": "event/...md", "correlation_id": "..."}``
+        Phase A+ sync extensions (added when GCal is configured):
+          - on success: ``"gcal_event_id": "<id>", "gcal_calendar": "alfred"``
+          - on sync failure: ``"gcal_sync_error": {"code": "<code>",
+            "detail": "<msg>"}`` where ``code`` is one of
+            ``calendar_id_missing`` / ``auth_failed`` /
+            ``missing_dependency`` / ``api_error`` / ``unknown``. Vault
+            record IS preserved; the projection failed, not the
+            canonical write. Downstream renderers (Hypatia / KAL-LE)
+            switch on ``code`` to produce calibrated user-facing
+            messages without parsing free-form ``detail`` text.
+          - GCal not configured: neither field present.
       * 200 with ``{"status": "conflict", "conflicts": [...]}`` when
-        overlap detected.
+        overlap detected. Each conflict carries a ``source`` field
+        (``vault`` / ``gcal_alfred`` / ``gcal_primary``) so the
+        proposing instance can render appropriately.
       * 404 ``canonical_not_owned`` when this instance isn't a canonical
         owner.
       * 400 ``schema_error`` for malformed bodies (missing fields,
@@ -1934,6 +1947,46 @@ async def _handle_canonical_event_propose_create(
     return web.json_response(response_payload, status=201)
 
 
+def _classify_gcal_error(exc: BaseException) -> str:
+    """Map a GCal-side exception to a stable code for downstream renderers.
+
+    The ``gcal_sync_error`` field on the ``/canonical/event/propose-create``
+    response carries a ``code`` so Hypatia / KAL-LE can switch on it
+    without parsing free-form ``detail`` text. Codes are intentionally
+    coarse for v1 — future refinements (e.g. splitting ``api_error``
+    into ``quota_exceeded`` / ``rate_limited`` / ``server_error``) can
+    add codes without breaking consumers that already handle the
+    coarse value.
+
+    Lazy-imports the ``GCalError`` hierarchy because this module loads
+    on instances that don't have the optional ``[gcal]`` deps installed
+    — eager import would crash KAL-LE / Hypatia at startup.
+    """
+    try:
+        from alfred.integrations.gcal import (
+            GCalAPIError,
+            GCalNotAuthorized,
+            GCalNotInstalled,
+        )
+    except ImportError:
+        # Optional dep absent — caller hit a non-GCal exception path.
+        return "unknown"
+
+    if isinstance(exc, GCalNotAuthorized):
+        # Token refresh failed OR no token on disk. Operator-fixable
+        # (run ``alfred gcal authorize``); transient network failures
+        # also surface here per the GCalClient docstring.
+        return "auth_failed"
+    if isinstance(exc, GCalNotInstalled):
+        # google-* libs missing; operator must ``pip install '.[gcal]'``.
+        return "missing_dependency"
+    if isinstance(exc, GCalAPIError):
+        # Catch-all for HTTP / quota / API surface failures. Future
+        # refinement can split on HTTP status if cheaply available.
+        return "api_error"
+    return "unknown"
+
+
 def _sync_event_to_gcal(
     request: web.Request,
     *,
@@ -1943,14 +1996,20 @@ def _sync_event_to_gcal(
     start_dt: datetime,
     end_dt: datetime,
     correlation_id: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Mirror a freshly-created vault event to the Alfred Calendar.
 
     Returns a dict with one of:
       * ``{}`` — GCal not configured for this instance (silent skip).
       * ``{"event_id": "<gcal-id>"}`` — sync succeeded; vault frontmatter
         has been updated to include ``gcal_event_id`` + ``gcal_calendar``.
-      * ``{"error": "<reason>"}`` — sync failed; vault stays intact.
+      * ``{"error": {"code": "<code>", "detail": "<msg>"}}`` — sync
+        failed; vault stays intact. The ``code`` is one of
+        ``calendar_id_missing`` / ``auth_failed`` / ``missing_dependency``
+        / ``api_error`` / ``unknown`` — see :func:`_classify_gcal_error`.
+        Downstream renderers (Hypatia / KAL-LE) switch on ``code`` to
+        produce calibrated user-facing messages without parsing free-form
+        ``detail`` text.
 
     Per architecture:
       * Salem ONLY writes to the configured Alfred Calendar ID — never
@@ -1977,7 +2036,12 @@ def _sync_event_to_gcal(
             reason="alfred_calendar_id_empty",
             correlation_id=correlation_id,
         )
-        return {"error": "gcal alfred_calendar_id not configured"}
+        return {
+            "error": {
+                "code": "calendar_id_missing",
+                "detail": "gcal alfred_calendar_id not configured",
+            }
+        }
 
     from alfred.integrations.gcal import GCalError
 
@@ -1993,12 +2057,14 @@ def _sync_event_to_gcal(
         # Per spec: do NOT roll back the vault create. Vault is canonical;
         # GCal is the projection. Surface the error so Hypatia / KAL-LE
         # can tell Andrew "saved to vault but GCal sync failed".
+        code = _classify_gcal_error(exc)
         log.warning(
             "transport.canonical.event_propose_gcal_sync_failed",
             error=str(exc),
+            error_code=code,
             correlation_id=correlation_id,
         )
-        return {"error": f"gcal sync failed: {exc}"}
+        return {"error": {"code": code, "detail": str(exc)}}
 
     # Success: write gcal_event_id + gcal_calendar back into the vault
     # record's frontmatter. We re-load the file we just wrote rather
