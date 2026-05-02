@@ -4,6 +4,10 @@ alfred_tags:
 - logging/run
 created: '2026-04-25'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — [[process/Alfred BIT]] parent process record does not exist
+  in vault. DIR001 — record has type=run but lives in process/; expected autofix.py
+  to handle deterministically. Human action: create the process record or retarget
+  the wikilink.'
 mode: quick
 name: Alfred BIT 2026-04-25
 overall_status: warn

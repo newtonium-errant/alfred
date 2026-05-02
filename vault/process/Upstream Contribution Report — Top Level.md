@@ -3,7 +3,6 @@ alfred_tags:
 - process/upstream-contribution
 - architecture/multi-instance
 created: '2026-04-21'
-updated: '2026-05-01'
 distiller_learnings:
 - '[[decision/Peer Protocol v1 Is HTTP REST JSON Localhost-Only]]'
 - '[[decision/Per-Instance Port Convention Stepped by Ten]]'
@@ -185,7 +184,18 @@ distiller_learnings:
   Substack]]'
 - '[[synthesis/Curator Assigns Maximum Confidence to Demonstrably False Relationship
   Context Claims]]'
-distiller_signals: constraint:2, contradiction:6
+- '[[decision/Alfred Fork Basis Is ssdavidai/alfred Through Commit 9d27ad9]]'
+- '[[decision/Single Config Schema Shared Across All Alfred Instances]]'
+- '[[decision/Voice Talker Tool-Use Loop Uses Model Escalation]]'
+- '[[synthesis/Architectural Arcs Routinely Spawn Post-Merge Hotfix Tails From Dogfooding]]'
+- '[[synthesis/Person Records Are the Canonical Site for Per-User Calibration Data]]'
+- '[[assumption/Curator Treats Existing Person Record as Evidence of Opt-In Subscription
+  Relationship]]'
+- '[[synthesis/Gambling Spam Currency Mismatched to Recipient Geography Indicates
+  Untargeted Mass Distribution]]'
+- '[[synthesis/Newsletter Re-Engagement Resends Create Separate Empty Records Carrying
+  Only Unread-Prompt Preheader]]'
+distiller_signals: constraint:3, contradiction:9
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
 janitor_note: 'LINK001 — three broken wikilinks in distiller_learnings: two are YAML-escape
@@ -220,6 +230,7 @@ tags:
 - contribution
 - writing
 type: note
+updated: '2026-05-01'
 ---
 
 *Ghostwritten by Salem (Andrew's personal AI instance) on Andrew's behalf.*
