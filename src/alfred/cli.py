@@ -1021,11 +1021,14 @@ def cmd_temporal(args: argparse.Namespace) -> None:
 
 
 def cmd_surveyor(args: argparse.Namespace) -> None:
-    # Dispatch to relink subcommand if specified; otherwise default to
-    # running the daemon (preserves `alfred surveyor` legacy behaviour).
+    # Dispatch to relink / cleanup subcommand if specified; otherwise
+    # default to running the daemon (preserves `alfred surveyor`
+    # legacy behaviour).
     subcmd = getattr(args, "surveyor_cmd", None)
     if subcmd == "relink":
         return cmd_surveyor_relink(args)
+    if subcmd == "cleanup-contamination":
+        return cmd_surveyor_cleanup_contamination(args)
     # `run` and None both start the daemon.
     return cmd_surveyor_run(args)
 
@@ -1639,6 +1642,102 @@ def cmd_surveyor_relink(args: argparse.Namespace) -> None:
         sys.exit(130)
 
 
+def cmd_surveyor_cleanup_contamination(args: argparse.Namespace) -> None:
+    """Phase 2 contamination cleanup — body-text-anchor heuristic.
+
+    Bulk-removes contaminated entity links (``related_persons`` /
+    ``related_orgs`` / ``related_matters`` / ``related_projects``)
+    from records where the linked entity has no textual presence in
+    the record's body / title / description / related list. See
+    ``alfred.surveyor.cleanup`` for the heuristic + scope rationale.
+
+    Always defaults to dry-run unless ``--apply`` is passed —
+    operator must opt in to the actual mutation. Per the Phase 2
+    ticket: this script ships, operator runs dry-run, reviews,
+    approves, runs for-real.
+    """
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="surveyor")
+
+    try:
+        from alfred.surveyor.cleanup import cleanup_entity_link_contamination
+        from alfred.surveyor.config import load_from_unified
+    except ImportError as e:
+        print(f"Surveyor dependencies not installed: {e}")
+        sys.exit(1)
+
+    config = load_from_unified(raw)
+    vault_path = Path(config.vault.path)
+
+    # Default targets: the four signatures from the QA finding. Operator
+    # can pass ``--target`` to override / extend (one ``--target`` per
+    # path). Empty default-set with explicit ``--target`` is honoured.
+    targets: list[str] = list(getattr(args, "target", None) or [])
+    if not targets:
+        targets = [
+            "person/Ben McMillan.md",
+            "person/Jamie.md",
+            "org/TIXR.md",
+            "org/Halifax Music Fest.md",
+        ]
+
+    apply = bool(getattr(args, "apply", False))
+    dry_run = not apply
+
+    # Audit-log path mirrors the daemon's derivation
+    # (``cfg.state.path``-sibling). Only used in non-dry-run mode.
+    audit_log_path = Path(config.state.path).parent / "vault_audit.log"
+
+    print(f"Surveyor contamination cleanup — {'DRY RUN' if dry_run else 'LIVE'}")
+    print(f"  Vault:    {vault_path}")
+    print(f"  Targets:  {len(targets)} entity path(s)")
+    for t in targets:
+        print(f"    • {t}")
+    print()
+
+    report = cleanup_entity_link_contamination(
+        vault_path=vault_path,
+        targets=targets,
+        dry_run=dry_run,
+        audit_log_path=audit_log_path if not dry_run else None,
+    )
+
+    # Per-target table (the operator-actionable summary).
+    verb = "Would remove" if dry_run else "Removed"
+    print(f"{verb} the following:")
+    for t in report.targets:
+        print(
+            f"  {t.target_path:<40s} "
+            f"removed: {len(t.removed_from):>5d}  "
+            f"preserved: {len(t.preserved_in):>5d}  "
+            f"(not present in {t.not_present_in} records)"
+        )
+    print()
+    print(f"Total mutations: {report.total_removed} across {report.affected_record_count} records")
+    if report.failed_records:
+        print(f"Failures:        {len(report.failed_records)} (see report JSON for details)")
+
+    # Save the report so operator has a deterministic record of what
+    # the dry-run found (for diff-against-live-run sanity).
+    from datetime import date as _date
+    report_path = (
+        Path(config.state.path).parent
+        / f"surveyor_cleanup_{'dryrun_' if dry_run else ''}{_date.today().isoformat()}.json"
+    )
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(report.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(f"\nFull report: {report_path}")
+    except OSError as exc:
+        print(f"\n(could not write report file: {exc})")
+
+    if dry_run:
+        print("\nRe-run with --apply to mutate the vault.")
+
+
 # --- Argument parser ---
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1903,6 +2002,37 @@ def build_parser() -> argparse.ArgumentParser:
     surv_relink.add_argument(
         "--threshold", type=float, default=None,
         help="Override entity_link.threshold for this run only (e.g. 0.65 for denser links)",
+    )
+
+    # cleanup-contamination — Phase 2 of the QA contamination fix.
+    # Bulk-removes contaminated related_* entries via body-text-anchor
+    # heuristic. Always defaults to dry-run; --apply opts in to mutation.
+    surv_cleanup = surv_sub.add_parser(
+        "cleanup-contamination",
+        help=(
+            "Bulk-remove contaminated related_persons / related_orgs / "
+            "related_matters / related_projects entries from records "
+            "where the linked entity has no textual presence in the "
+            "body / title / description / related list. Default is "
+            "dry-run; pass --apply to actually mutate. Default targets "
+            "are the 4 known signatures (Ben McMillan / Jamie / TIXR / "
+            "Halifax Music Fest); pass --target to override."
+        ),
+    )
+    surv_cleanup.add_argument(
+        "--apply", action="store_true", default=False,
+        help=(
+            "Actually mutate the vault. Default (without --apply) is "
+            "dry-run: report what would be removed without writing."
+        ),
+    )
+    surv_cleanup.add_argument(
+        "--target", action="append", default=None, dest="target",
+        help=(
+            "Vault path of an entity to clean (e.g. 'person/Ben McMillan.md'). "
+            "Pass --target multiple times for multiple entities. When "
+            "omitted, the 4 known QA-finding signatures are used."
+        ),
     )
 
     # tui
