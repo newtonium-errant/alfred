@@ -35,6 +35,23 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+def _parse_json_payload(captured_stdout: str) -> dict:
+    """Pull the JSON object out of captured stdout, ignoring leading log lines.
+
+    ``fiction_cli`` emits ``log.info("fiction_cli.scaffold_invoked", ...)``
+    via structlog with the default ``ConsoleRenderer`` sink, which lands
+    on stdout — same sink as the ``--json`` output. ``json.loads`` chokes
+    on the leading non-JSON content. Find the first line whose stripped
+    form starts with ``{`` and parse from there. Per
+    ``feedback_structlog_assertion_patterns.md``.
+    """
+    lines = captured_stdout.splitlines(keepends=True)
+    for idx, line in enumerate(lines):
+        if line.lstrip().startswith("{"):
+            return json.loads("".join(lines[idx:]))
+    raise AssertionError(f"no JSON object found in: {captured_stdout!r}")
+
+
 def _make_raw(vault_path: Path) -> dict:
     return {"vault": {"path": str(vault_path)}}
 
@@ -60,7 +77,7 @@ def test_scaffold_success_returns_documented_json_shape(tmp_path, capsys):
     assert rc == 0
 
     out = capsys.readouterr().out
-    payload = json.loads(out)
+    payload = _parse_json_payload(out)
 
     # The four documented contract fields, in exact shape.
     assert payload["slug"] == "the-glass-forest"
@@ -98,7 +115,7 @@ def test_scaffold_idempotent_second_invocation(tmp_path, capsys):
 
     rc2 = fiction_cli.cmd_scaffold(_make_raw(vault), "The Glass Forest")
     assert rc2 == 0
-    payload = json.loads(capsys.readouterr().out)
+    payload = _parse_json_payload(capsys.readouterr().out)
     assert payload["slug"] == "the-glass-forest"
     assert payload["already_existed"] is True
     assert payload["files_created"] == []
@@ -115,7 +132,7 @@ def test_scaffold_uses_nfkd_slug_parity(tmp_path, capsys):
     vault = _make_vault(tmp_path)
     rc = fiction_cli.cmd_scaffold(_make_raw(vault), "Café Society")
     assert rc == 0
-    payload = json.loads(capsys.readouterr().out)
+    payload = _parse_json_payload(capsys.readouterr().out)
     # NFKD-normalized: "Café" → "Cafe" (the Phase 2.5 fix); pre-fix
     # this would have been "caf-society".
     assert payload["slug"] == "cafe-society"
