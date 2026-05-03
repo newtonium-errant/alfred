@@ -411,9 +411,29 @@ def cleanup_entity_link_contamination(
         # Build the corpus once per record — each target reuses it.
         corpus = _build_record_corpus(fm, body)
 
-        # Track per-record set_fields for vault_edit (one write per
-        # record covering all targets; minimises file I/O).
-        set_fields: dict[str, list] = {}
+        # Two-phase per-record processing:
+        #   Phase 1 (decide): walk every target, classify as
+        #     not-present / preserve / remove. Update per-target
+        #     report counters and accumulate removals into
+        #     ``removals_by_field`` (field → set of paths-to-drop).
+        #   Phase 2 (write): for each affected field, build the
+        #     post-removal list ONCE from the original ``fm[field]``
+        #     minus all collected removals for that field.
+        #
+        # Bug fixed by this two-phase split (post-d2c30ce):
+        # previously the loop wrote ``set_fields[field] = [p for
+        # p in existing if p != target_path]`` on EVERY removal
+        # decision. When two targets shared the same field (e.g.
+        # both Ben McMillan and Jamie in ``related_persons``), the
+        # second target's write computed ``existing`` from the
+        # untouched ``fm`` and produced a list that omitted Jamie
+        # but kept Ben — overwriting the prior removal of Ben.
+        # The vault_edit then persisted a list with only ONE of
+        # the two targets actually removed. Operator-visible
+        # symptom: dry-run report claimed both removed, vault
+        # state contained one. Test:
+        # ``test_multiple_targets_one_record_one_write``.
+        removals_by_field: dict[str, set[str]] = {}
         removed_targets_for_record: list[str] = []
 
         for target_path, field_name, display_name in target_specs:
@@ -434,13 +454,23 @@ def cleanup_entity_link_contamination(
             # Mark for removal — operator-confirmed contamination.
             target_reports[target_path].removed_from.append(rel_path)
             removed_targets_for_record.append(target_path)
-            # Build the post-removal list, preserving order.
-            new_list = [p for p in existing if p != target_path]
-            set_fields[field_name] = new_list
+            removals_by_field.setdefault(field_name, set()).add(target_path)
 
         # No removals on this record? Move on.
-        if not set_fields:
+        if not removals_by_field:
             continue
+
+        # Phase 2: build the final set_fields payload — ONE filtered
+        # list per affected field, derived from the ORIGINAL fm[field]
+        # minus ALL accumulated removals for that field. Order
+        # preservation: filter in place (existing-list iteration
+        # order kept), drop any path that's in the removals set.
+        set_fields: dict[str, list] = {}
+        for field_name, drop_paths in removals_by_field.items():
+            original = fm.get(field_name) or []
+            set_fields[field_name] = [
+                p for p in original if p not in drop_paths
+            ]
 
         if dry_run:
             log.debug(

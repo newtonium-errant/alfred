@@ -482,6 +482,94 @@ def test_multiple_targets_one_record_one_write(vault: Path):
     assert fm.metadata.get("related_orgs", []) == []
 
 
+def test_five_targets_same_field_all_removed_in_single_write(vault: Path):
+    """Regression test for the post-d2c30ce write-batching bug: when
+    multiple targets share the same ``related_*`` field, the cleanup
+    must remove ALL of them in one write — not let later iterations
+    overwrite earlier removals.
+
+    Pre-fix the implementation built ``set_fields[field] = [p for p
+    in existing if p != target_path]`` on EVERY removal decision.
+    With 5 targets in ``related_persons``, the final ``set_fields``
+    came from the LAST iteration only — a list missing only the
+    last target, with the other 4 silently re-added on write.
+
+    Operator-visible symptom: dry-run report claimed all 5 removed,
+    apply landed only 1.
+    """
+    five_targets = [
+        "person/Ben McMillan.md",
+        "person/Jamie.md",
+        "person/Carol.md",
+        "person/Dave.md",
+        "person/Eve.md",
+    ]
+    _write_record(
+        vault,
+        rel_path="event/Five Contam.md",
+        body="A bland event log; no person mentioned by name.",
+        related_persons=list(five_targets),
+    )
+    report = cleanup_entity_link_contamination(
+        vault, five_targets, dry_run=False,
+    )
+    # Every target's report says removed.
+    by_target = {t.target_path: t for t in report.targets}
+    for tp in five_targets:
+        assert "event/Five Contam.md" in by_target[tp].removed_from, (
+            f"{tp} should be in removed_from"
+        )
+    # Vault state matches: ALL 5 actually gone (the bug fix).
+    fm = frontmatter.load(str(vault / "event/Five Contam.md"))
+    assert fm.metadata.get("related_persons", []) == [], (
+        f"all 5 targets must be removed in one write; "
+        f"got {fm.metadata.get('related_persons')!r}"
+    )
+
+
+def test_partial_removal_preserves_non_target_entries(vault: Path):
+    """When the field has a mix of contaminating + legitimate
+    entries, the legitimate entries survive the cleanup.
+
+    This is the load-bearing safety property of the fix: the
+    write-batching bug could in principle have ALSO dropped
+    legitimate entries if it confused itself differently. Pin
+    that the cleanup only removes what was specifically
+    target-marked-for-removal.
+    """
+    _write_record(
+        vault,
+        rel_path="event/Mixed.md",
+        body=(
+            "A real event with Andrew Newton in attendance. "
+            "No mention of Ben McMillan or Jamie."
+        ),
+        related_persons=[
+            "person/Ben McMillan.md",
+            "person/Andrew Newton.md",  # legitimate — name in body
+            "person/Jamie.md",
+            "person/Sarah.md",  # NOT a cleanup target → must survive
+        ],
+    )
+    cleanup_entity_link_contamination(
+        vault,
+        # Only target Ben + Jamie. Andrew Newton not targeted; Sarah
+        # not targeted.
+        ["person/Ben McMillan.md", "person/Jamie.md"],
+        dry_run=False,
+    )
+    fm = frontmatter.load(str(vault / "event/Mixed.md"))
+    surviving = fm.metadata.get("related_persons", [])
+    # Andrew Newton — would be preserved by body-text-anchor IF he
+    # had been targeted. He wasn't targeted, so he stays unconditionally.
+    assert "person/Andrew Newton.md" in surviving
+    # Sarah — never a target, must stay.
+    assert "person/Sarah.md" in surviving
+    # Ben + Jamie — targeted + body silent → removed.
+    assert "person/Ben McMillan.md" not in surviving
+    assert "person/Jamie.md" not in surviving
+
+
 # ---------------------------------------------------------------------------
 # Aggregate report shape
 # ---------------------------------------------------------------------------
