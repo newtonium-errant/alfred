@@ -51,6 +51,26 @@ _REMINDER_TYPES: set[str] = {"task"}
 # historical record, but the scheduler does not fire on them.
 _ELIGIBLE_STATUSES: set[str] = {"todo", "active"}
 
+# Grace window for ``remind_at`` values that land in the past.
+#
+# A reminder whose ``remind_at`` is at most this many seconds in the
+# past at scheduler-tick time fires normally. The grace covers two
+# legitimate cases:
+#   * Clock skew between the writer and the scheduler tick.
+#   * "Remind me right now" semantics — a task created with
+#     ``remind_at = now()`` will land a few hundred ms in the past by
+#     the time the next tick sees it.
+#
+# Anything older than the grace is REFUSED — never fires, never
+# stamps ``reminded_at``, never dead-letters. Per
+# ``feedback_intentionally_left_blank.md``: silence here is the bug
+# the QA pass caught (Salem set ``remind_at`` 6 days in the past,
+# scheduler bucketed as stale, ``clear_remind_at_and_stamp`` consumed
+# it without notifying Andrew). The refusal path emits a warning log
+# every tick the task is seen — recurring noise is the right signal
+# until the operator repairs the date.
+_REMIND_AT_PAST_GRACE_SECONDS: int = 60
+
 
 # The body comment signature the scheduler appends after a successful
 # reminder dispatch. One line per reminder so the audit trail is
@@ -107,14 +127,29 @@ def find_due_reminders(
     vault_path: Path,
     now: datetime,
     stale_max_minutes: int,
-) -> tuple[list[DueReminder], list[DueReminder]]:
+) -> tuple[list[DueReminder], list[DueReminder], list[DueReminder]]:
     """Walk ``vault_path/task/**/*.md`` and classify each record.
 
-    Returns ``(due, stale)`` — ``due`` fires; ``stale`` dead-letters.
-    Both lists are computed in one pass so the scheduler can pick up
-    either outcome without a second vault walk.
+    Returns ``(due, stale, refused_past_time)``:
+      * ``due`` — fires normally; scheduler dispatches + stamps
+        ``reminded_at``.
+      * ``stale`` — older than ``stale_max_minutes`` but inside the
+        legitimate-past window (operator opted into reminders that
+        accumulated during a daemon outage); dead-letters + stamps
+        so they don't re-fire.
+      * ``refused_past_time`` — ``remind_at`` is more than
+        ``_REMIND_AT_PAST_GRACE_SECONDS`` in the past (suspicious;
+        the writer almost certainly miscalculated). The scheduler
+        does NOT dispatch, dead-letter, or stamp these. Operator
+        sees a recurring warning log until the task is repaired
+        (delete or correct ``remind_at``). Closes the QA-finding bug
+        where Salem wrote ``remind_at`` 6 days in the past and the
+        scheduler silently consumed it.
 
-    Eligibility (for both lists):
+    All three lists are computed in one vault walk so the scheduler
+    can pick any outcome without a second pass.
+
+    Eligibility (for all three lists):
     - ``type == "task"``
     - ``status in {"todo", "active"}``
     - ``remind_at`` present and parseable
@@ -123,11 +158,13 @@ def find_due_reminders(
     """
     task_dir = vault_path / "task"
     if not task_dir.is_dir():
-        return [], []
+        return [], [], []
 
     due: list[DueReminder] = []
     stale: list[DueReminder] = []
+    refused_past_time: list[DueReminder] = []
     stale_cutoff = now - timedelta(minutes=stale_max_minutes)
+    past_grace_cutoff = now - timedelta(seconds=_REMIND_AT_PAST_GRACE_SECONDS)
 
     for md_path in task_dir.rglob("*.md"):
         try:
@@ -182,12 +219,31 @@ def find_due_reminders(
             status=status,
         )
 
-        if remind_at < stale_cutoff:
+        # Past-time refusal takes precedence over the stale-window
+        # bucket. A reminder more than the grace in the past is
+        # almost certainly a writer error (Salem's QA finding:
+        # ``remind_at`` 6 days in the past). The stale path would
+        # consume + dead-letter it; refusal preserves the task's
+        # un-fired state so the operator can repair the date.
+        #
+        # Note: with the new past-grace cutoff (60s) being narrower
+        # than the stale cutoff (default 3h), the stale branch below
+        # is reachable in practice only if an operator tightens
+        # stale_max_minutes below 1 — which would itself be a
+        # config bug. The branch is preserved (rather than removed)
+        # so the bucketing scaffolding stays intact + a future widen
+        # of the past-grace window doesn't silently re-enable stale
+        # consumption. ``feedback_intentionally_left_blank.md``
+        # principle: prefer explicit-and-redundant over deleted-
+        # because-unreachable.
+        if remind_at < past_grace_cutoff:
+            refused_past_time.append(entry)
+        elif remind_at < stale_cutoff:
             stale.append(entry)
         else:
             due.append(entry)
 
-    return due, stale
+    return due, stale, refused_past_time
 
 
 def format_reminder(entry: DueReminder) -> str:
@@ -291,9 +347,33 @@ async def _tick(
     now = datetime.now(timezone.utc)
 
     # 1) Task-record reminders.
-    due, stale = find_due_reminders(
+    due, stale, refused_past_time = find_due_reminders(
         vault_path, now, config.scheduler.stale_reminder_max_minutes,
     )
+
+    # Past-time refusal: log the gap, do NOT fire / dead-letter /
+    # stamp. The task stays in "todo, no reminder fired" state until
+    # the operator repairs the ``remind_at`` value (or removes it).
+    # The warning re-fires on every tick the task is seen — recurring
+    # noise is the right signal per ``feedback_intentionally_left_blank
+    # .md``. Operator greps ``scheduler.reminder_refused_past_time`` to
+    # catch any tasks Salem (or another writer) miscalculated.
+    for entry in refused_past_time:
+        delta_seconds = (entry.remind_at - now).total_seconds()
+        log.warning(
+            "transport.scheduler.reminder_refused_past_time",
+            path=entry.rel_path,
+            title=entry.title,
+            remind_at=entry.remind_at.isoformat(),
+            now=now.isoformat(),
+            delta_seconds=delta_seconds,
+            grace_seconds=_REMIND_AT_PAST_GRACE_SECONDS,
+            hint=(
+                "remind_at is more than the grace window in the past — "
+                "writer error. Task NOT consumed; repair or remove the "
+                "remind_at value to silence this warning."
+            ),
+        )
 
     for entry in stale:
         log.warning(

@@ -37,6 +37,16 @@ from alfred.transport.state import TransportState
 
 NOW = datetime(2026, 4, 20, 18, 0, tzinfo=timezone.utc)
 
+# A remind_at value that's within the past-grace window of NOW —
+# scheduler treats this as "fires normally" rather than "refused as
+# past-time writer error". 30s past < 60s grace.
+#
+# Pre-guardrail tests used ``NOW - 1h`` for "fires normally"; that's
+# now well outside the grace and lands in ``refused_past_time``.
+# Tests that want the legitimate-fire path use this constant instead.
+WITHIN_GRACE_REMIND_AT = (NOW - timedelta(seconds=30)).isoformat()
+WITHIN_GRACE_REMINDED_AT_OLDER = (NOW - timedelta(days=1)).isoformat()
+
 
 def _write_task(
     task_dir: Path,
@@ -92,15 +102,20 @@ def tmp_task_vault(tmp_path: Path) -> Path:
 
 
 def test_find_due_reminders_returns_past_due(tmp_task_vault: Path) -> None:
+    """Reminder within the past-grace window fires normally."""
     task_dir = tmp_task_vault / "task"
     _write_task(
         task_dir, "Call Dr Bailey",
-        remind_at="2026-04-20T17:00:00+00:00",  # 1h ago from NOW
+        # Within 60s grace — legitimate "remind me right now" case.
+        remind_at=WITHIN_GRACE_REMIND_AT,
     )
 
-    due, stale = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due, stale, refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     assert len(due) == 1
     assert len(stale) == 0
+    assert len(refused) == 0
     assert due[0].title == "Call Dr Bailey"
     assert due[0].status == "todo"
 
@@ -112,9 +127,12 @@ def test_find_due_reminders_skips_future(tmp_task_vault: Path) -> None:
         remind_at="2099-04-20T18:00:00+00:00",
     )
 
-    due, stale = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due, stale, refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     assert due == []
     assert stale == []
+    assert refused == []
 
 
 def test_find_due_reminders_skips_already_reminded(tmp_task_vault: Path) -> None:
@@ -122,11 +140,14 @@ def test_find_due_reminders_skips_already_reminded(tmp_task_vault: Path) -> None
     task_dir = tmp_task_vault / "task"
     _write_task(
         task_dir, "Already sent",
-        remind_at="2026-04-20T17:00:00+00:00",
-        reminded_at="2026-04-20T17:00:01+00:00",
+        remind_at=WITHIN_GRACE_REMIND_AT,
+        # reminded_at >= remind_at — already-fired guard short-circuits.
+        reminded_at=NOW.isoformat(),
     )
 
-    due, _stale = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due, _stale, _refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     assert due == []
 
 
@@ -137,11 +158,13 @@ def test_find_due_reminders_re_arms_when_remind_at_moves_forward(
     task_dir = tmp_task_vault / "task"
     _write_task(
         task_dir, "Follow-up",
-        remind_at="2026-04-20T17:30:00+00:00",  # new time, in past
-        reminded_at="2026-04-19T00:00:00+00:00",  # older than remind_at
+        remind_at=WITHIN_GRACE_REMIND_AT,  # new value, within grace
+        reminded_at=WITHIN_GRACE_REMINDED_AT_OLDER,  # older — re-arm fires
     )
 
-    due, _ = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due, _stale, _refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     assert len(due) == 1
     assert due[0].title == "Follow-up"
 
@@ -150,40 +173,127 @@ def test_find_due_reminders_skips_wrong_status(tmp_task_vault: Path) -> None:
     task_dir = tmp_task_vault / "task"
     _write_task(
         task_dir, "Done task", status="done",
-        remind_at="2026-04-20T17:00:00+00:00",
+        remind_at=WITHIN_GRACE_REMIND_AT,
     )
     _write_task(
         task_dir, "Cancelled task", status="cancelled",
-        remind_at="2026-04-20T17:00:00+00:00",
+        remind_at=WITHIN_GRACE_REMIND_AT,
     )
 
-    due, stale = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due, stale, refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     assert due == []
     assert stale == []
+    assert refused == []
 
 
 def test_find_due_reminders_splits_stale_from_live(tmp_task_vault: Path) -> None:
-    """Reminders older than stale_max_minutes go into the stale list."""
+    """Reminders within grace fire; older ones land in ``refused_past_time``.
+
+    Pre-guardrail this test asserted "30m past = fresh, days past =
+    stale". The new past-grace cutoff (60s) supersedes the stale
+    cutoff (3h) — anything more than 60s past is now refused, not
+    bucketed as fresh-but-stale. The test reflects the new contract.
+    """
     task_dir = tmp_task_vault / "task"
     _write_task(
-        task_dir, "Fresh reminder",
-        remind_at="2026-04-20T17:30:00+00:00",  # 30m stale
+        task_dir, "Within grace",
+        remind_at=WITHIN_GRACE_REMIND_AT,
     )
     _write_task(
-        task_dir, "Stale reminder",
-        remind_at="2026-04-17T00:00:00+00:00",  # days stale
+        task_dir, "Past grace (30m)",
+        remind_at="2026-04-20T17:30:00+00:00",  # 30m past — outside grace
+    )
+    _write_task(
+        task_dir, "Days past",
+        remind_at="2026-04-17T00:00:00+00:00",  # days past — outside grace
     )
 
-    due, stale = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
-    assert [e.title for e in due] == ["Fresh reminder"]
-    assert [e.title for e in stale] == ["Stale reminder"]
+    due, stale, refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
+    assert [e.title for e in due] == ["Within grace"]
+    # Both past-grace entries refused (the 60s past-grace is narrower
+    # than the 3h stale window, so stale is now unreachable in
+    # practice — see the dead-code rationale in scheduler.py).
+    assert sorted(e.title for e in refused) == sorted([
+        "Past grace (30m)", "Days past",
+    ])
+    assert stale == []
 
 
 def test_find_due_reminders_no_task_dir(tmp_path: Path) -> None:
     """Missing task/ directory returns empty — don't raise."""
-    due, stale = find_due_reminders(tmp_path, NOW, stale_max_minutes=180)
+    due, stale, refused = find_due_reminders(
+        tmp_path, NOW, stale_max_minutes=180,
+    )
     assert due == []
     assert stale == []
+    assert refused == []
+
+
+# ---------------------------------------------------------------------------
+# Past-time refusal guardrail (P1 from QA finding)
+# ---------------------------------------------------------------------------
+
+
+def test_refused_past_time_at_grace_boundary_just_past(
+    tmp_task_vault: Path,
+) -> None:
+    """Reminder 90s in the past lands in ``refused_past_time``."""
+    task_dir = tmp_task_vault / "task"
+    _write_task(
+        task_dir, "Slightly past grace",
+        remind_at=(NOW - timedelta(seconds=90)).isoformat(),
+    )
+    due, _stale, refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
+    assert due == []
+    assert len(refused) == 1
+    assert refused[0].title == "Slightly past grace"
+
+
+def test_refused_past_time_at_grace_boundary_just_within(
+    tmp_task_vault: Path,
+) -> None:
+    """Reminder 30s in the past fires normally (within 60s grace)."""
+    task_dir = tmp_task_vault / "task"
+    _write_task(
+        task_dir, "Within grace",
+        remind_at=(NOW - timedelta(seconds=30)).isoformat(),
+    )
+    due, _stale, refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
+    assert len(due) == 1
+    assert refused == []
+
+
+def test_refused_past_time_six_days_past_qa_repro(
+    tmp_task_vault: Path,
+) -> None:
+    """Direct repro of the QA-finding bug: ``remind_at`` 6 days past.
+
+    Pre-guardrail the scheduler bucketed this as ``stale`` and
+    ``clear_remind_at_and_stamp`` consumed it without notifying the
+    user (Andrew lost the LASIK reminder). Post-guardrail the same
+    input lands in ``refused_past_time`` and the task is left
+    intact for the operator to repair.
+    """
+    task_dir = tmp_task_vault / "task"
+    _write_task(
+        task_dir, "QA repro",
+        remind_at=(NOW - timedelta(days=6)).isoformat(),
+    )
+    due, stale, refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
+    assert due == []
+    assert stale == []  # narrower past-grace supersedes stale bucketing
+    assert len(refused) == 1
+    assert refused[0].title == "QA repro"
 
 
 # ---------------------------------------------------------------------------
@@ -195,10 +305,12 @@ def test_format_reminder_uses_reminder_text_when_set(tmp_task_vault: Path) -> No
     task_dir = tmp_task_vault / "task"
     _write_task(
         task_dir, "Fuel check",
-        remind_at="2026-04-20T17:00:00+00:00",
+        remind_at=WITHIN_GRACE_REMIND_AT,
         reminder_text="Get gas before the route",
     )
-    due, _ = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due, _stale, _refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     assert format_reminder(due[0]) == "Get gas before the route"
 
 
@@ -206,10 +318,12 @@ def test_format_reminder_includes_due_when_present(tmp_task_vault: Path) -> None
     task_dir = tmp_task_vault / "task"
     _write_task(
         task_dir, "Call Dr Bailey",
-        remind_at="2026-04-20T17:00:00+00:00",
+        remind_at=WITHIN_GRACE_REMIND_AT,
         due="2026-04-24",
     )
-    due, _ = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due, _stale, _refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     assert format_reminder(due[0]) == "Reminder: Call Dr Bailey (due 2026-04-24)"
 
 
@@ -217,9 +331,11 @@ def test_format_reminder_title_only_when_no_due(tmp_task_vault: Path) -> None:
     task_dir = tmp_task_vault / "task"
     _write_task(
         task_dir, "Plain reminder",
-        remind_at="2026-04-20T17:00:00+00:00",
+        remind_at=WITHIN_GRACE_REMIND_AT,
     )
-    due, _ = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due, _stale, _refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     assert format_reminder(due[0]) == "Reminder: Plain reminder"
 
 
@@ -232,15 +348,19 @@ def test_clear_remind_at_and_stamp_mutates_frontmatter(tmp_task_vault: Path) -> 
     task_dir = tmp_task_vault / "task"
     _write_task(
         task_dir, "Call Dr Bailey",
-        remind_at="2026-04-20T17:00:00+00:00",
+        remind_at=WITHIN_GRACE_REMIND_AT,
     )
 
-    due, _ = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due, _stale, _refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     assert len(due) == 1
     clear_remind_at_and_stamp(due[0], NOW)
 
     # Re-scan — the stamped task should no longer be due.
-    due_after, _ = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due_after, _stale, _refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     assert due_after == []
 
     # Inspect the file directly.
@@ -263,9 +383,11 @@ def test_clear_remind_at_and_stamp_idempotent_same_timestamp(
     task_dir = tmp_task_vault / "task"
     _write_task(
         task_dir, "Idempotent",
-        remind_at="2026-04-20T17:00:00+00:00",
+        remind_at=WITHIN_GRACE_REMIND_AT,
     )
-    due, _ = find_due_reminders(tmp_task_vault, NOW, stale_max_minutes=180)
+    due, _stale, _refused = find_due_reminders(
+        tmp_task_vault, NOW, stale_max_minutes=180,
+    )
     clear_remind_at_and_stamp(due[0], NOW)
     clear_remind_at_and_stamp(due[0], NOW)  # exact same timestamp
     content = due[0].abs_path.read_text(encoding="utf-8")
@@ -277,15 +399,27 @@ def test_clear_remind_at_and_stamp_idempotent_same_timestamp(
 # ---------------------------------------------------------------------------
 
 
-async def test_tick_fires_due_and_dead_letters_stale(tmp_task_vault: Path) -> None:
+async def test_tick_fires_within_grace_and_refuses_past_grace(
+    tmp_task_vault: Path,
+) -> None:
+    """End-to-end: a within-grace reminder fires; a past-grace one refuses.
+
+    Renamed from ``test_tick_fires_due_and_dead_letters_stale`` —
+    pre-guardrail this asserted the stale path dead-letters. The
+    new past-grace cutoff (60s) supersedes the stale cutoff (3h),
+    so any past-by-more-than-60s reminder refuses instead. The
+    refused entry is NOT dispatched, NOT dead-lettered, and NOT
+    stamped — the task stays in "todo, no reminder fired" state
+    for the operator to repair.
+    """
     task_dir = tmp_task_vault / "task"
     _write_task(
-        task_dir, "Fresh",
-        remind_at="2026-04-20T17:30:00+00:00",  # 30m stale — within window
+        task_dir, "Within grace",
+        remind_at="2026-04-20T17:30:00+00:00",  # placeholder — rewritten below
     )
     _write_task(
-        task_dir, "Stale",
-        remind_at="2026-04-17T00:00:00+00:00",  # > 180m stale
+        task_dir, "Past grace",
+        remind_at="2026-04-17T00:00:00+00:00",  # placeholder — rewritten below
     )
 
     sent: list[dict] = []
@@ -305,50 +439,130 @@ async def test_tick_fires_due_and_dead_letters_stale(tmp_task_vault: Path) -> No
     )
     state = TransportState.create(tmp_task_vault / "state.json")
 
-    # Freeze "now" by monkey-patching the module's datetime import.
-    # Simpler: pick a stale cutoff and a time window that makes the
-    # stale/fresh split deterministic without mocking clocks. The
-    # scheduler calls ``datetime.now(UTC)`` — so we can't trivially
-    # freeze it inside _tick. Instead we shift the test fixture
-    # timestamps so "now" being the real clock still gives us the
-    # intended stale/fresh split.
+    # The scheduler calls ``datetime.now(UTC)`` directly so we can't
+    # freeze its clock — instead, shift the fixture timestamps so
+    # "now" being the real clock still gives the intended split.
     from datetime import datetime as _dt, timezone as _tz
     real_now = _dt.now(_tz.utc)
 
-    # Rewrite the task records to use times relative to real_now.
     task_dir_files = sorted(task_dir.glob("*.md"))
-    fresh_path = next(p for p in task_dir_files if p.stem == "Fresh")
-    stale_path = next(p for p in task_dir_files if p.stem == "Stale")
+    fresh_path = next(p for p in task_dir_files if p.stem == "Within grace")
+    past_path = next(p for p in task_dir_files if p.stem == "Past grace")
 
-    fresh_remind = (real_now - timedelta(minutes=30)).isoformat()
-    stale_remind = (real_now - timedelta(hours=48)).isoformat()
+    # Within-grace: 30s past — fires normally.
+    fresh_remind = (real_now - timedelta(seconds=30)).isoformat()
+    # Past-grace: 48h past — refuses (was stale + dead-letter pre-fix).
+    past_remind = (real_now - timedelta(hours=48)).isoformat()
     fresh_path.write_text(
         fresh_path.read_text().replace(
             "2026-04-20T17:30:00+00:00", fresh_remind,
         ),
     )
-    stale_path.write_text(
-        stale_path.read_text().replace(
-            "2026-04-17T00:00:00+00:00", stale_remind,
+    past_path.write_text(
+        past_path.read_text().replace(
+            "2026-04-17T00:00:00+00:00", past_remind,
         ),
     )
 
     await _tick(config, state, _send, tmp_task_vault, user_id=42)
 
-    # Fresh was dispatched.
+    # Within-grace was dispatched.
     assert len(sent) == 1
     assert sent[0]["user_id"] == 42
-    assert sent[0]["text"].startswith("Reminder: Fresh")
-    assert "reminder-task/Fresh.md" in sent[0]["dedupe_key"]
+    assert sent[0]["text"].startswith("Reminder: Within grace")
+    assert "reminder-task/Within grace.md" in sent[0]["dedupe_key"]
 
-    # Stale was dead-lettered.
-    assert len(state.dead_letter) == 1
-    assert state.dead_letter[0]["dead_letter_reason"] == (
-        "stale_reminder_window_exceeded"
+    # Past-grace was REFUSED — NOT dead-lettered, NOT consumed.
+    assert state.dead_letter == [], (
+        f"refused-past-time entries must NOT be dead-lettered. "
+        f"Got: {state.dead_letter}"
     )
 
-    # Send log captured the fresh dispatch.
+    # Past-grace task's frontmatter is intact: ``remind_at`` still
+    # set, ``reminded_at`` not stamped. Operator can repair the date
+    # and the next tick will pick it up.
+    import frontmatter
+    past_post = frontmatter.load(str(past_path))
+    assert past_post.metadata.get("remind_at") == past_remind, (
+        "refused task's remind_at must NOT be cleared"
+    )
+    assert "reminded_at" not in past_post.metadata, (
+        "refused task must NOT have reminded_at stamped"
+    )
+    assert "<!-- ALFRED:REMINDER" not in (past_post.content or ""), (
+        "refused task must NOT have a fired audit comment appended"
+    )
+
+    # Send log captured ONLY the within-grace dispatch.
     assert len(state.send_log) == 1
+    assert "Within grace" in state.send_log[0]["text"]
+
+
+async def test_tick_logs_warning_for_refused_past_time(
+    tmp_task_vault: Path,
+) -> None:
+    """Past-grace refusal emits ``scheduler.reminder_refused_past_time``.
+
+    Operator greps the warning to spot tasks Salem (or another
+    writer) miscalculated. Per ``feedback_intentionally_left_blank.md``:
+    silent suppression is the bug — the warning must be loud and
+    re-emitted on every tick the task is seen until the operator
+    repairs the date.
+
+    Uses ``structlog.testing.capture_logs`` per
+    ``feedback_structlog_assertion_patterns.md`` — pytest's caplog
+    doesn't reliably capture from async code paths in this codebase.
+    """
+    from structlog.testing import capture_logs
+
+    task_dir = tmp_task_vault / "task"
+    _write_task(
+        task_dir, "Past grace task",
+        remind_at="2026-04-17T00:00:00+00:00",  # placeholder
+    )
+
+    async def _send(user_id: int, text: str, dedupe_key: str | None = None) -> list[int]:
+        return [42]
+
+    config = TransportConfig(
+        server=ServerConfig(),
+        scheduler=SchedulerConfig(
+            poll_interval_seconds=30,
+            stale_reminder_max_minutes=180,
+        ),
+        auth=AuthConfig(),
+        state=StateConfig(),
+    )
+    state = TransportState.create(tmp_task_vault / "state.json")
+
+    from datetime import datetime as _dt, timezone as _tz
+    real_now = _dt.now(_tz.utc)
+    past_path = next((task_dir).glob("*.md"))
+    past_remind = (real_now - timedelta(hours=48)).isoformat()
+    past_path.write_text(
+        past_path.read_text().replace(
+            "2026-04-17T00:00:00+00:00", past_remind,
+        ),
+    )
+
+    with capture_logs() as captured:
+        await _tick(config, state, _send, tmp_task_vault, user_id=42)
+
+    refusal_logs = [
+        c for c in captured
+        if c.get("event") == "transport.scheduler.reminder_refused_past_time"
+    ]
+    assert len(refusal_logs) == 1, (
+        f"expected exactly one refusal log, got {len(refusal_logs)}. "
+        f"All captured: {[c.get('event') for c in captured]}"
+    )
+    log_entry = refusal_logs[0]
+    assert log_entry["log_level"] == "warning"
+    assert log_entry["title"] == "Past grace task"
+    assert "task/Past grace task.md" in log_entry["path"]
+    assert log_entry["delta_seconds"] < -3600  # ~48h past
+    assert log_entry["grace_seconds"] == 60
+    assert "hint" in log_entry  # operator pointer present
 
 
 async def test_tick_drains_scheduled_pending_queue(tmp_task_vault: Path) -> None:
