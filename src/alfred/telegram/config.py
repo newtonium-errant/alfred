@@ -187,6 +187,30 @@ class VisionConfig:
 
 
 @dataclass
+class FictionConfig:
+    """Per-instance gate for the ``/fiction <title>`` slash command.
+
+    Default ``False`` so Salem (and any other operational-vault
+    instance) never accidentally registers the command. Hypatia opts
+    in via ``telegram.fiction.command_enabled: true`` in
+    ``config.hypatia.yaml`` because her vault layout (~/library-
+    alexandria/) has the ``draft/fiction/`` directory pattern the
+    command writes into.
+
+    Conditional registration: when ``enabled=False`` (or the
+    ``fiction`` block is absent entirely), ``/fiction`` is NOT
+    registered as a CommandHandler at all — Telegram's "unknown
+    command" behaviour fires for instances that legitimately don't
+    support fiction posture.
+
+    See ``project_hypatia_phase2_followups.md`` for the deferred
+    Phase 2.5 plan this implements.
+    """
+
+    command_enabled: bool = False
+
+
+@dataclass
 class BashExecConfig:
     """KAL-LE's ``bash_exec`` tool config.
 
@@ -232,6 +256,11 @@ class TalkerConfig:
     # ``enabled=True``. Future PHI-sensitive instances flip to false in
     # config until a PHI-firewall design lands.
     vision: VisionConfig = field(default_factory=VisionConfig)
+    # Fiction posture gate — see :class:`FictionConfig`. Default-OFF;
+    # only Hypatia opts in. None sentinel matches the existing
+    # optional-block convention (tts / bash_exec) so health probes can
+    # tell "block absent" from "block present, command disabled".
+    fiction: FictionConfig | None = None
     # Path to the config file this TalkerConfig was loaded from. Carried
     # so lazy/late loaders (notably the inter-instance peer-tool dispatcher
     # in ``conversation._dispatch_peer_inter_instance_tool``) can re-read
@@ -260,6 +289,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "bash_exec": BashExecConfig,
     "idle_tick": IdleTickConfig,
     "vision": VisionConfig,
+    "fiction": FictionConfig,
 }
 
 
@@ -336,6 +366,12 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     vision_raw = tool.get("vision")
     if isinstance(vision_raw, dict):
         built.vision = _build(VisionConfig, vision_raw)
+    # Fiction — defaulted-OFF / None sentinel. Only constructs the
+    # FictionConfig when the block is explicitly present in YAML, so
+    # ``health.py`` can tell "Hypatia opted in" from "Salem omitted".
+    fiction_raw = tool.get("fiction")
+    if isinstance(fiction_raw, dict) and fiction_raw:
+        built.fiction = _build(FictionConfig, fiction_raw)
     # Synthetic ``_config_path`` key — set by the CLI in ``cmd_up`` /
     # other entry points before handing ``raw`` to the orchestrator,
     # carried through ``multiprocessing`` pickling to subprocess

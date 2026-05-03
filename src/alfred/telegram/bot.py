@@ -204,6 +204,20 @@ def build_app(
     # preference. Reads/writes ``preferences.voice`` on the primary-user's
     # person record. Applies to every ElevenLabs TTS path (today: /brief).
     app.add_handler(CommandHandler("speed", on_speed))
+    # Hypatia Phase 2.5: /fiction <title> conditionally registered.
+    # Only fires the registration when the operator explicitly opts in
+    # via ``telegram.fiction.command_enabled: true`` in their instance
+    # config. Salem (and any other operational-vault instance) leaves
+    # the block out → command not registered → Telegram's "unknown
+    # command" handles user error. Per the Phase 2.5 contract: the
+    # natural-language path (Hypatia's SKILL detecting "let's start a
+    # fiction project called X") and this slash command produce
+    # identical on-disk shapes — see
+    # :func:`alfred.telegram.fiction.scaffold_fiction_project`.
+    if config.fiction is not None and config.fiction.command_enabled:
+        app.add_handler(CommandHandler("fiction", on_fiction))
+        log.info("talker.bot.fiction_command_registered")
+
     # Email-surfacing c2: Daily Sync slash commands. /calibrate fires
     # an out-of-cycle Daily Sync sample; /calibration_ok flips per-tier
     # confidence flags read by the (future) c3/c4/c5 surfacing layers.
@@ -1191,6 +1205,95 @@ async def on_speed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     suffix = f" (note saved)" if note else ""
     await update.message.reply_text(
         f"{instance_name} speed set to {validated}.{suffix}"
+    )
+
+
+# --- Hypatia fiction posture (Phase 2.5) ---------------------------------
+
+
+async def on_fiction(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/fiction <title>`` — scaffold a fiction project directory.
+
+    Hypatia-only by config gate (``telegram.fiction.command_enabled``);
+    only registered when that knob is True. Salem and other
+    operational-vault instances never see this command.
+
+    Produces the per-element directory shape Hypatia's SKILL revision
+    expects:
+
+      ``draft/fiction/<slug>/``
+        ``continuity.md``  — orientation index Hypatia reads first
+        ``story.md``       — working manuscript
+        ``structure.md``   — framework placeholder
+        ``world.md``       — setting / world details
+        ``voice.md``       — narrator register / voice contract
+        ``characters/``    — character files added later (.gitkeep
+                             keeps the empty dir alive in git)
+
+    Idempotent: if the project directory already exists, the user
+    gets an informative reply and nothing is overwritten. The
+    natural-language scaffolding path (Hypatia's SKILL) goes through
+    ``vault_create`` calls but produces the same shape — both paths
+    share the contract documented in
+    :func:`alfred.telegram.fiction.scaffold_fiction_project`.
+    """
+    from alfred.telegram.fiction import scaffold_fiction_project
+
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+
+    # Title can come from PTB's parsed args OR (for inline-style
+    # invocations like "/fiction The Glass Forest" with extra
+    # whitespace shapes) from the raw message text. Prefer args when
+    # available — PTB normalizes whitespace.
+    raw_text = update.message.text or ""
+    if ctx.args:
+        title = " ".join(ctx.args).strip()
+    else:
+        # Strip the leading "/fiction" (with possible "@botname" suffix
+        # from group chats) and use the rest as the title.
+        without_cmd = raw_text.split(maxsplit=1)
+        title = without_cmd[1].strip() if len(without_cmd) > 1 else ""
+
+    if not title:
+        await update.message.reply_text(
+            "usage: /fiction <title>  (e.g. /fiction The Glass Forest)"
+        )
+        return
+
+    vault_root = Path(config.vault.path)
+    if not vault_root.exists():
+        log.warning(
+            "talker.fiction.vault_root_missing",
+            chat_id=update.effective_chat.id,
+            vault_path=str(vault_root),
+        )
+        await update.message.reply_text(
+            "Vault path is not accessible from the daemon — can't "
+            "scaffold a fiction project. Check vault.path in config."
+        )
+        return
+
+    log.info(
+        "talker.fiction.invoked",
+        chat_id=update.effective_chat.id,
+        title=title[:80],
+    )
+
+    result = scaffold_fiction_project(vault_root, title)
+
+    if result.status == "already_exists":
+        await update.message.reply_text(result.detail)
+        return
+
+    # status == "created"
+    await update.message.reply_text(
+        f"{result.detail}\n\n"
+        f"Files created:\n"
+        + "\n".join(f"  • {p}" for p in result.created_files)
     )
 
 
