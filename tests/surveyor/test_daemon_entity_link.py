@@ -40,7 +40,17 @@ def _make_config(vault: Path, state_path: Path, threshold: float = 0.75, max_per
         labeler=LabelerConfig(),
         state=StateConfig(path=str(state_path)),
         logging=LoggingConfig(),
-        entity_link=EntityLinkConfig(threshold=threshold, max_per_record=max_per),
+        entity_link=EntityLinkConfig(
+            threshold=threshold,
+            max_per_record=max_per,
+            # Legacy threshold-only contract — these tests pre-date
+            # the Phase 1 source-side text-anchor gate (2026-05-03).
+            # Disabling the gate preserves their original semantics
+            # so they test what they were written to test (cosine
+            # threshold + max_per_record). New gate tested in
+            # test_daemon_text_anchor_gate.py.
+            require_text_anchor=False,
+        ),
     )
 
 

@@ -111,6 +111,24 @@ class EntityLinkConfig:
     # to co-cluster them with something.
     backfill_enabled: bool = True
 
+    # Per-write text-anchor gate (Phase 1 of source-side fix, ratified
+    # 2026-05-03). Before persisting any entity link, verify the entity's
+    # display name has a word-boundary text match in the source record's
+    # body / title / description / related list / relationships array.
+    # Cosine similarity alone produces topic-coherent false positives —
+    # records about "music events" cluster with music-related person
+    # records in embedding space without factual association. Combining
+    # cosine + mention-detection is standard precision-control in entity-
+    # linking systems (Bio-Yodie, WikiData linkers).
+    #
+    # Default: True (production). Tests that exercise the legacy
+    # threshold-only contract (test_daemon_entity_link.py et al.) set
+    # this False so their fixtures don't have to embed entity names in
+    # every test body. Operator can flip to False if a downstream
+    # workflow needs the looser cosine-only semantic for some reason —
+    # but the contamination bug class returns at full strength.
+    require_text_anchor: bool = True
+
 
 @dataclass
 class StateConfig:

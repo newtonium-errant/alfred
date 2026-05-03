@@ -41,7 +41,14 @@ def _cfg(vault, state_path, threshold=0.75, max_per=5, backfill=True) -> Pipelin
         state=StateConfig(path=str(state_path)),
         logging=LoggingConfig(),
         entity_link=EntityLinkConfig(
-            threshold=threshold, max_per_record=max_per, backfill_enabled=backfill
+            threshold=threshold,
+            max_per_record=max_per,
+            backfill_enabled=backfill,
+            # Legacy threshold-only contract — these tests pre-date
+            # the Phase 1 source-side text-anchor gate (2026-05-03).
+            # Disabling the gate preserves their original semantics.
+            # New gate tested in test_daemon_text_anchor_gate.py.
+            require_text_anchor=False,
         ),
     )
 

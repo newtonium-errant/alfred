@@ -494,6 +494,62 @@ class Daemon:
                 newly_added_entity_paths, records, paths, vectors,
             )
 
+    # ---- Per-write text-anchor gate (Phase 1 source-side fix 2026-05-03) ----
+    #
+    # Combines cosine similarity (which the three stages below already
+    # gate on) with mention detection (the entity's display name must
+    # appear as a word-boundary match in the source record's text
+    # surfaces). Standard precision-control pattern from entity-linking
+    # systems — pure cosine threshold underperforms because topic-
+    # coherent embeddings cluster without factual association.
+    #
+    # Reuses the cleanup module's word-boundary regex helper so the
+    # source-side gate and the bulk-cleanup CLI use byte-identical
+    # logic. Without that parity, a record could pass the source gate
+    # but fail the cleanup heuristic (or vice versa), creating a
+    # second contamination class.
+    #
+    # The helper expects an in-memory ``VaultRecord`` (which the
+    # daemon has already parsed); reading frontmatter+body off disk
+    # again would double the I/O for no semantic gain.
+
+    def _entity_name_appears_in_record(
+        self,
+        entity_path: str,
+        record: "VaultRecord",
+    ) -> bool:
+        """Word-boundary check for the entity's display name in the
+        record's text surfaces.
+
+        Returns ``True`` when:
+          * config has ``require_text_anchor=False`` (legacy threshold-
+            only contract; opt-out for tests + downstream workflows
+            that explicitly want cosine-only semantic), OR
+          * the entity's display name appears as a word-boundary
+            match in the record's body / title / description /
+            related list / relationships array's anchor strings
+
+        Returns ``False`` when require_text_anchor is True and no
+        textual presence is found — caller drops the candidate from
+        the write list and emits ``surveyor.entity_link_blocked_no_text_anchor``.
+
+        Reuses cleanup module helpers (``_display_name_from_path`` +
+        ``_has_textual_presence`` + ``_build_record_corpus``) for
+        byte-identical parity with the bulk-cleanup heuristic. Local
+        import inside the method so the cleanup module's tests can
+        run independently if surveyor's daemon module fails to load.
+        """
+        if not self.cfg.entity_link.require_text_anchor:
+            return True
+        from .cleanup import (
+            _build_record_corpus,
+            _display_name_from_path,
+            _has_textual_presence,
+        )
+        display_name = _display_name_from_path(entity_path)
+        corpus = _build_record_corpus(record.frontmatter, record.body)
+        return _has_textual_presence(corpus, display_name)
+
     def _link_entities_in_clusters(
         self,
         changed_cluster_ids: set[int],
@@ -580,8 +636,34 @@ class Daemon:
                         continue
 
                     scored.sort(key=lambda x: x[1], reverse=True)
-                    to_write = [p for p, _ in scored[:max_per]]
-                    sims_to_write = [s for _, s in scored[:max_per]]
+                    capped = scored[:max_per]
+
+                    # Per-write text-anchor gate: drop any candidate
+                    # whose entity name has no textual presence in
+                    # reg_record. Phase 1 source-side fix — closes
+                    # the contamination class the cleanup CLI is
+                    # currently repairing historical state for.
+                    reg_record_obj = records.get(reg_path)
+                    to_write: list[str] = []
+                    sims_to_write: list[float] = []
+                    for e_path, sim in capped:
+                        if reg_record_obj is None or self._entity_name_appears_in_record(
+                            e_path, reg_record_obj,
+                        ):
+                            to_write.append(e_path)
+                            sims_to_write.append(sim)
+                        else:
+                            log.info(
+                                "surveyor.entity_link_blocked_no_text_anchor",
+                                record_path=reg_path,
+                                entity_path=e_path,
+                                similarity=round(sim, 4),
+                                threshold=threshold,
+                                stage="cluster",
+                                cluster_id=cid,
+                            )
+                    if not to_write:
+                        continue
 
                     method = writer_methods[entity_type]
                     # Attribution log: forensic trail per
@@ -697,8 +779,32 @@ class Daemon:
                     continue
 
                 scored.sort(key=lambda x: x[1], reverse=True)
-                to_write = [p for p, _ in scored[:max_per]]
-                sims_to_write = [s for _, s in scored[:max_per]]
+                capped = scored[:max_per]
+
+                # Per-write text-anchor gate (Phase 1 source-side fix).
+                # Noise-point linking has the second-widest blast radius
+                # (every noise record vs every entity in the vault) so
+                # the gate matters most here for precision.
+                np_record_obj = records.get(np_path)
+                to_write: list[str] = []
+                sims_to_write: list[float] = []
+                for e_path, sim in capped:
+                    if np_record_obj is None or self._entity_name_appears_in_record(
+                        e_path, np_record_obj,
+                    ):
+                        to_write.append(e_path)
+                        sims_to_write.append(sim)
+                    else:
+                        log.info(
+                            "surveyor.entity_link_blocked_no_text_anchor",
+                            record_path=np_path,
+                            entity_path=e_path,
+                            similarity=round(sim, 4),
+                            threshold=threshold,
+                            stage="noise",
+                        )
+                if not to_write:
+                    continue
 
                 method = writer_methods[entity_type]
                 # Attribution log: stage=noise so the forensic
@@ -797,6 +903,26 @@ class Daemon:
                     continue
                 sim = float(np.dot(entity_vec, other_vec))
                 if sim < threshold:
+                    continue
+                # Per-write text-anchor gate (Phase 1 source-side fix).
+                # Backfill has the WIDEST blast radius (one new entity
+                # → potentially every record in the vault) so the gate
+                # matters most here for precision. Pre-fix this stage
+                # was the dominant contamination source — a new
+                # ``person/X.md`` with topic-coherent embedding would
+                # land in hundreds of records' related_persons even
+                # when X is never mentioned.
+                if not self._entity_name_appears_in_record(
+                    entity_path, other_record,
+                ):
+                    log.info(
+                        "surveyor.entity_link_blocked_no_text_anchor",
+                        record_path=other_path,
+                        entity_path=entity_path,
+                        similarity=round(sim, 4),
+                        threshold=threshold,
+                        stage="backfill",
+                    )
                     continue
                 # Write ONE entity at a time so each target record's
                 # max_per_record cap is respected independently.
