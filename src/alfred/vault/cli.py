@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .mutation_log import log_mutation
 from .ops import VaultError, vault_context, vault_create, vault_delete, vault_edit, vault_list, vault_move, vault_read, vault_search
+from .retype import vault_retype
 from .scope import ScopeError, check_scope
 from .snapshot import SnapshotError, get_status, init_repo, restore_file, take_snapshot
 
@@ -268,6 +269,53 @@ def cmd_move(args: argparse.Namespace) -> None:
         _error(str(e))
 
 
+def cmd_retype(args: argparse.Namespace) -> None:
+    """Convert a vault record from one type to another.
+
+    Composes ``vault_retype`` (writes new record at target path,
+    rewrites vault-wide wikilinks, deletes source unless
+    ``--keep-source``). The source delete fires the registered
+    event-delete hook → triggers GCal cleanup automatically when the
+    source had a ``gcal_event_id`` and the target type is non-event.
+
+    Default is to apply; pass ``--dry-run`` to preview without
+    touching the vault.
+    """
+    scope = _scope()
+    vault = _vault_path()
+
+    overrides: dict = {}
+    if getattr(args, "status", None):
+        overrides["status"] = args.status
+    if getattr(args, "priority", None):
+        overrides["priority"] = args.priority
+    if getattr(args, "due", None):
+        overrides["due"] = args.due
+
+    try:
+        report = vault_retype(
+            vault,
+            args.path,
+            args.to,
+            apply=not getattr(args, "dry_run", False),
+            keep_source=getattr(args, "keep_source", False),
+            overrides=overrides,
+            scope=scope,
+        )
+    except VaultError as exc:
+        details = getattr(exc, "details", None) or {}
+        _error(str(exc), details=details)
+
+    if not getattr(args, "dry_run", False):
+        log_mutation(
+            _session(), "retype", args.path,
+            target=report.target_path,
+            target_type=report.target_type,
+        )
+
+    _output(report.to_dict())
+
+
 def cmd_delete(args: argparse.Namespace) -> None:
     scope = _scope()
     try:
@@ -372,6 +420,54 @@ def build_vault_parser(subparsers: argparse._SubParsersAction) -> None:
     p = vault_sub.add_parser("delete", help="Delete a vault record")
     p.add_argument("path", help="Relative path to the record")
 
+    # retype
+    p = vault_sub.add_parser(
+        "retype",
+        help="Convert a vault record from one type to another",
+    )
+    p.add_argument("path", help="Relative path to the source record")
+    p.add_argument(
+        "--to", required=True, dest="to",
+        help="Target record type (e.g. task)",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Report what would happen without touching the vault",
+    )
+    p.add_argument(
+        "--keep-source", action="store_true", default=False,
+        help=(
+            "Leave the source record on disk after creating the target. "
+            "Default is to delete the source (which fires the GCal "
+            "delete hook for events). Useful for safety-checking the "
+            "target record before committing to the deletion."
+        ),
+    )
+    # Per-target-type overrides — currently only task. As future
+    # type-pairs land, document additional overrides here.
+    p.add_argument(
+        "--status", default=None,
+        help=(
+            "Override the target's ``status`` field. For task target, "
+            "default is ``todo``. Must be one of the target type's "
+            "valid statuses (see STATUS_BY_TYPE in vault/schema.py)."
+        ),
+    )
+    p.add_argument(
+        "--priority", default=None,
+        help=(
+            "Override the target's ``priority`` field (task target only). "
+            "Default is ``medium`` (matches scaffold/_templates/task.md)."
+        ),
+    )
+    p.add_argument(
+        "--due", default=None,
+        help=(
+            "Override the target's ``due`` field (task target only). "
+            "Defaults to the source's ``date`` field if present."
+        ),
+    )
+
     # triage-id
     p = vault_sub.add_parser(
         "triage-id",
@@ -402,6 +498,7 @@ def handle_vault_command(args: argparse.Namespace) -> None:
         "edit": cmd_edit,
         "move": cmd_move,
         "delete": cmd_delete,
+        "retype": cmd_retype,
         "triage-id": cmd_triage_id,
         "snapshot": cmd_snapshot,
     }
