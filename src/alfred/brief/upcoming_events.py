@@ -5,7 +5,9 @@ bucket by date relative to today (Halifax), drop anything more than 30 days
 out. Filter rules grow inline as real-data patterns reveal what's noise.
 
 Sources:
-- ``event`` records via frontmatter ``date`` (required ISO date string).
+- ``event`` records via frontmatter ``start`` (preferred — full ISO datetime
+  with timezone offset, written by Salem since SKILL update ``a923c1b``).
+  Falls back to ``date`` for legacy records pre-Phase-A+.
 - ``task`` records via frontmatter ``due`` (optional; tasks without ``due``
   are excluded entirely).
 
@@ -75,6 +77,30 @@ def _coerce_date(value: Any) -> date | None:
     return None
 
 
+def _event_date(fm: dict) -> date | None:
+    """Resolve an event record's display date — prefer ``start``, fall back
+    to ``date``.
+
+    Per Salem SKILL update ``a923c1b`` (and the cross-instance event-propose
+    handler), every new event ships with both ``start`` (full ISO datetime
+    with tz offset) and ``date`` (the same local-tz date, derived via
+    ``start_dt.astimezone().date()``). The two agree by construction. This
+    helper prefers ``start`` so:
+
+      - Future-only-``start`` records (e.g. backfill paths that didn't
+        write a redundant ``date``) still surface in the brief.
+      - Legacy-only-``date`` records (pre-Phase-A+) keep working.
+
+    For string ``start`` values the ``[:10]`` slice extracts the date
+    portion AT THE ENCODED OFFSET — which is the Halifax-local date when
+    Salem wrote the value (the GCal sync code uses the local tz offset
+    directly). For ``datetime`` values we use ``.date()`` which yields the
+    date in the encoded zone for the same reason. Naive datetimes fall
+    through to ``.date()`` defensively rather than guessing at a tz.
+    """
+    return _coerce_date(fm.get("start")) or _coerce_date(fm.get("date"))
+
+
 def _iter_records(vault_path: Path) -> list[tuple[Path, dict]]:
     """Walk the vault and return (path, frontmatter_dict) for every .md file
     that isn't in an ignored directory. Inline frontmatter read because
@@ -109,12 +135,25 @@ def _collect_items(
     for path, fm in _iter_records(vault_path):
         rec_type = fm.get("type")
         if rec_type == "event":
-            d = _coerce_date(fm.get("date"))
+            d = _event_date(fm)
         elif rec_type == "task":
             d = _coerce_date(fm.get("due"))
         else:
             continue
         if d is None:
+            # Per ``feedback_intentionally_left_blank.md``: events
+            # missing both ``start`` and ``date`` are a real signal,
+            # not noise — the record is malformed and silently
+            # disappearing from the brief is exactly the failure
+            # mode the principle exists to prevent. Log so an operator
+            # can grep ``upcoming_events.event_missing_date`` to spot
+            # the gap.
+            if rec_type == "event":
+                log.info(
+                    "upcoming_events.event_missing_date",
+                    path=str(path),
+                    detail="event record has neither 'start' nor 'date'",
+                )
             continue
         if d.toordinal() < today.toordinal():
             continue

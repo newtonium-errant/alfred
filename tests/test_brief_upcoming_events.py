@@ -98,6 +98,54 @@ def _default_config() -> UpcomingEventsConfig:
     return UpcomingEventsConfig(enabled=True, max_days_ahead=30)
 
 
+def _write_event_with_start(
+    vault: Path,
+    name: str,
+    *,
+    start: str,
+    end: str | None = None,
+    date_field: str | None = None,
+    location: str | None = None,
+    description: str | None = None,
+) -> None:
+    """Drop a Phase-A+-style event record (with ISO ``start`` field).
+
+    Mirrors what Salem writes via the cross-instance event-propose
+    handler + the GCal sync writeback paths since SKILL update
+    ``a923c1b``: ``start`` is full ISO datetime with tz offset; ``date``
+    is optional (handler writes both for redundancy / brief
+    compatibility, but a backfilled record may have only ``start``).
+    """
+    lines = [
+        "---",
+        "type: event",
+        f"name: {name}",
+        f"start: '{start}'",
+    ]
+    if end is not None:
+        lines.append(f"end: '{end}'")
+    if date_field is not None:
+        lines.append(f"date: {date_field}")
+    if location is not None:
+        lines.append(f"location: {location}")
+    if description is not None:
+        lines.append(f"description: {description}")
+    lines.extend(
+        [
+            "created: 2026-04-01",
+            "tags: []",
+            "---",
+            "",
+            f"# {name}",
+            "",
+        ]
+    )
+    (vault / "event").mkdir(exist_ok=True)
+    (vault / "event" / f"{name}.md").write_text(
+        "\n".join(lines), encoding="utf-8",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bucketing
 # ---------------------------------------------------------------------------
@@ -253,3 +301,131 @@ def test_load_from_unified_overrides(tmp_path: Path) -> None:
     cfg = load_from_unified(raw)
     assert cfg.upcoming_events.enabled is False
     assert cfg.upcoming_events.max_days_ahead == 14
+
+
+# ---------------------------------------------------------------------------
+# `start` field — Phase-A+ graceful upgrade
+# ---------------------------------------------------------------------------
+#
+# Per Salem SKILL update ``a923c1b``, every new event ships with both
+# ``start`` (full ISO datetime, tz offset) and ``date`` (the
+# Halifax-local date derived from ``start.astimezone().date()``). The
+# renderer prefers ``start`` so backfilled records that have ONLY
+# ``start`` (no redundant ``date``) still surface in the brief.
+
+
+def test_event_with_start_only_renders_correctly(vault: Path) -> None:
+    """Backfilled / GCal-synced records may have ``start`` but no ``date``.
+    Brief must still find them via the new lookup path.
+    """
+    target = TODAY + timedelta(days=4)
+    _write_event_with_start(
+        vault,
+        "VAC marketing call",
+        start=f"{target.isoformat()}T14:15:00-03:00",
+        end=f"{target.isoformat()}T15:00:00-03:00",
+        # date_field deliberately omitted — the gap pre-fix
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "VAC marketing call" in out
+    assert target.isoformat() in out
+    assert "### This Week" in out
+
+
+def test_event_with_both_start_and_date_uses_start(vault: Path) -> None:
+    """When both fields are present (the common case post-2026-05-02),
+    ``start`` wins. Output is identical to the ``date`` path because the
+    cross-instance propose handler derives ``date`` from ``start.astimezone()``
+    — so both paths produce the same Halifax-local date string.
+
+    Test guards against future divergence: if ``date`` ever drifts away
+    from ``start`` (e.g., a janitor edit normalizes one but not the
+    other), the brief's source of truth stays ``start`` and this test
+    pins which one wins.
+    """
+    target = TODAY + timedelta(days=2)
+    # Both fields encode the same date.
+    _write_event_with_start(
+        vault,
+        "Coaching session",
+        start=f"{target.isoformat()}T14:00:00-03:00",
+        end=f"{target.isoformat()}T15:00:00-03:00",
+        date_field=target.isoformat(),
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Coaching session" in out
+    assert target.isoformat() in out
+
+
+def test_event_with_only_date_legacy_still_works(vault: Path) -> None:
+    """Pre-Phase-A+ records have only ``date``. Fallback path keeps
+    them rendering."""
+    target = TODAY + timedelta(days=5)
+    _write_event(vault, "Legacy event", target.isoformat())
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Legacy event" in out
+    assert target.isoformat() in out
+
+
+def test_event_with_neither_start_nor_date_skipped_with_log(
+    vault: Path,
+) -> None:
+    """Per ``feedback_intentionally_left_blank.md``: a malformed event
+    (no ``start``, no ``date``) is a real signal — not noise. Skip the
+    record but emit a log line so an operator can grep
+    ``upcoming_events.event_missing_date`` to spot the gap.
+
+    Uses ``structlog.testing.capture_logs`` rather than pytest's
+    ``caplog`` — same pattern documented in
+    ``test_integrations_gcal_p2.py``: pytest caplog and structlog's
+    ConsoleRenderer don't reliably interoperate when the emit happens
+    via the LoggerFactory boundary, so capture at the structlog
+    processor layer instead.
+    """
+    from structlog.testing import capture_logs
+
+    # Manually drop a malformed event (neither helper supports this
+    # state because production paths never produce it).
+    (vault / "event").mkdir(exist_ok=True)
+    (vault / "event" / "Malformed.md").write_text(
+        "---\ntype: event\nname: Malformed\ncreated: 2026-04-01\n"
+        "tags: []\n---\n\n# Malformed\n",
+        encoding="utf-8",
+    )
+    with capture_logs() as captured:
+        out = render_upcoming_events_section(_default_config(), vault, TODAY)
+
+    # The record is excluded from the rendered brief.
+    assert "Malformed" not in out
+    assert out == "No upcoming events."
+    # ...but the log line is present, distinguishable from idle.
+    missing_logs = [
+        c for c in captured
+        if c.get("event") == "upcoming_events.event_missing_date"
+    ]
+    assert len(missing_logs) == 1
+    assert "Malformed.md" in missing_logs[0].get("path", "")
+
+
+def test_event_with_start_as_yaml_datetime_value(vault: Path) -> None:
+    """YAML can parse ``start`` as a datetime value (when the value is
+    NOT quoted in the source). Brief must handle both string + datetime
+    shapes — the existing ``_coerce_date`` helper covers both branches.
+    """
+    target = TODAY + timedelta(days=3)
+    # Unquoted ISO datetime in YAML — python-frontmatter will parse
+    # this into a Python ``datetime`` object, not a string.
+    (vault / "event").mkdir(exist_ok=True)
+    (vault / "event" / "YAMLDateTime.md").write_text(
+        f"---\n"
+        f"type: event\n"
+        f"name: YAMLDateTime\n"
+        f"start: {target.isoformat()}T14:00:00-03:00\n"
+        f"created: 2026-04-01\n"
+        f"tags: []\n"
+        f"---\n\n# YAMLDateTime\n",
+        encoding="utf-8",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "YAMLDateTime" in out
+    assert target.isoformat() in out
