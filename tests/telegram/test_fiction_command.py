@@ -69,9 +69,17 @@ from alfred.telegram.config import (
         # Case
         ("ALL CAPS TITLE", "all-caps-title"),
         ("MixedCase", "mixedcase"),
-        # Unicode (dropped — ASCII-only by design)
-        ("über", "ber"),
-        ("café", "caf"),
+        # Unicode — NFKD-normalized + combining marks stripped, base
+        # ASCII letters survive. The original ship lost the leading
+        # letter of "über" / "café" wholesale; fixed in Phase 2.5
+        # follow-up after the SKILL revision surfaced this as a real
+        # parity gap (Hypatia might propose a fiction project titled
+        # "Café Society" — slug should be "cafe-society", not
+        # "caf-society").
+        ("über", "uber"),
+        ("café", "cafe"),
+        ("Naïve résumé", "naive-resume"),
+        ("São Paulo", "sao-paulo"),
         # Edge: empty / all-punctuation
         ("", "untitled-fiction"),
         ("   ", "untitled-fiction"),

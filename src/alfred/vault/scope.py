@@ -232,15 +232,26 @@ KALLE_CREATE_TYPES: set[str] = {
 
 
 # Hypatia create allowlist — the seven record types defined in
-# ``library-alexandria/CLAUDE.md``. ``note`` overlaps with talker's
-# set but lives in ``research/note/`` for Hypatia (the directory
-# routing is the writer's responsibility, not scope's); ``session``
-# overlaps too but with a different ``mode`` field shape. The other
-# five (document, concept, source, citation, template) are
+# ``library-alexandria/CLAUDE.md`` plus the six Phase-2.5 fiction-
+# element types. ``note`` overlaps with talker's set but lives in
+# ``research/note/`` for Hypatia (the directory routing is the
+# writer's responsibility, not scope's); ``session`` overlaps too
+# but with a different ``mode`` field shape. The other five
+# (document, concept, source, citation, template) are
 # Hypatia-specific.
+#
+# Fiction posture types (Phase 2.5): see ``KNOWN_TYPES_HYPATIA`` in
+# ``schema.py`` for the rationale. Both registries must list the same
+# types — the schema layer gates ``_validate_type`` and the scope
+# layer gates ``check_scope("create", ...)``. Drift between the two
+# would surface as "type accepted by validator, rejected by scope" or
+# vice versa, breaking the slash-command and natural-language
+# scaffolding paths in different ways.
 HYPATIA_CREATE_TYPES: set[str] = {
     "document", "session", "concept", "note",
     "source", "citation", "template",
+    "fiction-continuity", "fiction-story", "fiction-structure",
+    "fiction-world", "fiction-voice", "fiction-character",
 }
 
 

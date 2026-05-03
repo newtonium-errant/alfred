@@ -730,6 +730,48 @@ def cmd_gcal(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def cmd_fiction(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred fiction`` subcommands.
+
+    Hypatia Phase 2.5 fiction posture support. Two subcommands:
+
+      * ``scaffold "<title>"`` — scaffolds the project directory +
+        per-element files. Prints JSON for SKILL consumption
+      * ``slug "<title>"`` — prints just the canonical slug
+
+    Both subcommands route through
+    :mod:`alfred.telegram.fiction` so the on-disk shape matches what
+    the ``/fiction`` slash command produces — same Python helper,
+    same slug rules, same directory shape. Hypatia's SKILL revision
+    invokes ``alfred fiction scaffold`` via bash for natural-
+    language scaffolding ("let's start a fiction project called
+    X"); the JSON output gives the SKILL the slug + path + file
+    list it needs to confirm to Andrew.
+
+    JSON output on stdout means logging MUST go to the file sink to
+    keep stdout clean for SKILL parsing. Same convention as ``alfred
+    vault``.
+    """
+    try:
+        raw = _load_unified_config(args.config)
+        _setup_logging_from_config(raw, tool="fiction", suppress_stdout=True)
+    except SystemExit:
+        raw = {}
+    except Exception:
+        raw = {}
+
+    from alfred.telegram import fiction_cli
+
+    subcmd = getattr(args, "fiction_cmd", None)
+    if subcmd == "scaffold":
+        sys.exit(fiction_cli.cmd_scaffold(raw, args.title))
+    if subcmd == "slug":
+        sys.exit(fiction_cli.cmd_slug(args.title))
+
+    print("Usage: alfred fiction {scaffold|slug} \"<title>\"")
+    sys.exit(2)
+
+
 def cmd_reviews(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred reviews`` subcommands.
 
@@ -2004,6 +2046,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit machine-readable JSON instead of human-readable output",
     )
 
+    # fiction — Hypatia Phase 2.5 fiction posture (scaffold/slug
+    # helpers; both invoke alfred.telegram.fiction so the SKILL's
+    # natural-language scaffolding path produces the same on-disk
+    # shape as the /fiction slash command).
+    fiction_p = sub.add_parser(
+        "fiction",
+        help="Hypatia fiction-posture helpers (scaffold a project / derive a slug)",
+    )
+    fiction_sub = fiction_p.add_subparsers(dest="fiction_cmd")
+    fiction_scaffold_p = fiction_sub.add_parser(
+        "scaffold",
+        help=(
+            "Scaffold a fiction project directory + per-element files. "
+            "Prints JSON for SKILL consumption: "
+            "{slug, path, files_created, already_existed}."
+        ),
+    )
+    fiction_scaffold_p.add_argument(
+        "title",
+        help='Project title (quote it: alfred fiction scaffold "The Glass Forest")',
+    )
+    fiction_slug_p = fiction_sub.add_parser(
+        "slug",
+        help=(
+            "Print the canonical slug for a title. Useful for the "
+            "SKILL when constructing a wikilink before invoking scaffold."
+        ),
+    )
+    fiction_slug_p.add_argument(
+        "title",
+        help='Project title (quote it: alfred fiction slug "The Glass Forest")',
+    )
+
     # audit (calibration audit gap, c3 retroactive sweep CLI)
     from alfred.audit import cli as audit_cli
     audit_cli.build_parser(sub)
@@ -2057,6 +2132,7 @@ def main() -> None:
         "reviews": cmd_reviews,
         "digest": cmd_digest,
         "gcal": cmd_gcal,
+        "fiction": cmd_fiction,
     }
 
     handler = handlers.get(args.command)

@@ -118,10 +118,21 @@ def test_hypatia_scope_body_writes_permitted() -> None:
 
 
 def test_hypatia_create_types_shape() -> None:
-    """Pin the exact set so a quiet edit can't widen the surface."""
+    """Pin the exact set so a quiet edit can't widen the surface.
+
+    Phase 2.5 fiction posture (``project_hypatia_phase2_followups.md``)
+    added six ``fiction-{element}`` types so the natural-language
+    scaffolding path can call ``vault_create`` for fiction records —
+    matches the schema-side ``KNOWN_TYPES_HYPATIA`` set. Both
+    registries must list the same fiction types or the gates will
+    disagree.
+    """
     assert HYPATIA_CREATE_TYPES == {
         "document", "session", "concept", "note",
         "source", "citation", "template",
+        # Phase 2.5 fiction posture
+        "fiction-continuity", "fiction-story", "fiction-structure",
+        "fiction-world", "fiction-voice", "fiction-character",
     }
 
 
@@ -131,9 +142,17 @@ def test_hypatia_create_types_shape() -> None:
 
 
 def test_known_types_hypatia_is_separate_set() -> None:
-    """Hypatia-only types are NOT in Salem's core KNOWN_TYPES."""
+    """Hypatia-only types are NOT in Salem's core KNOWN_TYPES.
+
+    Phase 2.5 fiction posture added six ``fiction-{element}`` types —
+    these must live ONLY under Hypatia's set, never in Salem's
+    operational KNOWN_TYPES (Salem doesn't write fiction projects).
+    """
     assert schema.KNOWN_TYPES_HYPATIA == {
         "document", "concept", "source", "citation", "template",
+        # Phase 2.5 fiction posture
+        "fiction-continuity", "fiction-story", "fiction-structure",
+        "fiction-world", "fiction-voice", "fiction-character",
     }
     for t in schema.KNOWN_TYPES_HYPATIA:
         assert t not in schema.KNOWN_TYPES, (
@@ -336,3 +355,98 @@ def test_vault_create_canonical_type_under_hypatia_scope_works(
         tmp_path, "note", "Test Note", scope="hypatia",
     )
     assert (tmp_path / result["path"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.5 fiction posture — the six fiction-{element} types
+# ---------------------------------------------------------------------------
+#
+# Both registries (KNOWN_TYPES_HYPATIA + HYPATIA_CREATE_TYPES) must
+# accept the fiction types under scope='hypatia'. The slash-command
+# scaffolding path doesn't go through vault_create — it writes files
+# directly via Path.write_text — so the in-process slash command
+# wouldn't catch a type-registration gap. The natural-language
+# scaffolding path (Hypatia's SKILL → vault_create) requires both
+# gates to pass for every element write. These tests pin the contract.
+
+
+_FICTION_TYPES = [
+    "fiction-continuity",
+    "fiction-story",
+    "fiction-structure",
+    "fiction-world",
+    "fiction-voice",
+    "fiction-character",
+]
+
+
+@pytest.mark.parametrize("record_type", _FICTION_TYPES)
+def test_validate_type_accepts_fiction_under_hypatia(record_type: str) -> None:
+    """Schema gate: every fiction-{element} type passes under scope='hypatia'."""
+    from alfred.vault.ops import _validate_type
+    # Should NOT raise.
+    _validate_type(record_type, scope="hypatia")
+
+
+@pytest.mark.parametrize("record_type", _FICTION_TYPES)
+def test_check_scope_accepts_fiction_create_under_hypatia(
+    record_type: str,
+) -> None:
+    """Scope gate: ``check_scope("create", ...)`` accepts every
+    fiction-{element} type under scope='hypatia'.
+
+    The slash command writes files directly so it doesn't fire
+    check_scope, but the SKILL natural-language path goes through
+    ``vault_create(..., scope="hypatia")`` which fires both gates.
+    """
+    # Should NOT raise.
+    check_scope("hypatia", "create", record_type=record_type)
+
+
+@pytest.mark.parametrize("record_type", _FICTION_TYPES)
+def test_vault_create_each_fiction_type_succeeds_under_hypatia(
+    tmp_path, record_type: str,
+) -> None:
+    """End-to-end: vault_create lands a fiction-element record under
+    scope='hypatia' (both gates pass + file actually writes)."""
+    # NAME_FIELD_BY_TYPE doesn't list fiction-* explicitly, so the
+    # type goes to TYPE_DIRECTORY's fallback ``record_type`` directory.
+    # Pre-create the dir so the write doesn't fail on missing parent.
+    (tmp_path / record_type).mkdir(exist_ok=True)
+    result = vault_create(
+        tmp_path,
+        record_type,
+        f"Test {record_type}",
+        scope="hypatia",
+    )
+    assert (tmp_path / result["path"]).exists()
+
+
+@pytest.mark.parametrize("record_type", _FICTION_TYPES)
+def test_fiction_type_rejected_under_kalle_scope(
+    tmp_path, record_type: str,
+) -> None:
+    """Cross-scope leak guard: KAL-LE must NOT be able to create
+    fiction-element records. KAL-LE's vault is aftermath-lab, not
+    library-alexandria — fiction belongs to Hypatia only.
+    """
+    with pytest.raises(VaultError) as exc_info:
+        vault_create(
+            tmp_path, record_type, f"Test {record_type}", scope="kalle",
+        )
+    assert "Unknown type" in str(exc_info.value)
+    assert "kalle" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("record_type", _FICTION_TYPES)
+def test_fiction_type_rejected_under_no_scope(
+    tmp_path, record_type: str,
+) -> None:
+    """Default scope (None / Salem-only) must reject fiction-element
+    types. Salem has no business writing fiction-{element} records;
+    the Phase 2.5 contract puts these strictly under Hypatia.
+    """
+    with pytest.raises(VaultError) as exc_info:
+        # No scope kwarg → falls through to canonical KNOWN_TYPES
+        vault_create(tmp_path, record_type, f"Test {record_type}")
+    assert "Unknown type" in str(exc_info.value)

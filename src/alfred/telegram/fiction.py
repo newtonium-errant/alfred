@@ -51,6 +51,7 @@ path; deviations break parity):
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date as _date
 from pathlib import Path
@@ -85,6 +86,9 @@ def slug_from_title(title: str) -> str:
     Convention (matches Hypatia's substack-draft slug shape from
     ``2e21fc6``):
 
+      * NFKD-normalize Unicode + strip combining marks so accented
+        Latin characters (``café`` / ``über`` / ``naïve``) keep their
+        ASCII base letters instead of being dropped wholesale
       * Lowercase
       * Whitespace collapsed to single hyphens
       * Non-alphanumeric characters dropped
@@ -97,18 +101,33 @@ def slug_from_title(title: str) -> str:
     Examples:
       ``"The Glass Forest"`` → ``"the-glass-forest"``
       ``"Storm's End"`` → ``"storms-end"`` (apostrophe dropped)
-      ``"50/50"`` → ``"50-50"`` (slash → hyphen via whitespace
-        collapse)
+      ``"50/50"`` → ``"5050"`` (slash dropped, digits collapse)
       ``"  multiple   spaces  "`` → ``"multiple-spaces"``
       ``"!!!"`` → ``"untitled-fiction"`` (no alphanumerics)
-      ``"über"`` → ``"ber"`` (unicode dropped — ASCII-only by design,
-        matches the existing ``_TOPIC_SLUG_KEEP`` regex; if richer
-        unicode handling is needed later, swap to ``unicodedata
-        .normalize("NFKD", ...)`` + filter)
+      ``"café"`` → ``"cafe"`` (NFKD: é → e + combining acute, then
+        the combining mark is stripped, then the e survives the
+        ASCII char-class filter)
+      ``"über"`` → ``"uber"`` (same NFKD path — ü → u + combining
+        diaeresis, mark stripped)
+      ``"São Paulo"`` → ``"sao-paulo"``
+
+    Non-Latin scripts (CJK, Cyrillic, Arabic, etc.) decompose to
+    bare codepoints with no ASCII base — those still get dropped by
+    the char-class filter and fall through to ``untitled-fiction``.
+    NFKD only rescues accented Latin (the common case for English /
+    European fiction titles); broader script support would need a
+    transliteration library (defer until a real use case demands it).
     """
     if not isinstance(title, str):
         return "untitled-fiction"
-    s = title.strip().lower()
+    # NFKD-normalize first so "café" (1 codepoint é) becomes
+    # "café" (e + combining acute), then strip combining marks
+    # so the bare e survives the ASCII char-class filter below.
+    normalized = unicodedata.normalize("NFKD", title)
+    ascii_only = "".join(
+        c for c in normalized if not unicodedata.combining(c)
+    )
+    s = ascii_only.strip().lower()
     if not s:
         return "untitled-fiction"
     # Collapse runs of whitespace to single hyphens BEFORE filtering

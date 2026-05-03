@@ -27,8 +27,19 @@ KNOWN_TYPES_KALLE: set[str] = {
 # Salem's operational vault doesn't gain Hypatia-only types. The
 # ``hypatia`` scope check (see ``vault/scope.py::HYPATIA_CREATE_TYPES``)
 # is the authoritative create allowlist.
+#
+# Phase 2.5 fiction posture (``project_hypatia_phase2_followups.md``):
+# six ``fiction-{element}`` types added so both scaffolding paths
+# (the slash command + the SKILL natural-language path) can call
+# ``vault_create`` for fiction records — the slash command writes
+# the directory + 5 element files atomically, but ongoing work
+# (a new character record, a re-keyed structure file) goes through
+# regular ``vault_create``. Without these types in the registry,
+# every such write fails ``_validate_type``.
 KNOWN_TYPES_HYPATIA: set[str] = {
     "document", "concept", "source", "citation", "template",
+    "fiction-continuity", "fiction-story", "fiction-structure",
+    "fiction-world", "fiction-voice", "fiction-character",
 }
 
 
