@@ -1,0 +1,623 @@
+"""Tests for the talker tool-execution-loop race fix (P1 from QA 2026-05-03).
+
+Live bug: Hypatia's conversation wedged twice with API 400
+``tool_use ids were found without tool_result blocks immediately
+after``. Sequence reconstructed from talker_state.json + alfred.log:
+
+  18:49:18 user: "Create the scaffold for it first"
+  18:49:xx Hypatia issued 6 tool_use blocks in one assistant turn
+           (vault_edit continuity + 4× vault_create + vault_edit)
+  18:49:xx tool execution loop ran; one of the calls raised
+           (the assistant turn was already persisted by append_turn)
+  18:50:xx user: "1. Yes / 2 yes / 3 yes" (next message arrived)
+           run_turn appended user turn AFTER the dangling assistant
+  18:51:35 next API call: messages = [..., assistant: 6 tool_use,
+                                       user: text] → API 400.
+  18:52:xx user retried → same wedge → same 400.
+
+Two-layer fix:
+
+  1. Per-tool try/except in run_turn's execution loop. ANY exception
+     from ``_execute_tool`` is caught + a synthetic error
+     tool_result block is added to ``tool_results``. The loop
+     completes and ``append_turn(state, session, "user",
+     tool_results)`` lands a well-formed user turn matching every
+     tool_use id. asyncio.CancelledError still propagates BUT only
+     after flushing partial results so the transcript is well-formed
+     when the daemon comes back up.
+
+  2. Defensive heal in ``_messages_for_api``. Walks the transcript
+     before sending; for any assistant tool_use missing a matching
+     tool_result in the next turn, injects a synthetic tool_result
+     ``is_error: True`` block. Seatbelt for already-corrupted state
+     (daemon restart mid-loop, manual edits, future code paths
+     that strand a tool_use).
+
+Coverage:
+
+  Heal logic (``_messages_for_api`` / ``_heal_dangling_tool_use``):
+    * Well-formed transcript passes through unchanged
+    * Single dangling tool_use gets a single synthetic tool_result
+    * Multiple dangling tool_use ids in one assistant turn → all healed
+    * Partial heal: 3 of 6 tool_use already have tool_results, 3 missing
+      → only the 3 missing get synthetic results
+    * Dangling tool_use followed by a regular text user message
+      (the live bug) → synthetic results inserted BEFORE the user
+      message in the API payload, preserving the original
+      transcript order
+    * Multiple dangling assistant turns → all healed independently
+    * Heal is idempotent (running it twice = same output)
+    * Heal logs ``conversation.transcript_healed`` warning per
+      dangling-turn + a summary log
+
+  Per-tool try/except (run_turn):
+    * Tool raises generic Exception → loop catches + appends error
+      tool_result + continues with next tool
+    * Tool raises CancelledError → partial tool_results flushed +
+      raised (for daemon shutdown propagation)
+    * Mixed: 6 tools, tool 3 raises, others succeed → 6 tool_result
+      blocks land in transcript (3 success + 1 error + 2 success
+      ordering preserved)
+
+Uses ``structlog.testing.capture_logs`` per
+``feedback_structlog_assertion_patterns.md`` (the run_turn loop is
+async; the conversation module logs through structlog).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from alfred.telegram import conversation
+from alfred.telegram.conversation import (
+    _heal_dangling_tool_use,
+    _messages_for_api,
+)
+
+
+# ---------------------------------------------------------------------------
+# Heal logic — direct unit tests
+# ---------------------------------------------------------------------------
+
+
+def _assistant_with_tool_use(*tool_use_ids: str) -> dict:
+    """Build an assistant message with one tool_use block per id."""
+    return {
+        "role": "assistant",
+        "content": [
+            {"type": "tool_use", "id": tid, "name": "vault_search", "input": {}}
+            for tid in tool_use_ids
+        ],
+    }
+
+
+def _user_with_tool_results(*tool_use_ids: str) -> dict:
+    """Build a user message with matching tool_result blocks."""
+    return {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": tid, "content": "[]"}
+            for tid in tool_use_ids
+        ],
+    }
+
+
+def test_well_formed_transcript_passes_through_unchanged():
+    """Tool_use + matching tool_result + plain text — heal is a no-op."""
+    transcript = [
+        {"role": "user", "content": "search vault"},
+        _assistant_with_tool_use("t1", "t2"),
+        _user_with_tool_results("t1", "t2"),
+        {"role": "assistant", "content": "found 3 records"},
+    ]
+    healed = _heal_dangling_tool_use(transcript)
+    assert healed == transcript, (
+        f"well-formed transcript must pass unchanged. Got: {healed}"
+    )
+
+
+def test_single_dangling_tool_use_gets_synthetic_result():
+    """The minimum repro: assistant has tool_use, no following user turn."""
+    transcript = [
+        {"role": "user", "content": "go"},
+        _assistant_with_tool_use("t1"),
+    ]
+    healed = _heal_dangling_tool_use(transcript)
+    assert len(healed) == 3
+    assert healed[0] == transcript[0]
+    assert healed[1] == transcript[1]
+    # Synthetic user message inserted at the end.
+    assert healed[2]["role"] == "user"
+    blocks = healed[2]["content"]
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "tool_result"
+    assert blocks[0]["tool_use_id"] == "t1"
+    assert blocks[0]["is_error"] is True
+    assert "Transcript healed" in blocks[0]["content"]
+
+
+def test_multiple_dangling_tool_uses_in_one_assistant_turn_all_healed():
+    """6 tool_use blocks (Hypatia's QA repro), all dangling → 6 results."""
+    transcript = [
+        _assistant_with_tool_use("t1", "t2", "t3", "t4", "t5", "t6"),
+    ]
+    healed = _heal_dangling_tool_use(transcript)
+    assert len(healed) == 2
+    blocks = healed[1]["content"]
+    assert len(blocks) == 6
+    assert {b["tool_use_id"] for b in blocks} == {
+        "t1", "t2", "t3", "t4", "t5", "t6",
+    }
+    assert all(b["is_error"] for b in blocks)
+
+
+def test_partial_dangling_only_missing_ids_healed():
+    """3 of 6 tool_use already have tool_results — heal only adds the 3 missing."""
+    transcript = [
+        _assistant_with_tool_use("t1", "t2", "t3", "t4", "t5", "t6"),
+        # Only 3 tool_results landed (t1, t3, t5).
+        _user_with_tool_results("t1", "t3", "t5"),
+    ]
+    healed = _heal_dangling_tool_use(transcript)
+    # The healer inserts synthetic blocks IMMEDIATELY after the
+    # dangling assistant turn — BEFORE the partial user turn — so
+    # the API sees a consistent assistant→user pairing for the
+    # missing ids before encountering the partial user turn that
+    # carries the rest.
+    assert len(healed) == 3
+    # Position 0: original assistant
+    assert healed[0] == transcript[0]
+    # Position 1: synthetic user with the 3 missing results
+    synthetic = healed[1]["content"]
+    assert {b["tool_use_id"] for b in synthetic} == {"t2", "t4", "t6"}
+    assert all(b["is_error"] for b in synthetic)
+    # Position 2: original partial user with the 3 successful results
+    original_partial = healed[2]["content"]
+    assert {b["tool_use_id"] for b in original_partial} == {"t1", "t3", "t5"}
+
+
+def test_dangling_tool_use_followed_by_text_user_message_qa_repro():
+    """Direct repro of the live bug: assistant has dangling tool_use,
+    next user message is plain text (not tool_results).
+
+    Pre-fix, the API saw:
+      [assistant: 6 tool_use] → [user: "1. Yes / 2 yes / 3 yes"]
+    and rejected with the 400 error.
+
+    Post-fix, the heal injects a synthetic tool_result user message
+    BEFORE the text user message, so the API sees:
+      [assistant: 6 tool_use] → [user: 6 synthetic tool_results]
+      → [user: "1. Yes / 2 yes / 3 yes"]
+    """
+    transcript = [
+        {"role": "user", "content": "Create the scaffold for it first"},
+        _assistant_with_tool_use("t1", "t2", "t3", "t4", "t5", "t6"),
+        # Andrew's natural reply that arrived during tool execution.
+        {"role": "user", "content": "1. Yes / 2 yes / 3 yes"},
+    ]
+    healed = _heal_dangling_tool_use(transcript)
+    assert len(healed) == 4
+    assert healed[0]["content"] == "Create the scaffold for it first"
+    assert healed[1]["content"][0]["type"] == "tool_use"  # original assistant
+    # Synthetic user with all 6 tool_results inserted BEFORE the
+    # original user text message.
+    assert healed[2]["role"] == "user"
+    synthetic_blocks = healed[2]["content"]
+    assert len(synthetic_blocks) == 6
+    assert all(b["type"] == "tool_result" for b in synthetic_blocks)
+    assert all(b["is_error"] for b in synthetic_blocks)
+    # Original user text message preserved as the next turn.
+    assert healed[3]["content"] == "1. Yes / 2 yes / 3 yes"
+
+
+def test_multiple_dangling_assistant_turns_all_healed():
+    """Two separate assistant turns each strand their own tool_use."""
+    transcript = [
+        _assistant_with_tool_use("t1"),
+        _assistant_with_tool_use("t2"),
+    ]
+    healed = _heal_dangling_tool_use(transcript)
+    # 4 messages: assistant1, synthetic1, assistant2, synthetic2
+    # Wait — the algorithm appends the assistant first, then checks
+    # the NEXT message in the original list. After healing assistant1,
+    # the original next message is assistant2 (not a user) → healer
+    # treats the assistant1 block as dangling and inserts a synthetic
+    # user. Then it processes assistant2 the same way.
+    assert len(healed) == 4
+    assert healed[0]["content"][0]["id"] == "t1"
+    assert healed[1]["content"][0]["tool_use_id"] == "t1"
+    assert healed[2]["content"][0]["id"] == "t2"
+    assert healed[3]["content"][0]["tool_use_id"] == "t2"
+
+
+def test_heal_is_idempotent():
+    """Running the heal twice produces the same output as once."""
+    transcript = [
+        _assistant_with_tool_use("t1", "t2"),
+        {"role": "user", "content": "follow-up"},
+    ]
+    healed_once = _heal_dangling_tool_use(transcript)
+    healed_twice = _heal_dangling_tool_use(healed_once)
+    assert healed_once == healed_twice
+
+
+def test_heal_emits_warning_log_per_dangling_turn():
+    """Per ``feedback_intentionally_left_blank.md``: heal must log loudly.
+
+    Operator greps ``transcript_healed`` to spot the gap-then-recovery
+    pattern. Uses ``structlog.testing.capture_logs`` per the
+    pattern memo.
+    """
+    from structlog.testing import capture_logs
+
+    transcript = [_assistant_with_tool_use("t1", "t2")]
+    with capture_logs() as captured:
+        _heal_dangling_tool_use(transcript)
+
+    heal_logs = [
+        c for c in captured
+        if c.get("event") == "talker.conversation.transcript_healed"
+    ]
+    assert len(heal_logs) == 1
+    assert heal_logs[0]["log_level"] == "warning"
+    assert heal_logs[0]["healed_block_count"] == 2
+    assert sorted(heal_logs[0]["dangling_tool_use_ids"]) == ["t1", "t2"]
+
+    # Summary log fires too.
+    summary_logs = [
+        c for c in captured
+        if c.get("event") == "talker.conversation.transcript_heal_summary"
+    ]
+    assert len(summary_logs) == 1
+    assert summary_logs[0]["total_healed"] == 2
+
+
+def test_messages_for_api_combines_strip_and_heal():
+    """End-to-end: _messages_for_api both strips _ts and heals dangling.
+
+    Composition contract: the public entry point applies both
+    transformations atomically.
+    """
+    transcript = [
+        {"role": "user", "content": "go", "_ts": "2026-05-03T18:49Z"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "t1", "name": "x", "input": {}},
+            ],
+            "_ts": "2026-05-03T18:50Z",
+        },
+        # Dangling — no tool_result follows.
+    ]
+    out = _messages_for_api(transcript)
+    # 3 messages: user, assistant, synthetic user
+    assert len(out) == 3
+    # _ts stripped from every message.
+    assert all("_ts" not in m for m in out)
+    # Synthetic user has tool_result for t1.
+    assert out[2]["role"] == "user"
+    assert out[2]["content"][0]["tool_use_id"] == "t1"
+
+
+def test_heal_handles_string_content_messages_safely():
+    """Plain-string-content messages (the wk1 shape) don't trip the heal."""
+    transcript = [
+        {"role": "user", "content": "hello"},  # string content
+        {"role": "assistant", "content": "hi"},  # string content
+    ]
+    healed = _heal_dangling_tool_use(transcript)
+    assert healed == transcript
+
+
+def test_heal_handles_assistant_with_only_text_blocks():
+    """Assistant message with text blocks but no tool_use → no heal."""
+    transcript = [
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "thinking..."}],
+        },
+    ]
+    healed = _heal_dangling_tool_use(transcript)
+    assert healed == transcript
+
+
+# ---------------------------------------------------------------------------
+# Per-tool try/except in run_turn — synthesises error tool_result on failure
+# ---------------------------------------------------------------------------
+#
+# These tests exercise the inner-loop catch by patching ``_execute_tool``
+# to raise. The expected behaviour: every tool_use block ends up with a
+# matching tool_result in the transcript, even when the underlying
+# call exploded. Without this, an exception strands the assistant
+# turn (already persisted by append_turn) and the next API call wedges.
+
+
+def _build_run_turn_inputs(tmp_path):
+    """Construct minimal run_turn inputs (config / state / session)."""
+    from datetime import datetime, timezone
+    from alfred.telegram.config import (
+        AnthropicConfig, InstanceConfig, LoggingConfig,
+        SessionConfig, STTConfig, TalkerConfig, VaultConfig,
+    )
+    from alfred.telegram.session import Session
+    from alfred.telegram.state import StateManager
+
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir(exist_ok=True)
+    for sub in ("session", "task", "note", "project"):
+        (vault_dir / sub).mkdir(exist_ok=True)
+
+    config = TalkerConfig(
+        bot_token="test-token",
+        allowed_users=[1],
+        primary_users=["person/Andrew Newton"],
+        anthropic=AnthropicConfig(
+            api_key="test-key",
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            temperature=1.0,
+        ),
+        stt=STTConfig(api_key="test-stt", model="whisper-large-v3"),
+        session=SessionConfig(
+            gap_timeout_seconds=1800,
+            state_path=str(tmp_path / "state.json"),
+        ),
+        vault=VaultConfig(path=str(vault_dir)),
+        logging=LoggingConfig(file=str(tmp_path / "talker.log")),
+        instance=InstanceConfig(name="Hypatia", canonical="Hypatia"),
+    )
+    state_mgr = StateManager(tmp_path / "talker_state.json")
+    state_mgr.load()
+    now = datetime(2026, 5, 3, 18, 49, tzinfo=timezone.utc)
+    session = Session(
+        chat_id=1,
+        session_id="test-session-123",
+        started_at=now,
+        last_message_at=now,
+        model="claude-sonnet-4-6",
+    )
+    return config, state_mgr, session
+
+
+async def test_run_turn_synthesises_error_tool_result_when_tool_raises(
+    tmp_path, monkeypatch,
+):
+    """Tool raises generic Exception → loop catches + appends error
+    tool_result + continues. Transcript stays well-formed.
+
+    The headline behavioral fix for the QA-finding bug.
+    """
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+
+    # First model call: tool_use response with 3 tool calls.
+    # Second model call (after tool_results land): plain text reply.
+    tool_use_response = FakeResponse(
+        content=[
+            FakeBlock(type="tool_use", id="t1", name="vault_search",
+                      input={"query": "x"}),
+            FakeBlock(type="tool_use", id="t2", name="vault_search",
+                      input={"query": "y"}),
+            FakeBlock(type="tool_use", id="t3", name="vault_search",
+                      input={"query": "z"}),
+        ],
+        stop_reason="tool_use",
+    )
+    final_response = FakeResponse(
+        content=[FakeBlock(type="text", text="ok done")],
+        stop_reason="end_turn",
+    )
+    client = FakeAnthropicClient([tool_use_response, final_response])
+
+    # Patch _execute_tool: t2 explodes; t1 + t3 succeed.
+    call_log: list[str] = []
+
+    async def _stub_execute(tool_name, tool_input, *args, **kwargs):
+        tid = tool_input.get("query", "")
+        call_log.append(tid)
+        if tid == "y":
+            raise RuntimeError("simulated vault op explosion")
+        return '{"result": "ok"}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    result = await conversation.run_turn(
+        client=client,
+        state=state_mgr,
+        session=session,
+        user_message="please run those tools",
+        config=config,
+        vault_context_str="",
+        system_prompt="test system",
+    )
+    assert result == "ok done"
+
+    # All 3 tool calls were attempted (loop didn't bail on t2's exception).
+    assert call_log == ["x", "y", "z"]
+
+    # Transcript: user, assistant (3 tool_use), user (3 tool_results), assistant (text)
+    assert len(session.transcript) == 4
+    tool_results_msg = session.transcript[2]
+    assert tool_results_msg["role"] == "user"
+    blocks = tool_results_msg["content"]
+    assert len(blocks) == 3
+    by_id = {b["tool_use_id"]: b for b in blocks}
+    # t1, t3 succeeded.
+    assert "is_error" not in by_id["t1"] or by_id["t1"].get("is_error") is False
+    assert "is_error" not in by_id["t3"] or by_id["t3"].get("is_error") is False
+    # t2 surfaces as an error tool_result.
+    assert by_id["t2"]["is_error"] is True
+    assert "RuntimeError" in by_id["t2"]["content"]
+    assert "simulated vault op explosion" in by_id["t2"]["content"]
+
+
+async def test_run_turn_propagates_cancelled_after_flushing_partial(
+    tmp_path, monkeypatch,
+):
+    """asyncio.CancelledError must propagate (daemon shutdown semantic),
+    but the partial tool_results must be flushed first so the
+    transcript is well-formed when the daemon comes back up."""
+    import asyncio
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+
+    tool_use_response = FakeResponse(
+        content=[
+            FakeBlock(type="tool_use", id="t1", name="vault_search",
+                      input={"query": "x"}),
+            FakeBlock(type="tool_use", id="t2", name="vault_search",
+                      input={"query": "y"}),
+        ],
+        stop_reason="tool_use",
+    )
+    client = FakeAnthropicClient([tool_use_response])
+
+    async def _stub_execute(tool_name, tool_input, *args, **kwargs):
+        if tool_input.get("query") == "y":
+            raise asyncio.CancelledError()
+        return '{"result": "ok"}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    with pytest.raises(asyncio.CancelledError):
+        await conversation.run_turn(
+            client=client,
+            state=state_mgr,
+            session=session,
+            user_message="run them",
+            config=config,
+            vault_context_str="",
+            system_prompt="test",
+        )
+
+    # Partial tool_results turn was flushed before re-raise.
+    # Transcript: user, assistant (2 tool_use), user (2 partial tool_results)
+    assert len(session.transcript) == 3
+    tool_results_msg = session.transcript[2]
+    assert tool_results_msg["role"] == "user"
+    blocks = tool_results_msg["content"]
+    # Both ids represented — t1 succeeded, t2 cancelled (with is_error).
+    assert len(blocks) == 2
+    by_id = {b["tool_use_id"]: b for b in blocks}
+    assert by_id["t2"]["is_error"] is True
+    assert "cancelled" in by_id["t2"]["content"].lower()
+
+
+async def test_run_turn_ordering_preserved_when_middle_tool_raises(
+    tmp_path, monkeypatch,
+):
+    """6 tool calls; tool 3 raises. Result blocks appear in original
+    tool_use order in the transcript, not "successes first then
+    failures". The Anthropic API doesn't require strict ordering but
+    deterministic ordering simplifies test assertions + keeps the
+    audit trail readable.
+    """
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+    ids = [f"t{i}" for i in range(1, 7)]
+    tool_use_response = FakeResponse(
+        content=[
+            FakeBlock(
+                type="tool_use", id=tid, name="vault_search",
+                input={"query": tid},
+            )
+            for tid in ids
+        ],
+        stop_reason="tool_use",
+    )
+    final_response = FakeResponse(
+        content=[FakeBlock(type="text", text="done")],
+        stop_reason="end_turn",
+    )
+    client = FakeAnthropicClient([tool_use_response, final_response])
+
+    async def _stub_execute(tool_name, tool_input, *args, **kwargs):
+        if tool_input.get("query") == "t3":
+            raise ValueError("boom")
+        return '{"ok": true}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    await conversation.run_turn(
+        client=client,
+        state=state_mgr,
+        session=session,
+        user_message="run all 6",
+        config=config,
+        vault_context_str="",
+        system_prompt="test",
+    )
+
+    tool_results_msg = session.transcript[2]
+    blocks = tool_results_msg["content"]
+    # Order is preserved: t1, t2, t3, t4, t5, t6.
+    assert [b["tool_use_id"] for b in blocks] == ids
+    # t3 is the only error.
+    error_ids = [b["tool_use_id"] for b in blocks if b.get("is_error")]
+    assert error_ids == ["t3"]
+
+
+async def test_run_turn_failure_log_emitted_with_diagnostic_fields(
+    tmp_path, monkeypatch,
+):
+    """Per ``feedback_intentionally_left_blank.md`` + the
+    subprocess-failure-logging convention: log loudly with structured
+    fields when a tool raises so the operator can grep
+    ``talker.tool.execute_failed`` to spot the regression class."""
+    from structlog.testing import capture_logs
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+    tool_use_response = FakeResponse(
+        content=[FakeBlock(
+            type="tool_use", id="t1", name="vault_search", input={"query": "x"},
+        )],
+        stop_reason="tool_use",
+    )
+    final_response = FakeResponse(
+        content=[FakeBlock(type="text", text="done")],
+        stop_reason="end_turn",
+    )
+    client = FakeAnthropicClient([tool_use_response, final_response])
+
+    async def _stub_execute(*args, **kwargs):
+        raise IOError("disk full")
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    with capture_logs() as captured:
+        await conversation.run_turn(
+            client=client,
+            state=state_mgr,
+            session=session,
+            user_message="run",
+            config=config,
+            vault_context_str="",
+            system_prompt="test",
+        )
+
+    fail_logs = [
+        c for c in captured
+        if c.get("event") == "talker.tool.execute_failed"
+    ]
+    assert len(fail_logs) == 1
+    log_entry = fail_logs[0]
+    assert log_entry["log_level"] == "warning"
+    assert log_entry["tool"] == "vault_search"
+    assert log_entry["tool_use_id"] == "t1"
+    assert log_entry["error_class"] == "OSError"  # IOError is OSError alias
+    assert "disk full" in log_entry["error"]

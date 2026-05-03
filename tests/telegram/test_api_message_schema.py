@@ -27,6 +27,12 @@ def test_strips_underscore_prefixed_keys():
 
 
 def test_preserves_standard_keys_even_with_complex_content():
+    """Metadata stripping doesn't damage tool_use blocks.
+
+    Includes a matching tool_result so the dangling-tool_use heal
+    (race-fix 2026-05-03) is a no-op — keeps this test focused on
+    its original purpose (schema preservation).
+    """
     transcript = [
         {
             "role": "assistant",
@@ -36,13 +42,23 @@ def test_preserves_standard_keys_even_with_complex_content():
             ],
             "_ts": "2026-04-18T22:33:05Z",
         },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "[]"},
+            ],
+            "_ts": "2026-04-18T22:33:06Z",
+        },
     ]
     cleaned = _messages_for_api(transcript)
-    assert len(cleaned) == 1
+    assert len(cleaned) == 2
     assert cleaned[0]["role"] == "assistant"
     assert cleaned[0]["content"][0]["type"] == "text"
     assert cleaned[0]["content"][1]["type"] == "tool_use"
     assert "_ts" not in cleaned[0]
+    assert cleaned[1]["role"] == "user"
+    assert cleaned[1]["content"][0]["type"] == "tool_result"
+    assert "_ts" not in cleaned[1]
 
 
 def test_empty_transcript_returns_empty():

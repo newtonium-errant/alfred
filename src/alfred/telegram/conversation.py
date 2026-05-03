@@ -16,6 +16,7 @@ exceptions. The Telegram layer handles rate-limit translation and user replies.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import json
 from typing import Any, Final
@@ -535,18 +536,173 @@ MAX_TOOL_ITERATIONS = 10
 
 
 def _messages_for_api(transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Strip metadata-only keys (``_ts``, ``_kind``, etc.) before API send.
+    """Strip metadata-only keys + heal dangling tool_use blocks before API send.
 
-    wk2 stamps timing/kind metadata onto each transcript turn for session-
-    record rendering. The Anthropic Messages API strictly validates message
-    schemas and rejects unknown fields (400: ``Extra inputs are not
-    permitted``). Keep metadata on the persisted transcript; send only the
-    Anthropic-schema fields.
+    Two responsibilities:
+
+    1. **Metadata strip** (wk2): stamps like ``_ts`` / ``_kind`` are
+       persisted to the transcript for session-record rendering but the
+       Anthropic Messages API strictly validates message schemas and
+       rejects unknown fields (400: ``Extra inputs are not permitted``).
+       Keep metadata on the persisted transcript; send only the
+       Anthropic-schema fields.
+
+    2. **Dangling-tool_use heal** (race-fix 2026-05-03): if any assistant
+       turn contains ``tool_use`` blocks but the immediately following
+       turn doesn't carry matching ``tool_result`` blocks for every
+       tool_use_id, the API returns
+       ``messages.N: tool_use ids were found without tool_result blocks
+       immediately after``. The wedge mode that hit Andrew's Hypatia
+       session 2026-05-03 18:51-18:52: ``_execute_tool`` raised
+       mid-loop, so ``run_turn`` exited without the
+       ``append_turn(state, session, "user", tool_results)`` line that
+       lands the matching tool_results. The next turn's ``run_turn``
+       appended a regular user message, sealing the dangling state.
+       The user retried twice → same wedge → same 400.
+
+    The heal injects synthetic ``tool_result`` blocks (``is_error: True``,
+    detail "execution interrupted; transcript healed") for any
+    tool_use_id missing a matching tool_result. The synthetic results
+    are inserted as a NEW user message immediately after the dangling
+    assistant turn, ahead of any subsequent real user messages.
+
+    The principal fix is the per-tool-call try/except in ``run_turn``'s
+    execution loop (which prevents the wedge from being created in the
+    first place). This heal is the seatbelt: covers daemon restarts
+    mid-tool-execution, manual transcript edits, or any future code
+    path that strands a tool_use block. Per
+    ``feedback_intentionally_left_blank.md``: log the heal at warning
+    level so an operator can grep ``conversation.transcript_healed``
+    to spot the gap-then-recovery pattern.
     """
-    return [
+    stripped = [
         {k: v for k, v in turn.items() if not k.startswith("_")}
         for turn in transcript
     ]
+    return _heal_dangling_tool_use(stripped)
+
+
+def _collect_tool_use_ids(content: Any) -> list[str]:
+    """Pull tool_use ids out of an assistant content list. Returns
+    empty if content is a plain string or no tool_use blocks present."""
+    if not isinstance(content, list):
+        return []
+    out: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use":
+            tid = block.get("id")
+            if isinstance(tid, str) and tid:
+                out.append(tid)
+    return out
+
+
+def _collect_tool_result_ids(content: Any) -> set[str]:
+    """Pull tool_use_ids out of a user content list (tool_result blocks).
+    Returns empty if content is a plain string or no tool_result blocks
+    present."""
+    if not isinstance(content, list):
+        return set()
+    out: set[str] = set()
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            tid = block.get("tool_use_id")
+            if isinstance(tid, str) and tid:
+                out.add(tid)
+    return out
+
+
+def _heal_dangling_tool_use(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Walk messages; insert synthetic tool_result blocks for any
+    assistant tool_use that lacks a matching tool_result in the next
+    turn.
+
+    Idempotent: a transcript that already has matching tool_results
+    passes through unchanged. The healer only adds; it never removes
+    or modifies existing blocks.
+    """
+    out: list[dict[str, Any]] = []
+    healed_count = 0
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        out.append(msg)
+        if msg.get("role") != "assistant":
+            i += 1
+            continue
+        tool_use_ids = _collect_tool_use_ids(msg.get("content"))
+        if not tool_use_ids:
+            i += 1
+            continue
+        # Look at the NEXT message — must be a user message with
+        # tool_result blocks for every id, in any order.
+        next_msg = messages[i + 1] if i + 1 < len(messages) else None
+        existing_result_ids: set[str] = set()
+        if next_msg is not None and next_msg.get("role") == "user":
+            existing_result_ids = _collect_tool_result_ids(next_msg.get("content"))
+        missing = [tid for tid in tool_use_ids if tid not in existing_result_ids]
+        if not missing:
+            i += 1
+            continue
+        # Heal: build synthetic tool_result blocks for the missing ids.
+        # We always insert a NEW user message immediately after the
+        # dangling assistant turn rather than mutating the existing
+        # next user message — keeps the "what arrived from the user"
+        # transcript faithful + makes the heal visible in any audit.
+        synthetic_blocks = [
+            {
+                "type": "tool_result",
+                "tool_use_id": tid,
+                "content": (
+                    "Tool execution was interrupted before completing. "
+                    "Transcript healed by client to satisfy "
+                    "tool_use/tool_result pairing — actual tool output "
+                    "is unavailable. Please retry the tool call if "
+                    "still needed, or proceed with what you have."
+                ),
+                "is_error": True,
+            }
+            for tid in missing
+        ]
+        synthetic_user_msg = {"role": "user", "content": synthetic_blocks}
+        out.append(synthetic_user_msg)
+        healed_count += len(missing)
+        log.warning(
+            "talker.conversation.transcript_healed",
+            assistant_turn_index=i,
+            dangling_tool_use_ids=missing,
+            healed_block_count=len(missing),
+            detail=(
+                "synthesised tool_result blocks for tool_use ids that "
+                "had no matching tool_result in the next turn — "
+                "almost always a sign of a prior wedge from a tool-"
+                "execution exception or daemon restart mid-loop"
+            ),
+        )
+        i += 1
+
+    if healed_count > 0:
+        log.warning(
+            "talker.conversation.transcript_heal_summary",
+            total_healed=healed_count,
+            assistant_turns_with_dangling=sum(
+                1 for m in out
+                if m.get("role") == "user"
+                and isinstance(m.get("content"), list)
+                and any(
+                    isinstance(b, dict) and b.get("is_error") is True
+                    and isinstance(b.get("content"), str)
+                    and "Transcript healed" in b.get("content", "")
+                    for b in m["content"]
+                )
+            ),
+        )
+    return out
 
 
 # --- Prompt assembly ------------------------------------------------------
@@ -1596,6 +1752,33 @@ async def run_turn(
             append_turn(state, session, "assistant", _blocks_to_jsonable(response.content))
 
             # Execute every tool_use block in order, collect tool_results.
+            #
+            # Per-tool try/except (race-fix 2026-05-03): the assistant
+            # turn above is persisted IMMEDIATELY by ``append_turn``.
+            # Any unhandled exception from ``_execute_tool`` here would
+            # exit ``run_turn`` with the assistant turn on disk + no
+            # matching tool_result user turn — wedge state. The next
+            # ``run_turn`` call would append a regular user message,
+            # sealing the dangling ``tool_use`` IDs. Subsequent
+            # ``client.messages.create`` then 400s with
+            # ``tool_use ids were found without tool_result blocks
+            # immediately after``. User sees "API error try again";
+            # retry hits the same wall.
+            #
+            # ``_execute_tool`` itself wraps vault ops in try/except
+            # and returns ``{"error": ...}`` JSON for known failure
+            # modes (line ~1104 docstring). But anything outside its
+            # catch — an uncaught import error, a syscall-level
+            # failure (vault disk full mid-write), an asyncio.
+            # CancelledError from daemon shutdown — would propagate.
+            # The per-tool try/except here is the safety net.
+            #
+            # Synthetic tool_result on failure: ``is_error: True`` +
+            # detail naming the exception class so the model can see
+            # what went wrong and recover (apologise, pick a
+            # different tool, retry with different args). The
+            # transcript stays well-formed; the next API call
+            # succeeds.
             tool_results: list[dict[str, Any]] = []
             for block in response.content:
                 btype = getattr(block, "type", None)
@@ -1610,19 +1793,78 @@ async def run_turn(
                     iteration=iteration,
                     tool=tool_name,
                 )
-                result_str = await _execute_tool(
-                    tool_name,
-                    tool_input if isinstance(tool_input, dict) else {},
-                    vault_path,
-                    state,
-                    session,
-                    config=config,
-                )
-                tool_results.append({
+                try:
+                    result_str = await _execute_tool(
+                        tool_name,
+                        tool_input if isinstance(tool_input, dict) else {},
+                        vault_path,
+                        state,
+                        session,
+                        config=config,
+                    )
+                    is_error = False
+                except asyncio.CancelledError:
+                    # Re-raise — daemon shutdown / task cancellation
+                    # must propagate. We append a synthetic
+                    # tool_result first so the partial transcript is
+                    # well-formed when the daemon comes back up and
+                    # rehydrates.
+                    log.warning(
+                        "talker.tool.cancelled",
+                        iteration=iteration,
+                        tool=tool_name,
+                        tool_use_id=tool_use_id,
+                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": (
+                            "Tool execution was cancelled (daemon "
+                            "shutdown or task cancellation). Result "
+                            "unavailable."
+                        ),
+                        "is_error": True,
+                    })
+                    # Still flush the partial tool_results so the
+                    # transcript is well-formed before re-raising.
+                    append_turn(state, session, "user", tool_results)
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # Any other exception: synthesize an error
+                    # tool_result and continue with the rest of the
+                    # tool calls. Per ``feedback_intentionally_left
+                    # _blank.md`` — log loudly so the operator knows
+                    # what failed.
+                    log.warning(
+                        "talker.tool.execute_failed",
+                        iteration=iteration,
+                        tool=tool_name,
+                        tool_use_id=tool_use_id,
+                        error_class=exc.__class__.__name__,
+                        error=str(exc)[:500],
+                        detail=(
+                            "_execute_tool raised an unhandled "
+                            "exception; synthesising an error "
+                            "tool_result so the transcript stays "
+                            "well-formed (preserves tool_use/"
+                            "tool_result pairing)."
+                        ),
+                    )
+                    result_str = _dumps({
+                        "error": (
+                            f"Tool execution failed with "
+                            f"{exc.__class__.__name__}: {str(exc)[:200]}"
+                        ),
+                    })
+                    is_error = True
+                tool_result_block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
                     "content": result_str,
-                })
+                }
+                if is_error:
+                    tool_result_block["is_error"] = True
+                tool_results.append(tool_result_block)
 
             # Feed tool results back as a single user message.
             append_turn(state, session, "user", tool_results)
