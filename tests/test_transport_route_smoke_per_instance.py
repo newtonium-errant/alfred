@@ -389,21 +389,15 @@ _ACCEPTABLE_STATUSES = {
 # without per-instance config-file loading.
 _PERSONAS = [
     pytest.param(
-        "salem",
-        True,   # canonical owner
-        _wire_salem,
+        ("salem", True, _wire_salem),  # canonical owner, full features
         id="salem-canonical-owner-full-features",
     ),
     pytest.param(
-        "kalle",
-        False,  # peer-only
-        _wire_kalle,
+        ("kalle", False, _wire_kalle),  # peer-only, no gcal
         id="kalle-peer-only-no-gcal",
     ),
     pytest.param(
-        "hypatia",
-        False,
-        _wire_hypatia,
+        ("hypatia", False, _wire_hypatia),  # minimal, no resolver, no gcal
         id="hypatia-minimal-no-resolver-no-gcal",
     ),
 ]
