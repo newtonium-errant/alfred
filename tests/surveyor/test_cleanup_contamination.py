@@ -536,13 +536,23 @@ def test_partial_removal_preserves_non_target_entries(vault: Path):
     legitimate entries if it confused itself differently. Pin
     that the cleanup only removes what was specifically
     target-marked-for-removal.
+
+    Test-authoring gotcha (caught 2026-05-03 first round of this
+    test): the body MUST express absence semantically (just don't
+    mention the names) NOT via explicit negation phrases ("no
+    mention of X"). The original draft of this body literally
+    said "No mention of Ben McMillan or Jamie." — which contains
+    the names "Ben McMillan" and "Jamie" verbatim, so body-text-
+    anchor correctly preserved them. Same trap will hit anyone
+    writing tests for surveyor's reverse-anchor checks: use
+    semantic absence, never explicit negation.
     """
     _write_record(
         vault,
         rel_path="event/Mixed.md",
         body=(
-            "A real event with Andrew Newton in attendance. "
-            "No mention of Ben McMillan or Jamie."
+            "A real event. Attended by Andrew Newton. "
+            "Sarah ran the slides."
         ),
         related_persons=[
             "person/Ben McMillan.md",

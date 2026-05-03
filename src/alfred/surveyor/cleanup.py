@@ -49,6 +49,21 @@ Conservative bias:
   to leave 50 stale-but-arguably-related links than to remove 1
   legitimate one.
 
+Test-authoring gotcha (the negation-phrase trap):
+
+  When writing tests for body-text-anchor (or any anchor-style
+  text-presence check), express absence SEMANTICALLY — just don't
+  mention the name. Do NOT use explicit negation phrases like
+  "no mention of X" or "did not include Y" — those phrases CONTAIN
+  the names X and Y verbatim, so the heuristic correctly matches
+  them and preserves the link the test was trying to verify gets
+  removed. First round of
+  ``test_partial_removal_preserves_non_target_entries`` (caught
+  2026-05-03) shipped with body="No mention of Ben McMillan or
+  Jamie." — body-text-anchor matched both names, preserved them,
+  test failed. Same trap will hit anyone writing tests for the
+  surveyor's reverse-anchor checks.
+
 Dry-run contract:
 
   ``cleanup_entity_link_contamination(..., dry_run=True)`` walks the
