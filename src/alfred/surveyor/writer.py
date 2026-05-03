@@ -94,6 +94,8 @@ class VaultWriter:
         field: str,
         new_paths: list[str],
         max_total: int | None = None,
+        *,
+        attribution: dict | None = None,
     ) -> int:
         """Append entries to a frontmatter list field (e.g. `related_matters`)
         without removing existing entries. Returns the number of new entries
@@ -105,6 +107,19 @@ class VaultWriter:
           - Preserve original ordering; append new entries at the end.
           - If `max_total` is set, cap final list length (drop from the
             TAIL of new entries, not existing ones).
+
+        ``attribution`` (Phase 1 contamination diagnostic): optional dict
+        of context fields the caller passes through to the
+        ``writer.entity_links_written`` log event so an operator can grep
+        the audit trail and pattern-match contamination AFTER it lands.
+        Recommended fields: ``stage`` (one of ``cluster`` / ``noise`` /
+        ``backfill``), ``cluster_id`` (int or "noise"), ``similarities``
+        (list[float] aligned with ``new_paths`` order), ``source_type``
+        (record_type of the source record). Per ``feedback_intentionally
+        _left_blank.md``: silence here is the diagnostic gap — every
+        write should log its full provenance so a "who linked Ben
+        McMillan to this random event?" investigation has actual
+        forensic data instead of guesswork.
         """
         if not new_paths:
             return 0
@@ -128,11 +143,16 @@ class VaultWriter:
         existing_set = set(existing)
 
         to_add: list[str] = []
-        for p in new_paths:
+        # Track which input indices actually got added (vs. dedup-skipped)
+        # so the attribution log can align similarity scores to the
+        # paths that actually landed.
+        added_indices: list[int] = []
+        for idx, p in enumerate(new_paths):
             if p in existing_set:
                 continue
             to_add.append(p)
             existing_set.add(p)
+            added_indices.append(idx)
 
         if not to_add:
             return 0
@@ -147,15 +167,52 @@ class VaultWriter:
         # "added" = net new entries actually retained after cap.
         added_kept = max(0, len(merged) - len(existing))
 
+        # Attribution log: pull caller-supplied context + align similarity
+        # scores to the input paths that actually landed. The log shape
+        # is intentionally flat (no nested dicts) so structlog +
+        # downstream JSON consumers can filter on individual fields.
+        log_kwargs: dict = {
+            "path": rel_path,
+            "field": field,
+            "added": added_kept,
+            "total": len(merged),
+        }
+        if attribution:
+            stage = attribution.get("stage")
+            if stage is not None:
+                log_kwargs["stage"] = stage
+            cluster_id = attribution.get("cluster_id")
+            if cluster_id is not None:
+                log_kwargs["cluster_id"] = cluster_id
+            source_type = attribution.get("source_type")
+            if source_type is not None:
+                log_kwargs["source_type"] = source_type
+            sims = attribution.get("similarities")
+            if isinstance(sims, list) and sims:
+                # Trim sims to only the paths that landed (dedup-aware) +
+                # the post-cap survivors. Logging the raw sims of every
+                # candidate would obscure the forensic signal — operator
+                # wants to see "this link was added with sim=0.78" not
+                # "we considered 50 candidates."
+                kept_count = added_kept
+                aligned: list[float] = []
+                for idx in added_indices[:kept_count]:
+                    if 0 <= idx < len(sims):
+                        aligned.append(round(float(sims[idx]), 4))
+                if aligned:
+                    log_kwargs["similarities_added"] = aligned
+            target_paths = attribution.get("target_paths")
+            if isinstance(target_paths, list) and target_paths:
+                # Same trim as similarities — log only what landed.
+                log_kwargs["target_paths_added"] = [
+                    target_paths[idx]
+                    for idx in added_indices[:added_kept]
+                    if 0 <= idx < len(target_paths)
+                ]
+
         post.metadata[field] = merged
         self._write_atomic(full_path, rel_path, post)
-        log.info(
-            "writer.entity_links_written",
-            path=rel_path,
-            field=field,
-            added=added_kept,
-            total=len(merged),
-        )
+        log.info("writer.entity_links_written", **log_kwargs)
         return added_kept
 
     def write_related_matters(
@@ -163,14 +220,20 @@ class VaultWriter:
         rel_path: str,
         matter_paths: list[str],
         max_total: int | None = None,
+        *,
+        attribution: dict | None = None,
     ) -> int:
         """Append matter vault paths to `related_matters` frontmatter.
 
         Respects existing entries (both human-authored and previously
         machine-written). Returns count of newly-added entries.
+
+        ``attribution`` (Phase 1 contamination diagnostic): see
+        :meth:`_append_to_list_field` for the schema.
         """
         return self._append_to_list_field(
-            rel_path, "related_matters", matter_paths, max_total
+            rel_path, "related_matters", matter_paths, max_total,
+            attribution=attribution,
         )
 
     def write_related_persons(
@@ -178,10 +241,13 @@ class VaultWriter:
         rel_path: str,
         person_paths: list[str],
         max_total: int | None = None,
+        *,
+        attribution: dict | None = None,
     ) -> int:
         """Append person vault paths to `related_persons` frontmatter."""
         return self._append_to_list_field(
-            rel_path, "related_persons", person_paths, max_total
+            rel_path, "related_persons", person_paths, max_total,
+            attribution=attribution,
         )
 
     def write_related_orgs(
@@ -189,10 +255,13 @@ class VaultWriter:
         rel_path: str,
         org_paths: list[str],
         max_total: int | None = None,
+        *,
+        attribution: dict | None = None,
     ) -> int:
         """Append org vault paths to `related_orgs` frontmatter."""
         return self._append_to_list_field(
-            rel_path, "related_orgs", org_paths, max_total
+            rel_path, "related_orgs", org_paths, max_total,
+            attribution=attribution,
         )
 
     def write_related_projects(
@@ -200,10 +269,13 @@ class VaultWriter:
         rel_path: str,
         project_paths: list[str],
         max_total: int | None = None,
+        *,
+        attribution: dict | None = None,
     ) -> int:
         """Append project vault paths to `related_projects` frontmatter."""
         return self._append_to_list_field(
-            rel_path, "related_projects", project_paths, max_total
+            rel_path, "related_projects", project_paths, max_total,
+            attribution=attribution,
         )
 
     def write_relationships(self, rel_path: str, new_rels: list[dict]) -> None:

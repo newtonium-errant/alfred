@@ -559,6 +559,8 @@ class Daemon:
                 reg_vec = path_to_vec.get(reg_path)
                 if reg_vec is None:
                     continue
+                reg_record = records.get(reg_path)
+                reg_type = reg_record.record_type if reg_record else ""
 
                 for entity_type, entity_paths in entities_by_type.items():
                     # Compute cos(reg_path, each entity), keep those above
@@ -579,9 +581,24 @@ class Daemon:
 
                     scored.sort(key=lambda x: x[1], reverse=True)
                     to_write = [p for p, _ in scored[:max_per]]
+                    sims_to_write = [s for _, s in scored[:max_per]]
 
                     method = writer_methods[entity_type]
-                    added = method(reg_path, to_write, max_total=max_per)
+                    # Attribution log: forensic trail per
+                    # contamination diagnostic. Operator can grep
+                    # ``writer.entity_links_written`` + filter on
+                    # stage=cluster + cluster_id=N to reconstruct
+                    # which cluster led to which link.
+                    added = method(
+                        reg_path, to_write, max_total=max_per,
+                        attribution={
+                            "stage": "cluster",
+                            "cluster_id": cid,
+                            "source_type": reg_type,
+                            "similarities": sims_to_write,
+                            "target_paths": to_write,
+                        },
+                    )
                     total_added += added
 
         if clusters_processed > 0:
@@ -681,9 +698,25 @@ class Daemon:
 
                 scored.sort(key=lambda x: x[1], reverse=True)
                 to_write = [p for p, _ in scored[:max_per]]
+                sims_to_write = [s for _, s in scored[:max_per]]
 
                 method = writer_methods[entity_type]
-                added = method(np_path, to_write, max_total=max_per)
+                # Attribution log: stage=noise so the forensic
+                # trail can distinguish noise-point links from
+                # cluster-member links — they have different
+                # cardinality (noise compares against ALL vault
+                # entities, not just cluster members) and so
+                # different contamination risk profiles.
+                added = method(
+                    np_path, to_write, max_total=max_per,
+                    attribution={
+                        "stage": "noise",
+                        "cluster_id": "noise",
+                        "source_type": src_type,
+                        "similarities": sims_to_write,
+                        "target_paths": to_write,
+                    },
+                )
                 total_added += added
 
         if noise_processed > 0:
@@ -767,7 +800,24 @@ class Daemon:
                     continue
                 # Write ONE entity at a time so each target record's
                 # max_per_record cap is respected independently.
-                added = method(other_path, [entity_path], max_total=max_per)
+                #
+                # Attribution log: stage=backfill. This stage has the
+                # widest blast radius (one new entity → potentially
+                # every record in the vault) so log discipline matters
+                # here most. Per
+                # ``feedback_intentionally_left_blank.md``: silent
+                # bulk linking is exactly the failure mode the QA
+                # finding caught.
+                added = method(
+                    other_path, [entity_path], max_total=max_per,
+                    attribution={
+                        "stage": "backfill",
+                        "cluster_id": "backfill",
+                        "source_type": other_record.record_type,
+                        "similarities": [sim],
+                        "target_paths": [entity_path],
+                    },
+                )
                 total_added += added
 
         if entities_processed > 0:
