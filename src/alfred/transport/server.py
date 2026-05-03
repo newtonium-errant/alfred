@@ -682,16 +682,34 @@ def wire_transport_app(
         alias=instance_alias,
     )
 
+    # Per ``feedback_intentionally_left_blank.md``: a feature kwarg
+    # passed as None must emit an explicit debug-level skip log so an
+    # operator audit can distinguish "feature X intentionally not
+    # wired (KAL-LE has no GCal)" from "feature X forgotten (developer
+    # missed the kwarg)". Without these logs, both states look
+    # identical in production.
+
     if vault_path is not None:
         register_vault_path(app, Path(vault_path))
         log.info(
             "transport.wire_transport_app.vault_path_registered",
             vault_path=str(vault_path),
         )
+    else:
+        log.debug(
+            "transport.wire_transport_app.vault_path_skipped",
+            reason="no vault_path passed (instance is vault-less or "
+                   "caller forgot kwarg)",
+        )
 
     if send_fn is not None:
         register_send_callable(app, send_fn)
         log.info("transport.wire_transport_app.send_fn_registered")
+    else:
+        log.debug(
+            "transport.wire_transport_app.send_fn_skipped",
+            reason="no send_fn passed (outbound/send will return 503)",
+        )
 
     if pending_items_aggregate_path is not None:
         register_pending_items_aggregate_path(
@@ -701,6 +719,12 @@ def wire_transport_app(
             "transport.wire_transport_app.pending_items_aggregate_registered",
             path=str(pending_items_aggregate_path),
         )
+    else:
+        log.debug(
+            "transport.wire_transport_app.pending_items_aggregate_skipped",
+            reason="no aggregate path passed (instance does not aggregate "
+                   "peer pending-items pushes; KAL-LE / Hypatia leave None)",
+        )
 
     if pending_items_resolve_callable is not None:
         register_pending_items_resolve_callable(
@@ -709,10 +733,22 @@ def wire_transport_app(
         log.info(
             "transport.wire_transport_app.pending_items_resolver_registered",
         )
+    else:
+        log.debug(
+            "transport.wire_transport_app.pending_items_resolver_skipped",
+            reason="no resolver callable passed (instance has no "
+                   "pending_items config block)",
+        )
 
     if peer_inbox_callable is not None:
         register_peer_inbox(app, peer_inbox_callable)
         log.info("transport.wire_transport_app.peer_inbox_registered")
+    else:
+        log.debug(
+            "transport.wire_transport_app.peer_inbox_skipped",
+            reason="no peer_inbox callable passed (/peer/send will "
+                   "return 501 peer_inbox_not_configured)",
+        )
 
     # GCal: client + config must be paired. Either-but-not-both is a
     # configuration error — log + skip rather than crash, but the
@@ -738,6 +774,13 @@ def wire_transport_app(
                 "skipping GCal registration"
             ),
         )
+    else:
+        log.debug(
+            "transport.wire_transport_app.gcal_skipped",
+            reason="no gcal_client + gcal_config passed (instance "
+                   "did not opt into GCal integration; KAL-LE / "
+                   "Hypatia / non-GCal Salem all leave None)",
+        )
 
     # P2-4 sentinel: ``gcal_intended_on=True`` flags the
     # "operator wanted GCal but setup failed" state so the conflict-
@@ -748,6 +791,13 @@ def wire_transport_app(
     if gcal_intended_on:
         register_gcal_intended_on(app)
         log.info("transport.wire_transport_app.gcal_intended_on_registered")
+    else:
+        log.debug(
+            "transport.wire_transport_app.gcal_intended_on_skipped",
+            reason="gcal_intended_on flag not set (instance did not "
+                   "opt into GCal, OR opted in and client constructed "
+                   "successfully so no sentinel needed)",
+        )
 
 
 async def run_server(
