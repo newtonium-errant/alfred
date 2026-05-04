@@ -34,6 +34,15 @@ def _stub_embedder() -> Embedder:
     Mirrors the fixture used in test_embedder_batching.py — uses
     ``Embedder.__new__`` to skip __init__ entirely so we don't need
     a Milvus client.
+
+    Note: ``_throttle_seconds`` is a read-only ``@property`` (line
+    218-220 of ``embedder.py``) derived from ``_is_cloud`` (which
+    itself reads ``api_key``); attempting to assign it raises
+    ``AttributeError: property has no setter``. We don't need to
+    override it for these tests — ``_get_embedding``'s single-chunk
+    fast path (the only path under test here) doesn't invoke the
+    throttle. Setting ``api_key=None`` makes the property naturally
+    return ``EMBED_THROTTLE_LOCAL`` if anything ever reads it.
     """
     e = Embedder.__new__(Embedder)
     e.api_key = None  # local Ollama path (matches KAL-LE / Salem prod)
@@ -41,7 +50,6 @@ def _stub_embedder() -> Embedder:
     e.embedding_dims = 768
     e.embed_url = "http://localhost:11434/api/embeddings"
     e._http = None
-    e._throttle_seconds = 0.0
     return e
 
 
