@@ -169,8 +169,33 @@ class TestCommandPrefix:
 
     def test_unbalanced_quotes_falls_back_to_split(self):
         """shlex raises on unbalanced quotes; whitespace fallback
-        keeps the analyzer running."""
+        keeps the analyzer running.
+
+        Critical for grouping: ``echo "unbalanced`` MUST collapse to
+        prefix ``echo`` (not ``echo "unbalanced``) so it groups with
+        well-formed siblings like ``echo "balanced text"`` and hits
+        the failed-pattern threshold. Otherwise different prefix
+        keys → no grouping → no event."""
         assert _command_prefix('echo "unbalanced') == "echo"
+
+    def test_unbalanced_single_quote_falls_back_to_split(self):
+        """Same contract as the double-quote case — single-quote
+        unbalanced shell also collapses to the binary-only prefix."""
+        assert _command_prefix("echo 'unbalanced") == "echo"
+
+    def test_leading_quote_with_no_binary_returns_empty(self):
+        """Edge: command starts with a quote-bearing token (no preceding
+        binary). The truncate-at-first-quote loop drops the entire
+        token list; _command_prefix then returns empty string. No
+        crash, just a non-grouping prefix (which is the right outcome
+        for unparseable input)."""
+        assert _command_prefix('"unbalanced from start') == ""
+
+    def test_balanced_quotes_use_shlex_not_fallback(self):
+        """Sanity: well-formed quoted commands don't enter the fallback
+        branch — shlex parses the quoted string as one token, and
+        prefix takes the first 2 tokens (binary + quoted-arg)."""
+        assert _command_prefix('echo "balanced text"') == 'echo balanced text'
 
 
 # ---------------------------------------------------------------------------

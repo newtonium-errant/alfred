@@ -190,16 +190,34 @@ def _tokenize_command(command: str) -> list[str]:
     """Return the command's argv-style tokens.
 
     Uses ``shlex.split`` (POSIX rules, matching what bash_exec passes
-    to ``asyncio.create_subprocess_exec``). Falls back to plain
-    whitespace split when shlex raises (unbalanced quotes, etc.) so
-    a malformed command in the audit log doesn't crash the analyzer.
+    to ``asyncio.create_subprocess_exec``). Falls back to a guarded
+    whitespace split when shlex raises (typically unbalanced quotes)
+    so a malformed command in the audit log doesn't crash the
+    analyzer AND doesn't leak the malformed token into the prefix
+    key.
+
+    Why the truncate-at-first-quote step in the fallback: the binary
+    name is what prefix grouping cares about. A quote-bearing token
+    is malformed and shouldn't propagate into the prefix; otherwise
+    ``echo "unbalanced`` would group under prefix ``echo "unbalanced``
+    and never match its well-formed sibling ``echo "balanced text"``
+    (which shlex parses to prefix ``echo``). Different prefix keys
+    → never hits the failed-pattern threshold → friction event never
+    fires.
+
+    Tokens before the first quote-bearing token are returned as-is;
+    everything from the malformed token onward is dropped. Empty
+    list when the very first token is quote-bearing (e.g., a leading
+    ``"`` with no preceding binary).
     """
     try:
         return shlex.split(command)
     except ValueError:
-        # Whitespace split is correct enough for prefix grouping when
-        # shlex can't parse the original; rare in practice.
-        return command.split()
+        tokens = command.split()
+        for i, t in enumerate(tokens):
+            if '"' in t or "'" in t:
+                return tokens[:i]
+        return tokens
 
 
 def _command_prefix(command: str, *, max_tokens: int = 2) -> str:
