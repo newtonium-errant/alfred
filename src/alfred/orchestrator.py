@@ -750,8 +750,13 @@ def run_all(
         runner = TOOL_RUNNERS[tool]
         # Tools whose runner signature is ``(raw, suppress_stdout)`` (no
         # skills_dir). BIT has no skill prompts — it drives the
-        # aggregator directly — so it lives in this bucket.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "pending_items_pusher", "radar_day", "friction_analyzer"):
+        # aggregator directly — so it lives in this bucket. Same for
+        # digest (renders a markdown summary, no agent prompt) and the
+        # other no-agent daemons listed below. Pinned by
+        # ``test_dispatcher_two_arg_branch_matches_two_arg_tools`` in
+        # ``tests/orchestrator/test_tool_dispatch.py`` so a missing
+        # entry trips a test rather than a TypeError on first spawn.
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "digest", "pending_items_pusher", "radar_day", "friction_analyzer"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

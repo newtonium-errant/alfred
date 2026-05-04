@@ -1,20 +1,31 @@
 """Dispatch table tests — ``TOOL_RUNNERS`` contents and signature branching.
 
-The orchestrator has nine registered tool runners. Four of them
-(surveyor, mail, brief, bit) take ``(raw, suppress_stdout)``; the other
-five (curator, janitor, distiller, instructor, talker) take
-``(raw, skills_dir, suppress_stdout)``.
+``run_all`` picks the arity based on a hard-coded tuple literal in
+``start_process`` (``tool in ("surveyor", ...)``). These tests guard
+the contract three ways:
 
-``run_all`` picks the arity based on a hard-coded tuple literal
-``tool in ("surveyor", "mail", "brief", "bit")``. These tests guard that
-contract: if someone adds a new tool and forgets to update the arity
-check, the dispatcher will pass the wrong number of args and ``Process``
-will swallow the ``TypeError`` inside the child.
+  1. ``test_tool_runners_covers_every_registered_tool`` — TOOL_RUNNERS
+     keys match EXPECTED_TOOLS. Forces test-update when a new
+     daemon ships.
+  2. ``test_two_arg_runners_have_expected_signature`` /
+     ``test_three_arg_runners_have_expected_signature`` — each runner
+     IS the arity its set claims. Catches an arity drift in the
+     runner definition itself.
+  3. ``test_dispatcher_two_arg_branch_matches_two_arg_tools`` — the
+     dispatcher's ``if tool in (...)`` literal matches TWO_ARG_TOOLS
+     exactly. **Load-bearing**: catches the regression class where a
+     new two-arg runner gets registered in TOOL_RUNNERS + listed in
+     TWO_ARG_TOOLS, but the author forgets to add it to the
+     dispatcher tuple, and the orchestrator passes 3 args to a 2-arg
+     runner on first spawn (digest pre-fix; radar_day before
+     1b95015; friction_analyzer before 5423fb1; same shape three
+     times — the documentation-trigger pattern).
 """
 
 from __future__ import annotations
 
 import inspect
+import re
 
 import alfred.orchestrator as orchestrator
 
@@ -27,12 +38,21 @@ EXPECTED_TOOLS = {
     # detector. Auto-starts on instances with a ``pending_items`` block
     # + ``enabled: true``.
     "pending_items_pusher",
+    # KAL-LE distiller-radar Phase 3 — daily radar auto-fire daemon.
+    # Auto-starts on instances with ``distiller.radar_day.enabled``.
+    "radar_day",
+    # KAL-LE Daily Sync K3 — friction analyzer (reads bash_exec.jsonl,
+    # writes friction events for the section provider). Auto-starts
+    # on instances with ``daily_sync.friction_analyzer.enabled``.
+    "friction_analyzer",
 }
 
 TWO_ARG_TOOLS = {
     "surveyor", "mail", "brief", "bit",
     "daily_sync", "brief_digest_push", "digest",
     "pending_items_pusher",
+    "radar_day",
+    "friction_analyzer",
 }
 THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "instructor", "talker"}
 
@@ -96,6 +116,57 @@ def test_tool_runners_are_not_shared_across_tools() -> None:
     # All ids should be distinct.
     assert len(set(ids.values())) == len(ids), (
         f"Duplicate runner detected: {ids}"
+    )
+
+
+def test_dispatcher_two_arg_branch_matches_two_arg_tools() -> None:
+    """The dispatcher's ``if tool in (...)`` literal in
+    ``orchestrator.run_all → start_process`` MUST match
+    ``TWO_ARG_TOOLS`` exactly.
+
+    Without this pin, a new two-arg runner can be registered in
+    TOOL_RUNNERS + listed in TWO_ARG_TOOLS but accidentally omitted
+    from the dispatcher tuple — orchestrator then passes 3 args to a
+    2-arg runner and ``Process`` swallows the ``TypeError`` inside the
+    child. The runner-signature test passes (the runner IS 2-arg);
+    the dispatch crashes on first spawn. Same regression class hit
+    digest, radar_day, and friction_analyzer.
+
+    Implementation: parse the literal tuple out of orchestrator.py's
+    source. Source-pin rather than runtime introspection because the
+    tuple isn't reified at module level — it's an inline expression
+    inside ``start_process``. A future refactor could lift it to a
+    module constant; until then this regex captures what the runtime
+    actually checks.
+    """
+    import inspect as _inspect
+
+    src = _inspect.getsource(orchestrator.run_all)
+    # Find the `if tool in (...):` line. Match content between the
+    # parens; tolerate trailing whitespace/newlines inside the tuple.
+    match = re.search(
+        r'if tool in \((?P<tuple_body>[^)]+)\):',
+        src,
+    )
+    assert match, (
+        "Could not locate the ``if tool in (...):`` dispatcher literal "
+        "in orchestrator.run_all. If the literal was lifted to a module "
+        "constant or restructured, update this test to read the new "
+        "source location."
+    )
+    tuple_body = match.group("tuple_body")
+    # Extract every quoted string inside the tuple.
+    dispatcher_tools = set(re.findall(r'"([^"]+)"', tuple_body))
+    assert dispatcher_tools == TWO_ARG_TOOLS, (
+        f"Dispatcher tuple does not match TWO_ARG_TOOLS.\n"
+        f"  In dispatcher tuple but not TWO_ARG_TOOLS: "
+        f"{dispatcher_tools - TWO_ARG_TOOLS}\n"
+        f"  In TWO_ARG_TOOLS but not dispatcher tuple: "
+        f"{TWO_ARG_TOOLS - dispatcher_tools}\n"
+        f"This is the regression class that bit digest / radar_day / "
+        f"friction_analyzer — a runner registered as 2-arg in "
+        f"TOOL_RUNNERS but missing from the dispatcher tuple causes "
+        f"the orchestrator to pass 3 args on first spawn."
     )
 
 
