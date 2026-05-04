@@ -344,11 +344,21 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # because the universal-deny is the right call here too: a
         # decision's body should be append-only or new-record. The
         # matrix entry keeps the SPEC explicit; the runtime denies it.
+        #
+        # ``architecture`` (added 2026-05-04) — multi-instance system
+        # design records. Mid-doc insertion + full rewrite both make
+        # sense: design docs evolve as the system changes, sometimes
+        # needing inserted sections (peer-protocol amendments) and
+        # sometimes wholesale rewrites (canonical-authority's first
+        # → second iteration). The Salem event/gcal carve-out doesn't
+        # apply here — architecture records have no sync-state mirror.
         "allow_body_insert_at": {
             "note": True, "principle": True, "pattern": True,
+            "architecture": True,
         },
         "allow_body_replace": {
             "note": True, "principle": True, "pattern": True,
+            "architecture": True,
         },
     },
     # Hypatia — scholar/scribe instance operating on the
@@ -461,12 +471,17 @@ TALKER_CREATE_TYPES: set[str] = {
 
 # Stage 3.5: record types KAL-LE may create. Superset of talker
 # minus operational types (task, event) — KAL-LE is the coding
-# instance, not an operational one — plus the two kalle-only types
-# (pattern, principle) from KNOWN_TYPES_KALLE.
+# instance, not an operational one — plus the kalle-only types
+# (pattern, principle, architecture) from KNOWN_TYPES_KALLE.
+#
+# ``architecture`` (added 2026-05-04) — multi-instance system design
+# records. Distinct from ``pattern`` (reusable how-to extracted FROM
+# the system); architecture describes the SYSTEM (canonical-authority,
+# PHI-firewall-design, peer-protocol). KAL-LE-only.
 KALLE_CREATE_TYPES: set[str] = {
     "note", "session", "conversation",
     "decision", "assumption", "synthesis",
-    "pattern", "principle",
+    "pattern", "principle", "architecture",
 }
 
 

@@ -18,8 +18,17 @@ KNOWN_TYPES: set[str] = {
 # own create allowlist. ``pattern`` is a reusable development pattern;
 # ``principle`` is a higher-level development principle.
 KNOWN_TYPES_KALLE: set[str] = {
-    "pattern", "principle",
+    "pattern", "principle", "architecture",
 }
+# ``architecture`` (added 2026-05-04) — multi-instance system design +
+# information-sharing decisions. Descriptive of THIS system (vs
+# ``pattern`` which is reusable how-to extracted FROM the system).
+# Examples: architecture/canonical-authority.md,
+# architecture/PHI-firewall-design.md, architecture/peer-protocol.md.
+# KAL-LE-only — Salem and Hypatia have no use case for this type.
+# aftermath-lab already has an architecture/ directory with operational
+# docs (deployment.md, testing.md); this registration adds schema
+# validation + scope-aware tooling to records placed there.
 
 # Hypatia operates inside ``~/library-alexandria/`` (see
 # ``library-alexandria/CLAUDE.md`` for directory layout + frontmatter
@@ -92,6 +101,12 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     "constraint": {"active", "expired", "waived", "superseded"},
     "contradiction": {"unresolved", "resolved", "accepted"},
     "synthesis": {"draft", "active", "superseded"},
+    # KAL-LE-only ``architecture`` records (multi-instance system
+    # design notes). Same status set as synthesis — drafts evolve,
+    # become active when ratified, get superseded when the design
+    # changes. Strict-but-small set; widen via deliberate decision
+    # if a real workflow needs another state.
+    "architecture": {"draft", "active", "superseded"},
 }
 
 # Type → expected top-level directory
@@ -113,6 +128,7 @@ TYPE_DIRECTORY: dict[str, str] = {
     "constraint": "constraint",
     "contradiction": "contradiction",
     "synthesis": "synthesis",
+    "architecture": "architecture",
     # session, input have flexible placement
 }
 

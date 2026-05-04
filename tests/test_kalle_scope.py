@@ -224,3 +224,116 @@ def test_kalle_skill_file_exists_and_renders():
     # Denial anchors — the commit/push rules are load-bearing.
     assert "git commit" in content.lower() or "no `git commit`" in content.lower()
     assert "git push" in content.lower() or "no `git push`" in content.lower()
+
+
+# ---------------------------------------------------------------------------
+# ``architecture`` type registration (added 2026-05-04)
+# ---------------------------------------------------------------------------
+#
+# Multi-instance system design records — distinct from ``pattern``
+# (reusable how-to extracted FROM the system). Examples:
+# architecture/canonical-authority.md, architecture/PHI-firewall-design.md,
+# architecture/peer-protocol.md. KAL-LE-only — Salem and Hypatia have
+# no use case.
+
+
+def test_architecture_type_in_kalle_known_types():
+    """``architecture`` registers in KNOWN_TYPES_KALLE so
+    ``_validate_type`` accepts it under the kalle scope."""
+    assert "architecture" in schema.KNOWN_TYPES_KALLE
+    # The kalle-extension union (KNOWN_TYPES_BY_SCOPE) must include it.
+    assert "architecture" in schema.KNOWN_TYPES_BY_SCOPE["kalle"]
+
+
+def test_architecture_type_in_kalle_create_types():
+    """``architecture`` registers in KALLE_CREATE_TYPES so the
+    kalle scope's ``create`` permission allows it."""
+    assert "architecture" in KALLE_CREATE_TYPES
+
+
+def test_architecture_type_NOT_in_canonical_known_types():
+    """Per the per-instance principle — Salem (KNOWN_TYPES) has no
+    use case for ``architecture`` records. Adding it here would
+    leak the type to every scope, breaking the kalle-only contract."""
+    assert "architecture" not in schema.KNOWN_TYPES
+
+
+def test_architecture_type_NOT_in_hypatia_or_talker_create_allowlists():
+    """Hypatia and Salem (talker) must not be able to create
+    ``architecture`` records. The scope-level create allowlists
+    enforce this; the schema-level KNOWN_TYPES_BY_SCOPE for hypatia
+    excludes the kalle extension set."""
+    from alfred.vault.scope import HYPATIA_CREATE_TYPES, TALKER_CREATE_TYPES
+    assert "architecture" not in TALKER_CREATE_TYPES
+    assert "architecture" not in HYPATIA_CREATE_TYPES
+    # Hypatia's scope-extension union should NOT pick it up.
+    assert "architecture" not in schema.KNOWN_TYPES_BY_SCOPE["hypatia"]
+
+
+def test_architecture_status_validation_pinned():
+    """``architecture`` carries the same status set as synthesis
+    ({draft, active, superseded}). Strict-but-small; widen via
+    deliberate decision."""
+    assert schema.STATUS_BY_TYPE["architecture"] == {
+        "draft", "active", "superseded",
+    }
+
+
+def test_architecture_type_directory_pinned():
+    """``architecture`` records land under ``architecture/`` —
+    matches existing aftermath-lab convention. Without an explicit
+    TYPE_DIRECTORY entry the fallback is ``record_type``, but the
+    explicit entry catches accidental drift."""
+    assert schema.TYPE_DIRECTORY["architecture"] == "architecture"
+
+
+def test_kalle_scope_create_allows_architecture():
+    """End-to-end: kalle scope's ``create`` permission accepts
+    ``architecture`` records."""
+    check_scope("kalle", "create", record_type="architecture")
+
+
+def test_talker_scope_create_denies_architecture():
+    """Salem (talker scope) must REFUSE ``architecture`` create —
+    KAL-LE-only per the per-instance principle."""
+    with pytest.raises(ScopeError) as exc_info:
+        check_scope("talker", "create", record_type="architecture")
+    assert "talker types" in str(exc_info.value).lower()
+
+
+def test_hypatia_scope_create_denies_architecture():
+    """Hypatia must REFUSE ``architecture`` create — KAL-LE-only."""
+    with pytest.raises(ScopeError) as exc_info:
+        check_scope("hypatia", "create", record_type="architecture")
+    assert "hypatia types" in str(exc_info.value).lower()
+
+
+def test_kalle_can_body_insert_at_architecture():
+    """``architecture`` is in kalle's body_insert_at allowlist —
+    design docs evolve via mid-doc inserted sections (e.g.
+    peer-protocol amendments)."""
+    check_scope("kalle", "body_insert_at", record_type="architecture")
+
+
+def test_kalle_can_body_replace_architecture():
+    """``architecture`` is in kalle's body_replace allowlist —
+    design docs sometimes need wholesale rewrites (e.g.
+    canonical-authority's first → second iteration). No gcal carve-
+    out applies (architecture has no sync mirror)."""
+    check_scope("kalle", "body_replace", record_type="architecture")
+
+
+def test_universal_deny_set_unchanged_by_architecture_addition():
+    """``architecture`` must NOT join _BODY_MUTATE_DENIED_TYPES —
+    it's a curation type that benefits from mid-doc and full-rewrite
+    tooling. Regression guard against accidental drift if a future
+    edit treats architecture like an atomic learning record."""
+    from alfred.vault.scope import _BODY_MUTATE_DENIED_TYPES
+    assert "architecture" not in _BODY_MUTATE_DENIED_TYPES
+    # Sanity-check the deny set still contains the expected types
+    # (catches drift in either direction in one assertion).
+    assert _BODY_MUTATE_DENIED_TYPES == frozenset({
+        "session", "conversation", "capture", "run", "input",
+        "assumption", "decision", "constraint", "contradiction",
+        "synthesis",
+    })
