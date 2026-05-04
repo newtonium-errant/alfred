@@ -223,7 +223,44 @@ def test_janitor_body_insert_at_wildcard_allowlist():
 
 def test_janitor_body_replace_denied_for_all_types():
     """body_replace is universally DENIED for janitor (autofix-loop
-    risk per spec). Even an allowed type like ``note`` refuses."""
+    risk per spec). Even an allowed type like ``note`` refuses.
+
+    Two gates can fire here in priority order:
+      1. ``allow_body_writes: False`` (existing rule) — fires FIRST
+         in ``check_scope`` because body-write rejection precedes the
+         operation-permission check. Message: "may not write record
+         body content".
+      2. ``allow_body_replace: {}`` (new rule, this commit) — would
+         fire IF allow_body_writes were True. Message: "no allowlist".
+
+    Today (2026-05-04) gate #1 is the operative one. The forgiving
+    ``match="janitor"`` substring matches both gate paths so the test
+    survives a future widen of allow_body_writes (the natural
+    extension path documented in c1's commit body) without needing
+    a wording chase. The test_janitor_new_allowlist_gate_message_
+    when_body_writes_widened test below pins the new gate's wording
+    via monkeypatch for that future migration."""
+    with pytest.raises(ScopeError, match="janitor"):
+        check_scope("janitor", "body_replace", record_type="note")
+
+
+def test_janitor_new_allowlist_gate_message_when_body_writes_widened(
+    monkeypatch,
+):
+    """Belt-and-suspenders: the NEW allow_body_replace allowlist gate
+    fires (with its "no allowlist" message) when allow_body_writes is
+    flipped to True. Pinned now so a future widen of allow_body_writes
+    (the natural extension path documented in c1's commit body) doesn't
+    silently lose the body_replace deny — the new gate must keep firing
+    independently of the body_write gate.
+
+    Monkeypatch the janitor scope's ``allow_body_writes`` to True so
+    the existing body-write gate stops firing FIRST; then assert the
+    new allowlist gate's specific "no allowlist" message takes over."""
+    from alfred.vault.scope import SCOPE_RULES
+    monkeypatch.setitem(
+        SCOPE_RULES["janitor"], "allow_body_writes", True,
+    )
     with pytest.raises(ScopeError, match="no allowlist"):
         check_scope("janitor", "body_replace", record_type="note")
 
