@@ -434,3 +434,209 @@ def sync_event_delete_to_gcal(
         correlation_id=correlation_id,
     )
     return {"deleted": True, "event_id": gcal_event_id}
+
+
+# ---------------------------------------------------------------------------
+# Public: cancel (vault_edit status: cancelled — soft-cancel path)
+# ---------------------------------------------------------------------------
+
+
+def sync_event_cancellation_to_gcal(
+    *,
+    client: Any,
+    config: Any,
+    intended_on: bool = False,
+    file_path: Path,
+    gcal_event_id: str,
+    keep_on_cancel: bool = False,
+    correlation_id: str = "",
+) -> dict[str, Any]:
+    """Mirror a ``vault_edit status: cancelled`` to GCal.
+
+    Two paths, controlled by ``keep_on_cancel``:
+
+      * ``keep_on_cancel=False`` (default) — DELETE the GCal event and
+        clear ``gcal_event_id`` from the vault record's frontmatter.
+        Subsequent re-creates start fresh; the deleted event is gone
+        from the calendar.
+
+      * ``keep_on_cancel=True`` — PATCH the GCal event with
+        ``status="cancelled"``. The event stays visible on the calendar
+        (struck through per Google's UI) but is marked cancelled.
+        ``gcal_event_id`` is RETAINED so a subsequent re-confirmation
+        edit could patch the status back. The prompt-tuner teaches
+        Salem to set ``gcal_keep_on_cancel: true`` ONLY when Andrew
+        explicitly asks "keep it visible / leave on calendar / mark
+        cancelled but keep showing".
+
+    This is distinct from :func:`sync_event_delete_to_gcal` which is
+    the vault_delete (hard-delete) hook. This function is the
+    vault_edit (soft-cancel) hook — same GCal end state on the
+    delete path, but the vault record persists and the
+    ``gcal_event_id`` clearing is part of THIS function's contract
+    (vs `sync_event_delete_to_gcal` where the vault record is gone
+    so there's nothing to clear).
+
+    Returns:
+      * ``{}`` — gcal not configured (skip).
+      * ``{"noop": "no_gcal_event_id"}`` — vault record had no
+        ``gcal_event_id`` (was never synced; nothing to remove or
+        patch). Common case for vault-only events that never made it
+        to GCal in the first place.
+      * ``{"cancelled": True, "event_id": "<id>", "path": "delete"}``
+        — keep_on_cancel=False path: DELETE succeeded (or event was
+        already gone — same outcome) AND ``gcal_event_id`` cleared
+        from the vault record.
+      * ``{"cancelled": True, "event_id": "<id>", "path":
+        "status_cancelled"}`` — keep_on_cancel=True path: PATCH
+        succeeded; ``gcal_event_id`` retained on the vault record.
+      * ``{"error": {"code": "<code>", "detail": "<msg>"}}`` — sync
+        failure other than already-deleted (e.g. 500 from GCal API,
+        auth failure). Vault state preserved (the original
+        cancellation edit is intact; only the GCal mirror failed).
+        ``gcal_event_id`` stays on the vault record so a future
+        retry can target the same event.
+      * ``{"error": {"code": "stale_gcal_id", "detail": "..."}}`` —
+        keep_on_cancel=True path only: GCal answered 404/410 on
+        patch. The event was already deleted on the calendar side.
+        Vault frontmatter keeps the stale ID for now.
+    """
+    skip = _gcal_skip_check(
+        client=client, config=config, intended_on=intended_on,
+        correlation_id=correlation_id, op="cancel",
+    )
+    if skip is not None:
+        return skip
+
+    if not gcal_event_id:
+        log.debug(
+            "gcal.sync_cancel_noop",
+            reason="no_gcal_event_id",
+            correlation_id=correlation_id,
+        )
+        return {"noop": "no_gcal_event_id"}
+
+    from alfred.integrations.gcal import GCalError
+
+    if keep_on_cancel:
+        # PATCH path — event stays visible, marked cancelled.
+        try:
+            updated = client.update_event(
+                config.alfred_calendar_id,
+                gcal_event_id,
+                status="cancelled",
+            )
+        except GCalError as exc:
+            code = classify_gcal_error(exc)
+            log.warning(
+                "gcal.sync_cancelled_via_status_failed",
+                error=str(exc),
+                error_code=code,
+                gcal_event_id=gcal_event_id,
+                path=str(file_path),
+                correlation_id=correlation_id,
+            )
+            return {"error": {"code": code, "detail": str(exc)}}
+
+        if updated is None:
+            # 404/410 — event already deleted calendar-side. Same
+            # outcome as the delete path would have produced.
+            log.warning(
+                "gcal.sync_cancel_stale_id",
+                gcal_event_id=gcal_event_id,
+                calendar_id=config.alfred_calendar_id,
+                path=str(file_path),
+                correlation_id=correlation_id,
+            )
+            return {
+                "error": {
+                    "code": "stale_gcal_id",
+                    "detail": (
+                        f"GCal event {gcal_event_id} not found on patch "
+                        "(already deleted on calendar side). Vault "
+                        "frontmatter keeps the stale ID; future repair "
+                        "sweep will surface for cleanup."
+                    ),
+                }
+            }
+
+        log.info(
+            "gcal.sync_cancelled_via_status",
+            event_id=gcal_event_id,
+            calendar_id=config.alfred_calendar_id,
+            path=str(file_path),
+            correlation_id=correlation_id,
+        )
+        return {
+            "cancelled": True,
+            "event_id": gcal_event_id,
+            "path": "status_cancelled",
+        }
+
+    # DELETE path (default) — remove from calendar, clear
+    # gcal_event_id from the vault record so subsequent re-creates
+    # start fresh.
+    try:
+        # GCalClient.delete_event returns True if it was there, False
+        # if it was already gone — either way the vault-side cancel
+        # is in effect, so we treat both as success.
+        client.delete_event(config.alfred_calendar_id, gcal_event_id)
+    except GCalError as exc:
+        code = classify_gcal_error(exc)
+        log.warning(
+            "gcal.sync_cancelled_via_delete_failed",
+            error=str(exc),
+            error_code=code,
+            gcal_event_id=gcal_event_id,
+            path=str(file_path),
+            correlation_id=correlation_id,
+        )
+        return {"error": {"code": code, "detail": str(exc)}}
+
+    # Clear gcal_event_id from the vault record. Direct frontmatter
+    # mutation rather than a recursive vault_edit call:
+    #   1. vault_edit would re-fire the update hooks → infinite loop /
+    #      double-trigger sync.
+    #   2. The audit log already captured the cancel (the original
+    #      vault_edit that set status: cancelled fired an audit row).
+    #   3. Direct mutation matches the existing pattern in
+    #      sync_event_create_to_gcal which writes back gcal_event_id
+    #      directly without round-tripping through vault_edit.
+    try:
+        post = frontmatter.load(str(file_path))
+        if "gcal_event_id" in post:
+            del post["gcal_event_id"]
+        # Also drop the calendar label since the mirror is gone — leaving
+        # it stale is misleading on a re-confirm cycle (a future re-
+        # create might land on a different calendar).
+        if "gcal_calendar" in post:
+            del post["gcal_calendar"]
+        new_text = frontmatter.dumps(post)
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+        file_path.write_text(new_text, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        # Soft fail — the GCal event is gone, but our cleanup of the
+        # vault stale ID failed. Log + keep the success path so the
+        # caller still gets the cancelled outcome (the operator can
+        # re-run a janitor sweep to clean up the stale ID).
+        log.warning(
+            "gcal.sync_cancel_writeback_failed",
+            error=str(exc),
+            event_id=gcal_event_id,
+            path=str(file_path),
+            correlation_id=correlation_id,
+        )
+
+    log.info(
+        "gcal.sync_cancelled_via_delete",
+        event_id=gcal_event_id,
+        calendar_id=config.alfred_calendar_id,
+        path=str(file_path),
+        correlation_id=correlation_id,
+    )
+    return {
+        "cancelled": True,
+        "event_id": gcal_event_id,
+        "path": "delete",
+    }

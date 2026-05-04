@@ -406,6 +406,7 @@ async def run(
                 # ``sync_event_create_to_gcal`` via the
                 # ``_sync_event_to_gcal`` shim, no double-fire).
                 from alfred.integrations.gcal_sync import (
+                    sync_event_cancellation_to_gcal,
                     sync_event_create_to_gcal,
                     sync_event_delete_to_gcal,
                     sync_event_update_to_gcal,
@@ -463,9 +464,16 @@ async def run(
                     )
 
                 def _on_event_updated(vault_path_, rel_path, fm, fields_changed):
-                    """Vault-edit hook — three branches:
+                    """Vault-edit hook — four branches:
 
-                      * gcal_event_id present → PATCH (existing path)
+                      * status newly set to ``cancelled`` AND
+                        gcal_event_id present → CANCEL: delete the GCal
+                        mirror (or patch status=cancelled if the record
+                        carries ``gcal_keep_on_cancel: true``); on
+                        delete, clear ``gcal_event_id`` from the vault
+                        record so a future re-confirm starts fresh
+                      * gcal_event_id present → PATCH (regular field
+                        edit on an existing mirror)
                       * gcal_event_id absent BUT start+end present →
                         PROMOTE: push as fresh create, writeback ID
                         (the "first-sync via edit" case — common when
@@ -473,9 +481,10 @@ async def run(
                         predates Phase A+, or when a vault_create
                         landed a record without times that subsequently
                         got them via vault_edit)
-                      * otherwise (no datetimes) → no-op; the GCal sync
-                        functions short-circuit on missing fields too,
-                        but bailing here saves the import + log noise
+                      * otherwise (no datetimes, no cancel) → no-op;
+                        the GCal sync functions short-circuit on missing
+                        fields too, but bailing here saves the import +
+                        log noise
 
                     The promotion branch invokes
                     ``sync_event_create_to_gcal`` rather than the update
@@ -486,11 +495,41 @@ async def run(
                     gcal_event_id was set, so no prior mirror exists)
                     and (2) frontmatter writeback of the new ID
                     (which is exactly what we want).
+
+                    The cancel branch goes FIRST — a cancellation edit
+                    on a synced event should never fall into the patch
+                    path (which would try to PATCH the event title /
+                    times after we've decided to delete it). The cancel
+                    branch is also gated on ``"status" in fields_changed``
+                    so an edit that doesn't touch status (but the record
+                    was already cancelled from a prior edit) doesn't
+                    re-fire the cancel sync.
                     """
                     from datetime import datetime as _dt
                     gcal_event_id = str(fm.get("gcal_event_id") or "")
                     start_raw = fm.get("start")
                     end_raw = fm.get("end")
+
+                    # CANCEL path — vault_edit set status=cancelled this
+                    # edit, AND we have a GCal mirror to act on.
+                    status_now = str(fm.get("status") or "").strip().lower()
+                    if (
+                        "status" in fields_changed
+                        and status_now == "cancelled"
+                        and gcal_event_id
+                    ):
+                        keep_on_cancel = bool(fm.get("gcal_keep_on_cancel"))
+                        file_path = Path(vault_path_) / rel_path
+                        sync_event_cancellation_to_gcal(
+                            client=_bound_client,
+                            config=_bound_config,
+                            intended_on=_bound_intended_on,
+                            file_path=file_path,
+                            gcal_event_id=gcal_event_id,
+                            keep_on_cancel=keep_on_cancel,
+                            correlation_id=str(fm.get("correlation_id") or ""),
+                        )
+                        return
 
                     # Promotion path — first-sync via edit.
                     if not gcal_event_id and start_raw and end_raw:

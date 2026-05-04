@@ -547,6 +547,7 @@ class GCalClient:
         title: str | None = None,
         description: str | None = None,
         time_zone: str | None = None,
+        status: str | None = None,
     ) -> GCalEvent | None:
         """Patch an existing event. Returns the updated :class:`GCalEvent`.
 
@@ -561,6 +562,13 @@ class GCalClient:
         ``start`` / ``end`` must be tz-aware when provided. ``time_zone``
         is optional — when set, applied to both start + end blocks (only
         the ones being patched).
+
+        ``status`` is the GCal event-status field — accepted values are
+        ``"confirmed"``, ``"tentative"``, and ``"cancelled"``. Patching
+        ``status="cancelled"`` keeps the event visible on the calendar
+        (struck through) instead of removing it. This is the
+        ``gcal_keep_on_cancel: true`` path of the vault-edit cancel
+        hook; the default cancel path uses ``delete_event`` instead.
         """
         if start is not None and start.tzinfo is None:
             raise GCalAPIError(
@@ -574,12 +582,21 @@ class GCalClient:
             raise GCalAPIError(
                 "update_event: end must be strictly after start",
             )
+        if status is not None and status not in (
+            "confirmed", "tentative", "cancelled",
+        ):
+            raise GCalAPIError(
+                f"update_event: status must be one of confirmed/tentative/"
+                f"cancelled, got {status!r}",
+            )
 
         body: dict[str, Any] = {}
         if title is not None:
             body["summary"] = title
         if description is not None:
             body["description"] = description
+        if status is not None:
+            body["status"] = status
         if start is not None:
             body["start"] = {"dateTime": start.isoformat()}
             if time_zone:
