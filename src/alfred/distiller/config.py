@@ -193,6 +193,45 @@ class AnthropicConfig:
 
 
 @dataclass
+class RadarDayConfig:
+    """Daily radar auto-fire — Phase 3a CLI on a scheduler.
+
+    When ``enabled: true``, the orchestrator spawns a daemon that fires
+    ``run_daily_radar`` once per day at ``schedule.time`` in the
+    configured timezone. The daily file lands at
+    ``<vault>/digests/daily/YYYY-MM-DD.md`` per Phase 3a; the surfaced-
+    log dedup guarantees an item that surfaced earlier in the week
+    doesn't re-surface.
+
+    Default schedule (08:00 ADT) sits 1h ahead of KAL-LE's Daily Sync
+    at 09:00 ADT so the radar provider has a freshly-written daily
+    file to read. It also sits ~4.5h after the 03:30 distiller
+    deep_extraction so the latest synthesis records are eligible.
+
+    ``enabled`` defaults to False so instances that don't run radar
+    (Salem, Hypatia today) stay unaffected; only KAL-LE flips it on
+    in its config.
+    """
+
+    enabled: bool = False
+    schedule: ScheduleConfig = field(
+        default_factory=lambda: ScheduleConfig(
+            time="08:00", timezone="America/Halifax",
+        )
+    )
+    # Optional overrides for the inner ``run_daily_radar`` call.
+    # Defaults match the Phase 3a CLI defaults.
+    top_n: int = 5
+    min_score: float | None = None
+    # Optional digests-dir override; default is ``<vault>/digests``
+    # resolved at run time so the daemon doesn't need vault path here.
+    digests_dir: str = ""
+    # Optional state-dir override; default is the parent of
+    # ``distiller.state.path`` resolved at run time.
+    state_dir: str = ""
+
+
+@dataclass
 class IdleTickConfig:
     """Distiller idle-tick heartbeat — "intentionally left blank" liveness signal.
 
@@ -234,6 +273,10 @@ class DistillerConfig:
     # via the dataclass default_factory; absent block in YAML keeps
     # ``enabled=True`` / ``interval_seconds=60``.
     idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
+    # Daily radar auto-fire — see :class:`RadarDayConfig`. Defaulted-off
+    # via the dataclass default; instances that want auto-fire opt in
+    # via ``distiller.radar_day.enabled: true`` in their config.
+    radar_day: RadarDayConfig = field(default_factory=RadarDayConfig)
 
 
 # --- Recursive builder ---
@@ -251,6 +294,15 @@ _DATACLASS_MAP: dict[str, type] = {
     "state": StateConfig,
     "logging": LoggingConfig,
     "idle_tick": IdleTickConfig,
+    "radar_day": RadarDayConfig,
+    # Reuse the same ScheduleConfig key for the radar_day nested schedule
+    # block — recursive _build dispatches by KEY name, not parent context,
+    # so the existing "schedule" → ScheduleConfig mapping covers
+    # extraction.deep_extraction_schedule, daily_sync.schedule, AND
+    # radar_day.schedule. Adding "schedule" here makes that explicit
+    # rather than relying on the side-effect of the other schedule
+    # entries.
+    "schedule": ScheduleConfig,
 }
 
 
@@ -311,4 +363,11 @@ def load_from_unified(raw: dict[str, Any]) -> DistillerConfig:
     idle_raw = tool.get("idle_tick")
     if isinstance(idle_raw, dict):
         built["idle_tick"] = idle_raw
+    # Radar-day auto-fire — defaulted-OFF; partial dict merges over the
+    # dataclass default so an instance config that just sets
+    # ``radar_day: { enabled: true }`` picks up the 08:00 ADT default
+    # schedule without re-stating it.
+    radar_day_raw = tool.get("radar_day")
+    if isinstance(radar_day_raw, dict):
+        built["radar_day"] = radar_day_raw
     return _build(DistillerConfig, built)

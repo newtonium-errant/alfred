@@ -312,6 +312,39 @@ def _run_digest(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     asyncio.run(run_dg_daemon(config, raw))
 
 
+def _run_radar_day(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """Daily radar daemon entry — auto-fires Phase 3a's run_daily_radar.
+
+    Per-instance auto-start: any instance with
+    ``distiller.radar_day.enabled: true`` runs this daemon. Default
+    fire 08:00 ADT — 1h ahead of the Daily Sync at 09:00 ADT so the
+    radar provider has a freshly-written daily file.
+
+    Exit code 78 (orchestrator's "not configured" convention) when
+    the block is absent / disabled so auto-restart skips us.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/radar_day.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    from alfred.brief.utils import setup_logging
+    setup_logging(
+        level=log_cfg.get("level", "INFO"),
+        log_file=log_file,
+        suppress_stdout=suppress_stdout,
+    )
+    from alfred.distiller.config import load_from_unified as load_distiller
+    from alfred.distiller.radar_day_daemon import run_daemon as run_rd_daemon
+    config = load_distiller(raw)
+    if not config.radar_day.enabled:
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("radar_day.daemon.disabled_in_config")
+        sys.exit(78)
+    asyncio.run(run_rd_daemon(config))
+
+
 def _run_pending_items_pusher(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Pending Items Queue periodic-flush daemon.
 
@@ -493,6 +526,7 @@ TOOL_RUNNERS = {
     "brief_digest_push": _run_brief_digest_push,
     "digest": _run_digest,
     "pending_items_pusher": _run_pending_items_pusher,
+    "radar_day": _run_radar_day,
 }
 
 
@@ -593,6 +627,17 @@ def run_all(
         # local queue to Salem's aggregate.
         if "pending_items" in raw and (raw.get("pending_items") or {}).get("enabled"):
             tools.append("pending_items_pusher")
+        # Daily radar auto-fire (distiller-radar Phase 3a → 3b feeder).
+        # Auto-starts when ``distiller.radar_day:`` block is present
+        # AND ``enabled: true``. KAL-LE is the first instance to flip
+        # this on; Salem / Hypatia leave it absent (no radar corpus).
+        # Nested under ``distiller`` because it's a distiller subsystem
+        # — same vault, same state-dir, same scoring formula.
+        radar_day_block = (
+            (raw.get("distiller") or {}).get("radar_day") or {}
+        )
+        if radar_day_block.get("enabled"):
+            tools.append("radar_day")
 
         if skipped:
             import structlog
@@ -653,7 +698,7 @@ def run_all(
         # Tools whose runner signature is ``(raw, suppress_stdout)`` (no
         # skills_dir). BIT has no skill prompts — it drives the
         # aggregator directly — so it lives in this bucket.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "pending_items_pusher"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "pending_items_pusher", "radar_day"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")
