@@ -621,3 +621,225 @@ async def test_run_turn_failure_log_emitted_with_diagnostic_fields(
     assert log_entry["tool_use_id"] == "t1"
     assert log_entry["error_class"] == "OSError"  # IOError is OSError alias
     assert "disk full" in log_entry["error"]
+
+
+# ---------------------------------------------------------------------------
+# Cancellation flushes the FULL tool_use set (P0 from QA 2026-05-04)
+# ---------------------------------------------------------------------------
+#
+# Pre-fix: CancelledError handler appended a synthetic tool_result for
+# only the cancelled tool, then re-raised. Tools AFTER the cancelled
+# one never got iterated → tool_use ids dangling on the next API call
+# → heal fired and the LLM read the heal's "interrupted before
+# completing" wording back to Andrew as a NEW symptom (the recurrence
+# Andrew saw 8+ times in his Hypatia DJ-tracker conversation between
+# 19:28-19:30 UTC despite yesterday's fix).
+#
+# Post-fix: the cancel handler synthesises tool_results for EVERY
+# remaining tool_use id in the assistant turn before re-raising.
+
+
+async def test_cancellation_mid_loop_synthesizes_all_unprocessed(
+    tmp_path, monkeypatch,
+):
+    """Assistant turn with 5 tool_use blocks; the 2nd raises
+    CancelledError. The flushed tool_results must contain ALL 5
+    blocks: 1 real success (t1) + 1 cancelled-synthetic (t2) +
+    3 unprocessed-synthetic (t3, t4, t5). No dangling ids; the
+    next run_turn's heal must NOT fire on this transcript.
+    """
+    import asyncio
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+    ids = [f"t{i}" for i in range(1, 6)]
+    tool_use_response = FakeResponse(
+        content=[
+            FakeBlock(
+                type="tool_use", id=tid, name="vault_search",
+                input={"query": tid},
+            )
+            for tid in ids
+        ],
+        stop_reason="tool_use",
+    )
+    client = FakeAnthropicClient([tool_use_response])
+
+    async def _stub_execute(tool_name, tool_input, *args, **kwargs):
+        if tool_input.get("query") == "t2":
+            raise asyncio.CancelledError()
+        return '{"ok": true}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    with pytest.raises(asyncio.CancelledError):
+        await conversation.run_turn(
+            client=client,
+            state=state_mgr,
+            session=session,
+            user_message="run all 5",
+            config=config,
+            vault_context_str="",
+            system_prompt="test",
+        )
+
+    # Transcript: user, assistant (5 tool_use), user (5 tool_results).
+    assert len(session.transcript) == 3
+    tool_results_msg = session.transcript[2]
+    assert tool_results_msg["role"] == "user"
+    blocks = tool_results_msg["content"]
+    assert len(blocks) == 5, (
+        f"Expected 5 tool_results (1 success + 1 cancelled + "
+        f"3 un-iterated), got {len(blocks)}: "
+        f"{[b['tool_use_id'] for b in blocks]}"
+    )
+
+    by_id = {b["tool_use_id"]: b for b in blocks}
+    # t1 succeeded (no is_error, real content).
+    assert by_id["t1"].get("is_error", False) is False
+    # t2 cancelled (the one that raised).
+    assert by_id["t2"]["is_error"] is True
+    assert "cancelled" in by_id["t2"]["content"].lower()
+    # t3, t4, t5 are un-iterated cancellation synthetics.
+    for tid in ("t3", "t4", "t5"):
+        assert by_id[tid]["is_error"] is True
+        assert "cancelled before this tool ran" in by_id[tid]["content"], (
+            f"{tid} should carry the un-iterated-tail wording, "
+            f"got: {by_id[tid]['content']!r}"
+        )
+
+    # The heal MUST be a no-op on this transcript — every tool_use
+    # has a matching tool_result, so _heal_dangling_tool_use returns
+    # the input unchanged. This is the load-bearing assertion: the
+    # whole point of the cancellation-flush fix is that the next
+    # API call doesn't need the heal at all.
+    api_messages = _messages_for_api(session.transcript)
+    healed = _heal_dangling_tool_use(api_messages)
+    assert healed == api_messages, (
+        "Heal added blocks even though the cancellation handler "
+        "should have flushed a complete tool_results set. The fix "
+        "didn't close the dangling-ids gap."
+    )
+
+
+async def test_cancellation_with_no_remaining_tools(tmp_path, monkeypatch):
+    """Edge: assistant with 2 tool_use, the 2nd (last) raises
+    CancelledError. There are no un-iterated tools after it, so the
+    flushed set is exactly 2 results (1 success + 1 cancelled).
+    Backward-compat with the existing
+    ``test_run_turn_propagates_cancelled_after_flushing_partial``
+    behaviour — the new fix must NOT add extra synthetics when
+    nothing's un-iterated."""
+    import asyncio
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+    tool_use_response = FakeResponse(
+        content=[
+            FakeBlock(
+                type="tool_use", id="t1", name="vault_search",
+                input={"query": "x"},
+            ),
+            FakeBlock(
+                type="tool_use", id="t2", name="vault_search",
+                input={"query": "y"},
+            ),
+        ],
+        stop_reason="tool_use",
+    )
+    client = FakeAnthropicClient([tool_use_response])
+
+    async def _stub_execute(tool_name, tool_input, *args, **kwargs):
+        if tool_input.get("query") == "y":
+            raise asyncio.CancelledError()
+        return '{"ok": true}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    with pytest.raises(asyncio.CancelledError):
+        await conversation.run_turn(
+            client=client,
+            state=state_mgr,
+            session=session,
+            user_message="run them",
+            config=config,
+            vault_context_str="",
+            system_prompt="test",
+        )
+
+    blocks = session.transcript[2]["content"]
+    # Exactly 2 — no extra unprocessed synthetics added when there's
+    # nothing un-iterated.
+    assert len(blocks) == 2
+    by_id = {b["tool_use_id"]: b for b in blocks}
+    assert "t1" in by_id and "t2" in by_id
+    assert by_id["t2"]["is_error"] is True
+    assert "cancelled" in by_id["t2"]["content"].lower()
+    # The cancelled block must use the original wording (not the
+    # un-iterated-tail wording) since it IS the tool that raised.
+    assert "cancelled before this tool ran" not in by_id["t2"]["content"]
+
+
+async def test_cancellation_flush_emits_diagnostic_log(
+    tmp_path, monkeypatch,
+):
+    """The cancel handler must emit
+    ``talker.tool.cancellation_flushed_full_set`` with the count of
+    un-iterated tools synthesised. Operator greps this to confirm
+    the flush ran AND to see how many tools were stranded."""
+    import asyncio
+    from structlog.testing import capture_logs
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+    ids = [f"t{i}" for i in range(1, 5)]  # t1..t4
+    tool_use_response = FakeResponse(
+        content=[
+            FakeBlock(
+                type="tool_use", id=tid, name="vault_search",
+                input={"query": tid},
+            )
+            for tid in ids
+        ],
+        stop_reason="tool_use",
+    )
+    client = FakeAnthropicClient([tool_use_response])
+
+    async def _stub_execute(tool_name, tool_input, *args, **kwargs):
+        if tool_input.get("query") == "t2":
+            raise asyncio.CancelledError()
+        return '{"ok": true}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    with capture_logs() as captured:
+        with pytest.raises(asyncio.CancelledError):
+            await conversation.run_turn(
+                client=client,
+                state=state_mgr,
+                session=session,
+                user_message="run",
+                config=config,
+                vault_context_str="",
+                system_prompt="test",
+            )
+
+    flush_logs = [
+        c for c in captured
+        if c.get("event") == "talker.tool.cancellation_flushed_full_set"
+    ]
+    assert len(flush_logs) == 1
+    entry = flush_logs[0]
+    assert entry["log_level"] == "warning"
+    assert entry["cancelled_tool_use_id"] == "t2"
+    # 4 total in the turn; t1 already resulted; t2 cancelled →
+    # remaining un-iterated = [t3, t4].
+    assert entry["unprocessed_tool_use_ids"] == ["t3", "t4"]
+    assert entry["unprocessed_count"] == 2
+    assert entry["total_tool_use_ids_in_turn"] == 4

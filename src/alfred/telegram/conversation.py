@@ -1779,6 +1779,23 @@ async def run_turn(
             # different tool, retry with different args). The
             # transcript stays well-formed; the next API call
             # succeeds.
+            # Pre-collect every tool_use id in this assistant turn so
+            # the cancellation handler can synthesize tool_results for
+            # the un-iterated tail (P0 from QA 2026-05-04). Pre-fix:
+            # CancelledError flushed only the cancelled tool's
+            # synthetic + tools BEFORE it; tools AFTER it never got
+            # iterated → tool_use ids dangling on next API call →
+            # heal fired and the LLM read the heal's "interrupted
+            # before completing" wording back to Andrew as a NEW
+            # symptom. Post-fix: complete the partial tool_results
+            # set with synthetic-cancelled blocks for every remaining
+            # tool_use id before re-raising.
+            all_tool_use_ids: list[str] = [
+                getattr(b, "id", "")
+                for b in response.content
+                if getattr(b, "type", None) == "tool_use"
+                and getattr(b, "id", "")
+            ]
             tool_results: list[dict[str, Any]] = []
             for block in response.content:
                 btype = getattr(block, "type", None)
@@ -1805,10 +1822,21 @@ async def run_turn(
                     is_error = False
                 except asyncio.CancelledError:
                     # Re-raise — daemon shutdown / task cancellation
-                    # must propagate. We append a synthetic
-                    # tool_result first so the partial transcript is
+                    # must propagate. Before raising, complete the
+                    # tool_results set so the persisted transcript is
                     # well-formed when the daemon comes back up and
                     # rehydrates.
+                    #
+                    # Append the cancelled tool's synthetic FIRST,
+                    # THEN walk the remaining (un-iterated) tool_use
+                    # ids and synthesize "cancelled" results for each.
+                    # Without the second step, every tool AFTER the
+                    # cancelled one in this assistant turn dangles,
+                    # the next run_turn's heal fires for them, and
+                    # the LLM parrots the heal's "interrupted before
+                    # completing" content back to the user as a new
+                    # symptom (the operator-confusing recurrence
+                    # this commit closes).
                     log.warning(
                         "talker.tool.cancelled",
                         iteration=iteration,
@@ -1825,7 +1853,44 @@ async def run_turn(
                         ),
                         "is_error": True,
                     })
-                    # Still flush the partial tool_results so the
+                    # Synthesize cancelled-results for every tool_use
+                    # id AFTER the cancelled one (anything not yet
+                    # in tool_results).
+                    already_resulted_ids = {
+                        r["tool_use_id"] for r in tool_results
+                        if isinstance(r, dict) and r.get("tool_use_id")
+                    }
+                    unprocessed_ids = [
+                        tid for tid in all_tool_use_ids
+                        if tid not in already_resulted_ids
+                    ]
+                    for un_tid in unprocessed_ids:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": un_tid,
+                            "content": (
+                                "Tool execution was cancelled before "
+                                "this tool ran (preceding tool in the "
+                                "same turn was cancelled). Result "
+                                "unavailable."
+                            ),
+                            "is_error": True,
+                        })
+                    log.warning(
+                        "talker.tool.cancellation_flushed_full_set",
+                        iteration=iteration,
+                        cancelled_tool_use_id=tool_use_id,
+                        unprocessed_tool_use_ids=unprocessed_ids,
+                        unprocessed_count=len(unprocessed_ids),
+                        total_tool_use_ids_in_turn=len(all_tool_use_ids),
+                        detail=(
+                            "Synthesised tool_result blocks for the "
+                            "un-iterated tail of the assistant turn so "
+                            "no tool_use id dangles after re-raise. "
+                            "Closes the heal-firing-on-restart symptom."
+                        ),
+                    )
+                    # Flush the COMPLETE tool_results set so the
                     # transcript is well-formed before re-raising.
                     append_turn(state, session, "user", tool_results)
                     raise
