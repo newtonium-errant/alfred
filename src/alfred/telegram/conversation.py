@@ -142,8 +142,12 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
                     "type": "object",
                     "description": (
                         "Frontmatter fields to set, e.g. "
-                        "``{\"status\": \"todo\", \"due\": \"2026-05-01\"}``."
+                        "``{\"status\": \"todo\", \"due\": \"2026-05-01\"}``. "
+                        "MUST NOT contain ``body`` — body content goes in "
+                        "the top-level ``body`` parameter below, not as a "
+                        "frontmatter field."
                     ),
+                    "not": {"required": ["body"]},
                 },
                 "body": {
                     "type": "string",
@@ -157,8 +161,9 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
         "name": "vault_edit",
         "description": (
             "Edit an existing vault record. Use ``set_fields`` to overwrite "
-            "frontmatter, ``append_fields`` to add to list fields, and "
-            "``body_append`` to append Markdown to the body."
+            "frontmatter (NOT ``body`` — that goes through ``body_append``), "
+            "``append_fields`` to add to list fields, and ``body_append`` to "
+            "append Markdown to the body."
         ),
         "input_schema": {
             "type": "object",
@@ -169,7 +174,14 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
                 },
                 "set_fields": {
                     "type": "object",
-                    "description": "Frontmatter fields to overwrite.",
+                    "description": (
+                        "Frontmatter fields to overwrite. MUST NOT contain "
+                        "``body`` — that's a markdown-content concept, not "
+                        "a frontmatter field. Use ``body_append`` for body "
+                        "edits. The vault-ops gate strips ``body`` keys "
+                        "from this dict and emits a warning if present."
+                    ),
+                    "not": {"required": ["body"]},
                 },
                 "append_fields": {
                     "type": "object",
@@ -224,7 +236,11 @@ _KALLE_VAULT_CREATE_TOOL = {
             },
             "set_fields": {
                 "type": "object",
-                "description": "Frontmatter fields to set.",
+                "description": (
+                    "Frontmatter fields to set. MUST NOT contain ``body`` — "
+                    "body content goes in the top-level ``body`` parameter."
+                ),
+                "not": {"required": ["body"]},
             },
             "body": {
                 "type": "string",

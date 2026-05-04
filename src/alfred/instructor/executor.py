@@ -157,13 +157,20 @@ VAULT_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "vault_create",
-        "description": "Create a new vault record. Input: {type, name, set_fields?, body?}.",
+        "description": (
+            "Create a new vault record. Input: {type, name, set_fields?, "
+            "body?}. NOTE: ``body`` is a TOP-LEVEL parameter, NOT a "
+            "frontmatter field — never put ``body`` in ``set_fields``."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "type": {"type": "string"},
                 "name": {"type": "string"},
-                "set_fields": {"type": "object"},
+                "set_fields": {
+                    "type": "object",
+                    "not": {"required": ["body"]},
+                },
                 "body": {"type": "string"},
             },
             "required": ["type", "name"],
@@ -173,13 +180,17 @@ VAULT_TOOLS: list[dict[str, Any]] = [
         "name": "vault_edit",
         "description": (
             "Edit an existing vault record. Input: {path, set_fields?, "
-            "append_fields?, body_append?}."
+            "append_fields?, body_append?}. NOTE: body content goes "
+            "through ``body_append`` — never put ``body`` in ``set_fields``."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "set_fields": {"type": "object"},
+                "set_fields": {
+                    "type": "object",
+                    "not": {"required": ["body"]},
+                },
                 "append_fields": {"type": "object"},
                 "body_append": {"type": "string"},
             },

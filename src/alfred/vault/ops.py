@@ -348,6 +348,70 @@ def _validate_required_fields(fm: dict) -> None:
             raise VaultError(f"Missing required field: {req}")
 
 
+# Frontmatter field names that MUST NEVER be written into YAML
+# frontmatter via ``set_fields``. These keys overlap with structural
+# concepts that have a separate write path (``body=`` for the
+# document body, ``body_append=`` / ``body_rewriter=`` for edits) and
+# leak content corruption into ``vault_read`` consumers when an agent
+# mis-routes them.
+#
+# Bug class (P1 from QA 2026-05-04): Hypatia in the DJ-tracker
+# conversation called ``vault_edit(set_fields={"body": "..."})``
+# instead of ``body_append=...`` (vault_edit's schema declares
+# ``body_append`` not ``body``; vault_create declares ``body`` at
+# top level — easy LLM confusion). The literal "body" key landed in
+# YAML frontmatter, ``vault_read`` returned frontmatter containing a
+# stale ``body`` field that didn't match the on-disk markdown body,
+# downstream consumers (distiller scoring, surveyor entity_links)
+# saw confused ground-truth.
+#
+# Fix is at the vault-ops gate so EVERY caller (talker, instructor,
+# capture, calibration, future agents) gets the protection without
+# each call site re-implementing the filter.
+_FRONTMATTER_RESERVED_KEYS: frozenset[str] = frozenset({"body"})
+
+
+def _filter_reserved_keys(
+    set_fields: dict, *, op: str, rel_path: str = "",
+) -> dict:
+    """Strip reserved keys from ``set_fields`` and warn loudly.
+
+    Returns a NEW dict (does not mutate the input). Emits one
+    structured ``vault.ops.body_in_set_fields_filtered`` warning per
+    filtered key so an operator can grep for the regression class.
+    Mirrors the SDK quirk centralization principle: one filter at
+    the gate beats N defensive checks at every call site.
+    """
+    if not set_fields:
+        return set_fields or {}
+    filtered: dict = {}
+    leaked_keys: list[str] = []
+    for k, v in set_fields.items():
+        if k in _FRONTMATTER_RESERVED_KEYS:
+            leaked_keys.append(k)
+            continue
+        filtered[k] = v
+    if leaked_keys:
+        log.warning(
+            "vault.ops.body_in_set_fields_filtered",
+            op=op,
+            rel_path=rel_path,
+            leaked_keys=leaked_keys,
+            detail=(
+                "Reserved frontmatter key(s) routed through set_fields "
+                "and stripped at the vault-ops gate. Body content "
+                "belongs in the body= (vault_create) or body_append= / "
+                "body_rewriter= (vault_edit) parameters, NOT in YAML "
+                "frontmatter. Likely an agent confusion between "
+                "vault_create's body= top-level arg and vault_edit's "
+                "body_append=. The write proceeded with the leaked "
+                "key dropped; the operator should review the calling "
+                "agent's prompt for body-handling guidance."
+            ),
+        )
+    return filtered
+
+
 def _check_directory(record_type: str, rel_path: str) -> str | None:
     """Return a warning string if file is in the wrong directory, else None."""
     expected_dir = TYPE_DIRECTORY.get(record_type)
@@ -657,6 +721,16 @@ def vault_create(
     """
     _validate_type(record_type, scope=scope)
     set_fields = set_fields or {}
+    # Strip reserved frontmatter keys before any downstream processing.
+    # Pre-filter rather than post-filter so the scope check sees the
+    # ACTUAL frontmatter shape that will land on disk; otherwise
+    # ``check_scope`` could approve a write whose payload contradicted
+    # the declared scope contract.
+    directory = TYPE_DIRECTORY.get(record_type, record_type)
+    rel_path_for_log = f"{directory}/{name}.md"
+    set_fields = _filter_reserved_keys(
+        set_fields, op="vault_create", rel_path=rel_path_for_log,
+    )
     if scope is not None:
         check_scope(
             scope,
@@ -666,9 +740,9 @@ def vault_create(
             body_write=body is not None,
         )
 
-    # Determine directory and path
-    directory = TYPE_DIRECTORY.get(record_type, record_type)
-    rel_path = f"{directory}/{name}.md"
+    # Determine directory and path (already computed above for the
+    # filter's log message — reuse so they don't drift).
+    rel_path = rel_path_for_log
     file_path = _resolve_vault_path(vault_path, rel_path)
 
     if file_path.exists():
@@ -794,6 +868,13 @@ def vault_edit(
     Optional ``scope`` runs ``check_scope`` before the write; default
     ``None`` preserves historical unrestricted behavior.
     """
+    # Strip reserved frontmatter keys before scope check + downstream
+    # processing. See ``_filter_reserved_keys`` for the rationale +
+    # bug-class history (Hypatia DJ-tracker conversation 2026-05-04).
+    if set_fields:
+        set_fields = _filter_reserved_keys(
+            set_fields, op="vault_edit", rel_path=rel_path,
+        )
     if scope is not None:
         fields_list = (
             list((set_fields or {}).keys()) + list((append_fields or {}).keys())
