@@ -1,7 +1,7 @@
 ---
 alfred_tags:
 - alfred/bit
-- logging/run
+- automation/logs
 created: '2026-04-24'
 description: Alfred built-in test (health sweep)
 janitor_note: LINK001 — frontmatter process target [[process/Alfred BIT]] does not
@@ -11,9 +11,7 @@ mode: quick
 name: Alfred BIT 2026-04-24
 overall_status: warn
 process: '[[process/Alfred BIT]]'
-related_orgs:
-- org/TIXR.md
-- org/Halifax Music Fest.md
+related_orgs: []
 started: '2026-04-24T05:55:01.888789-03:00'
 status: completed
 tags:

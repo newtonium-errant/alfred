@@ -2,28 +2,13 @@
 alfred_tags:
 - alfred/bit
 - automation/logs
-created: '2026-05-03'
+created: '2026-05-04'
 description: Alfred built-in test (health sweep)
-janitor_note: 'LINK001 — process target [[process/Alfred BIT]] does not exist; only
-  run records (process/Alfred BIT YYYY-MM-DD.md) exist. DIR001 — record has type=run
-  but lives in process/; deterministic flag for autofix. Same pattern as 2026-04-25
-  and 2026-04-26 records. Human action: create the parent process/Alfred BIT.md record
-  OR move run records to run/.'
 mode: quick
-name: Alfred BIT 2026-05-03
+name: Alfred BIT 2026-05-04
 overall_status: ok
 process: '[[process/Alfred BIT]]'
-related_persons:
-- person/Ben.md
-relationships:
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-05-03.md
-  source_anchor: run Alfred BIT 2026-05-03
-  target: process/Alfred BIT 2026-05-04.md
-  target_anchor: run Alfred BIT 2026-05-04
-  type: related-to
-started: '2026-05-03T05:55:02.709907-03:00'
+started: '2026-05-04T05:55:02.506206-03:00'
 status: completed
 tags:
 - bit
@@ -48,49 +33,49 @@ trigger: scheduled
 type: run
 ---
 
-# Alfred BIT 2026-05-03
+# Alfred BIT 2026-05-04
 
 Generated at 0555 ADT.
 
 ## Summary
 
 Alfred BIT (quick) — [ OK ]
-  started:  2026-05-03T08:55:00.142725+00:00
-  finished: 2026-05-03T08:55:02.709873+00:00
-  elapsed:  2567 ms
+  started:  2026-05-04T08:55:00.135337+00:00
+  finished: 2026-05-04T08:55:02.506169+00:00
+  elapsed:  2371 ms
 
-[ OK ] curator  (2032 ms)
+[ OK ] curator  (2042 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] inbox-dir — /home/andrew/alfred/vault/inbox
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (1023 ms) — count_tokens ok
+    [ OK ] anthropic-auth  (1098 ms) — count_tokens ok
 
-[ OK ] janitor  (979 ms)
+[ OK ] janitor  (1053 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] state-file — data/janitor_state.json
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (948 ms) — count_tokens ok
+    [ OK ] anthropic-auth  (1007 ms) — count_tokens ok
 
-[ OK ] distiller  (922 ms)
+[ OK ] distiller  (982 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] state-file — data/distiller_state.json
     [ OK ] candidate-threshold — 0.3
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (903 ms) — count_tokens ok
+    [ OK ] anthropic-auth  (919 ms) — count_tokens ok
 
-[ OK ] instructor  (733 ms)
+[ OK ] instructor  (766 ms)
     [ OK ] config-section — instructor section present
     [ OK ] state-path — data/instructor_state.json
     [ OK ] skill-file — /home/andrew/alfred/src/alfred/_bundled/skills/vault-instructor/SKILL.md
     [ OK ] pending-queue — pending queue length = 0
     [ OK ] retry-at-max — no records at max_retries=3
 
-[ OK ] surveyor  (191 ms)
+[ OK ] surveyor  (172 ms)
     [ OK ] ollama-reachable — HTTP 200
     [ OK ] milvus-lite — db: /home/andrew/alfred/data/milvus_lite.db
     [ OK ] openrouter-key — key set, model=qwen2.5:14b
 
-[ OK ] brief  (656 ms)
+[ OK ] brief  (430 ms)
     [ OK ] schedule-time — 06:00
     [ OK ] schedule-timezone — America/Halifax
     [ OK ] output-dir — /home/andrew/alfred/vault/run
@@ -100,15 +85,15 @@ Alfred BIT (quick) — [ OK ]
     [ OK ] account:live — andrew.newton@live.ca on imap-mail.outlook.com
     [ OK ] inbox-dir — /home/andrew/alfred/vault/inbox
 
-[ OK ] talker  (248 ms)
+[ OK ] talker  (386 ms)
     [ OK ] bot-token — token present (46 chars)
     [ OK ] allowed-users — 1 user(s) allowlisted
     [ OK ] stt-key — groq key present
     [ OK ] tts-key — elevenlabs key present (51 chars)
     [ OK ] capture-handler-registered — capture_batch + capture_extract modules importable
-    [ OK ] anthropic-auth  (203 ms) — count_tokens ok
+    [ OK ] anthropic-auth  (365 ms) — count_tokens ok
 
-[ OK ] transport  (166 ms)
+[ OK ] transport  (157 ms)
     [ OK ] config-section — transport section present
     [ OK ] token-configured — token length 64
     [ OK ] port-reachable — telegram_connected=True
@@ -128,8 +113,8 @@ Totals: ok=9 warn=0 fail=0 skip=0
 ```json
 {
   "mode": "quick",
-  "started_at": "2026-05-03T08:55:00.142725+00:00",
-  "finished_at": "2026-05-03T08:55:02.709873+00:00",
+  "started_at": "2026-05-04T08:55:00.135337+00:00",
+  "finished_at": "2026-05-04T08:55:02.506169+00:00",
   "overall_status": "ok",
   "tools": [
     {
@@ -167,7 +152,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 1023.3920820173807,
+          "latency_ms": 1097.9170810023788,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -175,7 +160,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 2032.3295360140037
+      "elapsed_ms": 2042.1667310001794
     },
     {
       "tool": "janitor",
@@ -212,7 +197,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 947.5463179987855,
+          "latency_ms": 1007.0457750116475,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -220,7 +205,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 979.0931530005764
+      "elapsed_ms": 1053.270906995749
     },
     {
       "tool": "distiller",
@@ -266,7 +251,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 903.4741809882689,
+          "latency_ms": 918.5467720089946,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -274,7 +259,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 921.9741440028884
+      "elapsed_ms": 982.3779359867331
     },
     {
       "tool": "instructor",
@@ -324,7 +309,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 733.1992750114296
+      "elapsed_ms": 765.8490730100311
     },
     {
       "tool": "surveyor",
@@ -363,7 +348,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 191.17937900591642
+      "elapsed_ms": 171.9192739983555
     },
     {
       "tool": "brief",
@@ -409,7 +394,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 656.339786015451
+      "elapsed_ms": 429.69066300429404
     },
     {
       "tool": "mail",
@@ -436,7 +421,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 0.08855698979459703
+      "elapsed_ms": 0.09220698848366737
     },
     {
       "tool": "talker",
@@ -490,7 +475,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 202.73652102332562,
+          "latency_ms": 364.9036719871219,
           "data": {
             "model": "claude-sonnet-4-6",
             "probe": "count_tokens"
@@ -498,7 +483,7 @@ Totals: ok=9 warn=0 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 248.3978479867801
+      "elapsed_ms": 386.4192299952265
     },
     {
       "tool": "transport",
@@ -626,10 +611,10 @@ Totals: ok=9 warn=0 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 165.52553899236955
+      "elapsed_ms": 156.94657401763834
     }
   ],
-  "elapsed_ms": 2567.1593500010204
+  "elapsed_ms": 2370.845568977529
 }
 ```
 

@@ -1,7 +1,7 @@
 ---
 alfred_tags:
 - alfred/bit
-- logging/run
+- automation/logs
 created: '2026-04-28'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — [[process/Alfred BIT]] parent process record does not exist
@@ -12,9 +12,7 @@ mode: quick
 name: Alfred BIT 2026-04-28
 overall_status: ok
 process: '[[process/Alfred BIT]]'
-related_orgs:
-- org/TIXR.md
-- org/Halifax Music Fest.md
+related_orgs: []
 started: '2026-04-28T05:55:04.029963-03:00'
 status: completed
 tags:

@@ -1,7 +1,7 @@
 ---
 alfred_tags:
 - alfred/bit
-- logging/run
+- automation/logs
 created: '2026-04-22'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — broken target [[process/Alfred BIT]]: no parent process record
@@ -12,9 +12,7 @@ mode: quick
 name: Alfred BIT 2026-04-22
 overall_status: warn
 process: '[[process/Alfred BIT]]'
-related_orgs:
-- org/TIXR.md
-- org/Halifax Music Fest.md
+related_orgs: []
 relationships:
 - confidence: 1
   context: Same Alfred BIT run series

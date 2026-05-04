@@ -1,16 +1,29 @@
 ---
 alfred_tags:
+- alfred/bit
 - automation/logs
-- testing/sessions
 created: '2026-05-02'
 description: Alfred built-in test (health sweep)
 mode: quick
 name: Alfred BIT 2026-05-02
 overall_status: ok
 process: '[[process/Alfred BIT]]'
-related_orgs:
-- org/TIXR.md
-- org/Halifax Music Fest.md
+related_orgs: []
+relationships:
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-02.md
+  source_anchor: run Alfred BIT 2026-05-02
+  target: process/Alfred BIT 2026-05-03.md
+  target_anchor: run Alfred BIT 2026-05-03
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-02.md
+  source_anchor: run Alfred BIT 2026-05-02
+  target: process/Alfred BIT 2026-05-04.md
+  target_anchor: run Alfred BIT 2026-05-04
+  type: related-to
 started: '2026-05-02T05:55:02.523225-03:00'
 status: completed
 tags:

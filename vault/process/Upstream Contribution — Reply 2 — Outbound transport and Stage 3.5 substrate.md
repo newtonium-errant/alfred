@@ -176,9 +176,7 @@ janitor_note: LINK001 — scanner false positives on distiller_learnings YAML-es
   awaiting autofix.
 project:
 - '[[project/Alfred]]'
-related_orgs:
-- org/TIXR.md
-- org/Halifax Music Fest.md
+related_orgs: []
 relationships:
 - confidence: 0.7
   context: Both mention Upstream Contribution stages.
