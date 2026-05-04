@@ -281,12 +281,33 @@ class TestVaultEditBodyReplace:
         self, tmp_vault: Path,
     ):
         """Janitor's allow_body_replace is empty — autofix-loop risk
-        per spec."""
+        per spec.
+
+        Two gates can fire here in priority order (see
+        ``test_scope_body_mutation.py`` for the full discussion):
+
+          1. ``allow_body_writes: False`` (existing rule) — fires
+             FIRST in ``check_scope`` because body-write rejection
+             precedes the operation-permission check. Message: "may
+             not write record body content".
+          2. ``allow_body_replace: {}`` (new rule, this commit arc)
+             — would fire IF allow_body_writes were True. Message:
+             "no allowlist".
+
+        Today gate #1 is the operative one. The forgiving
+        ``match="janitor"`` substring matches both gate paths so
+        the test survives a future widen of allow_body_writes
+        (the natural extension path documented in c1's commit body)
+        without needing a wording chase. The gate-priority pin
+        for the NEW gate's wording lives at
+        ``test_scope_body_mutation.py::
+        test_janitor_new_allowlist_gate_message_when_body_writes_widened``.
+        """
         vault_create(
             tmp_vault, "note", "Janitor Replace Test",
             body="# Old\n",
         )
-        with pytest.raises(ScopeError, match="no allowlist"):
+        with pytest.raises(ScopeError, match="janitor"):
             vault_edit(
                 tmp_vault, "note/Janitor Replace Test.md",
                 body_replace="# New\n",
