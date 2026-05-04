@@ -386,7 +386,25 @@ class Embedder:
         """
         chunks = _chunk_text(text)
         if len(chunks) == 1:
-            return await self._embed_single(chunks[0])
+            # Single-chunk fast path: skip pooling but ALSO L2-normalize
+            # the API-returned vector. Matches the multi-chunk path's
+            # output contract — ALL stored vectors must be unit length
+            # so downstream cosine-similarity computations (the daemon's
+            # entity-link gate, cluster scoring) use ``np.dot`` as the
+            # cosine. Without this normalization, single-chunk Ollama
+            # returns vectors with magnitudes well above 1 (observed
+            # ~16, dot products ~277), the daemon's threshold=0.85
+            # gate becomes meaningless, and the
+            # ``surveyor.entity_link_blocked_no_text_anchor`` log
+            # surfaces alarming similarity values.
+            single = await self._embed_single(chunks[0])
+            if single is None:
+                return None
+            arr = np.array(single, dtype=np.float32)
+            norm = float(np.linalg.norm(arr))
+            if norm > 0.0:
+                arr = arr / norm
+            return arr.tolist()
 
         log.info(
             "embedder.chunking",
