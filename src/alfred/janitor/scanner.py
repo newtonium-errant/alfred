@@ -87,6 +87,63 @@ def _decode_yaml_apostrophe(target: str) -> str:
     return target.replace("''", "'") if "''" in target else target
 
 
+def _normalize_wikilink_target_for_lookup(target: str) -> str:
+    """Normalize a wikilink target string for stem_index resolution.
+
+    Applied at every lookup site (LINK001 check, inbound_index build,
+    LINK002 frontmatter/body diff) so the same normalization rules
+    flow through every code path. Composes:
+
+    1. **YAML apostrophe decode** — ``''`` → ``'`` (see
+       :func:`_decode_yaml_apostrophe`). Required because YAML's
+       single-quoted scalar form escapes literal apostrophes by
+       doubling them, and the wikilink regex captures the raw text
+       before YAML decoding.
+
+    2. **Trailing ``.md`` strip** — ``[[session/Voice Note.md]]`` →
+       ``session/Voice Note``. Obsidian's resolver tolerates the
+       ``.md`` suffix and resolves to the same file as the
+       suffix-less form. The scanner used to look up the literal
+       captured text; with the suffix included, the lookup
+       effectively asked stem_index for ``...md.md`` and missed.
+       Constraint record (2026-05-01,
+       ``constraint/Janitor LINK001 Scanner Does Not Strip .md
+       Suffix From Wikilinks Before Resolving Targets``) documented
+       this as a high-volume false-positive class. Real false-pos
+       count on Salem's 920 false-positive-annotated records pre-fix.
+
+    3. **Anchor strip** — ``[[record#Section]]`` → ``record``. The
+       ``#anchor`` portion is an in-document jump destination, not
+       part of the file path. Obsidian resolves the file regardless
+       of the anchor; the scanner did the same when no anchor was
+       present and false-positived when one was. Low-volume on
+       Salem's vault (4 distinct patterns) but free to fix while
+       we're here, AND it matches the behavior the comment at the
+       LINK001 dispatch site implicitly assumes.
+
+    The order matters: apostrophe decode FIRST (so ``''`` doesn't
+    interfere with subsequent normalizations), then strip trailing
+    ``.md``, then drop the anchor. Empty strings pass through
+    untouched.
+    """
+    if not target:
+        return target
+    # 1. YAML apostrophe decode.
+    out = _decode_yaml_apostrophe(target)
+    # 2. Strip ``#anchor`` — split once, take the head. We strip the
+    # anchor BEFORE checking ``.md`` because anchors can sit between
+    # the path and the suffix in unusual cases (``[[X#Y.md]]``? not
+    # a real shape, but the order keeps us safe).
+    if "#" in out:
+        out = out.split("#", 1)[0]
+    # 3. Strip trailing ``.md``. Obsidian-tolerated suffix; without
+    # this strip, ``[[session/X.md]]`` lookup fails because stem_index
+    # only carries ``session/X`` (the rel-path-without-extension key).
+    if out.endswith(".md"):
+        out = out[:-3]
+    return out.strip()
+
+
 def _build_stem_index(vault_path: Path, ignore_dirs: set[str]) -> dict[str, set[str]]:
     """Map stem names to file relative paths for wikilink resolution.
 
@@ -140,12 +197,17 @@ def _build_inbound_index(
 
         links = extract_wikilinks(raw)
         for target in links:
-            # Resolve target to actual files. Decode YAML single-quote-
-            # doubled apostrophes (``Andrew''s`` → ``Andrew's``) so the
-            # inbound index sees the same key the on-disk file uses;
-            # otherwise records that link via apostrophe-bearing names
-            # never register inbound, inflating ORPHAN001.
-            resolved = stem_index.get(_decode_yaml_apostrophe(target), set())
+            # Resolve target to actual files via the shared
+            # normalization helper (YAML apostrophe decode + trailing
+            # ``.md`` strip + anchor strip). Without this normalization
+            # records that link via apostrophe-bearing names, paths
+            # carrying the ``.md`` suffix, or anchored wikilinks
+            # ``[[X#Section]]`` never register inbound — inflating
+            # ORPHAN001 false positives in parallel to the LINK001
+            # false positives the same normalization fixes downstream.
+            resolved = stem_index.get(
+                _normalize_wikilink_target_for_lookup(target), set(),
+            )
             for resolved_path in resolved:
                 inbound.setdefault(resolved_path, set()).add(rel_path)
 
@@ -363,12 +425,15 @@ def _check_record(
         # Skip Dataview base view references (e.g. "person.base#Decisions")
         if ".base" in target:
             continue
-        # Look up via the YAML-decoded form (``Andrew''s`` → ``Andrew's``)
-        # so apostrophe-bearing wikilinks emitted inside single-quoted
-        # YAML scalars resolve to the actual on-disk file. The raw
-        # ``target`` is kept for the user-visible LINK001 message so
-        # reviewers see exactly what the source file contained.
-        resolved = stem_index.get(_decode_yaml_apostrophe(target), set())
+        # Look up via the shared normalization helper (YAML apostrophe
+        # decode + trailing ``.md`` strip + ``#anchor`` strip) so
+        # wikilinks that vary along any of those axes still resolve to
+        # the same on-disk file Obsidian would. The raw ``target`` is
+        # kept for the user-visible LINK001 message so reviewers see
+        # exactly what the source file contained.
+        resolved = stem_index.get(
+            _normalize_wikilink_target_for_lookup(target), set(),
+        )
         if not resolved:
             issues.append(Issue(
                 code=IssueCode.BROKEN_WIKILINK,
@@ -382,15 +447,23 @@ def _check_record(
     # Obsidian Bases' file.hasLink(this.file) only checks frontmatter links,
     # so body-only entity links won't appear in base view tables.
     #
-    # Both sides of the body/frontmatter set difference go through
-    # ``_decode_yaml_apostrophe`` so apostrophe-bearing wikilinks aren't
-    # falsely flagged as body-only: the body shows ``Andrew's`` but the
-    # YAML re-serialization of frontmatter shows ``Andrew''s``, which
-    # would otherwise look like two distinct targets.
+    # Both sides of the body/frontmatter set difference go through the
+    # shared normalization helper (YAML apostrophe decode + trailing
+    # ``.md`` strip + ``#anchor`` strip) so the same target written in
+    # different forms across body and frontmatter (``[[X]]`` vs
+    # ``[[X.md]]`` vs ``[[X#Section]]``) collapses to one canonical
+    # key — otherwise the set difference falsely flags identical
+    # references as missing.
     _entity_dirs = set(TYPE_DIRECTORY.values())
     fm_text = _frontmatter_text(record.frontmatter)
-    fm_link_targets = {_decode_yaml_apostrophe(t) for t in extract_wikilinks(fm_text)}
-    body_links = {_decode_yaml_apostrophe(t) for t in extract_wikilinks(record.body)}
+    fm_link_targets = {
+        _normalize_wikilink_target_for_lookup(t)
+        for t in extract_wikilinks(fm_text)
+    }
+    body_links = {
+        _normalize_wikilink_target_for_lookup(t)
+        for t in extract_wikilinks(record.body)
+    }
     missing_from_fm = []
     for link in body_links - fm_link_targets:
         if "/" not in link:
