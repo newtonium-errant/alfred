@@ -180,8 +180,13 @@ VAULT_TOOLS: list[dict[str, Any]] = [
         "name": "vault_edit",
         "description": (
             "Edit an existing vault record. Input: {path, set_fields?, "
-            "append_fields?, body_append?}. NOTE: body content goes "
-            "through ``body_append`` — never put ``body`` in ``set_fields``."
+            "append_fields?, body_append?, body_insert_at?, body_replace?}. "
+            "Body content uses exactly ONE of body_append (end-of-doc), "
+            "body_insert_at (anchored mid-doc; {marker, position, content} "
+            "with line-exact marker), or body_replace (full rewrite). "
+            "Mutually exclusive — at most one body kwarg per call. "
+            "NOTE: body content NEVER goes in set_fields (that's a "
+            "frontmatter-only field)."
         ),
         "input_schema": {
             "type": "object",
@@ -193,8 +198,59 @@ VAULT_TOOLS: list[dict[str, Any]] = [
                 },
                 "append_fields": {"type": "object"},
                 "body_append": {"type": "string"},
+                "body_insert_at": {
+                    "type": "object",
+                    "properties": {
+                        "marker": {"type": "string"},
+                        "position": {
+                            "type": "string",
+                            "enum": ["before", "after"],
+                        },
+                        "content": {"type": "string"},
+                    },
+                    "required": ["marker", "position", "content"],
+                },
+                "body_replace": {"type": "string"},
             },
             "required": ["path"],
+            "oneOf": [
+                {
+                    "not": {
+                        "anyOf": [
+                            {"required": ["body_append"]},
+                            {"required": ["body_insert_at"]},
+                            {"required": ["body_replace"]},
+                        ],
+                    },
+                },
+                {
+                    "required": ["body_append"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["body_insert_at"]},
+                            {"required": ["body_replace"]},
+                        ],
+                    },
+                },
+                {
+                    "required": ["body_insert_at"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["body_append"]},
+                            {"required": ["body_replace"]},
+                        ],
+                    },
+                },
+                {
+                    "required": ["body_replace"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["body_append"]},
+                            {"required": ["body_insert_at"]},
+                        ],
+                    },
+                },
+            ],
         },
     },
     {
@@ -377,13 +433,33 @@ def _dispatch_tool(
             append_fields = tool_input.get("append_fields") if isinstance(
                 tool_input.get("append_fields"), dict
             ) else None
+            body_insert_at_raw = tool_input.get("body_insert_at")
+            body_replace_raw = tool_input.get("body_replace")
+            body_insert_at: dict | None = (
+                dict(body_insert_at_raw)
+                if isinstance(body_insert_at_raw, dict) else None
+            )
+            body_replace: str | None = (
+                str(body_replace_raw)
+                if body_replace_raw else None
+            )
             # Calibration audit gap (c4): wrap a body_append fragment
             # in inferred markers + carry forward any existing
             # attribution_audit entries on the target record.
+            #
+            # body_insert_at + body_replace (P1 c3 from QA 2026-05-04):
+            # the same attribution wrapping applies. body_insert_at
+            # wraps the ``content`` fragment; body_replace wraps the
+            # entire replacement.
             from alfred.vault import attribution
             sf_edit = dict(set_fields) if isinstance(set_fields, dict) else {}
             wrapped_append = body_append
-            if body_append and str(body_append).strip():
+            needs_attribution = bool(
+                (body_append and str(body_append).strip())
+                or body_replace
+                or (body_insert_at and body_insert_at.get("content"))
+            )
+            if needs_attribution:
                 # Read existing frontmatter to merge with prior audit
                 # entries — mirrors talker._execute_tool.
                 merged_fm: dict = {}
@@ -397,24 +473,74 @@ def _dispatch_tool(
                 except Exception:  # noqa: BLE001 — read failure shouldn't mask the underlying VaultError
                     pass
                 merged_fm.update(sf_edit)
-                # Section title — first heading in fragment, falling
-                # back to file stem.
-                section_title = "instructor-write"
-                for line in str(body_append).splitlines():
-                    s = line.strip()
-                    if s.startswith("#"):
-                        section_title = s.lstrip("#").strip() or section_title
-                        break
-                if section_title == "instructor-write" and rel_path:
-                    section_title = Path(rel_path).stem or section_title
                 src = session_path or "(no session)"
-                wrapped_append, audit_entry = attribution.with_inferred_marker(
-                    str(body_append),
-                    section_title=section_title,
-                    agent="instructor",
-                    reason=f"instructor directive (source={src})",
-                )
-                attribution.append_audit_entry(merged_fm, audit_entry)
+
+                def _section_title_from_fragment(fragment: str) -> str:
+                    section_title = "instructor-write"
+                    for line in fragment.splitlines():
+                        s = line.strip()
+                        if s.startswith("#"):
+                            section_title = (
+                                s.lstrip("#").strip() or section_title
+                            )
+                            break
+                    if section_title == "instructor-write" and rel_path:
+                        section_title = (
+                            Path(rel_path).stem or section_title
+                        )
+                    return section_title
+
+                if body_append and str(body_append).strip():
+                    section_title = _section_title_from_fragment(
+                        str(body_append),
+                    )
+                    wrapped_append, audit_entry = attribution.with_inferred_marker(
+                        str(body_append),
+                        section_title=section_title,
+                        agent="instructor",
+                        reason=f"instructor directive (source={src})",
+                    )
+                    attribution.append_audit_entry(merged_fm, audit_entry)
+                elif body_replace:
+                    section_title = (
+                        Path(rel_path).stem or "instructor-write"
+                    )
+                    wrapped_replace, audit_entry = attribution.with_inferred_marker(
+                        body_replace,
+                        section_title=section_title,
+                        agent="instructor",
+                        reason=(
+                            f"instructor directive body_replace "
+                            f"(source={src})"
+                        ),
+                    )
+                    attribution.append_audit_entry(merged_fm, audit_entry)
+                    body_replace = wrapped_replace
+                elif body_insert_at and body_insert_at.get("content"):
+                    insert_content = str(body_insert_at["content"])
+                    marker_for_title = str(
+                        body_insert_at.get("marker", "")
+                    )
+                    section_title = (
+                        _section_title_from_fragment(insert_content)
+                        if insert_content.strip().startswith("#")
+                        else (
+                            marker_for_title
+                            or Path(rel_path).stem
+                            or "instructor-write"
+                        )
+                    )
+                    wrapped_insert, audit_entry = attribution.with_inferred_marker(
+                        insert_content,
+                        section_title=section_title,
+                        agent="instructor",
+                        reason=(
+                            f"instructor directive body_insert_at "
+                            f"(source={src})"
+                        ),
+                    )
+                    attribution.append_audit_entry(merged_fm, audit_entry)
+                    body_insert_at["content"] = wrapped_insert
                 sf_edit = merged_fm
 
             result = ops.vault_edit(
@@ -423,6 +549,8 @@ def _dispatch_tool(
                 set_fields=sf_edit or None,
                 append_fields=append_fields,
                 body_append=wrapped_append,
+                body_insert_at=body_insert_at,
+                body_replace=body_replace,
             )
             mutated_paths.append(result["path"])
             log_mutation(

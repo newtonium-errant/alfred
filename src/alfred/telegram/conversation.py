@@ -160,10 +160,17 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
     {
         "name": "vault_edit",
         "description": (
-            "Edit an existing vault record. Use ``set_fields`` to overwrite "
-            "frontmatter (NOT ``body`` — that goes through ``body_append``), "
-            "``append_fields`` to add to list fields, and ``body_append`` to "
-            "append Markdown to the body."
+            "Edit an existing vault record. Frontmatter goes via "
+            "``set_fields`` (overwrite) or ``append_fields`` (add to "
+            "list fields). Body content goes via exactly ONE of: "
+            "``body_append`` (most common — add to end), "
+            "``body_insert_at`` (anchored mid-document insertion — "
+            "specific use case), or ``body_replace`` (full rewrite — "
+            "rare; explicit user request only). The four body-mutation "
+            "kwargs are MUTUALLY EXCLUSIVE — at most one per call. "
+            "``body_insert_at`` and ``body_replace`` are gated per-"
+            "instance × per-type (see scope matrix); some types and "
+            "scopes refuse them outright."
         ),
         "input_schema": {
             "type": "object",
@@ -189,10 +196,95 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
                 },
                 "body_append": {
                     "type": "string",
-                    "description": "Markdown to append to the body.",
+                    "description": (
+                        "Markdown to append to the END of the body. Most "
+                        "common body edit. Mutually exclusive with "
+                        "body_insert_at and body_replace."
+                    ),
+                },
+                "body_insert_at": {
+                    "type": "object",
+                    "description": (
+                        "Anchored mid-document insertion. ``marker`` is a "
+                        "LINE-EXACT match (the WHOLE line, not substring "
+                        "or regex — typically a heading like '## Section "
+                        "name'). ``position`` is 'before' or 'after'. "
+                        "``content`` is the markdown block to insert. "
+                        "Marker not found → clean error. Mutually "
+                        "exclusive with body_append and body_replace."
+                    ),
+                    "properties": {
+                        "marker": {"type": "string"},
+                        "position": {
+                            "type": "string",
+                            "enum": ["before", "after"],
+                        },
+                        "content": {"type": "string"},
+                    },
+                    "required": ["marker", "position", "content"],
+                },
+                "body_replace": {
+                    "type": "string",
+                    "description": (
+                        "Full body rewrite (frontmatter preserved). HIGH-"
+                        "RISK — use only when the user explicitly asks for "
+                        "a full rewrite. Per-instance × per-type allowlist "
+                        "applies. Salem ``event`` records with a synced "
+                        "GCal mirror REFUSE body_replace at the scope "
+                        "layer; vault_delete the event first to clear "
+                        "the GCal mirror, then create a fresh record. "
+                        "Mutually exclusive with body_append and "
+                        "body_insert_at."
+                    ),
                 },
             },
             "required": ["path"],
+            # Mutual exclusion of the four body-mutation kwargs at the
+            # JSON-schema layer — defense in depth above the runtime
+            # gate in vault_edit. ``oneOf`` here would force EXACTLY
+            # one, but vault_edit also accepts zero (frontmatter-only
+            # edits). So enumerate the valid shapes: zero body args,
+            # OR exactly one of the four. The Anthropic SDK's input-
+            # schema validation is hint-only (LLM is meant to honour
+            # it; runtime gate is load-bearing).
+            "oneOf": [
+                {
+                    "not": {
+                        "anyOf": [
+                            {"required": ["body_append"]},
+                            {"required": ["body_insert_at"]},
+                            {"required": ["body_replace"]},
+                        ],
+                    },
+                },
+                {
+                    "required": ["body_append"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["body_insert_at"]},
+                            {"required": ["body_replace"]},
+                        ],
+                    },
+                },
+                {
+                    "required": ["body_insert_at"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["body_append"]},
+                            {"required": ["body_replace"]},
+                        ],
+                    },
+                },
+                {
+                    "required": ["body_replace"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["body_append"]},
+                            {"required": ["body_insert_at"]},
+                        ],
+                    },
+                },
+            ],
         },
     },
 ]
@@ -1560,6 +1652,8 @@ async def _execute_tool(
         if tool_name == "vault_edit":
             append_fields = tool_input.get("append_fields")
             body_append = tool_input.get("body_append")
+            body_insert_at = tool_input.get("body_insert_at")
+            body_replace = tool_input.get("body_replace")
 
             # Attribution-marker wiring (calibration audit gap, c2). For
             # body_append, wrap ONLY the appended fragment — the existing
@@ -1567,8 +1661,22 @@ async def _execute_tool(
             # that already shipped). Merge the new audit entry with any
             # entries already on the record so prior inferred sections
             # aren't lost when this edit lands.
+            #
+            # body_insert_at + body_replace (P1 from QA 2026-05-04 c3):
+            # the same attribution wrapping applies to LLM-generated
+            # content from these new tools. body_insert_at wraps the
+            # ``content`` field (the inserted block); body_replace wraps
+            # the entire replacement body (it IS the inserted content).
             sf = dict(set_fields) if isinstance(set_fields, dict) else {}
-            if body_append:
+            needs_attribution = bool(
+                body_append
+                or body_replace
+                or (
+                    isinstance(body_insert_at, dict)
+                    and body_insert_at.get("content")
+                )
+            )
+            if needs_attribution:
                 # Read existing frontmatter so we can preserve prior
                 # attribution_audit entries. Read failures (file missing,
                 # malformed YAML) propagate as VaultError just like a
@@ -1587,16 +1695,56 @@ async def _execute_tool(
                 # Caller-supplied set_fields go on top of the merged base.
                 merged_fm.update(sf)
 
-                wrapped_append, audit_entry = attribution.with_inferred_marker(
-                    body_append,
-                    section_title=_section_title_for_edit_append(
-                        body_append, rel_path,
-                    ),
-                    agent=agent_slug_for(config),
-                    reason=_attribution_reason(session),
-                )
-                attribution.append_audit_entry(merged_fm, audit_entry)
-                body_append = wrapped_append
+                if body_append:
+                    wrapped_append, audit_entry = attribution.with_inferred_marker(
+                        body_append,
+                        section_title=_section_title_for_edit_append(
+                            body_append, rel_path,
+                        ),
+                        agent=agent_slug_for(config),
+                        reason=_attribution_reason(session),
+                    )
+                    attribution.append_audit_entry(merged_fm, audit_entry)
+                    body_append = wrapped_append
+                elif body_replace:
+                    # Full body rewrite — wrap the entire replacement.
+                    # Section title falls back to the file stem because
+                    # a full rewrite isn't bound to one section.
+                    wrapped_replace, audit_entry = attribution.with_inferred_marker(
+                        body_replace,
+                        section_title=Path(rel_path).stem or "body_replace",
+                        agent=agent_slug_for(config),
+                        reason=_attribution_reason(session),
+                    )
+                    attribution.append_audit_entry(merged_fm, audit_entry)
+                    body_replace = wrapped_replace
+                elif (
+                    isinstance(body_insert_at, dict)
+                    and body_insert_at.get("content")
+                ):
+                    # Mid-doc insertion — wrap the content fragment only.
+                    # Section title derived from the marker (typically a
+                    # heading) so the audit entry points at the right
+                    # location in the doc.
+                    insert_content = str(body_insert_at["content"])
+                    marker_for_title = str(body_insert_at.get("marker", ""))
+                    section_title = (
+                        _section_title_for_edit_append(
+                            insert_content, rel_path,
+                        )
+                        if insert_content.strip().startswith("#")
+                        else (marker_for_title or Path(rel_path).stem)
+                    )
+                    wrapped_insert, audit_entry = attribution.with_inferred_marker(
+                        insert_content,
+                        section_title=section_title,
+                        agent=agent_slug_for(config),
+                        reason=_attribution_reason(session),
+                    )
+                    attribution.append_audit_entry(merged_fm, audit_entry)
+                    # Rebuild body_insert_at with the wrapped content.
+                    body_insert_at = dict(body_insert_at)
+                    body_insert_at["content"] = wrapped_insert
                 sf = merged_fm
 
             result = ops.vault_edit(
@@ -1605,6 +1753,10 @@ async def _execute_tool(
                 set_fields=sf or None,
                 append_fields=append_fields if isinstance(append_fields, dict) else None,
                 body_append=body_append,
+                body_insert_at=(
+                    body_insert_at if isinstance(body_insert_at, dict) else None
+                ),
+                body_replace=body_replace if body_replace else None,
                 scope=active_scope,
             )
             append_vault_op(state, session, "edit", result["path"])
