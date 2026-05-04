@@ -721,6 +721,142 @@ def _heal_dangling_tool_use(
     return out
 
 
+# --- Startup dangling-tool_use detector (P2 from QA 2026-05-04) ----------
+
+
+def detect_dangling_tool_use_at_startup(
+    state: Any,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Walk every active session's transcript at daemon boot; emit a
+    structured warning per dangling tool_use detected.
+
+    Permanent observability — without this, the only operator-visible
+    tell that the talker wedged during a previous shutdown is the
+    LLM parroting the heal's "interrupted before completing" wording
+    back to the user on the NEXT turn. Detecting at startup lets an
+    operator grep for ``talker.conversation.startup_dangling_tool_use``
+    immediately after restart, before the user sees anything.
+
+    Per ``feedback_intentionally_left_blank.md``: emits a summary
+    info event ``talker.conversation.startup_dangling_tool_use_check_complete``
+    after the walk so a clean state is observably distinct from the
+    detector not having run.
+
+    Args:
+        state: A ``StateManager`` (duck-typed; we only access
+            ``state.state["active_sessions"]``).
+        now: Override for tests. Defaults to ``datetime.now(UTC)``.
+            Used to compute ``time_since_last_message_seconds``.
+
+    Returns:
+        Total count of dangling tool_use ids detected across all
+        sessions (summed over assistant turns).
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    if now is None:
+        now = _dt.now(_tz.utc)
+
+    sessions_state = {}
+    try:
+        sessions_state = state.state.get("active_sessions", {}) or {}
+    except AttributeError:
+        # Defensive — duck-typed input. Fall through to summary log.
+        sessions_state = {}
+
+    sessions_checked = 0
+    sessions_with_dangling = 0
+    total_dangling_ids = 0
+
+    for chat_id_str, raw in sessions_state.items():
+        sessions_checked += 1
+        if not isinstance(raw, dict):
+            continue
+        transcript = raw.get("transcript")
+        if not isinstance(transcript, list) or not transcript:
+            continue
+        session_id = raw.get("session_id", "")
+        last_message_iso = raw.get("last_message_at", "")
+
+        # Compute time-since-last-message for the diagnostic log.
+        time_since_seconds: float | None = None
+        if isinstance(last_message_iso, str) and last_message_iso:
+            try:
+                ts_str = (
+                    last_message_iso.replace("Z", "+00:00")
+                    if last_message_iso.endswith("Z") else last_message_iso
+                )
+                last_dt = _dt.fromisoformat(ts_str)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=_tz.utc)
+                time_since_seconds = (now - last_dt).total_seconds()
+            except (ValueError, TypeError):
+                time_since_seconds = None
+
+        # Walk each assistant turn — for any tool_use ids in the
+        # message, the IMMEDIATELY-following user turn must contain
+        # tool_result blocks for every id. Mirrors the heal's gate.
+        session_had_dangling = False
+        for i, msg in enumerate(transcript):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            tool_use_ids = _collect_tool_use_ids(msg.get("content"))
+            if not tool_use_ids:
+                continue
+            next_msg = transcript[i + 1] if i + 1 < len(transcript) else None
+            existing_result_ids: set[str] = set()
+            if (
+                next_msg is not None
+                and isinstance(next_msg, dict)
+                and next_msg.get("role") == "user"
+            ):
+                existing_result_ids = _collect_tool_result_ids(
+                    next_msg.get("content"),
+                )
+            missing = [
+                tid for tid in tool_use_ids
+                if tid not in existing_result_ids
+            ]
+            if not missing:
+                continue
+            session_had_dangling = True
+            total_dangling_ids += len(missing)
+            log.warning(
+                "talker.conversation.startup_dangling_tool_use",
+                chat_id=chat_id_str,
+                session_id=session_id,
+                assistant_turn_index=i,
+                dangling_tool_use_ids=missing,
+                count_of_dangling_ids=len(missing),
+                time_since_last_message_seconds=time_since_seconds,
+                detail=(
+                    "Active session's transcript carries a dangling "
+                    "tool_use turn at startup — the previous daemon "
+                    "shutdown left tool_use ids without matching "
+                    "tool_result blocks. The next ``run_turn`` will "
+                    "trigger the heal in ``_messages_for_api``; this "
+                    "log fires BEFORE that so an operator can grep "
+                    "for the wedge without needing the LLM's "
+                    "parroting-of-heal as the diagnostic tell."
+                ),
+            )
+        if session_had_dangling:
+            sessions_with_dangling += 1
+
+    # Always log a completion summary — per intentionally-left-blank,
+    # a clean state needs to be distinguishable from the detector not
+    # having run at all.
+    log.info(
+        "talker.conversation.startup_dangling_tool_use_check_complete",
+        sessions_checked=sessions_checked,
+        sessions_with_dangling=sessions_with_dangling,
+        total_dangling_ids=total_dangling_ids,
+    )
+    return total_dangling_ids
+
+
 # --- Prompt assembly ------------------------------------------------------
 
 

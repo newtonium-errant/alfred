@@ -194,6 +194,17 @@ async def run(
     if closed:
         log.info("talker.daemon.startup_sweep", closed=len(closed))
 
+    # Dangling-tool_use detector (P2 from QA 2026-05-04). Walks every
+    # surviving active session's transcript; logs a warning per
+    # assistant turn whose tool_use ids lack matching tool_result
+    # blocks in the next user turn. Runs AFTER resolve_on_startup so
+    # we don't waste a check on sessions we just closed; runs BEFORE
+    # the bot starts handling new turns so the diagnostic log is
+    # available to the operator before the LLM gets a chance to
+    # parrot the heal's "interrupted before completing" wording.
+    from .conversation import detect_dangling_tool_use_at_startup
+    detect_dangling_tool_use_at_startup(state_mgr, now=now)
+
     client = anthropic.AsyncAnthropic(api_key=config.anthropic.api_key)
     system_prompt = _apply_instance_templating(
         _load_system_prompt(

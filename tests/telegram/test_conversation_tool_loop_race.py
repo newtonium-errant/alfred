@@ -843,3 +843,323 @@ async def test_cancellation_flush_emits_diagnostic_log(
     assert entry["unprocessed_tool_use_ids"] == ["t3", "t4"]
     assert entry["unprocessed_count"] == 2
     assert entry["total_tool_use_ids_in_turn"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Startup dangling-tool_use detector (P2 from QA 2026-05-04)
+# ---------------------------------------------------------------------------
+#
+# Permanent observability so future occurrences don't need the LLM's
+# parroting of the heal's "interrupted before completing" wording as
+# the operator-visible tell. Walks active sessions at daemon boot;
+# logs a warning per dangling tool_use detected. Per
+# ``feedback_intentionally_left_blank.md``: clean state still gets
+# a summary info event so the detector running is observable.
+
+
+class _StubStateManager:
+    """Minimal duck-typed StateManager for the detector tests.
+
+    The real ``StateManager`` exposes ``state.state["active_sessions"]``;
+    this stub mirrors only that attribute. Keeps the tests free of the
+    full state-load + disk-write plumbing.
+    """
+
+    def __init__(self, active_sessions: dict[str, dict]):
+        self.state = {"active_sessions": active_sessions}
+
+
+def test_startup_detects_single_dangling_tool_use():
+    """One active session whose final assistant turn carries a
+    dangling tool_use id (no matching tool_result in the next user
+    turn). Warning fires; summary reports 1 session with 1 dangling
+    id."""
+    from datetime import datetime, timezone
+    from structlog.testing import capture_logs
+    from alfred.telegram.conversation import (
+        detect_dangling_tool_use_at_startup,
+    )
+
+    sessions = {
+        "1": {
+            "session_id": "sess-with-dangling",
+            "last_message_at": "2026-05-04T19:28:00+00:00",
+            "transcript": [
+                {"role": "user", "content": "do the thing"},
+                _assistant_with_tool_use("t1"),
+                # NO matching user/tool_result turn — this is dangling.
+            ],
+        },
+    }
+    state = _StubStateManager(sessions)
+
+    with capture_logs() as captured:
+        total = detect_dangling_tool_use_at_startup(
+            state, now=datetime(2026, 5, 4, 19, 30, tzinfo=timezone.utc),
+        )
+
+    assert total == 1
+    warning_logs = [
+        c for c in captured
+        if c.get("event") == "talker.conversation.startup_dangling_tool_use"
+    ]
+    assert len(warning_logs) == 1
+    entry = warning_logs[0]
+    assert entry["log_level"] == "warning"
+    assert entry["chat_id"] == "1"
+    assert entry["session_id"] == "sess-with-dangling"
+    assert entry["assistant_turn_index"] == 1
+    assert entry["dangling_tool_use_ids"] == ["t1"]
+    assert entry["count_of_dangling_ids"] == 1
+    # 2 minutes elapsed (19:30 - 19:28).
+    assert entry["time_since_last_message_seconds"] == 120.0
+
+
+def test_startup_detects_multiple_dangling_in_same_assistant_turn():
+    """Assistant turn with 5 tool_use ids; user-side tool_results
+    cover only 2 → detector reports the 3 missing as dangling."""
+    from datetime import datetime, timezone
+    from structlog.testing import capture_logs
+    from alfred.telegram.conversation import (
+        detect_dangling_tool_use_at_startup,
+    )
+
+    sessions = {
+        "1": {
+            "session_id": "partial-results-sess",
+            "last_message_at": "2026-05-04T19:28:00+00:00",
+            "transcript": [
+                {"role": "user", "content": "go"},
+                _assistant_with_tool_use("t1", "t2", "t3", "t4", "t5"),
+                _user_with_tool_results("t1", "t3"),  # missing t2/t4/t5
+            ],
+        },
+    }
+    state = _StubStateManager(sessions)
+
+    with capture_logs() as captured:
+        total = detect_dangling_tool_use_at_startup(
+            state, now=datetime(2026, 5, 4, 19, 30, tzinfo=timezone.utc),
+        )
+
+    assert total == 3
+    warnings = [
+        c for c in captured
+        if c.get("event") == "talker.conversation.startup_dangling_tool_use"
+    ]
+    assert len(warnings) == 1
+    assert sorted(warnings[0]["dangling_tool_use_ids"]) == ["t2", "t4", "t5"]
+    assert warnings[0]["count_of_dangling_ids"] == 3
+
+
+def test_startup_clean_state_emits_summary_info_no_warning():
+    """Per intentionally-left-blank: clean state STILL emits the
+    completion summary so the detector running is observable.
+    Asserts no warnings fire on a well-formed transcript."""
+    from datetime import datetime, timezone
+    from structlog.testing import capture_logs
+    from alfred.telegram.conversation import (
+        detect_dangling_tool_use_at_startup,
+    )
+
+    sessions = {
+        "1": {
+            "session_id": "well-formed-sess",
+            "last_message_at": "2026-05-04T19:28:00+00:00",
+            "transcript": [
+                {"role": "user", "content": "go"},
+                _assistant_with_tool_use("t1", "t2"),
+                _user_with_tool_results("t1", "t2"),
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "done"},
+                ]},
+            ],
+        },
+    }
+    state = _StubStateManager(sessions)
+
+    with capture_logs() as captured:
+        total = detect_dangling_tool_use_at_startup(
+            state, now=datetime(2026, 5, 4, 19, 30, tzinfo=timezone.utc),
+        )
+
+    assert total == 0
+    warnings = [
+        c for c in captured
+        if c.get("event") == "talker.conversation.startup_dangling_tool_use"
+    ]
+    assert warnings == []
+    # Summary info still fires.
+    summary_logs = [
+        c for c in captured
+        if c.get("event")
+        == "talker.conversation.startup_dangling_tool_use_check_complete"
+    ]
+    assert len(summary_logs) == 1
+    summary = summary_logs[0]
+    assert summary["log_level"] == "info"
+    assert summary["sessions_checked"] == 1
+    assert summary["sessions_with_dangling"] == 0
+    assert summary["total_dangling_ids"] == 0
+
+
+def test_startup_no_active_sessions_emits_summary_quietly():
+    """Empty active_sessions dict → summary fires with zeros, no
+    warnings. Confirms the detector handles the cold-install case."""
+    from datetime import datetime, timezone
+    from structlog.testing import capture_logs
+    from alfred.telegram.conversation import (
+        detect_dangling_tool_use_at_startup,
+    )
+
+    state = _StubStateManager({})
+
+    with capture_logs() as captured:
+        total = detect_dangling_tool_use_at_startup(
+            state, now=datetime(2026, 5, 4, 19, 30, tzinfo=timezone.utc),
+        )
+
+    assert total == 0
+    summary_logs = [
+        c for c in captured
+        if c.get("event")
+        == "talker.conversation.startup_dangling_tool_use_check_complete"
+    ]
+    assert len(summary_logs) == 1
+    assert summary_logs[0]["sessions_checked"] == 0
+
+
+def test_startup_multiple_sessions_each_with_dangling():
+    """Two sessions, each with their own dangling state. Detector
+    walks both, fires per-session warnings, summary aggregates."""
+    from datetime import datetime, timezone
+    from structlog.testing import capture_logs
+    from alfred.telegram.conversation import (
+        detect_dangling_tool_use_at_startup,
+    )
+
+    sessions = {
+        "1": {
+            "session_id": "sess-a",
+            "last_message_at": "2026-05-04T19:00:00+00:00",
+            "transcript": [
+                {"role": "user", "content": "x"},
+                _assistant_with_tool_use("ta1"),
+            ],
+        },
+        "2": {
+            "session_id": "sess-b",
+            "last_message_at": "2026-05-04T19:25:00+00:00",
+            "transcript": [
+                {"role": "user", "content": "y"},
+                _assistant_with_tool_use("tb1", "tb2"),
+                _user_with_tool_results("tb1"),  # tb2 dangling
+            ],
+        },
+    }
+    state = _StubStateManager(sessions)
+
+    with capture_logs() as captured:
+        total = detect_dangling_tool_use_at_startup(
+            state, now=datetime(2026, 5, 4, 19, 30, tzinfo=timezone.utc),
+        )
+
+    assert total == 2  # ta1 + tb2
+    warnings = [
+        c for c in captured
+        if c.get("event") == "talker.conversation.startup_dangling_tool_use"
+    ]
+    assert len(warnings) == 2
+    # Find each by chat_id.
+    by_chat = {w["chat_id"]: w for w in warnings}
+    assert by_chat["1"]["dangling_tool_use_ids"] == ["ta1"]
+    assert by_chat["2"]["dangling_tool_use_ids"] == ["tb2"]
+    # Summary aggregates.
+    summary = next(
+        c for c in captured
+        if c.get("event")
+        == "talker.conversation.startup_dangling_tool_use_check_complete"
+    )
+    assert summary["sessions_checked"] == 2
+    assert summary["sessions_with_dangling"] == 2
+    assert summary["total_dangling_ids"] == 2
+
+
+def test_startup_handles_session_with_no_transcript_field():
+    """Defensive: a session dict missing or with empty transcript
+    doesn't crash the detector. Counted as 'checked', not as
+    'with_dangling'."""
+    from datetime import datetime, timezone
+    from structlog.testing import capture_logs
+    from alfred.telegram.conversation import (
+        detect_dangling_tool_use_at_startup,
+    )
+
+    sessions = {
+        "1": {
+            "session_id": "no-transcript",
+            "last_message_at": "2026-05-04T19:28:00+00:00",
+            # No "transcript" key at all.
+        },
+        "2": {
+            "session_id": "empty-transcript",
+            "last_message_at": "2026-05-04T19:28:00+00:00",
+            "transcript": [],
+        },
+    }
+    state = _StubStateManager(sessions)
+
+    with capture_logs() as captured:
+        total = detect_dangling_tool_use_at_startup(
+            state, now=datetime(2026, 5, 4, 19, 30, tzinfo=timezone.utc),
+        )
+
+    assert total == 0
+    warnings = [
+        c for c in captured
+        if c.get("event") == "talker.conversation.startup_dangling_tool_use"
+    ]
+    assert warnings == []
+    summary = next(
+        c for c in captured
+        if c.get("event")
+        == "talker.conversation.startup_dangling_tool_use_check_complete"
+    )
+    assert summary["sessions_checked"] == 2
+    assert summary["sessions_with_dangling"] == 0
+
+
+def test_startup_handles_malformed_last_message_at_gracefully():
+    """If last_message_at is malformed, time_since_last_message_seconds
+    is None — but the dangling detection still works."""
+    from datetime import datetime, timezone
+    from structlog.testing import capture_logs
+    from alfred.telegram.conversation import (
+        detect_dangling_tool_use_at_startup,
+    )
+
+    sessions = {
+        "1": {
+            "session_id": "malformed-ts",
+            "last_message_at": "not a real timestamp",
+            "transcript": [
+                {"role": "user", "content": "x"},
+                _assistant_with_tool_use("t1"),
+            ],
+        },
+    }
+    state = _StubStateManager(sessions)
+
+    with capture_logs() as captured:
+        detect_dangling_tool_use_at_startup(
+            state, now=datetime(2026, 5, 4, 19, 30, tzinfo=timezone.utc),
+        )
+
+    warnings = [
+        c for c in captured
+        if c.get("event") == "talker.conversation.startup_dangling_tool_use"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["time_since_last_message_seconds"] is None
+    # Detection itself still fires.
+    assert warnings[0]["dangling_tool_use_ids"] == ["t1"]
