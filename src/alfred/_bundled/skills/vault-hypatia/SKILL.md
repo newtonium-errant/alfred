@@ -191,6 +191,41 @@ Prefer **append over overwrite**. `body_append` for new draft sections, follow-u
 
 In Substack copy editor posture, edits to `draft/essay/` are restricted to **inline `[suggestion: ...]` markers** unless Andrew explicitly asks for a rewrite. The annotation pass is `body_append` of a marked-up version, or careful in-place insertion of `[suggestion: ...]` markers — never silent prose replacement.
 
+#### Body mutation — three surfaces (shipped 2026-05-04)
+
+`vault_edit` exposes three body-write kwargs. Pick the narrowest one that matches the intent. They are **mutually exclusive in a single call** — combining `body_append` + `body_insert_at` + `body_replace` returns a clean error; do one mutation per call (chain calls if you need both).
+
+- **`body_append`** — adds content at the end of the body. The default for new draft sections, follow-up annotations, and continuity-log entries.
+
+- **`body_insert_at: {marker, position, content}`** — inserts content at a specific anchor line in the existing body. Use this when content belongs **mid-document**: a new section before an existing heading, an addition slotted into the middle of an existing taxonomy or table, an `[suggestion: ...]` marker placed exactly inside a paragraph rather than appended at the end. The `marker` is **line-exact** — full-line match, no regex, no substring. `position` is `"before"` or `"after"`. Allowed for Hypatia on `note`, `concept`, `essay`, `fiction-{continuity, story, structure, world, voice, character}`, and `template`.
+
+- **`body_replace: str`** — full body rewrite. Rare — this is the LAST resort, not the first. Use only when Andrew has handed you a complete replacement body and explicitly asked you to write it as the new body. Allowed on the same set as `body_insert_at`. **Never use on `draft/essay/` records without explicit "rewrite the whole thing" instructions** — voice is inviolate in Substack copy editor posture, and `body_replace` is the maximum-blast-radius operation.
+
+**Universally denied** for body mutation regardless of kwarg: `session`, `conversation`, `capture`, `run`, `input` (auto-generated transcripts — mutation = corruption) and `assumption`, `constraint`, `contradiction`, `decision`, `synthesis` (atomic learning records — atomic by design).
+
+**When `body_insert_at` is the right tool:** when an existing document needs a mid-document insertion — a new section before another section, a new entry in the middle of an existing list, a row added to a table that isn't at the end. The DJ tracker MPC addendum (2026-05-03) is the canonical example: two insertion points, both anchored on existing headings, both mid-document. Before the body-mutation surface shipped, the workaround was either `set_fields={"body": ...}` (correctly rejected by the gate) or punting to "for KAL-LE Python/sed patch." After this ship, `body_insert_at` is the natural retry; reach for it instead of either workaround.
+
+**Decision flow when Andrew asks for an edit:**
+
+1. Is he adding to the end? → `body_append`.
+2. Does the new content belong **mid-document** (before/after an existing heading or anchor line)? → `body_insert_at` with the heading line as marker.
+3. Is he rewriting the entire body? → `body_replace` (rare; the inviolate-voice rules above gate this).
+4. Is the change just a frontmatter field? → `set_fields` / `append_fields`, not body kwargs.
+
+**Worked example — `body_insert_at` (the DJ tracker MPC addendum, 2026-05-03):**
+
+> Andrew (sends MPC addendum with two insert points):
+>   *"Insert Tier 4e section before `## Hardware-specific drills`."*
+>   *"Insert MPC One block before the closing `---`."*
+>
+> Hypatia (internal): two mid-document insertions, both anchored on existing lines. Two `body_insert_at` calls, one per anchor, since the kwargs don't combine.
+>
+> Hypatia: `vault_edit body_insert_at = {"marker": "## Hardware-specific drills", "position": "before", "content": "## Tier 4e — MPC / Finger Drumming\n\n...content...\n\n"}` on the tracker record.
+>
+> Then: `vault_edit body_insert_at = {"marker": "---", "position": "before", "content": "### MPC One\n\n...content...\n\n"}` on the same record. (If `---` appears more than once in the body, the line-exact match takes the first one — read the record first to confirm the anchor is unambiguous, or use a more specific marker line like the heading immediately above the closing `---`.)
+>
+> Hypatia: *"Both sections inserted at requested anchors. Tracker now has Tier 4e + MPC One block."*
+
 ---
 
 ## Vault layout

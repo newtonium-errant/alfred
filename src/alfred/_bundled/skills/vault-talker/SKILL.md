@@ -364,6 +364,43 @@ Prefer **append** over **overwrite**.
 
 If Andrew asks you to change something and there's any chance of losing existing content, read the record first, confirm what you're about to do in one sentence, and wait for the go-ahead. "The description currently says X — replace with Y, or append?" Then act.
 
+### Body mutation — three surfaces (shipped 2026-05-04)
+
+`vault_edit` exposes three body-write kwargs. Pick the narrowest one that matches the intent. They are **mutually exclusive in a single call** — combining `body_append` + `body_insert_at` + `body_replace` returns a clean error; do one mutation per call (chain calls if you need both).
+
+- **`body_append`** — adds content at the end of the body. The default and most common. No additional gate beyond `allow_body_writes`. Allowed on every type you can edit. Use this when Andrew says "add a follow-up note" / "append the new entry" / "log the result."
+
+- **`body_insert_at: {marker, position, content}`** — inserts content at a specific anchor line in the existing body. Use this when content belongs **mid-document**: a new section before an existing heading, a row added to a table that isn't at the end, an entry inserted in the middle of an existing list. The `marker` is **line-exact** — full-line match, no regex, no substring. `position` is `"before"` or `"after"`. Allowed for Salem on `note`, `task`, `event`. Use over `body_append` when end-of-doc is the wrong place; use over `body_replace` when most of the body should stay intact.
+
+- **`body_replace: str`** — full body rewrite. Rare. Use only when the body genuinely needs to be rewritten end-to-end (Andrew gave a complete replacement and asked you to write it as the new body). Allowed for Salem on `note`, `task`, `event`. **REFUSED on `event` records that have `gcal_event_id`** — the GCal mirror tracks state in the synced body, and a full-body rewrite would lose that linkage. The scope guard returns an operator-actionable error pointing at `vault_delete` first (which clears the GCal mirror) followed by `vault_create` for the new body. If you find yourself reaching for `body_replace` on a synced event, that's the signal to pause and ask Andrew whether he wants to delete + recreate (which loses the original `gcal_event_id`) or whether `body_insert_at` / `body_append` would actually do the job.
+
+**Universally denied** for body mutation regardless of kwarg: `session`, `conversation`, `capture`, `run`, `input` (auto-generated transcripts — mutation = corruption) and `assumption`, `constraint`, `contradiction`, `decision`, `synthesis` (atomic learning records — atomic by design).
+
+**Decision flow when Andrew asks for an edit:**
+
+1. Is he adding to the end? → `body_append`.
+2. Does the new content belong **mid-document** (before/after an existing heading or anchor line)? → `body_insert_at` with the heading line as marker.
+3. Is he rewriting the entire body? → `body_replace` (with the event/`gcal_event_id` refusal in mind).
+4. Is the change just a frontmatter field? → `set_fields` / `append_fields`, not body kwargs.
+
+**Worked example — `body_insert_at`:**
+
+> Andrew: *"Add a Tier 5 section to my DJ tracker before the Hardware-specific drills heading."*
+>
+> Salem (internal): mid-document insertion before an existing heading — that's `body_insert_at` with the heading as marker.
+>
+> Salem: `vault_edit body_insert_at = {"marker": "## Hardware-specific drills", "position": "before", "content": "## Tier 5 — New section\n\n...content...\n\n"}` on the tracker record.
+>
+> Replies: *"Tier 5 inserted before Hardware-specific drills. Body unchanged elsewhere."*
+
+**Worked example — `body_replace` refused on synced event:**
+
+> Andrew: *"Rewrite the body of the Halifax Music Fest event with this new ticket text."* (event record has `gcal_event_id` from the original sync.)
+>
+> Salem (internal): `vault_read` confirms `gcal_event_id` is set. `body_replace` will be refused by the scope guard because it would lose GCal sync linkage. Surface the choice rather than silently doing something else.
+>
+> Salem: *"That event is synced to Alfred Calendar (`gcal_event_id` set). A full body rewrite would lose the GCal linkage. Two options: (a) `vault_delete` the event first (clears the GCal mirror), then `vault_create` with the new body — Jamie will see it disappear and reappear; or (b) if most of the existing body should stay, I can use `body_insert_at` to slot the new ticket text at a specific anchor instead. Which do you want?"*
+
 ---
 
 ## Setting reminders
