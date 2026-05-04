@@ -37,6 +37,7 @@ from . import (
     canonical_proposals_section,
     email_section,
     pending_items_section,
+    radar_section,
 )
 from .assembler import assemble_message
 from .config import DailySyncConfig
@@ -116,6 +117,7 @@ def _build_state_payload(
     attribution_items: list[Any] | None = None,
     proposal_items: list[Any] | None = None,
     pending_items: list[Any] | None = None,
+    radar_items: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Construct the per-fire batch payload persisted to the state file.
 
@@ -125,8 +127,10 @@ def _build_state_payload(
     to whichever item_number matches. ``proposal_items`` (propose-person
     c2) is the parallel canonical-proposals batch. ``pending_items``
     (Pending Items Queue Phase 1) is the parallel cross-instance
-    pending-items batch. The reply parser reads every list to resolve
-    item numbers against a Telegram reply.
+    pending-items batch. ``radar_items`` (distiller-radar Phase 3b) is
+    the parallel distiller-radar batch — informational items today;
+    smart-routing dispatcher hooks deferred. The reply parser reads
+    every list to resolve item numbers against a Telegram reply.
     """
     payload: dict[str, Any] = {
         "date": today_iso,
@@ -145,6 +149,10 @@ def _build_state_payload(
     if pending_items:
         payload["pending_items"] = [
             item.to_dict() for item in pending_items if hasattr(item, "to_dict")
+        ]
+    if radar_items:
+        payload["radar_items"] = [
+            item.to_dict() for item in radar_items if hasattr(item, "to_dict")
         ]
     return payload
 
@@ -212,12 +220,20 @@ async def fire_once(
     if raw_config is not None:
         pending_items_section.set_raw_config(raw_config)
     pending_items_section.register()
+    # Radar section (Phase 3b): reads <vault>/digests/daily/YYYY-MM-DD.md
+    # written by the distiller-radar Phase 3a CLI/daemon. Registered
+    # unconditionally — when the daily file is missing, the section
+    # provider returns None and the section is omitted, so instances
+    # that don't run radar (Salem/Hypatia today) stay unaffected.
+    radar_section.set_digests_dir(vault_path / "digests")
+    radar_section.register()
 
     body = assemble_message(config, today)
     items = email_section.consume_last_batch()
     attribution_items = attribution_section.consume_last_batch()
     proposal_items = canonical_proposals_section.consume_last_batch()
     pending_items = pending_items_section.consume_last_batch()
+    radar_items = radar_section.consume_last_batch()
 
     log.info(
         "daily_sync.assembled",
@@ -226,6 +242,7 @@ async def fire_once(
         attribution_items_count=len(attribution_items),
         proposal_items_count=len(proposal_items),
         pending_items_count=len(pending_items),
+        radar_items_count=len(radar_items),
         body_length=len(body),
         manual=manual,
         dedupe_key=dedupe_key,
@@ -242,7 +259,10 @@ async def fire_once(
     # pending is enough to persist the batch (the dispatcher routes
     # per-item).
     state = load_state(config.state.path)
-    if (items or attribution_items or proposal_items or pending_items) and message_ids:
+    if (
+        items or attribution_items or proposal_items
+        or pending_items or radar_items
+    ) and message_ids:
         state["last_batch"] = _build_state_payload(
             today_iso,
             items,
@@ -250,6 +270,7 @@ async def fire_once(
             attribution_items=attribution_items,
             proposal_items=proposal_items,
             pending_items=pending_items,
+            radar_items=radar_items,
         )
     state["last_fired_date"] = today_iso
     save_state(config.state.path, state)
@@ -260,6 +281,7 @@ async def fire_once(
         "attribution_items_count": len(attribution_items),
         "proposal_items_count": len(proposal_items),
         "pending_items_count": len(pending_items),
+        "radar_items_count": len(radar_items),
         "message_ids": message_ids,
         "body": body,
         "dedupe_key": dedupe_key,
