@@ -253,6 +253,93 @@ def cmd_rank_week(
         )
 
 
+def cmd_rank_day(
+    config: DistillerConfig,
+    *,
+    top_n: int = 5,
+    min_score: float | None = None,
+    digests_dir: str | None = None,
+    state_dir: str | None = None,
+    dry_run: bool = False,
+) -> None:
+    """Phase 3a — daily radar wrapper around the synthesis ranker.
+
+    Rebuilds the day's top-N synthesis/decision/contradiction items
+    (1-day window), dedups against the rolling surfaced-log, writes
+    ``<digests_dir>/daily/YYYY-MM-DD.md``, and appends each surfaced
+    item to ``<state_dir>/radar_surfaced.jsonl``.
+
+    Path resolution:
+      - ``digests_dir``: explicit CLI flag wins; else falls back to
+        ``vault_path/digests`` (KAL-LE convention).
+      - ``state_dir``: explicit CLI flag wins; else uses the parent of
+        ``config.state.path`` (so it sits next to
+        ``distiller_state.json``).
+
+    The empty-state behavior is per
+    ``feedback_intentionally_left_blank.md``: a no-radar-items day
+    still emits a file with an explicit "no radar items today" line.
+    """
+    from .radar_day import run_daily_radar
+
+    vault_path = config.vault.vault_path
+    if not vault_path.is_dir():
+        print(f"Vault path does not exist: {vault_path}")
+        return
+
+    if digests_dir:
+        digests_path = Path(digests_dir).expanduser().resolve()
+    else:
+        digests_path = (vault_path / "digests").resolve()
+
+    if state_dir:
+        state_path = Path(state_dir).expanduser().resolve()
+    else:
+        state_path = Path(config.state.path).expanduser().resolve().parent
+
+    result = run_daily_radar(
+        vault_path,
+        digests_path,
+        state_path,
+        top_n=top_n,
+        min_score=min_score,
+        dry_run=dry_run,
+    )
+
+    print(f"=== Daily Radar — {result.date} ===")
+    print(
+        f"vault={vault_path}  digests={digests_path}  "
+        f"state={state_path}  dry_run={dry_run}"
+    )
+    print(
+        f"items={len(result.items)}  ranker_count={result.ranker_count}  "
+        f"deduped={max(0, result.ranker_count - len(result.items))}"
+    )
+    if result.output_path is not None:
+        verb = "would write" if dry_run else "wrote"
+        print(f"{verb}: {result.output_path}")
+
+    if not result.items:
+        # Explicit empty-state ack — mirrors the rendered file. The
+        # distinction "ran, nothing to surface" vs "didn't run" is the
+        # whole point of feedback_intentionally_left_blank.md.
+        print("\nno radar items today (corpus checked: synthesis/, "
+              "decision/, contradiction/)")
+        return
+
+    print(
+        f"\n{'Rank':<5} {'Score':<8} {'Type':<14} {'Src':<5} "
+        f"{'Ent':<5} {'Age(d)':<8} {'Path'}"
+    )
+    print("-" * 110)
+    for i, r in enumerate(result.items, start=1):
+        age = "-" if r.age_days is None else f"{r.age_days:.2f}"
+        print(
+            f"{i:<5} {r.score:<8.2f} {r.record_type:<14} "
+            f"{r.source_count:<5} {r.entity_count:<5} {age:<8} {r.path.name}"
+        )
+
+
 def cmd_history(config: DistillerConfig, limit: int = 10) -> None:
     """Show past extraction runs."""
     state = _init_state(config)

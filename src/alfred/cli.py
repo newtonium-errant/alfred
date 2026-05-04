@@ -604,6 +604,15 @@ def cmd_distiller(args: argparse.Namespace) -> None:
             window_days=args.window_days,
             dry_run=args.dry_run,
         )
+    elif subcmd == "rank-day":
+        dcli.cmd_rank_day(
+            config,
+            top_n=args.top_n,
+            min_score=args.min_score,
+            digests_dir=args.digests_dir,
+            state_dir=args.state_dir,
+            dry_run=args.dry_run,
+        )
     else:
         print(f"Unknown distiller subcommand: {subcmd}")
         sys.exit(1)
@@ -1899,6 +1908,38 @@ def build_parser() -> argparse.ArgumentParser:
     dist_rank_week.add_argument(
         "--dry-run", action="store_true", default=False,
         help="Accepted for symmetry; the command is read-only either way",
+    )
+
+    # KAL-LE distiller-radar Phase 3a — daily continuous radar.
+    # Wraps rank_synthesis_records on a 1-day window, dedups against the
+    # rolling surfaced log, writes <digests_dir>/daily/YYYY-MM-DD.md, and
+    # appends each surfaced record to <state_dir>/radar_surfaced.jsonl.
+    # Defaults pick up vault/digests + state.path's parent so the typical
+    # KAL-LE invocation is just `alfred --config config.kalle.yaml
+    # distiller rank-day` with no flags.
+    dist_rank_day = dist_sub.add_parser(
+        "rank-day",
+        help="Daily radar: rank 1-day window + dedup + write daily file",
+    )
+    dist_rank_day.add_argument(
+        "--top-n", type=int, default=5,
+        help="Max items to surface per day (default 5)",
+    )
+    dist_rank_day.add_argument(
+        "--min-score", type=float, default=None,
+        help="Optional score floor; items below are skipped (default no floor)",
+    )
+    dist_rank_day.add_argument(
+        "--digests-dir", default=None,
+        help="Override target dir; default <vault>/digests",
+    )
+    dist_rank_day.add_argument(
+        "--state-dir", default=None,
+        help="Override surfaced-log dir; default parent of distiller state.path",
+    )
+    dist_rank_day.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Compute + log without writing the daily file or surfaced log",
     )
 
     # instructor
