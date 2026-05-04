@@ -9,6 +9,135 @@ class ScopeError(Exception):
     """Raised when an operation is denied by scope policy."""
 
 
+# ---------------------------------------------------------------------------
+# Body-mutation tools — per-instance × per-type allowlist matrix
+# ---------------------------------------------------------------------------
+#
+# Three body-mutation surfaces on ``vault_edit``:
+#
+#   1. ``body_append``      — add to end of doc (existing; gated by the
+#                             binary ``allow_body_writes`` flag below).
+#   2. ``body_insert_at``   — anchored mid-document insertion (NEW).
+#                             Per-type allowlist via
+#                             ``allow_body_insert_at`` dict.
+#   3. ``body_replace``     — full body rewrite (NEW). Higher-risk —
+#                             universally OFF by default; per-type
+#                             allowlist via ``allow_body_replace`` dict.
+#
+# Design philosophy (Andrew 2026-05-04): scope-first, NOT "ship
+# universal then restrict." Every per-type cell is an explicit
+# decision in the matrix below. Adding a new mutation surface in the
+# future means extending this matrix — not bolting another tool on
+# top.
+#
+# Per-instance × per-type matrix (the principal artifact):
+#
+# | Caller        | append    | insert_at                        | replace                       |
+# |---------------|-----------|----------------------------------|-------------------------------|
+# | hypatia       | universal | note,concept,document,           | same set                      |
+# |               |           | template,fiction-* (per spec)    |                               |
+# | talker(Salem) | universal | note,task,event(no-gcal-id)      | same — but refuses if         |
+# |               |           |                                  | event has gcal_event_id       |
+# | kalle         | universal | note,decision,principle,         | same set                      |
+# |               |           | pattern (decisions stay rare)    |                               |
+# | janitor       | universal | * (stub-flesh-out workflows)     | DENIED (autofix-loop risk)    |
+# | janitor_enrich| universal | DENIED (Stage 3 only writes      | DENIED                        |
+# |               |           | structured fields; bodies        |                               |
+# |               |           | append-only via existing path)   |                               |
+# | distiller     | universal | DENIED                           | DENIED                        |
+# | curator       | universal | DENIED                           | DENIED                        |
+# | surveyor      | universal | DENIED                           | DENIED                        |
+# | instructor    | universal | * (operator-driven, trusted)     | * (operator-driven, trusted)  |
+#
+# ``"*"`` in an allowlist means "any type allowed" — distinct from
+# the absence of a key (which means "no type allowed for this
+# instance"). The empty dict ``{}`` and the missing key both deny
+# all types.
+#
+# Universally-denied types — auto-generated/atomic records. These
+# refuse body_insert_at AND body_replace under EVERY scope, regardless
+# of the per-instance allowlist. An instance putting one of these in
+# its allowlist still gets denied at the type-gate. Mutation here =
+# history corruption (transcripts) or learning-record contradiction
+# (epistemic atoms).
+_BODY_MUTATE_DENIED_TYPES: frozenset[str] = frozenset({
+    # Auto-generated transcripts / event records.
+    "session", "conversation", "capture", "run", "input",
+    # Atomic learning records — assumption/decision/constraint/
+    # contradiction/synthesis. Mutation here would silently rewrite
+    # an epistemic atom that other records cite. The right path for
+    # changing a learning record is a NEW assumption/decision that
+    # supersedes the old one (distiller's natural workflow).
+    "assumption", "decision", "constraint", "contradiction", "synthesis",
+})
+
+
+def _check_body_mutation_allowed(
+    *,
+    operation: str,
+    scope: str,
+    record_type: str,
+    allowlist: dict[str, bool] | None,
+    existing_frontmatter: dict | None,
+) -> None:
+    """Shared gate for body_insert_at and body_replace.
+
+    Refuses if:
+      - record_type is in the universally-denied set (auto-generated
+        / atomic — never mutate via these tools).
+      - allowlist is None or empty (instance hasn't opted in to this
+        operation at all).
+      - record_type is not in the allowlist AND ``"*"`` wildcard
+        absent.
+      - ``operation == "body_replace"``, record_type is ``event``,
+        and the existing record has ``gcal_event_id`` set (would lose
+        GCal sync state on rewrite). The operator must vault_delete
+        the event first — which fires the GCal cancel hook and
+        properly removes the calendar mirror — before any body
+        rewrite. Refuse-at-scope keeps the contract centralised; the
+        sync-layer-preserves alternative would have to live in
+        every future sync hook.
+
+    Raises ``ScopeError`` with a message naming the rule + the
+    operator-actionable next step.
+    """
+    if record_type in _BODY_MUTATE_DENIED_TYPES:
+        raise ScopeError(
+            f"Operation '{operation}' is universally denied for "
+            f"record type '{record_type}' (auto-generated or atomic — "
+            f"mutation would corrupt history or contradict cited "
+            f"epistemic content). The right path is a new record that "
+            f"supersedes this one, not a body rewrite."
+        )
+    if not allowlist:
+        raise ScopeError(
+            f"Scope '{scope}' has no allowlist configured for "
+            f"'{operation}' — operation not enabled for this instance."
+        )
+    if record_type not in allowlist and "*" not in allowlist:
+        permitted = sorted(allowlist.keys())
+        raise ScopeError(
+            f"Scope '{scope}' may not '{operation}' on type "
+            f"'{record_type}'. Permitted types: "
+            f"{', '.join(permitted) if permitted else '(none)'}."
+        )
+    # gcal carve-out — Salem event with a synced GCal mirror.
+    if (
+        operation == "body_replace"
+        and record_type == "event"
+        and isinstance(existing_frontmatter, dict)
+        and existing_frontmatter.get("gcal_event_id")
+    ):
+        raise ScopeError(
+            f"Scope '{scope}' refuses 'body_replace' on event records "
+            f"with a synced GCal mirror (gcal_event_id present). "
+            f"Rewriting the body could lose sync state. To proceed, "
+            f"first vault_delete the event (fires the GCal cancel "
+            f"hook and removes the calendar mirror cleanly), then "
+            f"vault_create the replacement."
+        )
+
+
 # Operation → {scope: checker_function}
 # Checkers receive (operation, rel_path, record_type) and raise ScopeError if denied.
 
@@ -25,6 +154,14 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # Curator writes full record bodies at creation time and during
         # enrichment. Body writes stay allowed.
         "allow_body_writes": True,
+        # body_insert_at + body_replace DENIED — curator's writes happen
+        # via vault_create (full body at creation) or vault_edit's
+        # body_append for late additions. Mid-document insertion and
+        # full rewrites are operator-only territory; an autonomous
+        # curator mutating canonical record bodies mid-document would
+        # corrupt user-authored content.
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
     },
     "janitor": {
         "read": True,
@@ -60,6 +197,23 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # need to write body content — the body is user-authored and
         # stays immutable under this scope.
         "allow_body_writes": False,
+        # body_insert_at: stub-flesh-out workflows enabled (the spec's
+        # "*" wildcard). The structural autofix loop NEVER triggers
+        # body_insert_at on its own; this opens the door for future
+        # janitor-driven content insertion (e.g. linking existing stub
+        # bodies to a missing-section template) without re-shipping
+        # scope. Every real body_insert_at call still gates on
+        # allow_body_writes=False above — so the wildcard here is
+        # currently a NO-OP at runtime. The allowlist is documented +
+        # tested for the day allow_body_writes is widened or replaced
+        # by per-mutation-tool gates (the natural extension path).
+        "allow_body_insert_at": {"*": True},
+        # body_replace DENIED — ratified per spec (autofix-loop risk:
+        # a misbehaving structural fix could replace user-authored
+        # bodies wholesale). Yesterday's slug-drift Path B
+        # ``allow_body_replace`` for janitor was killed empirically;
+        # do NOT resurrect.
+        "allow_body_replace": {},
     },
     # Stage 3 enrichment writes substantive content (description, role,
     # email, etc.) onto existing stub person/org records. Split out as
@@ -83,6 +237,11 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # bodies when the frontmatter allowlist isn't enough. Body
         # writes stay allowed under this scope.
         "allow_body_writes": True,
+        # Stage 3 enriches stub bodies via body_append only — no
+        # mid-document insertion or full rewrite needed for the
+        # structured-field-fill workflow.
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
     },
     "distiller": {
         "read": True,
@@ -96,6 +255,14 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "move": False,
         "delete": False,
         "allow_body_writes": True,
+        # Distiller writes ATOMIC learning records (assumption /
+        # decision / constraint / contradiction / synthesis) — every
+        # one of which is in _BODY_MUTATE_DENIED_TYPES. So even if a
+        # future distiller path wanted body_insert_at / body_replace,
+        # the universal-deny set would refuse. Empty allowlist keeps
+        # the contract explicit.
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
     },
     "surveyor": {
         "read": True,
@@ -112,6 +279,10 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # permissive body-write rule on to avoid surprising a
         # hypothetical future surveyor body-rewrite.
         "allow_body_writes": True,
+        # Surveyor only writes frontmatter (alfred_tags / relationships).
+        # No body mutation tools needed.
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
     },
     "talker": {
         "read": True,
@@ -127,6 +298,21 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # Talker creates notes / sessions / conversations with body
         # content synthesised from the voice turn — body writes stay on.
         "allow_body_writes": True,
+        # Salem (talker) — body_insert_at + body_replace per spec
+        # matrix. note/task for typical conversational mid-doc edits;
+        # event for calendar-relevant content additions. ``event``
+        # body_replace is gated INSIDE _check_body_mutation_allowed
+        # by the gcal_event_id carve-out: an event with a synced GCal
+        # mirror refuses body_replace and points the operator at the
+        # vault_delete-then-vault_create path instead. So the entry
+        # below ALLOWS event in the dict but the carve-out runtime-
+        # enforces "only events without gcal mirrors".
+        "allow_body_insert_at": {
+            "note": True, "task": True, "event": True,
+        },
+        "allow_body_replace": {
+            "note": True, "task": True, "event": True,
+        },
     },
     # Stage 3.5: KAL-LE — coding instance operating on the
     # aftermath-lab vault. Broader than talker because curation
@@ -148,6 +334,22 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "delete": False,
         # Pattern/principle curation writes substantive bodies.
         "allow_body_writes": True,
+        # KAL-LE — per spec matrix: note + decision (kalle's curation
+        # records) + principle + pattern. ``decision`` here is KAL-LE's
+        # OWN decision records (kalle scope creates them); they're NOT
+        # in _BODY_MUTATE_DENIED_TYPES because that set's ``decision``
+        # entry refers to the canonical-distiller atomic learning
+        # record. The deny set takes precedence — calling body_insert_at
+        # on a ``decision`` record from kalle scope STILL refuses,
+        # because the universal-deny is the right call here too: a
+        # decision's body should be append-only or new-record. The
+        # matrix entry keeps the SPEC explicit; the runtime denies it.
+        "allow_body_insert_at": {
+            "note": True, "principle": True, "pattern": True,
+        },
+        "allow_body_replace": {
+            "note": True, "principle": True, "pattern": True,
+        },
     },
     # Hypatia — scholar/scribe instance operating on the
     # library-alexandria vault. Mirrors curator's "create + edit but
@@ -170,6 +372,34 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # Drafting essays, business docs, concept notes — bodies are
         # the whole point. Body writes stay allowed.
         "allow_body_writes": True,
+        # Hypatia — per spec matrix: note, concept, document,
+        # template, fiction-* types. The mid-document insertion case
+        # was the ORIGINATING use case for this whole arc (Andrew's
+        # MPC addendum to a DJ skill tracker — a note record).
+        "allow_body_insert_at": {
+            "note": True,
+            "concept": True,
+            "document": True,
+            "template": True,
+            "fiction-continuity": True,
+            "fiction-story": True,
+            "fiction-structure": True,
+            "fiction-world": True,
+            "fiction-voice": True,
+            "fiction-character": True,
+        },
+        "allow_body_replace": {
+            "note": True,
+            "concept": True,
+            "document": True,
+            "template": True,
+            "fiction-continuity": True,
+            "fiction-story": True,
+            "fiction-structure": True,
+            "fiction-world": True,
+            "fiction-voice": True,
+            "fiction-character": True,
+        },
     },
     # Instructor executes natural-language directives parked in the
     # ``alfred_instructions`` frontmatter field. Broader than janitor
@@ -191,6 +421,15 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # for drafting, restructuring, or inserting content into an
         # existing record body.
         "allow_body_writes": True,
+        # Instructor — operator-driven, trusted path. ``"*"`` wildcard
+        # means "any type passes the allowlist gate" — but the
+        # universal-deny set in _BODY_MUTATE_DENIED_TYPES still
+        # refuses session/conversation/learning records. Operator can
+        # override by directly editing the file outside the
+        # alfred_instructions watcher (operator has filesystem
+        # access; the gate guards only the agent path).
+        "allow_body_insert_at": {"*": True},
+        "allow_body_replace": {"*": True},
     },
 }
 
@@ -294,12 +533,14 @@ def check_scope(
     frontmatter: dict | None = None,
     fields: list[str] | None = None,
     body_write: bool = False,
+    existing_frontmatter: dict | None = None,
 ) -> None:
     """Check if an operation is allowed under the given scope.
 
     Args:
         scope: The agent scope (curator, janitor, distiller, surveyor) or None for unrestricted.
-        operation: The vault operation (read, search, list, context, create, edit, move, delete).
+        operation: The vault operation (read, search, list, context, create, edit, move, delete,
+            body_insert_at, body_replace).
         rel_path: Relative path of the target file (for path-based checks).
         record_type: Record type (for type-based checks on create).
         frontmatter: Optional frontmatter dict of the record being written
@@ -317,6 +558,14 @@ def check_scope(
             janitor could bypass the frontmatter allowlist by rewriting
             bodies. Defaults to False — callers that don't supply a body
             are trivially compliant.
+        existing_frontmatter: For ``body_replace`` the gate needs to
+            inspect the EXISTING (on-disk) frontmatter — specifically
+            ``gcal_event_id`` on event records — to enforce the Salem
+            event carve-out (refuse rewrite when a synced GCal mirror
+            exists). Defaults to None for callers that don't yet plumb
+            it; non-event types and non-replace operations are
+            unaffected. The vault_edit gate populates this from the
+            parsed file before calling.
 
     Raises:
         ScopeError: If the operation is denied.
@@ -341,6 +590,29 @@ def check_scope(
             f"(body_append / body_stdin). This scope is restricted "
             f"to frontmatter edits via its field allowlist."
         )
+
+    # Body-mutation tools (body_insert_at + body_replace) — per-type
+    # allowlist + universal-deny set. Gated independently of the
+    # ``edit`` permission because ``edit`` may succeed for frontmatter
+    # while body mutation is still denied. See
+    # ``_check_body_mutation_allowed`` for the rule shape.
+    if operation in ("body_insert_at", "body_replace"):
+        allowlist_key = (
+            "allow_body_insert_at"
+            if operation == "body_insert_at"
+            else "allow_body_replace"
+        )
+        allowlist = rules.get(allowlist_key)
+        if not isinstance(allowlist, dict):
+            allowlist = None  # treat missing/wrong-type as empty (deny-all)
+        _check_body_mutation_allowed(
+            operation=operation,
+            scope=scope,
+            record_type=record_type,
+            allowlist=allowlist,  # type: ignore[arg-type]
+            existing_frontmatter=existing_frontmatter,
+        )
+        return
 
     permission = rules.get(operation)
     if permission is None:
