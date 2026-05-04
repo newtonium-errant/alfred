@@ -36,6 +36,7 @@ from . import (
     attribution_section,
     canonical_proposals_section,
     email_section,
+    friction_section,
     pending_items_section,
     radar_section,
 )
@@ -118,6 +119,7 @@ def _build_state_payload(
     proposal_items: list[Any] | None = None,
     pending_items: list[Any] | None = None,
     radar_items: list[Any] | None = None,
+    friction_items: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Construct the per-fire batch payload persisted to the state file.
 
@@ -128,9 +130,10 @@ def _build_state_payload(
     c2) is the parallel canonical-proposals batch. ``pending_items``
     (Pending Items Queue Phase 1) is the parallel cross-instance
     pending-items batch. ``radar_items`` (distiller-radar Phase 3b) is
-    the parallel distiller-radar batch — informational items today;
-    smart-routing dispatcher hooks deferred. The reply parser reads
-    every list to resolve item numbers against a Telegram reply.
+    the parallel distiller-radar batch. ``friction_items`` (K3 c2) is
+    the parallel KAL-LE friction-queue batch — informational items
+    today; smart-routing dispatcher hooks deferred. The reply parser
+    reads every list to resolve item numbers against a Telegram reply.
     """
     payload: dict[str, Any] = {
         "date": today_iso,
@@ -153,6 +156,10 @@ def _build_state_payload(
     if radar_items:
         payload["radar_items"] = [
             item.to_dict() for item in radar_items if hasattr(item, "to_dict")
+        ]
+    if friction_items:
+        payload["friction_items"] = [
+            item.to_dict() for item in friction_items if hasattr(item, "to_dict")
         ]
     return payload
 
@@ -227,6 +234,18 @@ async def fire_once(
     # that don't run radar (Salem/Hypatia today) stay unaffected.
     radar_section.set_digests_dir(vault_path / "digests")
     radar_section.register()
+    # Friction queue section (K3 c2): reads the friction-event JSONL
+    # written by the K3 c1 analyzer. Registered unconditionally — the
+    # provider returns None when set_friction_log_path was never
+    # called, so instances without friction_analyzer (Salem/Hypatia
+    # today) stay unaffected. KAL-LE's daemon sets the path from the
+    # configured friction_analyzer.log_path; instances that disable
+    # friction_analyzer leave the holder unset and the section omits.
+    if config.friction_analyzer.enabled and config.friction_analyzer.log_path:
+        friction_section.set_friction_log_path(
+            Path(config.friction_analyzer.log_path).expanduser().resolve(),
+        )
+    friction_section.register()
 
     body = assemble_message(config, today)
     items = email_section.consume_last_batch()
@@ -234,6 +253,7 @@ async def fire_once(
     proposal_items = canonical_proposals_section.consume_last_batch()
     pending_items = pending_items_section.consume_last_batch()
     radar_items = radar_section.consume_last_batch()
+    friction_items = friction_section.consume_last_batch()
 
     log.info(
         "daily_sync.assembled",
@@ -243,6 +263,7 @@ async def fire_once(
         proposal_items_count=len(proposal_items),
         pending_items_count=len(pending_items),
         radar_items_count=len(radar_items),
+        friction_items_count=len(friction_items),
         body_length=len(body),
         manual=manual,
         dedupe_key=dedupe_key,
@@ -261,7 +282,7 @@ async def fire_once(
     state = load_state(config.state.path)
     if (
         items or attribution_items or proposal_items
-        or pending_items or radar_items
+        or pending_items or radar_items or friction_items
     ) and message_ids:
         state["last_batch"] = _build_state_payload(
             today_iso,
@@ -271,6 +292,7 @@ async def fire_once(
             proposal_items=proposal_items,
             pending_items=pending_items,
             radar_items=radar_items,
+            friction_items=friction_items,
         )
     state["last_fired_date"] = today_iso
     save_state(config.state.path, state)
@@ -282,6 +304,7 @@ async def fire_once(
         "proposal_items_count": len(proposal_items),
         "pending_items_count": len(pending_items),
         "radar_items_count": len(radar_items),
+        "friction_items_count": len(friction_items),
         "message_ids": message_ids,
         "body": body,
         "dedupe_key": dedupe_key,
