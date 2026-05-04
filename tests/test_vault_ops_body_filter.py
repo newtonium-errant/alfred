@@ -124,7 +124,7 @@ def test_vault_edit_strips_body_from_set_fields(tmp_vault: Path):
             tmp_vault,
             "task/Edit Filter Test.md",
             set_fields={
-                "status": "in_progress",
+                "status": "active",
                 "body": "should never land in frontmatter",
             },
         )
@@ -136,7 +136,7 @@ def test_vault_edit_strips_body_from_set_fields(tmp_vault: Path):
         f"{dict(post.metadata)}"
     )
     # Legitimate edit applied.
-    assert post.metadata["status"] == "in_progress"
+    assert post.metadata["status"] == "active"
     # On-disk body is unchanged (no body_append / body_rewriter passed).
     assert "Original body content." in post.content
     assert "should never land in frontmatter" not in post.content
@@ -164,7 +164,7 @@ def test_vault_edit_normal_set_fields_pass_through_unchanged(
         vault_edit(
             tmp_vault,
             "task/Edit Normal Test.md",
-            set_fields={"status": "in_progress", "due": "2026-05-12"},
+            set_fields={"status": "active", "due": "2026-05-12"},
         )
     filter_logs = [
         c for c in captured
@@ -197,7 +197,7 @@ def test_vault_edit_body_append_works_when_body_in_set_fields_stripped(
         tmp_vault,
         "task/Mixed Edit Test.md",
         set_fields={
-            "status": "in_progress",
+            "status": "active",
             # Erroneous body key — gets stripped.
             "body": "should be stripped",
         },
@@ -207,7 +207,7 @@ def test_vault_edit_body_append_works_when_body_in_set_fields_stripped(
     file_path = tmp_vault / "task/Mixed Edit Test.md"
     post = frontmatter.load(str(file_path))
     assert "body" not in post.metadata
-    assert post.metadata["status"] == "in_progress"
+    assert post.metadata["status"] == "active"
     # body_append landed.
     assert "Additional content." in post.content
     # Original body preserved.
