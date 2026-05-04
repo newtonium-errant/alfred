@@ -24,7 +24,7 @@ import asyncio
 import re
 from datetime import timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import anthropic
 from telegram import Update
@@ -142,7 +142,7 @@ def build_app(
     config: TalkerConfig,
     state_mgr: StateManager,
     anthropic_client: Any,
-    system_prompt: str,
+    system_prompt_provider: Callable[[], str] | str,
     vault_context_str: str,
     raw_config: dict | None = None,
 ) -> Application:
@@ -151,6 +151,15 @@ def build_app(
     Callers add their own post-init hooks (gap sweeper, signal handlers) via
     :mod:`daemon`. This function only does handler registration.
 
+    ``system_prompt_provider`` — accepts EITHER a zero-arg callable
+    (production path; the daemon passes
+    ``build_system_prompt_provider(skills_dir, config)`` so SKILL.md
+    is read fresh per conversation start, closing the same-cycle SKILL
+    ship gap from QA 2026-05-04) OR a static string (legacy path for
+    tests + ad-hoc callers that don't need hot-reload). When a string
+    is passed, it's wrapped in a constant-returning lambda so the
+    handler's call shape stays uniform.
+
     ``raw_config`` — Stage 3.5 addition. The peer-route dispatcher
     needs the full unified config dict to build a TransportConfig
     at forward time (peer URLs + tokens live under ``transport.peers``).
@@ -158,10 +167,22 @@ def build_app(
     """
     app = Application.builder().token(config.bot_token).build()
 
+    # Normalize the provider: callers may pass a callable (the daemon
+    # path, hot-reload-enabled) or a plain string (tests, legacy
+    # callers that don't need hot-reload). Wrap the string case in a
+    # constant-returning lambda so the read site at the message
+    # handler always invokes a callable.
+    if callable(system_prompt_provider):
+        provider: Callable[[], str] = system_prompt_provider
+    else:
+        _static_prompt = str(system_prompt_provider)
+        def provider() -> str:  # noqa: E306
+            return _static_prompt
+
     app.bot_data[_KEY_CONFIG] = config
     app.bot_data[_KEY_STATE] = state_mgr
     app.bot_data[_KEY_CLIENT] = anthropic_client
-    app.bot_data[_KEY_SYSTEM] = system_prompt
+    app.bot_data[_KEY_SYSTEM] = provider
     app.bot_data[_KEY_VAULT_CTX] = vault_context_str
     app.bot_data[_KEY_LOCKS] = {}
     app.bot_data["raw_config"] = raw_config
@@ -2641,7 +2662,16 @@ async def handle_message(
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
     state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
     client: Any = ctx.application.bot_data[_KEY_CLIENT]
-    system_prompt: str = ctx.application.bot_data[_KEY_SYSTEM]
+    # _KEY_SYSTEM is now a zero-arg provider callable (per
+    # build_app's wiring); invoke it per-turn so SKILL.md edits on
+    # disk take effect on the next conversation start without daemon
+    # restart. Closes the same-cycle SKILL ship gap from QA
+    # 2026-05-04 (Hypatia ran a conversation against the OLD SKILL
+    # after the new SKILL committed but before restart).
+    system_prompt_provider: Callable[[], str] = (
+        ctx.application.bot_data[_KEY_SYSTEM]
+    )
+    system_prompt: str = system_prompt_provider()
     vault_context_str: str = ctx.application.bot_data[_KEY_VAULT_CTX]
     locks: dict[int, asyncio.Lock] = ctx.application.bot_data[_KEY_LOCKS]
 

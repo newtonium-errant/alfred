@@ -28,7 +28,7 @@ import asyncio
 import signal
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import anthropic
 from telegram import Update
@@ -84,6 +84,17 @@ def _load_system_prompt(skills_dir: Path, skill_bundle: str = "vault-talker") ->
     Multi-instance (Stage 3.5): the bundle name comes from
     ``telegram.instance.skill_bundle`` in config.yaml. Salem keeps the
     legacy default ``"vault-talker"``; KAL-LE ships with ``"vault-kalle"``.
+
+    Reads fresh from disk each call. The per-conversation hot-reload
+    wiring (see ``build_system_prompt_provider`` below) calls this on
+    every conversation start so SKILL.md edits take effect without
+    a daemon restart — closes the "same-cycle SKILL ship" gap from
+    QA 2026-05-04 (Hypatia ran a conversation with the old SKILL
+    after the new SKILL committed but before restart).
+
+    File-system cost: ~1-3 KB SKILL files, OS page cache hot — read
+    is sub-millisecond. Negligible vs the per-turn Anthropic API
+    round-trip.
     """
     skill_path = skills_dir / skill_bundle / "SKILL.md"
     if not skill_path.exists():
@@ -93,7 +104,52 @@ def _load_system_prompt(skills_dir: Path, skill_bundle: str = "vault-talker") ->
             skill_bundle=skill_bundle,
         )
         return ""
-    return skill_path.read_text(encoding="utf-8")
+    text = skill_path.read_text(encoding="utf-8")
+    # Per-load diagnostic so an operator can verify the hot-reload
+    # IS happening on every conversation start. Debug level so it
+    # doesn't spam INFO-level logs in production; structlog
+    # filtering decides the surface.
+    log.debug(
+        "talker.conversation.skill_md_loaded",
+        path=str(skill_path),
+        skill_bundle=skill_bundle,
+        char_count=len(text),
+    )
+    return text
+
+
+def build_system_prompt_provider(
+    skills_dir: Path,
+    config: TalkerConfig,
+) -> Callable[[], str]:
+    """Return a zero-arg callable that reads SKILL.md fresh + templates it.
+
+    Used by ``bot.build_app`` to wire per-conversation SKILL.md hot-
+    reload — instead of stashing a static string in ``bot_data``, the
+    bot stashes this provider and invokes it per turn. SKILL edits on
+    disk take effect on the next conversation start; no daemon
+    restart needed.
+
+    Closure captures ``skills_dir`` + ``config`` (both immutable for
+    the daemon's lifetime). Templating reads ``config.instance.name``
+    / ``canonical`` which don't change across the daemon's life
+    either, so the only thing that varies between calls is the
+    SKILL.md content itself.
+
+    Errors degrade to empty string per ``_load_system_prompt``'s
+    contract (file-missing → warning + empty); the bot's downstream
+    Anthropic call still works on an empty system prompt (just with
+    no instance-specific guidance — better than crashing the turn).
+    """
+    skill_bundle = config.instance.skill_bundle
+
+    def _provider() -> str:
+        return _apply_instance_templating(
+            _load_system_prompt(skills_dir, skill_bundle=skill_bundle),
+            config,
+        )
+
+    return _provider
 
 
 def _apply_instance_templating(prompt: str, config: TalkerConfig) -> str:
@@ -206,12 +262,22 @@ async def run(
     detect_dangling_tool_use_at_startup(state_mgr, now=now)
 
     client = anthropic.AsyncAnthropic(api_key=config.anthropic.api_key)
-    system_prompt = _apply_instance_templating(
-        _load_system_prompt(
-            Path(skills_dir_str),
-            skill_bundle=config.instance.skill_bundle,
-        ),
-        config,
+    # Build a system-prompt PROVIDER instead of a frozen string. The
+    # provider is invoked per conversation so SKILL.md edits take
+    # effect on the next conversation start without a daemon restart
+    # — closes the same-cycle SKILL ship gap from QA 2026-05-04.
+    system_prompt_provider = build_system_prompt_provider(
+        Path(skills_dir_str), config,
+    )
+    # One-shot boot-time invocation surfaces SKILL-missing warnings +
+    # logs the initial char_count so the operator can confirm the
+    # SKILL loaded cleanly at startup. The provider's per-conversation
+    # invocations carry the same diagnostic via debug-level logs.
+    initial_prompt = system_prompt_provider()
+    log.info(
+        "talker.daemon.system_prompt_provider_ready",
+        skill_bundle=config.instance.skill_bundle,
+        initial_char_count=len(initial_prompt),
     )
     vault_context_str = _build_vault_context_str(config)
 
@@ -219,7 +285,7 @@ async def run(
         config=config,
         state_mgr=state_mgr,
         anthropic_client=client,
-        system_prompt=system_prompt,
+        system_prompt_provider=system_prompt_provider,
         vault_context_str=vault_context_str,
         raw_config=raw,
     )
