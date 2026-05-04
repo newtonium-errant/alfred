@@ -132,10 +132,14 @@ def test_kalle_scope_still_rejects_location():
 
 
 def test_kalle_create_types_shape():
+    """Pin: KAL-LE's create allowlist. ``architecture`` added
+    2026-05-04 — multi-instance system design records distinct from
+    ``pattern``'s reusable how-to. Updating this pin is the deliberate
+    surface-widening signal the test exists for."""
     assert KALLE_CREATE_TYPES == {
         "note", "session", "conversation",
         "decision", "assumption", "synthesis",
-        "pattern", "principle",
+        "pattern", "principle", "architecture",
     }
 
 
@@ -145,10 +149,16 @@ def test_kalle_create_types_shape():
 
 
 def test_known_types_kalle_is_separate_set():
-    """Pattern + principle are NOT in the core KNOWN_TYPES."""
-    assert schema.KNOWN_TYPES_KALLE == {"pattern", "principle"}
+    """Pattern + principle + architecture are NOT in the core
+    KNOWN_TYPES (KAL-LE-only, per the per-instance principle).
+    ``architecture`` added 2026-05-04 — see test_kalle_create_types_shape
+    for the rationale."""
+    assert schema.KNOWN_TYPES_KALLE == {
+        "pattern", "principle", "architecture",
+    }
     assert "pattern" not in schema.KNOWN_TYPES
     assert "principle" not in schema.KNOWN_TYPES
+    assert "architecture" not in schema.KNOWN_TYPES
 
 
 # ---------------------------------------------------------------------------
