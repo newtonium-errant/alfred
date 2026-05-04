@@ -839,6 +839,56 @@ def vault_create(
     return {"path": rel_path, "warnings": warnings}
 
 
+def _apply_body_insert_at(
+    body: str, *, marker: str, position: str, content: str,
+) -> str:
+    """Insert ``content`` before/after the line matching ``marker`` exactly.
+
+    Marker semantics: line-exact match. The whole line (after rstrip)
+    must equal ``marker``. Predictable, easy to reason about, no regex
+    injection risk; real-world markers are full headings (``## Hardware-
+    specific drills``) or distinctive lines.
+
+    Raises ``VaultError`` if:
+      - marker not found in body (clean error, body untouched)
+      - marker matches multiple lines (ambiguous; operator must use a
+        more distinctive marker)
+      - position is not "before" or "after"
+
+    Inserts ``content`` as a separate paragraph: a blank line on each
+    side (unless the body already has one there). Caller-supplied
+    content is inserted verbatim — newline normalization is the
+    caller's responsibility.
+    """
+    if position not in ("before", "after"):
+        raise VaultError(
+            f"body_insert_at position must be 'before' or 'after', "
+            f"got: {position!r}"
+        )
+    lines = body.split("\n")
+    matches = [
+        i for i, line in enumerate(lines) if line.rstrip() == marker
+    ]
+    if not matches:
+        raise VaultError(
+            f"body_insert_at marker not found (line-exact match): "
+            f"{marker!r}"
+        )
+    if len(matches) > 1:
+        raise VaultError(
+            f"body_insert_at marker matches {len(matches)} lines "
+            f"(ambiguous; pick a more distinctive marker): {marker!r}"
+        )
+    idx = matches[0]
+    insert_at = idx if position == "before" else idx + 1
+    # Wrap the insertion in blank-line padding for clean paragraph
+    # separation. Strip trailing whitespace so we don't accumulate
+    # blanks across repeated insertions.
+    block = ["", content.rstrip(), ""]
+    new_lines = lines[:insert_at] + block + lines[insert_at:]
+    return "\n".join(new_lines)
+
+
 def vault_edit(
     vault_path: Path,
     rel_path: str,
@@ -847,27 +897,59 @@ def vault_edit(
     append_fields: dict | None = None,
     body_append: str | None = None,
     body_rewriter: Callable[[str], str] | None = None,
+    body_insert_at: dict | None = None,
+    body_replace: str | None = None,
     scope: str | None = None,
 ) -> dict:
     """Edit a vault record. Returns {path, fields_changed}.
 
-    ``body_rewriter`` (wk3 commit 7) is an optional callable that takes
-    the current body string and returns a new body string. Runs after
-    ``body_append`` so a single edit can both append and rewrite, though
-    the common case is one or the other. If the rewriter returns the
-    body unchanged, ``body`` is NOT added to ``fields_changed`` — the
-    caller's check "did anything actually change?" stays honest.
+    Body-mutation surfaces (mutually exclusive — pick at most one per
+    call):
 
-    Used by the telegram calibration writer to surgically replace the
-    interior of the ``<!-- ALFRED:CALIBRATION -->`` block without
-    disturbing the surrounding person-record body. Generic surface
-    rather than a calibration-specific ``body_replace`` kwarg because
-    the shape generalises to any marker-fenced rewrite (dynamic briefings,
-    section summaries) without another round of vault_ops surgery.
+      * ``body_append: str`` — add to end of doc. Universal across
+        all instances; gated by ``allow_body_writes``.
+      * ``body_rewriter: Callable[[str], str]`` — function that takes
+        the current body and returns a new body. Used by the telegram
+        calibration writer for marker-fenced surgical rewrites; not
+        exposed to LLM agents.
+      * ``body_insert_at: {marker, position, content}`` — anchored
+        mid-document insertion. ``marker`` is a line-exact match
+        (full line content, not substring or regex); ``position`` is
+        ``"before"`` or ``"after"``. Per-instance × per-type
+        allowlist via ``check_scope("body_insert_at", ...)``.
+      * ``body_replace: str`` — full body rewrite (frontmatter
+        preserved). Per-instance × per-type allowlist via
+        ``check_scope("body_replace", ...)``. Salem ``event`` records
+        with ``gcal_event_id`` are refused at the scope layer; the
+        operator must vault_delete first to clear the GCal mirror.
+
+    Mutual exclusion: at most one body-mutation kwarg per call. If
+    multiple are supplied, raises VaultError naming the conflict.
+    Reasoning: each shapes the body differently; combining them
+    silently would surprise the operator and complicate audit.
 
     Optional ``scope`` runs ``check_scope`` before the write; default
     ``None`` preserves historical unrestricted behavior.
     """
+    # Mutual-exclusion gate FIRST — fail fast before any I/O. The
+    # gate covers all four body-mutation surfaces; calibration writer
+    # routes via body_rewriter so it inherits the gate too (it never
+    # combines with body_append in practice).
+    body_mutation_args = {
+        "body_append": body_append is not None,
+        "body_rewriter": body_rewriter is not None,
+        "body_insert_at": body_insert_at is not None,
+        "body_replace": body_replace is not None,
+    }
+    active = [name for name, present in body_mutation_args.items() if present]
+    if len(active) > 1:
+        raise VaultError(
+            f"vault_edit accepts at most ONE body-mutation kwarg per "
+            f"call (body_append, body_rewriter, body_insert_at, "
+            f"body_replace). Got: {', '.join(active)}. Combine in "
+            f"separate edits or pick the surface that matches intent."
+        )
+
     # Strip reserved frontmatter keys before scope check + downstream
     # processing. See ``_filter_reserved_keys`` for the rationale +
     # bug-class history (Hypatia DJ-tracker conversation 2026-05-04).
@@ -875,11 +957,27 @@ def vault_edit(
         set_fields = _filter_reserved_keys(
             set_fields, op="vault_edit", rel_path=rel_path,
         )
+
+    file_path = _resolve_vault_path(vault_path, rel_path)
+    if not file_path.exists():
+        raise VaultError(f"File not found: {rel_path}")
+
+    # Parse FIRST so the body-mutation scope checks (which need the
+    # existing frontmatter for the gcal carve-out) have the data they
+    # need. The existing ``edit`` scope check below stays in its
+    # original position; only the new body-mutation gates need
+    # existing_frontmatter.
+    fm, body = _parse_record(file_path)
+    record_type = fm.get("type", "")
+
     if scope is not None:
         fields_list = (
             list((set_fields or {}).keys()) + list((append_fields or {}).keys())
         )
-        body_write_requested = body_append is not None or body_rewriter is not None
+        body_write_requested = (
+            body_append is not None or body_rewriter is not None
+            or body_insert_at is not None or body_replace is not None
+        )
         check_scope(
             scope,
             "edit",
@@ -887,12 +985,26 @@ def vault_edit(
             fields=fields_list,
             body_write=body_write_requested,
         )
+        # Body-mutation tools have their own per-instance × per-type
+        # gate (per the c1 matrix). Run only if the corresponding kwarg
+        # is set so callers that don't use these tools are unaffected.
+        if body_insert_at is not None:
+            check_scope(
+                scope,
+                "body_insert_at",
+                rel_path=rel_path,
+                record_type=record_type,
+                existing_frontmatter=fm,
+            )
+        if body_replace is not None:
+            check_scope(
+                scope,
+                "body_replace",
+                rel_path=rel_path,
+                record_type=record_type,
+                existing_frontmatter=fm,
+            )
 
-    file_path = _resolve_vault_path(vault_path, rel_path)
-    if not file_path.exists():
-        raise VaultError(f"File not found: {rel_path}")
-
-    fm, body = _parse_record(file_path)
     fields_changed: list[str] = []
 
     # Set fields (overwrite)
@@ -913,21 +1025,42 @@ def vault_edit(
                 fm[k] = [existing, v]
             fields_changed.append(k)
 
-    # Coerce + validate after edits
+    # Coerce + validate after edits — re-read record_type in case
+    # set_fields touched it.
     _coerce_list_fields(fm)
     record_type = fm.get("type", "")
     if record_type:
         _validate_status(record_type, fm.get("status", ""))
     _validate_list_fields(fm)
 
-    # Append to body
-    if body_append:
+    # Body mutation — exactly one of the four surfaces, enforced above.
+    if body_replace is not None:
+        # Full-body rewrite. Frontmatter preserved (caller's set_fields
+        # / append_fields above already applied, but the body string
+        # comes wholesale from the caller). Trailing newline added so
+        # the file ends cleanly.
+        body = body_replace.rstrip("\n") + "\n"
+        fields_changed.append("body")
+    elif body_insert_at is not None:
+        marker = str(body_insert_at.get("marker", "") or "")
+        position = str(body_insert_at.get("position", "") or "")
+        content = str(body_insert_at.get("content", "") or "")
+        if not marker or not content:
+            raise VaultError(
+                "body_insert_at requires non-empty 'marker' and "
+                "'content' fields."
+            )
+        body = _apply_body_insert_at(
+            body, marker=marker, position=position, content=content,
+        )
+        fields_changed.append("body")
+    elif body_append:
+        # Append to body
         body = body.rstrip() + "\n\n" + body_append + "\n"
         fields_changed.append("body")
-
-    # Rewrite body (wk3 commit 7 — runs last so append + rewrite compose
-    # in a predictable order if both are provided on the same call).
-    if body_rewriter is not None:
+    elif body_rewriter is not None:
+        # Rewrite body (wk3 commit 7 — calibration writer's marker-fenced
+        # surgical rewrite path).
         new_body = body_rewriter(body)
         if new_body != body:
             body = new_body
