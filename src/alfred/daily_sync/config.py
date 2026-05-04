@@ -122,6 +122,57 @@ class AttributionConfig:
 
 
 @dataclass
+class FrictionThresholdsConfig:
+    """Detection thresholds for the friction analyzer (K3 c1).
+
+    Each threshold gates one friction-event category. Defaults match
+    the K3 spec (3 failures / 5 successes / 24h window). Bumping any
+    of these post-deploy raises the bar (fewer events surface);
+    lowering it floods the queue. Tune based on operator-feedback
+    signal-to-noise.
+    """
+
+    failed_pattern_count: int = 3
+    repeated_pattern_count: int = 5
+    window_hours: int = 24
+
+
+@dataclass
+class FrictionAnalyzerConfig:
+    """Friction analyzer (K3 c1) config block.
+
+    Reads KAL-LE's bash_exec.jsonl audit log, scores friction events
+    along three categories (failed_pattern / repeated_pattern /
+    missing_tool), and appends to the friction log file the section
+    provider (K3 c2) reads from.
+
+    ``audit_log_path`` empty string means "fall back to
+    ``telegram.bash_exec.audit_path`` from the unified config" — this
+    is the production case for KAL-LE. Operators can override per-
+    instance for testing or split-log scenarios.
+
+    ``log_path`` is the friction-event JSONL the section provider
+    will read. Append-only; one row per friction event.
+
+    ``enabled: false`` (default) is the per-instance opt-in switch.
+    KAL-LE is the first instance to flip it on; Salem and Hypatia
+    leave it absent (no bash_exec audit log → no friction surface).
+    """
+
+    enabled: bool = False
+    schedule: ScheduleConfig = field(
+        default_factory=lambda: ScheduleConfig(
+            time="07:30", timezone="America/Halifax",
+        )
+    )
+    audit_log_path: str = ""
+    log_path: str = "./data/kalle_friction_log.jsonl"
+    thresholds: FrictionThresholdsConfig = field(
+        default_factory=FrictionThresholdsConfig,
+    )
+
+
+@dataclass
 class DailySyncConfig:
     """Top-level Daily Sync config.
 
@@ -138,6 +189,12 @@ class DailySyncConfig:
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     state: StateConfig = field(default_factory=StateConfig)
     attribution: AttributionConfig = field(default_factory=AttributionConfig)
+    # Friction analyzer / queue (K3) — defaulted-OFF; instances opt
+    # in via ``daily_sync.friction_analyzer.enabled: true``. KAL-LE is
+    # the first such instance.
+    friction_analyzer: FrictionAnalyzerConfig = field(
+        default_factory=FrictionAnalyzerConfig,
+    )
     # Path to the config file this DailySyncConfig was loaded from.
     # Carried so lazy/late loaders (the canonical-proposals queue-path
     # helpers in ``canonical_proposals_section`` and ``reply_dispatch``)
@@ -161,6 +218,8 @@ _DATACLASS_MAP: dict[str, type] = {
     "confidence": ConfidenceConfig,
     "state": StateConfig,
     "attribution": AttributionConfig,
+    "friction_analyzer": FrictionAnalyzerConfig,
+    "thresholds": FrictionThresholdsConfig,
 }
 
 

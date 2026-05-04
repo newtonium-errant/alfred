@@ -345,6 +345,48 @@ def _run_radar_day(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     asyncio.run(run_rd_daemon(config))
 
 
+def _run_friction_analyzer(
+    raw: dict[str, Any], suppress_stdout: bool = False,
+) -> None:
+    """Friction analyzer daemon entry (K3 c1).
+
+    Per-instance auto-start: any instance with
+    ``daily_sync.friction_analyzer.enabled: true`` runs this daemon.
+    Default fire 07:30 ADT — 1.5h ahead of the Daily Sync at 09:00 ADT
+    so the friction log is fresh when the section provider reads it.
+
+    Reads ``telegram.bash_exec.audit_path`` (KAL-LE's bash_exec audit
+    log) and writes friction events to
+    ``daily_sync.friction_analyzer.log_path``. The K3 c2 section
+    provider reads the latter.
+
+    Exit code 78 when the block is absent / disabled so auto-restart
+    skips us.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/friction_analyzer.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    from alfred.brief.utils import setup_logging
+    setup_logging(
+        level=log_cfg.get("level", "INFO"),
+        log_file=log_file,
+        suppress_stdout=suppress_stdout,
+    )
+    from alfred.daily_sync.config import load_from_unified as load_ds
+    from alfred.daily_sync.friction_analyzer_daemon import (
+        run_daemon as run_fa_daemon,
+    )
+    config = load_ds(raw)
+    if not config.friction_analyzer.enabled:
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("friction_analyzer.daemon.disabled_in_config")
+        sys.exit(78)
+    asyncio.run(run_fa_daemon(config, raw_config=raw))
+
+
 def _run_pending_items_pusher(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Pending Items Queue periodic-flush daemon.
 
@@ -527,6 +569,7 @@ TOOL_RUNNERS = {
     "digest": _run_digest,
     "pending_items_pusher": _run_pending_items_pusher,
     "radar_day": _run_radar_day,
+    "friction_analyzer": _run_friction_analyzer,
 }
 
 
@@ -638,6 +681,16 @@ def run_all(
         )
         if radar_day_block.get("enabled"):
             tools.append("radar_day")
+        # Friction analyzer (K3 c1 — Daily Sync friction queue feeder).
+        # Auto-starts when ``daily_sync.friction_analyzer:`` block is
+        # present AND ``enabled: true``. KAL-LE is the first instance
+        # to flip this on; Salem / Hypatia have no bash_exec audit log
+        # and leave the block absent.
+        friction_block = (
+            (raw.get("daily_sync") or {}).get("friction_analyzer") or {}
+        )
+        if friction_block.get("enabled"):
+            tools.append("friction_analyzer")
 
         if skipped:
             import structlog
@@ -698,7 +751,7 @@ def run_all(
         # Tools whose runner signature is ``(raw, suppress_stdout)`` (no
         # skills_dir). BIT has no skill prompts — it drives the
         # aggregator directly — so it lives in this bucket.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "pending_items_pusher", "radar_day"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "pending_items_pusher", "radar_day", "friction_analyzer"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")
