@@ -617,3 +617,147 @@ def test_tag_cleanup_report_to_dict_round_trips_per_record():
     assert out["vault_path"] == "/v"
     assert out["records_scanned"] == 3
     assert out["per_record_modifications"][0]["record_path"] == "event/X.md"
+
+
+# ---------------------------------------------------------------------------
+# Cross-phase predicate parity (NOTE 3 from cffd820 review)
+# ---------------------------------------------------------------------------
+#
+# Both Phase 1 (the surveyor daemon's ``_filter_anchored_tags`` write-side
+# gate) and Phase 2 (this module's ``cleanup_alfred_tags_contamination``)
+# import ``_tag_anchored_in_corpus`` from the same module — byte-identical
+# predicate is structurally enforced today. But no explicit test asserts
+# "if the gate rejects X, the cleanup also removes X." A future refactor
+# that wraps the helper differently in one path but not the other would
+# silently introduce a parity break (the failure mode the reviewer named:
+# "either over-remove operator-curated tags or under-remove cluster-bleed
+# contamination"). Catching that regression class IS what this parametrized
+# test buys.
+#
+# Test shape: a parametrized table of (body, proposed_tags, expected_kept)
+# — each row exercises BOTH wrappers (Phase 1's _filter_anchored_tags
+# called as an unbound method against a stub config + stub VaultRecord;
+# Phase 2's full cleanup_alfred_tags_contamination written into a tmp
+# vault) and asserts both produce the same kept-set.
+
+
+import types  # noqa: E402  — local import keeps the parity block self-contained
+
+
+def _phase1_kept(body: str, proposed_tags: list[str]) -> list[str]:
+    """Invoke the surveyor daemon's ``_filter_anchored_tags`` with a
+    minimal stub config + stub VaultRecord. Bypasses ``Daemon.__init__``
+    so the test doesn't pull in the entire pipeline dependency tree."""
+    from alfred.surveyor.daemon import Daemon
+
+    fake_self = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(
+            labeler=types.SimpleNamespace(require_text_anchor=True),
+        ),
+    )
+    # The gate reads only frontmatter + body off the record.
+    fake_record = types.SimpleNamespace(frontmatter={}, body=body)
+    return Daemon._filter_anchored_tags(fake_self, proposed_tags, fake_record)
+
+
+def _phase2_kept(
+    vault: Path, body: str, proposed_tags: list[str]
+) -> list[str]:
+    """Invoke the Phase 2 cleanup against a single record carrying
+    ``proposed_tags``. Returns the kept set as the cleanup decides it.
+
+    Dry-run: the file isn't mutated, but the report's
+    ``per_record_modifications`` records the kept-set decision."""
+    rel_path = "note/Parity.md"
+    _write_record(
+        vault, rel_path=rel_path, body=body, alfred_tags=list(proposed_tags),
+    )
+    report = cleanup_alfred_tags_contamination(vault, dry_run=True)
+    if report.records_modified == 0:
+        # All tags kept — no entry in per_record_modifications.
+        return list(proposed_tags)
+    for m in report.per_record_modifications:
+        if m.record_path == rel_path:
+            return list(m.tags_kept)
+    raise AssertionError("parity-test record missing from report")
+
+
+@pytest.mark.parametrize(
+    "body, proposed_tags, expected_kept",
+    [
+        # All anchored — both phases keep everything.
+        (
+            "Live music at the venue tonight.",
+            ["music"],
+            ["music"],
+        ),
+        # All unanchored — both phases drop everything.
+        (
+            "Quiet morning, talked about gardening.",
+            ["music", "marketing"],
+            [],
+        ),
+        # Mixed — both phases keep the same subset.
+        (
+            "Live music at the venue. We discussed marketing afterwards.",
+            ["music", "marketing", "events"],
+            ["music", "marketing"],
+        ),
+        # Hierarchical anchor — last slash-segment is the anchor.
+        (
+            "Live music at the local pub.",
+            ["events/music"],
+            ["events/music"],
+        ),
+        # Compound anchor — last dash-segment is the anchor.
+        (
+            "Music at the festival was excellent.",
+            ["live-music"],
+            ["live-music"],
+        ),
+        # Hierarchical-then-compound — splits both, anchor is "music".
+        (
+            "Live music at the local pub.",
+            ["events/live-music"],
+            ["events/live-music"],
+        ),
+        # Case-insensitive — body says MUSIC, anchor is music.
+        (
+            "Tonight: live MUSIC at 8pm.",
+            ["music"],
+            ["music"],
+        ),
+        # Word-boundary discipline — "musical" should NOT anchor "music"
+        # (boundary regex requires a word break after the term). This
+        # is the precision-control case the heuristic exists to handle;
+        # both phases must enforce it identically.
+        (
+            "The musical performance was lovely.",
+            ["music"],
+            [],
+        ),
+    ],
+)
+def test_phase1_gate_and_phase2_cleanup_agree(
+    vault: Path,
+    body: str,
+    proposed_tags: list[str],
+    expected_kept: list[str],
+):
+    """Both phases must produce the same kept-set for the same
+    (body, proposed_tags) input. Catches the regression class where
+    a future refactor wraps the helper differently in one path."""
+    p1 = _phase1_kept(body, proposed_tags)
+    p2 = _phase2_kept(vault, body, proposed_tags)
+    # Order-preserving: both phases iterate the input list in order.
+    assert p1 == expected_kept, (
+        f"Phase 1 gate disagrees with expected: {p1} vs {expected_kept}"
+    )
+    assert p2 == expected_kept, (
+        f"Phase 2 cleanup disagrees with expected: {p2} vs {expected_kept}"
+    )
+    # The headline parity assertion — if both agree with the expected
+    # value, they agree with each other. This IS the named contract.
+    assert p1 == p2, (
+        f"Phase 1 / Phase 2 disagree on (body, tags): {p1} vs {p2}"
+    )

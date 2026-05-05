@@ -801,13 +801,19 @@ def cleanup_alfred_tags_contamination(
 
         report.records_modified += 1
         report.tags_removed_total += len(tags_removed)
-        report.per_record_modifications.append(
-            TagCleanupRecord(
-                record_path=rel_path,
-                tags_removed=tags_removed,
-                tags_kept=tags_kept,
-            )
+        # Capture the record object in a local so the rollback path can
+        # use identity-based ``.remove()`` instead of ``.pop()``.
+        # ``.pop()`` works in single-threaded code but is shape-fragile
+        # if a future change parallelizes per-record processing —
+        # concurrent ``append()`` + ``pop()`` would silently remove the
+        # wrong record. Mirrors link-side's identity-based removal at
+        # ``cleanup_entity_link_contamination`` line ~573.
+        record_entry = TagCleanupRecord(
+            record_path=rel_path,
+            tags_removed=tags_removed,
+            tags_kept=tags_kept,
         )
+        report.per_record_modifications.append(record_entry)
 
         if dry_run:
             log.debug(
@@ -833,12 +839,19 @@ def cleanup_alfred_tags_contamination(
                 "path": rel_path,
                 "phase": "write",
                 "error": str(exc),
+                # Always ``["alfred_tags"]`` for this CLI, but writing
+                # it explicitly lets unified ``vault_audit.log``
+                # analysis treat tag-side and link-side failure entries
+                # uniformly (link-side at line ~569 emits the same
+                # field). Mirror NOTE 2 from the cffd820 review.
+                "fields_attempted": ["alfred_tags"],
             })
             # Roll back the report entries so counts reflect what
-            # actually persisted.
+            # actually persisted. Identity-based ``.remove()`` (NOT
+            # ``.pop()``) — see NOTE above ``record_entry`` capture.
             report.records_modified -= 1
             report.tags_removed_total -= len(tags_removed)
-            report.per_record_modifications.pop()
+            report.per_record_modifications.remove(record_entry)
             continue
 
         log.info(
