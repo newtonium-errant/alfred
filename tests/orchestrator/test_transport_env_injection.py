@@ -723,9 +723,21 @@ class TestAutoLoadDotenvForConfig:
         ev = events[0]
         assert ev["vars_loaded"] == 2
         assert ev["vars_skipped_existing"] == 1
-        # Secret hygiene: counts only, never key names.
-        assert "key" not in ev
-        assert "keys" not in ev
+        # Secret hygiene: counts only, never key names OR values. A
+        # future regression that adds e.g. ``loaded_vars=[...]`` would
+        # slip past a literal-field-name check, so serialize-and-search
+        # for every fixture key + value the .env contained.
+        serialized = str(ev)
+        for forbidden in (
+            "DOTENV_INTEG_FRESH_A",
+            "DOTENV_INTEG_FRESH_B",
+            "DOTENV_INTEG_PRESET",
+            "preset-value",  # the live env value preserved by override=False
+            "ignored",  # the .env value the auto-loader skipped
+        ):
+            assert forbidden not in serialized, (
+                f"{forbidden!r} leaked into log entry: {ev}"
+            )
 
     def test_no_config_path_falls_back_to_cwd(self, tmp_path, monkeypatch):
         """Legacy callers / tests that build raw inline without going

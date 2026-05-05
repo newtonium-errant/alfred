@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import signal
 import sys
 from pathlib import Path
@@ -14,25 +13,19 @@ from .utils import setup_logging
 
 
 def _load_env_file(env_path: Path | None = None) -> None:
-    """Load a .env file into os.environ (without overriding existing vars)."""
+    """Load a .env file into os.environ (without overriding existing vars).
+
+    Thin shim over the canonical ``alfred._env.auto_load_dotenv`` so
+    parser semantics stay byte-identical with the orchestrator and
+    cli.py paths. See ``orchestrator._auto_load_dotenv_for_config`` for
+    the contract; pre-consolidation (2026-05-05) this had its own
+    parser that silently broke on ``export `` prefixes.
+    """
+    from alfred._env import auto_load_dotenv
+
     if env_path is None:
         env_path = Path(".env")
-    if not env_path.is_file():
-        return
-    with open(env_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-                value = value[1:-1]
-            if key not in os.environ:
-                os.environ[key] = value
+    auto_load_dotenv(env_path, override=False)
 
 
 def main() -> None:

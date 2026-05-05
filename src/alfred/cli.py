@@ -15,29 +15,26 @@ import yaml
 def _load_env_file(env_path: Path | None = None) -> None:
     """Load a .env file into os.environ (without overriding existing vars).
 
-    Supports lines of the form KEY=VALUE (with optional quoting).
-    Skips blank lines and comments (#).
+    Thin shim over the canonical ``alfred._env.auto_load_dotenv`` so
+    parser semantics stay byte-identical with the orchestrator's
+    ``_auto_load_dotenv_for_config`` path. Pre-consolidation
+    (2026-05-05), this function had its own ``KEY=VALUE`` parser that
+    silently set ``os.environ["export FOO"] = "bar"`` for every
+    ``export FOO=bar`` line — same .env file produced two different
+    environments depending on which loader fired first. See
+    ``orchestrator._auto_load_dotenv_for_config`` for the canonical
+    contract (path resolution, override=False semantics, structured
+    logs). This loader stays CWD-defaulted because cli.py doesn't have
+    a config path until argparse runs; the orchestrator path picks up
+    anything cli.py missed (e.g. when ``--config`` points at a
+    non-CWD directory) via ``override=False`` — both fire, second one
+    fills gaps, neither clobbers parent-shell exports.
     """
+    from alfred._env import auto_load_dotenv
+
     if env_path is None:
         env_path = Path(".env")
-    if not env_path.is_file():
-        return
-    with open(env_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip()
-            # Remove surrounding quotes if present
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-                value = value[1:-1]
-            # Only set if not already in environment (don't override)
-            if key not in os.environ:
-                os.environ[key] = value
+    auto_load_dotenv(env_path, override=False)
 
 
 def _load_unified_config(config_path: str) -> dict[str, Any]:
