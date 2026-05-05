@@ -1035,6 +1035,18 @@ def vault_edit(
 
     # Body mutation — exactly one of the four surfaces, enforced above.
     if body_replace is not None:
+        # Empty-content guard — feature parity with body_insert_at's
+        # ``not marker or not content`` check above. An agent calling
+        # ``vault_edit body_replace=""`` would silently nuke the
+        # entire body; the gate denies with the same shape. Whitespace-
+        # only content (e.g. ``" "``) IS allowed — mirrors
+        # body_insert_at's contract (``not "  "`` is False, truthy
+        # string passes). Operator who wants to set a body to literal
+        # whitespace chose that explicitly.
+        if not body_replace:
+            raise VaultError(
+                "body_replace requires non-empty content."
+            )
         # Full-body rewrite. Frontmatter preserved (caller's set_fields
         # / append_fields above already applied, but the body string
         # comes wholesale from the caller). Trailing newline added so

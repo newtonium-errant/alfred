@@ -314,6 +314,59 @@ class TestVaultEditBodyReplace:
                 scope="janitor",
             )
 
+    def test_body_replace_empty_string_refused(self, tmp_vault: Path):
+        """Empty-string guard — feature parity with body_insert_at's
+        ``not marker or not content`` check. An agent calling
+        ``vault_edit body_replace=""`` would silently nuke the entire
+        body; the gate denies with the same shape. P1 from the body-
+        mutation arc consistency follow-up."""
+        vault_create(
+            tmp_vault, "note", "Empty Replace Test",
+            body="# Original content.\n\nDon't lose this.\n",
+            scope="talker",
+        )
+        with pytest.raises(VaultError, match="non-empty content"):
+            vault_edit(
+                tmp_vault, "note/Empty Replace Test.md",
+                body_replace="",
+                scope="talker",
+            )
+        # Body untouched on refusal.
+        post = frontmatter.load(
+            str(tmp_vault / "note/Empty Replace Test.md")
+        )
+        assert "Original content." in post.content
+        assert "Don't lose this." in post.content
+
+    def test_body_replace_whitespace_only_allowed(self, tmp_vault: Path):
+        """Consistency pin with body_insert_at: ``not "  "`` evaluates
+        False (truthy string) — whitespace-only content passes the
+        empty-content gate in BOTH surfaces. Operator who explicitly
+        wants to set a body to literal whitespace chose that. The
+        pin guards against a future tightening of the guard that
+        would diverge from body_insert_at's contract.
+
+        Documented behaviour, not encouraged usage — but consistency
+        across the body-mutation surfaces is what the contract
+        promises."""
+        vault_create(
+            tmp_vault, "note", "Whitespace Replace Test",
+            body="# Original.\n",
+            scope="talker",
+        )
+        # Should NOT raise — whitespace-only is truthy.
+        vault_edit(
+            tmp_vault, "note/Whitespace Replace Test.md",
+            body_replace="   ",
+            scope="talker",
+        )
+        post = frontmatter.load(
+            str(tmp_vault / "note/Whitespace Replace Test.md")
+        )
+        # Body wholesale-replaced (rstrip("\n") + "\n" trailing newline).
+        # The 3-space input survives the rstrip (rstrip on \n only).
+        assert post.content.rstrip("\n") == "   "
+
 
 # ---------------------------------------------------------------------------
 # Mutual exclusion
