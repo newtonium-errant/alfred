@@ -1324,6 +1324,128 @@ def cmd_check(args: argparse.Namespace) -> None:
     sys.exit(1 if report.overall_status == Status.FAIL else 0)
 
 
+def cmd_check_tool_schemas(args: argparse.Namespace) -> None:
+    """Validate this instance's tool schemas against Anthropic's request validator.
+
+    Closes the bug class surfaced 2026-05-05 by the ``oneOf``-at-top-level
+    P0 (commit ``0d7e7a6``): schema passed every local test but Anthropic's
+    server-side request validator rejected with HTTP 400 on first real
+    conversation. This subcommand exercises the SAME validator pre-deploy
+    via ``client.messages.count_tokens`` (zero cost) so a schema break
+    surfaces BEFORE restart, not 36 hours after.
+
+    Operator workflow:
+        $ alfred --config config.yaml check-tool-schemas
+        Validating Salem tool schemas against api.anthropic.com...
+        - vault_search:      ✓ accepted
+        - vault_read:        ✓ accepted
+        - vault_create:      ✓ accepted
+        - vault_edit:        ✓ accepted
+        - gcal_list_events:  ✓ accepted
+        All 5 tools validated. Safe to restart.
+
+    On rejection:
+        - vault_edit: ✗ REJECTED
+            tools.0.custom.input_schema: input_schema does not support
+            oneOf, allOf, or anyOf at the top level
+        1 of 4 tools failed validation. DO NOT restart — fix schema first.
+        exit 1
+
+    Exit codes:
+      * 0  all tools accepted
+      * 1  one or more tools rejected (operator must fix schema)
+      * 2  fatal error (no api_key, missing SDK, network failure) —
+           validator couldn't run, status of tools unknown
+
+    Per-tool isolation: each tool gets its own probe so the operator
+    sees the tool NAME in errors, not Anthropic's "tools.N" index.
+    """
+    import asyncio
+
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="alfred", suppress_stdout=True)
+
+    # Load talker config to get api_key + model + tool_set + instance name.
+    from alfred.telegram.config import load_from_unified as talker_cfg_loader
+    config = talker_cfg_loader(raw)
+
+    # Mirror the talker's runtime tool selection. ``tools_for_set`` reads
+    # ``gcal_enabled`` to decide whether to surface the GCal read tool;
+    # we lazy-resolve from the loaded config the same way ``run_turn``
+    # does (see ``conversation._resolve_gcal_enabled_for_run_turn``).
+    from alfred.telegram.conversation import (
+        _resolve_gcal_enabled_for_run_turn,
+        tools_for_set,
+    )
+    gcal_enabled = _resolve_gcal_enabled_for_run_turn(config)
+    tool_set = (
+        config.instance.tool_set
+        if config.instance and config.instance.tool_set
+        else "talker"
+    )
+    tools = tools_for_set(tool_set, gcal_enabled=gcal_enabled)
+
+    instance_name = (
+        config.instance.name
+        if config.instance and config.instance.name
+        else "(unnamed)"
+    )
+    print(
+        f"Validating {instance_name} tool schemas "
+        f"({tool_set} set, {len(tools)} tools) against api.anthropic.com..."
+    )
+
+    from alfred.health.tool_schema_validator import validate_tool_schemas
+    report = asyncio.run(
+        validate_tool_schemas(
+            api_key=config.anthropic.api_key,
+            model=config.anthropic.model,
+            tools=tools,
+            instance_name=instance_name,
+            tool_set=tool_set,
+        )
+    )
+
+    if report.fatal_error:
+        # Per ``feedback_intentionally_left_blank.md``: distinguish
+        # "couldn't run" (fatal) from "ran and tools failed" (rejected).
+        # Fatal → exit 2 so CI / scripts can tell them apart.
+        print(f"FATAL: {report.fatal_error}")
+        print("Tool validation could not run; status of all tools is UNKNOWN.")
+        sys.exit(2)
+
+    if not report.results:
+        # Empty tool list — explicit "ran, nothing to do" signal.
+        print(
+            f"No tools surfaced for tool_set={tool_set!r} "
+            f"(gcal_enabled={gcal_enabled}). Nothing to validate."
+        )
+        sys.exit(0)
+
+    # Per-tool table. Pad tool names so the ✓/✗ column lines up.
+    name_width = max(len(r.tool_name) for r in report.results)
+    for r in report.results:
+        if r.accepted:
+            print(f"  - {r.tool_name:<{name_width}}: ✓ accepted")
+        else:
+            print(f"  - {r.tool_name:<{name_width}}: ✗ REJECTED")
+            # Indent the error so it's visually grouped with the tool.
+            for line in r.error_text.splitlines() or [r.error_text]:
+                print(f"      {line}")
+
+    print()
+    if report.all_accepted:
+        print(f"All {len(report.results)} tools validated. Safe to restart.")
+        sys.exit(0)
+    else:
+        rejected = report.rejected_count
+        print(
+            f"{rejected} of {len(report.results)} tools failed validation. "
+            f"DO NOT restart — fix schema first."
+        )
+        sys.exit(1)
+
+
 def cmd_instance(args: argparse.Namespace) -> None:
     """Stage 3.5: scaffold a new Alfred instance (config + dirs + BotFather checklist).
 
@@ -1917,6 +2039,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # check-tool-schemas — pre-deploy Anthropic schema validator
+    # (closes the bug class surfaced 2026-05-05 by the oneOf-at-top-level
+    # P0). Probes each tool individually via count_tokens (zero cost) so
+    # operator can verify schemas pre-restart.
+    sub.add_parser(
+        "check-tool-schemas",
+        help=(
+            "Validate this instance's tool schemas against Anthropic's "
+            "request validator (zero-cost count_tokens probe per tool). "
+            "Run before restarting daemons after a tool-schema change."
+        ),
+    )
+
     # curator
     sub.add_parser("curator", help="Start curator daemon")
 
@@ -2416,6 +2551,7 @@ def main() -> None:
         "instance": cmd_instance,
         "talker": cmd_talker,
         "check": cmd_check,
+        "check-tool-schemas": cmd_check_tool_schemas,
         "bit": cmd_bit,
         "audit": cmd_audit,
         "reviews": cmd_reviews,
