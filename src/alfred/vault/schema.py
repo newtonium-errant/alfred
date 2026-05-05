@@ -199,15 +199,41 @@ NAME_FIELD_BY_TYPE: dict[str, str] = {
 #     Terminal by design — nothing in the vault is expected to link
 #     to a specific run.
 #
+# 2026-05-06 expansion (epistemic types) — driven by ORPHAN001
+# residual breakdown (38 epistemic of 91 total: 32 synthesis,
+# 3 contradiction, 1 decision, 1 constraint, 1 assumption):
+#
+#   - ``synthesis`` / ``contradiction`` / ``decision`` / ``assumption``
+#     / ``constraint``: distiller-generated learnings extracted FROM
+#     source records. Each carries a forward reference via the
+#     ``source_links`` field pointing back to the source(s); the
+#     operator's "is this learning real?" check works via that
+#     forward-link lookup, NOT via inbound walk. Adding back-references
+#     would require mutating the SOURCE record on every distiller
+#     fire, which breaks the deterministic-writer principle the
+#     distiller rebuild ratified (each fire writes new records, never
+#     touches existing source records). Earlier comment said "Andrew
+#     may want to see synthesis flagged" — the actual signal Andrew
+#     needs is "operational-record orphans" (task/person/org/event
+#     gaps), and ORPHAN001 surfacing 38 epistemic records was noise
+#     that buried the 53 operational orphans that actually matter.
+#
 # Deliberately omitted (separate policy decisions):
 #   - ``task``: 34 entries, mixed bag. Some real (sub-task hierarchies),
 #     some terminal — needs a different rule (link-by-status?).
-#   - ``synthesis``: 35 entries. Andrew may want to see these flagged
-#     so they get woven into project narratives. Defer.
 #
 # Adding a new type here should be backed by data showing the type is
 # overwhelmingly terminal — don't generalize from one example.
 LEAF_TYPES: set[str] = {
     "note",
     "run",
+    # Epistemic types — distiller-generated, source_links is the
+    # forward reference; back-refs would require mutating source
+    # records on every distiller fire (breaks deterministic-writer
+    # principle).
+    "synthesis",
+    "contradiction",
+    "decision",
+    "assumption",
+    "constraint",
 }

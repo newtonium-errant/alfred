@@ -22,6 +22,8 @@ from __future__ import annotations
 from pathlib import Path
 from textwrap import dedent
 
+import pytest
+
 from alfred.janitor.config import (
     JanitorConfig,
     StateConfig,
@@ -663,11 +665,78 @@ class TestScannerOrphanLeafTypes:
         assert len(_orphan_issues(issues, "task/Lonely Task.md")) == 1
 
     def test_leaf_types_set_pinned(self) -> None:
-        # Pin the conservative starting set. Expansion requires data
-        # (per the schema.py docstring) — bumping this assertion is
-        # a deliberate signal, not a slip.
+        # Pin the current set. Expansion requires data (per the
+        # schema.py docstring) — bumping this assertion is a deliberate
+        # signal, not a slip.
+        #
+        # 2026-05-06 expansion: epistemic types added (synthesis /
+        # contradiction / decision / assumption / constraint).
+        # Distiller-generated learnings carry forward references via
+        # ``source_links``; back-references would require mutating
+        # source records on every distiller fire, breaking the
+        # deterministic-writer principle.
         from alfred.vault.schema import LEAF_TYPES
-        assert LEAF_TYPES == {"note", "run"}
+        assert LEAF_TYPES == {
+            "note",
+            "run",
+            "synthesis",
+            "contradiction",
+            "decision",
+            "assumption",
+            "constraint",
+        }
+
+    @pytest.mark.parametrize(
+        "rec_type, status",
+        [
+            ("synthesis", "active"),
+            ("contradiction", "unresolved"),
+            ("decision", "active"),
+            ("assumption", "active"),
+            ("constraint", "active"),
+        ],
+    )
+    def test_epistemic_types_with_no_inbound_skip_orphan(
+        self,
+        tmp_vault: Path,
+        tmp_path: Path,
+        rec_type: str,
+        status: str,
+    ) -> None:
+        # 2026-05-06 expansion regression: each epistemic type added
+        # to LEAF_TYPES must be exempt from ORPHAN001 even with zero
+        # inbound wikilinks. Source attribution for these records lives
+        # in the FORWARD-link field ``source_links`` (pointing back to
+        # the records they were extracted from), so the operator's
+        # "is this learning real?" check works without inbound walk.
+        rel = f"{rec_type}/Lonely {rec_type.title()}.md"
+        _write_record(
+            tmp_vault,
+            rel,
+            dedent(
+                f"""\
+                type: {rec_type}
+                name: Lonely {rec_type.title()}
+                created: '2026-05-06'
+                status: {status}
+                tags: []
+                related: []
+                source_links:
+                  - '[[note/Some Source.md]]'
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        assert _orphan_issues(issues, rel) == [], (
+            f"{rec_type} should skip ORPHAN001 (in LEAF_TYPES post-2026-05-06) "
+            f"but got: {_orphan_issues(issues, rel)}"
+        )
 
 
 # --- Scaffold/docs exclusion (vault-root files) -------------------------
