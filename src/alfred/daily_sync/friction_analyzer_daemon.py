@@ -70,8 +70,21 @@ async def fire_once(
     structured ``friction_analyzer.scheduled_fire_complete`` log event
     so an empty-audit day is observably distinct from a daemon that
     never ran.
+
+    ``now`` is the wall-clock fire time. Defaults to
+    ``datetime.now(ZoneInfo(fa.schedule.timezone))`` — the schedule's
+    configured zone, NOT the system locale. Kept as a parameter for
+    symmetry with the digest + radar_day daemons (test injection
+    point + parallel daemon signatures). ``run_friction_analysis``
+    is itself TZ-aware via the ``schedule_timezone`` argument below,
+    so ``now`` doesn't need to propagate further into the analysis
+    path. Pre-fix the parameter was unused; making it TZ-aware-by-
+    default closes the dead-param smell without diverging from the
+    digest pattern.
     """
     fa = config.friction_analyzer
+    if now is None:
+        now = datetime.now(ZoneInfo(fa.schedule.timezone))
     audit_log_path = _resolve_audit_log_path(fa, raw_config)
     log_path = Path(fa.log_path).expanduser().resolve()
 

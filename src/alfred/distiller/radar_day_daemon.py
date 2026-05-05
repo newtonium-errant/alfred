@@ -73,19 +73,30 @@ async def fire_once(
     from a daemon that never ran. The empty-state daily file is
     written as well (Phase 3a's render_daily_file handles the
     "no radar items today" copy).
+
+    ``now`` is the wall-clock fire time. Defaults to
+    ``datetime.now(ZoneInfo(rd.schedule.timezone))`` — the
+    schedule's configured zone, NOT the system locale. The daemon
+    loop passes this; tests + manual fires inherit the TZ-aware
+    default. Threaded into ``run_daily_radar`` as ``today=now.date()``
+    so the date computation honours the schedule's TZ — pre-fix
+    the parameter was unused and ``run_daily_radar`` fell back to
+    ``date.today()`` (system locale) which produced wrong-day
+    filenames + dedup keys for late-evening Halifax fires near UTC
+    midnight (e.g. 23:30 ADT = 02:30 UTC next day).
     """
-    digests_dir, state_dir = _resolve_dirs(config)
     rd = config.radar_day
+    if now is None:
+        now = datetime.now(ZoneInfo(rd.schedule.timezone))
+    digests_dir, state_dir = _resolve_dirs(config)
     result = run_daily_radar(
         config.vault.vault_path,
         digests_dir,
         state_dir,
         top_n=rd.top_n,
         min_score=rd.min_score,
-        # ``now`` here is the wall-clock fire time (timezone-aware);
-        # ``run_daily_radar`` derives ``today`` from
-        # ``date.today()`` when not passed, which is what we want for
-        # the daemon's natural cadence.
+        today=now.date(),
+        now=now,
     )
 
     # Single load-bearing log event — operator greps for this to see
