@@ -76,6 +76,8 @@ The distiller prompts use `{template_variables}` that the pipeline fills in at r
 
 5. **Template variables are sacred.** The `{variable_name}` placeholders in distiller prompts are filled by `pipeline.py`. If you rename one, the pipeline breaks silently (it just sends the literal `{variable_name}` string to the LLM).
 
+6. **Justifications must match code reality.** When a new rule cites code-layer behavior as justification (e.g., "do X because vault auto-handles Y"), `git grep` `src/alfred/` for the claimed behavior BEFORE writing the prompt. Inventing a justification that "sounds right" breaks worse than no justification at all because the LLM will rely on the false invariant in adjacent decisions. Surfaced 2026-05-05 in `f6121bf`: a SKILL claimed vault auto-appends date to filenames; `vault/ops.py` does no such thing. Salem following the rule would have generated VaultError collisions on same-name events. The rule (drop date from `name`) was correct; the justification was invented. Future prompt-layer updates should treat (a) the rule, (b) the justification, and (c) the worked example as three independently-verifiable surfaces. A correct rule with a false justification will misguide the LLM in cases the worked example doesn't cover.
+
 ## Common Quality Issues and Prompt Fixes
 
 ### Curator creating low-value records
