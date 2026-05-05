@@ -154,7 +154,8 @@ def build_app(
     ``system_prompt_provider`` — accepts EITHER a zero-arg callable
     (production path; the daemon passes
     ``build_system_prompt_provider(skills_dir, config)`` so SKILL.md
-    is read fresh per conversation start, closing the same-cycle SKILL
+    is read fresh per turn — i.e. every inbound Telegram message
+    routed through ``update_handler`` — closing the same-cycle SKILL
     ship gap from QA 2026-05-04) OR a static string (legacy path for
     tests + ad-hoc callers that don't need hot-reload). When a string
     is passed, it's wrapped in a constant-returning lambda so the
@@ -2664,10 +2665,10 @@ async def handle_message(
     client: Any = ctx.application.bot_data[_KEY_CLIENT]
     # _KEY_SYSTEM is now a zero-arg provider callable (per
     # build_app's wiring); invoke it per-turn so SKILL.md edits on
-    # disk take effect on the next conversation start without daemon
-    # restart. Closes the same-cycle SKILL ship gap from QA
-    # 2026-05-04 (Hypatia ran a conversation against the OLD SKILL
-    # after the new SKILL committed but before restart).
+    # disk take effect on the next user turn without daemon restart.
+    # Closes the same-cycle SKILL ship gap from QA 2026-05-04
+    # (Hypatia ran a conversation against the OLD SKILL after the
+    # new SKILL committed but before restart).
     system_prompt_provider: Callable[[], str] = (
         ctx.application.bot_data[_KEY_SYSTEM]
     )

@@ -85,12 +85,18 @@ def _load_system_prompt(skills_dir: Path, skill_bundle: str = "vault-talker") ->
     ``telegram.instance.skill_bundle`` in config.yaml. Salem keeps the
     legacy default ``"vault-talker"``; KAL-LE ships with ``"vault-kalle"``.
 
-    Reads fresh from disk each call. The per-conversation hot-reload
-    wiring (see ``build_system_prompt_provider`` below) calls this on
-    every conversation start so SKILL.md edits take effect without
-    a daemon restart — closes the "same-cycle SKILL ship" gap from
-    QA 2026-05-04 (Hypatia ran a conversation with the old SKILL
-    after the new SKILL committed but before restart).
+    Reads fresh from disk each call. The per-turn hot-reload wiring
+    (see ``build_system_prompt_provider`` below) calls this on every
+    Telegram update — i.e. every user message — so SKILL.md edits
+    take effect without a daemon restart — closes the "same-cycle
+    SKILL ship" gap from QA 2026-05-04 (Hypatia ran a conversation
+    with the old SKILL after the new SKILL committed but before
+    restart). The provider is invoked from ``bot.update_handler``
+    which python-telegram-bot fires per inbound message, NOT once
+    per logical conversation; the historical commit message
+    ``be53673`` and earlier comments named this "per-conversation"
+    inaccurately. The per-turn read is the actual behaviour and is
+    fine performance-wise (see file-system cost note below).
 
     File-system cost: ~1-3 KB SKILL files, OS page cache hot — read
     is sub-millisecond. Negligible vs the per-turn Anthropic API
@@ -106,9 +112,9 @@ def _load_system_prompt(skills_dir: Path, skill_bundle: str = "vault-talker") ->
         return ""
     text = skill_path.read_text(encoding="utf-8")
     # Per-load diagnostic so an operator can verify the hot-reload
-    # IS happening on every conversation start. Debug level so it
-    # doesn't spam INFO-level logs in production; structlog
-    # filtering decides the surface.
+    # IS happening on every user turn. Debug level so it doesn't
+    # spam INFO-level logs in production; structlog filtering
+    # decides the surface.
     log.debug(
         "talker.conversation.skill_md_loaded",
         path=str(skill_path),
@@ -124,11 +130,11 @@ def build_system_prompt_provider(
 ) -> Callable[[], str]:
     """Return a zero-arg callable that reads SKILL.md fresh + templates it.
 
-    Used by ``bot.build_app`` to wire per-conversation SKILL.md hot-
-    reload — instead of stashing a static string in ``bot_data``, the
-    bot stashes this provider and invokes it per turn. SKILL edits on
-    disk take effect on the next conversation start; no daemon
-    restart needed.
+    Used by ``bot.build_app`` to wire per-turn SKILL.md hot-reload —
+    instead of stashing a static string in ``bot_data``, the bot
+    stashes this provider and invokes it per turn (i.e. every
+    inbound Telegram message). SKILL edits on disk take effect on
+    the next user turn; no daemon restart needed.
 
     Closure captures ``skills_dir`` + ``config`` (both immutable for
     the daemon's lifetime). Templating reads ``config.instance.name``
@@ -263,15 +269,16 @@ async def run(
 
     client = anthropic.AsyncAnthropic(api_key=config.anthropic.api_key)
     # Build a system-prompt PROVIDER instead of a frozen string. The
-    # provider is invoked per conversation so SKILL.md edits take
-    # effect on the next conversation start without a daemon restart
-    # — closes the same-cycle SKILL ship gap from QA 2026-05-04.
+    # provider is invoked per turn (i.e. every inbound Telegram
+    # message in update_handler) so SKILL.md edits take effect on
+    # the next user turn without a daemon restart — closes the
+    # same-cycle SKILL ship gap from QA 2026-05-04.
     system_prompt_provider = build_system_prompt_provider(
         Path(skills_dir_str), config,
     )
     # One-shot boot-time invocation surfaces SKILL-missing warnings +
     # logs the initial char_count so the operator can confirm the
-    # SKILL loaded cleanly at startup. The provider's per-conversation
+    # SKILL loaded cleanly at startup. The provider's per-turn
     # invocations carry the same diagnostic via debug-level logs.
     initial_prompt = system_prompt_provider()
     log.info(
