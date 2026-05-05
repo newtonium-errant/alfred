@@ -50,9 +50,26 @@ from __future__ import annotations
 
 import pytest
 
-# Optional dep: jsonschema. Skipped if not installed; the runtime
-# gate in vault_edit (c2) carries the load-bearing protection.
-jsonschema = pytest.importorskip("jsonschema")
+# NOTE on jsonschema dep handling:
+#
+# ``jsonschema`` is an OPTIONAL test dep. Pre-2026-05-06 this module
+# called ``jsonschema = pytest.importorskip("jsonschema")`` at module
+# scope, which collection-skipped the ENTIRE file when the dep was
+# missing — including ``TestNoTopLevelSchemaCombinators``, the
+# regression pin specifically built to catch the production-breaking
+# bug fixed in ``708eddd``.
+#
+# Bug shape: a future environment regression (CI without the dep,
+# fresh venv, dep removal) would silently disable the regression pin.
+# A reintroduction of top-level ``oneOf`` could land green there.
+#
+# Fix: ``importorskip`` MOVED to function scope inside each test
+# method that actually calls ``jsonschema.validate``. The shape and
+# regression-pin tests now run unconditionally; only the positive
+# validation tests skip when the dep is missing. The runtime gate in
+# ``vault.ops.vault_edit`` is the load-bearing mutual-exclusion
+# protection — ``jsonschema``-based positive coverage is just
+# additional smoke testing.
 
 
 def _talker_vault_edit_schema():
@@ -171,16 +188,19 @@ class TestNoTopLevelSchemaCombinators:
 class TestTalkerSchemaPositiveValidation:
     def test_zero_body_kwargs_passes(self):
         """Frontmatter-only edit (no body kwargs) must validate."""
+        jsonschema = pytest.importorskip("jsonschema")
         schema = _talker_vault_edit_schema()
         instance = {"path": "note/X.md", "set_fields": {"status": "active"}}
         jsonschema.validate(instance=instance, schema=schema)  # no raise
 
     def test_only_body_append_passes(self):
+        jsonschema = pytest.importorskip("jsonschema")
         schema = _talker_vault_edit_schema()
         instance = {"path": "note/X.md", "body_append": "added"}
         jsonschema.validate(instance=instance, schema=schema)
 
     def test_only_body_insert_at_passes(self):
+        jsonschema = pytest.importorskip("jsonschema")
         schema = _talker_vault_edit_schema()
         instance = {
             "path": "note/X.md",
@@ -193,6 +213,7 @@ class TestTalkerSchemaPositiveValidation:
         jsonschema.validate(instance=instance, schema=schema)
 
     def test_only_body_replace_passes(self):
+        jsonschema = pytest.importorskip("jsonschema")
         schema = _talker_vault_edit_schema()
         instance = {"path": "note/X.md", "body_replace": "# New\n"}
         jsonschema.validate(instance=instance, schema=schema)
@@ -201,6 +222,7 @@ class TestTalkerSchemaPositiveValidation:
         """Property-level required-field validation still works (this
         is inside the body_insert_at property's own schema, not at
         the top level — Anthropic-safe)."""
+        jsonschema = pytest.importorskip("jsonschema")
         schema = _talker_vault_edit_schema()
         instance = {
             "path": "note/X.md",
@@ -215,6 +237,7 @@ class TestTalkerSchemaPositiveValidation:
 
     def test_body_insert_at_invalid_position_rejected(self):
         """Property-level enum validation still works (Anthropic-safe)."""
+        jsonschema = pytest.importorskip("jsonschema")
         schema = _talker_vault_edit_schema()
         instance = {
             "path": "note/X.md",
@@ -231,6 +254,7 @@ class TestTalkerSchemaPositiveValidation:
         """Cross-check the P1 not.required.[body] constraint. This is
         a property-level ``not`` (inside set_fields' schema), not a
         top-level combinator — Anthropic-safe."""
+        jsonschema = pytest.importorskip("jsonschema")
         schema = _talker_vault_edit_schema()
         instance = {
             "path": "note/X.md",
@@ -242,16 +266,19 @@ class TestTalkerSchemaPositiveValidation:
 
 class TestInstructorSchemaPositiveValidation:
     def test_only_body_replace_passes(self):
+        jsonschema = pytest.importorskip("jsonschema")
         schema = _instructor_vault_edit_schema()
         instance = {"path": "note/X.md", "body_replace": "# new\n"}
         jsonschema.validate(instance=instance, schema=schema)
 
     def test_only_body_append_passes(self):
+        jsonschema = pytest.importorskip("jsonschema")
         schema = _instructor_vault_edit_schema()
         instance = {"path": "note/X.md", "body_append": "added"}
         jsonschema.validate(instance=instance, schema=schema)
 
     def test_only_body_insert_at_passes(self):
+        jsonschema = pytest.importorskip("jsonschema")
         schema = _instructor_vault_edit_schema()
         instance = {
             "path": "note/X.md",
