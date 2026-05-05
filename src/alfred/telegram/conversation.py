@@ -577,17 +577,25 @@ _PEER_INTER_INSTANCE_TOOLS: list[dict[str, Any]] = [
 # ``alfred gcal`` CLI.
 _GCAL_LIST_EVENTS_TOOL = {
     "name": "gcal_list_events",
+    # Instance-agnostic wording — per CLAUDE.md "Three Layers" framing,
+    # tool descriptions are CODE-layer content shipped to every instance
+    # that opts into GCal. Per-instance specifics (e.g. which calendar
+    # is "the shared calendar" for Salem vs V.E.R.A.) belong in the
+    # PROMPT layer (SKILL.md), not embedded here. Earlier wording named
+    # "Salem" + "Andrew's Calendar (S.A.L.E.M.)" — would have leaked
+    # to KAL-LE / Hypatia / future instances the moment they enable
+    # GCal in their own configs.
     "description": (
-        "Read events from a Google Calendar by date range. Salem has "
-        "read access to BOTH calendars: the writable shared calendar "
-        "(Andrew's Calendar (S.A.L.E.M.)) AND Andrew's primary personal "
-        "calendar. Use when the user asks 'do I have anything on "
-        "Tuesday?' / 'what's on my calendar this week?' / 'is there a "
-        "CannaConnect appointment I should know about?'. Read-only — "
-        "use vault_create on `event` records to add to Andrew's Calendar "
-        "(S.A.L.E.M.); cannot write to the primary calendar. Returns a "
-        "list of ``{title, start, end, location, description}`` dicts "
-        "with start/end in ISO 8601 format."
+        "Read events from a Google Calendar by date range. The instance "
+        "has read access to BOTH calendars: the configured shared "
+        "calendar AND Andrew's primary personal calendar. Use when the "
+        "user asks 'do I have anything on Tuesday?' / 'what's on my "
+        "calendar this week?' / 'is there a CannaConnect appointment I "
+        "should know about?'. Read-only — use vault_create on `event` "
+        "records to add to the shared calendar; cannot write to the "
+        "primary calendar. Returns a list of ``{title, start, end, "
+        "location, description}`` dicts with start/end in ISO 8601 "
+        "format."
     ),
     "input_schema": {
         "type": "object",
@@ -596,9 +604,9 @@ _GCAL_LIST_EVENTS_TOOL = {
                 "type": "string",
                 "enum": ["alfred", "primary"],
                 "description": (
-                    "Which calendar to read. ``alfred`` = the writable "
-                    "shared calendar (Andrew's Calendar (S.A.L.E.M.)); "
-                    "``primary`` = Andrew's personal calendar (read-only)."
+                    "Which calendar to read. ``alfred`` = the configured "
+                    "shared calendar (writable); ``primary`` = Andrew's "
+                    "personal calendar (read-only)."
                 ),
             },
             "start": {

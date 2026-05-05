@@ -45,6 +45,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+import structlog
 import yaml
 
 from alfred.telegram import conversation
@@ -269,18 +270,19 @@ async def test_dispatch_alfred_calendar_resolves_and_returns_events(
         "alfred.integrations.gcal.GCalClient", FakeClient,
     )
 
-    result_str = await conversation._execute_tool(
-        tool_name="gcal_list_events",
-        tool_input={
-            "calendar": "alfred",
-            "start": "2026-05-07T00:00:00-03:00",
-            "end": "2026-05-08T00:00:00-03:00",
-        },
-        vault_path=str(tmp_path / "vault"),
-        state=None,
-        session=_session(),
-        config=config,
-    )
+    with structlog.testing.capture_logs() as captured_logs:
+        result_str = await conversation._execute_tool(
+            tool_name="gcal_list_events",
+            tool_input={
+                "calendar": "alfred",
+                "start": "2026-05-07T00:00:00-03:00",
+                "end": "2026-05-08T00:00:00-03:00",
+            },
+            vault_path=str(tmp_path / "vault"),
+            state=None,
+            session=_session(),
+            config=config,
+        )
     parsed = json.loads(result_str)
     assert parsed["calendar"] == "alfred"
     assert len(parsed["events"]) == 1
@@ -297,6 +299,26 @@ async def test_dispatch_alfred_calendar_resolves_and_returns_events(
     assert "id" not in ev
     # Calendar ID resolution worked.
     assert captured["calendar_id"] == "alfred-calendar-id-FAKE"
+
+    # Log-emission contract — WARN 1 from the b5cdfe6 review (third
+    # session-recurring instance of the log-emission test gap pattern).
+    # The dispatcher MUST emit ``talker.gcal_list.fired`` with the
+    # window + count fields for non-empty results so a future refactor
+    # that drops the log line fails this test instead of silently
+    # losing operator-visible signal.
+    fired_events = [
+        c for c in captured_logs
+        if c.get("event") == "talker.gcal_list.fired"
+    ]
+    assert len(fired_events) == 1, (
+        f"expected exactly one talker.gcal_list.fired event; "
+        f"got {[c.get('event') for c in captured_logs]}"
+    )
+    fired = fired_events[0]
+    assert fired["calendar"] == "alfred"
+    assert fired["count"] == 1
+    assert fired["window_start"] == "2026-05-07T00:00:00-03:00"
+    assert fired["window_end"] == "2026-05-08T00:00:00-03:00"
 
 
 @pytest.mark.asyncio
@@ -352,20 +374,49 @@ async def test_dispatch_empty_result_returns_empty_events_list(
         "alfred.integrations.gcal.GCalClient", FakeClient,
     )
 
-    result_str = await conversation._execute_tool(
-        tool_name="gcal_list_events",
-        tool_input={
-            "calendar": "alfred",
-            "start": "2026-05-07T00:00:00-03:00",
-            "end": "2026-05-08T00:00:00-03:00",
-        },
-        vault_path=str(tmp_path / "vault"),
-        state=None,
-        session=_session(),
-        config=config,
-    )
+    with structlog.testing.capture_logs() as captured_logs:
+        result_str = await conversation._execute_tool(
+            tool_name="gcal_list_events",
+            tool_input={
+                "calendar": "alfred",
+                "start": "2026-05-07T00:00:00-03:00",
+                "end": "2026-05-08T00:00:00-03:00",
+            },
+            vault_path=str(tmp_path / "vault"),
+            state=None,
+            session=_session(),
+            config=config,
+        )
     parsed = json.loads(result_str)
     assert parsed == {"calendar": "alfred", "events": []}
+
+    # Log-emission contract — WARN 1 from the b5cdfe6 review (third
+    # session-recurring instance of the log-emission test gap pattern).
+    # Per ``feedback_intentionally_left_blank.md``, the empty case
+    # MUST emit an explicit ``talker.gcal_list.empty`` event so a
+    # zero-result window stays distinguishable from a missed dispatch
+    # in operator log review. Pinned so a future refactor that drops
+    # the log line fails this test instead of silently losing the
+    # signal.
+    empty_events = [
+        c for c in captured_logs
+        if c.get("event") == "talker.gcal_list.empty"
+    ]
+    assert len(empty_events) == 1, (
+        f"expected exactly one talker.gcal_list.empty event; "
+        f"got {[c.get('event') for c in captured_logs]}"
+    )
+    empty = empty_events[0]
+    assert empty["calendar"] == "alfred"
+    assert empty["window_start"] == "2026-05-07T00:00:00-03:00"
+    assert empty["window_end"] == "2026-05-08T00:00:00-03:00"
+    # Zero-result path must NOT also fire ``.fired`` — the log-shape
+    # contract is one-or-the-other.
+    fired_events = [
+        c for c in captured_logs
+        if c.get("event") == "talker.gcal_list.fired"
+    ]
+    assert fired_events == []
 
 
 @pytest.mark.asyncio
