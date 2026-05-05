@@ -20,17 +20,17 @@ from typing import Any
 
 import yaml
 
-from alfred._env import (
-    ENV_PLACEHOLDER_RE as ENV_RE,
-    substitute_env_in_value as _substitute_env,
-)
-
 # Backward-compat aliases — ``ENV_RE`` and ``_substitute_env`` are
 # importable from this module (legacy callers reference them) but
 # the canonical home is now ``alfred._env``. New callers should
 # import from there directly. See alfred/_env.py for the empty-
-# string coalesce semantics + rationale.
-__all_extra__ = ["ENV_RE", "_substitute_env"]
+# string coalesce semantics + rationale. Module-level imports are
+# usable from outside as ``from alfred.transport.config import ENV_RE``
+# without any explicit ``__all__`` gate.
+from alfred._env import (
+    ENV_PLACEHOLDER_RE as ENV_RE,
+    substitute_env_in_value as _substitute_env,
+)
 
 
 # --- Dataclasses ------------------------------------------------------------

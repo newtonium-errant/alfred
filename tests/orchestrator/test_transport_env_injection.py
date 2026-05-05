@@ -331,10 +331,13 @@ class TestObservabilityLog:
         assert events[0]["source"] == "literal"
         assert events[0]["token_fingerprint"] == "literal-..."
 
-    def test_log_fires_on_skipped_unresolved_path(self, monkeypatch):
-        """Placeholder failed to resolve (env var missing) — log
-        says ``source=skipped_unresolved``, includes the placeholder
-        string for operator to fix."""
+    def test_log_fires_on_skipped_unresolved_path_no_prior_env(
+        self, monkeypatch,
+    ):
+        """Placeholder failed to resolve + ALFRED_TRANSPORT_TOKEN was
+        NOT set in env — log says ``source=skipped_unresolved``,
+        ``had_prior_env=False``, includes placeholder for operator
+        to fix."""
         monkeypatch.delenv("ALFRED_TRANSPORT_TOKEN", raising=False)
         monkeypatch.delenv("ALFRED_PHANTOM_VAR", raising=False)
         raw = {
@@ -356,8 +359,52 @@ class TestObservabilityLog:
         assert len(events) == 1
         assert events[0]["source"] == "skipped_unresolved"
         assert events[0]["placeholder"] == "${ALFRED_PHANTOM_VAR}"
+        assert events[0]["had_prior_env"] is False
         # No fingerprint on the skipped path — nothing was injected.
         assert "token_fingerprint" not in events[0]
+
+    def test_log_fires_on_skipped_unresolved_path_with_prior_env(
+        self, monkeypatch,
+    ):
+        """Placeholder failed to resolve BUT ALFRED_TRANSPORT_TOKEN
+        was set in env (e.g. inherited from sibling-instance startup
+        or .env). Log MUST report ``had_prior_env=True`` so the
+        operator's grep-for-stale-inherit catches the silent-survival
+        case — config wanted to override but couldn't, prior env
+        kept serving requests with the wrong token. Without this
+        assertion, a regression where ``had_prior_env`` returns
+        False despite a prior env being present would slip through."""
+        monkeypatch.setenv(
+            "ALFRED_TRANSPORT_TOKEN", "stale-inherited-from-elsewhere",
+        )
+        monkeypatch.delenv("ALFRED_PHANTOM_VAR", raising=False)
+        raw = {
+            "transport": {
+                "auth": {
+                    "tokens": {
+                        "local": {"token": "${ALFRED_PHANTOM_VAR}"},
+                    },
+                },
+            },
+        }
+        with structlog.testing.capture_logs() as captured:
+            _inject_transport_env_vars(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.transport_token.injected"
+        ]
+        assert len(events) == 1
+        assert events[0]["source"] == "skipped_unresolved"
+        assert events[0]["had_prior_env"] is True
+        assert events[0]["placeholder"] == "${ALFRED_PHANTOM_VAR}"
+        # Decline-to-inject preserves the inherited value — defensive
+        # path AND the operator-visibility signal that says "this
+        # instance is running with a token from somewhere else."
+        assert (
+            os.environ["ALFRED_TRANSPORT_TOKEN"]
+            == "stale-inherited-from-elsewhere"
+        )
 
     def test_log_fires_on_empty_config_token_path(self, monkeypatch):
         monkeypatch.delenv("ALFRED_TRANSPORT_TOKEN", raising=False)
