@@ -47,27 +47,40 @@ def test_pushback_directive_unknown_level_falls_back_to_three() -> None:
     )
 
 
-def test_build_system_blocks_appends_pushback_block_last() -> None:
-    """Pushback block is the last cache-control text block in the list.
+def test_build_system_blocks_pushback_block_second_to_last() -> None:
+    """Pushback block is the second-to-last cache-control text block.
 
     Cache ordering runs most-stable-first: system prompt → vault ctx →
-    calibration → pushback. This test locks the tail position so the
-    prompt-caching prefix stays stable as calibration lands in commit 2.
+    calibration → pushback → today. This test locks pushback's position
+    so the prompt-caching prefix stays stable as calibration lands;
+    today's-date block (added 2026-05-06 to close the day-of-week
+    date-math gap from conversation ``716f5b24``) sits AFTER pushback
+    because today is the most-volatile block (changes daily) and any
+    cacheable block placed after it would invalidate the cache prefix
+    on every date rollover.
     """
     blocks = conversation._build_system_blocks(
         system_prompt="SYS",
         vault_context_str="VAULT",
         pushback_level=4,
     )
-    # System + vault + pushback = 3 blocks (no calibration in this test).
-    assert len(blocks) == 3
+    # System + vault + pushback + today = 4 blocks (no calibration here).
+    assert len(blocks) == 4
     assert blocks[0]["text"] == "SYS"
     assert blocks[1]["text"] == "VAULT"
-    assert "Session pushback directive" in blocks[-1]["text"]
-    assert "level 4" in blocks[-1]["text"].lower()
-    for block in blocks:
+    # Pushback is now second-to-last; today-block tails.
+    assert "Session pushback directive" in blocks[-2]["text"]
+    assert "level 4" in blocks[-2]["text"].lower()
+    assert blocks[-1]["text"].startswith("## Today")
+    # Cache-control invariant: every block EXCEPT the today-block
+    # carries an ephemeral breakpoint. The today-block is intentionally
+    # uncached (changes daily; cache TTL is 5min so caching it would
+    # churn the cache pointlessly).
+    for block in blocks[:-1]:
         assert block["type"] == "text"
         assert block["cache_control"] == {"type": "ephemeral"}
+    assert blocks[-1]["type"] == "text"
+    assert "cache_control" not in blocks[-1]
 
 
 def test_build_system_blocks_pushback_none_skips_block() -> None:
@@ -75,23 +88,27 @@ def test_build_system_blocks_pushback_none_skips_block() -> None:
 
     This keeps pre-wk3 active sessions (rehydrated from state without a
     stashed level) behaving exactly like wk2 — no new system text injected.
+    The today-block ALWAYS tails so the date anchor is unconditional.
     """
     blocks = conversation._build_system_blocks(
         system_prompt="SYS",
         vault_context_str="VAULT",
         pushback_level=None,
     )
-    assert len(blocks) == 2
+    # System + vault + today = 3 blocks (today always present).
+    assert len(blocks) == 3
     assert all("pushback" not in b["text"].lower() for b in blocks)
+    assert blocks[-1]["text"].startswith("## Today")
 
 
-def test_build_system_blocks_cache_order_with_all_four_blocks() -> None:
-    """Full four-block layout in canonical order.
+def test_build_system_blocks_cache_order_with_all_five_blocks() -> None:
+    """Full five-block layout in canonical order.
 
-    Order: system prompt → vault context → calibration → pushback.
-    Locked here so commit 2's calibration wiring can't accidentally move
-    the pushback block ahead of calibration (would invalidate the cache
-    prefix every session).
+    Order: system prompt → vault context → calibration → pushback →
+    today. Locked here so a future addition can't accidentally move
+    today off the tail (which would either invalidate the cache prefix
+    on every date rollover OR re-cache an ephemeral block that
+    legitimately should stay uncached).
     """
     blocks = conversation._build_system_blocks(
         system_prompt="SYS",
@@ -99,12 +116,13 @@ def test_build_system_blocks_cache_order_with_all_four_blocks() -> None:
         calibration_str="CAL",
         pushback_level=2,
     )
-    assert len(blocks) == 4
+    assert len(blocks) == 5
     assert blocks[0]["text"] == "SYS"
     assert blocks[1]["text"] == "VAULT"
     assert blocks[2]["text"].startswith("## Alfred's calibration for this user")
     assert "CAL" in blocks[2]["text"]
     assert blocks[3]["text"].startswith("## Session pushback directive")
+    assert blocks[4]["text"].startswith("## Today")
 
 
 @pytest.mark.asyncio
@@ -144,9 +162,11 @@ async def test_run_turn_threads_pushback_level_into_system_blocks(
     call = client.messages.calls[0]
     system = call["system"]
     assert isinstance(system, list)
-    # Tail block carries the pushback directive.
-    assert "Session pushback directive" in system[-1]["text"]
-    assert "level 4" in system[-1]["text"].lower()
+    # Pushback is now second-to-last; today's-date block (added
+    # 2026-05-06) tails.
+    assert "Session pushback directive" in system[-2]["text"]
+    assert "level 4" in system[-2]["text"].lower()
+    assert system[-1]["text"].startswith("## Today")
 
 
 @pytest.mark.asyncio

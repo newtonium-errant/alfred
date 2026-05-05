@@ -112,18 +112,26 @@ def test_read_calibration_block_spans_multiple_lines(tmp_path: Path) -> None:
 
 
 def test_build_system_blocks_includes_calibration_between_vault_and_pushback() -> None:
-    """Canonical four-block layout: system → vault → calibration → pushback."""
+    """Canonical five-block layout: system → vault → calibration →
+    pushback → today.
+
+    The today's-date block (added 2026-05-06 to close the day-of-week
+    date-math gap from conversation ``716f5b24``) always tails;
+    pushback now sits second-to-last. Calibration's between-vault-and-
+    pushback position is unchanged.
+    """
     blocks = conversation._build_system_blocks(
         system_prompt="SYS",
         vault_context_str="VAULT",
         calibration_str="CAL_BODY",
         pushback_level=3,
     )
-    assert len(blocks) == 4
+    assert len(blocks) == 5
     assert blocks[2]["text"].startswith("## Alfred's calibration for this user")
     assert "CAL_BODY" in blocks[2]["text"]
-    # Pushback still tails so the suffix stays stable across sessions.
+    # Pushback no longer tails — today's-date does.
     assert "Session pushback directive" in blocks[3]["text"]
+    assert blocks[4]["text"].startswith("## Today")
 
 
 def test_build_system_blocks_calibration_none_skips_block() -> None:
@@ -133,7 +141,9 @@ def test_build_system_blocks_calibration_none_skips_block() -> None:
         calibration_str=None,
         pushback_level=3,
     )
-    assert len(blocks) == 3
+    # System + vault + pushback + today = 4 blocks (calibration skipped,
+    # today always present).
+    assert len(blocks) == 4
     assert all("calibration" not in b["text"].lower() for b in blocks[:2])
 
 

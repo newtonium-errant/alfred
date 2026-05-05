@@ -20,6 +20,7 @@ import asyncio
 import datetime as _dt
 import json
 from typing import Any, Final
+from zoneinfo import ZoneInfo
 
 import anthropic
 
@@ -1078,15 +1079,59 @@ def _pushback_directive(level: int) -> str:
     return _PUSHBACK_DIRECTIVES[3]
 
 
+_DEFAULT_INSTANCE_TIMEZONE = "America/Halifax"
+
+
+def _build_today_block_text(
+    now: _dt.datetime, instance_timezone: str,
+) -> str:
+    """Render the per-turn today's-date system-block body.
+
+    Anchors the LLM to the operator's local date + day-of-week so
+    relative time phrases ("Thursday", "tomorrow", "next week") resolve
+    against a known reference point. Surfaced 2026-05-05 in conversation
+    ``716f5b24``: Andrew said "Massage Thursday 10am-12pm." on Tue
+    2026-05-05; Salem computed "Thursday is 2026-05-08" (added 3 days,
+    got Friday's date). The SKILL's confirm-with-absolute-date
+    discipline (commit ``1c56966``) caught the mismatch — the safety
+    net held — but the LLM had no anchored knowledge of TODAY. This
+    block closes that gap at the system-prompt layer.
+
+    Pure helper (no I/O, no log) so tests can pin the rendered shape
+    without monkeypatching wall-clock or filesystem.
+    """
+    tz = ZoneInfo(instance_timezone)
+    local_now = now.astimezone(tz)
+    # ``%z`` returns "-0300" / "+0000" / etc. Format as "UTC-03:00".
+    raw_offset = local_now.strftime("%z")
+    if raw_offset:
+        offset_label = f"UTC{raw_offset[:3]}:{raw_offset[3:]}"
+    else:
+        offset_label = "UTC+00:00"
+    tz_short = local_now.strftime("%Z") or instance_timezone
+    return (
+        "## Today\n\n"
+        f"{local_now.strftime('%Y-%m-%d (%A)')}, {instance_timezone}, "
+        f"currently {offset_label} ({tz_short}).\n\n"
+        "Use this date as the anchor for resolving relative time phrases "
+        "('Thursday', 'tomorrow', 'next week', etc.). When confirming "
+        "events back to the user, always echo the day-of-week with the "
+        "absolute date so they can spot a mismatch."
+    )
+
+
 def _build_system_blocks(
     system_prompt: str,
     vault_context_str: str,
     calibration_str: str | None = None,
     pushback_level: int | None = None,
+    *,
+    now: _dt.datetime | None = None,
+    instance_timezone: str = _DEFAULT_INSTANCE_TIMEZONE,
 ) -> list[dict[str, Any]]:
     """Return ``system`` as a list of cacheable text blocks.
 
-    Up to four cache breakpoints (Anthropic-recommended for agents):
+    Up to five cache breakpoints (Anthropic-recommended for agents):
         1. The frozen SKILL.md-style system prompt (almost never changes).
         2. The vault context snapshot (changes across sessions but stable
            within one, so turn 2+ hits the cache).
@@ -1094,13 +1139,27 @@ def _build_system_blocks(
            of the user; stable within a session, updated at session close).
         4. The per-session pushback directive (wk3 — derived from session
            type's ``pushback_level``, stable within a session).
+        5. **The today's-date anchor block** (Phase A 2026-05-06 — closes
+           the day-of-week date-math gap surfaced 2026-05-05 in
+           conversation ``716f5b24``). Carries today's date +
+           day-of-week + tz offset. NO ``cache_control`` because it
+           changes every day; the cache TTL is 5min anyway, and putting
+           an ephemeral breakpoint on a daily-volatile block would
+           churn the cache pointlessly.
 
     Order matters for caching: the most-stable prefix first, the most-
-    volatile last. System prompt > vault context > calibration > pushback,
-    because the system prompt is frozen across every session, the vault
-    context rolls over between sessions (on a cadence measured in days),
-    calibration updates at session close (days to weeks), and pushback is
-    determined per-session by the router.
+    volatile last. System prompt > vault context > calibration > pushback
+    > today. The today-block now occupies the tail position pushback
+    used to hold; this is intentional — today is genuinely the most-
+    volatile block (changes at midnight ADT every day), and putting
+    cacheable blocks AFTER it would invalidate the cache prefix on
+    every date rollover.
+
+    ``now`` defaults to ``datetime.now(timezone.utc)`` — kwarg exists
+    for deterministic tests (mirrors the dangling-tool_use detector
+    pattern). ``instance_timezone`` defaults to ``America/Halifax``;
+    callers from a different operator timezone should pass an explicit
+    IANA name.
 
     See claude-api skill → shared/prompt-caching.md.
     """
@@ -1135,6 +1194,15 @@ def _build_system_blocks(
             ),
             "cache_control": {"type": "ephemeral"},
         })
+
+    # Today's-date anchor block — always present, never cached.
+    if now is None:
+        now = _dt.datetime.now(_dt.timezone.utc)
+    blocks.append({
+        "type": "text",
+        "text": _build_today_block_text(now, instance_timezone),
+        # Deliberately NO cache_control — see docstring.
+    })
     return blocks
 
 
