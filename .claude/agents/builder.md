@@ -112,6 +112,7 @@ After completing work, report using this format:
 ```
 ## Builder Report
 **Task:** [what was requested]
+**Ship receipt:** [explicit commit SHA on worktree branch — REQUIRED]
 **Files changed:** [list with brief description of each change]
 **Config changes:** [new sections, changed defaults, or "none"]
 **Orchestrator/CLI:** [registrations, parser changes, or "none"]
@@ -119,6 +120,12 @@ After completing work, report using this format:
 **Assumptions:** [anything you decided without explicit guidance]
 **Depends on:** [work needed from other agents, or "none"]
 ```
+
+**Ship receipt is mandatory.** Per 2026-05-05 incident: a prior session reported "in flight" for the surveyor `alfred_tags` Phase 1 fix, but no commit ever shipped. The void surfaced only when the next-session code-reviewer pass tried to read the cited line range and found ungated code. Always include the commit SHA explicitly so team-lead can verify the ship before fast-forward.
+
+If you completed work but couldn't commit (bash sandbox denial, etc.), say so explicitly — "WORK STAGED, commit blocked by <reason>; team-lead must commit from outside the worktree". Don't report "shipped" when commit didn't happen.
+
+**Test count audits.** When citing test counts in your report or commit message, recount via `grep -c "^    def test_" <test_file>` before claiming the number. Three instances this session of "claimed N, actual M" drift — minor in isolation but real if test counts track ship-quality across time.
 
 ## Pattern Discovery
 
@@ -145,6 +152,8 @@ Before staging changes for commit, run through this checklist:
 4. **Worktree venv pin** — don't `pip install -e` from a worktree (it re-pins the venv to the worktree path, which breaks after worktree cleanup). Use `PYTHONPATH=<worktree>/src python -m pytest …` to test from worktree. Per CLAUDE.md "Worktree + editable-install gotcha".
 5. **Per-instance defaults** — any default value, fallback string, or config path you add: ask "would this be wrong on a different instance?" If yes, parameterize or fail-loud-on-empty rather than ship a single-instance literal. Per `feedback_hardcoding_and_alfred_naming.md`.
 6. **Contract-pin sweep before allowlist widening** — before committing a per-instance allowlist widen (adding a type to `KNOWN_TYPES_*`, `*_CREATE_TYPES`, `allow_body_*`, etc.), run `git grep -nE "KALLE_CREATE_TYPES ==|KNOWN_TYPES_KALLE ==|TALKER_CREATE_TYPES ==|HYPATIA_CREATE_TYPES ==|allow_body_replace ==|allow_body_insert_at ==" tests/` (adapt to whatever surface you're widening) to surface contract-pin tests that need lockstep update. Pin tests exist by design — they catch silent additions; intentional widenings just need the pin updated in the same commit. Same shape as Rename grep above. Caught twice 2026-05-04 (architecture type widening + body-mutation matrix), worth pre-flight rather than discovering in cherry-pick.
+7. **Tokenizer-fallback fixture coverage** — when adding or modifying a fallback path (e.g., shlex.split → whitespace.split, regex parse → manual tokenize, JSON parse → eval-fallback), ensure at least one test fixture exercises EACH failure mode that triggers the fallback: unbalanced double quote, unbalanced single quote, leading-quote-no-binary, embedded special-char, etc. Per the 2026-05-04 friction analyzer `_command_prefix` quote-fallback bug — original c1 ship's fallback was structurally broken on quote-bearing tokens; only caught 24 minutes post-ship because no fixture exercised the unbalanced-shlex-on-2-token-command path. The structural fix (per-failure-mode fixture) matters more than the specific bug.
+8. **Cross-instance config pinning via test constants** — when a per-instance config value is INTENTIONALLY shared across instances (e.g., Salem's surveyor `entity_link.threshold: 0.85` reused by KAL-LE for consistency), pin it in the receiving instance's tests via a named constant (`SALEM_ENTITY_LINK_THRESHOLD = 0.85`) referencing the originating instance. The constant + test asserting the receiving instance matches it surfaces drift if either side moves. Per the 2026-05-04 KAL-LE surveyor enablement (`test_kalle_surveyor_config.py`). Not the same as the per-instance-defaults rule (#5) — that's about preventing single-instance literals; this is about preserving intentional cross-instance values. Both rules coexist.
 
 ## Standing memos worth knowing
 

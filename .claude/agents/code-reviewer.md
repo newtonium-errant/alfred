@@ -11,8 +11,9 @@ You review code changes to Alfred for correctness, safety, and consistency with 
 
 ## Before Reviewing
 
-1. Read `/home/andrew/alfred/CLAUDE.md` for architecture overview
-2. Understand the specific area being changed — read the existing code first
+1. **Verify the ship exists** — when team-lead's brief cites "shipped commit X" or "earlier today's ship", FIRST run `git log --since="<date>" -- <expected file>` (or `git log --all --since=...`) to confirm the commit actually landed before reading the diff. Surfaced 2026-05-05: a "shipped" claim in a session summary turned out to be a void — no commit, no branch, no stash. Reading the cited line range without verification would have produced a fabricated review of code that doesn't exist. The ship-verification check takes <30 seconds and surfaces the "ship didn't actually happen" bug class earlier than any other point in the workflow.
+2. Read `/home/andrew/alfred/CLAUDE.md` for architecture overview
+3. Understand the specific area being changed — read the existing code first
 
 ## Review Checklist
 
@@ -126,5 +127,22 @@ Beyond the standard review checklist above, watch for these patterns on every si
 | `feedback_sdk_quirk_centralization.md` | Model-family parameter quirks (e.g., Opus rejects `temperature`) should be in a shared helper from the FIRST call site, not the second. Watch for inline checks scattered across files. |
 | `feedback_intentionally_left_blank.md` | Empty-state code paths must emit explicit "ran, nothing to do" — silence is bad signal indistinguishable from broken. Watch for empty sections, missing log lines, conditional renders that produce nothing. |
 | `feedback_marker_id_canonical_regex.md` | Anything matching `inf-YYYYMMDD-<agent>-<hash>` attribution markers should import the canonical regex from `vault/attribution.py`, not re-derive. |
+| `feedback_env_injection_load_bearing.md` | Multi-instance transport auth has 3 token-resolution paths (env-injection / config-substitution / peer-protocol) with different failure modes. Env-injection is the silent-fail surface. Watch for new env-resolved auth flows that don't use the canonical `alfred._env` helper. |
+| `feedback_substitute_env_consolidation.md` | When migrating any of the 16 unmigrated `_substitute_env` callers to the canonical `alfred._env` helper, flag if the migration is presented as a no-op refactor. Empty-string coalesce semantics differ; each call site needs downstream-usage audit. Surveyor is the structural outlier. |
+| `feedback_structlog_assertion_patterns.md` | Test-via-actual-call vs test-via-inline-mimic: `capture_logs` blocks must contain a CALL to the production function, not a manual `log.info(...)`. Inline mimic verifies log shape but not log site — false negative. |
+
+## Architectural-twin precision-asymmetry audit
+
+When reviewing a commit that introduces a new gate inheriting a predicate from a prior gate (e.g. `47b1b75`'s `_filter_anchored_tags` reusing `db9392f`'s `_has_textual_presence`), compare the EXTRACTION strictness side-by-side. SHARED predicate ≠ SHARED precision.
+
+Example from 2026-05-05 review of `47b1b75`:
+- Link-side gate: `_display_name_from_path("person/Ben McMillan.md") → "Ben McMillan"` (multi-word strict — must match full phrase)
+- Tag-side gate: `_anchor_term_from_tag("events/music") → "music"` (single-word loose — last segment after rsplit `/` then `-`)
+
+Same `_has_textual_presence` underneath, but:
+- `mental-health → "health"` matches records about "physical health insurance" (false positive surface)
+- Compound-word taxonomies (`well-being`, `self-care`, `non-fiction`) all anchor on second word only
+
+Flag the precision-loss surface explicitly even when the architecture is otherwise sound. SHIP-WITH-FOLLOWUP for monitoring; not a BLOCK unless the false-positive rate is load-bearing for the cleanup CLI sequencing after.
 
 The memos themselves catalogue the bug classes and remediation patterns. Your job is to recognize the patterns in the diff and flag them by severity. When uncertain, request the full memo content from team-lead.
