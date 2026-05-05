@@ -562,6 +562,66 @@ _PEER_INTER_INSTANCE_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+# GCal read tool. Surfaced ONLY when the active config carries
+# ``gcal.enabled: true`` — see ``tools_for_set`` for the runtime gating
+# (the schema is dropped from the tool list entirely on instances
+# without GCal so the model can't hallucinate a "read calendar"
+# capability that isn't wired). Salem is the only current consumer.
+#
+# Output shape is intentionally chat-friendly (title / start / end /
+# location / description-truncated), NOT the full GCal API response.
+# The model is answering "do I have anything Tuesday?", not driving
+# a UI; pruning at the dispatch layer keeps tokens cheap and the
+# response readable in transcript review. ``raw`` debug field
+# deliberately omitted — operator who wants full event JSON uses the
+# ``alfred gcal`` CLI.
+_GCAL_LIST_EVENTS_TOOL = {
+    "name": "gcal_list_events",
+    "description": (
+        "Read events from a Google Calendar by date range. Salem has "
+        "read access to BOTH calendars: the writable shared calendar "
+        "(Andrew's Calendar (S.A.L.E.M.)) AND Andrew's primary personal "
+        "calendar. Use when the user asks 'do I have anything on "
+        "Tuesday?' / 'what's on my calendar this week?' / 'is there a "
+        "CannaConnect appointment I should know about?'. Read-only — "
+        "use vault_create on `event` records to add to Andrew's Calendar "
+        "(S.A.L.E.M.); cannot write to the primary calendar. Returns a "
+        "list of ``{title, start, end, location, description}`` dicts "
+        "with start/end in ISO 8601 format."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "calendar": {
+                "type": "string",
+                "enum": ["alfred", "primary"],
+                "description": (
+                    "Which calendar to read. ``alfred`` = the writable "
+                    "shared calendar (Andrew's Calendar (S.A.L.E.M.)); "
+                    "``primary`` = Andrew's personal calendar (read-only)."
+                ),
+            },
+            "start": {
+                "type": "string",
+                "description": (
+                    "ISO 8601 datetime, inclusive lower bound. Must be "
+                    "timezone-aware (e.g. ``2026-05-07T00:00:00-03:00``). "
+                    "GCal's events.list ``timeMin``."
+                ),
+            },
+            "end": {
+                "type": "string",
+                "description": (
+                    "ISO 8601 datetime, exclusive upper bound. Must be "
+                    "timezone-aware. GCal's events.list ``timeMax``."
+                ),
+            },
+        },
+        "required": ["calendar", "start", "end"],
+    },
+}
+
+
 KALLE_VAULT_TOOLS: list[dict[str, Any]] = [
     TALKER_VAULT_TOOLS[0],  # vault_search
     TALKER_VAULT_TOOLS[1],  # vault_read
@@ -599,9 +659,34 @@ VAULT_TOOLS_BY_SET: dict[str, list[dict[str, Any]]] = {
 }
 
 
-def tools_for_set(set_name: str) -> list[dict[str, Any]]:
-    """Return the tool schema list for ``set_name`` (default ``talker``)."""
-    return VAULT_TOOLS_BY_SET.get(set_name) or TALKER_VAULT_TOOLS
+def tools_for_set(
+    set_name: str,
+    *,
+    gcal_enabled: bool = False,
+) -> list[dict[str, Any]]:
+    """Return the tool schema list for ``set_name`` (default ``talker``).
+
+    ``gcal_enabled`` (Phase A capability-audit close 2026-05-06):
+    when True, appends ``gcal_list_events`` to the returned list so
+    the model can answer "do I have anything Tuesday?" honestly.
+    Default False so instances without GCal wired (KAL-LE, Hypatia
+    today; any future instance that doesn't opt in) don't surface a
+    capability they can't fulfil — matches the honesty contract
+    surfaced in conversation ``0e52c745`` ("Salem said 'I have no
+    calendar read access at all'" because she literally had no
+    tool for it).
+
+    Caller (``run_turn``) reads ``gcal.enabled`` off the loaded
+    GCalConfig; the schema is appended only when the operator opted
+    in. The dispatch branch in ``_execute_tool`` lazy-loads the
+    GCal client on each invocation (mirrors peer-tool pattern).
+    """
+    base = VAULT_TOOLS_BY_SET.get(set_name) or TALKER_VAULT_TOOLS
+    if not gcal_enabled:
+        return base
+    # Append (don't mutate the registry) so subsequent calls without
+    # the flag see the unaugmented list.
+    return [*base, _GCAL_LIST_EVENTS_TOOL]
 
 
 # tool_name -> vault scope operation name
@@ -1312,6 +1397,280 @@ async def _dispatch_peer_inter_instance_tool(
         return _dumps({"error": f"unexpected error: {exc}"})
 
 
+# Field-truncation cap for the GCal description payload. Calendar
+# event descriptions can carry meeting agendas, Zoom join blurbs,
+# multi-paragraph context. The model only needs enough to answer
+# "what's this about?" — 500 chars is well above a typical agenda
+# blurb. Operator who needs the full text uses ``alfred gcal``.
+_GCAL_DESCRIPTION_TRUNC_CHARS = 500
+
+
+def _resolve_gcal_enabled_for_run_turn(config: TalkerConfig) -> bool:
+    """Lazy-resolve ``gcal.enabled`` from the active config.yaml.
+
+    Used by ``run_turn`` to decide whether to surface
+    ``gcal_list_events`` in the per-turn tool list. Lazy because
+    :class:`TalkerConfig` doesn't carry the GCal binding directly
+    (GCal is a separate optional integration module — see
+    ``feedback_intentionally_left_blank.md``-style decoupling: the
+    talker doesn't need to know about every integration its
+    dispatcher might touch).
+
+    Failure to resolve (config path missing, GCal module missing,
+    YAML parse error) is non-fatal — returns False so the talker
+    falls back to "no GCal tool surfaced", matching pre-feature
+    behaviour. The dispatch helper would also catch the same error
+    if a misconfigured tool call somehow slipped through.
+
+    Sub-millisecond per call (one yaml read + one dataclass build).
+    Acceptable for the once-per-turn frequency.
+    """
+    config_path = (
+        config.config_path
+        if config is not None and config.config_path
+        else "config.yaml"
+    )
+    try:
+        from alfred.integrations.gcal_config import (
+            load_from_unified as load_gcal,
+        )
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        return bool(load_gcal(raw).enabled)
+    except FileNotFoundError:
+        return False
+    except ImportError:
+        # Test fixtures or trimmed installs without the GCal module.
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.debug("talker.gcal_resolve_enabled_failed", error=str(exc))
+        return False
+
+
+def _gcal_event_to_chat_dict(event: Any) -> dict[str, Any]:
+    """Render a :class:`GCalEvent` into the chat-friendly dispatch shape.
+
+    Pruned vs the full GCal API response: title / start / end /
+    location / description-truncated. Drops the kitchen-sink ``raw``
+    blob (operator-only via ``alfred gcal``), the ``id``
+    (chat doesn't need it; future "delete event" tool can use
+    ``vault_delete`` against the matching ``event`` record), and
+    the ``calendar_id`` (caller already knows which calendar they
+    queried — the dispatch helper doesn't echo it back).
+
+    Location is read from the raw GCal payload because
+    :class:`GCalEvent` doesn't lift it into a typed attribute today
+    (transport peer-handler conflict-check doesn't need it).
+    """
+    raw = getattr(event, "raw", {}) or {}
+    location = raw.get("location") or ""
+    description = getattr(event, "description", "") or ""
+    if len(description) > _GCAL_DESCRIPTION_TRUNC_CHARS:
+        description = description[:_GCAL_DESCRIPTION_TRUNC_CHARS] + "…"
+    return {
+        "title": getattr(event, "title", ""),
+        "start": getattr(event, "start").isoformat()
+            if getattr(event, "start", None) else "",
+        "end": getattr(event, "end").isoformat()
+            if getattr(event, "end", None) else "",
+        "location": location,
+        "description": description,
+    }
+
+
+async def _dispatch_gcal_list_events(
+    *,
+    tool_input: dict[str, Any],
+    config: TalkerConfig | None,
+) -> str:
+    """Dispatch ``gcal_list_events`` → :func:`GCalClient.list_events`.
+
+    Phase A capability-audit close (2026-05-06): exposes Salem's
+    existing GCal read capability through the talker tool surface
+    so the model can answer "do I have anything Tuesday?" honestly
+    instead of hitting the no-tool wall surfaced in conversation
+    ``0e52c745`` ("I have no calendar read access at all").
+
+    Lazy-loads :class:`GCalConfig` from the active
+    ``config.config_path`` (mirrors the peer-tool dispatch shape at
+    ``_dispatch_peer_inter_instance_tool``) so the daemon doesn't
+    have to plumb GCal through every callsite. Per-call cost is
+    one YAML read + one OAuth-token file read; both are sub-
+    millisecond and OS-page-cache hot.
+
+    Failure paths surface as ``{"error": "..."}`` to the model so
+    the LLM can apologise / retry / pick a different tool, NOT
+    propagate. Same pattern as every other tool in this dispatcher.
+    """
+    # --- Tool input validation ------------------------------------------
+    calendar_alias = (
+        tool_input.get("calendar") if isinstance(tool_input, dict) else None
+    )
+    start_str = tool_input.get("start") if isinstance(tool_input, dict) else None
+    end_str = tool_input.get("end") if isinstance(tool_input, dict) else None
+    if calendar_alias not in {"alfred", "primary"}:
+        return _dumps({
+            "error": (
+                "gcal_list_events requires 'calendar' to be 'alfred' or "
+                f"'primary' (got {calendar_alias!r})"
+            ),
+        })
+    if not isinstance(start_str, str) or not start_str:
+        return _dumps({"error": "gcal_list_events requires ISO 8601 'start'"})
+    if not isinstance(end_str, str) or not end_str:
+        return _dumps({"error": "gcal_list_events requires ISO 8601 'end'"})
+
+    try:
+        time_min = _dt.datetime.fromisoformat(start_str)
+    except ValueError as exc:
+        return _dumps({"error": f"gcal_list_events: invalid 'start' — {exc}"})
+    try:
+        time_max = _dt.datetime.fromisoformat(end_str)
+    except ValueError as exc:
+        return _dumps({"error": f"gcal_list_events: invalid 'end' — {exc}"})
+    if time_min.tzinfo is None or time_max.tzinfo is None:
+        return _dumps({
+            "error": (
+                "gcal_list_events: 'start' and 'end' must be timezone-aware "
+                "(include an offset, e.g. 2026-05-07T00:00:00-03:00)"
+            ),
+        })
+
+    # --- Lazy GCal config + client -------------------------------------
+    # Mirror peer-tool pattern: lazy import + lazy load via
+    # ``config.config_path``. Test fixtures that don't ship a config
+    # file see the failure as a tool error rather than a startup
+    # crash.
+    try:
+        from alfred.integrations.gcal_config import (
+            load_from_unified as load_gcal,
+        )
+        from alfred.integrations.gcal import (
+            GCalClient,
+            GCalError,
+            GCalNotAuthorized,
+            GCalNotInstalled,
+        )
+    except ImportError as exc:
+        log.warning("talker.gcal_list.import_failed", error=str(exc))
+        return _dumps({
+            "error": "Google Calendar dependencies not installed",
+            "detail": str(exc),
+        })
+
+    config_path = (
+        config.config_path
+        if config is not None and config.config_path
+        else "config.yaml"
+    )
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        gcal_config = load_gcal(raw)
+    except FileNotFoundError as exc:
+        log.warning(
+            "talker.gcal_list.config_missing",
+            error=str(exc),
+            config_path=config_path,
+        )
+        return _dumps({
+            "error": "GCal config unavailable for read",
+            "detail": str(exc),
+        })
+    except Exception as exc:  # noqa: BLE001
+        log.warning("talker.gcal_list.config_error", error=str(exc))
+        return _dumps({"error": f"GCal config load failed: {exc}"})
+
+    if not gcal_config.enabled:
+        # Defensive: tools_for_set should not have surfaced this tool
+        # when ``gcal.enabled: false``, but if a misconfiguration races
+        # mid-restart, fail honestly rather than silently no-op.
+        log.info("talker.gcal_list.not_enabled")
+        return _dumps({
+            "error": (
+                "GCal not enabled on this instance — operator must set "
+                "gcal.enabled: true in config.yaml"
+            ),
+        })
+
+    # Resolve the calendar alias to a real GCal calendar ID.
+    if calendar_alias == "alfred":
+        calendar_id = gcal_config.alfred_calendar_id
+    else:
+        calendar_id = gcal_config.primary_calendar_id
+    if not calendar_id:
+        return _dumps({
+            "error": (
+                f"GCal {calendar_alias} calendar ID not configured — operator "
+                f"must set gcal.{calendar_alias}_calendar_id in config.yaml"
+            ),
+        })
+
+    # --- API call --------------------------------------------------------
+    try:
+        client = GCalClient(
+            credentials_path=gcal_config.credentials_path,
+            token_path=gcal_config.token_path,
+            scopes=gcal_config.scopes,
+        )
+        events = client.list_events(calendar_id, time_min, time_max)
+    except GCalNotInstalled as exc:
+        log.warning("talker.gcal_list.not_installed", error=str(exc))
+        return _dumps({
+            "error": "Google Calendar Python deps not installed",
+            "detail": str(exc),
+        })
+    except GCalNotAuthorized as exc:
+        log.warning("talker.gcal_list.not_authorized", error=str(exc))
+        return _dumps({
+            "error": "GCal not authorized — operator must run `alfred gcal authorize`",
+            "detail": str(exc),
+        })
+    except GCalError as exc:
+        log.warning(
+            "talker.gcal_list.api_error",
+            calendar=calendar_alias,
+            error=str(exc),
+        )
+        return _dumps({
+            "error": f"GCal API error: {exc}",
+            "calendar": calendar_alias,
+        })
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.gcal_list.unexpected_error",
+            calendar=calendar_alias,
+            error=str(exc),
+        )
+        return _dumps({"error": f"unexpected error: {exc}"})
+
+    # Per ``feedback_intentionally_left_blank.md``: explicit
+    # "ran, nothing to do" log so an empty result is distinguishable
+    # from a missed call. The model gets ``{"events": []}`` either way.
+    if not events:
+        log.info(
+            "talker.gcal_list.empty",
+            calendar=calendar_alias,
+            window_start=start_str,
+            window_end=end_str,
+        )
+    else:
+        log.info(
+            "talker.gcal_list.fired",
+            calendar=calendar_alias,
+            window_start=start_str,
+            window_end=end_str,
+            count=len(events),
+        )
+
+    return _dumps({
+        "calendar": calendar_alias,
+        "events": [_gcal_event_to_chat_dict(e) for e in events],
+    })
+
+
 async def _peer_tool_query_canonical(
     tool_input: dict[str, Any],
     transport_config: Any,
@@ -1524,6 +1883,17 @@ async def _execute_tool(
             tool_name=tool_name,
             tool_input=tool_input,
             session=session,
+            config=config,
+        )
+
+    # GCal read tool — Phase A capability-audit close 2026-05-06. Only
+    # surfaced in the tool list when ``gcal.enabled: true``; the
+    # dispatch helper does its own config / scope / API-error handling
+    # and returns ``{"error": ...}`` shapes that match the rest of the
+    # dispatcher.
+    if tool_name == "gcal_list_events":
+        return await _dispatch_gcal_list_events(
+            tool_input=tool_input,
             config=config,
         )
 
@@ -2006,7 +2376,19 @@ async def run_turn(
     # ("talker") gets vault-only; KAL-LE ("kalle") gets vault + bash_exec.
     # Defaults to the talker set so any misconfigured instance can't
     # accidentally surface bash_exec.
-    instance_tools = tools_for_set(config.instance.tool_set)
+    #
+    # GCal capability gating (2026-05-06): we surface the
+    # ``gcal_list_events`` tool only when the active config has
+    # ``gcal.enabled: true``. Lazy-load mirrors the dispatch path —
+    # one yaml read per turn is cheap and keeps the GCal binding out
+    # of the talker hot path. Failure to load is non-fatal: we fall
+    # back to "no GCal tool" so the model can still answer (just
+    # without calendar reads), matching the pre-feature behaviour
+    # for any instance that doesn't carry a gcal block.
+    gcal_enabled = _resolve_gcal_enabled_for_run_turn(config)
+    instance_tools = tools_for_set(
+        config.instance.tool_set, gcal_enabled=gcal_enabled,
+    )
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         try:
