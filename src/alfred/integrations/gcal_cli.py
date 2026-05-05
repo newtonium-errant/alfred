@@ -14,13 +14,14 @@ Four commands:
     integration is live.
 
   * ``alfred gcal test-write`` — creates a throwaway event ~2 hours
-    from now on the Alfred calendar to validate the full create path
-    end-to-end, then optionally cleans it up. Useful right after
-    operator setup to confirm the writes are landing.
+    from now on Andrew's Calendar (S.A.L.E.M.) to validate the full
+    create path end-to-end, then optionally cleans it up. Useful right
+    after operator setup to confirm the writes are landing.
 
   * ``alfred gcal backfill`` — iterates existing vault ``event/``
     records, pushes any that haven't been synced (no ``gcal_event_id``
-    in frontmatter) to the Alfred calendar, and writes back the ID.
+    in frontmatter) to Andrew's Calendar (S.A.L.E.M.), and writes back
+    the ID.
     ``--dry-run`` reports what would happen without making API calls.
     ``--from-date YYYY-MM-DD`` skips events before that date (default:
     today; operator can pass an earlier date to backfill historical
@@ -185,8 +186,13 @@ def cmd_status(raw: dict[str, Any], *, wants_json: bool = False) -> int:
         _print(f"  authorized:           {out['authorized']}")
         _print(f"  credentials_path:     {out['credentials_path']}")
         _print(f"  token_path:           {out['token_path']}")
-        _print(f"  alfred calendar ID:   {out['alfred_calendar_id_redacted'] or '(not set)'}")
-        _print(f"  primary calendar ID:  {out['primary_calendar_id_redacted'] or '(not set)'}")
+        # Operator-facing label uses the canonical human name. The
+        # underlying JSON field name (``alfred_calendar_id_redacted``)
+        # stays as-is for back-compat — it's a stable API key, not
+        # operator-readable prose. See the SKILL.md sweep at commit
+        # ``332b66c`` for the canonical-label rationale.
+        _print(f"  Andrew's Calendar (S.A.L.E.M.) ID: {out['alfred_calendar_id_redacted'] or '(not set)'}")
+        _print(f"  Primary calendar ID:               {out['primary_calendar_id_redacted'] or '(not set)'}")
         _print(f"  scopes:               {', '.join(out['scopes'])}")
         _print("")
         if out["error"]:
@@ -194,8 +200,8 @@ def cmd_status(raw: dict[str, Any], *, wants_json: bool = False) -> int:
             _print("")
         if out["enabled"] and out["authorized"]:
             _print("  Next 24h:")
-            _print(f"    Alfred calendar:  {out['alfred_events_next_24h']}")
-            _print(f"    Primary calendar: {out['primary_events_next_24h']}")
+            _print(f"    Andrew's Calendar (S.A.L.E.M.): {out['alfred_events_next_24h']}")
+            _print(f"    Primary calendar:               {out['primary_events_next_24h']}")
 
     return 0 if not out["error"] else 1
 
@@ -211,7 +217,7 @@ def cmd_test_write(
     cleanup: bool = True,
     wants_json: bool = False,
 ) -> int:
-    """Create a throwaway event +2h from now on the Alfred calendar.
+    """Create a throwaway event +2h from now on Andrew's Calendar (S.A.L.E.M.).
 
     With ``cleanup=True`` (default), deletes the event right after to
     leave the calendar clean. Pass ``--no-cleanup`` to leave it in
@@ -298,7 +304,7 @@ def cmd_test_write(
     if wants_json:
         _print(json.dumps(result, indent=2, sort_keys=True))
     else:
-        _print(f"Test event created on Alfred calendar.")
+        _print(f"Test event created on Andrew's Calendar (S.A.L.E.M.).")
         _print(f"  event_id:  {event_id}")
         _print(f"  title:     {title}")
         _print(f"  start:     {start.isoformat()}")

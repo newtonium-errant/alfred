@@ -1,20 +1,29 @@
 """Google Calendar adapter — OAuth Installed-App flow + Calendar v3.
 
+Naming note: this module's Python field name ``alfred_calendar_id``
+predates the canonical human-facing label "Andrew's Calendar
+(S.A.L.E.M.)" (per the SKILL.md sweep at commit ``332b66c``). The
+field name stays as-is for config back-compat — operator
+``.env`` / config.yaml entries already key on ``alfred_calendar_id``.
+Docstrings + comments below use the canonical human-facing label
+to keep future-reader mental models aligned with the SKILL surface.
+
 Used by Salem's Phase A+ inter-instance comms to:
 
-  1. **Conflict-check** — query Andrew's Alfred Calendar (R/W) and his
-     primary calendar (read-only by application policy) so an event
-     proposed by Hypatia / KAL-LE doesn't slot on top of a real meeting
-     Salem can't see in the vault.
+  1. **Conflict-check** — query Andrew's Calendar (S.A.L.E.M.) (R/W)
+     and his primary calendar (read-only by application policy) so an
+     event proposed by Hypatia / KAL-LE doesn't slot on top of a real
+     meeting Salem can't see in the vault.
 
   2. **Push-to-phone** — after a vault ``event/`` record is created,
-     create the matching event on the Alfred Calendar so Andrew sees it
-     on his phone calendar app. The vault is canonical; the GCal entry
-     is a projection.
+     create the matching event on Andrew's Calendar (S.A.L.E.M.) so
+     Andrew sees it on his phone calendar app. The vault is canonical;
+     the GCal entry is a projection.
 
 Architecture:
   * **Calendar-as-provenance** — Salem only ever writes to the configured
-    Alfred Calendar ID. Andrew's manual writes go to his primary. The
+    ``alfred_calendar_id`` (operator-visible as Andrew's Calendar
+    (S.A.L.E.M.)). Andrew's manual writes go to his primary. The
     calendar holding the event encodes its origin; no metadata field
     needed.
   * **Read-only on primary** — enforced at this layer: the only methods
@@ -153,7 +162,8 @@ def event_to_conflict_dict(
 # OAuth scope sufficient for read+write on calendar events. Narrower
 # than ``calendar`` (which would also let us mutate calendars themselves —
 # create / delete entire calendars). Application-layer policy further
-# restricts writes to the configured Alfred Calendar ID.
+# restricts writes to the configured ``alfred_calendar_id`` (operator-
+# visible as Andrew's Calendar (S.A.L.E.M.)).
 DEFAULT_SCOPES: list[str] = [
     "https://www.googleapis.com/auth/calendar.events",
 ]
@@ -496,7 +506,8 @@ class GCalClient:
         (e.g. ``"America/Halifax"``) to force display semantics.
 
         Per architecture: this method should ONLY be called against the
-        Alfred Calendar ID. The handler enforces this; this function
+        configured ``alfred_calendar_id`` (operator-visible as Andrew's
+        Calendar (S.A.L.E.M.)). The handler enforces this; this function
         does not (it's a thin SDK wrapper).
         """
         if start.tzinfo is None or end.tzinfo is None:

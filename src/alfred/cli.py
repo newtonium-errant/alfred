@@ -2290,7 +2290,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gcal_test_p = gcal_sub.add_parser(
         "test-write",
-        help="Create a throwaway test event on the Alfred calendar",
+        help="Create a throwaway test event on Andrew's Calendar (S.A.L.E.M.)",
     )
     gcal_test_p.add_argument(
         "--no-cleanup", action="store_true", default=False,
@@ -2304,7 +2304,7 @@ def build_parser() -> argparse.ArgumentParser:
         "backfill",
         help=(
             "Push existing vault event records (without gcal_event_id) "
-            "to the Alfred calendar; writes back the GCal IDs"
+            "to Andrew's Calendar (S.A.L.E.M.); writes back the GCal IDs"
         ),
     )
     gcal_backfill_p.add_argument(

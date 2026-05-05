@@ -40,8 +40,8 @@ def _substitute_env(value: Any) -> Any:
 
 
 # Default OAuth scope. Wide enough to read both calendars + write to
-# the Alfred calendar; narrow enough that we can't mutate calendar
-# objects themselves.
+# Andrew's Calendar (S.A.L.E.M.) (the configured ``alfred_calendar_id``);
+# narrow enough that we can't mutate calendar objects themselves.
 DEFAULT_SCOPES: tuple[str, ...] = (
     "https://www.googleapis.com/auth/calendar.events",
 )

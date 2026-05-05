@@ -171,7 +171,11 @@ def sync_event_create_to_gcal(
     end_dt: datetime,
     correlation_id: str = "",
 ) -> dict[str, Any]:
-    """Push a freshly-created vault event to the configured Alfred Calendar.
+    """Push a freshly-created vault event to the configured calendar.
+
+    Pushes to ``config.alfred_calendar_id`` (operator-visible as
+    Andrew's Calendar (S.A.L.E.M.) per the canonical naming established
+    in the SKILL.md sweep at commit ``332b66c``).
 
     Mirrors the pre-Phase-A+ inline logic exactly, just lifted out of
     the aiohttp request handler. On success: writes ``gcal_event_id``

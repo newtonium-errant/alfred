@@ -1553,9 +1553,11 @@ def _scan_gcal_conflicts(
     map by default (see :func:`_scan_event_conflicts`). When GCal is
     enabled, we additionally query:
 
-      * **Alfred Calendar** (R/W) — the dedicated calendar Salem writes
-        to. Anything Salem has previously synced lands here. Source
-        tagged ``gcal_alfred``.
+      * **Andrew's Calendar (S.A.L.E.M.)** (R/W) — the dedicated calendar
+        Salem writes to (configured ``alfred_calendar_id``). Anything
+        Salem has previously synced lands here. Source tagged
+        ``gcal_alfred`` — the source-tag string keeps the legacy
+        ``alfred`` token for back-compat with existing log greps.
       * **Primary calendar** (R/O by application policy) — Andrew's own
         meetings he scheduled directly. Source tagged ``gcal_primary``.
 
@@ -1612,7 +1614,7 @@ def _scan_gcal_conflicts(
 
     out: list[dict[str, Any]] = []
 
-    # Alfred calendar — Salem's writable target.
+    # Andrew's Calendar (S.A.L.E.M.) — Salem's writable target.
     if config.alfred_calendar_id:
         try:
             events = client.list_events(
@@ -1857,10 +1859,10 @@ async def _handle_canonical_event_propose_create(
     )
     # Dedup vault-already-synced-to-gcal-alfred records: when commit 3
     # ships, every vault event has a ``gcal_event_id`` in frontmatter
-    # pointing at its mirror on the Alfred calendar. The same logical
-    # event would otherwise show up twice (once vault, once gcal_alfred)
-    # in the conflict list. Filter gcal_alfred entries whose ID matches
-    # any vault entry's gcal_event_id.
+    # pointing at its mirror on Andrew's Calendar (S.A.L.E.M.). The
+    # same logical event would otherwise show up twice (once vault,
+    # once gcal_alfred) in the conflict list. Filter gcal_alfred
+    # entries whose ID matches any vault entry's gcal_event_id.
     vault_synced_ids = {
         c["gcal_event_id"]
         for c in vault_conflicts
@@ -1984,12 +1986,12 @@ async def _handle_canonical_event_propose_create(
     )
 
     # --- Sync to GCal (Phase A+) -------------------------------------------
-    # Vault is canonical; the Alfred Calendar entry is a projection so
-    # Andrew sees the event on his phone. Sync failure does NOT roll
-    # back the vault create — operator can manually re-sync (or a
-    # future Phase D sync loop will do it). The response carries a
-    # ``gcal_sync_error`` field so the proposing instance can tell
-    # Andrew "saved to vault but GCal sync failed".
+    # Vault is canonical; the Andrew's Calendar (S.A.L.E.M.) entry is a
+    # projection so Andrew sees the event on his phone. Sync failure
+    # does NOT roll back the vault create — operator can manually
+    # re-sync (or a future Phase D sync loop will do it). The response
+    # carries a ``gcal_sync_error`` field so the proposing instance can
+    # tell Andrew "saved to vault but GCal sync failed".
     response_payload: dict[str, Any] = {
         "status": "created",
         "path": rel_path,
@@ -2044,7 +2046,7 @@ def _sync_event_to_gcal(
     end_dt: datetime,
     correlation_id: str,
 ) -> dict[str, Any]:
-    """Mirror a freshly-created vault event to the Alfred Calendar.
+    """Mirror a freshly-created vault event to Andrew's Calendar (S.A.L.E.M.).
 
     Thin shim around
     :func:`alfred.integrations.gcal_sync.sync_event_create_to_gcal` —
@@ -2065,7 +2067,8 @@ def _sync_event_to_gcal(
         :func:`alfred.integrations.gcal_sync.classify_gcal_error`.
 
     Per architecture:
-      * Salem ONLY writes to the configured Alfred Calendar ID — never
+      * Salem ONLY writes to the configured ``alfred_calendar_id``
+        (operator-visible as Andrew's Calendar (S.A.L.E.M.)) — never
         primary. The shared sync function enforces this by reading the
         ID from config and refusing to act on anything else.
       * Vault is canonical. The sync function re-writes the markdown

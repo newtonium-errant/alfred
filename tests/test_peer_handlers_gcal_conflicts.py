@@ -245,7 +245,11 @@ async def test_vault_conflict_now_includes_source_field(app_factory):  # type: i
 
 
 async def test_alfred_calendar_conflict_surfaces(app_factory):  # type: ignore[no-untyped-def]
-    """Event on Alfred calendar overlaps proposed window → gcal_alfred conflict."""
+    """Event on Andrew's Calendar (S.A.L.E.M.) overlaps proposed window →
+    gcal_alfred conflict. (Function name keeps the ``alfred_calendar``
+    Python identifier as a domain reference to the
+    ``alfred_calendar_id`` config field — see the canonical-naming
+    sweep at commit ``332b66c`` for the operator-visible label.)"""
     gcal_event = _make_gcal_event(
         event_id="ev-1",
         title="Coaching session",

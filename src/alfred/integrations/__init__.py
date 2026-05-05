@@ -6,7 +6,7 @@ Modules here:
     gcal — Google Calendar (OAuth-installed-app flow + Calendar v3 API).
            Used by Salem's transport handler for event conflict-check
            and by the post-create sync that pushes accepted events to
-           Andrew's Alfred Calendar so they land on his phone.
+           Andrew's Calendar (S.A.L.E.M.) so they land on his phone.
 
 Adapters keep their imports of the underlying SDK lazy so an instance
 that doesn't enable the integration doesn't pay the import cost (and

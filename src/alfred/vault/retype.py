@@ -3,7 +3,7 @@
 Use case: Andrew has 11 records currently typed as ``event`` in
 ``vault/event/`` that are really deadlines / renewals (Duolingo
 renewal, iCloud renewal, Kit.co shutdown, etc.). They need to be
-``task`` records so they don't pollute the shared Alfred Calendar
+``task`` records so they don't pollute Andrew's Calendar (S.A.L.E.M.)
 that's about to be shared with Jamie (RRTS operations partner).
 
 This module composes the existing primitives (``_parse_record``,

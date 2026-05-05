@@ -2,9 +2,9 @@
 
 Phase A+ inter-instance comms commit 3 — when the handler successfully
 creates a vault event and GCal is configured, it pushes the event to
-the Alfred Calendar so Andrew sees it on his phone, and writes the
-returned event ID back into the vault frontmatter as ``gcal_event_id``
-+ ``gcal_calendar``.
+Andrew's Calendar (S.A.L.E.M.) so Andrew sees it on his phone, and
+writes the returned event ID back into the vault frontmatter as
+``gcal_event_id`` + ``gcal_calendar``.
 
 Coverage:
   * No GCal config → vault create succeeds, no GCal call attempted,
