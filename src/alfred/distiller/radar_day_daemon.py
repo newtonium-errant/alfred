@@ -17,7 +17,6 @@ morning fire.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -25,7 +24,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
-from alfred.common.schedule import compute_next_fire, sleep_until
+from alfred.common.scheduled_daemon import run_scheduled_daemon
 
 from .config import DistillerConfig
 from .radar_day import run_daily_radar
@@ -125,8 +124,12 @@ async def fire_once(
 async def run_daemon(config: DistillerConfig) -> None:
     """Main loop — one fire per day at the configured slot.
 
-    Mirrors the digest daemon: drift-bounded ``sleep_until`` keeps the
-    fire wall-clock-aligned even on WSL2 with monotonic clock skew.
+    Delegates the canonical sleep/wake/fire/catch loop to
+    ``alfred.common.scheduled_daemon.run_scheduled_daemon``; this
+    function owns only the daemon-specific ``starting`` log event +
+    the ``fire_once`` partial. Drift-bounded ``sleep_until`` (kept
+    wall-clock-aligned even on WSL2 with monotonic clock skew) lives
+    inside the shared template.
     """
     rd = config.radar_day
     log.info(
@@ -138,32 +141,16 @@ async def run_daemon(config: DistillerConfig) -> None:
         min_score=rd.min_score,
         vault=str(config.vault.vault_path),
     )
-    while True:
-        tz = ZoneInfo(rd.schedule.timezone)
-        now = datetime.now(tz)
-        target = compute_next_fire(rd.schedule, now)
-        sleep_seconds = (target - now).total_seconds()
-        if sleep_seconds > 0:
-            log.info(
-                "radar_day.daemon.sleeping",
-                next_run=target.isoformat(),
-                sleep_seconds=round(sleep_seconds, 1),
-                sleep_hours=round(sleep_seconds / 3600, 1),
-            )
-            actual_seconds = await sleep_until(target)
-            log.info(
-                "radar_day.daemon.woke",
-                intended_seconds=round(sleep_seconds, 1),
-                actual_seconds=round(actual_seconds, 1),
-                drift_seconds=round(actual_seconds - sleep_seconds, 1),
-            )
-        try:
-            await fire_once(config, now=datetime.now(tz))
-        except Exception:  # noqa: BLE001
-            log.exception("radar_day.daemon.fire_error")
-        # Sleep 90s past fire so the next ``compute_next_fire`` lands
-        # on the following day, not the current minute.
-        await asyncio.sleep(90)
+
+    async def _fire(now: datetime) -> Any:
+        return await fire_once(config, now=now)
+
+    await run_scheduled_daemon(
+        schedule=rd.schedule,
+        fire=_fire,
+        log_namespace="radar_day.daemon",
+        log=log,
+    )
 
 
 __all__ = [

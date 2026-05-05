@@ -13,7 +13,6 @@ The daemon DOES NOT start automatically unless
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
-from alfred.common.schedule import compute_next_fire, sleep_until
+from alfred.common.scheduled_daemon import run_scheduled_daemon
 
 from .config import DailySyncConfig, FrictionAnalyzerConfig
 from .friction_analyzer import run_friction_analysis
@@ -131,9 +130,13 @@ async def run_daemon(
 ) -> None:
     """Main loop — one fire per day at the configured slot.
 
-    Mirrors radar_day_daemon's drift-bounded ``sleep_until`` + 90s
-    post-fire sleep so the next ``compute_next_fire`` lands on the
-    following day rather than the current minute.
+    Delegates the canonical sleep/wake/fire/catch loop to
+    ``alfred.common.scheduled_daemon.run_scheduled_daemon``; this
+    function owns only the daemon-specific ``starting`` log event +
+    the ``fire_once`` partial. Drift-bounded ``sleep_until`` + 90s
+    post-fire sleep (so the next ``compute_next_fire`` lands on the
+    following day rather than the current minute) live inside the
+    shared template.
     """
     fa = config.friction_analyzer
     log.info(
@@ -148,30 +151,16 @@ async def run_daemon(
             "window_hours": fa.thresholds.window_hours,
         },
     )
-    while True:
-        tz = ZoneInfo(fa.schedule.timezone)
-        now = datetime.now(tz)
-        target = compute_next_fire(fa.schedule, now)
-        sleep_seconds = (target - now).total_seconds()
-        if sleep_seconds > 0:
-            log.info(
-                "friction_analyzer.daemon.sleeping",
-                next_run=target.isoformat(),
-                sleep_seconds=round(sleep_seconds, 1),
-                sleep_hours=round(sleep_seconds / 3600, 1),
-            )
-            actual_seconds = await sleep_until(target)
-            log.info(
-                "friction_analyzer.daemon.woke",
-                intended_seconds=round(sleep_seconds, 1),
-                actual_seconds=round(actual_seconds, 1),
-                drift_seconds=round(actual_seconds - sleep_seconds, 1),
-            )
-        try:
-            await fire_once(config, raw_config=raw_config, now=datetime.now(tz))
-        except Exception:  # noqa: BLE001
-            log.exception("friction_analyzer.daemon.fire_error")
-        await asyncio.sleep(90)
+
+    async def _fire(now: datetime) -> Any:
+        return await fire_once(config, raw_config=raw_config, now=now)
+
+    await run_scheduled_daemon(
+        schedule=fa.schedule,
+        fire=_fire,
+        log_namespace="friction_analyzer.daemon",
+        log=log,
+    )
 
 
 __all__ = [
