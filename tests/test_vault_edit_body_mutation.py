@@ -338,23 +338,44 @@ class TestVaultEditBodyReplace:
         assert "Original content." in post.content
         assert "Don't lose this." in post.content
 
-    def test_body_replace_whitespace_only_allowed(self, tmp_vault: Path):
-        """Consistency pin with body_insert_at: ``not "  "`` evaluates
-        False (truthy string) — whitespace-only content passes the
-        empty-content gate in BOTH surfaces. Operator who explicitly
-        wants to set a body to literal whitespace chose that. The
-        pin guards against a future tightening of the guard that
-        would diverge from body_insert_at's contract.
+    def test_body_replace_whitespace_only_passes_gate_normalises_to_empty(
+        self, tmp_vault: Path,
+    ):
+        """Whitespace-only content passes the EMPTY-CONTENT GATE
+        (``not "   "`` evaluates False — truthy string), but
+        downstream the python-frontmatter / PyYAML serializer strips
+        trailing whitespace from body content. The whitespace-only
+        input therefore normalises to empty body on disk.
 
-        Documented behaviour, not encouraged usage — but consistency
-        across the body-mutation surfaces is what the contract
-        promises."""
+        This is end-to-end pipeline behaviour, NOT the gate's job to
+        re-tighten. body_insert_at exhibits the SAME normalisation:
+        ``_apply_body_insert_at`` does ``content.rstrip()`` on the
+        inserted block, so whitespace-only content there also
+        collapses to empty. Consistency holds at BOTH layers:
+
+          1. Gate accepts truthy strings (including whitespace-only)
+             — body_replace mirrors body_insert_at.
+          2. Downstream serializer / rstrip normalizes whitespace-
+             only to empty — both surfaces share this.
+
+        If a future operator workflow needs literal whitespace bodies
+        preserved, the fix lives downstream (custom serializer or
+        sentinel padding), NOT at the empty-content gate. This test
+        pins the documented end-to-end behaviour so a future
+        tightening at the gate produces a focused regression signal.
+
+        Originally tested as ``post.content.rstrip("\\n") == "   "``
+        on the assumption whitespace would survive end-to-end. Team-
+        lead pytest pass on 0064647 surfaced the AssertionError —
+        actual file content was empty string. Re-pinned to the
+        observed behaviour rather than tightened the gate (which
+        would diverge from body_insert_at's existing contract)."""
         vault_create(
             tmp_vault, "note", "Whitespace Replace Test",
             body="# Original.\n",
             scope="talker",
         )
-        # Should NOT raise — whitespace-only is truthy.
+        # Should NOT raise at the gate — whitespace-only is truthy.
         vault_edit(
             tmp_vault, "note/Whitespace Replace Test.md",
             body_replace="   ",
@@ -363,9 +384,13 @@ class TestVaultEditBodyReplace:
         post = frontmatter.load(
             str(tmp_vault / "note/Whitespace Replace Test.md")
         )
-        # Body wholesale-replaced (rstrip("\n") + "\n" trailing newline).
-        # The 3-space input survives the rstrip (rstrip on \n only).
-        assert post.content.rstrip("\n") == "   "
+        # Original body wholesale-replaced. Whitespace-only input
+        # normalises to empty body on disk via the
+        # python-frontmatter serializer's trailing-whitespace strip.
+        assert post.content.strip() == ""
+        # And critically: the original body content is gone (this IS
+        # a body_replace, not a no-op).
+        assert "Original" not in post.content
 
 
 # ---------------------------------------------------------------------------
