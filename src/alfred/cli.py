@@ -1035,6 +1035,8 @@ def cmd_surveyor(args: argparse.Namespace) -> None:
         return cmd_surveyor_relink(args)
     if subcmd == "cleanup-contamination":
         return cmd_surveyor_cleanup_contamination(args)
+    if subcmd == "cleanup-alfred-tags":
+        return cmd_surveyor_cleanup_alfred_tags(args)
     # `run` and None both start the daemon.
     return cmd_surveyor_run(args)
 
@@ -1744,6 +1746,101 @@ def cmd_surveyor_cleanup_contamination(args: argparse.Namespace) -> None:
         print("\nRe-run with --apply to mutate the vault.")
 
 
+def cmd_surveyor_cleanup_alfred_tags(args: argparse.Namespace) -> None:
+    """Phase 2 (tag side) — alfred_tags contamination cleanup CLI.
+
+    Walks the vault, finds records whose ``alfred_tags`` frontmatter
+    list contains tags whose anchor term has no textual presence in
+    the record's body / title / description / related list. Removes
+    those tags. See :func:`alfred.surveyor.cleanup.cleanup_alfred_tags_contamination`
+    for the heuristic + scope rationale.
+
+    Always defaults to dry-run unless ``--apply`` is passed — operator
+    must opt in to the actual mutation. Same shape as the link-side
+    ``cleanup-contamination`` handler above.
+    """
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="surveyor")
+
+    try:
+        from alfred.surveyor.cleanup import cleanup_alfred_tags_contamination
+        from alfred.surveyor.config import load_from_unified
+    except ImportError as e:
+        print(f"Surveyor dependencies not installed: {e}")
+        sys.exit(1)
+
+    config = load_from_unified(raw)
+    vault_path = Path(config.vault.path)
+
+    apply = bool(getattr(args, "apply", False))
+    dry_run = not apply
+
+    audit_log_path = Path(config.state.path).parent / "vault_audit.log"
+
+    print(f"Surveyor alfred_tags cleanup — {'DRY RUN' if dry_run else 'LIVE'}")
+    print(f"  Vault:    {vault_path}")
+    print()
+
+    report = cleanup_alfred_tags_contamination(
+        vault_path=vault_path,
+        dry_run=dry_run,
+        audit_log_path=audit_log_path if not dry_run else None,
+    )
+
+    # Per-record table — only modified records appear (unmodified
+    # records roll up into the aggregate counts). Aligns with the
+    # spec's "per-record table for modified records" shape.
+    verb = "Would remove" if dry_run else "Removed"
+    if report.per_record_modifications:
+        print(f"{verb} the following:")
+        for m in report.per_record_modifications:
+            print(
+                f"  {m.record_path:<60s}  "
+                f"removed: {len(m.tags_removed):>3d}  "
+                f"kept: {len(m.tags_kept):>3d}"
+            )
+            # Show the actual removed tags so operator can spot-check.
+            print(f"    tags removed: {', '.join(m.tags_removed)}")
+        print()
+    else:
+        # Per ``feedback_intentionally_left_blank.md``: explicit
+        # "ran, nothing to do" so silence is distinguishable from a
+        # broken walker. Surface as a one-liner instead of an empty
+        # table.
+        print("No records require modification — every alfred_tags entry")
+        print("has textual anchor support in its record's content.")
+        print()
+
+    print(
+        f"Records scanned:  {report.records_scanned}\n"
+        f"  with alfred_tags: {report.records_with_tags}\n"
+        f"  modified:         {report.records_modified}\n"
+        f"Tags removed:     {report.tags_removed_total}"
+    )
+    if report.failed_records:
+        print(f"Failures:         {len(report.failed_records)} (see report JSON for details)")
+
+    # Save the report so operator has a deterministic record of the
+    # dry-run findings (for diff-against-live-run sanity).
+    from datetime import date as _date
+    report_path = (
+        Path(config.state.path).parent
+        / f"surveyor_cleanup_alfred_tags_{'dryrun_' if dry_run else ''}{_date.today().isoformat()}.json"
+    )
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(report.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(f"\nFull report: {report_path}")
+    except OSError as exc:
+        print(f"\n(could not write report file: {exc})")
+
+    if dry_run:
+        print("\nRe-run with --apply to mutate the vault.")
+
+
 # --- Argument parser ---
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2070,6 +2167,30 @@ def build_parser() -> argparse.ArgumentParser:
             "Vault path of an entity to clean (e.g. 'person/Ben McMillan.md'). "
             "Pass --target multiple times for multiple entities. When "
             "omitted, the 4 known QA-finding signatures are used."
+        ),
+    )
+
+    # cleanup-alfred-tags — Phase 2 (tag side) of the QA contamination
+    # fix. Bulk-removes unanchored tags from records' alfred_tags
+    # frontmatter via the body-text-anchor heuristic. Companion to
+    # cleanup-contamination — same dry-run-by-default + --apply pattern;
+    # no --target because tag contamination is general (whole-vault
+    # walk).
+    surv_cleanup_tags = surv_sub.add_parser(
+        "cleanup-alfred-tags",
+        help=(
+            "Bulk-remove unanchored tags from alfred_tags frontmatter "
+            "lists across the whole vault. Per-tag predicate: tag's "
+            "anchor term must appear (word-boundary) in the record's "
+            "body / title / description / related list. Default is "
+            "dry-run; pass --apply to actually mutate."
+        ),
+    )
+    surv_cleanup_tags.add_argument(
+        "--apply", action="store_true", default=False,
+        help=(
+            "Actually mutate the vault. Default (without --apply) is "
+            "dry-run: report what would be removed without writing."
         ),
     )
 

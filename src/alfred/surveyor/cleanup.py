@@ -611,3 +611,268 @@ def cleanup_entity_link_contamination(
         failed_records=len(report.failed_records),
     )
     return report
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (tag side) — alfred_tags contamination cleanup
+# ---------------------------------------------------------------------------
+#
+# Architectural twin to ``cleanup_entity_link_contamination`` above; closes
+# the alfred_tags arc that started with the per-record write-side gate
+# (``47b1b75``) shipped 2026-05-05 and continued with the source-side fix
+# (``004ac54``). Phase 1 stops NEW tag contamination at the writer; Phase 2
+# scrubs the historical contamination in records written before the gate
+# landed.
+#
+# Why a separate entry point (vs reusing ``cleanup_entity_link_contamination``):
+#   1. No target-list — link-side scoped to specific entity paths because
+#      the QA finding named specific entities. Tag contamination is general:
+#      any record could carry an unanchored tag from cluster-bleed. Walk
+#      every record, check every tag in its alfred_tags list.
+#   2. Per-record shape — link-side aggregates per-target (one row per
+#      Ben McMillan / Jamie / TIXR / etc.). Tag-side has no fixed target
+#      set, so the natural shape is per-record-modified (one row per record
+#      that had at least one tag scrubbed).
+#   3. Frontmatter target — link-side touches related_persons /
+#      related_orgs / related_matters / related_projects. Tag-side only
+#      touches alfred_tags. No shared write path.
+#
+# Predicate parity:
+#   Both phases use ``_tag_anchored_in_corpus`` (already imported above);
+#   the Phase 2 cleanup uses byte-identical semantics to the Phase 1 gate
+#   per the docstring on that helper. A tag the gate would reject today
+#   is the SAME tag this cleanup removes from history. Mismatched semantics
+#   would either over-remove operator-curated tags or under-remove
+#   cluster-bleed contamination.
+
+
+@dataclass
+class TagCleanupRecord:
+    """One record's tag-cleanup decisions. Only emitted for records that
+    actually had at least one tag removed (no-op records aren't surfaced
+    individually — their counts roll up into the aggregate)."""
+
+    record_path: str  # vault-relative, e.g. "event/Quiet.md"
+    tags_removed: list[str] = field(default_factory=list)
+    tags_kept: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "record_path": self.record_path,
+            "tags_removed": list(self.tags_removed),
+            "tags_kept": list(self.tags_kept),
+        }
+
+
+@dataclass
+class TagCleanupReport:
+    """Aggregate report from a single ``cleanup_alfred_tags_contamination``
+    call. Counters distinguish four buckets so an operator can confirm
+    "scanned 1500 records, 800 had alfred_tags, 120 needed scrubbing,
+    340 tags removed total" from the report alone."""
+
+    vault_path: str
+    dry_run: bool
+    records_scanned: int = 0
+    records_with_tags: int = 0
+    records_modified: int = 0
+    tags_removed_total: int = 0
+    per_record_modifications: list[TagCleanupRecord] = field(default_factory=list)
+    failed_records: list[dict] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "vault_path": self.vault_path,
+            "dry_run": self.dry_run,
+            "records_scanned": self.records_scanned,
+            "records_with_tags": self.records_with_tags,
+            "records_modified": self.records_modified,
+            "tags_removed_total": self.tags_removed_total,
+            "per_record_modifications": [
+                m.to_dict() for m in self.per_record_modifications
+            ],
+            "failed_records": list(self.failed_records),
+        }
+
+
+def cleanup_alfred_tags_contamination(
+    vault_path: Path,
+    *,
+    dry_run: bool = True,
+    audit_log_path: Path | str | None = None,
+) -> TagCleanupReport:
+    """Bulk-remove unanchored tags from ``alfred_tags`` frontmatter lists.
+
+    Walks every record under ``vault_path`` (skipping ``_IGNORE_DIRS``).
+    For each record's ``alfred_tags`` list, partitions tags into
+    "anchored in corpus" (kept) vs "not anchored" (removed). Records
+    with no ``alfred_tags`` field, no tags-to-remove, or non-list tag
+    fields are no-ops — they roll up into the aggregate counts but
+    don't appear in ``per_record_modifications``.
+
+    Args:
+        vault_path: Vault root.
+        dry_run: When True (default), populates the report without
+            mutating any record. When False, calls ``vault_edit`` to
+            persist tag removals + emits one audit-log line per
+            modified file.
+        audit_log_path: Path to ``data/vault_audit.log``. Only used in
+            non-dry-run mode. When ``None``, audit-log writes are
+            skipped (a structured-log warning is emitted in their
+            place).
+
+    Returns:
+        :class:`TagCleanupReport` with aggregate counts +
+        per-modified-record details.
+
+    Raises:
+        VaultError: only if ``vault_path`` itself is invalid.
+        Per-record failures (parse error, write error) are caught
+        and recorded in ``report.failed_records`` so one bad file
+        can't abort the bulk operation.
+
+    Empty-tag-list semantics: when EVERY tag in a record's
+    ``alfred_tags`` fails the predicate, the field is preserved as an
+    empty list (``alfred_tags: []``) rather than removed entirely.
+    Frontmatter shape stays stable so future writes append rather
+    than re-introduce the field; operator can grep for
+    ``alfred_tags: \\[\\]`` to find records that lost everything (a
+    diagnostic signal — the surveyor's labeler matched zero anchors
+    on this record's content).
+    """
+    if not vault_path.exists() or not vault_path.is_dir():
+        raise VaultError(f"vault_path not a directory: {vault_path}")
+
+    report = TagCleanupReport(
+        vault_path=str(vault_path),
+        dry_run=dry_run,
+    )
+
+    log.info(
+        "surveyor.cleanup_tags.start",
+        vault_path=str(vault_path),
+        dry_run=dry_run,
+    )
+
+    all_records = _walk_vault_records(vault_path)
+    for md_path in all_records:
+        report.records_scanned += 1
+        try:
+            post = frontmatter.load(str(md_path))
+        except Exception as exc:  # noqa: BLE001
+            report.failed_records.append({
+                "path": str(md_path.relative_to(vault_path)),
+                "phase": "parse",
+                "error": str(exc),
+            })
+            continue
+
+        fm = dict(post.metadata or {})
+        body = post.content or ""
+        rel_path = str(md_path.relative_to(vault_path))
+
+        existing_tags = fm.get("alfred_tags")
+        if not isinstance(existing_tags, list):
+            # No alfred_tags field, OR the field is set to a non-list
+            # value (scalar string, dict, etc. — operator-malformed
+            # data the surveyor never wrote). Skip — not a tag-cleanup
+            # concern; janitor's structural-validation pass owns this.
+            continue
+
+        # Build the corpus once per record (matches link-side shape).
+        corpus = _build_record_corpus(fm, body)
+        report.records_with_tags += 1
+
+        tags_removed: list[str] = []
+        tags_kept: list[str] = []
+        for tag in existing_tags:
+            # Preserve non-string entries verbatim — same conservative
+            # bias as link-side. Janitor handles structural malformations.
+            if not isinstance(tag, str):
+                tags_kept.append(tag)
+                continue
+            if _tag_anchored_in_corpus(tag, corpus):
+                tags_kept.append(tag)
+            else:
+                tags_removed.append(tag)
+
+        if not tags_removed:
+            continue
+
+        report.records_modified += 1
+        report.tags_removed_total += len(tags_removed)
+        report.per_record_modifications.append(
+            TagCleanupRecord(
+                record_path=rel_path,
+                tags_removed=tags_removed,
+                tags_kept=tags_kept,
+            )
+        )
+
+        if dry_run:
+            log.debug(
+                "surveyor.cleanup_tags.would_remove",
+                path=rel_path,
+                removed=tags_removed,
+                kept_count=len(tags_kept),
+            )
+            continue
+
+        # Apply via vault_edit — same atomic-write + frontmatter-shape
+        # discipline as the link-side cleanup. Empty-tag-list
+        # preservation is the natural fallout of writing the filtered
+        # list back: ``set_fields={"alfred_tags": []}`` keeps the
+        # field with an empty value.
+        try:
+            vault_edit(
+                vault_path, rel_path,
+                set_fields={"alfred_tags": tags_kept},
+            )
+        except Exception as exc:  # noqa: BLE001
+            report.failed_records.append({
+                "path": rel_path,
+                "phase": "write",
+                "error": str(exc),
+            })
+            # Roll back the report entries so counts reflect what
+            # actually persisted.
+            report.records_modified -= 1
+            report.tags_removed_total -= len(tags_removed)
+            report.per_record_modifications.pop()
+            continue
+
+        log.info(
+            "surveyor.cleanup_tags.removed",
+            path=rel_path,
+            removed=tags_removed,
+            kept_count=len(tags_kept),
+        )
+
+        if audit_log_path is not None:
+            try:
+                append_to_audit_log(
+                    audit_log_path,
+                    tool="surveyor-cleanup-tags",
+                    mutations={"files_modified": [rel_path]},
+                    detail=(
+                        "removed unanchored alfred_tags: "
+                        + ", ".join(tags_removed)
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "surveyor.cleanup_tags.audit_log_failed",
+                    path=rel_path,
+                    error=str(exc),
+                )
+
+    log.info(
+        "surveyor.cleanup_tags.complete",
+        dry_run=dry_run,
+        records_scanned=report.records_scanned,
+        records_with_tags=report.records_with_tags,
+        records_modified=report.records_modified,
+        tags_removed_total=report.tags_removed_total,
+        failed_records=len(report.failed_records),
+    )
+    return report
