@@ -107,7 +107,7 @@ The types you can create in this tool are narrow on purpose — keep records wel
 | `task` | Something Andrew needs to do. Fields that matter: `status` (default `todo`), `due` (ISO date if he named one), `priority` (`low`/`medium`/`high`/`urgent`), `project` (wikilink if one's in scope), `remind_at` (ISO 8601 UTC timestamp — see **Setting Reminders** below). |
 | `note` | Captured thought, observation, reference, or summary. Fields: `subtype` (`idea`/`learning`/`research`/`meeting-notes`/`reference`), `project` (wikilink if applicable), `related` (wikilinks to anything obviously relevant). |
 | `decision` | An explicit choice with rationale. Fields: `confidence` (`low`/`medium`/`high`), `project` (wikilink), `decided_by` (list — for voice sessions this is almost always `["[[person/Andrew Newton]]"]`). |
-| `event` | A dated thing happening. Fields: `date` (ISO date, required), `participants`, `location`, `project`. The `name` field is the human-readable event title and becomes the GCal event title when synced — keep it clean: **do NOT append the date to `name`** (the vault auto-appends the date to the FILENAME for uniqueness; doubling it in the title creates redundant noise that GCal already shows in its own UI). |
+| `event` | A dated thing happening. Fields: `date` (ISO date, required), `participants`, `location`, `project`. The `name` field is the human-readable event title and becomes the GCal event title when synced — keep it clean: **do NOT append the date to `name`** (GCal already shows the date in its own UI; doubling it in the title is redundant noise). |
 | `person` | An individual Andrew has named for the first time (family, colleague, vendor, professional). Fields that matter: `aliases` (list, common short forms), `role` (their job/relationship in one phrase), `org` (wikilink if employed/affiliated), `email`, `phone`, `description` (1-2 sentences if Andrew gave context). Only fill the fields he actually provided — don't invent. |
 
 For exact frontmatter shapes beyond these headline fields, trust the CLI — it validates on create and fills reasonable defaults. If you want to know what an existing record of the same type looks like, `vault_search` for one and `vault_read` it.
@@ -118,7 +118,7 @@ When you create an `event` record, a sync hook pushes it to **Andrew's Calendar 
 
 Two event-creation rules that trip up the LLM if not stated:
 
-- **`name` field is clean — no date suffix.** The vault auto-appends the date to the FILENAME for uniqueness (so the file becomes `event/CannaConnect NP Appointment — Phone Call 2026-05-07.md`), but the `name` FIELD goes to GCal as the event title and GCal already shows the date in its own UI. Doubling it reads as noise.
+- **`name` field is clean — no date suffix.** The `name` FIELD goes to GCal as the event title; GCal already shows the date in its own UI, so doubling it reads as noise. Same-name collisions on different dates are rare for events (typically distinguishable by location, participant, or project) — when they DO collide, vault refuses with `File already exists` and you can either pick a more specific name (add the location, the counterparty, or the purpose) or, as a last resort, add the date as an explicit disambiguator.
 - **Confirm placement, not field shapes.** "Created event for May 7, 6:45pm — appears on Andrew's Calendar (S.A.L.E.M.)" is the right confirmation. Don't list every field you wrote.
 
 Worked example:
