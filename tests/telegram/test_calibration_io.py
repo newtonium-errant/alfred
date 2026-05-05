@@ -252,6 +252,10 @@ async def test_run_turn_injects_calibration_into_api_call(
 
     call = client.messages.calls[0]
     system = call["system"]
-    assert len(system) == 4
+    # Five blocks post-acda70c: system / vault / calibration / pushback /
+    # today. Calibration's third-position is unchanged; today's-date
+    # block always tails (never cached, changes daily).
+    assert len(system) == 5
     assert "Alfred's calibration" in system[2]["text"]
     assert "- terse" in system[2]["text"]
+    assert system[-1]["text"].startswith("## Today")
