@@ -94,6 +94,32 @@ class LabelerConfig:
     # labeling from tens of minutes to single digits.
     max_concurrent: int = 8
 
+    # Per-write text-anchor gate on alfred_tags writeback (architectural
+    # twin to ``EntityLinkConfig.require_text_anchor`` shipped in
+    # ``db9392f`` for entity-link writes; same contamination class,
+    # different writeback path). Before persisting any tag to a record,
+    # verify the tag's last segment (split on ``/`` then ``-``) has a
+    # word-boundary text match in the record's body / title / description
+    # / related list / relationships array's anchor strings. The labeler
+    # proposes one tag-set per cluster; this gate runs per-MEMBER so
+    # different members of the same cluster may keep different filtered
+    # subsets.
+    #
+    # Cosine clustering produces topic-coherent false positives — events
+    # cluster with music records in embedding space because they share
+    # date/location signal even when no music event is the subject.
+    # Combining cosine + last-segment word-boundary mention-detection
+    # is standard precision-control in entity-linking systems
+    # (Bio-Yodie, WikiData linkers).
+    #
+    # Default: True (production). Tests that exercise the legacy cosine-
+    # only contract pass ``require_text_anchor=False`` so their fixtures
+    # don't have to embed tag-words in every test body. Operator can flip
+    # to False if a downstream workflow needs the looser cosine-only
+    # semantic for some reason — but the contamination bug class
+    # returns at full strength.
+    require_text_anchor: bool = True
+
 
 @dataclass
 class EntityLinkConfig:

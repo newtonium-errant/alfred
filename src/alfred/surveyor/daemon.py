@@ -419,8 +419,65 @@ class Daemon:
             async with semaphore:
                 tags = await self.labeler.label_cluster(cid, members, records)
                 if tags:
+                    # Per-record text-anchor gate (architectural twin to
+                    # the entity-link gate shipped in db9392f, P0 from
+                    # vault-reviewer 2026-05-05). Embedding clusters
+                    # produce topic-coherent false positives — events
+                    # cluster with music records on shared date/location
+                    # signal even when no music event is the subject.
+                    # Without per-record filtering, every member of a
+                    # heterogeneous cluster gets every label (Halifax
+                    # Music Fest, dental appointments, EI Call all
+                    # tagged ``events/music``). The gate filters
+                    # per-MEMBER, so different members may keep
+                    # different filtered subsets of the cluster's
+                    # proposed tag-set.
                     for path in members:
-                        self.writer.write_alfred_tags(path, tags)
+                        record = records.get(path)
+                        if record is None:
+                            # No parsed record (transient or skipped) —
+                            # skip the write entirely. Don't fall
+                            # through to the legacy unfiltered write
+                            # because that's the contamination shape.
+                            log.info(
+                                "surveyor.tag_write_skipped_no_record",
+                                record_path=path,
+                                cluster_id=cid,
+                                proposed_count=len(tags),
+                            )
+                            continue
+                        anchored_tags = self._filter_anchored_tags(
+                            tags, record,
+                        )
+                        blocked_tags = [
+                            t for t in tags if t not in anchored_tags
+                        ]
+                        for blocked in blocked_tags:
+                            log.info(
+                                "surveyor.tag_blocked_no_text_anchor",
+                                record_path=path,
+                                tag=blocked,
+                                cluster_id=cid,
+                            )
+                        if anchored_tags:
+                            self.writer.write_alfred_tags(
+                                path, anchored_tags,
+                            )
+                        elif tags:
+                            # All tags filtered — explicit "ran, nothing
+                            # landed" signal per
+                            # ``feedback_intentionally_left_blank.md``
+                            # so an operator can grep for
+                            # ``surveyor.all_tags_blocked`` to see
+                            # heavily-heterogeneous clusters that
+                            # produced zero anchored matches.
+                            log.info(
+                                "surveyor.all_tags_blocked",
+                                record_path=path,
+                                cluster_id=cid,
+                                proposed_count=len(tags),
+                                proposed_tags=tags,
+                            )
                     cluster_key = f"semantic_{cid}"
                     self.state.clusters[cluster_key] = ClusterState(
                         label=tags,
@@ -512,6 +569,49 @@ class Daemon:
     # The helper expects an in-memory ``VaultRecord`` (which the
     # daemon has already parsed); reading frontmatter+body off disk
     # again would double the I/O for no semantic gain.
+
+    def _filter_anchored_tags(
+        self,
+        proposed_tags: list[str],
+        record: "VaultRecord",
+    ) -> list[str]:
+        """Return the subset of ``proposed_tags`` whose anchor terms
+        appear as word-boundary matches in the record's corpus.
+
+        Returns ``proposed_tags`` unchanged when:
+          * ``labeler.require_text_anchor`` is False (legacy cosine-
+            only contract — opt-out for tests + downstream workflows
+            that explicitly want untrusted tag application).
+          * ``proposed_tags`` is empty.
+
+        Otherwise iterates per-tag and keeps only those whose anchor
+        term (last segment after splitting on ``/`` then ``-``) has
+        word-boundary textual presence in the record body / title /
+        description / related list / relationships array's anchor
+        strings.
+
+        Architectural twin to ``_entity_name_appears_in_record``
+        (db9392f); same predicate, different extraction. Caller
+        emits ``surveyor.tag_blocked_no_text_anchor`` per dropped
+        tag and ``surveyor.all_tags_blocked`` when the filtered set
+        is empty (per ``feedback_intentionally_left_blank.md``).
+
+        Reuses cleanup module helpers (``_tag_anchored_in_corpus`` +
+        ``_build_record_corpus``) for byte-identical parity with the
+        Phase 2 cleanup CLI that will scrub historical contamination
+        — mismatched semantics would either over-remove operator-
+        curated tags or under-remove cluster-bleed contamination.
+        Local import inside the method so the cleanup module's tests
+        can run independently if surveyor's daemon module fails to
+        load.
+        """
+        if not self.cfg.labeler.require_text_anchor:
+            return list(proposed_tags)
+        if not proposed_tags:
+            return []
+        from .cleanup import _build_record_corpus, _tag_anchored_in_corpus
+        corpus = _build_record_corpus(record.frontmatter, record.body)
+        return [t for t in proposed_tags if _tag_anchored_in_corpus(t, corpus)]
 
     def _entity_name_appears_in_record(
         self,

@@ -234,6 +234,65 @@ def _has_textual_presence(record_corpus: str, display_name: str) -> bool:
     return pattern.search(record_corpus) is not None
 
 
+def _anchor_term_from_tag(tag: str) -> str:
+    """Extract the operator-meaningful anchor term from a tag.
+
+    Hierarchical tags use ``/`` (Obsidian convention) and compound tag
+    components use ``-``; the LAST segment after both splits is the
+    word we expect to find in the record body.
+
+    Examples:
+      * ``events/music`` → ``music``
+      * ``live-music`` → ``music``
+      * ``events/live-music`` → ``music``
+      * ``marketing`` → ``marketing``
+      * ``health/care/mental-health`` → ``health``
+
+    Returns empty string for falsy / whitespace-only inputs (defensive
+    — caller treats empty as "anchor unfindable" → tag dropped).
+    """
+    if not tag or not isinstance(tag, str):
+        return ""
+    stripped = tag.strip()
+    if not stripped:
+        return ""
+    # Split on ``/`` — take the most-specific (rightmost) hierarchy
+    # segment. ``events/music`` → ``music``.
+    last_slash_seg = stripped.rsplit("/", 1)[-1].strip()
+    if not last_slash_seg:
+        return ""
+    # Split on ``-`` — take the most-specific (rightmost) compound
+    # piece. ``live-music`` → ``music``.
+    last_dash_seg = last_slash_seg.rsplit("-", 1)[-1].strip()
+    return last_dash_seg
+
+
+def _tag_anchored_in_corpus(tag: str, record_corpus: str) -> bool:
+    """Word-boundary check for the tag's anchor term in the corpus.
+
+    Architectural twin to ``_has_textual_presence`` for entity-link
+    writes (db9392f); same precision-control predicate, different
+    extraction. Surveyor's per-record tag-write gate uses this; a
+    future Phase 2 cleanup CLI for historical tag contamination will
+    import this same helper for byte-identical parity (the cleanup
+    must remove only tags this gate would have rejected; mismatched
+    semantics would either over-remove operator-curated tags or
+    under-remove cluster-bleed contamination).
+
+    Returns ``True`` when the tag's anchor term (per
+    :func:`_anchor_term_from_tag`) appears as a word-boundary match
+    in the corpus. Returns ``False`` for empty anchors (defensive —
+    a tag with no extractable anchor can't be verified).
+
+    Per-record gate: caller iterates per (tag, record) pair, so a
+    cluster's tag-set may filter to different subsets across members.
+    """
+    anchor = _anchor_term_from_tag(tag)
+    if not anchor:
+        return False
+    return _has_textual_presence(record_corpus, anchor)
+
+
 def _build_record_corpus(fm: dict, body: str) -> str:
     """Concatenate every searchable surface of the record into one string.
 
