@@ -1,21 +1,49 @@
 """Schema-pin tests for the vault_edit tool surface (c3 of body-mutation arc).
 
 c3 exposes body_insert_at + body_replace through the LLM-facing JSON
-schemas in conversation.py + instructor/executor.py. The runtime
-gate at vault_edit (c2) is load-bearing; these schema constraints
-are defense in depth (Anthropic SDK doesn't strictly validate
-input_schema client-side — the schema is a hint to the LLM).
+schemas in conversation.py + instructor/executor.py.
 
-Coverage:
+Mutual-exclusion enforcement (HISTORICAL note — readers following
+breadcrumbs from commit ``0d7e7a6``):
+
+  c3 originally shipped a top-level ``oneOf`` constraint enumerating
+  the four valid body-kwarg shapes (zero / one of three) as defense
+  in depth above the runtime gate in ``vault.ops.vault_edit``. The
+  ``oneOf`` was removed 2026-05-06 because Anthropic's Messages API
+  request validator rejects ``oneOf`` / ``allOf`` / ``anyOf`` at the
+  top level of any tool's ``input_schema`` with HTTP 400 before the
+  model runs:
+
+    tools.N.custom.input_schema: input_schema does not support
+    oneOf, allOf, or anyOf at the top level
+
+  Surfaced when Salem (+ KAL-LE + Hypatia) restarted into the cherry-
+  picked code; every conversation carrying the tool list 400'd at
+  the request validator. Production fix is removal — the runtime
+  gate in ``vault_edit`` (raises ``VaultError("at most ONE
+  body-mutation kwarg per call")``) is THE load-bearing protection.
+  Mutual-exclusion regression coverage lives in
+  ``tests/test_vault_edit_body_mutation.py`` (3 tests at lines
+  ~410/430/450 covering every pairwise combination).
+
+  The schema's PROPERTY-LEVEL descriptions on body_append /
+  body_insert_at / body_replace each say "Mutually exclusive
+  with ..." in plain English so the LLM still gets the constraint
+  as guidance — just not as a structurally enforceable schema.
+
+Coverage retained here (post-2026-05-06):
   * talker vault_edit schema declares body_insert_at + body_replace
   * instructor vault_edit schema declares body_insert_at + body_replace
   * body_insert_at carries the {marker, position, content} required
     fields; position enum is ['before', 'after']
-  * Mutual-exclusion oneOf constraint structurally rejects calls
-    with multiple body kwargs (validates against a real JSON-schema
-    validator)
-  * set_fields still carries the not.required.body constraint
-    from P1 (c2 in body-filter arc)
+  * Each valid call shape (zero body kwargs, exactly one of three)
+    validates cleanly — these stay as positive-coverage tests
+  * set_fields still carries the not.required.body constraint from
+    P1 (c2 in body-filter arc) — different mechanism
+    (``not`` at the property level, NOT top-level), still allowed
+    by Anthropic
+  * Anthropic-API guard: assert no top-level oneOf / allOf / anyOf
+    in the schemas (regression test for the 2026-05-06 fix)
 """
 
 from __future__ import annotations
@@ -68,7 +96,8 @@ class TestTalkerSchemaShape:
 
     def test_set_fields_still_rejects_body_key(self):
         """Regression from P1 (c2 of body-filter arc): set_fields
-        carries the not.required.[body] constraint."""
+        carries the not.required.[body] constraint. This is at the
+        PROPERTY level (not top level), so Anthropic accepts it."""
         schema = _talker_vault_edit_schema()
         assert schema["properties"]["set_fields"]["not"] == {
             "required": ["body"],
@@ -90,21 +119,56 @@ class TestInstructorSchemaShape:
 
 
 # ---------------------------------------------------------------------------
-# Mutual exclusion via oneOf — validates against real jsonschema validator
+# Anthropic-API guard — no top-level oneOf / allOf / anyOf
 # ---------------------------------------------------------------------------
+#
+# 2026-05-06 production breakage regression: the Anthropic Messages
+# API rejects oneOf / allOf / anyOf at the top level of any tool's
+# input_schema with HTTP 400 BEFORE the model runs. Pin both schemas
+# so a future "schema as defense in depth" instinct can't quietly
+# reintroduce the same break.
 
 
-class TestTalkerSchemaMutualExclusion:
-    """The talker vault_edit schema's oneOf constraint must structurally
-    reject calls that include multiple body-mutation kwargs.
+class TestNoTopLevelSchemaCombinators:
+    """No top-level oneOf / allOf / anyOf in any tool's input_schema.
+    Anthropic's request validator 400s on this; runtime gate in
+    vault_edit is THE load-bearing mutual-exclusion protection."""
 
-    Note: the Anthropic SDK doesn't enforce input_schema client-side
-    (it's a hint to the LLM). These tests use python-jsonschema to
-    validate the SCHEMA SHAPE — confirming a strict validator would
-    reject the malformed calls. The runtime gate in vault_edit is
-    load-bearing for production.
-    """
+    @pytest.mark.parametrize(
+        "schema_factory",
+        [
+            _talker_vault_edit_schema,
+            _instructor_vault_edit_schema,
+        ],
+        ids=["talker", "instructor"],
+    )
+    def test_no_top_level_combinator(self, schema_factory):
+        schema = schema_factory()
+        for forbidden_key in ("oneOf", "allOf", "anyOf"):
+            assert forbidden_key not in schema, (
+                f"top-level {forbidden_key!r} in vault_edit input_schema "
+                f"will trigger Anthropic HTTP 400; the runtime gate in "
+                f"vault.ops.vault_edit enforces mutual exclusion. See "
+                f"tests/test_vault_edit_body_mutation.py for runtime-gate "
+                f"coverage."
+            )
 
+
+# ---------------------------------------------------------------------------
+# Positive validation — every legitimate call shape passes the schema
+# ---------------------------------------------------------------------------
+#
+# Pre-2026-05-06 these tests AND a parallel set of "multi-body-kwarg
+# rejected" tests both ran. The rejection tests pinned a structural
+# constraint (top-level oneOf) that we can't ship to Anthropic, so
+# they were removed. Production-side mutual-exclusion regression
+# coverage moved to tests/test_vault_edit_body_mutation.py against
+# the runtime gate in vault.ops.vault_edit. The positive tests stay
+# here because they confirm the LEGITIMATE call shapes the LLM can
+# emit are still well-formed against the (simpler) schema.
+
+
+class TestTalkerSchemaPositiveValidation:
     def test_zero_body_kwargs_passes(self):
         """Frontmatter-only edit (no body kwargs) must validate."""
         schema = _talker_vault_edit_schema()
@@ -133,60 +197,10 @@ class TestTalkerSchemaMutualExclusion:
         instance = {"path": "note/X.md", "body_replace": "# New\n"}
         jsonschema.validate(instance=instance, schema=schema)
 
-    def test_body_append_plus_body_replace_rejected(self):
-        schema = _talker_vault_edit_schema()
-        instance = {
-            "path": "note/X.md",
-            "body_append": "x",
-            "body_replace": "y",
-        }
-        with pytest.raises(jsonschema.ValidationError):
-            jsonschema.validate(instance=instance, schema=schema)
-
-    def test_body_insert_at_plus_body_replace_rejected(self):
-        schema = _talker_vault_edit_schema()
-        instance = {
-            "path": "note/X.md",
-            "body_insert_at": {
-                "marker": "## S",
-                "position": "after",
-                "content": "x",
-            },
-            "body_replace": "y",
-        }
-        with pytest.raises(jsonschema.ValidationError):
-            jsonschema.validate(instance=instance, schema=schema)
-
-    def test_body_append_plus_body_insert_at_rejected(self):
-        schema = _talker_vault_edit_schema()
-        instance = {
-            "path": "note/X.md",
-            "body_append": "x",
-            "body_insert_at": {
-                "marker": "## S",
-                "position": "after",
-                "content": "y",
-            },
-        }
-        with pytest.raises(jsonschema.ValidationError):
-            jsonschema.validate(instance=instance, schema=schema)
-
-    def test_all_three_body_kwargs_rejected(self):
-        schema = _talker_vault_edit_schema()
-        instance = {
-            "path": "note/X.md",
-            "body_append": "x",
-            "body_insert_at": {
-                "marker": "## S",
-                "position": "after",
-                "content": "y",
-            },
-            "body_replace": "z",
-        }
-        with pytest.raises(jsonschema.ValidationError):
-            jsonschema.validate(instance=instance, schema=schema)
-
     def test_body_insert_at_missing_required_field_rejected(self):
+        """Property-level required-field validation still works (this
+        is inside the body_insert_at property's own schema, not at
+        the top level — Anthropic-safe)."""
         schema = _talker_vault_edit_schema()
         instance = {
             "path": "note/X.md",
@@ -200,6 +214,7 @@ class TestTalkerSchemaMutualExclusion:
             jsonschema.validate(instance=instance, schema=schema)
 
     def test_body_insert_at_invalid_position_rejected(self):
+        """Property-level enum validation still works (Anthropic-safe)."""
         schema = _talker_vault_edit_schema()
         instance = {
             "path": "note/X.md",
@@ -213,8 +228,9 @@ class TestTalkerSchemaMutualExclusion:
             jsonschema.validate(instance=instance, schema=schema)
 
     def test_set_fields_with_body_key_rejected(self):
-        """Cross-check the P1 not.required.[body] constraint via
-        the same validator."""
+        """Cross-check the P1 not.required.[body] constraint. This is
+        a property-level ``not`` (inside set_fields' schema), not a
+        top-level combinator — Anthropic-safe."""
         schema = _talker_vault_edit_schema()
         instance = {
             "path": "note/X.md",
@@ -224,20 +240,25 @@ class TestTalkerSchemaMutualExclusion:
             jsonschema.validate(instance=instance, schema=schema)
 
 
-class TestInstructorSchemaMutualExclusion:
-    """Same oneOf contract on the instructor's vault_edit schema."""
-
+class TestInstructorSchemaPositiveValidation:
     def test_only_body_replace_passes(self):
         schema = _instructor_vault_edit_schema()
         instance = {"path": "note/X.md", "body_replace": "# new\n"}
         jsonschema.validate(instance=instance, schema=schema)
 
-    def test_body_append_plus_body_replace_rejected(self):
+    def test_only_body_append_passes(self):
+        schema = _instructor_vault_edit_schema()
+        instance = {"path": "note/X.md", "body_append": "added"}
+        jsonschema.validate(instance=instance, schema=schema)
+
+    def test_only_body_insert_at_passes(self):
         schema = _instructor_vault_edit_schema()
         instance = {
             "path": "note/X.md",
-            "body_append": "x",
-            "body_replace": "y",
+            "body_insert_at": {
+                "marker": "## S",
+                "position": "before",
+                "content": "x",
+            },
         }
-        with pytest.raises(jsonschema.ValidationError):
-            jsonschema.validate(instance=instance, schema=schema)
+        jsonschema.validate(instance=instance, schema=schema)

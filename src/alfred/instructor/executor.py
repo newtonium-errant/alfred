@@ -213,44 +213,16 @@ VAULT_TOOLS: list[dict[str, Any]] = [
                 "body_replace": {"type": "string"},
             },
             "required": ["path"],
-            "oneOf": [
-                {
-                    "not": {
-                        "anyOf": [
-                            {"required": ["body_append"]},
-                            {"required": ["body_insert_at"]},
-                            {"required": ["body_replace"]},
-                        ],
-                    },
-                },
-                {
-                    "required": ["body_append"],
-                    "not": {
-                        "anyOf": [
-                            {"required": ["body_insert_at"]},
-                            {"required": ["body_replace"]},
-                        ],
-                    },
-                },
-                {
-                    "required": ["body_insert_at"],
-                    "not": {
-                        "anyOf": [
-                            {"required": ["body_append"]},
-                            {"required": ["body_replace"]},
-                        ],
-                    },
-                },
-                {
-                    "required": ["body_replace"],
-                    "not": {
-                        "anyOf": [
-                            {"required": ["body_append"]},
-                            {"required": ["body_insert_at"]},
-                        ],
-                    },
-                },
-            ],
+            # Mutual exclusion of the body-mutation kwargs is enforced
+            # at the RUNTIME GATE in ``vault.ops.vault_edit``, NOT at
+            # the JSON-schema layer. Earlier ship (commit ``0d7e7a6``)
+            # included a top-level ``oneOf`` here; Anthropic's
+            # Messages API request validator rejects oneOf / allOf /
+            # anyOf at the top level of any tool's ``input_schema``
+            # with HTTP 400 before the model runs. Removed 2026-05-06
+            # to unblock production. Runtime gate in vault_edit is
+            # the load-bearing protection (covered by
+            # ``tests/test_vault_edit_body_mutation.py``).
         },
     },
     {

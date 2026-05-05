@@ -239,52 +239,28 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
                 },
             },
             "required": ["path"],
-            # Mutual exclusion of the four body-mutation kwargs at the
-            # JSON-schema layer — defense in depth above the runtime
-            # gate in vault_edit. ``oneOf`` here would force EXACTLY
-            # one, but vault_edit also accepts zero (frontmatter-only
-            # edits). So enumerate the valid shapes: zero body args,
-            # OR exactly one of the four. The Anthropic SDK's input-
-            # schema validation is hint-only (LLM is meant to honour
-            # it; runtime gate is load-bearing).
-            "oneOf": [
-                {
-                    "not": {
-                        "anyOf": [
-                            {"required": ["body_append"]},
-                            {"required": ["body_insert_at"]},
-                            {"required": ["body_replace"]},
-                        ],
-                    },
-                },
-                {
-                    "required": ["body_append"],
-                    "not": {
-                        "anyOf": [
-                            {"required": ["body_insert_at"]},
-                            {"required": ["body_replace"]},
-                        ],
-                    },
-                },
-                {
-                    "required": ["body_insert_at"],
-                    "not": {
-                        "anyOf": [
-                            {"required": ["body_append"]},
-                            {"required": ["body_replace"]},
-                        ],
-                    },
-                },
-                {
-                    "required": ["body_replace"],
-                    "not": {
-                        "anyOf": [
-                            {"required": ["body_append"]},
-                            {"required": ["body_insert_at"]},
-                        ],
-                    },
-                },
-            ],
+            # Mutual exclusion of the four body-mutation kwargs is
+            # enforced at the RUNTIME GATE in ``vault.ops.vault_edit``
+            # (raises ``VaultError("at most ONE body-mutation kwarg
+            # per call")``), NOT at the JSON-schema layer. Earlier
+            # ship of this schema (commit ``0d7e7a6``) included a
+            # top-level ``oneOf`` here as defense in depth, but the
+            # Anthropic Messages API rejects ``oneOf`` / ``allOf`` /
+            # ``anyOf`` at the top level of any tool's
+            # ``input_schema`` with HTTP 400 BEFORE the model runs:
+            #
+            #   tools.N.custom.input_schema: input_schema does not
+            #   support oneOf, allOf, or anyOf at the top level
+            #
+            # Surfaced 2026-05-06 when Salem (+ KAL-LE + Hypatia)
+            # restarted into the cherry-picked code; every conversation
+            # carrying the tool list 400'd at the request validator
+            # before any token cost was incurred. Fix is removal —
+            # the runtime gate in vault_edit is the load-bearing
+            # protection (covered by ``tests/test_vault_edit_body_mutation.py``).
+            # Property-level descriptions on body_append / body_insert_at
+            # / body_replace each say "Mutually exclusive with ..."
+            # so the LLM still gets the constraint as guidance.
         },
     },
 ]
