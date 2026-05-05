@@ -542,3 +542,202 @@ class TestEmptyStringEnvCoalesce:
         ]
         assert len(events) == 1
         assert events[0]["placeholder"] == "${ALFRED_KALLE_TRANSPORT_TOKEN}"
+
+
+# ---------------------------------------------------------------------------
+# _auto_load_dotenv_for_config — operator-gotcha closer (P1 from QA 2026-05-05)
+# ---------------------------------------------------------------------------
+#
+# Companion path to ``_inject_transport_env_vars``. The injector resolves
+# ``${VARNAME}`` placeholders against os.environ; the auto-loader makes
+# sure os.environ actually HAS the right per-instance vars in the first
+# place, even when the operator forgot ``set -a; source .env``.
+#
+# Invariants under test:
+#   1. .env present + var-not-in-environ → loaded into environ,
+#      ``_inject_transport_env_vars`` then resolves the placeholder.
+#   2. .env present + var-in-environ already → existing value WINS
+#      (override=False semantics — manual debugging stays predictable).
+#   3. .env absent → no-op + ``orchestrator.dotenv_missing`` info log.
+#   4. .env present but parses zero KEY=value lines (empty / all comments)
+#      → no-op + ``orchestrator.dotenv_empty`` info log.
+
+
+class TestAutoLoadDotenvForConfig:
+    """Orchestrator-side integration. Wires ``_config_path`` synthetic
+    key on raw → resolves to sibling .env path → invokes
+    ``_env.auto_load_dotenv``. Covers the four spec cases."""
+
+    def test_present_var_not_in_environ_loads(self, tmp_path, monkeypatch):
+        """Headline case: operator ran ``alfred up`` from a fresh shell.
+        The per-instance var (``ALFRED_KALLE_TRANSPORT_TOKEN``) isn't in
+        environ. .env has it. Auto-loader fills the gap; the injector
+        then resolves the placeholder cleanly."""
+        from alfred.orchestrator import (
+            _auto_load_dotenv_for_config,
+            _inject_transport_env_vars,
+        )
+
+        monkeypatch.delenv("ALFRED_KALLE_TRANSPORT_TOKEN", raising=False)
+        monkeypatch.delenv("ALFRED_TRANSPORT_TOKEN", raising=False)
+
+        config = tmp_path / "config.kalle.yaml"
+        config.write_text("# kalle config", encoding="utf-8")
+        env = tmp_path / ".env"
+        env.write_text(
+            "ALFRED_KALLE_TRANSPORT_TOKEN=kalle-loaded-from-dotenv\n",
+            encoding="utf-8",
+        )
+
+        raw = {
+            "_config_path": str(config),
+            "transport": {
+                "auth": {
+                    "tokens": {
+                        "local": {
+                            "token": "${ALFRED_KALLE_TRANSPORT_TOKEN}",
+                        },
+                    },
+                },
+            },
+        }
+        _auto_load_dotenv_for_config(raw)
+        # .env loaded → per-instance token now in environ.
+        assert (
+            os.environ["ALFRED_KALLE_TRANSPORT_TOKEN"]
+            == "kalle-loaded-from-dotenv"
+        )
+        # And the downstream injector resolves cleanly.
+        _inject_transport_env_vars(raw)
+        assert (
+            os.environ.get("ALFRED_TRANSPORT_TOKEN")
+            == "kalle-loaded-from-dotenv"
+        )
+
+    def test_present_var_already_in_environ_existing_wins(
+        self, tmp_path, monkeypatch,
+    ):
+        """``override=False`` contract: an explicit
+        ``export ALFRED_KALLE_TRANSPORT_TOKEN=...`` in the parent shell
+        survives. .env only fills gaps; manual-debug overrides stay
+        predictable."""
+        from alfred.orchestrator import _auto_load_dotenv_for_config
+
+        monkeypatch.setenv(
+            "ALFRED_KALLE_TRANSPORT_TOKEN", "from-parent-shell-export",
+        )
+
+        config = tmp_path / "config.kalle.yaml"
+        config.write_text("# kalle config", encoding="utf-8")
+        env = tmp_path / ".env"
+        env.write_text(
+            "ALFRED_KALLE_TRANSPORT_TOKEN=stale-value-in-dotenv\n",
+            encoding="utf-8",
+        )
+
+        raw = {"_config_path": str(config)}
+        _auto_load_dotenv_for_config(raw)
+        # Parent-shell value preserved; .env did NOT clobber.
+        assert (
+            os.environ["ALFRED_KALLE_TRANSPORT_TOKEN"]
+            == "from-parent-shell-export"
+        )
+
+    def test_absent_dotenv_no_op_with_missing_log(self, tmp_path):
+        """Production deploys (systemd, k8s) set env directly; .env
+        absence is the common case there. Must be a no-op + emit
+        ``orchestrator.dotenv_missing`` info log so operator can
+        confirm the auto-loader fired (not an unrelated failure)."""
+        from alfred.orchestrator import _auto_load_dotenv_for_config
+
+        config = tmp_path / "config.kalle.yaml"
+        config.write_text("# kalle config", encoding="utf-8")
+        # NOTE: no .env created.
+        raw = {"_config_path": str(config)}
+
+        with structlog.testing.capture_logs() as captured:
+            _auto_load_dotenv_for_config(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.dotenv_missing"
+        ]
+        assert len(events) == 1
+        assert events[0]["path"] == str(tmp_path / ".env")
+
+    def test_empty_dotenv_no_op_with_empty_log(self, tmp_path):
+        """File present but parses zero KEY=value lines (empty file
+        OR all-comments OR all-malformed). Distinct log shape from the
+        ``missing`` case — operator can grep
+        ``orchestrator.dotenv_empty`` to spot a .env that exists but
+        isn't doing anything (likely misformatted)."""
+        from alfred.orchestrator import _auto_load_dotenv_for_config
+
+        config = tmp_path / "config.kalle.yaml"
+        config.write_text("# kalle config", encoding="utf-8")
+        env = tmp_path / ".env"
+        env.write_text("# all comments\n# nothing else\n", encoding="utf-8")
+        raw = {"_config_path": str(config)}
+
+        with structlog.testing.capture_logs() as captured:
+            _auto_load_dotenv_for_config(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.dotenv_empty"
+        ]
+        assert len(events) == 1
+        assert events[0]["path"] == str(env)
+
+    def test_loaded_log_emits_counts(self, tmp_path, monkeypatch):
+        """The ``loaded`` log path must report
+        ``vars_loaded`` + ``vars_skipped_existing`` counts (NOT key
+        names — secret-shaped values land in .env). Operator can read
+        ``loaded=2 skipped=1`` from logs alone to confirm the .env
+        contributed AND that some env vars were preserved."""
+        from alfred.orchestrator import _auto_load_dotenv_for_config
+
+        monkeypatch.delenv("DOTENV_INTEG_FRESH_A", raising=False)
+        monkeypatch.delenv("DOTENV_INTEG_FRESH_B", raising=False)
+        monkeypatch.setenv("DOTENV_INTEG_PRESET", "preset-value")
+
+        config = tmp_path / "config.kalle.yaml"
+        config.write_text("# kalle config", encoding="utf-8")
+        env = tmp_path / ".env"
+        env.write_text(
+            "DOTENV_INTEG_FRESH_A=a\n"
+            "DOTENV_INTEG_FRESH_B=b\n"
+            "DOTENV_INTEG_PRESET=ignored\n",
+            encoding="utf-8",
+        )
+        raw = {"_config_path": str(config)}
+
+        with structlog.testing.capture_logs() as captured:
+            _auto_load_dotenv_for_config(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.dotenv_loaded"
+        ]
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["vars_loaded"] == 2
+        assert ev["vars_skipped_existing"] == 1
+        # Secret hygiene: counts only, never key names.
+        assert "key" not in ev
+        assert "keys" not in ev
+
+    def test_no_config_path_falls_back_to_cwd(self, tmp_path, monkeypatch):
+        """Legacy callers / tests that build raw inline without going
+        through ``_load_unified_config`` won't have ``_config_path``
+        on raw. Auto-loader falls back to CWD-relative ``.env``."""
+        from alfred.orchestrator import _auto_load_dotenv_for_config
+
+        monkeypatch.chdir(tmp_path)
+        env = tmp_path / ".env"
+        env.write_text("DOTENV_CWD_FALLBACK=cwd-found\n", encoding="utf-8")
+        monkeypatch.delenv("DOTENV_CWD_FALLBACK", raising=False)
+
+        raw: dict = {}  # No _config_path key.
+        _auto_load_dotenv_for_config(raw)
+        assert os.environ.get("DOTENV_CWD_FALLBACK") == "cwd-found"

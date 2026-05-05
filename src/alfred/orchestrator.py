@@ -115,6 +115,88 @@ def _run_instructor(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool 
 _MISSING_DEPS_EXIT = 78  # exit code signaling missing optional dependencies
 
 
+def _auto_load_dotenv_for_config(raw: dict[str, Any]) -> None:
+    """Load the active config's sibling ``.env`` into ``os.environ``.
+
+    Operator gotcha closer (P1 from QA 2026-05-05 401-fix validation):
+    running ``alfred up`` from a fresh shell that hasn't
+    ``set -a; source .env`` silently inherits whatever was already in
+    the shell's env — typically Salem's ``ALFRED_TRANSPORT_TOKEN``
+    from a prior session. Per-instance vars like
+    ``ALFRED_KALLE_TRANSPORT_TOKEN`` aren't visible →
+    ``_inject_transport_env_vars`` takes ``skipped_unresolved`` →
+    daemons inherit Salem's token → KAL-LE's transport server returns
+    401. Auto-loading ``.env`` BEFORE the injector closes the gap.
+
+    Path resolution: the active config file's directory wins (so
+    ``alfred --config /home/andrew/alfred/config.kalle.yaml up``
+    looks for ``/home/andrew/alfred/.env``). Falls back to CWD if
+    ``_config_path`` isn't on raw (legacy callers / tests). Per
+    ``feedback_intentionally_left_blank.md`` emits a structured log
+    on every call across three source paths (``loaded`` /
+    ``empty`` / ``missing``) so an operator can grep
+    ``orchestrator.dotenv_*`` post-restart to confirm env injection
+    fired.
+
+    Existing env vars WIN (``override=False`` semantics inside
+    ``auto_load_dotenv``). An explicit ``export FOO=...`` in the
+    parent shell still overrides — this is purely a gap-filler.
+
+    Missing file → no-op + info log (production deployments use
+    systemd / k8s secrets, not .env files; absence is the common
+    case there).
+    """
+    import structlog
+    from pathlib import Path
+    from alfred._env import auto_load_dotenv, load_dotenv_file
+
+    log = structlog.get_logger(__name__)
+
+    config_path_raw = raw.get("_config_path")
+    if isinstance(config_path_raw, str) and config_path_raw:
+        env_path = Path(config_path_raw).resolve().parent / ".env"
+    else:
+        # Legacy callers / tests that build raw inline without going
+        # through ``_load_unified_config``. Fall back to CWD-relative.
+        env_path = Path(".env").resolve()
+
+    if not env_path.is_file():
+        log.info(
+            "orchestrator.dotenv_missing",
+            path=str(env_path),
+            detail=(
+                "no .env file at the config's sibling location. "
+                "Production deploys (systemd, k8s) set env directly; "
+                "this log is informational, not a warning."
+            ),
+        )
+        return
+
+    # Pre-count so we can distinguish "loaded N" from "loaded 0 because
+    # file was empty / all comments" without re-parsing.
+    parsed = load_dotenv_file(env_path)
+    if not parsed:
+        log.info(
+            "orchestrator.dotenv_empty",
+            path=str(env_path),
+            detail=(
+                ".env file present but parsed zero KEY=value lines. "
+                "Either empty, all-comments, or all malformed."
+            ),
+        )
+        return
+
+    loaded, skipped = auto_load_dotenv(env_path, override=False)
+    log.info(
+        "orchestrator.dotenv_loaded",
+        path=str(env_path),
+        vars_loaded=loaded,
+        vars_skipped_existing=skipped,
+        # Deliberately NOT logging key names — secrets-shaped values
+        # land in .env. Counts only.
+    )
+
+
 def _inject_transport_env_vars(raw: dict[str, Any]) -> None:
     """Set ``ALFRED_TRANSPORT_{HOST,PORT,TOKEN}`` in the current process env.
 
@@ -818,6 +900,14 @@ def run_all(
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
 
+    # Auto-load the active config's sibling .env BEFORE the transport
+    # env-var injection. The injector's placeholder resolver reads
+    # ``os.environ``; if a per-instance token like
+    # ``ALFRED_KALLE_TRANSPORT_TOKEN`` lives in .env but the operator
+    # didn't ``set -a; source .env`` first, the resolver takes
+    # ``skipped_unresolved`` and the daemons inherit the wrong token.
+    # P1 from QA 2026-05-05 — see ``_auto_load_dotenv_for_config``.
+    _auto_load_dotenv_for_config(raw)
     # Resolve transport env vars once — orchestrator injects these
     # into every tool's child environment so any subprocess can call
     # the outbound-push client without looking at config.yaml again.

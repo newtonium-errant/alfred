@@ -217,3 +217,208 @@ class TestTransportConfigAliases:
         ``substitute_env_in_value``."""
         from alfred.transport.config import _substitute_env
         assert _substitute_env is substitute_env_in_value
+
+
+# ---------------------------------------------------------------------------
+# .env auto-loader (P1 from QA 2026-05-05)
+# ---------------------------------------------------------------------------
+
+
+class TestParseDotenvLine:
+    """Unit tests for the inline .env parser."""
+
+    def test_simple_key_value(self):
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line("FOO=bar") == ("FOO", "bar")
+
+    def test_double_quoted_value(self):
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line('FOO="bar baz"') == ("FOO", "bar baz")
+
+    def test_single_quoted_value(self):
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line("FOO='bar baz'") == ("FOO", "bar baz")
+
+    def test_export_prefix_stripped(self):
+        """``set -a; source .env`` habit produces ``export KEY=value``
+        lines. Parser strips the ``export `` prefix so they parse
+        the same as bare ``KEY=value``."""
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line("export FOO=bar") == ("FOO", "bar")
+
+    def test_comment_line_returns_none(self):
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line("# a comment") is None
+        assert _parse_dotenv_line("   # indented comment") is None
+
+    def test_blank_line_returns_none(self):
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line("") is None
+        assert _parse_dotenv_line("   ") is None
+
+    def test_missing_equals_returns_none(self):
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line("MALFORMED_NO_EQUALS") is None
+
+    def test_empty_key_returns_none(self):
+        """``=value`` with no key → malformed."""
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line("=value") is None
+
+    def test_empty_value_allowed(self):
+        """``KEY=`` is a valid empty-string assignment."""
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line("FOO=") == ("FOO", "")
+
+    def test_value_with_equals_sign_preserved(self):
+        """Values containing ``=`` use partition (only first ``=`` is
+        the separator). Common shape for base64-encoded secrets."""
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line("FOO=a=b=c") == ("FOO", "a=b=c")
+
+    def test_leading_trailing_whitespace_stripped_from_key(self):
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line("  FOO=bar  ") == ("FOO", "bar")
+
+    def test_unmatched_quotes_not_stripped(self):
+        """Only MATCHED surrounding quotes are stripped. ``"foo``
+        (unmatched leading quote) keeps the quote character."""
+        from alfred._env import _parse_dotenv_line
+        assert _parse_dotenv_line('FOO="bar') == ("FOO", '"bar')
+
+
+class TestLoadDotenvFile:
+    """Pure read — does NOT touch os.environ."""
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        from alfred._env import load_dotenv_file
+        assert load_dotenv_file(tmp_path / "nonexistent.env") == {}
+
+    def test_loads_canonical_shape(self, tmp_path):
+        from alfred._env import load_dotenv_file
+        env = tmp_path / ".env"
+        env.write_text(
+            "# comment\n"
+            "FOO=bar\n"
+            "BAZ=\"quoted value\"\n"
+            "\n"
+            "QUX='single-quoted'\n"
+            "export EXPORTED=value\n",
+            encoding="utf-8",
+        )
+        result = load_dotenv_file(env)
+        assert result == {
+            "FOO": "bar",
+            "BAZ": "quoted value",
+            "QUX": "single-quoted",
+            "EXPORTED": "value",
+        }
+
+    def test_skips_malformed_lines(self, tmp_path):
+        from alfred._env import load_dotenv_file
+        env = tmp_path / ".env"
+        env.write_text(
+            "VALID=ok\n"
+            "MALFORMED_NO_EQUALS\n"
+            "=missing-key\n"
+            "ALSO_VALID=ok2\n",
+            encoding="utf-8",
+        )
+        assert load_dotenv_file(env) == {
+            "VALID": "ok",
+            "ALSO_VALID": "ok2",
+        }
+
+    def test_empty_file_returns_empty(self, tmp_path):
+        from alfred._env import load_dotenv_file
+        env = tmp_path / ".env"
+        env.write_text("", encoding="utf-8")
+        assert load_dotenv_file(env) == {}
+
+    def test_all_comments_returns_empty(self, tmp_path):
+        from alfred._env import load_dotenv_file
+        env = tmp_path / ".env"
+        env.write_text("# c1\n# c2\n", encoding="utf-8")
+        assert load_dotenv_file(env) == {}
+
+    def test_does_not_touch_os_environ(self, tmp_path, monkeypatch):
+        """Pure read — caller decides whether to inject."""
+        from alfred._env import load_dotenv_file
+        monkeypatch.delenv("DOTENV_TEST_PURE_READ", raising=False)
+        env = tmp_path / ".env"
+        env.write_text("DOTENV_TEST_PURE_READ=value\n", encoding="utf-8")
+        load_dotenv_file(env)
+        # Pure-read contract: env untouched.
+        assert "DOTENV_TEST_PURE_READ" not in __import__("os").environ
+
+
+class TestAutoLoadDotenv:
+    """``override=False`` semantics + missing-file no-op."""
+
+    def test_loads_var_when_absent_from_env(self, tmp_path, monkeypatch):
+        from alfred._env import auto_load_dotenv
+        import os
+        monkeypatch.delenv("AUTOLOAD_FRESH", raising=False)
+        env = tmp_path / ".env"
+        env.write_text("AUTOLOAD_FRESH=resolved\n", encoding="utf-8")
+        loaded, skipped = auto_load_dotenv(env)
+        assert loaded == 1
+        assert skipped == 0
+        assert os.environ.get("AUTOLOAD_FRESH") == "resolved"
+
+    def test_existing_env_wins_with_override_false(
+        self, tmp_path, monkeypatch,
+    ):
+        """The headline contract: explicit ``export FOO=...`` in the
+        parent shell survives; .env only fills gaps."""
+        from alfred._env import auto_load_dotenv
+        import os
+        monkeypatch.setenv("AUTOLOAD_PRESET", "from-parent-shell")
+        env = tmp_path / ".env"
+        env.write_text("AUTOLOAD_PRESET=from-dotenv\n", encoding="utf-8")
+        loaded, skipped = auto_load_dotenv(env)
+        assert loaded == 0
+        assert skipped == 1
+        # Parent-shell value wins.
+        assert os.environ["AUTOLOAD_PRESET"] == "from-parent-shell"
+
+    def test_override_true_replaces_existing(self, tmp_path, monkeypatch):
+        """Reserved for test fixtures that want full env control."""
+        from alfred._env import auto_load_dotenv
+        import os
+        monkeypatch.setenv("AUTOLOAD_FORCED", "from-parent")
+        env = tmp_path / ".env"
+        env.write_text("AUTOLOAD_FORCED=from-dotenv\n", encoding="utf-8")
+        loaded, skipped = auto_load_dotenv(env, override=True)
+        assert loaded == 1
+        assert skipped == 0
+        assert os.environ["AUTOLOAD_FORCED"] == "from-dotenv"
+
+    def test_missing_file_is_noop(self, tmp_path):
+        """Production deploys (systemd, k8s) set env directly; .env
+        absence is the common case there. No-op, no raise."""
+        from alfred._env import auto_load_dotenv
+        loaded, skipped = auto_load_dotenv(tmp_path / "nonexistent.env")
+        assert loaded == 0
+        assert skipped == 0
+
+    def test_partial_load_mixed_skip_and_load(
+        self, tmp_path, monkeypatch,
+    ):
+        """Mixed case: one .env var is already in env (skipped), one
+        isn't (loaded). Counts reported separately."""
+        from alfred._env import auto_load_dotenv
+        import os
+        monkeypatch.setenv("AUTOLOAD_MIXED_PRESET", "preset")
+        monkeypatch.delenv("AUTOLOAD_MIXED_FRESH", raising=False)
+        env = tmp_path / ".env"
+        env.write_text(
+            "AUTOLOAD_MIXED_PRESET=ignored\n"
+            "AUTOLOAD_MIXED_FRESH=injected\n",
+            encoding="utf-8",
+        )
+        loaded, skipped = auto_load_dotenv(env)
+        assert loaded == 1
+        assert skipped == 1
+        assert os.environ["AUTOLOAD_MIXED_PRESET"] == "preset"
+        assert os.environ["AUTOLOAD_MIXED_FRESH"] == "injected"
