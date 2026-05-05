@@ -313,13 +313,19 @@ def test_inject_transport_env_vars_skips_unresolved_placeholder(
     assert "ALFRED_TRANSPORT_TOKEN" not in os.environ
 
 
-def test_inject_transport_env_vars_preserves_existing_env(
+def test_inject_transport_env_vars_overrides_existing_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If env var is already set (e.g. from .env), don't clobber."""
+    """If env var is already set (e.g. inherited from .env or from a
+    sibling instance's startup), the per-instance config token MUST
+    OVERRIDE — that's the orchestrator's intent ("this instance's
+    daemons must use THIS instance's token"). Inverted contract from
+    the pre-2026-05-05 behaviour where the inherited value won; the
+    multi-instance KAL-LE Daily Sync 401 (commit 87d5cfb) was the
+    surfacing event."""
     from alfred.orchestrator import _inject_transport_env_vars
 
-    monkeypatch.setenv("ALFRED_TRANSPORT_TOKEN", "manual-override")
+    monkeypatch.setenv("ALFRED_TRANSPORT_TOKEN", "stale-inherited-value")
     raw = {
         "transport": {
             "auth": {
@@ -333,7 +339,10 @@ def test_inject_transport_env_vars_preserves_existing_env(
         },
     }
     _inject_transport_env_vars(raw)
-    assert os.environ["ALFRED_TRANSPORT_TOKEN"] == "manual-override"
+    assert (
+        os.environ["ALFRED_TRANSPORT_TOKEN"]
+        == DUMMY_TRANSPORT_TEST_TOKEN
+    )
 
 
 # ---------------------------------------------------------------------------

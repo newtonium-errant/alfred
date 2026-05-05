@@ -14,28 +14,23 @@ loader.
 
 from __future__ import annotations
 
-import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-ENV_RE = re.compile(r"\$\{(\w+)\}")
+from alfred._env import (
+    ENV_PLACEHOLDER_RE as ENV_RE,
+    substitute_env_in_value as _substitute_env,
+)
 
-
-def _substitute_env(value: Any) -> Any:
-    """Recursively replace ``${VAR}`` placeholders with environment variables."""
-    if isinstance(value, str):
-        def _replace(m: re.Match) -> str:
-            return os.environ.get(m.group(1), m.group(0))
-        return ENV_RE.sub(_replace, value)
-    if isinstance(value, dict):
-        return {k: _substitute_env(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_substitute_env(v) for v in value]
-    return value
+# Backward-compat aliases — ``ENV_RE`` and ``_substitute_env`` are
+# importable from this module (legacy callers reference them) but
+# the canonical home is now ``alfred._env``. New callers should
+# import from there directly. See alfred/_env.py for the empty-
+# string coalesce semantics + rationale.
+__all_extra__ = ["ENV_RE", "_substitute_env"]
 
 
 # --- Dataclasses ------------------------------------------------------------

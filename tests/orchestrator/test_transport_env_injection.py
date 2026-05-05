@@ -16,14 +16,20 @@ Bug class (P0 from QA 2026-05-05):
 
 Post-fix:
   * Resolve ``${VARNAME}`` placeholders against ``os.environ`` AT
-    INJECTION TIME (via the new ``_resolve_env_placeholders`` helper).
+    INJECTION TIME (via the canonical ``alfred._env.resolve_env_placeholders``
+    helper — see ``tests/test_env_helpers.py`` for the helper's own unit
+    tests; this file covers the ORCHESTRATOR-side integration).
   * OVERRIDE any prior ``ALFRED_TRANSPORT_TOKEN`` value — the
     orchestrator's intent is "this instance's daemons must use THIS
     instance's token", not "preserve inherited env".
-  * Defensive: if a placeholder fails to resolve (env var missing),
-    keep the literal ``${VARNAME}`` in value and decline to inject;
+  * Defensive: if a placeholder fails to resolve (env var missing OR
+    set-to-empty-string per the helper's coalesce semantics), keep
+    the literal ``${VARNAME}`` in value and decline to inject;
     transport client's ``_resolve_token`` raises with a clear
     message rather than leaking a literal placeholder.
+  * Per ``feedback_intentionally_left_blank.md``: emit one structured
+    info log per call so operator can confirm "KAL-LE booted with
+    KAL-LE's token, not Salem's" from orchestrator log alone.
 """
 
 from __future__ import annotations
@@ -31,50 +37,9 @@ from __future__ import annotations
 import os
 
 import pytest
+import structlog
 
-from alfred.orchestrator import (
-    _inject_transport_env_vars,
-    _resolve_env_placeholders,
-)
-
-
-# ---------------------------------------------------------------------------
-# _resolve_env_placeholders — pure-function unit tests
-# ---------------------------------------------------------------------------
-
-
-class TestResolveEnvPlaceholders:
-    def test_no_placeholders_returns_input_unchanged(self):
-        assert _resolve_env_placeholders("plain-value") == "plain-value"
-        assert _resolve_env_placeholders("") == ""
-
-    def test_resolves_single_placeholder(self, monkeypatch):
-        monkeypatch.setenv("MY_TEST_VAR", "resolved-value")
-        assert _resolve_env_placeholders("${MY_TEST_VAR}") == "resolved-value"
-
-    def test_resolves_placeholder_inside_string(self, monkeypatch):
-        monkeypatch.setenv("MY_TOKEN", "abc123")
-        assert (
-            _resolve_env_placeholders("Bearer ${MY_TOKEN}")
-            == "Bearer abc123"
-        )
-
-    def test_unresolved_placeholder_stays_literal(self, monkeypatch):
-        """Defensive: env var missing → ``${VARNAME}`` literal stays
-        so callers can detect "still unresolved" via startswith."""
-        monkeypatch.delenv("DEFINITELY_NOT_SET_VAR", raising=False)
-        assert (
-            _resolve_env_placeholders("${DEFINITELY_NOT_SET_VAR}")
-            == "${DEFINITELY_NOT_SET_VAR}"
-        )
-
-    def test_partial_resolution_keeps_unresolved_literal(self, monkeypatch):
-        """Mixed string with one resolved + one unresolved placeholder:
-        the resolved one substitutes, the unresolved one stays."""
-        monkeypatch.setenv("RESOLVED_VAR", "ok")
-        monkeypatch.delenv("MISSING_VAR", raising=False)
-        result = _resolve_env_placeholders("${RESOLVED_VAR}/${MISSING_VAR}")
-        assert result == "ok/${MISSING_VAR}"
+from alfred.orchestrator import _inject_transport_env_vars
 
 
 # ---------------------------------------------------------------------------
@@ -298,3 +263,235 @@ class TestInjectTransportEnvVars:
             os.environ["ALFRED_TRANSPORT_TOKEN"]
             == "1c8c04e784737f91059fef042256c64b1cee9dc158d99465a2dc0d054b50b103"
         )
+
+
+# ---------------------------------------------------------------------------
+# Observability — orchestrator.transport_token.injected log event
+# ---------------------------------------------------------------------------
+#
+# Per ``feedback_intentionally_left_blank.md``: the load-bearing
+# override path MUST be observable. Without a per-call log, the
+# operator can't tell from ``data/orchestrator.log`` whether KAL-LE
+# booted with KAL-LE's token, fell into the placeholder-unresolved
+# branch, or had an empty config token. Silent-good is silent-broken's
+# cousin (review-block B from QA 2026-05-05).
+
+
+class TestObservabilityLog:
+    def test_log_fires_on_placeholder_resolved_path(self, monkeypatch):
+        monkeypatch.setenv(
+            "ALFRED_KALLE_TRANSPORT_TOKEN", "kalle-resolved-token-value",
+        )
+        monkeypatch.delenv("ALFRED_TRANSPORT_TOKEN", raising=False)
+        raw = {
+            "transport": {
+                "auth": {
+                    "tokens": {
+                        "local": {"token": "${ALFRED_KALLE_TRANSPORT_TOKEN}"},
+                    },
+                },
+            },
+        }
+        with structlog.testing.capture_logs() as captured:
+            _inject_transport_env_vars(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.transport_token.injected"
+        ]
+        assert len(events) == 1
+        e = events[0]
+        assert e["source"] == "placeholder_resolved"
+        assert e["overrode_inherited"] is False
+        # Fingerprint = first 8 chars + "..." — enough for operator
+        # to disambiguate Salem vs KAL-LE without leaking the secret.
+        assert e["token_fingerprint"] == "kalle-re..."
+
+    def test_log_fires_on_literal_token_path(self, monkeypatch):
+        """Operator hardcoded a literal token in config (no ${...})
+        — log says ``source=literal``."""
+        monkeypatch.delenv("ALFRED_TRANSPORT_TOKEN", raising=False)
+        raw = {
+            "transport": {
+                "auth": {
+                    "tokens": {
+                        "local": {"token": "literal-hardcoded-token"},
+                    },
+                },
+            },
+        }
+        with structlog.testing.capture_logs() as captured:
+            _inject_transport_env_vars(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.transport_token.injected"
+        ]
+        assert len(events) == 1
+        assert events[0]["source"] == "literal"
+        assert events[0]["token_fingerprint"] == "literal-..."
+
+    def test_log_fires_on_skipped_unresolved_path(self, monkeypatch):
+        """Placeholder failed to resolve (env var missing) — log
+        says ``source=skipped_unresolved``, includes the placeholder
+        string for operator to fix."""
+        monkeypatch.delenv("ALFRED_TRANSPORT_TOKEN", raising=False)
+        monkeypatch.delenv("ALFRED_PHANTOM_VAR", raising=False)
+        raw = {
+            "transport": {
+                "auth": {
+                    "tokens": {
+                        "local": {"token": "${ALFRED_PHANTOM_VAR}"},
+                    },
+                },
+            },
+        }
+        with structlog.testing.capture_logs() as captured:
+            _inject_transport_env_vars(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.transport_token.injected"
+        ]
+        assert len(events) == 1
+        assert events[0]["source"] == "skipped_unresolved"
+        assert events[0]["placeholder"] == "${ALFRED_PHANTOM_VAR}"
+        # No fingerprint on the skipped path — nothing was injected.
+        assert "token_fingerprint" not in events[0]
+
+    def test_log_fires_on_empty_config_token_path(self, monkeypatch):
+        monkeypatch.delenv("ALFRED_TRANSPORT_TOKEN", raising=False)
+        raw = {
+            "transport": {
+                "auth": {
+                    "tokens": {"local": {"token": ""}},
+                },
+            },
+        }
+        with structlog.testing.capture_logs() as captured:
+            _inject_transport_env_vars(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.transport_token.injected"
+        ]
+        assert len(events) == 1
+        assert events[0]["source"] == "empty_config_token"
+        assert events[0]["had_prior_env"] is False
+
+    def test_log_fires_with_overrode_inherited_true(self, monkeypatch):
+        """Headline observability case: KAL-LE-after-Salem. Prior env
+        token differs from resolved token → ``overrode_inherited=True``
+        so operator can grep for "did we silently override an
+        inherited value?" — the question that surfaced today's bug."""
+        monkeypatch.setenv("ALFRED_TRANSPORT_TOKEN", "salem-stale-token")
+        monkeypatch.setenv(
+            "ALFRED_KALLE_TRANSPORT_TOKEN", "kalle-fresh-token",
+        )
+        raw = {
+            "transport": {
+                "auth": {
+                    "tokens": {
+                        "local": {"token": "${ALFRED_KALLE_TRANSPORT_TOKEN}"},
+                    },
+                },
+            },
+        }
+        with structlog.testing.capture_logs() as captured:
+            _inject_transport_env_vars(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.transport_token.injected"
+        ]
+        assert len(events) == 1
+        assert events[0]["overrode_inherited"] is True
+        assert events[0]["token_fingerprint"] == "kalle-fr..."
+
+    def test_log_overrode_false_when_prior_env_matches_resolved(
+        self, monkeypatch,
+    ):
+        """Salem-shape no-op: prior env value equals resolved value
+        (Salem's ${ALFRED_TRANSPORT_TOKEN} resolves to the same
+        ALFRED_TRANSPORT_TOKEN that's already in env). Override
+        executes but is identity → ``overrode_inherited=False``."""
+        monkeypatch.setenv("ALFRED_TRANSPORT_TOKEN", "salem-token-value")
+        raw = {
+            "transport": {
+                "auth": {
+                    "tokens": {
+                        "local": {"token": "${ALFRED_TRANSPORT_TOKEN}"},
+                    },
+                },
+            },
+        }
+        with structlog.testing.capture_logs() as captured:
+            _inject_transport_env_vars(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.transport_token.injected"
+        ]
+        assert len(events) == 1
+        assert events[0]["source"] == "placeholder_resolved"
+        assert events[0]["overrode_inherited"] is False
+
+
+# ---------------------------------------------------------------------------
+# Empty-string env coalesce — review-block A
+# ---------------------------------------------------------------------------
+#
+# An operator who intentionally empties a token via
+# ``ALFRED_KALLE_TRANSPORT_TOKEN=""`` (testing auth-failure paths)
+# should hit the same defensive guard as one who never set the var.
+# Pre-fix used ``os.environ.get(name, fallback)`` which returns ""
+# for the empty case — the empty string would propagate as
+# ``Bearer `` (empty) to subprocesses → still 401, but a different
+# shape than "placeholder unresolved." Canonical helper coalesces
+# both via ``or``.
+
+
+class TestEmptyStringEnvCoalesce:
+    def test_empty_env_var_treated_as_unresolved(self, monkeypatch):
+        """``ALFRED_KALLE_TRANSPORT_TOKEN=""`` (set, but empty) →
+        placeholder stays literal → injector declines to inject."""
+        monkeypatch.setenv("ALFRED_KALLE_TRANSPORT_TOKEN", "")
+        monkeypatch.delenv("ALFRED_TRANSPORT_TOKEN", raising=False)
+        raw = {
+            "transport": {
+                "auth": {
+                    "tokens": {
+                        "local": {"token": "${ALFRED_KALLE_TRANSPORT_TOKEN}"},
+                    },
+                },
+            },
+        }
+        _inject_transport_env_vars(raw)
+        # Token NOT injected — empty env var coalesced to literal.
+        assert "ALFRED_TRANSPORT_TOKEN" not in os.environ
+
+    def test_empty_env_var_emits_skipped_unresolved_log(self, monkeypatch):
+        """The decline-to-inject path on empty env var must emit the
+        same diagnostic shape as the never-set case so operator's grep
+        catches both."""
+        monkeypatch.setenv("ALFRED_KALLE_TRANSPORT_TOKEN", "")
+        monkeypatch.delenv("ALFRED_TRANSPORT_TOKEN", raising=False)
+        raw = {
+            "transport": {
+                "auth": {
+                    "tokens": {
+                        "local": {"token": "${ALFRED_KALLE_TRANSPORT_TOKEN}"},
+                    },
+                },
+            },
+        }
+        with structlog.testing.capture_logs() as captured:
+            _inject_transport_env_vars(raw)
+
+        events = [
+            c for c in captured
+            if c.get("event") == "orchestrator.transport_token.injected"
+            and c.get("source") == "skipped_unresolved"
+        ]
+        assert len(events) == 1
+        assert events[0]["placeholder"] == "${ALFRED_KALLE_TRANSPORT_TOKEN}"

@@ -6,7 +6,6 @@ import asyncio
 import json
 import multiprocessing
 import os
-import re
 import signal
 import sys
 import time
@@ -116,24 +115,6 @@ def _run_instructor(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool 
 _MISSING_DEPS_EXIT = 78  # exit code signaling missing optional dependencies
 
 
-_ENV_PLACEHOLDER_RE = re.compile(r"\$\{(\w+)\}")
-
-
-def _resolve_env_placeholders(value: str) -> str:
-    """Substitute ``${VARNAME}`` placeholders against ``os.environ``.
-
-    Returns the input unchanged when no placeholders are present.
-    Unresolved placeholders (env var not set) stay as the literal
-    ``${VARNAME}`` so callers can detect "still unresolved" and
-    decline to inject. Mirrors ``alfred.transport.config._substitute_env``
-    but operates on a single string rather than walking a dict.
-    """
-    def _replace(m: re.Match) -> str:
-        name = m.group(1)
-        return os.environ.get(name, m.group(0))
-    return _ENV_PLACEHOLDER_RE.sub(_replace, value)
-
-
 def _inject_transport_env_vars(raw: dict[str, Any]) -> None:
     """Set ``ALFRED_TRANSPORT_{HOST,PORT,TOKEN}`` in the current process env.
 
@@ -146,8 +127,9 @@ def _inject_transport_env_vars(raw: dict[str, Any]) -> None:
     Values are read from the unsubstituted raw config dict (since
     ``_load_unified_config`` doesn't substitute env vars). For tokens
     written as ``${VARNAME}`` placeholders, this function resolves
-    against ``os.environ`` at injection time, then overrides any
-    prior ``ALFRED_TRANSPORT_TOKEN`` value with the per-instance
+    against ``os.environ`` at injection time via the canonical
+    ``alfred._env.resolve_env_placeholders`` helper, then overrides
+    any prior ``ALFRED_TRANSPORT_TOKEN`` value with the per-instance
     resolved token.
 
     The override is load-bearing for multi-instance deployments
@@ -162,11 +144,27 @@ def _inject_transport_env_vars(raw: dict[str, Any]) -> None:
     KAL-LE's token and replaces the inherited value.
 
     Defensive: if a placeholder fails to resolve (env var actually
-    missing), the literal ``${VARNAME}`` stays in the value and
-    we decline to inject — same protection as before. The
-    transport client's ``_resolve_token`` then raises
-    ``TransportAuthMissing`` with a clear message.
+    missing OR set-to-empty-string), the literal ``${VARNAME}``
+    stays in the value and we decline to inject — same protection
+    as before. The transport client's ``_resolve_token`` then raises
+    ``TransportAuthMissing`` with a clear message rather than
+    propagating an empty bearer header.
+
+    Per ``feedback_intentionally_left_blank.md``: emits one structured
+    info log per call (``orchestrator.transport_token.injected``)
+    naming the source path (``placeholder_resolved`` /
+    ``literal`` / ``skipped_unresolved`` / ``empty_config_token``),
+    whether a prior env value was overridden, and an 8-char token
+    fingerprint so the operator can confirm "KAL-LE booted with
+    KAL-LE's token, not Salem's" from the orchestrator log alone.
+    The fingerprint is the first 8 chars of the resolved token —
+    enough to disambiguate between Salem and KAL-LE in practice
+    without leaking the secret in full.
     """
+    import structlog
+    from alfred._env import resolve_env_placeholders
+
+    log = structlog.get_logger(__name__)
     transport = raw.get("transport", {}) or {}
 
     server = transport.get("server", {}) or {}
@@ -182,21 +180,51 @@ def _inject_transport_env_vars(raw: dict[str, Any]) -> None:
     tokens = auth.get("tokens", {}) or {}
     local = tokens.get("local", {}) or {}
     raw_token = str(local.get("token", "") or "")
+    prior_env_token = os.environ.get("ALFRED_TRANSPORT_TOKEN")
+
     if not raw_token:
+        # No config token at all — nothing to inject. Log the
+        # decision so operator can spot a misconfigured instance
+        # that fell off the v1 entry.
+        log.info(
+            "orchestrator.transport_token.injected",
+            source="empty_config_token",
+            overrode_inherited=False,
+            had_prior_env=prior_env_token is not None,
+        )
         return
-    resolved_token = _resolve_env_placeholders(raw_token)
-    # If the placeholder failed to resolve (env var missing), the
-    # literal ``${VARNAME}`` remains. Decline to inject — let the
-    # client's ``_resolve_token`` raise with a clear "ALFRED_TRANSPORT_TOKEN
-    # is not set" message rather than leaking a literal placeholder
-    # into bearer auth headers.
+
+    resolved_token = resolve_env_placeholders(raw_token)
     if resolved_token.startswith("${"):
+        # Placeholder failed to resolve (env var missing OR empty
+        # string per the canonical helper's coalesce semantics).
+        # Decline to inject — leak-prevention.
+        log.info(
+            "orchestrator.transport_token.injected",
+            source="skipped_unresolved",
+            overrode_inherited=False,
+            had_prior_env=prior_env_token is not None,
+            placeholder=raw_token,
+        )
         return
+
     # OVERRIDE any prior ALFRED_TRANSPORT_TOKEN — the orchestrator's
     # intent is "this instance's daemons must use THIS instance's
     # token". Without override, KAL-LE-after-Salem-startup silently
     # uses Salem's token via inherited env (the QA 2026-05-05 bug).
+    overrode = (
+        prior_env_token is not None and prior_env_token != resolved_token
+    )
     os.environ["ALFRED_TRANSPORT_TOKEN"] = resolved_token
+    log.info(
+        "orchestrator.transport_token.injected",
+        source=(
+            "placeholder_resolved"
+            if "${" in raw_token else "literal"
+        ),
+        overrode_inherited=overrode,
+        token_fingerprint=resolved_token[:8] + "...",
+    )
 
 
 def _run_surveyor(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
