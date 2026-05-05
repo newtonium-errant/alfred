@@ -347,12 +347,16 @@ class TestClusterWritebackHeterogeneous:
     representing the union of themes. Pre-fix: every member got every
     tag. Post-fix: per-record gate keeps only anchored tags."""
 
-    def test_per_member_filter_in_writeback_loop(
+    def test_per_member_filter_via_writeback_one_member(
         self, daemon_and_vault,
     ):
-        """Reproduce the Halifax Music Fest scenario inline. Three
-        records in one cluster; labeler returns 3 tags; only matching
-        records keep matching tags."""
+        """Reproduce the Halifax Music Fest scenario by driving the
+        actual production helper. Three records in one cluster; gate
+        + writeback go through ``_writeback_one_member`` (the same
+        function ``_process_cluster`` calls). Closes WARN 1 from
+        code-reviewer's verdict on 47b1b75 — pre-fix this test
+        mirrored the writeback loop inline; post-extraction it calls
+        the real helper."""
         daemon, vault = daemon_and_vault
 
         # Seed three records with distinct topical content.
@@ -386,27 +390,18 @@ class TestClusterWritebackHeterogeneous:
                 body="Employment Insurance call with Veronique.",
             ),
         }
-        members = [weezer_path, dental_path, ei_path]
         proposed_tags = [
             "events/music", "health/dental", "health/psychology",
         ]
-        daemon.labeler.label_cluster = AsyncMock(return_value=proposed_tags)
-        daemon.labeler.suggest_relationships = AsyncMock(return_value=[])
 
-        # Drive _process_cluster directly via the closure inside
-        # _label_clusters_and_emit_relationships. Easier path: build
-        # a minimal harness that mirrors the writeback loop.
-        async def _drive():
-            tags = await daemon.labeler.label_cluster(0, members, records)
-            for path in members:
-                record = records.get(path)
-                if record is None:
-                    continue
-                anchored = daemon._filter_anchored_tags(tags, record)
-                if anchored:
-                    daemon.writer.write_alfred_tags(path, anchored)
-
-        asyncio.run(_drive())
+        # Drive the real helper for each member.
+        for path in [weezer_path, dental_path, ei_path]:
+            daemon._writeback_one_member(
+                cid=0,
+                path=path,
+                record=records[path],
+                proposed_tags=proposed_tags,
+            )
 
         # Read back each record's frontmatter to confirm filtering.
         weezer_fm = frontmatter.load(str(vault / weezer_path)).metadata
@@ -428,35 +423,34 @@ class TestClusterWritebackHeterogeneous:
     ):
         """When every proposed tag fails the anchor check for a record,
         the all-blocked log MUST fire so the operator can grep for
-        heterogeneous clusters that produced zero anchored matches."""
-        daemon, _ = daemon_and_vault
-        record = _record(
-            "event/ei.md", "event",
+        heterogeneous clusters that produced zero anchored matches.
+
+        Drives the real ``_writeback_one_member`` helper (no inline
+        log mirror) so a future change to the log shape OR the gate
+        logic OR the helper's structure is caught by this test."""
+        daemon, vault = daemon_and_vault
+        ei_path = "event/ei.md"
+        _seed_record(
+            vault, ei_path, "event",
             body="Employment Insurance call with Veronique.",
         )
-
-        # Mirror the daemon's per-member loop in miniature, with
-        # the structured-log assertion. Direct call to the helper
-        # produces empty list; the all_tags_blocked log is emitted
-        # by the writeback loop in _process_cluster, so we mirror
-        # that loop here.
+        record = _record(
+            ei_path, "event",
+            body="Employment Insurance call with Veronique.",
+        )
         proposed_tags = ["events/music", "health/dental"]
+
         with capture_logs() as captured:
-            anchored = daemon._filter_anchored_tags(
-                proposed_tags, record,
-            )
-            assert anchored == []
-            # Daemon's writeback loop emits this log when anchored
-            # is empty AND tags is non-empty. Inline the same log
-            # call so the test exercises the log shape.
-            from alfred.surveyor.daemon import log as daemon_log
-            daemon_log.info(
-                "surveyor.all_tags_blocked",
-                record_path="event/ei.md",
-                cluster_id=42,
-                proposed_count=len(proposed_tags),
+            daemon._writeback_one_member(
+                cid=42,
+                path=ei_path,
+                record=record,
                 proposed_tags=proposed_tags,
             )
+
+        # No alfred_tags written (all proposed tags filtered).
+        ei_fm = frontmatter.load(str(vault / ei_path)).metadata
+        assert "alfred_tags" not in ei_fm
 
         all_blocked = [
             c for c in captured
@@ -464,7 +458,7 @@ class TestClusterWritebackHeterogeneous:
         ]
         assert len(all_blocked) == 1
         e = all_blocked[0]
-        assert e["record_path"] == "event/ei.md"
+        assert e["record_path"] == ei_path
         assert e["cluster_id"] == 42
         assert e["proposed_count"] == 2
         assert e["proposed_tags"] == ["events/music", "health/dental"]
@@ -477,31 +471,40 @@ class TestClusterWritebackHeterogeneous:
 
 class TestTagBlockLogShape:
     def test_block_log_emits_per_dropped_tag(self, daemon_and_vault):
-        """For each proposed tag that fails the anchor check, the
-        writeback loop emits one
+        """For each proposed tag that fails the anchor check,
+        ``_writeback_one_member`` emits one
         ``surveyor.tag_blocked_no_text_anchor`` log with record_path
         + tag + cluster_id. Operator greps this to see exactly which
-        proposed labels the gate rejected on which records."""
-        daemon, _ = daemon_and_vault
-        record = _record(
-            "event/dental.md", "event",
+        proposed labels the gate rejected on which records.
+
+        Drives the real helper (post-WARN 1 extraction) so the log
+        shape is exercised by production code, not an inline mirror."""
+        daemon, vault = daemon_and_vault
+        dental_path = "event/dental.md"
+        _seed_record(
+            vault, dental_path, "event",
             body="Dental appointment at Alliance Dental.",
         )
-        tags = ["events/music", "health/dental", "health/psychology"]
-        with capture_logs() as captured:
-            anchored = daemon._filter_anchored_tags(tags, record)
-            blocked = [t for t in tags if t not in anchored]
-            from alfred.surveyor.daemon import log as daemon_log
-            for blocked_tag in blocked:
-                daemon_log.info(
-                    "surveyor.tag_blocked_no_text_anchor",
-                    record_path="event/dental.md",
-                    tag=blocked_tag,
-                    cluster_id=7,
-                )
+        record = _record(
+            dental_path, "event",
+            body="Dental appointment at Alliance Dental.",
+        )
+        proposed_tags = [
+            "events/music", "health/dental", "health/psychology",
+        ]
 
-        # 2 of 3 proposed tags should have been blocked.
-        assert anchored == ["health/dental"]
+        with capture_logs() as captured:
+            daemon._writeback_one_member(
+                cid=7,
+                path=dental_path,
+                record=record,
+                proposed_tags=proposed_tags,
+            )
+
+        # Only health/dental landed.
+        dental_fm = frontmatter.load(str(vault / dental_path)).metadata
+        assert dental_fm.get("alfred_tags") == ["health/dental"]
+
         block_logs = [
             c for c in captured
             if c.get("event") == "surveyor.tag_blocked_no_text_anchor"
@@ -510,5 +513,89 @@ class TestTagBlockLogShape:
         blocked_tag_set = {e["tag"] for e in block_logs}
         assert blocked_tag_set == {"events/music", "health/psychology"}
         for e in block_logs:
-            assert e["record_path"] == "event/dental.md"
+            assert e["record_path"] == dental_path
             assert e["cluster_id"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Defensive path: record None (transient / skipped) — no write, log fires
+# ---------------------------------------------------------------------------
+
+
+class TestTagWriteSkippedNoRecord:
+    """The ``surveyor.tag_write_skipped_no_record`` log path fires
+    when ``records.get(path)`` returns None — the writer had no
+    parsed record to gate against. Originally untested (WARN 1 from
+    code-reviewer's verdict on 47b1b75); the helper extraction makes
+    this directly testable."""
+
+    def test_record_none_skips_write_and_logs(self, daemon_and_vault):
+        """Defensive: ``record is None`` (transient or skipped during
+        cluster pass) → DO NOT fall through to a legacy unfiltered
+        write (that's the contamination shape). Skip the write
+        entirely; emit ``surveyor.tag_write_skipped_no_record`` with
+        diagnostic fields so the operator can grep how often this
+        happens."""
+        daemon, vault = daemon_and_vault
+        phantom_path = "event/never-parsed.md"
+        proposed_tags = ["events/music", "health/dental"]
+
+        # File does not exist — confirm absence so any accidental
+        # write would surface immediately.
+        assert not (vault / phantom_path).exists()
+
+        with capture_logs() as captured:
+            daemon._writeback_one_member(
+                cid=99,
+                path=phantom_path,
+                record=None,
+                proposed_tags=proposed_tags,
+            )
+
+        # No file created (no write fell through).
+        assert not (vault / phantom_path).exists()
+
+        skip_logs = [
+            c for c in captured
+            if c.get("event") == "surveyor.tag_write_skipped_no_record"
+        ]
+        assert len(skip_logs) == 1
+        e = skip_logs[0]
+        assert e["record_path"] == phantom_path
+        assert e["cluster_id"] == 99
+        assert e["proposed_count"] == 2
+
+        # No tag_blocked or all_tags_blocked logs — the skip path is
+        # mutually exclusive with the gate path. Pin this so a future
+        # refactor that accidentally double-logs (skip + block) trips
+        # immediately.
+        other_tag_logs = [
+            c for c in captured
+            if c.get("event") in (
+                "surveyor.tag_blocked_no_text_anchor",
+                "surveyor.all_tags_blocked",
+            )
+        ]
+        assert other_tag_logs == []
+
+    def test_record_none_with_empty_proposed_tags_logs_zero_count(
+        self, daemon_and_vault,
+    ):
+        """Edge: ``record is None`` AND no proposed tags. Skip log
+        still fires (silence is ambiguous per
+        ``feedback_intentionally_left_blank.md``); proposed_count
+        reports 0."""
+        daemon, _ = daemon_and_vault
+        with capture_logs() as captured:
+            daemon._writeback_one_member(
+                cid=1,
+                path="event/x.md",
+                record=None,
+                proposed_tags=[],
+            )
+        skip_logs = [
+            c for c in captured
+            if c.get("event") == "surveyor.tag_write_skipped_no_record"
+        ]
+        assert len(skip_logs) == 1
+        assert skip_logs[0]["proposed_count"] == 0

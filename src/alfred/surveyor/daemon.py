@@ -431,53 +431,20 @@ class Daemon:
                     # tagged ``events/music``). The gate filters
                     # per-MEMBER, so different members may keep
                     # different filtered subsets of the cluster's
-                    # proposed tag-set.
+                    # proposed tag-set. Per-member writeback logic
+                    # extracted to ``_writeback_one_member`` so each
+                    # log path (tag_blocked, all_tags_blocked,
+                    # tag_write_skipped_no_record) is unit-testable
+                    # without driving the whole async cluster loop —
+                    # closes WARN 1 from code-reviewer's verdict on
+                    # 47b1b75.
                     for path in members:
-                        record = records.get(path)
-                        if record is None:
-                            # No parsed record (transient or skipped) —
-                            # skip the write entirely. Don't fall
-                            # through to the legacy unfiltered write
-                            # because that's the contamination shape.
-                            log.info(
-                                "surveyor.tag_write_skipped_no_record",
-                                record_path=path,
-                                cluster_id=cid,
-                                proposed_count=len(tags),
-                            )
-                            continue
-                        anchored_tags = self._filter_anchored_tags(
-                            tags, record,
+                        self._writeback_one_member(
+                            cid=cid,
+                            path=path,
+                            record=records.get(path),
+                            proposed_tags=tags,
                         )
-                        blocked_tags = [
-                            t for t in tags if t not in anchored_tags
-                        ]
-                        for blocked in blocked_tags:
-                            log.info(
-                                "surveyor.tag_blocked_no_text_anchor",
-                                record_path=path,
-                                tag=blocked,
-                                cluster_id=cid,
-                            )
-                        if anchored_tags:
-                            self.writer.write_alfred_tags(
-                                path, anchored_tags,
-                            )
-                        elif tags:
-                            # All tags filtered — explicit "ran, nothing
-                            # landed" signal per
-                            # ``feedback_intentionally_left_blank.md``
-                            # so an operator can grep for
-                            # ``surveyor.all_tags_blocked`` to see
-                            # heavily-heterogeneous clusters that
-                            # produced zero anchored matches.
-                            log.info(
-                                "surveyor.all_tags_blocked",
-                                record_path=path,
-                                cluster_id=cid,
-                                proposed_count=len(tags),
-                                proposed_tags=tags,
-                            )
                     cluster_key = f"semantic_{cid}"
                     self.state.clusters[cluster_key] = ClusterState(
                         label=tags,
@@ -569,6 +536,67 @@ class Daemon:
     # The helper expects an in-memory ``VaultRecord`` (which the
     # daemon has already parsed); reading frontmatter+body off disk
     # again would double the I/O for no semantic gain.
+
+    def _writeback_one_member(
+        self,
+        *,
+        cid: int,
+        path: str,
+        record: "VaultRecord | None",
+        proposed_tags: list[str],
+    ) -> None:
+        """Apply the per-record text-anchor gate + write the filtered
+        tag-set for one cluster member. Extracted from
+        ``_process_cluster``'s loop so each log path is unit-testable
+        without driving the whole async cluster pipeline (WARN 1
+        from code-reviewer on 47b1b75).
+
+        Three log paths, all observable per
+        ``feedback_intentionally_left_blank.md``:
+          * ``surveyor.tag_write_skipped_no_record`` — fires when
+            ``record is None`` (transient or skipped). Defensive: do
+            not fall through to the legacy unfiltered write because
+            that's the contamination shape.
+          * ``surveyor.tag_blocked_no_text_anchor`` — fires once per
+            tag dropped by the per-record gate. Operator greps to
+            see which proposed labels the gate rejected on which
+            records.
+          * ``surveyor.all_tags_blocked`` — fires when EVERY proposed
+            tag fails the anchor check (heterogeneous-cluster
+            signal). Surfaces clusters that produced zero anchored
+            matches so an operator can review HDBSCAN parameters or
+            the labeler prompt for that shape.
+
+        Writes only the anchored subset. No-op (with log) when the
+        whole proposed list is filtered out.
+        """
+        if record is None:
+            log.info(
+                "surveyor.tag_write_skipped_no_record",
+                record_path=path,
+                cluster_id=cid,
+                proposed_count=len(proposed_tags),
+            )
+            return
+        anchored_tags = self._filter_anchored_tags(proposed_tags, record)
+        blocked_tags = [t for t in proposed_tags if t not in anchored_tags]
+        for blocked in blocked_tags:
+            log.info(
+                "surveyor.tag_blocked_no_text_anchor",
+                record_path=path,
+                tag=blocked,
+                cluster_id=cid,
+            )
+        if anchored_tags:
+            self.writer.write_alfred_tags(path, anchored_tags)
+        elif proposed_tags:
+            log.info(
+                "surveyor.all_tags_blocked",
+                record_path=path,
+                cluster_id=cid,
+                proposed_count=len(proposed_tags),
+                proposed_tags=proposed_tags,
+            )
 
     def _filter_anchored_tags(
         self,
