@@ -34,6 +34,7 @@ import json
 
 import httpx
 import pytest
+import structlog
 
 from alfred.distiller import extractor as extractor_mod
 from alfred.distiller.backends import ollama as ollama_mod
@@ -236,13 +237,34 @@ class TestOllamaErrorPaths:
 
         _patch_httpx(monkeypatch, _dispatch)
 
-        with pytest.raises(RuntimeError) as exc_info:
-            await ollama_mod.call_ollama_no_tools(prompt="hi")
+        with structlog.testing.capture_logs() as captured_logs:
+            with pytest.raises(RuntimeError) as exc_info:
+                await ollama_mod.call_ollama_no_tools(prompt="hi")
         msg = str(exc_info.value)
         assert "503" in msg
         assert "model qwen2.5:72b not found" in msg
         # Operator-actionable: the message names ollama pull.
         assert "ollama pull" in msg
+
+        # Log-emission contract — WARN 1 from the d8c224d review (4th
+        # session-recurring instance of the log-emission test gap
+        # pattern). The dispatcher MUST emit ``ollama.http_error``
+        # with the status + body_preview fields so a future refactor
+        # that drops the log line fails this test instead of silently
+        # losing operator-visible signal.
+        http_errors = [
+            c for c in captured_logs
+            if c.get("event") == "ollama.http_error"
+        ]
+        assert len(http_errors) == 1, (
+            f"expected exactly one ollama.http_error event; "
+            f"got {[c.get('event') for c in captured_logs]}"
+        )
+        ev = http_errors[0]
+        assert ev["status"] == 503
+        assert "model qwen2.5:72b not found" in ev["body_preview"]
+        # Endpoint default reaches the log entry intact.
+        assert ev["endpoint"] == "http://localhost:11434"
 
     async def test_connection_refused_raises_runtime_error(
         self, monkeypatch,
@@ -255,14 +277,33 @@ class TestOllamaErrorPaths:
 
         _patch_httpx(monkeypatch, _dispatch)
 
-        with pytest.raises(RuntimeError) as exc_info:
-            await ollama_mod.call_ollama_no_tools(
-                prompt="hi", endpoint="http://localhost:11434",
-            )
+        with structlog.testing.capture_logs() as captured_logs:
+            with pytest.raises(RuntimeError) as exc_info:
+                await ollama_mod.call_ollama_no_tools(
+                    prompt="hi", endpoint="http://localhost:11434",
+                )
         msg = str(exc_info.value)
         assert "unreachable" in msg
         assert "ConnectError" in msg
         assert "http://localhost:11434/v1/chat/completions" in msg
+
+        # Log-emission contract — WARN 1 from the d8c224d review.
+        # ``ollama.request_failed`` MUST fire on httpx.RequestError so
+        # the operator can grep for "Ollama unreachable" before seeing
+        # the propagated RuntimeError in daemon logs.
+        request_fails = [
+            c for c in captured_logs
+            if c.get("event") == "ollama.request_failed"
+        ]
+        assert len(request_fails) == 1, (
+            f"expected exactly one ollama.request_failed event; "
+            f"got {[c.get('event') for c in captured_logs]}"
+        )
+        ev = request_fails[0]
+        assert ev["error_type"] == "ConnectError"
+        assert ev["endpoint"] == "http://localhost:11434"
+        # Underlying error message preserved for diagnostic grep.
+        assert "Connection refused" in ev["error"]
 
     async def test_empty_choices_returns_empty_text(self, monkeypatch) -> None:
         """Defensive: malformed Ollama response with empty ``choices``
@@ -273,9 +314,29 @@ class TestOllamaErrorPaths:
 
         _patch_httpx(monkeypatch, _dispatch)
 
-        text, meta = await ollama_mod.call_ollama_no_tools(prompt="hi")
+        with structlog.testing.capture_logs() as captured_logs:
+            text, meta = await ollama_mod.call_ollama_no_tools(prompt="hi")
         assert text == ""
         assert meta == {"stop_reason": None}
+
+        # Log-emission contract — WARN 1 from the d8c224d review.
+        # Per ``feedback_intentionally_left_blank.md``, the empty case
+        # MUST emit ``ollama.empty_response`` so a zero-text response
+        # stays distinguishable from a missed dispatch in operator
+        # log review. Pinned so a future refactor that drops the log
+        # line fails this test instead of silently losing the signal.
+        empty_events = [
+            c for c in captured_logs
+            if c.get("event") == "ollama.empty_response"
+        ]
+        assert len(empty_events) == 1, (
+            f"expected exactly one ollama.empty_response event; "
+            f"got {[c.get('event') for c in captured_logs]}"
+        )
+        ev = empty_events[0]
+        # Per the source: stop_reason key uses the literal "unknown"
+        # string when finish_reason was None (defensive default).
+        assert ev["stop_reason"] == "unknown"
 
     async def test_missing_message_returns_empty_text(
         self, monkeypatch,
