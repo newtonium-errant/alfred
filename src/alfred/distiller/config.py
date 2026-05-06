@@ -90,6 +90,26 @@ class AgentConfig:
 
 @dataclass
 class ExtractionConfig:
+    # Path C Phase 1 spike (2026-05-06) — backend selector for the
+    # non-agentic v2 extractor. ``"anthropic"`` (default) uses the
+    # Anthropic Messages API per ``backends/anthropic_sdk.py``;
+    # ``"ollama"`` uses Ollama's OpenAI-compatible chat-completions
+    # endpoint per ``backends/ollama.py``. Adding new backends is a
+    # pure-extend: register a new value here + a new sibling module
+    # in ``backends/``; ``_call_extraction_llm`` in ``extractor.py``
+    # is the single dispatch point. Defaulted to ``"anthropic"`` so
+    # existing config.yaml files load unchanged.
+    backend: str = "anthropic"
+    # Ollama endpoint (used only when ``backend == "ollama"``). Default
+    # matches Ollama's standard local install. The spike harness
+    # overrides via ``distiller.extraction.ollama_endpoint`` to point
+    # at a different host (e.g. a Framework Desktop on the LAN).
+    ollama_endpoint: str = "http://localhost:11434"
+    # Default Ollama model — chosen for the spike's hardware-feasibility
+    # test (qwen2.5:72b at q4_K_M is ~40GB, fits in 64GB unified memory
+    # with overhead). The spike harness overrides per-run to compare
+    # 7b / 14b / 32b / 72b candidates.
+    ollama_model: str = "qwen2.5:72b-instruct-q4_K_M"
     interval_seconds: int = 86400
     # Deprecated fallback — preserved so old config.yaml files still
     # load, but ``deep_extraction_schedule`` is the canonical gate for

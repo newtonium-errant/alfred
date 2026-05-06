@@ -9,7 +9,12 @@ the Pydantic contracts in ``contracts.py``.
 Flow per call:
   1. Render a prompt with the source body + frontmatter + existing
      learn titles (dedup context) + candidate signals (scoring hints).
-  2. Call :func:`call_anthropic_no_tools` — no tools, no subprocess.
+  2. Dispatch via :func:`_call_extraction_llm` to the configured
+     backend — no tools, no subprocess. Default
+     :func:`call_anthropic_no_tools` (Anthropic Messages API);
+     opt-in :func:`call_ollama_no_tools` (Ollama OpenAI-compatible
+     endpoint) for the Path C Phase 1 spike. Selection is per-config
+     via ``distiller.extraction.backend``.
   3. ``ExtractionResult.model_validate_json`` on the raw text.
   4. On ``ValidationError``: build a repair prompt with the error +
      raw output and call once more. Validate again.
@@ -29,6 +34,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .backends.anthropic_sdk import call_anthropic_no_tools
+from .backends.ollama import call_ollama_no_tools
 from .candidates import CandidateSignal
 from .config import DistillerConfig
 from .contracts import ExtractionResult
@@ -392,6 +398,54 @@ def _strip_code_fences(text: str) -> str:
     return t.strip()
 
 
+async def _call_extraction_llm(
+    *,
+    prompt: str,
+    system: str,
+    config: DistillerConfig,
+) -> tuple[str, dict]:
+    """Single dispatch point for the extractor's LLM calls.
+
+    Routes to the configured backend per ``config.extraction.backend``:
+
+      * ``"anthropic"`` (default) → :func:`call_anthropic_no_tools`
+      * ``"ollama"`` → :func:`call_ollama_no_tools`
+
+    Both backends honour the same ``(text, metadata)`` return contract
+    so the extractor's downstream parsing + repair-retry path stays
+    backend-agnostic.
+
+    Path C Phase 1 spike (2026-05-06): added so the spike harness
+    can flip ``backend: ollama`` in a per-run config and exercise
+    local extraction without forking the extract() body.
+
+    Unknown backend → ``RuntimeError`` (NOT silent fallback). Per the
+    spike spec: an operator who configures a typo'd backend should
+    see the failure immediately, not silently get the wrong path.
+    """
+    backend = (config.extraction.backend or "anthropic").lower()
+    if backend == "anthropic":
+        return await call_anthropic_no_tools(
+            prompt=prompt,
+            system=system,
+            model=config.anthropic.model,
+            max_tokens=config.anthropic.max_tokens,
+            api_key=config.anthropic.api_key or None,
+        )
+    if backend == "ollama":
+        return await call_ollama_no_tools(
+            prompt=prompt,
+            system=system,
+            model=config.extraction.ollama_model,
+            max_tokens=config.anthropic.max_tokens,
+            endpoint=config.extraction.ollama_endpoint,
+        )
+    raise RuntimeError(
+        f"Unknown distiller.extraction.backend: {config.extraction.backend!r}. "
+        f"Valid values: 'anthropic', 'ollama'."
+    )
+
+
 async def extract(
     source_body: str,
     source_frontmatter: dict[str, Any],
@@ -418,13 +472,12 @@ async def extract(
         signals=signals,
     )
 
-    # First attempt
-    raw, meta = await call_anthropic_no_tools(
+    # First attempt — dispatched via ``_call_extraction_llm`` so the
+    # backend selection (anthropic / ollama) is centralized.
+    raw, meta = await _call_extraction_llm(
         prompt=user_prompt,
         system=SYSTEM_PROMPT,
-        model=config.anthropic.model,
-        max_tokens=config.anthropic.max_tokens,
-        api_key=config.anthropic.api_key or None,
+        config=config,
     )
     cleaned = _strip_code_fences(raw)
     stop_reason = meta.get("stop_reason")
@@ -458,13 +511,13 @@ async def extract(
         )
 
     # Repair retry — give the model its own output + the exact error.
+    # Same dispatcher so a backend swap mid-extraction (which doesn't
+    # happen, but defensively) would be honoured.
     repair_prompt = _render_repair_prompt(raw, first_error)
-    raw_repair, meta_repair = await call_anthropic_no_tools(
+    raw_repair, meta_repair = await _call_extraction_llm(
         prompt=repair_prompt,
         system=SYSTEM_PROMPT,
-        model=config.anthropic.model,
-        max_tokens=config.anthropic.max_tokens,
-        api_key=config.anthropic.api_key or None,
+        config=config,
     )
     cleaned_repair = _strip_code_fences(raw_repair)
     stop_reason_repair = meta_repair.get("stop_reason")
