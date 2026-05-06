@@ -640,3 +640,336 @@ def test_alfred_vault_retype_to_is_required():
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["vault", "retype", "event/Foo.md"])
+
+
+# ---------------------------------------------------------------------------
+# Field mapping (note → practice-session)
+# ---------------------------------------------------------------------------
+#
+# Continuation-bias retype path. Hypatia learned to create
+# practice-session directly via the SKILL update at 1d4f8ba, but
+# records written before that update need a migration tool.
+#
+# Live test surfaced 2026-05-06: Hypatia created
+# ``note/Practice - 2026-05-06 - dj.md`` with ``type: note`` instead
+# of ``type: practice-session`` because the type didn't yet exist.
+# After 46ab588 added the type, retype is the migration tool — but
+# the (note, practice-session) FIELD_MAPPINGS entry was missing,
+# blocking the migration. This block tests the entry added in this
+# commit.
+
+
+def _seed_note(
+    vault: Path, *, name: str, fields: dict | None = None,
+    body: str = "body content\n",
+) -> str:
+    """Write note/<name>.md with given fields. Returns rel_path."""
+    fm = {"type": "note", "name": name}
+    if fields:
+        fm.update(fields)
+    rel_path = f"note/{name}.md"
+    file_path = vault / rel_path
+    post = frontmatter.Post(body, **fm)
+    file_path.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+    return rel_path
+
+
+def test_note_to_practice_session_keeps_safe_fields(tmp_vault):
+    """Universal record fields (name, created, date, tags, related,
+    relationships) + practice-session-shaped fields (domain,
+    skills_practiced, breakthrough, recorded, session_number) all
+    survive the conversion verbatim."""
+    from alfred.vault.retype import vault_retype
+
+    rel_path = _seed_note(
+        tmp_vault, name="Practice - 2026-05-06 - dj",
+        fields={
+            "name": "Practice - 2026-05-06 - dj",
+            "created": "2026-05-06",
+            "date": "2026-05-06",
+            "tags": ["dj", "practice"],
+            "domain": "DJ",
+            "skills_practiced": ["beatmatching", "EQ-cutting"],
+            "session_number": 12,
+            "breakthrough": "first clean transition without monitor",
+            "recorded": True,
+        },
+    )
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=True,
+        scope="hypatia",
+    )
+    fm = _read_fm(tmp_vault, report.target_path)
+    assert fm["type"] == "practice-session"
+    assert fm["name"] == "Practice - 2026-05-06 - dj"
+    assert fm["created"] == "2026-05-06"
+    assert fm["domain"] == "DJ"
+    assert fm["skills_practiced"] == ["beatmatching", "EQ-cutting"]
+    assert fm["session_number"] == 12
+    assert fm["breakthrough"] == "first clean transition without monitor"
+    assert fm["recorded"] is True
+
+
+def test_note_to_practice_session_target_path_uses_practice_session_dir(
+    tmp_vault,
+):
+    """Target lands at practice-session/<filename>.md per
+    TYPE_DIRECTORY routing. The retype helper creates the directory
+    if it doesn't exist (the tmp_vault fixture pre-creates ``note``
+    but not ``practice-session``)."""
+    from alfred.vault.retype import vault_retype
+
+    rel_path = _seed_note(tmp_vault, name="DJ Practice 2026-05-06")
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=True,
+        scope="hypatia",
+    )
+    assert report.target_path == "practice-session/DJ Practice 2026-05-06.md"
+    assert (tmp_vault / report.target_path).exists()
+
+
+def test_note_to_practice_session_drops_practice_session_tag(tmp_vault):
+    """The ``"practice-session"`` tag is now redundant with the
+    canonical ``type`` field — drop it from the kept tag list. Other
+    tags survive verbatim."""
+    from alfred.vault.retype import vault_retype
+
+    rel_path = _seed_note(
+        tmp_vault, name="DJ Session With Tag",
+        fields={"tags": ["dj", "practice-session", "evening"]},
+    )
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=True,
+        scope="hypatia",
+    )
+    fm = _read_fm(tmp_vault, report.target_path)
+    assert "practice-session" not in fm["tags"]
+    # Other tags preserved.
+    assert set(fm["tags"]) == {"dj", "evening"}
+
+
+def test_note_to_practice_session_drops_only_exact_tag_match(tmp_vault):
+    """The tag-drop rule is exact-string-match — don't accidentally
+    drop tags like ``"practice-session-prep"`` that share the prefix."""
+    from alfred.vault.retype import vault_retype
+
+    rel_path = _seed_note(
+        tmp_vault, name="DJ Tag Edge Case",
+        fields={"tags": ["practice-session", "practice-session-prep", "dj"]},
+    )
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=True,
+        scope="hypatia",
+    )
+    fm = _read_fm(tmp_vault, report.target_path)
+    # Exact "practice-session" stripped; "practice-session-prep" kept.
+    assert "practice-session" not in fm["tags"]
+    assert "practice-session-prep" in fm["tags"]
+    assert "dj" in fm["tags"]
+
+
+def test_note_to_practice_session_default_status_is_completed(tmp_vault):
+    """Source notes with no ``status`` get ``status: completed`` —
+    the most common case (operator only logs after the session).
+    Other practice-session status values are reachable via override."""
+    from alfred.vault.retype import vault_retype
+
+    rel_path = _seed_note(tmp_vault, name="No Status Note")
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=True,
+        scope="hypatia",
+    )
+    fm = _read_fm(tmp_vault, report.target_path)
+    assert fm["status"] == "completed"
+
+
+def test_note_to_practice_session_status_override_wins(tmp_vault):
+    """Operator can override the default status via ``--status``
+    (or ``overrides={"status": ...}`` programmatic call). Each of
+    the four valid practice-session status values must be reachable
+    this way."""
+    from alfred.vault.retype import vault_retype
+
+    for status in ("planned", "in_progress", "completed", "skipped"):
+        rel_path = _seed_note(
+            tmp_vault, name=f"Status Override {status}",
+        )
+        report = vault_retype(
+            tmp_vault, rel_path, "practice-session",
+            apply=True, scope="hypatia",
+            overrides={"status": status},
+        )
+        fm = _read_fm(tmp_vault, report.target_path)
+        assert fm["status"] == status
+
+
+def test_note_to_practice_session_existing_status_preserved(tmp_vault):
+    """If the source note already has a ``status`` (operator typed
+    it before the type was renamed), preserve it via the keep path.
+    Finalize only fills the gap when status is absent."""
+    from alfred.vault.retype import vault_retype
+
+    rel_path = _seed_note(
+        tmp_vault, name="Note With Status",
+        fields={"status": "planned"},
+    )
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=True,
+        scope="hypatia",
+    )
+    fm = _read_fm(tmp_vault, report.target_path)
+    assert fm["status"] == "planned"
+
+
+def test_note_to_practice_session_invalid_status_override_raises(tmp_vault):
+    """Status override must be one of the practice-session valid
+    values — defensive against operator typos."""
+    from alfred.vault.retype import vault_retype
+    from alfred.vault.ops import VaultError
+
+    rel_path = _seed_note(tmp_vault, name="Bad Status")
+    with pytest.raises(VaultError, match="not valid"):
+        vault_retype(
+            tmp_vault, rel_path, "practice-session",
+            apply=True, scope="hypatia",
+            overrides={"status": "rogue"},
+        )
+
+
+def test_note_to_practice_session_backfills_template_defaults(tmp_vault):
+    """Source notes without practice-session-template fields get
+    sensible defaults: duration_minutes=0, next_focus="",
+    related_persons/orgs/projects=[]. Retyped record should look
+    structurally similar to a freshly-scaffolded practice-session."""
+    from alfred.vault.retype import vault_retype
+
+    rel_path = _seed_note(tmp_vault, name="Bare Note")
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=True,
+        scope="hypatia",
+    )
+    fm = _read_fm(tmp_vault, report.target_path)
+    assert fm["duration_minutes"] == 0
+    assert fm["next_focus"] == ""
+    assert fm["related_persons"] == []
+    assert fm["related_orgs"] == []
+    assert fm["related_projects"] == []
+
+
+def test_note_to_practice_session_preserves_existing_template_fields(
+    tmp_vault,
+):
+    """If the source note ALREADY has practice-session-template
+    fields populated (operator pre-typed them on the mis-typed
+    record), preserve their values verbatim — don't overwrite with
+    the template default."""
+    from alfred.vault.retype import vault_retype
+
+    rel_path = _seed_note(
+        tmp_vault, name="Pre-Filled Note",
+        fields={
+            "duration_minutes": 90,
+            "next_focus": "Practice EQ cuts on the headphone monitor",
+            "related_persons": ["[[person/Andrew Newton]]"],
+            "related_projects": ["[[project/DJ Skill Mastery]]"],
+        },
+    )
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=True,
+        scope="hypatia",
+    )
+    fm = _read_fm(tmp_vault, report.target_path)
+    assert fm["duration_minutes"] == 90
+    assert fm["next_focus"] == "Practice EQ cuts on the headphone monitor"
+    assert fm["related_persons"] == ["[[person/Andrew Newton]]"]
+    assert fm["related_projects"] == ["[[project/DJ Skill Mastery]]"]
+    # ``related_orgs`` was absent → backfilled to [].
+    assert fm["related_orgs"] == []
+
+
+def test_note_to_practice_session_body_preserved(tmp_vault):
+    """Hypatia's improvised body section structure (## What I worked
+    on / ## What went well / ## What needs more reps / ## Open
+    questions) survives the conversion verbatim. Body content is
+    operator-meaningful — retype must not edit it."""
+    from alfred.vault.retype import vault_retype
+
+    body = (
+        "# DJ Practice 2026-05-06\n"
+        "\n"
+        "## What I worked on\n"
+        "Beatmatching at 128bpm. Three runs through the warm-up set.\n"
+        "\n"
+        "## What went well\n"
+        "First clean transition without monitor.\n"
+        "\n"
+        "## What needs more reps\n"
+        "EQ cuts on bass-heavy tracks.\n"
+        "\n"
+        "## Open questions / surfaces to ask Hypatia about\n"
+        "Should I work the headphone-monitor mute as a drill?\n"
+    )
+    rel_path = _seed_note(
+        tmp_vault, name="DJ Body Preservation",
+        body=body,
+    )
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=True,
+        scope="hypatia",
+    )
+    target_text = (tmp_vault / report.target_path).read_text(
+        encoding="utf-8",
+    )
+    # Every header survives.
+    assert "## What I worked on" in target_text
+    assert "## What went well" in target_text
+    assert "## What needs more reps" in target_text
+    assert "## Open questions / surfaces to ask Hypatia about" in target_text
+    # Body content survives.
+    assert "First clean transition without monitor." in target_text
+    assert "EQ cuts on bass-heavy tracks." in target_text
+
+
+def test_note_to_practice_session_apply_deletes_source(tmp_vault):
+    """Default apply behavior: source ``note`` removed; target lands
+    at ``practice-session/<slug>.md``. Mirrors the event-to-task
+    delete-source contract."""
+    from alfred.vault.retype import vault_retype
+
+    rel_path = _seed_note(tmp_vault, name="Source Delete Check")
+    src_full = tmp_vault / rel_path
+    assert src_full.exists()  # baseline
+
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=True,
+        scope="hypatia",
+    )
+    # Target written.
+    assert (tmp_vault / report.target_path).exists()
+    # Source deleted.
+    assert not src_full.exists()
+
+
+def test_note_to_practice_session_dry_run_does_not_mutate(tmp_vault):
+    """Dry-run produces an accurate report without touching disk —
+    same contract as event→task. Source stays in place; no target
+    file written."""
+    from alfred.vault.retype import vault_retype
+
+    rel_path = _seed_note(tmp_vault, name="Dry Run Note")
+    src_full = tmp_vault / rel_path
+    original_text = src_full.read_text(encoding="utf-8")
+
+    report = vault_retype(
+        tmp_vault, rel_path, "practice-session", apply=False,
+        scope="hypatia",
+    )
+    # Source unchanged.
+    assert src_full.exists()
+    assert src_full.read_text(encoding="utf-8") == original_text
+    # Target NOT written.
+    assert not (tmp_vault / report.target_path).exists()
+    # Report still populated correctly.
+    assert report.source_type == "note"
+    assert report.target_type == "practice-session"
+    assert report.apply is False

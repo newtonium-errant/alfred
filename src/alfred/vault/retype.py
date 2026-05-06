@@ -134,6 +134,63 @@ def _apply_event_to_task_overrides(
         target_fm["due"] = overrides["due"]
 
 
+def _apply_note_to_practice_session_overrides(
+    target_fm: dict,
+    source_fm: dict,
+    overrides: dict,
+) -> None:
+    """Final pass for note → practice-session.
+
+    Three responsibilities:
+
+    1. Set ``status`` default to ``"completed"`` (most common —
+       operator only logs after the session). Source may not have
+       a status; if it does, we already kept it via the keep path
+       and only fill the gap when absent. Operator can override
+       via the ``--status`` flag (``planned`` / ``in_progress`` /
+       ``completed`` / ``skipped``).
+
+    2. Drop the literal ``"practice-session"`` tag from the ``tags``
+       list — now redundant with the canonical ``type`` field. The
+       continuation-bias bug from 2026-05-06 surfaced records that
+       carried a ``practice-session`` tag because the type was wrong;
+       fixing the type makes the tag noise.
+
+    3. Backfill template fields that weren't in the source note:
+        * ``duration_minutes`` → 0 (operator backfills if relevant)
+        * ``next_focus`` → empty string
+        * ``related_persons`` / ``related_orgs`` /
+          ``related_projects`` → empty list
+
+       These mirror the practice-session template defaults so a
+       retyped record looks the same as a freshly-scaffolded one.
+    """
+    # Status default — honor override > existing > "completed" default.
+    if overrides.get("status"):
+        target_fm["status"] = overrides["status"]
+    elif "status" not in target_fm:
+        target_fm["status"] = "completed"
+
+    # Drop the redundant "practice-session" tag if present. Source's
+    # tag list was kept verbatim by the keep path; mutate in place.
+    tags = target_fm.get("tags")
+    if isinstance(tags, list):
+        target_fm["tags"] = [
+            t for t in tags
+            if not (isinstance(t, str) and t == "practice-session")
+        ]
+
+    # Backfill template defaults — only when absent. Operator may
+    # have set these explicitly on the note; preserve their values.
+    if "duration_minutes" not in target_fm:
+        target_fm["duration_minutes"] = 0
+    if "next_focus" not in target_fm:
+        target_fm["next_focus"] = ""
+    for list_field in ("related_persons", "related_orgs", "related_projects"):
+        if list_field not in target_fm:
+            target_fm[list_field] = []
+
+
 FIELD_MAPPINGS: dict[tuple[str, str], FieldMapping] = {
     ("event", "task"): FieldMapping(
         keep=(
@@ -171,6 +228,57 @@ FIELD_MAPPINGS: dict[tuple[str, str], FieldMapping] = {
             "origin_instance", "origin_context",
         ),
         finalize=_apply_event_to_task_overrides,
+    ),
+    # note → practice-session: continuation-bias retype path.
+    # Hypatia's SKILL learns to create practice-session directly, but
+    # records written before the SKILL update need a migration tool.
+    # Most note fields map cleanly — practice-session-shaped fields
+    # like ``domain`` / ``skills_practiced`` / ``breakthrough`` were
+    # already on the source records (operator-typed when the type was
+    # still ``note``). The few quirks are handled in
+    # ``_apply_note_to_practice_session_overrides``.
+    ("note", "practice-session"): FieldMapping(
+        keep=(
+            # Universal record fields.
+            "name",
+            "created",
+            "date",
+            "tags",
+            "alfred_tags",
+            "description",
+            "summary",
+            "related",
+            "relationships",
+            "project",
+            # practice-session-shaped fields (operator typed these on
+            # the source note before the type-discrimination SKILL
+            # update — preserve verbatim).
+            "domain",
+            "skills_practiced",
+            "duration_minutes",
+            "next_focus",
+            "related_persons",
+            "related_orgs",
+            "related_projects",
+            # Note-extension fields the operator may have added on the
+            # mis-typed records. Not in the practice-session template
+            # but kept verbatim — they're operator-meaningful and
+            # dropping them would lose context.
+            "session_number",
+            "breakthrough",
+            "recorded",
+            # Status — passed through from source if present; finalize
+            # sets the ``"completed"`` default when absent.
+            "status",
+        ),
+        # No renames — note field names that survive into
+        # practice-session keep their names.
+        rename=(),
+        drop=(
+            # ``type`` is set explicitly to the target.
+            "type",
+        ),
+        finalize=_apply_note_to_practice_session_overrides,
     ),
 }
 
