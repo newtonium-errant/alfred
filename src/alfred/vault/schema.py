@@ -49,6 +49,17 @@ KNOWN_TYPES_HYPATIA: set[str] = {
     "document", "concept", "source", "citation", "template",
     "fiction-continuity", "fiction-story", "fiction-structure",
     "fiction-world", "fiction-voice", "fiction-character",
+    # Practice-session (2026-05-06) — cross-domain practice logging
+    # (DJ practice, fencing, workouts, future skill-building tracks).
+    # Distinct from generic ``session`` records: practice-sessions
+    # link to a skill tracker / project + carry a domain field so
+    # progression aggregates over time. Filed 2026-05-04 from the DJ
+    # skill-building arc (see ``note/DJ Skill Mastery Tracker.md``);
+    # surfaced again in Hypatia conversation ``833bec8d`` when Andrew
+    # asked for it and the type didn't exist yet. See scope.py
+    # ``HYPATIA_CREATE_TYPES`` + the body-mutation matrix entry for
+    # the per-instance gating.
+    "practice-session",
 }
 
 
@@ -107,6 +118,14 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     # changes. Strict-but-small set; widen via deliberate decision
     # if a real workflow needs another state.
     "architecture": {"draft", "active", "superseded"},
+    # Hypatia-only ``practice-session`` records (cross-domain
+    # practice logging — DJ / fencing / workout / language / etc.).
+    # Status set covers the natural workflow: planned (scheduled
+    # ahead of time), in_progress (mid-session, e.g. live practice
+    # update), completed (most common — written after the session),
+    # skipped (intended-to-do but didn't, useful signal for the
+    # tracker aggregator).
+    "practice-session": {"planned", "in_progress", "completed", "skipped"},
 }
 
 # Type → expected top-level directory
@@ -129,6 +148,13 @@ TYPE_DIRECTORY: dict[str, str] = {
     "contradiction": "contradiction",
     "synthesis": "synthesis",
     "architecture": "architecture",
+    # Hypatia practice-session records — typically land at
+    # ``practice-session/<title>.md`` per the per-type-directory
+    # convention. The writer (``vault_create``) routes them via this
+    # entry; the operator can move them post-create if a different
+    # tree (e.g. ``practice-session/dj/<title>.md``) makes sense for
+    # a particular skill domain.
+    "practice-session": "practice-session",
     # session, input have flexible placement
 }
 
@@ -172,6 +198,15 @@ LIST_FIELDS: set[str] = {
     "cluster_sources", "governed_by", "references", "project",
     # Instruction fields — both are lists (pending queue + executed archive).
     "alfred_instructions", "alfred_instructions_last",
+    # Practice-session (2026-05-06) — list of skills worked on during
+    # the session. The ``related_persons`` / ``related_orgs`` /
+    # ``related_projects`` fields are also list-shaped on
+    # practice-session records but are written as lists by every
+    # producer in the wild (surveyor + the new template), so they
+    # don't need coerce-from-scalar handling. ``skills_practiced`` is
+    # genuinely new — operators may type a single skill as a string
+    # and rely on the create-time coerce.
+    "skills_practiced",
 }
 
 # Required fields for all records

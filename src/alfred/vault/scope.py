@@ -34,8 +34,9 @@ class ScopeError(Exception):
 #
 # | Caller        | append    | insert_at                        | replace                       |
 # |---------------|-----------|----------------------------------|-------------------------------|
-# | hypatia       | universal | note,concept,document,           | same set                      |
-# |               |           | template,fiction-* (per spec)    |                               |
+# | hypatia       | universal | note,concept,document,           | same set MINUS                |
+# |               |           | template,fiction-*,              | practice-session (history     |
+# |               |           | practice-session                 | preservation)                 |
 # | talker(Salem) | universal | note,task,event(no-gcal-id)      | same — but refuses if         |
 # |               |           |                                  | event has gcal_event_id       |
 # | kalle         | universal | note,decision,principle,         | same set                      |
@@ -386,6 +387,15 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # template, fiction-* types. The mid-document insertion case
         # was the ORIGINATING use case for this whole arc (Andrew's
         # MPC addendum to a DJ skill tracker — a note record).
+        #
+        # ``practice-session`` (added 2026-05-06) — anchored mid-doc
+        # updates allowed (operator adds an observation against a
+        # specific exercise heading mid-session). Body REPLACE
+        # explicitly DENIED below — a practice-session is a historical
+        # record; full rewrite would erase the in-session progression
+        # the record is meant to capture. body_append (different gate,
+        # ``allow_body_writes: True`` above) is the right tool for
+        # adding observations during/after a session.
         "allow_body_insert_at": {
             "note": True,
             "concept": True,
@@ -397,6 +407,7 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
             "fiction-world": True,
             "fiction-voice": True,
             "fiction-character": True,
+            "practice-session": True,
         },
         "allow_body_replace": {
             "note": True,
@@ -409,6 +420,8 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
             "fiction-world": True,
             "fiction-voice": True,
             "fiction-character": True,
+            # practice-session deliberately OMITTED — see
+            # ``allow_body_insert_at`` comment above.
         },
     },
     # Instructor executes natural-language directives parked in the
@@ -506,6 +519,15 @@ HYPATIA_CREATE_TYPES: set[str] = {
     "source", "citation", "template",
     "fiction-continuity", "fiction-story", "fiction-structure",
     "fiction-world", "fiction-voice", "fiction-character",
+    # Practice-session (2026-05-06) — Hypatia-only for now. Salem
+    # could conceivably want it later (RRTS-related practice logging),
+    # but the originating use case (DJ skill mastery, fencing,
+    # workouts) is Hypatia's domain. Operator can extend this set
+    # later if Salem needs it. Keep this set in sync with
+    # ``KNOWN_TYPES_HYPATIA`` in schema.py — drift between the two
+    # would surface as "type accepted by validator, rejected by scope"
+    # or vice versa.
+    "practice-session",
 }
 
 

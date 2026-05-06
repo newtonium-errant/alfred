@@ -100,6 +100,12 @@ def test_universal_deny_set_pinned_to_spec():
     "note", "concept", "document", "template",
     "fiction-continuity", "fiction-story", "fiction-structure",
     "fiction-world", "fiction-voice", "fiction-character",
+    # 2026-05-06 — practice-session allows anchored mid-doc updates
+    # (operator adds an observation against a specific exercise heading
+    # mid-session). See ``allow_body_replace`` test below for the
+    # asymmetry — replace is DENIED to preserve practice-session as a
+    # historical record.
+    "practice-session",
 ])
 def test_hypatia_body_insert_at_allows_per_spec_types(allowed_type):
     check_scope("hypatia", "body_insert_at", record_type=allowed_type)
@@ -108,9 +114,24 @@ def test_hypatia_body_insert_at_allows_per_spec_types(allowed_type):
 @pytest.mark.parametrize("allowed_type", [
     "note", "concept", "document", "template",
     "fiction-continuity",
+    # ``practice-session`` deliberately OMITTED here — the matrix
+    # asymmetry is: insert_at allowed, replace DENIED. See the
+    # body-mutation matrix table comment in scope.py for the rationale.
 ])
 def test_hypatia_body_replace_allows_per_spec_types(allowed_type):
     check_scope("hypatia", "body_replace", record_type=allowed_type)
+
+
+def test_hypatia_body_replace_denies_practice_session() -> None:
+    """Practice-session is OMITTED from Hypatia's body_replace
+    allowlist (added 2026-05-06). The matrix asymmetry is intentional:
+    insert_at is allowed (operator adds an observation against a
+    specific exercise heading); replace would erase the in-session
+    progression the record is meant to capture."""
+    with pytest.raises(ScopeError, match="may not 'body_replace'"):
+        check_scope(
+            "hypatia", "body_replace", record_type="practice-session",
+        )
 
 
 def test_hypatia_body_insert_at_denies_outside_spec_set():

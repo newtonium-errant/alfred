@@ -126,6 +126,10 @@ def test_hypatia_create_types_shape() -> None:
     matches the schema-side ``KNOWN_TYPES_HYPATIA`` set. Both
     registries must list the same fiction types or the gates will
     disagree.
+
+    2026-05-06 added ``practice-session`` (cross-domain practice
+    logging — DJ / fencing / workout / language) to close the gap
+    surfaced in Hypatia conversation ``833bec8d``.
     """
     assert HYPATIA_CREATE_TYPES == {
         "document", "session", "concept", "note",
@@ -133,6 +137,8 @@ def test_hypatia_create_types_shape() -> None:
         # Phase 2.5 fiction posture
         "fiction-continuity", "fiction-story", "fiction-structure",
         "fiction-world", "fiction-voice", "fiction-character",
+        # 2026-05-06 practice logging
+        "practice-session",
     }
 
 
@@ -147,12 +153,19 @@ def test_known_types_hypatia_is_separate_set() -> None:
     Phase 2.5 fiction posture added six ``fiction-{element}`` types —
     these must live ONLY under Hypatia's set, never in Salem's
     operational KNOWN_TYPES (Salem doesn't write fiction projects).
+
+    2026-05-06: ``practice-session`` added — Hypatia-only for now;
+    Salem could conceivably want it for RRTS-related practice
+    logging later, but the originating use case is Hypatia's
+    skill-building domain.
     """
     assert schema.KNOWN_TYPES_HYPATIA == {
         "document", "concept", "source", "citation", "template",
         # Phase 2.5 fiction posture
         "fiction-continuity", "fiction-story", "fiction-structure",
         "fiction-world", "fiction-voice", "fiction-character",
+        # 2026-05-06 practice logging
+        "practice-session",
     }
     for t in schema.KNOWN_TYPES_HYPATIA:
         assert t not in schema.KNOWN_TYPES, (
@@ -450,3 +463,108 @@ def test_fiction_type_rejected_under_no_scope(
         # No scope kwarg → falls through to canonical KNOWN_TYPES
         vault_create(tmp_path, record_type, f"Test {record_type}")
     assert "Unknown type" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# practice-session — cross-domain practice logging (2026-05-06)
+# ---------------------------------------------------------------------------
+#
+# Hypatia-only record type for DJ / fencing / workout / language /
+# other skill-building tracks. Distinct from the canonical ``session``
+# type because practice-sessions link to a skill tracker / project +
+# carry a domain field so progression aggregates over time.
+#
+# Filed 2026-05-04 from the DJ skill-building arc; surfaced again in
+# Hypatia conversation ``833bec8d`` when Andrew looked for it and the
+# type didn't exist yet.
+#
+# Cross-instance gating:
+#   * Hypatia: create + edit allowed (both gates)
+#   * Salem (talker scope): create REJECTED — operational types are
+#     Salem's territory, but practice-session is a skill-building
+#     domain artifact that lives under Hypatia
+#   * KAL-LE: create REJECTED — coding instance, not skill-building
+
+
+def test_practice_session_pinned_in_known_types_hypatia() -> None:
+    """Schema gate: practice-session is registered in KNOWN_TYPES_HYPATIA."""
+    assert "practice-session" in schema.KNOWN_TYPES_HYPATIA
+
+
+def test_practice_session_not_in_salem_known_types() -> None:
+    """Cross-instance leak guard: practice-session is Hypatia-only.
+    Operator can extend later if Salem needs RRTS-related practice
+    logging, but the originating use case is Hypatia's domain."""
+    assert "practice-session" not in schema.KNOWN_TYPES
+
+
+def test_practice_session_pinned_in_hypatia_create_types() -> None:
+    """Scope gate: practice-session passes the Hypatia create allowlist."""
+    assert "practice-session" in HYPATIA_CREATE_TYPES
+
+
+def test_check_scope_accepts_practice_session_create_under_hypatia() -> None:
+    """Scope gate: ``check_scope("create", ...)`` accepts
+    practice-session under scope='hypatia'."""
+    check_scope("hypatia", "create", record_type="practice-session")
+
+
+def test_vault_create_practice_session_succeeds_under_hypatia(
+    tmp_path,
+) -> None:
+    """End-to-end: vault_create lands a practice-session record under
+    scope='hypatia' (both gates pass + file actually writes)."""
+    (tmp_path / "practice-session").mkdir(exist_ok=True)
+    result = vault_create(
+        tmp_path,
+        "practice-session",
+        "Test Practice Session",
+        scope="hypatia",
+    )
+    assert (tmp_path / result["path"]).exists()
+
+
+def test_practice_session_rejected_under_kalle_scope(tmp_path) -> None:
+    """KAL-LE must NOT be able to create practice-session records.
+    KAL-LE is the coding instance; practice-session is skill-building."""
+    with pytest.raises(VaultError) as exc_info:
+        vault_create(
+            tmp_path, "practice-session", "Test", scope="kalle",
+        )
+    assert "Unknown type" in str(exc_info.value)
+    assert "kalle" in str(exc_info.value)
+
+
+def test_practice_session_rejected_under_no_scope(tmp_path) -> None:
+    """Default scope (None / Salem-only) must reject practice-session.
+    Per the matrix: Hypatia-only for now."""
+    with pytest.raises(VaultError) as exc_info:
+        vault_create(tmp_path, "practice-session", "Test")
+    assert "Unknown type" in str(exc_info.value)
+
+
+def test_practice_session_status_set_pinned() -> None:
+    """Pin the exact status set so a quiet edit can't widen / narrow it.
+    Workflow: planned (scheduled), in_progress (mid-session, e.g. live
+    update), completed (most common), skipped (intended-but-didn't —
+    useful signal for the tracker aggregator)."""
+    assert schema.STATUS_BY_TYPE["practice-session"] == {
+        "planned", "in_progress", "completed", "skipped",
+    }
+
+
+def test_practice_session_in_type_directory() -> None:
+    """Type → directory routing is registered."""
+    assert schema.TYPE_DIRECTORY["practice-session"] == "practice-session"
+
+
+def test_skills_practiced_in_list_fields() -> None:
+    """Schema list-coercion gate: ``skills_practiced`` is a list-shaped
+    field, so vault_create coerces a scalar string to ``[string]`` at
+    write time. The other list-shaped fields on practice-session
+    records (``related_persons`` / ``related_orgs`` /
+    ``related_projects``) are ALREADY established list-shaped fields
+    in the wild — every writer in the wild emits them as lists, so
+    they don't need coerce-from-scalar handling. ``skills_practiced``
+    is genuinely new — operators may type a single skill as a string."""
+    assert "skills_practiced" in schema.LIST_FIELDS
