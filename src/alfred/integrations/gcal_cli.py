@@ -572,7 +572,7 @@ def cmd_backfill(
 
     from .gcal import GCalClient
     from .gcal_config import load_from_unified
-    from .gcal_sync import sync_event_create_to_gcal
+    from .gcal_sync import resolve_gcal_title, sync_event_create_to_gcal
 
     config = load_from_unified(raw)
     if not config.enabled:
@@ -692,9 +692,10 @@ def cmd_backfill(
                 duration_min=inference["duration_min"],
                 heuristic=inference["heuristic"],
             )
+            _inferred_title, _ = resolve_gcal_title(fm)
             inferred.append({
                 "path": rel_path,
-                "title": str(fm.get("title") or fm.get("name") or md_file.stem),
+                "title": _inferred_title or md_file.stem,
                 "start": inference["start"],
                 "end": inference["end"],
                 "duration_min": inference["duration_min"],
@@ -749,7 +750,17 @@ def cmd_backfill(
             skipped_before_cutoff.append(rel_path)
             continue
 
-        title = str(fm.get("title") or fm.get("name") or md_file.stem)
+        # Resolve via the canonical helper so backfill respects the
+        # ``gcal_title`` override on records that have it set.
+        # ``resolve_gcal_title`` returns ``("", "")`` only when ALL of
+        # ``gcal_title`` / ``title`` / ``name`` are missing or empty —
+        # for backfill we still want to fall back to the filename stem
+        # in that degenerate case (a real record that somehow has no
+        # ``name`` field shouldn't break the sweep).
+        resolved_title, title_source = resolve_gcal_title(fm)
+        title = resolved_title or md_file.stem
+        if not resolved_title:
+            title_source = "name"  # filename-stem fallback
         description = str(fm.get("summary") or "")
         correlation_id = f"backfill-{md_file.stem[:32]}"
 
@@ -774,6 +785,7 @@ def cmd_backfill(
             start_dt=start_dt,
             end_dt=end_dt,
             correlation_id=correlation_id,
+            title_source=title_source,
         )
         if result.get("event_id"):
             synced.append({

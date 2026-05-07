@@ -58,6 +58,56 @@ log = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Title resolution — gcal_title vs name decoupling
+# ---------------------------------------------------------------------------
+
+
+def resolve_gcal_title(fm: dict) -> tuple[str, str]:
+    """Resolve the GCal event title from a vault record's frontmatter.
+
+    Decouples the vault filename / ``name`` field from the title that
+    Google Calendar shows on Andrew's phone. The vault frequently needs
+    a date-suffixed disambiguator on the filename (e.g.
+    ``Novaket — May 13``, ``Fergus Bath 2026-05-12``) so recurring
+    events stay findable; GCal renders the date in its own UI, so that
+    suffix is redundant noise on the calendar entry.
+
+    Resolution order (operator-set, no auto-derivation):
+
+      1. ``gcal_title`` — explicit override. When set, used verbatim.
+      2. ``title`` — existing fallback (peer-handler propose-create
+         writes both ``name`` and ``title``; daemon-direct creates
+         typically only set ``name``).
+      3. ``name`` — final fallback (the vault filename stem).
+
+    Returns ``(title, source)`` where ``source ∈ {"gcal_title",
+    "title", "name", ""}``. The source string is logged at the sync
+    layer (``title_source`` field on ``gcal.sync_created`` /
+    ``gcal.sync_updated``) so operators can grep for "which records
+    are using the override" without round-tripping through the
+    frontmatter. Empty source means no usable title — the sync layer
+    treats that as a degenerate case (returns empty string; GCal will
+    refuse to create anyway).
+
+    Per ``vault.schema.EVENT_GCAL_FIELDS`` — this is the canonical
+    resolver; future callers MUST use it rather than re-deriving the
+    chain (per ``feedback_marker_id_canonical_regex.md`` — once a
+    grammar is established, consumers import the canonical resolver
+    rather than copy-pasting the precedence rule).
+    """
+    gcal_title = fm.get("gcal_title")
+    if isinstance(gcal_title, str) and gcal_title.strip():
+        return gcal_title.strip(), "gcal_title"
+    title = fm.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip(), "title"
+    name = fm.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip(), "name"
+    return "", ""
+
+
+# ---------------------------------------------------------------------------
 # Error classification (formerly in peer_handlers)
 # ---------------------------------------------------------------------------
 
@@ -170,6 +220,7 @@ def sync_event_create_to_gcal(
     start_dt: datetime,
     end_dt: datetime,
     correlation_id: str = "",
+    title_source: str = "name",
 ) -> dict[str, Any]:
     """Push a freshly-created vault event to the configured calendar.
 
@@ -181,6 +232,12 @@ def sync_event_create_to_gcal(
     the aiohttp request handler. On success: writes ``gcal_event_id``
     + ``gcal_calendar`` (from ``config.alfred_calendar_label``) back
     into the vault record's frontmatter.
+
+    ``title_source`` describes which frontmatter field the caller
+    resolved the title from — one of ``"gcal_title"`` / ``"title"`` /
+    ``"name"`` (per :func:`resolve_gcal_title`). Logged on
+    ``gcal.sync_created`` so operators can grep for records using the
+    override. Default ``"name"`` matches the pre-decoupling behavior.
     """
     skip = _gcal_skip_check(
         client=client, config=config, intended_on=intended_on,
@@ -245,6 +302,7 @@ def sync_event_create_to_gcal(
         event_id=event_id,
         calendar_id=config.alfred_calendar_id,
         calendar_label=calendar_label,
+        title_source=title_source,
         correlation_id=correlation_id,
     )
     return {"event_id": event_id, "calendar_label": calendar_label}
@@ -266,6 +324,7 @@ def sync_event_update_to_gcal(
     start_dt: datetime | None = None,
     end_dt: datetime | None = None,
     correlation_id: str = "",
+    title_source: str | None = None,
 ) -> dict[str, Any]:
     """Patch an existing GCal event to mirror a vault edit.
 
@@ -364,6 +423,7 @@ def sync_event_update_to_gcal(
         calendar_id=config.alfred_calendar_id,
         calendar_label=calendar_label,
         patched=sorted(update_kwargs.keys()),
+        title_source=title_source if title is not None else None,
         correlation_id=correlation_id,
     )
     return {"event_id": gcal_event_id, "calendar_label": calendar_label}

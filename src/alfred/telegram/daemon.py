@@ -490,6 +490,7 @@ async def run(
                 # ``sync_event_create_to_gcal`` via the
                 # ``_sync_event_to_gcal`` shim, no double-fire).
                 from alfred.integrations.gcal_sync import (
+                    resolve_gcal_title,
                     sync_event_cancellation_to_gcal,
                     sync_event_create_to_gcal,
                     sync_event_delete_to_gcal,
@@ -535,16 +536,18 @@ async def run(
                         )
                         return
                     file_path = Path(vault_path_) / rel_path
+                    resolved_title, title_source = resolve_gcal_title(fm)
                     sync_event_create_to_gcal(
                         client=_bound_client,
                         config=_bound_config,
                         intended_on=_bound_intended_on,
                         file_path=file_path,
-                        title=str(fm.get("title") or fm.get("name") or ""),
+                        title=resolved_title,
                         description=str(fm.get("summary") or ""),
                         start_dt=start_dt,
                         end_dt=end_dt,
                         correlation_id=str(fm.get("correlation_id") or ""),
+                        title_source=title_source,
                     )
 
                 def _on_event_updated(vault_path_, rel_path, fm, fields_changed):
@@ -639,16 +642,18 @@ async def run(
                             correlation_id=str(fm.get("correlation_id") or ""),
                         )
                         file_path = Path(vault_path_) / rel_path
+                        resolved_title, title_source = resolve_gcal_title(fm)
                         sync_event_create_to_gcal(
                             client=_bound_client,
                             config=_bound_config,
                             intended_on=_bound_intended_on,
                             file_path=file_path,
-                            title=str(fm.get("title") or fm.get("name") or ""),
+                            title=resolved_title,
                             description=str(fm.get("summary") or ""),
                             start_dt=start_dt,
                             end_dt=end_dt,
                             correlation_id=str(fm.get("correlation_id") or ""),
+                            title_source=title_source,
                         )
                         return
 
@@ -666,11 +671,25 @@ async def run(
                     # GCal-relevant. ``fields_changed`` is a flat list
                     # of frontmatter keys + possibly "body" — the GCal
                     # patch surface is title / description / start / end.
-                    title = (
-                        str(fm.get("title") or fm.get("name") or "")
-                        if "title" in fields_changed or "name" in fields_changed
-                        else None
+                    #
+                    # Title trigger: any of ``gcal_title`` / ``title`` /
+                    # ``name`` in ``fields_changed`` re-resolves via
+                    # ``resolve_gcal_title``. The decoupling means an
+                    # operator setting ``gcal_title`` on a record that
+                    # already has ``title``/``name`` should patch the
+                    # GCal entry to the override even if title/name
+                    # didn't change.
+                    title_changed = (
+                        "gcal_title" in fields_changed
+                        or "title" in fields_changed
+                        or "name" in fields_changed
                     )
+                    if title_changed:
+                        resolved_title, title_source = resolve_gcal_title(fm)
+                        title = resolved_title
+                    else:
+                        title = None
+                        title_source = None
                     description = (
                         str(fm.get("summary") or "")
                         if "summary" in fields_changed
@@ -698,6 +717,7 @@ async def run(
                         start_dt=start_dt,
                         end_dt=end_dt,
                         correlation_id=str(fm.get("correlation_id") or ""),
+                        title_source=title_source,
                     )
 
                 def _on_event_deleted(vault_path_, rel_path, pre_delete_fm):

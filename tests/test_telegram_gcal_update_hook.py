@@ -57,6 +57,8 @@ def _promotion_branch_under_test(
     ``_on_event_updated``. Returns the closure for direct invocation
     from tests.
     """
+    from alfred.integrations.gcal_sync import resolve_gcal_title
+
     def _on_event_updated(vault_path_, rel_path, fm, fields_changed):
         gcal_event_id = str(fm.get("gcal_event_id") or "")
         start_raw = fm.get("start")
@@ -75,16 +77,18 @@ def _promotion_branch_under_test(
                 reason="vault_edit added start+end",
                 correlation_id=str(fm.get("correlation_id") or ""),
             )
+            resolved_title, title_source = resolve_gcal_title(fm)
             sync_event_create_to_gcal(
                 client=bound_client,
                 config=bound_config,
                 intended_on=bound_intended_on,
                 file_path=Path(vault_path_) / rel_path,
-                title=str(fm.get("title") or fm.get("name") or ""),
+                title=resolved_title,
                 description=str(fm.get("summary") or ""),
                 start_dt=start_dt,
                 end_dt=end_dt,
                 correlation_id=str(fm.get("correlation_id") or ""),
+                title_source=title_source,
             )
             return
 
@@ -93,11 +97,17 @@ def _promotion_branch_under_test(
             return
 
         # PATCH
-        title = (
-            str(fm.get("title") or fm.get("name") or "")
-            if "title" in fields_changed or "name" in fields_changed
-            else None
+        title_changed = (
+            "gcal_title" in fields_changed
+            or "title" in fields_changed
+            or "name" in fields_changed
         )
+        if title_changed:
+            resolved_title, title_source = resolve_gcal_title(fm)
+            title = resolved_title
+        else:
+            title = None
+            title_source = None
         description = (
             str(fm.get("summary") or "")
             if "summary" in fields_changed
@@ -125,6 +135,7 @@ def _promotion_branch_under_test(
             start_dt=start_dt,
             end_dt=end_dt,
             correlation_id=str(fm.get("correlation_id") or ""),
+            title_source=title_source,
         )
 
     return _on_event_updated

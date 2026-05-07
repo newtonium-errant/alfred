@@ -190,6 +190,44 @@ REMINDER_FIELDS: tuple[str, ...] = (
     "reminder_text",
 )
 
+# Optional frontmatter fields on ``event`` records that interact with
+# the Google Calendar sync layer. Per ``project_inter_instance_communication``
+# (Phase A+) GCal events are a projection of vault records — these
+# fields steer the projection without changing the canonical record:
+#
+#   - ``gcal_event_id``       — GCal event ID written back by the sync
+#     layer after a successful create. Used by the update / cancel
+#     hooks as the patch / delete target. Operators MUST NOT set this
+#     by hand; it's a sync-layer artifact.
+#   - ``gcal_calendar``       — short label for the destination calendar
+#     (e.g. ``"alfred"``, ``"rrts"``, ``"stayc"``). Config-driven
+#     per-instance via ``GCalConfig.alfred_calendar_label``.
+#   - ``gcal_keep_on_cancel`` — bool; when true, a cancel edit
+#     (``status: cancelled``) PATCHes the GCal event to
+#     ``status="cancelled"`` (struck-through, kept on calendar) instead
+#     of deleting it. Off by default — most cancellations should remove
+#     the calendar entry entirely.
+#   - ``gcal_title``          — operator-set override for the GCal
+#     event title (vault filename / ``name`` stays as-is). Decouples
+#     vault-side disambiguator suffixes (e.g. ``"Novaket — May 13"``
+#     for filename uniqueness) from the GCal entry the user actually
+#     sees on their phone (just ``"Novaket"`` — GCal already shows the
+#     date in its own UI). Optional, no auto-derivation: when absent,
+#     the sync layer falls back to the existing
+#     ``fm.title or fm.name`` chain (regression-safe). Operators
+#     populate via ``vault_edit`` set; the create / update / promote
+#     hooks pick it up automatically. See
+#     ``alfred.integrations.gcal_sync.resolve_gcal_title`` for the
+#     resolution helper.
+#
+# All four are opt-in per record. None are required.
+EVENT_GCAL_FIELDS: tuple[str, ...] = (
+    "gcal_event_id",
+    "gcal_calendar",
+    "gcal_keep_on_cancel",
+    "gcal_title",
+)
+
 # Fields that should be lists
 LIST_FIELDS: set[str] = {
     "tags", "aliases", "related", "relationships", "participants",
