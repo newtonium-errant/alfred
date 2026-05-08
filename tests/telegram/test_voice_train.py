@@ -2763,3 +2763,284 @@ async def test_method_source_does_not_arm_cluster_ask(
     # Reply does NOT carry the cluster question.
     last_reply = sent[-1][1]
     assert "Which cluster?" not in last_reply
+
+
+# ---------------------------------------------------------------------------
+# P1 fix from #69 review (2026-05-08) — cluster-tag race
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cluster_reply_reenqueues_extraction_job(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: cluster reply re-enqueues a fresh extraction job.
+
+    P1 fix (2026-05-08) for the cluster-tag race in #69. The original
+    /train job was enqueued with ``cluster=None`` so the worker's
+    voice-profile write would land WITHOUT a cluster field; tagging
+    only the raw essay leaves the structured voice profile uncluster-
+    aware, and ``_list_voice_leaves_with_cluster`` (which reads voice
+    profile frontmatter, NOT raw) excludes the leaf from the cluster-
+    tier rebuild.
+
+    Fix: ``_handle_cluster_ask_reply`` re-enqueues a fresh job with
+    ``cluster=<name>`` after the raw-essay vault_edit succeeds. The
+    worker re-runs extraction via the body_replace path, writing the
+    voice profile WITH cluster.
+
+    This test pins the queue contents — after the operator's reply,
+    the JSONL queue must carry a NEW job with the cluster value baked
+    in, addressed at the same raw_rel_path / raw_name as the original.
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 7777
+
+    # Step 1: /train without --cluster saves + arms the ask + enqueues
+    # the FIRST extraction job (cluster=None).
+    text = "An essay for the cluster-race regression. " * 20
+    await bot._finalize_train_paste(
+        ctx, chat_id=chat_id, text=text, cluster=None,
+    )
+    queue_path = Path(config.voice_train.queue_path)
+    first_jobs = voice_train.drain_queue(queue_path)
+    assert len(first_jobs) == 1
+    first_job = first_jobs[0]
+    assert first_job.cluster is None
+    assert first_job.kind == "voice"
+    raw_rel_path_pinned = first_job.raw_rel_path
+    raw_name_pinned = first_job.raw_name
+
+    # Step 2: operator answers "personal".
+    entry = bot._consume_pending_cluster_ask(ctx, chat_id)
+    assert entry is not None
+    # Sanity: the entry now carries raw_name + raw_body for re-enqueue.
+    assert entry["raw_name"] == raw_name_pinned
+    assert "An essay for the cluster-race" in entry["raw_body"]
+
+    await bot._handle_cluster_ask_reply(ctx, chat_id, "personal", entry)
+
+    # Step 3: a SECOND extraction job is now on the queue — same
+    # raw_rel_path, same raw_name, but with cluster="personal".
+    second_jobs = voice_train.drain_queue(queue_path)
+    assert len(second_jobs) == 1, (
+        "expected exactly one re-enqueued job after cluster reply"
+    )
+    second_job = second_jobs[0]
+    assert second_job.cluster == "personal", (
+        "re-enqueued job MUST carry the cluster value so the worker's "
+        "voice-profile write lands with cluster baked in"
+    )
+    assert second_job.kind == "voice"
+    assert second_job.raw_rel_path == raw_rel_path_pinned
+    assert second_job.raw_name == raw_name_pinned
+    # Distinct job_id (fresh job, not a duplicate of the original).
+    assert second_job.job_id != first_job.job_id
+    # Same raw_body (the saved essay text — frozen at /train time).
+    assert second_job.raw_body == first_job.raw_body
+
+
+@pytest.mark.asyncio
+async def test_cluster_reply_general_does_not_reenqueue(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: ``general`` opt-out does NOT re-enqueue extraction.
+
+    P1 fix (2026-05-08). The opt-out short-circuits before either the
+    raw-essay tag-write OR the re-enqueue runs. Pin: queue is empty
+    after a /train + ``general`` reply (the original /train job was
+    drained by the test helper before the reply ran, so the queue
+    state we observe here is purely whatever the cluster-reply path
+    contributed).
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 8484
+
+    text = "Essay content for opt-out re-enqueue test. " * 20
+    await bot._finalize_train_paste(
+        ctx, chat_id=chat_id, text=text, cluster=None,
+    )
+    # Drain the original /train job so we can observe what the
+    # cluster-reply path contributes.
+    queue_path = Path(config.voice_train.queue_path)
+    voice_train.drain_queue(queue_path)
+
+    entry = bot._consume_pending_cluster_ask(ctx, chat_id)
+    await bot._handle_cluster_ask_reply(ctx, chat_id, "general", entry)
+
+    # Opt-out: NO new job on the queue.
+    post_jobs = voice_train.drain_queue(queue_path)
+    assert post_jobs == [], (
+        "general opt-out must not enqueue a re-extraction job"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cluster_reply_reenqueue_failure_falls_back_gracefully(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: re-enqueue failure does NOT roll back raw-essay tag.
+
+    P1 fix (2026-05-08). If the re-enqueue throws (queue file
+    permissions, disk full, etc.), the raw-essay vault_edit tag is
+    already applied and stays applied. The reply text surfaces a
+    warning so the operator can re-run /train --cluster <name>
+    manually to retry.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 9595
+
+    text = "Essay for re-enqueue-failure test. " * 20
+    await bot._finalize_train_paste(
+        ctx, chat_id=chat_id, text=text, cluster=None,
+    )
+    raw_rel_path = bot_data["voice_train_pending_cluster"][chat_id][
+        "raw_rel_path"
+    ]
+    saved_file = Path(config.vault.path) / raw_rel_path
+
+    entry = bot._consume_pending_cluster_ask(ctx, chat_id)
+
+    # Force enqueue_job to raise.
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise OSError("simulated queue failure")
+
+    with patch.object(voice_train, "enqueue_job", _boom):
+        await bot._handle_cluster_ask_reply(
+            ctx, chat_id, "personal", entry,
+        )
+
+    # Raw-essay tag IS applied — first vault_edit ran before the
+    # re-enqueue.
+    post = frontmatter.loads(saved_file.read_text(encoding="utf-8"))
+    assert post.metadata.get("cluster") == "personal"
+
+    # Reply text surfaces the re-enqueue failure.
+    confirms = [s for s in sent if "tagged" in s[1].lower()]
+    assert confirms, "no confirmation reply"
+    last_reply = confirms[-1][1]
+    assert "re-extraction" in last_reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_cluster_ask_entry_carries_raw_body_and_name(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: pending-cluster entry carries raw_name + raw_body.
+
+    P1 fix (2026-05-08). The re-enqueue path needs the raw record's
+    name + body to construct a fresh ExtractionJob. Both are stored
+    on the entry at finalize time. Pin: after /train without
+    --cluster, the entry has these fields populated.
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            pass
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 6868
+
+    text = "Essay text used for re-enqueue. " * 20
+    await bot._finalize_train_paste(
+        ctx, chat_id=chat_id, text=text, cluster=None,
+    )
+
+    entry = bot_data["voice_train_pending_cluster"][chat_id]
+    assert "raw_name" in entry
+    assert entry["raw_name"]  # non-empty
+    assert "raw_body" in entry
+    # The exact assembled body — must include the original text so
+    # the worker's extraction operates on the same content.
+    assert text.strip() in entry["raw_body"]

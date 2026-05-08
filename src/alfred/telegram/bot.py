@@ -1570,11 +1570,26 @@ async def on_method_source(
 def _make_cluster_ask_entry(
     *,
     raw_rel_path: str,
+    raw_name: str,
+    raw_body: str,
     instance: str,
 ) -> dict[str, Any]:
-    """Build a pending-cluster entry. Keys are stable for test access."""
+    """Build a pending-cluster entry. Keys are stable for test access.
+
+    Carries enough state to (a) tag the raw essay with the cluster
+    field via vault_edit AND (b) re-enqueue a fresh extraction job
+    that will write the voice profile with the cluster baked in. The
+    re-enqueue is the cluster-tag race fix — see the docstring on
+    :func:`_handle_cluster_ask_reply` for the full failure mode.
+
+    ``raw_body`` is held in-memory only — never persisted. The 5-min
+    expiry caps the worst-case memory cost; once the operator answers
+    or the entry expires, the body is dropped.
+    """
     return {
         "raw_rel_path": raw_rel_path,
+        "raw_name": raw_name,
+        "raw_body": raw_body,
         "instance": instance,
         "expires_at": datetime.now(timezone.utc).timestamp()
         + _VOICE_TRAIN_CLUSTER_ASK_TIMEOUT_SECONDS,
@@ -1645,6 +1660,29 @@ async def _handle_cluster_ask_reply(
     ``general`` short-circuits without touching the vault; any other
     name is written via ``vault_edit`` on the recorded raw_rel_path.
 
+    Cluster-tag race fix (P1 from #69 review, 2026-05-08): the
+    /train job was enqueued with ``cluster=None``, so the worker's
+    voice-profile write would land WITHOUT a cluster field even after
+    we tag the raw essay here. ``_list_voice_leaves_with_cluster``
+    reads the VOICE PROFILE frontmatter (NOT the raw essay), so an
+    untagged voice profile gets excluded from the cluster-tier
+    rebuild — silently breaking the headline promise of the cluster
+    ask UX.
+
+    Fix is Option A.2 (re-enqueue): after the raw-essay vault_edit
+    succeeds, append a fresh ExtractionJob with ``cluster=<name>``.
+    The worker re-runs extraction (now with cluster carried through
+    job.cluster → ``_write_structured_record(cluster=...)``) and
+    body_replaces the prior voice-profile body with the cluster-
+    tagged version. Hypatia scope already permits ``body_replace``
+    on ``voice`` records (scope.py:436), so the second worker pass
+    succeeds where the first wrote without cluster. Cost: ~17s of
+    extra Opus extraction time; benefit: deterministic outcome with
+    no polling complexity. If the first extraction is still running
+    when the second job lands, both run in queue order — final
+    state is the cluster-tagged voice profile either way (FIFO
+    drain order + body_replace overwriting).
+
     On success we send a brief confirmation; failures fall back to a
     "couldn't tag" reply (the essay is saved either way — this is a
     nice-to-have on top of the already-shipped extraction).
@@ -1653,6 +1691,8 @@ async def _handle_cluster_ask_reply(
     bot_obj = ctx.bot
     cluster = text.strip()
     raw_rel_path = entry.get("raw_rel_path") or ""
+    raw_name = entry.get("raw_name") or ""
+    raw_body = entry.get("raw_body") or ""
 
     if cluster.lower() == _CLUSTER_OPT_OUT_SENTINEL:
         # Opt-out — leave cluster field unset; that was the legacy
@@ -1674,7 +1714,7 @@ async def _handle_cluster_ask_reply(
             )
         return
 
-    # Apply the cluster tag via vault_edit.
+    # Step 1: apply the cluster tag to the raw essay frontmatter.
     try:
         from alfred.vault import ops as _ops
         _ops.vault_edit(
@@ -1707,6 +1747,64 @@ async def _handle_cluster_ask_reply(
             )
         return
 
+    # Step 2: re-enqueue a fresh extraction job with the cluster
+    # value baked in. This rewrites the voice profile via the
+    # worker's body_replace path, ensuring the structured record
+    # carries the cluster field so the cluster-tier rebuild filter
+    # (`_list_voice_leaves_with_cluster`) actually picks it up.
+    #
+    # Failure of the re-enqueue is logged but does NOT roll back
+    # the raw-essay tag — the operator can still re-run /train with
+    # --cluster to retry. We surface a "tagged but re-extraction
+    # didn't enqueue" warning in the reply when this happens.
+    reextract_warning = ""
+    if not raw_name or not raw_body:
+        # Defensive — older entry shape (pre-fix) lacked these
+        # fields. Per intentionally-left-blank, surface explicitly.
+        log.warning(
+            "talker.bot.voice_train.cluster_ask_reextract_skipped",
+            chat_id=chat_id,
+            raw_rel_path=raw_rel_path,
+            reason="missing_raw_data",
+        )
+        reextract_warning = (
+            " (re-extraction skipped — missing raw fixture data; "
+            "the voice profile may not carry the cluster tag)"
+        )
+    else:
+        queue_path = _resolve_queue_path(config)
+        try:
+            reextract_job = voice_train.make_job(
+                kind="voice",
+                raw_rel_path=raw_rel_path,
+                raw_name=raw_name,
+                raw_body=raw_body,
+                cluster=cluster,
+                chat_id=chat_id,
+                instance=config.instance.name or "",
+            )
+            voice_train.enqueue_job(queue_path, reextract_job)
+            log.info(
+                "talker.bot.voice_train.cluster_ask_reextract_enqueued",
+                chat_id=chat_id,
+                raw_rel_path=raw_rel_path,
+                cluster=cluster,
+                job_id=reextract_job.job_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "talker.bot.voice_train.cluster_ask_reextract_failed",
+                chat_id=chat_id,
+                raw_rel_path=raw_rel_path,
+                cluster=cluster,
+                error=str(exc),
+            )
+            reextract_warning = (
+                f" (re-extraction couldn't enqueue: {exc} — the "
+                f"voice profile may not carry the cluster tag; "
+                f"re-run /train --cluster {cluster} to retry)"
+            )
+
     log.info(
         "talker.bot.voice_train.cluster_ask_applied",
         chat_id=chat_id,
@@ -1717,9 +1815,9 @@ async def _handle_cluster_ask_reply(
         await bot_obj.send_message(
             chat_id=chat_id,
             text=(
-                f"tagged `{raw_rel_path}` with cluster `{cluster}`. "
-                f"the cluster-tier rebuild will run when ≥2 leaves "
-                f"share this tag."
+                f"tagged `{raw_rel_path}` with cluster `{cluster}`"
+                f"{reextract_warning}. the cluster-tier rebuild will "
+                f"run when ≥2 leaves share this tag."
             ),
         )
     except Exception:  # noqa: BLE001
@@ -2127,6 +2225,8 @@ async def _finalize_train_paste(
         )
         pending_asks[chat_id] = _make_cluster_ask_entry(
             raw_rel_path=raw_result.rel_path,
+            raw_name=raw_result.name,
+            raw_body=text,
             instance=config.instance.name or "",
         )
         cluster_question = (
