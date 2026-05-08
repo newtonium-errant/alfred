@@ -314,3 +314,31 @@ brief_digest_push:
 #     aftermath-lab: "/home/andrew/aftermath-lab"
 #     alfred:        "/home/andrew/aftermath-alfred"
 #     rrts:          "/home/andrew/aftermath-rrts"
+
+# ---------------------------------------------------------------------------
+# telegram.voice_train — /train + /method-source slash commands (Hypatia)
+# ---------------------------------------------------------------------------
+# Goes inside the ``telegram:`` block (not at top-level). Phase 1 is
+# Hypatia-only (the four new vault types — essay / voice / voice-cluster
+# / method — are admitted only under HYPATIA_CREATE_TYPES). Salem and
+# KAL-LE adoption is a config flip + scope-allowlist edit.
+#
+# When enabled:
+#   * /train [--cluster <name>] [<text>] — saves the raw essay at
+#     document/essay/<slug>.md, enqueues an async voice-profile
+#     extraction job, replies sub-2s. Worker writes voice/<slug>.md
+#     when extraction completes; cluster + overall builders fire when
+#     ≥2 leaves / clusters share tags.
+#   * /method-source [<text>] — saves source/<slug>.md + queues a
+#     method-profile extraction. Image attachments are recorded; the
+#     LLM uses the raw text the operator pasted.
+# When disabled (default): commands NOT registered, worker not started.
+#
+# telegram:
+#   voice_train:
+#     command_enabled: true
+#     # extraction_model: "claude-opus-4-5"    # default; depth-class work
+#     # worker_poll_seconds: 8                 # 4-15s reasonable range
+#     # min_paste_chars: 200                   # rejects short inputs
+#     # queue_path: "/home/andrew/.alfred/<instance>/extraction_queue.jsonl"
+#     #   ^ defaults to ./data/<instance-slug>/extraction_queue.jsonl

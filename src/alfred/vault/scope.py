@@ -422,6 +422,20 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
             "fiction-character": True,
             # practice-session deliberately OMITTED — see
             # ``allow_body_insert_at`` comment above.
+            #
+            # Voice/method training types (2026-05-07): the structured
+            # records (voice, voice-cluster, method) are re-written by
+            # the async extraction worker on re-extraction or cluster
+            # rebuild. Raw records (essay, source) are write-once and
+            # NOT in the replace allowlist — re-running /train on the
+            # same essay produces a NEW voice profile, not a body
+            # rewrite of the original essay record. body_insert_at
+            # stays empty for all four types — no anchored mid-doc
+            # insertion is part of the workflow; the worker writes
+            # whole bodies, not patches.
+            "voice": True,
+            "voice-cluster": True,
+            "method": True,
         },
     },
     # Instructor executes natural-language directives parked in the
@@ -528,6 +542,13 @@ HYPATIA_CREATE_TYPES: set[str] = {
     # would surface as "type accepted by validator, rejected by scope"
     # or vice versa.
     "practice-session",
+    # Voice/method training types (2026-05-07, /train + /method-source).
+    # Hypatia is the originating instance; Salem/KAL-LE can opt in via
+    # config later (the worker module is instance-neutral). Keep this
+    # set in sync with ``KNOWN_TYPES_HYPATIA`` in schema.py — drift
+    # between the two would surface as "type accepted by validator,
+    # rejected by scope" or vice versa.
+    "essay", "voice", "voice-cluster", "method",
 }
 
 

@@ -52,6 +52,7 @@ from . import (
     transcribe,
     tts as tts_mod,
     vision,
+    voice_train,
 )
 from .config import TalkerConfig
 from .session import Session, append_image, append_outbound_failure
@@ -239,6 +240,23 @@ def build_app(
     if config.fiction is not None and config.fiction.command_enabled:
         app.add_handler(CommandHandler("fiction", on_fiction))
         log.info("talker.bot.fiction_command_registered")
+
+    # 2026-05-07 voice_train arc: /train + /method-source — Hypatia-only
+    # in Phase 1, gated by the same shape as fiction. PTB rejects ``-``
+    # in command names (must be ``[a-z0-9_]``) so ``/method-source`` is
+    # registered as ``method_source`` at the bot layer; users typing
+    # ``/method-source`` get the legacy unknown-command behaviour while
+    # ``/method_source`` works. The user-facing spec calls it
+    # ``/method-source`` for naming consistency with the directory; we
+    # accept BOTH spellings via the inline-text path. The slash-command
+    # registration uses the underscore form because PTB requires it.
+    if (
+        config.voice_train is not None
+        and config.voice_train.command_enabled
+    ):
+        app.add_handler(CommandHandler("train", on_train))
+        app.add_handler(CommandHandler("method_source", on_method_source))
+        log.info("talker.bot.voice_train_commands_registered")
 
     # Email-surfacing c2: Daily Sync slash commands. /calibrate fires
     # an out-of-cycle Daily Sync sample; /calibration_ok flips per-tier
@@ -1317,6 +1335,342 @@ async def on_fiction(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Files created:\n"
         + "\n".join(f"  • {p}" for p in result.created_files)
     )
+
+
+# --- Voice/method training slash commands (2026-05-07 arc) ---------------
+
+
+def _resolve_voice_train_input(
+    update: Update,
+    state_mgr: StateManager,
+    config: TalkerConfig,
+    *,
+    body_arg: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Return (text, image_metadata) for a /train or /method-source call.
+
+    Resolution order:
+      1. Caption text on the slash-message itself (if the user attached
+         media to the slash command).
+      2. The arg the user typed after the slash.
+      3. The most-recent qualifying user paste in the active session
+         transcript.
+
+    Image metadata is ALWAYS pulled from the active session transcript
+    (the spec ships /method-source vision via "send the screenshot,
+    then send /method-source") AND from the caption-attached path
+    (when the user sends the slash command in the same message as the
+    image — less common but supported).
+
+    Returns ``("", [])`` when nothing resolves — the handler renders a
+    "no recent paste" reply.
+    """
+    # Step 1+2: explicit body wins.
+    text = body_arg or ""
+
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return text, []
+
+    # Most-recent paste fallback.
+    if not text:
+        active = state_mgr.get_active(chat_id) or {}
+        transcript = active.get("transcript") or []
+        min_chars = (
+            config.voice_train.min_paste_chars
+            if config.voice_train is not None
+            else 200
+        )
+        text = voice_train.find_most_recent_user_paste(
+            transcript, min_chars=min_chars,
+        )
+
+    # Image metadata: pull from the session's images list (the photo
+    # handler stamps them onto session.images via append_image).
+    image_metadata: list[dict[str, Any]] = []
+    active = state_mgr.get_active(chat_id) or {}
+    images = active.get("images") or []
+    # Take the most-recent image (last entry). The slash-command
+    # workflow is "send image then send slash"; we attach the most-
+    # recent one. Operators wanting multiple images attached should
+    # send them as one Telegram media-group, which lands as multiple
+    # images on consecutive turns — out of scope for Phase 1.
+    if images:
+        image_metadata = [images[-1]]
+    return text, image_metadata
+
+
+async def on_train(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/train [--cluster <name>] [<text>]`` — train Hypatia on Andrew's voice.
+
+    Saves the raw essay record at ``document/essay/<slug>.md``
+    immediately, enqueues an async voice-profile extraction job, and
+    replies sub-2s with "saved, voice extraction queued".
+
+    Resolution: explicit body in the slash-arg → most-recent long
+    paste in conversation memory. Empty/short input gets a "no recent
+    paste" reply rather than a queued job.
+
+    The async worker (started by the daemon when voice_train is
+    configured) picks up the job, calls Opus, writes the structured
+    voice profile, and DMs the operator on completion.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+    if config.voice_train is None or not config.voice_train.command_enabled:
+        # Defensive — registration is gated, but if a future code path
+        # routes here without the gate (e.g. inline-command) we still
+        # refuse cleanly.
+        await update.message.reply_text(
+            "/train is not enabled on this instance."
+        )
+        return
+
+    raw_text = update.message.text or ""
+    cluster, body_arg = voice_train.parse_train_args(raw_text, ctx.args)
+    text, image_metadata = _resolve_voice_train_input(
+        update, state_mgr, config, body_arg=body_arg,
+    )
+
+    if not text or len(text) < config.voice_train.min_paste_chars:
+        await update.message.reply_text(
+            "no recent paste found — send the essay text after the "
+            "command (`/train your essay text...`) or paste it as a "
+            "prior message in this session."
+        )
+        log.info(
+            "talker.bot.voice_train.no_input",
+            chat_id=update.effective_chat.id,
+            cluster=cluster,
+            kind="voice",
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    log.info(
+        "talker.bot.voice_train.invoked",
+        chat_id=chat_id,
+        kind="voice",
+        text_len=len(text),
+        cluster=cluster,
+    )
+
+    # Save raw record immediately (sub-2s ack budget).
+    raw_result = voice_train.save_raw_essay(
+        Path(config.vault.path),
+        text=text,
+        cluster=cluster,
+        scope=_voice_train_scope_for(config),
+    )
+    if not raw_result.success:
+        await update.message.reply_text(
+            f"couldn't save raw essay record: {raw_result.error}"
+        )
+        return
+
+    # Enqueue extraction job. Failure here flips the raw record to
+    # ``failed`` so the operator knows to re-run.
+    queue_path = _resolve_queue_path(config)
+    job = voice_train.make_job(
+        kind="voice",
+        raw_rel_path=raw_result.rel_path,
+        raw_name=raw_result.name,
+        raw_body=text,
+        cluster=cluster,
+        chat_id=chat_id,
+        instance=config.instance.name or "",
+    )
+    try:
+        voice_train.enqueue_job(queue_path, job)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.voice_train.enqueue_failed",
+            error=str(exc),
+            raw_rel_path=raw_result.rel_path,
+        )
+        # Mark raw record failed so operator can retry.
+        try:
+            from alfred.vault import ops as _ops
+            _ops.vault_edit(
+                Path(config.vault.path),
+                raw_result.rel_path,
+                set_fields={
+                    "extraction_status": "failed",
+                    "extraction_failure_reason": f"enqueue: {exc}",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.bot.voice_train.mark_failed_failed",
+                rel_path=raw_result.rel_path,
+            )
+        await update.message.reply_text(
+            f"saved raw essay at `{raw_result.rel_path}`, but the "
+            f"extraction queue couldn't accept the job: {exc}. Re-run "
+            f"/train to retry."
+        )
+        return
+
+    cluster_msg = f" (cluster: {cluster})" if cluster else ""
+    await update.message.reply_text(
+        f"saved `{raw_result.rel_path}`{cluster_msg} — voice extraction "
+        f"queued. I'll DM you when the profile is ready."
+    )
+
+
+async def on_method_source(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """``/method-source [<text>]`` (registered as /method_source).
+
+    Saves the raw source record at ``source/<slug>.md`` immediately,
+    enqueues an async method-profile extraction job, replies sub-2s.
+
+    Image attachments: when an image is on the active session's
+    ``images`` list, the source body includes a reference to it AND
+    the LLM call gets vision-transcription wrapping in a future
+    Phase 1.5. Phase 1 ships the image-reference + raw-text path;
+    if the operator sent an image-only message (no caption, no prior
+    paste), the handler refuses with "no source text — describe the
+    method or paste it after the slash" rather than guessing.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+    if config.voice_train is None or not config.voice_train.command_enabled:
+        await update.message.reply_text(
+            "/method-source is not enabled on this instance."
+        )
+        return
+
+    raw_text = update.message.text or ""
+    body_arg = voice_train.parse_method_source_args(raw_text, ctx.args)
+    text, image_metadata = _resolve_voice_train_input(
+        update, state_mgr, config, body_arg=body_arg,
+    )
+
+    if not text or len(text) < config.voice_train.min_paste_chars:
+        await update.message.reply_text(
+            "no source text found — paste the method/system text "
+            "after the command (`/method-source your text...`) or "
+            "send it as a prior message in this session."
+        )
+        log.info(
+            "talker.bot.voice_train.no_input",
+            chat_id=update.effective_chat.id,
+            kind="method",
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    log.info(
+        "talker.bot.voice_train.invoked",
+        chat_id=chat_id,
+        kind="method",
+        text_len=len(text),
+        has_image=bool(image_metadata),
+    )
+
+    # Save raw record immediately.
+    raw_result = voice_train.save_raw_source(
+        Path(config.vault.path),
+        text=text,
+        scope=_voice_train_scope_for(config),
+        image_metadata=image_metadata,
+    )
+    if not raw_result.success:
+        await update.message.reply_text(
+            f"couldn't save raw source record: {raw_result.error}"
+        )
+        return
+
+    queue_path = _resolve_queue_path(config)
+    job = voice_train.make_job(
+        kind="method",
+        raw_rel_path=raw_result.rel_path,
+        raw_name=raw_result.name,
+        raw_body=text,
+        image_metadata=image_metadata,
+        chat_id=chat_id,
+        instance=config.instance.name or "",
+    )
+    try:
+        voice_train.enqueue_job(queue_path, job)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.voice_train.enqueue_failed",
+            error=str(exc),
+            raw_rel_path=raw_result.rel_path,
+        )
+        try:
+            from alfred.vault import ops as _ops
+            _ops.vault_edit(
+                Path(config.vault.path),
+                raw_result.rel_path,
+                set_fields={
+                    "extraction_status": "failed",
+                    "extraction_failure_reason": f"enqueue: {exc}",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.bot.voice_train.mark_failed_failed",
+                rel_path=raw_result.rel_path,
+            )
+        await update.message.reply_text(
+            f"saved raw source at `{raw_result.rel_path}`, but the "
+            f"extraction queue couldn't accept the job: {exc}. Re-run "
+            f"/method-source to retry."
+        )
+        return
+
+    image_msg = " (with image reference)" if image_metadata else ""
+    await update.message.reply_text(
+        f"saved `{raw_result.rel_path}`{image_msg} — method extraction "
+        f"queued. I'll DM you when the profile is ready."
+    )
+
+
+def _voice_train_scope_for(config: TalkerConfig) -> str:
+    """Return the vault scope string for voice_train writes.
+
+    Phase 1: hardcoded mapping by ``instance.tool_set`` so a Hypatia
+    daemon writes under the ``hypatia`` scope (admits the new ``essay``
+    / ``voice`` / ``voice-cluster`` / ``method`` types via
+    HYPATIA_CREATE_TYPES). A future Salem/KAL-LE adoption would extend
+    TALKER_CREATE_TYPES / KALLE_CREATE_TYPES with the same types and
+    flip the mapping below — config-flippable, not a refactor.
+    """
+    tool_set = (config.instance.tool_set or "").lower()
+    if tool_set == "hypatia":
+        return "hypatia"
+    if tool_set == "kalle":
+        return "kalle"
+    return "talker"
+
+
+def _resolve_queue_path(config: TalkerConfig) -> Path:
+    """Resolve the JSONL queue path, honouring the per-instance default.
+
+    Defaults to ``./data/<instance-slug>/extraction_queue.jsonl`` when
+    the operator hasn't set ``voice_train.queue_path`` in config. The
+    per-instance subdirectory keeps Salem / Hypatia / KAL-LE queues
+    isolated even when they share a working directory.
+    """
+    if config.voice_train is not None and config.voice_train.queue_path:
+        return Path(config.voice_train.queue_path)
+    instance_slug = (
+        (config.instance.name or "default").strip().lower()
+        .replace(" ", "-").replace(".", "")
+    )
+    return Path("./data") / instance_slug / "extraction_queue.jsonl"
 
 
 # --- Daily Sync slash commands (email-surfacing c2) -----------------------

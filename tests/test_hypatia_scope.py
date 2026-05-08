@@ -139,6 +139,13 @@ def test_hypatia_create_types_shape() -> None:
         "fiction-world", "fiction-voice", "fiction-character",
         # 2026-05-06 practice logging
         "practice-session",
+        # 2026-05-07 voice/method training (/train + /method-source arc).
+        # Four new top-level types: ``essay`` is the raw published-essay
+        # leaf, ``voice`` is the structured voice profile, ``voice-cluster``
+        # is the cluster-tier aggregate, ``method`` is the structured
+        # method/system profile. Per CLAUDE.md scope-first design — pin
+        # the matrix here so widening it later is a deliberate edit.
+        "essay", "voice", "voice-cluster", "method",
     }
 
 
@@ -166,6 +173,11 @@ def test_known_types_hypatia_is_separate_set() -> None:
         "fiction-world", "fiction-voice", "fiction-character",
         # 2026-05-06 practice logging
         "practice-session",
+        # 2026-05-07 voice/method training types — keep in sync with
+        # HYPATIA_CREATE_TYPES (the matching pinning test above).
+        # Drift between the two sets surfaces as "type accepted by
+        # validator, rejected by scope" or vice versa.
+        "essay", "voice", "voice-cluster", "method",
     }
     for t in schema.KNOWN_TYPES_HYPATIA:
         assert t not in schema.KNOWN_TYPES, (

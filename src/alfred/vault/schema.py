@@ -60,6 +60,31 @@ KNOWN_TYPES_HYPATIA: set[str] = {
     # ``HYPATIA_CREATE_TYPES`` + the body-mutation matrix entry for
     # the per-instance gating.
     "practice-session",
+    # Voice/method training (2026-05-07, /train + /method-source arc).
+    # Four new top-level types — registered here so the Hypatia create
+    # allowlist can admit them. The shape:
+    #   - ``essay``        — raw published essay, lands at
+    #                        ``document/essay/<slug>.md``. Distinct
+    #                        from a generic ``note`` because the routing
+    #                        is type-driven (TYPE_DIRECTORY entry below);
+    #                        the f006c48e routing bug landed because
+    #                        ``vault_create type=note`` was the outer
+    #                        call and the inner ``type: essay`` in
+    #                        set_fields was overridden by ops. Adding
+    #                        ``essay`` as a first-class type fixes it.
+    #   - ``voice``        — leaf voice profile, lands at
+    #                        ``voice/<slug>.md``. One per source essay;
+    #                        carries optional ``cluster`` frontmatter
+    #                        for grouping into cluster-summary tier.
+    #   - ``voice-cluster`` — cluster-tier voice summary, lands at
+    #                        ``voice/cluster/<name>.md``. Built async
+    #                        when ≥2 leaves share a ``cluster:`` tag.
+    #   - ``method``       — method/system profile, lands at
+    #                        ``method/<slug>.md``. Structured extraction
+    #                        of a method document (paired with a raw
+    #                        ``source`` record).
+    # ``source`` (already in this set) acts as the leaf for /method-source.
+    "essay", "voice", "voice-cluster", "method",
 }
 
 
@@ -126,6 +151,53 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     # skipped (intended-to-do but didn't, useful signal for the
     # tracker aggregator).
     "practice-session": {"planned", "in_progress", "completed", "skipped"},
+    # Voice/method training types (2026-05-07).
+    # ``essay`` — raw published essay records. Statuses match the
+    # operator's natural workflow: drafting → published → archived.
+    # The f006c48e example used ``status: published``; that's the
+    # most common state (these get registered AFTER publication).
+    "essay": {"draft", "published", "archived"},
+    # ``voice`` — leaf voice profiles. Pending = extraction queued
+    # but not yet completed by the worker; active = profile written;
+    # superseded = a re-extraction replaced this record (kept for
+    # audit, not deleted). Failed = extraction worker hit an error
+    # and the operator should re-run the slash command.
+    #
+    # Intentionally-left-blank sentinels (2026-05-07 prompt-tuner pass):
+    #   ``insufficient-evidence`` — leaf voice extraction: input was
+    #     too thin / fragmentary to extract a real voice profile.
+    #   ``no-overall-invariants`` — overall voice profile (also a
+    #     ``voice`` record by type — see maybe_rebuild_overall):
+    #     cluster summaries genuinely diverge, no real always_true
+    #     items emerged.
+    # Both pinned here so the writer can pass through the LLM-emitted
+    # status WITHOUT _validate_status rejecting it. Per the
+    # ``intentionally left blank`` rule, silent absence (i.e. dropping
+    # the sentinel and substituting ``active``) is forbidden — the
+    # operator must SEE that extraction emitted "no signal" rather
+    # than reading a fabricated profile that fills the schema.
+    "voice": {
+        "pending", "active", "superseded", "failed",
+        "insufficient-evidence", "no-overall-invariants",
+    },
+    # ``voice-cluster`` — aggregated cluster summaries built by the
+    # async cluster-summary builder. Status flips to ``stale`` when a
+    # new leaf with the same cluster tag lands (the next builder
+    # tick rewrites it back to ``active``).
+    # ``incoherent-cluster`` (2026-05-07) — same intentionally-left-
+    # blank pattern as voice's insufficient-evidence: the leaves under
+    # one cluster tag don't actually share a recognisable posture.
+    "voice-cluster": {"active", "stale", "incoherent-cluster"},
+    # ``method`` — structured method/system profiles, paired with a
+    # raw ``source`` record. Same status set as voice (extraction is
+    # the same async-worker shape).
+    # ``not-a-method`` (2026-05-07) — intentionally-left-blank exit:
+    # the source isn't actually a method (opinion essay / anecdote /
+    # ramble that doesn't formalise into principles + procedure).
+    "method": {
+        "pending", "active", "superseded", "failed",
+        "not-a-method",
+    },
 }
 
 # Type → expected top-level directory
@@ -155,6 +227,26 @@ TYPE_DIRECTORY: dict[str, str] = {
     # tree (e.g. ``practice-session/dj/<title>.md``) makes sense for
     # a particular skill domain.
     "practice-session": "practice-session",
+    # Voice/method training types (2026-05-07). Each routes to its
+    # own top-level directory:
+    #   - essay         → document/essay/<slug>.md  (nested under
+    #                     ``document/`` because essays are a kind of
+    #                     finished document; matches the f006c48e
+    #                     operator-set frontmatter ``path: document/
+    #                     essay/...`` that the routing bug exposed)
+    #   - voice         → voice/<slug>.md
+    #   - voice-cluster → voice/cluster/<slug>.md  (sub-path; the
+    #                     cluster summaries live under voice/ so
+    #                     Obsidian's tree view groups them with the
+    #                     leaf profiles they aggregate)
+    #   - method        → method/<slug>.md
+    # ``source`` (Hypatia type) keeps the default ``source/`` directory
+    # via TYPE_DIRECTORY.get(record_type, record_type) fallback — no
+    # explicit entry needed here.
+    "essay": "document/essay",
+    "voice": "voice",
+    "voice-cluster": "voice/cluster",
+    "method": "method",
     # session, input have flexible placement
 }
 

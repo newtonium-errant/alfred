@@ -882,6 +882,69 @@ async def run(
             interval_seconds=config.idle_tick.interval_seconds,
         )
 
+    # ---- Voice/method training worker ------------------------------------
+    # Async extraction worker that drains the JSONL queue, calls Opus on
+    # each pending job, writes the structured voice / method profile,
+    # and DMs the operator on completion. Per-instance opt-in via
+    # ``telegram.voice_train.command_enabled`` — when disabled (default
+    # for Salem / KAL-LE) the task is never created.
+    voice_train_task: asyncio.Task | None = None
+    if (
+        config.voice_train is not None
+        and config.voice_train.command_enabled
+    ):
+        from . import voice_train as _voice_train
+        from . import bot as _bot_mod
+
+        async def _voice_train_dm(chat_id: int, text: str) -> None:
+            """Best-effort DM to the operator on extraction completion / failure.
+
+            Wraps ``app.bot.send_message`` with the same per-chat lock
+            shape the transport uses (avoids double-fire if a transport
+            send raced with us). Failure is logged + swallowed — the
+            structured record landed regardless of whether the DM made it.
+            """
+            lock = send_lock_map.setdefault(chat_id, asyncio.Lock())
+            async with lock:
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=text)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "talker.daemon.voice_train_dm_failed",
+                        chat_id=chat_id,
+                    )
+                # 250ms inter-message floor mirrors the transport
+                # rate-limit pattern. Cheap insurance against bursts
+                # if the worker processes multiple jobs in one tick.
+                await asyncio.sleep(0.25)
+
+        queue_path = (
+            Path(config.voice_train.queue_path)
+            if config.voice_train.queue_path
+            else _bot_mod._resolve_queue_path(config)
+        )
+        scope = _bot_mod._voice_train_scope_for(config)
+        voice_train_task = asyncio.create_task(
+            _voice_train.run_worker(
+                queue_path=queue_path,
+                vault_path=Path(config.vault.path),
+                client=client,
+                model=config.voice_train.extraction_model,
+                scope=scope,
+                instance=config.instance.name or "",
+                poll_seconds=config.voice_train.worker_poll_seconds,
+                dm_callback=_voice_train_dm,
+                shutdown_event=shutdown_event,
+            ),
+            name="talker-voice-train-worker",
+        )
+        log.info(
+            "talker.daemon.voice_train_worker_started",
+            queue_path=str(queue_path),
+            poll_seconds=config.voice_train.worker_poll_seconds,
+            scope=scope,
+        )
+
     # ---- Transport server + scheduler tasks ------------------------------
     transport_server_task: asyncio.Task | None = None
     scheduler_task: asyncio.Task | None = None
@@ -971,9 +1034,14 @@ async def run(
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
 
-        # Stop the transport server + scheduler + heartbeat if they were
-        # started.
-        for t in (transport_server_task, scheduler_task, heartbeat_task):
+        # Stop the transport server + scheduler + heartbeat + voice_train
+        # worker if they were started.
+        for t in (
+            transport_server_task,
+            scheduler_task,
+            heartbeat_task,
+            voice_train_task,
+        ):
             if t is None:
                 continue
             t.cancel()

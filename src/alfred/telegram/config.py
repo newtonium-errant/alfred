@@ -211,6 +211,53 @@ class FictionConfig:
 
 
 @dataclass
+class VoiceTrainConfig:
+    """Per-instance gate for the ``/train`` + ``/method-source`` slash commands.
+
+    Default ``False`` so Salem (and any other operational-vault
+    instance) never accidentally registers the commands. Hypatia opts
+    in via ``telegram.voice_train.command_enabled: true`` in
+    ``config.hypatia.yaml`` because her vault layout has the
+    ``document/essay/`` + ``voice/`` + ``method/`` directory patterns
+    the worker writes into.
+
+    Conditional registration: when ``command_enabled=False`` (or the
+    ``voice_train`` block is absent entirely), neither slash command
+    is registered as a CommandHandler — Telegram's "unknown command"
+    behaviour fires for instances that legitimately don't support
+    voice/method training.
+
+    The async extraction worker only starts when
+    ``command_enabled=True``. With it disabled, no queue file is
+    polled, no Opus calls are made.
+
+    See ``project_image_vision_support.md`` and
+    ``project_hypatia_phase2_followups.md`` for adjacent posture gates
+    this follows the shape of.
+    """
+
+    command_enabled: bool = False
+    # JSONL queue file the slash-command handlers append to + the
+    # worker drains. ``None`` defaults to
+    # ``<vault.path>/../data/<instance>/extraction_queue.jsonl`` at
+    # daemon startup so each instance gets an isolated queue without
+    # the operator setting it explicitly.
+    queue_path: str | None = None
+    # Worker poll interval (seconds). 8s ticks pick up jobs within
+    # ack-perception time without burning CPU on idle ticks. Operator-
+    # tunable for low-volume instances.
+    worker_poll_seconds: int = 8
+    # Model used for the structured-extraction call. Opus 4.x is the
+    # default — extraction is deeper than per-turn conversation.
+    extraction_model: str = "claude-opus-4-5"
+    # Minimum char count for "most-recent paste" classification when
+    # the slash command is invoked with no body. Below this, the
+    # handler refuses with a "no recent paste" reply rather than
+    # extracting from a one-line "ok cool" prior message.
+    min_paste_chars: int = 200
+
+
+@dataclass
 class BashExecConfig:
     """KAL-LE's ``bash_exec`` tool config.
 
@@ -261,6 +308,11 @@ class TalkerConfig:
     # optional-block convention (tts / bash_exec) so health probes can
     # tell "block absent" from "block present, command disabled".
     fiction: FictionConfig | None = None
+    # Voice/method training gate — see :class:`VoiceTrainConfig`.
+    # Default-OFF / None sentinel like fiction. Hypatia is Phase 1's
+    # only opt-in; Salem/KAL-LE adoption is a config flip when their
+    # workflows need it.
+    voice_train: VoiceTrainConfig | None = None
     # Path to the config file this TalkerConfig was loaded from. Carried
     # so lazy/late loaders (notably the inter-instance peer-tool dispatcher
     # in ``conversation._dispatch_peer_inter_instance_tool``) can re-read
@@ -290,6 +342,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "idle_tick": IdleTickConfig,
     "vision": VisionConfig,
     "fiction": FictionConfig,
+    "voice_train": VoiceTrainConfig,
 }
 
 
@@ -372,6 +425,13 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     fiction_raw = tool.get("fiction")
     if isinstance(fiction_raw, dict) and fiction_raw:
         built.fiction = _build(FictionConfig, fiction_raw)
+    # Voice/method training — defaulted-OFF / None sentinel. Same shape
+    # as fiction. Block-absent means commands NOT registered; block
+    # present with explicit ``command_enabled: true`` registers /train
+    # + /method-source AND starts the extraction worker.
+    voice_train_raw = tool.get("voice_train")
+    if isinstance(voice_train_raw, dict) and voice_train_raw:
+        built.voice_train = _build(VoiceTrainConfig, voice_train_raw)
     # Synthetic ``_config_path`` key — set by the CLI in ``cmd_up`` /
     # other entry points before handing ``raw`` to the orchestrator,
     # carried through ``multiprocessing`` pickling to subprocess
