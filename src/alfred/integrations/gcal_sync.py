@@ -233,11 +233,15 @@ def sync_event_create_to_gcal(
     + ``gcal_calendar`` (from ``config.alfred_calendar_label``) back
     into the vault record's frontmatter.
 
-    ``title_source`` describes which frontmatter field the caller
-    resolved the title from — one of ``"gcal_title"`` / ``"title"`` /
-    ``"name"`` (per :func:`resolve_gcal_title`). Logged on
-    ``gcal.sync_created`` so operators can grep for records using the
-    override. Default ``"name"`` matches the pre-decoupling behavior.
+    ``title_source`` describes which field the caller resolved the
+    title from — typically one of ``"gcal_title"`` / ``"title"`` /
+    ``"name"`` (per :func:`resolve_gcal_title`). The backfill CLI may
+    also pass ``"filename_stem"`` when a record has none of the three
+    frontmatter title fields and falls back to the markdown filename
+    stem. Logged on ``gcal.sync_created`` so operators can grep for
+    records using the override (or the degenerate fallback) without
+    round-tripping through the frontmatter. Default ``"name"`` matches
+    the pre-decoupling behavior.
     """
     skip = _gcal_skip_check(
         client=client, config=config, intended_on=intended_on,

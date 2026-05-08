@@ -304,6 +304,99 @@ def test_backfill_live_sync_writes_back_id(tmp_path, capsys):
     assert fm["gcal_calendar"] == "alfred"
 
 
+def test_backfill_title_source_filename_stem_when_no_title_fields(tmp_path, capsys):
+    """Degenerate-fallback path: event with NO ``gcal_title`` / ``title`` /
+    ``name`` falls back to the markdown filename stem; ``title_source``
+    on the ``gcal.sync_created`` log emits ``"filename_stem"`` so
+    operators grepping ``title_source=name`` only see records that
+    legitimately resolved through the ``name`` frontmatter field.
+
+    Regression guard for the source-conflation fix: prior to the fix
+    the backfill code labeled this fallback as ``title_source="name"``
+    even though the title came from ``md_file.stem``, not the ``name``
+    field.
+    """
+    from structlog.testing import capture_logs
+    from alfred.integrations import gcal_cli
+
+    # Seed an event WITHOUT name/title/gcal_title — only start+end+type.
+    # This is degenerate (a real vault wouldn't have a nameless event),
+    # but the backfill code defends against it by falling back to the
+    # filename stem rather than crashing.
+    event_dir = tmp_path / "event"
+    event_dir.mkdir()
+    file_path = event_dir / "Nameless Stem Record.md"
+    post = frontmatter.Post(
+        "body\n",
+        type="event",
+        start="2026-06-27T19:00:00-03:00",
+        end="2026-06-27T22:00:00-03:00",
+    )
+    file_path.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+
+    fake_client = MagicMock()
+    fake_client.create_event.return_value = "stem-gcal-id-1"
+
+    with patch("alfred.integrations.gcal.GCalClient", return_value=fake_client):
+        with capture_logs() as captured:
+            rc = gcal_cli.cmd_backfill(
+                _make_raw(tmp_path),
+                from_date="2025-01-01",
+                wants_json=True,
+            )
+    assert rc == 0
+    # GCal received the filename stem as title.
+    kwargs = fake_client.create_event.call_args.kwargs
+    assert kwargs["title"] == "Nameless Stem Record"
+    # Log carries the new ``filename_stem`` source label, NOT ``name``.
+    created_logs = [c for c in captured if c.get("event") == "gcal.sync_created"]
+    assert len(created_logs) == 1
+    assert created_logs[0]["title_source"] == "filename_stem"
+
+
+def test_backfill_title_source_name_when_only_name_set(tmp_path, capsys):
+    """Legitimate ``name``-fallback path: event with ``name`` (no
+    ``gcal_title``, no ``title``) emits ``title_source="name"`` on the
+    sync log. Regression guard that the degenerate-fallback fix did NOT
+    accidentally relabel the legitimate ``name`` resolution path.
+    """
+    from structlog.testing import capture_logs
+    from alfred.integrations import gcal_cli
+
+    # Seed an event with ONLY ``name`` (no title, no gcal_title) — this
+    # is the legitimate ``name``-fallback path through resolve_gcal_title.
+    event_dir = tmp_path / "event"
+    event_dir.mkdir()
+    file_path = event_dir / "Has Name Field.md"
+    post = frontmatter.Post(
+        "body\n",
+        type="event",
+        name="Coaching Session",
+        start="2026-06-27T19:00:00-03:00",
+        end="2026-06-27T22:00:00-03:00",
+    )
+    file_path.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+
+    fake_client = MagicMock()
+    fake_client.create_event.return_value = "name-gcal-id-1"
+
+    with patch("alfred.integrations.gcal.GCalClient", return_value=fake_client):
+        with capture_logs() as captured:
+            rc = gcal_cli.cmd_backfill(
+                _make_raw(tmp_path),
+                from_date="2025-01-01",
+                wants_json=True,
+            )
+    assert rc == 0
+    # GCal received the resolved title from the ``name`` field.
+    kwargs = fake_client.create_event.call_args.kwargs
+    assert kwargs["title"] == "Coaching Session"
+    # Log carries ``name`` — the legitimate resolution path is unchanged.
+    created_logs = [c for c in captured if c.get("event") == "gcal.sync_created"]
+    assert len(created_logs) == 1
+    assert created_logs[0]["title_source"] == "name"
+
+
 def test_backfill_records_failures(tmp_path, capsys):
     """Per-record failures show up in the failed list with code + detail."""
     from alfred.integrations import gcal_cli

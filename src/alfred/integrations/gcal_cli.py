@@ -756,11 +756,15 @@ def cmd_backfill(
         # ``gcal_title`` / ``title`` / ``name`` are missing or empty —
         # for backfill we still want to fall back to the filename stem
         # in that degenerate case (a real record that somehow has no
-        # ``name`` field shouldn't break the sweep).
+        # ``name`` field shouldn't break the sweep). Tag this with a
+        # distinct ``filename_stem`` source so operators grepping
+        # ``title_source=name`` only see records that legitimately
+        # resolved through the ``name`` frontmatter field, not the
+        # degenerate filename-stem fallback path.
         resolved_title, title_source = resolve_gcal_title(fm)
         title = resolved_title or md_file.stem
         if not resolved_title:
-            title_source = "name"  # filename-stem fallback
+            title_source = "filename_stem"
         description = str(fm.get("summary") or "")
         correlation_id = f"backfill-{md_file.stem[:32]}"
 
