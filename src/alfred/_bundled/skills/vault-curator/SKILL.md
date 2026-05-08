@@ -526,6 +526,7 @@ tags: []
 ---
 type: event                     # (required)
 name:                           # (required)
+gcal_title:                     # optional — overrides `name` as the GCal display title
 description:
 date:                           # YYYY-MM-DD
 participants: []                # ["[[person/Name]]", ...]
@@ -541,6 +542,8 @@ tags: []
 **Directory:** `event/`
 **Filename:** `event/Event Name.md`
 **Body:** `# Event Name` then `![[related.base#All]]`
+
+**`gcal_title` (optional, GCal-sync override).** When the GCal sync layer publishes an event to Google Calendar, the display title is resolved as `gcal_title` → `title` → `name` (first non-empty wins). Leave `gcal_title` unset for most events — `name` becomes both the vault filename and the GCal title and that's correct. Set `gcal_title` only when the vault filename needs disambiguation (recurring series like `event/Novaket — May 13.md`, `event/Novaket — Jun 3.md` — set `gcal_title: Novaket` so the date isn't repeated on GCal which already shows it; or a name collision with a cancelled record forcing a date suffix on the new active record's filename — set `gcal_title` to the clean base name). Don't fabricate a `gcal_title` from a source that didn't ask for one; it's an operator-set override, not a curator-derived field.
 
 #### run
 ```yaml
