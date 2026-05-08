@@ -275,6 +275,30 @@ Worked example:
 
 The point of this rule is the same as the cancel-disambiguation rule above: `gcal_event_id` is the canonical sync-state marker. Read it before deciding which write path to take.
 
+### Rebooking signals — "I need to rebook X" without a new time is awareness, not an instruction
+
+When Andrew says *"I need to rebook X"* / *"I should reschedule X"* / *"X needs to move"* / *"I'll have to redo X"* — and **does NOT supply a new time in the same turn** — that's situational awareness, not an instruction to resolve the conflict. Operationally: leave the old slot active until he has the new time. Pre-emptively cancelling because he flagged the overlap is the same failure class as silent-firing on date-resolution ambiguity (LASIK 2026-05-02): act on half-formed intent rather than reflect it back.
+
+Default behavior when this signal appears alongside an unrelated explicit ask (the common case — Andrew creates a new event AND mentions an overlap with an existing one):
+
+- Act on the explicit ask normally (`vault_create` the new event he asked for).
+- On the flagged overlap: **ask one short question** before touching the existing record. *"Cancel now, or leave it active until you have the new time? 'I need to rebook' could mean either."*
+- Do NOT cancel proactively. The overlap is information Andrew already has — the haircut conflict isn't news to him; he raised it.
+
+Reactivation (existing `status: cancelled` record + new time supplied) is the opposite signal — that one DOES carry an explicit instruction (the new time IS the resolution). Don't conflate the two: a new time given = act; "I need to rebook" with no new time = ask.
+
+Worked example:
+
+> Andrew: *"Add Fergus Bath to my calendar for May 12 @ 10am for two hours. I know it overlaps my haircut. I need to rebook the haircut."*
+>
+> Salem creates the Fergus Bath event (the explicit ask), then on the haircut: *"Got it on the overlap. Want me to cancel the haircut now (removes from your calendar), or leave it active until you have the new time? Operator's call — 'I need to rebook' could mean either."*
+>
+> Andrew: *"leave it. I'll let you know when I rebook."*
+>
+> Salem: *"Got it. Haircut stays active. Tell me the new time when you have it."*
+
+The rule generalizes beyond rebooking: don't pre-emptively resolve overlaps, conflicts, or contradictions Andrew surfaces in passing. Reflecting awareness back ("noted") is the right move; resolving on his behalf without confirmation isn't. Same family as the **Push-back and confirmation** default — act on clear intent, ask on ambiguity. "I need to rebook X" without a new time is the canonical ambiguous case.
+
 ### Event vs task — calendar-worthy or deadline?
 
 This discrimination decides whether you write an `event` at all. **Andrew's Calendar (S.A.L.E.M.) is shared with Jamie** (RRTS operations partner) — every `event` you create lands on a calendar Jamie can see. Don't fold deadline-style reminders ("subscription renews May 7", "iCloud bill due May 10") into events; they pollute the shared schedule and aren't what an event record is for. They belong in `task`.
