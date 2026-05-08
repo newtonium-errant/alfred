@@ -263,16 +263,32 @@ class VoiceTrainConfig:
     # plain-text messages in the same chat during that window are
     # appended to the buffer instead of going through the natural-
     # language conversation path. See Bug #58 (2026-05-08) and the
-    # ``PendingPaste`` block in ``voice_train.py``. 5s is the default
-    # because Telegram clients send chunks within ~1s of each other;
-    # 5s captures the common case without making the operator wait.
-    debounce_seconds: int = 5
+    # ``PendingPaste`` block in ``voice_train.py``.
+    #
+    # Ticket #70 (2026-05-07): bumped from 5s → 10s because Telegram
+    # client auto-split inter-chunk delays were observed at 7-12s in
+    # real use, causing the 5s default to flush prematurely and drop
+    # late chunks to the natural-language conversation handler. 10s
+    # captures the long-tail of the chunking-gap distribution at the
+    # cost of slower ack on single-message /train (acceptable — the
+    # ack is a courtesy, not gating user action). End-marker detection
+    # (see :func:`_buffer_has_end_marker`) flushes complete-essay
+    # pastes early, recovering most of the latency cost.
+    debounce_seconds: int = 10
     # Hard ceiling on how long a buffer may stay open. Even if the
     # operator keeps typing, the buffer flushes at this point so it
     # can't grow unbounded. 60s is generous for a multi-paragraph
     # paste-in-pieces workflow but keeps a wandered-off buffer from
     # holding the slot indefinitely.
     max_buffer_seconds: int = 60
+    # Ticket #70 (2026-05-07) — rapid-arrival continuation window.
+    # When a second chunk arrives within ``rapid_arrival_seconds`` of
+    # the prior chunk in the same buffer, the chunk is treated as
+    # continuation regardless of debounce expiry. This catches the
+    # "Telegram bursts the auto-splits sub-second" case where a flush
+    # could otherwise race ahead of an in-flight chunk delivery. 3s
+    # is a generous window; bursts are observed sub-1s in practice.
+    rapid_arrival_seconds: float = 3.0
 
 
 @dataclass

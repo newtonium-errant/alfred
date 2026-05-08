@@ -1826,3 +1826,940 @@ async def test_voice_train_buffer_method_source_path(tmp_path: Path) -> None:
     assert queue_jobs[0].kind == "method"
     assert "First chunk" in queue_jobs[0].raw_body
     assert "Second chunk" in queue_jobs[0].raw_body
+
+
+# ---------------------------------------------------------------------------
+# Ticket #67 — em-dash / en-dash variant of --cluster flag (iOS auto-correct)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_train_args_emdash_cluster_flag() -> None:
+    """REGRESSION: iOS auto-corrects ``--`` → ``—``; em-dash variant works.
+
+    Ticket #67 (2026-05-07). Andrew's observation: ``/train --cluster
+    personal`` typed on iOS arrived as ``/train —cluster personal``;
+    the strict ``--cluster`` token comparison missed, the em-dash token
+    fell into the body, and the slug derivation produced
+    ``cluster-personal`` against a broken path.
+    """
+    cluster, body = voice_train.parse_train_args(
+        "/train —cluster personal",
+        ["—cluster", "personal"],
+    )
+    assert cluster == "personal"
+    assert body == ""
+
+
+def test_parse_train_args_endash_cluster_flag() -> None:
+    """En-dash (U+2013) variant — covered by the same normalization."""
+    cluster, body = voice_train.parse_train_args(
+        "/train –cluster veteran",
+        ["–cluster", "veteran"],
+    )
+    assert cluster == "veteran"
+    assert body == ""
+
+
+def test_parse_train_args_double_hyphen_cluster_flag_regression() -> None:
+    """REGRESSION: canonical ``--cluster`` still works post-Ticket #67.
+
+    The em/en-dash normalization is a defensive ADDITION; the ASCII
+    double-hyphen path must continue to parse identically.
+    """
+    cluster, body = voice_train.parse_train_args(
+        "/train --cluster business",
+        ["--cluster", "business"],
+    )
+    assert cluster == "business"
+    assert body == ""
+
+
+def test_parse_method_source_args_emdash_first_token_normalized() -> None:
+    """/method-source has no flags today; em-dash on first token is harmless.
+
+    /method-source's parser also runs the leading-dash normalization
+    (defensive — a future ``--<flag>`` would inherit the iOS-safe
+    parsing without re-derivation). Today there are no flags, so an
+    em-dash leading token gets normalized to ``--<word>`` and falls
+    into the body. This test pins the contract.
+    """
+    body = voice_train.parse_method_source_args(
+        "/method-source —notes some text",
+        ["—notes", "some", "text"],
+    )
+    # The first token has been normalized; body is the joined tokens.
+    assert "--notes" in body
+    assert "some text" in body
+
+
+def test_parse_method_source_args_endash_first_token_normalized() -> None:
+    """En-dash variant on first token also normalized."""
+    body = voice_train.parse_method_source_args(
+        "/method-source –notes some text",
+        ["–notes", "some", "text"],
+    )
+    assert "--notes" in body
+
+
+def test_parse_method_source_args_canonical_double_hyphen_regression() -> None:
+    """Canonical ASCII double-hyphen still works post-Ticket #67."""
+    body = voice_train.parse_method_source_args(
+        "/method-source --notes some text",
+        ["--notes", "some", "text"],
+    )
+    assert "--notes" in body
+    assert "some text" in body
+
+
+def test_parse_train_args_emdash_in_body_preserved() -> None:
+    """Em-dash WITHIN the essay body (after the flag) must NOT be normalized.
+
+    The normalization only applies to the leading flag-prefix token.
+    Body tokens — including em-dash-decorated prose — pass through
+    intact.
+    """
+    cluster, body = voice_train.parse_train_args(
+        "/train --cluster personal an essay — with em-dashes",
+        ["--cluster", "personal", "an", "essay", "—",
+         "with", "em-dashes"],
+    )
+    assert cluster == "personal"
+    # The em-dash inside the body survives.
+    assert "—" in body
+
+
+def test_parse_train_args_emdash_with_multiline_body() -> None:
+    """REGRESSION: em-dash flag + multiline body strips header cleanly.
+
+    Ticket #67 (2026-05-07). When the operator pastes an iOS-corrected
+    flag together with a newline-rich essay, ``_strip_command_prefix``
+    re-extracts the body to preserve paragraph breaks. The cluster-
+    header regex must match the em/en-dash variants OR the
+    ``—cluster personal`` text gets glued to the front of the saved
+    essay body.
+    """
+    raw = (
+        "/train —cluster personal\n"
+        "First paragraph here.\n\n"
+        "Second paragraph."
+    )
+    cluster, body = voice_train.parse_train_args(
+        raw,
+        ["—cluster", "personal", "First", "paragraph", "here.",
+         "Second", "paragraph."],
+    )
+    assert cluster == "personal"
+    # Header was stripped; body starts at the essay text.
+    assert body.startswith("First paragraph here.")
+    # Em-dash flag header was NOT smuggled into the body.
+    assert "—cluster" not in body
+    assert "personal\n" not in body
+    # Paragraph break preserved.
+    assert "\n\n" in body
+
+
+# ---------------------------------------------------------------------------
+# Ticket #65 — buffer regression tests (max-buffer ceiling, pre-emption)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_voice_train_buffer_ceiling_flushes_immediately(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: max-buffer ceiling clamps to immediate flush.
+
+    Ticket #65 (2026-05-07). The clamp logic in
+    ``_schedule_voice_train_flush`` (effective_sleep <=0 → flush
+    immediately) was verified by inspection but never exercised. Pin
+    it: open a buffer with ``opened_at`` mocked far enough in the
+    past that ``elapsed > max_buffer_seconds``, then call
+    ``_voice_train_buffer_append``. The flush must fire before the
+    next event-loop tick.
+    """
+    import asyncio as _asyncio
+    from datetime import datetime as _dt, timedelta, timezone as _tz
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            debounce_seconds=10,
+            max_buffer_seconds=30,
+            min_paste_chars=10,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 7777
+
+    # Open a buffer with an opened_at FAR in the past — past the
+    # max_buffer_seconds ceiling.
+    pending = voice_train.PendingPaste(
+        chat_id=chat_id, kind="voice", cluster=None,
+    )
+    pending.opened_at = _dt.now(_tz.utc) - timedelta(seconds=999)
+    voice_train.append_paste_chunk(
+        pending, "Some essay content. " * 20,
+    )
+    bot_data["voice_train_pending"][chat_id] = pending
+
+    # Append a chunk — this triggers _schedule_voice_train_flush, which
+    # should detect we're past the ceiling and flush immediately.
+    appended = bot._voice_train_buffer_append(ctx, chat_id, "more content")
+    assert appended is True
+
+    # Yield to allow the flush task to run. Single yield should be
+    # enough since the path is "create_task → immediate await of flush".
+    await _asyncio.sleep(0.05)
+
+    # Buffer popped (flushed).
+    assert chat_id not in bot_data["voice_train_pending"]
+    # Either save+enqueue ran OR the buffer flushed empty — but the
+    # flush DID happen (no longer in the registry).
+
+
+@pytest.mark.asyncio
+async def test_voice_train_buffer_preempted_on_new_command(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: a fresh command pre-empts an existing open buffer.
+
+    Ticket #65 (2026-05-07). ``_open_or_extend_voice_train_buffer``
+    closes any prior buffer before opening a new one. Pin: open a
+    /train buffer, call _open_or_extend with kind=method; assert (a)
+    the prior buffer was finalized (popped + flushed=True), (b) the
+    new buffer is the active one with the new kind, (c) the prior
+    kind/cluster are gone.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            debounce_seconds=10,
+            max_buffer_seconds=60,
+            min_paste_chars=10,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    # The reply_target.reply_text is awaited by _open_or_extend_voice_train_buffer.
+    reply_target = MagicMock()
+    reply_target.reply_text = AsyncMock()
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 8888
+
+    # First buffer: /train with cluster=veteran + initial chunk
+    # large enough to land a saved record on flush.
+    initial_voice = "Voice essay content. " * 30
+    await bot._open_or_extend_voice_train_buffer(
+        ctx,
+        chat_id=chat_id,
+        kind="voice",
+        cluster="veteran",
+        initial_text=initial_voice,
+        image_metadata=[],
+        reply_target=reply_target,
+    )
+    first_pending = bot_data["voice_train_pending"][chat_id]
+    assert first_pending.kind == "voice"
+    assert first_pending.cluster == "veteran"
+
+    # Second command: /method-source — this MUST pre-empt the first.
+    await bot._open_or_extend_voice_train_buffer(
+        ctx,
+        chat_id=chat_id,
+        kind="method",
+        cluster=None,
+        initial_text="Method source content. " * 30,
+        image_metadata=[],
+        reply_target=reply_target,
+    )
+
+    # The first buffer was flushed (it had flushed=True set during
+    # the pre-empt path).
+    assert first_pending.flushed is True
+    # The active buffer is the new one with kind=method.
+    new_pending = bot_data["voice_train_pending"][chat_id]
+    assert new_pending is not first_pending
+    assert new_pending.kind == "method"
+    assert new_pending.cluster is None
+
+
+# ---------------------------------------------------------------------------
+# Ticket #70 — debounce tuning + end-marker detection
+# ---------------------------------------------------------------------------
+
+
+def test_voice_train_config_debounce_default_is_10s() -> None:
+    """REGRESSION: debounce default bumped from 5s → 10s.
+
+    Ticket #70 (2026-05-07). Telegram client auto-split inter-chunk
+    delays observed at 7-12s in real use; 5s caused premature flushes
+    that dropped late chunks.
+    """
+    cfg = VoiceTrainConfig()
+    assert cfg.debounce_seconds == 10
+
+
+def test_voice_train_config_rapid_arrival_default() -> None:
+    """Rapid-arrival window default — 3s captures sub-second bursts."""
+    cfg = VoiceTrainConfig()
+    assert cfg.rapid_arrival_seconds == 3.0
+
+
+def test_buffer_has_end_marker_substack_footnote() -> None:
+    """Substack footnote-tail recognized as end marker."""
+    body = "Body content. " * 30 + "\n[^1]: a footnote definition"
+    assert voice_train.buffer_has_end_marker(body) is True
+
+
+def test_buffer_has_end_marker_substack_subscribed() -> None:
+    """Substack ``Subscribed`` closing block recognized."""
+    body = "Body content. " * 30 + "\nSubscribed\nmore"
+    assert voice_train.buffer_has_end_marker(body) is True
+
+
+def test_buffer_has_end_marker_signoff() -> None:
+    """``Would you like to know more?`` sign-off recognized."""
+    body = "Body content. " * 30 + " Would you like to know more?"
+    assert voice_train.buffer_has_end_marker(body) is True
+
+
+def test_buffer_has_end_marker_bio_opener() -> None:
+    """``I write about `` author-bio opener recognized."""
+    body = "Body content. " * 30 + " I write about software."
+    assert voice_train.buffer_has_end_marker(body) is True
+
+
+def test_buffer_has_end_marker_no_marker() -> None:
+    """A plain essay body without any marker → False."""
+    body = "Just a plain essay body without any closing markers. " * 20
+    assert voice_train.buffer_has_end_marker(body) is False
+
+
+def test_buffer_has_end_marker_marker_too_early_rejected() -> None:
+    """Marker appearing in the FIRST 200 chars is treated as false-positive.
+
+    A chat that mentions ``Subscribed`` early in the conversation
+    should not trigger end-marker detection — the guard requires the
+    marker to come AFTER body content.
+    """
+    body = "Subscribed early.\n\n" + "More body. " * 100
+    # ``\nSubscribed\n`` doesn't appear ≥200 chars in.
+    assert voice_train.buffer_has_end_marker(body) is False
+
+
+def test_buffer_has_end_marker_empty_string() -> None:
+    """Empty input → False (degenerate-input guard)."""
+    assert voice_train.buffer_has_end_marker("") is False
+
+
+@pytest.mark.asyncio
+async def test_voice_train_end_marker_shortens_flush_delay(
+    tmp_path: Path,
+) -> None:
+    """End-marker detection clamps the flush delay to rapid_arrival_seconds.
+
+    Ticket #70 (2026-05-07). When the buffer carries a recognized
+    end-marker, the scheduler shortens the effective sleep to
+    ``rapid_arrival_seconds`` (default 3s). The shorter delay IS the
+    silence guard — a chunk arriving inside the window resets the
+    timer. To make the test fast, we set ``rapid_arrival_seconds=0.1``.
+    """
+    import asyncio as _asyncio
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            debounce_seconds=10,
+            max_buffer_seconds=60,
+            min_paste_chars=10,
+            rapid_arrival_seconds=0.1,  # tighten so test runs fast
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 4242
+
+    pending = voice_train.PendingPaste(
+        chat_id=chat_id, kind="voice", cluster=None,
+    )
+    body_with_marker = (
+        "Essay content goes here. " * 40
+        + "\nSubscribed\nfooter"
+    )
+    voice_train.append_paste_chunk(pending, body_with_marker)
+    bot_data["voice_train_pending"][chat_id] = pending
+
+    # Schedule with the full 10s debounce; end-marker should clamp
+    # to ``rapid_arrival_seconds`` (0.1s in this test).
+    bot._schedule_voice_train_flush(ctx, chat_id, delay_seconds=10)
+
+    # Wait up to ~1.5s for the flush to land. With end-marker
+    # detection working, the flush task ran with ~0.1s sleep.
+    deadline = 1.5
+    waited = 0.0
+    step = 0.05
+    while waited < deadline:
+        if chat_id not in bot_data["voice_train_pending"]:
+            break
+        await _asyncio.sleep(step)
+        waited += step
+
+    # Buffer popped (flushed) within the early-flush window.
+    assert chat_id not in bot_data["voice_train_pending"], (
+        f"end-marker fast-path didn't fire within {deadline}s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_voice_train_no_end_marker_uses_full_debounce(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: without an end marker, debounce window is preserved.
+
+    Ticket #70 (2026-05-07). The end-marker fast-path is opt-in by
+    content — a buffer without any recognized marker MUST NOT flush
+    early. Otherwise we'd cut single-message /train pastes off mid-
+    chunk-window. We schedule with debounce=10s and assert the
+    buffer is still open ~0.5s later.
+    """
+    import asyncio as _asyncio
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            debounce_seconds=10,
+            max_buffer_seconds=60,
+            min_paste_chars=10,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 5252
+
+    pending = voice_train.PendingPaste(
+        chat_id=chat_id, kind="voice", cluster=None,
+    )
+    voice_train.append_paste_chunk(
+        pending, "Plain essay body without markers. " * 30,
+    )
+    bot_data["voice_train_pending"][chat_id] = pending
+
+    bot._schedule_voice_train_flush(ctx, chat_id, delay_seconds=10)
+
+    # Wait briefly. With no end-marker, the buffer must NOT flush
+    # within the test window.
+    await _asyncio.sleep(0.3)
+    assert chat_id in bot_data["voice_train_pending"], (
+        "buffer flushed without an end marker (false-positive on debounce)"
+    )
+
+    # Cancel the pending flush task to keep the test clean.
+    pending = bot_data["voice_train_pending"][chat_id]
+    if pending.flush_task is not None:
+        pending.flush_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_voice_train_max_ceiling_overrides_end_marker_window(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: ceiling enforcement still wins over end-marker logic.
+
+    Ticket #70 (2026-05-07). The end-marker fast-path uses
+    ``min(1.0, effective_sleep)``; if ``effective_sleep`` was already
+    clamped to 0 by the ceiling, the flush still goes immediate. Pin:
+    a buffer past the ceiling with end-markers present flushes
+    immediately (as if no markers).
+    """
+    import asyncio as _asyncio
+    from datetime import datetime as _dt, timedelta, timezone as _tz
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            debounce_seconds=10,
+            max_buffer_seconds=30,
+            min_paste_chars=10,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            pass
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 6262
+
+    pending = voice_train.PendingPaste(
+        chat_id=chat_id, kind="voice", cluster=None,
+    )
+    pending.opened_at = _dt.now(_tz.utc) - timedelta(seconds=999)
+    body = "Essay. " * 50 + "\nSubscribed\n"
+    voice_train.append_paste_chunk(pending, body)
+    bot_data["voice_train_pending"][chat_id] = pending
+
+    bot._schedule_voice_train_flush(ctx, chat_id, delay_seconds=10)
+
+    await _asyncio.sleep(0.05)
+    # Buffer flushed via the ceiling path (immediate task creation).
+    assert chat_id not in bot_data["voice_train_pending"]
+
+
+# ---------------------------------------------------------------------------
+# Ticket #69 — /train without --cluster: bot follow-up question
+# ---------------------------------------------------------------------------
+
+
+def test_looks_like_cluster_reply_single_word() -> None:
+    """Plain single token is a valid cluster name."""
+    assert bot._looks_like_cluster_reply("personal") is True
+    assert bot._looks_like_cluster_reply("veteran") is True
+    assert bot._looks_like_cluster_reply("general") is True
+
+
+def test_looks_like_cluster_reply_with_hyphens() -> None:
+    """Hyphen-separated tokens are valid cluster names."""
+    assert bot._looks_like_cluster_reply("tech-essays") is True
+    assert bot._looks_like_cluster_reply("voice_corpus") is True
+
+
+def test_looks_like_cluster_reply_rejects_sentences() -> None:
+    """Multi-word phrases are NOT cluster replies."""
+    assert bot._looks_like_cluster_reply("hello there friend") is False
+    assert bot._looks_like_cluster_reply("two words") is False
+
+
+def test_looks_like_cluster_reply_rejects_command_prefix() -> None:
+    """A leading ``/`` means it's a slash command, not a cluster name."""
+    assert bot._looks_like_cluster_reply("/end") is False
+    assert bot._looks_like_cluster_reply("/train") is False
+
+
+def test_looks_like_cluster_reply_rejects_too_long() -> None:
+    """31-char string exceeds the cluster-name length cap."""
+    assert bot._looks_like_cluster_reply("a" * 31) is False
+    # Boundary: 30 chars OK.
+    assert bot._looks_like_cluster_reply("a" * 30) is True
+
+
+def test_looks_like_cluster_reply_rejects_special_chars() -> None:
+    """Slashes / dots / inline whitespace reject.
+
+    Leading/trailing whitespace is stripped before the shape check
+    (operator-friendly — accidental trailing space is forgiven), but
+    inline whitespace remains rejected because it implies a multi-
+    word phrase.
+    """
+    assert bot._looks_like_cluster_reply("not/cluster") is False
+    assert bot._looks_like_cluster_reply("hello.com") is False
+    # Inline whitespace (mid-word) is rejected.
+    assert bot._looks_like_cluster_reply("two words") is False
+
+
+def test_looks_like_cluster_reply_empty() -> None:
+    """Empty / whitespace strings reject."""
+    assert bot._looks_like_cluster_reply("") is False
+    assert bot._looks_like_cluster_reply("   ") is False
+
+
+@pytest.mark.asyncio
+async def test_train_without_cluster_arms_pending_ask(
+    tmp_path: Path,
+) -> None:
+    """``/train`` (no --cluster) queues a pending-cluster ask.
+
+    Ticket #69 (2026-05-07). After the operator pastes /train without
+    --cluster, the success reply MUST include the "Which cluster?"
+    question AND the bot_data registry MUST carry a pending-cluster
+    entry keyed by chat_id.
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 1111
+
+    # Run finalize directly (the same path the buffer flush uses).
+    text = "Some essay content for training. " * 20
+    await bot._finalize_train_paste(
+        ctx, chat_id=chat_id, text=text, cluster=None,
+    )
+
+    # Pending-cluster entry was set.
+    pending_asks = bot_data["voice_train_pending_cluster"]
+    assert chat_id in pending_asks
+    entry = pending_asks[chat_id]
+    assert entry["raw_rel_path"].startswith("document/essay/")
+
+    # Reply contains the cluster question.
+    assert sent, "no reply was sent"
+    last_reply = sent[-1][1]
+    assert "Which cluster?" in last_reply
+    assert "general" in last_reply  # opt-out sentinel mentioned
+
+
+@pytest.mark.asyncio
+async def test_train_with_cluster_does_not_arm_pending_ask(
+    tmp_path: Path,
+) -> None:
+    """``/train --cluster X`` does NOT trigger the pending-cluster ask.
+
+    Ticket #69 (2026-05-07). The question only fires when the operator
+    didn't supply a cluster. With one supplied, the saved record is
+    already tagged and no question is needed.
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 2222
+
+    text = "Some essay content. " * 20
+    await bot._finalize_train_paste(
+        ctx, chat_id=chat_id, text=text, cluster="veteran",
+    )
+
+    # No pending-cluster entry.
+    assert chat_id not in bot_data["voice_train_pending_cluster"]
+    # Reply does NOT carry the cluster question.
+    last_reply = sent[-1][1]
+    assert "Which cluster?" not in last_reply
+
+
+@pytest.mark.asyncio
+async def test_cluster_reply_applies_via_vault_edit(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: cluster reply tags the just-saved fixture.
+
+    Ticket #69 (2026-05-07). After /train arms the pending-cluster
+    ask, the operator's reply (a single token like "personal") triggers
+    ``vault_edit`` on the saved record's frontmatter ``cluster:`` field.
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 3333
+
+    # Step 1: /train without --cluster saves + arms the ask.
+    text = "An essay paragraph that will be saved. " * 20
+    await bot._finalize_train_paste(
+        ctx, chat_id=chat_id, text=text, cluster=None,
+    )
+    # Capture the saved path before consumption.
+    raw_rel_path = bot_data["voice_train_pending_cluster"][chat_id][
+        "raw_rel_path"
+    ]
+    saved_file = Path(config.vault.path) / raw_rel_path
+    assert saved_file.exists()
+    # Pre-check: cluster field is null/None.
+    pre = frontmatter.loads(saved_file.read_text(encoding="utf-8"))
+    assert pre.metadata.get("cluster") in (None, "")
+
+    # Step 2: simulate the operator's "personal" reply.
+    entry = bot._consume_pending_cluster_ask(ctx, chat_id)
+    assert entry is not None
+    await bot._handle_cluster_ask_reply(ctx, chat_id, "personal", entry)
+
+    # The vault_edit applied: cluster field now == "personal".
+    post = frontmatter.loads(saved_file.read_text(encoding="utf-8"))
+    assert post.metadata.get("cluster") == "personal"
+    # Confirmation reply was sent.
+    confirms = [s for s in sent if "tagged" in s[1].lower()]
+    assert confirms, "no confirmation reply for cluster tag"
+
+
+@pytest.mark.asyncio
+async def test_cluster_reply_general_opts_out(
+    tmp_path: Path,
+) -> None:
+    """``general`` reply is the opt-out sentinel — leaves cluster unset.
+
+    Ticket #69 (2026-05-07). The brief specifies ``general`` as the
+    explicit "skip clustering" sentinel; treating it like a normal
+    cluster name would tag every uncategorized essay with cluster
+    ``general``, which loses the operator's intent.
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 4444
+
+    text = "Essay content for opt-out test. " * 20
+    await bot._finalize_train_paste(
+        ctx, chat_id=chat_id, text=text, cluster=None,
+    )
+    raw_rel_path = bot_data["voice_train_pending_cluster"][chat_id][
+        "raw_rel_path"
+    ]
+    saved_file = Path(config.vault.path) / raw_rel_path
+
+    entry = bot._consume_pending_cluster_ask(ctx, chat_id)
+    await bot._handle_cluster_ask_reply(ctx, chat_id, "general", entry)
+
+    # cluster field stays unset — opt-out.
+    post = frontmatter.loads(saved_file.read_text(encoding="utf-8"))
+    assert post.metadata.get("cluster") in (None, "", "null")
+
+
+@pytest.mark.asyncio
+async def test_cluster_reply_state_expires_after_timeout(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: cluster-ask state drops after the 5min timeout.
+
+    Ticket #69 (2026-05-07). If the operator doesn't reply within 5
+    minutes, the pending-cluster entry is dropped silently. A later
+    cluster-shaped message in the same chat does NOT get applied.
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            pass
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 5555
+
+    # Manually arm the pending-cluster ask with an expired timestamp
+    # (simulates 5+ minutes having passed).
+    bot_data["voice_train_pending_cluster"][chat_id] = {
+        "raw_rel_path": "document/essay/expired.md",
+        "instance": "Hypatia",
+        "expires_at": 0.0,  # epoch — long past
+    }
+
+    # Consume — must return None (entry expired) and drop the slot.
+    entry = bot._consume_pending_cluster_ask(ctx, chat_id)
+    assert entry is None
+    assert chat_id not in bot_data["voice_train_pending_cluster"]
+
+
+@pytest.mark.asyncio
+async def test_method_source_does_not_arm_cluster_ask(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION: /method-source completion does NOT arm a cluster ask.
+
+    Ticket #69 (2026-05-07). The brief notes that source/ records have
+    no ``cluster:`` field — the worker doesn't read or write one. The
+    cluster-question UX is /train-only by design.
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+        "voice_train_pending_cluster": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 6666
+
+    text = "Method source content for the worker. " * 20
+    await bot._finalize_method_source_paste(
+        ctx, chat_id=chat_id, text=text, image_metadata=[],
+    )
+
+    # No pending-cluster entry was armed by the method path.
+    assert chat_id not in bot_data["voice_train_pending_cluster"]
+    # Reply does NOT carry the cluster question.
+    last_reply = sent[-1][1]
+    assert "Which cluster?" not in last_reply

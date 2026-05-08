@@ -74,6 +74,25 @@ _KEY_LOCKS = "chat_locks"
 # Lives on bot_data so on_train / on_method_source / on_text all see the same
 # state. Single-event-loop concurrency means no lock needed.
 _KEY_VOICE_TRAIN_BUFFERS = "voice_train_pending"
+# Ticket #69 — voice_train pending-cluster registry. After a /train without
+# --cluster successfully saves, we ask "which cluster?" and remember the
+# saved record's relative path so the operator's next message can be
+# applied as a cluster tag without them re-uploading.
+# Shape: dict[chat_id, _PendingClusterAsk]. See ``_PendingClusterAsk``.
+_KEY_VOICE_TRAIN_PENDING_CLUSTER = "voice_train_pending_cluster"
+# Ticket #69 — how long the pending-cluster ask stays "live" after the
+# bot's "Which cluster?" message. Past this, an unrelated message in the
+# chat is NOT mistaken for a cluster reply. 5 minutes is generous for
+# the operator to type a single word.
+_VOICE_TRAIN_CLUSTER_ASK_TIMEOUT_SECONDS = 300
+# Ticket #69 — cluster-name shape. Single token of letters/digits/
+# hyphens/underscores; max 30 chars; no leading dash; no command prefix.
+# Excludes whitespace + slash so essay sentences and slash commands
+# can't masquerade as a cluster reply.
+_CLUSTER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_\-]{0,29}$")
+# The "skip clustering" sentinel — operator typed this to opt out of
+# clustering for the current /train. Case-insensitive match.
+_CLUSTER_OPT_OUT_SENTINEL = "general"
 
 
 # --- Instance-name normalisation ------------------------------------------
@@ -194,6 +213,11 @@ def build_app(
     # Bug #58 buffer registry — opened by /train + /method_source,
     # appended to by on_text, drained by the debounce flush callback.
     app.bot_data[_KEY_VOICE_TRAIN_BUFFERS] = {}
+    # Ticket #69 pending-cluster registry — populated by
+    # _finalize_train_paste when /train was issued without --cluster,
+    # consumed by on_text when the operator's next message looks like
+    # a cluster name.
+    app.bot_data[_KEY_VOICE_TRAIN_PENDING_CLUSTER] = {}
     app.bot_data["raw_config"] = raw_config
 
     # Application-level pre-pass: every inbound update bumps the
@@ -1522,6 +1546,189 @@ async def on_method_source(
 # --- Voice-train buffer helpers (Bug #58) -------------------------------
 
 
+# --- Ticket #69 cluster-ask helpers ------------------------------------
+#
+# When /train is issued WITHOUT ``--cluster``, the legacy path saved
+# the essay with ``cluster: null`` and the operator had to vault_edit
+# the field manually post-extraction to get clustering. The new flow
+# asks "Which cluster?" in the confirmation message, then watches the
+# next user message for a cluster-shaped reply. A successful reply
+# fires ``vault_edit`` on the just-saved fixture's ``cluster`` field
+# (and re-enqueues so the cluster-tier rebuild runs against the now-
+# tagged leaf). ``general`` is the explicit opt-out — same shape as
+# Andrew's prior workflow when he didn't want clustering. Anything
+# else is treated as a cluster name verbatim.
+#
+# /method-source path: cluster is /train-only by design. ``source/``
+# records do not carry a ``cluster:`` field and the worker never reads
+# one. So /method-source completion does NOT trigger this prompt — the
+# field would have nowhere to land. Symmetric coverage IS possible if
+# we extend the source schema later, but that requires schema +
+# extraction-prompt + worker changes orthogonal to this ticket.
+
+
+def _make_cluster_ask_entry(
+    *,
+    raw_rel_path: str,
+    instance: str,
+) -> dict[str, Any]:
+    """Build a pending-cluster entry. Keys are stable for test access."""
+    return {
+        "raw_rel_path": raw_rel_path,
+        "instance": instance,
+        "expires_at": datetime.now(timezone.utc).timestamp()
+        + _VOICE_TRAIN_CLUSTER_ASK_TIMEOUT_SECONDS,
+    }
+
+
+def _is_pending_cluster_live(entry: dict[str, Any]) -> bool:
+    """True when ``entry`` hasn't expired. Stale entries are dropped."""
+    expires_at = float(entry.get("expires_at", 0.0))
+    return datetime.now(timezone.utc).timestamp() < expires_at
+
+
+def _consume_pending_cluster_ask(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int,
+) -> dict[str, Any] | None:
+    """Pop the pending-cluster entry for ``chat_id`` if live; else None.
+
+    Drops expired entries silently — the operator moved on; we don't
+    want to mis-tag the next unrelated message. Lives in ``bot_data``
+    so all handlers (on_train, on_text) see one source of truth.
+    """
+    pending: dict[int, dict[str, Any]] = (
+        ctx.application.bot_data.get(_KEY_VOICE_TRAIN_PENDING_CLUSTER) or {}
+    )
+    entry = pending.get(chat_id)
+    if entry is None:
+        return None
+    if not _is_pending_cluster_live(entry):
+        pending.pop(chat_id, None)
+        log.info(
+            "talker.bot.voice_train.cluster_ask_expired", chat_id=chat_id,
+        )
+        return None
+    return pending.pop(chat_id)
+
+
+def _looks_like_cluster_reply(text: str) -> bool:
+    """True when ``text`` matches the cluster-name shape.
+
+    Single token (no whitespace), letters/digits/hyphens/underscores
+    only, max 30 chars, no command prefix (``/``). The ``general``
+    opt-out sentinel passes too — we treat it specially in the caller.
+    Anything else (sentences, command typos, URLs) returns False so
+    the message falls through to the normal conversation handler.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("/"):
+        return False
+    if " " in stripped or "\t" in stripped or "\n" in stripped:
+        return False
+    return bool(_CLUSTER_NAME_PATTERN.match(stripped))
+
+
+async def _handle_cluster_ask_reply(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    entry: dict[str, Any],
+) -> None:
+    """Apply a cluster-name reply to the pending fixture.
+
+    ``text`` has already passed :func:`_looks_like_cluster_reply` so
+    we know it's a clean single-token candidate. The opt-out sentinel
+    ``general`` short-circuits without touching the vault; any other
+    name is written via ``vault_edit`` on the recorded raw_rel_path.
+
+    On success we send a brief confirmation; failures fall back to a
+    "couldn't tag" reply (the essay is saved either way — this is a
+    nice-to-have on top of the already-shipped extraction).
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    bot_obj = ctx.bot
+    cluster = text.strip()
+    raw_rel_path = entry.get("raw_rel_path") or ""
+
+    if cluster.lower() == _CLUSTER_OPT_OUT_SENTINEL:
+        # Opt-out — leave cluster field unset; that was the legacy
+        # behaviour for /train without --cluster.
+        log.info(
+            "talker.bot.voice_train.cluster_ask_opt_out",
+            chat_id=chat_id,
+            raw_rel_path=raw_rel_path,
+        )
+        try:
+            await bot_obj.send_message(
+                chat_id=chat_id,
+                text="ok — leaving uncategorized.",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.bot.voice_train.cluster_ask_optout_reply_failed",
+                chat_id=chat_id,
+            )
+        return
+
+    # Apply the cluster tag via vault_edit.
+    try:
+        from alfred.vault import ops as _ops
+        _ops.vault_edit(
+            Path(config.vault.path),
+            raw_rel_path,
+            set_fields={"cluster": cluster},
+            scope=_voice_train_scope_for(config),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.voice_train.cluster_ask_apply_failed",
+            chat_id=chat_id,
+            raw_rel_path=raw_rel_path,
+            cluster=cluster,
+            error=str(exc),
+        )
+        try:
+            await bot_obj.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"couldn't tag `{raw_rel_path}` with cluster "
+                    f"`{cluster}`: {exc}. essay is still saved + "
+                    f"queued; tag manually with vault_edit if needed."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.bot.voice_train.cluster_ask_apply_failed_reply_failed",
+                chat_id=chat_id,
+            )
+        return
+
+    log.info(
+        "talker.bot.voice_train.cluster_ask_applied",
+        chat_id=chat_id,
+        raw_rel_path=raw_rel_path,
+        cluster=cluster,
+    )
+    try:
+        await bot_obj.send_message(
+            chat_id=chat_id,
+            text=(
+                f"tagged `{raw_rel_path}` with cluster `{cluster}`. "
+                f"the cluster-tier rebuild will run when ≥2 leaves "
+                f"share this tag."
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "talker.bot.voice_train.cluster_ask_apply_reply_failed",
+            chat_id=chat_id,
+        )
+
+
 async def _open_or_extend_voice_train_buffer(
     ctx: ContextTypes.DEFAULT_TYPE,
     *,
@@ -1576,7 +1783,7 @@ async def _open_or_extend_voice_train_buffer(
     debounce = (
         config.voice_train.debounce_seconds
         if config.voice_train is not None
-        else 5
+        else 10
     )
     _schedule_voice_train_flush(ctx, chat_id, delay_seconds=debounce)
 
@@ -1612,6 +1819,19 @@ def _schedule_voice_train_flush(
     task itself is a fire-and-forget asyncio task — we don't await it
     here; on_text returns immediately so Telegram delivery isn't
     blocked.
+
+    Ticket #70 (2026-05-07): two early-flush paths added.
+      * **End-marker fast-path** — if the assembled buffer contains a
+        recognized Substack-export end marker (footnote-tail, sign-off,
+        author bio opener, ``Subscribed`` block), the flush task uses
+        ``rapid_arrival_seconds`` (default 3s) instead of the full
+        debounce. The shorter delay IS itself the silence guard: a
+        chunk arriving inside the window cancels + reschedules, and
+        the next call re-checks the marker against the now-extended
+        text. Saves ~7s on every complete-essay paste.
+      * **Ceiling enforcement** — unchanged from Bug #58: even an
+        operator who keeps typing flushes at ``max_buffer_seconds``
+        past ``opened_at``.
     """
     buffers: dict[int, voice_train.PendingPaste] = (
         ctx.application.bot_data[_KEY_VOICE_TRAIN_BUFFERS]
@@ -1643,6 +1863,38 @@ def _schedule_voice_train_flush(
     ).total_seconds()
     remaining_until_ceiling = max(0.0, max_buffer - elapsed)
     effective_sleep = min(float(delay_seconds), remaining_until_ceiling)
+
+    # Ticket #70 — end-marker fast-path. If the buffer carries a
+    # recognized end-of-essay signal, shorten the flush delay to
+    # ~rapid_arrival_seconds so the operator gets their ack quickly
+    # while still allowing a tail chunk to land. The shorter delay IS
+    # itself the silence guard: any chunk arriving inside the 3s
+    # window resets the timer (cancel + reschedule), and the next
+    # schedule call will redo this end-marker check on the now-
+    # extended assembled text.
+    #
+    # Skipped when remaining_until_ceiling already drove
+    # effective_sleep below the rapid-arrival window — the ceiling
+    # path takes over.
+    rapid_arrival = (
+        config.voice_train.rapid_arrival_seconds
+        if config.voice_train is not None
+        else 3.0
+    )
+    early_flush_reason: str | None = None
+    if (
+        effective_sleep > rapid_arrival
+        and voice_train.buffer_has_end_marker(pending.assembled_text())
+    ):
+        effective_sleep = float(rapid_arrival)
+        early_flush_reason = "end_marker"
+        log.info(
+            "talker.bot.voice_train.end_marker_detected",
+            chat_id=chat_id,
+            kind=pending.kind,
+            assembled_chars=sum(len(c) for c in pending.chunks),
+        )
+
     if effective_sleep <= 0:
         # We're already past the ceiling — flush immediately.
         async def _flush_now() -> None:
@@ -1650,12 +1902,14 @@ def _schedule_voice_train_flush(
         pending.flush_task = asyncio.create_task(_flush_now())
         return
 
+    flush_reason = early_flush_reason or "debounce"
+
     async def _delayed_flush() -> None:
         try:
             await asyncio.sleep(effective_sleep)
         except asyncio.CancelledError:
             return
-        await _flush_voice_train_buffer(ctx, chat_id, reason="debounce")
+        await _flush_voice_train_buffer(ctx, chat_id, reason=flush_reason)
 
     pending.flush_task = asyncio.create_task(_delayed_flush())
 
@@ -1685,7 +1939,7 @@ def _voice_train_buffer_append(
     debounce = (
         config.voice_train.debounce_seconds
         if config.voice_train is not None
-        else 5
+        else 10
     )
     _schedule_voice_train_flush(ctx, chat_id, delay_seconds=debounce)
     log.info(
@@ -1860,13 +2114,37 @@ async def _finalize_train_paste(
         return
 
     cluster_msg = f" (cluster: {cluster})" if cluster else ""
+    # Ticket #69 — when /train fired without --cluster, append a
+    # follow-up question to the success reply AND park a pending-
+    # cluster ask in bot_data so the operator's next message is
+    # interpreted as a cluster reply (caught in ``on_text``).
+    cluster_question = ""
+    if cluster is None:
+        pending_asks: dict[int, dict[str, Any]] = (
+            ctx.application.bot_data.setdefault(
+                _KEY_VOICE_TRAIN_PENDING_CLUSTER, {},
+            )
+        )
+        pending_asks[chat_id] = _make_cluster_ask_entry(
+            raw_rel_path=raw_result.rel_path,
+            instance=config.instance.name or "",
+        )
+        cluster_question = (
+            "\n\nWhich cluster? (e.g., veteran, personal, tech-essays — "
+            "or `general` to skip clustering.)"
+        )
+        log.info(
+            "talker.bot.voice_train.cluster_ask_armed",
+            chat_id=chat_id,
+            raw_rel_path=raw_result.rel_path,
+        )
     try:
         await bot_obj.send_message(
             chat_id=chat_id,
             text=(
                 f"saved `{raw_result.rel_path}`{cluster_msg} — voice "
                 f"extraction queued ({len(text)} chars). I'll DM you "
-                f"when the profile is ready."
+                f"when the profile is ready.{cluster_question}"
             ),
         )
     except Exception:  # noqa: BLE001
@@ -2248,13 +2526,25 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # ensures unrecognised commands and other non-text-handler updates
     # still count. See the pre-pass comment block above ``build_app``.
 
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
+    # Ticket #69 — pending-cluster ask. If the previous /train (without
+    # --cluster) just finished and the operator is replying with a
+    # cluster name, consume the reply HERE before the buffer-append or
+    # natural-language paths fire. The check is cheap (dict lookup +
+    # short regex) and short-circuits a known-shape reply.
+    if chat_id is not None and _looks_like_cluster_reply(text):
+        entry = _consume_pending_cluster_ask(ctx, chat_id)
+        if entry is not None:
+            await _handle_cluster_ask_reply(ctx, chat_id, text, entry)
+            return
+
     # Bug #58 — multi-message paste capture. If a /train or /method-source
     # buffer is currently open for this chat, the text message is part
     # of the chunked paste rather than a conversation turn. Append to
     # the buffer (which resets the debounce timer) and skip the
     # natural-language conversation path. The buffer's flush callback
     # will run save_raw + enqueue once the operator goes silent.
-    chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is not None and _voice_train_buffer_append(ctx, chat_id, text):
         # React with a checkmark so the operator gets a visual receipt
         # for "chunk captured." Best-effort; failure here doesn't break

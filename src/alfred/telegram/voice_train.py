@@ -1801,6 +1801,35 @@ def make_job(
 # ---------------------------------------------------------------------------
 
 
+# Ticket #67 (2026-05-07) — iOS auto-corrects ``--`` to ``—`` (em-dash,
+# U+2014) on paste, and some clients emit ``–`` (en-dash, U+2013). When
+# the operator types ``/train --cluster personal`` on iOS, the bot
+# receives ``/train —cluster personal``; the strict ``--cluster`` token
+# match in :func:`parse_train_args` then misses, the en/em-dash token
+# falls into the body, and the slug derivation builds a broken filename
+# from ``—cluster personal``. Normalize the flag-prefix variants to the
+# canonical ASCII form once at the top of the parse path so downstream
+# token-comparison stays simple. Only the leading dashes of the
+# flag-marker are normalized — em/en-dashes inside essay BODY text
+# (after the flag) are preserved as-is.
+def _normalize_flag_prefix_dashes(token: str) -> str:
+    """Convert leading em/en-dash variants to ``--``.
+
+    Idempotent + cheap. Applied only to the FIRST flag token (i.e. the
+    one that should be ``--cluster``); body text passes through unchanged.
+
+    We translate any leading run of em-dash (U+2014) / en-dash (U+2013)
+    / hyphen-minus to ``--`` when it's followed by a flag-name shape
+    (``[a-zA-Z]``). That covers iOS-pasted ``—cluster``, ``–cluster``,
+    and any double-hyphen-like Unicode variant we haven't seen yet.
+    """
+    if not token:
+        return token
+    # Match a leading run of dash-like chars followed by a letter (the
+    # flag-name start). Replace with the canonical ``--`` prefix.
+    return re.sub(r"^[–—\-]+(?=[a-zA-Z])", "--", token)
+
+
 def parse_train_args(
     raw_text: str, ctx_args: list[str] | None,
 ) -> tuple[str | None, str]:
@@ -1814,6 +1843,11 @@ def parse_train_args(
       /train --cluster veteran         → ("veteran", "")
       /train --cluster veteran text..  → ("veteran", "text..")
 
+    iOS / smart-quote variants of ``--`` (em-dash ``—`` U+2014, en-dash
+    ``–`` U+2013) at the leading flag-token position are normalized to
+    ``--`` BEFORE flag detection (Ticket #67). Body text after the flag
+    keeps its original Unicode dashes.
+
     Empty body signals "use most-recent paste" — caller resolves that
     against the conversation transcript.
     """
@@ -1821,6 +1855,11 @@ def parse_train_args(
         return None, ""
     cluster: str | None = None
     rest_tokens: list[str] = list(ctx_args)
+    # Normalize ONLY the first token's leading dashes — the candidate
+    # flag marker. Body tokens pass through unchanged so essays that
+    # happen to start with an em-dashed phrase keep their formatting.
+    if rest_tokens:
+        rest_tokens[0] = _normalize_flag_prefix_dashes(rest_tokens[0])
     if rest_tokens and rest_tokens[0] == "--cluster":
         if len(rest_tokens) >= 2:
             cluster = rest_tokens[1].strip() or None
@@ -1857,10 +1896,18 @@ def parse_method_source_args(
     silently failed to match — multi-line bodies fell back to the
     whitespace-joined ``ctx.args`` shape and lost paragraph breaks.
     Underscore form fixes the regex to match what PTB delivers.
+
+    /method-source has no flags today, but Ticket #67's en/em-dash
+    normalization is applied to the first token defensively — a future
+    ``--<flag>`` extension on this path inherits the same iOS-safe
+    parsing without re-derivation.
     """
     if not ctx_args:
         return ""
-    body = " ".join(ctx_args).strip()
+    rest_tokens: list[str] = list(ctx_args)
+    if rest_tokens:
+        rest_tokens[0] = _normalize_flag_prefix_dashes(rest_tokens[0])
+    body = " ".join(rest_tokens).strip()
     if body and "\n" in raw_text:
         rebuilt = _strip_command_prefix(
             raw_text, command="method_source", cluster=None,
@@ -1878,6 +1925,14 @@ def _strip_command_prefix(
     Used to preserve newlines / formatting when the operator pastes a
     multi-line essay directly after the slash command. PTB's
     ``ctx.args`` whitespace-splits, which destroys paragraph breaks.
+
+    Ticket #67 (2026-05-07): the cluster-header regex accepts the
+    em-dash (``—``) and en-dash (``–``) variants of ``--`` so iOS
+    auto-corrected pastes of multi-line essays still strip the flag
+    cleanly. Without this, ``parse_train_args`` would correctly parse
+    the cluster from ctx_args (token-level normalization) but then
+    fail to strip the flag header from the multi-line body, leaving
+    ``—cluster personal`` glued to the front of the saved essay.
     """
     # Find the first non-whitespace block that's the command.
     # Telegram bots may receive ``/train@HypatiaErrantBot ...`` in
@@ -1887,9 +1942,12 @@ def _strip_command_prefix(
     if not match:
         return ""
     after = raw_text[match.end():]
-    # Strip optional ``--cluster <name>`` header.
+    # Strip optional ``--cluster <name>`` header. Accept ASCII
+    # double-hyphen + Unicode em/en-dash variants (Ticket #67).
     if cluster:
-        cluster_pattern = rf"^\s*--cluster\s+{re.escape(cluster)}\b"
+        cluster_pattern = (
+            rf"^\s*(?:--|—|–)cluster\s+{re.escape(cluster)}\b"
+        )
         cm = re.match(cluster_pattern, after)
         if cm:
             after = after[cm.end():]
@@ -1924,12 +1982,59 @@ def _strip_command_prefix(
 #      handler closes the prior buffer before opening a new one.
 
 # Default debounce / ceiling. Both are config-overridable via
-# ``VoiceTrainConfig.debounce_seconds`` / ``VoiceTrainConfig.max_buffer_seconds``
-# (added in this commit). 5s captures the typical paste-burst (Telegram
-# clients send chunked messages within ~1s of each other) without
-# making the operator wait noticeably; 60s is the safety ceiling.
-_DEFAULT_DEBOUNCE_SECONDS = 5
+# ``VoiceTrainConfig.debounce_seconds`` / ``VoiceTrainConfig.max_buffer_seconds``.
+#
+# Ticket #70 (2026-05-07) bumped the default debounce from 5s → 10s
+# after Telegram client auto-split inter-chunk delays were observed at
+# 7-12s in the wild. 10s captures the long-tail at the cost of slower
+# ack on single-message /train. Companion mitigations:
+#   - end-marker detection in :func:`buffer_has_end_marker` flushes
+#     complete-essay pastes immediately on the next idle tick;
+#   - rapid-arrival detection at the bot layer treats sub-3s
+#     follow-ups as continuation regardless of debounce expiry.
+_DEFAULT_DEBOUNCE_SECONDS = 10
 _DEFAULT_MAX_BUFFER_SECONDS = 60
+
+
+# Ticket #70 — Substack-export pattern end-of-essay markers.
+#
+# When the assembled buffer contains BOTH the head of a YAML/Markdown
+# essay and a recognized closing marker, we know the operator pasted a
+# complete essay (the chunker hit the end of the source). Flush
+# immediately on the next idle tick rather than waiting the full
+# debounce window — saves ~10s per essay paste. Markers are checked
+# in priority order so the most-distinctive one (footnote-tail) wins
+# when multiple are present. Match is case-sensitive on purpose:
+# Substack-exported text preserves the original casing.
+_VOICE_TRAIN_END_MARKERS: tuple[str, ...] = (
+    # Substack footnote-tail. The first footnote definition opens with
+    # ``\n[^1]: `` — a near-perfect end-of-body signal.
+    "\n[^1]: ",
+    # Substack closing block emitted by the export-to-clipboard flow.
+    "\nSubscribed\n",
+    # Recurring sign-off across Andrew's published voice corpus.
+    "Would you like to know more?",
+    # Author bio block opener — comes after the body but before the
+    # subscriber CTA in the export.
+    "I write about ",
+)
+
+
+def buffer_has_end_marker(text: str) -> bool:
+    """Return True when ``text`` contains a Substack-export end marker.
+
+    Used by :func:`bot._schedule_voice_train_flush` to decide whether
+    to flush early on the next debounce tick. We require the marker to
+    appear AFTER at least 200 chars of body content so a chat that
+    happens to mention "Subscribed" early on doesn't false-positive.
+    """
+    if not text:
+        return False
+    for marker in _VOICE_TRAIN_END_MARKERS:
+        idx = text.find(marker)
+        if idx >= 200:
+            return True
+    return False
 
 
 @dataclass
@@ -1948,6 +2053,13 @@ class PendingPaste:
     chunks: list[str] = field(default_factory=list)
     image_metadata: list[dict[str, Any]] = field(default_factory=list)
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Ticket #70 — wall-clock of the most recent chunk append. Updated
+    # by :func:`append_paste_chunk`. Currently observability-only; the
+    # rapid-arrival continuation heuristic is implicit in the
+    # debounce-reset on every append (each append cancels the prior
+    # flush task). Kept on the dataclass for future use + log
+    # correlation when triaging buffer-timing incidents.
+    last_chunk_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # The asyncio.TimerHandle (or Task) currently scheduled to flush.
     # Cancelled + replaced on each new chunk so the debounce window
     # restarts. ``None`` while a flush is actively running.
@@ -1966,6 +2078,27 @@ class PendingPaste:
         introducing artifacts when the chunker happened to break
         cleanly between paragraphs (the duplicated newlines collapse
         to a single paragraph break in any sensible Markdown reader).
+
+        EDGE-CASE / KNOWN ASSUMPTION (Ticket #65 doc): the join is
+        position-blind — it does NOT inspect chunk content for
+        structural markers. If Telegram's chunker happens to split a
+        message INSIDE a YAML frontmatter block (the ``---`` delimited
+        head used by Substack pastes), the assembled text will contain
+        a stray ``\n\n`` mid-frontmatter, which any YAML parser will
+        choke on (the frontmatter delimiter requires the closing
+        ``---`` to follow the key/value lines without a paragraph
+        break). Observed failure mode: ``slug_from_text`` reads
+        garbled YAML, falls back to the H1 / first-line heuristic,
+        and the saved record gets an unexpected slug.
+
+        Mitigation when this surfaces: detect the ``---`` head in the
+        FIRST chunk, then re-join differently when the closing ``---``
+        lands in a later chunk (e.g. join chunks 1..N with single
+        newlines until we see the closing fence, then double-newline
+        afterwards). Not implemented today — we have not observed
+        Telegram chunking inside frontmatter in the wild as of
+        2026-05-08, and the slug-fallback path is reasonable when it
+        does happen. Future builders: this comment is the breadcrumb.
         """
         return "\n\n".join(c.strip() for c in self.chunks if c.strip())
 
@@ -1979,11 +2112,16 @@ def append_paste_chunk(
     for resetting the debounce timer after this returns — kept
     separate so test code can drive append + flush deterministically
     without scheduling.
+
+    Updates ``pending.last_chunk_at`` on every successful append
+    (Ticket #70) so the bot-layer scheduler can detect rapid-arrival
+    bursts.
     """
     text = (chunk or "").strip()
     if not text:
         return
     pending.chunks.append(text)
+    pending.last_chunk_at = datetime.now(timezone.utc)
 
 
 __all__ = [
@@ -1996,6 +2134,7 @@ __all__ = [
     "VOICE_CLUSTER_PROMPT",
     "VOICE_OVERALL_PROMPT",
     "append_paste_chunk",
+    "buffer_has_end_marker",
     "drain_queue",
     "enqueue_job",
     "extract_method_profile",
