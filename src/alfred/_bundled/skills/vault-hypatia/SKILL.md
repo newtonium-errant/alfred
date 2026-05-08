@@ -1044,9 +1044,9 @@ If Andrew says *"general"* or *"no cluster"* / *"just voice"*, save without a cl
 
 The slash command:
 
-> `/method-source [<text>]`
+> `/method_source [<text>]`
 >
-> *(registered as `/method_source` per PTB command-naming rules, since hyphens are illegal in `CommandHandler` names — the bot accepts both forms in conversation; you can use either when teaching the shortcut to Andrew)*
+> *(registered as `/method_source` per PTB command-naming rules — hyphens are illegal in `CommandHandler` names. Andrew must type `/method_source` for the slash command to fire; typing `/method-source` falls through to legacy unknown-command behavior (Telegram routes it as a normal text message, never reaches the handler). Hypatia herself recognizes BOTH spellings in natural-language equivalents — see "Natural-language equivalents" below — but when teaching Andrew the slash-command shortcut, name the underscore form only.)*
 
 Saves the raw method source at `source/<slug>.md` with `extraction_status: pending`. The async worker calls Opus with `METHOD_EXTRACTION_PROMPT` and writes the structured profile to `method/<slug>.md`. Method side is leaf-only — no cluster or overall aggregation; each method stands on its own.
 
@@ -1386,7 +1386,7 @@ Bot-level summary:
 - `/brief <short-id>` — compress a session to ~300 words of spoken prose for ElevenLabs TTS playback.
 - `/fiction <title>` — scaffold a new fiction project; the bot creates the directory + element files; your turn opens with the project on disk. See "Posture — Fiction interlocutor" for orientation.
 - `/train [--cluster <name>] [<text>]` — voice-training shortcut; saves the most-recent long paste (or `<text>` after the command) as a voice fixture at `document/essay/<slug>.md` and queues async extraction to `voice/<slug>.md`. See "Voice/method profile ingestion" for full handling.
-- `/method_source [<text>]` — method/system ingestion shortcut; saves the most-recent long paste (or `<text>`) as a raw source at `source/<slug>.md` and queues async extraction to `method/<slug>.md`. Also reachable in conversation as `/method-source` (you can use either form when teaching the shortcut to Andrew; the bot accepts both). Same section.
+- `/method_source [<text>]` — method/system ingestion shortcut; saves the most-recent long paste (or `<text>`) as a raw source at `source/<slug>.md` and queues async extraction to `method/<slug>.md`. Slash command MUST be typed with the underscore (PTB doesn't allow hyphens in `CommandHandler` names); `/method-source` falls through silently to unknown-command behavior. Don't quote `/method-source` to Andrew — that form fails. Hypatia accepts both spellings only in natural-language phrase recognition (see "Voice/method profile ingestion" → "Natural-language equivalents"); the slash command itself needs the underscore.
 
 ---
 
