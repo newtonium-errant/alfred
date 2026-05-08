@@ -124,33 +124,80 @@ log = get_logger(__name__)
 _SLUG_DROP = re.compile(r"[^a-z0-9-]+")
 _SLUG_MAX_LEN = 80
 _DEFAULT_SLUG = "untitled"
+# Substack-export pastes start with a YAML frontmatter block delimited
+# by ``---`` lines. The original first-non-empty-line slug derivation
+# would happily consume ``---`` as the title, producing
+# ``document/essay/---.md`` (Bug #57, 2026-05-08). This regex matches
+# a leading ``---\n…\n---\n`` block (CRLF-tolerant, optional trailing
+# whitespace) so we can parse + strip it before the title-line scan.
+_LEADING_FRONTMATTER_RE = re.compile(
+    r"^\s*---\s*\r?\n(?P<body>.*?)\r?\n---\s*\r?\n",
+    re.DOTALL,
+)
+
+
+def _split_leading_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    """Detect + parse a leading YAML frontmatter block.
+
+    Returns ``(metadata_dict, remaining_text)``. When no frontmatter is
+    present (or parsing fails), returns ``({}, text)`` so the caller
+    falls back to the existing first-non-empty-line behaviour.
+
+    Used by both :func:`slug_from_text` and :func:`title_from_text` so
+    the two derivations agree on what counts as the "title source" —
+    if they disagree, the slug variable in logs diverges from the
+    actual filename written by ``vault_create`` (Bug #57's
+    "untitled" log vs ``---.md`` filename divergence signature).
+    """
+    if not isinstance(text, str):
+        return {}, ""
+    match = _LEADING_FRONTMATTER_RE.match(text)
+    if not match:
+        return {}, text
+    fm_body = match.group("body")
+    rest = text[match.end():]
+    try:
+        import yaml
+        loaded = yaml.safe_load(fm_body)
+    except Exception:  # noqa: BLE001
+        return {}, rest
+    if isinstance(loaded, dict):
+        return loaded, rest
+    return {}, rest
+
+
+def _is_yaml_marker(line: str) -> bool:
+    """True if ``line`` is a bare ``---`` (YAML doc separator).
+
+    Defensive guard against ever returning ``---`` as a title or slug.
+    Used when the frontmatter parser fails or when somebody pastes a
+    ``---``-only line in an unexpected position.
+    """
+    return line.strip() == "---"
 
 
 def slug_from_text(text: str) -> str:
     """Derive a filename-safe slug from a longer text or title.
 
-    First non-empty line is used as the title-source. NFKD-normalize +
-    strip combining marks (so ``café`` → ``cafe``), lowercase, collapse
-    whitespace to hyphens, drop non-alphanumerics, collapse runs of
-    hyphens, strip edges, cap at 80 chars.
+    Resolution order:
+
+      1. Detect a leading YAML frontmatter block (Substack-export
+         shape). If present and parseable, prefer the ``title:`` field.
+      2. Otherwise, scan post-frontmatter (or original) text for the
+         first non-empty line. Strip leading Markdown heading markers
+         (``# Title`` / ``## Title``). Skip any bare ``---`` lines
+         (defensive — never produce ``---`` as a slug).
+
+    NFKD-normalize + strip combining marks (so ``café`` → ``cafe``),
+    lowercase, collapse whitespace to hyphens, drop non-alphanumerics,
+    collapse runs of hyphens, strip edges, cap at 80 chars.
 
     Empty / all-punctuation input returns ``"untitled"`` so the caller
     always lands at a real path.
     """
     if not isinstance(text, str):
         return _DEFAULT_SLUG
-    # Use the first non-empty line as the title. Operators frequently
-    # paste an essay where the first line is the headline.
-    title_line = ""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        # Strip a leading markdown heading (``# Title`` / ``## Title``)
-        # before falling through.
-        m = re.match(r"^#+\s*(.+)$", stripped)
-        title_line = m.group(1).strip() if m else stripped
-        break
+    title_line = _resolve_title_line(text)
     if not title_line:
         return _DEFAULT_SLUG
     normalized = unicodedata.normalize("NFKD", title_line)
@@ -176,32 +223,73 @@ def slug_from_text(text: str) -> str:
     return s or _DEFAULT_SLUG
 
 
-def title_from_text(text: str) -> str:
-    """Derive a human-readable title from input text.
+def _resolve_title_line(text: str) -> str:
+    """Shared title-source resolver for slug + title derivation.
 
-    Uses the first non-empty line, stripped of markdown heading
-    markers. Falls back to a date-stamped placeholder if the input
-    is empty or non-string.
+    Resolution order (matches :func:`slug_from_text` docstring):
 
-    Distinct from ``slug_from_text`` because ``vault_create`` wants
-    BOTH (the ``name`` arg is human-readable; the path is slugged
-    separately).
+      1. Leading YAML frontmatter ``title:`` field (Substack export).
+      2. First non-empty line of post-frontmatter (or original) text,
+         with leading Markdown heading markers stripped.
+      3. Defensive guard: never return a bare ``---`` line — keep
+         scanning past it. Bug #57's load-bearing fix.
+
+    Returns an empty string when no title source is found; callers
+    apply their own fallback (``"untitled"`` for slug,
+    ``"Untitled — <today>"`` for title).
+
+    Centralised so :func:`slug_from_text` and :func:`title_from_text`
+    cannot drift — the divergence between the two was the surface
+    signature of Bug #57 (slug var said ``"untitled"``, filename
+    written said ``---.md``).
     """
-    if not isinstance(text, str):
-        return f"Untitled — {_date.today().isoformat()}"
-    for line in text.splitlines():
+    metadata, rest = _split_leading_frontmatter(text)
+    fm_title = metadata.get("title") if isinstance(metadata, dict) else None
+    if isinstance(fm_title, str) and fm_title.strip():
+        # The frontmatter title may be quoted in the YAML source;
+        # ``yaml.safe_load`` already strips outer quotes.
+        return fm_title.strip()
+    # Fall through: scan post-frontmatter text (which may equal
+    # original ``text`` when no frontmatter was present).
+    for line in rest.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
+        if _is_yaml_marker(stripped):
+            # Defensive: a stray ``---`` from a malformed frontmatter
+            # block must not become the title. Keep scanning.
+            continue
         m = re.match(r"^#+\s*(.+)$", stripped)
-        title = m.group(1).strip() if m else stripped
-        # Cap at a reasonable length to keep filenames manageable.
-        # Filesystems handle long names fine but operators don't read
-        # 200-char filenames.
-        if len(title) > 100:
-            title = title[:100].rstrip()
-        return title
-    return f"Untitled — {_date.today().isoformat()}"
+        return m.group(1).strip() if m else stripped
+    return ""
+
+
+def title_from_text(text: str) -> str:
+    """Derive a human-readable title from input text.
+
+    Same resolution order as :func:`slug_from_text` — leading YAML
+    frontmatter ``title:`` field, then first non-empty line with
+    Markdown heading markers stripped, with bare ``---`` lines skipped
+    defensively. Falls back to a date-stamped placeholder when no
+    title source resolves.
+
+    Distinct from ``slug_from_text`` because ``vault_create`` wants
+    BOTH (the ``name`` arg is human-readable; the path is slugged
+    separately). The two helpers share :func:`_resolve_title_line` so
+    the slug and the filename can never diverge — the divergence
+    between them was Bug #57's surface signature.
+    """
+    if not isinstance(text, str):
+        return f"Untitled — {_date.today().isoformat()}"
+    title = _resolve_title_line(text)
+    if not title:
+        return f"Untitled — {_date.today().isoformat()}"
+    # Cap at a reasonable length to keep filenames manageable.
+    # Filesystems handle long names fine but operators don't read
+    # 200-char filenames.
+    if len(title) > 100:
+        title = title[:100].rstrip()
+    return title
 
 
 # ---------------------------------------------------------------------------
@@ -1783,14 +1871,106 @@ def _strip_command_prefix(
     return after.lstrip("\n").lstrip(" \t").rstrip()
 
 
+# ---------------------------------------------------------------------------
+# Multi-message paste buffer (Bug #58 — Telegram 4096-char chunking)
+# ---------------------------------------------------------------------------
+#
+# Telegram caps each message at ~4096 chars. Long Substack essays
+# (5000-15000 chars) get split into 2-4 chunks by the client. Only the
+# FIRST chunk carries the ``/train`` prefix; subsequent chunks land
+# as plain text and fall through to Hypatia's natural-language path,
+# producing a TRUNCATED voice profile and a contaminated conversation
+# transcript. (Andrew, 2026-05-08: pasted 3 essays, each chunked into
+# 2-3 messages; voice extraction returned ``closing_style: "Incomplete
+# — essay cuts off mid-sentence at 'I was'"``.)
+#
+# Fix: the bot-layer slash handler opens a per-chat-id buffer when it
+# fires. Subsequent plain-text messages within ``debounce_seconds``
+# append to the buffer and reset the timer. The flush callback runs
+# the existing save_raw + enqueue path on the FULL accumulated text.
+#
+# Flush triggers (any one fires):
+#   1. Silence past ``debounce_seconds`` (default 5s) — the common
+#      case; user finishes pasting.
+#   2. ``max_buffer_seconds`` ceiling (default 60s) — safety stop so
+#      a buffer can't sit open indefinitely if the operator wanders
+#      off mid-paste with no closing silence.
+#   3. Operator sends another command — the on_train / on_method_source
+#      handler closes the prior buffer before opening a new one.
+
+# Default debounce / ceiling. Both are config-overridable via
+# ``VoiceTrainConfig.debounce_seconds`` / ``VoiceTrainConfig.max_buffer_seconds``
+# (added in this commit). 5s captures the typical paste-burst (Telegram
+# clients send chunked messages within ~1s of each other) without
+# making the operator wait noticeably; 60s is the safety ceiling.
+_DEFAULT_DEBOUNCE_SECONDS = 5
+_DEFAULT_MAX_BUFFER_SECONDS = 60
+
+
+@dataclass
+class PendingPaste:
+    """One open paste buffer for a single chat_id.
+
+    Held in the bot's ``bot_data`` dict (keyed by chat_id) so the
+    on_train / on_method_source / on_text handlers all see the same
+    state. Single-event-loop concurrency: PTB runs all handlers in
+    one asyncio loop, so the dict access doesn't need locking.
+    """
+
+    chat_id: int
+    kind: Literal["voice", "method"]
+    cluster: str | None
+    chunks: list[str] = field(default_factory=list)
+    image_metadata: list[dict[str, Any]] = field(default_factory=list)
+    opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # The asyncio.TimerHandle (or Task) currently scheduled to flush.
+    # Cancelled + replaced on each new chunk so the debounce window
+    # restarts. ``None`` while a flush is actively running.
+    flush_task: Any = None
+    # Tracks whether the flush has fired (so a late text append after
+    # flush starts doesn't double-process). Set to True at the top of
+    # the flush callback.
+    flushed: bool = False
+
+    def assembled_text(self) -> str:
+        """Join chunks with double-newline (paragraph) separators.
+
+        Telegram's chunking sometimes splits on a paragraph boundary
+        and sometimes mid-line; ``\n\n`` is the safest re-join because
+        it preserves the visual break between chunks without
+        introducing artifacts when the chunker happened to break
+        cleanly between paragraphs (the duplicated newlines collapse
+        to a single paragraph break in any sensible Markdown reader).
+        """
+        return "\n\n".join(c.strip() for c in self.chunks if c.strip())
+
+
+def append_paste_chunk(
+    pending: PendingPaste, chunk: str,
+) -> None:
+    """Append a non-empty chunk to a pending buffer.
+
+    Idempotent on empty chunks (drops them). Caller is responsible
+    for resetting the debounce timer after this returns — kept
+    separate so test code can drive append + flush deterministically
+    without scheduling.
+    """
+    text = (chunk or "").strip()
+    if not text:
+        return
+    pending.chunks.append(text)
+
+
 __all__ = [
     "DmCallback",
     "ExtractionJob",
+    "PendingPaste",
     "SaveRawResult",
     "VOICE_EXTRACTION_PROMPT",
     "METHOD_EXTRACTION_PROMPT",
     "VOICE_CLUSTER_PROMPT",
     "VOICE_OVERALL_PROMPT",
+    "append_paste_chunk",
     "drain_queue",
     "enqueue_job",
     "extract_method_profile",

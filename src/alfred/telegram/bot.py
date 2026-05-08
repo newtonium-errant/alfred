@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import anthropic
 from telegram import Update
@@ -70,6 +70,10 @@ _KEY_CLIENT = "anthropic_client"
 _KEY_SYSTEM = "system_prompt"
 _KEY_VAULT_CTX = "vault_context_str"
 _KEY_LOCKS = "chat_locks"
+# Voice-train multi-message paste buffer (Bug #58). dict[chat_id, PendingPaste].
+# Lives on bot_data so on_train / on_method_source / on_text all see the same
+# state. Single-event-loop concurrency means no lock needed.
+_KEY_VOICE_TRAIN_BUFFERS = "voice_train_pending"
 
 
 # --- Instance-name normalisation ------------------------------------------
@@ -187,6 +191,9 @@ def build_app(
     app.bot_data[_KEY_SYSTEM] = provider
     app.bot_data[_KEY_VAULT_CTX] = vault_context_str
     app.bot_data[_KEY_LOCKS] = {}
+    # Bug #58 buffer registry — opened by /train + /method_source,
+    # appended to by on_text, drained by the debounce flush callback.
+    app.bot_data[_KEY_VOICE_TRAIN_BUFFERS] = {}
     app.bot_data["raw_config"] = raw_config
 
     # Application-level pre-pass: every inbound update bumps the
@@ -1403,13 +1410,17 @@ def _resolve_voice_train_input(
 async def on_train(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """``/train [--cluster <name>] [<text>]`` — train Hypatia on Andrew's voice.
 
-    Saves the raw essay record at ``document/essay/<slug>.md``
-    immediately, enqueues an async voice-profile extraction job, and
-    replies sub-2s with "saved, voice extraction queued".
+    Saves the raw essay record at ``document/essay/<slug>.md`` and
+    enqueues an async voice-profile extraction job. Bug #58 changed
+    the timing: pastes that span multiple Telegram messages (long
+    Substack essays exceed the 4096-char per-message limit and get
+    chunked into 2-4 messages by the client) now buffer for
+    ``debounce_seconds`` of operator silence before flushing, so the
+    full text is captured rather than just the first chunk.
 
     Resolution: explicit body in the slash-arg → most-recent long
-    paste in conversation memory. Empty/short input gets a "no recent
-    paste" reply rather than a queued job.
+    paste in conversation memory. Empty body opens an empty buffer —
+    the operator can paste their chunks in the next few messages.
 
     The async worker (started by the daemon when voice_train is
     configured) picks up the job, calls Opus, writes the structured
@@ -1432,93 +1443,26 @@ async def on_train(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     raw_text = update.message.text or ""
     cluster, body_arg = voice_train.parse_train_args(raw_text, ctx.args)
-    text, image_metadata = _resolve_voice_train_input(
+    initial_text, image_metadata = _resolve_voice_train_input(
         update, state_mgr, config, body_arg=body_arg,
     )
-
-    if not text or len(text) < config.voice_train.min_paste_chars:
-        await update.message.reply_text(
-            "no recent paste found — send the essay text after the "
-            "command (`/train your essay text...`) or paste it as a "
-            "prior message in this session."
-        )
-        log.info(
-            "talker.bot.voice_train.no_input",
-            chat_id=update.effective_chat.id,
-            cluster=cluster,
-            kind="voice",
-        )
-        return
 
     chat_id = update.effective_chat.id
     log.info(
         "talker.bot.voice_train.invoked",
         chat_id=chat_id,
         kind="voice",
-        text_len=len(text),
+        text_len=len(initial_text),
         cluster=cluster,
     )
-
-    # Save raw record immediately (sub-2s ack budget).
-    raw_result = voice_train.save_raw_essay(
-        Path(config.vault.path),
-        text=text,
-        cluster=cluster,
-        scope=_voice_train_scope_for(config),
-    )
-    if not raw_result.success:
-        await update.message.reply_text(
-            f"couldn't save raw essay record: {raw_result.error}"
-        )
-        return
-
-    # Enqueue extraction job. Failure here flips the raw record to
-    # ``failed`` so the operator knows to re-run.
-    queue_path = _resolve_queue_path(config)
-    job = voice_train.make_job(
-        kind="voice",
-        raw_rel_path=raw_result.rel_path,
-        raw_name=raw_result.name,
-        raw_body=text,
-        cluster=cluster,
+    await _open_or_extend_voice_train_buffer(
+        ctx,
         chat_id=chat_id,
-        instance=config.instance.name or "",
-    )
-    try:
-        voice_train.enqueue_job(queue_path, job)
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "talker.bot.voice_train.enqueue_failed",
-            error=str(exc),
-            raw_rel_path=raw_result.rel_path,
-        )
-        # Mark raw record failed so operator can retry.
-        try:
-            from alfred.vault import ops as _ops
-            _ops.vault_edit(
-                Path(config.vault.path),
-                raw_result.rel_path,
-                set_fields={
-                    "extraction_status": "failed",
-                    "extraction_failure_reason": f"enqueue: {exc}",
-                },
-            )
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "talker.bot.voice_train.mark_failed_failed",
-                rel_path=raw_result.rel_path,
-            )
-        await update.message.reply_text(
-            f"saved raw essay at `{raw_result.rel_path}`, but the "
-            f"extraction queue couldn't accept the job: {exc}. Re-run "
-            f"/train to retry."
-        )
-        return
-
-    cluster_msg = f" (cluster: {cluster})" if cluster else ""
-    await update.message.reply_text(
-        f"saved `{raw_result.rel_path}`{cluster_msg} — voice extraction "
-        f"queued. I'll DM you when the profile is ready."
+        kind="voice",
+        cluster=cluster,
+        initial_text=initial_text,
+        image_metadata=image_metadata,
+        reply_target=update.message,
     )
 
 
@@ -1527,16 +1471,16 @@ async def on_method_source(
 ) -> None:
     """``/method-source [<text>]`` (registered as /method_source).
 
-    Saves the raw source record at ``source/<slug>.md`` immediately,
-    enqueues an async method-profile extraction job, replies sub-2s.
+    Saves the raw source record at ``source/<slug>.md`` and enqueues
+    the method-extraction job. Same multi-message paste handling as
+    :func:`on_train` (Bug #58) — pastes that span multiple Telegram
+    messages buffer for ``debounce_seconds`` of operator silence
+    before flushing.
 
     Image attachments: when an image is on the active session's
     ``images`` list, the source body includes a reference to it AND
     the LLM call gets vision-transcription wrapping in a future
-    Phase 1.5. Phase 1 ships the image-reference + raw-text path;
-    if the operator sent an image-only message (no caption, no prior
-    paste), the handler refuses with "no source text — describe the
-    method or paste it after the slash" rather than guessing.
+    Phase 1.5. Phase 1 ships the image-reference + raw-text path.
     """
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
     state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
@@ -1552,33 +1496,401 @@ async def on_method_source(
 
     raw_text = update.message.text or ""
     body_arg = voice_train.parse_method_source_args(raw_text, ctx.args)
-    text, image_metadata = _resolve_voice_train_input(
+    initial_text, image_metadata = _resolve_voice_train_input(
         update, state_mgr, config, body_arg=body_arg,
     )
-
-    if not text or len(text) < config.voice_train.min_paste_chars:
-        await update.message.reply_text(
-            "no source text found — paste the method/system text "
-            "after the command (`/method-source your text...`) or "
-            "send it as a prior message in this session."
-        )
-        log.info(
-            "talker.bot.voice_train.no_input",
-            chat_id=update.effective_chat.id,
-            kind="method",
-        )
-        return
 
     chat_id = update.effective_chat.id
     log.info(
         "talker.bot.voice_train.invoked",
         chat_id=chat_id,
         kind="method",
-        text_len=len(text),
+        text_len=len(initial_text),
         has_image=bool(image_metadata),
     )
+    await _open_or_extend_voice_train_buffer(
+        ctx,
+        chat_id=chat_id,
+        kind="method",
+        cluster=None,
+        initial_text=initial_text,
+        image_metadata=image_metadata,
+        reply_target=update.message,
+    )
 
-    # Save raw record immediately.
+
+# --- Voice-train buffer helpers (Bug #58) -------------------------------
+
+
+async def _open_or_extend_voice_train_buffer(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    kind: Literal["voice", "method"],
+    cluster: str | None,
+    initial_text: str,
+    image_metadata: list[dict[str, Any]],
+    reply_target: Any,
+) -> None:
+    """Open a paste buffer for this chat (or append to an existing one).
+
+    The flow:
+      1. If a buffer is already open for this chat_id, the operator
+         issued a SECOND command before the first one flushed. Flush
+         the prior buffer immediately (carrying its kind/cluster) and
+         then open a fresh buffer for this command.
+      2. Append the slash-command's initial body chunk (if any).
+      3. Schedule the debounce-flush task. Subsequent text messages
+         in this chat hit ``_voice_train_buffer_append`` (called from
+         ``on_text``) which appends + resets the timer.
+      4. Reply to the operator with a brief "buffering" ack.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    buffers: dict[int, voice_train.PendingPaste] = (
+        ctx.application.bot_data[_KEY_VOICE_TRAIN_BUFFERS]
+    )
+
+    # Step 1: flush any pre-existing buffer (operator switched modes).
+    existing = buffers.get(chat_id)
+    if existing is not None and not existing.flushed:
+        log.info(
+            "talker.bot.voice_train.buffer_preempted",
+            chat_id=chat_id,
+            old_kind=existing.kind,
+            new_kind=kind,
+        )
+        await _flush_voice_train_buffer(ctx, chat_id, reason="preempted")
+
+    # Step 2: open the new buffer + seed with the initial chunk.
+    pending = voice_train.PendingPaste(
+        chat_id=chat_id,
+        kind=kind,
+        cluster=cluster,
+        image_metadata=list(image_metadata or []),
+    )
+    if initial_text:
+        voice_train.append_paste_chunk(pending, initial_text)
+    buffers[chat_id] = pending
+
+    # Step 3: schedule the flush.
+    debounce = (
+        config.voice_train.debounce_seconds
+        if config.voice_train is not None
+        else 5
+    )
+    _schedule_voice_train_flush(ctx, chat_id, delay_seconds=debounce)
+
+    # Step 4: ack.
+    initial_chars = len(initial_text)
+    cluster_msg = f" (cluster: {cluster})" if cluster else ""
+    if initial_chars > 0:
+        await reply_target.reply_text(
+            f"buffering {initial_chars} chars{cluster_msg} — append more "
+            f"chunks within {debounce}s, or wait for auto-flush."
+        )
+    else:
+        if kind == "method":
+            empty_ack = (
+                f"/method-source ready{cluster_msg} — paste your text "
+                f"in the next message(s); I'll flush after {debounce}s "
+                f"of silence."
+            )
+        else:
+            empty_ack = (
+                f"/train ready{cluster_msg} — paste your essay in the "
+                f"next message(s); I'll flush after {debounce}s of silence."
+            )
+        await reply_target.reply_text(empty_ack)
+
+
+def _schedule_voice_train_flush(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, delay_seconds: int,
+) -> None:
+    """Replace the active flush task with a new debounce-delayed one.
+
+    Cancelling + replacing the task is the debounce reset. The flush
+    task itself is a fire-and-forget asyncio task — we don't await it
+    here; on_text returns immediately so Telegram delivery isn't
+    blocked.
+    """
+    buffers: dict[int, voice_train.PendingPaste] = (
+        ctx.application.bot_data[_KEY_VOICE_TRAIN_BUFFERS]
+    )
+    pending = buffers.get(chat_id)
+    if pending is None:
+        return
+    # Cancel the prior flush task if it's still scheduled (debounce
+    # reset). A flush already running is left alone — its early
+    # ``flushed=True`` flag prevents a subsequent append from
+    # double-processing.
+    if pending.flush_task is not None:
+        try:
+            pending.flush_task.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    max_buffer = (
+        config.voice_train.max_buffer_seconds
+        if config.voice_train is not None
+        else 60
+    )
+    # Compute the effective sleep — never beyond the max-buffer ceiling
+    # measured from when the buffer first opened. This keeps a chatty
+    # operator from extending the buffer indefinitely.
+    elapsed = (
+        datetime.now(timezone.utc) - pending.opened_at
+    ).total_seconds()
+    remaining_until_ceiling = max(0.0, max_buffer - elapsed)
+    effective_sleep = min(float(delay_seconds), remaining_until_ceiling)
+    if effective_sleep <= 0:
+        # We're already past the ceiling — flush immediately.
+        async def _flush_now() -> None:
+            await _flush_voice_train_buffer(ctx, chat_id, reason="ceiling")
+        pending.flush_task = asyncio.create_task(_flush_now())
+        return
+
+    async def _delayed_flush() -> None:
+        try:
+            await asyncio.sleep(effective_sleep)
+        except asyncio.CancelledError:
+            return
+        await _flush_voice_train_buffer(ctx, chat_id, reason="debounce")
+
+    pending.flush_task = asyncio.create_task(_delayed_flush())
+
+
+def _voice_train_buffer_append(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+) -> bool:
+    """Append a plain-text chunk to an open buffer, if one exists.
+
+    Returns ``True`` when the chunk was consumed by the buffer (caller
+    skips the natural-language conversation path). ``False`` when no
+    buffer is open or when the buffer has already flushed (caller
+    proceeds normally).
+
+    Resets the debounce timer on every successful append.
+    """
+    buffers: dict[int, voice_train.PendingPaste] = (
+        ctx.application.bot_data.get(_KEY_VOICE_TRAIN_BUFFERS) or {}
+    )
+    pending = buffers.get(chat_id)
+    if pending is None or pending.flushed:
+        return False
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    voice_train.append_paste_chunk(pending, text)
+    debounce = (
+        config.voice_train.debounce_seconds
+        if config.voice_train is not None
+        else 5
+    )
+    _schedule_voice_train_flush(ctx, chat_id, delay_seconds=debounce)
+    log.info(
+        "talker.bot.voice_train.buffer_chunk_appended",
+        chat_id=chat_id,
+        kind=pending.kind,
+        chunk_chars=len(text),
+        total_chunks=len(pending.chunks),
+    )
+    return True
+
+
+async def _flush_voice_train_buffer(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, reason: str,
+) -> None:
+    """Drain a chat's pending buffer and run the save+enqueue path.
+
+    Removes the buffer from the registry FIRST (so a late append
+    arriving during the flush opens a new buffer rather than trying
+    to extend a dying one). Then runs the kind-appropriate finalize
+    helper on the assembled text.
+    """
+    buffers: dict[int, voice_train.PendingPaste] = (
+        ctx.application.bot_data[_KEY_VOICE_TRAIN_BUFFERS]
+    )
+    pending = buffers.pop(chat_id, None)
+    if pending is None:
+        return
+    if pending.flushed:
+        # Another flush already ran (e.g. preempted then debounce
+        # fired late) — nothing to do.
+        return
+    pending.flushed = True
+    text = pending.assembled_text()
+    log.info(
+        "talker.bot.voice_train.buffer_flushed",
+        chat_id=chat_id,
+        kind=pending.kind,
+        reason=reason,
+        chunk_count=len(pending.chunks),
+        total_chars=len(text),
+    )
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    bot_obj = ctx.bot
+
+    if not text or (
+        config.voice_train is not None
+        and len(text) < config.voice_train.min_paste_chars
+    ):
+        # No usable input. Per intentionally-left-blank, emit an
+        # explicit reply rather than silent absence.
+        try:
+            await bot_obj.send_message(
+                chat_id=chat_id,
+                text=(
+                    "no usable paste — buffer flushed empty. Send the "
+                    "essay text after the command, or paste it as one "
+                    "or more messages within the buffer window."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.bot.voice_train.flush_empty_reply_failed",
+                chat_id=chat_id,
+            )
+        log.info(
+            "talker.bot.voice_train.no_input",
+            chat_id=chat_id,
+            kind=pending.kind,
+            reason=reason,
+        )
+        return
+
+    if pending.kind == "voice":
+        await _finalize_train_paste(
+            ctx,
+            chat_id=chat_id,
+            text=text,
+            cluster=pending.cluster,
+        )
+    else:
+        await _finalize_method_source_paste(
+            ctx,
+            chat_id=chat_id,
+            text=text,
+            image_metadata=pending.image_metadata,
+        )
+
+
+async def _finalize_train_paste(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    text: str,
+    cluster: str | None,
+) -> None:
+    """Run the save_raw_essay + enqueue path on assembled text.
+
+    Extracted from the original :func:`on_train` body — the only
+    difference is the reply target uses ``ctx.bot.send_message`` (the
+    flush callback runs outside the inbound-message handler so we
+    don't have ``update.message`` available).
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    bot_obj = ctx.bot
+    raw_result = voice_train.save_raw_essay(
+        Path(config.vault.path),
+        text=text,
+        cluster=cluster,
+        scope=_voice_train_scope_for(config),
+    )
+    if not raw_result.success:
+        try:
+            await bot_obj.send_message(
+                chat_id=chat_id,
+                text=f"couldn't save raw essay record: {raw_result.error}",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.bot.voice_train.flush_save_failed_reply_failed",
+                chat_id=chat_id,
+            )
+        return
+
+    queue_path = _resolve_queue_path(config)
+    job = voice_train.make_job(
+        kind="voice",
+        raw_rel_path=raw_result.rel_path,
+        raw_name=raw_result.name,
+        raw_body=text,
+        cluster=cluster,
+        chat_id=chat_id,
+        instance=config.instance.name or "",
+    )
+    try:
+        voice_train.enqueue_job(queue_path, job)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.voice_train.enqueue_failed",
+            error=str(exc),
+            raw_rel_path=raw_result.rel_path,
+        )
+        try:
+            from alfred.vault import ops as _ops
+            _ops.vault_edit(
+                Path(config.vault.path),
+                raw_result.rel_path,
+                set_fields={
+                    "extraction_status": "failed",
+                    "extraction_failure_reason": f"enqueue: {exc}",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.bot.voice_train.mark_failed_failed",
+                rel_path=raw_result.rel_path,
+            )
+        try:
+            await bot_obj.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"saved raw essay at `{raw_result.rel_path}`, but the "
+                    f"extraction queue couldn't accept the job: {exc}. "
+                    f"Re-run /train to retry."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.bot.voice_train.flush_enqueue_failed_reply_failed",
+                chat_id=chat_id,
+            )
+        return
+
+    cluster_msg = f" (cluster: {cluster})" if cluster else ""
+    try:
+        await bot_obj.send_message(
+            chat_id=chat_id,
+            text=(
+                f"saved `{raw_result.rel_path}`{cluster_msg} — voice "
+                f"extraction queued ({len(text)} chars). I'll DM you "
+                f"when the profile is ready."
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "talker.bot.voice_train.flush_ok_reply_failed",
+            chat_id=chat_id,
+        )
+
+
+async def _finalize_method_source_paste(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    text: str,
+    image_metadata: list[dict[str, Any]],
+) -> None:
+    """Run the save_raw_source + enqueue path on assembled text.
+
+    Extracted from the original :func:`on_method_source` body for the
+    same reason as :func:`_finalize_train_paste` — flush callback
+    runs outside the inbound-message handler.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    bot_obj = ctx.bot
     raw_result = voice_train.save_raw_source(
         Path(config.vault.path),
         text=text,
@@ -1586,9 +1898,16 @@ async def on_method_source(
         image_metadata=image_metadata,
     )
     if not raw_result.success:
-        await update.message.reply_text(
-            f"couldn't save raw source record: {raw_result.error}"
-        )
+        try:
+            await bot_obj.send_message(
+                chat_id=chat_id,
+                text=f"couldn't save raw source record: {raw_result.error}",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.bot.voice_train.flush_save_failed_reply_failed",
+                chat_id=chat_id,
+            )
         return
 
     queue_path = _resolve_queue_path(config)
@@ -1624,18 +1943,37 @@ async def on_method_source(
                 "talker.bot.voice_train.mark_failed_failed",
                 rel_path=raw_result.rel_path,
             )
-        await update.message.reply_text(
-            f"saved raw source at `{raw_result.rel_path}`, but the "
-            f"extraction queue couldn't accept the job: {exc}. Re-run "
-            f"/method-source to retry."
-        )
+        try:
+            await bot_obj.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"saved raw source at `{raw_result.rel_path}`, but "
+                    f"the extraction queue couldn't accept the job: "
+                    f"{exc}. Re-run /method-source to retry."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.bot.voice_train.flush_enqueue_failed_reply_failed",
+                chat_id=chat_id,
+            )
         return
 
     image_msg = " (with image reference)" if image_metadata else ""
-    await update.message.reply_text(
-        f"saved `{raw_result.rel_path}`{image_msg} — method extraction "
-        f"queued. I'll DM you when the profile is ready."
-    )
+    try:
+        await bot_obj.send_message(
+            chat_id=chat_id,
+            text=(
+                f"saved `{raw_result.rel_path}`{image_msg} — method "
+                f"extraction queued ({len(text)} chars). I'll DM you "
+                f"when the profile is ready."
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "talker.bot.voice_train.flush_ok_reply_failed",
+            chat_id=chat_id,
+        )
 
 
 def _voice_train_scope_for(config: TalkerConfig) -> str:
@@ -1909,6 +2247,27 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # ``_pre_record_inbound`` pre-pass (group=-1), not here — that
     # ensures unrecognised commands and other non-text-handler updates
     # still count. See the pre-pass comment block above ``build_app``.
+
+    # Bug #58 — multi-message paste capture. If a /train or /method-source
+    # buffer is currently open for this chat, the text message is part
+    # of the chunked paste rather than a conversation turn. Append to
+    # the buffer (which resets the debounce timer) and skip the
+    # natural-language conversation path. The buffer's flush callback
+    # will run save_raw + enqueue once the operator goes silent.
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is not None and _voice_train_buffer_append(ctx, chat_id, text):
+        # React with a checkmark so the operator gets a visual receipt
+        # for "chunk captured." Best-effort; failure here doesn't break
+        # the buffer logic.
+        try:
+            await _post_capture_ack(update, ctx, chat_id)
+        except Exception:  # noqa: BLE001
+            log.debug(
+                "talker.bot.voice_train.buffer_ack_failed",
+                chat_id=chat_id,
+            )
+        return
+
     await handle_message(update, ctx, text=text, voice=False)
 
 

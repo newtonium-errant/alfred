@@ -1338,3 +1338,491 @@ def test_writer_passes_through_method_not_a_method_status(
     assert fm.get("not_a_method_reason") == (
         "opinion essay, no extractable principles"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug #57 (2026-05-08) — YAML frontmatter slug derivation
+# ---------------------------------------------------------------------------
+#
+# Substack-export pastes start with a YAML frontmatter block delimited
+# by ``---`` lines:
+#
+#     ---
+#     title: "If You're Not Doing This..."
+#     subtitle: ...
+#     ---
+#
+#     # If You're Not Doing This...
+#     ...body...
+#
+# Pre-fix the slug derivation took the first non-empty line, which is
+# the bare ``---`` marker. Slug ended up as ``---`` (then dropped to
+# ``"untitled"`` by the alphanumeric filter) but the FILENAME written
+# by ``vault_create`` came from a separate path that produced ``---.md``.
+# Log signature was: ``slug=untitled`` + ``rel_path=document/essay/---.md``.
+
+_FRONTMATTER_PASTE = (
+    "---\n"
+    "title: \"If You're Not Doing This Then You're Being Left Behind\"\n"
+    "subtitle: \"No Fate But What We Make...\"\n"
+    "author: Andrew Errant\n"
+    "date: 2025-07-16\n"
+    "canonical: https://example.com/p/if-youre\n"
+    "---\n"
+    "\n"
+    "# If You're Not Doing This Then You're Being Left Behind\n"
+    "\n"
+    "### No Fate But What We Make...\n"
+    "\n"
+    "*By Andrew Errant — Jul 16, 2025*\n"
+    "\n"
+    "---\n"
+    "\n"
+    "# You've seen the headlines.\n"
+    "\n"
+    "AI is the FUTURE!! ...\n"
+)
+
+
+def test_slug_from_text_uses_yaml_frontmatter_title() -> None:
+    """Bug #57 (2026-05-08): YAML frontmatter title beats first-line ``---``.
+
+    Pre-fix: slug came out as ``---`` (then dropped to ``"untitled"``)
+    while the filename written was ``---.md``. Post-fix: parse the
+    frontmatter, use the ``title:`` field.
+    """
+    assert (
+        voice_train.slug_from_text(_FRONTMATTER_PASTE)
+        == "if-youre-not-doing-this-then-youre-being-left-behind"
+    )
+
+
+def test_title_from_text_uses_yaml_frontmatter_title() -> None:
+    """Bug #57: title derivation aligned with slug derivation.
+
+    The bug's surface signature was a divergence between the slug
+    variable (``"untitled"``) and the filename written (``---.md``).
+    Title MUST share the same resolution path as slug so they can't
+    drift.
+    """
+    assert (
+        voice_train.title_from_text(_FRONTMATTER_PASTE)
+        == "If You're Not Doing This Then You're Being Left Behind"
+    )
+
+
+def test_slug_from_text_frontmatter_no_title_field_falls_back_to_h1() -> None:
+    """Frontmatter present but no ``title:`` field → use first H1 below."""
+    text = (
+        "---\n"
+        "subtitle: \"Something else\"\n"
+        "author: Andrew Errant\n"
+        "---\n"
+        "\n"
+        "# The Real H1 Heading\n"
+        "\n"
+        "Body text.\n"
+    )
+    assert voice_train.slug_from_text(text) == "the-real-h1-heading"
+
+
+def test_title_from_text_frontmatter_no_title_field_falls_back_to_h1() -> None:
+    text = (
+        "---\n"
+        "author: Andrew Errant\n"
+        "---\n"
+        "\n"
+        "# The Real H1 Heading\n"
+        "\n"
+        "Body.\n"
+    )
+    assert voice_train.title_from_text(text) == "The Real H1 Heading"
+
+
+def test_slug_from_text_h1_only_no_frontmatter_regression() -> None:
+    """REGRESSION: pre-existing H1-only behaviour MUST still work.
+
+    The fix MUST NOT regress the no-frontmatter path — operators who
+    paste ``# Title\\n\\nbody`` directly (without a Substack export
+    wrapper) still get the H1 as the slug.
+    """
+    text = "# A Heading\n\nbody text"
+    assert voice_train.slug_from_text(text) == "a-heading"
+
+
+def test_slug_from_text_neither_frontmatter_nor_h1() -> None:
+    """No frontmatter, no heading — first non-blank line wins."""
+    text = "Just some prose\nthat starts with no markup."
+    assert voice_train.slug_from_text(text) == "just-some-prose"
+
+
+def test_slug_from_text_starts_with_dashes_never_returns_dashes() -> None:
+    """Defensive guard: a paste that begins with ``---\\n`` MUST NOT slug to ``---``.
+
+    This is the core regression for Bug #57. Even if the frontmatter
+    parser fails (malformed YAML, missing closing ``---``, etc.), the
+    slug MUST NOT come back as ``"---"`` or get used as a literal
+    filename component.
+    """
+    # Malformed frontmatter (no closing ``---``). Falls through to the
+    # line scanner — which must skip the ``---`` line.
+    text = "---\ntitle: not closed properly\nfoo: bar\n\n# Real Title\n"
+    slug = voice_train.slug_from_text(text)
+    # The bare ``---`` is not a valid slug component; the result must
+    # be derived from a real title source or the default.
+    assert slug != "---"
+    assert "---" not in slug or slug.count("-") < 3 * len(slug)
+    # Specifically, never just dashes.
+    assert slug.strip("-") != ""
+
+
+def test_slug_from_text_frontmatter_with_quoted_title() -> None:
+    """YAML quoted title (single or double) — outer quotes stripped."""
+    text_dquote = (
+        '---\ntitle: "Quoted Title"\n---\n\nbody\n'
+    )
+    text_squote = (
+        "---\ntitle: 'Quoted Title'\n---\n\nbody\n"
+    )
+    assert voice_train.slug_from_text(text_dquote) == "quoted-title"
+    assert voice_train.slug_from_text(text_squote) == "quoted-title"
+
+
+def test_slug_and_title_align_for_frontmatter_paste() -> None:
+    """Bug #57's load-bearing invariant: slug and title share one resolver.
+
+    The bug's surface signature was DIVERGENCE between the two — the
+    log emitted ``slug=untitled`` while the file landed at ``---.md``.
+    Pin: for any frontmatter-shaped input, ``title_from_text`` and
+    ``slug_from_text`` must agree on the title source.
+    """
+    title = voice_train.title_from_text(_FRONTMATTER_PASTE)
+    slug = voice_train.slug_from_text(_FRONTMATTER_PASTE)
+    # Slug should be the slugified form of the title.
+    expected_slug = title.lower()
+    expected_slug = expected_slug.replace("'", "")  # apostrophe drops
+    expected_slug = expected_slug.replace("  ", " ").replace(" ", "-")
+    # The exact slugification rules are tested elsewhere; here we just
+    # pin that BOTH derive from the title (not from the ``---`` marker).
+    assert "youre-not-doing" in slug
+    assert title.startswith("If You're Not")
+
+
+def test_save_raw_essay_frontmatter_paste_lands_at_real_slug(
+    vault_path: Path,
+) -> None:
+    """End-to-end: save_raw_essay on a Substack-export paste.
+
+    Pre-fix the file landed at ``document/essay/---.md`` (per Andrew's
+    2026-05-08 log: ``rel_path=document/essay/---.md slug=untitled``).
+    Post-fix the file lands under the real title.
+    """
+    result = voice_train.save_raw_essay(
+        vault_path,
+        text=_FRONTMATTER_PASTE,
+        cluster="veteran",
+        scope="hypatia",
+    )
+    assert result.success
+    # Critical: filename MUST NOT be ``---.md``.
+    assert "---.md" not in result.rel_path, (
+        f"Bug #57 regression — file landed at {result.rel_path!r}"
+    )
+    # Slug variable MUST NOT be ``"untitled"`` for a paste that has
+    # a real frontmatter title.
+    assert result.slug != "untitled", (
+        f"Bug #57 slug-divergence regression — slug={result.slug!r} "
+        f"despite valid frontmatter title"
+    )
+    # Real title flows through.
+    assert "youre-not-doing" in result.slug.lower()
+
+
+# ---------------------------------------------------------------------------
+# Bug #58 (2026-05-08) — multi-message paste buffer
+# ---------------------------------------------------------------------------
+#
+# Telegram caps each message at ~4096 chars; long Substack pastes get
+# split into 2-4 messages by the client. Pre-fix only the first chunk
+# (with the ``/train`` prefix) was processed; subsequent chunks fell
+# through to Hypatia's natural-language path.
+#
+# The fix is a per-chat-id paste buffer in bot.bot_data. The slash
+# handler opens the buffer + seeds it; on_text appends to the buffer
+# (instead of routing to handle_message); a debounce-delayed flush
+# task drains the buffer and runs the existing save_raw + enqueue path.
+
+
+def test_pending_paste_assembled_text_joins_with_paragraph_breaks() -> None:
+    """Chunks are joined with ``\\n\\n`` (paragraph break)."""
+    pending = voice_train.PendingPaste(
+        chat_id=1, kind="voice", cluster=None,
+    )
+    voice_train.append_paste_chunk(pending, "First chunk text.")
+    voice_train.append_paste_chunk(pending, "Second chunk text.")
+    voice_train.append_paste_chunk(pending, "Third chunk text.")
+    assembled = pending.assembled_text()
+    assert assembled == (
+        "First chunk text.\n\nSecond chunk text.\n\nThird chunk text."
+    )
+
+
+def test_pending_paste_skips_empty_chunks() -> None:
+    """Empty / whitespace-only chunks dropped silently."""
+    pending = voice_train.PendingPaste(
+        chat_id=1, kind="voice", cluster=None,
+    )
+    voice_train.append_paste_chunk(pending, "Real text.")
+    voice_train.append_paste_chunk(pending, "")
+    voice_train.append_paste_chunk(pending, "   \t  \n  ")
+    voice_train.append_paste_chunk(pending, "More text.")
+    assembled = pending.assembled_text()
+    assert assembled == "Real text.\n\nMore text."
+
+
+def test_pending_paste_assembled_long_substack_essay() -> None:
+    """REGRESSION: 3-chunk Substack paste reassembles to the full essay.
+
+    Andrew's 2026-05-08 case: voice profile extracted from the FIRST
+    chunk only. Worker output ended at ``closing_style: "Incomplete —
+    essay cuts off mid-sentence at 'I was'"``. Post-fix the buffer
+    reassembles the chunks into one paste so the worker sees the full
+    essay.
+    """
+    chunk_1 = "First half of an essay. " * 200  # ~5000 chars
+    chunk_2 = "Middle section continuing the thought. " * 200
+    chunk_3 = "Final paragraphs and the conclusion."
+    pending = voice_train.PendingPaste(
+        chat_id=999, kind="voice", cluster="veteran",
+    )
+    voice_train.append_paste_chunk(pending, chunk_1)
+    voice_train.append_paste_chunk(pending, chunk_2)
+    voice_train.append_paste_chunk(pending, chunk_3)
+    assembled = pending.assembled_text()
+    # All three chunks present.
+    assert "First half" in assembled
+    assert "Middle section" in assembled
+    assert "Final paragraphs" in assembled
+    # Combined length matches sum of chunks (modulo whitespace).
+    assert len(assembled) > len(chunk_1)
+    assert len(assembled) > len(chunk_2)
+
+
+@pytest.mark.asyncio
+async def test_voice_train_buffer_appends_text_messages(tmp_path: Path) -> None:
+    """End-to-end: /train + 2 plain-text continuations → single flushed paste.
+
+    Drives the bot helpers directly (avoids spinning up a real PTB
+    application). Confirms:
+      * Slash handler opens the buffer with the initial chunk.
+      * ``_voice_train_buffer_append`` consumes plain-text chunks
+        (returns True), appends them, resets the timer.
+      * Flush callback assembles the full paste and runs save_raw +
+        enqueue end-to-end.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            debounce_seconds=1,
+            max_buffer_seconds=10,
+            min_paste_chars=50,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    # Stand-in PTB application — only the bits the helpers touch.
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    fake_bot = _FakeBot()
+    application = SimpleNamespace(bot_data=bot_data)
+    ctx = SimpleNamespace(application=application, bot=fake_bot)
+
+    chat_id = 12345
+    initial_chunk = "Chunk one is the slash-arg paste. " * 5
+    second_chunk = "Chunk two is a plain text follow-up. " * 5
+    third_chunk = "Chunk three closes the paste. " * 5
+
+    # Open buffer + seed with first chunk.
+    pending = voice_train.PendingPaste(
+        chat_id=chat_id, kind="voice", cluster="veteran",
+    )
+    voice_train.append_paste_chunk(pending, initial_chunk)
+    bot_data["voice_train_pending"][chat_id] = pending
+
+    # Append second chunk (simulates on_text consuming a continuation).
+    appended_2 = bot._voice_train_buffer_append(ctx, chat_id, second_chunk)
+    assert appended_2 is True
+    # Append third chunk.
+    appended_3 = bot._voice_train_buffer_append(ctx, chat_id, third_chunk)
+    assert appended_3 is True
+    # Buffer carries all 3 chunks.
+    assert len(pending.chunks) == 3
+
+    # Drive the flush directly.
+    await bot._flush_voice_train_buffer(ctx, chat_id, reason="test")
+
+    # Buffer popped from registry.
+    assert chat_id not in bot_data["voice_train_pending"]
+    # Raw essay record landed.
+    essay_files = list((Path(config.vault.path) / "document" / "essay").glob("*.md"))
+    assert len(essay_files) == 1
+    body = essay_files[0].read_text(encoding="utf-8")
+    # All three chunks present in the assembled paste body.
+    assert "Chunk one" in body
+    assert "Chunk two" in body
+    assert "Chunk three" in body
+    # Queue has one job.
+    queue_jobs = voice_train.drain_queue(Path(config.voice_train.queue_path))
+    assert len(queue_jobs) == 1
+    assert queue_jobs[0].kind == "voice"
+    assert queue_jobs[0].cluster == "veteran"
+    # The enqueued raw_body matches the assembled paste, not just the
+    # first chunk — this is the load-bearing pin for Bug #58.
+    assert "Chunk one" in queue_jobs[0].raw_body
+    assert "Chunk two" in queue_jobs[0].raw_body
+    assert "Chunk three" in queue_jobs[0].raw_body
+    # Operator got at least one ack message.
+    assert sent, "no ack messages sent"
+
+
+@pytest.mark.asyncio
+async def test_voice_train_buffer_flush_skips_when_below_min_paste(
+    tmp_path: Path,
+) -> None:
+    """Buffer flushes empty when assembled text is below ``min_paste_chars``.
+
+    Per intentionally-left-blank: emits an explicit "no usable paste"
+    reply rather than silently dropping. Caller can re-issue.
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=200,  # threshold
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 999
+
+    pending = voice_train.PendingPaste(
+        chat_id=chat_id, kind="voice", cluster=None,
+    )
+    voice_train.append_paste_chunk(pending, "tiny")  # below threshold
+    bot_data["voice_train_pending"][chat_id] = pending
+
+    await bot._flush_voice_train_buffer(ctx, chat_id, reason="test")
+
+    # No raw record written (input below min).
+    essay_dir = Path(config.vault.path) / "document" / "essay"
+    assert not essay_dir.exists() or not list(essay_dir.glob("*.md"))
+    # No queue job.
+    queue_jobs = voice_train.drain_queue(
+        Path(config.voice_train.queue_path)
+    )
+    assert queue_jobs == []
+    # But the operator got a "no usable paste" reply.
+    assert sent
+    assert "no usable paste" in sent[0][1].lower()
+
+
+def test_voice_train_buffer_append_returns_false_when_no_buffer() -> None:
+    """When no buffer is open for chat_id, append returns False (caller proceeds).
+
+    Pin: the early-return path in on_text only fires when there's
+    actually a buffer to append to. Plain conversation text in a chat
+    with no /train in flight goes through handle_message normally.
+    """
+    from types import SimpleNamespace
+
+    bot_data: dict[str, Any] = {
+        "config": SimpleNamespace(voice_train=None),
+        "voice_train_pending": {},
+    }
+    ctx = SimpleNamespace(application=SimpleNamespace(bot_data=bot_data))
+    assert bot._voice_train_buffer_append(ctx, 12345, "any text") is False
+
+
+@pytest.mark.asyncio
+async def test_voice_train_buffer_method_source_path(tmp_path: Path) -> None:
+    """/method-source path: buffer + flush works for method kind too.
+
+    Pin: the symmetric application of the multi-message paste fix
+    across both slash commands. Same chunking issue affects
+    /method-source for the same reason (Andrew's 2026-05-08 brief
+    explicitly covered both).
+    """
+    from types import SimpleNamespace
+
+    config = _make_hypatia_config(
+        tmp_path,
+        voice_train_config=VoiceTrainConfig(
+            command_enabled=True,
+            min_paste_chars=20,
+            queue_path=str(tmp_path / "queue.jsonl"),
+        ),
+    )
+    bot_data: dict[str, Any] = {
+        "config": config,
+        "voice_train_pending": {},
+    }
+    sent: list[tuple[int, str]] = []
+
+    class _FakeBot:
+        async def send_message(self, *, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(
+        application=SimpleNamespace(bot_data=bot_data),
+        bot=_FakeBot(),
+    )
+    chat_id = 3737
+
+    pending = voice_train.PendingPaste(
+        chat_id=chat_id, kind="method", cluster=None,
+        image_metadata=[],
+    )
+    voice_train.append_paste_chunk(pending, "First chunk of method source.")
+    voice_train.append_paste_chunk(pending, "Second chunk of method source.")
+    bot_data["voice_train_pending"][chat_id] = pending
+
+    await bot._flush_voice_train_buffer(ctx, chat_id, reason="test")
+
+    # Source record landed.
+    src_files = list((Path(config.vault.path) / "source").glob("*.md"))
+    assert len(src_files) == 1
+    body = src_files[0].read_text(encoding="utf-8")
+    assert "First chunk" in body
+    assert "Second chunk" in body
+    # Queue carries the method job with full assembled body.
+    queue_jobs = voice_train.drain_queue(Path(config.voice_train.queue_path))
+    assert len(queue_jobs) == 1
+    assert queue_jobs[0].kind == "method"
+    assert "First chunk" in queue_jobs[0].raw_body
+    assert "Second chunk" in queue_jobs[0].raw_body

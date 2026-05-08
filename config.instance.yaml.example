@@ -340,5 +340,12 @@ brief_digest_push:
 #     # extraction_model: "claude-opus-4-5"    # default; depth-class work
 #     # worker_poll_seconds: 8                 # 4-15s reasonable range
 #     # min_paste_chars: 200                   # rejects short inputs
+#     # debounce_seconds: 5                    # multi-message paste debounce
+#     #   ^ Telegram caps each msg at ~4096 chars; long Substack pastes
+#     #   chunk into 2-4 messages. /train opens a buffer that waits this
+#     #   many seconds of operator silence before flushing — additional
+#     #   plain-text msgs in the same chat append to the buffer rather
+#     #   than going through the natural-language conversation path.
+#     # max_buffer_seconds: 60                 # safety ceiling on debounce
 #     # queue_path: "/home/andrew/.alfred/<instance>/extraction_queue.jsonl"
 #     #   ^ defaults to ./data/<instance-slug>/extraction_queue.jsonl

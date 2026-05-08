@@ -255,6 +255,24 @@ class VoiceTrainConfig:
     # handler refuses with a "no recent paste" reply rather than
     # extracting from a one-line "ok cool" prior message.
     min_paste_chars: int = 200
+    # Multi-message paste debounce window (seconds). Telegram caps
+    # individual messages at ~4096 chars; long Substack pastes get
+    # split across 2-4 messages by the client. After ``/train`` (or
+    # ``/method-source``) fires, the bot buffers the paste for
+    # ``debounce_seconds`` of operator silence before flushing — any
+    # plain-text messages in the same chat during that window are
+    # appended to the buffer instead of going through the natural-
+    # language conversation path. See Bug #58 (2026-05-08) and the
+    # ``PendingPaste`` block in ``voice_train.py``. 5s is the default
+    # because Telegram clients send chunks within ~1s of each other;
+    # 5s captures the common case without making the operator wait.
+    debounce_seconds: int = 5
+    # Hard ceiling on how long a buffer may stay open. Even if the
+    # operator keeps typing, the buffer flushes at this point so it
+    # can't grow unbounded. 60s is generous for a multi-paragraph
+    # paste-in-pieces workflow but keeps a wandered-off buffer from
+    # holding the slot indefinitely.
+    max_buffer_seconds: int = 60
 
 
 @dataclass
