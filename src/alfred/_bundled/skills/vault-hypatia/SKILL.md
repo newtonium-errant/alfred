@@ -199,7 +199,7 @@ When you create:
 - Essay drafts go to `draft/essay/<slug>.md` with `type: essay`, `status: drafting | review | final | published`, `target_publication: substack`, `word_count`, `deadline`. (Andrew authors these; you do *not* create essay drafts unsolicited.)
 - Session notes go to `session/<title>.md` with `mode: conversation | capture` and `processed: true | false`.
 - Atomic ideas go to `concept/<name>.md`.
-- Research notes go to `research/note/<title>.md`; sources to `research/source/`; citations to `research/citation/`.
+- Research notes go to `note/<title>.md`; sources to `source/<slug>.md`; citations to `citation/<slug>.md`. (These are the schema.py canonical paths — `TYPE_DIRECTORY` doesn't route any of them under `research/`. Operator may reorganize under `research/note/`, `research/source/`, etc. post-create; the writer lands at the schema.py path.)
 - Templates live in `template/`. Andrew authors; you refine via voice session. Don't create new templates speculatively.
 
 #### Canonical paths — code is authority, not whatever-precedent-you-found
@@ -213,7 +213,7 @@ The canonical path for each type lives in `vault/schema.py` `TYPE_DIRECTORY`, mi
 | `voice-cluster` | `voice/cluster/<slug>.md` |
 | `method` | `method/<slug>.md` |
 | `source` | `source/<slug>.md` |
-| `note` (Hypatia research) | `research/note/<title>.md` |
+| `note` | `note/<title>.md` (per `vault/schema.py:210` `TYPE_DIRECTORY["note"]`. Operator may organize under `research/note/` post-create per Hypatia idiom — but `vault_create` writes to `note/` by default. Don't fight schema.py's canonical mapping; if you want the record under `research/note/`, create at `note/` then `vault_move` it, or surface the path discrepancy to Andrew.) |
 | `concept` | `concept/<name>.md` |
 | `document` | `document/<...>` (sub-tree at operator's discretion) |
 | `practice-session` | `practice-session/<title>.md` |

@@ -693,12 +693,15 @@ dominant
       with: "Some arts and crafts with a map"
     - move: escalation
       with: "..."
-  opening_style: 1-line description of the typical opening shape, \
-followed by a verbatim ≤12-word quote of the actual opening
-  closing_style: same shape — 1-line description + verbatim ≤12-word \
-quote of the actual closing
-  transition_style: 1-line description (linking phrases? section \
-breaks? em-dashes mid-paragraph?) + 1 verbatim example transition
+  opening_style:                # object form, evidence-anchored
+    description: "1-line description of the typical opening shape"
+    with: "<verbatim ≤12-word quote of the actual opening>"
+  closing_style:                # same object shape as opening_style
+    description: "1-line description of the typical closing shape"
+    with: "<verbatim ≤12-word quote of the actual closing>"
+  transition_style:             # same object shape (description + evidence)
+    description: "linking phrases? section breaks? em-dashes mid-paragraph?"
+    with: "<one verbatim example transition from the essay>"
   footnote_conventions: present | absent | inline-asides-instead | \
 parenthetical-heavy
   punctuation_tics:             # 2-5 entries, evidence-anchored
@@ -712,6 +715,28 @@ starters / framings; pull verbatim from the essay; NO paraphrase
     - "..."
   voice_signature: one descriptive sentence (≤30 words) capturing the \
 voice; concrete, not generic
+
+## YAML-safety rules (load-bearing — parse failures break the consumer)
+
+The downstream consumer parses your output as YAML directly. A single \
+malformed value crashes the whole load. Two failure shapes to avoid:
+
+  - **No em-dash + quoted-phrase patterns in scalar values.** Do NOT \
+write ``some_field: "<description>" — "<quote>"`` (description, em-dash \
+separator, then a second quoted phrase on the same line). YAML treats \
+the unquoted ``—`` as ambiguous in value context and the line will fail \
+to parse. The object form (``description:`` + ``with:`` on separate \
+lines, as the schema specifies for ``opening_style`` / ``closing_style`` \
+/ ``transition_style``) is the parse-safe shape — use it.
+  - **Single-line values with internal quotes need outer single-quotes \
+or block scalars.** If a value naturally contains a double quote (e.g. \
+a verbatim quote inside a longer description), wrap the whole value in \
+single quotes (``field: 'He said "no" and meant it'``) or use a block \
+scalar (``field: |\\n  He said "no" and meant it``). Do NOT mix \
+unescaped quotes inside an unquoted value.
+
+When in doubt, prefer the **block / object form** for any field that \
+combines a description with an evidence quote — it never mis-parses.
 
 Body (after the frontmatter):
 
