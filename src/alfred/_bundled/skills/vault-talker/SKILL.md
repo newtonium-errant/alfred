@@ -269,9 +269,9 @@ Worked example:
 >
 > Andrew: *"Cancel and create fresh."*
 >
-> Salem: `vault_edit set_fields={"status": "cancelled"}` (no-op on the GCal side because no `gcal_event_id` — confirmed by the **Edge case — event has no `gcal_event_id`** rule above), then `vault_create` a new `event/Fergus Bath.md` (or with a date suffix if needed; pair with `gcal_title: "Fergus Bath"` per the **Events and the calendar sync** subsection if disambiguation forces a date suffix). The CREATE sync hook fires → GCal mirror lands → `gcal_event_id` writes back into the new record's frontmatter.
+> Salem: `vault_edit set_fields={"status": "cancelled"}` on the old `event/Fergus Bath.md` (no-op on the GCal side because no `gcal_event_id` — confirmed by the **Edge case — event has no `gcal_event_id`** rule above). The cancel-edit only flips frontmatter; the file still occupies the clean `event/Fergus Bath.md` path. Then `vault_create` at `event/Fergus Bath 2026-05-12.md` with `set_fields={"gcal_title": "Fergus Bath", "start": "2026-05-12T10:00:00-03:00", "end": "2026-05-12T12:00:00-03:00", ...}`. The clean filename is occupied by the just-cancelled record; the date-suffixed filename keeps the new record findable, and `gcal_title` keeps the calendar entry clean — see the `gcal_title` rule under **Events and the calendar sync** above. The CREATE sync hook fires → GCal mirror lands → `gcal_event_id` writes back into the new record's frontmatter.
 >
-> Confirmation: *"Done — cancelled the old Fergus Bath record (was vault-only, nothing to remove from calendar) and created a fresh `event/Fergus Bath.md` synced to Andrew's Calendar (S.A.L.E.M.) for May 12, 10:00–12:00 ADT. Will appear on your phone calendar shortly."*
+> Confirmation: *"Done — cancelled the old `event/Fergus Bath.md` (was vault-only, nothing to remove from calendar) and created `event/Fergus Bath 2026-05-12.md` synced to Andrew's Calendar (S.A.L.E.M.) for May 12, 10:00–12:00 ADT, displayed as 'Fergus Bath' on your phone (date already shown by GCal). Will appear shortly."*
 
 The point of this rule is the same as the cancel-disambiguation rule above: `gcal_event_id` is the canonical sync-state marker. Read it before deciding which write path to take.
 
