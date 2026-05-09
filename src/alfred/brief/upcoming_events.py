@@ -137,6 +137,19 @@ def _collect_items(
         if rec_type == "event":
             d = _event_date(fm)
         elif rec_type == "task":
+            # Phase 2 candidate #1 (2026-05-09 Batch C): drop closed-state
+            # tasks even when ``due`` is in the future. Pre-fix a task
+            # cancelled or completed weeks ago but with ``due`` set to a
+            # future date kept showing up in the brief — visual noise
+            # the operator had already triaged. Per the Phase 2 spec
+            # (project_brief_upcoming_events_phase2.md) ``cancelled`` and
+            # ``done`` are flagged; ``superseded`` is added here because
+            # it's the standard schema status for replaced records and
+            # would be equally noisy. Status comparison is case-sensitive
+            # to match how status is written elsewhere in the codebase
+            # (STATUS_BY_TYPE values are lowercase).
+            if fm.get("status") in {"cancelled", "done", "superseded"}:
+                continue
             d = _coerce_date(fm.get("due"))
         else:
             continue

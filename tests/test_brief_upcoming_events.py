@@ -72,10 +72,16 @@ def _write_task(
     *,
     due: str | None = None,
     description: str | None = None,
+    status: str | None = "todo",
 ) -> None:
     """Drop a task record into ``vault/task/{name}.md``. ``due`` may be
-    omitted to test the "task without due is excluded" path."""
-    lines = ["---", "type: task", "status: todo", f"name: {name}"]
+    omitted to test the "task without due is excluded" path. ``status``
+    defaults to ``"todo"``; pass ``None`` to omit the field entirely
+    (so the Phase 2 filter sees ``fm.get("status") is None`` and
+    treats it as "open" — i.e., included)."""
+    lines = ["---", "type: task", f"name: {name}"]
+    if status is not None:
+        lines.append(f"status: {status}")
     if due is not None:
         lines.append(f"due: {due}")
     if description is not None:
@@ -213,6 +219,138 @@ def test_task_without_due_excluded(vault: Path) -> None:
     out = render_upcoming_events_section(_default_config(), vault, TODAY)
     assert "Some open todo" not in out
     assert out == "No upcoming events."
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 candidate #1: status filter on tasks
+#
+# Per project_brief_upcoming_events_phase2.md and the spec memo: tasks
+# with ``status`` in {cancelled, done, superseded} should NOT appear in
+# the brief, even if their ``due`` is in the future. Pre-fix a task
+# cancelled or completed weeks ago but with ``due`` set to a future
+# date kept showing up in the brief — visual noise the operator had
+# already triaged.
+#
+# The filter applies to TASKS ONLY. Events go through the unchanged
+# ``_event_date`` path; the closed-state check is in the ``elif
+# rec_type == "task"`` branch of ``_collect_items``.
+# ---------------------------------------------------------------------------
+
+
+def test_task_with_cancelled_status_excluded(vault: Path) -> None:
+    """A task with ``status: cancelled`` and a future ``due`` must NOT
+    appear in the brief."""
+    target = TODAY + timedelta(days=3)
+    _write_task(
+        vault, "Cancelled future work",
+        due=target.isoformat(), status="cancelled",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Cancelled future work" not in out
+    # Brief should be empty (only this one record was written).
+    assert out == "No upcoming events."
+
+
+def test_task_with_done_status_excluded(vault: Path) -> None:
+    """A task with ``status: done`` and a future ``due`` must NOT
+    appear in the brief. Future-due-with-done is a real shape: the
+    operator marked the task done early but didn't clear the due
+    field — no need to surface it again."""
+    target = TODAY + timedelta(days=5)
+    _write_task(
+        vault, "Already done early",
+        due=target.isoformat(), status="done",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Already done early" not in out
+    assert out == "No upcoming events."
+
+
+def test_task_with_superseded_status_excluded(vault: Path) -> None:
+    """A task with ``status: superseded`` and a future ``due`` must NOT
+    appear in the brief. ``superseded`` is the standard schema status
+    for replaced records (the work moved to a newer task) — including
+    the original would double-surface the same work item."""
+    target = TODAY + timedelta(days=10)
+    _write_task(
+        vault, "Old superseded task",
+        due=target.isoformat(), status="superseded",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Old superseded task" not in out
+    assert out == "No upcoming events."
+
+
+def test_task_with_open_status_still_included(vault: Path) -> None:
+    """Positive regression pin: open-state tasks (status in {todo,
+    doing, blocked, ...}) MUST still appear. The filter is an
+    explicit denylist, not a generic predicate — a future schema
+    addition that introduces a new active-state status name must
+    not get caught up in the filter.
+
+    Pre-fix this would have passed too (no filter); this test
+    locks in the post-fix contract that the filter is restricted to
+    the closed-state denyset."""
+    target = TODAY + timedelta(days=2)
+    _write_task(
+        vault, "Pay invoice",
+        due=target.isoformat(), status="todo",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Pay invoice" in out
+    assert "### This Week" in out
+
+
+def test_task_without_status_field_still_included(vault: Path) -> None:
+    """Defensive coverage: a task missing the ``status`` field
+    altogether must still appear. ``fm.get("status")`` returns None;
+    None is not in the denyset, so the record passes through.
+
+    This guards against a future refactor that tightens the filter to
+    ``status not in {<active-state allowlist>}`` — under that shape, a
+    task without status would be DROPPED, which is the wrong default
+    (treats absence as "closed"). Locking the inclusive default here
+    forces the conversation if anyone ever proposes flipping it."""
+    target = TODAY + timedelta(days=4)
+    _write_task(
+        vault, "Status-less task",
+        due=target.isoformat(), status=None,
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Status-less task" in out
+
+
+def test_event_status_does_not_trigger_task_filter(vault: Path) -> None:
+    """The Phase 2 #1 filter applies to TASKS ONLY. An event record
+    with future date is unchanged by the new gate.
+
+    Today (Phase 1) events don't carry a ``status`` field at all, but
+    a future schema extension might. Per the spec: events go through
+    ``_event_date``, NOT the task branch where the closed-state check
+    lives. So even if an event eventually grows a ``status`` field
+    that happens to match the denyset, the brief renderer doesn't
+    apply the task-only gate to it. This test pins that scope."""
+    target = TODAY + timedelta(days=3)
+    # Drop an event with a status that would match the task-side
+    # denyset, just to prove the task gate doesn't apply.
+    (vault / "event").mkdir(exist_ok=True)
+    (vault / "event" / "Workshop with status.md").write_text(
+        "---\n"
+        "type: event\n"
+        "name: Workshop with status\n"
+        f"date: {target.isoformat()}\n"
+        # Even if the operator someday added status to events, the
+        # task-side gate ignores it. Today this field is just inert.
+        "status: cancelled\n"
+        "created: 2026-04-01\n"
+        "tags: []\n"
+        "---\n\n"
+        "# Workshop with status\n",
+        encoding="utf-8",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Workshop with status" in out
+    assert target.isoformat() in out
 
 
 # ---------------------------------------------------------------------------
