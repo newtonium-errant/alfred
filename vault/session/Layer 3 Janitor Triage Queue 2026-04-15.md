@@ -2,15 +2,14 @@
 alfred_tags:
 - software/alfred
 - software/janitor
-- feature/layer3
 created: '2026-04-15'
 description: Land the Layer 3 janitor triage queue — an advisory surface where the
   janitor agent surfaces ambiguous DUP001 dedup candidates as triage task records
   for human review, with deterministic triage IDs, scope-gated creates, and a soft+hard
   idempotency layer. No auto-merge loop.
-intent: Give the janitor a way to surface "should these two records be merged?"
-  decisions to the human without ever auto-merging, and without spamming the queue
-  on successive sweeps when the same candidates reappear
+intent: Give the janitor a way to surface "should these two records be merged?" decisions
+  to the human without ever auto-merging, and without spamming the queue on successive
+  sweeps when the same candidates reappear
 name: Layer 3 Janitor Triage Queue
 participants:
 - '[[person/Andrew Newton]]'

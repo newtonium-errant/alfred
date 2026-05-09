@@ -23,7 +23,7 @@ related_persons:
 - person/David Cain.md
 related_projects:
 - project/Alfred.md
-status: sent
+status: deprecated
 tags:
 - upstream
 - contribution

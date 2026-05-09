@@ -1,15 +1,13 @@
 ---
 alfred_tags:
 - software/alfred
-- voice
 - hotfix
 created: '2026-04-18'
 description: Strip underscore-prefixed metadata keys (_ts, _kind) from transcript
-  turns before sending to Anthropic's Messages API. The wk2 polish fix stamped
-  these for session-record rendering; they leak through messages= and Anthropic
-  400-rejects unknown fields.
-intent: Unblock the talker after first post-wk3 live E2E hit 400 errors on every
-  turn
+  turns before sending to Anthropic's Messages API. The wk2 polish fix stamped these
+  for session-record rendering; they leak through messages= and Anthropic 400-rejects
+  unknown fields.
+intent: Unblock the talker after first post-wk3 live E2E hit 400 errors on every turn
 name: Talker API Schema Hotfix
 participants:
 - '[[person/Andrew Newton]]'

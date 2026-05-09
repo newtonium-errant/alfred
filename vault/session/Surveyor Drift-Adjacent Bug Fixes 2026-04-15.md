@@ -2,7 +2,6 @@
 alfred_tags:
 - software/alfred
 - software/surveyor
-- bugfix/cleanup
 created: '2026-04-15'
 description: Two small surveyor bugs the prior drift-fix audit flagged but explicitly
   left out of scope — the relationships writer was emitting duplicate log lines per

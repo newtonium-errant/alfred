@@ -1,9 +1,13 @@
 ---
 alfred_tags:
 - alfred/bit
-- automation/logs
 created: '2026-05-02'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — process: field references [[process/Alfred BIT]] but the
+  parent process record does not exist in vault (process/ contains only Alfred BIT
+  and Email Triage Rules dailies). Operator decision needed: create process/Alfred
+  BIT.md as the canonical parent process record, or strip the wikilink from this run
+  record. DIR001 — deterministic-flagged separately (type=run filed under process/).'
 mode: quick
 name: Alfred BIT 2026-05-02
 overall_status: ok
@@ -23,6 +27,20 @@ relationships:
   source_anchor: run Alfred BIT 2026-05-02
   target: process/Alfred BIT 2026-05-04.md
   target_anchor: run Alfred BIT 2026-05-04
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT process
+  source: process/Alfred BIT 2026-05-02.md
+  source_anchor: run Alfred BIT 2026-05-02
+  target: process/Alfred BIT 2026-05-05.md
+  target_anchor: run Alfred BIT 2026-05-05
+  type: related-to
+- confidence: 1
+  context: Shared run date sequence
+  source: process/Alfred BIT 2026-05-02.md
+  source_anchor: run Alfred BIT 2026-05-02
+  target: process/Alfred BIT 2026-05-06.md
+  target_anchor: run Alfred BIT 2026-05-06
   type: related-to
 started: '2026-05-02T05:55:02.523225-03:00'
 status: completed

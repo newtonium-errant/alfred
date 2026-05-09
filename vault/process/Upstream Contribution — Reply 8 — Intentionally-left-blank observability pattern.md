@@ -1,8 +1,6 @@
 ---
 alfred_tags:
-- process/upstream-contribution
 - daemon-observability
-- user-interaction
 created: '2026-04-22'
 distiller_learnings:
 - '[[synthesis/Coding Instance Is Architectural Substrate for Other Alfred Instances]]'

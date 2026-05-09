@@ -1,7 +1,6 @@
 ---
 alfred_tags:
 - alfred/bit
-- automation/logs
 created: '2026-04-29'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — [[process/Alfred BIT]] target does not exist in vault; parent

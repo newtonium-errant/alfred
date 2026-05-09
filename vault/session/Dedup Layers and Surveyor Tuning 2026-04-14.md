@@ -4,7 +4,6 @@ alfred_tags:
 - alfred/surveyor
 - alfred/agent-team
 - alfred/hooks
-- alfred/observability
 created: '2026-04-14'
 description: Completed 3-layer dedup prevention work, surveyor labeler prompt + threshold
   tuning, Pocketpills note merge, janitor follow-link rule, foreground-default enforcement

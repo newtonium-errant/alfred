@@ -1,7 +1,6 @@
 ---
 alfred_tags:
 - software/alfred
-- email/integration
 - system/buildout
 created: '2026-04-08'
 description: Local LLM setup, consolidation unblock, surveyor activation, mail webhook

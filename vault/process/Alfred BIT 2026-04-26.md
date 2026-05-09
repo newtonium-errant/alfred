@@ -1,7 +1,6 @@
 ---
 alfred_tags:
 - alfred/bit
-- automation/logs
 created: '2026-04-26'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — broken target [[process/Alfred BIT]]: no parent process record

@@ -1,7 +1,6 @@
 ---
 alfred_tags:
 - alfred/bit
-- automation/logs
 created: '2026-05-03'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — process target [[process/Alfred BIT]] does not exist; only
@@ -13,8 +12,7 @@ mode: quick
 name: Alfred BIT 2026-05-03
 overall_status: ok
 process: '[[process/Alfred BIT]]'
-related_persons:
-- person/Ben.md
+related_persons: []
 relationships:
 - confidence: 1
   context: Same Alfred BIT run series
@@ -22,6 +20,13 @@ relationships:
   source_anchor: run Alfred BIT 2026-05-03
   target: process/Alfred BIT 2026-05-04.md
   target_anchor: run Alfred BIT 2026-05-04
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT process
+  source: process/Alfred BIT 2026-05-03.md
+  source_anchor: run Alfred BIT 2026-05-03
+  target: process/Alfred BIT 2026-05-05.md
+  target_anchor: run Alfred BIT 2026-05-05
   type: related-to
 started: '2026-05-03T05:55:02.709907-03:00'
 status: completed

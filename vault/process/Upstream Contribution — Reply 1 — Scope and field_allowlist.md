@@ -1,7 +1,6 @@
 ---
 alfred_tags:
 - process/upstream-contribution
-- system-monitoring
 created: '2026-04-21'
 distiller_learnings:
 - '[[decision/Peer Protocol v1 Is HTTP REST JSON Localhost-Only]]'
@@ -169,6 +168,11 @@ distiller_learnings:
 distiller_signals: constraint:1, contradiction:2
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: 'LINK001 — scanner false positive on distiller_learnings target [[decision/Morning
+  Brief Re-Renders Latest BIT Record as a ## Health Section]]; the literal `## Health
+  Section` in the title triggers the scanner but the file exists at decision/Morning
+  Brief Re-Renders Latest BIT Record as a ## Health Section.md. FM001/DIR001 deterministic
+  — file is type:note in process/ dir, missing name field; awaiting autofix.'
 project:
 - '[[project/Alfred]]'
 related_orgs:

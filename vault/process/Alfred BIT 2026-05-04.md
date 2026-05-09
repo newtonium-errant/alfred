@@ -1,13 +1,38 @@
 ---
 alfred_tags:
-- alfred/bit
-- automation/logs
+- testing/alfred-bit
 created: '2026-05-04'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — broken wikilink [[process/Alfred BIT]]; no canonical process/Alfred
+  BIT record exists in vault (only dated run records). DIR001 deterministic scanner
+  flag (type: run belongs in run/ directory, this record is in process/). Operator
+  action: create canonical process/Alfred BIT record to anchor the run series.'
 mode: quick
 name: Alfred BIT 2026-05-04
 overall_status: ok
 process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Shared date range and Alfred BIT process
+  source: process/Alfred BIT 2026-05-04.md
+  source_anchor: run Alfred BIT 2026-05-04
+  target: process/Alfred BIT 2026-05-05.md
+  target_anchor: run Alfred BIT 2026-05-05
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-04.md
+  source_anchor: run Alfred BIT 2026-05-04
+  target: process/Alfred BIT 2026-05-06.md
+  target_anchor: run Alfred BIT 2026-05-06
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-04.md
+  source_anchor: run Alfred BIT 2026-05-04
+  target: process/Alfred BIT 2026-05-07.md
+  target_anchor: run Alfred BIT 2026-05-07
+  type: related-to
 started: '2026-05-04T05:55:02.506206-03:00'
 status: completed
 tags:
