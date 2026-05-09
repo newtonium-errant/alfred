@@ -1136,7 +1136,13 @@ async def run_worker(
                 _mark_raw_failed(
                     vault_path, job.raw_rel_path, "worker_crash",
                 )
-                if dm_callback is not None:
+                # Skip DM when chat_id=0 (backfill-initiated job) — Ticket
+                # #79 (2026-05-07). Matches the guard pattern at the
+                # other three DM sites (lines ~1193, 1227, 1250). Without
+                # this guard, a crashed backfill job tries to send to
+                # chat_id=0, the API raises, and the inner except logs a
+                # confusing voice_train.worker.dm_failed_after_crash.
+                if dm_callback is not None and job.chat_id:
                     try:
                         await dm_callback(
                             job.chat_id,
@@ -2264,7 +2270,13 @@ def buffer_has_end_marker(text: str) -> bool:
     if anchor_threshold < 0:
         anchor_threshold = 0
     for marker in _VOICE_TRAIN_END_MARKERS:
-        idx = text.find(marker)
+        # Use rfind() so the LAST occurrence wins (Ticket #78, 2026-05-07).
+        # find() would return the first occurrence; if a marker appears
+        # both mid-body (false positive) AND at the actual end, find()
+        # returns the early position and the end-anchor gate rejects the
+        # valid late occurrence. rfind() is semantically correct for an
+        # end-anchor detector.
+        idx = text.rfind(marker)
         if idx < 0:
             continue
         # Minimum-body gate (200-char floor) AND end-anchor gate.

@@ -2307,6 +2307,37 @@ def test_buffer_has_end_marker_marker_at_buffer_start_rejected() -> None:
     assert voice_train.buffer_has_end_marker(body) is False
 
 
+def test_buffer_has_end_marker_uses_rfind_for_dual_occurrence() -> None:
+    """Ticket #78 (2026-05-07): marker mid-body AND at end → fires.
+
+    Regression pin for the find()→rfind() switch. Buffer contains the
+    sign-off marker BOTH at a mid-body position (rhetorical question,
+    embedded quote, etc. — would be rejected by the end-anchor gate)
+    AND at the actual end-of-essay position (the real closing chunk).
+
+    With the old ``text.find(marker)``, the FIRST occurrence wins, the
+    end-anchor gate rejects it, and the legitimate late occurrence is
+    silently lost — flush waits for the full debounce when it should
+    have fired early.
+
+    With ``text.rfind(marker)``, the LAST occurrence wins, the gate
+    accepts it, flush fires early — the correct end-of-essay behaviour.
+    """
+    marker = "Would you like to know more?"
+    # Mid-body marker at ~position 300 (past 200-char floor but well
+    # before any plausible anchor threshold on a 4000+ char buffer).
+    # Then a long bridge of body content. Then the marker again at the
+    # very end (the real closing chunk).
+    mid_body = "x" * 300 + " " + marker + " "
+    bridge = "y " * 1800  # ~3600 chars of bridge body
+    body = mid_body + bridge + marker
+    # text_len ≈ 3957. anchor_window = max(500, 3957//4=989) = 989.
+    # threshold ≈ 3957 - 989 = 2968. find() returns ~301; rfind()
+    # returns ~3929. Only rfind() clears the threshold.
+    assert len(body) > 3000
+    assert voice_train.buffer_has_end_marker(body) is True
+
+
 @pytest.mark.asyncio
 async def test_voice_train_end_marker_shortens_flush_delay(
     tmp_path: Path,
