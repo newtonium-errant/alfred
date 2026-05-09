@@ -1797,6 +1797,177 @@ def make_job(
 
 
 # ---------------------------------------------------------------------------
+# Ticket #59 (2026-05-08) — backfill helper for un-extracted raw records
+# ---------------------------------------------------------------------------
+#
+# Recovery path for raw essay/source records that landed at the right
+# vault path but never went through the extraction worker. Cases:
+#
+#   - /train partially succeeded (raw saved, enqueue failed silently)
+#   - operator created an essay record outside the slash command
+#   - operator/team-lead patched essay content directly (no slash
+#     command involved → no enqueue)
+#   - extraction failed earlier (extraction_status: failed) and the
+#     operator wants to retry after fixing the cause
+#
+# The original pre-CLI workaround was a one-off Python script that
+# wrote jobs straight to ``extraction_queue.jsonl``. This helper turns
+# that into a proper, scope-respecting CLI surface that:
+#
+#   1. Walks ``document/essay/`` + ``source/`` directories.
+#   2. Skips records that are already extracted (``extraction_status:
+#      complete`` AND the structured companion file exists).
+#   3. Builds an :class:`ExtractionJob` for each remaining record.
+#   4. Returns the (jobs, skip_count) tuple so the caller (CLI) can
+#      decide whether to dry-run or actually write to the queue.
+#
+# The helper does NOT touch the queue file itself — that's the
+# caller's responsibility (CLI uses :func:`enqueue_job` per-job, same
+# as the bot path).
+
+
+def _read_raw_record(
+    path: Path,
+) -> tuple[dict[str, Any], str] | None:
+    """Read a raw record file, returning (frontmatter, body) or None on error.
+
+    Uses the ``frontmatter`` library so YAML parsing matches the rest
+    of the codebase (curator, distiller, brief). Returns ``None`` when
+    the file can't be read or parsed — the caller logs + skips so a
+    single corrupt file doesn't abort the whole backfill.
+    """
+    try:
+        import frontmatter
+    except ImportError:  # pragma: no cover — frontmatter is a base dep
+        return None
+    try:
+        post = frontmatter.load(path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "voice_train.backfill.read_failed",
+            path=str(path),
+            error=str(exc),
+        )
+        return None
+    return dict(post.metadata or {}), post.content or ""
+
+
+def _structured_companion_exists(
+    *, vault_path: Path, kind: Literal["voice", "method"], raw_name: str,
+) -> bool:
+    """True iff the structured companion file for this raw record exists.
+
+    The structured-record writer uses the raw record's ``name`` (not
+    a slug) as the filename — see :func:`_write_structured_record`'s
+    "CRITICAL" comment. The backfill must mirror that lookup shape so
+    it correctly detects already-extracted records and doesn't
+    re-enqueue them.
+    """
+    target_dir = "voice" if kind == "voice" else "method"
+    companion = vault_path / target_dir / f"{raw_name}.md"
+    return companion.exists()
+
+
+def collect_backfill_jobs(
+    *,
+    vault_path: Path,
+    instance: str,
+) -> tuple[list[ExtractionJob], int, int]:
+    """Walk the vault and build extraction jobs for un-extracted raw records.
+
+    Returns ``(jobs, skipped_voice, skipped_method)``:
+
+      * ``jobs`` — list of :class:`ExtractionJob` ready to enqueue.
+      * ``skipped_voice`` / ``skipped_method`` — count of raw records
+        that were skipped because their structured companion already
+        exists AND ``extraction_status: complete``.
+
+    Skip rule (per Ticket #59 brief):
+      * Skip iff ``extraction_status == "complete"`` AND the structured
+        companion exists. Either condition alone is insufficient — a
+        ``complete`` status without companion file means the operator
+        deleted the structured record manually and wants it rebuilt.
+      * Records with ``extraction_status: failed`` ARE re-enqueued (this
+        is the recovery path after fixing the failure cause).
+
+    The helper is pure (reads vault, returns data) so it tests
+    cleanly without touching the JSONL queue. The CLI decides whether
+    to ``enqueue_job`` for each returned job or just print them
+    (``--dry-run``).
+
+    ``instance`` is stamped on every produced job so the worker /
+    audit logs show which instance owns the backfilled work.
+    """
+    jobs: list[ExtractionJob] = []
+    skipped_voice = 0
+    skipped_method = 0
+
+    # Voice (essay → voice profile).
+    essay_dir = vault_path / "document" / "essay"
+    if essay_dir.is_dir():
+        for path in sorted(essay_dir.glob("*.md")):
+            parsed = _read_raw_record(path)
+            if parsed is None:
+                continue
+            metadata, body = parsed
+            raw_name = path.stem  # the filename IS the name (vault_create
+            # uses ``raw_name`` verbatim per _write_structured_record).
+            extraction_status = str(metadata.get("extraction_status") or "")
+            companion_exists = _structured_companion_exists(
+                vault_path=vault_path, kind="voice", raw_name=raw_name,
+            )
+            if extraction_status == "complete" and companion_exists:
+                skipped_voice += 1
+                continue
+            cluster_val = metadata.get("cluster")
+            cluster_str = str(cluster_val) if cluster_val else None
+            jobs.append(make_job(
+                kind="voice",
+                raw_rel_path=f"document/essay/{path.name}",
+                raw_name=raw_name,
+                raw_body=body,
+                cluster=cluster_str,
+                chat_id=0,  # No DM target — operator-initiated
+                              # backfill, not a slash-command flush.
+                instance=instance,
+            ))
+
+    # Method (source → method profile).
+    source_dir = vault_path / "source"
+    if source_dir.is_dir():
+        for path in sorted(source_dir.glob("*.md")):
+            parsed = _read_raw_record(path)
+            if parsed is None:
+                continue
+            metadata, body = parsed
+            raw_name = path.stem
+            extraction_status = str(metadata.get("extraction_status") or "")
+            companion_exists = _structured_companion_exists(
+                vault_path=vault_path, kind="method", raw_name=raw_name,
+            )
+            if extraction_status == "complete" and companion_exists:
+                skipped_method += 1
+                continue
+            jobs.append(make_job(
+                kind="method",
+                raw_rel_path=f"source/{path.name}",
+                raw_name=raw_name,
+                raw_body=body,
+                chat_id=0,
+                instance=instance,
+            ))
+
+    log.info(
+        "voice_train.backfill.collected",
+        voice_jobs=sum(1 for j in jobs if j.kind == "voice"),
+        method_jobs=sum(1 for j in jobs if j.kind == "method"),
+        skipped_voice=skipped_voice,
+        skipped_method=skipped_method,
+    )
+    return jobs, skipped_voice, skipped_method
+
+
+# ---------------------------------------------------------------------------
 # Slash-command argument parsing
 # ---------------------------------------------------------------------------
 
@@ -1812,22 +1983,59 @@ def make_job(
 # token-comparison stays simple. Only the leading dashes of the
 # flag-marker are normalized — em/en-dashes inside essay BODY text
 # (after the flag) are preserved as-is.
+#
+# Ticket #74 (2026-05-07) — tightened to a flag-pattern allowlist so
+# that body text starting with an em-dash-led token (``/train —Some
+# opening line``) is NOT silently re-flowed into ``--Some opening
+# line``. The original implementation normalized any leading dash-run
+# followed by a letter, which caused operator-pasted essays opening
+# with an em-dash phrase to lose their leading typography. Now we only
+# normalize when the token matches a known flag-name shape
+# (``cluster`` today; future flags get added to ``_KNOWN_FLAG_NAMES``).
+# Anything else passes through unchanged so essay body em-dashes are
+# preserved verbatim — matching the docstring contract on the parse
+# helpers below.
+
+# Known --flag names that the dash-normalizer is allowed to fire on.
+# Add new flags here when adding /train (or /method-source) flags so
+# the iOS-safe normalization extends to them too.
+_KNOWN_FLAG_NAMES: tuple[str, ...] = ("cluster",)
+
+
 def _normalize_flag_prefix_dashes(token: str) -> str:
-    """Convert leading em/en-dash variants to ``--``.
+    """Convert leading em/en-dash variants to ``--`` for KNOWN flag names.
 
     Idempotent + cheap. Applied only to the FIRST flag token (i.e. the
     one that should be ``--cluster``); body text passes through unchanged.
 
-    We translate any leading run of em-dash (U+2014) / en-dash (U+2013)
-    / hyphen-minus to ``--`` when it's followed by a flag-name shape
-    (``[a-zA-Z]``). That covers iOS-pasted ``—cluster``, ``–cluster``,
-    and any double-hyphen-like Unicode variant we haven't seen yet.
+    Ticket #74 (2026-05-07): only fires when the post-dash token matches
+    a name in ``_KNOWN_FLAG_NAMES`` (currently just ``cluster``). A
+    naked em-dash followed by arbitrary text — e.g. ``—Some opening
+    line`` from an operator pasting an em-dash-led essay — passes
+    through unchanged. Without this allowlist guard the normalizer
+    would silently rewrite the essay's leading em-dash to ASCII
+    double-hyphen and the body would be saved as ``--Some opening
+    line``.
     """
     if not token:
         return token
-    # Match a leading run of dash-like chars followed by a letter (the
-    # flag-name start). Replace with the canonical ``--`` prefix.
-    return re.sub(r"^[–—\-]+(?=[a-zA-Z])", "--", token)
+    # Allowlist match: leading dash-run + one of the known flag names +
+    # word boundary. Word boundary matters so ``—clustertypo`` (a typo,
+    # not the cluster flag) doesn't get rewritten either. Matches:
+    # ``—cluster``, ``–cluster``, ``-cluster``, ``--cluster`` (the
+    # canonical ASCII form is also accepted so downstream comparison
+    # stays simple even when no normalization is needed).
+    flag_alt = "|".join(re.escape(name) for name in _KNOWN_FLAG_NAMES)
+    pattern = rf"^[–—\-]+(?P<flag>(?:{flag_alt}))\b"
+    match = re.match(pattern, token)
+    if not match:
+        return token
+    # Reconstruct as ``--<flag>`` + whatever followed the matched
+    # flag-name in the original token. Preserves any trailing text on
+    # the same token (rare — usually the flag value is a separate
+    # token — but cheap to keep).
+    suffix = token[match.end():]
+    return f"--{match.group('flag')}{suffix}"
 
 
 def parse_train_args(
@@ -2024,15 +2232,43 @@ def buffer_has_end_marker(text: str) -> bool:
     """Return True when ``text`` contains a Substack-export end marker.
 
     Used by :func:`bot._schedule_voice_train_flush` to decide whether
-    to flush early on the next debounce tick. We require the marker to
-    appear AFTER at least 200 chars of body content so a chat that
-    happens to mention "Subscribed" early on doesn't false-positive.
+    to flush early on the next debounce tick.
+
+    Two-gate detection:
+
+      1. **Minimum-body gate** — the marker must appear AFTER at least
+         200 chars of body content. Stops a chat that happens to
+         mention ``"Subscribed"`` two messages in from false-positive
+         flushing an in-progress paste.
+      2. **End-anchor gate (Ticket #73, 2026-05-07)** — the marker must
+         appear in the LAST 500 chars of the buffer (or the last 25%,
+         whichever is larger). End-of-essay markers are by definition a
+         tail signal — anchoring detection to end-of-content position
+         stops mid-body false-positives where a sign-off phrase like
+         ``"Would you like to know more?"`` appears in the middle of an
+         essay (rhetorical question, embedded quote, etc.) and races
+         ahead of the actual closing chunk.
+
+    The "last 25%" alternative is structural: long essays (8-15k chars)
+    naturally have proportionally more closing-block real estate and
+    Substack's exact closing-block placement varies with footnote
+    count. ``max(500, len(text)//4)`` keeps the threshold conservative
+    on short pastes and proportional on long ones.
     """
     if not text:
         return False
+    text_len = len(text)
+    # End-anchor window: last 500 chars or last 25%, whichever is larger.
+    anchor_window = max(500, text_len // 4)
+    anchor_threshold = text_len - anchor_window
+    if anchor_threshold < 0:
+        anchor_threshold = 0
     for marker in _VOICE_TRAIN_END_MARKERS:
         idx = text.find(marker)
-        if idx >= 200:
+        if idx < 0:
+            continue
+        # Minimum-body gate (200-char floor) AND end-anchor gate.
+        if idx >= 200 and idx >= anchor_threshold:
             return True
     return False
 

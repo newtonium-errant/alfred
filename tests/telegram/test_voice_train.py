@@ -1874,31 +1874,37 @@ def test_parse_train_args_double_hyphen_cluster_flag_regression() -> None:
     assert body == ""
 
 
-def test_parse_method_source_args_emdash_first_token_normalized() -> None:
-    """/method-source has no flags today; em-dash on first token is harmless.
+def test_parse_method_source_args_emdash_first_token_unknown_flag_preserved() -> None:
+    """Ticket #74 (2026-05-07): em-dash + non-flag-name word stays as em-dash.
 
-    /method-source's parser also runs the leading-dash normalization
-    (defensive — a future ``--<flag>`` would inherit the iOS-safe
-    parsing without re-derivation). Today there are no flags, so an
-    em-dash leading token gets normalized to ``--<word>`` and falls
-    into the body. This test pins the contract.
+    /method-source has no flags today, so ``—notes`` is NOT a known
+    flag and must NOT be re-flowed into ``--notes`` — the leading
+    em-dash is preserved verbatim so an operator pasting an em-dash-led
+    note keeps the original typography.
+
+    Pre-Ticket #74, the leading-dash normalizer fired on any
+    dash-run-followed-by-letter, which silently rewrote essay-body em
+    dashes to ASCII double-hyphen. The new allowlist (``cluster`` only
+    today; `_KNOWN_FLAG_NAMES`) limits the rewrite to actual flags.
     """
     body = voice_train.parse_method_source_args(
         "/method-source —notes some text",
         ["—notes", "some", "text"],
     )
-    # The first token has been normalized; body is the joined tokens.
-    assert "--notes" in body
+    # Em-dash preserved on the unknown-flag token.
+    assert "—notes" in body
+    assert "--notes" not in body
     assert "some text" in body
 
 
-def test_parse_method_source_args_endash_first_token_normalized() -> None:
-    """En-dash variant on first token also normalized."""
+def test_parse_method_source_args_endash_unknown_flag_preserved() -> None:
+    """Ticket #74: en-dash variant on a non-flag-name word also preserved."""
     body = voice_train.parse_method_source_args(
         "/method-source –notes some text",
         ["–notes", "some", "text"],
     )
-    assert "--notes" in body
+    assert "–notes" in body
+    assert "--notes" not in body
 
 
 def test_parse_method_source_args_canonical_double_hyphen_regression() -> None:
@@ -1956,6 +1962,58 @@ def test_parse_train_args_emdash_with_multiline_body() -> None:
     assert "personal\n" not in body
     # Paragraph break preserved.
     assert "\n\n" in body
+
+
+# ---------------------------------------------------------------------------
+# Ticket #74 — em-dash normalization tightened to flag-pattern allowlist
+# ---------------------------------------------------------------------------
+
+
+def test_parse_train_args_emdash_non_flag_token_preserved() -> None:
+    """Ticket #74 (2026-05-07): em-dash + arbitrary word stays as em-dash.
+
+    Pre-Ticket #74 the normalizer rewrote any leading dash-run-then-
+    letter token into ``--<word>``, so an operator pasting
+    ``/train —Some opening line`` lost the leading em-dash and got
+    ``--Some opening line`` saved as the body. The flag-pattern
+    allowlist now restricts normalization to ``--<known-flag>``
+    shapes only.
+    """
+    cluster, body = voice_train.parse_train_args(
+        "/train —Some opening line",
+        ["—Some", "opening", "line"],
+    )
+    # No flag → no cluster.
+    assert cluster is None
+    # Em-dash preserved verbatim on the leading token.
+    assert body.startswith("—Some")
+    assert "--Some" not in body
+
+
+def test_parse_train_args_emdash_not_a_flag_token_preserved() -> None:
+    """Ticket #74: ``—not-a-flag value`` keeps its em-dash.
+
+    Even when the post-em-dash text vaguely looks flag-shaped
+    (lowercase letters + hyphen) but doesn't match a known flag
+    name, the em-dash is preserved.
+    """
+    cluster, body = voice_train.parse_train_args(
+        "/train —not-a-flag value",
+        ["—not-a-flag", "value"],
+    )
+    assert cluster is None
+    assert body.startswith("—not-a-flag")
+    assert "--not-a-flag" not in body
+
+
+def test_parse_method_source_args_emdash_non_flag_token_preserved() -> None:
+    """Ticket #74: symmetric coverage on /method-source."""
+    body = voice_train.parse_method_source_args(
+        "/method-source —Some opening line",
+        ["—Some", "opening", "line"],
+    )
+    assert body.startswith("—Some")
+    assert "--Some" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -2185,6 +2243,68 @@ def test_buffer_has_end_marker_marker_too_early_rejected() -> None:
 def test_buffer_has_end_marker_empty_string() -> None:
     """Empty input → False (degenerate-input guard)."""
     assert voice_train.buffer_has_end_marker("") is False
+
+
+# --- Ticket #73 — end-marker anchored to last 500 chars / last 25% ---
+
+
+def test_buffer_has_end_marker_anchored_in_last_500_fires() -> None:
+    """Ticket #73 (2026-05-07): marker in last 500 chars → fires (happy path).
+
+    Long body (>500 chars) with the marker placed in the trailing
+    window. This is the ordinary end-of-essay case and must continue
+    to flush early on the next debounce tick.
+    """
+    body = "x" * 2000 + " Would you like to know more?"
+    # text_len=2030, marker at 2001. anchor_window=max(500, 2030//4)=507,
+    # threshold=2030-507=1523. 2001 >= 1523 → fires.
+    assert voice_train.buffer_has_end_marker(body) is True
+
+
+def test_buffer_has_end_marker_mid_body_false_positive_rejected() -> None:
+    """Ticket #73: marker BEFORE last 500 / last 25% → no fire.
+
+    The 200-char floor is satisfied but the marker is mid-body, not
+    end-of-body. End-anchor gate stops the false-positive flush that
+    would otherwise race ahead of the real closing chunk.
+
+    Brief's example shape: 4000-char buffer with marker at position
+    1500. text_len=4042 (4000 + 42 for marker tail), anchor_window=
+    max(500, 4042//4=1010)=1010, threshold=4042-1010=3032.
+    Marker at 1500 < 3032 → no fire.
+    """
+    body = (
+        "x" * 1500
+        + " Would you like to know more?"
+        + " continuation. " * 200  # ~3000 more chars
+    )
+    assert len(body) > 4000
+    assert voice_train.buffer_has_end_marker(body) is False
+
+
+def test_buffer_has_end_marker_anchored_in_last_25pct_fires() -> None:
+    """Ticket #73: marker in last 25% of a 4000-char buffer → fires.
+
+    Validates the ``max(500, len(text)//4)`` window: on a 4000-char
+    buffer the 25% window (1000 chars) wins over the 500-char floor.
+    Marker at position 3100 falls in the last 1000 chars → fires.
+    """
+    body = "x" * 3100 + " Would you like to know more?" + "y" * 100
+    # text_len ≈ 3229. Window = max(500, 3229//4=807) = 807.
+    # threshold = 3229-807 ≈ 2422. Marker at 3100 ≥ 2422 → fires.
+    assert voice_train.buffer_has_end_marker(body) is True
+
+
+def test_buffer_has_end_marker_marker_at_buffer_start_rejected() -> None:
+    """Ticket #73: marker within first 200 chars → no fire (regression).
+
+    The 200-char floor is unchanged by Ticket #73; the end-anchor gate
+    is additive. This test pins both gates fire correctly when the
+    marker is suspicious at BOTH ends — early in the buffer.
+    """
+    # Marker at position ~50 (inside 200-char floor). Long tail after.
+    body = "head text Would you like to know more? tail " + "y" * 5000
+    assert voice_train.buffer_has_end_marker(body) is False
 
 
 @pytest.mark.asyncio
@@ -3044,3 +3164,225 @@ async def test_cluster_ask_entry_carries_raw_body_and_name(
     # The exact assembled body — must include the original text so
     # the worker's extraction operates on the same content.
     assert text.strip() in entry["raw_body"]
+
+
+# ---------------------------------------------------------------------------
+# Ticket #59 (2026-05-08) — backfill helper for un-extracted raw records
+# ---------------------------------------------------------------------------
+
+
+def _write_raw_essay_file(
+    vault_path: Path,
+    *,
+    name: str,
+    extraction_status: str = "pending",
+    cluster: str | None = None,
+    body: str = "Essay body text here.",
+) -> Path:
+    """Write a raw essay record fixture (frontmatter + body)."""
+    essay_dir = vault_path / "document" / "essay"
+    essay_dir.mkdir(parents=True, exist_ok=True)
+    target = essay_dir / f"{name}.md"
+    fm: dict[str, Any] = {
+        "type": "essay",
+        "name": name,
+        "status": "draft",
+        "extraction_status": extraction_status,
+        "author": "Andrew Errant",
+        "source_kind": "paste",
+    }
+    if cluster:
+        fm["cluster"] = cluster
+    post = frontmatter.Post(body, **fm)
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+def _write_voice_companion(vault_path: Path, *, name: str) -> Path:
+    """Write a structured voice companion file at ``voice/<name>.md``."""
+    voice_dir = vault_path / "voice"
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    target = voice_dir / f"{name}.md"
+    post = frontmatter.Post(
+        "Voice profile body.",
+        **{"type": "voice", "name": name, "status": "active"},
+    )
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+def _write_raw_source_file(
+    vault_path: Path,
+    *,
+    name: str,
+    extraction_status: str = "pending",
+    body: str = "Source body text here.",
+) -> Path:
+    source_dir = vault_path / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    target = source_dir / f"{name}.md"
+    fm: dict[str, Any] = {
+        "type": "source",
+        "name": name,
+        "status": "pending",
+        "extraction_status": extraction_status,
+        "source_kind": "paste",
+    }
+    post = frontmatter.Post(body, **fm)
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+def _write_method_companion(vault_path: Path, *, name: str) -> Path:
+    method_dir = vault_path / "method"
+    method_dir.mkdir(parents=True, exist_ok=True)
+    target = method_dir / f"{name}.md"
+    post = frontmatter.Post(
+        "Method profile body.",
+        **{"type": "method", "name": name, "status": "active"},
+    )
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+def test_backfill_enqueues_pending_essay(vault_path: Path) -> None:
+    """Single essay with extraction_status=pending → backfill enqueues 1 job."""
+    _write_raw_essay_file(vault_path, name="My Essay")
+    jobs, sk_v, sk_m = voice_train.collect_backfill_jobs(
+        vault_path=vault_path, instance="hypatia",
+    )
+    assert len(jobs) == 1
+    assert sk_v == 0
+    assert sk_m == 0
+    assert jobs[0].kind == "voice"
+    assert jobs[0].raw_rel_path == "document/essay/My Essay.md"
+    assert jobs[0].raw_name == "My Essay"
+    assert jobs[0].instance == "hypatia"
+    # Body comes from the file content, not the frontmatter.
+    assert "Essay body text" in jobs[0].raw_body
+
+
+def test_backfill_skips_complete_with_companion(vault_path: Path) -> None:
+    """Essay with status=complete AND companion exists → skipped."""
+    _write_raw_essay_file(
+        vault_path, name="Done Essay", extraction_status="complete",
+    )
+    _write_voice_companion(vault_path, name="Done Essay")
+    jobs, sk_v, sk_m = voice_train.collect_backfill_jobs(
+        vault_path=vault_path, instance="hypatia",
+    )
+    assert jobs == []
+    assert sk_v == 1
+    assert sk_m == 0
+
+
+def test_backfill_enqueues_when_companion_missing(vault_path: Path) -> None:
+    """Essay with status=complete but companion MISSING → backfill enqueues.
+
+    Operator may have manually deleted the structured record to force
+    a rebuild; ``extraction_status`` alone isn't trustworthy if the
+    companion file is gone.
+    """
+    _write_raw_essay_file(
+        vault_path, name="Half Done", extraction_status="complete",
+    )
+    # No voice/Half Done.md created.
+    jobs, sk_v, sk_m = voice_train.collect_backfill_jobs(
+        vault_path=vault_path, instance="hypatia",
+    )
+    assert len(jobs) == 1
+    assert sk_v == 0
+    assert jobs[0].raw_name == "Half Done"
+
+
+def test_backfill_re_enqueues_failed(vault_path: Path) -> None:
+    """Essay with extraction_status=failed → re-enqueued (retry path)."""
+    _write_raw_essay_file(
+        vault_path, name="Broken Essay", extraction_status="failed",
+    )
+    jobs, _, _ = voice_train.collect_backfill_jobs(
+        vault_path=vault_path, instance="hypatia",
+    )
+    assert len(jobs) == 1
+    assert jobs[0].raw_name == "Broken Essay"
+
+
+def test_backfill_preserves_cluster(vault_path: Path) -> None:
+    """Essay with cluster: X → produced job carries cluster=X."""
+    _write_raw_essay_file(
+        vault_path, name="Veteran Essay", cluster="veteran",
+    )
+    jobs, _, _ = voice_train.collect_backfill_jobs(
+        vault_path=vault_path, instance="hypatia",
+    )
+    assert len(jobs) == 1
+    assert jobs[0].cluster == "veteran"
+
+
+def test_backfill_handles_source_method_symmetrically(
+    vault_path: Path,
+) -> None:
+    """source/<slug>.md → method job, with same skip semantics."""
+    _write_raw_source_file(vault_path, name="Pending Method")
+    _write_raw_source_file(
+        vault_path, name="Done Method", extraction_status="complete",
+    )
+    _write_method_companion(vault_path, name="Done Method")
+    jobs, sk_v, sk_m = voice_train.collect_backfill_jobs(
+        vault_path=vault_path, instance="hypatia",
+    )
+    assert len(jobs) == 1
+    assert jobs[0].kind == "method"
+    assert jobs[0].raw_rel_path == "source/Pending Method.md"
+    assert jobs[0].raw_name == "Pending Method"
+    assert sk_v == 0
+    assert sk_m == 1
+
+
+def test_backfill_returns_empty_on_empty_vault(vault_path: Path) -> None:
+    """No essays / no source dir → empty job list, no error.
+
+    Per ``feedback_intentionally_left_blank.md``, the helper should
+    silently return ``([], 0, 0)`` and let the caller decide whether
+    to print a "0 jobs" line — never crash on a vault that's never
+    received a /train.
+    """
+    jobs, sk_v, sk_m = voice_train.collect_backfill_jobs(
+        vault_path=vault_path, instance="hypatia",
+    )
+    assert jobs == []
+    assert sk_v == 0
+    assert sk_m == 0
+
+
+def test_backfill_mixed_essay_and_source(vault_path: Path) -> None:
+    """Mixed pending essay + pending source → produces both job kinds."""
+    _write_raw_essay_file(vault_path, name="Essay One")
+    _write_raw_source_file(vault_path, name="Source One")
+    jobs, _, _ = voice_train.collect_backfill_jobs(
+        vault_path=vault_path, instance="hypatia",
+    )
+    kinds = sorted(j.kind for j in jobs)
+    assert kinds == ["method", "voice"]
+
+
+def test_backfill_dry_run_does_not_write_to_queue(
+    tmp_path: Path,
+) -> None:
+    """Dry-run path (collect → don't enqueue) leaves queue file untouched.
+
+    The collector itself never writes to the queue — that's the CLI's
+    responsibility — but pin the contract so a future refactor doesn't
+    accidentally couple them.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _write_raw_essay_file(vault, name="X")
+    queue_path = tmp_path / "data" / "extraction_queue.jsonl"
+    # Don't create the queue file at all — collect should not try to
+    # write to it.
+    jobs, _, _ = voice_train.collect_backfill_jobs(
+        vault_path=vault, instance="hypatia",
+    )
+    assert len(jobs) == 1
+    assert not queue_path.exists()

@@ -1217,6 +1217,106 @@ def cmd_talker(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def cmd_voice(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred voice`` subcommands.
+
+    Currently exposes ``train backfill`` (Ticket #59, 2026-05-08) —
+    walks the vault for raw essay/source records that never went
+    through the extraction worker and enqueues extraction jobs for
+    them. Recovery path for partially-shipped /train invocations,
+    operator-authored essay records, or post-fix retries on
+    extraction-failed records.
+    """
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="talker", suppress_stdout=False)
+
+    subcmd = getattr(args, "voice_cmd", None)
+    train_cmd = getattr(args, "voice_train_cmd", None)
+
+    if subcmd == "train" and train_cmd == "backfill":
+        from alfred.telegram import voice_train as _voice_train
+        from alfred.telegram.bot import _resolve_queue_path
+        from alfred.telegram.config import load_from_unified as talker_cfg_loader
+
+        config = talker_cfg_loader(raw)
+        if config.voice_train is None:
+            print(
+                "voice_train block missing from config — backfill needs "
+                "telegram.voice_train.command_enabled: true (or at least "
+                "the block to exist) so the queue path can be resolved."
+            )
+            sys.exit(1)
+
+        vault_path = Path(config.vault.path)
+        if not vault_path.is_dir():
+            print(f"Vault path not found: {vault_path}")
+            sys.exit(1)
+
+        instance_name = config.instance.name or ""
+        queue_path = _resolve_queue_path(config)
+
+        jobs, skipped_voice, skipped_method = (
+            _voice_train.collect_backfill_jobs(
+                vault_path=vault_path,
+                instance=instance_name,
+            )
+        )
+        voice_count = sum(1 for j in jobs if j.kind == "voice")
+        method_count = sum(1 for j in jobs if j.kind == "method")
+        skipped_total = skipped_voice + skipped_method
+
+        dry_run = bool(getattr(args, "dry_run", False))
+
+        if dry_run:
+            if not jobs:
+                # Per ``feedback_intentionally_left_blank.md``: emit an
+                # explicit "ran, nothing to do" signal so dry-run with
+                # zero work is distinguishable from a broken walk.
+                print(
+                    "Dry-run: 0 jobs to enqueue "
+                    f"(skipped {skipped_total} already-extracted)."
+                )
+                return
+            print(
+                f"Dry-run: would enqueue {voice_count} voice + "
+                f"{method_count} method job(s) "
+                f"(skipped {skipped_total} already-extracted):"
+            )
+            for job in jobs:
+                print(
+                    f"  [{job.kind:6}] {job.raw_rel_path} "
+                    f"(cluster={job.cluster or '-'})"
+                )
+            return
+
+        # Real enqueue path — append each job to the JSONL queue. Same
+        # path as the bot uses, so the worker picks them up on the next
+        # poll tick (8s default).
+        if not jobs:
+            print(
+                "Enqueued 0 voice jobs + 0 method jobs "
+                f"(skipped {skipped_total} already-extracted)."
+            )
+            return
+        for job in jobs:
+            try:
+                _voice_train.enqueue_job(queue_path, job)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"Failed to enqueue job for {job.raw_rel_path}: {exc}"
+                )
+                sys.exit(1)
+        print(
+            f"Enqueued {voice_count} voice jobs + {method_count} method "
+            f"jobs (skipped {skipped_total} already-extracted)."
+        )
+        print(f"Queue: {queue_path}")
+        return
+
+    print("Usage: alfred voice train backfill [--dry-run]")
+    sys.exit(1)
+
+
 def cmd_audit(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred audit`` subcommands.
 
@@ -2369,6 +2469,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit JSON instead of human-readable text",
     )
 
+    # voice — voice/method-source training pipeline subcommands
+    # (Ticket #59, 2026-05-08). Currently exposes ``train backfill``;
+    # future commands (``train list``, ``train status``, etc.) plug
+    # into the same dispatcher.
+    voice_p = sub.add_parser(
+        "voice",
+        help="Voice/method-source training pipeline subcommands",
+    )
+    voice_sub = voice_p.add_subparsers(dest="voice_cmd")
+    voice_train_p = voice_sub.add_parser(
+        "train",
+        help="Voice training (/train) subcommands",
+    )
+    voice_train_sub = voice_train_p.add_subparsers(dest="voice_train_cmd")
+    voice_train_backfill = voice_train_sub.add_parser(
+        "backfill",
+        help=(
+            "Enqueue extraction jobs for raw essay/source records that "
+            "never went through the worker (recovery path for partial "
+            "/train invocations or operator-authored essay records)."
+        ),
+    )
+    voice_train_backfill.add_argument(
+        "--dry-run", dest="dry_run", action="store_true", default=False,
+        help="Print what would be enqueued without writing to the queue.",
+    )
+
     # bit — built-in test daemon
     bit_p = sub.add_parser("bit", help="Alfred built-in test (BIT) subcommands")
     bit_sub = bit_p.add_subparsers(dest="bit_cmd")
@@ -2550,6 +2677,7 @@ def main() -> None:
         "mail": cmd_mail,
         "instance": cmd_instance,
         "talker": cmd_talker,
+        "voice": cmd_voice,
         "check": cmd_check,
         "check-tool-schemas": cmd_check_tool_schemas,
         "bit": cmd_bit,
