@@ -4,12 +4,11 @@ The talker's SKILL.md contains two placeholders — ``{{instance_name}}``
 and ``{{instance_canonical}}`` — which the daemon substitutes at load
 time using plain :func:`str.replace`. Only persona references are
 templated; product/codebase mentions of ``Alfred`` (wikilinks, the
-code framework name, other-instance names like "Knowledge Alfred")
-stay literal.
+code framework name, other-instance names like "Hypatia") stay literal.
 
 See:
     - ``memory/project_multi_instance_design.md`` for naming rationale
-      (S.A.L.E.M., STAY-C, KAL-LE).
+      (S.A.L.E.M., STAY-C, KAL-LE, H.Y.P.A.T.I.A.).
     - ``vault/session/Talker instance name templating (Salem) 2026-04-19.md``
       for the bundled-commit context.
 """

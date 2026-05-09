@@ -62,21 +62,37 @@ def test_vault_edit_body_rewriter_noop_does_not_mark_body_changed(
     assert "body" not in result["fields_changed"]
 
 
-def test_vault_edit_body_rewriter_composes_with_body_append(tmp_path: Path) -> None:
-    """``body_append`` runs first, then ``body_rewriter`` sees the post-append body."""
-    rel = _make_person_record(tmp_path, "Z", "Original.\n")
-
-    def uppercase(body: str) -> str:
-        return body.upper()
-
-    ops.vault_edit(
-        tmp_path, rel,
-        body_append="added line",
-        body_rewriter=uppercase,
-    )
-    new_text = (tmp_path / rel).read_text(encoding="utf-8")
-    assert "ADDED LINE" in new_text
-    assert "ORIGINAL." in new_text
+# Removed 2026-05-09 (Batch A): test_vault_edit_body_rewriter_composes_with_body_append
+#
+# Original intent (wk3 c7, 1ef814f): pin that ``body_append`` runs
+# first, then ``body_rewriter`` sees the post-append body — i.e.
+# vault_edit composed both kwargs in a single call, with deterministic
+# ordering. The test was defending the composition contract.
+#
+# The 2026-05-04 body-mutation matrix arc (e67004d, body_insert_at +
+# body_replace + scope-first design) introduced mutual exclusion
+# across all four body-mutation kwargs (``body_append``, ``body_rewriter``,
+# ``body_insert_at``, ``body_replace``). vault_edit now raises
+# VaultError naming the conflict if multiple are supplied. The
+# rationale (per the e67004d commit message): "Combining them silently
+# would surprise the operator + complicate audit. Multiple-specified
+# raises VaultError naming the conflict."
+#
+# This test pinned a contract that production deliberately broke. The
+# new contract is: each body-mutation surface stands alone; combining
+# two requires sequential vault_edit calls, not composition. Sequential
+# is clearer + auditable, and matches the per-instance × per-type
+# scope-matrix design that drives the body-mutation surface.
+#
+# No replacement test in this commit because:
+#   - The body_rewriter path is already covered by the two tests
+#     above (``test_vault_edit_body_rewriter_runs_and_rewrites_body``
+#     and ``test_vault_edit_body_rewriter_noop_does_not_mark_body_changed``).
+#   - The mutual-exclusion contract is covered by tests in
+#     ``tests/test_vault_edit_body_mutation.py`` (the dedicated home
+#     for the e67004d body-mutation matrix tests).
+#   - This test's intent (composition ordering) is no longer a valid
+#     contract; pinning would lock in a deprecated behaviour.
 
 
 # --- Proposal + propose_updates -------------------------------------------
