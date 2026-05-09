@@ -652,124 +652,52 @@ def _raw_source_body(
 # ---------------------------------------------------------------------------
 # Extraction prompts (Opus)
 # ---------------------------------------------------------------------------
+#
+# The three voice prompts (extraction / cluster / overall) are externalised
+# under ``src/alfred/_bundled/skills/vault-hypatia/prompts/`` so prompt-tuner
+# can iterate on them without touching this Python module. Loaded fresh per
+# call (no module-import caching) — edits to the .md files take effect on
+# the NEXT extraction without needing a daemon restart.
+#
+# ``METHOD_EXTRACTION_PROMPT`` stays inline below; it is intentionally not
+# part of this externalisation pass.
 
 
-VOICE_EXTRACTION_PROMPT = """\
-You are extracting a structured voice profile from a single piece of \
-Andrew Errant's writing. The goal is a fixture future ghostwriting / \
-draft-tuning calls can read to match Andrew's voice precisely on \
-similar work.
+def _load_voice_prompt(prompt_file: str) -> str:
+    """Load a voice prompt from the bundled vault-hypatia/prompts/ directory.
 
-You will be given the FULL essay text. Your output is a Markdown \
-document with structured frontmatter + a brief prose summary in the \
-body. The downstream consumer parses the frontmatter directly and \
-reads the body for context.
+    Mirrors ``alfred.distiller.pipeline._load_stage_prompt``: importlib.resources
+    locator, fresh read per call, warning + empty string on missing file.
+    """
+    from alfred._data import get_skills_dir
 
-## Evidence-anchoring rule (load-bearing)
+    prompt_path = (
+        get_skills_dir() / "vault-hypatia" / "prompts" / prompt_file
+    )
+    if not prompt_path.exists():
+        log.warning(
+            "voice_train.prompt_not_found",
+            path=str(prompt_path),
+            prompt_file=prompt_file,
+            stdout_tail="",
+        )
+        return ""
+    return prompt_path.read_text(encoding="utf-8")
 
-Every label, list entry, or characterisation in this profile must be \
-**quotable**. A profile that says ``comic_moves: [deadpan, escalation]`` \
-without naming WHERE in the essay those moves appear is useless for \
-calibration — it could describe almost any writer. For every label, \
-you should be able to point to a verbatim ≤12-word quote from the \
-essay that demonstrates it. Lists below specify a ``with: "<short \
-verbatim quote>"`` per entry where applicable. Quote exactly — do not \
-paraphrase, do not insert ellipses inside the quote.
 
-## Required frontmatter fields
+def get_voice_extraction_prompt() -> str:
+    """Return the leaf voice extraction prompt (read fresh per call)."""
+    return _load_voice_prompt("voice_extraction.md")
 
-All strings unless noted. Use YAML inline syntax (e.g. \
-``comic_moves: [deadpan, escalation]``) for short lists; use block \
-syntax for the evidence-bearing lists below.
 
-  register: formal | casual | intimate | declarative | conversational | \
-academic | hybrid (1-3 hybrid labels OK, e.g. "casual-declarative")
-  paragraph_rhythm: short-paragraphs | medium-paragraphs | \
-long-paragraphs | mixed-rhythm
-  single_sentence_paragraphs_frequency: rare | occasional | frequent | \
-dominant
-  comic_moves:                  # 2-5 entries, evidence-anchored
-    - move: deadpan-after-technical-detail
-      with: "Some arts and crafts with a map"
-    - move: escalation
-      with: "..."
-  opening_style:                # object form, evidence-anchored
-    description: "1-line description of the typical opening shape"
-    with: "<verbatim ≤12-word quote of the actual opening>"
-  closing_style:                # same object shape as opening_style
-    description: "1-line description of the typical closing shape"
-    with: "<verbatim ≤12-word quote of the actual closing>"
-  transition_style:             # same object shape (description + evidence)
-    description: "linking phrases? section breaks? em-dashes mid-paragraph?"
-    with: "<one verbatim example transition from the essay>"
-  footnote_conventions: present | absent | inline-asides-instead | \
-parenthetical-heavy
-  punctuation_tics:             # 2-5 entries, evidence-anchored
-    - tic: em-dash-mid-paragraph
-      with: "the navigator — and yes I mean the role"
-    - tic: italics-for-emphasis
-      with: "..."
-  lexicon_tells:                # 4-8 verbatim phrases / sentence \
-starters / framings; pull verbatim from the essay; NO paraphrase
-    - "..."
-    - "..."
-  voice_signature: one descriptive sentence (≤30 words) capturing the \
-voice; concrete, not generic
+def get_voice_cluster_prompt() -> str:
+    """Return the cluster-tier voice synthesis prompt (read fresh per call)."""
+    return _load_voice_prompt("voice_cluster.md")
 
-## YAML-safety rules (load-bearing — parse failures break the consumer)
 
-The downstream consumer parses your output as YAML directly. A single \
-malformed value crashes the whole load. Two failure shapes to avoid:
-
-  - **No content after a closed quote on the same line.** Do NOT \
-write ``some_field: "<description>" — "<quote>"`` (description, em-dash \
-separator, then a second quoted phrase on the same line). YAML rejects \
-content after a quoted scalar on the same line: it parses ``"description"`` \
-then errors on the unexpected `` — "quote"``. The em-dash is a common \
-trigger but the rule is general — never put inline content after a \
-closed quote on the same line. The object form (``description:`` + \
-``with:`` on separate lines, as the schema specifies for \
-``opening_style`` / ``closing_style`` / ``transition_style``) is the \
-parse-safe shape — use it.
-  - **Single-line values with internal quotes need outer single-quotes \
-or block scalars.** If a value naturally contains a double quote (e.g. \
-a verbatim quote inside a longer description), wrap the whole value in \
-single quotes (``field: 'He said "no" and meant it'``) or use a block \
-scalar (``field: |\\n  He said "no" and meant it``). Do NOT mix \
-unescaped quotes inside an unquoted value.
-
-When in doubt, prefer the **block / object form** for any field that \
-combines a description with an evidence quote — it never mis-parses.
-
-Body (after the frontmatter):
-
-  - One paragraph (3-5 sentences) describing the overall voice in \
-plain prose. Concrete, NOT generic. Cite 2-3 short verbatim phrases \
-from the essay, each in quotes.
-  - One paragraph describing what NOT to do — voice elements another \
-draft might falsely add (e.g. "do not add corporate buzzwords; do not \
-write headline subheadings within paragraphs"). Be specific to this \
-essay's posture, not generic writing-advice.
-
-## When the essay has no clear voice
-
-If the input is a fragment, a rough draft, or otherwise too thin to \
-profile (under ~400 words, or stylistically inconsistent in a way that \
-suggests Andrew was just typing not crafting), DO NOT fabricate a \
-voice. Instead, return the frontmatter with:
-
-  status: insufficient-evidence
-  insufficient_reason: "<one sentence on what's missing>"
-
-and a body that says ``This input was insufficient to extract a voice \
-profile. <reason>.`` Do NOT pad with generic descriptors to look \
-useful — silent absence is worse than honest absence here per the \
-``intentionally left blank`` rule.
-
-Output only the Markdown document — no commentary, no code fence, \
-nothing before the frontmatter and nothing after the body. The \
-frontmatter starts with ``---`` on the first line.
-"""
+def get_voice_overall_prompt() -> str:
+    """Return the overall-tier voice synthesis prompt (read fresh per call)."""
+    return _load_voice_prompt("voice_overall.md")
 
 
 METHOD_EXTRACTION_PROMPT = """\
@@ -852,196 +780,6 @@ method. <reason>.`` Do NOT manufacture principles to fit the schema \
 
 Output only the Markdown document — no commentary, no code fence, \
 nothing before the frontmatter and nothing after the body.
-"""
-
-
-VOICE_CLUSTER_PROMPT = """\
-You are synthesizing a voice CLUSTER profile from multiple leaf voice \
-profiles that share a cluster tag. The cluster represents a posture \
-Andrew uses across several pieces (e.g. "veteran" for veteran-affairs \
-writing, "technical" for systems writeups, "personal-essay" for \
-substack drafts).
-
-You will be given the leaf voice profiles in order. Each leaf already \
-contains evidence-anchored frontmatter (comic_moves, punctuation_tics, \
-lexicon_tells, etc.) with verbatim quotes attached. Your job is to \
-**aggregate by COUNTING across leaves**, not to re-characterise from \
-scratch. If 4 of 5 leaves list ``deadpan-after-technical-detail`` as \
-a comic move, that's a signature move of this cluster. If only 1 of \
-5 does, it's leaf-specific noise — drop it.
-
-## Aggregation rules
-
-  - **Union with frequency**: for each list field (comic_moves, \
-punctuation_tics, lexicon_tells), count how many leaves include the \
-entry. Sort descending by count. Drop entries that appear in only 1 \
-leaf unless the cluster has only 2 leaves.
-  - **Preserve evidence**: each retained entry should keep ONE \
-representative verbatim quote from the leaves (pick the most \
-characteristic one).
-  - **Consolidated labels** (register, paragraph_rhythm): if the \
-leaves disagree, name the disagreement (``register: \
-casual-with-academic-asides``) rather than averaging.
-
-## Required frontmatter fields
-
-  cluster_name: <name>
-  leaf_count: <n>
-  leaf_titles: list[str]         # the file basenames or essay titles \
-of the leaves used (so downstream readers can trace back)
-  register: <consolidated label, may be hybrid; name disagreement if \
-present>
-  paragraph_rhythm: <consolidated>
-  comic_moves:                   # ordered by leaf-frequency desc
-    - move: <name>
-      seen_in: <n_of_total>
-      with: "<one representative ≤12-word quote>"
-  punctuation_tics:              # same shape
-    - tic: <name>
-      seen_in: <n_of_total>
-      with: "<quote>"
-  lexicon_tells:                 # phrases in ≥2 leaves
-    - "<verbatim phrase>"
-  signature_moves: list[str]     # 3-6 moves present in ≥60% of \
-leaves (the cluster's fingerprint — distinct from comic_moves; can \
-include structural patterns like "opens with a scene then pivots")
-  voice_signature: one descriptive sentence (≤30 words) capturing \
-the cluster's posture; concrete
-
-Body (after frontmatter):
-
-  - ## What this cluster sounds like
-    2-3 paragraphs in plain prose describing the cluster's voice. \
-Concrete. Cite 2-3 short verbatim phrases drawn from the leaves, \
-each in quotes, each tagged with the leaf it came from \
-(``"…" — from <leaf-title>``).
-
-  - ## What's distinctive about this posture
-    1-2 paragraphs describing what makes this cluster recognisable \
-on its own terms — the specific stance, audience-stance, register, \
-or rhetorical move that defines it. (You don't have the other \
-clusters in front of you; describe THIS cluster's defining shape \
-without comparison, and trust that distinctiveness will emerge by \
-contrast at the overall-profile stage.)
-
-  - ## Worked example sketch
-    A 3-5 sentence pseudo-paragraph in the cluster's voice, on a \
-made-up topic Andrew has not actually written about, demonstrating \
-the consolidated feel. CRITICAL: this must be a fresh demonstration \
-of the cluster's signature_moves and lexicon — NOT a remix of any \
-single leaf. Pick a topic clearly outside what's in the leaves \
-(e.g. if the leaves are about veteran affairs and Substack process, \
-write the sketch about train timetables or sourdough bread). Use \
-≥2 of the signature_moves and ≥1 lexicon_tell visibly.
-
-## When the cluster doesn't actually cohere
-
-If the leaves don't share a recognisable voice (the cluster tag was \
-likely wrong, or the leaves span genuinely different postures), \
-return:
-
-  status: incoherent-cluster
-  incoherent_reason: "<one sentence on what doesn't fit>"
-
-with a body section ``## Cluster does not cohere`` describing which \
-leaves seem to belong together vs which seem misfiled. Don't \
-manufacture a fake fingerprint to satisfy the schema.
-
-Output only the Markdown document.
-"""
-
-
-VOICE_OVERALL_PROMPT = """\
-You are synthesizing the OVERALL voice profile that aggregates \
-multiple cluster summaries into a single ground-truth document about \
-Andrew Errant's voice across all writing.
-
-You will be given the cluster summaries. Your output is a Markdown \
-document with frontmatter + a body that organises the postures.
-
-## What this profile is FOR (and what it is NOT)
-
-This profile is a calibration fixture for ghostwriting and copy-edit \
-calls. It tells the next call: (a) what's invariant about Andrew's \
-voice regardless of posture (the absolute fingerprint — must always \
-be present), and (b) what AXES shift across postures (so the call \
-can pick the right value for the piece in front of it). It is NOT \
-a rehash of the cluster summaries — those exist already in the \
-vault. Don't re-describe each cluster; that's wasted tokens. \
-Cross-cluster invariants and the differential between postures are \
-what only this profile can give.
-
-## Required frontmatter fields
-
-  cluster_count: <n>
-  postures:                      # the cluster names, ordered by \
-weight (number of leaves) descending
-    - name: <cluster-name>
-      leaf_count: <n>
-  always_true:                   # 4-8 voice traits present across \
-EVERY cluster (NOT "Andrew uses humor" — too vague. Try \
-"sentence-level rhythm leans short→short→long, with the long \
-sentence carrying the load.")
-    - trait: "<concrete trait>"
-      seen_in: "all <n> clusters"
-      with: "<one short verbatim quote drawn from any cluster>"
-  varies_by_posture:             # 3-6 dimensions where clusters \
-DIFFER. Frame as axes, not values. e.g. "register: ranges from \
-casual-confessional in personal-essay to dry-precise in technical"
-    - axis: <name>
-      range: "<value-A> in <cluster-X> → <value-B> in <cluster-Y>"
-
-Body:
-
-  - ## What stays constant
-    One paragraph (4-6 sentences) describing the absolute fingerprint \
-— what would tip a reader off that any of these pieces was written \
-by Andrew, regardless of audience or topic. Cite 2-3 verbatim \
-phrases (each tagged with the cluster it came from) that demonstrate \
-the constants.
-
-  - ## How postures differ (the differential)
-    One paragraph (NOT one-per-cluster — a SINGLE paragraph) \
-describing how the postures sit relative to each other along the \
-varies_by_posture axes. Use the axes from the frontmatter to \
-structure it. Example: "On register, technical sits formal-precise \
-where personal-essay sits casual-intimate; on paragraph rhythm, both \
-favour short paragraphs but technical breaks them with bulleted \
-lists where personal-essay breaks them with single-sentence \
-paragraphs that land like aphorisms."
-
-  - ## How to pick the posture for a new piece
-    1-2 paragraphs describing the decision criteria — audience, \
-topic, intended reading-context, draft purpose. Be concrete: "if the \
-piece is for veterans on Substack, default to <cluster>; if it's a \
-systems writeup for engineers, default to <cluster>; the gray zone \
-is X — when in doubt do Y."
-
-  - ## Anti-patterns
-    3-5 bullet points: things that would NEVER appear in any \
-cluster, and would tip a reader off that a draft is NOT Andrew. \
-Frame as "evidence of absence" — voice features common to other \
-writers that are notably missing from every cluster (e.g. \
-"corporate-stack openings like 'In today's fast-paced…' don't \
-appear anywhere"; "tweet-style one-line paragraph chains don't \
-appear, even in the casual cluster"). Concrete, falsifiable.
-
-## When the clusters don't actually share invariants
-
-If the cluster summaries genuinely diverge — no real always_true \
-items emerge after honest comparison — return:
-
-  status: no-overall-invariants
-  no_overall_reason: "<one sentence on what's actually going on>"
-
-with a body that says ``Andrew's clusters do not share a stable \
-voice fingerprint. <reason>.`` and skips the constants section. \
-Don't manufacture invariants from generic style-prose to fill the \
-template — a thin "yes there are invariants" is worse than a clear \
-"no there aren't, here's why" because the next ghostwriting call \
-will trust the invariants and produce drift.
-
-Output only the Markdown document.
 """
 
 
@@ -1342,7 +1080,7 @@ async def extract_voice_profile(
     return await _call_opus(
         client=client,
         model=model,
-        system_prompt=VOICE_EXTRACTION_PROMPT,
+        system_prompt=get_voice_extraction_prompt(),
         user_message=f"Essay:\n---\n{raw_text}\n---\n\nProduce the structured voice profile.",
     )
 
@@ -1581,7 +1319,8 @@ async def maybe_rebuild_cluster(
     """If ≥2 leaves share ``cluster_name``, build / rebuild the cluster summary.
 
     Reads all leaf voice profiles with the cluster tag, runs Opus
-    with VOICE_CLUSTER_PROMPT, writes ``voice/cluster/<name>.md``.
+    with the voice-cluster prompt (``get_voice_cluster_prompt()``),
+    writes ``voice/cluster/<name>.md``.
 
     Then maybe-rebuilds the overall profile (≥2 cluster summaries).
     """
@@ -1615,7 +1354,7 @@ async def maybe_rebuild_cluster(
     )
     output = await _call_opus(
         client=client, model=model,
-        system_prompt=VOICE_CLUSTER_PROMPT,
+        system_prompt=get_voice_cluster_prompt(),
         user_message=user_msg,
     )
     if not output:
@@ -1721,7 +1460,7 @@ async def maybe_rebuild_overall(
     )
     output = await _call_opus(
         client=client, model=model,
-        system_prompt=VOICE_OVERALL_PROMPT,
+        system_prompt=get_voice_overall_prompt(),
         user_message=user_msg,
     )
     if not output:
@@ -1738,7 +1477,7 @@ async def maybe_rebuild_overall(
         "is_overall_profile": True,
     }
     # Status passthrough — same shape as cluster/leaf writers. The
-    # ``no-overall-invariants`` sentinel from VOICE_OVERALL_PROMPT's
+    # ``no-overall-invariants`` sentinel from the voice-overall prompt's
     # intentionally-left-blank exit lands in vault. ``Andrew Voice
     # Profile.md`` is a fixed string so no idempotency-path concern
     # here; existence check + write target are byte-identical.
@@ -2380,10 +2119,7 @@ __all__ = [
     "ExtractionJob",
     "PendingPaste",
     "SaveRawResult",
-    "VOICE_EXTRACTION_PROMPT",
     "METHOD_EXTRACTION_PROMPT",
-    "VOICE_CLUSTER_PROMPT",
-    "VOICE_OVERALL_PROMPT",
     "append_paste_chunk",
     "buffer_has_end_marker",
     "drain_queue",
@@ -2391,6 +2127,9 @@ __all__ = [
     "extract_method_profile",
     "extract_voice_profile",
     "find_most_recent_user_paste",
+    "get_voice_cluster_prompt",
+    "get_voice_extraction_prompt",
+    "get_voice_overall_prompt",
     "make_job",
     "maybe_rebuild_cluster",
     "maybe_rebuild_overall",
