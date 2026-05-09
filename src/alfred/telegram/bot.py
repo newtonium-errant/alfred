@@ -206,30 +206,73 @@ def build_app(
     config: TalkerConfig,
     state_mgr: StateManager,
     anthropic_client: Any,
-    system_prompt_provider: Callable[[], str] | str,
-    vault_context_str: str,
+    system_prompt_provider: Callable[[], str] | str | None = None,
+    vault_context_str: str = "",
     raw_config: dict | None = None,
+    *,
+    system_prompt: str | None = None,
 ) -> Application:
     """Build a PTB :class:`Application` wired with handlers and bot_data.
 
     Callers add their own post-init hooks (gap sweeper, signal handlers) via
     :mod:`daemon`. This function only does handler registration.
 
-    ``system_prompt_provider`` — accepts EITHER a zero-arg callable
-    (production path; the daemon passes
-    ``build_system_prompt_provider(skills_dir, config)`` so SKILL.md
-    is read fresh per turn — i.e. every inbound Telegram message
-    routed through ``update_handler`` — closing the same-cycle SKILL
-    ship gap from QA 2026-05-04) OR a static string (legacy path for
-    tests + ad-hoc callers that don't need hot-reload). When a string
-    is passed, it's wrapped in a constant-returning lambda so the
-    handler's call shape stays uniform.
+    System-prompt input — TWO accepted shapes:
+
+    - ``system_prompt_provider`` — the canonical kwarg. Accepts EITHER a
+      zero-arg callable (production path; the daemon passes
+      ``build_system_prompt_provider(skills_dir, config)`` so SKILL.md
+      is read fresh per turn — i.e. every inbound Telegram message
+      routed through ``handle_message`` — closing the same-cycle SKILL
+      ship gap from QA 2026-05-04) OR a static string (legacy path for
+      tests + ad-hoc callers that don't need hot-reload). When a string
+      is passed, it's wrapped in a constant-returning lambda so the
+      handler's call shape stays uniform.
+
+    - ``system_prompt`` — keyword-only legacy compat alias (issue #49 /
+      Batch A 2026-05-09). 13 telegram-suite tests called
+      ``build_app(... system_prompt="", ...)`` from a pre-rename world;
+      rather than sweep 13 fixtures, accept the legacy kwarg here and
+      normalise it through the same provider-wrapping path. Mirrors the
+      defensive-accept-both shape already used by ``_resolve_system_prompt``
+      at the read site (handle_message line ~3884) — symmetry at the
+      write site.
+
+    Exactly one of the two must be supplied (passing both raises
+    :class:`ValueError`). Passing neither falls back to an empty static
+    prompt — useful for handler-introspection tests that build an app
+    purely to assert command-registration shape and never actually run
+    the LLM turn.
 
     ``raw_config`` — Stage 3.5 addition. The peer-route dispatcher
     needs the full unified config dict to build a TransportConfig
     at forward time (peer URLs + tokens live under ``transport.peers``).
     ``None`` disables peer routing cleanly.
     """
+    if system_prompt is not None and system_prompt_provider is not None:
+        raise ValueError(
+            "build_app: pass either ``system_prompt_provider`` OR "
+            "``system_prompt``, not both. The two are aliases for the "
+            "same input slot — passing both leaves the precedence "
+            "ambiguous. Use ``system_prompt_provider`` for the canonical "
+            "kwarg (callable or string); ``system_prompt`` is a legacy "
+            "string-only alias retained for fixture compat."
+        )
+    # Coalesce the two kwargs into one provider input. Empty default
+    # ("") rather than skipping the wrap so the bot_data slot always
+    # holds a callable — every read site can call it without a
+    # type-check (per the historical wrap contract). The read site
+    # ALSO accepts non-callable shapes via _resolve_system_prompt, so
+    # this default is belt-and-braces, not load-bearing on the read
+    # path.
+    provider_input: Callable[[], str] | str
+    if system_prompt is not None:
+        provider_input = system_prompt
+    elif system_prompt_provider is not None:
+        provider_input = system_prompt_provider
+    else:
+        provider_input = ""
+
     app = Application.builder().token(config.bot_token).build()
 
     # Normalize the provider: callers may pass a callable (the daemon
@@ -237,10 +280,10 @@ def build_app(
     # callers that don't need hot-reload). Wrap the string case in a
     # constant-returning lambda so the read site at the message
     # handler always invokes a callable.
-    if callable(system_prompt_provider):
-        provider: Callable[[], str] = system_prompt_provider
+    if callable(provider_input):
+        provider: Callable[[], str] = provider_input
     else:
-        _static_prompt = str(system_prompt_provider)
+        _static_prompt = str(provider_input)
         def provider() -> str:  # noqa: E306
             return _static_prompt
 
