@@ -62,15 +62,46 @@ EXPECTED_HASHES = {
     "voice_cluster.md": (
         "40b1a0e2915d55474ddb3a5e948757537de000169c62519f5a90e3b88c859663"
     ),
+    # Updated 2026-05-09 (Batch A): WARN-1 prompt-tuner pass at f70760f
+    # added the "Recurring named patterns across clusters" body section
+    # to voice_overall.md. The hash + length pin in this file weren't
+    # updated in lockstep at f70760f — the prompt-tuner agent doesn't
+    # have visibility into the test side. Captured here on 2026-05-09
+    # from the post-WARN-1 file as the new baseline; subsequent edits
+    # must update both file AND hash in lockstep per the test's own
+    # contract.
     "voice_overall.md": (
-        "275a8b8d19473431d67bf24870ba5b4bddfc34483bfa1b84ee9deb1332bcaca0"
+        "894c4e35d5d3dc98d3f24c1a89d708f39692c4e3cab4cfe0c6d4e449eba99683"
+    ),
+    # Captured 2026-05-09 from the inlined METHOD_EXTRACTION_PROMPT
+    # constant immediately before the Batch A externalisation. The
+    # joined-string semantics (``\`` line-continuations consuming
+    # newlines) collapse the inline constant's 80-line block into the
+    # 44-line .md file.
+    "method_extraction.md": (
+        "acdfdec49fe457bb9ea6b282b92570fdda31a989246d0adc3bc1fbe389f18e17"
     ),
 }
 
+# Codepoint counts (Python ``len(str)``), NOT byte counts. UTF-8
+# multi-byte characters (em-dash ``—``, ellipsis ``…``, arrows ``→``,
+# math symbols ``≤``) appear in these prompts and the assertion uses
+# ``len(content)`` against the file read with ``encoding="utf-8"`` so
+# the comparison is in codepoints. ``wc -c`` reports bytes; ``wc -m``
+# reports codepoints with the right locale; in Python: ``len(text)``.
 EXPECTED_LENGTHS = {
     "voice_extraction.md": 5505,
     "voice_cluster.md": 4037,
-    "voice_overall.md": 4069,
+    # Updated 2026-05-09 (Batch A) in lockstep with the hash above.
+    # 6643 bytes on disk (``wc -c``); 25 multi-byte UTF-8 codepoints
+    # (20 em-dash / 1 ellipsis / 3 arrows / 1 ≤) at 3 bytes each
+    # contribute 50 extra bytes vs codepoint count → 6593 codepoints.
+    "voice_overall.md": 6593,
+    # method_extraction.md: 3444 bytes on disk; 6 em-dashes contribute
+    # 12 extra bytes → 3432 codepoints. Pre-fix this was incorrectly
+    # set to 3444 (byte count); the test compares against codepoint
+    # count via ``len(text)``.
+    "method_extraction.md": 3432,
 }
 
 
@@ -144,6 +175,14 @@ def test_get_voice_overall_prompt_matches_bundled_file() -> None:
     assert voice_train.get_voice_overall_prompt() == raw
 
 
+def test_get_method_extraction_prompt_matches_bundled_file() -> None:
+    skills_dir = get_skills_dir()
+    raw = (skills_dir / "vault-hypatia" / "prompts" / "method_extraction.md").read_text(
+        encoding="utf-8"
+    )
+    assert voice_train.get_method_extraction_prompt() == raw
+
+
 # ---------------------------------------------------------------------------
 # 4. Loader works against the bundled importlib.resources path
 #    (covers both source-tree-dev and installed-wheel modes — get_skills_dir
@@ -181,20 +220,24 @@ def test_legacy_voice_prompt_constants_removed() -> None:
     .md files prompt-tuner can edit. If a future commit re-introduces the
     constants ("just for backward compat"), this fails and forces the
     question of WHY — the rebuild against bundled files is the contract.
+
+    ``METHOD_EXTRACTION_PROMPT`` joined the externalised set on 2026-05-09
+    (Batch A substrate hygiene), so it is now in this list. Pre-2026-05-09
+    this test asserted ``hasattr(voice_train, "METHOD_EXTRACTION_PROMPT")``
+    because the constant was held back as out-of-scope; the assertion was
+    inverted in lockstep with the externalisation.
     """
     for name in (
         "VOICE_EXTRACTION_PROMPT",
         "VOICE_CLUSTER_PROMPT",
         "VOICE_OVERALL_PROMPT",
+        "METHOD_EXTRACTION_PROMPT",
     ):
         assert not hasattr(voice_train, name), (
             f"{name} should no longer exist on the voice_train module — "
             f"externalised to vault-hypatia/prompts/. If you need the text, "
-            f"call the appropriate get_voice_*_prompt() helper."
+            f"call the appropriate get_*_prompt() helper."
         )
-
-    # METHOD_EXTRACTION_PROMPT stays inline (intentionally NOT in scope).
-    assert hasattr(voice_train, "METHOD_EXTRACTION_PROMPT")
 
 
 def test_voice_train_all_exports_use_loader_helpers() -> None:
@@ -202,11 +245,13 @@ def test_voice_train_all_exports_use_loader_helpers() -> None:
     assert "get_voice_extraction_prompt" in exports
     assert "get_voice_cluster_prompt" in exports
     assert "get_voice_overall_prompt" in exports
+    assert "get_method_extraction_prompt" in exports
     # The legacy constant names must NOT be in __all__ either.
     for name in (
         "VOICE_EXTRACTION_PROMPT",
         "VOICE_CLUSTER_PROMPT",
         "VOICE_OVERALL_PROMPT",
+        "METHOD_EXTRACTION_PROMPT",
     ):
         assert name not in exports, (
             f"{name} still listed in __all__ but the constant is gone — "
@@ -242,6 +287,28 @@ def test_prompt_content_reads_fresh_per_call(tmp_path: Path, monkeypatch) -> Non
 
     # Next call sees EDITED — confirms no module-import cache.
     assert voice_train.get_voice_extraction_prompt() == "EDITED\n"
+
+
+def test_method_prompt_content_reads_fresh_per_call(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Mirror of ``test_prompt_content_reads_fresh_per_call`` for the
+    method-extraction prompt. The method prompt joined the externalised
+    set on 2026-05-09 (Batch A); the per-call-freshness contract applies
+    identically to it."""
+    fake_skills_dir = tmp_path / "skills"
+    (fake_skills_dir / "vault-hypatia" / "prompts").mkdir(parents=True)
+    target = fake_skills_dir / "vault-hypatia" / "prompts" / "method_extraction.md"
+    target.write_text("METHOD ORIGINAL\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "alfred._data.get_skills_dir", lambda: fake_skills_dir
+    )
+
+    assert voice_train.get_method_extraction_prompt() == "METHOD ORIGINAL\n"
+
+    target.write_text("METHOD EDITED\n", encoding="utf-8")
+    assert voice_train.get_method_extraction_prompt() == "METHOD EDITED\n"
 
 
 def test_prompt_loader_warns_on_missing_file(tmp_path: Path, monkeypatch) -> None:
