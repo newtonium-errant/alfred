@@ -142,6 +142,52 @@ def cmd_up(args: argparse.Namespace) -> None:
             sys.exit(1)
         print("\nPreflight passed. Starting daemons...\n")
 
+    # Optional schema-check gate — ``alfred up --check-schemas`` runs
+    # the Anthropic tool-schema validator before spawning daemons.
+    # Closes the same bug class as ``alfred check-tool-schemas`` but at
+    # the operator's natural deploy point (right before restart) rather
+    # than as a separate manual step. Per the 2026-05-05 oneOf-at-top-
+    # level P0: schemas can pass every local test and STILL get rejected
+    # by Anthropic's server-side validator on first real conversation,
+    # 36 hours after restart. The ``count_tokens`` probe is zero-cost
+    # and surfaces the rejection in 1-2 seconds.
+    #
+    # Exit-code mapping from ``_run_schema_check``:
+    #   0  all tools accepted → continue spawning daemons
+    #   1  schema rejected   → BLOCK restart (the bug we're catching)
+    #   2  fatal infra error → log + continue (network blip / no api_key
+    #                          shouldn't block daemon startup; the
+    #                          standalone ``check-tool-schemas`` exit-2
+    #                          is preserved for scripts that want
+    #                          fatal-vs-rejected distinction).
+    #
+    # Opt-in (mirrors ``--preflight``) — not default-on because it
+    # requires an Anthropic API round-trip; some test/dev environments
+    # don't have api_key configured. Operators in production should
+    # adopt the flag in their restart wrapper / systemd unit.
+    if getattr(args, "check_schemas", False):
+        print("Pre-restart tool-schema validation...")
+        rc = _run_schema_check(raw)
+        if rc == 1:
+            print(
+                "\nSchema check FAILED — not starting daemons. "
+                "Fix the rejected schemas above, then re-run."
+            )
+            sys.exit(1)
+        if rc == 2:
+            # Fatal infra: warn but continue. The operator still wants
+            # the daemon up; the schema check failing to RUN doesn't
+            # mean the schemas themselves are broken. The standalone
+            # ``alfred check-tool-schemas`` subcommand surfaces this
+            # explicitly when the operator wants the strict version.
+            print(
+                "\nSchema check could not run (infra issue, see above). "
+                "Continuing daemon startup; re-run "
+                "``alfred check-tool-schemas`` later to verify."
+            )
+        else:
+            print()
+
     live_mode = getattr(args, "live", False)
     foreground = getattr(args, "_internal_foreground", False) or getattr(args, "foreground", False) or live_mode
 
@@ -1424,46 +1470,26 @@ def cmd_check(args: argparse.Namespace) -> None:
     sys.exit(1 if report.overall_status == Status.FAIL else 0)
 
 
-def cmd_check_tool_schemas(args: argparse.Namespace) -> None:
-    """Validate this instance's tool schemas against Anthropic's request validator.
+def _run_schema_check(raw: dict) -> int:
+    """Validate this instance's tool schemas; return CLI-style exit code.
 
-    Closes the bug class surfaced 2026-05-05 by the ``oneOf``-at-top-level
-    P0 (commit ``0d7e7a6``): schema passed every local test but Anthropic's
-    server-side request validator rejected with HTTP 400 on first real
-    conversation. This subcommand exercises the SAME validator pre-deploy
-    via ``client.messages.count_tokens`` (zero cost) so a schema break
-    surfaces BEFORE restart, not 36 hours after.
-
-    Operator workflow:
-        $ alfred --config config.yaml check-tool-schemas
-        Validating Salem tool schemas against api.anthropic.com...
-        - vault_search:      ✓ accepted
-        - vault_read:        ✓ accepted
-        - vault_create:      ✓ accepted
-        - vault_edit:        ✓ accepted
-        - gcal_list_events:  ✓ accepted
-        All 5 tools validated. Safe to restart.
-
-    On rejection:
-        - vault_edit: ✗ REJECTED
-            tools.0.custom.input_schema: input_schema does not support
-            oneOf, allOf, or anyOf at the top level
-        1 of 4 tools failed validation. DO NOT restart — fix schema first.
-        exit 1
+    Extracted from ``cmd_check_tool_schemas`` so both the standalone
+    subcommand AND the ``alfred up --check-schemas`` pre-restart gate
+    share one implementation. Prints the per-tool table to stdout as a
+    side effect (same shape as the standalone subcommand).
 
     Exit codes:
-      * 0  all tools accepted
+      * 0  all tools accepted (or empty tool list — "ran, nothing to do")
       * 1  one or more tools rejected (operator must fix schema)
       * 2  fatal error (no api_key, missing SDK, network failure) —
            validator couldn't run, status of tools unknown
 
-    Per-tool isolation: each tool gets its own probe so the operator
-    sees the tool NAME in errors, not Anthropic's "tools.N" index.
+    Pre-2026-05-09 this logic lived inline in ``cmd_check_tool_schemas``
+    with bare ``sys.exit`` calls; refactored to return an int so
+    ``cmd_up``'s pre-restart gate can short-circuit on rejection without
+    forking the implementation.
     """
     import asyncio
-
-    raw = _load_unified_config(args.config)
-    _setup_logging_from_config(raw, tool="alfred", suppress_stdout=True)
 
     # Load talker config to get api_key + model + tool_set + instance name.
     from alfred.telegram.config import load_from_unified as talker_cfg_loader
@@ -1512,7 +1538,7 @@ def cmd_check_tool_schemas(args: argparse.Namespace) -> None:
         # Fatal → exit 2 so CI / scripts can tell them apart.
         print(f"FATAL: {report.fatal_error}")
         print("Tool validation could not run; status of all tools is UNKNOWN.")
-        sys.exit(2)
+        return 2
 
     if not report.results:
         # Empty tool list — explicit "ran, nothing to do" signal.
@@ -1520,7 +1546,7 @@ def cmd_check_tool_schemas(args: argparse.Namespace) -> None:
             f"No tools surfaced for tool_set={tool_set!r} "
             f"(gcal_enabled={gcal_enabled}). Nothing to validate."
         )
-        sys.exit(0)
+        return 0
 
     # Per-tool table. Pad tool names so the ✓/✗ column lines up.
     name_width = max(len(r.tool_name) for r in report.results)
@@ -1536,14 +1562,59 @@ def cmd_check_tool_schemas(args: argparse.Namespace) -> None:
     print()
     if report.all_accepted:
         print(f"All {len(report.results)} tools validated. Safe to restart.")
-        sys.exit(0)
-    else:
-        rejected = report.rejected_count
-        print(
-            f"{rejected} of {len(report.results)} tools failed validation. "
-            f"DO NOT restart — fix schema first."
-        )
-        sys.exit(1)
+        return 0
+    rejected = report.rejected_count
+    print(
+        f"{rejected} of {len(report.results)} tools failed validation. "
+        f"DO NOT restart — fix schema first."
+    )
+    return 1
+
+
+def cmd_check_tool_schemas(args: argparse.Namespace) -> None:
+    """Validate this instance's tool schemas against Anthropic's request validator.
+
+    Closes the bug class surfaced 2026-05-05 by the ``oneOf``-at-top-level
+    P0 (commit ``0d7e7a6``): schema passed every local test but Anthropic's
+    server-side request validator rejected with HTTP 400 on first real
+    conversation. This subcommand exercises the SAME validator pre-deploy
+    via ``client.messages.count_tokens`` (zero cost) so a schema break
+    surfaces BEFORE restart, not 36 hours after.
+
+    Operator workflow:
+        $ alfred --config config.yaml check-tool-schemas
+        Validating Salem tool schemas against api.anthropic.com...
+        - vault_search:      ✓ accepted
+        - vault_read:        ✓ accepted
+        - vault_create:      ✓ accepted
+        - vault_edit:        ✓ accepted
+        - gcal_list_events:  ✓ accepted
+        All 5 tools validated. Safe to restart.
+
+    On rejection:
+        - vault_edit: ✗ REJECTED
+            tools.0.custom.input_schema: input_schema does not support
+            oneOf, allOf, or anyOf at the top level
+        1 of 4 tools failed validation. DO NOT restart — fix schema first.
+        exit 1
+
+    Exit codes:
+      * 0  all tools accepted
+      * 1  one or more tools rejected (operator must fix schema)
+      * 2  fatal error (no api_key, missing SDK, network failure) —
+           validator couldn't run, status of tools unknown
+
+    Per-tool isolation: each tool gets its own probe so the operator
+    sees the tool NAME in errors, not Anthropic's "tools.N" index.
+
+    Implementation: thin wrapper around ``_run_schema_check`` so the
+    ``alfred up --check-schemas`` pre-restart gate shares the same
+    validator path. Refactored 2026-05-09 (Batch B) to enable the
+    pre-restart wiring without forking the per-tool report shape.
+    """
+    raw = _load_unified_config(args.config)
+    _setup_logging_from_config(raw, tool="alfred", suppress_stdout=True)
+    sys.exit(_run_schema_check(raw))
 
 
 def cmd_instance(args: argparse.Namespace) -> None:
@@ -2101,6 +2172,18 @@ def build_parser() -> argparse.ArgumentParser:
     up_parser.add_argument(
         "--preflight", action="store_true", default=False,
         help="Run BIT quick check before starting daemons; abort if any tool FAILs",
+    )
+    up_parser.add_argument(
+        "--check-schemas", dest="check_schemas",
+        action="store_true", default=False,
+        help=(
+            "Run Anthropic tool-schema validation before starting "
+            "daemons; abort if any schema is rejected. Same probe as "
+            "``alfred check-tool-schemas`` but wired into the deploy "
+            "step. Catches the 2026-05-05 oneOf-at-top-level bug "
+            "class (schema passes local tests but Anthropic server "
+            "rejects on first conversation). Network call required."
+        ),
     )
 
     # down

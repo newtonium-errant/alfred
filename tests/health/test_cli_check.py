@@ -232,3 +232,133 @@ class TestCmdUpPreflight:
              patch("alfred.daemon.spawn_daemon", return_value=999) as spawn_mock:
             cli.cmd_up(args)
         assert spawn_mock.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# `alfred up --check-schemas` — pre-restart Anthropic schema validation.
+# Closes the 2026-05-05 oneOf-at-top-level bug class at the operator's
+# natural deploy point. Mirrors `--preflight`'s opt-in shape.
+# ---------------------------------------------------------------------------
+
+
+class TestCmdUpCheckSchemas:
+    """Pre-restart schema-validation gate. Mirrors TestCmdUpPreflight.
+
+    The gate calls ``cli._run_schema_check(raw)`` which returns:
+      * 0  all tools accepted → continue spawning
+      * 1  schema rejected   → BLOCK (exit 1, no spawn)
+      * 2  fatal infra error → log + continue (network/api_key issues
+                                 shouldn't block daemon startup)
+
+    We patch ``cli._run_schema_check`` directly to avoid threading a
+    fake Anthropic client through the lower layers — the integration
+    of validator → Anthropic SDK is exercised in
+    ``tests/health/test_tool_schema_validator.py``; here we only pin
+    the gate's branching logic.
+    """
+
+    def test_check_schemas_aborts_on_rejection(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """Rejected schemas (rc=1) → SystemExit(1), spawn NOT called."""
+        cfg = _write_config(tmp_path)
+
+        args = argparse.Namespace(
+            config=str(cfg),
+            only=None,
+            foreground=False,
+            _internal_foreground=False,
+            live=False,
+            preflight=False,
+            check_schemas=True,
+        )
+        with patch("alfred.daemon.check_already_running", return_value=None), \
+             patch("alfred.cli._run_schema_check", return_value=1), \
+             patch("alfred.daemon.spawn_daemon") as spawn_mock:
+            with pytest.raises(SystemExit) as ei:
+                cli.cmd_up(args)
+        assert ei.value.code == 1
+        # spawn must NOT be called — schema check rejected
+        assert spawn_mock.call_count == 0
+        out = capsys.readouterr().out
+        assert "Schema check FAILED" in out
+
+    def test_check_schemas_proceeds_on_all_accepted(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """rc=0 (all accepted) → spawn proceeds normally."""
+        cfg = _write_config(tmp_path)
+
+        args = argparse.Namespace(
+            config=str(cfg),
+            only=None,
+            foreground=False,
+            _internal_foreground=False,
+            live=False,
+            preflight=False,
+            check_schemas=True,
+        )
+        with patch("alfred.daemon.check_already_running", return_value=None), \
+             patch("alfred.cli._run_schema_check", return_value=0), \
+             patch("alfred.daemon.spawn_daemon", return_value=12345) as spawn_mock:
+            cli.cmd_up(args)
+        assert spawn_mock.call_count == 1
+
+    def test_check_schemas_continues_on_fatal_infra(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """rc=2 (fatal infra: no api_key, network down) → log + continue.
+
+        Daemon startup must not be blocked by infra issues unrelated to
+        schema correctness. The standalone ``alfred check-tool-schemas``
+        subcommand preserves the strict exit-2 semantic for scripts
+        that need fatal-vs-rejected distinction.
+        """
+        cfg = _write_config(tmp_path)
+
+        args = argparse.Namespace(
+            config=str(cfg),
+            only=None,
+            foreground=False,
+            _internal_foreground=False,
+            live=False,
+            preflight=False,
+            check_schemas=True,
+        )
+        with patch("alfred.daemon.check_already_running", return_value=None), \
+             patch("alfred.cli._run_schema_check", return_value=2), \
+             patch("alfred.daemon.spawn_daemon", return_value=12345) as spawn_mock:
+            cli.cmd_up(args)
+        assert spawn_mock.call_count == 1
+        out = capsys.readouterr().out
+        assert "could not run" in out
+        assert "Continuing daemon startup" in out
+
+    def test_no_check_schemas_flag_skips_check(
+        self, tmp_path: Path, capsys,
+    ) -> None:
+        """Backwards compat — `alfred up` without --check-schemas runs
+        no Anthropic API call. The validator is patched to raise to
+        prove it's not invoked."""
+        cfg = _write_config(tmp_path)
+
+        args = argparse.Namespace(
+            config=str(cfg),
+            only=None,
+            foreground=False,
+            _internal_foreground=False,
+            live=False,
+            preflight=False,
+            check_schemas=False,
+        )
+
+        def _should_not_be_called(_raw):
+            raise AssertionError(
+                "_run_schema_check called but --check-schemas was False"
+            )
+
+        with patch("alfred.daemon.check_already_running", return_value=None), \
+             patch("alfred.cli._run_schema_check", side_effect=_should_not_be_called), \
+             patch("alfred.daemon.spawn_daemon", return_value=999) as spawn_mock:
+            cli.cmd_up(args)
+        assert spawn_mock.call_count == 1
