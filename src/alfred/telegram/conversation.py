@@ -2484,7 +2484,70 @@ async def run_turn(
 
         stop_reason = getattr(response, "stop_reason", "end_turn")
 
-        if stop_reason == "tool_use":
+        # Dispatch is content-based, NOT stop_reason-based (race-fix
+        # 2026-05-09 from Hypatia voice-profile rebuild WARN-2). The
+        # SDK reports ``stop_reason="tool_use"`` only when the model
+        # finished naturally on a tool_use turn. When the response hits
+        # ``max_tokens`` mid-stream — which is exactly what happens when
+        # the model emits a long announcement-paragraph plus several
+        # tool_use blocks each carrying substantial body content — the
+        # final tool_use block(s) still come through the SDK as fully-
+        # formed blocks, but stop_reason flips to ``"max_tokens"``.
+        # Pre-fix the loop's "if stop_reason == 'tool_use'" guard fell
+        # through to the end-turn branch, persisted the tool_use blocks
+        # in the assistant transcript, and returned the partial text
+        # reply — leaving every tool_use id DANGLING with no tool_result.
+        # The 2026-05-03 ``_messages_for_api`` heal masked the symptom
+        # on the NEXT user turn (synthesised tool_result blocks so the
+        # API didn't 400), but the actual tool execution never happened.
+        # User experience: 7 minutes of silence between announcement and
+        # the operator pinging "Progress?" — the mid-stream truncation
+        # was completely invisible.
+        #
+        # Fix: dispatch on whether the response carries any tool_use
+        # blocks, regardless of stop_reason. This lets max_tokens-stop
+        # responses with tool_use blocks STILL execute the (well-formed)
+        # blocks they emitted, append tool_results, and continue the
+        # loop — the next API call will let the model finish whatever
+        # work was truncated. A max_tokens-stop with NO tool_use blocks
+        # falls through to the existing end-turn path (the model just
+        # ran long on text — partial reply is still useful).
+        has_tool_use_blocks = any(
+            getattr(b, "type", None) == "tool_use"
+            for b in (response.content or [])
+        )
+
+        if has_tool_use_blocks:
+            # Observability: when we entered this branch on a non-
+            # ``tool_use`` stop_reason, log it explicitly. The most
+            # common case is ``"max_tokens"`` (model ran out of budget
+            # mid-stream). Per ``feedback_intentionally_left_blank.md``
+            # — silence is ambiguous; emit an explicit signal so the
+            # operator can grep for the truncation pattern. Also surfaces
+            # any future stop_reason that lands tool_use blocks
+            # (``"refusal"`` if a future content-policy stop somehow
+            # produces partial tool_use, etc.).
+            if stop_reason != "tool_use":
+                log.warning(
+                    "talker.run_turn.tool_use_with_nonstandard_stop",
+                    iteration=iteration,
+                    stop_reason=stop_reason,
+                    tool_use_count=sum(
+                        1 for b in response.content
+                        if getattr(b, "type", None) == "tool_use"
+                    ),
+                    detail=(
+                        "Response contained tool_use blocks but "
+                        "stop_reason was not 'tool_use'. Most likely "
+                        "max_tokens-truncated mid-stream — the tool_use "
+                        "blocks the model DID emit will execute "
+                        "normally; the next iteration lets the model "
+                        "finish whatever was cut off. Pre-2026-05-09 "
+                        "fix: this case fell through to end-turn and "
+                        "left the tool_use blocks dangling, presenting "
+                        "as a multi-minute silent gap to the user."
+                    ),
+                )
             # Append assistant turn (list of blocks) so the tool_use IDs are
             # preserved for the matching tool_result.
             append_turn(state, session, "assistant", _blocks_to_jsonable(response.content))

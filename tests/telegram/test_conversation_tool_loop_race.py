@@ -1163,3 +1163,327 @@ def test_startup_handles_malformed_last_message_at_gracefully():
     assert warnings[0]["time_since_last_message_seconds"] is None
     # Detection itself still fires.
     assert warnings[0]["dangling_tool_use_ids"] == ["t1"]
+
+
+# ---------------------------------------------------------------------------
+# WARN-2 (2026-05-09): max_tokens-stop with tool_use blocks must execute
+# ---------------------------------------------------------------------------
+#
+# Live bug from Hypatia voice-profile rebuild 2026-05-09 08:00 UTC. Hypatia
+# announced "writing all four files simultaneously" then went silent for 7
+# minutes. Andrew had to ping "Progress?" before any output landed.
+#
+# Diagnosis (talker.log + alfred.log + conversation transcript):
+#  - Assistant turn at index 7 contained text + 2 tool_use blocks
+#    (toolu_019HW... and toolu_01Uep...) for vault_create.
+#  - SDK reported stop_reason="max_tokens" because the response hit the
+#    4096-token budget mid-stream (long announcement-paragraph + 2 large
+#    vault_create body= contents).
+#  - Pre-fix dispatch was ``if stop_reason == "tool_use"``, so the loop
+#    fell through to the end-turn branch, persisted the tool_use blocks,
+#    and returned the partial text.
+#  - The 2026-05-03 _messages_for_api heal kicked in on the NEXT user
+#    turn and synthesised tool_results so the API didn't 400 — but the
+#    actual tool execution NEVER HAPPENED. User-visible: a multi-minute
+#    silent gap with no progress signal.
+#
+# Fix: dispatch on response content (any tool_use blocks present?) rather
+# than stop_reason. The well-formed tool_use blocks the model managed to
+# emit get executed normally; the loop continues; the next API call lets
+# the model finish whatever was truncated.
+
+
+async def test_run_turn_executes_tool_use_when_stop_reason_max_tokens(
+    tmp_path, monkeypatch,
+):
+    """The Hypatia 2026-05-09 repro: response carries text + tool_use
+    blocks but stop_reason == 'max_tokens'. Pre-fix the loop fell
+    through to the end-turn branch and the tool_use blocks dangled.
+    Post-fix the tool_use blocks execute normally and the loop
+    continues.
+    """
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+
+    # First model call: text + 2 tool_use blocks, stop_reason="max_tokens".
+    # This is the EXACT shape Hypatia hit at 11:00 UTC.
+    truncated_response = FakeResponse(
+        content=[
+            FakeBlock(
+                type="text",
+                text=(
+                    "All nine leaves read. Now writing all four files "
+                    "simultaneously — three cluster summaries and the "
+                    "overall profile."
+                ),
+            ),
+            FakeBlock(
+                type="tool_use",
+                id="toolu_019HWTw84hGui9S7yoafLoVq",  # real id from incident
+                name="vault_create",
+                input={"type": "voice-cluster", "name": "x"},
+            ),
+            FakeBlock(
+                type="tool_use",
+                id="toolu_01UepN5njTqXhkdNMRKEbnjH",  # real id from incident
+                name="vault_create",
+                input={"type": "voice-cluster", "name": "y"},
+            ),
+        ],
+        stop_reason="max_tokens",
+    )
+    # Second call: model finishes with plain text (the 2 tools succeeded
+    # so the next turn just confirms).
+    final_response = FakeResponse(
+        content=[FakeBlock(type="text", text="two created, continuing")],
+        stop_reason="end_turn",
+    )
+    client = FakeAnthropicClient([truncated_response, final_response])
+
+    # Stub _execute_tool: track which tool_use_ids actually got executed.
+    executed_ids: list[str] = []
+
+    async def _stub_execute(tool_name, tool_input, *args, **kwargs):
+        # Record by name (we only have name+input, not the id) — but
+        # the test asserts on the transcript's tool_result blocks below
+        # which DO carry the tool_use_id, so this is sufficient.
+        executed_ids.append(tool_name)
+        return '{"path": "voice/cluster/x.md", "warnings": []}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    result = await conversation.run_turn(
+        client=client,
+        state=state_mgr,
+        session=session,
+        user_message="generate cluster summaries",
+        config=config,
+        vault_context_str="",
+        system_prompt="test system",
+    )
+
+    # Pre-fix: the function would have returned the partial text from
+    # the truncated_response and never called the second response.
+    # Post-fix: it executes the 2 tool_use blocks, gets results, calls
+    # the model again, returns the final text.
+    assert result == "two created, continuing"
+
+    # Both tool_use blocks were executed (not dangling).
+    assert len(executed_ids) == 2
+    assert executed_ids == ["vault_create", "vault_create"]
+
+    # Transcript: user, assistant (text+2 tool_use), user (2 tool_results),
+    # assistant (final text). 4 entries total.
+    assert len(session.transcript) == 4
+    assert session.transcript[0]["role"] == "user"
+    assert session.transcript[1]["role"] == "assistant"
+    # The assistant turn carries the 2 tool_use ids we expected.
+    assistant_blocks = session.transcript[1]["content"]
+    assistant_tool_use_ids = {
+        b["id"] for b in assistant_blocks
+        if b.get("type") == "tool_use"
+    }
+    assert assistant_tool_use_ids == {
+        "toolu_019HWTw84hGui9S7yoafLoVq",
+        "toolu_01UepN5njTqXhkdNMRKEbnjH",
+    }
+    # Tool_results landed for both — no dangling.
+    assert session.transcript[2]["role"] == "user"
+    tool_results = session.transcript[2]["content"]
+    result_ids = {b["tool_use_id"] for b in tool_results}
+    assert result_ids == {
+        "toolu_019HWTw84hGui9S7yoafLoVq",
+        "toolu_01UepN5njTqXhkdNMRKEbnjH",
+    }
+    # Both succeeded (no is_error flag).
+    for b in tool_results:
+        assert b.get("is_error", False) is False
+    # Final assistant text present.
+    assert session.transcript[3]["role"] == "assistant"
+
+
+async def test_run_turn_logs_nonstandard_stop_with_tool_use_blocks(
+    tmp_path, monkeypatch,
+):
+    """Observability contract: when the loop dispatches into the
+    tool-execution branch on a non-tool_use stop_reason (the new
+    2026-05-09 path), it MUST emit
+    ``talker.run_turn.tool_use_with_nonstandard_stop`` so the operator
+    can grep for the truncation pattern.
+
+    Per ``feedback_intentionally_left_blank.md`` — silence is ambiguous;
+    every code path that handles a surprising state must say so.
+    Per ``feedback_log_emission_test_pattern.md`` — the test must pin
+    the log emission, not just the behavior, so future refactors don't
+    silently degrade observability.
+
+    Per ``feedback_structlog_assertion_patterns.md`` — async code uses
+    ``structlog.testing.capture_logs``.
+    """
+    import structlog
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+
+    truncated_response = FakeResponse(
+        content=[
+            FakeBlock(type="text", text="thinking..."),
+            FakeBlock(
+                type="tool_use", id="t1", name="vault_search",
+                input={"query": "x"},
+            ),
+        ],
+        stop_reason="max_tokens",
+    )
+    final_response = FakeResponse(
+        content=[FakeBlock(type="text", text="done")],
+        stop_reason="end_turn",
+    )
+    client = FakeAnthropicClient([truncated_response, final_response])
+
+    async def _stub_execute(*args, **kwargs):
+        return '{"hits": []}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    with structlog.testing.capture_logs() as captured:
+        await conversation.run_turn(
+            client=client,
+            state=state_mgr,
+            session=session,
+            user_message="search for x",
+            config=config,
+            vault_context_str="",
+            system_prompt="test system",
+        )
+
+    matches = [
+        c for c in captured
+        if c.get("event") == "talker.run_turn.tool_use_with_nonstandard_stop"
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one nonstandard-stop log; got {len(matches)}: "
+        f"{[c.get('event') for c in captured]}"
+    )
+    log_entry = matches[0]
+    assert log_entry["log_level"] == "warning"
+    assert log_entry["stop_reason"] == "max_tokens"
+    assert log_entry["tool_use_count"] == 1
+    # Field presence pin — operator-grep contract.
+    assert "iteration" in log_entry
+    assert "detail" in log_entry
+
+
+async def test_run_turn_normal_tool_use_stop_does_not_log_nonstandard(
+    tmp_path, monkeypatch,
+):
+    """Negative pin: when stop_reason IS 'tool_use', the nonstandard-stop
+    log MUST NOT fire. Prevents the log from becoming noise on the
+    common-case path.
+    """
+    import structlog
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+
+    tool_use_response = FakeResponse(
+        content=[
+            FakeBlock(
+                type="tool_use", id="t1", name="vault_search",
+                input={"query": "x"},
+            ),
+        ],
+        stop_reason="tool_use",  # the normal case
+    )
+    final_response = FakeResponse(
+        content=[FakeBlock(type="text", text="done")],
+        stop_reason="end_turn",
+    )
+    client = FakeAnthropicClient([tool_use_response, final_response])
+
+    async def _stub_execute(*args, **kwargs):
+        return '{"hits": []}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    with structlog.testing.capture_logs() as captured:
+        await conversation.run_turn(
+            client=client,
+            state=state_mgr,
+            session=session,
+            user_message="search",
+            config=config,
+            vault_context_str="",
+            system_prompt="test system",
+        )
+
+    matches = [
+        c for c in captured
+        if c.get("event") == "talker.run_turn.tool_use_with_nonstandard_stop"
+    ]
+    assert matches == [], (
+        f"nonstandard-stop log fired on the normal stop_reason='tool_use' "
+        f"path; this is noise. Captured: {matches}"
+    )
+
+
+async def test_run_turn_max_tokens_no_tool_use_falls_through_to_end_turn(
+    tmp_path, monkeypatch,
+):
+    """The text-only max_tokens case: response has only text blocks,
+    no tool_use. The loop should fall through to the end-turn branch
+    (return the partial text) — NOT enter the tool-execution branch.
+
+    Prevents a regression where the new content-based dispatch
+    accidentally triggers on text-only responses.
+    """
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+
+    text_only_truncated = FakeResponse(
+        content=[
+            FakeBlock(
+                type="text",
+                text="This is a long answer that ran out of budget mid-",
+            ),
+        ],
+        stop_reason="max_tokens",
+    )
+    client = FakeAnthropicClient([text_only_truncated])
+
+    # _execute_tool MUST NOT be called — text-only path doesn't go
+    # through tool execution.
+    execute_calls: list[Any] = []
+
+    async def _stub_execute(*args, **kwargs):
+        execute_calls.append(args)
+        return '{"hits": []}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    result = await conversation.run_turn(
+        client=client,
+        state=state_mgr,
+        session=session,
+        user_message="please answer at length",
+        config=config,
+        vault_context_str="",
+        system_prompt="test system",
+    )
+
+    # The partial reply is returned to the user.
+    assert "This is a long answer" in result
+    # No tool execution happened.
+    assert execute_calls == []
+    # Transcript: user + assistant (the partial text). 2 entries.
+    assert len(session.transcript) == 2
