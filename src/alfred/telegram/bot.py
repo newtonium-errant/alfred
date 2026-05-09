@@ -3063,6 +3063,24 @@ async def _dispatch_peer_route(
         await update.message.reply_text(
             f"Couldn't reach {target.upper()}: {exc}"
         )
+        # Issue #62: clear the peer-route stash so subsequent messages
+        # in this session don't keep hitting the same dead peer. The
+        # ``peer_unavailable`` branch above returns False and the
+        # caller pops the stash via fall-through (see ``handle_message``
+        # right after the dispatch); ``peer_route_failed`` returns True
+        # (error surfaced), so we have to pop inline. Mirrors that
+        # caller-side cleanup pattern.
+        try:
+            state_mgr_ref: StateManager | None = (
+                ctx.application.bot_data.get(_KEY_STATE)
+            )
+        except Exception:  # noqa: BLE001 — defensive; bot_data must be a dict
+            state_mgr_ref = None
+        if state_mgr_ref is not None:
+            active = state_mgr_ref.get_active(chat_id) or {}
+            if active.pop("_peer_route_target", None) is not None:
+                state_mgr_ref.set_active(chat_id, active)
+                state_mgr_ref.save()
         return True  # Don't fall through — error already surfaced
 
     # --- Wait for the peer to call back via /peer/send ----------------
@@ -3113,6 +3131,45 @@ async def _dispatch_peer_route(
     return True
 
 
+def _instance_peer_targets(
+    raw_config: dict | None, self_name: str,
+) -> set[str] | None:
+    """Return the set of peer-key names THIS instance can route to.
+
+    Issue #62: Hypatia's classifier emitted ``peer_route target=kal-le``
+    on a vault-cleanup message, but Hypatia's ``transport.peers`` is
+    ``[local, salem]`` — kal-le is not a configured peer. The router
+    used to validate against a hardcoded global set of peer names, so
+    the bogus target sailed past the gate and the bot tried to route to
+    a peer it had no transport entry for. This helper sources the
+    truth from the SAME config the actual transport dispatcher uses
+    (``transport.peers`` keys), drops ``local`` (self alias) and the
+    instance's own normalised name, and returns the residual set for
+    the router to validate against.
+
+    Returns ``None`` when the raw config is missing or the peers
+    section is empty — the router falls back to its hardcoded global
+    set in that case, preserving the legacy behaviour for installs
+    that haven't configured ``transport.peers`` at all (single-
+    instance default).
+    """
+    if not raw_config:
+        return None
+    transport_section = raw_config.get("transport") or {}
+    peers_section = transport_section.get("peers") or {}
+    if not isinstance(peers_section, dict) or not peers_section:
+        return None
+    targets: set[str] = set()
+    for raw_name in peers_section.keys():
+        normalised = _normalize_instance_name(str(raw_name))
+        if not normalised:
+            continue
+        if normalised in {"local", self_name}:
+            continue
+        targets.add(normalised)
+    return targets
+
+
 async def _open_routed_session(
     state_mgr: StateManager,
     config: TalkerConfig,
@@ -3120,6 +3177,7 @@ async def _open_routed_session(
     chat_id: int,
     first_message: str,
     has_reply_context: bool = False,
+    valid_peer_targets: set[str] | None = None,
 ) -> Session:
     """Classify the opening cue, open a new session with the right defaults.
 
@@ -3143,6 +3201,13 @@ async def _open_routed_session(
     note. Reply-to-bot-message is a strong "this is a follow-up"
     signal. Defaults to ``False`` for legacy callers and the rehydrate-
     failure path when the bug that triggered it wasn't a reply.
+
+    ``valid_peer_targets`` (issue #62): the per-instance peer-key set
+    the classifier should validate ``peer_route target=...`` against.
+    Computed by the caller from ``transport.peers`` via
+    :func:`_instance_peer_targets`. ``None`` falls back to the router's
+    hardcoded global set — the safe default for tests and any caller
+    that doesn't have ``raw_config`` in scope.
     """
     recent = _recent_sessions_for_router(state_mgr)
     # Stage 3.5 hotfix c3: thread the local instance identity into the
@@ -3160,6 +3225,7 @@ async def _open_routed_session(
         self_name=self_name,
         self_display_name=self_display_name,
         has_reply_context=has_reply_context,
+        valid_peer_targets=valid_peer_targets,
     )
 
     # Pushback level from the session-type defaults — the router doesn't
@@ -3875,6 +3941,19 @@ async def handle_message(
         # re-route too — the user's next message should feel like a fresh
         # session, not a continuation of whatever state corruption we just
         # discarded.
+        # Issue #62: compute the per-instance peer-target set ONCE here
+        # so both router branches (rehydrate-failure + fresh-session)
+        # validate against the same per-instance acceptance set. Sourced
+        # from ``transport.peers`` via the same raw_config the dispatch
+        # path uses; ``None`` if peers aren't configured (single-instance
+        # default), which lets the router fall back to its global set.
+        _self_name_for_peers = _normalize_instance_name(
+            config.instance.name or config.instance.canonical or "",
+        )
+        _instance_peers = _instance_peer_targets(
+            ctx.application.bot_data.get("raw_config"),
+            _self_name_for_peers,
+        )
         active = state_mgr.get_active(chat_id)
         if active:
             try:
@@ -3894,6 +3973,7 @@ async def handle_message(
                 sess = await _open_routed_session(
                     state_mgr, config, client, chat_id, effective_text,
                     has_reply_context=has_reply_context,
+                    valid_peer_targets=_instance_peers,
                 )
         else:
             # No active session — the router runs. When this message is a
@@ -3904,6 +3984,7 @@ async def handle_message(
             sess = await _open_routed_session(
                 state_mgr, config, client, chat_id, effective_text,
                 has_reply_context=has_reply_context,
+                valid_peer_targets=_instance_peers,
             )
 
         # Stage 3.5 peer-route flow. On the first message of a

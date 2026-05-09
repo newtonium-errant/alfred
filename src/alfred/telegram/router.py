@@ -261,7 +261,15 @@ def _fallback_decision(reason: str) -> RouterDecision:
     )
 
 
-# Known peer-route targets — update when a new instance comes online.
+# Globally-known peer names — used as the fallback acceptance set when a
+# caller doesn't pass an instance-specific ``valid_peer_targets``. The
+# instance-specific set (sourced from ``transport.peers`` keys minus
+# ``local`` / self) is what production callers SHOULD pass; this fallback
+# preserves backwards compatibility for tests and any legacy in-process
+# caller that hasn't been updated yet. See #62: a hardcoded global set
+# silently accepted ``kal-le`` on Hypatia (whose ``transport.peers`` is
+# ``[local, salem]``), causing the bot to attempt a route to a peer it
+# wasn't configured to reach.
 _VALID_PEER_TARGETS: set[str] = {"kal-le", "stay-c"}
 
 
@@ -269,6 +277,7 @@ def _decision_from_parsed(
     parsed: dict[str, Any],
     recent: list[dict[str, Any]],
     self_name: str = "",
+    valid_peer_targets: set[str] | None = None,
 ) -> RouterDecision:
     """Build a :class:`RouterDecision` from a parsed JSON dict.
 
@@ -287,6 +296,16 @@ def _decision_from_parsed(
     still do it — so we guard at parse time too (degrade-to-note with a
     warning log). Empty string disables the check (tests and legacy
     callers).
+
+    Issue #62 fix: ``valid_peer_targets`` is the per-instance set of
+    peer-key names (sourced from this instance's ``transport.peers``
+    config, minus ``local`` and self). When provided, the peer-target
+    validation uses THIS set instead of the global
+    :data:`_VALID_PEER_TARGETS`. Result: Hypatia (whose
+    ``transport.peers`` is ``[local, salem]``) rejects
+    ``target=kal-le`` even though kal-le is a globally-known peer
+    name. ``None`` falls back to the hardcoded global set so existing
+    callers/tests keep working.
     """
     session_type = parsed.get("session_type") or "note"
     if session_type not in known_types():
@@ -302,11 +321,24 @@ def _decision_from_parsed(
     # Peer-route target validation. A peer_route classification without
     # a known target degrades to ``note`` — we'd rather fall through to
     # Salem's normal handling than forward to nobody.
+    #
+    # Issue #62: prefer the per-instance ``valid_peer_targets`` (caller-
+    # supplied, sourced from ``transport.peers`` minus ``local``/self)
+    # over the hardcoded global set. The fallback exists so legacy/test
+    # callers that don't pass a per-instance set still get the old
+    # behaviour. Logs distinguish the two rejection modes so future
+    # debugging can tell "unknown peer name globally" (old hardcoded
+    # check) from "valid global name but not configured on THIS
+    # instance" (new per-instance check).
+    accepted_targets = (
+        valid_peer_targets if valid_peer_targets is not None
+        else _VALID_PEER_TARGETS
+    )
     target: str | None = None
     peer_route_hint: str = ""
     if session_type == "peer_route":
         raw_target = parsed.get("target")
-        if isinstance(raw_target, str) and raw_target.lower() in _VALID_PEER_TARGETS:
+        if isinstance(raw_target, str) and raw_target.lower() in accepted_targets:
             candidate = raw_target.lower()
             # c3 parse-time guard: even with the "never self-target"
             # instruction in the prompt, the classifier can still emit
@@ -325,6 +357,24 @@ def _decision_from_parsed(
             else:
                 target = candidate
                 peer_route_hint = str(parsed.get("peer_route_hint") or "")[:200]
+        elif (
+            valid_peer_targets is not None
+            and isinstance(raw_target, str)
+            and raw_target.lower() in _VALID_PEER_TARGETS
+        ):
+            # NEW (#62): the target is a globally-known peer name but not
+            # configured on THIS instance. Distinct log so the failure
+            # mode is debuggable — operators can see at a glance that
+            # the classifier emitted a plausible target the local
+            # transport just doesn't know about.
+            log.warning(
+                "talker.router.peer_route_target_not_configured",
+                raw_target=str(raw_target)[:80],
+                valid_peers=sorted(accepted_targets),
+            )
+            session_type = "note"
+            defaults = defaults_for("note")
+            model = defaults.model
         else:
             log.info(
                 "talker.router.peer_route_missing_target",
@@ -380,6 +430,7 @@ async def classify_opening_cue(
     self_name: str = "",
     self_display_name: str = "",
     has_reply_context: bool = False,
+    valid_peer_targets: set[str] | None = None,
 ) -> RouterDecision:
     """Classify one opening message; return a :class:`RouterDecision`.
 
@@ -410,6 +461,16 @@ async def classify_opening_cue(
             toward continuation / note, away from fresh cue-driven
             types. Defaults to ``False`` for legacy callers and
             non-reply messages.
+        valid_peer_targets: Issue #62 fix — the per-instance set of
+            peer-key names this instance is configured to reach
+            (sourced from ``transport.peers`` keys minus ``local`` and
+            self). When provided, ``peer_route`` classifications with a
+            target NOT in this set degrade to ``note`` even if the
+            target is a globally-known peer name. ``None`` (default)
+            falls back to the hardcoded global set for backwards
+            compatibility with legacy/test callers; production
+            ``handle_message`` flow always passes the per-instance
+            set.
 
     Returns:
         A :class:`RouterDecision`. Any error (network, bad JSON, unknown
@@ -469,7 +530,10 @@ async def classify_opening_cue(
         log.warning("talker.router.parse_failed", raw_head=raw[:200])
         return _fallback_decision("parse_failed")
 
-    decision = _decision_from_parsed(parsed, recent_sessions, self_name)
+    decision = _decision_from_parsed(
+        parsed, recent_sessions, self_name,
+        valid_peer_targets=valid_peer_targets,
+    )
     log.info(
         "talker.router.decided",
         session_type=decision.session_type,
