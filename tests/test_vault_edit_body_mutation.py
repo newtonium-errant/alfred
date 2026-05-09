@@ -455,6 +455,74 @@ class TestMutualExclusion:
                 scope="hypatia",
             )
 
+    # 3-of-6 → 6-of-6 coverage of the 4-choose-2 mutex matrix
+    # (code-reviewer flag from 884255f review). The gate at
+    # ``vault/ops.py:972-984`` covers all six pairs of body-mutation
+    # kwargs (``body_append`` / ``body_rewriter`` / ``body_insert_at`` /
+    # ``body_replace``); the three pins below close the gap. The
+    # body_append+body_rewriter pair (``test_..._refused`` immediately
+    # below) is the load-bearing inversion pin: 884255f deleted a prior
+    # test that asserted these COULD compose, so this pin locks in the
+    # post-e67004d contract that they explicitly CANNOT.
+    def test_body_append_and_body_rewriter_together_refused(
+        self, tmp_vault: Path,
+    ):
+        """Inversion pin: pre-e67004d these COULD compose; now refused.
+
+        Closes the contract gap left by 884255f's deletion of
+        ``test_vault_edit_body_rewriter_composes_with_body_append``.
+        Without this pin a future regression that re-permits the combo
+        would slip through every TestMutualExclusion sweep.
+        """
+        vault_create(
+            tmp_vault, "note", "Mutex Append Rewriter",
+            body="# Title\n\nOriginal.\n",
+            scope="hypatia",
+        )
+        with pytest.raises(VaultError, match="at most ONE body-mutation"):
+            vault_edit(
+                tmp_vault, "note/Mutex Append Rewriter.md",
+                body_append="appended",
+                body_rewriter=lambda body: body.upper(),
+                scope="hypatia",
+            )
+
+    def test_body_replace_and_body_rewriter_together_refused(
+        self, tmp_vault: Path,
+    ):
+        vault_create(
+            tmp_vault, "note", "Mutex Replace Rewriter",
+            body="# Old\n",
+            scope="hypatia",
+        )
+        with pytest.raises(VaultError, match="at most ONE body-mutation"):
+            vault_edit(
+                tmp_vault, "note/Mutex Replace Rewriter.md",
+                body_replace="# New\n",
+                body_rewriter=lambda body: body.upper(),
+                scope="hypatia",
+            )
+
+    def test_body_insert_at_and_body_rewriter_together_refused(
+        self, tmp_vault: Path,
+    ):
+        vault_create(
+            tmp_vault, "note", "Mutex Insert Rewriter",
+            body="# Title\n\n## Section\n",
+            scope="hypatia",
+        )
+        with pytest.raises(VaultError, match="at most ONE body-mutation"):
+            vault_edit(
+                tmp_vault, "note/Mutex Insert Rewriter.md",
+                body_insert_at={
+                    "marker": "## Section",
+                    "position": "after",
+                    "content": "x",
+                },
+                body_rewriter=lambda body: body.upper(),
+                scope="hypatia",
+            )
+
 
 # ---------------------------------------------------------------------------
 # Regression: existing body_append + body_rewriter paths unchanged
