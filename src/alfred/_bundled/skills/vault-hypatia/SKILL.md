@@ -1059,7 +1059,7 @@ A growing reference of narrative frameworks Andrew can choose from when building
 
 Two bot-registered slash commands feed your calibration corpus: `/train` for voice profiles (ingested from finished essays Andrew has published or otherwise considers voice-canonical) and `/method-source` for method/system profiles (ingested from frameworks, techniques, or methodology sources Andrew wants you to be able to apply later). Both follow the same sub-2s ack pattern: the bot saves the raw record, enqueues an async extraction job, replies "saved, extraction queued"; the worker processes the queue in the background and DMs Andrew when each extraction completes.
 
-You don't run extractions yourself — the bot's worker does, using dedicated extraction prompts (`VOICE_EXTRACTION_PROMPT`, `METHOD_EXTRACTION_PROMPT`, plus cluster + overall aggregation prompts). Your job in this section is twofold:
+You don't run extractions yourself — the bot's worker does, using dedicated extraction prompts (the voice-leaf extraction prompt, `METHOD_EXTRACTION_PROMPT`, plus cluster + overall voice-aggregation prompts). Your job in this section is twofold:
 
 1. **Recognize natural-language equivalents** to the slash commands and route accordingly (the bot also recognizes them at handler-level, but you should too — sometimes Andrew talks before he types the slash).
 2. **Use the resulting profiles** (`voice/<slug>.md`, `voice/cluster/<name>.md`, `voice/Andrew Voice Profile.md`, `method/<slug>.md`) when calibrating in the postures above.
@@ -1072,7 +1072,7 @@ The slash command:
 >
 > *(or: paste text first, then `/train --cluster <name>` — the bot classifies the most-recent long paste)*
 
-Saves the raw essay at `document/essay/<slug>.md` with `extraction_status: pending`. The async worker calls Opus with `VOICE_EXTRACTION_PROMPT` and writes the structured voice profile to `voice/<slug>.md`. When ≥2 leaves share a cluster tag, the worker also runs `VOICE_CLUSTER_PROMPT` to aggregate into `voice/cluster/<name>.md`. When ≥2 cluster summaries exist, it runs `VOICE_OVERALL_PROMPT` to synthesize `voice/Andrew Voice Profile.md`.
+Saves the raw essay at `document/essay/<slug>.md` with `extraction_status: pending`. The async worker calls Opus with the voice-leaf extraction prompt and writes the structured voice profile to `voice/<slug>.md`. When ≥2 leaves share a cluster tag, the worker also runs the cluster-aggregation prompt to produce `voice/cluster/<name>.md`. When ≥2 cluster summaries exist, it runs the overall-synthesis prompt to produce `voice/Andrew Voice Profile.md`.
 
 #### Buffered paste — multi-message handling (Bug #58, shipped 2026-05-08)
 
@@ -1191,7 +1191,7 @@ Mention once when relevant — not pushy, not on every long paste. After Andrew 
 
 ### Status sentinels — intentionally-left-blank signals
 
-The four extraction prompts (`VOICE_EXTRACTION_PROMPT`, `METHOD_EXTRACTION_PROMPT`, `VOICE_CLUSTER_PROMPT`, `VOICE_OVERALL_PROMPT`) emit explicit status sentinels rather than fabricating low-quality profiles. When you load a profile and see one of these in the frontmatter, do NOT treat it as load-bearing calibration data. Each names a specific failure mode of extraction:
+The four extraction prompts (voice-leaf, `METHOD_EXTRACTION_PROMPT`, voice-cluster, voice-overall) emit explicit status sentinels rather than fabricating low-quality profiles. When you load a profile and see one of these in the frontmatter, do NOT treat it as load-bearing calibration data. Each names a specific failure mode of extraction:
 
 | `status:` value | Meaning | What to do |
 |---|---|---|
