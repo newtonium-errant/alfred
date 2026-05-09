@@ -126,6 +126,308 @@ async def test_send_rejects_client_not_in_allowlist(client):  # type: ignore[no-
 
 
 # ---------------------------------------------------------------------------
+# Claim-first-then-verify auth (Stage 3.5 multi-peer)
+#
+# Refactor 2026-05-09 (Batch B) closes the fragility flagged 2026-05-01
+# in ``feedback_per_peer_token_uniqueness.md``: previously the auth
+# middleware iterated ``config.auth.tokens.items()`` and matched the
+# FIRST token-equality. If two peer pairs (e.g. KAL-LE + STAY-C)
+# accidentally shared a token, iter() picked one arbitrarily and the
+# OTHER client got rejected with ``client_not_allowed`` based on the
+# wrong peer's allowlist.
+#
+# The new resolver (``_resolve_peer_for_auth``) does claim-first lookup
+# (X-Alfred-Client header → peer key), THEN verifies the token. v1
+# internal clients (scheduler / brief / ...) preserve the legacy
+# iter+token-match path because their client_name isn't a peer key.
+# ---------------------------------------------------------------------------
+
+
+# Distinct dummy tokens per peer — obvious-fake patterns, no
+# realistic provider prefix per builder.md's GitGuardian rule.
+DUMMY_KALLE_TEST_TOKEN = "DUMMY_KALLE_TEST_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_01234567"
+DUMMY_STAYC_TEST_TOKEN = "DUMMY_STAYC_TEST_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_01234567"
+
+
+@pytest.fixture
+async def multi_peer_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """Client wired with three peers: local + kal-le + stay-c.
+
+    Each peer has its OWN distinct token + an allowlist that names just
+    its own client. This is the Stage 3.5 shape — Salem's transport
+    server fields requests from co-located internal clients (via the
+    ``local`` entry) AND from cross-instance peers (via the per-peer
+    entries).
+    """
+    extra_peers = {
+        "kal-le": AuthTokenEntry(
+            token=DUMMY_KALLE_TEST_TOKEN,
+            allowed_clients=["kal-le"],
+        ),
+        "stay-c": AuthTokenEntry(
+            token=DUMMY_STAYC_TEST_TOKEN,
+            allowed_clients=["stay-c"],
+        ),
+    }
+    config = _build_config(extra_peers=extra_peers)
+    state = _build_state(tmp_path)
+
+    async def _send_stub(user_id: int, text: str, dedupe_key: str | None = None) -> list[int]:
+        return [42]
+
+    app = build_app(config, state, send_fn=_send_stub)
+    tc: TestClient = await aiohttp_client(app)
+    return tc
+
+
+async def test_claim_first_routes_kal_le_to_its_own_peer(  # type: ignore[no-untyped-def]
+    multi_peer_client,
+):
+    """KAL-LE's request matches the kal-le peer (not local) via claim-first.
+
+    The X-Alfred-Client header value (``kal-le``) is itself a peer key in
+    the server's tokens dict. Phase 1 resolves directly to that peer and
+    verifies its token. Pre-fix this DID work (KAL-LE's token is
+    distinct from local's), but only because iter()-order happened to
+    visit them in registration order — the new path is deterministic
+    by design, not by happenstance.
+    """
+    resp = await multi_peer_client.post(
+        "/outbound/send",
+        json={"user_id": 1, "text": "hi"},
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_TEST_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 200, await resp.text()
+
+
+async def test_claim_first_routes_stay_c_to_its_own_peer(  # type: ignore[no-untyped-def]
+    multi_peer_client,
+):
+    """Companion to the kal-le test — stay-c lookup is independent.
+
+    Pinned separately to lock both peers, not just whichever happens to
+    be the iter()-first entry.
+    """
+    resp = await multi_peer_client.post(
+        "/outbound/send",
+        json={"user_id": 1, "text": "hi"},
+        headers={
+            "Authorization": f"Bearer {DUMMY_STAYC_TEST_TOKEN}",
+            "X-Alfred-Client": "stay-c",
+        },
+    )
+    assert resp.status == 200, await resp.text()
+
+
+async def test_claim_first_rejects_kal_le_with_stay_c_token(  # type: ignore[no-untyped-def]
+    multi_peer_client,
+):
+    """The headline regression pin for the per-peer-uniqueness fragility.
+
+    A request claiming X-Alfred-Client: kal-le but presenting STAY-C's
+    token must reject — phase 1 looks up ``kal-le`` directly, finds the
+    kal-le entry, compares its token against STAY-C's presented token,
+    finds mismatch, falls through to phase 2. Phase 2 then matches
+    STAY-C by token-equality, but STAY-C's allowlist is ``[stay-c]``,
+    so the post-match ``allowed_clients`` gate refuses with
+    ``client_not_allowed``.
+
+    Pre-fix shape: iter() picked an arbitrary peer-by-token-match;
+    behavior depended on dict insertion order. Post-fix: deterministic
+    rejection regardless of order.
+    """
+    resp = await multi_peer_client.post(
+        "/outbound/send",
+        json={"user_id": 1, "text": "hi"},
+        headers={
+            "Authorization": f"Bearer {DUMMY_STAYC_TEST_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 401
+    body = await resp.json()
+    # Resolver flow: phase 1 finds kal-le entry, token mismatches
+    # (kal-le's token != stay-c's presented token), falls through.
+    # Phase 2 iter+token-match finds stay-c (whose token matches the
+    # presented value). Middleware then runs allowed_clients gate
+    # against stay-c's allowlist (["stay-c"]) — client_name "kal-le"
+    # is NOT in it → reject with client_not_allowed, peer=stay-c.
+    assert body["error"] == "client_not_allowed"
+    assert body["peer"] == "stay-c"
+
+
+async def test_claim_first_unknown_client_falls_through_to_legacy(  # type: ignore[no-untyped-def]
+    multi_peer_client,
+):
+    """v1 internal clients preserve legacy iter+token-match path.
+
+    A request from ``scheduler`` (an internal client, NOT a peer key)
+    presents the local token. Phase 1's direct lookup misses (no
+    ``scheduler`` entry in tokens). Phase 2 falls through to legacy
+    iter+token-match — finds ``local`` via token-equality. Then the
+    ``allowed_clients`` gate confirms ``scheduler`` is in
+    ``local.allowed_clients`` and the request proceeds.
+
+    This is the load-bearing v1-compat pin — without it the refactor
+    would break every co-located client.
+    """
+    resp = await multi_peer_client.post(
+        "/outbound/send",
+        json={"user_id": 1, "text": "hi"},
+        headers={
+            "Authorization": f"Bearer {DUMMY_TRANSPORT_TEST_TOKEN}",
+            "X-Alfred-Client": "scheduler",
+        },
+    )
+    assert resp.status == 200, await resp.text()
+
+
+async def test_claim_first_rejects_matching_client_wrong_token(  # type: ignore[no-untyped-def]
+    multi_peer_client,
+):
+    """Phase 1 token mismatch + phase 2 no token match → invalid_token.
+
+    Request claims X-Alfred-Client: kal-le but presents a junk token.
+    Phase 1 finds the kal-le peer entry, compare_digest returns False.
+    Falls through to phase 2; no peer's token matches the junk; resolver
+    returns (None, "invalid_token") and middleware emits 401.
+    """
+    resp = await multi_peer_client.post(
+        "/outbound/send",
+        json={"user_id": 1, "text": "hi"},
+        headers={
+            "Authorization": "Bearer junk-token-not-matching-anything",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 401
+    body = await resp.json()
+    assert body["error"] == "invalid_token"
+
+
+# --- Resolver-level unit tests (skip the aiohttp middleware) ---------------
+#
+# These exercise ``_resolve_peer_for_auth`` directly to pin the
+# claim-first-then-verify branching at the function boundary, without
+# the aiohttp request plumbing. Each one corresponds to a distinct
+# branch in the resolver.
+
+
+def test_resolver_claim_first_direct_match() -> None:
+    """Phase 1 happy path: client_name matches a peer key + token matches."""
+    from alfred.transport.server import _resolve_peer_for_auth
+
+    tokens = {
+        "kal-le": AuthTokenEntry(token=DUMMY_KALLE_TEST_TOKEN),
+        "stay-c": AuthTokenEntry(token=DUMMY_STAYC_TEST_TOKEN),
+    }
+    peer, reason = _resolve_peer_for_auth(
+        tokens, client_name="kal-le", presented_token=DUMMY_KALLE_TEST_TOKEN,
+    )
+    assert peer == "kal-le"
+    assert reason == ""
+
+
+def test_resolver_claim_first_falls_through_on_token_mismatch() -> None:
+    """Phase 1 finds the peer but token mismatches; phase 2 finds the
+    REAL peer that owns the presented token. The fragility-fix headline
+    case: claim-first doesn't lock you to a wrong-peer answer when the
+    claim is wrong but the token is real."""
+    from alfred.transport.server import _resolve_peer_for_auth
+
+    tokens = {
+        "kal-le": AuthTokenEntry(token=DUMMY_KALLE_TEST_TOKEN),
+        "stay-c": AuthTokenEntry(token=DUMMY_STAYC_TEST_TOKEN),
+    }
+    # Claim kal-le but present stay-c's real token — phase 1 mismatches,
+    # phase 2 finds stay-c by token-match.
+    peer, reason = _resolve_peer_for_auth(
+        tokens, client_name="kal-le", presented_token=DUMMY_STAYC_TEST_TOKEN,
+    )
+    assert peer == "stay-c"
+    assert reason == ""
+
+
+def test_resolver_legacy_path_for_internal_clients() -> None:
+    """v1 internal clients (scheduler, brief, ...) miss phase 1 — their
+    client_name isn't a peer key. Phase 2 finds ``local`` by token-match."""
+    from alfred.transport.server import _resolve_peer_for_auth
+
+    tokens = {
+        "local": AuthTokenEntry(
+            token=DUMMY_TRANSPORT_TEST_TOKEN,
+            allowed_clients=["scheduler", "brief"],
+        ),
+    }
+    peer, reason = _resolve_peer_for_auth(
+        tokens, client_name="scheduler",
+        presented_token=DUMMY_TRANSPORT_TEST_TOKEN,
+    )
+    assert peer == "local"
+    assert reason == ""
+
+
+def test_resolver_no_match_returns_invalid_token() -> None:
+    """Both phases miss → (None, "invalid_token")."""
+    from alfred.transport.server import _resolve_peer_for_auth
+
+    tokens = {
+        "local": AuthTokenEntry(token=DUMMY_TRANSPORT_TEST_TOKEN),
+    }
+    peer, reason = _resolve_peer_for_auth(
+        tokens, client_name="kal-le", presented_token="nope",
+    )
+    assert peer is None
+    assert reason == "invalid_token"
+
+
+def test_resolver_empty_token_rejected() -> None:
+    """Empty presented token never matches anything (defensive)."""
+    from alfred.transport.server import _resolve_peer_for_auth
+
+    tokens = {
+        "local": AuthTokenEntry(token=DUMMY_TRANSPORT_TEST_TOKEN),
+    }
+    peer, reason = _resolve_peer_for_auth(
+        tokens, client_name="local", presented_token="",
+    )
+    assert peer is None
+    assert reason == "invalid_token"
+
+
+def test_resolver_skips_empty_token_entries() -> None:
+    """A peer entry with ``token=""`` (misconfigured) never matches —
+    even when the request presents some real-shaped token. The defense:
+    phase 1's ``direct_entry.token`` truthiness guard skips empty
+    entries; phase 2's ``if not entry.token: continue`` does the same.
+
+    Without this guard, a misconfigured peer with ``token=""`` would
+    match every request whose presented token also happened to be empty
+    (or — worse — could create false-positive match ambiguity if the
+    string-comparison short-circuited on length-zero).
+    """
+    from alfred.transport.server import _resolve_peer_for_auth
+
+    tokens = {
+        "broken-peer": AuthTokenEntry(token=""),  # misconfig
+        "local": AuthTokenEntry(token=DUMMY_TRANSPORT_TEST_TOKEN),
+    }
+    # Claim broken-peer with a non-empty fake token. Phase 1: entry
+    # exists but entry.token is empty → guard skips. Phase 2 iterates
+    # — broken-peer skipped (empty), local doesn't match the fake token.
+    # No legitimate match.
+    peer, reason = _resolve_peer_for_auth(
+        tokens, client_name="broken-peer",
+        presented_token="fake-but-non-empty-token",
+    )
+    assert peer is None
+    assert reason == "invalid_token"
+
+
+# ---------------------------------------------------------------------------
 # Outbound send — immediate
 # ---------------------------------------------------------------------------
 

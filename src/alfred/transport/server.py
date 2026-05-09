@@ -31,6 +31,7 @@ module; no caller elsewhere needs to change.
 from __future__ import annotations
 
 import asyncio
+import secrets
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -71,6 +72,70 @@ _KEY_SEND_FN = "transport.send_fn"
 # ---------------------------------------------------------------------------
 
 
+def _resolve_peer_for_auth(
+    tokens: dict, client_name: str, presented_token: str,
+) -> tuple[str | None, str]:
+    """Resolve which peer entry authenticates ``(client_name, token)``.
+
+    Two-phase claim-first-then-verify match (refactor 2026-05-09 Batch B,
+    closes the fragility flagged 2026-05-01 in
+    ``feedback_per_peer_token_uniqueness.md``):
+
+    Phase 1 — direct claim-first lookup. If ``client_name`` is itself a
+    peer key in ``tokens`` (the Stage 3.5 cross-instance peer-auth
+    shape — KAL-LE's transport client identifies as ``X-Alfred-Client:
+    kal-le`` and the Salem server's ``tokens`` dict has a ``kal-le``
+    entry), look up that entry directly and verify the presented token
+    matches. This eliminates the iter()-order dependency that the
+    previous "first matching token wins" loop had: if two peer pairs
+    accidentally shared a token, iter() picked one arbitrarily and the
+    other client got rejected with ``client_not_allowed`` based on the
+    wrong peer's allowlist.
+
+    Phase 2 — fall through to legacy iter+token-match. v1 single-tenant
+    Salem has ``tokens = {"local": ...}`` with internal clients
+    (``scheduler`` / ``brief`` / ``janitor`` / ``curator`` / ``talker``)
+    that identify themselves by their tool name, NOT by ``local``. Their
+    ``client_name`` doesn't match any peer key, so phase 1 misses and we
+    fall through to the legacy match. With only one entry in ``tokens``
+    iter() picks ``local`` deterministically — no fragility — and the
+    existing ``allowed_clients`` check downstream confirms the client
+    was authorized.
+
+    Returns ``(peer_name, reject_reason)``:
+        peer_name == None       — auth failed; reject_reason names which
+                                   gate ("invalid_token" or "unknown").
+        peer_name == "local"... — peer that claims this auth pair.
+
+    All token comparisons use ``secrets.compare_digest`` for timing-
+    attack safety. Empty tokens (entries with ``token=""``) are skipped
+    in both phases — an empty token pair is misconfiguration, never a
+    valid match.
+    """
+    if not presented_token:
+        return None, "invalid_token"
+
+    # Phase 1 — claim-first direct lookup.
+    direct_entry = tokens.get(client_name)
+    if direct_entry is not None and direct_entry.token:
+        if secrets.compare_digest(direct_entry.token, presented_token):
+            return client_name, ""
+        # Direct-match peer exists but token mismatched. Fall through
+        # to phase 2 — this lets a misconfigured-client scenario where
+        # client_name happens to collide with a peer key still resolve
+        # via the legacy path. The defensive ``compare_digest`` keeps
+        # phase 1's negative path timing-safe.
+
+    # Phase 2 — legacy iter+token-match.
+    for peer_name, entry in tokens.items():
+        if not entry.token:
+            continue
+        if secrets.compare_digest(entry.token, presented_token):
+            return peer_name, ""
+
+    return None, "invalid_token"
+
+
 @web.middleware
 async def auth_middleware(
     request: web.Request,
@@ -78,11 +143,24 @@ async def auth_middleware(
 ) -> web.StreamResponse:
     """Bearer-token auth + ``X-Alfred-Client`` allowlist enforcement.
 
-    Looks up the token in the config's ``auth.tokens`` dict (keyed by
-    peer name). On match, verifies the ``X-Alfred-Client`` header is
-    in that peer's ``allowed_clients``. Never logs token contents —
-    only a prefix + length for audit correlation, per builder.md's
-    secret-logging rule.
+    Two-phase claim-first-then-verify match (see
+    ``_resolve_peer_for_auth``):
+      1. If the ``X-Alfred-Client`` header value is itself a peer key
+         in ``auth.tokens``, verify that peer's token directly. Stage
+         3.5 cross-instance peer-auth lives on this path.
+      2. Else fall through to legacy iter+token-match. v1 internal
+         clients (scheduler / brief / janitor / curator / talker) live
+         here — their ``X-Alfred-Client`` value isn't a peer key, but
+         it's in the ``allowed_clients`` list of the matched peer.
+
+    The post-match ``allowed_clients`` check is the final gate for
+    BOTH phases, so the existing v1 client-allowlist semantic is
+    preserved unchanged.
+
+    Never logs token contents — only a prefix + length for audit
+    correlation, per builder.md's secret-logging rule. All token
+    comparisons use ``secrets.compare_digest`` for timing-attack
+    safety.
 
     The ``/health`` route is unauthenticated on purpose: it's the only
     probe a caller can hit before they've loaded the token, and the
@@ -110,11 +188,9 @@ async def auth_middleware(
 
     token = auth_header.removeprefix("Bearer ").strip()
 
-    matching_peer: str | None = None
-    for peer, entry in config.auth.tokens.items():
-        if entry.token and entry.token == token:
-            matching_peer = peer
-            break
+    matching_peer, _reject_reason = _resolve_peer_for_auth(
+        config.auth.tokens, client_name, token,
+    )
 
     if matching_peer is None:
         log.warning(
