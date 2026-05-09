@@ -721,13 +721,16 @@ voice; concrete, not generic
 The downstream consumer parses your output as YAML directly. A single \
 malformed value crashes the whole load. Two failure shapes to avoid:
 
-  - **No em-dash + quoted-phrase patterns in scalar values.** Do NOT \
+  - **No content after a closed quote on the same line.** Do NOT \
 write ``some_field: "<description>" — "<quote>"`` (description, em-dash \
-separator, then a second quoted phrase on the same line). YAML treats \
-the unquoted ``—`` as ambiguous in value context and the line will fail \
-to parse. The object form (``description:`` + ``with:`` on separate \
-lines, as the schema specifies for ``opening_style`` / ``closing_style`` \
-/ ``transition_style``) is the parse-safe shape — use it.
+separator, then a second quoted phrase on the same line). YAML rejects \
+content after a quoted scalar on the same line: it parses ``"description"`` \
+then errors on the unexpected `` — "quote"``. The em-dash is a common \
+trigger but the rule is general — never put inline content after a \
+closed quote on the same line. The object form (``description:`` + \
+``with:`` on separate lines, as the schema specifies for \
+``opening_style`` / ``closing_style`` / ``transition_style``) is the \
+parse-safe shape — use it.
   - **Single-line values with internal quotes need outer single-quotes \
 or block scalars.** If a value naturally contains a double quote (e.g. \
 a verbatim quote inside a longer description), wrap the whole value in \
