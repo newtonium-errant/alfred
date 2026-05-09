@@ -227,7 +227,24 @@ async def test_handle_message_reaction_fallback_text_reply(
 async def test_inline_end_still_fires_during_capture(
     state_mgr, talker_config, fake_client, tmp_path,
 ) -> None:
-    """``/end`` inline during a capture session must still close normally."""
+    """``/end`` inline during a capture session must still close normally.
+
+    Capture-mode contract from wk2b c2 (09e5f7b): inline commands
+    (``/end``, ``/opus``) fire BEFORE the capture-mode short-circuit in
+    ``run_turn``. The pre-check lives at ``handle_message`` line ~4005;
+    capture mode never gets a chance to swallow the message.
+
+    Fixture text was originally ``"ok /end"`` (09e5f7b), which matched
+    the lax pre-2026-04-21 regex (any whitespace before the slash). The
+    2026-04-21 commit 2601067 tightened ``_INLINE_CMD_RE`` to require
+    sentence-terminating punctuation OR start-of-message before the
+    slash, fixing prose false-positives like ``"the road came to a /end"``.
+    Post-2601067, ``"ok /end"`` is correctly classified as bare prose
+    (no preceding ``.,!?;:``), not a command. The test's INTENT — inline
+    ``/end`` closes a capture session — is preserved by switching the
+    fixture to a canonical post-2601067 shape: ``"ok. /end"`` (period +
+    space + slash matches the boundary regex).
+    """
     _seed_capture_session(state_mgr, chat_id=3)
     # /end needs a writeable vault path.
     active = state_mgr.get_active(3)
@@ -235,10 +252,10 @@ async def test_inline_end_still_fires_during_capture(
     state_mgr.set_active(3, active)
     state_mgr.save()
 
-    update = _make_update("ok /end", chat_id=3)
+    update = _make_update("ok. /end", chat_id=3)
     ctx = _make_ctx(talker_config, state_mgr, fake_client)
 
-    await bot.handle_message(update, ctx, text="ok /end", voice=False)
+    await bot.handle_message(update, ctx, text="ok. /end", voice=False)
 
     # Session closed — active slot cleared.
     assert state_mgr.get_active(3) is None
