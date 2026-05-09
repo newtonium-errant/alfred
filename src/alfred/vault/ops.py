@@ -413,13 +413,47 @@ def _filter_reserved_keys(
 
 
 def _check_directory(record_type: str, rel_path: str) -> str | None:
-    """Return a warning string if file is in the wrong directory, else None."""
+    """Return a warning string if file is in the wrong directory, else None.
+
+    Sub-path support: some types in ``TYPE_DIRECTORY`` use a multi-segment
+    expected directory (e.g. ``voice-cluster`` → ``voice/cluster``,
+    ``essay`` → ``document/essay``). The check must compare ``rel_path``'s
+    leading segments against the FULL expected sub-path, not just the
+    first segment. Pre-fix the comparator did ``parts[0] != expected_dir``
+    which compared ``"voice"`` against ``"voice/cluster"`` and fired a
+    false-positive warning on every canonical voice-cluster create — even
+    though the file landed at the correct ``voice/cluster/<name>.md``
+    path. Per Hypatia voice-profile rebuild 2026-05-09 (NOTE-1) and
+    identical class for any future sub-path type. Regression test:
+    ``test_vault_ops_subpath_directory_warning.py``.
+    """
     expected_dir = TYPE_DIRECTORY.get(record_type)
     if not expected_dir:
         return None
-    parts = rel_path.replace("\\", "/").split("/")
-    if len(parts) > 1 and parts[0] != expected_dir:
-        return f"Type '{record_type}' expected in '{expected_dir}/', found in '{parts[0]}/'"
+    rel_norm = rel_path.replace("\\", "/")
+    expected_norm = expected_dir.replace("\\", "/").strip("/")
+    if not expected_norm:
+        return None
+    expected_parts = expected_norm.split("/")
+    actual_parts = rel_norm.split("/")
+    # Need at least one filename segment plus every expected directory
+    # segment for the path to be canonically placed. A path with too few
+    # segments to encode the full expected sub-path can't be canonical, so
+    # warn against the first-segment mismatch as before.
+    if len(actual_parts) <= len(expected_parts):
+        if len(actual_parts) > 1 and actual_parts[0] != expected_parts[0]:
+            return (
+                f"Type '{record_type}' expected in '{expected_norm}/', "
+                f"found in '{actual_parts[0]}/'"
+            )
+        return None
+    actual_prefix = actual_parts[: len(expected_parts)]
+    if actual_prefix != expected_parts:
+        found_prefix = "/".join(actual_prefix)
+        return (
+            f"Type '{record_type}' expected in '{expected_norm}/', "
+            f"found in '{found_prefix}/'"
+        )
     return None
 
 
