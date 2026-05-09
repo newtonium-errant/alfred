@@ -159,6 +159,46 @@ async def _pre_record_inbound(
         log.exception("talker.bot.record_inbound_failed")
 
 
+# --- System-prompt shape normalisation -----------------------------------
+#
+# ``bot_data[_KEY_SYSTEM]`` may carry EITHER a zero-arg provider callable
+# (the production path; the daemon passes
+# ``build_system_prompt_provider(skills_dir, config)`` so SKILL.md edits
+# on disk take effect on the next turn) OR a plain string (legacy +
+# direct-test-fixture path; many tests bypass ``build_app`` entirely
+# and write the static text into ``bot_data`` themselves). Both shapes
+# are valid inputs to ``build_app`` per its docstring contract; the
+# read site mirrors that contract via this helper so test fixtures
+# don't need to wrap their static prompts in lambdas.
+#
+# Pre-2026-05-09: the read site at ``update_handler`` assumed the
+# ``build_app`` wrap was always in place, calling
+# ``ctx.application.bot_data[_KEY_SYSTEM]()`` unconditionally. Tests that
+# wrote a string directly into ``bot_data`` exploded with
+# ``TypeError: 'str' object is not callable`` on 32 different tests.
+# Centralising the normalisation here closes that drift class without
+# requiring fixture sweeps across 14 test files.
+
+
+def _resolve_system_prompt(provider_or_text: Callable[[], str] | str) -> str:
+    """Resolve ``bot_data[_KEY_SYSTEM]`` to a static string for one turn.
+
+    Accepts the same shapes as ``build_app``'s ``system_prompt_provider``
+    parameter — zero-arg callable or plain string. A callable is invoked
+    fresh per call (so the daemon's hot-reload provider re-reads SKILL.md
+    on each turn without a restart); a string is returned as-is.
+
+    Anything else is coerced via ``str()`` to keep the contract
+    fail-loud-not-crash — operators who stash an unexpected shape get a
+    string back rather than a runtime exception inside the message
+    handler. The defensive ``str()`` mirrors the legacy ``str(...)``
+    coercion already in ``build_app`` for the non-callable branch.
+    """
+    if callable(provider_or_text):
+        return provider_or_text()
+    return str(provider_or_text)
+
+
 # --- Application assembly -------------------------------------------------
 
 
@@ -3832,16 +3872,18 @@ async def handle_message(
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
     state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
     client: Any = ctx.application.bot_data[_KEY_CLIENT]
-    # _KEY_SYSTEM is now a zero-arg provider callable (per
-    # build_app's wiring); invoke it per-turn so SKILL.md edits on
-    # disk take effect on the next user turn without daemon restart.
-    # Closes the same-cycle SKILL ship gap from QA 2026-05-04
-    # (Hypatia ran a conversation against the OLD SKILL after the
-    # new SKILL committed but before restart).
-    system_prompt_provider: Callable[[], str] = (
+    # _KEY_SYSTEM holds whatever the wiring layer stashed there — typically
+    # a zero-arg provider callable (per ``build_app``'s normalisation;
+    # invoked per-turn so SKILL.md edits on disk take effect on the next
+    # user turn without daemon restart, closing the same-cycle SKILL ship
+    # gap from QA 2026-05-04). Older callers / direct test fixtures may
+    # still stash a plain string. ``_resolve_system_prompt`` accepts
+    # both shapes so the read site mirrors ``build_app``'s input contract
+    # — string OR callable — without forcing every test fixture to wrap
+    # its static prompt in a lambda.
+    system_prompt: str = _resolve_system_prompt(
         ctx.application.bot_data[_KEY_SYSTEM]
     )
-    system_prompt: str = system_prompt_provider()
     vault_context_str: str = ctx.application.bot_data[_KEY_VAULT_CTX]
     locks: dict[int, asyncio.Lock] = ctx.application.bot_data[_KEY_LOCKS]
 

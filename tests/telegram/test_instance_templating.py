@@ -94,7 +94,18 @@ def test_default_config_substitutes_to_salem(talker_config: TalkerConfig) -> Non
     # Product references remain literal "Alfred" — the project /
     # codebase name persists everywhere it appears.
     assert "[[project/Alfred]]" in prompt
-    assert "Knowledge Alfred" in prompt
+    # Pre-2026-05-09 this checked ``"Knowledge Alfred" in prompt`` to
+    # verify another-instance references didn't get rewritten by the
+    # templating pass. The 5th-instance roster ratified 2026-04-24
+    # renamed that instance from "Knowledge Alfred" to "Hypatia"; the
+    # SKILL was updated but this test wasn't. We swap to a Hypatia-name
+    # check that exercises the same intent — a non-templated literal
+    # mention of another instance must survive the templating pass
+    # without rewrite.
+    assert "Hypatia" in prompt, (
+        "Hypatia (the scholar/scribe instance) is referenced in the "
+        "talker SKILL; the templating pass must not rewrite it"
+    )
 
 
 # --- Salem override --------------------------------------------------------
@@ -132,8 +143,17 @@ def test_salem_instance_substitution(talker_config: TalkerConfig) -> None:
         "project/Alfred wikilink must not be rewritten — it's a vault path"
     )
     assert "project/Alfred" in prompt  # appears in the privacy section example
-    assert "Knowledge Alfred" in prompt, (
-        "Knowledge Alfred names another instance; don't rewrite as Knowledge Salem"
+    # Pre-2026-05-09 this checked ``"Knowledge Alfred" in prompt`` to
+    # verify another-instance references didn't get rewritten by the
+    # templating pass. The 5th-instance roster ratified 2026-04-24
+    # renamed that instance from "Knowledge Alfred" to "Hypatia"; the
+    # SKILL was updated but this test wasn't. We swap to a Hypatia-name
+    # check that exercises the same intent — a non-templated literal
+    # mention of another instance must survive the templating pass
+    # without rewrite (and Salem-config templating must NOT rewrite
+    # it as "Salem" or anything else).
+    assert "Hypatia" in prompt, (
+        "Hypatia names another instance; templating must not rewrite it"
     )
     assert "work on Alfred itself" in prompt, (
         "'Alfred itself' refers to the codebase — leave literal"
