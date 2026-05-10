@@ -471,35 +471,51 @@ def cmd_mine_patterns(
     print(
         f"\nNew mining: clusters_evaluated={result.candidates_evaluated}  "
         f"survivors={result.survivors}  "
-        f"proposed={len(result.proposed)}\n"
+        f"proposed={len(result.proposed)}  "
+        f"flagged_split={result.flagged_split}\n"
         f"  skipped_dedup={result.skipped_dedup}  "
         f"skipped_no_slug={result.skipped_no_slug}  "
         f"skipped_slug_unresolvable={result.skipped_slug_unresolvable}  "
-        f"slug_collisions_resolved={result.slug_collisions_resolved}  "
+        f"skipped_no_claim={result.skipped_no_claim}\n"
+        f"  slug_collisions_resolved={result.slug_collisions_resolved}  "
         f"drafter_failures={result.drafter_failures}"
     )
 
-    if not result.proposed:
+    if not result.proposed and not result.flagged_split:
         # Per the universal "intentionally left blank" rule — explicit
         # empty-result ack. mine_patterns has already written the
-        # .gitkeep marker (live mode); just signal here.
-        print("\nno new patterns surfaced this run.")
+        # .gitkeep marker (live mode); just signal here. Note:
+        # flagged_split also counts as "ran, did something" — split
+        # markers are operator-actionable surface even though they
+        # aren't proposals.
+        print("\nno new patterns or split markers surfaced this run.")
         if not dry_run:
             print(f"(placeholder marker written: {proposed_dir}/.gitkeep)")
         return
 
-    print(f"\n{'#':<3} {'Type':<14} {'Members':<8} {'Slug':<40} {'Labels'}")
-    print("-" * 110)
-    for i, c in enumerate(result.proposed, start=1):
-        labels = ", ".join(c.cluster.labels[:3])
-        slug_display = c.proposed_slug[:38] + ("…" if len(c.proposed_slug) > 38 else "")
-        print(
-            f"{i:<3} {c.proposed_canonical_type:<14} "
-            f"{len(c.cluster.member_files):<8} {slug_display:<40} {labels}"
-        )
+    if result.proposed:
+        print(f"\n{'#':<3} {'Type':<14} {'Members':<8} {'Slug':<40} {'Labels'}")
+        print("-" * 110)
+        for i, c in enumerate(result.proposed, start=1):
+            labels = ", ".join(c.cluster.labels[:3])
+            slug_display = c.proposed_slug[:38] + ("…" if len(c.proposed_slug) > 38 else "")
+            print(
+                f"{i:<3} {c.proposed_canonical_type:<14} "
+                f"{len(c.cluster.member_files):<8} {slug_display:<40} {labels}"
+            )
 
-    verb = "would write" if dry_run else "wrote"
-    print(f"\n{verb} {len(result.proposed)} proposal(s) under: {proposed_dir}")
+        verb = "would write" if dry_run else "wrote"
+        print(f"\n{verb} {len(result.proposed)} proposal(s) under: {proposed_dir}")
+
+    if result.flagged_split:
+        # Split markers are written under the same proposed_dir but
+        # with the ``-needs-split.md`` suffix. Surface count + path
+        # so the operator knows where to look.
+        verb = "would write" if dry_run else "wrote"
+        print(
+            f"\n{verb} {result.flagged_split} split marker(s) under: "
+            f"{proposed_dir}/<slug>-needs-split.md"
+        )
 
 
 def cmd_history(config: DistillerConfig, limit: int = 10) -> None:

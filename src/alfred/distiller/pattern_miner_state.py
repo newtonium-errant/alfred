@@ -13,10 +13,19 @@ a new fingerprint and a new proposal opportunity.
 
 ## Status lifecycle
 
-A proposal cycles through four states based on the operator's response:
+A proposal cycles through five states based on the operator's response:
 
 - ``pending`` — file exists at ``proposed_path``. Don't re-propose for
   the same fingerprint.
+- ``split_pending`` — drafter LLM emitted the ``SPLIT`` sentinel for
+  this cluster. The miner wrote a split-marker file at
+  ``inbox/proposed-canonical/<slug>-needs-split.md`` instead of a
+  proposal. Operator action: review the themes the LLM identified,
+  either fix labels at the surveyor layer to break the false-glue
+  OR split into N separate canonical records by hand. Reconcile
+  sweep treats split_pending the same as pending — file presence
+  → still split_pending; absence + canonical match → promoted;
+  absence + no match → discarded. (Phase 4 stage 2b, 2026-05-10.)
 - ``promoted`` — operator moved the proposal file out of
   ``inbox/proposed-canonical/`` (typically into ``architecture/`` or
   ``principles/``). Reconcile sweep marks the entry ``promoted`` on
@@ -33,6 +42,11 @@ walking the configured ``canonical_match_dirs`` for any file whose
 slug matches ``proposed_slug``; if found, status flips to
 ``promoted``. If absent and ``proposed_path`` is also absent, status
 flips to ``discarded`` (operator's decision recorded as "no").
+
+Note: NO-CLAIM (the LLM's refusal sentinel) is NOT a status in the
+lifecycle. NO-CLAIM clusters are skipped entirely and intentionally
+not recorded so a later cluster shape change re-evaluates fresh.
+Only proposal + split outcomes get state entries.
 
 ## Schema-tolerance contract
 
@@ -71,9 +85,28 @@ STATUS_PENDING: str = "pending"
 STATUS_PROMOTED: str = "promoted"
 STATUS_DISCARDED: str = "discarded"
 STATUS_SUPERSEDED: str = "superseded"
+# Phase 4 stage 2b (2026-05-10) — when the LLM emits the ``SPLIT``
+# sentinel, the miner writes a split-marker file under
+# ``inbox/proposed-canonical/<slug>-needs-split.md`` and records the
+# entry with this status. Reconcile sweep treats split_pending the
+# same as pending: presence of file → still split_pending; absence
+# + canonical match → promoted (operator split the cluster into real
+# canonical records); absence + no match → discarded.
+STATUS_SPLIT_PENDING: str = "split_pending"
 
 _VALID_STATUSES: frozenset[str] = frozenset({
     STATUS_PENDING, STATUS_PROMOTED, STATUS_DISCARDED, STATUS_SUPERSEDED,
+    STATUS_SPLIT_PENDING,
+})
+
+# Statuses the reconcile sweep walks for file-presence checks. The
+# reconcile contract is "operator hasn't decided yet" — both pending
+# (happy-path proposal) and split_pending (split-marker awaiting
+# operator review) qualify. Promoted/discarded/superseded are
+# terminal; reconcile leaves them alone. Public because
+# ``pattern_miner.reconcile_state`` consumes it cross-module.
+RECONCILABLE_STATUSES: frozenset[str] = frozenset({
+    STATUS_PENDING, STATUS_SPLIT_PENDING,
 })
 
 
@@ -239,8 +272,10 @@ class PatternMinerState:
 __all__ = [
     "ProposalEntry",
     "PatternMinerState",
+    "RECONCILABLE_STATUSES",
     "STATUS_PENDING",
     "STATUS_PROMOTED",
     "STATUS_DISCARDED",
     "STATUS_SUPERSEDED",
+    "STATUS_SPLIT_PENDING",
 ]

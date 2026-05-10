@@ -57,9 +57,11 @@ from pathlib import Path
 import structlog
 
 from .pattern_miner_state import (
+    RECONCILABLE_STATUSES,
     STATUS_DISCARDED,
     STATUS_PENDING,
     STATUS_PROMOTED,
+    STATUS_SPLIT_PENDING,
     PatternMinerState,
     ProposalEntry,
 )
@@ -566,22 +568,72 @@ _TYPE_LINE_RE = re.compile(r"^\s*TYPE\s*:\s*(architecture|principles)\s*$", re.I
 _SLUG_LINE_RE = re.compile(r"^\s*SLUG\s*:\s*([a-z0-9][a-z0-9-]*)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
+# Three-outcome contract from the stage 2a drafter prompt
+# (``draft_canonical_proposal.md``). The LLM picks ONE per cluster and
+# emits the matching format. Sentinel string-constants for grep-ability;
+# mirror the status-constant pattern in ``pattern_miner_state.py``.
+OUTCOME_PROPOSAL: str = "proposal"  # happy path: claim + TYPE/SLUG trailer
+OUTCOME_NO_CLAIM: str = "no_claim"  # refusal: cluster has no shared theme
+OUTCOME_SPLIT: str = "split"        # split: cluster has 2+ distinct sub-themes
+
+_VALID_OUTCOMES: frozenset[str] = frozenset({
+    OUTCOME_PROPOSAL, OUTCOME_NO_CLAIM, OUTCOME_SPLIT,
+})
+
+# Sentinel detection — the LLM is instructed to emit ``NO-CLAIM`` or
+# ``SPLIT`` on its own line as the FIRST line of the response. Match
+# at start of stripped content rather than scanning the whole body so
+# a happy-path paragraph that happens to mention "NO-CLAIM" inline
+# (e.g. quoting the prompt) doesn't get misclassified as a refusal.
+_NO_CLAIM_RE = re.compile(r"^\s*NO-CLAIM\s*$", re.MULTILINE)
+_SPLIT_RE = re.compile(r"^\s*SPLIT\s*$", re.MULTILINE)
+_REASON_RE = re.compile(r"^\s*REASON\s*:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
+_THEMES_HEADER_RE = re.compile(r"^\s*THEMES\s*:\s*$", re.MULTILINE | re.IGNORECASE)
+_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$", re.MULTILINE)
+
+
 @dataclass
 class DraftResult:
-    """Outcome of a drafter LLM call. ``paragraph`` empty iff failed.
+    """Outcome of a drafter LLM call. Three outcomes per the stage 2a
+    prompt; ``outcome`` discriminates which fields are populated.
 
-    ``llm_type_suggestion`` and ``llm_slug_suggestion`` come from the
-    optional TYPE/SLUG trailer the prompt asks for; either may be
-    empty if the LLM omitted them or the parser couldn't pick them
-    up. The writer falls back to the heuristic-derived slug + type
-    from :func:`derive_proposed_slug` / :func:`derive_proposed_canonical_type`
-    when the LLM suggestions are missing.
+    ``outcome == OUTCOME_PROPOSAL`` (default — happy path):
+        ``paragraph`` carries the claim. ``llm_type_suggestion`` and
+        ``llm_slug_suggestion`` come from the optional TYPE/SLUG
+        trailer; either may be empty if the LLM omitted them or the
+        parser couldn't pick them up — the writer falls back to the
+        heuristic-derived values via :func:`derive_proposed_slug` /
+        :func:`derive_proposed_canonical_type`.
+
+    ``outcome == OUTCOME_NO_CLAIM``:
+        LLM refused — cluster has no shared theme. ``reason`` carries
+        the one-line explanation from the ``REASON:`` line (may be
+        empty if the LLM emitted ``NO-CLAIM`` without a REASON line;
+        the token alone is the load-bearing signal). Other fields
+        unused. Orchestrator skips the cluster — no file written, no
+        state entry recorded.
+
+    ``outcome == OUTCOME_SPLIT``:
+        LLM identified 2+ distinct sub-themes. ``themes`` carries
+        the bulleted list under ``THEMES:``. Other fields unused.
+        Orchestrator writes a split-marker file at
+        ``<proposed_dir>/<slug>-needs-split.md`` and records the
+        entry with status ``split_pending``.
+
+    ``error`` is non-empty when the HTTP / LLM call itself failed
+    (network, non-2xx, malformed JSON, empty response). On error,
+    ``outcome`` stays at the default ``OUTCOME_PROPOSAL`` so the
+    orchestrator's existing placeholder-paragraph fallback runs;
+    a degraded proposal is preferable to a silent skip.
     """
 
     paragraph: str = ""
     llm_type_suggestion: str = ""
     llm_slug_suggestion: str = ""
     error: str = ""
+    outcome: str = OUTCOME_PROPOSAL
+    reason: str = ""
+    themes: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -789,26 +841,63 @@ def call_drafter(
         )
         return DraftResult(error="LLM returned empty content")
 
-    paragraph, type_sug, slug_sug = _parse_drafter_response(content)
-    return DraftResult(
-        paragraph=paragraph,
-        llm_type_suggestion=type_sug,
-        llm_slug_suggestion=slug_sug,
-    )
+    return _parse_drafter_response(content)
 
 
-def _parse_drafter_response(content: str) -> tuple[str, str, str]:
-    """Split the drafter's ``content`` into (paragraph, type, slug).
+def _parse_drafter_response(content: str) -> DraftResult:
+    """Parse the drafter's ``content`` into a populated DraftResult.
 
-    The prompt asks for the paragraph on its own, then a TYPE/SLUG
-    trailer. We extract the trailer with regex and treat everything
-    NOT matched by the trailer as the paragraph. The trailer is
-    optional; when it's absent we return ``("", "")`` for the
-    suggestions and the writer falls back to the heuristic.
+    Three-way branch on the stage 2a prompt's three outcomes. Order
+    matters — sentinels are checked FIRST so a happy-path TYPE/SLUG
+    trailer can never accidentally trigger NO-CLAIM/SPLIT detection
+    AND vice versa.
 
-    Strips trailing whitespace + blank lines from the paragraph so
-    the proposal markdown looks clean.
+    1. **NO-CLAIM**: literal token on its own line as the first non-
+       whitespace content. Returns ``DraftResult(outcome=NO_CLAIM,
+       reason=<text from REASON: line, or "" if absent>)``. A NO-CLAIM
+       without a REASON line still counts — the token alone is the
+       load-bearing skip signal; the reason is operator-helpful but
+       not required.
+
+    2. **SPLIT**: literal token on its own line as the first non-
+       whitespace content. Returns ``DraftResult(outcome=SPLIT,
+       themes=<bulleted list under THEMES:>)``. Bullets are matched
+       greedily after ``THEMES:`` until the response ends.
+
+    3. **Happy path** (default): paragraph + optional TYPE/SLUG
+       trailer. Returns ``DraftResult(outcome=PROPOSAL, paragraph,
+       llm_type_suggestion, llm_slug_suggestion)``.
+
+    Sentinel matches anchor at start-of-content (``stripped`` view)
+    so a happy-path paragraph that happens to mention "NO-CLAIM"
+    inline (e.g. quoting the prompt) doesn't trigger a misclass.
     """
+    stripped = content.strip()
+
+    # Outcome B: NO-CLAIM. The prompt requires the token to appear on
+    # its own line as the first line of the response.
+    if stripped.startswith("NO-CLAIM"):
+        no_claim_match = _NO_CLAIM_RE.match(stripped)
+        if no_claim_match:
+            reason_match = _REASON_RE.search(stripped)
+            reason = reason_match.group(1).strip() if reason_match else ""
+            return DraftResult(outcome=OUTCOME_NO_CLAIM, reason=reason)
+
+    # Outcome C: SPLIT. The prompt requires the token to appear on its
+    # own line as the first line, followed by THEMES: + bullets.
+    if stripped.startswith("SPLIT"):
+        split_match = _SPLIT_RE.match(stripped)
+        if split_match:
+            themes: list[str] = []
+            themes_header = _THEMES_HEADER_RE.search(stripped)
+            if themes_header:
+                # Walk bullets after the THEMES: header. The prompt
+                # asks for ``- <theme>`` shape; tolerate ``*`` too.
+                tail = stripped[themes_header.end():]
+                themes = [m.group(1).strip() for m in _BULLET_RE.finditer(tail)]
+            return DraftResult(outcome=OUTCOME_SPLIT, themes=themes)
+
+    # Outcome A: happy path. Existing TYPE/SLUG trailer parse.
     type_match = _TYPE_LINE_RE.search(content)
     slug_match = _SLUG_LINE_RE.search(content)
     type_sug = (type_match.group(1).lower() if type_match else "")
@@ -822,7 +911,12 @@ def _parse_drafter_response(content: str) -> tuple[str, str, str]:
         paragraph = paragraph.replace(slug_match.group(0), "")
     # Collapse trailing blank lines.
     paragraph = paragraph.strip()
-    return paragraph, type_sug, slug_sug
+    return DraftResult(
+        outcome=OUTCOME_PROPOSAL,
+        paragraph=paragraph,
+        llm_type_suggestion=type_sug,
+        llm_slug_suggestion=slug_sug,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -915,6 +1009,97 @@ def render_proposal_markdown(
     return "\n".join(fm_lines)
 
 
+def render_split_marker_markdown(
+    candidate: ProposalCandidate,
+    draft: DraftResult,
+    *,
+    proposed_at: str,
+    proposed_path: str,
+    proposed_slug: str,
+) -> str:
+    """Render the SPLIT marker body for a multi-theme cluster.
+
+    Mirrors ``render_proposal_markdown`` shape minus the "Mined claim"
+    section. The marker file lives at
+    ``<proposed_dir>/<slug>-needs-split.md`` (the ``-needs-split``
+    suffix on the filename is the operator-visible signal in
+    ``ls inbox/proposed-canonical/`` output — no need to open the file
+    to see what kind it is).
+
+    Frontmatter type is ``proposed-canonical-split`` (distinct from
+    happy-path ``proposed-canonical``) so a future janitor pass or
+    operator grep can filter by kind.
+
+    Per ``feedback_intentionally_left_blank.md``: silent skip on a
+    cluster the LLM identified as multi-theme would lose information.
+    The marker file IS the operator-visible signal — operator reviews
+    the themes, decides whether to fix labels at the surveyor layer
+    or split into N hand-authored canonical records.
+    """
+    title_text = " ".join(
+        word[:1].upper() + word[1:] if word else word
+        for word in proposed_slug.replace("-", " ").split(" ")
+    ) or proposed_slug
+
+    fm_lines = [
+        "---",
+        "type: proposed-canonical-split",
+        f'proposed_at: "{proposed_at}"',
+        f'source_cluster_id: "{candidate.cluster.cluster_id}"',
+        f"source_cluster_labels: {json.dumps(candidate.cluster.labels)}",
+        f"source_member_count: {len(candidate.cluster.member_files)}",
+        f'proposed_slug: "{proposed_slug}"',
+        f'fingerprint: "{candidate.fingerprint}"',
+        "status: split_pending",
+        "---",
+        "",
+        f"# {title_text}",
+        "",
+        "> Phase 4 pattern miner flagged this cluster as multi-theme. "
+        "The LLM identified 2+ distinct themes that would be better as "
+        "separate canonical records.",
+        "",
+        "## Themes identified",
+        "",
+    ]
+    if draft.themes:
+        for theme in draft.themes:
+            fm_lines.append(f"- {theme}")
+    else:
+        # Defensive: SPLIT outcome with no themes parsed (LLM emitted
+        # the SPLIT token but the THEMES bullet list didn't parse).
+        # Operator still gets the file + the cluster's source members
+        # so they can investigate; record the parse failure inline so
+        # the cause is visible without grepping logs.
+        fm_lines.append(
+            "_(No themes parsed from drafter response. Inspect the "
+            "cluster's source members below; the LLM's THEMES list "
+            "may have been malformed.)_"
+        )
+    fm_lines.append("")
+    fm_lines.append("## Source members")
+    fm_lines.append("")
+    for rel in candidate.cluster.member_files:
+        stem = rel[:-3] if rel.endswith(".md") else rel
+        fm_lines.append(f"- [[{stem}]]")
+    fm_lines.append("")
+    fm_lines.append("## Suggested next step")
+    fm_lines.append("")
+    fm_lines.append(
+        "Operator action: review the themes above. Either edit the "
+        "cluster's labels at the surveyor layer to break the false-"
+        "glue, or split into N separate proposed-canonical records "
+        "by hand, or `rm` to discard."
+    )
+    fm_lines.append("")
+    fm_lines.append(
+        f"Marker file: `{proposed_path}` (state status `split_pending` "
+        "until operator acts)."
+    )
+    fm_lines.append("")
+    return "\n".join(fm_lines)
+
+
 def _atomic_write(path: Path, content: str) -> None:
     """Atomic-ish write: tmp → rename. Creates parent dirs first.
 
@@ -985,21 +1170,33 @@ def reconcile_state(
     vault_path: Path,
     canonical_match_dirs: list[str] | tuple[str, ...],
 ) -> dict[str, int]:
-    """For each ``pending`` proposal, check whether the operator acted.
+    """For each reconcilable entry, check whether the operator acted.
 
-    Three outcomes per pending entry:
-    1. ``proposed_path`` still exists → still pending, no change.
+    Reconcilable statuses (per ``RECONCILABLE_STATUSES`` in
+    ``pattern_miner_state.py``): ``pending`` (happy-path proposal
+    awaiting operator promote/discard) AND ``split_pending``
+    (split-marker awaiting operator review). Promoted / discarded /
+    superseded are terminal; reconcile leaves them alone.
+
+    Three outcomes per reconcilable entry:
+    1. ``proposed_path`` still exists → still pending (or
+       split_pending), no change.
     2. ``proposed_path`` missing AND a file with ``proposed_slug``
        exists under any ``canonical_match_dirs`` → status = promoted.
     3. ``proposed_path`` missing AND no canonical match → status =
        discarded.
 
-    Returns a tally dict: ``{"promoted": N, "discarded": M,
-    "still_pending": K}`` for caller-side logging.
+    Note: split_pending entries follow the same promoted/discarded
+    contract — operator either splits the cluster into real
+    canonical records (which triggers the canonical-match path) or
+    deletes the marker (discarded). The ``-needs-split.md`` filename
+    suffix means the canonical-match check naturally won't match the
+    marker file's own slug; only true canonical artifacts will.
 
-    Note: the canonical-match check uses :func:`slugify` on the file
-    stem so e.g. an operator who renames during promotion still
-    counts as "promoted" if the slug substantially matches.
+    Returns a tally dict: ``{"promoted": N, "discarded": M,
+    "still_pending": K}`` for caller-side logging. ``still_pending``
+    counts both ``pending`` and ``split_pending`` entries that
+    haven't moved.
 
     Reconcile is opt-in by the caller. Top-level mine_patterns calls
     it before the new-mining pass so the state is fresh; CLI handlers
@@ -1010,16 +1207,16 @@ def reconcile_state(
     discarded = 0
     still_pending = 0
     for fp, entry in list(state.proposals.items()):
-        if entry.status != STATUS_PENDING:
+        if entry.status not in RECONCILABLE_STATUSES:
             continue
         # Vault-relative proposed_path; resolve against vault_path.
         proposed_abs = vault_path / entry.proposed_path
         if proposed_abs.is_file():
             still_pending += 1
             continue
-        # Operator removed the proposal file. Was it promoted (a
-        # matching canonical artifact appeared) or discarded (deleted
-        # outright)?
+        # Operator removed the proposal/marker file. Was it promoted
+        # (a matching canonical artifact appeared) or discarded
+        # (deleted outright)?
         if entry.proposed_slug and entry.proposed_slug in canonical_index:
             state.mark_status(fp, STATUS_PROMOTED)
             promoted += 1
@@ -1056,6 +1253,18 @@ class MineResult:
     skipped_slug_unresolvable: int = 0
     slug_collisions_resolved: int = 0
     drafter_failures: int = 0
+    # Phase 4 stage 2b (2026-05-10) — drafter LLM outcome counters.
+    # ``skipped_no_claim`` increments when the LLM emits the NO-CLAIM
+    # sentinel: cluster cosine-coherent but no shared theme; no file
+    # written, no state recorded (intentional — re-run re-evaluates if
+    # cluster materially changes). ``flagged_split`` increments when
+    # the LLM emits the SPLIT sentinel: cluster has 2+ distinct sub-
+    # themes; a split-marker file IS written under ``inbox/proposed-
+    # canonical/<slug>-needs-split.md`` AND a state entry IS recorded
+    # with status ``split_pending`` (operator action needed; reconcile
+    # sweep walks split_pending the same way it walks pending).
+    skipped_no_claim: int = 0
+    flagged_split: int = 0
     reconcile_promoted: int = 0
     reconcile_discarded: int = 0
     reconcile_still_pending: int = 0
@@ -1206,6 +1415,8 @@ def mine_patterns(
     drafter_failures = 0
     skipped_slug_unresolvable = 0
     slug_collisions_resolved = 0
+    skipped_no_claim = 0
+    flagged_split = 0
     for candidate in survivors:
         # LLM draft. Empty endpoint = skip the drafter and use a
         # placeholder paragraph (operator will write the claim manually).
@@ -1221,8 +1432,34 @@ def mine_patterns(
         else:
             draft = DraftResult()  # paragraph empty → placeholder used
 
+        # Phase 4 stage 2b (2026-05-10): branch on draft.outcome before
+        # the slug-resolution + write path. NO-CLAIM short-circuits
+        # entirely (no file, no state); SPLIT routes through a marker
+        # file with a distinct ``-needs-split`` suffix and records
+        # status ``split_pending``. Happy-path is unchanged.
+        if draft.outcome == OUTCOME_NO_CLAIM:
+            # Cluster cosine-coherent but no shared theme. Per the
+            # design memo + stage 2a prompt: skip entirely. Don't
+            # claim the slug (no file written), don't record state
+            # (re-run re-evaluates if cluster materially changes —
+            # the LLM may judge differently if labels/members shift,
+            # and a stale "no_claim" state entry would silently
+            # block legitimate future proposals on the same shape).
+            log.info(
+                "pattern_miner.cluster_no_claim",
+                cluster_id=candidate.cluster.cluster_id,
+                fingerprint=candidate.fingerprint,
+                labels=list(candidate.cluster.labels),
+                reason=draft.reason,
+            )
+            skipped_no_claim += 1
+            continue
+
         # Honor LLM TYPE/SLUG suggestions when present + valid; otherwise
         # fall back to the heuristic-derived ones we already computed.
+        # SPLIT outcome doesn't carry TYPE/SLUG (the prompt forbids it
+        # — "Do NOT also emit a paragraph or a TYPE/SLUG trailer") so
+        # both branches stay on the heuristic-derived defaults.
         proposed_canonical_type = candidate.proposed_canonical_type
         if draft.llm_type_suggestion in ("architecture", "principles"):
             proposed_canonical_type = draft.llm_type_suggestion
@@ -1247,6 +1484,14 @@ def mine_patterns(
         # indefinitely; if 50 isn't enough the cluster is dropped with
         # a load-bearing log so the operator can investigate. Per
         # WARN-1 in the 2026-05-10 code-review pass.
+        #
+        # Slug resolution applies to BOTH proposal and split outcomes —
+        # the SPLIT marker filename is ``<slug>-needs-split.md`` so the
+        # ``-needs-split`` suffix on the file naturally distinguishes
+        # it from a happy-path ``<slug>.md`` proposal. The state-side
+        # ``proposed_slug`` field stays bare so reconcile_state's
+        # canonical-match check operates on the slug the operator
+        # would actually use when promoting (architecture/<slug>.md).
         original_slug = proposed_slug
         if proposed_slug in claimed_slugs:
             uniquified: str | None = None
@@ -1280,33 +1525,58 @@ def mine_patterns(
             slug_collisions_resolved += 1
         claimed_slugs.add(proposed_slug)
 
-        # Compute the final proposed_path now that we know the slug.
-        # vault-relative for portability; the writer resolves against
-        # ``proposed_dir`` (which is itself vault_path-relative or
-        # absolute, caller's choice).
+        # Compute file basename + path. SPLIT uses ``<slug>-needs-split.md``
+        # so an operator running ``ls inbox/proposed-canonical/`` can
+        # tell at a glance which clusters need split-review vs which
+        # are happy-path proposals — no need to open the file.
+        if draft.outcome == OUTCOME_SPLIT:
+            file_basename = f"{proposed_slug}-needs-split.md"
+        else:
+            file_basename = f"{proposed_slug}.md"
+
+        # Compute the final proposed_path now that we know the slug
+        # AND the file basename. vault-relative for portability; the
+        # writer resolves against ``proposed_dir`` (which is itself
+        # vault_path-relative or absolute, caller's choice).
         try:
             proposed_dir_rel = proposed_dir.relative_to(vault_path)
-            proposed_path_rel = str(proposed_dir_rel / f"{proposed_slug}.md")
+            proposed_path_rel = str(proposed_dir_rel / file_basename)
         except ValueError:
             # ``proposed_dir`` not under vault — fall back to absolute.
-            proposed_path_rel = str(proposed_dir / f"{proposed_slug}.md")
+            proposed_path_rel = str(proposed_dir / file_basename)
 
-        # Render markdown (whether dry-run or live — we want the same
-        # observable content for inspection).
-        markdown = render_proposal_markdown(
-            candidate, draft,
-            proposed_at=now_iso,
-            proposed_path=proposed_path_rel,
-            proposed_canonical_type=proposed_canonical_type,
-            proposed_slug=proposed_slug,
-            instance_config_basename=instance_config_basename,
-        )
+        # Render markdown — happy-path proposal vs SPLIT marker. The
+        # SPLIT marker uses the dedicated render_split_marker_markdown
+        # which has a distinct frontmatter type and an operator-action
+        # "review themes" footer instead of the proposal's "promote /
+        # refine / discard" hint.
+        if draft.outcome == OUTCOME_SPLIT:
+            markdown = render_split_marker_markdown(
+                candidate, draft,
+                proposed_at=now_iso,
+                proposed_path=proposed_path_rel,
+                proposed_slug=proposed_slug,
+            )
+        else:
+            markdown = render_proposal_markdown(
+                candidate, draft,
+                proposed_at=now_iso,
+                proposed_path=proposed_path_rel,
+                proposed_canonical_type=proposed_canonical_type,
+                proposed_slug=proposed_slug,
+                instance_config_basename=instance_config_basename,
+            )
 
         # Persist (live only). Dry-run leaves the survivors list
         # populated for the CLI to summarize without touching disk.
         if not dry_run:
-            target = proposed_dir / f"{proposed_slug}.md"
+            target = proposed_dir / file_basename
             _atomic_write(target, markdown)
+            entry_status = (
+                STATUS_SPLIT_PENDING
+                if draft.outcome == OUTCOME_SPLIT
+                else STATUS_PENDING
+            )
             entry = ProposalEntry(
                 fingerprint=candidate.fingerprint,
                 cluster_id=candidate.cluster.cluster_id,
@@ -1316,17 +1586,41 @@ def mine_patterns(
                 proposed_path=proposed_path_rel,
                 proposed_slug=proposed_slug,
                 proposed_canonical_type=proposed_canonical_type,
+                status=entry_status,
             )
             state.record_proposal(entry)
 
-        result.proposed.append(candidate)
+        if draft.outcome == OUTCOME_SPLIT:
+            log.info(
+                "pattern_miner.cluster_multi_theme",
+                cluster_id=candidate.cluster.cluster_id,
+                fingerprint=candidate.fingerprint,
+                themes=list(draft.themes),
+            )
+            flagged_split += 1
+        else:
+            result.proposed.append(candidate)
 
     result.drafter_failures = drafter_failures
     result.skipped_slug_unresolvable = skipped_slug_unresolvable
     result.slug_collisions_resolved = slug_collisions_resolved
+    result.skipped_no_claim = skipped_no_claim
+    result.flagged_split = flagged_split
 
     # 7. Save state ONCE at the end (atomic; one .tmp → rename per run).
-    if not dry_run and result.proposed:
+    # Save when EITHER proposals OR split markers were recorded — both
+    # mutate state. Without the flagged_split clause a SPLIT-only run
+    # would write the marker file but lose the state entry on the next
+    # daemon start, which would re-emit the same SPLIT cluster. The
+    # reconcile sweep also mutates state (promoted/discarded
+    # transitions); save when reconcile fired any transition too so
+    # those don't get lost.
+    if not dry_run and (
+        result.proposed
+        or flagged_split
+        or reconcile["promoted"]
+        or reconcile["discarded"]
+    ):
         state.save()
 
     log.info(
@@ -1338,6 +1632,8 @@ def mine_patterns(
         skipped_no_slug=skipped_no_slug,
         skipped_slug_unresolvable=skipped_slug_unresolvable,
         slug_collisions_resolved=slug_collisions_resolved,
+        skipped_no_claim=skipped_no_claim,
+        flagged_split=flagged_split,
         drafter_failures=drafter_failures,
         reconcile=reconcile,
         dry_run=dry_run,
@@ -1350,6 +1646,9 @@ __all__ = [
     "ClusterRecord",
     "DraftResult",
     "MineResult",
+    "OUTCOME_NO_CLAIM",
+    "OUTCOME_PROPOSAL",
+    "OUTCOME_SPLIT",
     "ProposalCandidate",
     "ProposalEntry",
     "PatternMinerState",
@@ -1367,5 +1666,6 @@ __all__ = [
     "read_surveyor_clusters",
     "reconcile_state",
     "render_proposal_markdown",
+    "render_split_marker_markdown",
     "slugify",
 ]

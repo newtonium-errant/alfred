@@ -209,7 +209,10 @@ class TestEmptyResults:
         assert "Candidates that passed the gate: 0" in content
 
         out = capsys.readouterr().out
-        assert "no new patterns surfaced this run." in out
+        # Stage 2b widened this message to cover split markers too —
+        # "no new patterns surfaced" alone would lie when only NO-CLAIM /
+        # SPLIT outcomes happened. Pin the new wording.
+        assert "no new patterns or split markers surfaced this run." in out
 
 
 # ---------------------------------------------------------------------------
@@ -853,3 +856,675 @@ class TestSlugCollisionResolution:
         assert (proposed_dir / "topic-x.md").is_file()
         assert (proposed_dir / "topic-x-2.md").is_file()
         assert (proposed_dir / "topic-x-3.md").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Stage 2b parser — _parse_drafter_response branches on three outcomes
+# (2026-05-10). NO-CLAIM and SPLIT sentinels added to the prompt at
+# stage 2a (commit 5ed62bf); this builder pass adds parser detection
+# + orchestrator routing.
+# ---------------------------------------------------------------------------
+
+
+class TestParseDrafterResponse:
+    """Pure parser unit tests. No HTTP, no fs.
+
+    Sentinel detection MUST anchor on start-of-content so a happy-
+    path paragraph that quotes the prompt (mentioning "NO-CLAIM"
+    inline) can't trigger a misclass.
+    """
+
+    def test_happy_path_returns_proposal_outcome(self) -> None:
+        from alfred.distiller.pattern_miner import (
+            OUTCOME_PROPOSAL,
+            _parse_drafter_response,
+        )
+        result = _parse_drafter_response(
+            "Hardcoding a single log destination routes events wrong. "
+            "The fix is a tool kwarg.\n"
+            "TYPE: principles\n"
+            "SLUG: log-routing-tool-kwarg\n"
+        )
+        assert result.outcome == OUTCOME_PROPOSAL
+        assert "Hardcoding a single log destination" in result.paragraph
+        assert result.llm_type_suggestion == "principles"
+        assert result.llm_slug_suggestion == "log-routing-tool-kwarg"
+        # Sentinel-only fields stay empty on the happy path.
+        assert result.reason == ""
+        assert result.themes == []
+
+    def test_no_claim_with_reason_parses_outcome_and_reason(self) -> None:
+        from alfred.distiller.pattern_miner import (
+            OUTCOME_NO_CLAIM,
+            _parse_drafter_response,
+        )
+        result = _parse_drafter_response(
+            "NO-CLAIM\n"
+            "REASON: members share the word 'alias' but discuss "
+            "alias-skip policy, field placement, and Telegram "
+            "/calibration alias separately.\n"
+        )
+        assert result.outcome == OUTCOME_NO_CLAIM
+        assert "alias-skip policy" in result.reason
+        # Happy-path fields stay empty.
+        assert result.paragraph == ""
+        assert result.llm_type_suggestion == ""
+        assert result.llm_slug_suggestion == ""
+        assert result.themes == []
+
+    def test_no_claim_without_reason_still_routes_to_no_claim(
+        self,
+    ) -> None:
+        # Per the dispatch decision: emitting the NO-CLAIM token is
+        # the load-bearing skip signal; reason is operator-helpful
+        # but not required. A bare NO-CLAIM still routes correctly.
+        from alfred.distiller.pattern_miner import (
+            OUTCOME_NO_CLAIM,
+            _parse_drafter_response,
+        )
+        result = _parse_drafter_response("NO-CLAIM\n")
+        assert result.outcome == OUTCOME_NO_CLAIM
+        assert result.reason == ""
+
+    def test_split_with_themes_parses_outcome_and_themes(self) -> None:
+        from alfred.distiller.pattern_miner import (
+            OUTCOME_SPLIT,
+            _parse_drafter_response,
+        )
+        result = _parse_drafter_response(
+            "SPLIT\n"
+            "THEMES:\n"
+            "- regex-perf: assumption/regex-cache.md, "
+            "constraint/regex-backtracking.md\n"
+            "- regex-portability: assumption/posix-vs-pcre.md\n"
+        )
+        assert result.outcome == OUTCOME_SPLIT
+        assert len(result.themes) == 2
+        assert "regex-perf" in result.themes[0]
+        assert "regex-portability" in result.themes[1]
+        # Happy-path fields stay empty.
+        assert result.paragraph == ""
+
+    def test_split_with_no_themes_still_routes_split(self) -> None:
+        # Defensive: SPLIT token without a parseable THEMES list
+        # still routes to the split outcome — the split-marker
+        # writer has a graceful "no themes parsed" fallback so the
+        # operator still gets a file + the source members.
+        from alfred.distiller.pattern_miner import (
+            OUTCOME_SPLIT,
+            _parse_drafter_response,
+        )
+        result = _parse_drafter_response("SPLIT\n")
+        assert result.outcome == OUTCOME_SPLIT
+        assert result.themes == []
+
+    def test_split_tolerates_asterisk_bullets(self) -> None:
+        # The prompt asks for ``- <theme>`` shape but the LLM may
+        # emit ``* <theme>`` instead. Both forms count.
+        from alfred.distiller.pattern_miner import (
+            OUTCOME_SPLIT,
+            _parse_drafter_response,
+        )
+        result = _parse_drafter_response(
+            "SPLIT\n"
+            "THEMES:\n"
+            "* theme one\n"
+            "* theme two\n"
+        )
+        assert result.outcome == OUTCOME_SPLIT
+        assert result.themes == ["theme one", "theme two"]
+
+    def test_paragraph_quoting_no_claim_inline_does_not_misclass(
+        self,
+    ) -> None:
+        # Pin the start-of-content anchor: a happy-path paragraph
+        # that legitimately contains "NO-CLAIM" inline (e.g., the
+        # cluster's subject is "the NO-CLAIM sentinel itself")
+        # MUST stay routed to the proposal outcome.
+        from alfred.distiller.pattern_miner import (
+            OUTCOME_PROPOSAL,
+            _parse_drafter_response,
+        )
+        result = _parse_drafter_response(
+            "The NO-CLAIM sentinel is the prompt's refusal token.\n"
+            "TYPE: architecture\n"
+            "SLUG: no-claim-sentinel\n"
+        )
+        assert result.outcome == OUTCOME_PROPOSAL
+        assert result.llm_slug_suggestion == "no-claim-sentinel"
+
+    def test_paragraph_quoting_split_inline_does_not_misclass(
+        self,
+    ) -> None:
+        # Mirror of above for SPLIT — anchor must be start-of-content.
+        from alfred.distiller.pattern_miner import (
+            OUTCOME_PROPOSAL,
+            _parse_drafter_response,
+        )
+        result = _parse_drafter_response(
+            "When a cluster needs SPLIT, the LLM emits a sentinel.\n"
+            "TYPE: architecture\n"
+            "SLUG: split-sentinel\n"
+        )
+        assert result.outcome == OUTCOME_PROPOSAL
+
+
+# ---------------------------------------------------------------------------
+# Stage 2b orchestrator — NO-CLAIM outcome routing
+# ---------------------------------------------------------------------------
+
+
+class TestNoClaimOutcome:
+    def test_no_claim_skips_cluster_no_file_no_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # NO-CLAIM contract: no proposal file written, no state entry
+        # recorded. Re-running the miner against the same cluster
+        # should re-evaluate (LLM may judge differently if labels
+        # shift). Pinning "no state" is load-bearing — without it,
+        # a stale no_claim entry would silently block legitimate
+        # future proposals on the same fingerprint.
+        (tmp_path / "assumption").mkdir()
+        for stem in ("a", "b", "c"):
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_5": {
+                "label": ["topic/alias"],
+                "member_files": [
+                    "assumption/a.md",
+                    "assumption/b.md",
+                    "assumption/c.md",
+                ],
+            },
+        })))
+
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                json=_drafter_response(
+                    "NO-CLAIM\n"
+                    "REASON: members share the word 'alias' but "
+                    "discuss separate concerns.\n"
+                ),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=tmp_path / "s.json",
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+        dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        # No proposal file written.
+        proposed_dir = tmp_path / "inbox" / "proposed-canonical"
+        assert not list(proposed_dir.glob("*.md")) or all(
+            p.name == ".gitkeep" for p in proposed_dir.glob("*")
+        )
+
+        # State file: either absent (no proposals AND no reconcile
+        # transitions to save), or present-but-empty proposals dict.
+        # Either way, NO entry for the NO-CLAIM cluster's fingerprint.
+        state_path = tmp_path / "s.json"
+        if state_path.is_file():
+            state_data = json.loads(state_path.read_text())
+            assert state_data.get("proposals") in (None, {})
+
+    def test_no_claim_emits_log_with_reason_and_increments_counter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Per feedback_intentionally_left_blank.md + the log-
+        # emission test discipline: skip-without-signal is the bug
+        # we're closing. Pin the operator-visible log line + the
+        # MineResult counter that surfaces through CLI summary.
+        (tmp_path / "assumption").mkdir()
+        for stem in ("a", "b", "c"):
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_99": {
+                "label": ["topic/cosmetic"],
+                "member_files": [
+                    "assumption/a.md",
+                    "assumption/b.md",
+                    "assumption/c.md",
+                ],
+            },
+        })))
+
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                json=_drafter_response(
+                    "NO-CLAIM\n"
+                    "REASON: cosmetic surface match only.\n"
+                ),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=tmp_path / "s.json",
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        # The cluster_no_claim log MUST fire with the reason field
+        # so an operator can grep for "why did the LLM refuse" without
+        # re-running the cluster against the LLM.
+        no_claim_logs = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.cluster_no_claim"
+        ]
+        assert len(no_claim_logs) == 1
+        nc = no_claim_logs[0]
+        assert nc["cluster_id"] == "semantic_99"
+        assert "cosmetic surface match only" in nc["reason"]
+
+        # run_complete log surfaces the counter (for the BIT-side /
+        # Daily-Sync-side eyes the operator might consult instead of
+        # the per-event no_claim log).
+        completes = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.run_complete"
+        ]
+        assert len(completes) == 1
+        assert completes[0]["skipped_no_claim"] == 1
+        assert completes[0]["proposed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Stage 2b orchestrator — SPLIT outcome routing
+# ---------------------------------------------------------------------------
+
+
+class TestSplitOutcome:
+    def test_split_writes_marker_file_with_themes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # SPLIT contract: write a split-marker file at
+        # ``<proposed_dir>/<slug>-needs-split.md`` (distinct filename
+        # so an operator's `ls` shows which cluster needs which
+        # action). Frontmatter type ``proposed-canonical-split``;
+        # body lists the themes the LLM identified.
+        (tmp_path / "assumption").mkdir()
+        for stem in ("a", "b", "c", "d"):
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_42": {
+                "label": ["topic/regex"],
+                "member_files": [
+                    "assumption/a.md",
+                    "assumption/b.md",
+                    "assumption/c.md",
+                    "assumption/d.md",
+                ],
+            },
+        })))
+
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                json=_drafter_response(
+                    "SPLIT\n"
+                    "THEMES:\n"
+                    "- regex-perf concerns: a.md, b.md\n"
+                    "- regex-portability concerns: c.md, d.md\n"
+                ),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=tmp_path / "s.json",
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+        dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        # Marker file at the expected path with the -needs-split
+        # suffix. NOT a happy-path proposal file.
+        proposed_dir = tmp_path / "inbox" / "proposed-canonical"
+        marker = proposed_dir / "topic-regex-needs-split.md"
+        proposal = proposed_dir / "topic-regex.md"
+        assert marker.is_file()
+        assert not proposal.exists()
+
+        body = marker.read_text()
+        assert "type: proposed-canonical-split" in body
+        assert "status: split_pending" in body
+        assert "regex-perf concerns: a.md, b.md" in body
+        assert "regex-portability concerns: c.md, d.md" in body
+        # Source members rendered as wikilinks.
+        assert "[[assumption/a]]" in body
+        assert "[[assumption/d]]" in body
+
+    def test_split_records_state_with_split_pending_status(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Unlike NO-CLAIM (no state), SPLIT records state so reconcile
+        # can detect operator action (split into N records → promoted;
+        # rm marker → discarded). Pin the status field is exactly
+        # ``split_pending`` (the new lifecycle value).
+        (tmp_path / "assumption").mkdir()
+        for stem in ("a", "b", "c"):
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_5": {
+                "label": ["topic/x"],
+                "member_files": [
+                    "assumption/a.md",
+                    "assumption/b.md",
+                    "assumption/c.md",
+                ],
+            },
+        })))
+
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                json=_drafter_response(
+                    "SPLIT\n"
+                    "THEMES:\n"
+                    "- theme alpha\n"
+                    "- theme beta\n"
+                ),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=tmp_path / "s.json",
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+        dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        state_path = tmp_path / "s.json"
+        assert state_path.is_file()
+        state_data = json.loads(state_path.read_text())
+        assert len(state_data["proposals"]) == 1
+        entry = next(iter(state_data["proposals"].values()))
+        assert entry["status"] == "split_pending"
+        # The proposed_path points at the marker file (so reconcile
+        # will find it).
+        assert entry["proposed_path"].endswith("topic-x-needs-split.md")
+        # The proposed_slug stays bare (operator promotes to
+        # architecture/<slug>.md or principles/<slug>.md, not to
+        # something with ``-needs-split`` in the name).
+        assert entry["proposed_slug"] == "topic-x"
+
+    def test_split_emits_log_and_increments_counter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Pin the cluster_multi_theme log + the flagged_split counter
+        # surfacing through run_complete.
+        (tmp_path / "assumption").mkdir()
+        for stem in ("a", "b", "c"):
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_99": {
+                "label": ["topic/x"],
+                "member_files": [
+                    "assumption/a.md",
+                    "assumption/b.md",
+                    "assumption/c.md",
+                ],
+            },
+        })))
+
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                json=_drafter_response(
+                    "SPLIT\n"
+                    "THEMES:\n"
+                    "- theme one\n"
+                    "- theme two\n"
+                ),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=tmp_path / "s.json",
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        multi_theme_logs = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.cluster_multi_theme"
+        ]
+        assert len(multi_theme_logs) == 1
+        mt = multi_theme_logs[0]
+        assert mt["cluster_id"] == "semantic_99"
+        assert mt["themes"] == ["theme one", "theme two"]
+
+        completes = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.run_complete"
+        ]
+        assert len(completes) == 1
+        assert completes[0]["flagged_split"] == 1
+        # Split outcomes do NOT count toward proposed (the existing
+        # contract — proposed = happy-path proposals). Pin so a
+        # future regression that lumps split into proposed surfaces.
+        assert completes[0]["proposed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Stage 2b CLI summary — counters surface through the printed output
+# ---------------------------------------------------------------------------
+
+
+class TestStage2bCLISummarySurface:
+    def test_cli_summary_includes_no_claim_and_split_counters(
+        self, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Mixed run: one happy path proposal + one NO-CLAIM + one
+        # SPLIT, all surfacing in the summary line. Catches a
+        # regression where one of the counters gets dropped from the
+        # print format.
+        (tmp_path / "assumption").mkdir()
+        for stem in ("a", "b", "c", "d", "e", "f", "g", "h", "i"):
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_1": {
+                "label": ["topic/happy"],
+                "member_files": [
+                    "assumption/a.md", "assumption/b.md", "assumption/c.md",
+                ],
+            },
+            "semantic_2": {
+                "label": ["topic/refuse"],
+                "member_files": [
+                    "assumption/d.md", "assumption/e.md", "assumption/f.md",
+                ],
+            },
+            "semantic_3": {
+                "label": ["topic/multi"],
+                "member_files": [
+                    "assumption/g.md", "assumption/h.md", "assumption/i.md",
+                ],
+            },
+        })))
+
+        # Per-cluster dispatch: assignment by URL inspection isn't
+        # possible (single endpoint), so route by call order using a
+        # closure-shared counter. The miner walks survivors in the
+        # surveyor-state's ordering; on this state the order is
+        # semantic_1 -> semantic_2 -> semantic_3.
+        call_count = {"n": 0}
+        responses = [
+            "Happy path claim.\nTYPE: architecture\nSLUG: topic-happy\n",
+            "NO-CLAIM\nREASON: surface tag only.\n",
+            "SPLIT\nTHEMES:\n- alpha\n- beta\n",
+        ]
+
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            content = responses[call_count["n"] % len(responses)]
+            call_count["n"] += 1
+            return httpx.Response(
+                status_code=200,
+                json=_drafter_response(content),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=tmp_path / "s.json",
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+        dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        out = capsys.readouterr().out
+        # Both new counters MUST appear in the print output —
+        # operators are the principal consumer of this surface.
+        assert "skipped_no_claim=1" in out
+        assert "flagged_split=1" in out
+        # Existing counters still present.
+        assert "proposed=1" in out
+
+
+# ---------------------------------------------------------------------------
+# Stage 2b reconcile — split_pending entries reconcile like pending
+# ---------------------------------------------------------------------------
+
+
+class TestSplitPendingReconcile:
+    def test_split_pending_marker_present_stays_split_pending(
+        self, tmp_path: Path,
+    ) -> None:
+        # Reconcile sweep contract: a split_pending entry whose
+        # marker file is still on disk stays split_pending. Mirrors
+        # pending's "still here, no action yet" behavior.
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            STATUS_SPLIT_PENDING,
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        marker_rel = "inbox/proposed-canonical/topic-x-needs-split.md"
+        (tmp_path / "inbox" / "proposed-canonical").mkdir(parents=True)
+        (tmp_path / marker_rel).write_text("---\n---\n", encoding="utf-8")
+
+        state.proposals["fp1"] = ProposalEntry(
+            fingerprint="fp1",
+            cluster_id="semantic_5",
+            proposed_path=marker_rel,
+            proposed_slug="topic-x",
+            status=STATUS_SPLIT_PENDING,
+        )
+
+        result = reconcile_state(
+            state, tmp_path, ["architecture", "principles", "stack"],
+        )
+        assert result["still_pending"] == 1
+        assert result["promoted"] == 0
+        assert result["discarded"] == 0
+        assert state.proposals["fp1"].status == STATUS_SPLIT_PENDING
+
+    def test_split_pending_promoted_when_canonical_appears(
+        self, tmp_path: Path,
+    ) -> None:
+        # Operator split the cluster: marker file gone, a canonical
+        # artifact with the matching slug exists. Reconcile flips
+        # split_pending → promoted (same as the pending case).
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            STATUS_PROMOTED,
+            STATUS_SPLIT_PENDING,
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        # Marker file absent (operator removed it).
+        # Canonical artifact present:
+        (tmp_path / "architecture").mkdir()
+        (tmp_path / "architecture" / "topic-x.md").write_text(
+            "---\n---\n", encoding="utf-8",
+        )
+
+        state.proposals["fp1"] = ProposalEntry(
+            fingerprint="fp1",
+            cluster_id="semantic_5",
+            proposed_path="inbox/proposed-canonical/topic-x-needs-split.md",
+            proposed_slug="topic-x",
+            status=STATUS_SPLIT_PENDING,
+        )
+
+        result = reconcile_state(
+            state, tmp_path, ["architecture", "principles", "stack"],
+        )
+        assert result["promoted"] == 1
+        assert state.proposals["fp1"].status == STATUS_PROMOTED
+
+    def test_split_pending_discarded_when_marker_removed_no_match(
+        self, tmp_path: Path,
+    ) -> None:
+        # Operator deleted the marker without splitting. Reconcile
+        # flips split_pending → discarded.
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            STATUS_DISCARDED,
+            STATUS_SPLIT_PENDING,
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        # No marker file, no canonical artifact.
+
+        state.proposals["fp1"] = ProposalEntry(
+            fingerprint="fp1",
+            cluster_id="semantic_5",
+            proposed_path="inbox/proposed-canonical/topic-x-needs-split.md",
+            proposed_slug="topic-x",
+            status=STATUS_SPLIT_PENDING,
+        )
+
+        result = reconcile_state(
+            state, tmp_path, ["architecture", "principles", "stack"],
+        )
+        assert result["discarded"] == 1
+        assert state.proposals["fp1"].status == STATUS_DISCARDED
