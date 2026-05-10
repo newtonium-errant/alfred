@@ -1,4 +1,6 @@
 ---
+alfred_tags:
+- alfred/bit
 created: '2026-05-08'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — process/Alfred BIT target does not exist in vault; process
@@ -8,6 +10,14 @@ mode: quick
 name: Alfred BIT 2026-05-08
 overall_status: ok
 process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Both mention Alfred BIT run on different dates
+  source: process/Alfred BIT 2026-05-08.md
+  source_anchor: run Alfred BIT 2026-05-08
+  target: process/Alfred BIT 2026-05-09.md
+  target_anchor: run Alfred BIT 2026-05-09
+  type: related-to
 started: '2026-05-08T05:55:01.694259-03:00'
 status: completed
 tags:

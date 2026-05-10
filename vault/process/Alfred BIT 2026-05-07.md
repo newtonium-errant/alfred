@@ -1,6 +1,6 @@
 ---
 alfred_tags:
-- testing/alfred-bit
+- alfred/bit
 created: '2026-05-07'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — [[process/Alfred BIT]] parent process record does not exist
@@ -11,6 +11,21 @@ mode: quick
 name: Alfred BIT 2026-05-07
 overall_status: ok
 process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Both mention Alfred BIT run on different dates
+  source: process/Alfred BIT 2026-05-07.md
+  source_anchor: run Alfred BIT 2026-05-07
+  target: process/Alfred BIT 2026-05-08.md
+  target_anchor: run Alfred BIT 2026-05-08
+  type: related-to
+- confidence: 1
+  context: Both mention Alfred BIT run on different dates
+  source: process/Alfred BIT 2026-05-07.md
+  source_anchor: run Alfred BIT 2026-05-07
+  target: process/Alfred BIT 2026-05-09.md
+  target_anchor: run Alfred BIT 2026-05-09
+  type: related-to
 started: '2026-05-07T05:55:01.316181-03:00'
 status: completed
 tags:

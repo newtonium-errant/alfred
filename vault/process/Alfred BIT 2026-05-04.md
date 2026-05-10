@@ -1,6 +1,6 @@
 ---
 alfred_tags:
-- testing/alfred-bit
+- alfred/bit
 created: '2026-05-04'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — broken wikilink [[process/Alfred BIT]]; no canonical process/Alfred
@@ -32,6 +32,20 @@ relationships:
   source_anchor: run Alfred BIT 2026-05-04
   target: process/Alfred BIT 2026-05-07.md
   target_anchor: run Alfred BIT 2026-05-07
+  type: related-to
+- confidence: 1
+  context: Both mention Alfred BIT run on different dates
+  source: process/Alfred BIT 2026-05-04.md
+  source_anchor: run Alfred BIT 2026-05-04
+  target: process/Alfred BIT 2026-05-08.md
+  target_anchor: run Alfred BIT 2026-05-08
+  type: related-to
+- confidence: 1
+  context: Both mention Alfred BIT run on different dates
+  source: process/Alfred BIT 2026-05-04.md
+  source_anchor: run Alfred BIT 2026-05-04
+  target: process/Alfred BIT 2026-05-09.md
+  target_anchor: run Alfred BIT 2026-05-09
   type: related-to
 started: '2026-05-04T05:55:02.506206-03:00'
 status: completed
