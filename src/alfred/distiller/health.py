@@ -8,12 +8,18 @@ Probes:
     refuse to start but it will produce nonsense.
   * backend known
   * anthropic auth (when backend == claude)
+  * last-successful-extraction — daemon liveness validation per the
+    universal "intentionally left blank" / observability discipline
+    (added 2026-05-10 as part of the cross-daemon BIT-probe arc).
+    Distiller's expected interval is hourly (default
+    ``extraction.interval_seconds = 3600``); thresholds reflect that.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +29,15 @@ from alfred.health.types import CheckResult, Status, ToolHealth
 
 
 _KNOWN_BACKENDS = ("claude", "zo", "openclaw")
+
+
+# Stale-threshold calibrations for the last-successful-extraction probe.
+# Distiller's default cadence is hourly
+# (``extraction.interval_seconds = 3600``); 90min OK / 90min..4h WARN /
+# >4h FAIL gives one full grace cycle before WARN and three before
+# FAIL. Module-level constants so a tune is a 1-line change.
+_DISTILLER_STALE_OK_MINUTES = 90
+_DISTILLER_STALE_FAIL_MINUTES = 240
 
 
 def _check_vault(raw: dict[str, Any]) -> CheckResult:
@@ -132,6 +147,146 @@ def _check_backend(raw: dict[str, Any]) -> CheckResult:
     )
 
 
+def _resolve_distiller_state_path(raw: dict[str, Any]) -> Path:
+    """Resolve distiller's state-file path the same way
+    ``alfred.distiller.config.load_from_unified`` does — explicit
+    path wins, otherwise dataclass default
+    ``./data/distiller_state.json``.
+    """
+    state_section = (raw.get("distiller", {}) or {}).get("state", {}) or {}
+    explicit = state_section.get("path", "")
+    if explicit:
+        return Path(explicit)
+    return Path("./data/distiller_state.json")
+
+
+def _read_distiller_most_recent_run(state_path: Path) -> str | None:
+    """Read distiller state and return the max ``runs[*].timestamp``
+    plus the top-level ``last_deep_extraction`` (whichever is newer).
+
+    Returns None on missing / unparseable / no signals. Inline dict-
+    walk per the precedent — a corrupt state file degrades to SKIP
+    rather than crashing the BIT run.
+
+    Same shape as janitor's ``_read_janitor_most_recent_sweep`` —
+    runs and deep-extraction marker are informationally distinct;
+    both contribute to the "any successful activity" daemon-liveness
+    signal.
+    """
+    if not state_path.is_file():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    candidates: list[str] = []
+
+    runs = data.get("runs", {})
+    if isinstance(runs, dict):
+        for run in runs.values():
+            if not isinstance(run, dict):
+                continue
+            ts = run.get("timestamp", "")
+            if isinstance(ts, str) and ts:
+                candidates.append(ts)
+
+    last_deep = data.get("last_deep_extraction")
+    if isinstance(last_deep, str) and last_deep:
+        candidates.append(last_deep)
+
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _check_last_successful_extraction(raw: dict[str, Any]) -> CheckResult:
+    """Validate that the distiller daemon has run an extraction recently.
+
+    Distiller's hourly cadence is tighter than janitor's (hourly vs
+    daily) — thresholds reflect that. 90min OK gives a 30min grace
+    window past the 1h interval; 4h FAIL means three full intervals
+    have elapsed without any extraction completing.
+
+    Status mapping:
+      * SKIP if state file missing (fresh install) / no runs recorded /
+        unparseable
+      * OK   if most-recent-run <= 90min ago
+      * WARN if most-recent-run 90min..4h ago (one missed run)
+      * FAIL if most-recent-run > 4h ago (multi-cycle silent failure)
+
+    "Now" is computed in UTC because distiller's RunResult.timestamp
+    is written in UTC. No timezone config to consult.
+
+    Per ``feedback_intentionally_left_blank.md``: silence (distiller
+    daemon idle, no extraction log activity) is ambiguous between
+    healthy-quiet and broken; the probe disambiguates.
+    """
+    state_path = _resolve_distiller_state_path(raw)
+    most_recent_iso = _read_distiller_most_recent_run(state_path)
+
+    if most_recent_iso is None:
+        if not state_path.is_file():
+            return CheckResult(
+                name="last-successful-extraction",
+                status=Status.SKIP,
+                detail=f"no state file (fresh install): {state_path}",
+                data={"state_path": str(state_path), "exists": False},
+            )
+        return CheckResult(
+            name="last-successful-extraction",
+            status=Status.SKIP,
+            detail="no extraction runs recorded yet",
+            data={"state_path": str(state_path), "exists": True},
+        )
+
+    try:
+        normalized = (
+            most_recent_iso.replace("Z", "+00:00")
+            if most_recent_iso.endswith("Z") else most_recent_iso
+        )
+        most_recent = datetime.fromisoformat(normalized)
+        if most_recent.tzinfo is None:
+            most_recent = most_recent.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return CheckResult(
+            name="last-successful-extraction",
+            status=Status.SKIP,
+            detail=f"unparseable timestamp in state: {most_recent_iso!r}",
+            data={"state_path": str(state_path)},
+        )
+
+    now = datetime.now(timezone.utc)
+    elapsed = now - most_recent
+    elapsed_minutes = elapsed.total_seconds() / 60.0
+    payload: dict[str, Any] = {
+        "state_path": str(state_path),
+        "last_extraction": most_recent_iso,
+        "elapsed_minutes": round(elapsed_minutes, 1),
+    }
+
+    if elapsed < timedelta(minutes=_DISTILLER_STALE_OK_MINUTES):
+        return CheckResult(
+            name="last-successful-extraction",
+            status=Status.OK,
+            detail=f"last extraction {round(elapsed_minutes)}min ago",
+            data=payload,
+        )
+    if elapsed < timedelta(minutes=_DISTILLER_STALE_FAIL_MINUTES):
+        return CheckResult(
+            name="last-successful-extraction",
+            status=Status.WARN,
+            detail=f"last extraction {round(elapsed_minutes)}min ago (one missed run)",
+            data=payload,
+        )
+    return CheckResult(
+        name="last-successful-extraction",
+        status=Status.FAIL,
+        detail=f"last extraction {round(elapsed_minutes)}min ago (daemon may be silently failing)",
+        data=payload,
+    )
+
+
 async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     """Run distiller health checks."""
     results: list[CheckResult] = [
@@ -145,6 +300,8 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     if backend == "claude":
         api_key = resolve_api_key(raw)
         results.append(await check_anthropic_auth(api_key))
+
+    results.append(_check_last_successful_extraction(raw))
 
     status = Status.worst([r.status for r in results])
     return ToolHealth(tool="distiller", status=status, results=results)
