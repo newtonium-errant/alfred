@@ -118,6 +118,8 @@ Each tool has its own `config.py` with typed dataclasses. All follow the same pa
 - `_build()` recursively constructs dataclasses from nested dicts
 - Config is loaded lazily in CLI handlers (not at import time)
 
+**`_build` collision footgun.** The recursive `_build` helper dispatches by **key name** via a global `_DATACLASS_MAP`. Common keys like `state`, `agent`, `schedule`, `openrouter` are mapped to specific dataclasses. If your nested dataclass has a sub-field with a key already in `_DATACLASS_MAP` (e.g., `pattern_miner: {state: {...}, openrouter: {...}}` — `state` would dispatch to the global `StateConfig`, not `PatternMinerStateConfig`), the recursion will build the wrong dataclass without error. The fix is to **hand-roll** that block's construction in both `load_config` and `load_from_unified`, applying the schema-tolerance filter to each sub-block manually. See `pattern_miner` in `distiller/config.py` for the canonical pattern. Don't try to fix `_build` to be parent-context-aware — that's a substantial refactor with regression risk to every other tool's config.
+
 ### State persistence — load() schema-tolerance contract
 
 Every tool's `state.py` `load()` MUST filter incoming JSONL/JSON data against the dataclass's known fields before constructing instances. The pattern, validated across distiller, surveyor, janitor, and curator:
