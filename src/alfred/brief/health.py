@@ -6,6 +6,14 @@ Probes:
   * vault output directory writable
   * weather API reachable (quick HTTP probe; WARN on failure — the
     brief falls back to cached weather at runtime, so it's not FAIL)
+  * last-successful-brief — daemon liveness validation (added
+    2026-05-10 after a 10-day silent-failure incident: the brief
+    daemon's ``except Exception:`` swallowed a TypeError on every
+    clear day, no error surfaced to BIT until the operator noticed
+    ``vault/run/`` was empty. Per the universal "intentionally left
+    blank" / observability discipline — silence is ambiguous, so an
+    explicit liveness probe distinguishes idle-healthy from broken.
+    See ``feedback_intentionally_left_blank.md``.)
 
 Brief is a scheduler — there's nothing token-expensive about its
 preconditions. We keep the quick/full distinction lightweight.
@@ -13,7 +21,9 @@ preconditions. We keep the quick/full distinction lightweight.
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -171,6 +181,170 @@ async def _check_weather_api(weather: dict, timeout: float) -> CheckResult:
     )
 
 
+def _resolve_state_path(raw: dict[str, Any], brief: dict) -> Path:
+    """Mirror ``alfred.brief.config.load_from_unified``'s state-path
+    resolution so the probe consults the same file the daemon writes.
+
+    Resolution order (matches the loader):
+      1. ``brief.state.path`` if explicitly set
+      2. ``{logging.dir}/brief_state.json`` (logging.dir defaults to
+         ``./data``)
+    """
+    state_section = brief.get("state", {}) or {}
+    explicit = state_section.get("path", "")
+    if explicit:
+        return Path(explicit)
+    log_dir = (raw.get("logging", {}) or {}).get("dir", "./data")
+    return Path(f"{log_dir}/brief_state.json")
+
+
+def _most_recent_successful_brief_date(state_path: Path) -> str | None:
+    """Read ``brief_state.json`` and return the max ISO date string of
+    any run with ``success=True``. Returns None if file missing /
+    unparseable / no successful runs.
+
+    Inlined dict-walking rather than constructing
+    ``alfred.brief.state.StateManager`` to keep the health module's
+    import surface minimal — this probe is only consuming, not
+    persisting, and a malformed state file should produce a graceful
+    N/A rather than crash the whole BIT run on a JSONDecodeError.
+    """
+    if not state_path.is_file():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    runs = data.get("runs", [])
+    if not isinstance(runs, list):
+        return None
+    successful_dates: list[str] = []
+    for r in runs:
+        if not isinstance(r, dict):
+            continue
+        if not r.get("success", False):
+            continue
+        d = r.get("date", "")
+        if isinstance(d, str) and d:
+            successful_dates.append(d)
+    if not successful_dates:
+        return None
+    return max(successful_dates)
+
+
+def _check_last_successful_brief(
+    raw: dict[str, Any],
+    brief: dict,
+) -> CheckResult:
+    """Validate that the brief daemon actually produced a brief recently.
+
+    Status mapping:
+      * SKIP if ``brief_state.json`` doesn't exist (fresh install — no
+        runs yet; not an error)
+      * SKIP if state file exists but has no successful runs (same
+        rationale)
+      * OK   if most-recent-success-date == yesterday in the brief's
+        configured timezone (BIT runs at 05:55 ADT before the brief
+        daemon at 06:00; today's brief doesn't exist at probe time)
+      * WARN if most-recent-success-date == day-before-yesterday
+        (one missed day — could be a transient API blip)
+      * FAIL if older than that (multi-day silent failure — the exact
+        pattern the 2026-04-30 → 2026-05-10 incident exhibited)
+
+    "Yesterday" is computed in the brief's configured timezone
+    (``brief.schedule.timezone``) NOT UTC — a brief generated at
+    06:00 America/Halifax on 2026-05-09 has ``date == "2026-05-09"``,
+    and a probe at 05:55 America/Halifax on 2026-05-10 should accept
+    it as yesterday regardless of UTC offset.
+
+    Per ``feedback_intentionally_left_blank.md``: this is the
+    operator-visible signal that a daemon-level silent failure
+    surfaces. Silence (``brief.daemon.fired`` keeps logging,
+    ``vault/run/`` stays empty) is ambiguous between idle-healthy
+    and broken; the probe disambiguates.
+    """
+    state_path = _resolve_state_path(raw, brief)
+    most_recent = _most_recent_successful_brief_date(state_path)
+
+    schedule = brief.get("schedule", {}) or {}
+    tz_name = schedule.get("timezone", "America/Halifax")
+    try:
+        tz = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        # Bad timezone — already FAILed by _check_schedule. Don't
+        # double-fail; SKIP this probe so the operator sees the
+        # canonical timezone error rather than two redundant ones.
+        return CheckResult(
+            name="last-successful-brief",
+            status=Status.SKIP,
+            detail=f"timezone {tz_name!r} unresolvable (see schedule-timezone)",
+        )
+
+    today_local = datetime.now(tz).date()
+    yesterday = today_local - timedelta(days=1)
+    day_before = today_local - timedelta(days=2)
+
+    if most_recent is None:
+        if not state_path.is_file():
+            return CheckResult(
+                name="last-successful-brief",
+                status=Status.SKIP,
+                detail=f"no state file (fresh install): {state_path}",
+                data={"state_path": str(state_path), "exists": False},
+            )
+        return CheckResult(
+            name="last-successful-brief",
+            status=Status.SKIP,
+            detail="no successful runs recorded yet",
+            data={"state_path": str(state_path), "exists": True},
+        )
+
+    try:
+        most_recent_d = date.fromisoformat(most_recent)
+    except ValueError:
+        return CheckResult(
+            name="last-successful-brief",
+            status=Status.SKIP,
+            detail=f"unparseable date in state: {most_recent!r}",
+            data={"state_path": str(state_path)},
+        )
+
+    days_old = (today_local - most_recent_d).days
+    payload: dict[str, Any] = {
+        "state_path": str(state_path),
+        "most_recent_date": most_recent,
+        "today_local": today_local.isoformat(),
+        "days_old": days_old,
+    }
+
+    if most_recent_d >= yesterday:
+        # most_recent_d could equal today (operator already ran
+        # ``alfred brief generate`` manually after BIT) — that's
+        # also OK; treat anything from yesterday-or-newer as healthy.
+        return CheckResult(
+            name="last-successful-brief",
+            status=Status.OK,
+            detail=f"last brief: {most_recent} ({days_old}d ago)",
+            data=payload,
+        )
+    if most_recent_d == day_before:
+        # One missed day — could be transient API blip. WARN, not FAIL.
+        return CheckResult(
+            name="last-successful-brief",
+            status=Status.WARN,
+            detail=f"last brief: {most_recent} (2d ago — one missed run)",
+            data=payload,
+        )
+    # Multi-day silent failure — the bug class the 2026-04-30 → 05-10
+    # incident demonstrated.
+    return CheckResult(
+        name="last-successful-brief",
+        status=Status.FAIL,
+        detail=f"last brief: {most_recent} ({days_old}d ago — daemon may be silently failing)",
+        data=payload,
+    )
+
+
 async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     """Run brief health checks."""
     brief = raw.get("brief")
@@ -187,6 +361,7 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     results.extend(_check_schedule(brief.get("schedule", {}) or {}))
     results.append(_check_output_dir(raw, brief))
     results.append(await _check_weather_api(brief.get("weather", {}) or {}, timeout))
+    results.append(_check_last_successful_brief(raw, brief))
 
     status = Status.worst([r.status for r in results])
     return ToolHealth(tool="brief", status=status, results=results)
