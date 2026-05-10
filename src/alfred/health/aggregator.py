@@ -49,6 +49,7 @@ KNOWN_TOOL_MODULES: dict[str, str] = {
     "mail": "alfred.mail.health",
     "talker": "alfred.telegram.health",
     "transport": "alfred.transport.health",
+    "daily_sync": "alfred.daily_sync.health",
 }
 
 
