@@ -2,15 +2,23 @@
 
 Janitor probes are deliberately cheap: vault writability, configured
 sweep directories, state file readability, backend known, Anthropic
-auth. The runtime cost of a full janitor sweep is irrelevant to this
-health check — we're only checking that the preconditions to start
-a sweep are satisfied.
+auth, and last-successful-sweep daemon-liveness. The runtime cost of
+a full janitor sweep is irrelevant to this health check — we're only
+checking that the preconditions to start a sweep are satisfied AND
+that the daemon's loop has actually produced a sweep recently.
+
+The ``last-successful-sweep`` probe was added 2026-05-10 as part of
+the cross-daemon BIT-probe arc; per
+``feedback_intentionally_left_blank.md`` silence is ambiguous between
+healthy-quiet and broken — the probe disambiguates by consulting
+the daemon's existing state file.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +28,14 @@ from alfred.health.types import CheckResult, Status, ToolHealth
 
 
 _KNOWN_BACKENDS = ("claude", "zo", "openclaw")
+
+
+# Stale-threshold calibrations for the last-successful-sweep probe.
+# Janitor's default cadence is daily-ish (deep sweep schedule plus
+# event-driven shallow passes). 30h OK / 30-48h WARN / >48h FAIL
+# mirrors the dispatch's per-daemon calibration table.
+_JANITOR_STALE_OK_HOURS = 30
+_JANITOR_STALE_FAIL_HOURS = 48
 
 
 def _check_vault(raw: dict[str, Any]) -> CheckResult:
@@ -104,6 +120,145 @@ def _check_backend(raw: dict[str, Any]) -> CheckResult:
     )
 
 
+def _resolve_janitor_state_path(raw: dict[str, Any]) -> Path:
+    """Resolve the janitor's state-file path the same way
+    ``alfred.janitor.config.load_from_unified`` does — explicit path
+    wins, otherwise the dataclass default ``./data/janitor_state.json``.
+    """
+    state_section = (raw.get("janitor", {}) or {}).get("state", {}) or {}
+    explicit = state_section.get("path", "")
+    if explicit:
+        return Path(explicit)
+    return Path("./data/janitor_state.json")
+
+
+def _read_janitor_most_recent_sweep(state_path: Path) -> str | None:
+    """Read janitor state and return the max ``sweeps[*].timestamp``
+    plus the top-level ``last_deep_sweep`` (whichever is newer).
+
+    Returns None if the file is missing, unparseable, or the sweep
+    history + last_deep_sweep are all empty/missing. Inline dict-walk
+    rather than constructing ``alfred.janitor.state.JanitorState`` —
+    matches the precedent set by yesterday's brief health probe.
+
+    The "any sweep" signal is what we want for daemon-liveness: a
+    shallow sweep that ran 6h ago means the daemon's loop is
+    cycling. The deep-sweep signal alone would FAIL between deep
+    sweeps even on a perfectly healthy daemon.
+    """
+    if not state_path.is_file():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    candidates: list[str] = []
+
+    sweeps = data.get("sweeps", {})
+    if isinstance(sweeps, dict):
+        for sw in sweeps.values():
+            if not isinstance(sw, dict):
+                continue
+            ts = sw.get("timestamp", "")
+            if isinstance(ts, str) and ts:
+                candidates.append(ts)
+
+    last_deep = data.get("last_deep_sweep")
+    if isinstance(last_deep, str) and last_deep:
+        candidates.append(last_deep)
+
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _check_last_successful_sweep(raw: dict[str, Any]) -> CheckResult:
+    """Validate that the janitor daemon's loop has produced a sweep
+    recently.
+
+    Status mapping:
+      * SKIP if state file missing (fresh install) / no sweeps
+        recorded / unparseable timestamp
+      * OK   if most-recent-sweep <= 30h ago
+      * WARN if most-recent-sweep 30h..48h ago (one missed run —
+        could be a transient API blip)
+      * FAIL if most-recent-sweep > 48h ago (multi-day silent failure)
+
+    "Now" is computed in UTC because janitor's sweep timestamps are
+    written in UTC (see ``SweepResult`` and ``state.update_file``
+    both use ``datetime.now(timezone.utc)``). No timezone config to
+    consult.
+
+    Per ``feedback_intentionally_left_blank.md``: silence (janitor
+    daemon idle, no scan/fix log activity) is ambiguous between
+    healthy-quiet and broken; the probe disambiguates.
+    """
+    state_path = _resolve_janitor_state_path(raw)
+    most_recent_iso = _read_janitor_most_recent_sweep(state_path)
+
+    if most_recent_iso is None:
+        if not state_path.is_file():
+            return CheckResult(
+                name="last-successful-sweep",
+                status=Status.SKIP,
+                detail=f"no state file (fresh install): {state_path}",
+                data={"state_path": str(state_path), "exists": False},
+            )
+        return CheckResult(
+            name="last-successful-sweep",
+            status=Status.SKIP,
+            detail="no sweeps recorded yet",
+            data={"state_path": str(state_path), "exists": True},
+        )
+
+    try:
+        normalized = (
+            most_recent_iso.replace("Z", "+00:00")
+            if most_recent_iso.endswith("Z") else most_recent_iso
+        )
+        most_recent = datetime.fromisoformat(normalized)
+        if most_recent.tzinfo is None:
+            most_recent = most_recent.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return CheckResult(
+            name="last-successful-sweep",
+            status=Status.SKIP,
+            detail=f"unparseable timestamp in state: {most_recent_iso!r}",
+            data={"state_path": str(state_path)},
+        )
+
+    now = datetime.now(timezone.utc)
+    elapsed = now - most_recent
+    elapsed_hours = elapsed.total_seconds() / 3600.0
+    payload: dict[str, Any] = {
+        "state_path": str(state_path),
+        "last_sweep": most_recent_iso,
+        "elapsed_hours": round(elapsed_hours, 2),
+    }
+
+    if elapsed < timedelta(hours=_JANITOR_STALE_OK_HOURS):
+        return CheckResult(
+            name="last-successful-sweep",
+            status=Status.OK,
+            detail=f"last sweep {round(elapsed_hours, 1)}h ago",
+            data=payload,
+        )
+    if elapsed < timedelta(hours=_JANITOR_STALE_FAIL_HOURS):
+        return CheckResult(
+            name="last-successful-sweep",
+            status=Status.WARN,
+            detail=f"last sweep {round(elapsed_hours, 1)}h ago (one missed run)",
+            data=payload,
+        )
+    return CheckResult(
+        name="last-successful-sweep",
+        status=Status.FAIL,
+        detail=f"last sweep {round(elapsed_hours, 1)}h ago (daemon may be silently failing)",
+        data=payload,
+    )
+
+
 async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     """Run janitor health checks."""
     results: list[CheckResult] = [
@@ -116,6 +271,8 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     if backend == "claude":
         api_key = resolve_api_key(raw)
         results.append(await check_anthropic_auth(api_key))
+
+    results.append(_check_last_successful_sweep(raw))
 
     status = Status.worst([r.status for r in results])
     return ToolHealth(tool="janitor", status=status, results=results)
