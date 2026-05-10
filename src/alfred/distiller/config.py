@@ -271,6 +271,88 @@ class IdleTickConfig:
 
 
 @dataclass
+class PatternMinerOpenRouterConfig:
+    """OpenAI-compatible LLM endpoint config for the Phase 4 drafter.
+
+    Mirrors the surveyor's :class:`OpenRouterConfig` shape so a
+    multi-instance deployment can reuse the same backend (e.g.
+    KAL-LE's local Ollama at qwen2.5:14b) for both the labeler and
+    the pattern-miner drafter without re-stating connection details.
+
+    Empty ``base_url`` or empty ``model`` triggers the "drafter
+    unavailable" fallback in :func:`mine_patterns` — proposals are
+    still written, but with a placeholder paragraph the operator
+    fills in manually. The API-key field is sent as a Bearer token
+    when non-empty (Ollama accepts any value); leave empty for
+    local Ollama.
+    """
+
+    api_key: str = ""
+    base_url: str = ""
+    model: str = ""
+
+
+@dataclass
+class PatternMinerStateConfig:
+    """State-path config for the Phase 4 miner.
+
+    Tool-scoped default per the load() schema-tolerance contract +
+    the per-tool-state-path discipline in CLAUDE.md. Distinct file
+    from the main distiller_state.json so a Phase 4 wipe doesn't
+    invalidate the extraction-pipeline state.
+    """
+
+    path: str = "./data/pattern_miner_state.json"
+
+
+@dataclass
+class PatternMinerConfig:
+    """Phase 4 embedding-pattern miner config.
+
+    Defaults are conservative — the block is opt-in via
+    ``enabled: true``. Salem omits the block; KAL-LE adds it in
+    config.kalle.yaml. See ``project_kalle_phase4_pattern_miner.md``
+    for the design memo.
+
+    All defaults are instance-agnostic — no kalle / aftermath-lab
+    literals. Per-instance values (state path, label denylist
+    extensions) come from the config file at load time.
+    """
+
+    enabled: bool = False
+    # Path to the surveyor's state JSON. Defaults to the surveyor's
+    # default path so a co-located install (KAL-LE-style) needs no
+    # override; per-instance configs (e.g. KAL-LE) point at their
+    # own /home/andrew/.alfred/<instance>/data/surveyor_state.json.
+    surveyor_state_path: str = "./data/surveyor_state.json"
+    # Vault-relative dir the proposal markdown lands in. Resolved
+    # against config.vault.path when relative; absolute paths used
+    # as-is. The curator daemon's inbox watcher picks up files
+    # written here.
+    proposed_dir: str = "inbox/proposed-canonical"
+    # Cluster-size gate threshold. Below this size, the cluster is
+    # noise risk even when cohered. CLI --min-cluster-size overrides.
+    min_cluster_size: int = 3
+    # Dirs scanned for the no-canonical-match gate (Q3 rule 3 in the
+    # design memo). The miner walks these for slug stems and treats
+    # any cluster whose label-segments match an existing slug as
+    # "already canonized." KAL-LE's three are the default; Salem
+    # would override if it ever runs Phase 4.
+    canonical_match_dirs: list[str] = field(default_factory=lambda: [
+        "architecture", "principles", "stack",
+    ])
+    # Operator-extended label denylist. Union'd with the module-level
+    # default in pattern_miner.py at run time. Use this to add
+    # instance-specific low-signal labels surveyor sometimes emits
+    # without redefining the default set.
+    label_denylist: list[str] = field(default_factory=list)
+    state: PatternMinerStateConfig = field(default_factory=PatternMinerStateConfig)
+    openrouter: PatternMinerOpenRouterConfig = field(
+        default_factory=PatternMinerOpenRouterConfig,
+    )
+
+
+@dataclass
 class DistillerConfig:
     # Top-level opt-out flag. Distinct from the orchestrator's
     # configuration-by-presence gate: the orchestrator already skips
@@ -297,6 +379,16 @@ class DistillerConfig:
     # via the dataclass default; instances that want auto-fire opt in
     # via ``distiller.radar_day.enabled: true`` in their config.
     radar_day: RadarDayConfig = field(default_factory=RadarDayConfig)
+    # Phase 4 embedding-pattern miner — see :class:`PatternMinerConfig`.
+    # Defaulted-OFF; instances opt in via
+    # ``distiller.pattern_miner.enabled: true`` in their config.
+    # ``Optional`` so the absence-vs-block-with-defaults case is
+    # observable to callers (the CLI handler treats None and
+    # enabled=False identically). ``load_from_unified`` constructs
+    # the field manually rather than via _build to avoid the nested-
+    # ``state`` key collision with the top-level :class:`StateConfig`
+    # in the recursive builder's global key dispatch.
+    pattern_miner: PatternMinerConfig | None = None
 
 
 # --- Recursive builder ---
@@ -338,7 +430,14 @@ def _build(cls: type, data: dict[str, Any]) -> Any:
 
 
 def load_config(path: str | Path = "config.yaml") -> DistillerConfig:
-    """Load and parse config.yaml into DistillerConfig."""
+    """Load and parse config.yaml into DistillerConfig.
+
+    Note: this loader expects a distiller-only YAML (top-level keys
+    are distiller fields). The unified-config entrypoint
+    :func:`load_from_unified` is what the CLI actually uses; this
+    function exists for stand-alone testing of distiller config
+    parsing without the unified config wrapper.
+    """
     from alfred.vault.config_helpers import normalize_vault_block
 
     config_path = Path(path)
@@ -347,7 +446,39 @@ def load_config(path: str | Path = "config.yaml") -> DistillerConfig:
     raw = _substitute_env(raw or {})
     if "vault" in raw:
         raw["vault"] = normalize_vault_block(raw["vault"])
-    return _build(DistillerConfig, raw)
+    # Pattern miner is built manually for the same nested-state-key-
+    # collision reason load_from_unified handles. Pop before _build
+    # then re-attach.
+    pm_raw = raw.pop("pattern_miner", None)
+    cfg = _build(DistillerConfig, raw)
+    if isinstance(pm_raw, dict):
+        pm_state_raw = pm_raw.get("state")
+        if isinstance(pm_state_raw, dict):
+            pm_state = PatternMinerStateConfig(
+                **{k: v for k, v in pm_state_raw.items()
+                   if k in PatternMinerStateConfig.__dataclass_fields__}
+            )
+        else:
+            pm_state = PatternMinerStateConfig()
+        pm_or_raw = pm_raw.get("openrouter")
+        if isinstance(pm_or_raw, dict):
+            pm_openrouter = PatternMinerOpenRouterConfig(
+                **{k: v for k, v in pm_or_raw.items()
+                   if k in PatternMinerOpenRouterConfig.__dataclass_fields__}
+            )
+        else:
+            pm_openrouter = PatternMinerOpenRouterConfig()
+        scalar_kwargs = {
+            k: v for k, v in pm_raw.items()
+            if k in PatternMinerConfig.__dataclass_fields__
+            and k not in ("state", "openrouter")
+        }
+        cfg.pattern_miner = PatternMinerConfig(
+            state=pm_state,
+            openrouter=pm_openrouter,
+            **scalar_kwargs,
+        )
+    return cfg
 
 
 def load_from_unified(raw: dict[str, Any]) -> DistillerConfig:
@@ -390,4 +521,44 @@ def load_from_unified(raw: dict[str, Any]) -> DistillerConfig:
     radar_day_raw = tool.get("radar_day")
     if isinstance(radar_day_raw, dict):
         built["radar_day"] = radar_day_raw
-    return _build(DistillerConfig, built)
+    # Phase 4 pattern miner. Built manually rather than via _build so
+    # the nested ``state`` key (PatternMinerStateConfig) doesn't
+    # collide with the top-level distiller ``state`` (StateConfig) in
+    # the recursive builder's global key dispatch. Absent block →
+    # field stays None; CLI handler treats None and enabled=False
+    # identically (prints "not enabled in this config" + returns).
+    pm_raw = tool.get("pattern_miner")
+    pattern_miner_obj: PatternMinerConfig | None = None
+    if isinstance(pm_raw, dict):
+        pm_state_raw = pm_raw.get("state")
+        if isinstance(pm_state_raw, dict):
+            pm_state = PatternMinerStateConfig(
+                **{k: v for k, v in pm_state_raw.items()
+                   if k in PatternMinerStateConfig.__dataclass_fields__}
+            )
+        else:
+            pm_state = PatternMinerStateConfig()
+        pm_or_raw = pm_raw.get("openrouter")
+        if isinstance(pm_or_raw, dict):
+            pm_openrouter = PatternMinerOpenRouterConfig(
+                **{k: v for k, v in pm_or_raw.items()
+                   if k in PatternMinerOpenRouterConfig.__dataclass_fields__}
+            )
+        else:
+            pm_openrouter = PatternMinerOpenRouterConfig()
+        # Top-level scalar/list fields — schema-tolerant filter so an
+        # older config with extra keys loads without crashing (matches
+        # the from_dict pattern used in pattern_miner_state.py).
+        scalar_kwargs = {
+            k: v for k, v in pm_raw.items()
+            if k in PatternMinerConfig.__dataclass_fields__
+            and k not in ("state", "openrouter")
+        }
+        pattern_miner_obj = PatternMinerConfig(
+            state=pm_state,
+            openrouter=pm_openrouter,
+            **scalar_kwargs,
+        )
+    cfg = _build(DistillerConfig, built)
+    cfg.pattern_miner = pattern_miner_obj
+    return cfg

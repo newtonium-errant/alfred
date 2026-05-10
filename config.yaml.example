@@ -217,6 +217,43 @@ distiller:
   idle_tick:
     enabled: true
     interval_seconds: 60
+  # Phase 4 embedding-pattern miner — KAL-LE distiller-radar consumer
+  # of the surveyor's labeled-cluster output. Surfaces "unnamed
+  # themes" (clusters that have cohered semantically but lack a
+  # canonical artifact) as inbox proposals for new architecture/ or
+  # principles/ records.
+  #
+  # See `project_kalle_phase4_pattern_miner.md` for the full design.
+  # Block defaults to OFF (`enabled: false`); per-instance configs
+  # opt in. Salem typically omits the block entirely; KAL-LE adds it.
+  #
+  # Run ad-hoc with:
+  #   alfred --config <config> distiller mine-patterns [--dry-run]
+  #     [--min-cluster-size N] [--top N]
+  #
+  # Drafter LLM endpoint reuses an OpenAI-compatible chat-completions
+  # API. KAL-LE points it at its local Ollama (qwen2.5:14b at
+  # 172.22.0.1:11434/v1) — no cloud cost. Empty base_url or model
+  # triggers the safe-degraded path: proposals still write but with
+  # a placeholder paragraph the operator fills in manually.
+  #
+  # pattern_miner:
+  #   enabled: true
+  #   surveyor_state_path: "./data/surveyor_state.json"
+  #   proposed_dir: "inbox/proposed-canonical"
+  #   min_cluster_size: 3
+  #   canonical_match_dirs: ["architecture", "principles", "stack"]
+  #   label_denylist:
+  #     # Operator-extended; union'd with the module-level default.
+  #     # Add labels surveyor sometimes emits that don't signal a
+  #     # real theme (e.g. cohered on document-type rather than topic).
+  #     # - "instance-specific-low-signal-label"
+  #   state:
+  #     path: "./data/pattern_miner_state.json"
+  #   openrouter:
+  #     api_key: "ollama"  # ignored by Ollama; any value works
+  #     base_url: "http://172.22.0.1:11434/v1"
+  #     model: "qwen2.5:14b"
 
 # Instructor — polls every vault record for pending ``alfred_instructions``
 # directives and executes them in-process via the Anthropic SDK. See
