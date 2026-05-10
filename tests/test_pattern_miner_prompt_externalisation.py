@@ -212,44 +212,93 @@ class TestMissingFileDegradation:
 # ---------------------------------------------------------------------------
 
 
-class TestContentByteEquivalence:
-    """Stage 1 is a mechanical refactor — the prompt body must be
-    byte-identical with the prior inline ``DRAFT_PROMPT_TEMPLATE``
-    constant. Pinning the bug-of-record diagnostic content (the
-    "no preamble" instruction, the TYPE/SLUG suffix format, etc.)
-    catches a regression where stage-1 accidentally drops content
-    that stage-2 was supposed to iterate on rather than restore.
+class TestContentStructuralPins:
+    """Stage 2 (prompt-tuner content fix) replaced the byte-equivalence
+    pins with structural pins matching the new content. The original
+    pins asserted on the inline-constant body ("write a SINGLE-PARAGRAPH
+    (3-5 sentences) summary", "No preamble", "TYPE: architecture|
+    principles", "SLUG: <kebab-case-slug-no-extension>") — Stage 2
+    reshaped the prompt around three branches (one-claim / NO-CLAIM /
+    SPLIT) so the byte pins no longer hold.
 
-    Stage 2 (prompt-tuner content fix) WILL break these pins — that's
-    intentional. When prompt-tuner ships, these byte-equivalence pins
-    get replaced by structural pins ("contains the new refusal
-    sentinel," "contains the split sentinel").
+    The pins now assert the load-bearing surface stage 2b (builder)
+    will parse against:
+
+      - voice anchor — present-tense paragraph constraint preserved
+      - NO-CLAIM sentinel — refusal token the parser will detect
+      - SPLIT / THEMES: sentinels — split-cluster tokens the parser
+        will detect
+      - TYPE: trailer surface — architecture / principles labels
+        still present so _parse_drafter_response keeps working on
+        the happy-path branch
+
+    A future prompt-tuner pass that drops any of these tokens silently
+    breaks the parser contract. Pin them so the regression fails
+    loudly instead.
     """
 
-    def test_prompt_contains_single_paragraph_instruction(self) -> None:
-        # The "write a SINGLE-PARAGRAPH (3-5 sentences) summary"
-        # directive is the core voice constraint that stage 2 will
-        # rework. Stage 1 pins it byte-identical.
+    def test_prompt_contains_voice_anchor(self) -> None:
+        # The voice constraint that fires on every cluster: 2-4 sentence
+        # paragraph, opens with the claim subject, present tense.
+        # Stage 1 had "SINGLE-PARAGRAPH (3-5 sentences)"; stage 2
+        # tightened to "2-4 sentences" + an explicit "do not begin
+        # with" negative example list. Pin the new anchor.
         content = pattern_miner._load_draft_prompt_template()
-        assert (
-            "write a SINGLE-PARAGRAPH (3-5 sentences) summary"
-            in content
+        assert "2-4 sentences" in content, (
+            "Voice anchor missing — drafter will revert to verbose "
+            "operator-narrator framing without the sentence-count "
+            "ceiling."
         )
 
-    def test_prompt_contains_no_preamble_directive(self) -> None:
-        # "No preamble, no 'the unifying theme is', just the claim."
-        # Voice directive. Stage 2 reworks; stage 1 preserves.
+    def test_prompt_contains_no_claim_refusal_sentinel(self) -> None:
+        # The NO-CLAIM token is the refusal path for cosine-coherent-
+        # but-thematically-empty clusters. Stage 2b parser detects the
+        # literal token; dropping it from the prompt collapses the
+        # refusal branch back into vague-paragraph drafts.
         content = pattern_miner._load_draft_prompt_template()
-        assert "No preamble" in content
+        assert "NO-CLAIM" in content, (
+            "Refusal sentinel missing — drafter has no escape valve "
+            "for thematically-empty clusters and will produce throat-"
+            "clearing prose instead of a parseable refusal."
+        )
+        assert "REASON:" in content, (
+            "REASON: line missing — operator review can't surface "
+            "WHY the drafter refused without it."
+        )
 
-    def test_prompt_contains_type_slug_suffix_format(self) -> None:
-        # The TYPE: / SLUG: trailer is the structured-output contract
-        # _parse_drafter_response in pattern_miner.py parses. Stage 1
-        # MUST preserve this byte-for-byte or the parser regex fails
-        # against the new prompt's output.
+    def test_prompt_contains_split_sentinel(self) -> None:
+        # The SPLIT / THEMES: tokens are the split-cluster path for
+        # large clusters glued by a surface tag. Stage 2b parser
+        # detects the literal tokens; dropping them collapses the
+        # split branch back into vague umbrella claims.
         content = pattern_miner._load_draft_prompt_template()
-        assert "TYPE: architecture|principles" in content
-        assert "SLUG: <kebab-case-slug-no-extension>" in content
+        assert "SPLIT" in content, (
+            "Split sentinel missing — drafter has no path for multi-"
+            "theme clusters and will glue unrelated sub-themes under "
+            "one umbrella claim."
+        )
+        assert "THEMES:" in content, (
+            "THEMES: line missing — operator review can't enumerate "
+            "the sub-themes the drafter saw without it."
+        )
+
+    def test_prompt_contains_type_slug_trailer_for_happy_path(self) -> None:
+        # The TYPE: / SLUG: trailer is the structured-output contract
+        # _parse_drafter_response parses on the one-claim branch.
+        # Stage 2 preserves "TYPE: architecture|principles" verbatim
+        # plus a SLUG: token. Pin both — a silent rename to e.g.
+        # "KIND:" would break the parser regex even though the prompt
+        # still reads sensibly to a human reviewer.
+        content = pattern_miner._load_draft_prompt_template()
+        assert "TYPE: architecture|principles" in content, (
+            "TYPE: trailer missing or renamed — parser regex in "
+            "_parse_drafter_response will fail to extract the "
+            "proposed-canonical type on the happy-path branch."
+        )
+        assert "SLUG:" in content, (
+            "SLUG: token missing — parser cannot extract the proposed "
+            "kebab-case slug for the canonical filename."
+        )
 
 
 # ---------------------------------------------------------------------------
