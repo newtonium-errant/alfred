@@ -300,8 +300,22 @@ async def fetch_tafs(config: WeatherConfig) -> list[dict]:
         return resp.json()
 
 
-def _format_taf_period(period: dict) -> str:
-    """Format a single TAF forecast period as a compact string."""
+def _format_taf_period(period: dict, *, station_id: str = "") -> str:
+    """Format a single TAF forecast period as a compact string.
+
+    The aviationweather.gov TAF JSON returns ``visib`` with the same
+    mixed-type surface as the METAR endpoint (int / float /
+    numeric-string / ``"<N>+"``). The METAR boundary fix
+    (``_parse_visibility``, see commit d2228d4 / project_kalle…
+    follow-up dispatch) is reused here so the TAF formatter renders
+    consistently regardless of API shape — previously the literal
+    ``"6+"`` was special-cased but ``"10+"`` (or any other
+    ``"<N>+"`` for N != 6) would have rendered as ``"10+SM"``.
+
+    ``station_id`` is plumbed through for the ``weather.visibility_unparseable``
+    operator-trace log; default empty string for external callers /
+    tests that don't carry station context.
+    """
     change = period.get("fcstChange") or "BASE"
     parts = [change]
 
@@ -313,9 +327,21 @@ def _format_taf_period(period: dict) -> str:
         wind = f"{d}/{wspd}G{wgst}kt" if wgst else f"{d}/{wspd}kt"
         parts.append(wind)
 
-    vis = period.get("visib")
+    raw_vis = period.get("visib")
+    vis = _parse_visibility(raw_vis, station_id=station_id)
     if vis is not None:
-        parts.append(f"{vis}SM" if vis != "6+" else ">6SM")
+        if vis >= 10:
+            parts.append(">10SM")
+        elif vis >= 6 and isinstance(raw_vis, str) and raw_vis.strip().endswith("+"):
+            # Preserve the FAA "at-least" semantic for the rare ``"6+"``
+            # case (the original code's only special-case). At >= 10
+            # we already render ``>10SM`` regardless; in the 6..10
+            # band the ``+`` suffix on the raw value is the operator-
+            # meaningful signal so we surface ``>NSM`` rather than the
+            # numeric value.
+            parts.append(f">{int(vis)}SM")
+        else:
+            parts.append(f"{vis}SM")
 
     wx = period.get("wxString")
     if wx:
@@ -357,15 +383,25 @@ def format_taf_section(tafs: list[dict], station_configs: list[StationConfig]) -
         for p in periods:
             change = p.get("fcstChange") or "BASE"
             wx = p.get("wxString") or ""
-            vis = p.get("visib")
+            # Reuse the boundary parser so the gate sees a real
+            # ``float | None`` regardless of API shape — replaces the
+            # legacy ``isinstance(vis, (int, float)) and vis < 6``
+            # defensive check that handled the no-crash case but
+            # silently dropped string-shaped vis from the gate. The
+            # contract: low-vis (< 6SM) is sig; "<N>+" for any N
+            # never registers as low-vis (since N >= 6 by API
+            # convention).
+            parsed_vis = _parse_visibility(
+                p.get("visib"), station_id=station_id,
+            )
             # Highlight significant weather, low vis, or tempo/FM changes
             is_sig = (
-                wx
-                or (vis is not None and vis not in ("6+", None) and (isinstance(vis, (int, float)) and vis < 6))
+                bool(wx)
+                or (parsed_vis is not None and parsed_vis < 6)
                 or change in ("FM", "BECMG")
             )
             if is_sig:
-                sig_periods.append(_format_taf_period(p))
+                sig_periods.append(_format_taf_period(p, station_id=station_id))
 
         if sig_periods:
             lines.append(f"Key changes: {' → '.join(sig_periods[:5])}")

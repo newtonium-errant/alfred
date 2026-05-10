@@ -234,3 +234,158 @@ class TestParseMetarToFormatPipeline:
         warns = [c for c in captured if c.get("event") == "weather.visibility_unparseable"]
         assert len(warns) == 1
         assert warns[0]["station"] == "CYQI"
+
+
+# ---------------------------------------------------------------------------
+# TAF path — same root cause as METAR. ``_format_taf_period`` previously
+# special-cased ``"6+"`` only; ``"<N>+"`` for N != 6 would render literally
+# as ``"10+SM"``. ``format_taf_section``'s is_sig gate had a defensive
+# isinstance check that avoided crashes but silently dropped string-shaped
+# vis from the low-vis significance signal. Both paths now consume
+# ``_parse_visibility`` for consistent behavior across API shapes.
+# ---------------------------------------------------------------------------
+
+
+class TestFormatTafPeriodVisibility:
+    def test_at_least_10_renders_gt10sm(self) -> None:
+        # The bug-of-record shape on the TAF side. API returns
+        # ``"visib": "10+"`` for clear forecast; previous code would
+        # render literally as ``"10+SM"``. Boundary parser → 10.0 →
+        # ``>10SM``.
+        from alfred.brief.weather import _format_taf_period
+        out = _format_taf_period({"fcstChange": "FM", "visib": "10+"})
+        assert ">10SM" in out
+        assert "10+SM" not in out
+
+    def test_six_plus_preserves_at_least_semantic(self) -> None:
+        # The legacy special-case still works. ``"6+"`` parsed → 6.0,
+        # raw value ends with ``+`` so we render ``>6SM`` not the bare
+        # numeric ``6.0SM`` — preserving operator-meaningful semantics
+        # in the 6..10 band where ``+`` suffix is the FAA at-least
+        # signal but the value is below the universal >10 threshold.
+        from alfred.brief.weather import _format_taf_period
+        out = _format_taf_period({"fcstChange": "BASE", "visib": "6+"})
+        assert ">6SM" in out
+
+    def test_int_visib_renders_normally(self) -> None:
+        from alfred.brief.weather import _format_taf_period
+        out = _format_taf_period({"fcstChange": "BASE", "visib": 4})
+        assert "4.0SM" in out
+
+    def test_below_6_low_vis_renders_with_value(self) -> None:
+        # Low-vis numeric — no ``+`` semantic, render the raw float.
+        from alfred.brief.weather import _format_taf_period
+        out = _format_taf_period({"fcstChange": "TEMPO", "visib": 2.5})
+        assert "2.5SM" in out
+
+    def test_unparseable_visib_omitted_with_warn_log(self) -> None:
+        # The boundary parser drops + warns. The TAF formatter then
+        # has nothing to append for vis (vis is None). Pin the log
+        # emission to catch silent-drop regressions per the
+        # log-emission test discipline.
+        from alfred.brief.weather import _format_taf_period
+        with structlog.testing.capture_logs() as captured:
+            out = _format_taf_period(
+                {"fcstChange": "FM", "visib": "garbage"},
+                station_id="CYHZ",
+            )
+        # No vis token in output — neither the garbage nor an SM render.
+        assert "garbage" not in out
+        warns = [c for c in captured if c.get("event") == "weather.visibility_unparseable"]
+        assert len(warns) == 1
+        assert warns[0]["station"] == "CYHZ"
+
+    def test_missing_visib_omitted_cleanly(self) -> None:
+        # Period with no ``visib`` key — vis is None, no token emitted,
+        # no log fires (None is the well-formed empty case).
+        from alfred.brief.weather import _format_taf_period
+        with structlog.testing.capture_logs() as captured:
+            out = _format_taf_period({"fcstChange": "BASE"})
+        assert "SM" not in out
+        warns = [c for c in captured if c.get("event") == "weather.visibility_unparseable"]
+        assert len(warns) == 0
+
+
+class TestFormatTafSectionSignificanceGate:
+    """The ``format_taf_section`` is_sig gate filters TAF periods to
+    "key changes" — significant weather, low visibility, or BECMG/FM
+    transitions. The legacy gate used ``isinstance(vis, (int, float)) and
+    vis < 6`` which silently dropped string-shaped vis from the low-vis
+    signal. Boundary parser fixes that contract.
+    """
+
+    def _taf(self, periods: list[dict]) -> dict:
+        return {
+            "icaoId": "CYZX",
+            "rawTAF": "TAF CYZX 101200Z 1012/1112 27010KT P6SM",
+            "fcsts": periods,
+        }
+
+    def test_string_low_vis_now_registered_as_significant(self) -> None:
+        # The legacy gate's isinstance check would silently drop a
+        # string-shaped low-vis value (``"3"``) — gate would say
+        # "not sig" and the period would be omitted from "Key
+        # changes". Boundary parser → 3.0 → gate registers as sig.
+        from alfred.brief.weather import format_taf_section
+        from alfred.brief.config import StationConfig
+
+        taf = self._taf([
+            {"fcstChange": "TEMPO", "visib": "3"},
+        ])
+        out = format_taf_section([taf], [StationConfig(id="CYZX", name="Greenwood")])
+        # The rendered low-vis period must show up under "Key changes".
+        assert "Key changes" in out
+        assert "3.0SM" in out
+
+    def test_at_least_10_not_significant_unless_other_signal(self) -> None:
+        # ``"10+"`` (parsed → 10.0) is not low-vis. Without other
+        # signals (no wxString, no FM/BECMG change), the period is NOT
+        # significant → no Key changes line.
+        from alfred.brief.weather import format_taf_section
+        from alfred.brief.config import StationConfig
+
+        taf = self._taf([
+            {"fcstChange": "BASE", "visib": "10+"},
+        ])
+        out = format_taf_section([taf], [StationConfig(id="CYZX", name="Greenwood")])
+        # Header always present; the per-period "Key changes" line is
+        # the conditional one.
+        assert "Key changes" not in out
+
+    def test_six_plus_not_significant_at_or_above_threshold(self) -> None:
+        # ``"6+"`` (parsed → 6.0) is at the gate boundary (gate uses
+        # ``< 6``). At 6 exactly, NOT significant.
+        from alfred.brief.weather import format_taf_section
+        from alfred.brief.config import StationConfig
+
+        taf = self._taf([
+            {"fcstChange": "BASE", "visib": "6+"},
+        ])
+        out = format_taf_section([taf], [StationConfig(id="CYZX", name="Greenwood")])
+        assert "Key changes" not in out
+
+    def test_int_low_vis_still_significant(self) -> None:
+        # Numeric path stays unchanged — int low-vis is still
+        # significant. Pin to catch regressions on the easy path.
+        from alfred.brief.weather import format_taf_section
+        from alfred.brief.config import StationConfig
+
+        taf = self._taf([
+            {"fcstChange": "TEMPO", "visib": 2},
+        ])
+        out = format_taf_section([taf], [StationConfig(id="CYZX", name="Greenwood")])
+        assert "Key changes" in out
+        assert "2.0SM" in out
+
+    def test_fm_change_significant_regardless_of_vis(self) -> None:
+        # FM transition is ALWAYS significant, even with no other
+        # signals. Pin to ensure the gate's ``or`` semantics are
+        # preserved across the boundary-parser refactor.
+        from alfred.brief.weather import format_taf_section
+        from alfred.brief.config import StationConfig
+
+        taf = self._taf([
+            {"fcstChange": "FM", "visib": "10+"},
+        ])
+        out = format_taf_section([taf], [StationConfig(id="CYZX", name="Greenwood")])
+        assert "Key changes" in out
