@@ -656,6 +656,14 @@ def cmd_distiller(args: argparse.Namespace) -> None:
             state_dir=args.state_dir,
             dry_run=args.dry_run,
         )
+    elif subcmd == "mine-patterns":
+        dcli.cmd_mine_patterns(
+            config,
+            config_path=args.config,
+            dry_run=args.dry_run,
+            min_cluster_size=args.min_cluster_size,
+            top=args.top,
+        )
     else:
         print(f"Unknown distiller subcommand: {subcmd}")
         sys.exit(1)
@@ -2352,6 +2360,29 @@ def build_parser() -> argparse.ArgumentParser:
     dist_rank_day.add_argument(
         "--dry-run", action="store_true", default=False,
         help="Compute + log without writing the daily file or surfaced log",
+    )
+
+    # KAL-LE distiller-radar Phase 4 — embedding-pattern miner.
+    # Reads the surveyor pipeline's labeled-cluster output, gates each
+    # cluster against the four-part rule (labeled / substantive / no
+    # canonical match / label-quality), and surfaces survivors as
+    # inbox proposals for new architecture/ or principles/ records.
+    # Per-instance opt-in via distiller.pattern_miner.enabled in config.
+    dist_mine = dist_sub.add_parser(
+        "mine-patterns",
+        help="Phase 4 embedding-pattern miner: surface unnamed-theme inbox proposals",
+    )
+    dist_mine.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Evaluate + render counts without writing proposal files or state",
+    )
+    dist_mine.add_argument(
+        "--min-cluster-size", type=int, default=None,
+        help="Override the gate's size threshold for one run (default 3 from config)",
+    )
+    dist_mine.add_argument(
+        "--top", type=int, default=None,
+        help="Cap on new proposals per run (default unlimited; useful for bulk-mine)",
     )
 
     # instructor

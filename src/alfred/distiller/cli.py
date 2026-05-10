@@ -340,6 +340,166 @@ def cmd_rank_day(
         )
 
 
+def cmd_mine_patterns(
+    config: DistillerConfig,
+    *,
+    config_path: str | Path | None = None,
+    dry_run: bool = False,
+    min_cluster_size: int | None = None,
+    top: int | None = None,
+) -> None:
+    """KAL-LE distiller-radar Phase 4 — embedding-pattern miner.
+
+    Reads the surveyor pipeline's labeled-cluster output, gates each
+    cluster against the four-part rule (labeled / substantive / no
+    canonical match / label-quality), and surfaces survivors as inbox
+    proposals for new ``architecture/`` or ``principles/`` records.
+
+    Behavior is gated by ``distiller.pattern_miner.enabled`` — when
+    the block is absent or ``enabled: false``, this handler prints a
+    clear "not enabled in this config" message and returns. KAL-LE
+    opts in via its own config; Salem omits the block.
+
+    Reads from the surveyor state JSON at the configured path (NOT
+    Milvus directly — see the design memo for the lock-contention
+    rationale).
+
+    Args:
+        config: Loaded distiller config.
+        config_path: The CLI's --config flag value. Used to derive the
+            instance basename embedded in proposal "Suggested next
+            step" CLI invocations so the operator can copy-paste a
+            correct ``alfred --config <name> vault move ...`` line.
+        dry_run: Evaluate + log + render counts but write neither
+            proposal files nor state mutations. Useful as an
+            inspection pass before a live run.
+        min_cluster_size: Optional override for the gate's size
+            threshold; when None, uses the config's value (default 3).
+        top: Optional cap on new proposals per run. Useful for an
+            initial bulk-mine when the queue is empty and the gate
+            yields many candidates at once.
+    """
+    pm = config.pattern_miner
+    if pm is None or not pm.enabled:
+        print("Pattern miner not enabled in this config.")
+        print("To enable, add `distiller.pattern_miner.enabled: true`.")
+        return
+
+    vault_path = config.vault.vault_path
+    if not vault_path.is_dir():
+        print(f"Vault path does not exist: {vault_path}")
+        return
+
+    surveyor_state_path = Path(pm.surveyor_state_path).expanduser()
+    if not surveyor_state_path.exists():
+        # Per the universal "intentionally left blank" rule — explicit
+        # empty-state ack so the operator can distinguish "miner ran,
+        # no surveyor data yet" from "miner is broken."
+        print(
+            f"Surveyor state file not found at {surveyor_state_path}.\n"
+            f"Run the surveyor daemon first; it produces this file.\n"
+        )
+        return
+
+    state_path = Path(pm.state.path).expanduser()
+    proposed_dir_raw = pm.proposed_dir
+    proposed_dir = (
+        Path(proposed_dir_raw).expanduser()
+        if Path(proposed_dir_raw).is_absolute()
+        else (vault_path / proposed_dir_raw)
+    )
+
+    # Derive the instance basename for the suggested-next-step line.
+    if config_path:
+        instance_basename = Path(str(config_path)).name
+    else:
+        instance_basename = "config.yaml"
+
+    # Resolve overrides + defaults from the config block.
+    effective_min = (
+        int(min_cluster_size)
+        if min_cluster_size is not None
+        else int(pm.min_cluster_size)
+    )
+    effective_top = top  # None → unlimited
+
+    # Operator-extended denylist (default + config) per the design memo.
+    from .pattern_miner import _DEFAULT_LABEL_DENYLIST  # type: ignore
+    denylist = frozenset(set(_DEFAULT_LABEL_DENYLIST) | set(pm.label_denylist or []))
+
+    # Drafter LLM endpoint. Empty endpoint OR empty model → skip the
+    # drafter, write proposals with placeholder paragraphs. This is
+    # the safe-degraded path the design memo calls out for env where
+    # Ollama is down or not configured.
+    drafter_endpoint = pm.openrouter.base_url or ""
+    drafter_model = pm.openrouter.model or ""
+    drafter_api_key = pm.openrouter.api_key or ""
+
+    # Load state.
+    from .pattern_miner_state import PatternMinerState
+    state = PatternMinerState(state_path)
+    state.load()
+
+    from .pattern_miner import mine_patterns
+    result = mine_patterns(
+        vault_path=vault_path,
+        surveyor_state_path=surveyor_state_path,
+        state=state,
+        proposed_dir=proposed_dir,
+        canonical_match_dirs=tuple(pm.canonical_match_dirs),
+        label_denylist=denylist,
+        min_cluster_size=effective_min,
+        top_n=effective_top,
+        drafter_endpoint=drafter_endpoint,
+        drafter_model=drafter_model,
+        drafter_api_key=drafter_api_key,
+        instance_config_basename=instance_basename,
+        dry_run=dry_run,
+    )
+
+    print(f"=== Pattern Miner — vault={vault_path} ===")
+    print(
+        f"surveyor_state={surveyor_state_path}  proposed_dir={proposed_dir}\n"
+        f"min_cluster_size={effective_min}  top={effective_top}  "
+        f"dry_run={dry_run}"
+    )
+    print(
+        f"\nReconcile sweep: promoted={result.reconcile_promoted}  "
+        f"discarded={result.reconcile_discarded}  "
+        f"still_pending={result.reconcile_still_pending}"
+    )
+    print(
+        f"\nNew mining: clusters_evaluated={result.candidates_evaluated}  "
+        f"survivors={result.survivors}  "
+        f"proposed={len(result.proposed)}\n"
+        f"  skipped_dedup={result.skipped_dedup}  "
+        f"skipped_no_slug={result.skipped_no_slug}  "
+        f"drafter_failures={result.drafter_failures}"
+    )
+
+    if not result.proposed:
+        # Per the universal "intentionally left blank" rule — explicit
+        # empty-result ack. mine_patterns has already written the
+        # .gitkeep marker (live mode); just signal here.
+        print("\nno new patterns surfaced this run.")
+        if not dry_run:
+            print(f"(placeholder marker written: {proposed_dir}/.gitkeep)")
+        return
+
+    print(f"\n{'#':<3} {'Type':<14} {'Members':<8} {'Slug':<40} {'Labels'}")
+    print("-" * 110)
+    for i, c in enumerate(result.proposed, start=1):
+        labels = ", ".join(c.cluster.labels[:3])
+        slug_display = c.proposed_slug[:38] + ("…" if len(c.proposed_slug) > 38 else "")
+        print(
+            f"{i:<3} {c.proposed_canonical_type:<14} "
+            f"{len(c.cluster.member_files):<8} {slug_display:<40} {labels}"
+        )
+
+    verb = "would write" if dry_run else "wrote"
+    print(f"\n{verb} {len(result.proposed)} proposal(s) under: {proposed_dir}")
+
+
 def cmd_history(config: DistillerConfig, limit: int = 10) -> None:
     """Show past extraction runs."""
     state = _init_state(config)
