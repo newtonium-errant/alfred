@@ -31,6 +31,78 @@ class StationWeather:
     observed_at: str = ""
 
 
+def _parse_visibility(raw_visib: object, *, station_id: str = "") -> float | None:
+    """Coerce aviationweather.gov's mixed-type ``visib`` field into a float.
+
+    Boundary validator per the validate-at-system-boundary discipline —
+    the API IS the boundary here, so the parse happens once at
+    construction time and the rest of the module trusts that
+    ``StationWeather.visibility_sm`` is ``float | None`` (per the
+    dataclass field type).
+
+    Live API surface (verified 2026-05-10):
+    - numeric (int / float / numeric string): treated as miles, returned as float
+    - ``"10+"`` / ``"6+"`` / ``"<N>+"``: aviationweather convention for "at least N
+      statute miles." Returns the bare ``N`` — downstream
+      ``_format_visibility`` re-adds the ``>10SM`` rendering when value >= 10
+    - ``""`` / ``None`` / unparseable shape: returns ``None``; logs
+      ``weather.visibility_unparseable`` so the operator has a trace
+      rather than a silent drop
+
+    Note: the bare ``N`` returned for ``"<N>+"`` is a small fidelity loss
+    (we discard the "+") but matches the rendering contract of
+    ``_format_visibility``: any value >= 10 renders as ``>10SM`` regardless,
+    and ``"<N>+"`` for N < 10 is exceedingly rare in METAR data (the FAA
+    convention is to emit a numeric value once below the >10SM threshold).
+
+    Per the 2026-05-10 P0 fix (operator brief): ``brief.daemon`` was
+    silently swallowing ``TypeError: '>=' not supported between instances
+    of 'str' and 'int'`` for ~10 days because the dataclass field was
+    typed ``float | None`` but populated with the API's mixed type
+    untransformed. This parser is the contract enforcer.
+    """
+    if raw_visib is None:
+        return None
+    if isinstance(raw_visib, bool):
+        # ``isinstance(True, int)`` is True in Python — handle bool
+        # explicitly so a stray API JSON boolean doesn't smuggle 1.0
+        # through the int branch below.
+        log.warning(
+            "weather.visibility_unparseable",
+            raw=raw_visib,
+            station=station_id,
+            reason="bool",
+        )
+        return None
+    if isinstance(raw_visib, (int, float)):
+        return float(raw_visib)
+    if isinstance(raw_visib, str):
+        s = raw_visib.strip()
+        if not s:
+            return None
+        # FAA "<N>+" — at-least-N. Strip the trailing "+" and parse the
+        # numeric prefix.
+        if s.endswith("+"):
+            s = s[:-1].strip()
+        try:
+            return float(s)
+        except ValueError:
+            log.warning(
+                "weather.visibility_unparseable",
+                raw=raw_visib,
+                station=station_id,
+                reason="non_numeric_string",
+            )
+            return None
+    log.warning(
+        "weather.visibility_unparseable",
+        raw=raw_visib,
+        station=station_id,
+        reason=f"type_{type(raw_visib).__name__}",
+    )
+    return None
+
+
 async def fetch_metars(config: WeatherConfig) -> list[dict]:
     """Fetch METAR data for configured stations."""
     ids = ",".join(s.id for s in config.stations)
@@ -64,7 +136,12 @@ def parse_metar(raw: dict, station_configs: list[StationConfig]) -> StationWeath
         wind_dir=raw.get("wdir"),
         wind_speed_kt=raw.get("wspd"),
         wind_gust_kt=raw.get("wgst"),
-        visibility_sm=raw.get("visib"),
+        # API returns ``visib`` as int / float / numeric-string / ``"<N>+"``
+        # depending on conditions. ``_parse_visibility`` is the boundary
+        # validator that coerces all shapes into the dataclass's typed
+        # ``float | None``. See the helper's docstring for the full
+        # surface + the 2026-05-10 P0 incident the boundary fix addresses.
+        visibility_sm=_parse_visibility(raw.get("visib"), station_id=station_id),
         ceiling_ft=ceiling_ft,
         cloud_cover=raw.get("cover", ""),
         clouds=raw.get("clouds", []),
