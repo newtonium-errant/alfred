@@ -474,6 +474,8 @@ def cmd_mine_patterns(
         f"proposed={len(result.proposed)}\n"
         f"  skipped_dedup={result.skipped_dedup}  "
         f"skipped_no_slug={result.skipped_no_slug}  "
+        f"skipped_slug_unresolvable={result.skipped_slug_unresolvable}  "
+        f"slug_collisions_resolved={result.slug_collisions_resolved}  "
         f"drafter_failures={result.drafter_failures}"
     )
 

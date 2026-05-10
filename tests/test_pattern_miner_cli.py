@@ -484,3 +484,372 @@ class TestRunCompleteLog:
         assert c["proposed"] == 1
         assert c["drafter_failures"] == 0
         assert c["dry_run"] is False
+
+
+# ---------------------------------------------------------------------------
+# WARN-2 (2026-05-10 code-review) — LLM-emitted slug must pass through
+# slugify() so trailing hyphens / non-alnum garbage can't leak to disk.
+# ---------------------------------------------------------------------------
+
+
+class TestLLMSlugReSlugified:
+    def test_trailing_hyphen_in_llm_slug_normalized(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The LLM emits a slug with a trailing hyphen — _SLUG_LINE_RE
+        # permits it, but the writer must NOT use it as-is or the file
+        # lands as ``local-llm-hardware-.md`` (legal but ugly). The
+        # production code re-slugifies before assignment.
+        (tmp_path / "assumption").mkdir()
+        for stem in ("a", "b", "c"):
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_5": {
+                "label": ["llm/quantization"],
+                "member_files": [
+                    "assumption/a.md", "assumption/b.md", "assumption/c.md",
+                ],
+            },
+        })))
+
+        # LLM trailer with trailing hyphen on the slug line.
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                json=_drafter_response(
+                    "claim about hardware\n"
+                    "TYPE: principles\n"
+                    "SLUG: local-llm-hardware-\n"
+                ),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=tmp_path / "s.json",
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+        dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        # File MUST land at the slugified path, NOT the trailing-hyphen
+        # path. Both checks present so a future regression on either
+        # half (drop the slugify call OR loosen the regex) is caught.
+        normalized_path = (
+            tmp_path / "inbox" / "proposed-canonical"
+            / "local-llm-hardware.md"
+        )
+        ill_formed_path = (
+            tmp_path / "inbox" / "proposed-canonical"
+            / "local-llm-hardware-.md"
+        )
+        assert normalized_path.is_file()
+        assert not ill_formed_path.exists()
+
+        # Also pin the state entry's proposed_slug field — the writer
+        # AND the state record both flow from the same variable, so
+        # one must match the other.
+        state_data = json.loads((tmp_path / "s.json").read_text())
+        proposal = next(iter(state_data["proposals"].values()))
+        assert proposal["proposed_slug"] == "local-llm-hardware"
+
+    def test_garbage_llm_slug_falls_back_to_heuristic(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # If slugify() of the LLM's suggestion produces an empty string
+        # (pathological all-non-alnum input), the heuristic-derived slug
+        # from the cluster's first label must be used instead — we never
+        # ship a file named ``.md``.
+        (tmp_path / "assumption").mkdir()
+        for stem in ("a", "b", "c"):
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_5": {
+                "label": ["llm/quantization"],
+                "member_files": [
+                    "assumption/a.md", "assumption/b.md", "assumption/c.md",
+                ],
+            },
+        })))
+
+        # Note: the _SLUG_LINE_RE regex requires the LLM slug to start
+        # with [a-z0-9], so a pure-garbage slug like "////" never even
+        # parses out — the captured group is empty and the heuristic
+        # is the only path used. Pinning that contract here so a future
+        # regex relaxation doesn't silently let garbage through.
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                # No SLUG line at all — just paragraph + TYPE.
+                json=_drafter_response(
+                    "claim\n"
+                    "TYPE: architecture\n"
+                ),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=tmp_path / "s.json",
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+        dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        # Heuristic-derived slug from "llm/quantization" → "llm-quantization".
+        target = (
+            tmp_path / "inbox" / "proposed-canonical"
+            / "llm-quantization.md"
+        )
+        assert target.is_file()
+
+
+# ---------------------------------------------------------------------------
+# WARN-1 (2026-05-10 code-review) — same-run + cross-run slug collision
+# resolution. Two distinct fingerprints competing for the same slug
+# must both land, with the second uniquified rather than overwriting
+# the first.
+# ---------------------------------------------------------------------------
+
+
+class TestSlugCollisionResolution:
+    def test_same_run_collision_uniquifies_second(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Two clusters whose first label slugifies identically — both
+        # would derive the same proposed_slug. The second must land at
+        # ``<slug>-2.md`` rather than overwrite the first.
+        (tmp_path / "assumption").mkdir()
+        for stem in ("a", "b", "c", "d", "e", "f"):
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_5": {
+                # First label slugifies to "topic-x".
+                "label": ["topic/x"],
+                "member_files": [
+                    "assumption/a.md", "assumption/b.md", "assumption/c.md",
+                ],
+            },
+            "semantic_7": {
+                # Different cluster, distinct fingerprint — but first
+                # label ALSO slugifies to "topic-x". The collision
+                # resolver must uniquify rather than silently overwrite.
+                "label": ["Topic X"],
+                "member_files": [
+                    "assumption/d.md", "assumption/e.md", "assumption/f.md",
+                ],
+            },
+        })))
+
+        # Drafter returns no SLUG line so each cluster uses its
+        # heuristic-derived slug ("topic-x" / "topic-x" — the
+        # collision).
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                json=_drafter_response("claim\nTYPE: architecture\n"),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=tmp_path / "s.json",
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        proposed_dir = tmp_path / "inbox" / "proposed-canonical"
+        first = proposed_dir / "topic-x.md"
+        second = proposed_dir / "topic-x-2.md"
+        assert first.is_file()
+        assert second.is_file()
+
+        # Both fingerprints recorded in state with their respective
+        # paths — neither was overwritten.
+        state_data = json.loads((tmp_path / "s.json").read_text())
+        assert len(state_data["proposals"]) == 2
+        slugs = sorted(p["proposed_slug"] for p in state_data["proposals"].values())
+        assert slugs == ["topic-x", "topic-x-2"]
+
+        # The collision-resolved log MUST fire with the original_slug +
+        # resolved_slug fields so an operator can grep for collisions.
+        # Per feedback_log_emission_test_pattern.md: pin the event AND
+        # the field shape, not just the count.
+        resolved = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.slug_collision_resolved"
+        ]
+        assert len(resolved) == 1
+        r = resolved[0]
+        assert r["original_slug"] == "topic-x"
+        assert r["resolved_slug"] == "topic-x-2"
+
+        # Run-complete log surfaces the collision counter so the CLI
+        # summary stays in sync with the production behavior.
+        completes = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.run_complete"
+        ]
+        assert len(completes) == 1
+        assert completes[0]["slug_collisions_resolved"] == 1
+
+    def test_prior_run_state_blocks_new_slug_claim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A prior run already owns ``topic-x`` (state entry exists,
+        # status pending). A NEW cluster with a DIFFERENT fingerprint
+        # whose slug derives to ``topic-x`` must NOT overwrite the
+        # prior run's file or state entry — must uniquify to
+        # ``topic-x-2``.
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+            STATUS_PENDING,
+        )
+
+        (tmp_path / "assumption").mkdir()
+        for stem in ("a", "b", "c"):
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+
+        # Pre-seed state with a pending proposal owning "topic-x".
+        state_path = tmp_path / "s.json"
+        prior_state = PatternMinerState(state_path)
+        prior_state.record_proposal(ProposalEntry(
+            fingerprint="prior_fp_xyz",
+            cluster_id="semantic_3",
+            labels=["unrelated/label"],
+            member_count=4,
+            proposed_at="2026-05-09T00:00:00+00:00",
+            proposed_path="inbox/proposed-canonical/topic-x.md",
+            proposed_slug="topic-x",
+            proposed_canonical_type="architecture",
+            status=STATUS_PENDING,
+        ))
+        prior_state.save()
+
+        # Also write a real file so reconcile_state sees it as still-
+        # pending (otherwise reconcile would mark it discarded — that's
+        # a separate behavior, not under test here).
+        proposed_dir = tmp_path / "inbox" / "proposed-canonical"
+        proposed_dir.mkdir(parents=True)
+        (proposed_dir / "topic-x.md").write_text(
+            "prior run's proposal — must not be overwritten",
+        )
+
+        # NEW cluster whose first label slugifies to "topic-x" (collides
+        # with the prior run's claim).
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_99": {
+                "label": ["topic/x"],
+                "member_files": [
+                    "assumption/a.md", "assumption/b.md", "assumption/c.md",
+                ],
+            },
+        })))
+
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                json=_drafter_response("new claim\nTYPE: architecture\n"),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=state_path,
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+        dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        # Prior file's contents intact.
+        assert (proposed_dir / "topic-x.md").read_text() == (
+            "prior run's proposal — must not be overwritten"
+        )
+        # New proposal lives at -2.
+        assert (proposed_dir / "topic-x-2.md").is_file()
+
+        # Both state entries present, one each.
+        state_data = json.loads(state_path.read_text())
+        assert len(state_data["proposals"]) == 2
+        slugs_by_fp = {
+            fp: e["proposed_slug"]
+            for fp, e in state_data["proposals"].items()
+        }
+        assert slugs_by_fp["prior_fp_xyz"] == "topic-x"
+        # The new fingerprint (computed at runtime) maps to topic-x-2.
+        new_fps = [fp for fp in slugs_by_fp if fp != "prior_fp_xyz"]
+        assert len(new_fps) == 1
+        assert slugs_by_fp[new_fps[0]] == "topic-x-2"
+
+    def test_three_collisions_in_one_run_yield_three_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Three clusters all wanting "topic-x" — must land as
+        # topic-x.md, topic-x-2.md, topic-x-3.md.
+        (tmp_path / "assumption").mkdir()
+        for stem in "abcdefghi":
+            (tmp_path / "assumption" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\n---\n\nbody\n",
+            )
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_1": {
+                "label": ["topic/x"],
+                "member_files": [
+                    "assumption/a.md", "assumption/b.md", "assumption/c.md",
+                ],
+            },
+            "semantic_2": {
+                "label": ["Topic X"],
+                "member_files": [
+                    "assumption/d.md", "assumption/e.md", "assumption/f.md",
+                ],
+            },
+            "semantic_3": {
+                "label": ["TOPIC-X"],
+                "member_files": [
+                    "assumption/g.md", "assumption/h.md", "assumption/i.md",
+                ],
+            },
+        })))
+
+        def _dispatch(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                json=_drafter_response("claim\nTYPE: architecture\n"),
+            )
+        _patch_httpx_for_drafter(monkeypatch, _dispatch)
+
+        cfg = _config(
+            vault_path=tmp_path,
+            state_path=tmp_path / "s.json",
+            surveyor_state_path=surveyor_state_path,
+            drafter_endpoint="http://x",
+            drafter_model="qwen",
+        )
+        dcli.cmd_mine_patterns(cfg, dry_run=False)
+
+        proposed_dir = tmp_path / "inbox" / "proposed-canonical"
+        assert (proposed_dir / "topic-x.md").is_file()
+        assert (proposed_dir / "topic-x-2.md").is_file()
+        assert (proposed_dir / "topic-x-3.md").is_file()

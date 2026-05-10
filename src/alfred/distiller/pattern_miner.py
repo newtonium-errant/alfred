@@ -1035,6 +1035,8 @@ class MineResult:
     proposed: list[ProposalCandidate] = field(default_factory=list)
     skipped_dedup: int = 0
     skipped_no_slug: int = 0
+    skipped_slug_unresolvable: int = 0
+    slug_collisions_resolved: int = 0
     drafter_failures: int = 0
     reconcile_promoted: int = 0
     reconcile_discarded: int = 0
@@ -1171,7 +1173,21 @@ def mine_patterns(
         return result
 
     # 6. For each survivor: drafter call + markdown write + state record.
+    #
+    # Pre-seed the within-run slug claim set with slugs already owned
+    # by prior runs' state entries (any status). Without this, a fresh
+    # mine could produce ``local-llm-hardware.md`` overwriting a prior
+    # run's pending or already-promoted file of the same slug — silent
+    # data loss. The same set is augmented per-iteration so two new
+    # candidates competing for the same slug within ONE run also
+    # uniquify cleanly. Per WARN-1 in the 2026-05-10 code-review pass.
+    claimed_slugs: set[str] = set()
+    for entry in state.proposals.values():
+        if entry.proposed_slug:
+            claimed_slugs.add(entry.proposed_slug)
     drafter_failures = 0
+    skipped_slug_unresolvable = 0
+    slug_collisions_resolved = 0
     for candidate in survivors:
         # LLM draft. Empty endpoint = skip the drafter and use a
         # placeholder paragraph (operator will write the claim manually).
@@ -1194,7 +1210,57 @@ def mine_patterns(
             proposed_canonical_type = draft.llm_type_suggestion
         proposed_slug = candidate.proposed_slug
         if draft.llm_slug_suggestion:
-            proposed_slug = draft.llm_slug_suggestion
+            # Re-slugify the LLM's suggestion before assignment. The
+            # _SLUG_LINE_RE regex permits trailing hyphens and the
+            # current ``_parse_drafter_response`` only lower-cases — both
+            # would let an ill-formed shape (e.g. ``local-llm-hardware-``)
+            # through to the filesystem. ``slugify()`` is the single
+            # source of truth for slug shape; any operator-facing path
+            # that derives a slug must pass through it. Per WARN-2 in
+            # the 2026-05-10 code-review pass.
+            normalized = slugify(draft.llm_slug_suggestion)
+            if normalized:
+                proposed_slug = normalized
+
+        # Resolve same-run + cross-run slug collisions by appending a
+        # numeric suffix until the slug is unique against both prior-
+        # run state claims AND within-run claims. Cap the search at 50
+        # attempts so a pathological collision storm can't spin
+        # indefinitely; if 50 isn't enough the cluster is dropped with
+        # a load-bearing log so the operator can investigate. Per
+        # WARN-1 in the 2026-05-10 code-review pass.
+        original_slug = proposed_slug
+        if proposed_slug in claimed_slugs:
+            uniquified: str | None = None
+            for n in range(2, 52):  # 2..51 inclusive → 50 attempts
+                candidate_slug = f"{original_slug}-{n}"
+                if candidate_slug not in claimed_slugs:
+                    uniquified = candidate_slug
+                    break
+            if uniquified is None:
+                # Pathological — log + skip rather than silently
+                # overwrite. The cluster will surface again on the next
+                # mine pass once the operator clears one of the
+                # colliding slugs.
+                log.warning(
+                    "pattern_miner.slug_unresolvable",
+                    cluster_id=candidate.cluster.cluster_id,
+                    fingerprint=candidate.fingerprint,
+                    original_slug=original_slug,
+                    attempts=50,
+                )
+                skipped_slug_unresolvable += 1
+                continue
+            log.info(
+                "pattern_miner.slug_collision_resolved",
+                cluster_id=candidate.cluster.cluster_id,
+                fingerprint=candidate.fingerprint,
+                original_slug=original_slug,
+                resolved_slug=uniquified,
+            )
+            proposed_slug = uniquified
+            slug_collisions_resolved += 1
+        claimed_slugs.add(proposed_slug)
 
         # Compute the final proposed_path now that we know the slug.
         # vault-relative for portability; the writer resolves against
@@ -1238,6 +1304,8 @@ def mine_patterns(
         result.proposed.append(candidate)
 
     result.drafter_failures = drafter_failures
+    result.skipped_slug_unresolvable = skipped_slug_unresolvable
+    result.slug_collisions_resolved = slug_collisions_resolved
 
     # 7. Save state ONCE at the end (atomic; one .tmp → rename per run).
     if not dry_run and result.proposed:
@@ -1250,6 +1318,8 @@ def mine_patterns(
         proposed=len(result.proposed),
         skipped_dedup=skipped_dedup,
         skipped_no_slug=skipped_no_slug,
+        skipped_slug_unresolvable=skipped_slug_unresolvable,
+        slug_collisions_resolved=slug_collisions_resolved,
         drafter_failures=drafter_failures,
         reconcile=reconcile,
         dry_run=dry_run,
