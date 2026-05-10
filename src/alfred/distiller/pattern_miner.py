@@ -483,42 +483,59 @@ def evaluate_cluster(
 
 
 # ---------------------------------------------------------------------------
-# Drafting prompt — inline constant per the dispatch's c1 discipline
+# Drafting prompt — externalized to a bundled .md file (2026-05-10)
 # ---------------------------------------------------------------------------
 #
-# Q5 prompt verbatim from the design memo. Externalization to a
-# ``prompts/`` file is a deferred follow-up if prompt-tuner needs to
-# iterate. For v1 the prompt lives here so the call site is the single
-# source of truth.
+# Originally an inline constant per the design memo's c1 discipline.
+# Externalized after the Phase 4 first-live-run review found severe W1
+# voice mismatch (9/10 proposals) — the prompt-tuner is hook-blocked
+# from editing inline Python prompt constants (precedent: commit
+# ``9904730`` 2026-05-09, voice-prompts externalization). Stage 1 ships
+# the mechanical refactor only; content changes (refusal sentinel,
+# split sentinel, voice alignment) land in stage 2 against the now-
+# externalized .md file.
 #
-# The two ``{labels}`` and ``{count}`` placeholders are substituted at
-# call time. ``{members_with_previews}`` carries the cluster's member
-# titles + body previews; the writer assembles this string from the
-# cluster's vault paths.
+# Loader semantics mirror ``alfred.distiller.pipeline._load_stage_prompt``
+# exactly: ``importlib.resources``-located parent dir, fresh read per
+# call (so prompt-tuner edits land without daemon restart), warning +
+# empty string on missing file (the empty string falls through to
+# ``str.format`` which propagates the missing-prompt as a render-time
+# diagnostic rather than a silent KeyError mid-call).
+#
+# Placeholders kept byte-identical with the prior inline constant:
+# ``{labels}`` and ``{count}`` substituted at call time;
+# ``{members_with_previews}`` carries the cluster's member titles +
+# body previews assembled from vault paths.
 
-DRAFT_PROMPT_TEMPLATE: str = """\
-You are reading a cluster of related documents from a developer's knowledge vault.
-The cluster has cohered semantically but has not yet been promoted to a canonical
-named artifact (architecture/<theme>.md or principles/<rule>.md).
 
-Your job: write a SINGLE-PARAGRAPH (3-5 sentences) summary of what unifies these
-documents — the theme that nobody has named yet. Be specific and concrete. Cite
-patterns, not generic categories.
+def _load_draft_prompt_template() -> str:
+    """Load the Phase 4 drafter prompt from the bundled skills dir.
 
-Cluster labels (from surveyor): {labels}
-Document count: {count}
+    Path: ``src/alfred/_bundled/skills/vault-distiller/prompts/
+    draft_canonical_proposal.md``. Mirrors the canonical distiller
+    precedent (``alfred.distiller.pipeline._load_stage_prompt``) —
+    same parent dir, same fresh-per-call semantics, same warning-
+    plus-empty-string fallback on missing file.
 
-Documents:
-{members_with_previews}
+    Fresh read per call (no module-level cache, no ``functools.cache``)
+    so prompt-tuner edits to the .md file take effect on the NEXT
+    miner invocation without needing a daemon restart. The cost is
+    one filesystem stat + read per mining run, which is negligible
+    next to the per-cluster LLM call.
+    """
+    from alfred._data import get_skills_dir
 
-Respond with ONLY the paragraph. No preamble, no "the unifying theme is", just
-the claim.
-
-Then on a new line, suggest whether this is better as `architecture/<slug>.md`
-(structural design choice) or `principles/<slug>.md` (rule of practice). Format:
-TYPE: architecture|principles
-SLUG: <kebab-case-slug-no-extension>
-"""
+    prompt_path = (
+        get_skills_dir() / "vault-distiller" / "prompts"
+        / "draft_canonical_proposal.md"
+    )
+    if not prompt_path.exists():
+        log.warning(
+            "pattern_miner.prompt_not_found",
+            path=str(prompt_path),
+        )
+        return ""
+    return prompt_path.read_text(encoding="utf-8")
 
 
 # Per-call HTTP timeout. Phase 4's drafter is a single per-cluster call
@@ -669,7 +686,8 @@ def call_drafter(
         body_preview_chars=body_preview_chars,
         max_members=max_members,
     )
-    prompt = DRAFT_PROMPT_TEMPLATE.format(
+    template = _load_draft_prompt_template()
+    prompt = template.format(
         labels=", ".join(candidate.cluster.labels),
         count=len(candidate.cluster.member_files),
         members_with_previews=members_block,
