@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from .mutation_log import log_mutation
+from .mutation_log import append_to_audit_log, log_mutation
 from .ops import VaultError, vault_context, vault_create, vault_delete, vault_edit, vault_list, vault_move, vault_read, vault_search
 from .retype import vault_retype
 from .scope import ScopeError, check_scope
@@ -37,6 +37,110 @@ def _scope() -> str | None:
 
 def _session() -> str | None:
     return _env("ALFRED_VAULT_SESSION") or None
+
+
+def _audit_log_path() -> str | None:
+    """Audit-log destination for direct CLI invocations.
+
+    Set by the top-level ``cmd_vault`` dispatcher
+    (``src/alfred/cli.py``) to the per-instance ``logging.dir /
+    vault_audit.log``. Absent when ``alfred vault ...`` is invoked
+    outside the dispatcher (e.g. direct module-level test
+    invocations); in that case ``_log_or_audit`` silently no-ops,
+    preserving legacy behavior.
+    """
+    return _env("ALFRED_VAULT_AUDIT_LOG") or None
+
+
+def _single_mutation_dict(op: str, path: str, **extra: str) -> dict:
+    """Build the ``{files_created, files_modified, files_deleted}``
+    shape from one mutation. Mirrors
+    ``alfred.vault.mutation_log.read_mutations`` exactly so the CLI
+    fallback and the agent-backend flush path stay in lockstep —
+    same mapping of op-strings to bucket lists, same handling of
+    move's old/new path split.
+
+    Move semantics: a single move op is recorded as one delete (old
+    path) + one create (new path), matching ``read_mutations`` line
+    67-72. Caller must pass ``to=<new_path>`` in ``extra`` so the
+    create side has a target.
+
+    Retype semantics: retype is a create-at-target + delete-source
+    composite (see ``vault_retype``). The CLI passes
+    ``target=<target_path>`` in ``extra`` so we record both sides.
+    ``read_mutations`` doesn't know about retype because the agent
+    backends don't issue retype ops — only direct CLI does. This is
+    the one place CLI's op-set is a superset of the session-file
+    op-set; keeping the divergence here (not in mutation_log)
+    avoids polluting the session-file format with a CLI-only op.
+
+    Unknown op-strings produce an empty dict (no buckets filled) +
+    are silently skipped by the audit-log append.
+    """
+    created: list[str] = []
+    modified: list[str] = []
+    deleted: list[str] = []
+    if op == "create":
+        created.append(path)
+    elif op == "edit":
+        modified.append(path)
+    elif op == "move":
+        deleted.append(path)
+        to_path = str(extra.get("to", ""))
+        if to_path:
+            created.append(to_path)
+    elif op == "delete":
+        deleted.append(path)
+    elif op == "retype":
+        # retype = create new target + delete source (composite).
+        deleted.append(path)
+        target = str(extra.get("target", ""))
+        if target:
+            created.append(target)
+    return {
+        "files_created": created,
+        "files_modified": modified,
+        "files_deleted": deleted,
+    }
+
+
+def _log_or_audit(op: str, path: str, **extra: str | list[str]) -> None:
+    """Record a single mutation — session file when under agent
+    context, audit log when invoked directly via CLI.
+
+    Per-instance audit-log path comes from the
+    ``ALFRED_VAULT_AUDIT_LOG`` env var set by ``cmd_vault``
+    (mirrors ``logging.dir`` convention). Absent env var = no audit
+    context = silent no-op (preserves legacy behavior for callers
+    outside the dispatcher).
+
+    Precedence: when ``ALFRED_VAULT_SESSION`` is set, the agent
+    backend will collect the session file and flush it to the
+    audit log at wrap-up time — so the CLI must NOT also write to
+    the audit log here, or the mutation would be double-counted.
+    The session-file path takes precedence; audit-log fallback
+    only fires when no session is active.
+
+    Issue #64 (2026-05-10): direct ``alfred --config <c> vault ...``
+    invocations silently bypassed the audit log for ~10 days of
+    operator workflow because ``log_mutation`` early-returned on
+    missing session. This helper closes the gap.
+    """
+    session = _session()
+    if session:
+        log_mutation(session, op, path, **extra)
+        return
+    audit_path = _audit_log_path()
+    if not audit_path:
+        return
+    # str-only extras for _single_mutation_dict (list values like
+    # "fields" from edit are session-file-only diagnostics; the
+    # audit log doesn't carry them).
+    str_extras: dict[str, str] = {
+        k: v for k, v in extra.items() if isinstance(v, str)
+    }
+    mutations = _single_mutation_dict(op, path, **str_extras)
+    append_to_audit_log(audit_path, "cli", mutations, detail=f"vault {op} via CLI")
 
 
 def _ignore_dirs() -> list[str]:
@@ -175,7 +279,7 @@ def cmd_create(args: argparse.Namespace) -> None:
             set_fields=set_fields, body=body,
             scope=scope,
         )
-        log_mutation(_session(), "create", result["path"])
+        _log_or_audit("create", result["path"])
         _output(result)
     except VaultError as e:
         _error(str(e), details=getattr(e, "details", None))
@@ -241,8 +345,8 @@ def cmd_edit(args: argparse.Namespace) -> None:
             append_fields=append_fields or None,
             body_append=body_append,
         )
-        log_mutation(
-            _session(), "edit", result["path"],
+        _log_or_audit(
+            "edit", result["path"],
             fields=result["fields_changed"],
         )
         _output(result)
@@ -260,8 +364,8 @@ def cmd_move(args: argparse.Namespace) -> None:
     vault = _vault_path()
     try:
         result = vault_move(vault, args.source, args.dest)
-        log_mutation(
-            _session(), "move", result["from"],
+        _log_or_audit(
+            "move", result["from"],
             to=result["to"],
         )
         _output(result)
@@ -307,8 +411,8 @@ def cmd_retype(args: argparse.Namespace) -> None:
         _error(str(exc), details=details)
 
     if not getattr(args, "dry_run", False):
-        log_mutation(
-            _session(), "retype", args.path,
+        _log_or_audit(
+            "retype", args.path,
             target=report.target_path,
             target_type=report.target_type,
         )
@@ -326,7 +430,7 @@ def cmd_delete(args: argparse.Namespace) -> None:
     vault = _vault_path()
     try:
         result = vault_delete(vault, args.path)
-        log_mutation(_session(), "delete", result["path"])
+        _log_or_audit("delete", result["path"])
         _output(result)
     except VaultError as e:
         _error(str(e))

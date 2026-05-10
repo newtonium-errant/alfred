@@ -866,6 +866,7 @@ def cmd_vault(args: argparse.Namespace) -> None:
     # Route logs to a dedicated file sink. The vault CLI emits JSON on stdout
     # that calling agents parse, so logging MUST NOT leak to stdout.
     # suppress_stdout=True is load-bearing for the JSON contract.
+    raw: dict[str, Any] = {}
     try:
         raw = _load_unified_config(args.config)
         _setup_logging_from_config(raw, tool="vault", suppress_stdout=True)
@@ -876,6 +877,32 @@ def cmd_vault(args: argparse.Namespace) -> None:
     except Exception:
         # Never let logging setup break the vault CLI contract (JSON stdout).
         pass
+
+    # Issue #64 — direct CLI invocations bypassed ``vault_audit.log``
+    # because mutation logging required ``ALFRED_VAULT_SESSION`` (only
+    # set by agent backends). Wire the audit-log path into the
+    # environment here so ``vault/cli.py``'s ``_log_or_audit`` helper
+    # can append-to-audit-log when no session is active. Mirrors the
+    # ``cmd_exec`` precedent (cli.py:942): ``logging.dir`` is the
+    # per-instance-correct parent (Salem -> ``./data``, KAL-LE ->
+    # ``/home/andrew/.alfred/kalle/data``).
+    #
+    # Only set the env var if we successfully loaded the unified config
+    # — without a known logging.dir we'd be writing to an arbitrary
+    # path which is worse than the legacy no-op behavior. The CLI
+    # fallback in vault/cli.py treats an absent env var as "no audit
+    # context" and silently no-ops, preserving the contract for
+    # standalone test invocations that don't go through this dispatcher.
+    if raw:
+        log_cfg = raw.get("logging", {}) or {}
+        log_dir = log_cfg.get("dir", "./data")
+        audit_path = Path(log_dir) / "vault_audit.log"
+        # Respect a caller-set ALFRED_VAULT_AUDIT_LOG override (lets
+        # tests / one-off invocations point at a different path without
+        # rewriting config). Convention matches ALFRED_VAULT_PATH /
+        # ALFRED_VAULT_SCOPE / ALFRED_VAULT_SESSION precedence.
+        if not os.environ.get("ALFRED_VAULT_AUDIT_LOG"):
+            os.environ["ALFRED_VAULT_AUDIT_LOG"] = str(audit_path)
 
     from alfred.vault.cli import handle_vault_command
     handle_vault_command(args)
