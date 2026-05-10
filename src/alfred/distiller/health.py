@@ -32,12 +32,28 @@ _KNOWN_BACKENDS = ("claude", "zo", "openclaw")
 
 
 # Stale-threshold calibrations for the last-successful-extraction probe.
-# Distiller's default cadence is hourly
-# (``extraction.interval_seconds = 3600``); 90min OK / 90min..4h WARN /
-# >4h FAIL gives one full grace cycle before WARN and three before
-# FAIL. Module-level constants so a tune is a 1-line change.
-_DISTILLER_STALE_OK_MINUTES = 90
-_DISTILLER_STALE_FAIL_MINUTES = 240
+#
+# Recalibrated 2026-05-10 after smoke-test FAIL on healthy daemon: the
+# previous 90min / 240min values were premised on the false assumption
+# that distiller extracts hourly. It does NOT — the hourly
+# ``extraction.interval_seconds = 3600`` is just the loop tick that
+# re-checks whether the deep-extraction window is due. The only path
+# that writes to ``state.runs[*]`` / ``state.last_deep_extraction`` is
+# the daily deep extraction at 03:30 ADT (06:30 UTC) per
+# ``extraction.deep_extraction_schedule``. Hourly light scans don't
+# touch state.
+#
+# Recalibrated thresholds mirror janitor's daily-sweep shape (30h OK /
+# 48h FAIL) since both daemons fire-and-record once per day. One full
+# grace cycle before WARN; multi-day silence before FAIL.
+#
+# Out of scope here (deferred follow-ups): a separate
+# ``last-successful-light-scan`` probe would catch a loop-died-mid-day
+# failure mode the current probe wouldn't surface for 30+ hours;
+# requires the hourly tick to write to state, which it currently
+# doesn't.
+_DISTILLER_STALE_OK_HOURS = 30
+_DISTILLER_STALE_FAIL_HOURS = 48
 
 
 def _check_vault(raw: dict[str, Any]) -> CheckResult:
@@ -203,17 +219,22 @@ def _read_distiller_most_recent_run(state_path: Path) -> str | None:
 def _check_last_successful_extraction(raw: dict[str, Any]) -> CheckResult:
     """Validate that the distiller daemon has run an extraction recently.
 
-    Distiller's hourly cadence is tighter than janitor's (hourly vs
-    daily) — thresholds reflect that. 90min OK gives a 30min grace
-    window past the 1h interval; 4h FAIL means three full intervals
-    have elapsed without any extraction completing.
+    Distiller's deep extraction (the only path that writes to
+    ``state.runs[*]`` / ``state.last_deep_extraction``) fires once per
+    day per ``extraction.deep_extraction_schedule`` (default 03:30 ADT
+    / 06:30 UTC). The hourly ``extraction.interval_seconds = 3600`` is
+    just the loop tick that re-checks whether the deep-extraction
+    window is due — light scans don't touch state. Thresholds reflect
+    the daily cadence:
 
-    Status mapping:
       * SKIP if state file missing (fresh install) / no runs recorded /
         unparseable
-      * OK   if most-recent-run <= 90min ago
-      * WARN if most-recent-run 90min..4h ago (one missed run)
-      * FAIL if most-recent-run > 4h ago (multi-cycle silent failure)
+      * OK   if most-recent-run <= 30h ago
+      * WARN if most-recent-run 30h..48h ago (one missed daily run)
+      * FAIL if most-recent-run > 48h ago (multi-day silent failure)
+
+    Mirrors janitor's daily-sweep thresholds — both daemons fire-and-
+    record once per day.
 
     "Now" is computed in UTC because distiller's RunResult.timestamp
     is written in UTC. No timezone config to consult.
@@ -258,31 +279,31 @@ def _check_last_successful_extraction(raw: dict[str, Any]) -> CheckResult:
 
     now = datetime.now(timezone.utc)
     elapsed = now - most_recent
-    elapsed_minutes = elapsed.total_seconds() / 60.0
+    elapsed_hours = elapsed.total_seconds() / 3600.0
     payload: dict[str, Any] = {
         "state_path": str(state_path),
         "last_extraction": most_recent_iso,
-        "elapsed_minutes": round(elapsed_minutes, 1),
+        "elapsed_hours": round(elapsed_hours, 2),
     }
 
-    if elapsed < timedelta(minutes=_DISTILLER_STALE_OK_MINUTES):
+    if elapsed < timedelta(hours=_DISTILLER_STALE_OK_HOURS):
         return CheckResult(
             name="last-successful-extraction",
             status=Status.OK,
-            detail=f"last extraction {round(elapsed_minutes)}min ago",
+            detail=f"last extraction {round(elapsed_hours, 1)}h ago",
             data=payload,
         )
-    if elapsed < timedelta(minutes=_DISTILLER_STALE_FAIL_MINUTES):
+    if elapsed < timedelta(hours=_DISTILLER_STALE_FAIL_HOURS):
         return CheckResult(
             name="last-successful-extraction",
             status=Status.WARN,
-            detail=f"last extraction {round(elapsed_minutes)}min ago (one missed run)",
+            detail=f"last extraction {round(elapsed_hours, 1)}h ago (one missed run)",
             data=payload,
         )
     return CheckResult(
         name="last-successful-extraction",
         status=Status.FAIL,
-        detail=f"last extraction {round(elapsed_minutes)}min ago (daemon may be silently failing)",
+        detail=f"last extraction {round(elapsed_hours, 1)}h ago (daemon may be silently failing)",
         data=payload,
     )
 
