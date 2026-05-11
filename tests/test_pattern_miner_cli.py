@@ -3012,3 +3012,507 @@ class TestCmdDistillerDispatcherWiring:
         cmd_distiller(self._make_args(config, "promote-proposal"))
         # Override preserved.
         assert captured["audit_log"] == override
+
+
+# ---------------------------------------------------------------------------
+# Stage 2e semantic-dupe + canonical-as-source integration tests
+# (2026-05-11). Closes the 40% → 22% promote-rate drop observed during
+# second-batch processing: surveyor re-clustered yesterday's promoted
+# members under new slugs, slug-match gate missed, operator manually
+# discarded the duplicates. The two new gate rules catch these before
+# the drafter runs.
+# ---------------------------------------------------------------------------
+
+
+def _config_with_threshold(
+    *,
+    vault_path: Path,
+    state_path: Path,
+    surveyor_state_path: Path,
+    jaccard_threshold: float = 0.5,
+) -> DistillerConfig:
+    """``_config`` helper variant that exposes ``jaccard_threshold``."""
+    cfg = DistillerConfig(vault=VaultConfig(path=str(vault_path)))
+    cfg.pattern_miner = PatternMinerConfig(
+        enabled=True,
+        surveyor_state_path=str(surveyor_state_path),
+        proposed_dir="inbox/proposed-canonical",
+        min_cluster_size=3,
+        canonical_match_dirs=["architecture", "principles", "stack"],
+        label_denylist=[],
+        jaccard_threshold=jaccard_threshold,
+        state=PatternMinerStateConfig(path=str(state_path)),
+        openrouter=PatternMinerOpenRouterConfig(),
+    )
+    return cfg
+
+
+class TestCanonicalAsSourceGate:
+    def test_cluster_with_canonical_member_rejected_and_log_fires(
+        self, tmp_path: Path,
+    ) -> None:
+        # Bug-of-record case from 2026-05-11: surveyor pulled an
+        # already-canonical record (``principles/voice-corpus.md``)
+        # into today's cluster as a "source member." The new gate
+        # rejects + logs the matched canonical path so the operator
+        # can grep "which canonical record reappeared."
+        import structlog
+
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        from alfred.distiller.pattern_miner import mine_patterns
+
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_5": {
+                "label": ["voice/training"],
+                "member_files": [
+                    "assumption/voice-tier-a.md",
+                    "principles/voice-corpus.md",  # canonical surface!
+                    "decision/voice-cluster.md",
+                    "assumption/voice-tier-b.md",
+                ],
+            },
+        })))
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.load()
+        proposed_dir = tmp_path / "inbox" / "proposed-canonical"
+
+        with structlog.testing.capture_logs() as captured:
+            result = mine_patterns(
+                vault_path=tmp_path,
+                surveyor_state_path=surveyor_state_path,
+                state=state,
+                proposed_dir=proposed_dir,
+                canonical_match_dirs=("architecture", "principles", "stack"),
+                drafter_endpoint="",  # skip drafter
+                dry_run=True,
+            )
+
+        # Cluster rejected.
+        assert result.skipped_canonical_as_source == 1
+        assert len(result.proposed) == 0
+        # Log fired with the matched canonical-member path.
+        logs = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.cluster_canonical_as_source"
+        ]
+        assert len(logs) == 1
+        assert logs[0]["canonical_member"] == "principles/voice-corpus.md"
+        assert logs[0]["cluster_id"] == "semantic_5"
+
+    def test_cluster_without_canonical_member_passes_through(
+        self, tmp_path: Path,
+    ) -> None:
+        # Regression pin: cluster where NO member is canonical should
+        # NOT trigger the gate. (Catches a future widening of the
+        # canonical-dir check that accidentally rejects everything.)
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        from alfred.distiller.pattern_miner import mine_patterns
+
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_5": {
+                "label": ["new/theme"],
+                "member_files": [
+                    "assumption/a.md",
+                    "constraint/b.md",
+                    "decision/c.md",
+                ],
+            },
+        })))
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.load()
+        proposed_dir = tmp_path / "inbox" / "proposed-canonical"
+
+        result = mine_patterns(
+            vault_path=tmp_path,
+            surveyor_state_path=surveyor_state_path,
+            state=state,
+            proposed_dir=proposed_dir,
+            canonical_match_dirs=("architecture", "principles", "stack"),
+            drafter_endpoint="",
+            dry_run=True,
+        )
+        # Cluster passed both new gates; survives to dry-run proposal.
+        assert result.skipped_canonical_as_source == 0
+        assert result.skipped_semantic_dupe == 0
+        assert result.survivors == 1
+
+
+class TestSemanticDupeGate:
+    def test_bug_of_record_yesterday_promote_matches_today_cluster(
+        self, tmp_path: Path,
+    ) -> None:
+        # The exact failure mode from 2026-05-11 second-batch
+        # processing: yesterday's promoted entry has member set M;
+        # today's cluster has identical (or near-identical) member
+        # set M' but under a new LLM-named slug. Jaccard ≥ threshold
+        # → reject.
+        import structlog
+
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+            STATUS_PROMOTED,
+        )
+        from alfred.distiller.pattern_miner import mine_patterns
+
+        yesterday_members = [
+            "constraint/telegram-1.md",
+            "constraint/telegram-2.md",
+            "decision/telegram-3.md",
+            "constraint/telegram-4.md",
+        ]
+
+        # Yesterday's promoted entry with the member list populated
+        # (stage 2e writeback contract).
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.record_proposal(ProposalEntry(
+            fingerprint="fp_yesterday_promoted",
+            cluster_id="semantic_prior",
+            proposed_slug="telegram-handlers",
+            proposed_canonical_type="architecture",
+            status=STATUS_PROMOTED,
+            promoted_to="architecture/telegram-handlers.md",
+            promoted_at="2026-05-10T18:00:00+00:00",
+            source_member_files=yesterday_members,
+        ))
+        state.save()
+
+        # Today's cluster — identical members, different LLM-named
+        # slug. The bug-of-record shape.
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_today": {
+                "label": ["telegram/bot-command-handling"],
+                "member_files": yesterday_members,  # SAME members
+            },
+        })))
+
+        proposed_dir = tmp_path / "inbox" / "proposed-canonical"
+
+        with structlog.testing.capture_logs() as captured:
+            result = mine_patterns(
+                vault_path=tmp_path,
+                surveyor_state_path=surveyor_state_path,
+                state=state,
+                proposed_dir=proposed_dir,
+                canonical_match_dirs=("architecture", "principles", "stack"),
+                drafter_endpoint="",
+                jaccard_threshold=0.5,
+                dry_run=True,
+            )
+
+        # Rejected as semantic dupe.
+        assert result.skipped_semantic_dupe == 1
+        assert len(result.proposed) == 0
+        # Log fired with operator-grep fields.
+        logs = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.cluster_semantic_dupe"
+        ]
+        assert len(logs) == 1
+        assert logs[0]["max_jaccard"] == 1.0
+        # Match references yesterday's fingerprint.
+        assert logs[0]["matched_prior_fingerprint"].startswith(
+            "fp_yesterday"
+        )
+
+    def test_threshold_below_overlap_rejects(self, tmp_path: Path) -> None:
+        # 2-of-4 overlap on each side → Jaccard 0.5 exactly. At
+        # threshold 0.5 it rejects (>=). Pinning the boundary
+        # behavior: 0.49 threshold would also reject, 0.51 would not.
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+            STATUS_PROMOTED,
+        )
+        from alfred.distiller.pattern_miner import mine_patterns
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.record_proposal(ProposalEntry(
+            fingerprint="fp_prior",
+            status=STATUS_PROMOTED,
+            source_member_files=["a.md", "b.md"],
+        ))
+        state.save()
+
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_today": {
+                "label": ["new/theme"],
+                "member_files": ["a.md", "b.md", "c.md", "d.md"],
+            },
+        })))
+
+        result = mine_patterns(
+            vault_path=tmp_path,
+            surveyor_state_path=surveyor_state_path,
+            state=state,
+            proposed_dir=tmp_path / "inbox" / "proposed-canonical",
+            canonical_match_dirs=("architecture", "principles", "stack"),
+            drafter_endpoint="",
+            jaccard_threshold=0.5,
+            dry_run=True,
+        )
+        # |∩|=2, |∪|=4 → 0.5 exactly. ≥ threshold → reject.
+        assert result.skipped_semantic_dupe == 1
+
+    def test_threshold_above_overlap_passes(self, tmp_path: Path) -> None:
+        # Same input as above, but threshold tightened to 0.6 → 0.5
+        # NOT ≥ 0.6 → passes through to drafter.
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+            STATUS_PROMOTED,
+        )
+        from alfred.distiller.pattern_miner import mine_patterns
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.record_proposal(ProposalEntry(
+            fingerprint="fp_prior",
+            status=STATUS_PROMOTED,
+            source_member_files=["a.md", "b.md"],
+        ))
+        state.save()
+
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_today": {
+                "label": ["new/theme"],
+                "member_files": ["a.md", "b.md", "c.md", "d.md"],
+            },
+        })))
+
+        result = mine_patterns(
+            vault_path=tmp_path,
+            surveyor_state_path=surveyor_state_path,
+            state=state,
+            proposed_dir=tmp_path / "inbox" / "proposed-canonical",
+            canonical_match_dirs=("architecture", "principles", "stack"),
+            drafter_endpoint="",
+            jaccard_threshold=0.6,
+            dry_run=True,
+        )
+        # 0.5 < 0.6 → not rejected; cluster proceeds.
+        assert result.skipped_semantic_dupe == 0
+        assert result.survivors == 1
+
+    def test_pre_2e_state_no_false_rejects(self, tmp_path: Path) -> None:
+        # Pre-stage-2e state entries have empty source_member_files
+        # (no writeback at promote time). Jaccard against empty set
+        # is 0.0 → no false rejects from legacy entries. Critical for
+        # the schema migration path.
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+            STATUS_PROMOTED,
+        )
+        from alfred.distiller.pattern_miner import mine_patterns
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        # Legacy entry: status promoted, source_member_files empty
+        # (pre-stage-2e writeback didn't populate this field).
+        state.record_proposal(ProposalEntry(
+            fingerprint="fp_legacy",
+            status=STATUS_PROMOTED,
+            source_member_files=[],
+        ))
+        state.save()
+
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_today": {
+                "label": ["new/theme"],
+                "member_files": ["a.md", "b.md", "c.md"],
+            },
+        })))
+
+        result = mine_patterns(
+            vault_path=tmp_path,
+            surveyor_state_path=surveyor_state_path,
+            state=state,
+            proposed_dir=tmp_path / "inbox" / "proposed-canonical",
+            canonical_match_dirs=("architecture", "principles", "stack"),
+            drafter_endpoint="",
+            dry_run=True,
+        )
+        # Legacy entry's empty member set → Jaccard 0.0 → no reject.
+        assert result.skipped_semantic_dupe == 0
+        assert result.survivors == 1
+
+    def test_no_prior_terminal_entries_passes_through(
+        self, tmp_path: Path,
+    ) -> None:
+        # State with no terminal entries (fresh install or all
+        # entries still pending). Jaccard returns 0.0 → no rejects.
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        from alfred.distiller.pattern_miner import mine_patterns
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.load()  # empty state
+
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_today": {
+                "label": ["new/theme"],
+                "member_files": ["a.md", "b.md", "c.md"],
+            },
+        })))
+
+        result = mine_patterns(
+            vault_path=tmp_path,
+            surveyor_state_path=surveyor_state_path,
+            state=state,
+            proposed_dir=tmp_path / "inbox" / "proposed-canonical",
+            canonical_match_dirs=("architecture", "principles", "stack"),
+            drafter_endpoint="",
+            dry_run=True,
+        )
+        assert result.skipped_semantic_dupe == 0
+        assert result.survivors == 1
+
+
+class TestStage2eCounterSurface:
+    def test_counters_surface_in_cli_summary(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # End-to-end pin: both new counters appear in the operator-
+        # facing CLI summary. Catches a regression where the print
+        # statement drops one of the new fields.
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+            STATUS_PROMOTED,
+        )
+
+        # Seed state with a terminal entry whose members overlap with
+        # today's cluster → semantic-dupe reject.
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.record_proposal(ProposalEntry(
+            fingerprint="fp_prior",
+            status=STATUS_PROMOTED,
+            source_member_files=["a.md", "b.md", "c.md"],
+        ))
+        state.save()
+
+        # Cluster #1: triggers canonical-as-source.
+        # Cluster #2: triggers semantic-dupe.
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            "semantic_1": {
+                "label": ["topic/x"],
+                "member_files": [
+                    "assumption/a.md",
+                    "principles/already-canonical.md",
+                    "decision/b.md",
+                ],
+            },
+            "semantic_2": {
+                "label": ["topic/y"],
+                "member_files": ["a.md", "b.md", "c.md"],
+            },
+        })))
+
+        cfg = _config_with_threshold(
+            vault_path=tmp_path,
+            state_path=state_path,
+            surveyor_state_path=surveyor_state_path,
+        )
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+        dcli.cmd_mine_patterns(cfg, dry_run=True)
+
+        out = capsys.readouterr().out
+        # Both counters in the printed output.
+        assert "skipped_canonical_as_source=1" in out
+        assert "skipped_semantic_dupe=1" in out
+        # jaccard_threshold also surfaced in the config-summary line.
+        assert "jaccard_threshold=0.5" in out
+
+    def test_run_complete_log_carries_new_counter_fields(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Pin the run_complete log emission carries the two new
+        # counter fields. Per the standing log-emission test
+        # discipline (feedback_log_emission_test_pattern.md):
+        # observability tests must drive the production code path
+        # so a future refactor that drops a field fails loudly.
+        #
+        # Fixture mixes a SEMANTIC-DUPE cluster (drives the new
+        # counter) with a CLEAN cluster that survives the gate (so
+        # the mining loop reaches the survivor-processing path and
+        # ``run_complete`` actually fires). A dupe-only fixture
+        # would hit the ``no_candidates`` early-return — a separate
+        # log surface tested elsewhere — and miss the run_complete
+        # contract this test exists to pin.
+        import structlog
+
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+            STATUS_PROMOTED,
+        )
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.record_proposal(ProposalEntry(
+            fingerprint="fp_prior",
+            status=STATUS_PROMOTED,
+            source_member_files=["a.md", "b.md", "c.md"],
+        ))
+        state.save()
+
+        surveyor_state_path = tmp_path / "surv.json"
+        surveyor_state_path.write_text(json.dumps(_surveyor_state({
+            # Dupe — drives skipped_semantic_dupe=1.
+            "semantic_dupe": {
+                "label": ["topic/y"],
+                "member_files": ["a.md", "b.md", "c.md"],
+            },
+            # Clean cluster — survives gate; mining loop reaches
+            # survivor-processing → run_complete fires.
+            "semantic_clean": {
+                "label": ["new/fresh-theme"],
+                "member_files": [
+                    "assumption/x.md",
+                    "constraint/y.md",
+                    "decision/z.md",
+                ],
+            },
+        })))
+
+        cfg = _config_with_threshold(
+            vault_path=tmp_path,
+            state_path=state_path,
+            surveyor_state_path=surveyor_state_path,
+        )
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        with structlog.testing.capture_logs() as captured:
+            dcli.cmd_mine_patterns(cfg, dry_run=True)
+
+        runs = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.run_complete"
+        ]
+        assert len(runs) == 1
+        rc = runs[0]
+        # Both new counter fields present + non-zero on the dupe.
+        assert "skipped_canonical_as_source" in rc
+        assert "skipped_semantic_dupe" in rc
+        assert rc["skipped_semantic_dupe"] == 1

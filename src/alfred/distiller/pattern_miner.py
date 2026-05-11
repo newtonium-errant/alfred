@@ -373,6 +373,14 @@ def gate_cluster(
     canonical match is O(N_labels * N_segments). Bailing on the cheap
     checks first keeps the pass-loop fast on a vault with hundreds of
     clusters.
+
+    Two later gates (stage 2e, 2026-05-11) live OUTSIDE this function
+    because they need state and vault-path context that the pure gate
+    doesn't carry: :func:`_cluster_has_canonical_source` (canonical-as-
+    source-member detection) and :func:`_max_jaccard_against_terminal_entries`
+    (semantic-dupe via Jaccard against prior promoted/discarded
+    entries). The orchestrator in :func:`mine_patterns` chains them
+    after this check returns True.
     """
     if not cluster.labels:
         return False
@@ -383,6 +391,116 @@ def gate_cluster(
     if cluster_matches_canonical(cluster.labels, canonical_index):
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Stage 2e gate extensions (2026-05-11). Closes the semantic-duplicate
+# failure mode observed during the second-batch promote pass: surveyor
+# re-clustered yesterday's promoted members under new slugs the LLM
+# named differently, so the existing slug-match gate missed them. Two
+# new checks composable from the orchestrator after gate_cluster:
+#
+#   _cluster_has_canonical_source — cheap deterministic check;
+#     rejects when surveyor pulled an already-canonical record into
+#     today's cluster as a source member (e.g. yesterday's
+#     ``principles/voice-corpus.md`` reappearing in a cluster's
+#     member_files list).
+#
+#   _max_jaccard_against_terminal_entries — costlier per-entry walk;
+#     rejects when today's cluster's member set substantially
+#     overlaps with the member set of a prior promoted/discarded
+#     entry (the 4-of-9 duplicate batch on 2026-05-11).
+# ---------------------------------------------------------------------------
+
+
+# Module-level constant — operators can tune via
+# ``distiller.pattern_miner.jaccard_threshold`` config field.
+# The default 0.5 matches the dispatch calibration; the orchestrator
+# reads the config value, falling back to this constant only when
+# the config isn't supplied.
+_DEFAULT_JACCARD_THRESHOLD: float = 0.5
+
+
+def _cluster_has_canonical_source(
+    cluster: ClusterRecord,
+    canonical_match_dirs: list[str] | tuple[str, ...],
+) -> str | None:
+    """True (returns the matching member path) iff any cluster member
+    points at a file already under one of ``canonical_match_dirs``.
+
+    Returns the FIRST matching member path so the caller can log it
+    for operator review, or None when no member references canonical
+    surface. The check is path-prefix-only (operates on the
+    vault-relative member string); on-disk existence is NOT verified
+    here — a member path like ``principles/voice-corpus.md`` is
+    treated as canonical even if the file was renamed since surveyor
+    ran. This is intentional: the surveyor's view of "what's a
+    member" is the load-bearing signal; we reject as semantic dupe
+    on the SIGNAL, not on the current filesystem state.
+
+    Per the dispatch design: the existing slug-match gate already
+    handles the on-disk-canonical-file case. This one catches the
+    orthogonal case where surveyor surfaces an already-canonical
+    record AS a member of a new cluster.
+    """
+    canonical_dirs = set(canonical_match_dirs)
+    for member in cluster.member_files:
+        if not member:
+            continue
+        # Vault-relative path; first part is the top-level dir.
+        parts = Path(member).parts
+        if not parts:
+            continue
+        if parts[0] in canonical_dirs:
+            return member
+    return None
+
+
+def _max_jaccard_against_terminal_entries(
+    cluster_members: list[str],
+    state: PatternMinerState,
+) -> tuple[float, str]:
+    """Compute max Jaccard similarity of ``cluster_members`` against
+    every terminal-status (promoted/discarded) state entry's member
+    set. Returns ``(max_similarity, matched_fingerprint)``.
+
+    Jaccard formula::
+
+        |A ∩ B| / |A ∪ B|
+
+    Returns ``(0.0, "")`` when:
+      - cluster_members is empty
+      - state has no terminal entries with populated source_member_files
+      - all terminal entries have empty source_member_files (pre-stage-2e
+        legacy entries — the schema-tolerance default)
+
+    Returns the matching fingerprint so the caller can log it for
+    operator inspection. When multiple terminal entries tie on the
+    max similarity, the first-encountered wins (dict iteration
+    order in Python 3.7+ is insertion order; state.proposals is
+    keyed by fingerprint so the order is deterministic per state
+    file).
+    """
+    cluster_set = set(cluster_members)
+    if not cluster_set:
+        return 0.0, ""
+    max_sim = 0.0
+    matched_fp = ""
+    for fp, entry in state.proposals.items():
+        if entry.status not in (STATUS_PROMOTED, STATUS_DISCARDED):
+            continue
+        prior_set = set(entry.source_member_files)
+        if not prior_set:
+            continue
+        intersection = len(cluster_set & prior_set)
+        union = len(cluster_set | prior_set)
+        if union == 0:
+            continue
+        sim = intersection / union
+        if sim > max_sim:
+            max_sim = sim
+            matched_fp = fp
+    return max_sim, matched_fp
 
 
 # ---------------------------------------------------------------------------
@@ -1659,6 +1777,16 @@ class MineResult:
     # sweep walks split_pending the same way it walks pending).
     skipped_no_claim: int = 0
     flagged_split: int = 0
+    # Stage 2e (2026-05-11) — semantic-dupe gate counters. The two
+    # extra gate checks added after gate_cluster's 4-part rule:
+    #   skipped_canonical_as_source: rejected because a cluster member
+    #     is already a canonical record (surveyor pulled
+    #     ``principles/voice-corpus.md`` etc. into today's cluster).
+    #   skipped_semantic_dupe: rejected because cluster.member_files
+    #     overlap ≥ jaccard_threshold against a terminal-status
+    #     state entry's source_member_files.
+    skipped_canonical_as_source: int = 0
+    skipped_semantic_dupe: int = 0
     reconcile_promoted: int = 0
     reconcile_discarded: int = 0
     reconcile_still_pending: int = 0
@@ -1680,6 +1808,7 @@ def mine_patterns(
     drafter_model: str = "",
     drafter_api_key: str = "",
     instance_config_basename: str = "config.yaml",
+    jaccard_threshold: float = _DEFAULT_JACCARD_THRESHOLD,
     dry_run: bool = False,
     now_iso: str | None = None,
 ) -> MineResult:
@@ -1741,20 +1870,83 @@ def mine_patterns(
     )
 
     # 4. Gate + dedup pass.
+    #
+    # Six-stage filter chain per stage 2e (2026-05-11):
+    #   a. gate_cluster (4-part rule): labeled, substantive, no
+    #      slug-match against canonical, label-quality.
+    #   b. canonical-as-source: reject when a cluster member is
+    #      already a canonical record (surveyor re-surfaced one).
+    #   c. fingerprint-dedup: cluster already seen this run / prior.
+    #   d. semantic-dupe: cluster.member_files Jaccard ≥ threshold
+    #      against a terminal-status state entry.
+    #   e. slug-derivation: candidate must produce a valid slug.
+    #   f. top-n cap.
+    # Order is cheap-to-expensive — (a) and (e) are O(1), (b) is
+    # O(N_members), (c) is dict-lookup, (d) is O(M_terminal_entries
+    # * N_members_avg). Bailing on cheap checks first.
     survivors: list[ProposalCandidate] = []
     skipped_dedup = 0
     skipped_no_slug = 0
+    skipped_canonical_as_source = 0
+    skipped_semantic_dupe = 0
     for cluster in clusters:
-        # Gate first (cheap), then dedup.
+        # (a) gate_cluster — 4-part pure-function rule.
         if not gate_cluster(
             cluster, canonical_index, denylist,
             min_cluster_size=min_cluster_size,
         ):
             continue
+
+        # (b) canonical-as-source check — surveyor pulled an
+        # already-canonical record into this cluster as a member.
+        # Reject with operator-visible log (the matched member path
+        # is the load-bearing diagnostic for "which canonical
+        # record is reappearing").
+        canonical_source = _cluster_has_canonical_source(
+            cluster, canonical_match_dirs,
+        )
+        if canonical_source is not None:
+            log.info(
+                "pattern_miner.cluster_canonical_as_source",
+                cluster_id=cluster.cluster_id,
+                fingerprint=fingerprint_cluster(
+                    cluster.member_files, cluster.labels,
+                )[:12],
+                canonical_member=canonical_source,
+            )
+            skipped_canonical_as_source += 1
+            continue
+
         fp = fingerprint_cluster(cluster.member_files, cluster.labels)
+
+        # (c) fingerprint dedup — already seen this exact cluster.
         if state.has_entry_for_fingerprint(fp):
             skipped_dedup += 1
             continue
+
+        # (d) semantic-dupe via Jaccard against terminal-status
+        # entries. Catches surveyor's habit of re-clustering
+        # yesterday's promoted/discarded members under a new slug
+        # the LLM names differently. Threshold tunable via
+        # ``pattern_miner.jaccard_threshold`` config field;
+        # ``_DEFAULT_JACCARD_THRESHOLD = 0.5`` per the dispatch
+        # calibration.
+        max_sim, matched_fp = _max_jaccard_against_terminal_entries(
+            cluster.member_files, state,
+        )
+        if max_sim >= jaccard_threshold:
+            log.info(
+                "pattern_miner.cluster_semantic_dupe",
+                cluster_id=cluster.cluster_id,
+                fingerprint=fp[:12],
+                max_jaccard=round(max_sim, 3),
+                matched_prior_fingerprint=matched_fp[:12],
+                threshold=jaccard_threshold,
+            )
+            skipped_semantic_dupe += 1
+            continue
+
+        # (e) slug-derivation.
         slug = derive_proposed_slug(cluster.labels)
         if not slug:
             skipped_no_slug += 1
@@ -1766,12 +1958,16 @@ def mine_patterns(
             proposed_canonical_type=derive_proposed_canonical_type(cluster.labels),
         )
         survivors.append(candidate)
+
+        # (f) top-n cap.
         if top_n is not None and len(survivors) >= top_n:
             break
 
     result.survivors = len(survivors)
     result.skipped_dedup = skipped_dedup
     result.skipped_no_slug = skipped_no_slug
+    result.skipped_canonical_as_source = skipped_canonical_as_source
+    result.skipped_semantic_dupe = skipped_semantic_dupe
 
     # 5. Empty-state observability per the universal rule.
     if not survivors:
@@ -1780,6 +1976,8 @@ def mine_patterns(
             evaluated=len(clusters),
             skipped_dedup=skipped_dedup,
             skipped_no_slug=skipped_no_slug,
+            skipped_canonical_as_source=skipped_canonical_as_source,
+            skipped_semantic_dupe=skipped_semantic_dupe,
             reconcile=reconcile,
             proposed_dir=str(proposed_dir),
             dry_run=dry_run,
@@ -1981,6 +2179,13 @@ def mine_patterns(
                 proposed_slug=proposed_slug,
                 proposed_canonical_type=proposed_canonical_type,
                 status=entry_status,
+                # Stage 2e (2026-05-11) — persist member-file list so
+                # subsequent mine runs can compute Jaccard similarity
+                # against this entry (semantic-dupe gate). Pre-2e
+                # entries default to empty list and return Jaccard
+                # 0.0; new entries written from this point on populate
+                # the field correctly.
+                source_member_files=list(candidate.cluster.member_files),
             )
             state.record_proposal(entry)
 
@@ -2027,6 +2232,8 @@ def mine_patterns(
         skipped_slug_unresolvable=skipped_slug_unresolvable,
         slug_collisions_resolved=slug_collisions_resolved,
         skipped_no_claim=skipped_no_claim,
+        skipped_canonical_as_source=skipped_canonical_as_source,
+        skipped_semantic_dupe=skipped_semantic_dupe,
         flagged_split=flagged_split,
         drafter_failures=drafter_failures,
         reconcile=reconcile,

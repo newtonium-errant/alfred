@@ -456,6 +456,7 @@ def cmd_mine_patterns(
         drafter_model=drafter_model,
         drafter_api_key=drafter_api_key,
         instance_config_basename=instance_basename,
+        jaccard_threshold=pm.jaccard_threshold,
         dry_run=dry_run,
     )
 
@@ -463,7 +464,7 @@ def cmd_mine_patterns(
     print(
         f"surveyor_state={surveyor_state_path}  proposed_dir={proposed_dir}\n"
         f"min_cluster_size={effective_min}  top={effective_top}  "
-        f"dry_run={dry_run}"
+        f"jaccard_threshold={pm.jaccard_threshold}  dry_run={dry_run}"
     )
     print(
         f"\nReconcile sweep: promoted={result.reconcile_promoted}  "
@@ -479,6 +480,8 @@ def cmd_mine_patterns(
         f"skipped_no_slug={result.skipped_no_slug}  "
         f"skipped_slug_unresolvable={result.skipped_slug_unresolvable}  "
         f"skipped_no_claim={result.skipped_no_claim}\n"
+        f"  skipped_canonical_as_source={result.skipped_canonical_as_source}  "
+        f"skipped_semantic_dupe={result.skipped_semantic_dupe}\n"
         f"  slug_collisions_resolved={result.slug_collisions_resolved}  "
         f"drafter_failures={result.drafter_failures}"
     )

@@ -202,6 +202,51 @@ class TestPerActionFieldsSchema:
         assert as_dict["discarded_reason"] == ""
 
 
+class TestSourceMemberFilesSchema:
+    """Stage 2e (2026-05-11) — pin the ``source_member_files`` field
+    round-trips cleanly + legacy entries without it default to empty
+    list (the Jaccard 0.0 path → no false rejects).
+    """
+
+    def test_source_member_files_round_trip(self) -> None:
+        members = [
+            "assumption/a.md",
+            "constraint/b.md",
+            "decision/c.md",
+        ]
+        original = ProposalEntry(
+            fingerprint="abc123",
+            cluster_id="c1",
+            proposed_slug="topic-x",
+            source_member_files=members,
+        )
+        restored = ProposalEntry.from_dict(original.to_dict())
+        assert restored.source_member_files == members
+
+    def test_legacy_entry_defaults_to_empty_list(self) -> None:
+        # Pre-stage-2e state files have no source_member_files field.
+        # Default empty list → Jaccard always 0.0 → no false rejects.
+        entry = ProposalEntry.from_dict({
+            "fingerprint": "legacy",
+            "status": "promoted",
+        })
+        assert entry.source_member_files == []
+        # Mutating it doesn't affect other instances (no shared default).
+        entry.source_member_files.append("a.md")
+        other = ProposalEntry.from_dict({"fingerprint": "other"})
+        assert other.source_member_files == []
+
+    def test_to_dict_emits_source_member_files(self) -> None:
+        entry = ProposalEntry(fingerprint="abc", source_member_files=["a.md"])
+        as_dict = entry.to_dict()
+        assert as_dict["source_member_files"] == ["a.md"]
+
+    def test_to_dict_emits_empty_list_for_unset(self) -> None:
+        entry = ProposalEntry(fingerprint="abc")
+        as_dict = entry.to_dict()
+        assert as_dict["source_member_files"] == []
+
+
 # ---------------------------------------------------------------------------
 # PatternMinerState.load — missing file + schema-tolerance
 # ---------------------------------------------------------------------------

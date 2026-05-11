@@ -139,6 +139,13 @@ class ProposalEntry:
     string defaults via the schema-tolerance filter). Reconcile-sweep-
     set transitions (the backstop path) do NOT populate these fields —
     only operator CLI invocations do.
+
+    Stage 2e (2026-05-11) added ``source_member_files`` so the
+    semantic-dupe gate (Jaccard against terminal-status entries) can
+    compare a new cluster's member set against the historical record
+    of what's already been promoted/discarded. Pre-2e entries default
+    to empty list — they don't trigger false rejects (Jaccard against
+    an empty set is always 0.0).
     """
 
     fingerprint: str = ""
@@ -160,6 +167,14 @@ class ProposalEntry:
     promoted_at: str = ""  # ISO timestamp of CLI promote action
     discarded_at: str = ""  # ISO timestamp of CLI discard action
     discarded_reason: str = ""  # optional operator-supplied context
+    # Stage 2e (2026-05-11). Cluster member-file paths (vault-relative)
+    # at record time. The semantic-dupe gate computes Jaccard
+    # similarity between a new cluster's member set and the member
+    # set of every terminal-status entry to catch surveyor's habit
+    # of re-clustering yesterday's promoted/discarded members under
+    # a new slug. Empty list on a legacy entry → Jaccard 0.0 → no
+    # false reject.
+    source_member_files: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> "ProposalEntry":
@@ -191,6 +206,7 @@ class ProposalEntry:
             "promoted_at": self.promoted_at,
             "discarded_at": self.discarded_at,
             "discarded_reason": self.discarded_reason,
+            "source_member_files": list(self.source_member_files),
         }
 
 

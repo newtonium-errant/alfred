@@ -248,6 +248,14 @@ distiller:
   #     # Add labels surveyor sometimes emits that don't signal a
   #     # real theme (e.g. cohered on document-type rather than topic).
   #     # - "instance-specific-low-signal-label"
+  #   # Stage 2e (2026-05-11) — semantic-dupe gate. Candidate clusters
+  #   # whose member-set Jaccard similarity meets/exceeds this value
+  #   # against any prior promoted/discarded entry are rejected as
+  #   # semantic duplicates. Catches surveyor's habit of re-clustering
+  #   # yesterday's promoted members under a new slug the LLM names
+  #   # differently. Default 0.5; tune higher (0.7) for tighter
+  #   # rejection or lower (0.3) for looser overlap.
+  #   jaccard_threshold: 0.5
   #   state:
   #     path: "./data/pattern_miner_state.json"
   #   openrouter:

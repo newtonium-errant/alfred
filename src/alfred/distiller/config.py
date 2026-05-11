@@ -346,6 +346,17 @@ class PatternMinerConfig:
     # instance-specific low-signal labels surveyor sometimes emits
     # without redefining the default set.
     label_denylist: list[str] = field(default_factory=list)
+    # Stage 2e (2026-05-11) — Jaccard similarity threshold for the
+    # semantic-dupe gate. Candidate clusters whose member-set Jaccard
+    # against any terminal-status (promoted/discarded) state entry
+    # meets or exceeds this value are rejected as semantic duplicates.
+    # Default 0.5 matches the dispatch's calibration; operators can
+    # tune in per-instance config (raise to 0.7 for tighter rejection,
+    # lower to 0.3 to catch looser overlaps at the cost of more
+    # false rejects). Pre-stage-2e state entries with empty
+    # source_member_files default to Jaccard 0.0 — they don't
+    # contribute false rejects.
+    jaccard_threshold: float = 0.5
     state: PatternMinerStateConfig = field(default_factory=PatternMinerStateConfig)
     openrouter: PatternMinerOpenRouterConfig = field(
         default_factory=PatternMinerOpenRouterConfig,
