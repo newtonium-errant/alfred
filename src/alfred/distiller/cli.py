@@ -623,6 +623,7 @@ def cmd_promote_proposal(
     from alfred.vault.mutation_log import append_to_audit_log
     from .pattern_miner import (
         canonical_promotion_banner,
+        insert_promotion_banner_after_title,
         strip_proposal_scaffolding,
     )
     from .pattern_miner_state import (
@@ -720,7 +721,11 @@ def cmd_promote_proposal(
             member_count=entry.member_count,
             fingerprint=entry.fingerprint,
         )
-        final_content = banner + body
+        # Insert AFTER the first H1 heading rather than prepending to
+        # the top — matches the cli-logging.md convention (title on
+        # line 1, banner on line 3 after blank). Falls back to prepend
+        # behavior when no H1 found. Per the 2026-05-11 cosmetic fix.
+        final_content = insert_promotion_banner_after_title(body, banner)
     else:
         final_content = raw_content
 

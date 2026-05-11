@@ -1183,6 +1183,107 @@ def strip_proposal_scaffolding(content: str) -> str:
     return out
 
 
+# Match the first ATX-style H1 heading in the body (``# Title``).
+# MULTILINE so ``^`` anchors at line starts; non-greedy on the title
+# capture so a stray ``\n`` in the middle of the line doesn't extend
+# the match. The negative lookahead on ``#`` rules out ``##`` headers
+# (those are section headers, not titles).
+_TITLE_RE = re.compile(r"^#(?!#)\s+(.+?)\s*$", re.MULTILINE)
+
+
+def insert_promotion_banner_after_title(
+    body: str,
+    banner: str,
+) -> str:
+    """Insert the canonical promotion banner AFTER the first H1 heading.
+
+    Matches the ``aftermath-lab/architecture/cli-logging.md`` convention
+    (title on line 1, banner on line 3 after a blank line). The prior
+    behavior — prepending banner above title — inverted the convention
+    and produced an awkward "banner-then-title" shape that doesn't
+    render cleanly in Obsidian or look right in plain markdown viewers.
+
+    Algorithm:
+    - Find the first ``# Heading`` line in ``body`` via ``_TITLE_RE``.
+    - Normalize both arguments to bare-text (strip leading + trailing
+      newlines from the banner; consume any newlines already between
+      title and body). The helper is the single source of truth for
+      the title / blank / banner / blank / rest spacing — caller's
+      banner can carry whatever trailing-newline shape it likes and
+      the output stays uniform.
+    - Compose: ``<title-line>\\n\\n<bare-banner>\\n\\n<rest>``.
+    - If no H1 heading is found (edge case — proposal got malformed,
+      or strip ran on a body without a title), fall back to the
+      legacy prepend-to-top behavior so the banner doesn't get lost.
+      The fall-back is logged at info-level so a future operator
+      grep can surface "promote produced a no-title canonical."
+
+    Returns the body with the banner inserted (always — either after
+    the title or prepended). Caller writes the result to disk.
+
+    Per the 2026-05-11 amend: the banner's caller-provided trailing
+    ``\\n\\n`` (from ``canonical_promotion_banner``) used to compose
+    with the helper's own separator to produce TWO blank lines
+    between title and banner. The fix strips banner-edge newlines
+    inside the helper so the spacing contract is owned in one place.
+    """
+    title_match = _TITLE_RE.search(body)
+    # Normalize the banner: strip leading + trailing newlines so the
+    # helper owns the title/banner/body spacing contract. Caller can
+    # pass banner shapes like "> ...\n\n" (current canonical_promotion_banner
+    # output) OR "> ..." (bare) OR "\n> ...\n" — all collapse to the
+    # same bare-text shape here.
+    bare_banner = banner.strip("\n")
+
+    if title_match is None:
+        # No H1 heading. Fall back to prepend-to-top so the banner
+        # still lands on disk. Log so the operator can see this in
+        # post-mortem if a canonical record ends up looking weird.
+        # Use the bare-banner shape + ``\n\n`` separator so the
+        # prepend-fallback spacing matches the after-title shape
+        # (banner / blank-line / body) for consistency.
+        log.info(
+            "pattern_miner.promotion_banner_no_title",
+            note=(
+                "no H1 heading found in proposal body; banner "
+                "prepended above content instead of after title"
+            ),
+        )
+        return bare_banner + "\n\n" + body
+
+    # Split the body at the title-line boundary. The regex's
+    # ``\s*$`` may have greedily consumed trailing whitespace
+    # (including the newline closing the title line), so
+    # ``title_match.end()`` can land AFTER the title's ``\n``. Take
+    # ``title_match.group(0)`` for the canonical title-line text and
+    # walk past any newlines in the body following the match end to
+    # find where the rest-of-body content starts.
+    title_line = title_match.group(0).rstrip()
+    title_start = title_match.start()
+    # Strip leading newlines from the after-match remainder so the
+    # helper owns the blank-line spacing.
+    rest = body[title_match.end():].lstrip("\n")
+
+    # Compose:
+    #   <prefix><title-line>\n        — title's own line ends here
+    #   \n                             — blank separator
+    #   <bare-banner>                  — banner content, no edge newlines
+    #   \n\n                           — blank separator
+    #   <rest>                         — body remainder, leading newlines stripped
+    # ``prefix`` is whatever was before the title in the original body
+    # (typically empty when the title is line 1; preserved for the
+    # rare case where the body has leading content before the title).
+    prefix = body[:title_start]
+    return (
+        prefix
+        + title_line
+        + "\n\n"
+        + bare_banner
+        + "\n\n"
+        + rest
+    )
+
+
 def canonical_promotion_banner(
     *,
     promoted_at_iso: str,
@@ -1763,6 +1864,7 @@ __all__ = [
     "PatternMinerState",
     "call_drafter",
     "canonical_promotion_banner",
+    "insert_promotion_banner_after_title",
     "cluster_matches_canonical",
     "cluster_passes_label_quality",
     "derive_proposed_canonical_type",

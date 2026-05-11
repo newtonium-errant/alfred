@@ -1823,6 +1823,120 @@ class TestCanonicalPromotionBanner:
 
 
 # ---------------------------------------------------------------------------
+# insert_promotion_banner_after_title — title-then-banner ordering
+# (2026-05-11 cosmetic fix: match the cli-logging.md convention)
+# ---------------------------------------------------------------------------
+
+
+class TestInsertPromotionBannerAfterTitle:
+    """Pin the title-line-1 / banner-line-3 layout. The prior
+    implementation inverted this (banner above title); operator-
+    visible output didn't match the canonical convention.
+    """
+
+    def test_banner_lands_after_title_with_blank_line_separator(
+        self,
+    ) -> None:
+        from alfred.distiller.pattern_miner import (
+            insert_promotion_banner_after_title,
+        )
+
+        body = "# Topic X\n\nThe claim body.\n"
+        banner = "> Promoted from inbox/proposed-canonical on 2026-05-11.\n\n"
+        result = insert_promotion_banner_after_title(body, banner)
+
+        lines = result.split("\n")
+        # Title is line 1 (index 0).
+        assert lines[0] == "# Topic X"
+        # Line 2 (index 1) is blank.
+        assert lines[1] == ""
+        # Line 3 (index 2) is the banner.
+        assert lines[2].startswith("> Promoted from inbox/proposed-canonical")
+        # Subsequent lines preserve body content.
+        assert "The claim body." in result
+
+    def test_banner_does_not_prepend_above_title(self) -> None:
+        # Regression pin against the legacy prepend-above-title shape.
+        from alfred.distiller.pattern_miner import (
+            insert_promotion_banner_after_title,
+        )
+
+        body = "# Topic\n\nClaim.\n"
+        banner = "> Promoted line\n\n"
+        result = insert_promotion_banner_after_title(body, banner)
+
+        # The title MUST appear before the banner in the output —
+        # catches a regression that restores the legacy prepend
+        # behavior.
+        title_pos = result.find("# Topic")
+        banner_pos = result.find("> Promoted line")
+        assert title_pos >= 0
+        assert banner_pos >= 0
+        assert title_pos < banner_pos
+
+    def test_no_h1_falls_back_to_prepend_with_log(self) -> None:
+        # Edge case: body without an H1 heading (malformed proposal,
+        # or strip ran on a body that never had a title). Fallback
+        # is "prepend to top" so the banner doesn't get lost; an
+        # info log fires so post-mortem can grep for this shape.
+        import structlog
+
+        from alfred.distiller.pattern_miner import (
+            insert_promotion_banner_after_title,
+        )
+
+        body = "Just some text without a heading.\n"
+        banner = "> Promoted banner\n\n"
+
+        with structlog.testing.capture_logs() as captured:
+            result = insert_promotion_banner_after_title(body, banner)
+
+        # Banner lands at top (prepend fallback).
+        assert result.startswith("> Promoted banner")
+        # Body preserved after banner.
+        assert "Just some text" in result
+        # No-title fallback log emitted with operator-grep-able event.
+        no_title_logs = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.promotion_banner_no_title"
+        ]
+        assert len(no_title_logs) == 1
+
+    def test_h2_alone_does_not_count_as_title(self) -> None:
+        # Defensive: an ``## Subhead`` without a preceding ``# Title``
+        # is NOT a title. Fallback to prepend.
+        from alfred.distiller.pattern_miner import (
+            insert_promotion_banner_after_title,
+        )
+
+        body = "## Subhead\n\nText.\n"
+        banner = "> Banner\n\n"
+        result = insert_promotion_banner_after_title(body, banner)
+
+        # Banner lands at the top (prepend) — the ## subhead doesn't
+        # match _TITLE_RE so the title-aware path is skipped.
+        assert result.startswith("> Banner")
+
+    def test_first_h1_is_used_when_multiple_present(self) -> None:
+        # Defensive: a body with multiple H1s (rare but possible —
+        # operator hand-edited the proposal) inserts after the FIRST
+        # one. Doesn't try to be clever about choosing.
+        from alfred.distiller.pattern_miner import (
+            insert_promotion_banner_after_title,
+        )
+
+        body = "# First Title\n\nText.\n\n# Second Title\n\nMore.\n"
+        banner = "> Banner\n\n"
+        result = insert_promotion_banner_after_title(body, banner)
+
+        # Banner lands right after First Title, NOT after Second.
+        first_pos = result.find("# First Title")
+        banner_pos = result.find("> Banner")
+        second_pos = result.find("# Second Title")
+        assert first_pos < banner_pos < second_pos
+
+
+# ---------------------------------------------------------------------------
 # cmd_promote_proposal — happy path + error cases
 # ---------------------------------------------------------------------------
 
@@ -1860,7 +1974,7 @@ class TestPromoteProposalHappyPath:
         assert "promoted: topic-x" in out
         assert "architecture/topic-x.md" in out
 
-    def test_strip_scaffolding_default_on_strips_and_prepends_banner(
+    def test_strip_scaffolding_default_on_strips_and_inserts_banner_after_title(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -1878,11 +1992,33 @@ class TestPromoteProposalHappyPath:
         assert "type: proposed-canonical" not in content
         assert "Phase 4 pattern miner surfaced" not in content
         assert "Suggested next step" not in content
-        # Canonical promotion banner prepended.
+        # Canonical promotion banner present.
         assert "Promoted from inbox/proposed-canonical" in content
         # Real content preserved.
         assert "## Mined claim" in content
         assert "Hardcoding a single log destination" in content
+        # NEW (2026-05-11): banner lands AFTER the title, not before.
+        # Matches the cli-logging.md convention.
+        title_pos = content.find("# Topic X")
+        banner_pos = content.find("> Promoted from inbox/proposed-canonical")
+        assert title_pos >= 0
+        assert banner_pos >= 0
+        assert title_pos < banner_pos, (
+            "Banner must land AFTER the title line per "
+            "cli-logging.md convention; got banner at "
+            f"{banner_pos} but title at {title_pos}"
+        )
+        # Also pin the line-3 structure (title / blank / banner).
+        lines = content.split("\n")
+        assert lines[0] == "# Topic X", (
+            f"Title should be line 1; got {lines[0]!r}"
+        )
+        assert lines[1] == "", (
+            f"Line 2 should be blank (separator); got {lines[1]!r}"
+        )
+        assert lines[2].startswith("> Promoted from inbox/proposed-canonical"), (
+            f"Line 3 should be the banner; got {lines[2]!r}"
+        )
 
     def test_no_strip_scaffolding_preserves_verbatim(
         self,
