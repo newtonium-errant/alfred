@@ -300,6 +300,36 @@ class TestContentStructuralPins:
             "kebab-case slug for the canonical filename."
         )
 
+    def test_prompt_contains_output_shape_self_check_signals(self) -> None:
+        # Stage 2d added an OUTPUT-SHAPE self-check after the drafter
+        # writes its paragraph: re-read it and route to B/C if the
+        # SUBJECT changes between sentences without a unifying noun
+        # phrase, OR if the paragraph is generic restatement rather
+        # than a concrete claim. The signal is output-shape-keyed
+        # (more stable than the input-property-keyed signals from
+        # stages 2a/2c). Pin BOTH anchor phrases — a future rewrite
+        # that drops "SUBJECT" or "generic restatement" silently
+        # collapses the calibration back to stage-2c's under-firing
+        # behaviour (0/10 refusals on the third live run).
+        content = pattern_miner._load_draft_prompt_template()
+        assert "Self-check before emitting Outcome A" in content, (
+            "Self-check section header missing — drafter has no "
+            "instruction to re-read its own paragraph before committing "
+            "to Outcome A, and the output-shape signal cannot fire."
+        )
+        assert "SUBJECT changes between sentences" in content, (
+            "Subject-change signal missing — the load-bearing anchor "
+            "for the enumeration-shape NO-CLAIM trigger (caught case B "
+            "on the third live run: talker StateManager / asyncio "
+            "counter / aviation weather)."
+        )
+        assert "generic restatement" in content, (
+            "Generic-restatement signal missing — the load-bearing "
+            "anchor for the 'These rules dictate...' NO-CLAIM trigger "
+            "(caught case A on the third live run: alias-management "
+            "cluster)."
+        )
+
 
 # ---------------------------------------------------------------------------
 # 6. call_drafter integration — format() round-trip works end-to-end

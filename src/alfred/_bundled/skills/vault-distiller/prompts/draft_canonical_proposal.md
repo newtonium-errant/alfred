@@ -101,15 +101,55 @@ Counter-example — does NOT qualify for Outcome B:
 > pattern with public-route restriction." This is Outcome A, not B. The
 > theme is real even though the surface details vary.
 
-If you are uncertain whether a cluster qualifies for B, it does NOT.
-Default to A and write the thinnest defensible theme. Operator review will
-catch a weak draft; it cannot recover a missed one.
+**Self-check before emitting Outcome A.** Re-read your drafted paragraph
+before you commit to A. If EITHER of these is true, your cluster qualifies
+for Outcome B instead:
+
+1. **SUBJECT changes between sentences without a unifying noun phrase.**
+   Shape: "X does A. Y does B. Z does C." — three sentences, three different
+   grammatical subjects, no noun phrase that binds them. This is enumeration,
+   not synthesis. A real shared theme produces a paragraph where the SAME
+   subject (or a tight family of subjects under one named umbrella) recurs
+   across sentences.
+
+2. **Generic restatement that just describes what's in the cluster** rather
+   than naming a concrete shared theme. Tell-tale phrasings: "These rules
+   dictate..." / "These behaviors ensure..." / "Configuration and X
+   management often involve specific rules regarding the handling of..." —
+   the paragraph names the cluster's surface category instead of stating
+   the unifying claim. If you can't replace "these rules dictate" with a
+   concrete subject-verb claim, there is no claim.
+
+Worked examples of the self-check firing (both from real third-run output):
+
+> Drafted: *"Configuration and alias management in system recovery and
+> setup processes often involve specific rules regarding the handling of
+> aliases for different types of records and configurations. These rules
+> dictate whether certain steps, such as alias placement or skipping, are
+> necessary based on the context and type of record being processed."* —
+> Generic restatement (signal #2): tells you the cluster is about "rules
+> regarding handling of aliases" but never states what the rule is. The
+> source members were activity-records-skip-alias, dataclass-field-order,
+> and a Telegram /calibration alias — three unrelated topics. NO-CLAIM.
+
+> Drafted: *"The talker StateManager normalizes chat_id keys to strings
+> internally, and the daemon runs on a single asyncio loop without
+> requiring locks for an integer counter. Aviation weather data sometimes
+> returns wind direction as a string..."* — Subject-change (signal #1):
+> sentence 1 = StateManager, sentence 2 = daemon/asyncio counter, sentence
+> 3 = aviation weather. No unifying noun phrase. NO-CLAIM.
+
+If you are uncertain whether a cluster qualifies for B, run the self-check
+on your drafted paragraph FIRST. If the self-check is clean (single subject
+family across sentences, concrete claim not generic restatement), it does
+not qualify for B — default to A. The self-check is the override; the
+default is still A.
 
 When the cluster genuinely qualifies, emit EXACTLY:
 
 ```
 NO-CLAIM
-REASON: <one-line explanation of which surface keyword glued the unrelated members>
+REASON: <one-line explanation — either the surface keyword that glued the unrelated members, or the disjoint-subject pattern the self-check flagged>
 ```
 
 `NO-CLAIM` MUST appear on its own line as the first line of your response.
@@ -128,6 +168,16 @@ their own `architecture/<slug>.md` or `principles/<slug>.md`, this is a
 SPLIT, not an umbrella claim. Resist the temptation to write a vague
 umbrella sentence that covers both.
 
+**Self-check before emitting Outcome A.** This is the SPLIT-side mirror of
+the Outcome B self-check. Re-read your drafted paragraph. If the SUBJECT
+changes between sentences AND the subjects sort into 2+ coherent groups
+(each group has 2+ member records that share a real theme — not just one
+isolated subject per group), your cluster is a SPLIT, not an umbrella
+claim. The output shape: N distinct subjects that cluster into 2+ named
+sub-themes. Contrast: Outcome B is N subjects that cluster into 0 themes;
+SPLIT is N subjects that cluster into 2+ themes; Outcome A is N subjects
+united by 1 theme.
+
 When this is the case, emit EXACTLY:
 
 ```
@@ -144,14 +194,20 @@ literal `SPLIT` token and surfaces the cluster for operator review.
 
 ## Format summary
 
-Pick ONE — and remember A is the default:
+Pick ONE — and remember A is the default, but run the self-check before
+committing:
 
 - **A (theme)**: 2-4 sentence paragraph + TYPE/SLUG trailer. Default for any
-  cluster with even a thin shared theme.
+  cluster with even a thin shared theme. Before emitting, run the
+  self-check: if the SUBJECT changes between sentences without a unifying
+  noun phrase, or you find yourself writing a generic restatement, route to
+  B or C instead.
 - **B (refusal)**: `NO-CLAIM` line + `REASON:` line. Reserved for clusters
-  where the members are genuinely unrelated except for one surface keyword.
+  where the members are genuinely unrelated except for one surface keyword
+  — output-shape signal: N subjects, 0 themes.
 - **C (split)**: `SPLIT` line + `THEMES:` line + bullet list. Reserved for
-  clusters where 2+ distinct themes each deserve their own canonical record.
+  clusters where 2+ distinct themes each deserve their own canonical record
+  — output-shape signal: N subjects, 2+ themes.
 
 No preamble. No "the unifying theme is". No restating the labels back at me.
 Just the chosen outcome.
