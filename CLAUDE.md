@@ -135,6 +135,14 @@ This is the **load-time schema-tolerance contract**. It enforces forward-compati
 
 **Default state paths must be tool-scoped** to avoid collision when an instance config omits a tool's block. Each tool's `StateConfig.path` defaults to `./data/<tool>_state.json` (e.g., `./data/distiller_state.json`). Sharing the same default `./data/state.json` across tools would let one tool silently load another tool's state file and present misleading status info — the schema-tolerance filter prevents the crash but not the wrong-source-of-truth.
 
+### Dispatcher env-var injection — test-hygiene contract
+
+Several top-level CLI dispatchers (`cmd_exec`, `cmd_vault`, `cmd_distiller`) inject env vars (`ALFRED_VAULT_PATH`, `ALFRED_VAULT_SESSION`, `ALFRED_VAULT_AUDIT_LOG`, etc.) into `os.environ` before delegating to downstream handlers. The injection is process-global state; downstream handlers read it via `_env(...)` helpers.
+
+**Test-hygiene requirement:** every test that touches a dispatcher path MUST `monkeypatch.delenv(<var>, raising=False)` at fixture setup. Without this, env-var bleed from one test's dispatch call carries into the next test's handler invocation, masking validation. Particularly load-bearing for `ALFRED_VAULT_AUDIT_LOG` (commits `2f1644a` + `089d6f5` both inject; 3 dispatcher sites now mutate the same var).
+
+If you ever extend a dispatcher to inject a NEW env var, audit existing tests for the bleed-risk. The pattern is a recurring footgun — surfaced via code-review on the #64 vault CLI audit-log fix (2026-05-11). Defensible long-term refactor: thread the dispatcher state as kwargs to the handler instead of via env. Out of scope for the per-feature ship; refactor as its own arc when the env-var-mutation site count crosses 5.
+
 ### Vault Operations Layer (`src/alfred/vault/`)
 
 - `ops.py` — CRUD operations (`vault_create`, `vault_read`, `vault_edit`, `vault_move`, `vault_delete`, `vault_search`, `vault_list`, `vault_context`). Integrates with Obsidian CLI (1.12+) when available for search and moves.
