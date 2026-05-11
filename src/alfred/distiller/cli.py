@@ -688,6 +688,38 @@ def cmd_promote_proposal(
             f"{entry.proposed_canonical_type}/{entry.proposed_slug}.md"
         )
     target_abs = (vault_path / target_rel).resolve()
+
+    # WARN-1 cure (retroactive code-review, 2026-05-11): pathlib's
+    # ``Path("/vault") / "/absolute/foo.md"`` evaluates to
+    # ``Path("/absolute/foo.md")`` — the left side is silently
+    # dropped. Without this check, ``--to /tmp/escape.md`` would
+    # write outside the vault AND record an absolute path into
+    # ``entry.promoted_to``, breaking the documented vault-relative
+    # invariant for the state field. Path traversal (``--to
+    # ../escape.md``) hits the same issue via ``.resolve()``
+    # normalization.
+    #
+    # The reconcile sweep (commit 90532ea, ``reconcile_state``) already
+    # has the symmetric defense via ``try: relative_to(vault_path);
+    # except ValueError: str(slug_match_path)`` but the CLI did not —
+    # this fix makes them symmetric.
+    vault_abs = vault_path.resolve()
+    if not target_abs.is_relative_to(vault_abs):
+        print(
+            f"Error: --to must resolve to a path inside the vault; "
+            f"got {to!r} which resolves to {target_abs}, outside "
+            f"vault {vault_abs}. Use a vault-relative path "
+            f"(e.g. 'architecture/<slug>.md')."
+        )
+        sys.exit(1)
+
+    # Normalize target_rel to the canonical vault-relative form so
+    # ``entry.promoted_to`` records the same shape regardless of
+    # whether the operator passed a relative path or an absolute path
+    # that resolved inside the vault. Mirrors the reconcile-side
+    # ``relative_to(vault_path)`` pattern.
+    target_rel = str(target_abs.relative_to(vault_abs))
+
     if target_abs.exists():
         print(
             f"Error: target canonical file already exists at "

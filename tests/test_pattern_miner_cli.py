@@ -2679,6 +2679,176 @@ class TestPromoteProposalErrors:
         assert entry.status == "pending"
 
 
+class TestPromoteProposalVaultRelativeValidation:
+    """WARN-1 cure (retroactive code-review, 2026-05-11).
+
+    Pathlib silently drops the left operand of ``/`` when the right
+    side is absolute: ``Path("/vault") / "/tmp/foo.md"`` →
+    ``Path("/tmp/foo.md")``. Without explicit ``--to`` validation,
+    an operator typo or shell expansion produces a canonical file
+    written OUTSIDE the vault PLUS a state entry with an absolute
+    ``promoted_to`` that violates the documented vault-relative
+    invariant.
+
+    These pins cover four shapes:
+      - vault-relative ``--to`` succeeds (regression pin)
+      - ``../escape.md`` (traversal) errors; state + inbox unchanged
+      - absolute path outside vault errors; state + inbox unchanged
+      - absolute path INSIDE vault succeeds; ``entry.promoted_to`` is
+        normalized to the canonical vault-relative form
+    """
+
+    def test_relative_to_path_succeeds_regression(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Regression pin against an over-eager validator that rejects
+        # legitimate relative paths. The bug we're closing is on
+        # ABSOLUTE / TRAVERSAL paths, not on the relative happy path.
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_promote_proposal(
+            cfg, slug="topic-x", to="principles/relative-target.md",
+        )
+
+        target = tmp_path / "principles" / "relative-target.md"
+        assert target.is_file()
+        assert not inbox_file.exists()
+
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        state = PatternMinerState(state_path)
+        state.load()
+        entry = next(iter(state.proposals.values()))
+        assert entry.status == "promoted"
+        assert entry.promoted_to == "principles/relative-target.md"
+
+    def test_traversal_to_path_errors_state_and_inbox_unchanged(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Path traversal via ``..``: ``Path(vault) / "../escape.md"``
+        # ``.resolve()`` normalizes to the parent dir. The validator
+        # MUST detect that and error before any write happens.
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        with pytest.raises(SystemExit) as exc_info:
+            dcli.cmd_promote_proposal(
+                cfg, slug="topic-x", to="../escape.md",
+            )
+        assert exc_info.value.code == 1
+
+        out = capsys.readouterr().out
+        # Operator-actionable message names both the rejected --to
+        # value and the vault path the operator can correct against.
+        assert "--to" in out
+        assert "outside" in out
+
+        # Atomic: no escape file written, inbox unchanged, state
+        # unchanged.
+        escape = tmp_path.parent / "escape.md"
+        assert not escape.exists()
+        assert inbox_file.exists()
+
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        state = PatternMinerState(state_path)
+        state.load()
+        entry = next(iter(state.proposals.values()))
+        assert entry.status == "pending"
+        # Per-action fields untouched.
+        assert entry.promoted_to == ""
+        assert entry.promoted_at == ""
+
+    def test_absolute_to_path_outside_vault_errors(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Bug-of-record shape: pathlib's ``Path(vault) /
+        # "/absolute/path.md"`` silently drops the vault prefix.
+        # Without validation this would write to the absolute path
+        # AND record it into ``entry.promoted_to``.
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        # Build an absolute path that's clearly OUTSIDE tmp_path's
+        # tree. Using a sibling directory under tmp_path.parent
+        # avoids hardcoding /tmp/ which may collide with pytest's
+        # own tmp scheme.
+        outside_dir = tmp_path.parent / "outside-vault-target"
+        outside_dir.mkdir(exist_ok=True)
+        outside_path = outside_dir / "escape.md"
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        with pytest.raises(SystemExit) as exc_info:
+            dcli.cmd_promote_proposal(
+                cfg, slug="topic-x", to=str(outside_path),
+            )
+        assert exc_info.value.code == 1
+
+        out = capsys.readouterr().out
+        assert "--to" in out
+        assert "outside" in out
+
+        # File NOT written to the absolute outside path.
+        assert not outside_path.exists()
+        # Inbox + state unchanged.
+        assert inbox_file.exists()
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        state = PatternMinerState(state_path)
+        state.load()
+        entry = next(iter(state.proposals.values()))
+        assert entry.status == "pending"
+        assert entry.promoted_to == ""
+
+    def test_absolute_to_path_inside_vault_succeeds_and_normalizes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Legitimate case the dispatch flagged: operator passes an
+        # absolute path that DOES resolve inside the vault. The
+        # validator MUST allow this AND normalize ``entry.promoted_to``
+        # to the vault-relative form (mirrors reconcile's
+        # ``relative_to(vault_path)`` pattern). Without normalization
+        # the state field would mix absolute + relative shapes
+        # depending on how the operator invoked the CLI.
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        # Absolute path INSIDE the vault.
+        absolute_inside = tmp_path / "architecture" / "absolute-inside.md"
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_promote_proposal(
+            cfg, slug="topic-x", to=str(absolute_inside),
+        )
+
+        # File written at the absolute path.
+        assert absolute_inside.is_file()
+
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        state = PatternMinerState(state_path)
+        state.load()
+        entry = next(iter(state.proposals.values()))
+        assert entry.status == "promoted"
+        # Critical: state records the VAULT-RELATIVE form, NOT the
+        # absolute path the operator typed. Mirrors reconcile-side
+        # ``relative_to(vault_path)`` normalization.
+        assert entry.promoted_to == "architecture/absolute-inside.md"
+
+
 # ---------------------------------------------------------------------------
 # cmd_discard_proposal — happy path + error cases
 # ---------------------------------------------------------------------------
