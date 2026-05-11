@@ -1528,3 +1528,981 @@ class TestSplitPendingReconcile:
         )
         assert result["discarded"] == 1
         assert state.proposals["fp1"].status == STATUS_DISCARDED
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 operator-promote tracking (2026-05-11) — CLI commands
+# ``promote-proposal`` and ``discard-proposal``. Closes the 3 deferred
+# follow-ups: slug-rename-on-promote silently miscounted, no audit
+# trail, no scaffolding-strip automation.
+# ---------------------------------------------------------------------------
+
+
+def _seed_inbox_proposal(
+    tmp_path: Path,
+    *,
+    slug: str = "topic-x",
+    canonical_type: str = "architecture",
+    body: str | None = None,
+    fingerprint: str = "abc123def456",
+) -> tuple[Path, Path]:
+    """Seed an inbox proposal file + return (inbox_file, state_path).
+
+    Mirrors what mine_patterns would write for a happy-path
+    proposal — frontmatter, banner, claim, source members, footer.
+    Stage-2b SPLIT marker files have a different shape and aren't
+    needed for these tests.
+    """
+    inbox_dir = tmp_path / "inbox" / "proposed-canonical"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    proposal_file = inbox_dir / f"{slug}.md"
+    if body is None:
+        body = (
+            "Hardcoding a single log destination routes every CLI "
+            "subcommand's events to the wrong file. The fix is a "
+            "``tool`` kwarg with a backward-compatible default — each "
+            "dispatcher passes its own tool name."
+        )
+    proposal_file.write_text(
+        f"---\n"
+        f"type: proposed-canonical\n"
+        f'proposed_at: "2026-05-10T12:00:00+00:00"\n'
+        f'source_cluster_id: "semantic_5"\n'
+        f"source_member_count: 3\n"
+        f'proposed_canonical_type: "{canonical_type}"\n'
+        f'proposed_slug: "{slug}"\n'
+        f'fingerprint: "{fingerprint}"\n'
+        f"status: proposed\n"
+        f"---\n"
+        f"\n"
+        f"# Topic X\n"
+        f"\n"
+        f"> Phase 4 pattern miner surfaced this cluster on "
+        f"2026-05-10. Andrew should read the source members below.\n"
+        f"\n"
+        f"## Mined claim\n"
+        f"\n"
+        f"{body}\n"
+        f"\n"
+        f"## Source members\n"
+        f"\n"
+        f"- [[assumption/a]]\n"
+        f"- [[assumption/b]]\n"
+        f"- [[assumption/c]]\n"
+        f"\n"
+        f"## Suggested next step\n"
+        f"\n"
+        f"Promote with: `alfred --config config.yaml vault move "
+        f'"inbox/proposed-canonical/{slug}.md" '
+        f'"{canonical_type}/{slug}.md"`\n'
+        f"\n"
+        f"Or `rm` to discard.\n",
+        encoding="utf-8",
+    )
+    state_path = tmp_path / "data" / "state.json"
+    return proposal_file, state_path
+
+
+def _seed_state_with_proposal(
+    state_path: Path,
+    *,
+    fingerprint: str = "abc123def456",
+    slug: str = "topic-x",
+    canonical_type: str = "architecture",
+    status: str = "pending",
+    extra: dict | None = None,
+) -> None:
+    """Write a state file with one proposal entry."""
+    from alfred.distiller.pattern_miner_state import (
+        PatternMinerState,
+        ProposalEntry,
+    )
+
+    state = PatternMinerState(state_path)
+    entry = ProposalEntry(
+        fingerprint=fingerprint,
+        cluster_id="semantic_5",
+        labels=["topic/x"],
+        member_count=3,
+        proposed_at="2026-05-10T12:00:00+00:00",
+        proposed_path=f"inbox/proposed-canonical/{slug}.md",
+        proposed_slug=slug,
+        proposed_canonical_type=canonical_type,
+        status=status,
+    )
+    if extra:
+        for k, v in extra.items():
+            setattr(entry, k, v)
+    state.record_proposal(entry)
+    state.save()
+
+
+def _config_for_promote(
+    tmp_path: Path, state_path: Path,
+) -> DistillerConfig:
+    """Build a DistillerConfig pointing at tmp_path as vault."""
+    cfg = DistillerConfig(vault=VaultConfig(path=str(tmp_path)))
+    cfg.pattern_miner = PatternMinerConfig(
+        enabled=True,
+        surveyor_state_path=str(tmp_path / "unused-surveyor-state.json"),
+        proposed_dir="inbox/proposed-canonical",
+        min_cluster_size=3,
+        canonical_match_dirs=["architecture", "principles", "stack"],
+        label_denylist=[],
+        state=PatternMinerStateConfig(path=str(state_path)),
+        openrouter=PatternMinerOpenRouterConfig(),
+    )
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Scaffolding-strip helpers (pure functions; no CLI involvement)
+# ---------------------------------------------------------------------------
+
+
+class TestStripProposalScaffolding:
+    """Pin the four scaffolding-strip rules from the design memo."""
+
+    def test_strips_frontmatter(self) -> None:
+        from alfred.distiller.pattern_miner import strip_proposal_scaffolding
+
+        content = (
+            "---\n"
+            "type: proposed-canonical\n"
+            "proposed_slug: foo\n"
+            "---\n"
+            "\n"
+            "# Foo\n"
+            "\n"
+            "The real claim.\n"
+        )
+        stripped = strip_proposal_scaffolding(content)
+        assert "---" not in stripped
+        assert "type: proposed-canonical" not in stripped
+        assert "# Foo" in stripped
+        assert "The real claim." in stripped
+
+    def test_strips_phase4_banner(self) -> None:
+        from alfred.distiller.pattern_miner import strip_proposal_scaffolding
+
+        content = (
+            "# Topic\n"
+            "\n"
+            "> Phase 4 pattern miner surfaced this cluster on 2026-05-10. Andrew should read.\n"
+            "\n"
+            "## Mined claim\n"
+            "\n"
+            "The claim.\n"
+        )
+        stripped = strip_proposal_scaffolding(content)
+        assert "Phase 4 pattern miner surfaced" not in stripped
+        assert "## Mined claim" in stripped
+        assert "The claim." in stripped
+
+    def test_strips_suggested_next_step_footer(self) -> None:
+        from alfred.distiller.pattern_miner import strip_proposal_scaffolding
+
+        content = (
+            "# Topic\n"
+            "\n"
+            "The claim.\n"
+            "\n"
+            "## Suggested next step\n"
+            "\n"
+            "Promote with: `alfred vault move ...`\n"
+            "\n"
+            "Or `rm` to discard.\n"
+        )
+        stripped = strip_proposal_scaffolding(content)
+        assert "Suggested next step" not in stripped
+        assert "alfred vault move" not in stripped
+        assert "rm` to discard" not in stripped
+        assert "The claim." in stripped
+
+    def test_strips_empty_fenced_code_blocks(self) -> None:
+        from alfred.distiller.pattern_miner import strip_proposal_scaffolding
+
+        content = (
+            "# Topic\n"
+            "\n"
+            "Claim text.\n"
+            "\n"
+            "```\n"
+            "\n"
+            "```\n"
+            "\n"
+            "More text.\n"
+        )
+        stripped = strip_proposal_scaffolding(content)
+        # Empty fences gone.
+        assert "```\n\n```" not in stripped
+        # Surrounding content preserved.
+        assert "Claim text." in stripped
+        assert "More text." in stripped
+
+    def test_preserves_non_empty_code_fences(self) -> None:
+        # Defensive: a legitimate fenced code block with content MUST
+        # NOT be stripped. The empty-fence regex requires zero non-
+        # whitespace content between fences.
+        from alfred.distiller.pattern_miner import strip_proposal_scaffolding
+
+        content = (
+            "# Topic\n"
+            "\n"
+            "```python\n"
+            "print('hello')\n"
+            "```\n"
+        )
+        stripped = strip_proposal_scaffolding(content)
+        assert "```python" in stripped
+        assert "print('hello')" in stripped
+
+    def test_strips_all_four_categories_together(self) -> None:
+        # End-to-end: input is the full proposal shape mine_patterns
+        # writes; output is the body that lands at architecture/
+        # canonical_record.md after promote.
+        from alfred.distiller.pattern_miner import strip_proposal_scaffolding
+
+        content = (
+            "---\n"
+            "type: proposed-canonical\n"
+            "proposed_slug: foo\n"
+            "---\n"
+            "\n"
+            "# Foo\n"
+            "\n"
+            "> Phase 4 pattern miner surfaced this cluster on 2026-05-10. "
+            "Andrew should read.\n"
+            "\n"
+            "## Mined claim\n"
+            "\n"
+            "The load-bearing claim.\n"
+            "\n"
+            "```\n"
+            "\n"
+            "```\n"
+            "\n"
+            "## Source members\n"
+            "\n"
+            "- [[a]]\n"
+            "\n"
+            "## Suggested next step\n"
+            "\n"
+            "Promote with: `alfred vault move ...`\n"
+        )
+        stripped = strip_proposal_scaffolding(content)
+        # All four scaffolding kinds gone.
+        assert "type: proposed-canonical" not in stripped
+        assert "Phase 4 pattern miner surfaced" not in stripped
+        assert "```\n\n```" not in stripped
+        assert "Suggested next step" not in stripped
+        # Real content kept.
+        assert "# Foo" in stripped
+        assert "## Mined claim" in stripped
+        assert "The load-bearing claim." in stripped
+        assert "## Source members" in stripped
+        assert "[[a]]" in stripped
+
+
+class TestCanonicalPromotionBanner:
+    def test_includes_date_member_count_short_fingerprint(self) -> None:
+        from alfred.distiller.pattern_miner import canonical_promotion_banner
+
+        banner = canonical_promotion_banner(
+            promoted_at_iso="2026-05-11T10:00:00+00:00",
+            member_count=11,
+            fingerprint="abcdef1234567890abcd",
+        )
+        assert "2026-05-11" in banner
+        assert "11 records" in banner
+        # Short fingerprint = 12 chars per the helper contract.
+        assert "abcdef123456" in banner
+        # Full fingerprint NOT in banner (truncated for readability).
+        assert "abcdef1234567890abcd" not in banner
+        assert banner.startswith(">")
+
+
+# ---------------------------------------------------------------------------
+# cmd_promote_proposal — happy path + error cases
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteProposalHappyPath:
+    def test_pending_proposal_promoted_state_updated_inbox_removed(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_promote_proposal(cfg, slug="topic-x")
+
+        # Inbox file gone, canonical file written.
+        assert not inbox_file.exists()
+        target = tmp_path / "architecture" / "topic-x.md"
+        assert target.is_file()
+
+        # State updated.
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        state = PatternMinerState(state_path)
+        state.load()
+        entry = next(iter(state.proposals.values()))
+        assert entry.status == "promoted"
+        assert entry.promoted_to == "architecture/topic-x.md"
+        assert entry.promoted_at != ""
+
+        # Stdout confirmation.
+        out = capsys.readouterr().out
+        assert "promoted: topic-x" in out
+        assert "architecture/topic-x.md" in out
+
+    def test_strip_scaffolding_default_on_strips_and_prepends_banner(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_promote_proposal(cfg, slug="topic-x")
+
+        target = tmp_path / "architecture" / "topic-x.md"
+        content = target.read_text()
+        # Scaffolding gone.
+        assert "type: proposed-canonical" not in content
+        assert "Phase 4 pattern miner surfaced" not in content
+        assert "Suggested next step" not in content
+        # Canonical promotion banner prepended.
+        assert "Promoted from inbox/proposed-canonical" in content
+        # Real content preserved.
+        assert "## Mined claim" in content
+        assert "Hardcoding a single log destination" in content
+
+    def test_no_strip_scaffolding_preserves_verbatim(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_promote_proposal(
+            cfg, slug="topic-x", strip_scaffolding=False,
+        )
+
+        target = tmp_path / "architecture" / "topic-x.md"
+        content = target.read_text()
+        # Verbatim: frontmatter + banner + footer all present.
+        assert "type: proposed-canonical" in content
+        assert "Phase 4 pattern miner surfaced" in content
+        assert "Suggested next step" in content
+        # No canonical promotion banner (no strip = no banner).
+        assert "Promoted from inbox/proposed-canonical" not in content
+
+    def test_to_override_uses_explicit_target_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_promote_proposal(
+            cfg, slug="topic-x", to="principles/renamed-thing.md",
+        )
+
+        # Target lands at the override path; default-derived path NOT
+        # used.
+        override = tmp_path / "principles" / "renamed-thing.md"
+        default = tmp_path / "architecture" / "topic-x.md"
+        assert override.is_file()
+        assert not default.exists()
+
+        # State records the actual target.
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        state = PatternMinerState(state_path)
+        state.load()
+        entry = next(iter(state.proposals.values()))
+        assert entry.promoted_to == "principles/renamed-thing.md"
+
+    def test_auto_derived_path_uses_canonical_type_and_slug(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Pin the default-target derivation rule:
+        # <proposed_canonical_type>/<proposed_slug>.md
+        inbox_file, state_path = _seed_inbox_proposal(
+            tmp_path, slug="foo", canonical_type="principles",
+        )
+        _seed_state_with_proposal(
+            state_path, slug="foo", canonical_type="principles",
+        )
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_promote_proposal(cfg, slug="foo")  # no --to
+
+        target = tmp_path / "principles" / "foo.md"
+        assert target.is_file()
+
+    def test_audit_log_written_with_distiller_tool_and_2_rows(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        audit_log = tmp_path / "vault_audit.log"
+        monkeypatch.setenv("ALFRED_VAULT_AUDIT_LOG", str(audit_log))
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_promote_proposal(cfg, slug="topic-x")
+
+        assert audit_log.is_file()
+        rows = [
+            json.loads(line)
+            for line in audit_log.read_text().splitlines()
+            if line.strip()
+        ]
+        # 2 rows: create canonical + delete inbox.
+        assert len(rows) == 2
+        creates = [r for r in rows if r["op"] == "create"]
+        deletes = [r for r in rows if r["op"] == "delete"]
+        assert len(creates) == 1
+        assert len(deletes) == 1
+        assert creates[0]["path"] == "architecture/topic-x.md"
+        assert deletes[0]["path"] == "inbox/proposed-canonical/topic-x.md"
+        # Tool field is "distiller" (NOT "cli" or "vault").
+        assert creates[0]["tool"] == "distiller"
+        assert deletes[0]["tool"] == "distiller"
+        # Detail field carries fingerprint context.
+        assert "fingerprint" in creates[0]["detail"]
+
+
+class TestPromoteProposalErrors:
+    def test_slug_not_found_errors(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = tmp_path / "data" / "state.json"
+        _seed_state_with_proposal(state_path, slug="topic-x")
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        with pytest.raises(SystemExit) as exc_info:
+            dcli.cmd_promote_proposal(cfg, slug="nonexistent")
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "no proposal found for slug" in out
+
+    def test_already_promoted_errors(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = tmp_path / "data" / "state.json"
+        _seed_state_with_proposal(
+            state_path, slug="topic-x", status="promoted",
+        )
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        with pytest.raises(SystemExit) as exc_info:
+            dcli.cmd_promote_proposal(cfg, slug="topic-x")
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "not promotable" in out
+
+    def test_already_discarded_errors(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = tmp_path / "data" / "state.json"
+        _seed_state_with_proposal(
+            state_path, slug="topic-x", status="discarded",
+        )
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        with pytest.raises(SystemExit) as exc_info:
+            dcli.cmd_promote_proposal(cfg, slug="topic-x")
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "not promotable" in out
+
+    def test_ambiguous_slug_errors_with_fingerprints_listed(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Two entries sharing the same slug (post-collision-resolve
+        # scenario; mine_patterns can produce e.g. topic-x +
+        # topic-x-2 with the same proposed_slug after recovery).
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        state_path = tmp_path / "data" / "state.json"
+        state = PatternMinerState(state_path)
+        for fp in ("fp_aaa111", "fp_bbb222"):
+            state.record_proposal(ProposalEntry(
+                fingerprint=fp,
+                cluster_id="semantic_5",
+                proposed_slug="topic-x",  # collision: same slug
+                proposed_path=f"inbox/proposed-canonical/topic-x-{fp}.md",
+                status="pending",
+            ))
+        state.save()
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        with pytest.raises(SystemExit) as exc_info:
+            dcli.cmd_promote_proposal(cfg, slug="topic-x")
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "multiple proposals with slug" in out
+        # Fingerprints listed for operator disambiguation.
+        assert "fp_aaa111" in out or "fp_aaa111"[:12] in out
+        assert "fp_bbb222" in out or "fp_bbb222"[:12] in out
+
+    def test_fingerprint_disambiguation_works(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        # Two slug-colliding entries. Seed corresponding inbox files
+        # so the chosen one can actually be promoted.
+        inbox_dir = tmp_path / "inbox" / "proposed-canonical"
+        inbox_dir.mkdir(parents=True)
+        for stem in ("topic-x-aaa", "topic-x-bbb"):
+            (inbox_dir / f"{stem}.md").write_text(
+                "---\ntype: proposed-canonical\n---\n\n"
+                "# Topic\n\nBody text.\n",
+                encoding="utf-8",
+            )
+
+        state_path = tmp_path / "data" / "state.json"
+        state = PatternMinerState(state_path)
+        state.record_proposal(ProposalEntry(
+            fingerprint="fp_aaa111",
+            proposed_slug="topic-x",
+            proposed_path="inbox/proposed-canonical/topic-x-aaa.md",
+            proposed_canonical_type="architecture",
+            status="pending",
+        ))
+        state.record_proposal(ProposalEntry(
+            fingerprint="fp_bbb222",
+            proposed_slug="topic-x",
+            proposed_path="inbox/proposed-canonical/topic-x-bbb.md",
+            proposed_canonical_type="principles",
+            status="pending",
+        ))
+        state.save()
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        # Pick the second one explicitly by fingerprint.
+        dcli.cmd_promote_proposal(
+            cfg,
+            slug="topic-x",
+            fingerprint="fp_bbb222",
+            to="principles/disambiguated.md",
+        )
+
+        # Chosen entry promoted; the other one untouched.
+        state2 = PatternMinerState(state_path)
+        state2.load()
+        assert state2.proposals["fp_bbb222"].status == "promoted"
+        assert state2.proposals["fp_aaa111"].status == "pending"
+
+    def test_target_path_already_exists_errors(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Operator-safety check: don't overwrite an existing canonical
+        # record. Explicit error so the operator can rm first or
+        # choose a different --to path.
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        # Pre-create the canonical target.
+        (tmp_path / "architecture").mkdir()
+        (tmp_path / "architecture" / "topic-x.md").write_text(
+            "existing canonical record\n", encoding="utf-8",
+        )
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        with pytest.raises(SystemExit) as exc_info:
+            dcli.cmd_promote_proposal(cfg, slug="topic-x")
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "already exists" in out
+        # Inbox file NOT removed (atomic: either both target-write
+        # and inbox-delete succeed, or neither).
+        assert inbox_file.exists()
+        # State unchanged.
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        state = PatternMinerState(state_path)
+        state.load()
+        entry = next(iter(state.proposals.values()))
+        assert entry.status == "pending"
+
+
+# ---------------------------------------------------------------------------
+# cmd_discard_proposal — happy path + error cases
+# ---------------------------------------------------------------------------
+
+
+class TestDiscardProposalHappyPath:
+    def test_pending_proposal_discarded_state_updated_inbox_removed(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_discard_proposal(cfg, slug="topic-x")
+
+        assert not inbox_file.exists()
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        state = PatternMinerState(state_path)
+        state.load()
+        entry = next(iter(state.proposals.values()))
+        assert entry.status == "discarded"
+        assert entry.discarded_at != ""
+
+        out = capsys.readouterr().out
+        assert "discarded: topic-x" in out
+
+    def test_reason_recorded_in_state(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_discard_proposal(
+            cfg, slug="topic-x",
+            reason="overlaps with principles/foo.md",
+        )
+
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        state = PatternMinerState(state_path)
+        state.load()
+        entry = next(iter(state.proposals.values()))
+        assert entry.discarded_reason == "overlaps with principles/foo.md"
+
+    def test_audit_log_written_with_delete_row_and_reason_in_detail(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        inbox_file, state_path = _seed_inbox_proposal(tmp_path)
+        _seed_state_with_proposal(state_path)
+        audit_log = tmp_path / "vault_audit.log"
+        monkeypatch.setenv("ALFRED_VAULT_AUDIT_LOG", str(audit_log))
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_discard_proposal(
+            cfg, slug="topic-x", reason="duplicate theme",
+        )
+
+        rows = [
+            json.loads(line)
+            for line in audit_log.read_text().splitlines()
+            if line.strip()
+        ]
+        # Single row: delete inbox.
+        assert len(rows) == 1
+        assert rows[0]["op"] == "delete"
+        assert rows[0]["path"] == "inbox/proposed-canonical/topic-x.md"
+        assert rows[0]["tool"] == "distiller"
+        # Reason carried in detail.
+        assert "duplicate theme" in rows[0]["detail"]
+        assert "fingerprint" in rows[0]["detail"]
+
+    def test_inbox_already_absent_still_records_state(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Defensive: operator manually rm'd the inbox file before
+        # running discard-proposal. State mutation is the load-
+        # bearing record; the missing file is non-fatal.
+        state_path = tmp_path / "data" / "state.json"
+        _seed_state_with_proposal(state_path)
+        # NO inbox file seeded.
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        dcli.cmd_discard_proposal(cfg, slug="topic-x")
+
+        from alfred.distiller.pattern_miner_state import PatternMinerState
+        state = PatternMinerState(state_path)
+        state.load()
+        entry = next(iter(state.proposals.values()))
+        assert entry.status == "discarded"
+        out = capsys.readouterr().out
+        assert "already absent" in out
+
+
+class TestDiscardProposalErrors:
+    def test_slug_not_found_errors(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = tmp_path / "data" / "state.json"
+        _seed_state_with_proposal(state_path)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        with pytest.raises(SystemExit) as exc_info:
+            dcli.cmd_discard_proposal(cfg, slug="nonexistent")
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "no proposal found for slug" in out
+
+    def test_already_terminal_errors(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = tmp_path / "data" / "state.json"
+        _seed_state_with_proposal(
+            state_path, slug="topic-x", status="promoted",
+        )
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        cfg = _config_for_promote(tmp_path, state_path)
+        with pytest.raises(SystemExit) as exc_info:
+            dcli.cmd_discard_proposal(cfg, slug="topic-x")
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "not discardable" in out
+
+
+# ---------------------------------------------------------------------------
+# Parent dispatcher — cmd_distiller injects ALFRED_VAULT_AUDIT_LOG
+# (mirrors cmd_vault precedent from issue #64)
+# ---------------------------------------------------------------------------
+
+
+class TestCmdDistillerDispatcherWiring:
+    """Pin that cmd_distiller injects ALFRED_VAULT_AUDIT_LOG for the
+    promote-proposal / discard-proposal subcommands. The actual
+    subcommand handler is stubbed so this test surface stays tight
+    to the env-wiring contract (other test classes cover the
+    handlers themselves).
+    """
+
+    def _write_config(
+        self,
+        path: Path,
+        *,
+        log_dir: str,
+        vault_path: Path,
+    ) -> None:
+        path.write_text(
+            f"vault:\n"
+            f"  path: {vault_path}\n"
+            f"logging:\n"
+            f"  dir: {log_dir}\n",
+            encoding="utf-8",
+        )
+
+    def _make_args(
+        self, config_path: Path, distiller_cmd: str,
+    ):
+        import argparse
+
+        ns = argparse.Namespace(
+            config=str(config_path),
+            distiller_cmd=distiller_cmd,
+            # promote/discard kwargs
+            slug="topic-x",
+            to=None,
+            no_strip_scaffolding=False,
+            reason=None,
+            fingerprint=None,
+        )
+        return ns
+
+    def _stub_handler(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        captured: dict,
+        handler_name: str,
+    ) -> None:
+        """Replace dcli.cmd_promote_proposal / cmd_discard_proposal
+        with a stub that captures ``ALFRED_VAULT_AUDIT_LOG`` at call
+        time. The dispatcher's contract is "set the env var BEFORE
+        delegating," so capturing from inside the stub pins ordering.
+        """
+        import os
+
+        def _stub(*args, **kwargs) -> None:
+            captured["audit_log"] = os.environ.get("ALFRED_VAULT_AUDIT_LOG")
+        monkeypatch.setattr(
+            f"alfred.distiller.cli.{handler_name}", _stub,
+        )
+
+    def test_promote_proposal_injects_audit_log_env_var(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from alfred.cli import cmd_distiller
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        log_dir = tmp_path / "data"
+        log_dir.mkdir()
+        config = tmp_path / "config.yaml"
+        self._write_config(
+            config, log_dir=str(log_dir), vault_path=vault,
+        )
+
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+        captured: dict = {}
+        self._stub_handler(
+            monkeypatch, captured, "cmd_promote_proposal",
+        )
+
+        cmd_distiller(self._make_args(config, "promote-proposal"))
+        assert (
+            captured["audit_log"] == str(log_dir / "vault_audit.log")
+        )
+
+    def test_discard_proposal_injects_audit_log_env_var(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from alfred.cli import cmd_distiller
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        log_dir = tmp_path / "data"
+        log_dir.mkdir()
+        config = tmp_path / "config.yaml"
+        self._write_config(
+            config, log_dir=str(log_dir), vault_path=vault,
+        )
+
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+        captured: dict = {}
+        self._stub_handler(
+            monkeypatch, captured, "cmd_discard_proposal",
+        )
+
+        cmd_distiller(self._make_args(config, "discard-proposal"))
+        assert (
+            captured["audit_log"] == str(log_dir / "vault_audit.log")
+        )
+
+    def test_other_distiller_subcommands_do_not_inject_audit_log(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Non-mutating subcommands (status, history, rank-week, etc.)
+        # don't need the audit context — pin that the dispatcher
+        # ONLY injects for the two new subcommands. Catches a
+        # regression where the injection block accidentally widens
+        # to all subcommands.
+        from alfred.cli import cmd_distiller
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        log_dir = tmp_path / "data"
+        log_dir.mkdir()
+        config = tmp_path / "config.yaml"
+        self._write_config(
+            config, log_dir=str(log_dir), vault_path=vault,
+        )
+
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+        captured: dict = {}
+
+        import os
+
+        def _stub_status(*args, **kwargs) -> None:
+            captured["audit_log"] = os.environ.get("ALFRED_VAULT_AUDIT_LOG")
+        monkeypatch.setattr(
+            "alfred.distiller.cli.cmd_status", _stub_status,
+        )
+
+        import argparse
+        ns = argparse.Namespace(
+            config=str(config),
+            distiller_cmd="status",
+        )
+        cmd_distiller(ns)
+        # No env var set by dispatcher → still None.
+        assert captured["audit_log"] is None
+
+    def test_dispatcher_respects_caller_override(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # If the caller / test harness has already set
+        # ALFRED_VAULT_AUDIT_LOG, the dispatcher MUST NOT overwrite
+        # it. Mirrors the standard ALFRED_* env-var precedence.
+        from alfred.cli import cmd_distiller
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        log_dir = tmp_path / "data"
+        log_dir.mkdir()
+        config = tmp_path / "config.yaml"
+        self._write_config(
+            config, log_dir=str(log_dir), vault_path=vault,
+        )
+
+        override = str(tmp_path / "test-only-audit.log")
+        monkeypatch.setenv("ALFRED_VAULT_AUDIT_LOG", override)
+        captured: dict = {}
+        self._stub_handler(
+            monkeypatch, captured, "cmd_promote_proposal",
+        )
+
+        cmd_distiller(self._make_args(config, "promote-proposal"))
+        # Override preserved.
+        assert captured["audit_log"] == override

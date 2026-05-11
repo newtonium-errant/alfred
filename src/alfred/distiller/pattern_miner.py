@@ -1100,6 +1100,115 @@ def render_split_marker_markdown(
     return "\n".join(fm_lines)
 
 
+# ---------------------------------------------------------------------------
+# Scaffolding-strip — transforms inbox proposal markdown into the body
+# that lands at architecture/<slug>.md or principles/<slug>.md when the
+# operator promotes via ``alfred distiller promote-proposal``.
+# ---------------------------------------------------------------------------
+
+
+# Match a YAML frontmatter block at the very start of the file.
+# ``---`` on the first line, content, ``---`` on its own line. DOTALL
+# so the body can contain newlines; non-greedy so we stop at the
+# FIRST closing ``---``.
+_FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*\n?", re.DOTALL)
+
+# Match the "Phase 4 pattern miner surfaced this cluster..." banner —
+# always emitted by ``render_proposal_markdown`` immediately after the
+# H1 title, starting with ``> Phase 4 pattern miner surfaced``.
+# Matches the entire blockquote (one line is the standard shape).
+_PROPOSAL_BANNER_RE = re.compile(
+    r"^>\s*Phase 4 pattern miner surfaced.*?$\n?",
+    re.MULTILINE,
+)
+
+# Match the operator-facing footer that starts at ``## Suggested next
+# step`` and runs to end-of-file. The footer is scaffolding —
+# ``alfred vault move ...`` hint, "Or refine the body", "Or ``rm`` to
+# discard" — none of which belong in the canonical promoted record.
+_FOOTER_RE = re.compile(
+    r"^##\s+Suggested next step\b.*\Z",
+    re.MULTILINE | re.DOTALL,
+)
+
+# Match empty fenced code blocks — ``` followed by zero or more
+# whitespace-only lines then ```. The drafter sometimes emits these
+# when the LLM produces an empty code-fence placeholder.
+_EMPTY_FENCE_RE = re.compile(
+    r"^```[a-zA-Z0-9_+-]*\s*\n(?:[ \t]*\n)*```\s*\n?",
+    re.MULTILINE,
+)
+
+
+def strip_proposal_scaffolding(content: str) -> str:
+    """Strip inbox-only scaffolding from a proposal markdown body.
+
+    Inbox proposals carry four kinds of scaffolding the canonical
+    record shouldn't keep:
+
+      1. YAML frontmatter (``type: proposed-canonical``, ``proposed_at``,
+         etc.). Canonical records under ``architecture/`` and
+         ``principles/`` are plain markdown — no frontmatter.
+      2. The "Phase 4 pattern miner surfaced this cluster..." banner
+         line immediately after the H1 title.
+      3. The ``## Suggested next step`` section + everything after
+         (the ``alfred vault move`` hint, the refine/discard prompts).
+      4. Empty fenced code blocks — drafter occasionally emits these
+         as placeholders.
+
+    Returns the stripped content. Caller is responsible for any
+    additional transformations (e.g., prepending a canonical
+    promotion banner via :func:`canonical_promotion_banner`).
+
+    Defensive against malformed proposals: each strip is independent;
+    a missing frontmatter or missing banner just leaves that part of
+    the content unchanged. Trailing whitespace collapsed to a single
+    newline at end-of-file for canonical-record hygiene.
+
+    Per the subprocess-failure-logging discipline: callers (the CLI
+    handler) log the strip result so an operator can grep for
+    surprising shapes (e.g. "stripped but content went to zero").
+    """
+    out = content
+    out = _FRONTMATTER_RE.sub("", out, count=1)
+    out = _PROPOSAL_BANNER_RE.sub("", out, count=1)
+    out = _FOOTER_RE.sub("", out, count=1)
+    out = _EMPTY_FENCE_RE.sub("", out)
+    # Collapse runs of >2 consecutive blank lines to exactly 2 (one
+    # blank line between sections is canonical; multiple are
+    # scaffolding artifacts from the stripped sections above).
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    # Trim trailing whitespace; ensure single trailing newline.
+    out = out.rstrip() + "\n"
+    return out
+
+
+def canonical_promotion_banner(
+    *,
+    promoted_at_iso: str,
+    member_count: int,
+    fingerprint: str,
+) -> str:
+    """Return a one-line banner to prepend to a promoted canonical
+    record. Recording provenance keeps the audit trail visible at
+    the canonical record itself, not only in vault_audit.log.
+
+    Format::
+
+        > Promoted from inbox/proposed-canonical on YYYY-MM-DD.
+        > Sources: N records (fingerprint: <short-fp>).
+
+    The fingerprint is truncated to 12 chars for readability; the
+    full hash lives in state for grep-by-fingerprint workflows.
+    """
+    date_part = promoted_at_iso[:10] if promoted_at_iso else "unknown date"
+    short_fp = fingerprint[:12] if fingerprint else "unknown"
+    return (
+        f"> Promoted from inbox/proposed-canonical on {date_part}. "
+        f"Sources: {member_count} records (fingerprint: {short_fp}).\n\n"
+    )
+
+
 def _atomic_write(path: Path, content: str) -> None:
     """Atomic-ish write: tmp → rename. Creates parent dirs first.
 
@@ -1653,6 +1762,7 @@ __all__ = [
     "ProposalEntry",
     "PatternMinerState",
     "call_drafter",
+    "canonical_promotion_banner",
     "cluster_matches_canonical",
     "cluster_passes_label_quality",
     "derive_proposed_canonical_type",
@@ -1668,4 +1778,5 @@ __all__ = [
     "render_proposal_markdown",
     "render_split_marker_markdown",
     "slugify",
+    "strip_proposal_scaffolding",
 ]

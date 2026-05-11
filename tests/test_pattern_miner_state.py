@@ -102,6 +102,107 @@ class TestProposalEntryToDict:
 
 
 # ---------------------------------------------------------------------------
+# Per-action fields (promote-proposal / discard-proposal CLI, 2026-05-11).
+# Closes 3 deferred follow-ups from the Phase 4 first-promote review.
+# ---------------------------------------------------------------------------
+
+
+class TestPerActionFieldsSchema:
+    """Pin the four new fields (promoted_to, promoted_at, discarded_at,
+    discarded_reason) round-trip cleanly + schema-tolerance still
+    drops genuinely unknown fields not in the new set.
+    """
+
+    def test_promoted_fields_round_trip(self) -> None:
+        original = ProposalEntry(
+            fingerprint="abc123",
+            cluster_id="c1",
+            proposed_slug="topic-x",
+            proposed_canonical_type="architecture",
+            status=STATUS_PROMOTED,
+            promoted_to="architecture/topic-x.md",
+            promoted_at="2026-05-11T10:00:00+00:00",
+        )
+        restored = ProposalEntry.from_dict(original.to_dict())
+        assert restored.promoted_to == "architecture/topic-x.md"
+        assert restored.promoted_at == "2026-05-11T10:00:00+00:00"
+        # Unset fields stay empty.
+        assert restored.discarded_at == ""
+        assert restored.discarded_reason == ""
+
+    def test_discarded_fields_round_trip(self) -> None:
+        from alfred.distiller.pattern_miner_state import STATUS_DISCARDED
+
+        original = ProposalEntry(
+            fingerprint="def456",
+            cluster_id="c2",
+            proposed_slug="topic-y",
+            status=STATUS_DISCARDED,
+            discarded_at="2026-05-11T11:00:00+00:00",
+            discarded_reason="overlaps with principles/foo.md",
+        )
+        restored = ProposalEntry.from_dict(original.to_dict())
+        assert restored.discarded_at == "2026-05-11T11:00:00+00:00"
+        assert restored.discarded_reason == "overlaps with principles/foo.md"
+        assert restored.promoted_to == ""
+        assert restored.promoted_at == ""
+
+    def test_legacy_entry_without_per_action_fields_loads_clean(
+        self,
+    ) -> None:
+        # Pre-2026-05-11 state files have no per-action fields. The
+        # schema-tolerance filter MUST default them to empty strings
+        # rather than crash on missing keys.
+        entry = ProposalEntry.from_dict({
+            "fingerprint": "legacy",
+            "cluster_id": "c1",
+            "proposed_slug": "old-proposal",
+            "status": "promoted",  # already-acted via reconcile sweep
+            # NO promoted_to / promoted_at / discarded_at /
+            # discarded_reason — legacy schema.
+        })
+        assert entry.fingerprint == "legacy"
+        assert entry.status == "promoted"
+        # All four new fields default to empty strings cleanly.
+        assert entry.promoted_to == ""
+        assert entry.promoted_at == ""
+        assert entry.discarded_at == ""
+        assert entry.discarded_reason == ""
+
+    def test_unknown_field_still_dropped_after_extension(self) -> None:
+        # The schema-tolerance filter still drops fields not in the
+        # dataclass — adding the 4 new fields didn't accidentally
+        # widen the filter to "accept anything." Pin the existing
+        # contract.
+        entry = ProposalEntry.from_dict({
+            "fingerprint": "abc",
+            "promoted_to": "architecture/foo.md",  # new field, kept
+            "future_field_v3": "should not survive",  # unknown, dropped
+            "really_random": [1, 2, 3],  # unknown, dropped
+        })
+        assert entry.promoted_to == "architecture/foo.md"
+        # No crash; unknown fields silently dropped.
+        # (Can't assert "future_field_v3 not present" because dataclasses
+        # don't carry arbitrary attrs, but the constructor would have
+        # raised TypeError if the filter let unknown keys through.)
+
+    def test_to_dict_emits_all_four_new_fields(self) -> None:
+        # to_dict MUST include the 4 new fields so a save → load
+        # round-trip preserves them. Pin the on-disk shape.
+        entry = ProposalEntry(fingerprint="abc")
+        as_dict = entry.to_dict()
+        assert "promoted_to" in as_dict
+        assert "promoted_at" in as_dict
+        assert "discarded_at" in as_dict
+        assert "discarded_reason" in as_dict
+        # Default values for an unaction'd entry.
+        assert as_dict["promoted_to"] == ""
+        assert as_dict["promoted_at"] == ""
+        assert as_dict["discarded_at"] == ""
+        assert as_dict["discarded_reason"] == ""
+
+
+# ---------------------------------------------------------------------------
 # PatternMinerState.load — missing file + schema-tolerance
 # ---------------------------------------------------------------------------
 

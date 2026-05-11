@@ -623,6 +623,22 @@ def cmd_distiller(args: argparse.Namespace) -> None:
     from alfred._data import get_skills_dir
     skills_dir = get_skills_dir()
 
+    # Inject ALFRED_VAULT_AUDIT_LOG so promote-proposal /
+    # discard-proposal can write to the unified vault audit log.
+    # Mirrors the cmd_vault (issue #64) precedent: resolve
+    # ``<logging.dir>/vault_audit.log`` from the unified config, set
+    # env var before delegating to per-subcommand handlers. Respect
+    # a caller-set override (test harnesses, one-off invocations).
+    # Only set on subcommands that actually mutate (promote-proposal,
+    # discard-proposal) — other distiller subcommands don't need the
+    # audit context and shouldn't pay the env-mutation cost.
+    if args.distiller_cmd in ("promote-proposal", "discard-proposal"):
+        log_cfg = raw.get("logging", {}) or {}
+        log_dir = log_cfg.get("dir", "./data")
+        audit_path = Path(log_dir) / "vault_audit.log"
+        if not os.environ.get("ALFRED_VAULT_AUDIT_LOG"):
+            os.environ["ALFRED_VAULT_AUDIT_LOG"] = str(audit_path)
+
     from alfred.distiller import cli as dcli
     subcmd = args.distiller_cmd
 
@@ -663,6 +679,21 @@ def cmd_distiller(args: argparse.Namespace) -> None:
             dry_run=args.dry_run,
             min_cluster_size=args.min_cluster_size,
             top=args.top,
+        )
+    elif subcmd == "promote-proposal":
+        dcli.cmd_promote_proposal(
+            config,
+            slug=args.slug,
+            to=args.to,
+            strip_scaffolding=not args.no_strip_scaffolding,
+            fingerprint=args.fingerprint,
+        )
+    elif subcmd == "discard-proposal":
+        dcli.cmd_discard_proposal(
+            config,
+            slug=args.slug,
+            reason=args.reason,
+            fingerprint=args.fingerprint,
         )
     else:
         print(f"Unknown distiller subcommand: {subcmd}")
@@ -2410,6 +2441,76 @@ def build_parser() -> argparse.ArgumentParser:
     dist_mine.add_argument(
         "--top", type=int, default=None,
         help="Cap on new proposals per run (default unlimited; useful for bulk-mine)",
+    )
+
+    # Phase 4 operator-promote tracking (2026-05-11). Closes 3 deferred
+    # follow-ups from project_phase4_drafter_prompt_tuning.md: slug-
+    # rename-on-promote silently miscounted as discarded by the
+    # reconcile sweep; no audit trail for promote/discard actions; no
+    # scaffolding-strip automation. The CLI commands set state status
+    # explicitly + write per-action fields + write to vault_audit.log
+    # + strip scaffolding on promote. Reconcile sweep stays as the
+    # backstop for direct-filesystem operator actions.
+    dist_promote = dist_sub.add_parser(
+        "promote-proposal",
+        help="Promote a Phase 4 inbox proposal to a canonical record",
+    )
+    dist_promote.add_argument(
+        "slug",
+        help=(
+            "proposed_slug of the inbox proposal (e.g. "
+            "python-frontmatter-parsing-behaviors). Use --fingerprint "
+            "to disambiguate when multiple proposals share a slug."
+        ),
+    )
+    dist_promote.add_argument(
+        "--to", default=None,
+        help=(
+            "Canonical target path within the vault (e.g. "
+            "architecture/python-frontmatter.md). Defaults to "
+            "<proposed_canonical_type>/<proposed_slug>.md derived "
+            "from state."
+        ),
+    )
+    dist_promote.add_argument(
+        "--no-strip-scaffolding", action="store_true", default=False,
+        help=(
+            "Leave the proposal body verbatim (frontmatter + banner + "
+            "footer + empty fences). Default behavior strips all four "
+            "categories and prepends a canonical promotion banner."
+        ),
+    )
+    dist_promote.add_argument(
+        "--fingerprint", default=None,
+        help=(
+            "Cluster fingerprint to disambiguate ambiguous slugs. "
+            "Required when multiple state entries share the same slug "
+            "(e.g. after a collision-resolve pass)."
+        ),
+    )
+
+    dist_discard = dist_sub.add_parser(
+        "discard-proposal",
+        help="Discard a Phase 4 inbox proposal (record + delete file)",
+    )
+    dist_discard.add_argument(
+        "slug",
+        help=(
+            "proposed_slug of the inbox proposal. Use --fingerprint to "
+            "disambiguate when multiple proposals share a slug."
+        ),
+    )
+    dist_discard.add_argument(
+        "--reason", default=None,
+        help=(
+            "Optional operator context (e.g. 'overlaps with existing "
+            "principles/foo.md'). Recorded on the state entry as "
+            "discarded_reason."
+        ),
+    )
+    dist_discard.add_argument(
+        "--fingerprint", default=None,
+        help="Cluster fingerprint to disambiguate ambiguous slugs.",
     )
 
     # instructor

@@ -43,6 +43,18 @@ slug matches ``proposed_slug``; if found, status flips to
 ``promoted``. If absent and ``proposed_path`` is also absent, status
 flips to ``discarded`` (operator's decision recorded as "no").
 
+The reconcile sweep is the BACKSTOP. The primary path is the
+operator running ``alfred distiller promote-proposal <slug>`` /
+``discard-proposal <slug>`` at action time, which sets status
+explicitly + records the per-action fields (``promoted_to``,
+``promoted_at``, ``discarded_at``, ``discarded_reason``) on the
+entry. The reconcile sweep is for the case where the operator
+acted via direct filesystem (mv / rm) without the CLI — same
+contract, less rich state. Per the 2026-05-11 promote-proposal
+arc closing 3 deferred follow-ups: slug-rename-on-promote silently
+miscounted as discarded, no audit trail, no scaffolding-strip
+automation. The CLI commands fix all three.
+
 Note: NO-CLAIM (the LLM's refusal sentinel) is NOT a status in the
 lifecycle. NO-CLAIM clusters are skipped entirely and intentionally
 not recorded so a later cluster shape change re-evaluates fresh.
@@ -119,6 +131,14 @@ class ProposalEntry:
     (slug, cluster id, member count, proposed type). The status field
     is state-only — the proposal markdown carries ``status: proposed``
     at write time and never changes; the state file owns the lifecycle.
+
+    Per-action fields (``promoted_to`` / ``promoted_at`` /
+    ``discarded_at`` / ``discarded_reason``) are populated by the
+    ``alfred distiller promote-proposal`` / ``discard-proposal`` CLI
+    commands. Legacy entries without these fields load cleanly (empty
+    string defaults via the schema-tolerance filter). Reconcile-sweep-
+    set transitions (the backstop path) do NOT populate these fields —
+    only operator CLI invocations do.
     """
 
     fingerprint: str = ""
@@ -130,6 +150,16 @@ class ProposalEntry:
     proposed_slug: str = ""
     proposed_canonical_type: str = ""  # "architecture" | "principles"
     status: str = STATUS_PENDING
+    # Per-action fields (2026-05-11). Populated by the CLI commands
+    # ``promote-proposal`` / ``discard-proposal`` at action time.
+    # Reconcile-sweep-set transitions leave these empty — only operator
+    # CLI invocations write them. Empty strings on a ``promoted`` /
+    # ``discarded`` entry signal "reconcile-detected, no operator
+    # context recorded."
+    promoted_to: str = ""  # canonical target path (e.g. "architecture/foo.md")
+    promoted_at: str = ""  # ISO timestamp of CLI promote action
+    discarded_at: str = ""  # ISO timestamp of CLI discard action
+    discarded_reason: str = ""  # optional operator-supplied context
 
     @classmethod
     def from_dict(cls, data: dict) -> "ProposalEntry":
@@ -157,6 +187,10 @@ class ProposalEntry:
             "status": (
                 self.status if self.status in _VALID_STATUSES else STATUS_PENDING
             ),
+            "promoted_to": self.promoted_to,
+            "promoted_at": self.promoted_at,
+            "discarded_at": self.discarded_at,
+            "discarded_reason": self.discarded_reason,
         }
 
 
