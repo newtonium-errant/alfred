@@ -1529,37 +1529,61 @@ def _load_canonical_path_index(
     return out
 
 
-def _find_canonical_by_fingerprint(
+# Regex matches the ``fingerprint: <12-char>`` substring that
+# ``canonical_promotion_banner`` embeds in promoted canonical records.
+# Anchored on ``fingerprint:`` to avoid false matches against other
+# ``: <12-char>`` substrings; capture group is the 12-char short-form
+# so the index-build pass extracts it directly without manual slicing.
+#
+# Character class is ``[a-zA-Z0-9]`` rather than strict hex ``[a-f0-9]``:
+# production fingerprints are SHA-256 hex (all lowercase a-f0-9) so
+# strict-hex would suffice for real records, but test fixtures and
+# any future change to the fingerprint encoding (e.g., base32, base64)
+# would silently break under strict hex. Looser char class is a
+# negligible false-positive risk (still anchored on the
+# ``fingerprint:`` prefix) and gains forward-compatibility.
+_FINGERPRINT_BANNER_RE = re.compile(r"fingerprint:\s*([a-zA-Z0-9]{12})")
+
+
+def _build_canonical_fingerprint_index(
     vault_path: Path,
     canonical_match_dirs: list[str] | tuple[str, ...],
-    short_fingerprint: str,
-) -> list[Path]:
-    """Grep canonical_match_dirs for the short-form fingerprint.
+) -> dict[str, list[Path]]:
+    """Build ``{short_fingerprint: [paths]}`` from one walk of
+    ``canonical_match_dirs``. Used by :func:`reconcile_state` so the
+    fingerprint-grep step (step 3) is O(1) lookup per pending entry
+    rather than re-walking the canonical tree per entry.
 
-    The ``canonical_promotion_banner`` helper embeds ``fingerprint:
-    <12-char>`` in the banner it prepends to promoted records. This
-    helper greps for that signal so reconcile can detect promotions
-    that bypassed the slug-match path (operator renamed the slug
-    during promote — the case fix #2 is closing).
+    The old per-entry helper :func:`_find_canonical_by_fingerprint`
+    was O(N_entries × M_canonical_files) — at today's scale (~14
+    terminal entries × ~50 canonical files) the cost is negligible,
+    but the linear-in-N compounding becomes load-bearing at
+    hundreds of historical entries. This index-build is
+    O(M_canonical_files) once per reconcile sweep + O(1) per
+    entry, giving O(M + N) total.
 
-    Returns a list of absolute paths whose body contains the
-    fingerprint substring. Empty list = no match. Length > 1 = the
-    operator copy-pasted the banner across multiple files (rare but
-    real); caller decides how to handle (today: warn, pick first).
+    Values are lists rather than scalars because a fingerprint
+    substring CAN appear in multiple canonical files (operator copy-
+    paste mistake). The list preserves walk order so reconcile picks
+    the first match deterministically. The duplicate-fingerprint warn
+    log fires inside this builder at index-build time (once per
+    duplicate set), not per consuming entry.
 
     Per the subprocess-failure-logging discipline: unreadable files
     are logged + skipped + iteration continues. A single permission
-    error on one file MUST NOT crash the whole reconcile sweep.
+    error MUST NOT crash the whole reconcile sweep.
     """
-    if not short_fingerprint:
-        return []
-    needle = f"fingerprint: {short_fingerprint}"
-    matches: list[Path] = []
+    index: dict[str, list[Path]] = {}
     for dirname in canonical_match_dirs:
         d = vault_path / dirname
         if not d.is_dir():
             continue
-        for md_path in d.rglob("*.md"):
+        for md_path in sorted(d.rglob("*.md")):
+            # Sorted so duplicate-match ordering is deterministic
+            # across filesystems with different directory-walk
+            # orders. Operator gets the same "chosen_path" on
+            # successive reconcile runs without filesystem-state
+            # leakage.
             if md_path.name == ".gitkeep":
                 continue
             try:
@@ -1572,9 +1596,62 @@ def _find_canonical_by_fingerprint(
                     error=str(exc)[:200],
                 )
                 continue
-            if needle in content:
-                matches.append(md_path)
-    return matches
+            # A canonical file CAN carry multiple ``fingerprint:``
+            # banners (e.g., operator merged two proposals into one
+            # canonical record). Index each one — every entry that
+            # cites either fingerprint should resolve to this file.
+            for match in _FINGERPRINT_BANNER_RE.finditer(content):
+                short_fp = match.group(1)
+                bucket = index.setdefault(short_fp, [])
+                if md_path not in bucket:
+                    bucket.append(md_path)
+
+    # Emit the multi-match warn at index-build time (once per
+    # duplicate set) rather than per consuming entry. Same operator-
+    # actionable signal as the prior per-entry warn; deferred to
+    # here so it doesn't fire N times for N entries sharing a
+    # fingerprint.
+    for short_fp, paths in index.items():
+        if len(paths) > 1:
+            log.warning(
+                "pattern_miner.fingerprint_multiple_matches",
+                fingerprint=short_fp,
+                matching_paths=[str(p) for p in paths],
+                chosen_path=str(paths[0]),
+                note=(
+                    "fingerprint banner found in multiple canonical "
+                    "files; first match wins. Operator should "
+                    "review and dedup."
+                ),
+            )
+
+    return index
+
+
+def _find_canonical_by_fingerprint(
+    vault_path: Path,
+    canonical_match_dirs: list[str] | tuple[str, ...],
+    short_fingerprint: str,
+) -> list[Path]:
+    """Grep canonical_match_dirs for the short-form fingerprint.
+
+    .. deprecated::
+       Kept for backward compatibility with external callers (e.g.
+       tests pinning the per-entry helper directly). Internal
+       reconcile code path now uses :func:`_build_canonical_fingerprint_index`
+       for the O(M+N) two-phase optimization.
+
+    Delegates to the index-build helper + returns the bucket for the
+    requested fingerprint. Per-entry cost is now O(M_canonical_files)
+    because each call rebuilds the index from scratch — only the
+    internal reconcile loop benefits from the shared-index optimization.
+    External callers (if any) eat the per-call rebuild cost but get
+    identical results.
+    """
+    if not short_fingerprint:
+        return []
+    index = _build_canonical_fingerprint_index(vault_path, canonical_match_dirs)
+    return list(index.get(short_fingerprint, []))
 
 
 def reconcile_state(
@@ -1627,14 +1704,29 @@ def reconcile_state(
     it before the new-mining pass so the state is fresh; CLI handlers
     can call it standalone for status reporting without re-mining.
     """
-    # Build both indices once for the whole sweep. The slug index is
-    # cheap (one stat per file). The path index is the same walk; we
-    # do both rather than choosing because reconcile may need both.
+    # Build all three indices once for the whole sweep. The slug
+    # index is cheap (one stat per file). The path index is the same
+    # walk; we do both rather than choosing because reconcile may
+    # need both. The fingerprint index is a separate walk (reads
+    # each file's body); the multi-match warn fires from inside its
+    # build at most once per duplicate-fingerprint set, not per
+    # consuming entry.
+    #
+    # 2026-05-11 optimization (deferred-followup #2): the
+    # fingerprint-grep step was per-entry O(M_canonical_files); now
+    # O(1) dict lookup against a once-built index. Total reconcile
+    # complexity goes from O(N_entries × M_canonical_files) to
+    # O(N + M).
     canonical_path_index = _load_canonical_path_index(
         vault_path, canonical_match_dirs,
     )
     # The set view drives the existing slug-match step.
     canonical_index = set(canonical_path_index.keys())
+    # Fingerprint index built once per sweep; consulted O(1) per
+    # entry below.
+    fingerprint_index = _build_canonical_fingerprint_index(
+        vault_path, canonical_match_dirs,
+    )
 
     promoted = 0
     discarded = 0
@@ -1657,16 +1749,15 @@ def reconcile_state(
         if entry.proposed_slug and entry.proposed_slug in canonical_index:
             slug_match_path = canonical_path_index[entry.proposed_slug]
 
-        # Step 3 (2026-05-11 extension): fingerprint-grep fallback.
-        # Only runs when slug-match didn't fire — slug-match is more
-        # deterministic and faster (set membership vs. file read per
-        # candidate). When slug-match finds a hit, step 3 is skipped.
+        # Step 3 (2026-05-11 extension): fingerprint-grep fallback
+        # via O(1) index lookup. Only runs when slug-match didn't
+        # fire — slug-match is more deterministic. The multi-match
+        # warn was already emitted at index-build time (if it
+        # applied), so no per-entry warn here.
         fp_match_paths: list[Path] = []
         if slug_match_path is None and entry.fingerprint:
             short_fp = entry.fingerprint[:12]
-            fp_match_paths = _find_canonical_by_fingerprint(
-                vault_path, canonical_match_dirs, short_fp,
-            )
+            fp_match_paths = list(fingerprint_index.get(short_fp, []))
 
         # Classify based on signals.
         if slug_match_path is not None:
@@ -1688,23 +1779,8 @@ def reconcile_state(
                 promoted_to=target_rel,
             )
         elif fp_match_paths:
-            # Step 3 hit. Pick first match; warn if multiple.
-            if len(fp_match_paths) > 1:
-                # Operator copy-paste mistake — fingerprint banner
-                # appears in multiple files. Pick the first one and
-                # flag for review. The operator-actionable log carries
-                # all matching paths so the operator can investigate.
-                log.warning(
-                    "pattern_miner.fingerprint_multiple_matches",
-                    fingerprint=fp[:12],
-                    matching_paths=[str(p) for p in fp_match_paths],
-                    chosen_path=str(fp_match_paths[0]),
-                    note=(
-                        "fingerprint banner found in multiple canonical "
-                        "files; first match wins. Operator should "
-                        "review and dedup."
-                    ),
-                )
+            # Step 3 hit. Pick first match; the multi-match warn
+            # already fired at index-build time if applicable.
             chosen = fp_match_paths[0]
             try:
                 target_rel = str(chosen.relative_to(vault_path))

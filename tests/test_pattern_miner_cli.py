@@ -1901,6 +1901,209 @@ class TestFingerprintReconcile:
 
 
 # ---------------------------------------------------------------------------
+# 2026-05-11 deferred follow-up #2: O(N×M) fingerprint-grep optimization.
+# The original ``_find_canonical_by_fingerprint`` was called per-entry,
+# re-reading every canonical .md file each time. The optimization
+# builds a ``{fingerprint: [paths]}`` index ONCE per reconcile sweep
+# (O(M_canonical_files)), then O(1) dict lookup per entry. Total
+# O(M + N) instead of O(M × N).
+# ---------------------------------------------------------------------------
+
+
+class TestFingerprintIndexOptimization:
+    def test_index_builds_once_per_reconcile_sweep(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Pin the O(M+N) contract by counting file-read calls. With
+        # the optimization, ``Path.read_text`` is called once per
+        # canonical .md file regardless of how many pending entries
+        # the reconcile sweep walks. Pre-optimization, the count
+        # would scale linearly with the entry count.
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        # Set up 3 canonical files (no fingerprint banners — slug-
+        # match path won't fire; index-build still reads them all).
+        (tmp_path / "architecture").mkdir()
+        for stem in ("a", "b", "c"):
+            (tmp_path / "architecture" / f"{stem}.md").write_text(
+                f"# {stem}\n\nbody\n", encoding="utf-8",
+            )
+
+        # Set up 5 pending entries with distinct fingerprints that
+        # WON'T match any canonical file → step 4 (discarded) for
+        # all 5. Pre-optimization: per-entry fingerprint grep
+        # reads 3 × 5 = 15 file-read calls. Post-optimization: 3
+        # reads once at index-build + zero re-reads.
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        for i in range(5):
+            state.proposals[f"fp_pending_{i:04x}"] = ProposalEntry(
+                fingerprint=f"fp_pending_{i:04x}_padding_22",
+                proposed_path=f"inbox/proposed-canonical/missing-{i}.md",
+                proposed_slug=f"missing-{i}",
+                status="pending",
+            )
+
+        # Count Path.read_text calls.
+        read_count = {"n": 0}
+        original_read_text = Path.read_text
+
+        def _counting_read_text(self, *args, **kwargs):
+            read_count["n"] += 1
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _counting_read_text)
+
+        reconcile_state(
+            state, tmp_path, ["architecture", "principles", "stack"],
+        )
+
+        # With the optimization: 3 reads (one per canonical .md).
+        # Pre-optimization would have been 3 × 5 = 15 (assuming
+        # slug-match misses for all 5). Pinning the upper bound at
+        # the canonical file count + a small slack for any future
+        # incidental reads (e.g., state-file reads, if any). The
+        # load-bearing assertion is the COUNT IS NOT LINEAR IN N.
+        canonical_file_count = 3
+        entry_count = 5
+        # Strict upper bound: at most canonical_file_count + 2
+        # incidental reads. (entry_count * canonical_file_count =
+        # 15 would be the pre-optimization shape; we expect ~3.)
+        assert read_count["n"] <= canonical_file_count + 2, (
+            f"Expected ≤{canonical_file_count + 2} Path.read_text "
+            f"calls (O(M) shape); got {read_count['n']}. The "
+            f"fingerprint-grep is re-walking canonical_match_dirs "
+            f"per entry — O(N×M) regression of the optimization."
+        )
+        # Sanity: at least one read happened (otherwise the index
+        # didn't get built).
+        assert read_count["n"] >= 1
+
+    def test_multi_match_warn_fires_from_index_build_path(
+        self, tmp_path: Path,
+    ) -> None:
+        # The multi-match warn was previously emitted per consuming
+        # entry. With the index-build optimization, it fires ONCE
+        # per duplicate-fingerprint set at index-build time. Same
+        # operator-actionable signal; same event name; same payload
+        # shape. Pin the new emission path.
+        import structlog
+
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        # Two canonical files carrying the same fingerprint banner.
+        _write_canonical_with_banner(
+            tmp_path, "architecture/first.md",
+            fingerprint_short="abcdef123456",
+        )
+        _write_canonical_with_banner(
+            tmp_path, "principles/second.md",
+            fingerprint_short="abcdef123456",
+        )
+
+        # Two pending entries citing the SAME duplicated fingerprint.
+        # Pre-optimization: the multi-match warn would fire twice
+        # (once per entry). Post-optimization: fires ONCE at index-
+        # build time, regardless of how many entries cite it.
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        for i in range(2):
+            state.proposals[f"abcdef123456_entry_{i}"] = ProposalEntry(
+                fingerprint=f"abcdef123456_entry_{i}_pad",
+                proposed_path=f"inbox/proposed-canonical/topic-{i}.md",
+                proposed_slug=f"topic-{i}",
+                status="pending",
+            )
+
+        with structlog.testing.capture_logs() as captured:
+            reconcile_state(
+                state, tmp_path,
+                ["architecture", "principles", "stack"],
+            )
+
+        # Exactly one multi-match warn — fired at index-build time
+        # rather than per consuming entry. Catches a regression that
+        # moves the warn back inside the per-entry loop.
+        multi_logs = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.fingerprint_multiple_matches"
+        ]
+        assert len(multi_logs) == 1, (
+            f"Expected exactly one multi-match warn (fired at "
+            f"index-build time); got {len(multi_logs)}. A future "
+            f"regression that moves the warn inside the per-entry "
+            f"loop would fire it N times."
+        )
+        ml = multi_logs[0]
+        assert ml["fingerprint"] == "abcdef123456"
+        assert len(ml["matching_paths"]) == 2
+
+    def test_index_helper_returns_dict_shape(self, tmp_path: Path) -> None:
+        # Pin the canonical-fingerprint-index helper's return shape:
+        # ``{short_fingerprint: [Path, ...]}``. Lists rather than
+        # single Paths because duplicate-fingerprint cases need to
+        # preserve all matches for the multi-match warn.
+        from alfred.distiller.pattern_miner import (
+            _build_canonical_fingerprint_index,
+        )
+
+        _write_canonical_with_banner(
+            tmp_path, "architecture/x.md",
+            fingerprint_short="aaaaaaaaaaaa",
+        )
+        _write_canonical_with_banner(
+            tmp_path, "architecture/y.md",
+            fingerprint_short="bbbbbbbbbbbb",
+        )
+
+        index = _build_canonical_fingerprint_index(
+            tmp_path, ["architecture", "principles", "stack"],
+        )
+
+        assert "aaaaaaaaaaaa" in index
+        assert "bbbbbbbbbbbb" in index
+        # Values are lists of Path objects.
+        assert isinstance(index["aaaaaaaaaaaa"], list)
+        assert all(
+            isinstance(p, Path) for p in index["aaaaaaaaaaaa"]
+        )
+        # Single-match cases produce single-element lists.
+        assert len(index["aaaaaaaaaaaa"]) == 1
+
+    def test_deprecated_helper_still_works_via_delegation(
+        self, tmp_path: Path,
+    ) -> None:
+        # ``_find_canonical_by_fingerprint`` is kept as a deprecated
+        # wrapper that delegates to the index-build helper. Pin the
+        # backward-compat contract so external callers (existing
+        # tests, future external consumers) keep working.
+        from alfred.distiller.pattern_miner import (
+            _find_canonical_by_fingerprint,
+        )
+
+        _write_canonical_with_banner(
+            tmp_path, "architecture/x.md",
+            fingerprint_short="ccccccccccccc"[:12],
+        )
+
+        matches = _find_canonical_by_fingerprint(
+            tmp_path,
+            ["architecture", "principles", "stack"],
+            "ccccccccccccc"[:12],
+        )
+        assert len(matches) == 1
+        assert matches[0].name == "x.md"
+
+
+# ---------------------------------------------------------------------------
 # Phase 4 operator-promote tracking (2026-05-11) — CLI commands
 # ``promote-proposal`` and ``discard-proposal``. Closes the 3 deferred
 # follow-ups: slug-rename-on-promote silently miscounted, no audit
