@@ -1531,6 +1531,376 @@ class TestSplitPendingReconcile:
 
 
 # ---------------------------------------------------------------------------
+# Fingerprint-based reconcile (2026-05-11 extension). Closes the
+# slug-rename-on-promote misclassification: when an operator promotes
+# a proposal but renames the slug at promote time, the slug-match
+# step misses; the fingerprint banner ``canonical_promotion_banner``
+# embeds in the canonical record provides a fallback signal.
+# ---------------------------------------------------------------------------
+
+
+def _write_canonical_with_banner(
+    vault_path: Path,
+    rel_path: str,
+    *,
+    fingerprint_short: str,
+    title: str = "Some Title",
+) -> Path:
+    """Write a canonical record that carries the fingerprint banner
+    in the body — matches what ``cmd_promote_proposal`` writes when
+    the CLI handler runs.
+    """
+    full = vault_path / rel_path
+    full.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        f"# {title}\n"
+        f"\n"
+        f"> Promoted from inbox/proposed-canonical on 2026-05-11. "
+        f"Sources: 5 records (fingerprint: {fingerprint_short}).\n"
+        f"\n"
+        f"## Mined claim\n"
+        f"\n"
+        f"Body text here.\n"
+    )
+    full.write_text(content, encoding="utf-8")
+    return full
+
+
+class TestFingerprintReconcile:
+    """Pin the fingerprint-grep fallback step in reconcile_state.
+
+    Closes the slug-rename-on-promote misclassification — when
+    operator renames slug at promote time, slug-match misses but
+    the fingerprint banner still carries the signal.
+    """
+
+    def test_fingerprint_match_promotes_with_correct_promoted_to(
+        self, tmp_path: Path,
+    ) -> None:
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            STATUS_PROMOTED,
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        # Operator promoted to a RENAMED slug (`renamed-thing.md`
+        # instead of the original `topic-x.md`). Slug-match misses;
+        # fingerprint-grep should catch it.
+        _write_canonical_with_banner(
+            tmp_path,
+            "architecture/renamed-thing.md",
+            fingerprint_short="fpabcdef1234",
+        )
+        state.proposals["fpabcdef1234567890ab"] = ProposalEntry(
+            fingerprint="fpabcdef1234567890ab",
+            cluster_id="semantic_5",
+            proposed_path="inbox/proposed-canonical/topic-x.md",
+            proposed_slug="topic-x",  # original slug; doesn't match
+            status="pending",
+        )
+
+        result = reconcile_state(
+            state, tmp_path, ["architecture", "principles", "stack"],
+        )
+        assert result["promoted"] == 1
+        assert result["discarded"] == 0
+        entry = state.proposals["fpabcdef1234567890ab"]
+        assert entry.status == STATUS_PROMOTED
+        # promoted_to reflects the actual renamed canonical path.
+        assert entry.promoted_to == "architecture/renamed-thing.md"
+        # promoted_at populated by reconcile.
+        assert entry.promoted_at != ""
+
+    def test_slug_match_wins_when_both_signals_present(
+        self, tmp_path: Path,
+    ) -> None:
+        # Defensive: when BOTH slug-match and fingerprint-grep would
+        # fire, slug-match wins (step 2 is more deterministic + faster).
+        # Edge case is rare but pinned so the priority stays explicit.
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            STATUS_PROMOTED,
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        # Slug-match path: architecture/topic-x.md (matches proposed_slug)
+        (tmp_path / "architecture").mkdir(parents=True)
+        (tmp_path / "architecture" / "topic-x.md").write_text(
+            "# Topic X\n\nSlug-match wins.\n",
+            encoding="utf-8",
+        )
+        # Fingerprint-grep would also fire: another file with the banner
+        _write_canonical_with_banner(
+            tmp_path,
+            "principles/renamed-via-fingerprint.md",
+            fingerprint_short="fpabcdef1234",
+        )
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.proposals["fpabcdef1234567890ab"] = ProposalEntry(
+            fingerprint="fpabcdef1234567890ab",
+            proposed_path="inbox/proposed-canonical/topic-x.md",
+            proposed_slug="topic-x",
+            status="pending",
+        )
+
+        result = reconcile_state(
+            state, tmp_path, ["architecture", "principles", "stack"],
+        )
+        assert result["promoted"] == 1
+        entry = state.proposals["fpabcdef1234567890ab"]
+        assert entry.status == STATUS_PROMOTED
+        # Slug-match path won — promoted_to points at topic-x.md, NOT
+        # renamed-via-fingerprint.md.
+        assert entry.promoted_to == "architecture/topic-x.md"
+
+    def test_no_match_anywhere_falls_through_to_discarded(
+        self, tmp_path: Path,
+    ) -> None:
+        # Backstop case: no slug-match AND no fingerprint hit.
+        # Existing behavior preserved.
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            STATUS_DISCARDED,
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.proposals["fp_nothing"] = ProposalEntry(
+            fingerprint="fp_nothing",
+            proposed_path="inbox/proposed-canonical/lost.md",
+            proposed_slug="lost",
+            status="pending",
+        )
+        # No canonical files at all → fall through to discarded.
+        result = reconcile_state(
+            state, tmp_path, ["architecture", "principles", "stack"],
+        )
+        assert result["discarded"] == 1
+        entry = state.proposals["fp_nothing"]
+        assert entry.status == STATUS_DISCARDED
+        # discarded_at populated by reconcile (new behavior per
+        # 2026-05-11 contract widening).
+        assert entry.discarded_at != ""
+
+    def test_multiple_fingerprint_matches_warn_and_pick_first(
+        self, tmp_path: Path,
+    ) -> None:
+        # Operator copy-paste mistake: fingerprint banner appears in
+        # multiple canonical files. Reconcile picks the first match
+        # and logs a warning so the operator can dedup.
+        import structlog
+
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            STATUS_PROMOTED,
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        # Two canonical files both carrying the same fingerprint banner.
+        _write_canonical_with_banner(
+            tmp_path,
+            "architecture/first.md",
+            fingerprint_short="fpaaaaaa1111",
+        )
+        _write_canonical_with_banner(
+            tmp_path,
+            "principles/second.md",
+            fingerprint_short="fpaaaaaa1111",
+        )
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.proposals["fpaaaaaa1111bbbbcccc"] = ProposalEntry(
+            fingerprint="fpaaaaaa1111bbbbcccc",
+            proposed_path="inbox/proposed-canonical/topic.md",
+            proposed_slug="topic",
+            status="pending",
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            result = reconcile_state(
+                state, tmp_path, ["architecture", "principles", "stack"],
+            )
+        assert result["promoted"] == 1
+        entry = state.proposals["fpaaaaaa1111bbbbcccc"]
+        assert entry.status == STATUS_PROMOTED
+        # First match picked (walk order: architecture first per
+        # canonical_match_dirs order).
+        assert entry.promoted_to in (
+            "architecture/first.md",
+            "principles/second.md",
+        )
+        # Warning fired with both paths for operator review.
+        multi_logs = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.fingerprint_multiple_matches"
+        ]
+        assert len(multi_logs) == 1
+        ml = multi_logs[0]
+        assert len(ml["matching_paths"]) == 2
+
+    def test_terminal_status_entries_skipped(
+        self, tmp_path: Path,
+    ) -> None:
+        # Existing behavior pin: promoted/discarded/superseded entries
+        # are terminal — reconcile leaves them alone even if a slug-
+        # or fingerprint-match would fire.
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            STATUS_PROMOTED,
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        # Canonical file that would match the slug.
+        (tmp_path / "architecture").mkdir(parents=True)
+        (tmp_path / "architecture" / "topic-x.md").write_text(
+            "# Topic X\n", encoding="utf-8",
+        )
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        # Entry is ALREADY promoted with stale promoted_to. Reconcile
+        # must NOT touch it.
+        state.proposals["fp1"] = ProposalEntry(
+            fingerprint="fp1",
+            proposed_path="inbox/proposed-canonical/topic-x.md",
+            proposed_slug="topic-x",
+            status=STATUS_PROMOTED,
+            promoted_to="architecture/topic-x.md",
+            promoted_at="2026-05-10T00:00:00+00:00",
+        )
+
+        result = reconcile_state(
+            state, tmp_path, ["architecture", "principles", "stack"],
+        )
+        # No transitions counted.
+        assert result["promoted"] == 0
+        assert result["discarded"] == 0
+        # Entry untouched — same promoted_at as before reconcile.
+        entry = state.proposals["fp1"]
+        assert entry.promoted_at == "2026-05-10T00:00:00+00:00"
+
+    def test_unreadable_canonical_file_logs_and_continues(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Per subprocess-failure-logging discipline: an unreadable
+        # canonical file MUST NOT crash the reconcile sweep. Log +
+        # skip + continue with other files.
+        import structlog
+
+        from alfred.distiller.pattern_miner import (
+            _find_canonical_by_fingerprint,
+        )
+
+        # Set up: one canonical dir with two files. We'll monkey-patch
+        # Path.read_text to raise on the first file and succeed on the
+        # second.
+        (tmp_path / "architecture").mkdir()
+        f1 = tmp_path / "architecture" / "first.md"
+        f2 = tmp_path / "architecture" / "second.md"
+        f1.write_text(
+            "# First\n\n> fingerprint: fpxxxx111111\n",
+            encoding="utf-8",
+        )
+        f2.write_text(
+            "# Second\n\n> fingerprint: fpxxxx111111\n",
+            encoding="utf-8",
+        )
+
+        original_read_text = Path.read_text
+
+        def _patched_read_text(self, *args, **kwargs):
+            if self == f1:
+                raise OSError("simulated permission denied")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _patched_read_text)
+
+        with structlog.testing.capture_logs() as captured:
+            matches = _find_canonical_by_fingerprint(
+                tmp_path, ["architecture"], "fpxxxx111111",
+            )
+
+        # The good file still matches; the bad file skipped.
+        assert len(matches) == 1
+        assert matches[0] == f2
+        # Warn log fired for the unreadable file.
+        read_failed = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.fingerprint_grep_read_failed"
+        ]
+        assert len(read_failed) == 1
+        assert "first.md" in read_failed[0]["path"]
+
+    def test_reconcile_transition_log_emitted_per_entry(
+        self, tmp_path: Path,
+    ) -> None:
+        # Per feedback_intentionally_left_blank.md: each per-entry
+        # transition emits an operator-grep-able log line. Pin the
+        # event name + key fields so an operator can grep "what just
+        # got reclassified this run."
+        import structlog
+
+        from alfred.distiller.pattern_miner import reconcile_state
+        from alfred.distiller.pattern_miner_state import (
+            PatternMinerState,
+            ProposalEntry,
+        )
+
+        # One slug-match transition + one no-match (discard) transition.
+        (tmp_path / "architecture").mkdir(parents=True)
+        (tmp_path / "architecture" / "promoted-thing.md").write_text(
+            "# Promoted\n", encoding="utf-8",
+        )
+
+        state_path = tmp_path / "s.json"
+        state = PatternMinerState(state_path)
+        state.proposals["fp_a"] = ProposalEntry(
+            fingerprint="fp_a",
+            proposed_path="inbox/proposed-canonical/promoted-thing.md",
+            proposed_slug="promoted-thing",
+            status="pending",
+        )
+        state.proposals["fp_b"] = ProposalEntry(
+            fingerprint="fp_b",
+            proposed_path="inbox/proposed-canonical/never-acted-on.md",
+            proposed_slug="never-acted-on",
+            status="pending",
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            reconcile_state(
+                state, tmp_path, ["architecture", "principles", "stack"],
+            )
+
+        # Two transition logs: one slug_match → promoted, one no_match
+        # → discarded.
+        transitions = [
+            c for c in captured
+            if c.get("event") == "pattern_miner.reconcile_transition"
+        ]
+        assert len(transitions) == 2
+        by_rule = {t["detection_rule"]: t for t in transitions}
+        assert "slug_match" in by_rule
+        assert "no_match" in by_rule
+        # The slug-match transition carries promoted_to; the no-match
+        # one doesn't (discard has no canonical path to record).
+        assert by_rule["slug_match"]["to_status"] == "promoted"
+        assert by_rule["slug_match"]["promoted_to"] == "architecture/promoted-thing.md"
+        assert by_rule["no_match"]["to_status"] == "discarded"
+
+
+# ---------------------------------------------------------------------------
 # Phase 4 operator-promote tracking (2026-05-11) — CLI commands
 # ``promote-proposal`` and ``discard-proposal``. Closes the 3 deferred
 # follow-ups: slug-rename-on-promote silently miscounted, no audit

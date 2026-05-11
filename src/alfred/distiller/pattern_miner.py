@@ -1375,6 +1375,90 @@ def _write_empty_state_marker(
 # ---------------------------------------------------------------------------
 
 
+def _load_canonical_path_index(
+    vault_path: Path,
+    canonical_match_dirs: list[str] | tuple[str, ...],
+) -> dict[str, Path]:
+    """Sibling to :func:`load_canonical_index` that returns
+    ``{slug: absolute_path}`` instead of just the slug set.
+
+    Reconcile needs the absolute path of the matching canonical
+    artifact so it can populate ``promoted_to`` on the state entry.
+    Gate logic only needs the set (does-it-exist check) so the
+    public ``load_canonical_index`` stays slug-only; this one is
+    private to reconcile.
+
+    First-write-wins on slug collisions (rare but possible when two
+    canonical dirs both have a file with the same stem). Walk order
+    is determined by ``canonical_match_dirs`` order — typically
+    ``architecture`` → ``principles`` → ``stack`` per the default,
+    which is also priority order for promotion classification.
+    """
+    out: dict[str, Path] = {}
+    for dirname in canonical_match_dirs:
+        d = vault_path / dirname
+        if not d.is_dir():
+            continue
+        for md_path in d.rglob("*.md"):
+            if md_path.name == ".gitkeep":
+                continue
+            slug = slugify(md_path.stem)
+            if slug and slug not in out:
+                # First-wins. A later dir's same-slug file doesn't
+                # overwrite; gate logic also treats slugs as a set
+                # (existence-only), so this matches.
+                out[slug] = md_path
+    return out
+
+
+def _find_canonical_by_fingerprint(
+    vault_path: Path,
+    canonical_match_dirs: list[str] | tuple[str, ...],
+    short_fingerprint: str,
+) -> list[Path]:
+    """Grep canonical_match_dirs for the short-form fingerprint.
+
+    The ``canonical_promotion_banner`` helper embeds ``fingerprint:
+    <12-char>`` in the banner it prepends to promoted records. This
+    helper greps for that signal so reconcile can detect promotions
+    that bypassed the slug-match path (operator renamed the slug
+    during promote — the case fix #2 is closing).
+
+    Returns a list of absolute paths whose body contains the
+    fingerprint substring. Empty list = no match. Length > 1 = the
+    operator copy-pasted the banner across multiple files (rare but
+    real); caller decides how to handle (today: warn, pick first).
+
+    Per the subprocess-failure-logging discipline: unreadable files
+    are logged + skipped + iteration continues. A single permission
+    error on one file MUST NOT crash the whole reconcile sweep.
+    """
+    if not short_fingerprint:
+        return []
+    needle = f"fingerprint: {short_fingerprint}"
+    matches: list[Path] = []
+    for dirname in canonical_match_dirs:
+        d = vault_path / dirname
+        if not d.is_dir():
+            continue
+        for md_path in d.rglob("*.md"):
+            if md_path.name == ".gitkeep":
+                continue
+            try:
+                content = md_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                log.warning(
+                    "pattern_miner.fingerprint_grep_read_failed",
+                    path=str(md_path),
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:200],
+                )
+                continue
+            if needle in content:
+                matches.append(md_path)
+    return matches
+
+
 def reconcile_state(
     state: PatternMinerState,
     vault_path: Path,
@@ -1388,51 +1472,151 @@ def reconcile_state(
     (split-marker awaiting operator review). Promoted / discarded /
     superseded are terminal; reconcile leaves them alone.
 
-    Three outcomes per reconcilable entry:
+    Four outcomes per reconcilable entry, checked in order:
+
     1. ``proposed_path`` still exists → still pending (or
        split_pending), no change.
     2. ``proposed_path`` missing AND a file with ``proposed_slug``
-       exists under any ``canonical_match_dirs`` → status = promoted.
-    3. ``proposed_path`` missing AND no canonical match → status =
-       discarded.
+       exists under any ``canonical_match_dirs`` → status =
+       promoted, ``promoted_to`` set to the matched path,
+       ``promoted_at`` set to now.
+    3. ``proposed_path`` missing AND ``proposed_slug`` doesn't match
+       AND the fingerprint short-form is found in some canonical
+       file's body → status = promoted, ``promoted_to`` set to the
+       found path (operator renamed the slug during promote; the
+       banner still carries the fingerprint signal). [2026-05-11
+       extension closing the slug-rename misclassification.]
+    4. ``proposed_path`` missing AND no canonical match anywhere →
+       status = discarded, ``discarded_at`` set to now.
 
-    Note: split_pending entries follow the same promoted/discarded
-    contract — operator either splits the cluster into real
-    canonical records (which triggers the canonical-match path) or
-    deletes the marker (discarded). The ``-needs-split.md`` filename
-    suffix means the canonical-match check naturally won't match the
-    marker file's own slug; only true canonical artifacts will.
+    Per-action fields (``promoted_to`` / ``promoted_at`` /
+    ``discarded_at``) are populated on the entry — reconcile now
+    matches the CLI-promote contract for these fields. Reconcile-
+    set ``promoted_to`` is vault-relative (matches what the CLI
+    writes); ``discarded_reason`` stays empty (reconcile can't
+    infer operator intent).
+
+    Note: split_pending entries follow the same contract.
 
     Returns a tally dict: ``{"promoted": N, "discarded": M,
-    "still_pending": K}`` for caller-side logging. ``still_pending``
-    counts both ``pending`` and ``split_pending`` entries that
-    haven't moved.
+    "still_pending": K}``. Caller (mine_patterns) logs this. Per-
+    entry transitions also emit individual
+    ``pattern_miner.reconcile_transition`` log events with
+    fingerprint + from-status + to-status + detection-rule fields
+    so an operator can grep "what just got reclassified this run."
 
     Reconcile is opt-in by the caller. Top-level mine_patterns calls
     it before the new-mining pass so the state is fresh; CLI handlers
     can call it standalone for status reporting without re-mining.
     """
-    canonical_index = load_canonical_index(vault_path, canonical_match_dirs)
+    # Build both indices once for the whole sweep. The slug index is
+    # cheap (one stat per file). The path index is the same walk; we
+    # do both rather than choosing because reconcile may need both.
+    canonical_path_index = _load_canonical_path_index(
+        vault_path, canonical_match_dirs,
+    )
+    # The set view drives the existing slug-match step.
+    canonical_index = set(canonical_path_index.keys())
+
     promoted = 0
     discarded = 0
     still_pending = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     for fp, entry in list(state.proposals.items()):
         if entry.status not in RECONCILABLE_STATUSES:
             continue
-        # Vault-relative proposed_path; resolve against vault_path.
+        from_status = entry.status
+
+        # Step 1: proposed file still on disk → no transition.
         proposed_abs = vault_path / entry.proposed_path
         if proposed_abs.is_file():
             still_pending += 1
             continue
-        # Operator removed the proposal/marker file. Was it promoted
-        # (a matching canonical artifact appeared) or discarded
-        # (deleted outright)?
+
+        # Step 2: slug-match against canonical_match_dirs.
+        slug_match_path: Path | None = None
         if entry.proposed_slug and entry.proposed_slug in canonical_index:
+            slug_match_path = canonical_path_index[entry.proposed_slug]
+
+        # Step 3 (2026-05-11 extension): fingerprint-grep fallback.
+        # Only runs when slug-match didn't fire — slug-match is more
+        # deterministic and faster (set membership vs. file read per
+        # candidate). When slug-match finds a hit, step 3 is skipped.
+        fp_match_paths: list[Path] = []
+        if slug_match_path is None and entry.fingerprint:
+            short_fp = entry.fingerprint[:12]
+            fp_match_paths = _find_canonical_by_fingerprint(
+                vault_path, canonical_match_dirs, short_fp,
+            )
+
+        # Classify based on signals.
+        if slug_match_path is not None:
+            # Step 2 hit. Compute vault-relative path for promoted_to.
+            try:
+                target_rel = str(slug_match_path.relative_to(vault_path))
+            except ValueError:
+                target_rel = str(slug_match_path)
             state.mark_status(fp, STATUS_PROMOTED)
+            entry.promoted_to = target_rel
+            entry.promoted_at = now_iso
             promoted += 1
+            log.info(
+                "pattern_miner.reconcile_transition",
+                fingerprint=fp[:12],
+                from_status=from_status,
+                to_status=STATUS_PROMOTED,
+                detection_rule="slug_match",
+                promoted_to=target_rel,
+            )
+        elif fp_match_paths:
+            # Step 3 hit. Pick first match; warn if multiple.
+            if len(fp_match_paths) > 1:
+                # Operator copy-paste mistake — fingerprint banner
+                # appears in multiple files. Pick the first one and
+                # flag for review. The operator-actionable log carries
+                # all matching paths so the operator can investigate.
+                log.warning(
+                    "pattern_miner.fingerprint_multiple_matches",
+                    fingerprint=fp[:12],
+                    matching_paths=[str(p) for p in fp_match_paths],
+                    chosen_path=str(fp_match_paths[0]),
+                    note=(
+                        "fingerprint banner found in multiple canonical "
+                        "files; first match wins. Operator should "
+                        "review and dedup."
+                    ),
+                )
+            chosen = fp_match_paths[0]
+            try:
+                target_rel = str(chosen.relative_to(vault_path))
+            except ValueError:
+                target_rel = str(chosen)
+            state.mark_status(fp, STATUS_PROMOTED)
+            entry.promoted_to = target_rel
+            entry.promoted_at = now_iso
+            promoted += 1
+            log.info(
+                "pattern_miner.reconcile_transition",
+                fingerprint=fp[:12],
+                from_status=from_status,
+                to_status=STATUS_PROMOTED,
+                detection_rule="fingerprint_grep",
+                promoted_to=target_rel,
+            )
         else:
+            # Step 4 fallback: discarded.
             state.mark_status(fp, STATUS_DISCARDED)
+            entry.discarded_at = now_iso
             discarded += 1
+            log.info(
+                "pattern_miner.reconcile_transition",
+                fingerprint=fp[:12],
+                from_status=from_status,
+                to_status=STATUS_DISCARDED,
+                detection_rule="no_match",
+            )
+
     return {
         "promoted": promoted,
         "discarded": discarded,
