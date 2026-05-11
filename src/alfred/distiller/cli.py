@@ -623,7 +623,10 @@ def cmd_promote_proposal(
     """
     from datetime import datetime, timezone
 
-    from alfred.vault.mutation_log import append_to_audit_log
+    from alfred.vault.mutation_log import (
+        append_to_audit_log,
+        build_audit_mutations,
+    )
     from .pattern_miner import (
         canonical_promotion_banner,
         insert_promotion_banner_after_title,
@@ -794,11 +797,14 @@ def cmd_promote_proposal(
     # / test invocations outside the dispatcher).
     audit_path = _resolve_audit_log_path()
     if audit_path:
-        mutations = {
-            "files_created": [target_rel],
-            "files_modified": [],
-            "files_deleted": [entry.proposed_path],
-        }
+        # WARN-3 cure (2026-05-11): use the canonical
+        # ``build_audit_mutations`` helper rather than constructing
+        # the bucket dict inline. Same shape as before; one source of
+        # truth across all three CLI audit-log call sites (vault/cli,
+        # distiller promote, distiller discard).
+        mutations = build_audit_mutations(
+            "promote", entry.proposed_path, target=target_rel,
+        )
         append_to_audit_log(
             audit_path,
             "distiller",
@@ -849,7 +855,10 @@ def cmd_discard_proposal(
     """
     from datetime import datetime, timezone
 
-    from alfred.vault.mutation_log import append_to_audit_log
+    from alfred.vault.mutation_log import (
+        append_to_audit_log,
+        build_audit_mutations,
+    )
     from .pattern_miner_state import (
         RECONCILABLE_STATUSES,
         PatternMinerState,
@@ -910,11 +919,11 @@ def cmd_discard_proposal(
 
     audit_path = _resolve_audit_log_path()
     if audit_path:
-        mutations = {
-            "files_created": [],
-            "files_modified": [],
-            "files_deleted": [entry.proposed_path],
-        }
+        # WARN-3 cure (2026-05-11): canonical helper, same as the
+        # promote path above.
+        mutations = build_audit_mutations(
+            "discard", entry.proposed_path,
+        )
         detail = (
             f"discarded proposal (fingerprint: {fp[:12]})"
         )

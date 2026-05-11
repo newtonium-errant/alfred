@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from .mutation_log import append_to_audit_log, log_mutation
+from .mutation_log import append_to_audit_log, build_audit_mutations, log_mutation
 from .ops import VaultError, vault_context, vault_create, vault_delete, vault_edit, vault_list, vault_move, vault_read, vault_search
 from .retype import vault_retype
 from .scope import ScopeError, check_scope
@@ -53,55 +53,22 @@ def _audit_log_path() -> str | None:
 
 
 def _single_mutation_dict(op: str, path: str, **extra: str) -> dict:
-    """Build the ``{files_created, files_modified, files_deleted}``
-    shape from one mutation. Mirrors
-    ``alfred.vault.mutation_log.read_mutations`` exactly so the CLI
-    fallback and the agent-backend flush path stay in lockstep —
-    same mapping of op-strings to bucket lists, same handling of
-    move's old/new path split.
+    """Thin delegator to :func:`alfred.vault.mutation_log.build_audit_mutations`.
 
-    Move semantics: a single move op is recorded as one delete (old
-    path) + one create (new path), matching ``read_mutations`` line
-    67-72. Caller must pass ``to=<new_path>`` in ``extra`` so the
-    create side has a target.
+    Kept as a module-local wrapper so existing test imports
+    (``tests/test_vault_cli_audit_log.py::TestSingleMutationDict``)
+    don't churn — they pinned the bucket-dict shape at this
+    location before the WARN-3 lift (2026-05-11). The canonical
+    implementation now lives next to ``append_to_audit_log`` in
+    ``mutation_log.py`` so the three callers (this file,
+    ``distiller/cli.py::cmd_promote_proposal``,
+    ``distiller/cli.py::cmd_discard_proposal``) share one op-to-
+    bucket mapping.
 
-    Retype semantics: retype is a create-at-target + delete-source
-    composite (see ``vault_retype``). The CLI passes
-    ``target=<target_path>`` in ``extra`` so we record both sides.
-    ``read_mutations`` doesn't know about retype because the agent
-    backends don't issue retype ops — only direct CLI does. This is
-    the one place CLI's op-set is a superset of the session-file
-    op-set; keeping the divergence here (not in mutation_log)
-    avoids polluting the session-file format with a CLI-only op.
-
-    Unknown op-strings produce an empty dict (no buckets filled) +
-    are silently skipped by the audit-log append.
+    New CLI code should import ``build_audit_mutations`` directly
+    rather than going through this wrapper.
     """
-    created: list[str] = []
-    modified: list[str] = []
-    deleted: list[str] = []
-    if op == "create":
-        created.append(path)
-    elif op == "edit":
-        modified.append(path)
-    elif op == "move":
-        deleted.append(path)
-        to_path = str(extra.get("to", ""))
-        if to_path:
-            created.append(to_path)
-    elif op == "delete":
-        deleted.append(path)
-    elif op == "retype":
-        # retype = create new target + delete source (composite).
-        deleted.append(path)
-        target = str(extra.get("target", ""))
-        if target:
-            created.append(target)
-    return {
-        "files_created": created,
-        "files_modified": modified,
-        "files_deleted": deleted,
-    }
+    return build_audit_mutations(op, path, **extra)
 
 
 def _log_or_audit(op: str, path: str, **extra: str | list[str]) -> None:

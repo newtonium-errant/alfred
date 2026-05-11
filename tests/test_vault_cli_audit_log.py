@@ -134,6 +134,118 @@ class TestSingleMutationDict:
 
 
 # ---------------------------------------------------------------------------
+# WARN-3 cure (2026-05-11): canonical lift to mutation_log.py. The same
+# op→bucket-dict contract previously private to vault/cli.py is now
+# importable as ``build_audit_mutations`` from the canonical home
+# (next to ``append_to_audit_log``). Three call sites consume it:
+# this file (via the thin ``_single_mutation_dict`` wrapper),
+# ``distiller/cli.py::cmd_promote_proposal``, and
+# ``distiller/cli.py::cmd_discard_proposal``.
+#
+# These pins cover the canonical helper directly + the two new
+# op-strings (``promote``, ``discard``) added when lifting. The
+# existing ``TestSingleMutationDict`` pins above still pass — they
+# exercise the same logic transparently via the wrapper.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildAuditMutationsCanonical:
+    def test_imported_from_mutation_log_module(self) -> None:
+        # Pin that the helper is exported from the canonical
+        # location. Catches a regression that moves it back to
+        # ``vault/cli.py`` or splits it across modules.
+        from alfred.vault.mutation_log import build_audit_mutations
+        assert callable(build_audit_mutations)
+
+    def test_wrapper_delegates_to_canonical(self) -> None:
+        # Pin that ``vault/cli.py::_single_mutation_dict`` is a thin
+        # wrapper — same outputs across the two import paths so a
+        # future refactor that breaks delegation surfaces here.
+        from alfred.vault.cli import _single_mutation_dict
+        from alfred.vault.mutation_log import build_audit_mutations
+        # Cover the 5 ops the wrapper used to handle plus the 2 new
+        # ones; both paths must produce identical dicts.
+        for op, kwargs in [
+            ("create", {}),
+            ("edit", {}),
+            ("delete", {}),
+            ("move", {"to": "new/path.md"}),
+            ("retype", {"target": "org/Acme.md"}),
+            ("promote", {"target": "architecture/x.md"}),
+            ("discard", {}),
+        ]:
+            wrapper_result = _single_mutation_dict(op, "x.md", **kwargs)
+            direct_result = build_audit_mutations(op, "x.md", **kwargs)
+            assert wrapper_result == direct_result, (
+                f"wrapper vs direct diverged for op={op!r}: "
+                f"wrapper={wrapper_result} direct={direct_result}"
+            )
+
+    def test_promote_op_writes_both_delete_and_create(self) -> None:
+        # New op-string lifted as part of WARN-3 cure. Distiller's
+        # cmd_promote_proposal calls this with target=<canonical>.
+        # Same bucket-dict shape as ``retype`` since both are
+        # "convert-via-create-plus-delete" composites — kept as
+        # separate op-strings so the audit-log row detail can
+        # distinguish operator intent (promote-from-inbox vs
+        # retype-via-vault-cli).
+        from alfred.vault.mutation_log import build_audit_mutations
+        result = build_audit_mutations(
+            "promote",
+            "inbox/proposed-canonical/topic-x.md",
+            target="architecture/topic-x.md",
+        )
+        assert result["files_deleted"] == [
+            "inbox/proposed-canonical/topic-x.md",
+        ]
+        assert result["files_created"] == ["architecture/topic-x.md"]
+        assert result["files_modified"] == []
+
+    def test_promote_op_without_target_omits_create_side(self) -> None:
+        # Defensive against a malformed promote call (no target).
+        # Same defensive shape as move-without-to.
+        from alfred.vault.mutation_log import build_audit_mutations
+        result = build_audit_mutations(
+            "promote", "inbox/proposed-canonical/x.md",
+        )
+        assert result["files_deleted"] == [
+            "inbox/proposed-canonical/x.md",
+        ]
+        assert result["files_created"] == []
+
+    def test_discard_op_writes_delete_only(self) -> None:
+        # New op-string lifted as part of WARN-3 cure. Distiller's
+        # cmd_discard_proposal calls this with no target — only the
+        # inbox file gets deleted (no canonical replacement).
+        from alfred.vault.mutation_log import build_audit_mutations
+        result = build_audit_mutations(
+            "discard", "inbox/proposed-canonical/x.md",
+        )
+        assert result["files_deleted"] == [
+            "inbox/proposed-canonical/x.md",
+        ]
+        assert result["files_created"] == []
+        assert result["files_modified"] == []
+
+    def test_canonical_helper_handles_all_existing_ops(self) -> None:
+        # Sanity coverage that lifting didn't accidentally drop one
+        # of the 5 pre-existing ops the private helper handled. Pin
+        # each op produces non-empty output for at least one bucket.
+        from alfred.vault.mutation_log import build_audit_mutations
+        assert build_audit_mutations("create", "a.md")["files_created"]
+        assert build_audit_mutations("edit", "a.md")["files_modified"]
+        assert build_audit_mutations("delete", "a.md")["files_deleted"]
+        move_result = build_audit_mutations(
+            "move", "a.md", to="b.md",
+        )
+        assert move_result["files_deleted"] and move_result["files_created"]
+        retype_result = build_audit_mutations(
+            "retype", "a.md", target="b.md",
+        )
+        assert retype_result["files_deleted"] and retype_result["files_created"]
+
+
+# ---------------------------------------------------------------------------
 # _log_or_audit — the four-state contract
 # ---------------------------------------------------------------------------
 
