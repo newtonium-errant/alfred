@@ -472,6 +472,15 @@ class TestTalkerHealth:
                 # elevenlabs-auth probes don't SKIP (which would bubble
                 # up to mark the rollup SKIP rather than OK).
                 "tts": {"api_key": "test-tts-key"},
+                # #80 (2026-05-12): include instance block so the new
+                # skill-capability-audit probe doesn't SKIP (which would
+                # bubble to SKIP otherwise). Salem-equivalent values.
+                "instance": {
+                    "name": "Salem",
+                    "canonical": "S.A.L.E.M.",
+                    "skill_bundle": "vault-talker",
+                    "tool_set": "talker",
+                },
             }
         }
         # Quick mode so the remote elevenlabs probe isn't attempted.
@@ -507,6 +516,15 @@ class TestTalkerHealth:
                 # wk2b c6: include tts so the rollup stays OK (tts-key
                 # SKIP would bubble to SKIP otherwise).
                 "tts": {"api_key": "${ELEVENLABS_API_KEY}"},
+                # #80 (2026-05-12): include instance block — see
+                # test_happy_path_ok for the rationale (skill-audit SKIP
+                # would bubble up otherwise).
+                "instance": {
+                    "name": "Salem",
+                    "canonical": "S.A.L.E.M.",
+                    "skill_bundle": "vault-talker",
+                    "tool_set": "talker",
+                },
             }
         }
         result = await talker_health.health_check(raw, mode="quick")

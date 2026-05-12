@@ -1229,6 +1229,42 @@ def cmd_talker(args: argparse.Namespace) -> None:
             return
         sys.exit(code)
 
+    if subcmd == "skill-audit":
+        # SKILL capability-audit detector. Stateless — read the config,
+        # compare the runtime tool registry against the bundled SKILL.md,
+        # report missing-advertisement findings. Exit 1 on findings so
+        # CI / operator scripts can gate on it; exit 0 when clean.
+        from alfred.telegram.skill_audit import audit_skill, render_audit
+        try:
+            result = audit_skill(raw)
+        except Exception as exc:  # noqa: BLE001
+            # Should be rare — audit_skill swallows operator-input issues.
+            # A raise here typically means the conversation module failed
+            # to import (e.g. broken deps). Surface it loudly.
+            if wants_json:
+                print(json.dumps({
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }, indent=2))
+            else:
+                print(f"ERROR: skill-audit failed: {exc.__class__.__name__}: {exc}")
+            sys.exit(2)
+        if wants_json:
+            payload = {
+                "instance_name": result.instance_name,
+                "tool_set": result.tool_set,
+                "skill_bundle": result.skill_bundle,
+                "skill_path": str(result.skill_path),
+                "skill_missing": result.skill_missing,
+                "registered_tools": list(result.registered_tools),
+                "advertised": list(result.advertised),
+                "missing_advertisements": list(result.missing_advertisements),
+                "is_clean": result.is_clean,
+            }
+            print(json.dumps(payload, indent=2))
+        else:
+            print(render_audit(result))
+        sys.exit(0 if result.is_clean else 1)
+
     # The remaining subcommands all touch state — share the load.
     from alfred.telegram.config import load_from_unified as talker_cfg_loader
     from alfred.telegram.state import StateManager
@@ -1325,7 +1361,7 @@ def cmd_talker(args: argparse.Namespace) -> None:
                 print(f"      {rp}")
         return
 
-    print("Usage: alfred talker {watch|status|end|history}")
+    print("Usage: alfred talker {watch|status|end|history|skill-audit}")
     sys.exit(1)
 
 
@@ -2774,6 +2810,23 @@ def build_parser() -> argparse.ArgumentParser:
     talker_history = talker_sub.add_parser("history", help="Show recent closed sessions")
     talker_history.add_argument("--limit", type=int, default=10)
     talker_history.add_argument(
+        "--json", action="store_true", default=False,
+        help="Emit JSON instead of human-readable text",
+    )
+    # skill-audit — SKILL capability-audit detector. Compares the
+    # talker's runtime tool registry (per instance.tool_set + gcal.enabled)
+    # against the advertised tool surface in the instance's bundled
+    # SKILL.md. Exits 1 when missing advertisements are found so CI /
+    # operator scripts can gate on it. See
+    # ``src/alfred/telegram/skill_audit.py`` for the rationale.
+    talker_skill_audit = talker_sub.add_parser(
+        "skill-audit",
+        help=(
+            "Audit instance SKILL.md against the runtime tool registry "
+            "(detects features wired in code but not advertised to the agent)"
+        ),
+    )
+    talker_skill_audit.add_argument(
         "--json", action="store_true", default=False,
         help="Emit JSON instead of human-readable text",
     )

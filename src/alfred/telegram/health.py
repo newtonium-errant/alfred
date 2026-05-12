@@ -23,6 +23,7 @@ from alfred.health.aggregator import register_check
 from alfred.health.anthropic_auth import check_anthropic_auth
 from alfred.health.types import CheckResult, Status, ToolHealth
 from alfred.telegram.config import _substitute_env
+from alfred.telegram.skill_audit import audit_skill
 
 
 def _is_unresolved(value: str) -> bool:
@@ -196,6 +197,102 @@ def _check_stt_key(stt: dict) -> CheckResult:
     )
 
 
+def _check_skill_capability_audit(raw: dict[str, Any]) -> CheckResult:
+    """Static probe: tools in the runtime registry are advertised in SKILL.md.
+
+    Safety net for the "Feature-enabling commits trigger a SKILL capability
+    audit in the same cycle" operator-discipline rule (see ``CLAUDE.md``).
+    When the rule lapses, this probe surfaces missing-advertisement
+    findings every BIT cycle automatically.
+
+    Status mapping:
+        * No missing advertisements → ``OK`` with an explicit
+          "tools advertised" summary (per
+          ``feedback_intentionally_left_blank.md``).
+        * Missing advertisements → ``WARN`` (not FAIL — the daemon is
+          functional; the SKILL is just out of sync). The detail line
+          names every missing tool so the operator can grep BIT records
+          for the gap.
+        * SKILL.md path doesn't exist → ``FAIL`` (every registered tool
+          is unadvertised — this is broken-not-stale).
+        * Audit raises → ``WARN`` with the exception detail (rare;
+          typically a corrupt config the other probes would also flag).
+    """
+    try:
+        result = audit_skill(raw)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            name="skill-capability-audit",
+            status=Status.WARN,
+            detail=f"audit raised: {exc.__class__.__name__}: {exc}",
+        )
+    if result.instance_missing:
+        # SKIP cascades cleanly through the rollup — matches other
+        # talker probes that SKIP on absent sections (e.g. tts-key).
+        return CheckResult(
+            name="skill-capability-audit",
+            status=Status.SKIP,
+            detail=f"skipped — {result.instance_missing_reason}",
+        )
+    if result.skill_missing:
+        return CheckResult(
+            name="skill-capability-audit",
+            status=Status.FAIL,
+            detail=(
+                f"SKILL.md missing at {result.skill_path} "
+                f"(skill_bundle={result.skill_bundle!r}); "
+                f"all {len(result.registered_tools)} registered tools "
+                f"are unadvertised"
+            ),
+            data={
+                "instance_name": result.instance_name,
+                "tool_set": result.tool_set,
+                "skill_bundle": result.skill_bundle,
+                "skill_path": str(result.skill_path),
+                "registered_count": len(result.registered_tools),
+                "missing_count": len(result.missing_advertisements),
+                "missing_tools": list(result.missing_advertisements),
+            },
+        )
+    if not result.missing_advertisements:
+        return CheckResult(
+            name="skill-capability-audit",
+            status=Status.OK,
+            detail=(
+                f"all {len(result.registered_tools)} tools advertised in "
+                f"skills/{result.skill_bundle}/SKILL.md "
+                f"(instance={result.instance_name}, "
+                f"tool_set={result.tool_set})"
+            ),
+            data={
+                "instance_name": result.instance_name,
+                "tool_set": result.tool_set,
+                "skill_bundle": result.skill_bundle,
+                "registered_count": len(result.registered_tools),
+                "advertised_count": len(result.advertised),
+            },
+        )
+    missing = ", ".join(result.missing_advertisements)
+    return CheckResult(
+        name="skill-capability-audit",
+        status=Status.WARN,
+        detail=(
+            f"{len(result.missing_advertisements)} tool(s) in "
+            f"tool_set={result.tool_set!r} not advertised in "
+            f"skills/{result.skill_bundle}/SKILL.md: {missing}"
+        ),
+        data={
+            "instance_name": result.instance_name,
+            "tool_set": result.tool_set,
+            "skill_bundle": result.skill_bundle,
+            "registered_count": len(result.registered_tools),
+            "advertised_count": len(result.advertised),
+            "missing_count": len(result.missing_advertisements),
+            "missing_tools": list(result.missing_advertisements),
+        },
+    )
+
+
 async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     """Run talker health checks."""
     # Env-var substitution — the talker daemon runs `_substitute_env` on
@@ -229,6 +326,7 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
         _check_stt_key(tel.get("stt", {}) or {}),
         _check_tts_key(tts_raw),
         _check_capture_handlers(),
+        _check_skill_capability_audit(raw),
     ]
 
     # Remote TTS auth probe — only in ``full`` mode. Skipped in ``quick``
