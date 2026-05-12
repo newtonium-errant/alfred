@@ -1457,6 +1457,22 @@ def cmd_scaffold(args: argparse.Namespace) -> None:
     var on dry-runs would be a write of process-global state without
     a downstream consumer, the exact "test-hygiene contract" violation
     CLAUDE.md flags for env-var-mutating dispatchers.
+
+    Include / exclude precedence (Stage 2 follow-up to Build #38,
+    closes the structural gap surfaced by KAL-LE + Hypatia apply
+    cycles 2026-05-12): the unified config dict is threaded down to
+    ``cmd_sync`` via ``scaffold_cli.dispatch(args, raw)`` so the
+    handler can read ``raw["scaffold"]["include"]`` /
+    ``raw["scaffold"]["exclude"]`` via :func:`alfred.scaffold.config
+    .load_from_unified`. Three layers, highest wins:
+
+      1. CLI ``--include`` / ``--exclude`` (operator override)
+      2. Per-instance config ``scaffold.include`` / ``scaffold.exclude``
+      3. Module-level ``DEFAULT_INCLUDE`` / ``DEFAULT_EXCLUDE``
+         (Salem-shape fallback)
+
+    The resolution logic lives in :func:`alfred.scaffold.cli
+    ._resolve_filter` so all three layers compose in one place.
     """
     raw: dict[str, Any] = {}
     try:

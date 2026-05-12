@@ -26,6 +26,7 @@ from typing import Any
 import structlog
 
 from alfred._data import get_scaffold_dir
+from alfred.scaffold.config import load_from_unified
 from alfred.scaffold.sync import (
     DEFAULT_EXCLUDE,
     DEFAULT_INCLUDE,
@@ -125,6 +126,47 @@ def dispatch(args: argparse.Namespace, raw_config: dict[str, Any]) -> int:
     return 1
 
 
+def _resolve_filter(
+    *,
+    cli_value: str | None,
+    config_value: list[str] | None,
+    default: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Apply the 3-layer include/exclude precedence (CLI > config > default).
+
+    Args:
+        cli_value: The ``--include`` / ``--exclude`` argparse value
+            (comma-separated string, or ``None`` when the flag wasn't
+            passed). ``None`` is distinct from an empty string — the
+            flag with an empty arg is a malformed invocation that
+            collapses to the empty-set via the comma-split below.
+        config_value: The per-instance config value (list of strings,
+            or ``None`` when ``scaffold.include`` / ``scaffold.exclude``
+            wasn't set in the config block). ``None`` here means "fall
+            through to module default"; an explicit empty list ``[]``
+            means "operator intentionally zeroed out the filter."
+        default: The module-level fallback (always Salem-shape).
+
+    Returns:
+        Tuple of path-prefixes (frozen, hashable) for the layer that
+        won the precedence race.
+    """
+    # Layer 1 — CLI wins everything. Empty / whitespace-only CLI values
+    # fall through (treated as "no flag passed") rather than zeroing
+    # out the filter — the empty-list opt-out path lives in the config
+    # layer, not the CLI layer. Operator who wants the empty filter
+    # explicitly should set ``scaffold.include: []`` in their config.
+    if cli_value is not None:
+        items = tuple(p.strip() for p in cli_value.split(",") if p.strip())
+        if items:
+            return items
+    # Layer 2 — config-set value (including explicit empty list).
+    if config_value is not None:
+        return tuple(config_value)
+    # Layer 3 — module-level fallback.
+    return default
+
+
 def cmd_sync(args: argparse.Namespace, raw_config: dict[str, Any]) -> int:
     """Execute ``alfred scaffold sync``. Returns exit code (0 OK, 1 error)."""
     # Resolve vault dir. --vault-path wins over config; config is
@@ -145,16 +187,33 @@ def cmd_sync(args: argparse.Namespace, raw_config: dict[str, Any]) -> int:
             return 1
         vault_dir = Path(vault_path_str).expanduser().resolve()
 
-    # Resolve include/exclude. Comma-split, strip whitespace, drop empties.
-    include = (
-        tuple(p.strip() for p in args.include.split(",") if p.strip())
-        if args.include
-        else DEFAULT_INCLUDE
+    # Resolve include/exclude via 3-layer precedence:
+    #
+    #   1. CLI flag (``--include`` / ``--exclude``) — operator override,
+    #      highest precedence. Wins everything.
+    #   2. Per-instance config (``scaffold.include`` / ``scaffold.exclude``)
+    #      — the per-vault default. KAL-LE and Hypatia use a trimmed
+    #      include here to avoid the Salem-shape default writing 50+
+    #      dead files into canonical-curation / knowledge-work vaults.
+    #   3. Module-level default (Salem-shape) — final fallback when
+    #      neither CLI nor config supplied a value.
+    #
+    # Empty-list semantics: a config (or CLI flag) that explicitly
+    # supplies an empty list is honored — operator can intentionally
+    # zero out the include set via ``scaffold.include: []`` to opt out
+    # of all auto-sync without unsetting the block. ``no_candidates``
+    # empty-state signal will fire downstream so idle is distinguishable
+    # from broken (per ``feedback_intentionally_left_blank.md``).
+    scaffold_cfg = load_from_unified(raw_config)
+    include = _resolve_filter(
+        cli_value=args.include,
+        config_value=scaffold_cfg.include,
+        default=DEFAULT_INCLUDE,
     )
-    exclude = (
-        tuple(p.strip() for p in args.exclude.split(",") if p.strip())
-        if args.exclude
-        else DEFAULT_EXCLUDE
+    exclude = _resolve_filter(
+        cli_value=args.exclude,
+        config_value=scaffold_cfg.exclude,
+        default=DEFAULT_EXCLUDE,
     )
 
     # --dry-run wins over --apply if both passed; argparse can't express

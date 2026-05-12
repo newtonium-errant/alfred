@@ -37,6 +37,7 @@ Out of scope entirely:
   territory, runtime-located not vault-located
 """
 
+from alfred.scaffold.config import ScaffoldConfig, load_from_unified
 from alfred.scaffold.sync import (
     DEFAULT_EXCLUDE,
     DEFAULT_INCLUDE,
@@ -49,8 +50,10 @@ from alfred.scaffold.sync import (
 __all__ = [
     "DEFAULT_EXCLUDE",
     "DEFAULT_INCLUDE",
+    "ScaffoldConfig",
     "ScaffoldItem",
     "SyncStatus",
     "apply_sync",
+    "load_from_unified",
     "scan_scaffold",
 ]

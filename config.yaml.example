@@ -668,3 +668,43 @@ surveyor:
   idle_tick:
     enabled: true
     interval_seconds: 60
+
+# Optional. Tunes ``alfred scaffold sync`` (Build #38 — diff-and-copy
+# of bundled scaffold content into an existing instance vault). The
+# block is OPTIONAL; when absent, the module-level Salem-shape default
+# applies (the same list shown below as ``include``).
+#
+# Three-layer precedence (highest wins) for the resolved sync filter:
+#   1. CLI flag ``--include`` / ``--exclude`` (operator override)
+#   2. This config block (per-instance default)
+#   3. Module-level ``DEFAULT_INCLUDE`` / ``DEFAULT_EXCLUDE``
+#      (Salem-shape fallback — what this example shows)
+#
+# Per-instance customization: KAL-LE and Hypatia (canonical-curation
+# and knowledge-work shapes respectively) override this block in their
+# ``config.<instance>.yaml`` files with a trimmed include set — just
+# the top-level docs (README.md, Start Here.md, user-profile.md) —
+# because the per-record-type templates and base-views shipped in the
+# scaffold are Salem-operational-vault shape and would write 50+ dead
+# files into vaults that don't use those record types. Trimmed shape:
+#
+#   scaffold:
+#     include: ["README.md", "Start Here.md", "user-profile.md"]
+#     exclude: [".obsidian", ".gitkeep"]
+#
+# Empty-list semantics: ``include: []`` is honored — operator can opt
+# out of all auto-sync via an explicit empty list. The ``no_candidates``
+# empty-state signal fires downstream so idle is distinguishable from
+# broken.
+scaffold:
+  include:
+    - "_templates"
+    - "_bases"
+    - "view"
+    - "CLAUDE.md"
+    - "README.md"
+    - "Start Here.md"
+    - "user-profile.md"
+  exclude:
+    - ".obsidian"
+    - ".gitkeep"
