@@ -77,8 +77,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> None:
         "--include",
         default=None,
         help=(
-            "Comma-separated path-prefixes to include. Overrides the "
-            f"default set: {','.join(DEFAULT_INCLUDE)}. Example: "
+            "Comma-separated path-prefixes to include. FULL OVERRIDE of "
+            "the default include set (NOT a merge) — pass the complete "
+            "list you want. If you pass --include _templates alone you "
+            "will lose _bases, view, and the top-level docs in this run. "
+            f"Defaults: {','.join(DEFAULT_INCLUDE)}. Example: "
             "--include _templates,_bases,.obsidian"
         ),
     )
@@ -86,8 +89,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> None:
         "--exclude",
         default=None,
         help=(
-            "Comma-separated path-prefixes to exclude. Overrides the "
-            f"default set: {','.join(DEFAULT_EXCLUDE)}."
+            "Comma-separated path-prefixes to exclude. FULL OVERRIDE of "
+            "the default exclude set (NOT a merge) — pass the complete "
+            "list you want. If you pass --exclude .gitkeep alone you "
+            "will lose the .obsidian exclude in this run. "
+            f"Defaults: {','.join(DEFAULT_EXCLUDE)}."
         ),
     )
     sync_p.add_argument(

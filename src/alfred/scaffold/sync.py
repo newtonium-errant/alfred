@@ -19,6 +19,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
+import structlog
+
+log = structlog.get_logger(__name__)
+
 
 class SyncStatus(str, Enum):
     """Per-file scan outcome."""
@@ -234,6 +238,54 @@ class SyncSummary:
         }
 
 
+def _cleanup_orphan_tmp_files(items: list[ScaffoldItem]) -> list[str]:
+    """Remove ``<vault_path>.tmp`` orphans left by a previously-crashed sync.
+
+    :func:`_write_file` writes via ``.tmp`` + ``replace`` for atomicity.
+    If a previous ``apply_sync`` run crashed between ``tmp.write_bytes``
+    and ``tmp.replace`` (process kill, OOM, disk-full at replace-time),
+    the ``.tmp`` file lingers in the vault. Without cleanup, those
+    orphans accumulate operational debt and confuse vault tooling.
+
+    The sweep walks ONLY the include/exclude-filtered set that the
+    current sync already processed — i.e. exactly the locations where
+    a prior sync could have crashed leaving an orphan. We don't scan
+    arbitrary subtrees; the filter contract is preserved.
+
+    Args:
+        items: The same filtered :class:`ScaffoldItem` list that
+            :func:`apply_sync` is about to process. Each item's
+            ``vault_path`` tells us where a prior tmp could live.
+
+    Returns:
+        List of relpaths whose orphan tmp was unlinked. Useful for
+        callers that want to attribute the cleanup to operator output.
+    """
+    removed: list[str] = []
+    for item in items:
+        tmp_path = item.vault_path.with_suffix(item.vault_path.suffix + ".tmp")
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+                log.info(
+                    "scaffold.sync.orphan_tmp_removed",
+                    path=str(tmp_path),
+                    relpath=item.relpath,
+                )
+                removed.append(item.relpath)
+            except OSError as e:
+                # Best-effort cleanup — don't block the sync. The
+                # operator will see the structured warning and can
+                # clean up manually.
+                log.warning(
+                    "scaffold.sync.orphan_tmp_unlink_failed",
+                    path=str(tmp_path),
+                    relpath=item.relpath,
+                    error=str(e),
+                )
+    return removed
+
+
 def apply_sync(
     items: list[ScaffoldItem],
     apply: bool = False,
@@ -254,7 +306,19 @@ def apply_sync(
 
     Returns:
         :class:`SyncSummary` with per-category relpath lists.
+
+    Side effects:
+        On ``apply=True`` only, runs a pre-flight cleanup pass over
+        ``<vault_path>.tmp`` orphans (from a previously-crashed sync)
+        across the same filtered set this call will process. Dry-runs
+        do not mutate the filesystem and therefore do not clean.
     """
+    # Pre-flight: remove orphan .tmp files from any prior crashed sync.
+    # Only runs when we'd actually write — dry-run contract is "no
+    # filesystem mutation," which includes cleanup.
+    if apply:
+        _cleanup_orphan_tmp_files(items)
+
     summary = SyncSummary(dry_run=not apply)
 
     for item in items:

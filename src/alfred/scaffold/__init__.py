@@ -7,12 +7,23 @@ vaults: when a release ships new templates, base views, or doc updates,
 operators run ``alfred scaffold sync --apply`` to pull the deltas in
 without re-running quickstart (which would clobber operator content).
 
+Sync is **additive**: it creates new files and overwrites stale ones
+from the bundled scaffold. It NEVER deletes vault files that the
+bundled scaffold no longer ships. Operator-customized files and
+operator-authored content are preserved. If a release drops a template
+or base view, the vault retains the operator's copy until they
+manually remove it — sync does not enforce convergence to the current
+scaffold tree, only forward-propagation of new content.
+
 Per-file semantics:
 
 * **CREATE** — file exists in scaffold but not in vault. Sync creates it.
 * **NOOP** — file exists in both and bytes match. Sync skips it.
 * **CONFLICT** — file exists in both but bytes differ. Sync skips by
   default (operator content preserved); ``--force`` flips to overwrite.
+* **DELETE** — never. Files that exist in the vault but not in the
+  current scaffold are left untouched. (No --prune flag exists by
+  design; vault drift is operator-managed.)
 
 Default-include set covers the four sync-worthy buckets:
 

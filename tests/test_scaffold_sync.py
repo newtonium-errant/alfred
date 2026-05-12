@@ -323,6 +323,91 @@ class TestApplySync:
         summary = apply_sync(items, apply=True)
         assert "_templates/person.md" in summary.skipped_noops
 
+    def test_orphan_tmp_cleaned_on_apply(
+        self, fake_scaffold: Path, empty_vault: Path
+    ) -> None:
+        # Regression-pin for NOTE 3 (Build #38 reviewer pass):
+        # if a previous apply_sync run crashed between tmp.write_bytes
+        # and tmp.replace, a stray ``<vault_path>.tmp`` orphan lingers
+        # in the vault. The next apply_sync MUST detect and unlink any
+        # such orphans within the include/exclude-filtered set before
+        # processing the plan.
+        from alfred.scaffold.sync import apply_sync, scan_scaffold
+
+        # Pre-state: drop a fake orphan tmp file in the vault at a
+        # location the scaffold will touch. ``person.md`` is in the
+        # default include set, so ``person.md.tmp`` is exactly the
+        # orphan shape that would result from a crashed run.
+        (empty_vault / "_templates").mkdir()
+        orphan = empty_vault / "_templates" / "person.md.tmp"
+        orphan.write_bytes(b"partial-write-from-crashed-sync")
+        assert orphan.exists()
+
+        items = scan_scaffold(fake_scaffold, empty_vault)
+
+        with structlog.testing.capture_logs() as captured:
+            summary = apply_sync(items, apply=True)
+
+        # The orphan is gone
+        assert not orphan.exists()
+
+        # And the real file landed (sync continued past the cleanup)
+        assert (empty_vault / "_templates" / "person.md").exists()
+        assert "_templates/person.md" in summary.created
+
+        # Log emission pinned per CLAUDE.md "Log-emission tests must
+        # drive the production code path." Catches both event-drop
+        # and field-rename regressions.
+        removed_events = [
+            c for c in captured
+            if c.get("event") == "scaffold.sync.orphan_tmp_removed"
+        ]
+        assert len(removed_events) == 1
+        assert removed_events[0]["relpath"] == "_templates/person.md"
+        assert removed_events[0]["path"].endswith("_templates/person.md.tmp")
+
+    def test_orphan_tmp_not_cleaned_on_dry_run(
+        self, fake_scaffold: Path, empty_vault: Path
+    ) -> None:
+        # Dry-run is "no filesystem mutation" — that contract extends
+        # to the orphan cleanup. A dry-run must leave the orphan in
+        # place (operator sees the .tmp file when they next ls; apply
+        # cleans it).
+        from alfred.scaffold.sync import apply_sync, scan_scaffold
+
+        (empty_vault / "_templates").mkdir()
+        orphan = empty_vault / "_templates" / "person.md.tmp"
+        orphan.write_bytes(b"partial-write-from-crashed-sync")
+
+        items = scan_scaffold(fake_scaffold, empty_vault)
+        apply_sync(items, apply=False)
+
+        # Orphan untouched on dry-run
+        assert orphan.exists()
+        assert orphan.read_bytes() == b"partial-write-from-crashed-sync"
+
+    def test_orphan_tmp_outside_filtered_set_preserved(
+        self, fake_scaffold: Path, empty_vault: Path
+    ) -> None:
+        # The cleanup walks ONLY the include/exclude-filtered set
+        # that apply_sync is about to process. An orphan that landed
+        # in a vault location NOT covered by the current sync's
+        # include/exclude filter must be left alone — we don't have
+        # license to mutate arbitrary subtrees, only paths sync owns.
+        from alfred.scaffold.sync import apply_sync, scan_scaffold
+
+        # Drop an orphan in a path outside default-include set
+        # (a content dir excluded by default).
+        (empty_vault / "person").mkdir()
+        outside_orphan = empty_vault / "person" / "stranger.md.tmp"
+        outside_orphan.write_bytes(b"foreign tmp file")
+
+        items = scan_scaffold(fake_scaffold, empty_vault)
+        apply_sync(items, apply=True)
+
+        # The foreign orphan survives — sync didn't walk that dir.
+        assert outside_orphan.exists()
+
     def test_to_audit_mutations_shape(
         self, fake_scaffold: Path, partially_synced_vault: Path
     ) -> None:
