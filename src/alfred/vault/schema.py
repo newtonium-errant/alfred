@@ -247,6 +247,19 @@ TYPE_DIRECTORY: dict[str, str] = {
     "voice": "voice",
     "voice-cluster": "voice/cluster",
     "method": "method",
+    # Hypatia ``template`` records — prose-form scaffolds (essay
+    # scaffolds, reusable section structures, etc.). Routed to
+    # ``prose-templates/`` to disambiguate from Obsidian's per-type
+    # ``_templates/`` directory (the scaffold/_templates layer shipped
+    # with the bundled vault contains placeholder-bearing per-record-
+    # type markdown templates; Hypatia's ``template`` type is a
+    # different concept entirely — operator-curated prose forms).
+    # Latent orphan-path bug fixed 2026-05-12: SKILL was renamed
+    # ``template/`` → ``prose-templates/`` in ``a14e0ab`` (vault-side
+    # ``mv`` performed by team-lead), but ``TYPE_DIRECTORY`` had no
+    # entry so the ``.get(record_type, record_type)`` fallback routed
+    # writes to the now-empty ``template/`` orphan directory.
+    "template": "prose-templates",
     # session, input have flexible placement
 }
 

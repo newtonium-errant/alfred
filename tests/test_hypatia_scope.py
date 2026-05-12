@@ -580,3 +580,97 @@ def test_skills_practiced_in_list_fields() -> None:
     they don't need coerce-from-scalar handling. ``skills_practiced``
     is genuinely new — operators may type a single skill as a string."""
     assert "skills_practiced" in schema.LIST_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# Template → prose-templates routing (latent orphan-path fix, 2026-05-12)
+# ---------------------------------------------------------------------------
+#
+# Hypatia's ``template`` type is in both ``KNOWN_TYPES_HYPATIA`` (schema
+# layer) and ``HYPATIA_CREATE_TYPES`` (scope layer), but for a window
+# between 2026-05-12 ``a14e0ab`` (SKILL rename ``template/`` →
+# ``prose-templates/``) and the fix below, ``TYPE_DIRECTORY`` had no
+# entry — so the ``.get(record_type, record_type)`` fallback in
+# ``vault_create`` (ops.py:763) routed writes to the now-empty
+# ``template/`` ORPHAN directory instead of the canonical
+# ``prose-templates/``. Mitigated socially by the SKILL's "Don't create
+# new templates speculatively" line but latent — explicit invocation
+# would mis-route. These tests pin the routing contract so a future
+# accidental removal of the TYPE_DIRECTORY entry reverts the orphan-
+# routing bug noisily instead of silently.
+
+
+def test_template_type_directory_routes_to_prose_templates() -> None:
+    """Direct schema pin — the regression-trigger that catches a removed
+    ``TYPE_DIRECTORY`` entry. If this assertion ever fires, the fallback
+    is silently routing back to ``template/`` (now an orphan dir post-
+    2026-05-12 ``a14e0ab``). Failure here always means orphan routing
+    has returned."""
+    assert schema.TYPE_DIRECTORY["template"] == "prose-templates"
+
+
+def test_template_still_in_known_types_hypatia() -> None:
+    """Allowlist regression-pin: removing ``template`` from
+    ``KNOWN_TYPES_HYPATIA`` would break the SKILL flow that creates
+    operator-curated prose scaffolds. The earlier broader assertion
+    (``test_known_types_hypatia_is_separate_set``) already covers this,
+    but a dedicated test makes the contract explicit so a "trim unused
+    types" pass doesn't accidentally yank it."""
+    assert "template" in schema.KNOWN_TYPES_HYPATIA
+
+
+def test_template_still_in_hypatia_create_types() -> None:
+    """Scope-layer regression-pin: same shape as the schema-layer pin
+    above. Scope and schema must both keep ``template`` registered or
+    the gate-ordering will surface the orphan asymmetry as confusing
+    error messages."""
+    assert "template" in HYPATIA_CREATE_TYPES
+
+
+def test_vault_create_template_under_hypatia_routes_to_prose_templates(
+    tmp_path,
+) -> None:
+    """End-to-end: ``vault_create type=template scope=hypatia`` lands the
+    file at ``prose-templates/<name>.md``, NOT ``template/<name>.md``.
+
+    This is the canonical test for the 2026-05-12 fix — it would have
+    failed BEFORE the ``TYPE_DIRECTORY`` entry was added (record would
+    have landed at ``template/Test prose form.md`` per the fallback).
+    """
+    result = vault_create(
+        tmp_path, "template", "Test prose form", scope="hypatia",
+    )
+    assert result["path"] == "prose-templates/Test prose form.md"
+    assert (tmp_path / "prose-templates" / "Test prose form.md").exists()
+    # The orphan dir MUST NOT have been created — if it has, the
+    # fallback routing has returned silently.
+    assert not (tmp_path / "template" / "Test prose form.md").exists()
+
+
+def test_vault_create_template_under_salem_scope_rejected(tmp_path) -> None:
+    """Cross-instance correctness: Salem (canonical scope) MUST NOT be
+    able to create ``template`` records — the type isn't in
+    ``KNOWN_TYPES``. Rejected at ``_validate_type`` (the first gate),
+    not at the create allowlist (the second gate). Pinning here so a
+    future "merge KNOWN_TYPES sets" refactor doesn't silently widen
+    Salem's reach.
+
+    No ``scope`` kwarg → validates against the canonical
+    ``KNOWN_TYPES`` set, which does NOT contain ``template``."""
+    with pytest.raises(VaultError) as exc_info:
+        vault_create(tmp_path, "template", "Should fail")
+    assert "Unknown type" in str(exc_info.value)
+
+
+def test_vault_create_template_under_kalle_scope_rejected(tmp_path) -> None:
+    """KAL-LE scope is bounded by ``KNOWN_TYPES | KNOWN_TYPES_KALLE``;
+    ``template`` is in neither set. Rejected at ``_validate_type``. Same
+    pin shape as the Salem test above — guards the per-instance allowlist
+    contract so a refactor that accidentally aliased Hypatia's types
+    into KAL-LE's set would surface here."""
+    with pytest.raises(VaultError) as exc_info:
+        vault_create(
+            tmp_path, "template", "Should fail", scope="kalle",
+        )
+    assert "Unknown type" in str(exc_info.value)
+    assert "kalle" in str(exc_info.value)
