@@ -1442,6 +1442,57 @@ def cmd_audit(args: argparse.Namespace) -> None:
     sys.exit(code)
 
 
+def cmd_scaffold(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred scaffold`` subcommands.
+
+    Currently exposes only ``sync`` (Build #38). Mirrors ``cmd_vault`` /
+    ``cmd_distiller`` env-var injection: when the subcommand actually
+    mutates the vault (``--apply``), resolve ``<logging.dir>/vault_audit
+    .log`` and set ``ALFRED_VAULT_AUDIT_LOG`` so the canonical
+    ``append_to_audit_log`` helper can find the per-instance-correct
+    audit log path without each handler re-reading the config.
+
+    Gated to ``--apply`` only — ``--dry-run`` is a no-op on the
+    filesystem and therefore produces no audit rows; setting the env
+    var on dry-runs would be a write of process-global state without
+    a downstream consumer, the exact "test-hygiene contract" violation
+    CLAUDE.md flags for env-var-mutating dispatchers.
+    """
+    raw: dict[str, Any] = {}
+    try:
+        raw = _load_unified_config(args.config)
+        _setup_logging_from_config(raw, tool="scaffold")
+    except SystemExit:
+        # Allow --vault-path to bypass the config requirement; the
+        # downstream handler emits its own error if neither config
+        # nor --vault-path provides a vault root.
+        pass
+    except Exception:
+        pass
+
+    # Inject ALFRED_VAULT_AUDIT_LOG only on mutating subcommands.
+    # ``--dry-run`` wins over ``--apply`` if both passed (matches the
+    # precedence in cmd_sync), so we re-check both flags here for
+    # parity. ``scaffold_cmd == "sync"`` is the only mutating path
+    # today; future ``alfred scaffold ...`` subcommands that mutate
+    # should be added to the tuple.
+    sub = getattr(args, "scaffold_cmd", None)
+    apply_flag = bool(getattr(args, "apply", False))
+    dry_run_flag = bool(getattr(args, "dry_run", False))
+    will_mutate = sub == "sync" and apply_flag and not dry_run_flag
+    if will_mutate and raw:
+        log_cfg = raw.get("logging", {}) or {}
+        log_dir = log_cfg.get("dir", "./data")
+        audit_path = Path(log_dir) / "vault_audit.log"
+        if not os.environ.get("ALFRED_VAULT_AUDIT_LOG"):
+            os.environ["ALFRED_VAULT_AUDIT_LOG"] = str(audit_path)
+
+    from alfred.scaffold import cli as scaffold_cli
+
+    code = scaffold_cli.dispatch(args, raw)
+    sys.exit(code)
+
+
 def cmd_bit(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred bit`` subcommands (run-now / status / history)."""
     raw = _load_unified_config(args.config)
@@ -2876,6 +2927,10 @@ def build_parser() -> argparse.ArgumentParser:
     from alfred.audit import cli as audit_cli
     audit_cli.build_parser(sub)
 
+    # scaffold — Build #38, diff-and-copy bundled scaffold into existing vaults
+    from alfred.scaffold import cli as scaffold_cli
+    scaffold_cli.build_parser(sub)
+
     # reviews — KAL-LE per-project review files
     from alfred.reviews import cli as reviews_cli
     reviews_cli.build_subparser(sub)
@@ -2924,6 +2979,7 @@ def main() -> None:
         "check-tool-schemas": cmd_check_tool_schemas,
         "bit": cmd_bit,
         "audit": cmd_audit,
+        "scaffold": cmd_scaffold,
         "reviews": cmd_reviews,
         "digest": cmd_digest,
         "gcal": cmd_gcal,

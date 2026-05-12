@@ -189,7 +189,9 @@ def append_to_audit_log(
             ad-hoc CLI invocations" distinct from per-tool agent
             backends). ``"distiller"`` also covers the promote-proposal
             / discard-proposal CLI paths (2026-05-11), in addition to
-            its prior agent-backend usage.
+            its prior agent-backend usage. ``"scaffold"`` was added
+            2026-05-12 (Build #38, ``alfred scaffold sync --apply``) for
+            mutations produced by the bundled-scaffold diff-and-copy CLI.
         mutations: Dict as returned by ``read_mutations()`` OR
             ``build_audit_mutations()`` with files_created /
             files_modified / files_deleted lists.
