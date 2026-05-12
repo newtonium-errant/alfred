@@ -323,6 +323,60 @@ class TestApplySync:
         summary = apply_sync(items, apply=True)
         assert "_templates/person.md" in summary.skipped_noops
 
+    def test_orphans_cleaned_surfaced_in_summary(
+        self, fake_scaffold: Path, empty_vault: Path
+    ) -> None:
+        # Reviewer-pass refinement on Build #38 NOTE 3: the cleanup
+        # helper's return value MUST land in summary.orphans_cleaned so
+        # cmd_sync (and any other caller) can surface a per-run signal
+        # without re-walking. Pinned shape: list[str] of relpaths.
+        from alfred.scaffold.sync import apply_sync, scan_scaffold
+
+        (empty_vault / "_templates").mkdir()
+        orphan_a = empty_vault / "_templates" / "person.md.tmp"
+        orphan_a.write_bytes(b"crashed-write-a")
+        orphan_b = empty_vault / "_templates" / "task.md.tmp"
+        orphan_b.write_bytes(b"crashed-write-b")
+
+        items = scan_scaffold(fake_scaffold, empty_vault)
+        summary = apply_sync(items, apply=True)
+
+        assert sorted(summary.orphans_cleaned) == [
+            "_templates/person.md",
+            "_templates/task.md",
+        ]
+
+    def test_orphans_cleaned_empty_when_no_orphans_on_apply(
+        self, fake_scaffold: Path, empty_vault: Path
+    ) -> None:
+        # Explicit-empty contract: an apply run with no orphans MUST
+        # still populate the attribute (as []), so the stdout
+        # "Orphan tmp files cleaned: 0" signal can fire.
+        from alfred.scaffold.sync import apply_sync, scan_scaffold
+
+        items = scan_scaffold(fake_scaffold, empty_vault)
+        summary = apply_sync(items, apply=True)
+
+        assert summary.orphans_cleaned == []
+
+    def test_orphans_cleaned_empty_on_dry_run(
+        self, fake_scaffold: Path, empty_vault: Path
+    ) -> None:
+        # Dry-run does not run the cleanup pass. Even with orphans on
+        # disk, summary.orphans_cleaned must be empty — the sweep
+        # didn't happen.
+        from alfred.scaffold.sync import apply_sync, scan_scaffold
+
+        (empty_vault / "_templates").mkdir()
+        (empty_vault / "_templates" / "person.md.tmp").write_bytes(b"x")
+
+        items = scan_scaffold(fake_scaffold, empty_vault)
+        summary = apply_sync(items, apply=False)
+
+        assert summary.orphans_cleaned == []
+        # Disk untouched — orphan still there (dry-run no-mutation).
+        assert (empty_vault / "_templates" / "person.md.tmp").exists()
+
     def test_orphan_tmp_cleaned_on_apply(
         self, fake_scaffold: Path, empty_vault: Path
     ) -> None:
@@ -538,6 +592,77 @@ class TestCmdSync:
         assert not (empty_vault / "_templates" / "person.md").exists()
         out = capsys.readouterr().out
         assert "DRY-RUN" in out
+
+    def test_orphan_cleanup_line_on_apply_when_nonzero(
+        self,
+        fake_scaffold: Path,
+        empty_vault: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # On --apply, the stdout summary MUST surface
+        # "Orphan tmp files cleaned: N" with N matching the orphans
+        # found. This is the operator-visible side of the cleanup
+        # contract — pinned per "intentionally left blank."
+        from alfred.scaffold.cli import cmd_sync
+
+        self._patch_scaffold(monkeypatch, fake_scaffold)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        # Two orphans pre-staged at sync-owned paths.
+        (empty_vault / "_templates").mkdir()
+        (empty_vault / "_templates" / "person.md.tmp").write_bytes(b"a")
+        (empty_vault / "_templates" / "task.md.tmp").write_bytes(b"b")
+
+        args = _make_sync_args(empty_vault, apply=True)
+        rc = cmd_sync(args, raw_config={})
+        assert rc == 0
+
+        out = capsys.readouterr().out
+        assert "Orphan tmp files cleaned: 2" in out
+
+    def test_orphan_cleanup_line_on_apply_when_zero(
+        self,
+        fake_scaffold: Path,
+        empty_vault: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # Zero-orphan apply MUST STILL print the cleanup line — the
+        # "intentionally left blank" contract says silence is
+        # indistinguishable from broken. Operator should be able to
+        # tell from stdout that the sweep ran.
+        from alfred.scaffold.cli import cmd_sync
+
+        self._patch_scaffold(monkeypatch, fake_scaffold)
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+
+        args = _make_sync_args(empty_vault, apply=True)
+        rc = cmd_sync(args, raw_config={})
+        assert rc == 0
+
+        out = capsys.readouterr().out
+        assert "Orphan tmp files cleaned: 0" in out
+
+    def test_orphan_cleanup_line_suppressed_on_dry_run(
+        self,
+        fake_scaffold: Path,
+        empty_vault: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # Dry-run did NOT run the cleanup sweep — printing
+        # "Orphan tmp files cleaned: 0" would imply it did. Suppress
+        # the line on dry-run to avoid the misleading signal.
+        from alfred.scaffold.cli import cmd_sync
+
+        self._patch_scaffold(monkeypatch, fake_scaffold)
+        args = _make_sync_args(empty_vault, apply=False)
+        cmd_sync(args, raw_config={})
+
+        out = capsys.readouterr().out
+        assert "DRY-RUN" in out
+        assert "Orphan tmp files cleaned" not in out
 
     def test_no_candidates_emits_left_blank_signal(
         self,

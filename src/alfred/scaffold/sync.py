@@ -211,6 +211,10 @@ class SyncSummary:
         skipped_conflicts: relpaths of CONFLICT files left untouched
             (operator content preserved).
         skipped_noops: relpaths of files identical in both trees.
+        orphans_cleaned: relpaths whose ``<vault_path>.tmp`` orphan
+            (left by a previously-crashed sync) was unlinked during
+            the pre-flight cleanup. Always empty on dry-run (cleanup
+            does not run when ``apply=False``).
         dry_run: True iff no filesystem writes occurred (apply=False).
     """
 
@@ -218,6 +222,7 @@ class SyncSummary:
     overwritten: list[str] = field(default_factory=list)
     skipped_conflicts: list[str] = field(default_factory=list)
     skipped_noops: list[str] = field(default_factory=list)
+    orphans_cleaned: list[str] = field(default_factory=list)
     dry_run: bool = False
 
     @property
@@ -313,13 +318,15 @@ def apply_sync(
         across the same filtered set this call will process. Dry-runs
         do not mutate the filesystem and therefore do not clean.
     """
+    summary = SyncSummary(dry_run=not apply)
+
     # Pre-flight: remove orphan .tmp files from any prior crashed sync.
     # Only runs when we'd actually write — dry-run contract is "no
-    # filesystem mutation," which includes cleanup.
+    # filesystem mutation," which includes cleanup. Captured into the
+    # summary so cmd_sync can surface "Orphan tmp files cleaned: N"
+    # on every --apply run (zero or not — per intentionally-left-blank).
     if apply:
-        _cleanup_orphan_tmp_files(items)
-
-    summary = SyncSummary(dry_run=not apply)
+        summary.orphans_cleaned = _cleanup_orphan_tmp_files(items)
 
     for item in items:
         if item.status == SyncStatus.NOOP:

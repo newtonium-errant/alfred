@@ -277,6 +277,16 @@ def cmd_sync(args: argparse.Namespace, raw_config: dict[str, Any]) -> int:
         f"{n_conflict_skipped} conflict-skipped, {n_noop} noop"
     )
 
+    # Orphan tmp cleanup signal — unconditional on --apply, even when N=0.
+    # That's the "intentionally left blank" contract: silence is
+    # indistinguishable from broken, so the operator should be able to
+    # tell from stdout whether the pre-flight cleanup ran. Dry-run
+    # suppresses the line because cleanup didn't run (no-mutation
+    # contract); printing "0 cleaned" on dry-run would imply the sweep
+    # happened, which it didn't.
+    if not summary.dry_run:
+        print(f"Orphan tmp files cleaned: {len(summary.orphans_cleaned)}")
+
     # Per-file detail. Group by status; sort within each group for
     # stable output (helps diff-of-diffs across reruns).
     if summary.created:
