@@ -510,7 +510,17 @@ async def run(
                 _bound_intended_on = gcal_intended_on
 
                 def _on_event_created(vault_path_, rel_path, fm):
-                    """Vault-create hook → push event to GCal + writeback ID."""
+                    """Vault-create hook → push event to GCal + writeback ID.
+
+                    Returns the sync function's result dict so
+                    ``_fire_create_hooks`` can bubble it up to
+                    ``vault_create`` for ``gcal_sync`` surfacing in the
+                    LLM tool_result. Early-bail branches (no datetimes,
+                    unparseable datetimes) return ``None`` — those map
+                    to "no GCal action attempted" in
+                    :func:`alfred.vault.ops._extract_gcal_sync_status`,
+                    which omits the ``gcal_sync`` key entirely.
+                    """
                     from datetime import datetime as _dt
                     start_raw = fm.get("start")
                     end_raw = fm.get("end")
@@ -523,7 +533,7 @@ async def run(
                             reason="no_start_or_end",
                             rel_path=rel_path,
                         )
-                        return
+                        return None
                     try:
                         start_dt = _dt.fromisoformat(str(start_raw))
                         end_dt = _dt.fromisoformat(str(end_raw))
@@ -534,10 +544,10 @@ async def run(
                             start=str(start_raw)[:40],
                             end=str(end_raw)[:40],
                         )
-                        return
+                        return None
                     file_path = Path(vault_path_) / rel_path
                     resolved_title, title_source = resolve_gcal_title(fm)
-                    sync_event_create_to_gcal(
+                    return sync_event_create_to_gcal(
                         client=_bound_client,
                         config=_bound_config,
                         intended_on=_bound_intended_on,
@@ -591,6 +601,15 @@ async def run(
                     so an edit that doesn't touch status (but the record
                     was already cancelled from a prior edit) doesn't
                     re-fire the cancel sync.
+
+                    Returns the sync function's result dict so
+                    ``_fire_update_hooks`` can bubble it up to
+                    ``vault_edit`` for ``gcal_sync`` surfacing in the
+                    LLM tool_result. No-op branches (record had no
+                    gcal_event_id and no datetimes; bad-time parse on
+                    promote) return ``None`` — see
+                    :func:`alfred.vault.ops._extract_gcal_sync_status`
+                    for the contract.
                     """
                     from datetime import datetime as _dt
                     gcal_event_id = str(fm.get("gcal_event_id") or "")
@@ -607,7 +626,7 @@ async def run(
                     ):
                         keep_on_cancel = bool(fm.get("gcal_keep_on_cancel"))
                         file_path = Path(vault_path_) / rel_path
-                        sync_event_cancellation_to_gcal(
+                        return sync_event_cancellation_to_gcal(
                             client=_bound_client,
                             config=_bound_config,
                             intended_on=_bound_intended_on,
@@ -616,7 +635,6 @@ async def run(
                             keep_on_cancel=keep_on_cancel,
                             correlation_id=str(fm.get("correlation_id") or ""),
                         )
-                        return
 
                     # Promotion path — first-sync via edit.
                     if not gcal_event_id and start_raw and end_raw:
@@ -630,7 +648,7 @@ async def run(
                                 start=str(start_raw)[:40],
                                 end=str(end_raw)[:40],
                             )
-                            return
+                            return None
                         log.info(
                             "gcal.sync_promoted_to_create",
                             rel_path=rel_path,
@@ -643,7 +661,7 @@ async def run(
                         )
                         file_path = Path(vault_path_) / rel_path
                         resolved_title, title_source = resolve_gcal_title(fm)
-                        sync_event_create_to_gcal(
+                        return sync_event_create_to_gcal(
                             client=_bound_client,
                             config=_bound_config,
                             intended_on=_bound_intended_on,
@@ -655,7 +673,6 @@ async def run(
                             correlation_id=str(fm.get("correlation_id") or ""),
                             title_source=title_source,
                         )
-                        return
 
                     # No-op path — never synced AND still no datetimes.
                     if not gcal_event_id:
@@ -664,7 +681,7 @@ async def run(
                             reason="no_gcal_event_id_and_no_times",
                             rel_path=rel_path,
                         )
-                        return
+                        return None
 
                     # PATCH path — existing GCal mirror, normal update.
                     # Only patch fields that actually changed AND are
@@ -707,7 +724,7 @@ async def run(
                             end_dt = _dt.fromisoformat(str(fm["end"]))
                         except Exception:  # noqa: BLE001
                             pass
-                    sync_event_update_to_gcal(
+                    return sync_event_update_to_gcal(
                         client=_bound_client,
                         config=_bound_config,
                         intended_on=_bound_intended_on,
@@ -721,9 +738,15 @@ async def run(
                     )
 
                 def _on_event_deleted(vault_path_, rel_path, pre_delete_fm):
-                    """Vault-delete hook → remove the GCal mirror."""
+                    """Vault-delete hook → remove the GCal mirror.
+
+                    Returns the sync function's result dict so
+                    ``_fire_delete_hooks`` can bubble it up to
+                    ``vault_delete`` for ``gcal_sync`` surfacing in the
+                    LLM tool_result.
+                    """
                     gcal_event_id = str(pre_delete_fm.get("gcal_event_id") or "")
-                    sync_event_delete_to_gcal(
+                    return sync_event_delete_to_gcal(
                         client=_bound_client,
                         config=_bound_config,
                         intended_on=_bound_intended_on,
