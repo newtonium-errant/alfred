@@ -8,7 +8,7 @@ from pathlib import Path
 import frontmatter
 import structlog
 
-from alfred.vault.mutation_log import append_to_audit_log
+from alfred.vault.mutation_log import append_to_audit_log, build_audit_mutations
 
 from .state import PipelineState
 from .utils import compute_md5_bytes
@@ -395,7 +395,7 @@ class VaultWriter:
                 append_to_audit_log(
                     self.audit_log_path,
                     "surveyor",
-                    {"files_created": [], "files_modified": [rel_path], "files_deleted": []},
+                    build_audit_mutations("edit", rel_path),
                     detail=audit_detail,
                 )
             except OSError as e:

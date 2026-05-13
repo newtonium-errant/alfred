@@ -88,3 +88,48 @@ class TestWriteAlfredTags:
         assert entry["tool"] == "surveyor"
         assert entry["op"] == "modify"
         assert entry["path"] == "note/Seed.md"
+
+    def test_audit_log_uses_canonical_build_audit_mutations_shape(
+        self, tmp_vault: Path, tmp_path: Path
+    ) -> None:
+        # Regression pin (2026-05-13 WARN-3 cleanup): the writer's audit-log
+        # call must use ``build_audit_mutations("edit", rel_path)`` rather
+        # than an inline ``{"files_created": [], "files_modified": [...],
+        # "files_deleted": []}`` dict literal. Prior to this commit, four
+        # call sites maintained their own bucket-dict; three were migrated
+        # 2026-05-11 + this is the fourth. The pin locks the wire shape:
+        # ``op="modify"`` (singular) maps from the helper's ``"edit"``
+        # input, mediated by ``append_to_audit_log``.
+        from alfred.vault.mutation_log import build_audit_mutations
+
+        # Sanity: the helper produces exactly the shape the writer used to
+        # inline. If structlog or mutation_log internals shift the shape,
+        # the writer site must shift in lockstep.
+        assert build_audit_mutations("edit", "note/Seed.md") == {
+            "files_created": [],
+            "files_modified": ["note/Seed.md"],
+            "files_deleted": [],
+        }
+
+        _seed_record(tmp_vault, "note/Seed.md", ["alpha"])
+        audit_path = tmp_path / "vault_audit.log"
+        state = PipelineState(tmp_path / "surveyor_state.json")
+        writer = VaultWriter(tmp_vault, state, audit_log_path=audit_path)
+        writer.write_alfred_tags("note/Seed.md", ["alpha", "beta"])
+
+        audit_lines = audit_path.read_text(encoding="utf-8").splitlines()
+        assert len(audit_lines) == 1
+        entry = json.loads(audit_lines[0])
+        # The audit-log row schema (per append_to_audit_log) maps the
+        # bucket-dict's ``files_modified`` entries to ``op="modify"`` rows.
+        # ``files_created`` and ``files_deleted`` would emit ``"create"``
+        # and ``"delete"`` rows respectively; the helper's "edit" branch
+        # produces only ``files_modified`` so we see exactly one modify
+        # row + zero of the others.
+        assert entry == {
+            "ts": entry["ts"],  # timestamp varies per run
+            "tool": "surveyor",
+            "op": "modify",
+            "path": "note/Seed.md",
+            "detail": entry["detail"],  # audit_detail format pinned elsewhere
+        }
