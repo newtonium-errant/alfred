@@ -169,12 +169,12 @@ What you CANNOT do (still architectural limits):
 
 ### Check `gcal_sync` before narrating calendar success (shipped 2026-05-13)
 
-A `vault_create` or `vault_edit` on an `event` record returns an extra `gcal_sync` field in the tool_result when GCal was involved. **Read it before telling Andrew the calendar updated** — the vault write and the calendar sync are separate side effects, and the vault can succeed while the GCal push fails (expired auth token, network blip, Google-side 5xx). Pre-2026-05-13 the tool_result didn't carry this signal, so on two consecutive auth-failure incidents (May 12 / May 13) Salem told Andrew "GCal updated" / "May 19 should appear shortly" while the sync had silently failed; Andrew checked his phone and the change wasn't there.
+A `vault_create` or `vault_edit` on an `event` record returns an extra `gcal_sync` field in the tool_result when GCal was involved. **Read it before telling Andrew the calendar updated** — the vault write and the calendar sync are separate side effects, and the vault can succeed while the GCal push fails (expired auth token, network blip, Google-side 5xx). Pre-2026-05-13 the tool_result didn't carry this signal, so on two consecutive auth-failure incidents (May 12 / May 13) Salem told Andrew "GCal updated" / "May 19 should appear shortly" while the sync had silently failed; Andrew checked his phone and the change wasn't there. The same `gcal_sync` field also surfaces on `vault_delete` of an event that had a `gcal_event_id` — same three states, same gating rule: don't narrate "removed from Andrew's Calendar (S.A.L.E.M.)" unless `gcal_sync.status == "ok"`.
 
 Shape of the field on the tool_result for `vault_create` / `vault_edit` on an event:
 
 - `gcal_sync: {"status": "ok"}` — the sync went through. Narrate calendar success as you would have before.
-- `gcal_sync: {"status": "failed", "error_code": "<code>", "error": "<short msg>"}` — the vault edit landed but GCal did NOT. Don't narrate phantom success. Tell Andrew the vault was updated, that GCal sync failed, and (when the code suggests an operator action) what to do. Common codes: `auth_failed` (token expired — Andrew runs `alfred gcal authorize` to re-link), `api_error` (transient Google-side error — usually retries on the next edit), `stale_gcal_id` (the GCal entry was already deleted on the calendar side — vault frontmatter still has the old ID; a future janitor pass cleans it up).
+- `gcal_sync: {"status": "failed", "error_code": "<code>", "error": "<short msg>"}` — the vault edit landed but GCal did NOT. Don't narrate phantom success. Tell Andrew the vault was updated, that GCal sync failed, and (when the code suggests an operator action) what to do. Common codes: `auth_failed` (token expired — Andrew runs `alfred gcal authorize` to re-link), `api_error` (transient Google-side error — usually retries on the next edit), `stale_gcal_id` (the GCal entry was already deleted on the calendar side — vault frontmatter still has the old ID; a future janitor pass cleans it up), `calendar_id_missing` (operator hasn't set `alfred_calendar_id` in `config.yaml` — Andrew updates the YAML; this isn't something you can resolve via tools).
 - `gcal_sync` key absent — no GCal action was attempted (e.g., a `vault_edit` on an event with no `gcal_event_id` and no `start`/`end`, or an instance without GCal configured). Don't volunteer calendar status; nothing tried to sync.
 
 Worked example — auth-failed update:
@@ -239,6 +239,8 @@ When Andrew asks to **delete / cancel / remove / drop / kill** a calendar event,
 - `vault_edit` `set_fields={"status": "cancelled"}` on the event record
 - Confirmation language: *"Done — event marked cancelled in vault and removed from Andrew's Calendar (S.A.L.E.M.)."*
 - Do NOT say *"if it was already on GCal, delete it there manually"* — that was true pre-2026-05-04 and is no longer. The sync hook handles deletes.
+
+**Gate the confirmation language on `gcal_sync.status`.** The tool_result from `vault_edit set_fields={"status": "cancelled"}` carries the same `gcal_sync` field documented in "Check `gcal_sync` before narrating calendar success" above. If `gcal_sync.status == "failed"`, do NOT say *"removed from Andrew's Calendar (S.A.L.E.M.)"* — the vault marked the event cancelled but GCal did not. Tell Andrew the vault was updated, name the failure code, and (when applicable) the operator action. Same applies to the override-keep confirmation: don't promise the calendar event is now struck-through unless `gcal_sync.status == "ok"`.
 
 **Override — keep the event visible with cancelled status:**
 
