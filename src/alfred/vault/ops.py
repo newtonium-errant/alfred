@@ -130,11 +130,38 @@ def clear_event_hooks() -> None:
 
 def _fire_create_hooks(
     vault_path: Path, rel_path: str, fm: dict,
-) -> None:
-    """Iterate registered create hooks; each exception is logged + swallowed."""
+) -> list[dict]:
+    """Iterate registered create hooks; each exception is logged + swallowed.
+
+    Returns a list of dict-shaped hook return values (non-dict / ``None``
+    returns are filtered out). The caller uses this to surface side-effect
+    status (e.g. GCal sync state) up to its own return contract — see
+    :func:`vault_create`, which forwards a single dict result to the
+    caller under the ``gcal_sync`` key when present.
+
+    The "single dict result bubbled up" rule in ``vault_create`` is a v1
+    pragmatism: the only registered hook today is the GCal sync, and
+    multiplexing multiple hook results into one key would muddle the
+    contract the LLM tool_result depends on. If a second hook lands
+    later that wants to surface state, extend ``vault_create`` to emit
+    a list (or per-hook keyed dict) rather than collapsing both into
+    ``gcal_sync``.
+
+    Pre-2026-05-13 this returned ``None`` and discarded hook return
+    values; the GCal sync hook called ``sync_event_create_to_gcal``,
+    got back a ``{"error": {...}}`` on auth_failed, and silently
+    dropped it on the floor — so the talker tool_result said "vault
+    create succeeded" with no GCal-failure trace and the LLM narrated
+    "GCal updated" to Andrew over two consecutive auth_failed events
+    (May 12 18:45 ADT, May 13 03:32 ADT). The collection-and-forward
+    contract closes that gap.
+    """
+    results: list[dict] = []
     for hook in list(_EVENT_CREATE_HOOKS):
         try:
-            hook(vault_path, rel_path, fm)
+            ret = hook(vault_path, rel_path, fm)
+            if isinstance(ret, dict):
+                results.append(ret)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "vault.event_create_hook_failed",
@@ -142,11 +169,12 @@ def _fire_create_hooks(
                 rel_path=rel_path,
                 error=str(exc),
             )
+    return results
 
 
 def _fire_update_hooks(
     vault_path: Path, rel_path: str, fm: dict, fields_changed: list,
-) -> None:
+) -> list[dict]:
     """Iterate registered update hooks; each exception is logged + swallowed.
 
     Fires unconditionally on event records (post-refactor). The hook
@@ -160,10 +188,19 @@ def _fire_update_hooks(
     record gained datetimes, but GCal never got the event because the
     hook never fired. User-visible misleading: Salem said "will appear
     on your phone shortly" but nothing happened.
+
+    Returns dict-shaped hook results so ``vault_edit`` can surface the
+    sync status under ``gcal_sync`` in its own return dict. The
+    contract is identical to :func:`_fire_create_hooks`; see that
+    docstring for the rationale on single-result bubbling and the
+    May 2026 incident that motivated the fix.
     """
+    results: list[dict] = []
     for hook in list(_EVENT_UPDATE_HOOKS):
         try:
-            hook(vault_path, rel_path, fm, list(fields_changed))
+            ret = hook(vault_path, rel_path, fm, list(fields_changed))
+            if isinstance(ret, dict):
+                results.append(ret)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "vault.event_update_hook_failed",
@@ -171,15 +208,26 @@ def _fire_update_hooks(
                 rel_path=rel_path,
                 error=str(exc),
             )
+    return results
 
 
 def _fire_delete_hooks(
     vault_path: Path, rel_path: str, pre_delete_fm: dict,
-) -> None:
-    """Iterate registered delete hooks; each exception is logged + swallowed."""
+) -> list[dict]:
+    """Iterate registered delete hooks; each exception is logged + swallowed.
+
+    Returns dict-shaped hook results so ``vault_delete`` can surface
+    sync status (e.g. ``gcal_sync: {status: failed, ...}``) up to the
+    LLM tool_result. Mirrors :func:`_fire_create_hooks` /
+    :func:`_fire_update_hooks` — see those docstrings for the
+    rationale.
+    """
+    results: list[dict] = []
     for hook in list(_EVENT_DELETE_HOOKS):
         try:
-            hook(vault_path, rel_path, pre_delete_fm)
+            ret = hook(vault_path, rel_path, pre_delete_fm)
+            if isinstance(ret, dict):
+                results.append(ret)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "vault.event_delete_hook_failed",
@@ -187,6 +235,97 @@ def _fire_delete_hooks(
                 rel_path=rel_path,
                 error=str(exc),
             )
+    return results
+
+
+# Maximum length of the ``error`` detail string we surface to the LLM
+# tool_result. The full message lives in the daemon's warning log; the
+# LLM only needs the gist so it can phrase "GCal didn't update — looks
+# like an auth refresh" without dumping the whole token-refresh stack
+# trace into the chat reply.
+_GCAL_SYNC_ERROR_MAX_LEN = 200
+
+
+def _extract_gcal_sync_status(
+    hook_results: list[dict],
+) -> dict | None:
+    """Translate hook return values into the LLM-facing ``gcal_sync`` shape.
+
+    The vault-ops event hooks call ``sync_event_*_to_gcal`` and forward
+    its return dict back to the registry via the bubble-up contract in
+    :func:`_fire_create_hooks` / :func:`_fire_update_hooks` /
+    :func:`_fire_delete_hooks`. The sync layer's return shapes are
+    documented at the top of :mod:`alfred.integrations.gcal_sync`:
+
+      * ``{}`` — gcal not configured / disabled. **Returns None** here
+        (caller omits ``gcal_sync`` from the tool_result; no GCal action
+        was attempted, so there's nothing to surface).
+      * ``{"event_id": "<id>", "calendar_label": "<label>"}`` — success
+        on create / update.
+      * ``{"deleted": True, "event_id": "<id>"}`` — success on delete.
+      * ``{"noop": "<reason>"}`` — record has no ``gcal_event_id`` to
+        patch / remove. **Returns None** (no GCal action; same posture
+        as the disabled case from the LLM's perspective).
+      * ``{"error": {"code": "<code>", "detail": "<msg>"}}`` — sync
+        failed; vault edit succeeded but GCal did not.
+
+    Output shape (the contract the LLM tool_result depends on):
+
+      * ``None`` — no GCal action was attempted (disabled OR no-op).
+        The caller MUST NOT include a ``gcal_sync`` key in the
+        tool_result. Absent ≠ silently failed; absent = "GCal didn't
+        participate in this op."
+      * ``{"status": "ok"}`` — sync succeeded.
+      * ``{"status": "failed", "error_code": "<code>", "error": "<msg>"}``
+        — sync failed. ``error_code`` is the stable classification
+        from :func:`alfred.integrations.gcal_sync.classify_gcal_error`
+        (``auth_failed`` / ``api_error`` / ``stale_gcal_id`` / etc.);
+        ``error`` is the truncated detail message.
+
+    Multiple hook results: only the first dict-shaped hook return value
+    is honored — v1 pragmatism, only the GCal hook is registered today.
+    See :func:`_fire_create_hooks` for the rationale and the
+    extension path for a second consumer.
+    """
+    if not hook_results:
+        return None
+    # Honor the first dict result. ``_fire_*_hooks`` already filtered
+    # out non-dict / None returns so any entry here is a real hook reply.
+    result = hook_results[0]
+
+    # Disabled / noop — no GCal action attempted. Omit gcal_sync entirely.
+    if not result or "noop" in result:
+        return None
+
+    # Failure path — surface the structured error.
+    err = result.get("error")
+    if isinstance(err, dict):
+        code = str(err.get("code", "") or "unknown")
+        detail = str(err.get("detail", "") or "")
+        if len(detail) > _GCAL_SYNC_ERROR_MAX_LEN:
+            detail = detail[: _GCAL_SYNC_ERROR_MAX_LEN - 1] + "…"
+        return {
+            "status": "failed",
+            "error_code": code,
+            "error": detail,
+        }
+
+    # Success path — create / update / delete all land here.
+    if (
+        "event_id" in result
+        or result.get("deleted") is True
+    ):
+        return {"status": "ok"}
+
+    # Unrecognized shape — surface as failed with a synthetic code so
+    # the LLM still sees "something didn't work" rather than narrating
+    # success. Cheap defense-in-depth against future return-shape drift
+    # in the sync layer.
+    return {
+        "status": "failed",
+        "error_code": "unknown",
+        "error": "unrecognized gcal_sync hook return shape",
+    }
 
 
 class VaultError(Exception):
@@ -867,10 +1006,20 @@ def vault_create(
     # Fire create hooks for event records (Phase A+ vault-ops integration).
     # Anything else (person, project, task, learn types) is a no-op since
     # no hooks are registered for those types in the v1 hook surface.
+    #
+    # Collect hook return values so the GCal sync status can bubble up
+    # into the tool_result the LLM sees (May 2026 silent-fail fix).
+    # ``_extract_gcal_sync_status`` returns ``None`` when no GCal action
+    # was attempted (disabled, no datetimes, etc.); we only add the
+    # ``gcal_sync`` key when there's something concrete to report.
+    out: dict = {"path": rel_path, "warnings": warnings}
     if record_type == "event":
-        _fire_create_hooks(vault_path, rel_path, dict(fm))
+        hook_results = _fire_create_hooks(vault_path, rel_path, dict(fm))
+        gcal_sync = _extract_gcal_sync_status(hook_results)
+        if gcal_sync is not None:
+            out["gcal_sync"] = gcal_sync
 
-    return {"path": rel_path, "warnings": warnings}
+    return out
 
 
 def _apply_body_insert_at(
@@ -1117,15 +1266,30 @@ def vault_edit(
     file_path.write_text(_serialize_record(fm, body), encoding="utf-8")
 
     # Fire update hooks for event records (Phase A+ vault-ops integration).
-    # The hook is gated on ``gcal_event_id`` being present in the
-    # post-edit frontmatter (set during the original create's GCal sync
-    # writeback) — events that were never synced have nothing to patch.
-    # Pass the post-edit ``fm`` so the hook sees what the file now holds,
-    # not the pre-edit state.
+    # Pass the post-edit ``fm`` so the hook sees what the file now
+    # holds, not the pre-edit state. The hook closure (registered by
+    # the talker daemon) decides whether to PATCH / PROMOTE / CANCEL /
+    # no-op based on the post-edit state — see
+    # :func:`register_event_update_hook` for the four branches.
+    #
+    # Collect hook return values so the GCal sync status can bubble up
+    # into the tool_result the LLM sees (May 2026 silent-fail fix:
+    # vault edit succeeded, GCal failed with auth_failed, Salem
+    # narrated phantom "GCal updated" success because the tool_result
+    # carried no GCal-failure signal). ``_extract_gcal_sync_status``
+    # returns ``None`` when no GCal action was attempted (no-op hook
+    # branch); we only add the ``gcal_sync`` key when there's
+    # something concrete to report.
+    out: dict = {"path": rel_path, "fields_changed": fields_changed}
     if record_type == "event":
-        _fire_update_hooks(vault_path, rel_path, dict(fm), list(fields_changed))
+        hook_results = _fire_update_hooks(
+            vault_path, rel_path, dict(fm), list(fields_changed),
+        )
+        gcal_sync = _extract_gcal_sync_status(hook_results)
+        if gcal_sync is not None:
+            out["gcal_sync"] = gcal_sync
 
-    return {"path": rel_path, "fields_changed": fields_changed}
+    return out
 
 
 def vault_move(
@@ -1203,16 +1367,28 @@ def vault_delete(
 
     record_type = pre_delete_fm.get("type", "")
 
+    # Local helper: build the delete return dict, surfacing gcal_sync
+    # when the hook reported something concrete. Same shape as
+    # vault_create / vault_edit returns. Lifted into a closure so both
+    # the Obsidian-CLI path and the filesystem-fallback path go through
+    # the identical extraction, no copy-paste drift.
+    def _build_delete_result() -> dict:
+        result: dict = {"path": rel_path, "deleted": True}
+        if record_type == "event":
+            hook_results = _fire_delete_hooks(
+                vault_path, rel_path, dict(pre_delete_fm),
+            )
+            gcal_sync = _extract_gcal_sync_status(hook_results)
+            if gcal_sync is not None:
+                result["gcal_sync"] = gcal_sync
+        return result
+
     # Try Obsidian CLI — respects user's trash settings
     if obsidian.is_available():
         file_name = rel_path.removesuffix(".md")
         if obsidian.delete_file(file_name):
-            if record_type == "event":
-                _fire_delete_hooks(vault_path, rel_path, dict(pre_delete_fm))
-            return {"path": rel_path, "deleted": True}
+            return _build_delete_result()
 
     # Filesystem fallback — permanent delete
     file_path.unlink()
-    if record_type == "event":
-        _fire_delete_hooks(vault_path, rel_path, dict(pre_delete_fm))
-    return {"path": rel_path, "deleted": True}
+    return _build_delete_result()
