@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from alfred.daily_sync.health import (
     _check_last_successful_fire,
     _check_state_path,
+    _read_last_error,
     _read_last_fired_date,
     _resolve_state_path,
     health_check,
@@ -411,3 +412,183 @@ class TestAggregatorRegistration:
         from alfred.health.aggregator import KNOWN_TOOL_MODULES
         assert "daily_sync" in KNOWN_TOOL_MODULES
         assert KNOWN_TOOL_MODULES["daily_sync"] == "alfred.daily_sync.health"
+
+
+# ---------------------------------------------------------------------------
+# _read_last_error — defensive dict-walking for the diagnostic field
+# (added 2026-05-14)
+# ---------------------------------------------------------------------------
+
+
+class TestReadLastError:
+    def test_missing_state_file_returns_none(self, tmp_path: Path) -> None:
+        assert _read_last_error(tmp_path / "missing.json") is None
+
+    def test_state_without_last_error_returns_none(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(state_path, _yesterday_iso())
+        assert _read_last_error(state_path) is None
+
+    def test_last_error_null_returns_none(self, tmp_path: Path) -> None:
+        # After a successful recovery the field is None (set by
+        # clear_last_error_on_state), not absent.
+        state_path = tmp_path / "s.json"
+        _write_state(state_path, _yesterday_iso(), last_error=None)
+        assert _read_last_error(state_path) is None
+
+    def test_last_error_populated_returns_dict(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        err = {"ts": "2026-05-14T09:00:00+00:00", "message": "KeyError: 'foo'"}
+        _write_state(state_path, _yesterday_iso(), last_error=err)
+        assert _read_last_error(state_path) == err
+
+    def test_last_error_not_a_dict_returns_none(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(state_path, _yesterday_iso(), last_error="not-a-dict")
+        assert _read_last_error(state_path) is None
+
+    def test_last_error_without_message_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path, _yesterday_iso(),
+            last_error={"ts": "2026-05-14T09:00:00+00:00"},
+        )
+        assert _read_last_error(state_path) is None
+
+    def test_corrupt_json_returns_none(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        state_path.write_text("{ not json", encoding="utf-8")
+        assert _read_last_error(state_path) is None
+
+    def test_non_dict_top_level_returns_none(self, tmp_path: Path) -> None:
+        # Defensive against a future schema migration that puts a
+        # list at the top level.
+        state_path = tmp_path / "s.json"
+        state_path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+        assert _read_last_error(state_path) is None
+
+
+# ---------------------------------------------------------------------------
+# _check_last_successful_fire — last_error surfacing in WARN/FAIL detail
+# (added 2026-05-14)
+# ---------------------------------------------------------------------------
+
+
+class TestLastErrorSurfacing:
+    """Pin that when ``last_error`` is populated, the probe's
+    WARN/FAIL detail string includes the message so the BIT line
+    carries the cause without requiring the operator to grep
+    ``data/daily_sync.log``.
+
+    Symmetric: when ``last_error`` is None or absent, the detail
+    stays clean (no trailing "; last error: " sentinel).
+    """
+
+    def test_fail_includes_last_error_message(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path,
+            _days_ago_iso(10),
+            last_error={
+                "ts": "2026-05-14T09:00:00+00:00",
+                "message": "KeyError: 'foo'",
+            },
+        )
+        raw = _config(tmp_path, state_path=state_path)
+        result = _check_last_successful_fire(raw, raw["daily_sync"])
+        assert result.status == Status.FAIL
+        assert "silently failing" in result.detail
+        assert "last error: KeyError: 'foo'" in result.detail
+
+    def test_warn_includes_last_error_message(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path,
+            _days_ago_iso(2),
+            last_error={
+                "ts": "2026-05-14T09:00:00+00:00",
+                "message": "TimeoutError",
+            },
+        )
+        raw = _config(tmp_path, state_path=state_path)
+        result = _check_last_successful_fire(raw, raw["daily_sync"])
+        assert result.status == Status.WARN
+        assert "one missed run" in result.detail
+        assert "last error: TimeoutError" in result.detail
+
+    def test_fail_without_last_error_omits_suffix(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(state_path, _days_ago_iso(10))
+        raw = _config(tmp_path, state_path=state_path)
+        result = _check_last_successful_fire(raw, raw["daily_sync"])
+        assert result.status == Status.FAIL
+        assert "last error:" not in result.detail
+
+    def test_warn_without_last_error_omits_suffix(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(state_path, _days_ago_iso(2))
+        raw = _config(tmp_path, state_path=state_path)
+        result = _check_last_successful_fire(raw, raw["daily_sync"])
+        assert result.status == Status.WARN
+        assert "last error:" not in result.detail
+
+    def test_long_message_truncated_to_150_chars(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        long_msg = "TypeError: " + ("x" * 500)
+        _write_state(
+            state_path,
+            _days_ago_iso(10),
+            last_error={"ts": "2026-05-14T09:00:00+00:00", "message": long_msg},
+        )
+        raw = _config(tmp_path, state_path=state_path)
+        result = _check_last_successful_fire(raw, raw["daily_sync"])
+        assert result.status == Status.FAIL
+        assert "..." in result.detail
+        suffix = result.detail.split("last error: ", 1)[1]
+        assert len(suffix) <= 150
+
+    def test_short_message_not_truncated(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path,
+            _days_ago_iso(10),
+            last_error={"ts": "2026-05-14T09:00:00+00:00", "message": "short"},
+        )
+        raw = _config(tmp_path, state_path=state_path)
+        result = _check_last_successful_fire(raw, raw["daily_sync"])
+        assert "last error: short" in result.detail
+        assert "..." not in result.detail
+
+    def test_ok_status_does_not_append_error_suffix(
+        self, tmp_path: Path,
+    ) -> None:
+        # Defensive: stale last_error with a fresh last_fired_date
+        # shouldn't leak into OK detail. clear_last_error_on_state
+        # wipes on success, so this only happens on operator hand-edit.
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path,
+            _yesterday_iso(),
+            last_error={"ts": "2026-05-14T09:00:00+00:00", "message": "stale"},
+        )
+        raw = _config(tmp_path, state_path=state_path)
+        result = _check_last_successful_fire(raw, raw["daily_sync"])
+        assert result.status == Status.OK
+        assert "last error:" not in result.detail
+
+    def test_payload_carries_last_error_for_json_consumers(
+        self, tmp_path: Path,
+    ) -> None:
+        # JSON consumers of BIT output get the full structured error.
+        state_path = tmp_path / "s.json"
+        err = {"ts": "2026-05-14T09:00:00+00:00", "message": "KeyError: 'foo'"}
+        _write_state(
+            state_path,
+            _days_ago_iso(10),
+            last_error=err,
+        )
+        raw = _config(tmp_path, state_path=state_path)
+        result = _check_last_successful_fire(raw, raw["daily_sync"])
+        assert result.data.get("last_error") == err

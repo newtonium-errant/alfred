@@ -15,8 +15,17 @@ State file shape::
     {
       "confidence": {"high": true, "medium": false, "low": false, "spam": true},
       "last_batch": {"date": "2026-04-22", "items": [...], "message_ids": [...]},
-      "last_fired_date": "2026-04-22"
+      "last_fired_date": "2026-04-22",
+      "last_error": {"ts": "2026-05-14T09:00:00+00:00", "message": "..."} | None
     }
+
+``last_error`` mirrors the brief.state pattern from 2026-05-14 and
+its janitor/distiller siblings (commits 66a6344 and 13529c5). The
+daemon's outer ``except Exception:`` at daemon.py:378 calls
+:func:`record_error_on_state` to capture the failure cause; the BIT
+``last-successful-fire`` probe surfaces it on its WARN/FAIL detail.
+Cleared by :func:`clear_last_error_on_state` on each successful
+fire (the ``state["last_fired_date"] = today_iso`` save point).
 """
 
 from __future__ import annotations
@@ -24,10 +33,15 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from .config import ConfidenceConfig
+
+log = structlog.get_logger(__name__)
 
 _VALID_TIERS = ("high", "medium", "low", "spam")
 
@@ -126,3 +140,56 @@ def format_confidence_report(flags: dict[str, bool]) -> str:
         check = "✅" if flags.get(tier, False) else "⏳"
         rows.append(f"  {check} {tier}")
     return "Per-tier surfacing confidence:\n" + "\n".join(rows)
+
+
+def record_error_on_state(
+    state_path: str | Path,
+    message: str,
+) -> None:
+    """Capture a daemon-level failure into ``state['last_error']`` and persist.
+
+    Called from the daily_sync daemon's outer ``except Exception:`` at
+    daemon.py:378 so the BIT ``last-successful-fire`` probe can
+    surface the failure cause (e.g. ``KeyError: 'foo'``) on the BIT
+    line rather than forcing the operator to grep
+    ``data/daily_sync.log``.
+
+    daily_sync's state is dict-shaped (not a dataclass like
+    brief/janitor/distiller StateManager); this helper inlines the
+    load → mutate → save round-trip so the daemon call site stays a
+    one-liner. Behaviour mirrors brief.StateManager.record_error:
+    persists the {ts, message} dict, defensive on save-failure
+    (logs warning, doesn't crash). Added 2026-05-14 per
+    ``project_cross_daemon_swallow_audit.md``.
+    """
+    state = load_state(state_path)
+    state["last_error"] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "message": message,
+    }
+    try:
+        save_state(state_path, state)
+    except OSError as e:
+        log.warning("daily_sync.state.record_error_save_failed", error=str(e))
+
+
+def clear_last_error_on_state(state: dict[str, Any]) -> None:
+    """Wipe ``state['last_error']`` in-place.
+
+    Called by the daemon's successful-fire path BEFORE the existing
+    ``save_state`` (the ``state['last_fired_date'] = today_iso`` save
+    point). Mirrors the brief.State.add_run(success=True)
+    clear-on-success semantics — reaching this call site means the
+    fire completed without raising, so wipe any stale failure context
+    the probe would otherwise trail on the BIT line.
+
+    No-op when ``last_error`` is already absent / None — the happy
+    path stays clean.
+
+    Mutates the dict in place rather than returning a new one because
+    daily_sync's existing daemon code uses a single ``state`` dict
+    through its fire path and saves it as a unit; making this a
+    return-value would force a call-site rewrite for no benefit.
+    """
+    if "last_error" in state:
+        state["last_error"] = None

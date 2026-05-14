@@ -42,7 +42,12 @@ from . import (
 )
 from .assembler import assemble_message
 from .config import DailySyncConfig
-from .confidence import load_state, save_state
+from .confidence import (
+    clear_last_error_on_state,
+    load_state,
+    record_error_on_state,
+    save_state,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -295,6 +300,12 @@ async def fire_once(
             friction_items=friction_items,
         )
     state["last_fired_date"] = today_iso
+    # Clear-on-success: reaching this save point means the fire
+    # completed without raising → wipe stale failure context. The
+    # outer daemon-loop ``except Exception:`` at daemon.py owns the
+    # failure-side write via record_error_on_state. Mirrors the
+    # brief.State.add_run clear-on-success pattern (2026-05-14).
+    clear_last_error_on_state(state)
     save_state(config.state.path, state)
 
     return {
@@ -375,7 +386,18 @@ async def run_daemon(
                     items=result["items_count"],
                     message_ids=result["message_ids"],
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                # Capture failure cause into state so the BIT
+                # ``last-successful-fire`` probe surfaces the message
+                # on its detail line. Keeps the swallow-the-exception
+                # behaviour (daemons must not crash); just labels the
+                # swallow. Added 2026-05-14 — mirrors the brief,
+                # janitor, and distiller daemon captures (closes the
+                # cross-daemon diagnostic-gap class per
+                # ``project_cross_daemon_swallow_audit.md``).
+                record_error_on_state(
+                    config.state.path, f"{type(exc).__name__}: {exc}",
+                )
                 log.exception("daily_sync.daemon.fire_error")
 
         # Sleep 60s to avoid double-firing within the same minute.
