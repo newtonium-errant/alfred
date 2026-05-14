@@ -78,13 +78,20 @@ class DistillerState:
         # ``last_error`` mirrors the brief.state pattern (2026-05-14):
         # parallel state at the DistillerState-level (not per-file).
         # Shape is ``{"ts": iso_string, "message": str}`` when populated;
-        # None when no error since last successful extraction tick.
+        # None when no error since last successful deep extraction.
         # Captured by the daemon's outer ``except Exception:`` at
         # daemon.py:749 and surfaced in the BIT
         # ``last-successful-extraction`` probe detail so operators see
         # WHY the extraction stalled, not just that it did. Cleared on
-        # each successful ``add_run`` call (the natural successful-tick
-        # boundary mirroring brief.State.add_run clear-on-success).
+        # the next successful DEEP extraction (``add_run`` only fires
+        # inside ``run_extraction`` on a ``deep_due`` tick — light
+        # scans don't reset ``last_error``). A failure captured by
+        # the daemon's outer except can therefore persist across many
+        # successful light-scan ticks until the next deep extraction
+        # succeeds; that's intentional, so operators see the failure
+        # cause until it's proven fixed by a clean deep run. Compare
+        # brief.State.add_run, where every successful brief is a
+        # per-tick clear because brief.daemon ticks at one cadence.
         self.last_error: dict | None = None
 
     def load(self) -> None:
@@ -232,10 +239,17 @@ class DistillerState:
 
         Also clears ``last_error`` — reaching this call site means a
         deep extraction completed without raising, so the recovery
-        semantics treat the tick as successful and wipe any stale
+        semantics treat the deep run as successful and wipe any stale
         failure context the probe would otherwise trail across the BIT
-        line. Mirrors the brief.State ``add_run(success=True)``
-        clear-on-success pattern from 2026-05-14.
+        line. NOTE: this is a per-deep-extraction clear (``add_run`` is
+        only called from ``run_extraction`` on a ``deep_due`` tick),
+        NOT a per-tick clear; a stored ``last_error`` persists across
+        successful light-scan ticks until the next deep extraction
+        succeeds. That's the intended recovery semantic — the operator
+        wants the deep-extraction failure cause surfaced on BIT until
+        a clean deep run proves it's fixed. Compare brief.State, where
+        every successful brief tick clears because the brief daemon
+        runs at a single cadence.
         """
         self.runs[result.run_id] = result
         self.last_error = None
