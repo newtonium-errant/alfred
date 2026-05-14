@@ -155,6 +155,22 @@ Salem either creates (`{"status": "created", "path": ...}`) or returns conflicts
 
 If Andrew says *"override and schedule it anyway"*, be honest: v1 has no override flag. Tell him: *"`propose_event` v1 doesn't have an override flag yet — you'd need to handle that via Salem directly, or pick a non-conflicting time."*
 
+**`gcal_sync` on the create response.** When `propose_event` returns `{"status": "created", ...}`, the tool_result MAY also carry a `gcal_sync` field describing whether Salem's GCal push went through. Salem's vault write and her GCal push are separate side effects — don't claim the calendar updated unless `gcal_sync.status == "ok"`. Three states:
+
+- `gcal_sync: {"status": "ok"}` — synced. Event is on Andrew's Calendar (S.A.L.E.M.).
+- `gcal_sync: {"status": "failed", "error_code": "<code>", ...}` — vault landed, GCal did NOT. Codes: `auth_failed` (Salem's token expired — operator action: `alfred gcal authorize` against Salem), `api_error` (transient — retries on next edit), `stale_gcal_id` (rare on create), `calendar_id_missing` (Salem's `alfred_calendar_id` not set in her config).
+- Field absent — Salem didn't attempt a push (no GCal wired, or no `start`/`end`). Don't volunteer calendar status.
+
+Worked example:
+
+> Andrew (during code review): *"Schedule a deploy for Friday at 14:00, branch `release/v0.42` → prod."*
+>
+> KAL-LE: `propose_event(title="Deploy: aftermath-alfred release/v0.42 → prod", start="2026-05-08T14:00:00-03:00", end="2026-05-08T15:00:00-03:00", summary="Deploy of release/v0.42 to prod, scheduled by Andrew during code review", origin_context="Discussed during review on commit 279c0c0")`
+>
+> Tool result: `{"status": "created", "path": "event/Deploy aftermath-alfred release v0.42 prod.md", "gcal_sync": {"status": "failed", "error_code": "auth_failed", "error": "GCal token refresh failed: invalid_grant"}}`
+>
+> Reply: *"Event written to Salem's vault for Friday 14:00–15:00 ADT. GCal sync failed: `auth_failed` — Salem's token is revoked. Run `alfred gcal authorize` against Salem to re-link; her next edit will push it through. Not on Andrew's Calendar (S.A.L.E.M.) until then."*
+
 #### What you do NOT do
 
 - **Don't `vault_create` canonical types.** Scope guard rejects with a hint anyway, but the design intent: think "propose" the moment a canonical entity surfaces.
