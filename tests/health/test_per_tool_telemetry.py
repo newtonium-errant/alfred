@@ -9,6 +9,8 @@ exception without a real network call.
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -82,11 +84,25 @@ class TestSurveyorHealth:
 
     async def test_happy_path_ok(self, monkeypatch, tmp_path: Path) -> None:
         _patch_httpx(monkeypatch, surveyor_health, lambda: _FakeClient(status_code=200))
+        # Seed a recent last_run so last-successful-cycle returns OK
+        # (else SKIP bubbles up via Status.worst). Without an explicit
+        # state.path override + content, the freshness probe resolves to
+        # the cwd-relative default ``./data/surveyor_state.json`` — the
+        # test only passed from main-repo CWD where that file exists.
+        state_path = tmp_path / "surveyor_state.json"
+        state_path.write_text(
+            json.dumps({
+                "version": 1,
+                "last_run": datetime.now(timezone.utc).isoformat(),
+            }),
+            encoding="utf-8",
+        )
         raw = {
             "surveyor": {
                 "ollama": {"base_url": "http://localhost:11434"},
                 "milvus": {"uri": str(tmp_path / "milvus.db")},
                 "openrouter": {"api_key": "or-xxx", "model": "x-ai/grok"},
+                "state": {"path": str(state_path)},
             }
         }
         result = await surveyor_health.health_check(raw)
@@ -165,12 +181,40 @@ class TestBriefHealth:
         vault = tmp_path / "vault"
         (vault / "run").mkdir(parents=True)
         _patch_httpx(monkeypatch, brief_health, lambda: _FakeClient(200))
+        # Seed a state file with a "yesterday" successful run in the
+        # configured timezone so last-successful-brief returns OK (else
+        # SKIP bubbles up via Status.worst). Without an explicit state
+        # path + content, the probe resolves to ``{logging.dir}/brief_state.json``
+        # (cwd-relative default ``./data/brief_state.json``); the test
+        # was previously dependent on whatever main-repo state happened
+        # to be there.
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/Halifax")
+        yesterday = (datetime.now(tz).date() - timedelta(days=1)).isoformat()
+        state_path = tmp_path / "brief_state.json"
+        state_path.write_text(
+            json.dumps({
+                "version": 1,
+                "last_run": datetime.now(timezone.utc).isoformat(),
+                "runs": [
+                    {
+                        "date": yesterday,
+                        "generated_at": datetime.now(timezone.utc).isoformat(),
+                        "vault_path": str(vault),
+                        "sections": [],
+                        "success": True,
+                    }
+                ],
+            }),
+            encoding="utf-8",
+        )
         raw = {
             "vault": {"path": str(vault)},
             "brief": {
                 "schedule": {"time": "06:00", "timezone": "America/Halifax"},
                 "output": {"directory": "run"},
                 "weather": {"stations": [{"id": "CYZX", "name": "Greenwood"}]},
+                "state": {"path": str(state_path)},
             },
         }
         result = await brief_health.health_check(raw)

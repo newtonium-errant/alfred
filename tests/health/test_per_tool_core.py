@@ -14,6 +14,7 @@ its own test file.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,10 @@ def _base_config(vault_path: Path, backend: str = "zo") -> dict[str, Any]:
     return {
         "vault": {"path": str(vault_path)},
         "agent": {"backend": backend},
-        "curator": {"inbox_dir": "inbox"},
+        "curator": {
+            "inbox_dir": "inbox",
+            "state": {"path": str(vault_path.parent / "curator_state.json")},
+        },
         "janitor": {"state": {"path": str(vault_path.parent / "janitor_state.json")}},
         "distiller": {
             "extraction": {"candidate_threshold": 0.3},
@@ -61,6 +65,20 @@ async def _ok_auth(api_key, model="claude-haiku-4-5"):  # noqa: ANN001
 
 class TestCuratorHealth:
     async def test_happy_path_ok(self, vault: Path) -> None:
+        # Seed a recent last_run so last-successful-process returns OK
+        # (and not SKIP, which would bubble up via Status.worst). Without
+        # this, the test was implicitly relying on a curator_state.json
+        # in the main repo's ``./data/`` dir, so it only passed from
+        # main-repo CWD — a worktree or fresh tmpdir CWD failed.
+        state_path = vault.parent / "curator_state.json"
+        state_path.write_text(
+            json.dumps({
+                "version": 1,
+                "last_run": datetime.now(timezone.utc).isoformat(),
+                "processed": {},
+            }),
+            encoding="utf-8",
+        )
         result = await curator_health.health_check(_base_config(vault))
         assert result.tool == "curator"
         assert result.status == Status.OK
@@ -127,6 +145,20 @@ class TestCuratorHealth:
 
 class TestJanitorHealth:
     async def test_happy_path_ok(self, vault: Path) -> None:
+        # Seed a recent last_deep_sweep so last-successful-sweep returns
+        # OK (else SKIP bubbles up via Status.worst). The override path
+        # in _base_config points at a fresh tmpdir; without a state
+        # file there, this test was failing from every CWD.
+        state_path = vault.parent / "janitor_state.json"
+        state_path.write_text(
+            json.dumps({
+                "version": 1,
+                "files": {},
+                "sweeps": {},
+                "last_deep_sweep": datetime.now(timezone.utc).isoformat(),
+            }),
+            encoding="utf-8",
+        )
         result = await janitor_health.health_check(_base_config(vault))
         assert result.tool == "janitor"
         assert result.status == Status.OK
@@ -167,6 +199,19 @@ class TestJanitorHealth:
 
 class TestDistillerHealth:
     async def test_happy_path_ok(self, vault: Path) -> None:
+        # Seed a recent last_deep_extraction so last-successful-extraction
+        # returns OK (else SKIP bubbles up via Status.worst). Same shape
+        # as janitor — override path is a fresh tmpdir without a state
+        # file, so the freshness probe needs explicit content.
+        state_path = vault.parent / "distiller_state.json"
+        state_path.write_text(
+            json.dumps({
+                "version": 1,
+                "runs": {},
+                "last_deep_extraction": datetime.now(timezone.utc).isoformat(),
+            }),
+            encoding="utf-8",
+        )
         result = await distiller_health.health_check(_base_config(vault))
         assert result.tool == "distiller"
         assert result.status == Status.OK
