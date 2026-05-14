@@ -286,7 +286,15 @@ async def run_daemon(config: BriefConfig) -> None:
             path = await generate_brief(config, state_mgr)
             if path:
                 log.info("brief.daemon.generated", path=path)
-        except Exception:
+        except Exception as exc:
+            # Capture failure cause into state so the BIT
+            # ``last-successful-brief`` probe surfaces the message on
+            # its detail line. Keeps the swallow-the-exception
+            # behaviour (daemons must not crash); just labels the
+            # swallow. Added 2026-05-14 — closes the diagnostic gap
+            # the 2026-04-30 → 05-10 incident exposed (BIT could
+            # detect the silent fail but not say WHY).
+            state_mgr.record_error(f"{type(exc).__name__}: {exc}")
             log.exception("brief.daemon.error")
 
         # Sleep 60s to avoid double-firing

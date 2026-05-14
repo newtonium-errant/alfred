@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 from alfred.brief.health import (
     _check_last_successful_brief,
     _most_recent_successful_brief_date,
+    _read_last_error,
     _resolve_state_path,
 )
 from alfred.health.types import Status
@@ -43,6 +44,27 @@ def _write_state(state_path: Path, runs: list[dict]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(
         json.dumps({"version": 1, "last_run": "", "runs": runs}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_state_with_error(
+    state_path: Path, runs: list[dict], last_error: dict | None,
+) -> None:
+    """Variant of ``_write_state`` that also writes the ``last_error``
+    field. Added 2026-05-14 for the diagnostic-surfacing pins.
+    """
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "last_run": "",
+                "runs": runs,
+                "last_error": last_error,
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -366,3 +388,195 @@ class TestHealthCheckIntegration:
         # Confirm it ran healthily on yesterday's data.
         last = next(r for r in rollup.results if r.name == "last-successful-brief")
         assert last.status == Status.OK
+
+
+# ---------------------------------------------------------------------------
+# _read_last_error — defensive dict-walking for the diagnostic field
+# (added 2026-05-14)
+# ---------------------------------------------------------------------------
+
+
+class TestReadLastError:
+    def test_missing_state_file_returns_none(self, tmp_path: Path) -> None:
+        assert _read_last_error(tmp_path / "missing.json") is None
+
+    def test_state_without_last_error_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        state_path = tmp_path / "brief_state.json"
+        _write_state(state_path, [])
+        # No last_error field in the legacy state shape.
+        assert _read_last_error(state_path) is None
+
+    def test_last_error_null_returns_none(self, tmp_path: Path) -> None:
+        # After a successful recovery the field is None, not absent.
+        state_path = tmp_path / "brief_state.json"
+        _write_state_with_error(state_path, [], None)
+        assert _read_last_error(state_path) is None
+
+    def test_last_error_populated_returns_dict(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "brief_state.json"
+        err = {"ts": "2026-05-14T06:00:00+00:00", "message": "KeyError: 'visib'"}
+        _write_state_with_error(state_path, [], err)
+        loaded = _read_last_error(state_path)
+        assert loaded == err
+
+    def test_last_error_not_a_dict_returns_none(self, tmp_path: Path) -> None:
+        # Degrade gracefully on a corrupt shape.
+        state_path = tmp_path / "brief_state.json"
+        _write_state_with_error(state_path, [], "not-a-dict")  # type: ignore[arg-type]
+        assert _read_last_error(state_path) is None
+
+    def test_last_error_without_message_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        # No actionable message → treat as absent. The probe-side then
+        # omits the suffix rather than rendering "; last error: ".
+        state_path = tmp_path / "brief_state.json"
+        _write_state_with_error(
+            state_path, [], {"ts": "2026-05-14T06:00:00+00:00"},
+        )
+        assert _read_last_error(state_path) is None
+
+    def test_corrupt_json_returns_none(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "brief_state.json"
+        state_path.write_text("{ not json", encoding="utf-8")
+        assert _read_last_error(state_path) is None
+
+
+# ---------------------------------------------------------------------------
+# _check_last_successful_brief — last_error surfacing in WARN/FAIL detail
+# (added 2026-05-14)
+# ---------------------------------------------------------------------------
+
+
+class TestLastErrorSurfacing:
+    """Pin that when ``last_error`` is populated, the probe's
+    WARN/FAIL detail string includes the message so the BIT line
+    carries the cause without requiring the operator to grep
+    ``data/brief.log``.
+
+    Symmetric: when ``last_error`` is None or absent, the detail
+    stays clean (no trailing "; last error: " sentinel).
+    """
+
+    def test_fail_includes_last_error_message(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "brief_state.json"
+        _write_state_with_error(
+            state_path,
+            [_run_record(_days_ago_iso(10))],
+            {"ts": "2026-05-14T06:00:00+00:00", "message": "KeyError: 'visib'"},
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_brief(raw, raw["brief"])
+        assert result.status == Status.FAIL
+        # The headline date threshold message stays present...
+        assert "silently failing" in result.detail
+        # ...AND the error cause is appended for diagnostic context.
+        assert "last error: KeyError: 'visib'" in result.detail
+
+    def test_warn_includes_last_error_message(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "brief_state.json"
+        _write_state_with_error(
+            state_path,
+            [_run_record(_days_ago_iso(2))],
+            {"ts": "2026-05-14T06:00:00+00:00", "message": "TimeoutError"},
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_brief(raw, raw["brief"])
+        assert result.status == Status.WARN
+        assert "one missed run" in result.detail
+        assert "last error: TimeoutError" in result.detail
+
+    def test_fail_without_last_error_omits_suffix(
+        self, tmp_path: Path,
+    ) -> None:
+        # The intentionally-left-blank semantics: when there's no
+        # error to surface, don't emit a bare "; last error: " — keep
+        # the detail clean.
+        state_path = tmp_path / "brief_state.json"
+        _write_state(state_path, [_run_record(_days_ago_iso(10))])
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_brief(raw, raw["brief"])
+        assert result.status == Status.FAIL
+        assert "last error:" not in result.detail
+
+    def test_warn_without_last_error_omits_suffix(
+        self, tmp_path: Path,
+    ) -> None:
+        state_path = tmp_path / "brief_state.json"
+        _write_state(state_path, [_run_record(_days_ago_iso(2))])
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_brief(raw, raw["brief"])
+        assert result.status == Status.WARN
+        assert "last error:" not in result.detail
+
+    def test_long_message_truncated_to_150_chars(
+        self, tmp_path: Path,
+    ) -> None:
+        # The BIT line is a single-line operator surface — long
+        # multi-line tracebacks would wreck readability. Cap at 150
+        # chars with an ellipsis sentinel.
+        state_path = tmp_path / "brief_state.json"
+        long_msg = "TypeError: " + ("x" * 500)
+        _write_state_with_error(
+            state_path,
+            [_run_record(_days_ago_iso(10))],
+            {"ts": "2026-05-14T06:00:00+00:00", "message": long_msg},
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_brief(raw, raw["brief"])
+        assert result.status == Status.FAIL
+        # The detail contains a truncated message ending in "...".
+        # The truncation point is 147 + "..." = 150 chars total.
+        assert "..." in result.detail
+        # Pull out the suffix and check the length ceiling.
+        suffix = result.detail.split("last error: ", 1)[1]
+        assert len(suffix) <= 150
+
+    def test_short_message_not_truncated(self, tmp_path: Path) -> None:
+        # Below the cap, message goes through verbatim.
+        state_path = tmp_path / "brief_state.json"
+        _write_state_with_error(
+            state_path,
+            [_run_record(_days_ago_iso(10))],
+            {"ts": "2026-05-14T06:00:00+00:00", "message": "short msg"},
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_brief(raw, raw["brief"])
+        assert "last error: short msg" in result.detail
+        assert "..." not in result.detail
+
+    def test_ok_status_does_not_append_error_suffix(
+        self, tmp_path: Path,
+    ) -> None:
+        # Defensive: if somehow last_error is set but the most recent
+        # date is fresh (shouldn't happen because add_run clears, but
+        # don't let a state-file edit by an operator break the OK
+        # path), the OK detail stays clean. Documents the intent that
+        # error surfacing is a WARN/FAIL concern, not OK.
+        state_path = tmp_path / "brief_state.json"
+        _write_state_with_error(
+            state_path,
+            [_run_record(_yesterday_iso())],
+            {"ts": "2026-05-14T06:00:00+00:00", "message": "stale error"},
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_brief(raw, raw["brief"])
+        assert result.status == Status.OK
+        assert "last error:" not in result.detail
+
+    def test_payload_carries_last_error_for_json_consumers(
+        self, tmp_path: Path,
+    ) -> None:
+        # JSON consumers of BIT output (operator dashboards, alert
+        # routing) get the full structured error in ``result.data``,
+        # not just the truncated detail-string suffix.
+        state_path = tmp_path / "brief_state.json"
+        err = {"ts": "2026-05-14T06:00:00+00:00", "message": "KeyError: 'visib'"}
+        _write_state_with_error(
+            state_path, [_run_record(_days_ago_iso(10))], err,
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_brief(raw, raw["brief"])
+        assert result.data.get("last_error") == err

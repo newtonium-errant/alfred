@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
@@ -32,12 +33,17 @@ class BriefRun:
 
     @classmethod
     def from_dict(cls, data: dict) -> BriefRun:
+        # Schema-tolerance filter per CLAUDE.md "State persistence —
+        # load() schema-tolerance contract": ignore unknown keys so
+        # a state file written by a newer/older version of the tool
+        # doesn't crash the loader.
+        known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
         return cls(
-            date=data.get("date", ""),
-            generated_at=data.get("generated_at", ""),
-            vault_path=data.get("vault_path", ""),
-            sections=data.get("sections", []),
-            success=data.get("success", False),
+            date=known.get("date", ""),
+            generated_at=known.get("generated_at", ""),
+            vault_path=known.get("vault_path", ""),
+            sections=known.get("sections", []),
+            success=known.get("success", False),
         )
 
 
@@ -46,12 +52,25 @@ class State:
     version: int = 1
     last_run: str = ""
     runs: list[BriefRun] = field(default_factory=list)
+    # ``last_error`` is parallel state at the State-level (not a per-run
+    # thing). Shape is ``{"ts": iso_string, "message": str}`` when
+    # populated; None when no error since last success. Added 2026-05-14
+    # so the BIT ``last-successful-brief`` probe can surface WHY the
+    # daemon stalled, not just that it did.
+    last_error: dict | None = None
 
     def add_run(self, run: BriefRun) -> None:
         self.last_run = run.generated_at
         self.runs.append(run)
         if len(self.runs) > MAX_HISTORY:
             self.runs = self.runs[-MAX_HISTORY:]
+        # Clear-on-success: a successful run wipes the last_error
+        # field so the probe doesn't trail stale failure context after
+        # the daemon recovers. Failed runs (success=False) leave
+        # last_error alone — the explicit ``record_error`` call from
+        # the daemon's except-block is what owns the failure-side write.
+        if run.success:
+            self.last_error = None
 
     def has_brief_for_date(self, date: str) -> bool:
         return any(r.date == date and r.success for r in self.runs)
@@ -61,14 +80,21 @@ class State:
             "version": self.version,
             "last_run": self.last_run,
             "runs": [r.to_dict() for r in self.runs],
+            "last_error": self.last_error,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> State:
+        # Schema-tolerance filter per CLAUDE.md "State persistence —
+        # load() schema-tolerance contract". Surfaces forward/backward
+        # compat: an older state file without ``last_error`` loads
+        # fine; a newer state file with extra fields is tolerated.
+        known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
         return cls(
-            version=data.get("version", 1),
-            last_run=data.get("last_run", ""),
-            runs=[BriefRun.from_dict(r) for r in data.get("runs", [])],
+            version=known.get("version", 1),
+            last_run=known.get("last_run", ""),
+            runs=[BriefRun.from_dict(r) for r in known.get("runs", [])],
+            last_error=known.get("last_error", None),
         )
 
 
@@ -96,3 +122,25 @@ class StateManager:
             encoding="utf-8",
         )
         tmp.replace(self.path)
+
+    def record_error(self, message: str) -> None:
+        """Capture a daemon-level failure into ``state.last_error`` and
+        persist.
+
+        Called from the daemon's outer ``except Exception:`` so the BIT
+        ``last-successful-brief`` probe can surface the failure cause
+        (e.g. ``KeyError: 'visib'``) on the BIT line itself rather than
+        forcing the operator to grep ``data/brief.log``.
+
+        Does NOT crash the daemon if persistence itself fails — a
+        broken state file shouldn't compound a broken brief. Logs the
+        secondary failure and returns.
+        """
+        self.state.last_error = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "message": message,
+        }
+        try:
+            self.save()
+        except OSError as e:
+            log.warning("brief.state.record_error_save_failed", error=str(e))

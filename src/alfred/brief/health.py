@@ -232,6 +232,30 @@ def _most_recent_successful_brief_date(state_path: Path) -> str | None:
     return max(successful_dates)
 
 
+def _read_last_error(state_path: Path) -> dict | None:
+    """Read ``brief_state.json`` and return the ``last_error`` payload
+    (shape: ``{"ts": iso_string, "message": str}``) or None when
+    absent/unreadable.
+
+    Same defensive-read posture as ``_most_recent_successful_brief_date``
+    — a corrupt state file degrades silently to None so the probe still
+    runs the date-based threshold check rather than crashing.
+    """
+    if not state_path.is_file():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    err = data.get("last_error")
+    if not isinstance(err, dict):
+        return None
+    msg = err.get("message")
+    if not isinstance(msg, str) or not msg:
+        return None
+    return err
+
+
 def _check_last_successful_brief(
     raw: dict[str, Any],
     brief: dict,
@@ -317,6 +341,24 @@ def _check_last_successful_brief(
         "days_old": days_old,
     }
 
+    # WARN/FAIL details get the ``last_error.message`` suffix when
+    # populated, so the BIT line carries the failure cause without the
+    # operator grepping ``data/brief.log``. Capped at 150 chars to
+    # keep the line readable. OK detail stays clean (no suffix) since
+    # last_error is wiped on success. Added 2026-05-14 — closes the
+    # diagnostic gap above the date-based threshold check that landed
+    # 2026-05-10 (the probe could detect "no brief in N days" but not
+    # say WHY).
+    last_error = _read_last_error(state_path)
+    if last_error is not None:
+        message = last_error.get("message", "")
+        if isinstance(message, str) and len(message) > 150:
+            message = message[:147] + "..."
+        payload["last_error"] = last_error
+        error_suffix = f"; last error: {message}" if message else ""
+    else:
+        error_suffix = ""
+
     if most_recent_d >= yesterday:
         # most_recent_d could equal today (operator already ran
         # ``alfred brief generate`` manually after BIT) — that's
@@ -332,7 +374,7 @@ def _check_last_successful_brief(
         return CheckResult(
             name="last-successful-brief",
             status=Status.WARN,
-            detail=f"last brief: {most_recent} (2d ago — one missed run)",
+            detail=f"last brief: {most_recent} (2d ago — one missed run){error_suffix}",
             data=payload,
         )
     # Multi-day silent failure — the bug class the 2026-04-30 → 05-10
@@ -340,7 +382,7 @@ def _check_last_successful_brief(
     return CheckResult(
         name="last-successful-brief",
         status=Status.FAIL,
-        detail=f"last brief: {most_recent} ({days_old}d ago — daemon may be silently failing)",
+        detail=f"last brief: {most_recent} ({days_old}d ago — daemon may be silently failing){error_suffix}",
         data=payload,
     )
 
