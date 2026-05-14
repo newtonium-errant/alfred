@@ -11,6 +11,18 @@ is just bookkeeping:
   or when the file's hash changes (indicating the operator edited the
   directive).
 - ``last_run_ts``: ISO-8601 timestamp of the last completed poll pass.
+- ``last_error``: diagnostic field for daemon-loop failures captured by
+  the outer ``except Exception:`` at daemon.py:331. Shape is
+  ``{"ts": iso_string, "message": str}`` when populated; None when no
+  error since the last successful poll. Surfaced via the BIT
+  ``last-successful-poll`` probe so operators see WHY the poll
+  stalled, not just that it did. Cleared by :meth:`stamp_run` on
+  every successful completion — the poll loop reaches stamp_run at
+  the end of each tick that didn't raise, so the recovery semantic
+  is per-tick (unlike distiller's per-deep-extraction clear, because
+  instructor only has one tick cadence). Added 2026-05-14 — mirrors
+  the brief / janitor / distiller / daily_sync last_error patterns
+  shipped earlier in the cross-daemon swallow audit arc.
 
 Atomic writes use the same ``.tmp → os.replace`` contract every other
 tool follows — see ``tests/state/test_state_roundtrip.py`` for the
@@ -38,6 +50,7 @@ class InstructorState:
         self.file_hashes: dict[str, str] = {}
         self.retry_counts: dict[str, int] = {}
         self.last_run_ts: str | None = None
+        self.last_error: dict | None = None
 
     def load(self) -> None:
         """Load state from disk if it exists.
@@ -66,6 +79,13 @@ class InstructorState:
             k: int(v) for k, v in (raw.get("retry_counts", {}) or {}).items()
         }
         self.last_run_ts = raw.get("last_run_ts") or None
+        # Schema tolerance per CLAUDE.md "load-time schema-tolerance
+        # contract": older state files (pre-2026-05-14) won't have
+        # last_error at all → default None. A corrupt non-dict value
+        # also degrades to None so a malformed state file can't poison
+        # the probe-side _read_last_error helper.
+        last_error_raw = raw.get("last_error")
+        self.last_error = last_error_raw if isinstance(last_error_raw, dict) else None
         log.info(
             "instructor.state.loaded",
             tracked_files=len(self.file_hashes),
@@ -79,6 +99,7 @@ class InstructorState:
             "file_hashes": self.file_hashes,
             "retry_counts": self.retry_counts,
             "last_run_ts": self.last_run_ts,
+            "last_error": self.last_error,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.state_path.with_suffix(".tmp")
@@ -119,5 +140,43 @@ class InstructorState:
     # --- Run timestamp ---
 
     def stamp_run(self) -> None:
-        """Stamp ``last_run_ts`` with the current UTC time."""
+        """Stamp ``last_run_ts`` with the current UTC time.
+
+        Also clears ``last_error`` — reaching this call site means the
+        poll loop completed without raising (detection + execution +
+        re-hash-seal all returned), so the recovery semantic treats
+        the tick as successful and wipes any stale failure context
+        the probe would otherwise trail across the BIT line. Mirrors
+        the brief.State / janitor.State / daily_sync clear-on-success
+        patterns from 2026-05-14. Per-tick clear is appropriate here
+        because instructor only has one tick cadence (unlike
+        distiller's deep-vs-light split where the clear lives only on
+        the deep path).
+        """
         self.last_run_ts = datetime.now(timezone.utc).isoformat()
+        self.last_error = None
+
+    # --- Error capture ---
+
+    def record_error(self, message: str) -> None:
+        """Capture a daemon-level failure into ``state.last_error`` and persist.
+
+        Called from the daemon's outer ``except Exception:`` at
+        daemon.py:331 so the BIT ``last-successful-poll`` probe can
+        surface the failure cause (e.g. ``KeyError: 'foo'``) on the
+        BIT line rather than forcing the operator to grep
+        ``data/instructor.log``.
+
+        Does NOT crash the daemon if persistence itself fails — a
+        broken state file shouldn't compound a broken poll. Logs the
+        secondary failure and returns. Mirrors the brief / janitor /
+        distiller record_error patterns from 2026-05-14.
+        """
+        self.last_error = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "message": message,
+        }
+        try:
+            self.save()
+        except OSError as e:
+            log.warning("instructor.state.record_error_save_failed", error=str(e))

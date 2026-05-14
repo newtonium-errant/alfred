@@ -329,6 +329,15 @@ async def run(
             state.stamp_run()
             state.save()
         except Exception as exc:  # noqa: BLE001 — never break the loop
+            # Capture failure cause into state so the BIT
+            # ``last-successful-poll`` probe surfaces the message on
+            # its detail line. Keeps the swallow-the-exception
+            # behaviour (daemons must not crash); just labels the
+            # swallow. Added 2026-05-14 — mirrors brief / janitor /
+            # distiller / daily_sync captures from earlier today
+            # (closes the same diagnostic-gap class across daemons
+            # per ``project_cross_daemon_swallow_audit.md``).
+            state.record_error(f"{type(exc).__name__}: {exc}")
             log.warning("instructor.daemon.poll_error", error=str(exc))
 
         try:
