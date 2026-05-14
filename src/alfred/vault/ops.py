@@ -246,53 +246,43 @@ def _fire_delete_hooks(
 _GCAL_SYNC_ERROR_MAX_LEN = 200
 
 
-def _extract_gcal_sync_status(
-    hook_results: list[dict],
-) -> dict | None:
-    """Translate hook return values into the LLM-facing ``gcal_sync`` shape.
+def translate_gcal_sync_result(result: dict | None) -> dict | None:
+    """Translate one ``sync_event_*_to_gcal`` return dict to the LLM-facing shape.
 
-    The vault-ops event hooks call ``sync_event_*_to_gcal`` and forward
-    its return dict back to the registry via the bubble-up contract in
-    :func:`_fire_create_hooks` / :func:`_fire_update_hooks` /
-    :func:`_fire_delete_hooks`. The sync layer's return shapes are
-    documented at the top of :mod:`alfred.integrations.gcal_sync`:
+    Single-result variant of :func:`_extract_gcal_sync_status`. Both
+    the in-process vault-ops hooks (which receive a ``list[dict]`` from
+    the hook registry) and the out-of-process peer-handler path (which
+    calls ``sync_event_create_to_gcal`` directly and gets ONE dict
+    back) need the same translation, so the per-result logic lives
+    here and the list-shaped helper just delegates.
 
-      * ``{}`` — gcal not configured / disabled. **Returns None** here
-        (caller omits ``gcal_sync`` from the tool_result; no GCal action
-        was attempted, so there's nothing to surface).
+    Input shapes (documented at the top of
+    :mod:`alfred.integrations.gcal_sync`):
+
+      * ``None`` / ``{}`` — gcal not configured / disabled. Returns
+        ``None`` (caller omits ``gcal_sync``).
       * ``{"event_id": "<id>", "calendar_label": "<label>"}`` — success
         on create / update.
       * ``{"deleted": True, "event_id": "<id>"}`` — success on delete.
       * ``{"noop": "<reason>"}`` — record has no ``gcal_event_id`` to
-        patch / remove. **Returns None** (no GCal action; same posture
-        as the disabled case from the LLM's perspective).
+        patch / remove. Returns ``None`` (no GCal action; same posture
+        as disabled from the LLM's perspective).
       * ``{"error": {"code": "<code>", "detail": "<msg>"}}`` — sync
-        failed; vault edit succeeded but GCal did not.
+        failed; vault op succeeded but GCal did not.
 
     Output shape (the contract the LLM tool_result depends on):
 
-      * ``None`` — no GCal action was attempted (disabled OR no-op).
-        The caller MUST NOT include a ``gcal_sync`` key in the
-        tool_result. Absent ≠ silently failed; absent = "GCal didn't
-        participate in this op."
+      * ``None`` — no GCal action attempted (disabled OR noop). The
+        caller MUST NOT include a ``gcal_sync`` key in the tool_result.
+        Absent ≠ silently failed; absent = "GCal didn't participate."
       * ``{"status": "ok"}`` — sync succeeded.
       * ``{"status": "failed", "error_code": "<code>", "error": "<msg>"}``
         — sync failed. ``error_code`` is the stable classification
         from :func:`alfred.integrations.gcal_sync.classify_gcal_error`
-        (``auth_failed`` / ``api_error`` / ``stale_gcal_id`` / etc.);
+        (``auth_failed`` / ``api_error`` / ``stale_gcal_id`` /
+        ``calendar_id_missing`` / ``missing_dependency`` / etc.);
         ``error`` is the truncated detail message.
-
-    Multiple hook results: only the first dict-shaped hook return value
-    is honored — v1 pragmatism, only the GCal hook is registered today.
-    See :func:`_fire_create_hooks` for the rationale and the
-    extension path for a second consumer.
     """
-    if not hook_results:
-        return None
-    # Honor the first dict result. ``_fire_*_hooks`` already filtered
-    # out non-dict / None returns so any entry here is a real hook reply.
-    result = hook_results[0]
-
     # Disabled / noop — no GCal action attempted. Omit gcal_sync entirely.
     if not result or "noop" in result:
         return None
@@ -326,6 +316,32 @@ def _extract_gcal_sync_status(
         "error_code": "unknown",
         "error": "unrecognized gcal_sync hook return shape",
     }
+
+
+def _extract_gcal_sync_status(
+    hook_results: list[dict],
+) -> dict | None:
+    """Translate hook return values into the LLM-facing ``gcal_sync`` shape.
+
+    List-shaped variant for the vault-ops hook registry: the event
+    hooks call ``sync_event_*_to_gcal`` and forward its return dict
+    back through the bubble-up contract in :func:`_fire_create_hooks`
+    / :func:`_fire_update_hooks` / :func:`_fire_delete_hooks`.
+
+    Multiple hook results: only the first dict-shaped hook return
+    value is honored — v1 pragmatism, only the GCal hook is registered
+    today. See :func:`_fire_create_hooks` for the rationale and the
+    extension path for a second consumer.
+
+    Per-result translation lives in :func:`translate_gcal_sync_result`
+    so the peer-handler (which gets a single dict directly from
+    ``sync_event_create_to_gcal``) can reuse the same shape contract.
+    """
+    if not hook_results:
+        return None
+    # Honor the first dict result. ``_fire_*_hooks`` already filtered
+    # out non-dict / None returns so any entry here is a real hook reply.
+    return translate_gcal_sync_result(hook_results[0])
 
 
 class VaultError(Exception):

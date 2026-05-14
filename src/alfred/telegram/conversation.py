@@ -516,7 +516,19 @@ _PROPOSE_EVENT_TOOL = {
         "asks to schedule something mid-conversation. If Salem flags "
         "a conflict, surface it inline ('you have an X at 14:00 — "
         "reschedule to 16:00?'). Times must be ISO 8601 with "
-        "timezone (e.g. '2026-05-04T14:00:00-03:00')."
+        "timezone (e.g. '2026-05-04T14:00:00-03:00'). "
+        "PARTIAL-FAILURE SURFACE: a ``status: created`` response MAY "
+        "also carry a ``gcal_sync`` field describing whether the "
+        "Google Calendar projection succeeded. Three states: "
+        "``{status: ok}`` — vault AND calendar both updated; narrate "
+        "calendar success freely. ``{status: failed, error_code, "
+        "error}`` — vault saved, calendar NOT updated; tell Andrew "
+        "explicitly the event is in the vault but Google Calendar "
+        "didn't sync, and switch on ``error_code`` (e.g. "
+        "``auth_failed`` → 'looks like the GCal token needs a "
+        "refresh'). ``gcal_sync`` field ABSENT — Salem doesn't sync "
+        "to GCal for this op (no calendar mention needed). DO NOT "
+        "narrate calendar success unless ``gcal_sync.status == 'ok'``."
     ),
     "input_schema": {
         "type": "object",

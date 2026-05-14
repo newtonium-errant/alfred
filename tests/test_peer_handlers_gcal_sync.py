@@ -8,16 +8,24 @@ writes the returned event ID back into the vault frontmatter as
 
 Coverage:
   * No GCal config → vault create succeeds, no GCal call attempted,
-    response has no ``gcal_event_id`` field
+    response has no ``gcal_event_id`` field AND no ``gcal_sync`` key
+    (absent = "GCal didn't participate")
   * GCal enabled + create_event succeeds → vault frontmatter rewritten
     with gcal_event_id + gcal_calendar; response carries both fields
+    PLUS ``gcal_sync: {status: ok}`` (unified-shape contract)
   * GCal enabled + create_event raises → vault file preserved,
-    response carries ``gcal_sync_error`` (no rollback)
-  * alfred_calendar_id empty → no API call, response carries error
+    response carries ``gcal_sync: {status: failed, error_code, error}``
+    (no rollback). Replaces the older ``gcal_sync_error`` field.
+  * alfred_calendar_id empty → no API call, response carries
+    ``gcal_sync: {status: failed, error_code: calendar_id_missing}``
   * Frontmatter writeback failure → soft fail (event_id still in
-    response, log warning)
+    response, ``gcal_sync.status == "ok"``, log warning)
   * GCal enabled but event proposal hits CONFLICT → no create_event
     call (sync only happens on success path)
+  * Legacy-field regression pin: ``gcal_sync_error`` MUST NOT appear
+    in any response shape — the unified ``gcal_sync`` field replaces
+    it. Same-day convergence with the in-process tool_result contract
+    from :func:`alfred.vault.ops.translate_gcal_sync_result`.
 """
 
 from __future__ import annotations
@@ -133,6 +141,10 @@ async def test_no_gcal_no_sync_field_in_response(app_factory):  # type: ignore[n
     body = await resp.json()
     assert body["status"] == "created"
     assert "gcal_event_id" not in body
+    # No GCal action attempted → ``gcal_sync`` omitted entirely
+    # (absent = "GCal didn't participate", NOT "succeeded silently").
+    assert "gcal_sync" not in body
+    # Legacy-field regression pin (Build #82 unification).
     assert "gcal_sync_error" not in body
     # Vault file has no gcal_event_id either.
     vault_root = client.server.app["_vault_root"]
@@ -172,6 +184,12 @@ async def test_gcal_sync_happy_path_writes_back_event_id(app_factory):  # type: 
     assert body["status"] == "created"
     assert body["gcal_event_id"] == "new-gcal-event-id-42"
     assert body["gcal_calendar"] == "alfred"
+    # Unified contract: success carries ``gcal_sync: {status: ok}`` so
+    # a partial-failure consumer doesn't have to special-case the
+    # success branch (mirrors in-process vault_create tool_result).
+    assert body["gcal_sync"] == {"status": "ok"}
+    # Legacy-field regression pin.
+    assert "gcal_sync_error" not in body
 
     # Verify create_event was called with the right shape.
     gcal_client.create_event.assert_called_once()
@@ -193,7 +211,8 @@ async def test_gcal_sync_happy_path_writes_back_event_id(app_factory):  # type: 
 
 
 # ---------------------------------------------------------------------------
-# Sync failure: vault preserved, response carries gcal_sync_error
+# Sync failure: vault preserved, response carries gcal_sync.status=failed
+# (replaces the older ``gcal_sync_error`` field — see module docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -227,13 +246,17 @@ async def test_gcal_sync_failure_preserves_vault_record(app_factory):  # type: i
     body = await resp.json()
     assert body["status"] == "created"
     assert "gcal_event_id" not in body
-    # gcal_sync_error is a structured dict so downstream renderers can
-    # switch on ``code`` without parsing free-form ``detail`` text.
-    assert "gcal_sync_error" in body
-    err = body["gcal_sync_error"]
-    assert isinstance(err, dict)
-    assert err["code"] == "api_error"  # GCalAPIError → api_error
-    assert "quota" in err["detail"].lower()
+    # Legacy-field regression pin: ``gcal_sync_error`` is replaced by
+    # the unified ``gcal_sync`` field (Build #82 convergence).
+    assert "gcal_sync_error" not in body
+    # ``gcal_sync`` is a structured dict so downstream renderers can
+    # switch on ``error_code`` without parsing free-form ``error`` text.
+    assert "gcal_sync" in body
+    sync = body["gcal_sync"]
+    assert isinstance(sync, dict)
+    assert sync["status"] == "failed"
+    assert sync["error_code"] == "api_error"  # GCalAPIError → api_error
+    assert "quota" in sync["error"].lower()
 
     # Vault file exists, no gcal_event_id field.
     vault_root = client.server.app["_vault_root"]
@@ -269,10 +292,12 @@ async def test_gcal_sync_failure_classifies_auth_failed(app_factory):  # type: i
     )
     assert resp.status == 201
     body = await resp.json()
-    err = body["gcal_sync_error"]
-    assert isinstance(err, dict)
-    assert err["code"] == "auth_failed"
-    assert "token expired" in err["detail"]
+    assert "gcal_sync_error" not in body  # legacy-field regression pin
+    sync = body["gcal_sync"]
+    assert isinstance(sync, dict)
+    assert sync["status"] == "failed"
+    assert sync["error_code"] == "auth_failed"
+    assert "token expired" in sync["error"]
 
 
 async def test_gcal_sync_failure_classifies_missing_dependency(app_factory):  # type: ignore[no-untyped-def]
@@ -303,9 +328,11 @@ async def test_gcal_sync_failure_classifies_missing_dependency(app_factory):  # 
     )
     assert resp.status == 201
     body = await resp.json()
-    err = body["gcal_sync_error"]
-    assert isinstance(err, dict)
-    assert err["code"] == "missing_dependency"
+    assert "gcal_sync_error" not in body  # legacy-field regression pin
+    sync = body["gcal_sync"]
+    assert isinstance(sync, dict)
+    assert sync["status"] == "failed"
+    assert sync["error_code"] == "missing_dependency"
 
 
 # ---------------------------------------------------------------------------
@@ -339,14 +366,17 @@ async def test_gcal_sync_skipped_when_calendar_id_empty(app_factory):  # type: i
     assert body["status"] == "created"
     # No create_event call attempted.
     assert gcal_client.create_event.called is False
-    # Error surfaced in response — structured dict with calendar_id_missing
-    # code so a Hypatia/KAL-LE renderer can switch on the code rather
-    # than parsing free-form ``detail`` text.
-    assert "gcal_sync_error" in body
-    err = body["gcal_sync_error"]
-    assert isinstance(err, dict)
-    assert err["code"] == "calendar_id_missing"
-    assert "alfred_calendar_id" in err["detail"]
+    # Legacy-field regression pin.
+    assert "gcal_sync_error" not in body
+    # Error surfaced in the unified response — structured dict with
+    # ``error_code: calendar_id_missing`` so a Hypatia/KAL-LE renderer
+    # can switch on the code rather than parsing free-form ``error`` text.
+    assert "gcal_sync" in body
+    sync = body["gcal_sync"]
+    assert isinstance(sync, dict)
+    assert sync["status"] == "failed"
+    assert sync["error_code"] == "calendar_id_missing"
+    assert "alfred_calendar_id" in sync["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +467,10 @@ async def test_frontmatter_writeback_failure_is_soft(app_factory, monkeypatch): 
     assert resp.status == 201
     body = await resp.json()
     # Created + GCal sync succeeded — only the writeback failed.
+    # The sync layer logs + swallows, so the LLM-facing surface
+    # still reads "ok" (which is correct — GCal DOES have the event).
     assert body["status"] == "created"
     assert body["gcal_event_id"] == "soft-fail-id-99"
     assert body["gcal_calendar"] == "alfred"
+    assert body["gcal_sync"] == {"status": "ok"}
+    assert "gcal_sync_error" not in body  # legacy-field regression pin

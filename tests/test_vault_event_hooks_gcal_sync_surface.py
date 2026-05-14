@@ -194,6 +194,59 @@ def test_extract_honors_first_dict_result_only():
     assert out == {"status": "ok"}
 
 
+# Single-dict variant — exposed for the peer-handler path that gets
+# one dict from ``sync_event_create_to_gcal`` rather than a list of
+# hook returns. Same shape contract; the list-shaped helper now
+# delegates to this one so peer + in-process can't drift.
+
+
+def test_translate_returns_none_for_disabled_empty_dict():
+    from alfred.vault.ops import translate_gcal_sync_result
+    assert translate_gcal_sync_result({}) is None
+
+
+def test_translate_returns_none_for_none():
+    from alfred.vault.ops import translate_gcal_sync_result
+    assert translate_gcal_sync_result(None) is None
+
+
+def test_translate_returns_none_for_noop():
+    from alfred.vault.ops import translate_gcal_sync_result
+    assert translate_gcal_sync_result({"noop": "no_gcal_event_id"}) is None
+
+
+def test_translate_returns_ok_for_create_success():
+    from alfred.vault.ops import translate_gcal_sync_result
+    assert translate_gcal_sync_result(
+        {"event_id": "gcal-123", "calendar_label": "alfred"},
+    ) == {"status": "ok"}
+
+
+def test_translate_returns_failed_for_error():
+    from alfred.vault.ops import translate_gcal_sync_result
+    out = translate_gcal_sync_result(
+        {"error": {"code": "auth_failed", "detail": "token expired"}},
+    )
+    assert out == {
+        "status": "failed",
+        "error_code": "auth_failed",
+        "error": "token expired",
+    }
+
+
+def test_translate_truncates_long_error_detail():
+    """Error detail capped at 200 chars (full message stays in daemon log)."""
+    long_detail = "x" * 500
+    from alfred.vault.ops import translate_gcal_sync_result
+    out = translate_gcal_sync_result(
+        {"error": {"code": "api_error", "detail": long_detail}},
+    )
+    assert out is not None
+    # 199 chars + ellipsis = 200-char total
+    assert len(out["error"]) == 200
+    assert out["error"].endswith("…")
+
+
 # ---------------------------------------------------------------------------
 # Group 2: _fire_*_hooks bubble-up tests
 # ---------------------------------------------------------------------------

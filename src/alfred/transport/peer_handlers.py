@@ -1704,15 +1704,23 @@ async def _handle_canonical_event_propose_create(
         ``{"status": "created", "path": "event/...md", "correlation_id": "..."}``
         Phase A+ sync extensions (added when GCal is configured):
           - on success: ``"gcal_event_id": "<id>", "gcal_calendar": "alfred"``
-          - on sync failure: ``"gcal_sync_error": {"code": "<code>",
-            "detail": "<msg>"}`` where ``code`` is one of
-            ``calendar_id_missing`` / ``auth_failed`` /
-            ``missing_dependency`` / ``api_error`` / ``unknown``. Vault
-            record IS preserved; the projection failed, not the
-            canonical write. Downstream renderers (Hypatia / KAL-LE)
-            switch on ``code`` to produce calibrated user-facing
-            messages without parsing free-form ``detail`` text.
-          - GCal not configured: neither field present.
+            PLUS ``"gcal_sync": {"status": "ok"}`` so a partial-failure
+            consumer doesn't have to special-case the success branch.
+          - on sync failure: ``"gcal_sync": {"status": "failed",
+            "error_code": "<code>", "error": "<truncated msg>"}`` where
+            ``error_code`` is one of ``calendar_id_missing`` /
+            ``auth_failed`` / ``missing_dependency`` / ``api_error`` /
+            ``stale_gcal_id`` / ``unknown``. Vault record IS preserved;
+            the projection failed, not the canonical write. Downstream
+            renderers (Hypatia / KAL-LE) switch on ``error_code`` to
+            produce calibrated user-facing messages without parsing
+            free-form ``error`` text. The ``error`` field is truncated
+            to 200 chars (full detail lives in the daemon log).
+          - GCal not configured / no action attempted: ``gcal_sync``
+            field omitted entirely. Absent = "GCal didn't participate
+            in this op" (NOT "succeeded silently"). Mirrors the
+            in-process ``vault_create`` tool_result contract from
+            :func:`alfred.vault.ops.translate_gcal_sync_result`.
       * 200 with ``{"status": "conflict", "conflicts": [...]}`` when
         overlap detected. Each conflict carries a ``source`` field
         (``vault`` / ``gcal_alfred`` / ``gcal_primary``) so the
@@ -1990,8 +1998,11 @@ async def _handle_canonical_event_propose_create(
     # projection so Andrew sees the event on his phone. Sync failure
     # does NOT roll back the vault create — operator can manually
     # re-sync (or a future Phase D sync loop will do it). The response
-    # carries a ``gcal_sync_error`` field so the proposing instance can
-    # tell Andrew "saved to vault but GCal sync failed".
+    # carries a unified ``gcal_sync`` field (shape matches the
+    # in-process ``vault_create`` tool_result contract from
+    # :func:`alfred.vault.ops.translate_gcal_sync_result`) so the
+    # proposing instance's LLM can tell Andrew "saved to vault but
+    # GCal sync failed" without inferring success from absence.
     response_payload: dict[str, Any] = {
         "status": "created",
         "path": rel_path,
@@ -2016,11 +2027,19 @@ async def _handle_canonical_event_propose_create(
         response_payload["gcal_calendar"] = sync_result.get(
             "calendar_label", "alfred",
         )
-    elif sync_result.get("error"):
-        response_payload["gcal_sync_error"] = sync_result["error"]
-    # When sync_result is empty (GCal not configured), neither key is
-    # added — the proposing instance's silence on the GCal field is
-    # the same signal as "this instance doesn't sync to GCal".
+
+    # Unify the sync-status surface with the in-process contract.
+    # ``translate_gcal_sync_result`` returns ``None`` when there's
+    # no action to surface (GCal disabled OR noop); we only add the
+    # ``gcal_sync`` key when there's something concrete to report.
+    # This replaces the older ``gcal_sync_error`` field (which was
+    # only ever set on the failure branch — silent success now also
+    # carries ``{"status": "ok"}`` so a single key tells the consumer
+    # everything).
+    from alfred.vault.ops import translate_gcal_sync_result
+    gcal_sync = translate_gcal_sync_result(sync_result)
+    if gcal_sync is not None:
+        response_payload["gcal_sync"] = gcal_sync
 
     return web.json_response(response_payload, status=201)
 

@@ -325,6 +325,147 @@ async def test_propose_event_missing_title(tmp_path, monkeypatch):
     assert call_count["n"] == 0
 
 
+# --- propose_event gcal_sync field — LLM-facing surface ---------------------
+#
+# These three tests pin the unified ``gcal_sync`` shape (Build #82
+# convergence with the in-process ``vault_create`` tool_result
+# contract). Same bug class as the in-process narrate-phantom-success
+# ship from 2026-05-13: the LLM sees the JSON, and if the field shape
+# doesn't carry sync status, the LLM hallucinates calendar success
+# when the projection silently failed. Pin the three states (ok /
+# failed / absent) at the dispatcher boundary so the contract holds
+# end-to-end (producer → http → client → tool_result).
+
+
+@pytest.mark.asyncio
+async def test_propose_event_gcal_sync_ok_pass_through(tmp_path, monkeypatch):
+    """Success branch: tool_result carries ``gcal_sync: {status: ok}``."""
+    _stub_transport_config(monkeypatch)
+    config = _peer_config(tmp_path, tool_set="hypatia", name="Hypatia")
+
+    async def fake_propose_event(peer_name, **kwargs):
+        return {
+            "status": "created",
+            "path": "event/Coaching session 2026-05-04.md",
+            "correlation_id": "hypatia-propose-event-ok1",
+            "gcal_event_id": "gcal-id-12345",
+            "gcal_calendar": "alfred",
+            "gcal_sync": {"status": "ok"},
+        }
+
+    monkeypatch.setattr(
+        "alfred.transport.client.peer_propose_event", fake_propose_event,
+    )
+
+    result_str = await conversation._execute_tool(
+        tool_name="propose_event",
+        tool_input={
+            "title": "Coaching session",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+        },
+        vault_path=str(tmp_path / "vault"),
+        state=None,
+        session=_session(),
+        config=config,
+    )
+    parsed = json.loads(result_str)
+    assert parsed["status"] == "created"
+    assert parsed["gcal_sync"] == {"status": "ok"}
+    # Legacy-field regression pin (Build #82 convergence).
+    assert "gcal_sync_error" not in parsed
+
+
+@pytest.mark.asyncio
+async def test_propose_event_gcal_sync_failed_pass_through(tmp_path, monkeypatch):
+    """Failure branch: tool_result carries failed shape with error_code + error."""
+    _stub_transport_config(monkeypatch)
+    config = _peer_config(tmp_path, tool_set="kalle", name="KAL-LE")
+
+    async def fake_propose_event(peer_name, **kwargs):
+        return {
+            "status": "created",
+            "path": "event/Quota-blocked event 2026-05-04.md",
+            "correlation_id": "kal-le-propose-event-fail1",
+            "gcal_sync": {
+                "status": "failed",
+                "error_code": "auth_failed",
+                "error": "token refresh failed: invalid_grant",
+            },
+        }
+
+    monkeypatch.setattr(
+        "alfred.transport.client.peer_propose_event", fake_propose_event,
+    )
+
+    result_str = await conversation._execute_tool(
+        tool_name="propose_event",
+        tool_input={
+            "title": "Quota-blocked event",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+        },
+        vault_path=str(tmp_path / "vault"),
+        state=None,
+        session=_session(),
+        config=config,
+    )
+    parsed = json.loads(result_str)
+    assert parsed["status"] == "created"
+    # Vault create still succeeded — only GCal failed.
+    sync = parsed["gcal_sync"]
+    assert sync["status"] == "failed"
+    assert sync["error_code"] == "auth_failed"
+    assert "invalid_grant" in sync["error"]
+    # The LLM has the data — no excuse for narrating calendar success.
+    assert "gcal_event_id" not in parsed
+    # Legacy-field regression pin.
+    assert "gcal_sync_error" not in parsed
+
+
+@pytest.mark.asyncio
+async def test_propose_event_gcal_sync_absent_pass_through(tmp_path, monkeypatch):
+    """No-action branch: tool_result has NO ``gcal_sync`` key at all.
+
+    Absent ≠ silently failed; absent = "GCal didn't participate in
+    this op" (peer instance has no GCal configured, or this op had
+    nothing to sync). The LLM should not mention calendar at all.
+    """
+    _stub_transport_config(monkeypatch)
+    config = _peer_config(tmp_path, tool_set="hypatia", name="Hypatia")
+
+    async def fake_propose_event(peer_name, **kwargs):
+        return {
+            "status": "created",
+            "path": "event/Solo event 2026-05-04.md",
+            "correlation_id": "hypatia-propose-event-absent1",
+            # NO gcal_sync, NO gcal_event_id — peer doesn't sync to GCal.
+        }
+
+    monkeypatch.setattr(
+        "alfred.transport.client.peer_propose_event", fake_propose_event,
+    )
+
+    result_str = await conversation._execute_tool(
+        tool_name="propose_event",
+        tool_input={
+            "title": "Solo event",
+            "start": "2026-05-04T14:00:00-03:00",
+            "end": "2026-05-04T15:00:00-03:00",
+        },
+        vault_path=str(tmp_path / "vault"),
+        state=None,
+        session=_session(),
+        config=config,
+    )
+    parsed = json.loads(result_str)
+    assert parsed["status"] == "created"
+    assert "gcal_sync" not in parsed
+    assert "gcal_event_id" not in parsed
+    # Legacy-field regression pin.
+    assert "gcal_sync_error" not in parsed
+
+
 # --- propose_org / propose_location / propose_person ----------------------
 
 
