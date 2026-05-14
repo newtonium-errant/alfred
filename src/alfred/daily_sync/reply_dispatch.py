@@ -1175,6 +1175,91 @@ def _format_attribution_applied_line(
     return f"Item {item_number}: {agent} marker in {record_path} — {verb}"
 
 
+# Verb-mismatch markers — substrings the resolvers (and the dispatch
+# loop's pre-resolver gates) emit when Andrew's verb doesn't match
+# what the item type accepts. Used by :func:`_is_verb_mismatch_error`
+# to distinguish "the parser understood, but the verb doesn't apply"
+# (which deserves the calibration hint) from "the parser understood
+# AND routed correctly, but the executor failed" (which deserves the
+# verbatim error string — typically a scope-deny or
+# vault-path-not-configured message that Andrew needs to see so he
+# can react, e.g. "this proposal needs Salem to confirm, not me").
+#
+# 2026-05-10 incident: Andrew's "1 confirm" on KAL-LE's Daily Sync hit
+# the proposal-confirm path, dispatched correctly, then ``vault_create``
+# raised ``ScopeError`` (KAL-LE isn't the canonical owner for person
+# records). The error string was perfectly informative ("Scope 'kalle'
+# may not create local 'person' records — those are Salem's canonical
+# authority") but the dispatcher buried it under "didn't understand
+# item 1" + an email-section hint. This discriminator + the new
+# ``execution_errors`` bucket fix the surfacing.
+_VERB_MISMATCH_MARKERS = (
+    "only accept",       # "attribution items only accept ..." / "canonical proposals only accept ..." / "pending items only accept ..."
+    "only meaningful",   # "`reject` is only meaningful for attribution items"
+    "not meaningful",    # "`reject` not meaningful — use `noted`"
+)
+
+
+def _is_verb_mismatch_error(err: str) -> bool:
+    """Return True when ``err`` is a verb/shape-mismatch (deserves hint).
+
+    Verb-mismatch errors mean Andrew's verb didn't fit this item type
+    (e.g. ``reject`` on an email item, ``high`` on a pending item).
+    They surface to Andrew via the "didn't understand item N" message
+    with a hint about which verbs DO apply to this batch's items.
+
+    Execution failures (``not in last batch``, ``vault_path not
+    provided``, scope-deny from vault_create, peer dispatch failed)
+    have richer error strings the operator needs to see verbatim.
+    Those return ``False`` here and route to ``execution_errors``.
+    """
+    return any(marker in err for marker in _VERB_MISMATCH_MARKERS)
+
+
+def _compose_calibration_hint(
+    *,
+    has_email: bool,
+    has_attribution: bool,
+    has_proposal: bool,
+    has_pending: bool,
+) -> str:
+    """Build the "Tip: ..." hint based on which item types are in the batch.
+
+    The 2026-05-10 KAL-LE incident surfaced the gap: the hint was
+    hardcoded "Same / Ditto / Same as #N" — email-calibration verbs —
+    but KAL-LE's batch had zero email items. The hint told Andrew to
+    use verbs that wouldn't have parsed against any item in the batch.
+
+    Hint composition (per item-type presence):
+
+      * Email only → preserve the historical Salem hint
+        ("Same / Ditto / Same as #N" — the chaining shortcut for
+        contiguous identical-priority items).
+      * Attribution / proposal items → ``N confirm`` / ``N reject``
+        (matches what attribution_section.py:357 and
+        canonical_proposals_section.py:186 advertise in the batch
+        message body).
+      * Pending items → ``N noted`` / ``N show me``.
+      * Mixed → list the applicable verbs.
+
+    Empty batch (none flagged) → empty hint (no actionable verbs to
+    suggest). Falls through cleanly without a stray "Tip:" prefix.
+    """
+    verbs: list[str] = []
+    if has_attribution or has_proposal:
+        verbs.append("'N confirm' / 'N reject'")
+    if has_pending:
+        verbs.append("'N noted' / 'N show me'")
+    if has_email:
+        verbs.append("'Same' / 'Ditto' / 'Same as #N'")
+
+    if not verbs:
+        return ""
+    if len(verbs) == 1:
+        return f" (Tip: {verbs[0]} are supported for list items.)"
+    return f" (Tip: {' or '.join(verbs)}.)"
+
+
 def _build_confirmation_body(
     *,
     parsed_all_ok: bool,
@@ -1182,6 +1267,8 @@ def _build_confirmation_body(
     written_count: int,
     unparsed_item_numbers: list[int],
     raw_errors: list[str],
+    execution_errors: list[str] | None = None,
+    hint: str = "",
 ) -> str:
     """Compose the user-facing confirmation reply.
 
@@ -1198,13 +1285,39 @@ def _build_confirmation_body(
     exist) prints the raw error because the parser produced fragments
     that don't map to item numbers — the operator still needs to see
     them.
+
+    2026-05-10 — split parse-shape failures (``unparsed_item_numbers``)
+    from execution failures (``execution_errors``). Execution errors
+    have informative strings of their own — surface them verbatim
+    instead of burying them under the canned "didn't understand" hint.
+    ``hint`` is item-type-aware (built by ``_compose_calibration_hint``);
+    callers that don't pass one get the empty default.
     """
     # all-ok shortcut stays terse — Andrew already knows what he confirmed.
     if parsed_all_ok:
-        if written_count == 0:
+        if written_count == 0 and not execution_errors:
             return "Calibration: nothing to apply."
-        # Prefer the short form; attribution/email split is internal detail.
-        return f"Calibration: confirmed all {written_count} item(s)."
+        if written_count == 0:
+            # All_ok shortcut where every item hit an execution failure
+            # (e.g. ✅ on a Daily Sync where vault_path isn't wired). The
+            # confirmation summary becomes the error list.
+            lines = ["Calibration: confirmed, but none could be applied:"]
+            for err in (execution_errors or [])[:5]:
+                lines.append(f"  - {err}")
+            remaining = max(0, len(execution_errors or []) - 5)
+            if remaining > 0:
+                lines.append(f"  ... and {remaining} more.")
+            return "\n".join(lines)
+        head = f"Calibration: confirmed all {written_count} item(s)."
+        if not execution_errors:
+            return head
+        lines = [head, "Some items couldn't be applied:"]
+        for err in execution_errors[:5]:
+            lines.append(f"  - {err}")
+        remaining = max(0, len(execution_errors) - 5)
+        if remaining > 0:
+            lines.append(f"  ... and {remaining} more.")
+        return "\n".join(lines)
 
     lines: list[str] = []
     if applied_lines:
@@ -1216,21 +1329,29 @@ def _build_confirmation_body(
         if remaining > 0:
             lines.append(f"  ... and {remaining} more.")
 
+    if execution_errors:
+        # Execution-failure errors carry their own informative string
+        # (scope-deny, vault_path not provided, peer dispatch failed,
+        # etc.). Surface verbatim so Andrew can react.
+        prefix = "Couldn't apply" if lines else "Calibration: couldn't apply"
+        lines.append(f"{prefix}:")
+        for err in execution_errors[:5]:
+            lines.append(f"  - {err}")
+        remaining = max(0, len(execution_errors) - 5)
+        if remaining > 0:
+            lines.append(f"  ... and {remaining} more.")
+
     if unparsed_item_numbers:
         nums_sorted = sorted(set(unparsed_item_numbers))
         if len(nums_sorted) == 1:
             which = f"item {nums_sorted[0]}"
         else:
             which = "items " + ", ".join(str(n) for n in nums_sorted)
-        hint = (
-            " (Tip: 'Same' / 'Ditto' / 'Same as #N' are supported "
-            "for list items.)"
-        )
         if lines:
             lines.append(f"Didn't understand {which} — could you restate?{hint}")
         else:
             lines.append(f"Calibration: didn't understand {which} — could you restate?{hint}")
-    elif raw_errors and not applied_lines:
+    elif raw_errors and not applied_lines and not execution_errors:
         # Edge case: parser-level failures that never got a bucketed
         # item number (e.g. the pre-c1 regression of orphan fragments).
         # Render them as-is so the operator can see the raw input. This
@@ -1417,11 +1538,30 @@ def handle_daily_sync_reply(
     pending_written = 0  # Pending Items Queue Phase 1
     applied_lines: list[str] = []  # c3 — one per-item summary line per accepted correction
     errors: list[str] = list(parsed.unparsed)
-    unparsed_item_numbers: list[int] = []  # c3 — numeric IDs of items that couldn't parse
+    unparsed_item_numbers: list[int] = []  # c3 — numeric IDs of items that hit a verb/shape mismatch
+    execution_errors: list[str] = []  # 2026-05-10 — informative strings from resolver execution failures
     corpus_path = _attribution_corpus_path(config)
     proposals_queue_path = (
         _canonical_proposals_queue_path(config) if proposal_items else None
     )
+
+    def _bucket_resolver_error(item_number: int, err: str) -> None:
+        """Route a resolver's error string to the right user-facing bucket.
+
+        Verb-mismatch errors (the resolver / pre-resolver gate refused
+        because the verb doesn't fit this item type) land in
+        ``unparsed_item_numbers`` so the user-facing message shows the
+        item-type-aware "Tip: ..." hint. Execution failures (scope-deny,
+        vault_create exception, peer dispatch failed, queue-path
+        unconfigured, etc.) land in ``execution_errors`` so the
+        informative error string is surfaced verbatim. See
+        ``_is_verb_mismatch_error`` for the discriminator details.
+        """
+        errors.append(err)
+        if _is_verb_mismatch_error(err):
+            unparsed_item_numbers.append(item_number)
+        else:
+            execution_errors.append(err)
 
     # all_ok shortcut: write an email corpus row per email item (fanned
     # out across cluster members — c5) AND confirm every attribution
@@ -1473,13 +1613,14 @@ def handle_daily_sync_reply(
                 # Log + record an error for each attribution item so
                 # the operator sees the gap rather than a silent no-op.
                 for item in attribution_items:
-                    errors.append(
-                        f"item {item.get('item_number')}: vault_path not provided"
-                    )
                     try:
-                        unparsed_item_numbers.append(int(item.get("item_number", 0)))
+                        item_num = int(item.get("item_number", 0))
                     except (TypeError, ValueError):
-                        pass
+                        item_num = 0
+                    _bucket_resolver_error(
+                        item_num,
+                        f"item {item.get('item_number')}: vault_path not provided",
+                    )
             else:
                 for item in attribution_items:
                     synthetic = ReplyCorrection(
@@ -1490,8 +1631,7 @@ def handle_daily_sync_reply(
                         synthetic, item, vault_path, corpus_path,
                     )
                     if err is not None:
-                        errors.append(err)
-                        unparsed_item_numbers.append(synthetic.item_number)
+                        _bucket_resolver_error(synthetic.item_number, err)
                     elif did_write:
                         attribution_written += 1
                         applied_lines.append(
@@ -1500,15 +1640,16 @@ def handle_daily_sync_reply(
         if proposal_items:
             if vault_path is None or proposals_queue_path is None:
                 for item in proposal_items:
-                    errors.append(
+                    try:
+                        item_num = int(item.get("item_number", 0))
+                    except (TypeError, ValueError):
+                        item_num = 0
+                    _bucket_resolver_error(
+                        item_num,
                         f"item {item.get('item_number')}: "
                         f"{'vault_path' if vault_path is None else 'proposals queue'}"
-                        f" not configured"
+                        f" not configured",
                     )
-                    try:
-                        unparsed_item_numbers.append(int(item.get("item_number", 0)))
-                    except (TypeError, ValueError):
-                        pass
             else:
                 for item in proposal_items:
                     synthetic = ReplyCorrection(
@@ -1520,8 +1661,7 @@ def handle_daily_sync_reply(
                         instance_scope=instance_scope,
                     )
                     if err is not None:
-                        errors.append(err)
-                        unparsed_item_numbers.append(synthetic.item_number)
+                        _bucket_resolver_error(synthetic.item_number, err)
                     elif did_write:
                         proposal_written += 1
                         applied_lines.append(
@@ -1544,8 +1684,7 @@ def handle_daily_sync_reply(
                     raw_config=raw_config,
                 )
                 if err is not None:
-                    errors.append(err)
-                    unparsed_item_numbers.append(synthetic.item_number)
+                    _bucket_resolver_error(synthetic.item_number, err)
                 elif did_resolve:
                     pending_written += 1
                     applied_lines.append(
@@ -1564,16 +1703,15 @@ def handle_daily_sync_reply(
             if email_item is not None:
                 # Reject verb makes no sense on an email item.
                 if correction.reject:
-                    errors.append(
+                    _bucket_resolver_error(
+                        correction.item_number,
                         f"item {correction.item_number}: `reject` is "
-                        f"only meaningful for attribution items"
+                        f"only meaningful for attribution items",
                     )
-                    unparsed_item_numbers.append(correction.item_number)
                     continue
                 entries, err = _resolve_correction(correction, email_by_num)
                 if err is not None:
-                    errors.append(err)
-                    unparsed_item_numbers.append(correction.item_number)
+                    _bucket_resolver_error(correction.item_number, err)
                     continue
                 assert entries is not None and entries
                 # c5 — fan-out: one corpus row per cluster member.
@@ -1603,17 +1741,16 @@ def handle_daily_sync_reply(
                     )
             elif attribution_item is not None:
                 if vault_path is None:
-                    errors.append(
-                        f"item {correction.item_number}: vault_path not provided"
+                    _bucket_resolver_error(
+                        correction.item_number,
+                        f"item {correction.item_number}: vault_path not provided",
                     )
-                    unparsed_item_numbers.append(correction.item_number)
                     continue
                 err, did_write = _resolve_attribution_correction(
                     correction, attribution_item, vault_path, corpus_path,
                 )
                 if err is not None:
-                    errors.append(err)
-                    unparsed_item_numbers.append(correction.item_number)
+                    _bucket_resolver_error(correction.item_number, err)
                     continue
                 if did_write:
                     attribution_written += 1
@@ -1625,20 +1762,19 @@ def handle_daily_sync_reply(
                     )
             elif proposal_item is not None:
                 if vault_path is None or proposals_queue_path is None:
-                    errors.append(
+                    _bucket_resolver_error(
+                        correction.item_number,
                         f"item {correction.item_number}: "
                         f"{'vault_path' if vault_path is None else 'proposals queue'}"
-                        f" not configured"
+                        f" not configured",
                     )
-                    unparsed_item_numbers.append(correction.item_number)
                     continue
                 err, did_write = _resolve_proposal_correction(
                     correction, proposal_item, vault_path, proposals_queue_path,
                     instance_scope=instance_scope,
                 )
                 if err is not None:
-                    errors.append(err)
-                    unparsed_item_numbers.append(correction.item_number)
+                    _bucket_resolver_error(correction.item_number, err)
                     continue
                 if did_write:
                     proposal_written += 1
@@ -1653,12 +1789,12 @@ def handle_daily_sync_reply(
                 # Reject verbs make no sense here (use ``noted`` for
                 # "no action needed"). Tier / modifier likewise.
                 if correction.reject:
-                    errors.append(
+                    _bucket_resolver_error(
+                        correction.item_number,
                         f"item {correction.item_number}: "
                         f"`reject` not meaningful — use `noted` to "
-                        f"close without action"
+                        f"close without action",
                     )
-                    unparsed_item_numbers.append(correction.item_number)
                     continue
                 err, did_resolve, summary = _resolve_pending_item_correction(
                     correction, pending_item,
@@ -1666,8 +1802,7 @@ def handle_daily_sync_reply(
                     raw_config=raw_config,
                 )
                 if err is not None:
-                    errors.append(err)
-                    unparsed_item_numbers.append(correction.item_number)
+                    _bucket_resolver_error(correction.item_number, err)
                     continue
                 if did_resolve:
                     pending_written += 1
@@ -1682,6 +1817,12 @@ def handle_daily_sync_reply(
                         )
                     )
             else:
+                # No matching item in any of the four batch maps. This
+                # is parse-stage "wrong number" — the user typed an item
+                # number that wasn't in the batch. Belongs to
+                # ``unparsed_item_numbers`` (gets the calibration hint),
+                # NOT execution_errors. The error string lacks one of
+                # the verb-mismatch markers so we route explicitly here.
                 errors.append(
                     f"item {correction.item_number} not in last batch"
                 )
@@ -1693,14 +1834,24 @@ def handle_daily_sync_reply(
 
     # c3 — user-facing body. Per-item summary lines go in (capped at 5
     # so the Telegram reply stays readable on mobile), followed by a
-    # human-readable parse-failure sentence that mentions the "Same"
-    # chaining shortcut instead of dumping raw fragments.
+    # human-readable parse-failure sentence with an item-type-aware
+    # hint (2026-05-10 — see ``_compose_calibration_hint``). Execution
+    # errors are surfaced verbatim instead of being buried under
+    # "didn't understand".
+    hint = _compose_calibration_hint(
+        has_email=bool(email_items),
+        has_attribution=bool(attribution_items),
+        has_proposal=bool(proposal_items),
+        has_pending=bool(pending_items),
+    )
     body = _build_confirmation_body(
         parsed_all_ok=parsed.all_ok,
         applied_lines=applied_lines,
         written_count=written_count,
         unparsed_item_numbers=unparsed_item_numbers,
         raw_errors=errors,
+        execution_errors=execution_errors,
+        hint=hint,
     )
 
     log.info(
@@ -1712,6 +1863,7 @@ def handle_daily_sync_reply(
         proposal_written=proposal_written,
         pending_written=pending_written,
         unparsed=len(errors),
+        execution_failures=len(execution_errors),
     )
 
     # Mark the batch as replied so subsequent messages route through
