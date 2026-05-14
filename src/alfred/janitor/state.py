@@ -54,6 +54,15 @@ class JanitorState:
         # Prevents the agent from re-creating the same triage task across
         # successive sweeps. Persisted as a JSON list; loaded as a set.
         self.triage_ids_seen: set[str] = set()
+        # ``last_error`` mirrors the brief.state pattern (2026-05-14):
+        # parallel state at the JanitorState-level (not per-file). Shape
+        # is ``{"ts": iso_string, "message": str}`` when populated; None
+        # when no error since last successful sweep. Captured by the
+        # daemon's outer ``except Exception:`` at daemon.py:639 and
+        # surfaced in the BIT ``last-successful-sweep`` probe detail so
+        # operators see WHY the sweep stalled, not just that it did.
+        # Cleared on each successful ``save_sweep_issues`` call.
+        self.last_error: dict | None = None
 
     def load(self) -> None:
         """Load state from disk if it exists."""
@@ -80,6 +89,12 @@ class JanitorState:
         self.last_deep_sweep = raw.get("last_deep_sweep")
         self.previous_sweep_issues = raw.get("previous_sweep_issues", {})
         self.triage_ids_seen = set(raw.get("triage_ids_seen", []))
+        # Schema tolerance: older state files (pre 2026-05-14) won't
+        # have last_error — defaults to None. A corrupt non-dict value
+        # also degrades to None so a malformed state file can't poison
+        # the probe-side _read_last_error helper.
+        last_error_raw = raw.get("last_error")
+        self.last_error = last_error_raw if isinstance(last_error_raw, dict) else None
         log.info(
             "state.loaded",
             files=len(self.files),
@@ -115,6 +130,7 @@ class JanitorState:
             "last_deep_sweep": self.last_deep_sweep,
             "previous_sweep_issues": self.previous_sweep_issues,
             "triage_ids_seen": sorted(self.triage_ids_seen),
+            "last_error": self.last_error,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.state_path.with_suffix(".tmp")
@@ -228,5 +244,38 @@ class JanitorState:
         return new
 
     def save_sweep_issues(self, issues: dict[str, list[str]]) -> None:
-        """Persist the current sweep's issue snapshot for the next comparison."""
+        """Persist the current sweep's issue snapshot for the next comparison.
+
+        Also clears ``last_error`` — reaching this call site means the
+        outer ``except Exception:`` in daemon.run_watch did NOT fire on
+        this tick, so the recovery semantics treat the sweep as
+        successful and wipe any stale failure context the probe would
+        otherwise trail across the BIT line. Mirrors the brief.State
+        ``add_run(success=True)`` clear-on-success pattern from
+        2026-05-14.
+        """
         self.previous_sweep_issues = issues
+        self.last_error = None
+
+    def record_error(self, message: str) -> None:
+        """Capture a daemon-level failure into ``state.last_error`` and persist.
+
+        Called from the daemon's outer ``except Exception:`` at
+        daemon.py:639 so the BIT ``last-successful-sweep`` probe can
+        surface the failure cause (e.g. ``KeyError: 'foo'``) on the
+        BIT line rather than forcing the operator to grep
+        ``data/janitor.log``.
+
+        Does NOT crash the daemon if persistence itself fails — a
+        broken state file shouldn't compound a broken sweep. Logs the
+        secondary failure and returns. Mirrors the brief.StateManager
+        ``record_error`` pattern from 2026-05-14.
+        """
+        self.last_error = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "message": message,
+        }
+        try:
+            self.save()
+        except OSError as e:
+            log.warning("janitor.state.record_error_save_failed", error=str(e))

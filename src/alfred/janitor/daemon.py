@@ -636,7 +636,16 @@ async def run_watch(
                         state.update_file(issue.file, md5, current_codes)
                 state.save()
                 last_drift = now
-        except Exception:
+        except Exception as exc:
+            # Capture failure cause into state so the BIT
+            # ``last-successful-sweep`` probe surfaces the message on
+            # its detail line. Keeps the swallow-the-exception
+            # behaviour (daemons must not crash); just labels the
+            # swallow. Added 2026-05-14 — mirrors the brief daemon's
+            # state.record_error capture from earlier today (closes
+            # the same diagnostic-gap class across daemons per
+            # ``project_cross_daemon_swallow_audit.md``).
+            state.record_error(f"{type(exc).__name__}: {exc}")
             log.exception("daemon.sweep_error")
 
         await asyncio.sleep(interval)

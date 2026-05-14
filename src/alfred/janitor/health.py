@@ -173,6 +173,31 @@ def _read_janitor_most_recent_sweep(state_path: Path) -> str | None:
     return max(candidates)
 
 
+def _read_last_error(state_path: Path) -> dict | None:
+    """Read janitor state and return the ``last_error`` payload
+    (shape: ``{"ts": iso_string, "message": str}``) or None when
+    absent / unreadable / corrupted-shape.
+
+    Same defensive-read posture as ``_read_janitor_most_recent_sweep``
+    — a corrupt state file degrades silently to None so the probe
+    still runs the timestamp threshold check rather than crashing.
+    Mirrors ``brief.health._read_last_error`` (2026-05-14).
+    """
+    if not state_path.is_file():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    err = data.get("last_error")
+    if not isinstance(err, dict):
+        return None
+    msg = err.get("message")
+    if not isinstance(msg, str) or not msg:
+        return None
+    return err
+
+
 def _check_last_successful_sweep(raw: dict[str, Any]) -> CheckResult:
     """Validate that the janitor daemon's loop has produced a sweep
     recently.
@@ -193,6 +218,12 @@ def _check_last_successful_sweep(raw: dict[str, Any]) -> CheckResult:
     Per ``feedback_intentionally_left_blank.md``: silence (janitor
     daemon idle, no scan/fix log activity) is ambiguous between
     healthy-quiet and broken; the probe disambiguates.
+
+    WARN/FAIL detail gets a ``; last error: <msg>`` suffix when
+    ``state.last_error`` is populated (capped 150 chars) so the BIT
+    line carries WHY the sweep stalled. OK detail stays clean —
+    last_error is wiped on success. Added 2026-05-14 (per
+    ``project_cross_daemon_swallow_audit.md``).
     """
     state_path = _resolve_janitor_state_path(raw)
     most_recent_iso = _read_janitor_most_recent_sweep(state_path)
@@ -237,6 +268,24 @@ def _check_last_successful_sweep(raw: dict[str, Any]) -> CheckResult:
         "elapsed_hours": round(elapsed_hours, 2),
     }
 
+    # Build the WARN/FAIL error suffix. Capped at 150 chars so the BIT
+    # line stays a single readable row. Full structured error always
+    # rides in ``result.data["last_error"]`` for JSON consumers
+    # regardless of the cap. OK status path skips the suffix because
+    # last_error is wiped on success — a stale entry surviving past a
+    # successful sweep would only happen if an operator hand-edited
+    # the state file, which the defensive _read_last_error has
+    # already filtered for.
+    last_error = _read_last_error(state_path)
+    if last_error is not None:
+        message = last_error.get("message", "")
+        if isinstance(message, str) and len(message) > 150:
+            message = message[:147] + "..."
+        payload["last_error"] = last_error
+        error_suffix = f"; last error: {message}" if message else ""
+    else:
+        error_suffix = ""
+
     if elapsed < timedelta(hours=_JANITOR_STALE_OK_HOURS):
         return CheckResult(
             name="last-successful-sweep",
@@ -248,13 +297,13 @@ def _check_last_successful_sweep(raw: dict[str, Any]) -> CheckResult:
         return CheckResult(
             name="last-successful-sweep",
             status=Status.WARN,
-            detail=f"last sweep {round(elapsed_hours, 1)}h ago (one missed run)",
+            detail=f"last sweep {round(elapsed_hours, 1)}h ago (one missed run){error_suffix}",
             data=payload,
         )
     return CheckResult(
         name="last-successful-sweep",
         status=Status.FAIL,
-        detail=f"last sweep {round(elapsed_hours, 1)}h ago (daemon may be silently failing)",
+        detail=f"last sweep {round(elapsed_hours, 1)}h ago (daemon may be silently failing){error_suffix}",
         data=payload,
     )
 
