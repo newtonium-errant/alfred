@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Alfred is a Python monorepo containing five AI-powered tools for managing an Obsidian vault. All tools share one config (`config.yaml`), one CLI entry point (`alfred`), and common infrastructure.
+**Algernon** is the system name for the multi-instance AI platform — a Python monorepo containing five AI-powered tools for managing an Obsidian vault, deployable as multiple independent instances (Salem, KAL-LE, Hypatia) that talk to each other over a peer protocol. Each instance is its own daemon set with its own vault, config, and Telegram bot, but they share one codebase.
+
+The codebase itself is still named `alfred` (package, CLI entry point `alfred`, default config `config.yaml`, env vars `ALFRED_*`) — that's a legacy name kept for stability; **Algernon** is the operator-facing platform name. When talking about the system as a concept (architecture, deployment, multi-instance behavior), call it Algernon. When referring to the codebase, CLI, or any specific identifier, use the existing `alfred` form. Instance names (Salem, KAL-LE, Hypatia) are unchanged.
+
+All tools share one config (`config.yaml` per instance), one CLI entry point (`alfred`), and common infrastructure.
 
 | Tool | Purpose |
 |------|---------|
