@@ -75,6 +75,17 @@ class DistillerState:
         # restarts do not reset to epoch and trigger a full deep extraction
         # on every boot. Ports upstream e510cbe.
         self.last_deep_extraction: str | None = None
+        # ``last_error`` mirrors the brief.state pattern (2026-05-14):
+        # parallel state at the DistillerState-level (not per-file).
+        # Shape is ``{"ts": iso_string, "message": str}`` when populated;
+        # None when no error since last successful extraction tick.
+        # Captured by the daemon's outer ``except Exception:`` at
+        # daemon.py:749 and surfaced in the BIT
+        # ``last-successful-extraction`` probe detail so operators see
+        # WHY the extraction stalled, not just that it did. Cleared on
+        # each successful ``add_run`` call (the natural successful-tick
+        # boundary mirroring brief.State.add_run clear-on-success).
+        self.last_error: dict | None = None
 
     def load(self) -> None:
         """Load state from disk if it exists."""
@@ -99,6 +110,12 @@ class DistillerState:
         ]
         self.pending_writes = raw.get("pending_writes", {})
         self.last_deep_extraction = raw.get("last_deep_extraction")
+        # Schema tolerance: older state files (pre 2026-05-14) won't
+        # have last_error — defaults to None. A corrupt non-dict value
+        # also degrades to None so a malformed state file can't poison
+        # the probe-side _read_last_error helper.
+        last_error_raw = raw.get("last_error")
+        self.last_error = last_error_raw if isinstance(last_error_raw, dict) else None
         log.info("state.loaded", files=len(self.files), runs=len(self.runs))
 
     def save(self) -> None:
@@ -126,6 +143,7 @@ class DistillerState:
             "extraction_log": [e.to_dict() for e in self.extraction_log],
             "pending_writes": self.pending_writes,
             "last_deep_extraction": self.last_deep_extraction,
+            "last_error": self.last_error,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.state_path.with_suffix(".tmp")
@@ -210,9 +228,41 @@ class DistillerState:
             )
 
     def add_run(self, result: RunResult) -> None:
-        """Record an extraction run result."""
+        """Record an extraction run result.
+
+        Also clears ``last_error`` — reaching this call site means a
+        deep extraction completed without raising, so the recovery
+        semantics treat the tick as successful and wipe any stale
+        failure context the probe would otherwise trail across the BIT
+        line. Mirrors the brief.State ``add_run(success=True)``
+        clear-on-success pattern from 2026-05-14.
+        """
         self.runs[result.run_id] = result
+        self.last_error = None
 
     def add_log_entry(self, entry: ExtractionLogEntry) -> None:
         """Append to the permanent extraction log."""
         self.extraction_log.append(entry)
+
+    def record_error(self, message: str) -> None:
+        """Capture a daemon-level failure into ``state.last_error`` and persist.
+
+        Called from the daemon's outer ``except Exception:`` at
+        daemon.py:749 so the BIT ``last-successful-extraction`` probe
+        can surface the failure cause (e.g. ``KeyError: 'foo'``) on
+        the BIT line rather than forcing the operator to grep
+        ``data/distiller.log``.
+
+        Does NOT crash the daemon if persistence itself fails — a
+        broken state file shouldn't compound a broken extraction.
+        Logs the secondary failure and returns. Mirrors the
+        brief.StateManager ``record_error`` pattern from 2026-05-14.
+        """
+        self.last_error = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "message": message,
+        }
+        try:
+            self.save()
+        except OSError as e:
+            log.warning("distiller.state.record_error_save_failed", error=str(e))

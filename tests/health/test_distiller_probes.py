@@ -25,6 +25,7 @@ from alfred.distiller.health import (
     _DISTILLER_STALE_OK_HOURS,
     _check_last_successful_extraction,
     _read_distiller_most_recent_run,
+    _read_last_error,
     _resolve_distiller_state_path,
 )
 from alfred.health.types import Status
@@ -39,6 +40,7 @@ def _write_state(
     *,
     runs: dict[str, dict] | None = None,
     last_deep_extraction: str | None = None,
+    last_error: dict | None = None,
 ) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(
@@ -50,6 +52,7 @@ def _write_state(
                 "extraction_log": [],
                 "pending_writes": {},
                 "last_deep_extraction": last_deep_extraction,
+                "last_error": last_error,
             },
             indent=2,
         ),
@@ -274,3 +277,180 @@ class TestHealthCheckIntegration:
         assert "last-successful-extraction" in names
         last = next(r for r in rollup.results if r.name == "last-successful-extraction")
         assert last.status == Status.OK
+
+
+# ---------------------------------------------------------------------------
+# _read_last_error — defensive dict-walking for the diagnostic field
+# (added 2026-05-14)
+# ---------------------------------------------------------------------------
+
+
+class TestReadLastError:
+    def test_missing_state_file_returns_none(self, tmp_path: Path) -> None:
+        assert _read_last_error(tmp_path / "missing.json") is None
+
+    def test_state_without_last_error_returns_none(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(state_path)
+        assert _read_last_error(state_path) is None
+
+    def test_last_error_null_returns_none(self, tmp_path: Path) -> None:
+        # After a successful recovery the field is None, not absent.
+        state_path = tmp_path / "s.json"
+        _write_state(state_path, last_error=None)
+        assert _read_last_error(state_path) is None
+
+    def test_last_error_populated_returns_dict(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        err = {"ts": "2026-05-14T06:00:00+00:00", "message": "KeyError: 'foo'"}
+        _write_state(state_path, last_error=err)
+        assert _read_last_error(state_path) == err
+
+    def test_last_error_not_a_dict_returns_none(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(state_path, last_error="not-a-dict")  # type: ignore[arg-type]
+        assert _read_last_error(state_path) is None
+
+    def test_last_error_without_message_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path, last_error={"ts": "2026-05-14T06:00:00+00:00"},
+        )
+        assert _read_last_error(state_path) is None
+
+    def test_corrupt_json_returns_none(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        state_path.write_text("{ not json", encoding="utf-8")
+        assert _read_last_error(state_path) is None
+
+
+# ---------------------------------------------------------------------------
+# _check_last_successful_extraction — last_error surfacing in WARN/FAIL detail
+# (added 2026-05-14)
+# ---------------------------------------------------------------------------
+
+
+class TestLastErrorSurfacing:
+    """Pin that when ``last_error`` is populated, the probe's
+    WARN/FAIL detail string includes the message so the BIT line
+    carries the cause without requiring the operator to grep
+    ``data/distiller.log``.
+
+    Symmetric: when ``last_error`` is None or absent, the detail
+    stays clean (no trailing "; last error: " sentinel).
+    """
+
+    def test_fail_includes_last_error_message(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path,
+            runs={"r1": {"run_id": "r1", "timestamp": _hours_ago_iso(72)}},
+            last_error={
+                "ts": "2026-05-14T06:00:00+00:00",
+                "message": "KeyError: 'foo'",
+            },
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_extraction(raw)
+        assert result.status == Status.FAIL
+        assert "silently failing" in result.detail
+        assert "last error: KeyError: 'foo'" in result.detail
+
+    def test_warn_includes_last_error_message(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path,
+            runs={"r1": {"run_id": "r1", "timestamp": _hours_ago_iso(36)}},
+            last_error={
+                "ts": "2026-05-14T06:00:00+00:00",
+                "message": "TimeoutError",
+            },
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_extraction(raw)
+        assert result.status == Status.WARN
+        assert "missed run" in result.detail
+        assert "last error: TimeoutError" in result.detail
+
+    def test_fail_without_last_error_omits_suffix(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path,
+            runs={"r1": {"run_id": "r1", "timestamp": _hours_ago_iso(72)}},
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_extraction(raw)
+        assert result.status == Status.FAIL
+        assert "last error:" not in result.detail
+
+    def test_warn_without_last_error_omits_suffix(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path,
+            runs={"r1": {"run_id": "r1", "timestamp": _hours_ago_iso(36)}},
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_extraction(raw)
+        assert result.status == Status.WARN
+        assert "last error:" not in result.detail
+
+    def test_long_message_truncated_to_150_chars(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        long_msg = "TypeError: " + ("x" * 500)
+        _write_state(
+            state_path,
+            runs={"r1": {"run_id": "r1", "timestamp": _hours_ago_iso(72)}},
+            last_error={"ts": "2026-05-14T06:00:00+00:00", "message": long_msg},
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_extraction(raw)
+        assert result.status == Status.FAIL
+        assert "..." in result.detail
+        suffix = result.detail.split("last error: ", 1)[1]
+        assert len(suffix) <= 150
+
+    def test_short_message_not_truncated(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path,
+            runs={"r1": {"run_id": "r1", "timestamp": _hours_ago_iso(72)}},
+            last_error={"ts": "2026-05-14T06:00:00+00:00", "message": "short"},
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_extraction(raw)
+        assert "last error: short" in result.detail
+        assert "..." not in result.detail
+
+    def test_ok_status_does_not_append_error_suffix(
+        self, tmp_path: Path,
+    ) -> None:
+        # Defensive: stale last_error with a fresh timestamp shouldn't
+        # leak into OK detail. add_run clears, so this only happens on
+        # operator hand-edit.
+        state_path = tmp_path / "s.json"
+        _write_state(
+            state_path,
+            runs={"r1": {"run_id": "r1", "timestamp": _hours_ago_iso(6)}},
+            last_error={"ts": "2026-05-14T06:00:00+00:00", "message": "stale"},
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_extraction(raw)
+        assert result.status == Status.OK
+        assert "last error:" not in result.detail
+
+    def test_payload_carries_last_error_for_json_consumers(
+        self, tmp_path: Path,
+    ) -> None:
+        # JSON consumers of BIT output get the full structured error.
+        state_path = tmp_path / "s.json"
+        err = {"ts": "2026-05-14T06:00:00+00:00", "message": "KeyError: 'foo'"}
+        _write_state(
+            state_path,
+            runs={"r1": {"run_id": "r1", "timestamp": _hours_ago_iso(72)}},
+            last_error=err,
+        )
+        raw = _raw(tmp_path, state_path=state_path)
+        result = _check_last_successful_extraction(raw)
+        assert result.data.get("last_error") == err
