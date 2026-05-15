@@ -190,7 +190,10 @@ _SMART_ROUTE_NUM_REF_RE = re.compile(
     r"confirm|keep|yes|reject|delete|remove|no|"
     r"ok|okay|good|approved|"
     # Pending Items Queue Phase 1 verbs.
-    r"noted|show)\b",
+    r"noted|show|"
+    # Stage 1 2026-05-15 — duplicate verb for "5 duplicate" /
+    # "5 duplicate of 4" shapes.
+    r"duplicate)\b",
     re.IGNORECASE,
 )
 
@@ -694,6 +697,7 @@ def _resolve_proposal_correction(
     # "hypatia"; validated by SCOPE_RULES). Read from
     # ``config.instance.tool_set`` and threaded in by the caller; default
     # "talker" preserves legacy behaviour for callers that skip the plumb.
+    from alfred.vault.ops import VaultError
     try:
         result = vault_create(
             vault_path=vault_path,
@@ -702,11 +706,45 @@ def _resolve_proposal_correction(
             set_fields=proposed_fields or None,
             scope=instance_scope,
         )
+    except VaultError as exc:
+        # File-already-exists is the merge-trigger for Stage 1 person
+        # proposals (2026-05-15). Andrew's design: when Hypatia / KAL-LE
+        # propose a person canonical record that ALREADY exists in
+        # Salem's vault, merge proposed fields into the existing record
+        # (fill-empty conservative) rather than fail the proposal.
+        # Other VaultErrors (scope-deny, near-match refusal, etc.) and
+        # non-person record types fall through to the original
+        # ``couldn't create`` error path.
+        err_str = str(exc)
+        if (
+            record_type == "person"
+            and "already exists" in err_str.lower()
+        ):
+            return _merge_person_proposal(
+                correction=correction,
+                correlation_id=correlation_id,
+                name=name,
+                proposed_fields=proposed_fields,
+                vault_path=vault_path,
+                proposals_queue_path=proposals_queue_path,
+                instance_scope=instance_scope,
+            )
+        log.warning(
+            "daily_sync.proposals.create_failed",
+            correlation_id=correlation_id,
+            record_type=record_type,
+            name=name,
+            error=err_str,
+            error_type=exc.__class__.__name__,
+        )
+        return (
+            f"item {correction.item_number}: couldn't create "
+            f"{record_type}/{name}: {exc}",
+            False,
+        )
     except Exception as exc:  # noqa: BLE001
-        # Most common failure: record already exists on disk (race).
-        # Surface the reason so Andrew sees what happened; either way
-        # the proposal should not block the queue indefinitely, so flip
-        # it to rejected with a note in the log.
+        # Non-VaultError exceptions surface verbatim — defensive
+        # against unexpected backend failures.
         log.warning(
             "daily_sync.proposals.create_failed",
             correlation_id=correlation_id,
@@ -745,6 +783,364 @@ def _resolve_proposal_correction(
         vault_path=result.get("path") if isinstance(result, dict) else None,
     )
     return (None, True)
+
+
+# ---------------------------------------------------------------------------
+# Person merge-on-conflict (Stage 1, 2026-05-15)
+# ---------------------------------------------------------------------------
+#
+# When a peer (Hypatia / KAL-LE) proposes a canonical person record that
+# already exists in Salem's vault, we want a fill-empty merge rather
+# than an "execution failure" bucket. Stage 1 supports ``person`` only;
+# Stage 2 will generalize + surface conflicts as next-batch daily-sync
+# items. Andrew's framing 2026-05-15: aliases are important — all
+# variants resolve to the same record, the receiving instance picks up
+# what the proposer offered without clobbering Salem's existing data.
+
+
+# Path of the auditable merge log inside Salem's vault. Append-only;
+# new merges are appended as H2 sections. Used by Salem's vault_read
+# when Andrew asks about a recent merge.
+_PERSON_MERGE_LOG_REL_PATH = "process/Person Merge Log.md"
+
+
+def _merge_person_proposal(
+    *,
+    correction: ReplyCorrection,
+    correlation_id: str,
+    name: str,
+    proposed_fields: dict[str, Any],
+    vault_path: Path,
+    proposals_queue_path: str,
+    instance_scope: str,
+) -> tuple[str | None, bool]:
+    """Merge a person proposal into an existing record (Stage 1, 2026-05-15).
+
+    Called from :func:`_resolve_proposal_correction` when
+    ``vault_create`` raised a ``File already exists`` :class:`VaultError`
+    AND ``record_type == "person"``. The merge is conservative
+    (fill-empty only) and alias-aware:
+
+      * Direct match: try ``person/{name}.md`` first.
+      * Alias fallback: if direct miss, scan ``person/*.md`` and match
+        ``name`` against each record's ``aliases`` frontmatter list.
+        First match wins; 2+ matches return an error (operator
+        disambiguates).
+      * No match: defensive error — the file-exists VaultError implied
+        SOMETHING exists, so 0 matches is "weird state."
+
+    Field policy:
+      * Existing field is None / empty / missing → SET from proposal.
+      * Existing equals proposal → no-op.
+      * Existing differs from proposal (both non-empty) → SKIP, append
+        to ``conflict_fields``. Stage 2 surfaces these as next-batch
+        items. Stage 1 logs them and writes them to the merge log
+        for operator visibility.
+
+    Alias addition: if ``name`` differs from existing record's ``name``
+    AND isn't already in ``aliases``, append it to ``aliases``.
+
+    On success: emit ``daily_sync.proposals.merged_into_existing`` log
+    event, append a section to the merge log file, mark the proposal
+    ``accepted`` with ``accepted_via="merge"``.
+
+    Returns ``(error_str_or_None, did_write)``.
+    """
+    from alfred.transport.canonical_proposals import (
+        STATE_ACCEPTED,
+        update_proposal_state,
+    )
+    from alfred.vault.ops import VaultError, vault_edit, vault_read
+
+    # 1. Locate the existing record — direct first, then alias scan.
+    existing_path: str | None = None
+    existing_fm: dict[str, Any] = {}
+
+    direct_rel = f"person/{name}.md"
+    try:
+        record = vault_read(vault_path, direct_rel)
+        existing_path = direct_rel
+        existing_fm = dict(record.get("frontmatter") or {})
+    except VaultError:
+        # Direct miss — fall through to alias scan.
+        existing_path = None
+
+    if existing_path is None:
+        matches: list[tuple[str, dict[str, Any]]] = []
+        person_dir = vault_path / "person"
+        if person_dir.exists():
+            for fp in sorted(person_dir.glob("*.md")):
+                rel = f"person/{fp.name}"
+                try:
+                    rec = vault_read(vault_path, rel)
+                except VaultError:
+                    continue
+                fm = dict(rec.get("frontmatter") or {})
+                aliases = fm.get("aliases") or []
+                if not isinstance(aliases, list):
+                    continue
+                # Case-insensitive alias match; Salem's curator stores
+                # aliases as the operator typed them, but match permits
+                # casing drift.
+                if any(
+                    isinstance(a, str) and a.strip().lower() == name.strip().lower()
+                    for a in aliases
+                ):
+                    matches.append((rel, fm))
+        if len(matches) == 0:
+            log.warning(
+                "daily_sync.proposals.merge_lookup_failed",
+                correlation_id=correlation_id,
+                proposal_name=name,
+                reason="no_direct_or_alias_match",
+            )
+            return (
+                f"item {correction.item_number}: file-exists VaultError "
+                f"but couldn't locate existing record by name or alias",
+                False,
+            )
+        if len(matches) > 1:
+            paths_list = ", ".join(p for p, _ in matches)
+            log.warning(
+                "daily_sync.proposals.merge_lookup_ambiguous",
+                correlation_id=correlation_id,
+                proposal_name=name,
+                paths=[p for p, _ in matches],
+            )
+            return (
+                f"item {correction.item_number}: alias '{name}' matches "
+                f"multiple existing records: {paths_list}",
+                False,
+            )
+        existing_path, existing_fm = matches[0]
+
+    # 2. Conservative fill-empty merge — walk proposed_fields, classify.
+    filled_fields: list[str] = []
+    conflict_fields: list[tuple[str, Any, Any]] = []
+    merge_set: dict[str, Any] = {}
+
+    for field_name, proposed_value in (proposed_fields or {}).items():
+        existing_value = existing_fm.get(field_name)
+        if existing_value is None or existing_value == "" or (
+            isinstance(existing_value, list) and not existing_value
+        ):
+            merge_set[field_name] = proposed_value
+            filled_fields.append(field_name)
+        elif existing_value == proposed_value:
+            # No-op — proposal contributes nothing new.
+            continue
+        else:
+            conflict_fields.append((field_name, existing_value, proposed_value))
+
+    # 3. Alias addition — if the proposal's name differs from the
+    # existing record's ``name`` AND isn't already aliased.
+    existing_name = str(existing_fm.get("name") or "").strip()
+    existing_aliases_raw = existing_fm.get("aliases") or []
+    if not isinstance(existing_aliases_raw, list):
+        existing_aliases_raw = []
+    existing_aliases = [str(a) for a in existing_aliases_raw if isinstance(a, str)]
+    aliases_added: list[str] = []
+    if name and name != existing_name and name not in existing_aliases:
+        # Preserve any pending alias merge from filled_fields above
+        # (if proposed_fields itself supplied aliases, we'd union).
+        new_aliases = list(existing_aliases)
+        if "aliases" in merge_set:
+            # Merge proposed aliases first, then append the proposal name.
+            proposed_aliases = merge_set["aliases"] or []
+            if isinstance(proposed_aliases, list):
+                for a in proposed_aliases:
+                    sa = str(a)
+                    if sa and sa not in new_aliases:
+                        new_aliases.append(sa)
+        new_aliases.append(name)
+        merge_set["aliases"] = new_aliases
+        aliases_added.append(name)
+        if "aliases" not in filled_fields:
+            filled_fields.append("aliases")
+
+    # 4. Apply via vault_edit when there's anything to write.
+    if merge_set:
+        try:
+            vault_edit(
+                vault_path=vault_path,
+                rel_path=existing_path,
+                set_fields=merge_set,
+                scope=instance_scope,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "daily_sync.proposals.merge_edit_failed",
+                correlation_id=correlation_id,
+                proposal_name=name,
+                existing_path=existing_path,
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+            )
+            return (
+                f"item {correction.item_number}: merge into "
+                f"{existing_path} failed: {exc}",
+                False,
+            )
+
+    # 5. Emit audit log.
+    log.info(
+        "daily_sync.proposals.merged_into_existing",
+        correlation_id=correlation_id,
+        proposal_name=name,
+        existing_path=existing_path,
+        filled_fields=list(filled_fields),
+        conflict_fields=[
+            (fname, fexisting, fproposed)
+            for (fname, fexisting, fproposed) in conflict_fields
+        ],
+        aliases_added=list(aliases_added),
+    )
+
+    # 6. Append a section to the merge log file. Best-effort: errors
+    # here are observability leaks, not data loss — the merge already
+    # landed on the existing record.
+    try:
+        _append_person_merge_log_entry(
+            vault_path=vault_path,
+            correlation_id=correlation_id,
+            proposal_name=name,
+            existing_path=existing_path,
+            filled_fields=filled_fields,
+            conflict_fields=conflict_fields,
+            aliases_added=aliases_added,
+        )
+    except Exception as exc:  # noqa: BLE001 — log-file write must not crash dispatch
+        log.warning(
+            "daily_sync.proposals.merge_log_write_failed",
+            correlation_id=correlation_id,
+            existing_path=existing_path,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+
+    # 7. Flip queue state to ``accepted`` with ``accepted_via="merge"``.
+    try:
+        update_proposal_state(
+            proposals_queue_path,
+            correlation_id,
+            STATE_ACCEPTED,
+            accepted_via="merge",
+        )
+    except OSError as exc:
+        log.warning(
+            "daily_sync.proposals.state_write_failed",
+            correlation_id=correlation_id,
+            action="merge",
+            error=str(exc),
+        )
+        # Idempotency: even if the queue write fails the merge already
+        # landed on the existing record. Next Daily Sync will re-surface
+        # the proposal; the alias / fill-empty path is idempotent so a
+        # re-confirm produces no-op or another merge-log entry.
+
+    return (None, True)
+
+
+# Mode tag for the structlog event when a merge had no diffs to apply
+# (everything proposed already matched the existing record). Kept as
+# a separate constant so dashboards / grep workflows can pin it.
+_MERGE_NOOP_EVENT = "daily_sync.proposals.merge_noop"
+
+
+def _append_person_merge_log_entry(
+    *,
+    vault_path: Path,
+    correlation_id: str,
+    proposal_name: str,
+    existing_path: str,
+    filled_fields: list[str],
+    conflict_fields: list[tuple[str, Any, Any]],
+    aliases_added: list[str],
+) -> None:
+    """Append a merge-log section to ``vault/process/Person Merge Log.md``.
+
+    Creates the file with valid frontmatter (``type: process``) when
+    absent, so it's a queryable vault record. Each merge appends an
+    H2 section with timestamp + summary fields; Salem's ``vault_read``
+    on the file gives the operator a readable history.
+
+    Race-conscious: we open + read + append + atomic-rename via tmp
+    file. The dispatcher is invoked from the bot's per-chat-serialized
+    handler, so concurrent merges in practice never happen — but the
+    pattern matches Salem's other append-only vault writers.
+    """
+    import frontmatter as _frontmatter
+    file_path = vault_path / _PERSON_MERGE_LOG_REL_PATH
+
+    timestamp = _now_iso()
+    section_lines: list[str] = []
+    section_lines.append("")
+    section_lines.append(f"## {timestamp} — {proposal_name}")
+    section_lines.append(f"- Proposal correlation: `{correlation_id}`")
+    section_lines.append(f"- Existing record: `{existing_path}`")
+    if filled_fields:
+        section_lines.append(
+            "- Fields filled (empty → proposal): "
+            + ", ".join(filled_fields)
+        )
+    else:
+        section_lines.append("- Fields filled (empty → proposal): (none)")
+    if conflict_fields:
+        section_lines.append(
+            "- Fields kept (existing non-empty differed from proposal): "
+            + ", ".join(fname for (fname, _e, _p) in conflict_fields)
+        )
+    else:
+        section_lines.append(
+            "- Fields kept (existing non-empty differed from proposal): (none)"
+        )
+    if aliases_added:
+        section_lines.append("- Aliases added: " + ", ".join(aliases_added))
+    else:
+        section_lines.append("- Aliases added: (none)")
+
+    new_section = "\n".join(section_lines) + "\n"
+
+    # Bootstrap file with valid process-record frontmatter on first
+    # merge. Reuses the canonical scaffold template fields so the file
+    # is a queryable vault record (type=process) rather than a free-
+    # form markdown blob.
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    if not file_path.exists():
+        bootstrap_fm = {
+            "type": "process",
+            "status": "active",
+            "name": "Person Merge Log",
+            "description": (
+                "Append-only audit log of person canonical proposals "
+                "merged into existing records (Stage 1, 2026-05-15)."
+            ),
+            "frequency": "as-needed",
+            "tags": [],
+            "related": [],
+            "created": timestamp.split("T", 1)[0],
+        }
+        bootstrap_body = (
+            "# Person Merge Log\n\n"
+            "Each entry below corresponds to one canonical proposal "
+            "merged into an existing person record. Stage 1 (2026-05-15) "
+            "covers the person record type only.\n"
+        )
+        post = _frontmatter.Post(bootstrap_body, **bootstrap_fm)
+        file_path.write_text(
+            _frontmatter.dumps(post) + "\n",
+            encoding="utf-8",
+        )
+
+    # Atomic append: read existing content, concat new section, write
+    # via tmp + rename so a crash mid-write doesn't leave a torn file.
+    existing_text = file_path.read_text(encoding="utf-8")
+    if not existing_text.endswith("\n"):
+        existing_text += "\n"
+    new_text = existing_text + new_section
+    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    tmp_path.write_text(new_text, encoding="utf-8")
+    tmp_path.replace(file_path)
 
 
 def _resolution_id_from_correction(
@@ -1410,16 +1806,48 @@ def _resolve_correction(
     classifier_action_hint = item.get("classifier_action_hint")
     classifier_reason = str(item.get("classifier_reason") or "")
 
+    # ``via="duplicate-of-M"`` (Stage 1, 2026-05-15) — when the parser
+    # resolved a ``duplicate`` chain, the correction inherits item M's
+    # tier/modifier/ok flags. But ``ok=True`` on the inherited
+    # correction would resolve against item N's classifier_priority,
+    # not item M's — and the operator's intent is "treat item N the
+    # same way as item M", which means andrew_priority must equal
+    # whatever item M would have produced. We special-case the
+    # resolution: look up the source item by number and use ITS
+    # classifier_priority as the basis when applying ok/modifier.
+    # Explicit new_tier corrections still win as-is (unconditional).
+    source_classifier_priority: str | None = None
+    if correction.via and correction.via.startswith("duplicate-of-"):
+        try:
+            source_num = int(correction.via.split("-")[-1])
+        except (ValueError, IndexError):
+            source_num = -1
+        source_item = items_by_num.get(source_num) if source_num > 0 else None
+        if source_item is not None:
+            source_classifier_priority = str(
+                source_item.get("classifier_priority", "")
+            ).lower()
+
     # Resolve the new tier:
     #   - explicit tier wins if set
     #   - else apply modifier ("down"/"up") to classifier_priority
-    #   - else "ok" — andrew confirms classifier output
+    #     (or to the duplicate-source's classifier_priority when via=duplicate)
+    #   - else "ok" — andrew confirms classifier output (source's, for duplicates)
     if correction.new_tier is not None:
         andrew_priority = correction.new_tier
     elif correction.modifier:
-        andrew_priority = apply_modifier(classifier_priority, correction.modifier)
+        basis = (
+            source_classifier_priority
+            if source_classifier_priority is not None
+            else classifier_priority
+        )
+        andrew_priority = apply_modifier(basis, correction.modifier)
     elif correction.ok:
-        andrew_priority = classifier_priority
+        andrew_priority = (
+            source_classifier_priority
+            if source_classifier_priority is not None
+            else classifier_priority
+        )
     else:
         # Should be unreachable — _parse_fragment requires at least one of
         # tier/modifier/ok to be set. Defensive return so a future regex
@@ -1448,6 +1876,7 @@ def _resolve_correction(
             sender=str(item.get("sender") or ""),
             subject=str(item.get("subject") or ""),
             snippet=str(item.get("snippet") or ""),
+            via=correction.via,
         )
         for path in record_paths
     ]

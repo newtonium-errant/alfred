@@ -286,6 +286,31 @@ _SAME_CHAIN_RE = re.compile(
 )
 
 
+# "duplicate" / "duplicate of #N" / "duplicate of N" — Andrew flags an
+# item as a duplicate of another item in the same reply (Stage 1, 2026-
+# 05-15). Semantic: resolve item N the same way as item M (where M is
+# either the explicit reference OR the previous item N-1 in the same
+# reply when bare). The dispatcher tags the resulting corpus row with
+# ``via="duplicate-of-M"`` so few-shot rotation can pick up the
+# operator's "X is a duplicate" signal.
+#
+# Trailing content after a dash/colon/em-dash/comma is preserved as
+# note content, matching the same-chain shape.
+_DUPLICATE_RE = re.compile(
+    r"""
+    ^\s*
+    duplicate
+    (?:\s+of\s+\#?(?P<explicit>\d+))?     # optional explicit pointer
+    \s*
+    (?:                                    # optional trailing note, any separator
+        [.!]?\s*(?:[—–\-:]+|,)\s*(?P<note>.*)
+      | [.!]?\s*$
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+
 # Whole-message ack tokens. Any of these alone (after stripping
 # whitespace and the leading bullet) means "all items confirmed as
 # classified, no changes". Emoji + word forms.
@@ -324,6 +349,21 @@ class ReplyCorrection:
     tier/modifier/ok/reject fields onto this correction before handing
     it to the dispatcher. By the time the dispatcher sees the
     correction, ``same_as_item`` is always ``None``.
+
+    ``duplicate_of_item`` mirrors ``same_as_item`` for the
+    ``duplicate`` / ``duplicate of #N`` verb (Stage 1, 2026-05-15).
+    Semantically identical to chaining — the resolved correction takes
+    the source item's tier/modifier/ok/reject — but the dispatcher
+    additionally stamps ``via="duplicate-of-M"`` on the resulting
+    corpus row so the calibration signal "X is a duplicate of Y"
+    survives into the few-shot tail. Cleared after resolution like
+    ``same_as_item``.
+
+    ``via`` carries the optional "how this correction was derived"
+    tag. Default empty. Set to ``"duplicate-of-M"`` (M = source item
+    number) when the fragment was a ``duplicate`` chain. Future few-
+    shot rotation can detect "Andrew calls X a duplicate" patterns
+    via this field.
     """
 
     item_number: int
@@ -334,6 +374,8 @@ class ReplyCorrection:
     note: str = ""
     same_as_item: int | None = None
     consumed_token: str = ""
+    duplicate_of_item: int | None = None
+    via: str = ""
 
 
 @dataclass
@@ -517,6 +559,13 @@ def parse_reply(reply_text: str) -> ReplyParseResult:
                 continue
             result.corrections.append(resolved)
             continue
+        if correction.duplicate_of_item is not None:
+            resolved, err = _resolve_duplicate_chain(correction, result.corrections)
+            if err is not None:
+                result.unparsed.append(f"item {correction.item_number}: {err}")
+                continue
+            result.corrections.append(resolved)
+            continue
         result.corrections.append(correction)
 
     return result
@@ -593,6 +642,69 @@ def _resolve_same_chain(
     return resolved, None
 
 
+def _resolve_duplicate_chain(
+    correction: ReplyCorrection,
+    prior_corrections: list[ReplyCorrection],
+) -> tuple[ReplyCorrection, str | None]:
+    """Resolve a ``duplicate`` / ``duplicate of N`` reference.
+
+    Mirrors :func:`_resolve_same_chain` — copy the source correction's
+    tier/modifier/ok/reject onto a new correction with the current
+    fragment's item number — then additionally stamp
+    ``via="duplicate-of-M"`` where M is the SOURCE item's number. The
+    dispatcher uses ``via`` to tag the resulting corpus row so
+    "Andrew calls X a duplicate of Y" survives downstream.
+
+    Source selection:
+
+      * ``duplicate_of_item=N`` (``duplicate of #N``) — find the
+        correction whose ``item_number == N`` in
+        ``prior_corrections``. If absent, return an error.
+      * ``duplicate_of_item=-1`` (bare ``duplicate``) — take the LAST
+        entry in ``prior_corrections``. Defensive — operator probably
+        never types this alone; verified via test.
+
+    The resolved correction preserves THIS fragment's ``note`` (the
+    text after a dash/colon). The source's note is NOT inherited —
+    only the classification intent.
+    """
+    if correction.duplicate_of_item is None:
+        return correction, None
+
+    explicit = correction.duplicate_of_item
+    source: ReplyCorrection | None = None
+    if explicit == -1:
+        if not prior_corrections:
+            return correction, (
+                "no prior item to mark duplicate of — 'duplicate' must "
+                "follow another item"
+            )
+        source = prior_corrections[-1]
+    else:
+        source = next(
+            (c for c in prior_corrections if c.item_number == explicit),
+            None,
+        )
+        if source is None:
+            return correction, (
+                f"no item {explicit} to mark duplicate of"
+            )
+
+    resolved = ReplyCorrection(
+        item_number=correction.item_number,
+        new_tier=source.new_tier,
+        modifier=source.modifier,
+        ok=source.ok,
+        reject=source.reject,
+        note=correction.note,
+        same_as_item=None,
+        consumed_token=source.consumed_token,
+        duplicate_of_item=None,
+        via=f"duplicate-of-{source.item_number}",
+    )
+    return resolved, None
+
+
 def _parse_fragment(fragment: str) -> ReplyCorrection | None:
     """Parse one ``"2 down"`` / ``"4: high — note"`` shard.
 
@@ -630,6 +742,23 @@ def _parse_fragment(fragment: str) -> ReplyCorrection | None:
         return ReplyCorrection(
             item_number=item_num,
             same_as_item=int(explicit) if explicit else -1,
+            note=note,
+        )
+
+    # "duplicate" / "duplicate of #N" / "duplicate of N" — Stage 1
+    # 2026-05-15. Detect BEFORE the token walker so ``duplicate`` (not
+    # in any token set) doesn't drop into the unparseable bucket. A
+    # bare ``duplicate`` resolves against the previous correction in
+    # the same reply; ``duplicate of N`` resolves against item N
+    # explicitly. The chain resolver tags ``via="duplicate-of-M"`` on
+    # the resolved correction.
+    dup_match = _DUPLICATE_RE.match(rest)
+    if dup_match:
+        explicit = dup_match.group("explicit")
+        note = (dup_match.group("note") or "").strip()
+        return ReplyCorrection(
+            item_number=item_num,
+            duplicate_of_item=int(explicit) if explicit else -1,
             note=note,
         )
 

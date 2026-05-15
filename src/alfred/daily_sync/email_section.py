@@ -346,6 +346,16 @@ def _already_calibrated(corpus_path: str | Path) -> set[str]:
 # stripped and the loop continues (so a title ending in "April 2026 v2"
 # collapses to just the stem).
 _SUBJECT_TRAILING_PATTERNS = [
+    # Em-dash / en-dash attribution suffix: "... — Headspace Marketing"
+    # (Stage 1, 2026-05-15). The curator's batch-rendered subject line
+    # appends a ``— <attribution>`` for from-source disambiguation; the
+    # canonical subject does NOT include this tail. Stripping the
+    # suffix lets ``Mental Health Support Tailored for You — Headspace
+    # Marketing`` cluster with the unsuffixed ``Mental health support
+    # tailored for you``. Kept tight to the actual divergence — only
+    # the dash forms ``—`` (em) / ``–`` (en) so a regular hyphen in a
+    # subject like ``Re: design - draft`` doesn't get stripped.
+    re.compile(r"\s+[—–]\s+.+$"),
     # ISO dates: 2026-04-11, 2026/04/11
     re.compile(r"\s+\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\s*$"),
     # Month + year: "April 2026", "Apr 2026", "April, 2026"

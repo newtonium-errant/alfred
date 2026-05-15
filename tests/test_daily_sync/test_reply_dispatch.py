@@ -166,3 +166,48 @@ def test_handle_corpus_row_carries_metadata(tmp_path: Path):
     assert rows[0].subject == "Subject 1"
     assert rows[0].snippet == "Snippet 1"
     assert rows[0].timestamp  # set
+
+
+def test_handle_duplicate_verb_writes_via_tag(tmp_path: Path):
+    # Stage 1 (2026-05-15) — when Andrew flags item N as a duplicate
+    # of item M via ``N duplicate`` or ``N duplicate of M``, the
+    # resulting corpus row carries ``via="duplicate-of-M"`` so future
+    # few-shot rotation can detect the operator's "X is a duplicate
+    # of Y" signal.
+    cfg = _config(tmp_path)
+    _seed_batch(cfg, items=[
+        _item(4, priority="spam"),
+        _item(5, priority="medium"),  # classifier got this one wrong
+    ], message_ids=[100])
+
+    result = handle_daily_sync_reply(cfg, 100, "4 ok, 5 duplicate")
+    assert result is not None
+    assert result["confirmed_count"] == 2
+    rows = list(iter_corrections(cfg.corpus.path))
+    by_path = {r.record_path: r for r in rows}
+    # Item 4: ok confirms classifier_priority, no via tag.
+    assert by_path["note/Item4.md"].andrew_priority == "spam"
+    assert by_path["note/Item4.md"].via == ""
+    # Item 5: duplicate-of-4 → andrew_priority inherits spam,
+    # via tag set.
+    assert by_path["note/Item5.md"].andrew_priority == "spam"
+    assert by_path["note/Item5.md"].via == "duplicate-of-4"
+
+
+def test_handle_duplicate_explicit_pointer_writes_via_tag(tmp_path: Path):
+    # ``N duplicate of M`` explicit pointer form.
+    cfg = _config(tmp_path)
+    _seed_batch(cfg, items=[
+        _item(1, priority="high"),
+        _item(2, priority="low"),
+        _item(3, priority="medium"),
+    ], message_ids=[100])
+
+    result = handle_daily_sync_reply(cfg, 100, "1 ok, 2 ok, 3 duplicate of 1")
+    assert result is not None
+    assert result["confirmed_count"] == 3
+    rows = list(iter_corrections(cfg.corpus.path))
+    by_path = {r.record_path: r for r in rows}
+    # Item 3: explicit pointer to item 1 → inherit "high".
+    assert by_path["note/Item3.md"].andrew_priority == "high"
+    assert by_path["note/Item3.md"].via == "duplicate-of-1"

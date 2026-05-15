@@ -280,6 +280,91 @@ def test_parse_reply_existing_forms_still_pass():
     assert dash.corrections[0].modifier == "down"
 
 
+# --- duplicate verb (Stage 1, 2026-05-15) ---------------------------------
+#
+# ``N duplicate`` resolves item N the same way as the previous item
+# in the same reply (item N-1). ``N duplicate of M`` form is the
+# explicit pointer. The dispatcher stamps the resulting corpus row
+# with ``via="duplicate-of-M"`` so few-shot rotation can detect the
+# "Andrew calls X a duplicate of Y" signal.
+
+
+def test_parse_reply_duplicate_resolves_to_previous_item():
+    result = parse_reply("4 spam, 5 duplicate")
+    assert result.unparsed == []
+    assert len(result.corrections) == 2
+    item4 = result.corrections[0]
+    item5 = result.corrections[1]
+    assert item4.item_number == 4
+    assert item4.new_tier == "spam"
+    assert item5.item_number == 5
+    # Resolved correction takes item 4's classification.
+    assert item5.new_tier == "spam"
+    assert item5.via == "duplicate-of-4"
+    # Chain placeholders cleared after resolution.
+    assert item5.duplicate_of_item is None
+
+
+def test_parse_reply_duplicate_explicit_pointer():
+    result = parse_reply("1 ok, 2 down, 5 duplicate of 1")
+    assert result.unparsed == []
+    assert len(result.corrections) == 3
+    item5 = result.corrections[2]
+    assert item5.item_number == 5
+    # Resolved correction takes item 1's classification (ok=True).
+    assert item5.ok is True
+    assert item5.via == "duplicate-of-1"
+    assert item5.duplicate_of_item is None
+
+
+def test_parse_reply_duplicate_with_hash_pointer():
+    result = parse_reply("1 high, 4 duplicate of #1")
+    assert result.unparsed == []
+    item4 = result.corrections[1]
+    assert item4.new_tier == "high"
+    assert item4.via == "duplicate-of-1"
+
+
+def test_parse_reply_duplicate_with_no_prior_item_unparsed():
+    # Defensive: bare "duplicate" with no prior correction in the
+    # reply lands in unparsed. The brief flagged this as the path
+    # operator probably never types alone — verify it doesn't crash
+    # and produces a parseable error.
+    result = parse_reply("3 duplicate")
+    assert result.corrections == []
+    assert len(result.unparsed) == 1
+    assert "3" in result.unparsed[0]
+    assert "duplicate" in result.unparsed[0].lower()
+
+
+def test_parse_reply_duplicate_of_nonexistent_item_unparsed():
+    # ``5 duplicate of 9`` when item 9 wasn't mentioned earlier
+    # produces a parseable error, not a crash.
+    result = parse_reply("1 ok, 5 duplicate of 9")
+    assert len(result.corrections) == 1  # only item 1
+    assert any("5" in u for u in result.unparsed)
+
+
+def test_parse_reply_duplicate_with_trailing_note():
+    # Trailing content after a dash is preserved as the new
+    # correction's note, mirroring same-chain behavior.
+    result = parse_reply("4 spam, 5 duplicate — same Headspace newsletter")
+    assert result.unparsed == []
+    item5 = result.corrections[1]
+    assert item5.new_tier == "spam"
+    assert item5.via == "duplicate-of-4"
+    assert "Headspace" in item5.note
+
+
+def test_parse_reply_duplicate_preserves_modifier_chain():
+    # Source correction has a modifier (``down``); duplicate inherits it.
+    result = parse_reply("2 down, 5 duplicate")
+    assert result.unparsed == []
+    item5 = result.corrections[1]
+    assert item5.modifier == "down"
+    assert item5.via == "duplicate-of-2"
+
+
 # --- Modifier arithmetic ---------------------------------------------------
 
 

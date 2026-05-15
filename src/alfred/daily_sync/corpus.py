@@ -52,6 +52,12 @@ class CorpusEntry:
     sender: str = ""
     subject: str = ""
     snippet: str = ""
+    # Optional "how this correction was derived" tag. Empty for normal
+    # corrections; set to ``"duplicate-of-N"`` when Andrew flagged the
+    # item as a duplicate via the ``duplicate`` verb (Stage 1, 2026-
+    # 05-15). Future few-shot rotation can detect duplicate-marking
+    # patterns via this field.
+    via: str = ""
 
     def is_correction(self) -> bool:
         """Return True when Andrew's call differed from the classifier's."""
@@ -115,6 +121,7 @@ def _entry_from_dict(data: dict) -> CorpusEntry:
         sender=data.get("sender", ""),
         subject=data.get("subject", ""),
         snippet=data.get("snippet", ""),
+        via=data.get("via", ""),
     )
 
 

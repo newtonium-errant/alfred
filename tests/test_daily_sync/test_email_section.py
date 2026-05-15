@@ -213,3 +213,128 @@ def test_email_calibration_section_returns_text_with_content(tmp_path: Path):
     out = email_calibration_section(config, date(2026, 4, 22))
     assert out is not None
     assert "## Email calibration" in out
+
+
+# --- Subject-normalization for clustering (Stage 1, 2026-05-15) -----------
+#
+# The 2026-05-15 calibration batch surfaced items 4 + 5 as separate
+# "Headspace marketing" pings even though they're the same recurring
+# message. Item 4 carried an em-dash attribution suffix; item 5 did
+# not. Subject normalization must strip ``— <attribution>`` so they
+# cluster.
+
+
+def test_cluster_key_normalizes_em_dash_suffix():
+    """Items with an em-dash attribution suffix cluster with the
+    unsuffixed form. Item 4 + item 5 from the morning's batch:
+    ``Mental Health Support Tailored for You — Headspace Marketing``
+    and ``Mental health support tailored for you``."""
+    from alfred.daily_sync.email_section import _CandidateRecord, _cluster_key_for
+
+    c4 = _CandidateRecord(
+        rel_path="note/Item4.md",
+        priority="low",
+        action_hint=None,
+        reasoning="",
+        sender="newsletter@headspace.com",
+        subject="Mental Health Support Tailored for You — Headspace Marketing",
+        snippet="",
+        mtime=1234.0,
+    )
+    c5 = _CandidateRecord(
+        rel_path="note/Item5.md",
+        priority="low",
+        action_hint=None,
+        reasoning="",
+        sender="newsletter@headspace.com",
+        subject="Mental health support tailored for you",
+        snippet="",
+        mtime=1233.0,
+    )
+    assert _cluster_key_for(c4) == _cluster_key_for(c5)
+
+
+def test_cluster_key_does_not_overcluster_distinct_subjects():
+    """Defensive: subjects that DIFFER in core wording must NOT cluster
+    even after em-dash stripping."""
+    from alfred.daily_sync.email_section import _CandidateRecord, _cluster_key_for
+
+    c_support = _CandidateRecord(
+        rel_path="note/A.md",
+        priority="low",
+        action_hint=None,
+        reasoning="",
+        sender="newsletter@example.com",
+        subject="Mental Health Support",
+        snippet="",
+        mtime=1.0,
+    )
+    c_resource = _CandidateRecord(
+        rel_path="note/B.md",
+        priority="low",
+        action_hint=None,
+        reasoning="",
+        sender="newsletter@example.com",
+        subject="Mental Health Resource Guide",
+        snippet="",
+        mtime=2.0,
+    )
+    assert _cluster_key_for(c_support) != _cluster_key_for(c_resource)
+
+
+def test_cluster_key_em_dash_strip_preserves_hyphenated_subject():
+    """A regular hyphen (``-``) inside a subject is NOT an attribution
+    delimiter. ``Re: design - draft`` should keep ``design - draft``."""
+    from alfred.daily_sync.email_section import _CandidateRecord, _cluster_key_for
+
+    c1 = _CandidateRecord(
+        rel_path="note/A.md",
+        priority="low",
+        action_hint=None,
+        reasoning="",
+        sender="alice@example.com",
+        subject="Re: design - draft",
+        snippet="",
+        mtime=1.0,
+    )
+    c2 = _CandidateRecord(
+        rel_path="note/B.md",
+        priority="low",
+        action_hint=None,
+        reasoning="",
+        sender="alice@example.com",
+        subject="Re: design",
+        snippet="",
+        mtime=2.0,
+    )
+    # The hyphen form must NOT cluster with the bare form — only the
+    # em-dash / en-dash with whitespace gets stripped.
+    assert _cluster_key_for(c1) != _cluster_key_for(c2)
+
+
+def test_cluster_key_normalizes_en_dash_suffix():
+    """En-dash variant (Unicode U+2013) is also stripped, mirroring
+    the em-dash treatment. Curator output uses both interchangeably."""
+    from alfred.daily_sync.email_section import _CandidateRecord, _cluster_key_for
+
+    c_em = _CandidateRecord(
+        rel_path="note/A.md",
+        priority="low",
+        action_hint=None,
+        reasoning="",
+        sender="alice@example.com",
+        subject="Weekly digest — Vendor X",
+        snippet="",
+        mtime=1.0,
+    )
+    c_en = _CandidateRecord(
+        rel_path="note/B.md",
+        priority="low",
+        action_hint=None,
+        reasoning="",
+        sender="alice@example.com",
+        subject="Weekly digest – Vendor Y",
+        snippet="",
+        mtime=2.0,
+    )
+    assert _cluster_key_for(c_em) == _cluster_key_for(c_en)

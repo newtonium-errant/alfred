@@ -56,6 +56,14 @@ class Proposal:
     subordinate suggests Salem set on the new record. Salem is the
     authoritative writer — it applies whatever fields it trusts and
     silently drops anything it doesn't recognise.
+
+    ``accepted_via`` (Stage 1, 2026-05-15) records HOW an accepted
+    proposal was resolved. Empty when ``state != STATE_ACCEPTED`` OR
+    when accepted via a fresh ``vault_create``. Set to ``"merge"``
+    when the dispatcher detected an existing record at the proposed
+    path and merged the proposed fields into it instead. The state
+    value stays ``accepted`` either way; ``accepted_via`` is the
+    auditable provenance for the operator's merge log.
     """
 
     correlation_id: str
@@ -66,6 +74,7 @@ class Proposal:
     name: str
     proposed_fields: dict[str, Any] = field(default_factory=dict)
     source: str = ""
+    accepted_via: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -77,6 +86,7 @@ class Proposal:
             "name": self.name,
             "proposed_fields": dict(self.proposed_fields or {}),
             "source": self.source,
+            "accepted_via": self.accepted_via,
         }
 
     @classmethod
@@ -90,6 +100,7 @@ class Proposal:
             name=str(data.get("name") or ""),
             proposed_fields=dict(data.get("proposed_fields") or {}),
             source=str(data.get("source") or ""),
+            accepted_via=str(data.get("accepted_via") or ""),
         )
 
 
@@ -177,6 +188,8 @@ def update_proposal_state(
     queue_path: str | Path,
     correlation_id: str,
     new_state: str,
+    *,
+    accepted_via: str | None = None,
 ) -> bool:
     """Flip one proposal's state in place. Returns True on success.
 
@@ -194,6 +207,15 @@ def update_proposal_state(
     try/except and logs; unlike :func:`append_proposal`, losing a state
     transition WOULD confuse the operator (re-surfacing an already-
     approved proposal), so we don't silently swallow.
+
+    ``accepted_via`` (Stage 1, 2026-05-15) is an optional provenance
+    tag stamped on the proposal alongside the state flip. Only
+    applied when ``new_state == STATE_ACCEPTED`` AND
+    ``accepted_via`` is a non-empty string; ignored otherwise. Today
+    the only valid value is ``"merge"`` (used when the dispatcher
+    routes a confirm onto an existing record rather than
+    ``vault_create``). Default ``None`` leaves the field unchanged
+    so existing callers retain their behavior.
     """
     if new_state not in _VALID_STATES:
         return False
@@ -205,6 +227,8 @@ def update_proposal_state(
     for p in proposals:
         if p.correlation_id == correlation_id:
             p.state = new_state
+            if new_state == STATE_ACCEPTED and accepted_via:
+                p.accepted_via = accepted_via
             found = True
     if not found:
         return False
