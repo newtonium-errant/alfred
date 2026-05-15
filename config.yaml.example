@@ -669,6 +669,43 @@ surveyor:
     enabled: true
     interval_seconds: 60
 
+# Cloudflared tunnel supervisor — wraps the ``cloudflared`` Go binary as
+# a supervised child of ``alfred up`` so the Cloudflare tunnel auto-
+# restarts with the other daemons (rather than running manually via
+# ``nohup cloudflared tunnel run <id> &``).
+#
+# Background: on 2026-05-13 we discovered the Outlook → mail webhook
+# pipeline had been silently disconnected for ~2 weeks because the
+# manually-started cloudflared process stopped after a WSL2 restart
+# and nobody noticed. Bringing the tunnel under ``alfred up`` closes
+# that observability gap (auto-restart up to 5 times, structured
+# ``cloudflared.started`` / ``cloudflared.exited`` events in
+# ``data/alfred.log``).
+#
+# Per-instance opt-in (conservative — needs explicit ``enabled: true``,
+# not just block presence). Salem turns it on for the mail webhook
+# bridge; KAL-LE / Hypatia / instances without an exposed tunnel leave
+# the block out entirely.
+#
+# Operator handoff: if a manually-started cloudflared instance is
+# already running (e.g. left over from the pre-supervision era), kill
+# it before ``alfred up`` — v1 does NOT detect-and-takeover existing
+# processes. Find the manual PID with ``ps -ef | grep cloudflared``.
+#
+# Required:
+#   tunnel_id   — UUID of the cloudflared tunnel (from Cloudflare dash).
+#
+# Optional:
+#   config_path — Override the default ``~/.cloudflared/config.yml``.
+#   binary_path — Override the default ``/usr/local/bin/cloudflared``.
+#   log_path    — Override the default ``<logging.dir>/cloudflared.log``.
+# cloudflared:
+#   enabled: false
+#   tunnel_id: ""
+#   config_path: "~/.cloudflared/config.yml"
+#   binary_path: "/usr/local/bin/cloudflared"
+#   log_path: "./data/cloudflared.log"
+
 # Optional. Tunes ``alfred scaffold sync`` (Build #38 — diff-and-copy
 # of bundled scaffold content into an existing instance vault). The
 # block is OPTIONAL; when absent, the module-level Salem-shape default

@@ -45,6 +45,11 @@ EXPECTED_TOOLS = {
     # writes friction events for the section provider). Auto-starts
     # on instances with ``daily_sync.friction_analyzer.enabled``.
     "friction_analyzer",
+    # Cloudflared tunnel supervisor — wraps the ``cloudflared`` Go
+    # binary so the Outlook → mail webhook tunnel auto-restarts with
+    # the other daemons. Auto-starts on instances with
+    # ``cloudflared.enabled: true``.
+    "cloudflared",
 }
 
 TWO_ARG_TOOLS = {
@@ -53,6 +58,7 @@ TWO_ARG_TOOLS = {
     "pending_items_pusher",
     "radar_day",
     "friction_analyzer",
+    "cloudflared",
 }
 THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "instructor", "talker"}
 

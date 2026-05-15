@@ -606,6 +606,64 @@ def _run_pending_items_pusher(raw: dict[str, Any], suppress_stdout: bool = False
     )
 
 
+def _run_cloudflared(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """Cloudflared tunnel daemon process entry point.
+
+    Wraps the ``cloudflared`` Go binary as a supervised child of
+    ``alfred up`` so the Cloudflare tunnel auto-restarts with the
+    other daemons. Replaces the manual ``nohup cloudflared tunnel run
+    <id> &`` workflow.
+
+    Per-instance auto-start: any instance with ``cloudflared:`` block
+    AND ``enabled: true`` runs this daemon. When ``enabled: false`` or
+    missing tunnel_id / binary, exits ``_MISSING_DEPS_EXIT`` (78) so
+    the orchestrator's auto-restart loop skips us cleanly.
+
+    Per ``feedback_intentionally_left_blank.md``: emits a structured
+    ``cloudflared.disabled_in_config`` log when the block is present
+    but disabled, distinguishing "operator opted out" from
+    "daemon never registered" (the latter would not even reach this
+    runner — the auto-start gate filters it).
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/cloudflared_supervisor.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    # Reuse brief's setup_logging — the signature matches and we don't
+    # need a bespoke logger for this thin wrapper. The supervisor log
+    # (this file) captures lifecycle structlog events;
+    # ``cloudflared.log_path`` (a separate file) captures the binary's
+    # own stdout/stderr.
+    from alfred.brief.utils import setup_logging
+    setup_logging(
+        level=log_cfg.get("level", "INFO"),
+        log_file=log_file,
+        suppress_stdout=suppress_stdout,
+    )
+    from alfred.cloudflared.config import load_from_unified
+    from alfred.cloudflared.daemon import run as run_cloudflared
+    config = load_from_unified(raw)
+    if not config.enabled:
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning(
+            "cloudflared.disabled_in_config",
+            detail=(
+                "cloudflared block present but enabled=false. Exiting 78 — "
+                "orchestrator's auto-restart will skip this daemon."
+            ),
+        )
+        sys.exit(_MISSING_DEPS_EXIT)
+    exit_code = run_cloudflared(
+        binary_path=config.binary_path,
+        tunnel_id=config.tunnel_id,
+        config_path=config.config_path,
+        log_path=config.log_path,
+    )
+    if exit_code:
+        sys.exit(exit_code)
+
+
 def _run_daily_sync(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Daily Sync daemon process entry point.
 
@@ -729,6 +787,7 @@ TOOL_RUNNERS = {
     "pending_items_pusher": _run_pending_items_pusher,
     "radar_day": _run_radar_day,
     "friction_analyzer": _run_friction_analyzer,
+    "cloudflared": _run_cloudflared,
 }
 
 
@@ -850,6 +909,19 @@ def run_all(
         )
         if friction_block.get("enabled"):
             tools.append("friction_analyzer")
+        # Cloudflared tunnel supervisor. Auto-starts when
+        # ``cloudflared:`` block is present AND ``enabled: true``.
+        # Per-instance opt-in: only instances that need an exposed
+        # tunnel (today: Salem for the Outlook → mail webhook bridge)
+        # turn it on. Other instances leave the block absent.
+        #
+        # Conservative gate (enabled-true required, not enabled-by-
+        # presence) because misconfigured cloudflared spins in a
+        # restart loop on missing-credential errors that surface only
+        # in cloudflared's own log file — keeping it opt-in prevents
+        # accidental loops on instances that copied a template config.
+        if "cloudflared" in raw and (raw.get("cloudflared") or {}).get("enabled"):
+            tools.append("cloudflared")
 
         if skipped:
             import structlog
@@ -923,7 +995,7 @@ def run_all(
         # ``test_dispatcher_two_arg_branch_matches_two_arg_tools`` in
         # ``tests/orchestrator/test_tool_dispatch.py`` so a missing
         # entry trips a test rather than a TypeError on first spawn.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "digest", "pending_items_pusher", "radar_day", "friction_analyzer"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

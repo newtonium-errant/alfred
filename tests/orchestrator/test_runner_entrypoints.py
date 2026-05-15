@@ -433,6 +433,122 @@ def test_kill_stale_tool_removes_dead_pid_file(orch_dirs) -> None:
     assert not pid_path.exists()
 
 
+def test_run_cloudflared_disabled_in_config_exits_78(
+    orch_dirs, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_run_cloudflared`` with disabled config → ``sys.exit(78)``.
+
+    Pins the disabled-in-config branch. The orchestrator's
+    enabled-true gate filters disabled blocks BEFORE this runner is
+    invoked in production, so the only way to reach this branch is
+    via ``alfred up --only cloudflared`` against a misconfigured
+    file. We still want a clean exit-78 rather than a silent loop.
+
+    Log-emission pinning per ``feedback_log_emission_test_pattern.md``
+    + ``feedback_structlog_assertion_patterns.md`` — we stub
+    ``setup_logging`` to a no-op so structlog stays in its default
+    capture-friendly mode and ``structlog.testing.capture_logs``
+    sees the warning event.
+    """
+    import structlog
+
+    # Stub setup_logging — without this, the runner's
+    # ``logging.basicConfig(force=True)`` rips out pytest's log
+    # handler and we lose the capture.
+    _install_stub_module(
+        monkeypatch, "alfred.brief.utils",
+        {"setup_logging": lambda **_: None},
+    )
+
+    raw = {
+        "logging": {"level": "INFO", "dir": str(orch_dirs["data"])},
+        "cloudflared": {"enabled": False, "tunnel_id": "abc"},
+    }
+
+    with structlog.testing.capture_logs() as captured:
+        with pytest.raises(SystemExit) as exc_info:
+            orchestrator._run_cloudflared(raw, suppress_stdout=False)
+
+    assert exc_info.value.code == orchestrator._MISSING_DEPS_EXIT == 78
+    matches = [c for c in captured if c.get("event") == "cloudflared.disabled_in_config"]
+    assert len(matches) == 1, (
+        f"Expected one cloudflared.disabled_in_config event, "
+        f"got {[c.get('event') for c in captured]}"
+    )
+
+
+def test_run_cloudflared_invokes_daemon_run(
+    orch_dirs, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_run_cloudflared`` with enabled config → daemon.run() invoked + exit-code propagated.
+
+    We stub the daemon's ``run`` function to return 0 (clean exit)
+    so the orchestrator entrypoint completes without spawning the
+    actual cloudflared binary.
+    """
+    captured: dict[str, Any] = {"args": None}
+
+    def _stub_run(**kwargs) -> int:
+        captured["args"] = kwargs
+        return 0  # clean exit
+
+    # Stub setup_logging so we don't reconfigure handlers mid-test.
+    _install_stub_module(
+        monkeypatch, "alfred.brief.utils",
+        {"setup_logging": lambda **_: None},
+    )
+    monkeypatch.setattr(
+        "alfred.cloudflared.daemon.run", _stub_run,
+    )
+
+    raw = {
+        "logging": {"level": "INFO", "dir": str(orch_dirs["data"])},
+        "cloudflared": {
+            "enabled": True,
+            "tunnel_id": "5e44e541-b24c-4caa-8246-105559dd8744",
+            "config_path": "/etc/cloudflared/config.yml",
+        },
+    }
+    # Clean exit (0) → no SystemExit raised.
+    orchestrator._run_cloudflared(raw, suppress_stdout=False)
+
+    assert captured["args"] is not None
+    assert captured["args"]["tunnel_id"] == "5e44e541-b24c-4caa-8246-105559dd8744"
+    assert captured["args"]["config_path"] == "/etc/cloudflared/config.yml"
+
+
+def test_run_cloudflared_propagates_nonzero_exit_code(
+    orch_dirs, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-zero return from daemon.run → ``sys.exit(code)``.
+
+    Mirror of the talker propagation test. Required so the
+    orchestrator's restart loop sees the same exit code the binary
+    produced — otherwise a crash-looping cloudflared would silently
+    succeed at the supervisor level and never trigger the max-5-retry
+    backoff.
+    """
+
+    def _stub_run(**kwargs) -> int:
+        return 42  # arbitrary non-zero exit
+
+    _install_stub_module(
+        monkeypatch, "alfred.brief.utils",
+        {"setup_logging": lambda **_: None},
+    )
+    monkeypatch.setattr(
+        "alfred.cloudflared.daemon.run", _stub_run,
+    )
+
+    raw = {
+        "logging": {"level": "INFO", "dir": str(orch_dirs["data"])},
+        "cloudflared": {"enabled": True, "tunnel_id": "abc"},
+    }
+    with pytest.raises(SystemExit) as exc_info:
+        orchestrator._run_cloudflared(raw, suppress_stdout=False)
+    assert exc_info.value.code == 42
+
+
 def test_kill_stale_tool_sigterm_live_process(orch_dirs) -> None:
     """Live stale process → SIGTERM'd by ``_kill_stale_tool``.
 
