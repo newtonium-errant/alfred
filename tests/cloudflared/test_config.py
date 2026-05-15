@@ -155,3 +155,99 @@ def test_disabled_explicit_false() -> None:
     assert config.enabled is False
     # Other fields still parse — useful for the orchestrator's log line.
     assert config.tunnel_id == "abc"
+
+
+def test_schema_tolerance_ignores_unknown_fields() -> None:
+    """Schema-tolerance contract: unknown fields don't crash the loader.
+
+    Per CLAUDE.md "State persistence — load() schema-tolerance
+    contract": the loader filters incoming keys against the dataclass's
+    known fields before constructing instances. A config file with an
+    extra key (forward-compat from a newer version, or operator typo)
+    should load without raising ``TypeError`` on the unexpected keyword.
+    """
+    raw = {
+        "cloudflared": {
+            "enabled": True,
+            "tunnel_id": "abc",
+            "future_unknown_field": "would-crash-without-filter",
+            "another_typo_field": 12345,
+        },
+    }
+    config = load_from_unified(raw)
+    # Known fields still parsed correctly.
+    assert config.enabled is True
+    assert config.tunnel_id == "abc"
+    # Unknown fields silently ignored — no attribute exposed.
+    assert not hasattr(config, "future_unknown_field")
+    assert not hasattr(config, "another_typo_field")
+
+
+def test_metrics_port_default() -> None:
+    """``metrics_port`` defaults to 20241 (cloudflared's own default)."""
+    raw = {
+        "cloudflared": {"enabled": True, "tunnel_id": "abc"},
+    }
+    config = load_from_unified(raw)
+    assert config.metrics_port == 20241
+
+
+def test_metrics_port_override() -> None:
+    """Operator can override ``metrics_port`` if 20241 is taken."""
+    raw = {
+        "cloudflared": {
+            "enabled": True,
+            "tunnel_id": "abc",
+            "metrics_port": 30241,
+        },
+    }
+    config = load_from_unified(raw)
+    assert config.metrics_port == 30241
+
+
+def test_metrics_port_string_coerced() -> None:
+    """YAML-quoted ``"20241"`` coerces to int 20241.
+
+    Reason: YAML 1.1 parses ``20241`` as int but quoted forms parse as
+    str. The loader tolerates either form rather than crashing on type
+    mismatch.
+    """
+    raw = {
+        "cloudflared": {
+            "enabled": True,
+            "tunnel_id": "abc",
+            "metrics_port": "30241",
+        },
+    }
+    config = load_from_unified(raw)
+    assert config.metrics_port == 30241
+
+
+def test_metrics_port_invalid_falls_back_to_default() -> None:
+    """Garbage ``metrics_port`` falls back to default rather than crash.
+
+    A misconfigured port surfaces at probe time (the health probe
+    returns FAIL on "unreachable") rather than crashing the loader.
+    """
+    raw = {
+        "cloudflared": {
+            "enabled": True,
+            "tunnel_id": "abc",
+            "metrics_port": "not-a-number",
+        },
+    }
+    config = load_from_unified(raw)
+    assert config.metrics_port == 20241
+
+
+def test_metrics_url_property() -> None:
+    """``metrics_url`` composes from ``metrics_port``."""
+    raw = {
+        "cloudflared": {
+            "enabled": True,
+            "tunnel_id": "abc",
+            "metrics_port": 22222,
+        },
+    }
+    config = load_from_unified(raw)
+    assert config.metrics_url == "http://localhost:22222/metrics"

@@ -29,13 +29,22 @@ Why Pattern A (not a separate supervisor process / not exec-replace):
    branch then skips restart — same contract surveyor uses for
    missing ML extras.
 
-**Operator handoff note:** if a manually-started cloudflared instance
-is already running (e.g. ``nohup /usr/local/bin/cloudflared tunnel
-run <id> &``), it will conflict with the orchestrator-spawned one
-on the same tunnel ID. v1 does NOT auto-kill the manual one — the
-operator must ``kill`` it before running ``alfred up``. Detection +
-takeover is a future enhancement (would query the metrics endpoint
-at ``localhost:20241/metrics`` to see if a tunnel is already alive).
+**Detect-and-takeover (2026-05-15):** if a manually-started cloudflared
+instance is already running (e.g. ``nohup /usr/local/bin/cloudflared
+tunnel run <id> &``), the orchestrator-spawned one would fail with
+"address already in use" on the metrics port (20241). Before calling
+``subprocess.Popen``, we probe the metrics endpoint; if it responds,
+we emit ``cloudflared.existing_instance_detected`` with a clear
+operator-action hint and exit 78 so the orchestrator's auto-restart
+skips us. We deliberately do NOT auto-kill the manual instance —
+detection + log + clean exit only. The operator must run
+``pkill cloudflared`` to relinquish; ``alfred up`` then spawns its
+own supervised cloudflared on next restart.
+
+Distinguish detect-and-takeover from the health probe in
+``cloudflared/health.py``: this runs ONCE at daemon spawn, before
+``Popen``, never after. The health probe runs on
+``alfred status`` / BIT invocations, on demand, anytime.
 """
 
 from __future__ import annotations
@@ -61,17 +70,93 @@ _MISSING_DEPS_EXIT = 78
 # 5s leaves slack for slow network teardown.
 _SHUTDOWN_GRACE_SECONDS = 5.0
 
+# HTTP timeout for the detect-and-takeover probe at daemon spawn time.
+# Kept tight so we don't stall the startup path on a slow loopback —
+# 1s is plenty for a metrics endpoint on localhost.
+_DETECT_PROBE_TIMEOUT_SECONDS = 1.0
+
+
+def _probe_metrics_endpoint(metrics_port: int) -> dict[str, object]:
+    """Detect-and-takeover probe: is a cloudflared already running?
+
+    Returns one of:
+
+      ``{"existing": True, "ha_connections": int}`` — a cloudflared is
+          live on the metrics port; the orchestrator should NOT spawn
+          another.
+      ``{"existing": False}`` — nothing on the port, free to spawn.
+
+    The probe is deliberately broad — any HTTP-200 response on the
+    metrics URL is treated as "something owns this port" rather than
+    parsing the metrics body and confirming it's cloudflared. Reason:
+    if a different process happened to bind to 20241 we still want to
+    bail rather than crash-loop; the operator-action hint says
+    ``pkill cloudflared`` which is a no-op when nothing matches, but
+    the broader ``netstat -tlnp | grep 20241`` discovery step covers
+    every case.
+
+    We import ``httpx`` lazily so a missing dep at daemon spawn doesn't
+    fail-loud before the existence probe runs — ``httpx`` is a base
+    dep across the project but the lazy import keeps this module's
+    top-level imports minimal.
+    """
+    try:
+        import httpx
+    except ImportError:
+        # httpx unavailable — skip the probe rather than crashing.
+        # The downstream Popen will then surface the port-conflict via
+        # its own crash path. Better than refusing to spawn.
+        return {"existing": False}
+
+    metrics_url = f"http://localhost:{metrics_port}/metrics"
+    try:
+        resp = httpx.get(metrics_url, timeout=_DETECT_PROBE_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001
+        # Connection refused / timeout / any error → nothing live on
+        # the port. Safe to spawn.
+        return {"existing": False}
+
+    if resp.status_code != 200:
+        # Something is on the port but not serving metrics. Treat as
+        # "nothing useful here, let Popen surface the actual conflict."
+        # Going through the Popen path keeps a single fail-message
+        # source rather than splitting the diagnostic between detect
+        # and spawn.
+        return {"existing": False}
+
+    # Try to extract the connection count for the operator-visible log
+    # line. Parse failure → count unknown but probe still indicates
+    # something is alive on the port.
+    ha_connections: int = -1
+    try:
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if line.startswith("cloudflared_tunnel_ha_connections ") or line == "cloudflared_tunnel_ha_connections":
+                parts = line.split()
+                if len(parts) >= 2:
+                    ha_connections = int(float(parts[1]))
+                    break
+    except Exception:  # noqa: BLE001
+        # Parse failure — leave ha_connections=-1 (unknown). The log
+        # line below explicitly shows "-1" so the operator can tell it
+        # was a probe-parse miss rather than a true zero.
+        pass
+
+    return {"existing": True, "ha_connections": ha_connections}
+
 
 def run(
     binary_path: str,
     tunnel_id: str,
     config_path: str = "",
     log_path: str = "",
+    metrics_port: int = 20241,
 ) -> int:
     """Spawn cloudflared and supervise it until exit.
 
     Returns the cloudflared child's exit code, or ``_MISSING_DEPS_EXIT``
-    when the binary is missing / non-executable.
+    when the binary is missing / non-executable / a manual cloudflared
+    is already running on the metrics port.
 
     Args:
         binary_path: Absolute path to the cloudflared binary.
@@ -83,6 +168,11 @@ def run(
             Empty disables file logging (output goes to inherited
             stdout — typically the orchestrator's silenced-stdio
             null-sink in production).
+        metrics_port: Port to consult for the detect-and-takeover
+            probe (cloudflared's own metrics-server port; default
+            20241). When a cloudflared is already listening here we
+            exit 78 rather than crash-looping on "address already in
+            use".
     """
     log = structlog.get_logger(__name__)
 
@@ -126,6 +216,32 @@ def run(
             detail=(
                 "cloudflared.tunnel_id is empty. Set it in config.yaml "
                 "to the UUID of the tunnel to run. Exiting 78."
+            ),
+        )
+        return _MISSING_DEPS_EXIT
+
+    # Detect-and-takeover guard. If an operator manually started
+    # cloudflared (``nohup cloudflared tunnel run <id> &``) and then
+    # invoked ``alfred up``, the orchestrator-spawned cloudflared would
+    # crash with "address already in use" on the metrics port. Per the
+    # 2026-05-15 follow-up: probe the metrics endpoint before Popen, and
+    # if something's already serving on it, emit a clear log line +
+    # exit 78 (skip-restart) so the operator-driven kill-and-restart
+    # path is unambiguous.
+    detect_result = _probe_metrics_endpoint(metrics_port)
+    if detect_result.get("existing"):
+        log.warning(
+            "cloudflared.existing_instance_detected",
+            metrics_url=f"http://localhost:{metrics_port}/metrics",
+            ha_connections=detect_result.get("ha_connections", -1),
+            detail=(
+                f"A cloudflared instance is already serving on "
+                f"localhost:{metrics_port}/metrics. Will NOT spawn a "
+                "second cloudflared (would conflict on the metrics "
+                "port). Run `pkill cloudflared` to kill the manual "
+                "instance; the orchestrator will then spawn its own "
+                "supervised cloudflared on next restart. Exiting 78 — "
+                "auto-restart skipped."
             ),
         )
         return _MISSING_DEPS_EXIT

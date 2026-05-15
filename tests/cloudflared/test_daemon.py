@@ -72,11 +72,34 @@ class _FakeProc:
 
 
 @pytest.fixture
-def fake_popen(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+def stub_clean_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub ``_probe_metrics_endpoint`` to always return "no existing".
+
+    Default fixture used by every happy-path test. Without this the
+    real probe would try to hit ``localhost:<metrics_port>/metrics``
+    and — depending on whether cloudflared happens to be running on the
+    test host — would either return ``{"existing": True}`` and short-
+    circuit the spawn (breaking ALL spawn tests) or return False after
+    timing out (slowing the suite). Pin "clean port" explicitly.
+    """
+    monkeypatch.setattr(
+        cf_daemon, "_probe_metrics_endpoint",
+        lambda port: {"existing": False},
+    )
+
+
+@pytest.fixture
+def fake_popen(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_clean_probe,  # noqa: ARG001 — fixture activation only
+) -> dict[str, Any]:
     """Install a fake ``subprocess.Popen`` and return a record dict.
 
     The fake records the ``cmd`` arg + the kwargs (stdout, stderr,
     start_new_session) so tests can assert on command construction.
+
+    Composes with ``stub_clean_probe`` so the spawn path is exercised
+    without the detect-and-takeover probe interfering.
     """
     record: dict[str, Any] = {"calls": [], "proc": None}
 
@@ -320,3 +343,255 @@ def test_run_log_file_open_failure_falls_back_to_devnull(
     assert ret == 0
     events = [c.get("event") for c in captured]
     assert "cloudflared.log_file_open_failed" in events
+
+
+# ---------------------------------------------------------------------------
+# Detect-and-takeover (2026-05-15 follow-up)
+# ---------------------------------------------------------------------------
+
+class TestDetectAndTakeover:
+    """Probe the metrics endpoint before ``Popen``; bail if something's already there.
+
+    If an operator manually started cloudflared (``nohup cloudflared
+    tunnel run ... &``) and then ran ``alfred up``, spawning a second
+    cloudflared would crash on "address already in use" for the metrics
+    port. These tests pin the detect-probe behavior: clean port =
+    normal spawn; busy port = exit 78 + structured warning log.
+
+    Log pinning per ``feedback_log_emission_test_pattern.md``: the
+    ``cloudflared.existing_instance_detected`` event is the operator's
+    grep signal that detect-and-takeover fired. A future refactor that
+    drops the log line goes red here.
+    """
+
+    def test_clean_port_spawns_normally(
+        self, make_executable, fake_popen, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No existing cloudflared on metrics port → normal Popen path."""
+        # fake_popen activates stub_clean_probe — the probe returns
+        # ``{"existing": False}``. Verify the spawn went through.
+        binary = make_executable()
+        ret = cf_daemon.run(binary_path=str(binary), tunnel_id="abc")
+        assert ret == 0
+        assert len(fake_popen["calls"]) == 1
+        # Sanity: detect-warning should NOT have fired in this path.
+
+    def test_existing_instance_detected_returns_78(
+        self, make_executable, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Probe reports existing → exit 78, NO Popen, warning log fires."""
+        # Override the default stub: simulate an existing cloudflared
+        # serving 4 connections on the metrics port.
+        monkeypatch.setattr(
+            cf_daemon, "_probe_metrics_endpoint",
+            lambda port: {"existing": True, "ha_connections": 4},
+        )
+        # Popen sentinel — should NOT be called when detect fires. If
+        # it IS called the test fails loudly rather than silently
+        # passing on a fall-through bug.
+        popen_calls: list[Any] = []
+
+        def _should_not_be_called(cmd, **kwargs):
+            popen_calls.append({"cmd": cmd, "kwargs": kwargs})
+            raise AssertionError(
+                "subprocess.Popen called after detect-and-takeover fired"
+            )
+
+        monkeypatch.setattr(cf_daemon.subprocess, "Popen", _should_not_be_called)
+
+        binary = make_executable()
+        with structlog.testing.capture_logs() as captured:
+            ret = cf_daemon.run(
+                binary_path=str(binary),
+                tunnel_id="abc",
+                metrics_port=20241,
+            )
+
+        assert ret == 78
+        assert popen_calls == []
+        # Log emission pinning — assert the warning fired with key
+        # operator-visible fields (URL + connection count). Field drops
+        # in a future refactor go red here.
+        matches = [
+            c for c in captured
+            if c.get("event") == "cloudflared.existing_instance_detected"
+        ]
+        assert len(matches) == 1
+        evt = matches[0]
+        assert evt["metrics_url"] == "http://localhost:20241/metrics"
+        assert evt["ha_connections"] == 4
+        # Operator-action hint should appear in the detail string.
+        assert "pkill cloudflared" in evt["detail"]
+
+    def test_existing_instance_count_unknown(
+        self, make_executable, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Probe says ``existing`` but couldn't parse the gauge → -1 surfaces.
+
+        Reason: a future cloudflared version-bump might rename the
+        ha_connections gauge. The probe still flags "something on the
+        port" but the count surfaces as -1 (sentinel) rather than 0
+        (which would imply zero connections, a different failure).
+        """
+        monkeypatch.setattr(
+            cf_daemon, "_probe_metrics_endpoint",
+            lambda port: {"existing": True, "ha_connections": -1},
+        )
+
+        def _should_not_be_called(cmd, **kwargs):
+            raise AssertionError("Popen called when detect should have short-circuited")
+
+        monkeypatch.setattr(cf_daemon.subprocess, "Popen", _should_not_be_called)
+
+        binary = make_executable()
+        with structlog.testing.capture_logs() as captured:
+            ret = cf_daemon.run(binary_path=str(binary), tunnel_id="abc")
+
+        assert ret == 78
+        matches = [
+            c for c in captured
+            if c.get("event") == "cloudflared.existing_instance_detected"
+        ]
+        assert len(matches) == 1
+        assert matches[0]["ha_connections"] == -1
+
+    def test_existing_check_respects_custom_metrics_port(
+        self, make_executable, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``metrics_port`` kwarg is plumbed into the probe.
+
+        If an operator overrides ``metrics_port: 30241``, the detect
+        probe must check THAT port rather than the default 20241.
+        """
+        observed_ports: list[int] = []
+
+        def _capture_port(port: int) -> dict:
+            observed_ports.append(port)
+            return {"existing": False}
+
+        monkeypatch.setattr(cf_daemon, "_probe_metrics_endpoint", _capture_port)
+        # Default fake_popen-style Popen so the normal path runs.
+        def _fake_popen(cmd, **kwargs):
+            proc = _FakeProc()
+            proc.set_exit_code(0)
+            return proc
+
+        monkeypatch.setattr(cf_daemon.subprocess, "Popen", _fake_popen)
+
+        binary = make_executable()
+        cf_daemon.run(
+            binary_path=str(binary),
+            tunnel_id="abc",
+            metrics_port=30241,
+        )
+        assert observed_ports == [30241]
+
+
+class TestProbeMetricsEndpoint:
+    """Unit-level coverage for ``_probe_metrics_endpoint`` itself.
+
+    The probe is a thin HTTP-and-parse wrapper; we verify the failure
+    modes (connection refused, timeout, non-200, malformed body) all
+    collapse to ``{"existing": False}`` and the success path parses
+    the gauge correctly.
+    """
+
+    def test_connection_refused_returns_no_existing(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``httpx.get`` raises ``ConnectError`` → ``{"existing": False}``."""
+        import httpx as real_httpx
+
+        class _Refusing:
+            @staticmethod
+            def get(*args, **kwargs):
+                raise real_httpx.ConnectError("connection refused")
+
+        monkeypatch.setitem(
+            __import__("sys").modules, "httpx", _Refusing,
+        )
+        result = cf_daemon._probe_metrics_endpoint(20241)
+        assert result == {"existing": False}
+
+    def test_timeout_returns_no_existing(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``httpx.get`` times out → ``{"existing": False}``."""
+        import httpx as real_httpx
+
+        class _Slow:
+            @staticmethod
+            def get(*args, **kwargs):
+                raise real_httpx.ReadTimeout("timed out")
+
+        monkeypatch.setitem(__import__("sys").modules, "httpx", _Slow)
+        result = cf_daemon._probe_metrics_endpoint(20241)
+        assert result == {"existing": False}
+
+    def test_non_200_returns_no_existing(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HTTP 500 on metrics endpoint → not a healthy cloudflared,
+        return ``{"existing": False}`` so Popen runs normally."""
+
+        class _FakeResp:
+            status_code = 500
+            text = ""
+
+        class _Stub:
+            @staticmethod
+            def get(*args, **kwargs):
+                return _FakeResp()
+
+        monkeypatch.setitem(__import__("sys").modules, "httpx", _Stub)
+        result = cf_daemon._probe_metrics_endpoint(20241)
+        assert result == {"existing": False}
+
+    def test_success_parses_ha_connections(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HTTP 200 with valid metrics body → existing=True + parsed count."""
+
+        body = (
+            "# HELP cloudflared_tunnel_ha_connections HA Connections\n"
+            "# TYPE cloudflared_tunnel_ha_connections gauge\n"
+            "cloudflared_tunnel_ha_connections 4\n"
+            "cloudflared_tunnel_total_requests 8\n"
+        )
+
+        class _OKResp:
+            status_code = 200
+            text = body
+
+        class _Stub:
+            @staticmethod
+            def get(*args, **kwargs):
+                return _OKResp()
+
+        monkeypatch.setitem(__import__("sys").modules, "httpx", _Stub)
+        result = cf_daemon._probe_metrics_endpoint(20241)
+        assert result == {"existing": True, "ha_connections": 4}
+
+    def test_success_missing_gauge_falls_back_to_minus_one(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HTTP 200 but no ha_connections gauge → existing=True, count=-1.
+
+        Treat as "something IS on the port" (would conflict with Popen)
+        but with the count unknown sentinel so the log line is honest
+        about why.
+        """
+        body = "# HELP build_info Build\n# TYPE build_info gauge\nbuild_info 1\n"
+
+        class _OKResp:
+            status_code = 200
+            text = body
+
+        class _Stub:
+            @staticmethod
+            def get(*args, **kwargs):
+                return _OKResp()
+
+        monkeypatch.setitem(__import__("sys").modules, "httpx", _Stub)
+        result = cf_daemon._probe_metrics_endpoint(20241)
+        assert result == {"existing": True, "ha_connections": -1}

@@ -659,6 +659,7 @@ def _run_cloudflared(raw: dict[str, Any], suppress_stdout: bool = False) -> None
         tunnel_id=config.tunnel_id,
         config_path=config.config_path,
         log_path=config.log_path,
+        metrics_port=config.metrics_port,
     )
     if exit_code:
         sys.exit(exit_code)
