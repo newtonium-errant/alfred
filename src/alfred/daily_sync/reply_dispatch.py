@@ -934,25 +934,43 @@ def _merge_person_proposal(
 
     # 3. Alias addition — if the proposal's name differs from the
     # existing record's ``name`` AND isn't already aliased.
+    #
+    # Case-insensitive uniqueness on BOTH sides of the comparison.
+    # Earlier ship had a case-drift bug: ``existing_aliases=["ben"]`` +
+    # proposal ``name="Ben"`` would slip the case-sensitive
+    # ``name not in existing_aliases`` check and produce a duplicate
+    # ``aliases=["ben", "Ben"]`` after merge. The lookup loop above
+    # already matches case-insensitively (line ~886); the addition
+    # check now mirrors that semantic. The lookup path stays untouched.
     existing_name = str(existing_fm.get("name") or "").strip()
     existing_aliases_raw = existing_fm.get("aliases") or []
     if not isinstance(existing_aliases_raw, list):
         existing_aliases_raw = []
     existing_aliases = [str(a) for a in existing_aliases_raw if isinstance(a, str)]
+    existing_aliases_lower = {a.strip().lower() for a in existing_aliases}
     aliases_added: list[str] = []
-    if name and name != existing_name and name not in existing_aliases:
+    name_lower = name.strip().lower() if name else ""
+    if (
+        name
+        and name_lower != existing_name.strip().lower()
+        and name_lower not in existing_aliases_lower
+    ):
         # Preserve any pending alias merge from filled_fields above
         # (if proposed_fields itself supplied aliases, we'd union).
         new_aliases = list(existing_aliases)
+        new_aliases_lower = set(existing_aliases_lower)
         if "aliases" in merge_set:
             # Merge proposed aliases first, then append the proposal name.
             proposed_aliases = merge_set["aliases"] or []
             if isinstance(proposed_aliases, list):
                 for a in proposed_aliases:
                     sa = str(a)
-                    if sa and sa not in new_aliases:
+                    sa_lower = sa.strip().lower()
+                    if sa and sa_lower not in new_aliases_lower:
                         new_aliases.append(sa)
+                        new_aliases_lower.add(sa_lower)
         new_aliases.append(name)
+        new_aliases_lower.add(name_lower)
         merge_set["aliases"] = new_aliases
         aliases_added.append(name)
         if "aliases" not in filled_fields:
@@ -1069,7 +1087,6 @@ def _append_person_merge_log_entry(
     handler, so concurrent merges in practice never happen — but the
     pattern matches Salem's other append-only vault writers.
     """
-    import frontmatter as _frontmatter
     file_path = vault_path / _PERSON_MERGE_LOG_REL_PATH
 
     timestamp = _now_iso()
@@ -1126,9 +1143,9 @@ def _append_person_merge_log_entry(
             "merged into an existing person record. Stage 1 (2026-05-15) "
             "covers the person record type only.\n"
         )
-        post = _frontmatter.Post(bootstrap_body, **bootstrap_fm)
+        post = frontmatter.Post(bootstrap_body, **bootstrap_fm)
         file_path.write_text(
-            _frontmatter.dumps(post) + "\n",
+            frontmatter.dumps(post) + "\n",
             encoding="utf-8",
         )
 

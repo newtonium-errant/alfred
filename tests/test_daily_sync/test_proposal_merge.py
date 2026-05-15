@@ -430,53 +430,142 @@ def test_merge_alias_fallback_when_direct_match_misses(
 def test_merge_adds_proposal_name_to_aliases_when_different(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    """Proposal name differs from existing record's ``name`` and isn't
-    already aliased — the proposal name gets appended to ``aliases``."""
+    """Proposal name differs from the merge target's canonical ``name``
+    field AND isn't already aliased — the proposal name gets appended
+    to ``aliases``.
+
+    Setup: direct match SUCCEEDS but returns a record whose ``name``
+    frontmatter field differs from the filename (legitimate state —
+    operator renamed the canonical ``name`` without renaming the
+    file, or vice versa). Filename is ``Benjamin McMillan.md`` so
+    ``vault_create`` raises File-already-exists; the direct
+    ``vault_read`` returns the record with ``name="Ben McMillan"``,
+    aliases=["Benjamin", "Ben M."]. Proposal name "Benjamin McMillan"
+    differs from the record's ``name`` AND isn't in aliases — so the
+    addition path fires.
+
+    This is the test that previously self-admitted (pre-WARN-1 fix)
+    that the setup didn't actually exercise the alias-addition path;
+    rewritten here to genuinely cover it.
+    """
     vault = _make_vault(tmp_path)
     cfg = _config(tmp_path)
     queue_path = tmp_path / "proposals.jsonl"
     _patch_proposals_queue_path(monkeypatch, queue_path)
 
-    # Existing person with NO aliases.
-    _seed_person(vault, name="Alexander Newton", role="CEO")
-
-    # Seed a stub at the proposal's direct path so vault_create raises
-    # File-already-exists.
-    (vault / "person" / "Alex Newton.md").write_text(
-        "---\ntype: person\nname: Alex Newton\n---\n",
+    # Direct-path stub whose ``name`` frontmatter differs from the
+    # filename. vault_create raises File-already-exists; the direct
+    # vault_read succeeds and returns this stub as the merge target.
+    direct_path = vault / "person" / "Benjamin McMillan.md"
+    direct_path.write_text(
+        "---\n"
+        "type: person\n"
+        "name: Ben McMillan\n"           # name field differs from filename
+        "aliases:\n  - Benjamin\n  - Ben M.\n"
+        "tags: []\n"
+        "related: []\n"
+        "created: 2026-04-01\n"
+        "---\n",
         encoding="utf-8",
     )
 
-    correlation_id = "hypatia-propose-person-alex"
-    proposed_fields = {"role": "CEO"}
+    correlation_id = "hypatia-propose-person-benjamin"
+    proposed_fields = {"role": "Lead developer"}
     _seed_proposals_queue(
         queue_path, correlation_id=correlation_id,
-        record_type="person", name="Alex Newton",
+        record_type="person", name="Benjamin McMillan",
         proposed_fields=proposed_fields,
     )
     _seed_proposal_state(
         cfg, item_number=1, correlation_id=correlation_id,
-        record_type="person", name="Alex Newton",
+        record_type="person", name="Benjamin McMillan",
         proposed_fields=proposed_fields,
     )
 
-    # No selective patch — direct vault_read on "Alex Newton.md"
-    # SUCCEEDS (we wrote a stub). The merge merges into the stub
-    # record, and aliases get added.
     result = handle_daily_sync_reply(
         cfg, parent_message_id=100, reply_text="1 confirm",
         vault_path=vault, instance_scope="talker",
     )
     assert result is not None
-    assert result["confirmed_count"] == 1
+    assert result["confirmed_count"] == 1, result.get("unparsed")
 
-    # Stub's name is "Alex Newton" — proposal name matches, so no
-    # alias addition on the stub. This test was meant to verify the
-    # alias-addition path; with the direct-match-wins behavior we
-    # need a different setup. Verify role was filled instead.
-    post = frontmatter.load(str(vault / "person" / "Alex Newton.md"))
-    # Stub had no role; proposal filled it.
-    assert post.metadata.get("role") == "CEO"
+    # Proposal name "Benjamin McMillan" got appended to the merge
+    # target's aliases (it differs from name="Ben McMillan" and
+    # wasn't already in the aliases list).
+    post = frontmatter.load(str(direct_path))
+    aliases_after = post.metadata.get("aliases") or []
+    assert "Benjamin McMillan" in aliases_after, aliases_after
+    # Pre-existing aliases survive the merge.
+    assert "Benjamin" in aliases_after
+    assert "Ben M." in aliases_after
+    # Role was empty pre-merge; proposal filled it.
+    assert post.metadata.get("role") == "Lead developer"
+
+
+def test_merge_alias_addition_case_insensitive_uniqueness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """WARN-1 regression pin: alias-addition uniqueness is case-
+    insensitive. Existing ``aliases=["ben"]`` + proposal ``name="Ben"``
+    → no duplicate variant added (the addition check must mirror the
+    case-insensitive lookup semantic, otherwise we'd get
+    ``aliases=["ben", "Ben"]``)."""
+    vault = _make_vault(tmp_path)
+    cfg = _config(tmp_path)
+    queue_path = tmp_path / "proposals.jsonl"
+    _patch_proposals_queue_path(monkeypatch, queue_path)
+
+    # Direct-path stub: filename = "Ben.md", frontmatter name =
+    # "Benjamin Carter" (so name differs from proposal), aliases
+    # = ["ben"] (lowercase). Proposal name "Ben" matches the alias
+    # case-insensitively — the case-sensitive ``name not in aliases``
+    # would have added a duplicate "Ben" variant pre-fix.
+    direct_path = vault / "person" / "Ben.md"
+    direct_path.write_text(
+        "---\n"
+        "type: person\n"
+        "name: Benjamin Carter\n"
+        "aliases:\n  - ben\n"
+        "tags: []\n"
+        "related: []\n"
+        "created: 2026-04-01\n"
+        "---\n",
+        encoding="utf-8",
+    )
+
+    correlation_id = "hypatia-propose-person-case-ben"
+    proposed_fields = {"role": "Drummer"}
+    _seed_proposals_queue(
+        queue_path, correlation_id=correlation_id,
+        record_type="person", name="Ben",
+        proposed_fields=proposed_fields,
+    )
+    _seed_proposal_state(
+        cfg, item_number=1, correlation_id=correlation_id,
+        record_type="person", name="Ben",
+        proposed_fields=proposed_fields,
+    )
+
+    result = handle_daily_sync_reply(
+        cfg, parent_message_id=100, reply_text="1 confirm",
+        vault_path=vault, instance_scope="talker",
+    )
+    assert result is not None
+    assert result["confirmed_count"] == 1, result.get("unparsed")
+
+    post = frontmatter.load(str(direct_path))
+    aliases_after = post.metadata.get("aliases") or []
+    # Exactly one variant — no case-drift duplicate. Whichever
+    # variant the code preserves ("ben" or "Ben") is fine; the
+    # point is len == 1.
+    lower_variants = [a for a in aliases_after if a.lower() == "ben"]
+    assert len(lower_variants) == 1, (
+        f"expected single case-variant for 'ben'/'Ben', got "
+        f"{lower_variants!r} (full aliases: {aliases_after!r})"
+    )
+    # And the existing lowercase variant survived (the addition
+    # branch should have skipped, not replaced).
+    assert "ben" in aliases_after
 
 
 def test_merge_no_op_when_all_fields_already_match(
