@@ -1950,7 +1950,15 @@ def handle_daily_sync_reply(
     On a match, the result dict carries:
       - ``confirmed_count``: int — how many entries were written
         (sum across email + attribution + proposal + pending)
-      - ``unparsed``: list[str] — fragments the parser couldn't resolve
+      - ``unparsed``: list[str] — MIXED bucket of fragments the
+        dispatcher couldn't materialize: parse-shape failures AND
+        execution failures (scope-deny, vault_path missing, etc.).
+        Kept dual-purpose for backward compatibility with existing
+        programmatic consumers.
+      - ``execution_errors``: list[str] — SUBSET of ``unparsed``
+        carrying only the execution-failure strings (2026-05-16
+        addition). Always present, always a list, possibly empty —
+        consumers can branch without ``KeyError`` defense.
       - ``message``: str — confirmation text to reply with
       - ``all_ok``: bool
       - ``email_count``: int — email rows written
@@ -2335,6 +2343,19 @@ def handle_daily_sync_reply(
         "proposal_count": proposal_written,
         "pending_count": pending_written,
         "unparsed": errors,
+        # 2026-05-16 — NOTE-1 closeout. ``unparsed`` is a mixed bucket
+        # (both parse-shape failures and execution failures) for
+        # backward compatibility with existing programmatic consumers
+        # (n8n hooks, dashboards). ``execution_errors`` is the
+        # additive SIBLING field carrying ONLY the execution-failure
+        # subset that ``_bucket_resolver_error`` routed via the
+        # ``_is_verb_mismatch_error`` discriminator's execution-error
+        # branch (e.g., scope-deny strings from ``vault_create``,
+        # ``vault_path`` missing, peer-dispatch failures). Always a
+        # list (possibly empty), never missing — consumers can
+        # branch on ``result["execution_errors"]`` without
+        # ``KeyError`` defensive code.
+        "execution_errors": list(execution_errors),
         "message": body,
         "all_ok": parsed.all_ok,
     }

@@ -48,9 +48,15 @@ import pytest
 
 from alfred.daily_sync.config import AttributionConfig, DailySyncConfig
 from alfred.daily_sync.confidence import save_state
+from alfred.daily_sync.assembler import ReplyCorrection
 from alfred.daily_sync.reply_dispatch import (
+    _VERB_MISMATCH_MARKERS,
     _compose_calibration_hint,
     _is_verb_mismatch_error,
+    _resolve_attribution_correction,
+    _resolve_correction,
+    _resolve_pending_item_correction,
+    _resolve_proposal_correction,
     handle_daily_sync_reply,
 )
 from alfred.transport.canonical_proposals import (
@@ -503,3 +509,370 @@ def test_verb_mismatch_discriminator_rejects_item_not_in_batch():
     assert _is_verb_mismatch_error(
         "item 7 not in last batch"
     ) is False
+
+
+# --- NOTE-1 closeout (2026-05-16) -----------------------------------------
+# Sibling ``execution_errors`` field on the result dict — additive, doesn't
+# change the existing ``unparsed`` shape (which remains a mixed bucket for
+# backward compatibility with programmatic consumers). The new field carries
+# ONLY the execution-failure subset that the discriminator routed via the
+# execution-error branch, always a list (possibly empty), never missing.
+
+
+def test_result_dict_exposes_sibling_execution_errors_on_scope_deny(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Scope-deny scenario pins both fields independently.
+
+    Pre-NOTE-1: only ``result["unparsed"]`` carried the scope-deny string.
+    Programmatic consumers (n8n hooks, dashboards) had no clean way to
+    distinguish parse failures from execution failures without
+    re-implementing ``_is_verb_mismatch_error``. The sibling field
+    surfaces the execution subset directly.
+    """
+    vault = _make_vault(tmp_path)
+    cfg = _config(tmp_path)
+    queue_path = tmp_path / "proposals.jsonl"
+    _patch_proposals_queue_path(monkeypatch, queue_path)
+    _patch_vault_create_scope_deny(monkeypatch)
+
+    correlation_id = "hypatia-propose-person-scope-deny"
+    append_proposal(str(queue_path), Proposal(
+        correlation_id=correlation_id,
+        ts="2026-05-10T12:00:00+00:00",
+        state=STATE_PENDING,
+        proposer="hypatia",
+        record_type="person",
+        name="Ben McMillan",
+        proposed_fields={},
+        source="test",
+    ))
+    _seed_kalle_batch(cfg, correlation_id=correlation_id)
+
+    result = handle_daily_sync_reply(
+        cfg,
+        parent_message_id=74,
+        reply_text="1 confirm",
+        vault_path=vault,
+        instance_scope="kalle",
+        instance_name="kalle",
+    )
+    assert result is not None
+    # Both fields are populated with the same scope-deny string.
+    assert len(result["unparsed"]) == 1
+    assert "Scope 'kalle' may not create local 'person' records" in result["unparsed"][0]
+    assert "execution_errors" in result, (
+        "execution_errors must always be present, even on empty"
+    )
+    assert isinstance(result["execution_errors"], list)
+    assert len(result["execution_errors"]) == 1
+    assert "Scope 'kalle' may not create local 'person' records" in result["execution_errors"][0]
+    # Sibling field content matches the unparsed entry verbatim — same
+    # string, different bucket (execution_errors is the subset filter).
+    assert result["execution_errors"][0] == result["unparsed"][0]
+
+
+def test_result_dict_execution_errors_empty_list_on_pure_parse_failure(
+    tmp_path: Path,
+):
+    """Pure parse-failure scenario: ``unparsed`` populated, ``execution_errors`` empty.
+
+    Operator types a verb that doesn't apply to any batch item. The
+    parser routes through the verb-mismatch branch (which deserves the
+    calibration hint), NOT the execution-error branch. The sibling
+    field is an empty list — present (so consumers can branch without
+    ``KeyError`` defensive code), but empty.
+    """
+    cfg = _config(tmp_path)
+    save_state(cfg.state.path, {
+        "last_batch": {
+            "items": [],
+            "message_ids": [100],
+            "attribution_items": [_attribution_item(1, "inf-foo")],
+        },
+    })
+
+    # "1 high" — tier verb on an attribution item. Attribution resolver
+    # routes this as a verb-mismatch ("only accept" marker present).
+    result = handle_daily_sync_reply(
+        cfg,
+        parent_message_id=100,
+        reply_text="1 high",
+        vault_path=_make_vault(tmp_path),
+        instance_scope="kalle",
+        instance_name="kalle",
+    )
+    assert result is not None
+    # unparsed has the parse-shape failure string.
+    assert len(result["unparsed"]) == 1
+    assert "only accept" in result["unparsed"][0]
+    # execution_errors is present and empty — the discriminator
+    # correctly classified this as a verb-mismatch, NOT an execution
+    # failure.
+    assert "execution_errors" in result
+    assert result["execution_errors"] == []
+
+
+def test_result_dict_execution_errors_present_when_no_corrections(
+    tmp_path: Path,
+):
+    """``execution_errors`` is always present, even on an all_ok happy path.
+
+    The "always present, never missing" contract — programmatic
+    consumers can write ``if result["execution_errors"]:`` without
+    defensive ``.get(...)`` calls.
+    """
+    cfg = _config(tmp_path)
+    save_state(cfg.state.path, {
+        "last_batch": {
+            "items": [{
+                "item_number": 1,
+                "record_path": "note/A.md",
+                "classifier_priority": "medium",
+                "classifier_action_hint": None,
+                "classifier_reason": "test",
+                "sender": "a@example.com",
+                "subject": "x",
+                "snippet": "y",
+            }],
+            "message_ids": [100],
+        },
+    })
+    # all_ok shortcut — no per-item corrections at all.
+    result = handle_daily_sync_reply(
+        cfg, parent_message_id=100, reply_text="ok",
+    )
+    assert result is not None
+    assert "execution_errors" in result
+    assert result["execution_errors"] == []
+
+
+def test_result_dict_mixed_parse_and_execution_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Mixed scenario: 1 parse failure + 1 execution failure.
+
+    Reply has two corrections — one trips a verb-mismatch (attribution
+    item with a tier verb), one trips an execution failure (proposal
+    confirm where ``vault_create`` scope-denies). The sibling field
+    carries ONLY the execution-failure subset; ``unparsed`` carries both.
+    """
+    vault = _make_vault(tmp_path)
+    cfg = _config(tmp_path)
+    queue_path = tmp_path / "proposals.jsonl"
+    _patch_proposals_queue_path(monkeypatch, queue_path)
+    _patch_vault_create_scope_deny(monkeypatch)
+
+    correlation_id = "hypatia-propose-person-mixed"
+    append_proposal(str(queue_path), Proposal(
+        correlation_id=correlation_id,
+        ts="2026-05-10T12:00:00+00:00",
+        state=STATE_PENDING,
+        proposer="hypatia",
+        record_type="person",
+        name="Ben McMillan",
+        proposed_fields={},
+        source="test",
+    ))
+    _seed_kalle_batch(cfg, correlation_id=correlation_id)
+
+    # "1 confirm, 2 high" — item 1 is the proposal (scope-deny on
+    # vault_create → execution failure); item 2 is an attribution item
+    # with a tier verb (verb-mismatch → parse failure).
+    result = handle_daily_sync_reply(
+        cfg,
+        parent_message_id=74,
+        reply_text="1 confirm, 2 high",
+        vault_path=vault,
+        instance_scope="kalle",
+        instance_name="kalle",
+    )
+    assert result is not None
+    # ``unparsed`` has BOTH (mixed bucket — preserved for backward compat).
+    assert len(result["unparsed"]) == 2
+    # ``execution_errors`` has ONLY the scope-deny (subset filter).
+    assert len(result["execution_errors"]) == 1
+    assert "Scope 'kalle' may not create local 'person' records" in result["execution_errors"][0]
+    # The parse-failure string (attribution-only-accepts) is NOT in
+    # execution_errors — it's a verb-mismatch.
+    for err in result["execution_errors"]:
+        assert "only accept" not in err
+
+
+# --- NOTE-2 closeout (2026-05-16) -----------------------------------------
+# Parametrize-over-resolvers regression test for ``_VERB_MISMATCH_MARKERS``.
+#
+# The discriminator is substring-fragile by design — it matches specific
+# phrases in resolver error strings. If a future maintainer rewords a
+# resolver string (e.g., changes "only accepts X" to "is only valid for X"),
+# the discriminator would silently break and execution errors would
+# mis-route as parse failures. These tests pin "every resolver's verb-
+# mismatch error contains at least one marker." Future drift → test fires.
+
+
+def _bad_verb_for_attribution() -> ReplyCorrection:
+    """Tier verb on an attribution item — triggers the verb-mismatch gate.
+
+    Attribution resolver accepts ``ok`` / ``reject`` only. Setting
+    ``new_tier`` (e.g. operator said "1 high") with neither ``ok`` nor
+    ``reject`` trips the "attribution items only accept ..." branch.
+    """
+    return ReplyCorrection(item_number=1, new_tier="high")
+
+
+def _bad_verb_for_proposal() -> ReplyCorrection:
+    """Tier verb on a proposal item — triggers the verb-mismatch gate.
+
+    Proposal resolver accepts ``ok`` / ``reject`` only. Same shape as
+    attribution: a tier-only correction with neither flag set.
+    """
+    return ReplyCorrection(item_number=1, new_tier="low")
+
+
+def _bad_verb_for_pending() -> ReplyCorrection:
+    """Tier verb on a pending item — triggers the verb-mismatch gate.
+
+    Pending resolver accepts ``noted`` / ``show me`` only (mapped via
+    ``_resolution_id_from_correction``). A correction with only
+    ``new_tier`` set fails that mapping → "pending items only accept
+    `noted` or `show me`".
+    """
+    return ReplyCorrection(item_number=1, new_tier="high")
+
+
+def _attribution_resolver_call(
+    correction: ReplyCorrection, tmp_path: Path,
+) -> tuple[str | None, bool]:
+    """Drive ``_resolve_attribution_correction`` with a fixture item."""
+    return _resolve_attribution_correction(
+        correction,
+        item=_attribution_item(1, "inf-foo"),
+        vault_path=tmp_path / "vault",
+        corpus_path=str(tmp_path / "attribution_corpus.jsonl"),
+    )
+
+
+def _proposal_resolver_call(
+    correction: ReplyCorrection, tmp_path: Path,
+) -> tuple[str | None, bool]:
+    """Drive ``_resolve_proposal_correction`` with a fixture item."""
+    return _resolve_proposal_correction(
+        correction,
+        item=_proposal_item(1, "corr-bad-verb-test"),
+        vault_path=tmp_path / "vault",
+        proposals_queue_path=str(tmp_path / "proposals.jsonl"),
+        instance_scope="kalle",
+    )
+
+
+def _pending_resolver_call(
+    correction: ReplyCorrection, tmp_path: Path,
+) -> tuple[str | None, bool, str]:
+    """Drive ``_resolve_pending_item_correction`` with a fixture item."""
+    item = {
+        "item_number": 1,
+        "id": "pending-fixture-001",
+        "created_by_instance": "kalle",
+        "summary": "fixture",
+    }
+    return _resolve_pending_item_correction(
+        correction,
+        item,
+        self_instance="kalle",
+        raw_config=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "resolver_name,resolver_caller,bad_correction",
+    [
+        (
+            "_resolve_attribution_correction",
+            _attribution_resolver_call,
+            _bad_verb_for_attribution(),
+        ),
+        (
+            "_resolve_proposal_correction",
+            _proposal_resolver_call,
+            _bad_verb_for_proposal(),
+        ),
+        (
+            "_resolve_pending_item_correction",
+            _pending_resolver_call,
+            _bad_verb_for_pending(),
+        ),
+    ],
+)
+def test_all_resolvers_emit_verb_mismatch_markers_on_unknown_verb(
+    resolver_name: str,
+    resolver_caller,
+    bad_correction: ReplyCorrection,
+    tmp_path: Path,
+):
+    """Regression pin: every resolver's verb-mismatch error trips the discriminator.
+
+    The discriminator is substring-fragile (matches phrases like "only
+    accept" in resolver error strings). If a future maintainer rewords
+    a resolver string, this test fires before the discriminator
+    silently mis-routes execution errors. The pin walks each resolver,
+    feeds a deliberately-wrong-verb input, and asserts:
+
+    1. The resolver returns a non-None error string.
+    2. The error string trips ``_is_verb_mismatch_error`` (i.e. contains
+       at least one of ``_VERB_MISMATCH_MARKERS``).
+
+    Coverage: attribution, proposal, and pending resolvers — the 3
+    resolver-side verb-mismatch surfaces. Email and pending verb-
+    mismatches that live as inline dispatcher gates (not resolver
+    returns) are covered separately below.
+    """
+    returned = resolver_caller(bad_correction, tmp_path)
+    # Unpack the error string regardless of tuple arity (2-tuple for
+    # attribution/proposal, 3-tuple for pending).
+    error_str = returned[0]
+    assert error_str is not None, (
+        f"{resolver_name} returned no error on a bad-verb correction; "
+        f"if intentional, update the test fixture. Otherwise the "
+        f"verb-mismatch gate has drifted."
+    )
+    assert _is_verb_mismatch_error(error_str), (
+        f"{resolver_name} verb-mismatch error {error_str!r} "
+        f"doesn't trip _is_verb_mismatch_error — markers may have "
+        f"drifted. Either reword the resolver string to include one "
+        f"of {_VERB_MISMATCH_MARKERS!r} or extend the marker tuple."
+    )
+
+
+def test_inline_dispatcher_email_reject_emits_verb_mismatch_marker():
+    """Inline dispatcher gate: email + ``reject`` verb → verb-mismatch.
+
+    The email-section verb-mismatch lives in the dispatch loop (not in
+    ``_resolve_correction``) — line ~2151 in reply_dispatch.py. This
+    test pins the literal string emitted by that gate against the
+    discriminator, mirroring the parametrize pattern above for the
+    inline surfaces. If the inline string gets reworded without the
+    discriminator marker tuple being updated, this fires.
+    """
+    inline_err = (
+        "item 1: `reject` is only meaningful for attribution items"
+    )
+    assert _is_verb_mismatch_error(inline_err), (
+        f"Inline email-reject gate string {inline_err!r} doesn't trip "
+        f"the discriminator — markers may have drifted."
+    )
+
+
+def test_inline_dispatcher_pending_reject_emits_verb_mismatch_marker():
+    """Inline dispatcher gate: pending + ``reject`` verb → verb-mismatch.
+
+    Mirrors the email-reject case for the other inline surface
+    (line ~2237 in reply_dispatch.py).
+    """
+    inline_err = (
+        "item 1: `reject` not meaningful — use `noted` to "
+        "close without action"
+    )
+    assert _is_verb_mismatch_error(inline_err), (
+        f"Inline pending-reject gate string {inline_err!r} doesn't "
+        f"trip the discriminator — markers may have drifted."
+    )
