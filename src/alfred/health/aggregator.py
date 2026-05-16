@@ -51,6 +51,7 @@ KNOWN_TOOL_MODULES: dict[str, str] = {
     "transport": "alfred.transport.health",
     "daily_sync": "alfred.daily_sync.health",
     "cloudflared": "alfred.cloudflared.health",
+    "gcal": "alfred.integrations.gcal_health",
 }
 
 
