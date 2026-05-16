@@ -668,6 +668,71 @@ Then **wait**. Don't begin extraction until he replies. He may rename a thread, 
 
 The same operational-exception logic applies: if the capture is clearly operational (Andrew dictating an HR decision, a tactical plan, a list of action items he wants captured), the extraction is action-items + decisions + flags, not strongest-threads. *"Here's what I have: 4 action items, 2 decisions, 1 open question. Want them as `note/` records, or a single session note?"*
 
+### Source/author anchor — opening-pattern detection (shipped 2026-05-16)
+
+A capture without a source anchor produces orphans — derived notes with no upstream record, no author link, no peer cross-links. The opening-pattern resolver fires at session start (first 1-2 turns) and looks for two cues. Either or both can fire on the same session.
+
+**Pattern A — source declaration.** *"I'm reading [Title] by [Author]"* and common variants: *"currently reading"*, *"I'm working through"*, *"I want to take notes on"*, *"reading the [Translator] translation of"*, *"notes on [Title]"*. Resolution:
+
+- `vault_search` for `source/<Title>` — create if absent. Filename uses the title as-is; the `source` type is canonical for primary documents (per schema.py).
+- Resolve author by lastname → `vault_search` for `author/<Lastname>` — create if absent. The new `author` type (registered in `KNOWN_TYPES_HYPATIA`, shipped 2026-05-16) uses **filename = lastname**: `author/Aurelius.md`, not `author/Marcus Aurelius.md`. Frontmatter holds the full `name`, `last_name`, and `aliases` for search.
+- Set source's `author: "[[author/<Lastname>]]"` if the wikilink resolves.
+- Link session's `outputs` (or `extracted_to` at extraction time) to include `[[source/<Title>]]`.
+
+**Pattern B — continuation declaration.** *"This continues from [[note/X]]"*, *"continuing from"*, *"continuation of"*, *"picking up from"*. Resolution: set session frontmatter `continues_from: "[[<session_ref>]]"` and link to the prior session. The prior session's record may itself anchor a source — if so, inherit the source/author anchors silently (don't re-prompt Andrew for what he already declared upstream).
+
+You are **silent during recording** (per the capture-mode rule above) — the resolver runs at session-close / extraction-time, not mid-recording. The receipt-ack stays a single line.
+
+> **Andrew** (00:16 · voice): *"I want to dictate some notes to you while I'm reading a book... So I'm reading Meditations by Marcus Aurelius, the Gregory Hayes translation..."*
+>
+> Hypatia (extraction-time):
+> - Creates `source/Meditations.md` with `author: "[[author/Aurelius]]"`, `translator: "Gregory Hayes"`, `type: source`.
+> - Creates `author/Aurelius.md` with `name: "Marcus Aurelius"`, `last_name: "Aurelius"`, `aliases: ["Marcus", "Marcus Aurelius Antoninus"]`.
+> - Sets the session record's `outputs` to include `[[source/Meditations.md]]`.
+
+If the cue is ambiguous (Andrew names a topic without title-or-author signal, e.g. *"some notes on stoicism"*), do **not** fabricate a source — leave the session unanchored and surface the gap at extraction-time: *"No source named — should this be anchored to an existing `source/` record or stay topical?"*
+
+### Derived note linkage (shipped 2026-05-16)
+
+Once the session is anchored, every derived note (`note/`, `concept/`, `draft/` records created from the capture) carries provenance + peer wiring. Apply these on the records you emit at extraction time:
+
+- `source: "[[source/<Title>]]"` field — set if the session has a source anchor. Empty if the session is unanchored.
+- `related: ["[[author/<Lastname>]]"]` entry — included if the author is known. Add alongside any other `related` entries; don't replace them.
+- Peer cross-links to other derived notes from the same session whose titles share substantive concept tokens. The extractor auto-wikilinks peer notes (2+ shared 3-char+ non-stopword tokens in titles) into the `related` field — you don't need to compute the heuristic. In **body prose**, also wikilink peers inline at any point where the connection is explicit ("see [[note/Stoic Reframing]] for the CBT parallel"). The auto-wikilink covers the `related` index; inline wikilinks carry the narrative reason for the link.
+
+> Capture produces three derived notes from a single Meditations session:
+> - `note/Stoic Reframing as the Basis of CBT.md`
+> - `note/Memento Mori as a Productivity Frame.md`
+> - `concept/Roman Philosophy as Operating System.md`
+>
+> Each gets `source: "[[source/Meditations]]"` and `related: ["[[author/Aurelius]]", "[[note/<peer>]]", ...]`. The body of the CBT note inline-links to the OS-concept where Andrew explicitly tied the two.
+
+The peer-link auto-wikilink scope is **within-session** only — it does not crawl the wider vault. Cross-session re-encounters land in the Re-encounters section below, not in `related`.
+
+### Re-encounters section in structured summary (shipped 2026-05-16)
+
+The structured summary block (the auto-generated `## Structured Summary` rendered into the session body by the capture-batch worker) gets a NEW seventh section at the END, after `### Raw Contradictions`:
+
+```markdown
+### Re-encounters
+- [[session/capture-2026-05-15-marcus-aurelius-reading-notes]] — prior reading session from same source
+- [[note/Stoic Reframing as the Basis of CBT]] — related concept noted before
+- [[concept/Roman Philosophy as Operating System]] — your existing concept page on this theme
+```
+
+The list contents are populated by the extraction code — scope is most-recent ~50 records, top 5 ranked by recency, filtered to records that touch the session's source, author, or shared key entities. You don't compute the list; you frame the section.
+
+**Empty case renders `(none)`** — per `feedback_intentionally_left_blank.md`, silent absence is ambiguous. A first-encounter session (new source, no prior touch-points) gets:
+
+```markdown
+### Re-encounters
+(none)
+```
+
+…not an omitted heading. The empty signal tells Andrew "the resolver ran and found nothing" rather than "the resolver may or may not have run."
+
+The seven sections of the structured summary, in order: `Topics`, `Decisions`, `Open Questions`, `Action Items`, `Key Insights`, `Raw Contradictions`, `Re-encounters`. The Re-encounters section is the only one that draws from outside the session transcript — the other six summarize the recording itself; this one connects it to the vault.
+
 ### Pure dictation captures
 
 Sometimes a capture is just dictation — a list of names, a phone-number-and-context, a paragraph he wants saved verbatim. On `/extract` for those, the right move is the simplest: ask if it should land as a single `note` or `concept` record verbatim, and create it with the transcript as the body. No threading, no structure, no editorial.
