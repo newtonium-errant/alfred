@@ -36,7 +36,8 @@ class ScopeError(Exception):
 # |---------------|-----------|----------------------------------|-------------------------------|
 # | hypatia       | universal | note,concept,document,           | same set MINUS                |
 # |               |           | template,fiction-*,              | practice-session (history     |
-# |               |           | practice-session                 | preservation)                 |
+# |               |           | practice-session,zettel,MOC,     | preservation); memo not in    |
+# |               |           | question,research-pointer        | either matrix (write-once)    |
 # | talker(Salem) | universal | note,task,event(no-gcal-id)      | same — but refuses if         |
 # |               |           |                                  | event has gcal_event_id       |
 # | kalle         | universal | note,decision,principle,         | same set                      |
@@ -408,6 +409,23 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
             "fiction-voice": True,
             "fiction-character": True,
             "practice-session": True,
+            # Zettelkasten schema cutover (2026-05-16, Phase 1).
+            # ``zettel``, ``MOC``, ``question``, ``research-pointer``
+            # all evolve over time — zettels accrue Notes paragraphs
+            # and refined Premise content; MOCs accrue hierarchical
+            # Contents trees; questions accrue Exploration notes and
+            # an eventual Answer; research-pointers accrue progress
+            # Notes. Anchored mid-document insertion is the right tool
+            # for all four growth shapes.
+            #
+            # ``memo`` deliberately OMITTED — memos are fleeting
+            # single-thought captures, write-once by definition. If a
+            # memo needs more substance, the operator promotes it to
+            # a zettel (a new record, not a body rewrite).
+            "zettel": True,
+            "MOC": True,
+            "question": True,
+            "research-pointer": True,
         },
         "allow_body_replace": {
             "note": True,
@@ -436,6 +454,18 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
             "voice": True,
             "voice-cluster": True,
             "method": True,
+            # Zettelkasten schema cutover (2026-05-16, Phase 1). Same
+            # rationale as the insert_at matrix above — zettels / MOCs /
+            # questions / research-pointers are operator-curated
+            # documents that legitimately need full-body rewrites
+            # (e.g. operator refines a zettel's Premise + Notes
+            # together, or restructures a MOC's Contents tree from
+            # flat to hierarchical). Memo deliberately OMITTED —
+            # write-once by design.
+            "zettel": True,
+            "MOC": True,
+            "question": True,
+            "research-pointer": True,
         },
     },
     # Instructor executes natural-language directives parked in the
@@ -555,6 +585,25 @@ HYPATIA_CREATE_TYPES: set[str] = {
     # initiated /method-source workflows. Salem has no use case for
     # this type. Keep in sync with ``KNOWN_TYPES_HYPATIA`` in schema.py.
     "author",
+    # Zettelkasten schema cutover (2026-05-16, Phase 1). Five new
+    # Hypatia-only types per ``project_hypatia_zettelkasten_redesign.md``
+    # "LOCKED IMPLEMENTATION PLAN". Keep in sync with
+    # ``KNOWN_TYPES_HYPATIA`` in schema.py — drift between the two
+    # would surface as "type accepted by validator, rejected by scope"
+    # or vice versa.
+    #
+    #   - ``memo``            — capture-mode auto-branch path. Created
+    #                           by Hypatia at session-close when the
+    #                           capture session has <=1 user message.
+    #   - ``zettel``          — capture-mode multi-message extraction
+    #                           target (replaces ``note/`` for Hypatia
+    #                           captures). Operator-curated subsequently.
+    #   - ``MOC``             — Maps of Content. Operator-led; Hypatia
+    #                           auto-creates members in response to
+    #                           ``# Indexing & MOCs`` wikilinks.
+    #   - ``question``        — elevated atomic question records.
+    #   - ``research-pointer`` — elevated atomic research actions.
+    "memo", "zettel", "MOC", "question", "research-pointer",
 }
 
 

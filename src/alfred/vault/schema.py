@@ -93,6 +93,47 @@ KNOWN_TYPES_HYPATIA: set[str] = {
     # tolerated for backward compatibility with pre-2026-05-16 source
     # records (e.g. ``author: Carlo Atendido``).
     "author",
+    # Zettelkasten schema cutover (2026-05-16, Phase 1) — five new
+    # Hypatia-only types per ``project_hypatia_zettelkasten_redesign.md``
+    # "LOCKED IMPLEMENTATION PLAN":
+    #
+    #   - ``memo``            — fleeting single-thought capture.
+    #                           Created by capture-mode auto-branch when
+    #                           a session has <=1 user message at /end
+    #                           (the "I just had this thought" path that
+    #                           doesn't warrant a structured extraction).
+    #   - ``zettel``          — atomic Zettelkasten records: synthesis /
+    #                           category / definitional sub-shapes all
+    #                           covered by one flexible template (type-
+    #                           minimalism guardrail). Capture-mode multi-
+    #                           message extraction targets ``zettel/``
+    #                           instead of the prior ``note/`` default.
+    #                           Operator curates after first auto-creation.
+    #   - ``MOC``             — Maps of Content. Topic organizers with
+    #                           hierarchical Contents trees. Mixed-case
+    #                           ``MOC`` literal preserved per Andrew's
+    #                           existing convention (``Practical Stoicism
+    #                           MOC.md`` etc.). Operator-led; Hypatia
+    #                           maintains member lists.
+    #   - ``question``        — elevated atomic question records,
+    #                           spawned from inline ``# Follow Up
+    #                           Questions`` sections in source/zettel
+    #                           records when the question deserves
+    #                           tracking as its own atom. Status set
+    #                           (open/refined/answered/superseded)
+    #                           tracks lifecycle.
+    #   - ``research-pointer`` — elevated atomic research action,
+    #                            spawned from inline ``# Research Ideas``
+    #                            similarly. Status set
+    #                            (open/in-progress/completed/dropped)
+    #                            tracks lifecycle.
+    #
+    # All five are Hypatia-only. Salem (operational) and KAL-LE (coding)
+    # do not produce or consume these types. Per the type-minimalism
+    # principle, no per-shape sub-types — shape diversity (synthesis vs
+    # category vs definitional zettel; book vs conversation vs podcast
+    # source) lives in SKILL-layer templates, not the schema.
+    "memo", "zettel", "MOC", "question", "research-pointer",
 }
 
 
@@ -212,6 +253,39 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     # ``Smith.md`` records resolved by the operator) — the merged
     # record is kept for audit so existing wikilinks don't dangle.
     "author": {"active", "merged"},
+    # Zettelkasten schema cutover (2026-05-16, Phase 1).
+    #
+    # ``zettel``: loose status set (for category-shape Z's that use a
+    # status header like "Seen, Unvalidated" — Andrew's existing
+    # convention). Most zettels (synthesis + definitional shapes)
+    # carry no status at all; ``_validate_status`` returns silently
+    # when status is empty. The three values cover lifecycle for the
+    # category-shape: ``open`` (initial), ``refined`` (operator-edited
+    # toward stability), ``superseded`` (replaced via the supersede-
+    # by-default opinion-drift pattern). Future shape-specific
+    # vocabularies (e.g. "Seen, Unvalidated" / "Validated" /
+    # "Contested" per OQ-20) are SKILL-layer body-content choices,
+    # not schema-layer status enums.
+    "zettel": {"open", "refined", "superseded"},
+    # ``question``: lifecycle for elevated atomic question records.
+    # ``open`` → newly elevated; ``refined`` → operator iterated the
+    # question text; ``answered`` → resolution linked via
+    # ``answered_by`` wikilink (typically a zettel); ``superseded`` →
+    # replaced by a sharper question.
+    "question": {"open", "refined", "answered", "superseded"},
+    # ``research-pointer``: lifecycle for elevated atomic research
+    # actions. ``open`` → newly elevated; ``in-progress`` → operator
+    # actively researching; ``completed`` → produced one or more
+    # records (linked via ``produces``); ``dropped`` → operator
+    # decided not to pursue.
+    "research-pointer": {"open", "in-progress", "completed", "dropped"},
+    # ``memo``: NO entry. Memos are transient single-thought captures
+    # — lifecycle is implicit (the record exists; nothing more is
+    # tracked). ``_validate_status`` returns silently for types not
+    # in STATUS_BY_TYPE, so memo records can omit ``status`` from
+    # frontmatter entirely.
+    # ``MOC``: NO entry. MOCs are organizational artifacts curated by
+    # the operator; no lifecycle-state matters at the schema level.
 }
 
 # Type → expected top-level directory
@@ -281,6 +355,18 @@ TYPE_DIRECTORY: dict[str, str] = {
     # check fires the disambiguation prompt when two authors share a
     # last name.
     "author": "author",
+    # Zettelkasten schema cutover (2026-05-16, Phase 1) — each type
+    # routes to a top-level directory of the same name. The ``MOC``
+    # mixed-case literal preserves Andrew's existing convention
+    # (``MOC/Practical Stoicism MOC.md``); WSL ext4 is case-sensitive
+    # so this is unambiguous on the running filesystem. ``research-
+    # pointer`` keeps its hyphen — directory names tolerate hyphens
+    # and the type name is already hyphenated.
+    "memo": "memo",
+    "zettel": "zettel",
+    "MOC": "MOC",
+    "question": "question",
+    "research-pointer": "research-pointer",
     # session, input have flexible placement
 }
 

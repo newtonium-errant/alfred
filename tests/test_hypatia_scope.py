@@ -151,6 +151,14 @@ def test_hypatia_create_types_shape() -> None:
         # mode opening-pattern resolver ("I'm reading X by Y"); explicit
         # operator workflows can also create them. Hypatia-only.
         "author",
+        # 2026-05-16 Zettelkasten schema cutover (Phase 1). Five new
+        # Hypatia-only types per project_hypatia_zettelkasten_redesign.md
+        # "LOCKED IMPLEMENTATION PLAN": memo (fleeting captures),
+        # zettel (atomic Zettelkasten records), MOC (Maps of Content),
+        # question (elevated atomic questions), research-pointer
+        # (elevated atomic research actions). Capture-mode multi-message
+        # extraction now targets zettel/ instead of note/.
+        "memo", "zettel", "MOC", "question", "research-pointer",
     }
 
 
@@ -187,6 +195,9 @@ def test_known_types_hypatia_is_separate_set() -> None:
         # Hypatia-only; indexes works by author. Keep in sync with
         # HYPATIA_CREATE_TYPES above.
         "author",
+        # 2026-05-16 Zettelkasten schema cutover (Phase 1). Same five
+        # types as the HYPATIA_CREATE_TYPES pin above — keep in sync.
+        "memo", "zettel", "MOC", "question", "research-pointer",
     }
     for t in schema.KNOWN_TYPES_HYPATIA:
         assert t not in schema.KNOWN_TYPES, (
