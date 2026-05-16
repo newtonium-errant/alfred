@@ -7,6 +7,14 @@ mode: quick
 name: Alfred BIT 2026-05-15
 overall_status: ok
 process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-15.md
+  source_anchor: run Alfred BIT 2026-05-15
+  target: process/Alfred BIT 2026-05-16.md
+  target_anchor: run Alfred BIT 2026-05-16
+  type: related-to
 started: '2026-05-15T05:55:02.090694-03:00'
 status: completed
 tags:

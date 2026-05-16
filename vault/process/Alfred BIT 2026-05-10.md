@@ -1,6 +1,6 @@
 ---
 alfred_tags:
-- alfred/bit
+- testing/alfred-bit
 created: '2026-05-10'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — [[process/Alfred BIT]] parent process record does not exist
