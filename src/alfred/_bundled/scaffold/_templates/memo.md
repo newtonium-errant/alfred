@@ -1,15 +1,13 @@
 ---
-type: author
+type: memo
 name: {{title}}
 created: {{date}}
-aliases: []
+session: ""
 tags: []
 ---
 
-# Summary
+# Memo
 
-# Contents
+# Context
 
 # Tags
-
-# See Also

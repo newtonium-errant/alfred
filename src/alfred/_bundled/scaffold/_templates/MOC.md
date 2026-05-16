@@ -1,14 +1,16 @@
 ---
-type: author
+type: MOC
 name: {{title}}
 created: {{date}}
-aliases: []
+parent_mocs: []
 tags: []
 ---
 
-# Summary
+# Premise
 
 # Contents
+
+# Notes
 
 # Tags
 
