@@ -146,6 +146,11 @@ def test_hypatia_create_types_shape() -> None:
         # method/system profile. Per CLAUDE.md scope-first design — pin
         # the matrix here so widening it later is a deliberate edit.
         "essay", "voice", "voice-cluster", "method",
+        # 2026-05-16 capture-source-anchor arc — ``author`` type indexes
+        # works by author (filename = lastname). Created via the capture-
+        # mode opening-pattern resolver ("I'm reading X by Y"); explicit
+        # operator workflows can also create them. Hypatia-only.
+        "author",
     }
 
 
@@ -178,6 +183,10 @@ def test_known_types_hypatia_is_separate_set() -> None:
         # Drift between the two sets surfaces as "type accepted by
         # validator, rejected by scope" or vice versa.
         "essay", "voice", "voice-cluster", "method",
+        # 2026-05-16 capture-source-anchor arc — ``author`` type.
+        # Hypatia-only; indexes works by author. Keep in sync with
+        # HYPATIA_CREATE_TYPES above.
+        "author",
     }
     for t in schema.KNOWN_TYPES_HYPATIA:
         assert t not in schema.KNOWN_TYPES, (

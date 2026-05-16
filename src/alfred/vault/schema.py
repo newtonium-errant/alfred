@@ -85,6 +85,14 @@ KNOWN_TYPES_HYPATIA: set[str] = {
     #                        ``source`` record).
     # ``source`` (already in this set) acts as the leaf for /method-source.
     "essay", "voice", "voice-cluster", "method",
+    # Author (2026-05-16, capture-source-anchor arc) — index works by
+    # author. Filename = ``author/<last_name>.md``; ``last_name``
+    # frontmatter field is the lookup key. Records of type ``source``
+    # populate ``author`` as a wikilink (``[[author/<Lastname>]]``)
+    # when the source has a registered author; free-text values stay
+    # tolerated for backward compatibility with pre-2026-05-16 source
+    # records (e.g. ``author: Carlo Atendido``).
+    "author",
 }
 
 
@@ -198,6 +206,12 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
         "pending", "active", "superseded", "failed",
         "not-a-method",
     },
+    # Author records (2026-05-16). Status set is intentionally small:
+    # ``active`` is the default after creation; ``merged`` flags a
+    # record that was consolidated into another author entry (e.g. two
+    # ``Smith.md`` records resolved by the operator) — the merged
+    # record is kept for audit so existing wikilinks don't dangle.
+    "author": {"active", "merged"},
 }
 
 # Type → expected top-level directory
@@ -260,6 +274,13 @@ TYPE_DIRECTORY: dict[str, str] = {
     # entry so the ``.get(record_type, record_type)`` fallback routed
     # writes to the now-empty ``template/`` orphan directory.
     "template": "prose-templates",
+    # Author records (2026-05-16, capture-source-anchor arc) — routed
+    # to ``author/<last_name>.md`` via this entry. Author last name is
+    # the filename stem to keep ``Aurelius``, ``Smith``, ``Bar`` (after
+    # suffix stripping) collision-detectable; ``vault_create`` near-match
+    # check fires the disambiguation prompt when two authors share a
+    # last name.
+    "author": "author",
     # session, input have flexible placement
 }
 

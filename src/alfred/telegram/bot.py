@@ -770,6 +770,15 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             from pathlib import Path as _Path
             from alfred.audit import agent_slug_for
             batch_model = config.anthropic.model or "claude-sonnet-4-6"
+            # Capture-source-anchor (2026-05-16): pass the per-instance
+            # scope key so the orchestrator can fire the opening-pattern
+            # resolver (``I'm reading X by Y``) → source/author records.
+            # Empty string for non-Hypatia instances; their scopes don't
+            # carry the ``author`` create-allowlist entry today.
+            anchor_scope = (
+                "hypatia" if (config.instance.tool_set or "").lower() == "hypatia"
+                else ""
+            )
             asyncio.create_task(
                 capture_batch.process_capture_session(
                     client=client,
@@ -780,6 +789,7 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     send_follow_up=_send_follow_up,
                     short_id=short_id,
                     agent_slug=agent_slug_for(config),
+                    anchor_scope=anchor_scope,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — scheduling shouldn't block close reply

@@ -192,6 +192,29 @@ def _flatten_transcript(transcript: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _first_user_text(transcript: list[dict[str, Any]]) -> str:
+    """Return the first user turn's text content, or ``""``.
+
+    Local copy of :func:`session._first_user_text` to avoid the
+    cross-import (session.py imports from .state, .config; pulling it
+    in here for one helper would broaden the dependency surface). Same
+    contract: tolerates both string ``content`` and list-of-blocks
+    ``content`` shapes.
+    """
+    for turn in transcript:
+        if turn.get("role") != "user":
+            continue
+        content = turn.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    return str(block.get("text") or "")
+        return ""
+    return ""
+
+
 async def run_batch_structuring(
     client: Any,
     transcript: list[dict[str, Any]],
@@ -273,7 +296,11 @@ async def run_batch_structuring(
 # --- Rendering -----------------------------------------------------------
 
 
-def render_summary_markdown(summary: StructuredSummary) -> str:
+def render_summary_markdown(
+    summary: StructuredSummary,
+    *,
+    re_encounters_body: str = "",
+) -> str:
     """Render a :class:`StructuredSummary` as ``## Structured Summary`` markdown.
 
     Wrapped in ``<!-- ALFRED:DYNAMIC -->`` markers so the distiller can
@@ -283,6 +310,15 @@ def render_summary_markdown(summary: StructuredSummary) -> str:
     parser can rely on every heading being present, and makes "this
     session had no decisions" visually distinguishable from "we
     forgot to extract decisions".
+
+    ``re_encounters_body`` (2026-05-16, capture-source-anchor arc) is
+    the pre-rendered body of the new ``### Re-encounters`` 7th section
+    (excluding the heading itself). When empty, the section emits
+    ``(none)`` per ``feedback_intentionally_left_blank.md``. The
+    extraction-time helper
+    :func:`alfred.telegram.capture_source_anchor.render_re_encounters_section`
+    is the canonical producer; the orchestrator passes its output
+    here.
     """
     lines: list[str] = [SUMMARY_MARKER_START, "", "## Structured Summary", ""]
 
@@ -301,6 +337,13 @@ def render_summary_markdown(summary: StructuredSummary) -> str:
     _section("Action Items", summary.action_items)
     _section("Key Insights", summary.key_insights)
     _section("Raw Contradictions", summary.raw_contradictions)
+
+    # Re-encounters (7th section, at end). Pre-rendered body in,
+    # heading added here so the section shape matches its siblings.
+    lines.append("### Re-encounters")
+    body = re_encounters_body.strip() or "(none)"
+    lines.append(body)
+    lines.append("")
 
     lines.append(SUMMARY_MARKER_END)
     return "\n".join(lines).rstrip() + "\n"
@@ -369,6 +412,7 @@ async def write_summary_to_session_record(
     structured_flag: str,
     *,
     agent_slug: str = "salem",
+    extra_fields: dict[str, Any] | None = None,
 ) -> None:
     """Inject the summary block + flip ``capture_structured`` frontmatter.
 
@@ -394,6 +438,12 @@ async def write_summary_to_session_record(
     wrapping — there's no inferred prose, just a human-readable error.
     """
     set_fields: dict = {"capture_structured": structured_flag}
+    if extra_fields:
+        # Merge caller-supplied fields (e.g. ``source`` / ``author`` /
+        # ``continues_from`` wikilinks produced by the capture-source-
+        # anchor resolver). The caller's keys win — they reflect
+        # resolution decisions specific to this session-close.
+        set_fields.update(extra_fields)
     summary_to_write = summary_markdown
 
     if structured_flag == "true":
@@ -450,6 +500,7 @@ async def process_capture_session(
     short_id: str = "",
     *,
     agent_slug: str = "salem",
+    anchor_scope: str = "",
 ) -> None:
     """Top-level orchestrator — run batch pass, write summary, send follow-up.
 
@@ -467,7 +518,60 @@ async def process_capture_session(
     ``config.instance.name``) — forwarded to
     :func:`write_summary_to_session_record` so the attribution-audit
     entry carries the right agent.
+
+    ``anchor_scope`` (2026-05-16, capture-source-anchor arc) — when
+    non-empty, the orchestrator parses the first user turn for
+    ``I'm reading X by Y`` / ``This continues from [[X]]`` patterns
+    and resolves source/author records via the
+    :mod:`capture_source_anchor` module. The scope name is forwarded
+    to vault_create as the create-allowlist key. Default ``""``
+    preserves legacy behaviour for instances that don't carry the
+    ``author`` type (e.g. Salem).
     """
+    # Local import keeps this module's surface tight + avoids the
+    # capture_source_anchor module loading frontmatter eagerly during
+    # cold-start test imports.
+    from . import capture_source_anchor as _csa
+
+    # --- Anchor resolution (best-effort; never blocks the batch pass).
+    anchors: _csa.ResolvedAnchors | None = None
+    opening_text = ""
+    if anchor_scope:
+        opening_text = _first_user_text(transcript)
+        if opening_text:
+            try:
+                anchors = _csa.resolve_session_anchors(
+                    vault_path, opening_text, scope=anchor_scope,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "talker.capture.anchor_resolve_failed",
+                    session_rel_path=session_rel_path,
+                    error=str(exc),
+                )
+                anchors = None
+            else:
+                log.info(
+                    "talker.capture.anchors_resolved",
+                    session_rel_path=session_rel_path,
+                    source_wikilink=anchors.source_wikilink,
+                    author_wikilink=anchors.author_wikilink,
+                    continues_from=anchors.continues_from,
+                    source_created=anchors.source_created,
+                    author_created=anchors.author_created,
+                    author_ambiguous=anchors.author_ambiguous,
+                )
+
+    # Extra session-frontmatter fields written alongside the summary.
+    extra_fields: dict[str, Any] = {}
+    if anchors is not None:
+        if anchors.source_wikilink:
+            extra_fields["source"] = anchors.source_wikilink
+        if anchors.author_wikilink:
+            extra_fields["author"] = anchors.author_wikilink
+        if anchors.continues_from:
+            extra_fields["continues_from"] = anchors.continues_from
+
     try:
         summary = await run_batch_structuring(client, transcript, model)
     except Exception as exc:  # noqa: BLE001
@@ -481,6 +585,7 @@ async def process_capture_session(
             await write_summary_to_session_record(
                 vault_path, session_rel_path, failure_md, "failed",
                 agent_slug=agent_slug,
+                extra_fields=extra_fields,
             )
         except Exception as write_exc:  # noqa: BLE001
             log.warning(
@@ -502,11 +607,43 @@ async def process_capture_session(
                 )
         return
 
-    summary_md = render_summary_markdown(summary)
+    # Re-encounter scan — recency-capped vault search over source /
+    # author / topic terms. Failure is non-fatal; section renders
+    # ``(none)`` if the scan errors. Per
+    # ``feedback_intentionally_left_blank.md`` the section is always
+    # emitted so "no prior records" is distinguishable from "scan
+    # skipped".
+    re_encounters_body = "(none)"
+    if anchor_scope:
+        try:
+            rows = _csa.find_re_encounters(
+                vault_path,
+                source_wikilink=(anchors.source_wikilink if anchors else ""),
+                author_wikilink=(anchors.author_wikilink if anchors else ""),
+                topic_terms=list(summary.topics),
+                current_session_rel_path=session_rel_path,
+            )
+            re_encounters_body = _csa.render_re_encounters_section(rows)
+            log.info(
+                "talker.capture.re_encounters_scanned",
+                session_rel_path=session_rel_path,
+                hits=len(rows),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "talker.capture.re_encounters_failed",
+                session_rel_path=session_rel_path,
+                error=str(exc),
+            )
+
+    summary_md = render_summary_markdown(
+        summary, re_encounters_body=re_encounters_body,
+    )
     try:
         await write_summary_to_session_record(
             vault_path, session_rel_path, summary_md, "true",
             agent_slug=agent_slug,
+            extra_fields=extra_fields,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(

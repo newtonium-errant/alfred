@@ -178,6 +178,33 @@ def _load_session_record(
         return None
 
 
+def _wikilink_from_fm(value: Any) -> str:
+    """Coerce a frontmatter ``source`` / ``author`` field to a wikilink.
+
+    Tolerates the three legal shapes:
+        * Wikilink string ``"[[source/Meditations]]"`` → passed through.
+        * Bare wikilink-target ``"source/Meditations"`` → wrapped.
+        * Free-text (e.g. ``"Carlo Atendido"`` on legacy records) →
+          ignored; returns ``""`` because a free-text author isn't
+          a record reference and would create a broken wikilink.
+
+    Empty / None → ``""``.
+    """
+    if not value:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.startswith("[[") and text.endswith("]]"):
+        return text
+    # Plausible record path: contains a slash AND looks like
+    # ``<type>/<name>``. Bare strings without slashes are legacy free-
+    # text (e.g. ``author: Carlo Atendido``) — leave them alone.
+    if "/" in text and not text.startswith("http"):
+        return f"[[{text}]]"
+    return ""
+
+
 def _derived_notes_from_post(post: frontmatter.Post) -> list[str]:
     """Return the existing ``derived_notes`` list from frontmatter, or []."""
     raw = post.get("derived_notes")
@@ -320,6 +347,14 @@ async def extract_notes_from_capture(
 
     transcript_text = _extract_transcript_from_post(post)
 
+    # Capture-source-anchor (2026-05-16): read source/author wikilinks
+    # off the session frontmatter so derived notes can carry them in
+    # ``related``. The capture-batch orchestrator wrote these at
+    # session-close time when the opening turn matched
+    # ``I'm reading X by Y``.
+    source_wikilink = _wikilink_from_fm(post.get("source"))
+    author_wikilink = _wikilink_from_fm(post.get("author"))
+
     try:
         notes = await _call_extract_llm(
             client=client,
@@ -347,6 +382,7 @@ async def extract_notes_from_capture(
     notes = notes[:max_notes]
 
     created_paths: list[str] = []
+    created_titles: list[tuple[str, str]] = []  # (rel_path, original_title)
     for note in notes:
         name = str(note.get("name") or "").strip()
         body = str(note.get("body") or "").strip()
@@ -357,19 +393,33 @@ async def extract_notes_from_capture(
             continue
 
         full_body = _note_body(body, source_quote, session_rel)
+        # Compose ``related`` with source + author wikilinks. Peer cross-
+        # links are appended below once all notes in this session are
+        # created (we need every peer's vault path first).
+        related: list[str] = []
+        if source_wikilink:
+            related.append(source_wikilink)
+        if author_wikilink:
+            related.append(author_wikilink)
+
+        set_fields: dict[str, Any] = {
+            "created_by_capture": True,
+            "source_session": f"[[{session_rel}]]",
+            "confidence_tier": confidence_tier,
+        }
+        if related:
+            set_fields["related"] = related
+
         try:
             result = ops.vault_create(
                 vault_path,
                 "note",
                 name,
-                set_fields={
-                    "created_by_capture": True,
-                    "source_session": f"[[{session_rel}]]",
-                    "confidence_tier": confidence_tier,
-                },
+                set_fields=set_fields,
                 body=full_body,
             )
             created_paths.append(result["path"])
+            created_titles.append((result["path"], name))
         except ops.VaultError as exc:
             log.info(
                 "talker.extract.vault_create_failed",
@@ -378,6 +428,56 @@ async def extract_notes_from_capture(
                 error=str(exc),
             )
             continue
+
+    # Within-session cross-link pass. Computed AFTER all notes are
+    # created so every peer has a real vault path to wikilink against.
+    # Each note's ``related`` gets the peer wikilinks merged in
+    # (preserving the source/author entries that vault_create already
+    # wrote). When there are no qualifying peers, no edit fires —
+    # matches the conservative-by-default heuristic.
+    if len(created_titles) >= 2:
+        try:
+            # Local import to keep the capture_extract import surface tight.
+            from . import capture_source_anchor as _csa
+
+            cross_links = _csa.compute_peer_cross_links(created_titles)
+            if cross_links:
+                log.info(
+                    "talker.extract.cross_links_computed",
+                    session_rel_path=session_rel,
+                    links=len(cross_links),
+                )
+                # Source/author wikilinks computed earlier; merge into
+                # each note's related list with the peer links.
+                anchor_links = [
+                    link for link in (source_wikilink, author_wikilink) if link
+                ]
+                for rel_path, peer_links in cross_links.items():
+                    merged = list(anchor_links) + peer_links
+                    try:
+                        ops.vault_edit(
+                            vault_path,
+                            rel_path,
+                            set_fields={"related": merged},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.info(
+                            "talker.extract.cross_link_edit_failed",
+                            note_path=rel_path,
+                            error=str(exc),
+                        )
+            else:
+                log.info(
+                    "talker.extract.cross_links_none",
+                    session_rel_path=session_rel,
+                    notes=len(created_titles),
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "talker.extract.cross_links_failed",
+                session_rel_path=session_rel,
+                error=str(exc),
+            )
 
     if created_paths:
         try:
@@ -399,6 +499,8 @@ async def extract_notes_from_capture(
         "talker.extract.done",
         session_rel_path=session_rel,
         created=len(created_paths),
+        source_anchored=bool(source_wikilink),
+        author_anchored=bool(author_wikilink),
     )
     return ExtractResult(created_paths=created_paths)
 

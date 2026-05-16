@@ -549,6 +549,12 @@ HYPATIA_CREATE_TYPES: set[str] = {
     # between the two would surface as "type accepted by validator,
     # rejected by scope" or vice versa.
     "essay", "voice", "voice-cluster", "method",
+    # Author (2026-05-16, capture-source-anchor arc). Hypatia-only —
+    # author records index works by author, populated by capture-mode
+    # opening-pattern resolver (``I'm reading X by Y``) and operator-
+    # initiated /method-source workflows. Salem has no use case for
+    # this type. Keep in sync with ``KNOWN_TYPES_HYPATIA`` in schema.py.
+    "author",
 }
 
 
