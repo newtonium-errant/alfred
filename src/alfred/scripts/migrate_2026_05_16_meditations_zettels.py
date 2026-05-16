@@ -109,20 +109,22 @@ class MigrationPlan:
 # --- Plan discovery -------------------------------------------------------
 
 
-def identify_orphan_meditations_notes(vault: Path) -> list[Path]:
-    """Return the list of ``note/*.md`` records anchored to Meditations.
+def _scan_dir_for_meditations_anchor(vault: Path, subdir: str) -> list[Path]:
+    """Scan ``vault/<subdir>/*.md`` for records anchored to Meditations.
 
     Anchoring is detected by frontmatter ``source:`` matching one of
     :data:`_SOURCE_ANCHOR_FORMS` (wikilink, bare-target, or free-text).
 
-    Sorted by filename for deterministic output.
+    Sorted by filename for deterministic output. Returns ``[]`` when
+    the subdirectory doesn't exist (handles the case where ``zettel/``
+    hasn't been created yet on a fresh vault).
     """
-    note_dir = vault / "note"
-    if not note_dir.exists():
+    target_dir = vault / subdir
+    if not target_dir.exists():
         return []
 
     matches: list[Path] = []
-    for path in sorted(note_dir.glob("*.md")):
+    for path in sorted(target_dir.glob("*.md")):
         try:
             post = frontmatter.load(path)
         except Exception:
@@ -134,6 +136,29 @@ def identify_orphan_meditations_notes(vault: Path) -> list[Path]:
         if source_str in _SOURCE_ANCHOR_FORMS:
             matches.append(path)
     return matches
+
+
+def identify_orphan_meditations_notes(vault: Path) -> list[Path]:
+    """Return the list of ``note/*.md`` records anchored to Meditations.
+
+    Sorted by filename for deterministic output.
+    """
+    return _scan_dir_for_meditations_anchor(vault, "note")
+
+
+def identify_migrated_meditations_zettels(vault: Path) -> list[Path]:
+    """Return the list of ``zettel/*.md`` records anchored to Meditations.
+
+    Bug-fix companion to :func:`identify_orphan_meditations_notes`:
+    after the migration runs, records live in ``zettel/`` (not
+    ``note/``). The idempotency-skip-detection path needs to ALSO scan
+    ``zettel/`` to recognise prior migrations on re-run, otherwise
+    ``already_migrated_titles`` is always empty post-migration and a
+    second invocation can't report the skipped state.
+
+    Sorted by filename for deterministic output.
+    """
+    return _scan_dir_for_meditations_anchor(vault, "zettel")
 
 
 def already_migrated(vault: Path, note_title: str) -> bool:
@@ -211,11 +236,24 @@ def find_wikilink_update_targets(
     migrated_titles: set[str],
     *,
     exclude_dirs: tuple[str, ...] = (".obsidian", ".trash"),
+    exclude_paths: tuple[Path | None, ...] = (),
 ) -> list[tuple[Path, int]]:
     """Scan all ``*.md`` files vault-wide and return paths that need
     wikilink updates, plus the count of replacements per file.
 
     ``exclude_dirs`` skips Obsidian system + trash folders.
+
+    ``exclude_paths`` skips specific files entirely. Used by the
+    orchestrator to exclude ``source/Meditations.md`` from the vault-
+    wide pass — that file is owned by :func:`update_source_permanent_notes`
+    so the counter accounting can separate body-section replacements
+    (counted under ``source_section_updates``) from generic vault-wide
+    rewrites (counted under ``wikilink_replacements``). Without the
+    exclusion, the source record's body wikilinks would get rewritten
+    twice: once at step 3 (vault-wide pass, no-op the second time but
+    counted in ``wikilink_replacements``) and again at step 4
+    (``update_source_permanent_notes``, finds zero remaining matches,
+    counted as 0 in ``source_section_updates``).
     """
     if not migrated_titles and not (vault / "author" / f"{LEGACY_AUTHOR_STEM}.md").exists():
         # Nothing to scan for — caller should bail early.
@@ -225,10 +263,21 @@ def find_wikilink_update_targets(
     if not patterns:
         return []
 
+    # Normalise excluded paths to a set of resolved absolute paths so
+    # the membership check works regardless of how the caller passed
+    # the path in. ``None`` entries are filtered (callers like
+    # ``build_plan`` may pass ``None`` when no source record exists).
+    exclude_resolved: set[Path] = {
+        p.resolve() for p in exclude_paths if p is not None
+    }
+
     targets: list[tuple[Path, int]] = []
     for path in sorted(vault.rglob("*.md")):
         # Skip excluded directories.
         if any(part in exclude_dirs for part in path.parts):
+            continue
+        # Skip excluded paths.
+        if path.resolve() in exclude_resolved:
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -368,7 +417,20 @@ def update_source_permanent_notes(
     source_path: Path, migrated_titles: set[str],
 ) -> int:
     """Update ``[[note/X]]`` → ``[[zettel/X]]`` in the ``## Permanent
-    Notes spawned`` section of source_path. Returns replacement count."""
+    Notes spawned`` section of source_path. Returns the count of body-
+    section replacements.
+
+    Also opportunistically rewrites the source record's frontmatter
+    ``author: [[author/Aurelius]]`` → ``[[author/Aurelius, Marcus]]``
+    if present. That rewrite is NOT counted in the return value — the
+    return is specifically the body-section counter that the
+    orchestrator surfaces as ``source_section_updates``. The author
+    frontmatter update is bundled here (rather than in the vault-wide
+    pass) because we deliberately exclude the source record from the
+    vault-wide pass so the body-section counter stays accurate.
+
+    Idempotent: re-running on an already-updated source is a no-op.
+    """
     if not source_path.exists():
         return 0
     try:
@@ -376,35 +438,73 @@ def update_source_permanent_notes(
     except Exception:
         return 0
 
+    original = text
+    body_section_total = 0
+
+    # 1. Body section — count ``[[note/<migrated-title>]]`` → ``[[zettel/...]]``
+    # replacements. This is the counter the test asserts on.
     match = _PERM_NOTES_SECTION.search(text)
-    if not match:
-        return 0
+    if match is not None:
+        section_body = match.group(1)
+        new_section_body = section_body
+        for title in migrated_titles:
+            old = f"[[note/{title}]]"
+            new = f"[[zettel/{title}]]"
+            count_for_title = section_body.count(old)
+            if count_for_title > 0:
+                new_section_body = new_section_body.replace(old, new)
+                body_section_total += count_for_title
+        if body_section_total > 0:
+            text = text[: match.start(1)] + new_section_body + text[match.end(1):]
 
-    section_body = match.group(1)
-    new_section_body = section_body
-    total = 0
-    for title in migrated_titles:
-        old = f"[[note/{title}]]"
-        new = f"[[zettel/{title}]]"
-        if old in new_section_body:
-            new_section_body = new_section_body.replace(old, new)
-            total += section_body.count(old)
-    if total == 0:
-        return 0
+    # 2. Frontmatter author wikilink — rewrite legacy
+    # ``[[author/Aurelius]]`` to ``[[author/Aurelius, Marcus]]``. This
+    # is the source record's own frontmatter author field, distinct
+    # from the body section above. Bundled here because the source is
+    # excluded from the vault-wide pass.
+    #
+    # NOT counted in the return value — the orchestrator's
+    # ``source_section_updates`` counter is specifically the body
+    # section, per the contract pinned by the end-to-end test.
+    legacy_link = f"[[author/{LEGACY_AUTHOR_STEM}]]"
+    canonical_link = f"[[author/{CANONICAL_AUTHOR_STEM}]]"
+    if legacy_link in text:
+        text = text.replace(legacy_link, canonical_link)
 
-    new_text = text[: match.start(1)] + new_section_body + text[match.end(1):]
-    source_path.write_text(new_text, encoding="utf-8")
-    return total
+    if text != original:
+        source_path.write_text(text, encoding="utf-8")
+
+    return body_section_total
 
 
 # --- Plan + apply orchestrator --------------------------------------------
 
 
 def build_plan(vault: Path) -> MigrationPlan:
-    """Discover everything that needs migrating. No vault writes."""
+    """Discover everything that needs migrating. No vault writes.
+
+    Two sources of ``already_migrated_titles`` evidence:
+
+      1. ``note/<title>.md`` AND ``zettel/<title>.md`` both exist —
+         partial-migration state where the move-step crashed after
+         the zettel was written but before the note was deleted. The
+         scan picks the title up via :func:`identify_orphan_meditations_notes`
+         and flags it via :func:`already_migrated`.
+      2. Only ``zettel/<title>.md`` exists (the common steady-state
+         after a successful prior migration). The scan picks the title
+         up via :func:`identify_migrated_meditations_zettels` — this
+         catches re-run-after-success cases that the note/ scan
+         can't see (the note is gone).
+
+    Both shapes deduplicate into ``plan.already_migrated_titles``.
+    The vault-wide wikilink-update pass uses the union of all known
+    Meditations titles so any lingering ``[[note/<title>]]`` references
+    get rewritten regardless of which path detected them.
+    """
     plan = MigrationPlan()
 
-    # Identify orphan Meditations notes.
+    # 1. Identify orphan Meditations notes still in note/. Partition into
+    # "needs move" vs. "already-migrated duplicate" (case 1 above).
     all_candidates = identify_orphan_meditations_notes(vault)
     for candidate in all_candidates:
         title = candidate.stem
@@ -413,17 +513,27 @@ def build_plan(vault: Path) -> MigrationPlan:
         else:
             plan.notes_to_move.append(candidate)
 
-    # Identify author rename.
+    # 2. Identify already-migrated zettels (case 2 above — the steady-
+    # state after a successful prior run). Dedupe with the note/-derived
+    # entries from step 1.
+    already_known: set[str] = set(plan.already_migrated_titles)
+    for zettel_path in identify_migrated_meditations_zettels(vault):
+        title = zettel_path.stem
+        if title not in already_known:
+            plan.already_migrated_titles.append(title)
+            already_known.add(title)
+
+    # 3. Identify author rename.
     plan.author_rename = identify_author_rename(vault)
 
-    # Source record path (if present).
+    # 4. Source record path (if present).
     source_rel = vault / "source" / f"{SOURCE_TITLE}.md"
     if source_rel.exists():
         plan.source_record = source_rel
 
-    # Wikilink targets — based on the notes that WILL move + the author
-    # rename. Already-migrated titles also count for wikilink updates
-    # (operators may have rewritten files that haven't propagated).
+    # 5. Wikilink targets — based on the notes that WILL move + every
+    # known migrated title (so lingering [[note/<title>]] references
+    # elsewhere in the vault get rewritten on re-run).
     migrated_titles: set[str] = set()
     for note_path in plan.notes_to_move:
         migrated_titles.add(note_path.stem)
@@ -432,6 +542,7 @@ def build_plan(vault: Path) -> MigrationPlan:
 
     plan.wikilink_update_targets = find_wikilink_update_targets(
         vault, migrated_titles,
+        exclude_paths=(plan.source_record,) if plan.source_record else (),
     )
 
     return plan
@@ -486,7 +597,9 @@ def print_plan(plan: MigrationPlan, vault: Path) -> None:
         print("  (not present — no Permanent Notes spawned section to update)")
     else:
         print(f"  {plan.source_record.relative_to(vault)}")
-        print(f"  (any ``## Permanent Notes spawned`` wikilinks will be rewritten)")
+        print(f"  (any ``## Permanent Notes spawned`` body wikilinks will be")
+        print(f"   rewritten; the source's frontmatter author wikilink will")
+        print(f"   also be updated to the canonical form)")
     print()
 
 
@@ -523,11 +636,18 @@ def apply_plan(plan: MigrationPlan, vault: Path) -> dict[str, int]:
     for title in plan.already_migrated_titles:
         migrated_titles.add(title)
 
-    # 3. Update wikilinks vault-wide. Re-scan to pick up any links
-    # inside files that may have been mutated by step 1/2 (rare —
-    # author/Aurelius.md was moved, but its OWN body might link
-    # back to a moved note).
-    refreshed_targets = find_wikilink_update_targets(vault, migrated_titles)
+    # 3. Update wikilinks vault-wide — EXCLUDING the source record.
+    # Re-scan to pick up any links inside files that may have been
+    # mutated by step 1/2 (rare — author/Aurelius.md was moved, but
+    # its OWN body might link back to a moved note). The source record
+    # is owned by step 4 (``update_source_permanent_notes``) so the
+    # ``source_section_updates`` counter accounting stays accurate;
+    # without the exclusion, step 3 would pre-emptively rewrite the
+    # body section and step 4 would find zero replacements left.
+    refreshed_targets = find_wikilink_update_targets(
+        vault, migrated_titles,
+        exclude_paths=(plan.source_record,) if plan.source_record else (),
+    )
     for path, _expected_count in refreshed_targets:
         applied = apply_wikilink_updates(path, migrated_titles)
         if applied > 0:
@@ -536,7 +656,11 @@ def apply_plan(plan: MigrationPlan, vault: Path) -> dict[str, int]:
             print(f"  wikilinks updated in {path.relative_to(vault)} "
                   f"({applied} replacement{'s' if applied != 1 else ''})")
 
-    # 4. Source record's Permanent Notes spawned section.
+    # 4. Source record — body's Permanent Notes spawned section + its
+    # own frontmatter author wikilink. ``update_source_permanent_notes``
+    # handles BOTH surfaces (the source is excluded from the vault-wide
+    # pass above) and returns ONLY the body-section counter — that's
+    # what ``source_section_updates`` reports.
     if plan.source_record is not None and migrated_titles:
         applied = update_source_permanent_notes(plan.source_record, migrated_titles)
         if applied > 0:
