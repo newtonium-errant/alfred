@@ -278,6 +278,42 @@ class TestHealthCheckIntegration:
         last = next(r for r in rollup.results if r.name == "last-successful-extraction")
         assert last.status == Status.OK
 
+    async def test_skips_when_distiller_section_absent(
+        self, tmp_path: Path,
+    ) -> None:
+        """KAL-LE peer-digest regression-pin (2026-05-16).
+
+        Instances that don't run distiller must surface a tool-level
+        SKIP rather than running probes against a config that has no
+        distiller section. Mirrors the gating in surveyor / brief /
+        mail / etc.
+
+        KAL-LE actually DOES run distiller in production, but
+        Hypatia / future instances may not — and the bug class is the
+        same: tool absent → probe must not consult an ageing state
+        file via the dataclass default path.
+        """
+        from alfred.distiller.health import health_check
+
+        rollup = await health_check({}, mode="quick")
+        assert rollup.status == Status.SKIP
+        assert rollup.results == []
+        assert "no distiller section" in (rollup.detail or "")
+
+    async def test_skips_when_only_other_sections_present(
+        self, tmp_path: Path,
+    ) -> None:
+        """Hypatia-shape config: vault + telegram present, distiller absent."""
+        from alfred.distiller.health import health_check
+
+        raw: dict[str, Any] = {
+            "vault": {"path": str(tmp_path)},
+            "telegram": {"bot_token": "test"},
+        }
+        rollup = await health_check(raw, mode="quick")
+        assert rollup.status == Status.SKIP
+        assert rollup.results == []
+
 
 # ---------------------------------------------------------------------------
 # _read_last_error — defensive dict-walking for the diagnostic field

@@ -309,7 +309,26 @@ def _check_last_successful_sweep(raw: dict[str, Any]) -> CheckResult:
 
 
 async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
-    """Run janitor health checks."""
+    """Run janitor health checks.
+
+    Returns SKIP at the tool level when the ``janitor:`` config section
+    is absent — the orchestrator gates janitor daemon startup on
+    ``"janitor" in raw`` (see ``orchestrator.py``'s tool-add loop), so
+    the probe mirrors that pattern. Without this gate, instances that
+    don't run janitor (e.g. KAL-LE) surface a stale
+    ``last-successful-sweep`` FAIL because the probe consults an
+    absent state file and sees an ageing dataclass default path. Per
+    ``feedback_intentionally_left_blank.md``: SKIP-with-detail
+    distinguishes "not configured for this instance" from "configured
+    but broken."
+    """
+    if raw.get("janitor") is None:
+        return ToolHealth(
+            tool="janitor",
+            status=Status.SKIP,
+            detail="no janitor section in config",
+        )
+
     results: list[CheckResult] = [
         _check_vault(raw),
         _check_state_file(raw),

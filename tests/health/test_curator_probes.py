@@ -310,3 +310,51 @@ class TestHealthCheckIntegration:
         last = next(r for r in rollup.results if r.name == "last-successful-process")
         # Quiet inbox + recent last_run → OK.
         assert last.status == Status.OK
+
+    async def test_skips_when_curator_section_absent(
+        self, tmp_path: Path,
+    ) -> None:
+        """KAL-LE peer-digest regression-pin (2026-05-16).
+
+        Instances that don't run curator (e.g. KAL-LE — surveyor watches
+        its inbox; no curator daemon) must surface a tool-level SKIP,
+        not a stale ``last-successful-process`` FAIL. Mirrors the
+        gating already in place on surveyor / brief / mail / etc.
+
+        Bug-of-record shape: KAL-LE's BIT showed
+        ``[ FAIL ] curator.last-successful-process`` for 5 days because
+        the probe consulted an absent state file via the dataclass
+        default path and treated the missing-file as "fresh install"
+        SKIP at the probe level — but ALSO ran ``_check_vault`` and
+        ``_check_backend`` which produced OK results. The rollup's
+        worst-of stayed OK on KAL-LE, but Salem's peer-digest pulled
+        KAL-LE's BIT record and the per-probe SKIP detail rendered as
+        a 'red — 1 fail' surface in the morning brief. Tool-level SKIP
+        ahead of any probe is the canonical fix.
+        """
+        from alfred.curator.health import health_check
+
+        rollup = await health_check({}, mode="quick")
+        assert rollup.status == Status.SKIP
+        assert rollup.results == []
+        assert "no curator section" in (rollup.detail or "")
+
+    async def test_skips_when_only_other_sections_present(
+        self, tmp_path: Path,
+    ) -> None:
+        """Defensive: raw has vault + surveyor but no curator → SKIP.
+
+        Specifically pins the KAL-LE config shape (surveyor configured,
+        curator absent) so a future refactor that conflates
+        ``vault`` / ``curator`` keys surfaces here rather than silently
+        on KAL-LE's morning brief.
+        """
+        from alfred.curator.health import health_check
+
+        raw: dict[str, Any] = {
+            "vault": {"path": str(tmp_path)},
+            "surveyor": {"watcher": {"debounce_seconds": 30}},
+        }
+        rollup = await health_check(raw, mode="quick")
+        assert rollup.status == Status.SKIP
+        assert rollup.results == []

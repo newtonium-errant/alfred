@@ -257,6 +257,38 @@ class TestHealthCheckIntegration:
         last = next(r for r in rollup.results if r.name == "last-successful-sweep")
         assert last.status == Status.OK
 
+    async def test_skips_when_janitor_section_absent(
+        self, tmp_path: Path,
+    ) -> None:
+        """KAL-LE peer-digest regression-pin (2026-05-16).
+
+        Instances that don't run janitor (e.g. KAL-LE) must surface a
+        tool-level SKIP rather than running probes against a config
+        that has no janitor section. Mirrors the gating in
+        surveyor / brief / mail / etc.
+        """
+        from alfred.janitor.health import health_check
+
+        rollup = await health_check({}, mode="quick")
+        assert rollup.status == Status.SKIP
+        assert rollup.results == []
+        assert "no janitor section" in (rollup.detail or "")
+
+    async def test_skips_when_only_other_sections_present(
+        self, tmp_path: Path,
+    ) -> None:
+        """KAL-LE-shape config: surveyor + distiller present, janitor absent."""
+        from alfred.janitor.health import health_check
+
+        raw: dict[str, Any] = {
+            "vault": {"path": str(tmp_path)},
+            "surveyor": {"watcher": {"debounce_seconds": 30}},
+            "distiller": {},
+        }
+        rollup = await health_check(raw, mode="quick")
+        assert rollup.status == Status.SKIP
+        assert rollup.results == []
+
 
 # ---------------------------------------------------------------------------
 # _read_last_error — defensive dict-walking for the diagnostic field

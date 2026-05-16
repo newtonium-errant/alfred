@@ -358,7 +358,26 @@ def _check_last_successful_extraction(raw: dict[str, Any]) -> CheckResult:
 
 
 async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
-    """Run distiller health checks."""
+    """Run distiller health checks.
+
+    Returns SKIP at the tool level when the ``distiller:`` config
+    section is absent — the orchestrator gates distiller daemon
+    startup on ``"distiller" in raw`` (see ``orchestrator.py``'s
+    tool-add loop), so the probe mirrors that pattern. Without this
+    gate, instances that don't run distiller surface a stale
+    ``last-successful-extraction`` FAIL because the probe consults an
+    absent state file and sees an ageing dataclass default path. Per
+    ``feedback_intentionally_left_blank.md``: SKIP-with-detail
+    distinguishes "not configured for this instance" from "configured
+    but broken."
+    """
+    if raw.get("distiller") is None:
+        return ToolHealth(
+            tool="distiller",
+            status=Status.SKIP,
+            detail="no distiller section in config",
+        )
+
     results: list[CheckResult] = [
         _check_vault(raw),
         _check_state_file(raw),

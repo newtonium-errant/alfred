@@ -306,7 +306,25 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
 
     The ``mode`` argument is accepted for interface uniformity; curator
     checks are all cheap so quick and full do the same work today.
+
+    Returns SKIP at the tool level when the ``curator:`` config section
+    is absent — the orchestrator gates curator daemon startup on
+    ``"curator" in raw`` (see ``orchestrator.py``'s tool-add loop), so
+    the probe mirrors that pattern. Without this gate, instances that
+    don't run curator (e.g. KAL-LE — surveyor handles its inbox)
+    surface a stale ``last-successful-process`` FAIL because the probe
+    consults an absent state file and sees an ageing dataclass default
+    path. Per ``feedback_intentionally_left_blank.md``: SKIP-with-detail
+    distinguishes "not configured for this instance" from "configured
+    but broken."
     """
+    if raw.get("curator") is None:
+        return ToolHealth(
+            tool="curator",
+            status=Status.SKIP,
+            detail="no curator section in config",
+        )
+
     results: list[CheckResult] = []
     results.extend(_check_vault(raw))
     results.append(_check_backend(raw))

@@ -95,7 +95,14 @@ class TestCuratorHealth:
         assert vp.status == Status.FAIL
 
     async def test_empty_vault_path_fails(self, tmp_path: Path) -> None:
-        raw = {"vault": {"path": ""}, "agent": {"backend": "zo"}}
+        # NOTE: must include a ``curator:`` section so the tool-level
+        # SKIP gate (added 2026-05-16 for the KAL-LE peer-digest fix)
+        # doesn't short-circuit before _check_vault runs. The test's
+        # intent is to verify that an empty vault.path produces FAIL
+        # when curator IS configured for this instance — KAL-LE-shape
+        # configs (curator section absent entirely) are covered
+        # separately in test_curator_probes.py::TestHealthCheckIntegration.
+        raw = {"vault": {"path": ""}, "agent": {"backend": "zo"}, "curator": {}}
         result = await curator_health.health_check(raw)
         assert result.status == Status.FAIL
 
