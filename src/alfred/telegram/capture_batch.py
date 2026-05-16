@@ -691,6 +691,7 @@ async def process_capture_session(
     *,
     agent_slug: str = "salem",
     anchor_scope: str = "",
+    extract_target_override: str = "",
 ) -> None:
     """Top-level orchestrator — run batch pass, write summary, send follow-up.
 
@@ -717,6 +718,15 @@ async def process_capture_session(
     to vault_create as the create-allowlist key. Default ``""``
     preserves legacy behaviour for instances that don't carry the
     ``author`` type (e.g. Salem).
+
+    ``extract_target_override`` (Phase 1.x, 2026-05-16) — operator's
+    explicit choice from the ``/end-zettel`` / ``/end-note`` slash-
+    command variants. When non-empty (``"zettel"`` or ``"note"``), it's
+    written to the session record's
+    ``capture_extract_target_override:`` frontmatter field so the
+    later ``/extract`` invocation honours it via the three-tier
+    discriminator. Default ``""`` → field omitted; the discriminator
+    falls back to the source-anchored default.
     """
     # Local import keeps this module's surface tight + avoids the
     # capture_source_anchor module loading frontmatter eagerly during
@@ -761,6 +771,19 @@ async def process_capture_session(
             extra_fields["author"] = anchors.author_wikilink
         if anchors.continues_from:
             extra_fields["continues_from"] = anchors.continues_from
+
+    # Phase 1.x operator override (2026-05-16). When the operator closed
+    # the session with ``/end-zettel`` or ``/end-note`` instead of plain
+    # ``/end``, the bot.py snapshot caller threads the choice through to
+    # this orchestrator. Persist it to session frontmatter so the
+    # later ``/extract`` invocation (run via the deferred
+    # capture_extract.extract_notes_from_capture path) honours the
+    # operator's choice. Validates to one of the canonical values so
+    # garbage values don't pollute the record.
+    if extract_target_override in ("zettel", "note"):
+        extra_fields["capture_extract_target_override"] = (
+            extract_target_override
+        )
 
     # --- Memo branch (Phase 1 Zettelkasten cutover, 2026-05-16).
     # ≤1 user message + Hypatia scope → memo path. Skip the entire

@@ -312,6 +312,14 @@ def build_app(
 
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("end", on_end))
+    # Phase 1.x (2026-05-16): /end-zettel and /end-note variants force
+    # the extraction target type for the just-closing capture session.
+    # PTB only allows [a-z0-9_] in command names, so the canonical
+    # registrations use underscores (mirrors the /method_source decision
+    # at line ~371). Operators typing the dash form get the legacy
+    # unknown-command behaviour; the underscore form works.
+    app.add_handler(CommandHandler("end_zettel", on_end_zettel))
+    app.add_handler(CommandHandler("end_note", on_end_note))
     app.add_handler(CommandHandler("status", on_status))
     # Wk3 commit 5: explicit model overrides for the active session. Both
     # flip ``session.model`` on the active dict; the next ``run_turn`` reads
@@ -612,6 +620,89 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _stamp_extract_target_override_on_active(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    override: str,
+) -> bool:
+    """Stamp ``_extract_target_override`` on the active session dict.
+
+    Helper shared by ``/end-zettel`` and ``/end-note`` (Phase 1.x,
+    2026-05-16). The override field is read by
+    :func:`alfred.telegram.session._snapshot_for_post_close` so the
+    capture-batch orchestrator sees the operator's choice after
+    ``close_session`` pops the active dict.
+
+    Returns ``True`` when the override was applied (active session
+    exists, override is canonical); ``False`` and replies to the user
+    when there's no active session — caller short-circuits.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
+    if not _is_allowed(update, config):
+        return False
+    if update.message is None or update.effective_chat is None:
+        return False
+    chat_id = update.effective_chat.id
+    active = state_mgr.get_active(chat_id)
+    if not active:
+        # No active session — same error shape as /end's no-active path.
+        await update.message.reply_text("no active session.")
+        return False
+    active["_extract_target_override"] = override
+    # Persist via the state-manager's save path so the snapshot pickup
+    # post-close sees the same on-disk shape (mirrors how other active-
+    # dict fields are mutated — e.g. _continues_from in the routing
+    # handler).
+    state_mgr.save()
+    log.info(
+        "talker.bot.extract_target_override_stamped",
+        chat_id=chat_id,
+        override=override,
+    )
+    return True
+
+
+async def on_end_zettel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/end-zettel — close session with operator override forcing
+    ``zettel/`` extraction target regardless of source-anchor state.
+
+    Phase 1.x (2026-05-16) per the three-tier-discriminator rework.
+    Marks the active session with ``_extract_target_override = "zettel"``
+    and then delegates to :func:`on_end` for the actual close flow.
+    The override is persisted to the session record's
+    ``capture_extract_target_override:`` frontmatter field via
+    :func:`alfred.telegram.capture_batch.process_capture_session`, so
+    a deferred ``/extract`` invocation minutes later still honours
+    the choice.
+
+    No-active-session case → "no active session." reply, same as /end.
+    """
+    if not await _stamp_extract_target_override_on_active(
+        update, ctx, override="zettel",
+    ):
+        return
+    await on_end(update, ctx)
+
+
+async def on_end_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/end-note — close session with operator override forcing
+    ``note/`` extraction target regardless of source-anchor state.
+
+    Mirror of :func:`on_end_zettel` with override = ``"note"``. Used
+    when the operator wants the capture filed as a fleeting note even
+    though the session has source-anchor wikilinks (e.g. operator
+    caught a wrong anchor or deliberately wants the record as a
+    note rather than a zettel).
+    """
+    if not await _stamp_extract_target_override_on_active(
+        update, ctx, override="note",
+    ):
+        return
+    await on_end(update, ctx)
+
+
 async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/end — explicitly close the current session, return vault record path.
 
@@ -621,6 +712,13 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     applied proposals are surfaced inline in the close reply so Andrew
     can confirm / object. Errors in the calibration write are logged but
     never block the close reply.
+
+    Phase 1.x (2026-05-16) variants: ``/end-zettel`` and ``/end-note``
+    (handled by :func:`on_end_zettel` / :func:`on_end_note`) stamp an
+    ``_extract_target_override`` field on the active session before
+    delegating to this handler; the override flows through the
+    snapshot helper + capture-batch orchestrator into session
+    frontmatter so the later ``/extract`` honours it.
     """
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
     state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
@@ -645,6 +743,13 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     post_close_snap = session._snapshot_for_post_close(active)
     transcript_snapshot = post_close_snap["transcript"]
     session_id_snapshot = post_close_snap["session_id"]
+    # Phase 1.x: ``/end-zettel`` / ``/end-note`` set _extract_target_override
+    # on the active dict before delegating to /end; the snapshot above
+    # captures it so we can pass it through to the capture-batch
+    # orchestrator after close pops the active dict.
+    extract_target_override = post_close_snap.get(
+        "extract_target_override", ""
+    )
     user_rel = (
         active.get("_user_vault_path")
         or (config.primary_users[0] if config.primary_users else "")
@@ -790,6 +895,13 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     short_id=short_id,
                     agent_slug=agent_slug_for(config),
                     anchor_scope=anchor_scope,
+                    # Phase 1.x (2026-05-16): operator's explicit
+                    # /end-zettel / /end-note choice (or ``""`` for
+                    # plain /end). process_capture_session writes the
+                    # value to session frontmatter so the later
+                    # /extract honours it via the three-tier
+                    # discriminator.
+                    extract_target_override=extract_target_override,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — scheduling shouldn't block close reply

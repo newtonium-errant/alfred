@@ -659,14 +659,23 @@ def _snapshot_for_post_close(active: dict[str, Any]) -> dict[str, Any]:
     instead of three.
 
     Returns a dict with ``transcript`` (list copy, never None),
-    ``session_id`` (string, may be empty), and ``vault_path_root``
-    (string, may be empty — caller resolves the fallback). The caller
-    threads these directly into :func:`maybe_apply_substance_slug`.
+    ``session_id`` (string, may be empty), ``vault_path_root``
+    (string, may be empty — caller resolves the fallback), and
+    ``extract_target_override`` (string: ``"zettel"`` / ``"note"`` /
+    ``""`` for no override — Phase 1.x ``/end-zettel`` / ``/end-note``
+    slash-command variants set this on the active dict before close;
+    the bot orchestrator passes it through to
+    :func:`alfred.telegram.capture_batch.process_capture_session` which
+    writes it to session frontmatter so the deferred ``/extract`` call
+    honours the operator's choice).
     """
     return {
         "transcript": list(active.get("transcript") or []),
         "session_id": active.get("session_id", ""),
         "vault_path_root": active.get("_vault_path_root", ""),
+        "extract_target_override": str(
+            active.get("_extract_target_override") or ""
+        ),
     }
 
 
