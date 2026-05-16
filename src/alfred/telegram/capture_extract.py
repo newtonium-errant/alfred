@@ -264,6 +264,46 @@ def _note_body(
 # --- Main extraction entry point -----------------------------------------
 
 
+#: Per-instance mapping from anchor_scope → vault_create record type
+#: for capture-extract output. Phase 1 of the Hypatia Zettelkasten
+#: schema cutover (2026-05-16): Hypatia captures produce ``zettel/``
+#: records instead of ``note/``. Salem (operational) and any unset /
+#: unknown scope continue producing ``note/`` records — preserves
+#: behaviour for legacy callers + tests.
+#:
+#: The mapping is keyed by ``anchor_scope`` (a per-instance config
+#: contract already plumbed through bot.py::on_end + the
+#: capture_source_anchor.resolve_session_anchors path). Extension to
+#: future instances (KAL-LE etc.) goes here — adding a new instance
+#: with a distinct extraction target is a one-line entry.
+_EXTRACT_TARGET_TYPE_BY_SCOPE: dict[str, str] = {
+    "hypatia": "zettel",
+    # Salem (operational) and unset scope fall through to the default
+    # below. Explicit entry kept for clarity / future-instance template.
+    "": "note",
+}
+
+#: Default extraction target when ``anchor_scope`` doesn't match any
+#: registered instance. Salem's behaviour — produce ``note/`` records.
+_EXTRACT_TARGET_TYPE_DEFAULT: str = "note"
+
+
+def _extract_target_type(anchor_scope: str) -> str:
+    """Return the vault_create record type for extracted records.
+
+    Per-instance branch: Hypatia (anchor_scope='hypatia') produces
+    ``zettel/`` records; everyone else produces ``note/`` records
+    (Salem operational default).
+
+    Per the type-minimalism / scope-aware-branching design (Q2 of the
+    Phase 1 brief): the type choice is plumbed through anchor_scope,
+    NOT hardcoded at the call site.
+    """
+    return _EXTRACT_TARGET_TYPE_BY_SCOPE.get(
+        anchor_scope, _EXTRACT_TARGET_TYPE_DEFAULT,
+    )
+
+
 async def extract_notes_from_capture(
     client: Any,
     state: StateManager,
@@ -273,6 +313,7 @@ async def extract_notes_from_capture(
     max_notes: int = DEFAULT_MAX_NOTES,
     *,
     agent_slug: str = "salem",
+    anchor_scope: str = "",
 ) -> ExtractResult:
     """Extract up to ``max_notes`` standalone notes from a capture session.
 
@@ -285,6 +326,15 @@ async def extract_notes_from_capture(
     implicit-chain :func:`capture_batch.write_summary_to_session_record`
     call so the attribution-audit entry carries the right agent. Default
     ``"salem"`` preserves legacy behaviour for tests that skip the plumb.
+
+    ``anchor_scope`` (Phase 1 Zettelkasten cutover, 2026-05-16) — when
+    ``"hypatia"``, extracted records are created as ``zettel/<title>.md``
+    instead of ``note/<title>.md``. Default ``""`` → ``note/`` records
+    (Salem's operational behaviour and the legacy default for tests
+    that skip the plumb). Forwarded to ``ops.vault_create`` as the
+    ``scope`` kwarg so the per-instance create-allowlist gate runs
+    against the right rule. See :func:`_extract_target_type` for the
+    full mapping.
 
     Returns an :class:`ExtractResult`. Never raises; failure modes
     degrade to empty ``created_paths`` + a populated ``skipped_reason``.
@@ -381,6 +431,12 @@ async def extract_notes_from_capture(
     # Cap defensively — the LLM should have obeyed, but trim anyway.
     notes = notes[:max_notes]
 
+    # Per-instance extraction target (Phase 1 Zettelkasten cutover):
+    # Hypatia → ``zettel/``; Salem (and unset / unknown scope) →
+    # ``note/`` (legacy default). Resolved once outside the loop so
+    # every record from this extraction lands at the same type.
+    target_type = _extract_target_type(anchor_scope)
+
     created_paths: list[str] = []
     created_titles: list[tuple[str, str]] = []  # (rel_path, original_title)
     for note in notes:
@@ -411,12 +467,19 @@ async def extract_notes_from_capture(
             set_fields["related"] = related
 
         try:
+            # ``scope`` kwarg routes the create through the per-instance
+            # create-allowlist gate. Empty string ``""`` (Salem default)
+            # passes through ``check_scope(None, ...)`` semantics — no
+            # scope check fires, matching legacy behaviour. Hypatia
+            # scope gates against ``HYPATIA_CREATE_TYPES`` which admits
+            # ``zettel``.
             result = ops.vault_create(
                 vault_path,
-                "note",
+                target_type,
                 name,
                 set_fields=set_fields,
                 body=full_body,
+                scope=(anchor_scope or None),
             )
             created_paths.append(result["path"])
             created_titles.append((result["path"], name))
@@ -425,6 +488,7 @@ async def extract_notes_from_capture(
                 "talker.extract.vault_create_failed",
                 session_rel_path=session_rel,
                 name=name,
+                target_type=target_type,
                 error=str(exc),
             )
             continue
@@ -499,6 +563,8 @@ async def extract_notes_from_capture(
         "talker.extract.done",
         session_rel_path=session_rel,
         created=len(created_paths),
+        target_type=target_type,
+        anchor_scope=anchor_scope,
         source_anchored=bool(source_wikilink),
         author_anchored=bool(author_wikilink),
     )
@@ -595,4 +661,6 @@ __all__ = [
     "DEFAULT_MAX_NOTES",
     "ExtractResult",
     "extract_notes_from_capture",
+    # Per-scope extraction-target resolution (Phase 1 Zettelkasten cutover).
+    "_extract_target_type",
 ]

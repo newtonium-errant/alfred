@@ -1047,6 +1047,16 @@ async def on_extract(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     from alfred.audit import agent_slug_for as _agent_slug_for_extract
+    # Per-instance extraction target (Phase 1 Zettelkasten cutover,
+    # 2026-05-16): Hypatia produces ``zettel/`` records; everyone else
+    # (Salem, unset) produces ``note/``. Empty string for non-Hypatia
+    # instances preserves legacy Salem behaviour. Mirrors the
+    # ``anchor_scope`` derivation in ``on_end`` so both source-anchor
+    # resolution and post-anchor extraction route the same way.
+    anchor_scope = (
+        "hypatia" if (config.instance.tool_set or "").lower() == "hypatia"
+        else ""
+    )
     result = await capture_extract.extract_notes_from_capture(
         client=client,
         state=state_mgr,
@@ -1054,6 +1064,7 @@ async def on_extract(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         short_id=short_id,
         model=model,
         agent_slug=_agent_slug_for_extract(config),
+        anchor_scope=anchor_scope,
     )
 
     if result.skipped_reason == "already_extracted":
