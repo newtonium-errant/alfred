@@ -487,6 +487,196 @@ async def write_summary_to_session_record(
     )
 
 
+# --- Memo branch (≤1 user message → memo path, skip batch pipeline) ------
+#
+# Phase 1 Zettelkasten cutover (2026-05-16). Per
+# project_hypatia_zettelkasten_redesign.md "LOCKED IMPLEMENTATION PLAN":
+# capture sessions with ≤1 user message at /end (or timeout-close) take
+# the memo path instead of running the structured-extraction pipeline.
+#
+# Memo path is fast + cheap: no Sonnet calls, no structured summary,
+# no re-encounter scan. Just a ``memo/<slug>.md`` record carrying the
+# raw user text + a wikilink back to the originating session.
+#
+# Trigger is per-instance via ``anchor_scope`` — only Hypatia carries
+# the ``memo`` create-allowlist entry today. Salem captures with ≤1
+# user message will FALL THROUGH to the regular batch path (which
+# handles low-content sessions by emitting empty buckets — already
+# tested behaviour). Adding ``memo`` to Salem's scope is a future
+# decision; not made here.
+
+
+#: Memo branch trigger threshold. Sessions with this many user turns
+#: or fewer route to the memo path. The threshold is "≤1" per Andrew's
+#: spec — single-thought captures land as memos; multi-message
+#: sessions go through extraction.
+_MEMO_BRANCH_MAX_USER_TURNS: int = 1
+
+
+#: Body cap for memo records — guard against the rare case where a
+#: single user turn is enormous (e.g. operator pasted a long block of
+#: text in one /capture turn). Memo bodies trim at this byte count
+#: with a "(truncated)" marker so the file stays manageable in
+#: Obsidian's editor; the full text lives in the originating session
+#: record's transcript regardless.
+_MEMO_BODY_MAX_CHARS: int = 4000
+
+
+def _count_user_turns(transcript: list[dict[str, Any]]) -> int:
+    """Count user turns with non-empty text content.
+
+    Mirrors the filter logic in ``_first_user_text`` / ``_flatten_transcript``
+    — only user-role turns with actual text content (string ``content``
+    or text-block list) count. Empty-content turns and assistant turns
+    are excluded.
+    """
+    count = 0
+    for turn in transcript:
+        if turn.get("role") != "user":
+            continue
+        content = turn.get("content", "")
+        text = ""
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    btext = (block.get("text") or "").strip()
+                    if btext:
+                        text = btext
+                        break
+        if text:
+            count += 1
+    return count
+
+
+def _memo_slug_from_text(text: str, *, max_words: int = 5) -> str:
+    """Derive a filename-safe memo slug from the raw user text.
+
+    Local helper (mirrors :func:`session._slug_from_topic`) so this
+    module doesn't import session.py — same dependency-isolation
+    rationale as ``_first_user_text``. Returns ``"untitled"`` on empty
+    input; trimming + casefolding + non-alphanumeric stripping keep
+    the slug filename-safe across all filesystems Alfred targets.
+    """
+    import re as _re
+
+    if not text:
+        return "untitled"
+    s = text.strip().lower()
+    if not s:
+        return "untitled"
+    tokens = s.split()[:max_words]
+    joined = "-".join(tokens)
+    # Drop everything not a-z / 0-9 / -, collapse runs, trim.
+    joined = _re.sub(r"[^a-z0-9-]", "", joined)
+    joined = _re.sub(r"-{2,}", "-", joined).strip("-")
+    return joined or "untitled"
+
+
+def _memo_body_from_text(text: str, *, max_chars: int = _MEMO_BODY_MAX_CHARS) -> str:
+    """Render the raw user text as a memo body.
+
+    Pattern matches the memo template (``# Memo`` / ``# Context`` /
+    ``# Tags``): the user's text lands under ``# Memo``; ``# Context``
+    + ``# Tags`` stay empty (operator fills them retrospectively if
+    useful). Truncation at ``max_chars`` adds a ``(truncated)`` marker
+    so the operator knows the full text is in the session record.
+    """
+    body = (text or "").strip()
+    truncated = False
+    if len(body) > max_chars:
+        body = body[:max_chars].rstrip()
+        truncated = True
+
+    lines = ["# Memo", "", body]
+    if truncated:
+        lines += ["", "_(truncated — full text in originating session)_"]
+    lines += ["", "# Context", "", "# Tags", ""]
+    return "\n".join(lines)
+
+
+async def _create_memo_record(
+    vault_path: Path,
+    user_text: str,
+    session_rel_path: str,
+    *,
+    scope: str,
+    agent_slug: str,
+) -> str | None:
+    """Write a ``memo/<slug>.md`` record. Return the rel_path or None on failure.
+
+    Body shape comes from :func:`_memo_body_from_text` (raw text + memo
+    template scaffolding). Frontmatter carries:
+
+      * ``type: memo`` (set by ops via the type kwarg)
+      * ``name``: the human-readable title (slug-display form)
+      * ``session``: wikilink to the originating capture session
+      * ``created``: today's date (ops default)
+
+    On vault_create failure (scope-deny, write error, etc.), logs and
+    returns ``None`` — the caller falls back to the regular batch path
+    so a misconfigured memo trigger doesn't black-hole the session.
+
+    ``agent_slug`` is currently unused at this layer (vault_create
+    doesn't carry agent attribution for non-attribution-audit writes);
+    accepted as a kwarg so the call site matches the rest of the
+    orchestrator surface and a future change adding memo attribution
+    has the slug in scope.
+    """
+    slug = _memo_slug_from_text(user_text)
+    # Display name is the first ~8 words capitalised, falling back to
+    # the slug if the text is empty.
+    display = " ".join((user_text or "").strip().split()[:8])
+    if not display:
+        display = slug.replace("-", " ").title() or "Untitled Memo"
+
+    body = _memo_body_from_text(user_text)
+    set_fields = {
+        "session": f"[[{session_rel_path[:-3]}]]" if session_rel_path.endswith(".md")
+                   else f"[[{session_rel_path}]]",
+    }
+
+    try:
+        result = ops.vault_create(
+            vault_path,
+            "memo",
+            slug,
+            set_fields=set_fields,
+            body=body,
+            scope=(scope or None),
+        )
+    except ops.VaultError as exc:
+        log.warning(
+            "talker.capture.memo_create_failed",
+            session_rel_path=session_rel_path,
+            slug=slug,
+            scope=scope,
+            error=str(exc),
+        )
+        return None
+
+    # Best-effort: set ``name`` to the human-readable display form so
+    # Obsidian's title pane shows something nicer than the slug.
+    # Failure here is non-fatal — the record exists; just the display
+    # name didn't update.
+    try:
+        ops.vault_edit(
+            vault_path,
+            result["path"],
+            set_fields={"name": display},
+            scope=(scope or None),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.info(
+            "talker.capture.memo_name_update_failed",
+            memo_path=result["path"],
+            error=str(exc),
+        )
+
+    return result["path"]
+
+
 # --- Orchestrator --------------------------------------------------------
 
 
@@ -571,6 +761,95 @@ async def process_capture_session(
             extra_fields["author"] = anchors.author_wikilink
         if anchors.continues_from:
             extra_fields["continues_from"] = anchors.continues_from
+
+    # --- Memo branch (Phase 1 Zettelkasten cutover, 2026-05-16).
+    # ≤1 user message + Hypatia scope → memo path. Skip the entire
+    # batch-structuring pipeline (no Sonnet call, no summary block, no
+    # re-encounter scan). The memo lives at ``memo/<slug>.md`` with a
+    # wikilink back to the originating session record. Per the brief:
+    # "the captured thought, lightly cleaned" — body is the raw user
+    # text under the ``# Memo`` heading.
+    #
+    # Salem captures with ≤1 user message do NOT branch here (Salem's
+    # scope doesn't carry the ``memo`` create-allowlist entry); they
+    # continue through the batch pipeline and produce a session record
+    # with mostly-empty Structured Summary buckets (existing behaviour).
+    #
+    # Failure-isolated: if memo creation fails (scope deny, vault
+    # write error), we fall back to the regular batch path. Operator
+    # sees the session record either way; just the memo extraction
+    # mode degrades.
+    user_turn_count = _count_user_turns(transcript)
+    if anchor_scope == "hypatia" and user_turn_count <= _MEMO_BRANCH_MAX_USER_TURNS:
+        first_user_text = _first_user_text(transcript)
+        log.info(
+            "talker.capture.memo_branch_triggered",
+            session_rel_path=session_rel_path,
+            user_turn_count=user_turn_count,
+            anchor_scope=anchor_scope,
+            first_user_text_len=len(first_user_text),
+        )
+        memo_rel = await _create_memo_record(
+            vault_path=vault_path,
+            user_text=first_user_text,
+            session_rel_path=session_rel_path,
+            scope=anchor_scope,
+            agent_slug=agent_slug,
+        )
+        if memo_rel is not None:
+            # Tag the session record so downstream tooling (distiller,
+            # vault-reviewer) knows the structured-extraction step was
+            # deliberately skipped. ``capture_structured: memo`` is a
+            # third valid value alongside ``"true"`` and ``"failed"``;
+            # downstream consumers should treat it as "valid completion
+            # via the memo path, no Structured Summary expected".
+            session_set_fields: dict[str, Any] = {
+                "capture_structured": "memo",
+                "memo_record": f"[[{memo_rel[:-3]}]]" if memo_rel.endswith(".md")
+                               else f"[[{memo_rel}]]",
+            }
+            session_set_fields.update(extra_fields)
+            try:
+                ops.vault_edit(
+                    vault_path,
+                    session_rel_path,
+                    set_fields=session_set_fields,
+                    scope=(anchor_scope or None),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "talker.capture.memo_session_update_failed",
+                    session_rel_path=session_rel_path,
+                    error=str(exc),
+                )
+            log.info(
+                "talker.capture.memo_done",
+                session_rel_path=session_rel_path,
+                memo_rel=memo_rel,
+            )
+            if send_follow_up is not None:
+                try:
+                    await send_follow_up(
+                        f"Captured as memo ({short_id}). "
+                        f"Saved to: {memo_rel}"
+                    )
+                except Exception as send_exc:  # noqa: BLE001
+                    log.warning(
+                        "talker.capture.follow_up_failed",
+                        session_rel_path=session_rel_path,
+                        error=str(send_exc),
+                    )
+            return
+        else:
+            # Memo creation failed — log and fall through to the batch
+            # path so the session is still processed (degraded but not
+            # black-holed). The memo_create_failed log already fired
+            # inside _create_memo_record.
+            log.warning(
+                "talker.capture.memo_branch_fallback_to_batch",
+                session_rel_path=session_rel_path,
+                user_turn_count=user_turn_count,
+            )
 
     try:
         summary = await run_batch_structuring(client, transcript, model)
@@ -711,4 +990,11 @@ __all__ = [
     "write_summary_to_session_record",
     "process_capture_session",
     "summary_to_dict",
+    # Memo branch (Phase 1 Zettelkasten cutover, 2026-05-16) — exposed
+    # for testability.
+    "_count_user_turns",
+    "_memo_slug_from_text",
+    "_memo_body_from_text",
+    "_create_memo_record",
+    "_MEMO_BRANCH_MAX_USER_TURNS",
 ]
