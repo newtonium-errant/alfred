@@ -88,6 +88,7 @@ async def run_scheduled_daemon(
     log_namespace: str,
     log: structlog.BoundLogger | None = None,
     post_fire_sleep_seconds: float = _POST_FIRE_SLEEP_SECONDS_DEFAULT,
+    record_error_callback: Callable[[str], None] | None = None,
 ) -> None:
     """Run the canonical scheduled-fire loop until cancelled.
 
@@ -113,6 +114,20 @@ async def run_scheduled_daemon(
             before re-computing next-fire. Default 90 matches the
             canonical three daemons. Knob exposed for the daily_sync /
             bit migrations once their idiosyncrasies settle.
+        record_error_callback: optional ``Callable[[str], None]``.
+            When the swallow path fires, the callback is invoked with
+            an error-string of shape ``f"{type(exc).__name__}: {exc}"``
+            BEFORE the existing ``log.exception`` emission. Caller can
+            use this to write a ``last_error`` field on the daemon's
+            persistent state — the conservative pattern is
+            ``state.record_error(msg)`` mirroring the brief.state
+            shape from ``279c0c0`` (2026-05-14). If the callback
+            itself raises, the swallow path continues unchanged:
+            the callback failure gets its own structured log event
+            (``scheduled_daemon.record_error_callback_failed``), the
+            original exception still gets ``log.exception``'d, and
+            the original exception is NOT lost. Defaults to ``None``
+            so existing callers are byte-for-byte unchanged.
 
     Returns:
         Never — runs until cancelled (orchestrator sends SIGTERM /
@@ -152,7 +167,14 @@ async def run_scheduled_daemon(
 
         try:
             await fire(datetime.now(tz))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if record_error_callback is not None:
+                try:
+                    record_error_callback(f"{type(exc).__name__}: {exc}")
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "scheduled_daemon.record_error_callback_failed"
+                    )
             log.exception(f"{log_namespace}.fire_error")
 
         # Sleep past the fire so the next ``compute_next_fire`` lands

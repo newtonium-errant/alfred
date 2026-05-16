@@ -304,6 +304,136 @@ async def test_fire_receives_tz_aware_now_in_schedule_timezone():
 
 
 # ---------------------------------------------------------------------------
+# record_error_callback — Arc B P3 prerequisite for per-sub-daemon
+# ``last_error`` capture. Helper-only ship; no callers wire it yet.
+# ---------------------------------------------------------------------------
+
+
+async def test_record_error_callback_invoked_on_tick_failure():
+    """When the swallow path fires AND a callback is provided, the
+    callback receives the standard ``f"{type(exc).__name__}: {exc}"``
+    string exactly once."""
+    captured_calls: list[str] = []
+
+    def _record(msg: str) -> None:
+        captured_calls.append(msg)
+
+    fire_calls: list[int] = []
+
+    async def _fire(now: datetime) -> Any:
+        fire_calls.append(len(fire_calls))
+        if len(fire_calls) == 1:
+            raise RuntimeError("simulated fire failure")
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_scheduled_daemon(
+            schedule=_schedule_far_future(),
+            fire=_fire,
+            log_namespace="test_ns",
+            record_error_callback=_record,
+        )
+
+    # Callback invoked exactly once, with the standard format.
+    assert captured_calls == ["RuntimeError: simulated fire failure"]
+    # Loop still iterated past the failure — second fire was reached.
+    assert len(fire_calls) == 2
+
+
+async def test_record_error_callback_none_preserves_existing_behavior():
+    """Omitting ``record_error_callback`` (the default) leaves the
+    pre-callback flow byte-for-byte unchanged: existing
+    ``log.exception(<ns>.fire_error)`` still fires; the loop
+    continues; no new log events appear."""
+    fire_calls: list[int] = []
+
+    async def _fire(now: datetime) -> Any:
+        fire_calls.append(len(fire_calls))
+        if len(fire_calls) == 1:
+            raise RuntimeError("simulated fire failure")
+        raise asyncio.CancelledError
+
+    with structlog.testing.capture_logs() as captured:
+        with pytest.raises(asyncio.CancelledError):
+            await run_scheduled_daemon(
+                schedule=_schedule_far_future(),
+                fire=_fire,
+                log_namespace="test_ns",
+                # record_error_callback omitted — default None.
+            )
+
+    # Existing fire_error log still emitted exactly once.
+    fire_errors = [
+        c for c in captured if c.get("event") == "test_ns.fire_error"
+    ]
+    assert len(fire_errors) == 1
+    assert fire_errors[0].get("log_level") == "error"
+
+    # The callback-failure event must NOT appear when no callback is set.
+    callback_failures = [
+        c
+        for c in captured
+        if c.get("event") == "scheduled_daemon.record_error_callback_failed"
+    ]
+    assert callback_failures == []
+
+    # Loop still iterated past the failure.
+    assert len(fire_calls) == 2
+
+
+async def test_record_error_callback_exception_does_not_break_swallow():
+    """If the callback itself raises, the swallow path continues:
+    the callback failure gets its own structured log event, the
+    original ``log.exception`` for the underlying ``fire`` exception
+    still fires, the loop continues, and the original exception is
+    NOT propagated to the caller."""
+    callback_invocations: list[str] = []
+
+    def _raising_callback(msg: str) -> None:
+        callback_invocations.append(msg)
+        raise RuntimeError("callback exploded")
+
+    fire_calls: list[int] = []
+
+    async def _fire(now: datetime) -> Any:
+        fire_calls.append(len(fire_calls))
+        if len(fire_calls) == 1:
+            raise ValueError("simulated fire failure")
+        raise asyncio.CancelledError
+
+    with structlog.testing.capture_logs() as captured:
+        with pytest.raises(asyncio.CancelledError):
+            await run_scheduled_daemon(
+                schedule=_schedule_far_future(),
+                fire=_fire,
+                log_namespace="test_ns",
+                record_error_callback=_raising_callback,
+            )
+
+    # The callback WAS invoked (and raised internally).
+    assert callback_invocations == ["ValueError: simulated fire failure"]
+
+    # The callback-failure log event fired exactly once.
+    callback_failures = [
+        c
+        for c in captured
+        if c.get("event") == "scheduled_daemon.record_error_callback_failed"
+    ]
+    assert len(callback_failures) == 1
+    assert callback_failures[0].get("log_level") == "error"
+
+    # The ORIGINAL fire_error log still fires — original exception not lost.
+    fire_errors = [
+        c for c in captured if c.get("event") == "test_ns.fire_error"
+    ]
+    assert len(fire_errors) == 1
+    assert fire_errors[0].get("log_level") == "error"
+
+    # Loop continued past the failure (second iteration reached + cancelled).
+    assert len(fire_calls) == 2
+
+
+# ---------------------------------------------------------------------------
 # Idempotent re-import (ensures the module loads cleanly under
 # multi-process orchestrator + test re-import patterns).
 # ---------------------------------------------------------------------------
