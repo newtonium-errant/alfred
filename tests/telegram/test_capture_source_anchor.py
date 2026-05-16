@@ -156,70 +156,98 @@ def _make_vault(tmp_path: Path) -> Path:
 
 
 def test_resolve_session_anchors_creates_source_and_author(tmp_path: Path) -> None:
+    """Phase 1 resolver overhaul (2026-05-16, Q1 ratified): canonical
+    filename ``author/Aurelius, Marcus.md`` (Lastname-comma-Firstname),
+    aliases carry both forms for resolution. No more ``last_name``
+    frontmatter on auto-created records — that field is retired."""
     vault = _make_vault(tmp_path)
     result = csa.resolve_session_anchors(
         vault, "I'm reading Meditations by Marcus Aurelius",
     )
     assert result.source_wikilink == "[[source/Meditations]]"
-    assert result.author_wikilink == "[[author/Aurelius]]"
+    assert result.author_wikilink == "[[author/Aurelius, Marcus]]"
     assert result.source_created is True
     assert result.author_created is True
     assert not result.author_ambiguous
 
     # Files actually exist + author wikilink threaded into source.
     assert (vault / "source" / "Meditations.md").exists()
-    assert (vault / "author" / "Aurelius.md").exists()
+    assert (vault / "author" / "Aurelius, Marcus.md").exists()
     src = ops.vault_read(vault, "source/Meditations.md")
-    assert src["frontmatter"]["author"] == "[[author/Aurelius]]"
-    auth = ops.vault_read(vault, "author/Aurelius.md")
+    assert src["frontmatter"]["author"] == "[[author/Aurelius, Marcus]]"
+    auth = ops.vault_read(vault, "author/Aurelius, Marcus.md")
     assert auth["frontmatter"]["name"] == "Marcus Aurelius"
-    assert auth["frontmatter"]["last_name"] == "Aurelius"
+    # Phase 1: aliases carry both input + canonical for future lookups.
+    aliases = auth["frontmatter"].get("aliases") or []
+    assert "Marcus Aurelius" in aliases
+    assert "Aurelius, Marcus" in aliases
+    # last_name retired from auto-created records (Phase 1 strip).
+    assert "last_name" not in auth["frontmatter"]
 
 
 def test_resolve_session_anchors_jr_suffix(tmp_path: Path) -> None:
-    """Suffixed author derives the correct last-name lookup key."""
+    """Suffixed author: suffix stripped, then canonical-form swap.
+
+    ``Foo Bar Jr.`` → suffix strip → ``Foo Bar`` → canonical
+    ``Bar, Foo``.
+    """
     vault = _make_vault(tmp_path)
     result = csa.resolve_session_anchors(
         vault, "Currently reading The Frame by Foo Bar Jr.",
     )
-    assert result.author_wikilink == "[[author/Bar]]"
-    assert (vault / "author" / "Bar.md").exists()
+    assert result.author_wikilink == "[[author/Bar, Foo]]"
+    assert (vault / "author" / "Bar, Foo.md").exists()
 
 
 def test_resolve_session_anchors_idempotent(tmp_path: Path) -> None:
-    """Second call resolves to existing records — no double-creation."""
+    """Second call resolves to existing canonical record — no double-create."""
     vault = _make_vault(tmp_path)
     csa.resolve_session_anchors(vault, "I'm reading X by Y Smith")
     again = csa.resolve_session_anchors(vault, "I'm reading X by Y Smith")
     assert again.source_wikilink == "[[source/X]]"
-    assert again.author_wikilink == "[[author/Smith]]"
+    # Canonical form: ``Smith, Y``.
+    assert again.author_wikilink == "[[author/Smith, Y]]"
     assert again.source_created is False
     assert again.author_created is False
 
 
-def test_resolve_session_anchors_ambiguous_author(tmp_path: Path) -> None:
-    """Same last-name with different ``name`` returns ambiguity flag."""
+def test_resolve_session_anchors_same_lastname_different_first_creates_distinct(
+    tmp_path: Path,
+) -> None:
+    """Phase 1 resolver: same last-name + different first-name → DISTINCT
+    canonical filenames (``Smith, Adam`` vs ``Smith, John``).
+
+    Replaces the pre-Phase-1 ambiguity-flag test: with last-name-only
+    filenames, two Smiths collided at ``author/Smith.md``. With
+    canonical Lastname-comma-Firstname filenames, they're distinct.
+    No ambiguity flag fires — operator gets a clean record per author.
+
+    The ``ambiguous_paths`` field on AuthorRef is retained for API
+    backward-compat but rarely activates under the new heuristic.
+    """
     vault = _make_vault(tmp_path)
-    # Pre-existing author/Smith.md with a different full name.
-    (vault / "author" / "Smith.md").write_text(
+    # Pre-existing author/Smith, Adam.md (canonical form, post-Phase-1
+    # creation shape).
+    (vault / "author" / "Smith, Adam.md").write_text(
         "---\n"
         "type: author\n"
         "name: Adam Smith\n"
-        "last_name: Smith\n"
+        "aliases:\n"
+        "  - Adam Smith\n"
+        "  - Smith, Adam\n"
         "created: '2026-05-15'\n"
-        "---\n# Adam Smith\n",
+        "---\n# Summary\n",
         encoding="utf-8",
     )
     result = csa.resolve_session_anchors(
         vault, "I'm reading Methodology by John Smith",
     )
-    assert result.author_ambiguous is True
-    # Source gets created but WITHOUT the (ambiguous) author wikilink —
-    # the operator disambiguates first.
-    assert result.source_wikilink == "[[source/Methodology]]"
-    src = ops.vault_read(vault, "source/Methodology.md")
-    # Free-text fallback so the trace isn't lost.
-    assert src["frontmatter"].get("author") == "John Smith"
+    # New author lands at distinct canonical filename — no collision.
+    assert result.author_wikilink == "[[author/Smith, John]]"
+    assert result.author_ambiguous is False
+    assert (vault / "author" / "Smith, John.md").exists()
+    # Adam Smith record untouched.
+    assert (vault / "author" / "Smith, Adam.md").exists()
 
 
 def test_resolve_session_anchors_no_match(tmp_path: Path) -> None:
@@ -458,9 +486,16 @@ async def test_process_capture_session_re_encounters_logged(tmp_path: Path) -> N
         )
     ])
 
+    # Two user turns — keeps the orchestrator on the BATCH pipeline (the
+    # re-encounter scan path). With 1 user turn + hypatia scope, the
+    # Phase 1 commit 4 memo branch fires instead, which intentionally
+    # skips re-encounter scanning. Memo-branch behaviour is covered by
+    # tests/telegram/test_capture_batch_memo_branch.py.
     transcript = [
         {"role": "user", "content": "rambling about stoicism",
          "_ts": "2026-05-16T10:00:00+00:00"},
+        {"role": "user", "content": "more thoughts on the dichotomy of control",
+         "_ts": "2026-05-16T10:01:00+00:00"},
     ]
 
     with structlog.testing.capture_logs() as captured:
@@ -495,7 +530,8 @@ async def test_process_capture_session_anchors_resolved_logged(tmp_path: Path) -
     (vault / "session" / "current.md").write_text(
         "---\ntype: session\nname: current\n"
         "created: '2026-05-16'\nsession_type: capture\n---\n\n"
-        "# Transcript\n\n**Andrew** (10:00): I'm reading Meditations by Marcus Aurelius\n",
+        "# Transcript\n\n**Andrew** (10:00): I'm reading Meditations by Marcus Aurelius\n"
+        "**Andrew** (10:01): the dichotomy of control comes alive in book 5\n",
         encoding="utf-8",
     )
 
@@ -512,10 +548,17 @@ async def test_process_capture_session_anchors_resolved_logged(tmp_path: Path) -
         )
     ])
 
+    # Two user turns — keeps the orchestrator on the BATCH pipeline (the
+    # anchors_resolved path applies under either memo OR batch, but the
+    # session-frontmatter assertions below pin the batch-path's write_summary
+    # path. Avoid the Phase 1 commit 4 memo branch by going >1 turn.)
     transcript = [
         {"role": "user",
          "content": "I'm reading Meditations by Marcus Aurelius",
          "_ts": "2026-05-16T10:00:00+00:00"},
+        {"role": "user",
+         "content": "the dichotomy of control comes alive in book 5",
+         "_ts": "2026-05-16T10:01:00+00:00"},
     ]
 
     with structlog.testing.capture_logs() as captured:
@@ -535,11 +578,19 @@ async def test_process_capture_session_anchors_resolved_logged(tmp_path: Path) -
                      if c.get("event") == "talker.capture.anchors_resolved"]
     assert len(resolved_logs) == 1
     assert resolved_logs[0]["source_wikilink"] == "[[source/Meditations]]"
-    assert resolved_logs[0]["author_wikilink"] == "[[author/Aurelius]]"
+    # Phase 1 resolver overhaul (2026-05-16): canonical Lastname,
+    # Firstname filename. Was [[author/Aurelius]] pre-Phase-1.
+    assert resolved_logs[0]["author_wikilink"] == "[[author/Aurelius, Marcus]]"
     assert resolved_logs[0]["source_created"] is True
     assert resolved_logs[0]["author_created"] is True
 
-    # Session record now carries the wikilinks too.
+    # Session record now carries the wikilinks too. NOTE: with 1 user
+    # turn + anchor_scope="hypatia", the memo branch fires (Phase 1
+    # commit 4) and writes these via the memo-path vault_edit instead
+    # of the batch-path write_summary_to_session_record. Both paths
+    # merge ``extra_fields`` (source + author wikilinks) into the
+    # session frontmatter, so the assertion below works for either
+    # path.
     rec = ops.vault_read(vault, "session/current.md")
     assert rec["frontmatter"]["source"] == "[[source/Meditations]]"
-    assert rec["frontmatter"]["author"] == "[[author/Aurelius]]"
+    assert rec["frontmatter"]["author"] == "[[author/Aurelius, Marcus]]"

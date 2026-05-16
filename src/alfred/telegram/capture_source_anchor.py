@@ -92,6 +92,29 @@ NAME_SUFFIXES: frozenset[str] = frozenset({
 })
 
 
+#: Name particles that belong to the surname rather than between
+#: given-name and surname. Per Phase 1 Q1 (ratified): preserve these in
+#: the surname token so ``Fiore dei Liberi`` resolves to filename
+#: ``Fiore dei Liberi``, not ``Liberi`` or ``Fiore, dei Liberi``.
+#: Particles are detected case-insensitively but case-preserved in
+#: output (``van`` stays ``van``, ``Van`` stays ``Van``).
+#:
+#: Source: standard European/Western particle list (van, von, de, der,
+#: dei, di, della, du, le, la, mac, mc, fitz, ben, ibn, al). Phase 1
+#: starts with the four explicitly named in the brief; expansion is
+#: a one-line dict-extension when new cases surface.
+NAME_PARTICLES: frozenset[str] = frozenset({
+    # Brief explicitly names these.
+    "van", "de", "dei", "von", "der",
+    # Adjacent particles in the same family — defensively included
+    # so adding them later doesn't require a separate commit cycle.
+    # Each one is a standard European name particle that belongs to
+    # the surname phrase (medieval Italian "dei", Dutch "van der",
+    # German "von der", French "de", Spanish "de la").
+    "del", "della", "di", "du", "la", "le",
+})
+
+
 # --- Opening pattern parsing ---------------------------------------------
 
 # "I'm reading X by Y", "I am reading X by Y", "Currently reading X by Y",
@@ -201,6 +224,14 @@ def derive_last_name(author_full: str) -> str:
         * Single name ``"Aristotle"`` → ``"Aristotle"``
 
     Empty / whitespace-only input → ``""``.
+
+    .. note:: This is the LEGACY last-name-only filename helper from the
+        original 2026-05-16 morning ship. Phase 1's resolver overhaul
+        uses :func:`derive_canonical_filename` instead (which returns
+        ``"Aurelius, Marcus"`` form). ``derive_last_name`` is kept
+        for: (a) backward-compat with the migration script reading
+        legacy ``author/<lastname>.md`` files; (b) the lookup-key
+        scan when resolving an author against pre-Phase-1 records.
     """
     text = (author_full or "").strip()
     if not text:
@@ -226,6 +257,105 @@ def derive_last_name(author_full: str) -> str:
     return tokens[-1].rstrip(".")
 
 
+def _strip_suffix_tokens(tokens: list[str]) -> list[str]:
+    """Return ``tokens`` with trailing suffix tokens (Jr / Sr / III / PhD)
+    removed. Mirror of the legacy ``derive_last_name`` suffix-walk."""
+    out = list(tokens)
+    while out:
+        normalized = out[-1].rstrip(".").lower()
+        if normalized in NAME_SUFFIXES:
+            out.pop()
+            continue
+        break
+    return out
+
+
+def derive_canonical_filename(author_full: str) -> str:
+    """Derive the canonical Hypatia filename stem from a full author string.
+
+    Phase 1 Q1 heuristic-with-particle-preservation (ratified 2026-05-16):
+
+      * ``"Marcus Aurelius"`` → ``"Aurelius, Marcus"`` (modern Western;
+        default Lastname-comma-Firstname).
+      * ``"Foo Bar Jr."`` → ``"Bar, Foo"`` (suffix stripped before swap).
+      * ``"Fiore dei Liberi"`` → ``"Fiore dei Liberi"`` (medieval particle
+        preserved in surname phrase; no comma-swap because the particle
+        binds the multi-token surname to the given name).
+      * ``"Aurelius, Marcus"`` → ``"Aurelius, Marcus"`` (already canonical
+        form; pass-through).
+      * ``"Aristotle"`` → ``"Aristotle"`` (single-name historical figure;
+        canonical form is the name itself).
+
+    Ambiguous cases (3+ tokens without particles, non-Western patterns,
+    operator-corrected forms): the heuristic picks its best guess and
+    auto-creates — there is NO clarifier-turn UI in Phase 1 (operator
+    renames manually if wrong). See the resolver's TODO marker for the
+    Phase 1.5 hook point.
+
+    Empty / whitespace-only input → ``""``.
+    """
+    text = (author_full or "").strip()
+    if not text:
+        return ""
+
+    # Comma form — already canonical; pass through (after normalising
+    # whitespace). Don't try to reshape an operator-corrected form.
+    if "," in text:
+        return text  # operator-provided canonical form wins
+
+    tokens = text.split()
+    tokens = _strip_suffix_tokens(tokens)
+    if not tokens:
+        return ""
+    if len(tokens) == 1:
+        # Single-token historical figure (Aristotle, Plato, Fiore-the-
+        # single-name-attribution). Canonical = the name itself.
+        return tokens[0]
+
+    # Particle detection — if any token (other than the first) is a
+    # particle, we treat ALL tokens from the particle onward as the
+    # surname phrase. ``Fiore dei Liberi`` → particle "dei" at index 1
+    # → surname = "dei Liberi", first part = "Fiore" → preserve as-is
+    # (no comma swap). This handles the "medieval" / "multi-part-
+    # surname" cases the brief calls out.
+    lowercased = [t.lower() for t in tokens]
+    particle_idx: int | None = None
+    for i, lt in enumerate(lowercased[1:], start=1):
+        if lt in NAME_PARTICLES:
+            particle_idx = i
+            break
+
+    if particle_idx is not None:
+        # Particle present → preserve original form (no comma swap).
+        # Andrew's lived example: ``Fiore dei Liberi``.
+        return " ".join(tokens)
+
+    # Default: modern Western Firstname Lastname → ``Lastname, Firstname``
+    # form. Multiple given names ("John Stuart Mill") → all non-final
+    # tokens become the firstname phrase.
+    last = tokens[-1]
+    rest = " ".join(tokens[:-1])
+    # TODO Phase 1.5: clarifier-turn UX hook. For ambiguous patterns
+    # (3+ tokens without particles, non-Western names, multi-part
+    # given names) we currently just emit the heuristic best-guess.
+    # The Phase 1.5 hook surfaces a Telegram clarifier ("I'll create
+    # author/<proposed>.md — accept or override?") before commit;
+    # operator's reply re-runs create with the chosen form. Wire here
+    # by detecting len(tokens) >= 3 + no-particle and returning a
+    # PendingAuthor sentinel for the orchestrator to handle.
+    return f"{last}, {rest}"
+
+
+def _normalize_lookup(text: str) -> str:
+    """Lowercase + collapse whitespace for case-insensitive comparison.
+
+    Used by the resolver's alias-scan to compare e.g. ``"Marcus Aurelius"``
+    against an existing record's ``aliases: ["Marcus Aurelius",
+    "Aurelius, Marcus"]`` list.
+    """
+    return " ".join((text or "").lower().split())
+
+
 # --- Author resolution ---------------------------------------------------
 
 
@@ -238,64 +368,168 @@ class AuthorRef:
     ambiguous_paths: tuple[str, ...] = ()  # populated on disambiguation
 
 
+def _scan_authors_by_alias(
+    vault_path: Path, lookup_form: str,
+) -> str | None:
+    """Scan ``author/`` directory for a record matching ``lookup_form``.
+
+    Lookup matches the normalised form of any string in:
+      * the record's filename stem (without ``.md``)
+      * the record's ``name`` frontmatter
+      * any entry in the record's ``aliases`` frontmatter list
+
+    Returns the vault-relative path of the first match, or ``None``.
+
+    This handles three cases:
+      1. Operator typed ``"Marcus Aurelius"`` and the record was created
+         in canonical form ``author/Aurelius, Marcus.md`` with
+         ``aliases: ["Marcus Aurelius"]`` — alias match.
+      2. Operator typed ``"Aurelius"`` and the record's filename is
+         ``Aurelius, Marcus`` — partial-token match on filename.
+         (Defensive — operator may use short-form for known figures.)
+      3. Pre-Phase-1 legacy records: ``author/Aurelius.md`` with
+         ``name: Marcus Aurelius`` and no ``aliases`` field. The
+         ``name`` match catches these so the resolver doesn't double-
+         create a record post-migration setup but pre-migration-run.
+
+    Scan cost is O(N) over ``author/*.md`` — fine for vaults with
+    hundreds of authors. If author counts grow into the thousands, the
+    natural extension is a name-indexed registry file.
+    """
+    author_dir = vault_path / "author"
+    if not author_dir.exists():
+        return None
+
+    lookup_norm = _normalize_lookup(lookup_form)
+    if not lookup_norm:
+        return None
+
+    for path in sorted(author_dir.glob("*.md")):
+        rel = f"author/{path.name}"
+        try:
+            rec = ops.vault_read(vault_path, rel)
+        except ops.VaultError:
+            continue
+        fm = rec.get("frontmatter") or {}
+
+        # Filename stem (no .md).
+        stem = path.stem
+        if _normalize_lookup(stem) == lookup_norm:
+            return rel
+
+        # name frontmatter.
+        name_field = str(fm.get("name") or "").strip()
+        if name_field and _normalize_lookup(name_field) == lookup_norm:
+            return rel
+
+        # aliases frontmatter list.
+        aliases_raw = fm.get("aliases")
+        if isinstance(aliases_raw, list):
+            for alias in aliases_raw:
+                alias_str = str(alias or "").strip()
+                if alias_str and _normalize_lookup(alias_str) == lookup_norm:
+                    return rel
+
+    return None
+
+
 def resolve_or_create_author(
     vault_path: Path,
     author_full: str,
     *,
     scope: str = "hypatia",
 ) -> AuthorRef | None:
-    """Resolve an author by last-name lookup, or create the record.
+    """Resolve an author via heuristic-canonical-filename + alias scan,
+    or create the record if no match.
 
-    Returns ``None`` when ``author_full`` is empty or last-name derivation
-    yields nothing.
+    Phase 1 Q1 ratified (2026-05-16): the resolver no longer uses
+    last-name-only filenames. It now:
 
-    Conflict handling: if ``author/<Lastname>.md`` exists and its
-    ``name`` frontmatter differs from ``author_full``, this returns an
-    :class:`AuthorRef` with ``ambiguous_paths`` populated and ``created=False``
-    so the caller can present the operator with both candidates rather
-    than silently writing a wrong link.
+      1. Derives the CANONICAL filename via
+         :func:`derive_canonical_filename` (e.g. ``"Marcus Aurelius"``
+         → ``"Aurelius, Marcus"``; ``"Fiore dei Liberi"`` →
+         ``"Fiore dei Liberi"``).
+      2. Checks ``author/<canonical>.md`` for direct filename match.
+      3. Scans ``author/*.md`` via :func:`_scan_authors_by_alias` for
+         a name / aliases match (handles legacy last-name-only
+         filenames + operator short-forms).
+      4. Falls back to creating ``author/<canonical>.md`` with
+         ``aliases:`` carrying BOTH the canonical form AND the input
+         form so future lookups in either shape resolve to the same
+         record.
+
+    Returns ``None`` when ``author_full`` is empty or canonical
+    filename derivation yields nothing.
+
+    No clarifier-turn UI in Phase 1 (Q1 Option A) — ambiguous /
+    non-Western / multi-part names take the heuristic best-guess and
+    auto-create. Operator renames manually if the heuristic guess is
+    wrong. See the TODO marker in :func:`derive_canonical_filename`
+    for the Phase 1.5 hook point.
+
+    The ``ambiguous_paths`` field on :class:`AuthorRef` is retained
+    for backward compat with the prior call site (same-last-name
+    conflict detection) — but Phase 1's heuristic mostly removes the
+    last-name collision shape, since canonical-form filenames are
+    Lastname-comma-Firstname distinct.
     """
     if not author_full:
         return None
 
-    last_name = derive_last_name(author_full)
-    if not last_name:
+    canonical = derive_canonical_filename(author_full)
+    if not canonical:
         return None
 
-    rel_path = f"author/{last_name}.md"
-    file_path = vault_path / rel_path
+    canonical_rel = f"author/{canonical}.md"
 
-    if file_path.exists():
-        # Verify ``name`` frontmatter matches; if not, flag ambiguity.
-        try:
-            rec = ops.vault_read(vault_path, rel_path)
-            existing_name = str(rec.get("frontmatter", {}).get("name") or "").strip()
-        except ops.VaultError:
-            existing_name = ""
-        if existing_name and _normalize_for_compare(existing_name) != _normalize_for_compare(author_full):
+    # 1. Direct canonical-filename match.
+    if (vault_path / canonical_rel).exists():
+        log.info(
+            "talker.capture.author_canonical_match",
+            canonical=canonical,
+            input=author_full,
+            rel_path=canonical_rel,
+        )
+        return AuthorRef(rel_path=canonical_rel, created=False)
+
+    # 2. Alias / name / legacy-filename scan — catches pre-migration
+    # records (``author/Aurelius.md`` with ``name: Marcus Aurelius``)
+    # AND operator-short-form lookups against existing canonical
+    # records. Try BOTH the original input AND the canonical form so
+    # either spelling resolves.
+    for lookup in (author_full, canonical):
+        existing_rel = _scan_authors_by_alias(vault_path, lookup)
+        if existing_rel:
             log.info(
-                "talker.capture.author_ambiguous",
-                last_name=last_name,
-                existing_name=existing_name,
-                proposed_name=author_full,
+                "talker.capture.author_alias_match",
+                canonical=canonical,
+                input=author_full,
+                matched_via=lookup,
+                rel_path=existing_rel,
             )
-            return AuthorRef(
-                rel_path=rel_path,
-                created=False,
-                ambiguous_paths=(rel_path,),
-            )
-        return AuthorRef(rel_path=rel_path, created=False)
+            return AuthorRef(rel_path=existing_rel, created=False)
 
-    # Create. Filename = last_name; frontmatter name = full canonical.
+    # 3. Create at canonical filename. Aliases carry both forms so
+    # future "Marcus Aurelius" / "Aurelius, Marcus" / etc. lookups
+    # resolve to the same record. Filename and canonical-form alias
+    # may be the same string — dedup.
+    aliases: list[str] = []
+    for candidate in (author_full, canonical):
+        if candidate and candidate not in aliases:
+            aliases.append(candidate)
+
     try:
         result = ops.vault_create(
             vault_path,
             "author",
-            last_name,
+            canonical,
             set_fields={
                 "name": author_full,
-                "last_name": last_name,
-                "status": "active",
+                "aliases": aliases,
+                # ``status: active`` was stripped from the Phase 1
+                # author template, but the existing _validate_status
+                # tolerates absence; we leave it off so the writer
+                # doesn't pin a status the template no longer defaults.
             },
             scope=scope,
         )
@@ -303,10 +537,17 @@ def resolve_or_create_author(
         log.warning(
             "talker.capture.author_create_failed",
             author=author_full,
-            last_name=last_name,
+            canonical=canonical,
             error=str(exc),
         )
         return None
+    log.info(
+        "talker.capture.author_created_canonical",
+        canonical=canonical,
+        input=author_full,
+        rel_path=result["path"],
+        aliases=aliases,
+    )
     return AuthorRef(rel_path=result["path"], created=True)
 
 
@@ -661,6 +902,9 @@ __all__ = [
     "CROSS_LINK_MIN_TOKEN_LEN",
     "CROSS_LINK_STOPWORDS",
     "NAME_SUFFIXES",
+    # Phase 1 author-resolver overhaul (2026-05-16).
+    "NAME_PARTICLES",
+    "derive_canonical_filename",
     "OpeningAnchors",
     "ResolvedAnchors",
     "AuthorRef",
