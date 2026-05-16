@@ -1,9 +1,11 @@
 """Migration script tests — synthesized 22-Meditations-note fixture vault.
 
 Phase 1 commit 5/5 of the Hypatia Zettelkasten cutover. Tests the
-migration script ``scripts/migrate_2026-05-16_meditations_zettels.py``
-against a synthesized fixture vault that simulates the morning's
-auto-created Meditations notes + author record + wikilinks.
+migration script ``alfred.scripts.migrate_2026_05_16_meditations_zettels``
+(also reachable via the dash-form shim
+``scripts/migrate_2026-05-16_meditations_zettels.py``) against a
+synthesized fixture vault that simulates the morning's auto-created
+Meditations notes + author record + wikilinks.
 
 The script runs against the LIVE Hypatia vault when team-lead executes
 it (sandbox blocks cross-vault access from this test suite). These
@@ -23,40 +25,36 @@ fixture tests cover:
     ``[[note/X]]`` wikilinks rewritten to ``[[zettel/X]]``.
   * Idempotency: re-running on an already-migrated vault is a no-op.
   * Dry-run vs. apply: dry-run reports the plan but writes nothing.
+
+Import shape: the migration logic was hoisted from ``scripts/`` into
+``src/alfred/scripts/`` so dataclass field-resolution at decorator-time
+sees a properly-registered ``sys.modules`` entry. The ``mig`` fixture
+imports the package module normally; no importlib-spec gymnastics.
 """
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
 
 import frontmatter
 import pytest
 
-
-# --- Loader (script is not a package member, so importlib.util) -----------
-
-
-def _load_migration_module():
-    """Load the migration script as a module for testing."""
-    script_path = (
-        Path(__file__).resolve().parent.parent
-        / "scripts" / "migrate_2026-05-16_meditations_zettels.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "_migrate_meditations", script_path,
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from alfred.scripts import migrate_2026_05_16_meditations_zettels as _mig_module
 
 
 @pytest.fixture
 def mig():
-    """Module-level fixture: the migration script as an importable module."""
-    return _load_migration_module()
+    """Module-level fixture: the migration module — imported normally
+    from the alfred.scripts package.
+
+    Replaces an earlier importlib.util shim that placed the module
+    name outside ``sys.modules``, causing
+    ``AttributeError: 'NoneType' object has no attribute '__dict__'``
+    from the dataclass machinery at decorator time. The package-hoist
+    fixed it; this fixture is now just a passthrough kept for
+    readability of the test bodies (``mig.identify_*`` etc.).
+    """
+    return _mig_module
 
 
 # --- Fixture-vault builder ------------------------------------------------
