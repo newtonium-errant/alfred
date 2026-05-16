@@ -286,6 +286,17 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     # frontmatter entirely.
     # ``MOC``: NO entry. MOCs are organizational artifacts curated by
     # the operator; no lifecycle-state matters at the schema level.
+    # Fiction-structure (2026-05-16, operator-template #2 ship — the
+    # 24-Chapter Story Template). Lifecycle covers the four states
+    # an outline / draft moves through: ``outlining`` (initial state
+    # — operator filling in beats), ``drafting`` (chapters being
+    # written), ``revising`` (post-draft editing), ``complete``
+    # (finished work). The other five fiction-* types (story, world,
+    # voice, character, continuity) do not have status sets yet —
+    # they're added when their respective templates ship.
+    "fiction-structure": {
+        "outlining", "drafting", "revising", "complete",
+    },
 }
 
 # Type → expected top-level directory
