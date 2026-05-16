@@ -264,43 +264,80 @@ def _note_body(
 # --- Main extraction entry point -----------------------------------------
 
 
-#: Per-instance mapping from anchor_scope → vault_create record type
-#: for capture-extract output. Phase 1 of the Hypatia Zettelkasten
-#: schema cutover (2026-05-16): Hypatia captures produce ``zettel/``
-#: records instead of ``note/``. Salem (operational) and any unset /
-#: unknown scope continue producing ``note/`` records — preserves
-#: behaviour for legacy callers + tests.
+#: Operator override values for the capture-extract target. Set via
+#: the ``/end-zettel`` / ``/end-note`` slash-command variants; null when
+#: the operator uses plain ``/end`` (default discriminator runs).
 #:
-#: The mapping is keyed by ``anchor_scope`` (a per-instance config
-#: contract already plumbed through bot.py::on_end + the
-#: capture_source_anchor.resolve_session_anchors path). Extension to
-#: future instances (KAL-LE etc.) goes here — adding a new instance
-#: with a distinct extraction target is a one-line entry.
-_EXTRACT_TARGET_TYPE_BY_SCOPE: dict[str, str] = {
-    "hypatia": "zettel",
-    # Salem (operational) and unset scope fall through to the default
-    # below. Explicit entry kept for clarity / future-instance template.
-    "": "note",
-}
-
-#: Default extraction target when ``anchor_scope`` doesn't match any
-#: registered instance. Salem's behaviour — produce ``note/`` records.
-_EXTRACT_TARGET_TYPE_DEFAULT: str = "note"
+#: ``zettel`` forces zettel/ regardless of source-anchor state.
+#: ``note`` forces note/ regardless of source-anchor state.
+#: Anything else (including None / "" / unknown values) is treated
+#: as "no override — use default discriminator".
+_OPERATOR_OVERRIDE_VALUES: frozenset[str] = frozenset({"zettel", "note"})
 
 
-def _extract_target_type(anchor_scope: str) -> str:
+def _resolve_extract_target_type(
+    anchor_scope: str,
+    *,
+    source_anchored: bool,
+    operator_override: str | None = None,
+) -> str:
     """Return the vault_create record type for extracted records.
 
-    Per-instance branch: Hypatia (anchor_scope='hypatia') produces
-    ``zettel/`` records; everyone else produces ``note/`` records
-    (Salem operational default).
+    Phase 1.x three-tier discriminator (2026-05-16 ratified rework after
+    Andrew's "not all Hypatia notes are zettels" correction):
 
-    Per the type-minimalism / scope-aware-branching design (Q2 of the
-    Phase 1 brief): the type choice is plumbed through anchor_scope,
-    NOT hardcoded at the call site.
+      * Salem (anchor_scope != "hypatia") → always ``note/``.
+        Scope-gated: Salem doesn't carry the ``zettel`` create-allowlist
+        entry, so even if a future bug surfaced an override on Salem,
+        ops.vault_create would refuse. Returning ``note`` here is the
+        contract-honest path.
+
+      * Hypatia + operator override = "note" → forced ``note/``.
+        Operator's explicit ``/end-note`` overrides any anchor state.
+
+      * Hypatia + operator override = "zettel" → forced ``zettel/``.
+        Operator's explicit ``/end-zettel`` overrides any anchor state.
+
+      * Hypatia + no override → default discriminator:
+          - source_anchored=True (session has ``source:`` or ``author:``
+            wikilink in frontmatter) → ``zettel/``
+          - source_anchored=False → ``note/``
+
+    The memo branch (≤1 user message → ``memo/``) lives in
+    ``capture_batch.process_capture_session`` and runs BEFORE the
+    extractor — this discriminator only applies on the multi-message
+    path. See the three-tier table in the brief:
+
+    | Trigger                                  | Type      |
+    |------------------------------------------|-----------|
+    | ≤1 user message at /end                  | memo/     |
+    | multi-msg + source-anchored OR /end-zettel | zettel/   |
+    | multi-msg + (no anchor AND no /end-zettel) | note/    |
     """
-    return _EXTRACT_TARGET_TYPE_BY_SCOPE.get(
-        anchor_scope, _EXTRACT_TARGET_TYPE_DEFAULT,
+    if anchor_scope != "hypatia":
+        return "note"
+    if operator_override in _OPERATOR_OVERRIDE_VALUES:
+        return operator_override  # type: ignore[return-value]
+    return "zettel" if source_anchored else "note"
+
+
+#: Backwards-compat passthrough — preserved for any caller that hasn't
+#: migrated to ``_resolve_extract_target_type`` yet. Routes through the
+#: new discriminator with source_anchored=True (the prior shape's
+#: behaviour for Hypatia) so the result matches the previous all-zettel
+#: dispatch. New callers should use the discriminator directly.
+def _extract_target_type(anchor_scope: str) -> str:
+    """DEPRECATED: pre-Phase-1.x dispatch. Use
+    :func:`_resolve_extract_target_type` instead.
+
+    Returns ``zettel`` for Hypatia, ``note`` for everyone else —
+    matching the original Phase 1 behaviour. Kept as a one-line
+    passthrough so any external import doesn't break; production
+    extraction calls go through ``_resolve_extract_target_type``
+    via ``extract_notes_from_capture``.
+    """
+    return _resolve_extract_target_type(
+        anchor_scope, source_anchored=True, operator_override=None,
     )
 
 
@@ -314,6 +351,7 @@ async def extract_notes_from_capture(
     *,
     agent_slug: str = "salem",
     anchor_scope: str = "",
+    operator_override: str | None = None,
 ) -> ExtractResult:
     """Extract up to ``max_notes`` standalone notes from a capture session.
 
@@ -328,13 +366,26 @@ async def extract_notes_from_capture(
     ``"salem"`` preserves legacy behaviour for tests that skip the plumb.
 
     ``anchor_scope`` (Phase 1 Zettelkasten cutover, 2026-05-16) — when
-    ``"hypatia"``, extracted records are created as ``zettel/<title>.md``
-    instead of ``note/<title>.md``. Default ``""`` → ``note/`` records
-    (Salem's operational behaviour and the legacy default for tests
-    that skip the plumb). Forwarded to ``ops.vault_create`` as the
-    ``scope`` kwarg so the per-instance create-allowlist gate runs
-    against the right rule. See :func:`_extract_target_type` for the
-    full mapping.
+    ``"hypatia"``, the three-tier discriminator in
+    :func:`_resolve_extract_target_type` runs to pick the target type:
+    ``zettel/`` for source-anchored sessions, ``note/`` for unanchored
+    sessions, with operator-override support via ``/end-zettel`` /
+    ``/end-note``. Salem (anchor_scope="" or anything non-Hypatia)
+    always produces ``note/`` records (legacy operational behaviour).
+
+    ``operator_override`` (Phase 1.x, 2026-05-16) — when non-None,
+    bypasses the source-anchored default discriminator. Values:
+    ``"zettel"`` (forces zettel/ even if no anchor), ``"note"`` (forces
+    note/ even if anchored), ``None`` (use the source-anchored default).
+    Caller reads this from the session record's
+    ``capture_extract_target_override:`` frontmatter field (set by
+    the ``/end-zettel`` / ``/end-note`` slash command variants at
+    session close). Salem scope ignores the override — see
+    :func:`_resolve_extract_target_type` for the full contract.
+
+    ``source_anchored`` is inferred from the session record's
+    frontmatter — True when either ``source:`` or ``author:`` carries
+    a wikilink. Computed inline below; not a separate kwarg.
 
     Returns an :class:`ExtractResult`. Never raises; failure modes
     degrade to empty ``created_paths`` + a populated ``skipped_reason``.
@@ -404,6 +455,22 @@ async def extract_notes_from_capture(
     # ``I'm reading X by Y``.
     source_wikilink = _wikilink_from_fm(post.get("source"))
     author_wikilink = _wikilink_from_fm(post.get("author"))
+    source_anchored = bool(source_wikilink) or bool(author_wikilink)
+
+    # Phase 1.x discriminator support (2026-05-16): the session record's
+    # ``capture_extract_target_override`` frontmatter field carries the
+    # operator's ``/end-zettel`` / ``/end-note`` choice (or is absent if
+    # the operator used plain ``/end``). The kwarg ``operator_override``
+    # takes precedence when explicitly passed (test paths, future
+    # programmatic re-extraction); otherwise we read from frontmatter
+    # so an ``/extract`` invocation minutes/hours after the original
+    # ``/end-zettel`` still honours the override.
+    if operator_override is None:
+        fm_override = str(
+            post.get("capture_extract_target_override") or ""
+        ).strip().lower()
+        if fm_override in _OPERATOR_OVERRIDE_VALUES:
+            operator_override = fm_override
 
     try:
         notes = await _call_extract_llm(
@@ -431,11 +498,21 @@ async def extract_notes_from_capture(
     # Cap defensively — the LLM should have obeyed, but trim anyway.
     notes = notes[:max_notes]
 
-    # Per-instance extraction target (Phase 1 Zettelkasten cutover):
-    # Hypatia → ``zettel/``; Salem (and unset / unknown scope) →
-    # ``note/`` (legacy default). Resolved once outside the loop so
-    # every record from this extraction lands at the same type.
-    target_type = _extract_target_type(anchor_scope)
+    # Phase 1.x three-tier discriminator (2026-05-16): the target type
+    # depends on (anchor_scope, source_anchored, operator_override).
+    # Resolved once outside the loop so every record from this
+    # extraction lands at the same type.
+    #
+    # Salem always note/. Hypatia: operator_override wins; otherwise
+    # source-anchored → zettel, unanchored → note. The memo branch
+    # (≤1 user message) lives in capture_batch and runs before this
+    # extractor is invoked; this discriminator only fires on the
+    # multi-message path.
+    target_type = _resolve_extract_target_type(
+        anchor_scope,
+        source_anchored=source_anchored,
+        operator_override=operator_override,
+    )
 
     created_paths: list[str] = []
     created_titles: list[tuple[str, str]] = []  # (rel_path, original_title)
@@ -565,8 +642,9 @@ async def extract_notes_from_capture(
         created=len(created_paths),
         target_type=target_type,
         anchor_scope=anchor_scope,
-        source_anchored=bool(source_wikilink),
+        source_anchored=source_anchored,
         author_anchored=bool(author_wikilink),
+        operator_override=operator_override or "",
     )
     return ExtractResult(created_paths=created_paths)
 
@@ -661,6 +739,10 @@ __all__ = [
     "DEFAULT_MAX_NOTES",
     "ExtractResult",
     "extract_notes_from_capture",
-    # Per-scope extraction-target resolution (Phase 1 Zettelkasten cutover).
+    # Phase 1 (legacy) per-scope dispatch — kept as a passthrough; new
+    # callers should use ``_resolve_extract_target_type`` directly.
     "_extract_target_type",
+    # Phase 1.x three-tier discriminator (2026-05-16).
+    "_resolve_extract_target_type",
+    "_OPERATOR_OVERRIDE_VALUES",
 ]

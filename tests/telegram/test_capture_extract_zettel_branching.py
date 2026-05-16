@@ -80,7 +80,21 @@ def _make_closed_session(state_mgr, short_id: str, rel_path: str) -> None:
 
 def _write_session_record(
     vault_path: Path, name: str, with_summary: bool = True,
+    source_anchored: bool = True,
 ) -> str:
+    """Build a Hypatia capture session record.
+
+    Phase 1.x rework note (2026-05-16): the discriminator only routes to
+    zettel/ when the session is source-anchored (``source:`` or
+    ``author:`` wikilink in frontmatter). The default
+    ``source_anchored=True`` writes a Meditations source wikilink so
+    existing tests in this file (which were written against the
+    pre-rework universal "Hypatia → zettel" dispatch) continue to
+    assert zettel/ output.
+
+    Set ``source_anchored=False`` to simulate an unanchored Hypatia
+    capture (the fleeting-notes path that now routes to note/).
+    """
     (vault_path / "session").mkdir(exist_ok=True, parents=True)
     rel = f"session/{name}.md"
     body = (
@@ -98,6 +112,13 @@ def _write_session_record(
     else:
         body = "# Transcript\n\n" + body
 
+    fm_extra = ""
+    if source_anchored:
+        fm_extra = (
+            'source: "[[source/Meditations]]"\n'
+            'author: "[[author/Aurelius, Marcus]]"\n'
+        )
+
     (vault_path / rel).write_text(
         "---\n"
         "type: session\n"
@@ -105,7 +126,8 @@ def _write_session_record(
         f"name: {name}\n"
         "created: '2026-05-16'\n"
         "session_type: capture\n"
-        "---\n\n" + body,
+        + fm_extra
+        + "---\n\n" + body,
         encoding="utf-8",
     )
     return rel
