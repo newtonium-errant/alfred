@@ -1,7 +1,7 @@
 ---
 type: zettel
-name: {{title}}
-created: {{date}}
+name: "{{title}}"
+created: "{{date}}"
 author: ""
 source: ""
 mocs: []

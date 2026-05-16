@@ -1,7 +1,7 @@
 ---
 type: question
-name: {{title}}
-created: {{date}}
+name: "{{title}}"
+created: "{{date}}"
 status: open
 origin_sources: []
 answered_by: ""

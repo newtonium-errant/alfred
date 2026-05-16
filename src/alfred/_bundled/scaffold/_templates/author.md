@@ -1,7 +1,7 @@
 ---
 type: author
-name: {{title}}
-created: {{date}}
+name: "{{title}}"
+created: "{{date}}"
 aliases: []
 tags: []
 ---

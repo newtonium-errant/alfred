@@ -1,7 +1,7 @@
 ---
 type: MOC
-name: {{title}}
-created: {{date}}
+name: "{{title}}"
+created: "{{date}}"
 parent_mocs: []
 tags: []
 ---

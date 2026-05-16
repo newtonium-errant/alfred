@@ -1,7 +1,7 @@
 ---
 type: memo
-name: {{title}}
-created: {{date}}
+name: "{{title}}"
+created: "{{date}}"
 session: ""
 tags: []
 ---
