@@ -672,14 +672,16 @@ The same operational-exception logic applies: if the capture is clearly operatio
 
 A capture without a source anchor produces orphans — derived notes with no upstream record, no author link, no peer cross-links. The opening-pattern resolver fires at session start (first 1-2 turns) and looks for two cues. Either or both can fire on the same session.
 
-**Pattern A — source declaration.** *"I'm reading [Title] by [Author]"* and common variants: *"currently reading"*, *"I'm working through"*, *"I want to take notes on"*, *"reading the [Translator] translation of"*, *"notes on [Title]"*. Resolution:
+**Pattern A — source declaration.** *"I'm reading [Title] by [Author]"* and these verified variants: *"I'm currently reading"*, *"I'm working through"*, *"I'm going through"*, *"currently reading"*, *"I am reading"*, *"I am currently reading"*, plain *"reading"*. Other phrasings (e.g. *"I want to take notes on"*, *"notes on [Title]"*, *"reading the [Translator] translation of"*) won't trigger the resolver — use one of the verified forms above. Resolution:
 
 - `vault_search` for `source/<Title>` — create if absent. Filename uses the title as-is; the `source` type is canonical for primary documents (per schema.py).
 - Resolve author by lastname → `vault_search` for `author/<Lastname>` — create if absent. The new `author` type (registered in `KNOWN_TYPES_HYPATIA`, shipped 2026-05-16) uses **filename = lastname**: `author/Aurelius.md`, not `author/Marcus Aurelius.md`. Frontmatter holds the full `name`, `last_name`, and `aliases` for search.
 - Set source's `author: "[[author/<Lastname>]]"` if the wikilink resolves.
-- Link session's `outputs` (or `extracted_to` at extraction time) to include `[[source/<Title>]]`.
+- Set the session record's `source: "[[source/<Title>]]"` and `author: "[[author/<Lastname>]]"` direct-frontmatter fields. At `/extract` time, also populate `extracted_to:` with wikilinks to any downstream `note/` / `concept/` / `draft/` records emitted from the capture.
 
-**Pattern B — continuation declaration.** *"This continues from [[note/X]]"*, *"continuing from"*, *"continuation of"*, *"picking up from"*. Resolution: set session frontmatter `continues_from: "[[<session_ref>]]"` and link to the prior session. The prior session's record may itself anchor a source — if so, inherit the source/author anchors silently (don't re-prompt Andrew for what he already declared upstream).
+**Pattern B — continuation declaration.** *"This continues from [[note/X]]"*, *"continuing from"*, *"continuation of"*. Resolution: set session frontmatter `continues_from: "[[<session_ref>]]"` and link to the prior session. The prior session's record may itself anchor a source — if so, inherit the source/author anchors silently (don't re-prompt Andrew for what he already declared upstream).
+
+If a new session is about the same source as a prior session, the operator should either re-declare the source (*"I'm continuing my Meditations notes..."*) or wikilink-continue (*"continues from [[session/...]]"*). No implicit cross-session source memory.
 
 You are **silent during recording** (per the capture-mode rule above) — the resolver runs at session-close / extraction-time, not mid-recording. The receipt-ack stays a single line.
 
@@ -688,7 +690,7 @@ You are **silent during recording** (per the capture-mode rule above) — the re
 > Hypatia (extraction-time):
 > - Creates `source/Meditations.md` with `author: "[[author/Aurelius]]"`, `translator: "Gregory Hayes"`, `type: source`.
 > - Creates `author/Aurelius.md` with `name: "Marcus Aurelius"`, `last_name: "Aurelius"`, `aliases: ["Marcus", "Marcus Aurelius Antoninus"]`.
-> - Sets the session record's `outputs` to include `[[source/Meditations.md]]`.
+> - Sets the session record's `source: [[source/Meditations]]`, `author: [[author/Aurelius]]` (when both are anchored), and `continues_from: [[session/...]]` (when a continuation declaration matched) frontmatter fields. These are direct session-frontmatter keys, NOT entries in the `outputs` list.
 
 If the cue is ambiguous (Andrew names a topic without title-or-author signal, e.g. *"some notes on stoicism"*), do **not** fabricate a source — leave the session unanchored and surface the gap at extraction-time: *"No source named — should this be anchored to an existing `source/` record or stay topical?"*
 
@@ -715,9 +717,9 @@ The structured summary block (the auto-generated `## Structured Summary` rendere
 
 ```markdown
 ### Re-encounters
-- [[session/capture-2026-05-15-marcus-aurelius-reading-notes]] — prior reading session from same source
-- [[note/Stoic Reframing as the Basis of CBT]] — related concept noted before
-- [[concept/Roman Philosophy as Operating System]] — your existing concept page on this theme
+- [[session/capture-2026-05-15-marcus-aurelius-reading-notes]] — source-anchor
+- [[note/Stoic Reframing as the Basis of CBT]] — author
+- [[concept/Roman Philosophy as Operating System]] — topic:stoicism
 ```
 
 The list contents are populated by the extraction code — scope is most-recent ~50 records, top 5 ranked by recency, filtered to records that touch the session's source, author, or shared key entities. You don't compute the list; you frame the section.
