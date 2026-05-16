@@ -3,10 +3,23 @@ alfred_tags:
 - alfred/bit
 created: '2026-05-14'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — process target [[process/Alfred BIT]] does not exist in vault;
+  only run records (process/Alfred BIT YYYY-MM-DD.md) exist. DIR001 deterministic
+  scanner flag (type: run belongs in run/ directory). Same pattern as prior BIT run
+  records. Human action: create the parent process/Alfred BIT.md record OR move run
+  records to run/.'
 mode: quick
 name: Alfred BIT 2026-05-14
 overall_status: warn
 process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-14.md
+  source_anchor: '[run] Alfred BIT 2026-05-14'
+  target: process/Alfred BIT 2026-05-15.md
+  target_anchor: '[run] Alfred BIT 2026-05-15'
+  type: related-to
 started: '2026-05-14T05:55:01.839592-03:00'
 status: completed
 tags:
