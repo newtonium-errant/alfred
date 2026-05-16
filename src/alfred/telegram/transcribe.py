@@ -28,6 +28,22 @@ log = get_logger(__name__)
 _GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 _TIMEOUT_SECONDS = 30.0
 
+# Vocabulary bias for Whisper decoding. Groq's Whisper endpoint accepts an
+# ``prompt`` multipart field (OpenAI-compatible — same parameter name as the
+# OpenAI ``/audio/transcriptions`` endpoint). Whisper conditions decoding on
+# this prompt, biasing the language model toward listed proper nouns and
+# project-specific terminology that would otherwise drift to phonetically
+# similar but wrong outputs (e.g., "Zettelkasten" → "Zeno Kessen", or
+# instance names like "KAL-LE" → "Calle"). Andrew's stable vocabulary set;
+# hardcoded for now, config-driven version deferred to 6b.
+_STT_VOCABULARY_PROMPT = (
+    "Algernon, Salem, S.A.L.E.M., KAL-LE, K.A.L.-L.E., Hypatia, V.E.R.A., "
+    "STAY-C, Zettelkasten, aftermath-lab, library-alexandria, distiller, "
+    "surveyor, curator, janitor, talker, gcal, Obsidian, Andrew Newton, "
+    "RRTS, Fergus, Marcus Aurelius, Heraclitus, Stoicism, Epicureanism, "
+    "Meditations, Hayes, Ryan Holiday"
+)
+
 
 class TranscribeError(Exception):
     """Raised when transcription fails (API error, empty transcript, etc)."""
@@ -62,7 +78,9 @@ async def transcribe(audio_bytes: bytes, mime: str, config: STTConfig) -> str:
     # works regardless of the filename — but we set a sensible default.
     filename = "voice.ogg" if mime.endswith("ogg") else "voice.bin"
     files = {"file": (filename, audio_bytes, mime)}
-    data = {"model": config.model}
+    # ``prompt`` biases Whisper's decoder toward known proper nouns / terms.
+    # See ``_STT_VOCABULARY_PROMPT`` for rationale.
+    data = {"model": config.model, "prompt": _STT_VOCABULARY_PROMPT}
     headers = {"Authorization": f"Bearer {config.api_key}"}
 
     try:
@@ -95,5 +113,10 @@ async def transcribe(audio_bytes: bytes, mime: str, config: STTConfig) -> str:
         # Guard the silent-audio case — see module docstring.
         raise TranscribeError("empty transcription")
 
-    log.info("talker.stt.ok", chars=len(text), model=config.model)
+    log.info(
+        "talker.stt.ok",
+        chars=len(text),
+        model=config.model,
+        vocab_prompt_chars=len(_STT_VOCABULARY_PROMPT),
+    )
     return text
