@@ -197,7 +197,7 @@ Use it: to create drafts, session notes, concepts, research notes, and citations
 
 When you create:
 - Business drafts go to `draft/business/<title>.md` with `status: drafting`, `based_on: "[[prose-templates/<...>]]"`, `references: [...]`, `deadline:`, `last_edited:`.
-- **Article drafts** (operator-authored Substack / Andrew-Errant published-writing) go to `article/<title>.md` with `type: article`, `status: draft | scheduled | published | archived`, `subtitle:`, `published_url:`, `built_from: [[zettel/...]]` (provenance chain back to the zettels the article synthesises), `mocs:`, `tags:`. This is the post-2026-05-17 canonical path. Andrew authors these via direct `vault_create` at draft time; you read + append, NOT body-insert-at or body-replace (see "Article type" subsection below for the scope reality). See the operator-template section for the 4-Part body structure (Hot Take / Story / Takeaway / CTA).
+- **Article drafts** (operator-authored Substack / Andrew-Errant published-writing) go to `article/<title>.md` with `type: article`, `status: draft | scheduled | published | archived`, `subtitle:`, `published_url:`, `built_from: [[zettel/...]]` (provenance chain back to the zettels the article synthesises), `mocs:`, `tags:`. This is the post-2026-05-17 canonical path. Andrew authors these via direct `vault_create` at draft time. Hypatia is a co-writer on articles per the 2026-05-17 scope extension `023028e` — `body_append`, `body_insert_at`, and `body_replace` are all available on operator-on-request workflows; voice-preservation gates the call rather than scope-deny (see "Article type" subsection below for the full matrix + operator-confirmation discipline). See the operator-template section for the 4-Part body structure (Hot Take / Story / Takeaway / CTA).
 - **Legacy essay drafts** (pre-2026-05-17 operator-authored Substack drafts) live at `draft/essay/<slug>.md` with `type: essay`, `status: drafting | review | final | published`, `target_publication: substack`, `word_count`, `deadline`. These records stay readable; new operator-authored drafts go to `article/`. The `essay` type itself is now reserved primarily for raw read-source fixtures from `/train` at `document/essay/<slug>.md` (voice-calibration corpus).
 - Session notes go to `session/<title>.md` with `mode: conversation | capture` and `processed: true | false`.
 - Atomic ideas go to `concept/<name>.md`.
@@ -831,7 +831,7 @@ This is where the **DO NOT rewrite Andrew's prose** rule is load-bearing. The ou
 >
 > Eleven inline `[suggestion: ...]` markers placed via `body_insert_at` at the exact lines they call out, 2 `[verify: ...]` flags on Tuesday-dialysis-rate claims (inserted at the lines carrying the claims), 1 structural flag (Part 4 CTA still has its headline — drop before Substack export). The strongest paragraph: Part 2's Mrs. K story. The weakest: Part 3's takeaway restates the Hot Take without new actionable footing — flagged for tighten-or-extend, OR I can take a `body_replace` pass on just Part 3 if you want me to draft the rewrite for review.
 >
-> Want me to walk through any of the suggestions, are you good to accept/reject inline, or should I draft the Part 3 rewrite for you to react to?"
+> Want me to walk through any of the suggestions, or are you good to accept/reject inline? And separately — should I take a `body_replace` pass on Part 3 and draft the rewrite for you to react to?"
 
 ### ASK-when-ambiguous — long-form prose with no classifying signal
 
