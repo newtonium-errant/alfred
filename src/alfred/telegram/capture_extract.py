@@ -89,6 +89,45 @@ _EXTRACT_TOOL = {
                     "that grounds this note. Rendered as a blockquote."
                 ),
             },
+            # Phase 2 deliverable #2 (2026-05-17): anchor preservation.
+            # When the operator dictated a positional anchor near the
+            # claim ("p. 23 says..." / "at the 15-minute mark..." /
+            # "in paragraph 3..."), emit the normalised anchor here.
+            # Empty string when no anchor was dictated near this claim.
+            #
+            # Normalisation conventions (per the locked plan's
+            # "Auto-maintenance behaviors" → item 4):
+            #   * Book              → ``p.23``  (page; arabic numerals
+            #                                    for body, roman for
+            #                                    front matter — preserve
+            #                                    exactly what operator
+            #                                    said)
+            #   * Article / Substack → ``¶3``    (paragraph mark + number;
+            #                                    or ``§<n>`` for sections)
+            #   * Podcast / video    → ``0:15:30`` (HH:MM:SS or MM:SS)
+            #   * Lecture            → ``slide 12`` / ``min 23``
+            #   * Conversation       → ``""`` (typically no anchor — leave
+            #                                    empty)
+            #
+            # The anchor is preserved BOTH as ``source_anchor:`` frontmatter
+            # on the spawned zettel AND as an inline body annotation at
+            # the start of the body (e.g., ``(p.23)``). The frontmatter
+            # is the queryable surface; the inline annotation is
+            # human-readable in the rendered note.
+            "source_anchor": {
+                "type": "string",
+                "description": (
+                    "Optional positional anchor (page / timestamp / "
+                    "paragraph / slide) from the source material near "
+                    "this claim. Examples: ``p.23`` (book), ``¶3`` "
+                    "(article), ``0:15:30`` (video/podcast), "
+                    "``slide 12`` (lecture). Empty string when no "
+                    "anchor was dictated near this claim. The anchor "
+                    "is preserved on the spawned zettel as both "
+                    "``source_anchor:`` frontmatter and an inline "
+                    "``(<anchor>)`` body annotation."
+                ),
+            },
         },
         "required": ["name", "body", "confidence_tier", "source_quote"],
     },
@@ -119,6 +158,48 @@ returned to it multiple times; ``medium`` means you (the model) judged \
 it worth extracting but the user didn't dwell.
 - Stop when you're out of high-signal ideas, even if you've emitted \
 fewer than 8 notes.
+
+ANCHOR PRESERVATION (Phase 2, 2026-05-17):
+
+When the operator dictated a positional anchor near a claim — a page \
+number, timestamp, paragraph mark, slide number — preserve it in the \
+``source_anchor`` field. The anchor lets the operator (and Hypatia in \
+future re-engagements) jump back to the exact source location later.
+
+Anchor formats by source type:
+- Book              → ``p.23`` (preserve arabic vs roman numerals as \
+operator said them)
+- Article / Substack → ``¶3`` (paragraph) or ``§2`` (section)
+- Podcast / video    → ``0:15:30`` (HH:MM:SS) or ``15:30`` (MM:SS)
+- Lecture            → ``slide 12`` or ``min 23``
+- Conversation       → typically no anchor; leave ``source_anchor`` empty
+
+Worked examples:
+
+Transcript snippet 1: "Marcus on page 23 talks about how the dichotomy \
+of control is foundational..."
+  → Extract a note about "Dichotomy of Control as Foundation" with \
+``source_anchor: "p.23"``. The body should mention the claim in \
+operator's voice; do NOT inline the (p.23) annotation in the body \
+text — the wrapping code adds it automatically.
+
+Transcript snippet 2: "Around the fifteen-minute mark Hadot makes a \
+really striking point about spiritual exercises..."
+  → ``source_anchor: "0:15:00"`` (normalize "fifteen minutes" to \
+``0:15:00``; if operator said "fifteen-thirty" or "15 minutes and 30 \
+seconds" use ``0:15:30``).
+
+Transcript snippet 3: "In paragraph three of the Substack post the \
+author argues..."
+  → ``source_anchor: "¶3"``.
+
+Transcript snippet 4: "I was just rambling about my own thoughts on \
+stoicism, no specific source location..."
+  → ``source_anchor: ""`` (empty — operator wasn't anchoring to a \
+specific source location).
+
+When in doubt, leave ``source_anchor`` empty. False anchors are worse \
+than missing anchors.
 """
 
 
@@ -245,12 +326,40 @@ def _extract_summary_from_post(post: frontmatter.Post) -> str:
 
 
 def _note_body(
-    body: str, source_quote: str, source_session_rel: str,
+    body: str,
+    source_quote: str,
+    source_session_rel: str,
+    *,
+    source_anchor: str = "",
 ) -> str:
-    """Compose the final note body with a source-quote blockquote + attribution."""
+    """Compose the final note body with a source-quote blockquote + attribution.
+
+    Phase 2 deliverable #2 (2026-05-17): when ``source_anchor`` is
+    non-empty, prepend an inline ``(<anchor>)`` annotation at the start
+    of the body. This gives the operator a human-readable anchor right
+    in the note's first line; the queryable ``source_anchor:``
+    frontmatter is set separately by the caller.
+
+    Examples of rendered output:
+        source_anchor="p.23" → "(p.23) Marcus returns to the dichotomy
+                                of control as foundational..."
+        source_anchor=""     → "Marcus returns to the dichotomy of
+                                control as foundational..."
+    """
     body_clean = body.strip()
     quote_clean = source_quote.strip()
+    anchor_clean = (source_anchor or "").strip()
     attribution = f"_Source: [[{source_session_rel}]]_"
+
+    # Prepend the inline anchor annotation when present. Operator-facing
+    # surface: anchor sits at the start of the body text, immediately
+    # before the substantive content. The LLM is instructed NOT to
+    # include the inline annotation in its body output (the system
+    # prompt's ANCHOR PRESERVATION section says "do NOT inline the
+    # (p.23) annotation in the body text — the wrapping code adds it
+    # automatically").
+    if anchor_clean:
+        body_clean = f"({anchor_clean}) {body_clean}"
 
     parts = [body_clean]
     if quote_clean:
@@ -521,11 +630,21 @@ async def extract_notes_from_capture(
         body = str(note.get("body") or "").strip()
         confidence_tier = str(note.get("confidence_tier") or "medium").strip()
         source_quote = str(note.get("source_quote") or "").strip()
+        # Phase 2 deliverable #2 (2026-05-17): anchor preservation.
+        # ``source_anchor`` is optional in the tool schema; absent /
+        # empty string means the operator didn't dictate a positional
+        # reference near this claim. When present, it lands BOTH on
+        # the zettel's frontmatter (queryable) AND inline in the body
+        # (human-readable in the rendered note).
+        source_anchor = str(note.get("source_anchor") or "").strip()
 
         if not name or not body:
             continue
 
-        full_body = _note_body(body, source_quote, session_rel)
+        full_body = _note_body(
+            body, source_quote, session_rel,
+            source_anchor=source_anchor,
+        )
         # Compose ``related`` with source + author wikilinks. Peer cross-
         # links are appended below once all notes in this session are
         # created (we need every peer's vault path first).
@@ -542,6 +661,13 @@ async def extract_notes_from_capture(
         }
         if related:
             set_fields["related"] = related
+        # Phase 2: persist anchor as queryable frontmatter when present.
+        # Empty anchors are omitted (no field at all) — Phase 1 lesson:
+        # silent absence is fine when the absence is meaningful (no
+        # anchor was dictated), but writing ``source_anchor: ""``
+        # everywhere pollutes the frontmatter surface.
+        if source_anchor:
+            set_fields["source_anchor"] = source_anchor
 
         try:
             # ``scope`` kwarg routes the create through the per-instance
