@@ -966,6 +966,45 @@ async def process_capture_session(
                 )
         return
 
+    # Phase 2 deliverable #4 (2026-05-17): re-encounter source-body
+    # append. When the capture session resolved to a PRE-EXISTING source
+    # record (source_created=False), append today's observations to
+    # that source's ``## Observations During`` section. First-encounter
+    # sources (just created by the resolver) skip this — they have no
+    # prior body to extend.
+    #
+    # Failure-isolated: a missing source record, a body without the
+    # ``## Observations During`` section, or any other write error logs
+    # + returns False without raising. The session record is already
+    # written; the re-encounter append is best-effort decoration.
+    if (
+        anchors is not None
+        and anchors.source_wikilink
+        and not anchors.source_created
+    ):
+        try:
+            from datetime import date as _date
+            # Resolve source rel_path from the wikilink form
+            # ``[[source/<Title>]]`` → ``source/<Title>.md``.
+            source_rel = anchors.source_wikilink.strip("[]")
+            if not source_rel.endswith(".md"):
+                source_rel = source_rel + ".md"
+            _csa.append_re_encounter_observation(
+                vault_path=vault_path,
+                source_rel_path=source_rel,
+                today_iso=_date.today().isoformat(),
+                topics=list(summary.topics),
+                key_insights=list(summary.key_insights),
+                session_rel_path=session_rel_path,
+                scope=(anchor_scope or "hypatia"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "talker.capture.re_encounter_append_unhandled",
+                session_rel_path=session_rel_path,
+                error=str(exc),
+            )
+
     log.info(
         "talker.capture.batch_done",
         session_rel_path=session_rel_path,

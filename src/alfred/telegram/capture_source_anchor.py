@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from alfred.vault import ops
 
@@ -1095,6 +1095,252 @@ def render_re_encounters_section(rows: list[ReEncounter]) -> str:
     return "\n".join(lines)
 
 
+# --- Re-encounter source-body append (Phase 2 deliverable #4, 2026-05-17) -
+
+
+# Section headers used by the re-encounter append. ``## Observations
+# During`` is where per-encounter dated subsections accumulate;
+# ``## Permanent Notes spawned`` (or a fallback) marks the end of the
+# observations section in the canonical Phase 2 source template.
+_OBSERVATIONS_DURING_HEADING: str = "## Observations During"
+_PERM_NOTES_SPAWNED_HEADING: str = "## Permanent Notes spawned"
+
+
+def _render_observations_for_session(
+    topics: list[str],
+    key_insights: list[str],
+    session_rel_path: str,
+) -> str:
+    """Render the per-session observation bullets for the ``###
+    YYYY-MM-DD`` subsection body.
+
+    Phase 2 MVP shape: bullet list of topics + key_insights from the
+    structured summary, followed by a backlink to the originating
+    session record. Future iterations may enrich this with anchor-
+    annotated quotes from derived zettels — but for the first ship,
+    topics + insights + backref is enough scaffolding to validate the
+    re-encounter flow.
+
+    Empty topics + insights → just the session backref. The bullet
+    list is empty in that case (per the "intentionally left blank"
+    discipline — explicit emptiness is legal; the backref still ties
+    the source to the encounter).
+    """
+    lines: list[str] = []
+    for topic in topics or []:
+        lines.append(f"- {topic}")
+    for insight in key_insights or []:
+        lines.append(f"- {insight}")
+    if not lines:
+        lines.append("- (no topics or insights surfaced this session)")
+    # Backref to the originating session record.
+    session_no_md = (
+        session_rel_path[:-3] if session_rel_path.endswith(".md")
+        else session_rel_path
+    )
+    lines.append(f"")
+    lines.append(f"_From [[{session_no_md}]]_")
+    return "\n".join(lines)
+
+
+def _build_re_encounter_rewriter(
+    today_iso: str,
+    observation_body: str,
+) -> Callable[[str], str]:
+    """Build a body_rewriter callable for the re-encounter append.
+
+    Behaviour:
+      * If ``## Observations During`` section is missing from the body
+        (older source records pre-dating Phase 2 template), no-op —
+        return body unchanged. The locked plan says "subsequent
+        capture sessions on the same source APPEND a new dated
+        subsection under ``## Observations During``" — the section
+        must exist. Phase 2 deliverable #1 ships the template with
+        the section; operator-synced vaults pick it up.
+      * If ``### <today>`` subsection already exists within Observations
+        During, append observation_body BELOW the existing subsection
+        body (no duplicate ``### <today>`` heading). Same-day idempotent.
+      * Otherwise, create the ``### <today>`` subsection at the END of
+        the Observations During section (just before ``## Permanent
+        Notes spawned`` or, if that section is also missing, just
+        before the next ``# `` or ``## `` heading; if there's no next
+        heading, append at the end of the section / file).
+
+    The rewriter is pure: takes a body string, returns a new body
+    string. Idempotency lives in the same-day-detection branch.
+    """
+    today_heading = f"### {today_iso}"
+
+    def _rewriter(body: str) -> str:
+        # Locate Observations During section.
+        obs_idx = body.find(_OBSERVATIONS_DURING_HEADING)
+        if obs_idx == -1:
+            # Section missing — pre-Phase-2 template or operator-edited
+            # body. No-op rather than write to an arbitrary location.
+            return body
+
+        # Find the end of the Observations During section. The section
+        # ends at the next H1 or H2 heading (NOT H3 — ### <date> is a
+        # sub-heading within the section).
+        section_start = obs_idx + len(_OBSERVATIONS_DURING_HEADING)
+        section_end = _find_next_top_heading(body, section_start)
+        section_body = body[section_start:section_end]
+
+        # Check for an existing ### <today> subsection within the
+        # section body.
+        today_idx = section_body.find(today_heading)
+        if today_idx != -1:
+            # Idempotent same-day: append the new observation bullets
+            # within the existing ### <today> subsection. The
+            # subsection body runs from the heading line's end to the
+            # next ### or section boundary.
+            today_start = today_idx + len(today_heading)
+            # End of THIS subsection = next ### heading OR section_end.
+            next_subsection = section_body.find("\n### ", today_start)
+            if next_subsection == -1:
+                subsection_end = len(section_body)
+            else:
+                subsection_end = next_subsection
+            existing_subsection_body = section_body[today_start:subsection_end]
+            # Strip trailing newlines, append new bullets + a blank
+            # line separator. The existing bullets stay untouched.
+            new_subsection_body = (
+                existing_subsection_body.rstrip("\n")
+                + "\n\n"
+                + observation_body
+                + "\n"
+            )
+            new_section_body = (
+                section_body[:today_start]
+                + new_subsection_body
+                + section_body[subsection_end:]
+            )
+        else:
+            # First encounter today: create a new ### <today> subsection
+            # at the END of the Observations During section.
+            # Trim trailing whitespace from the section body before
+            # appending; preserve any existing per-encounter subsections.
+            new_subsection = (
+                f"\n\n{today_heading}\n\n{observation_body}\n"
+            )
+            new_section_body = section_body.rstrip("\n") + new_subsection
+            # Re-establish the trailing-newline boundary so the next
+            # H1/H2 heading isn't glued to the new subsection.
+            new_section_body = new_section_body + "\n"
+
+        return body[:section_start] + new_section_body + body[section_end:]
+
+    return _rewriter
+
+
+def _find_next_top_heading(body: str, start_idx: int) -> int:
+    """Return the index of the next H1 (``# ``) or H2 (``## ``) heading
+    line at or after ``start_idx``, or ``len(body)`` if none.
+
+    Used by the re-encounter rewriter to bound the Observations During
+    section. H3 (``### ``) and deeper headings are NOT bounds — they're
+    subsections within the H2 section.
+
+    A heading line must start at the beginning of a line (after a
+    newline) and have exactly 1 or 2 ``#`` characters followed by a
+    space.
+    """
+    i = start_idx
+    while i < len(body):
+        # Find next newline.
+        nl_idx = body.find("\n", i)
+        if nl_idx == -1:
+            return len(body)
+        # Inspect the line immediately after.
+        line_start = nl_idx + 1
+        if line_start >= len(body):
+            return len(body)
+        # H1 or H2 (NOT H3 or deeper).
+        if body[line_start:line_start + 2] == "# ":
+            return line_start
+        if body[line_start:line_start + 3] == "## " and body[line_start:line_start + 4] != "## ":
+            # Defensive: catches the rare case where line starts with
+            # "## " but is actually "## " followed by a space (no text).
+            # The earlier check ``== "## "`` is the canonical one.
+            pass
+        if body[line_start:line_start + 3] == "## ":
+            return line_start
+        i = line_start
+    return len(body)
+
+
+def append_re_encounter_observation(
+    vault_path: Path,
+    source_rel_path: str,
+    today_iso: str,
+    topics: list[str],
+    key_insights: list[str],
+    session_rel_path: str,
+    *,
+    scope: str = "hypatia",
+) -> bool:
+    """Append today's observation bullets to a source record's
+    ``## Observations During`` section.
+
+    Phase 2 deliverable #4 (2026-05-17) — re-encounter source-body
+    growth. Called from
+    :func:`alfred.telegram.capture_batch.process_capture_session` when
+    the capture session resolved to a PRE-EXISTING source record
+    (``anchors.source_created=False``). First encounter on a fresh
+    source (source_created=True) doesn't trigger this — the source
+    has no prior observations to extend.
+
+    Idempotency:
+      * Same-day re-runs append observation bullets WITHIN the
+        existing ``### <today>`` subsection (no duplicate heading).
+      * Different-day captures get a new ``### <today>`` subsection.
+      * Pre-Phase-2 source records (missing ``## Observations During``
+        section) → no-op, returns False.
+
+    Returns True if the source body was updated; False on no-op or
+    failure (logged but never raised — failure isolated from the
+    capture-batch orchestrator).
+    """
+    rel_path = source_rel_path.lstrip("/")
+    if rel_path.startswith("[[") and rel_path.endswith("]]"):
+        rel_path = rel_path[2:-2]
+    if not rel_path.endswith(".md"):
+        rel_path = rel_path + ".md"
+    if not (vault_path / rel_path).exists():
+        log.info(
+            "talker.capture.re_encounter_source_missing",
+            source_rel_path=rel_path,
+        )
+        return False
+
+    observation_body = _render_observations_for_session(
+        topics, key_insights, session_rel_path,
+    )
+    rewriter = _build_re_encounter_rewriter(today_iso, observation_body)
+    try:
+        ops.vault_edit(
+            vault_path,
+            rel_path,
+            body_rewriter=rewriter,
+            scope=scope,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.capture.re_encounter_append_failed",
+            source_rel_path=rel_path,
+            session_rel_path=session_rel_path,
+            error=str(exc),
+        )
+        return False
+    log.info(
+        "talker.capture.re_encounter_append_done",
+        source_rel_path=rel_path,
+        session_rel_path=session_rel_path,
+        today=today_iso,
+    )
+    return True
+
+
 # --- Helpers -------------------------------------------------------------
 
 
@@ -1126,4 +1372,6 @@ __all__ = [
     "compute_peer_cross_links",
     "find_re_encounters",
     "render_re_encounters_section",
+    # Phase 2 re-encounter source-body append (2026-05-17).
+    "append_re_encounter_observation",
 ]
