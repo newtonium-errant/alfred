@@ -2,8 +2,6 @@
 type: source
 name: "{{title}}"
 created: "{{date}}"
-author: ""
-url: ""
 status: active
 mocs: []
 tags: []

@@ -10,10 +10,20 @@ Pins:
   * Template file exists in the bundled scaffold.
   * Frontmatter parses cleanly via python-frontmatter (b92c982 lesson:
     {{title}} / {{date}} MUST be quoted).
-  * Frontmatter shape per the brief's deliverable #1: type, name,
-    created, author, url, source_type, source_anchor, status, mocs,
-    tags. ``source_type`` and ``source_anchor`` are NEW fields
-    populated by deliverables #2 and #3.
+  * Frontmatter shape (post-cleanup, 2026-05-17): ONLY 5 default
+    fields ship in the template — type, name, created, status, mocs,
+    tags. The four fields ``source_type``, ``source_anchor``,
+    ``author``, ``url`` are ABSENT as defaults. Each is set
+    on-demand:
+      - ``author`` — resolver opening-pattern when "X by Y" matches
+      - ``source_type`` — resolver shape-inference verb
+      - ``url`` — operator-fillable
+      - ``source_anchor`` — per-zettel field; doesn't belong on source
+    Pre-cleanup ``author: ""`` + ``url: ""`` defaults persisted past
+    ``vault_create``'s template-merge step regardless of resolver
+    omit-discipline, producing drift between the template surface
+    and the resolver's "intentionally left blank" intent. Queue #9a
+    closes that drift.
   * Body sections (in canonical order):
       # Source Details
         ## Bibliographic Details
@@ -79,53 +89,89 @@ def test_source_frontmatter_parses_cleanly() -> None:
 def test_source_frontmatter_shape() -> None:
     """Frontmatter carries the Phase 2 field set per the brief.
 
-    Template-default vs resolver-omit drift fix (NOTE-1 of the Phase 2
-    hardening pass, 2026-05-17): ``source_type`` and ``source_anchor``
-    are NOT in the template defaults. Reasoning:
+    Template-default vs resolver-omit drift fix (Phase 2 hardening
+    NOTE-1, 2026-05-17 + queue #9a follow-up, 2026-05-17): the
+    template ships with NO empty-string defaults for
+    ``source_type`` / ``source_anchor`` / ``author`` / ``url``.
+    Reasoning:
 
-      * The resolver and extraction-loop already omit these fields from
-        ``set_fields`` when their values are empty (per the
+      * The resolver and extraction-loop already omit these fields
+        from ``set_fields`` when their values are empty (per the
         "intentionally left blank" discipline — silent absence is
         meaningful: parser couldn't infer / operator didn't dictate).
-      * If the template carried ``source_type: ""`` as a default,
+      * If the template carried ``author: ""`` as a default,
         ``vault_create``'s template-frontmatter merge would persist
         the empty string regardless of the resolver's omit-discipline.
         Drift between the two surfaces would silently land empty
         strings on every new record.
-      * Additionally, ``source_anchor`` is a per-claim ZETTEL field
-        (set by the extraction LLM on derived zettels). It doesn't
-        semantically belong on ``source/`` records at all — the
-        source record represents the WORK, not any single observation
-        within it.
+      * ``url`` is operator-fillable (not auto-set by any code path).
+        SKILL line 818 acknowledged the template-leak; this commit
+        closes the underlying drift surface.
+      * ``author`` is auto-set by the capture-source-anchor resolver
+        when the opening pattern names an author. For shapes where
+        the pattern matches but no ``by Y`` clause appears (videos
+        without a director byline, podcasts without a host byline),
+        the resolver omits the field — and post-cleanup, the
+        template's empty-string default no longer survives the
+        merge to contradict the omit.
+      * ``source_anchor`` is a per-claim ZETTEL field (set by the
+        extraction LLM on derived zettels). It doesn't semantically
+        belong on ``source/`` records at all.
 
-    Fresh source records get ``source_type`` only when the parser
-    infers a shape (book / article / podcast / video / lecture /
-    conversation). When unset, the field is absent from frontmatter
-    entirely — operator can add it manually if needed.
+    Fresh source records get each field ONLY when actually set by
+    a code path (resolver) or by the operator. When unset, the field
+    is absent from frontmatter entirely. SKILL line 819's
+    end-to-end OMIT-discipline claim now holds without exception.
     """
     post = _parse_template()
     fm = post.metadata
     assert fm["type"] == "source"
     assert fm["name"] == "{{title}}"
     assert fm["created"] == "{{date}}"
-    # author + url default empty strings — populated by the resolver
-    # (author) or operator (url).
-    assert "author" in fm
-    assert fm["author"] == ""
-    assert "url" in fm
-    assert fm["url"] == ""
-    # Phase 2 hardening (NOTE-1): source_type + source_anchor REMOVED
-    # from template defaults to prevent template/resolver drift. The
-    # resolver writes source_type to frontmatter when the parser
-    # infers a shape; otherwise the field is absent (per
-    # "intentionally left blank" discipline). source_anchor is a
-    # per-zettel field, not a per-source field — doesn't belong here.
-    assert "source_type" not in fm
-    assert "source_anchor" not in fm
+    # Phase 2 hardening (NOTE-1) + queue #9a cleanup: 4 fields confirmed
+    # ABSENT as template defaults. Each is set on-demand by the
+    # appropriate code path or operator action; the template no longer
+    # ships empty-string defaults that would silently persist past
+    # ``vault_create``'s template-merge step.
+    assert "source_type" not in fm     # set by resolver shape-inference
+    assert "source_anchor" not in fm   # per-zettel field; doesn't belong
+    assert "author" not in fm          # set by resolver opening-pattern
+    assert "url" not in fm             # operator-fillable
     # Existing fields preserved.
     assert fm["status"] == "active"
     assert fm["mocs"] == []
     assert fm["tags"] == []
+
+
+def test_source_template_four_omitted_defaults_absent_explicitly() -> None:
+    """Sibling pin: the four fields cleaned up (source_type,
+    source_anchor, author, url) are ABSENT from the template's
+    rendered frontmatter — parallel to the existing
+    ``test_source_frontmatter_shape`` absence assertion but a
+    standalone pin that survives reordering / refactoring of the
+    main shape test.
+
+    The pin exists to surface accidental re-introduction
+    immediately. If a future commit reverts one of these to an
+    empty-string default ("for documentation"), this fires.
+    """
+    post = _parse_template()
+    fm = post.metadata
+    omitted_defaults: tuple[str, ...] = (
+        "source_type",
+        "source_anchor",
+        "author",
+        "url",
+    )
+    for field_name in omitted_defaults:
+        assert field_name not in fm, (
+            f"Template default leak: ``{field_name}`` should be ABSENT "
+            f"from the source template frontmatter (each field is "
+            f"set on-demand by the resolver or operator, not as a "
+            f"template-level empty-string default that would persist "
+            f"past vault_create's template-merge step). Got value: "
+            f"{fm.get(field_name)!r}"
+        )
 
 
 def test_source_uses_canonical_placeholders() -> None:
