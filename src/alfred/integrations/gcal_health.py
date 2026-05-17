@@ -1,51 +1,62 @@
-"""GCal health check — registered with the BIT aggregator.
+"""GCal health check — active-call probe (queue #8 rework, 2026-05-17).
 
 Mirrors the brief / janitor / distiller / daily_sync / instructor
 ``last-successful-*`` daemon-liveness pattern but for the Google
-Calendar OAuth token rather than a daemon state file.
+Calendar OAuth token. Active-call rework: probe makes a lightweight
+authenticated API call (``calendarList().list(maxResults=1)``) and
+maps the outcome to status. Prior mtime-only logic produced
+false-positive FAIL on idle days when token was still valid but
+hadn't been refreshed because no API activity touched it.
 
-**Source-of-truth signal:** ``data/secrets/gcal_token.json``'s mtime.
-The Google OAuth library re-writes this file via tmp+rename every time
-the cached ``access_token`` is refreshed (see
-``GCalClient._save_credentials`` in ``gcal.py``). A healthy install
-sees the file touched roughly every ~hour (access tokens expire at
-that cadence). When the ``refresh_token`` is revoked / expired /
-rotated, no refresh happens, no rewrite happens, and the mtime ages
-unbounded.
+**Pre-rework problem (mtime-only):** when Andrew has no event
+activity for >24h (vacation, weekend, just no calendar changes),
+the token file's mtime stays old even though the refresh token is
+still valid. The probe couldn't distinguish "idle (no event
+activity)" from "broken (auth failed)" — operator saw FAIL on a
+healthy system. Per CLAUDE.md universal
+``feedback_intentionally_left_blank.md``: silence-from-no-activity
+must surface DIFFERENTLY from silence-from-failure.
+
+**Post-rework probe:** active call verifies auth state regardless
+of activity history.
 
 Status mapping:
 
-* **OK**   — token mtime < 24h ago. Active refreshes are happening
-  (or have happened recently); auth is alive.
-* **WARN** — 24h ≤ mtime age < 72h. Could be a quiet calendar day
-  (no sync attempts → no forced refresh) OR an early auth issue.
-* **FAIL** — mtime age ≥ 72h. Three days without a single refresh on
-  a normally-active calendar means the refresh_token almost certainly
-  needs re-authorisation. Run ``alfred gcal authorize``.
+* **OK**   — API call succeeded. Token works. mtime info appended
+  to the detail string as supporting context (e.g. "token last
+  refreshed 0.3h ago") but isn't the gate.
+* **WARN** — API call raised a network / transient error
+  (connection refused, DNS failure, timeout, generic transport).
+  Couldn't verify auth; flag for operator awareness. Last-error
+  suffix from log scan still applied.
+* **FAIL** — API call raised auth-specific failure: ``RefreshError``
+  (refresh token revoked / expired / invalid) OR ``HttpError`` with
+  status 401 (unauthorized) / 403 (forbidden). Operator must run
+  ``alfred gcal authorize``.
 * **SKIP** — ``gcal.enabled=false`` OR the section is absent OR the
   token file doesn't exist (fresh install — operator hasn't run the
-  ``authorize`` flow yet, which is expected).
+  ``authorize`` flow yet, which is expected) OR the ``google-*``
+  libraries aren't installed (degraded-but-functional install).
 
-**Last-error suffix:** when the timestamp threshold flags WARN/FAIL,
-the detail string gets a ``; last error: <error_code>`` suffix if any
+**Last-error suffix:** when the probe lands WARN/FAIL, the detail
+string gets a ``; last error: <error_code>`` suffix if any
 ``gcal.sync_*_failed`` log line landed within the last 24h. Mirrors
-the brief/instructor probes' last-error contract, but the source is
-log-scanning rather than a state-file field — gcal has no per-daemon
-state file. Capped at 150 chars (same convention).
-
-Per ``feedback_intentionally_left_blank.md``: the failure case here is
-EXACTLY the 2026-05-07 → 2026-05-15 silent-auth incident — token
-expired May 7, Andrew didn't notice for 9 days because the only
-operator-visible signal was Salem's narration after a calendar-edit
-attempt, which only fires when Andrew makes a calendar change. This
-probe disambiguates "no sync happening because no calendar activity"
-from "no sync happening because auth is broken" at day 3 instead of
-day 9.
+the brief/instructor probes' last-error contract; source is
+log-scanning since gcal has no per-daemon state file. Capped at
+150 chars.
 
 Per ``feedback_intentionally_left_blank.md`` for the probe itself:
 every status path emits an explicit detail string so the operator
 distinguishes "skipped because disabled" from "skipped because no
-token yet" from "ok, X hours since last refresh."
+token yet" from "skipped because libs not installed" from "ok, API
+call succeeded" from "fail, auth revoked" from "warn, transient
+network".
+
+Per CLAUDE.md "Subprocess Failure Logging" / equivalent: errors
+captured for the detail string use ``str(exc)[:200]`` truncation so
+a verbose Google API error doesn't blow up the BIT detail line. Full
+exception info still surfaces in the result.data dict for diagnostic
+deep-dive.
 """
 
 from __future__ import annotations
@@ -60,21 +71,6 @@ from alfred.health.aggregator import register_check
 from alfred.health.types import CheckResult, Status, ToolHealth
 
 
-# Thresholds for the mtime-based status mapping. Documented in module
-# docstring above; isolated here as constants so a future tuning pass
-# is a one-line edit.
-#
-# Why 24h WARN / 72h FAIL: the Google OAuth library refreshes the
-# access_token every ~hour while in use. On an idle-but-healthy
-# calendar (Andrew didn't make a change today) the file still gets
-# touched whenever Salem's transport reads the calendar for the daily
-# brief (06:00 ADT). So a healthy mtime is always within 24h. A 24-72h
-# gap is ambiguous (legitimately quiet weekend, or early auth failure
-# — operator should look). > 72h is almost certainly auth-broken on
-# any normally-active install.
-_GCAL_WARN_SECONDS = 24 * 60 * 60       # 24 hours
-_GCAL_FAIL_SECONDS = 72 * 60 * 60       # 72 hours
-
 # Window for the last-error log scan. Anything older than 24h is
 # unlikely to be the cause of "auth is currently broken" — could be a
 # transient that's already resolved.
@@ -88,6 +84,12 @@ _LOG_TAIL_BYTES = 256 * 1024
 
 # Same 150-char cap as brief/instructor for the last-error suffix.
 _LAST_ERROR_CAP = 150
+
+# Truncation cap for the active-call error message embedded in the
+# detail string. Google API errors can run multiple kilobytes of
+# JSON; 200 chars is enough to identify the failure class without
+# blowing up the BIT detail line.
+_EXC_DETAIL_CAP = 200
 
 # ANSI escape-sequence stripper. The dev/console structlog renderer
 # writes ANSI-coloured logs to file (e.g. ``\x1b[2m...\x1b[0m``), so
@@ -280,10 +282,123 @@ def _format_age_hours(seconds: float) -> str:
     return f"{hours:.1f}h"
 
 
-def _check_last_successful_gcal_sync(raw: dict[str, Any]) -> CheckResult:
-    """Validate that the GCal OAuth token has been refreshed recently.
+def _build_calendar_service(token_path: Path) -> Any:
+    """Build a GCal v3 ``service`` object using the cached credentials.
 
-    See module docstring for full status-mapping rationale.
+    Mirrors ``GCalClient._service_obj`` shape (per
+    ``feedback_sdk_quirk_centralization.md`` — keep import-time + build-
+    time SDK quirks consistent across call sites) but lighter — no
+    refresh-on-load round-trip. The probe wants to know whether the
+    saved credentials work AS-IS at call time; if the access token is
+    expired, the API call itself triggers a refresh via google-auth's
+    auto-refresh middleware. If the refresh fails, the API call
+    raises ``RefreshError`` — exactly the signal we want for the FAIL
+    path.
+
+    Raises ``ImportError`` (re-raised as ``GoogleLibsNotInstalled``)
+    when the google-* libraries aren't available. Caller maps this to
+    SKIP.
+    """
+    # Lazy import (matches the pattern in gcal.py) — keeps gcal_health
+    # importable on installs that didn't pull in the optional gcal
+    # extras.
+    from google.oauth2.credentials import Credentials  # type: ignore
+    from googleapiclient.discovery import build  # type: ignore
+
+    # Same scopes the adapter uses. ``Credentials.from_authorized_user_file``
+    # tolerates the scopes arg being None — we pass it for parity but
+    # the loaded credentials carry the scopes that were minted at
+    # authorize-time anyway.
+    creds = Credentials.from_authorized_user_file(str(token_path), None)
+    # cache_discovery=False suppresses the file-cache deprecation
+    # warning. discovery fetched fresh per probe call — acceptable
+    # latency cost for the diagnostic value.
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+
+class _GoogleLibsNotInstalled(Exception):
+    """Internal sentinel: ``google-*`` libs aren't importable.
+
+    Distinct from ``alfred.integrations.gcal.GCalNotInstalled`` to
+    avoid cross-module import cycles at health-probe load time.
+    """
+
+
+def _classify_active_call_outcome(
+    exc: BaseException,
+) -> tuple[Status, str]:
+    """Map an active-call exception to (status, error_class_tag).
+
+    The ``error_class_tag`` is a short stable identifier embedded in
+    the detail string so operators can grep for specific failure
+    classes across BIT runs.
+
+    Mapping rules:
+
+      * ``RefreshError`` (google-auth) → FAIL / ``refresh_failed``
+        The cached refresh token is no longer accepted. Operator must
+        re-authorize.
+
+      * ``HttpError`` with status 401 / 403 (googleapiclient) → FAIL /
+        ``http_<code>``. Auth-rejected at the API layer.
+
+      * ``HttpError`` with any other status (5xx, 429, etc.) → WARN /
+        ``http_<code>``. Could be transient quota / Google
+        outage / API change — operator should retry, not re-auth.
+
+      * Anything else (network errors, SSL handshake, generic
+        Exception) → WARN / ``transient``. Worth flagging but not
+        worth burning the operator's OAuth flow on.
+
+    Imports are lazy / defensive so the classifier still works when
+    the google-* libs aren't present (in which case the outer caller
+    short-circuits to SKIP before this is reached, but the defensive
+    isinstance checks remain).
+    """
+    # RefreshError — terminal auth failure. The token's refresh_token
+    # is revoked / expired / invalid. Operator must re-authorize.
+    try:
+        from google.auth.exceptions import RefreshError  # type: ignore
+        if isinstance(exc, RefreshError):
+            return Status.FAIL, "refresh_failed"
+    except ImportError:
+        # google-auth not importable — fall through. Probably handled
+        # at the SKIP branch upstream; defensive here.
+        pass
+
+    # HttpError — distinguish auth-rejected (401/403) from transient
+    # / quota (other status codes).
+    try:
+        from googleapiclient.errors import HttpError  # type: ignore
+        if isinstance(exc, HttpError):
+            # HttpError exposes the HTTP status code via ``resp.status``
+            # on its underlying httplib2 response. Be defensive — the
+            # attribute path has shifted across googleapiclient versions.
+            status_code = 0
+            resp = getattr(exc, "resp", None)
+            if resp is not None:
+                status_code = int(getattr(resp, "status", 0) or 0)
+            if status_code in (401, 403):
+                return Status.FAIL, f"http_{status_code}"
+            # Any other HttpError status (5xx server error, 429 quota,
+            # 4xx client error other than auth) is transient/retry-
+            # worthy from the operator's perspective — don't push them
+            # toward re-authorize.
+            return Status.WARN, f"http_{status_code or 'unknown'}"
+    except ImportError:
+        pass
+
+    # Anything else — generic transient: network failure, DNS, TLS
+    # handshake, socket timeout, json decode error, etc. Flag the
+    # operator but don't claim auth is broken.
+    return Status.WARN, "transient"
+
+
+def _check_last_successful_gcal_sync(raw: dict[str, Any]) -> CheckResult:
+    """Active-call probe: verify GCal auth state by making a lightweight
+    API call.
+
+    See module docstring for the full status-mapping rationale.
     """
     gcal_raw = raw.get("gcal", {}) or {}
     enabled = bool(gcal_raw.get("enabled", False))
@@ -314,21 +429,99 @@ def _check_last_successful_gcal_sync(raw: dict[str, Any]) -> CheckResult:
             data={**payload, "exists": False},
         )
 
+    # Build mtime context for the detail string. The active-call result
+    # is the gate; mtime is supporting context only.
     now_dt = datetime.now(timezone.utc)
     mtime_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
     age_seconds = (now_dt - mtime_dt).total_seconds()
-
-    # ISO 8601 with Z-suffix for parity with structlog TimeStamper(fmt="iso").
     mtime_iso = mtime_dt.isoformat().replace("+00:00", "Z")
     payload["last_refreshed"] = mtime_iso
     payload["age_seconds"] = int(age_seconds)
+    age_h = _format_age_hours(age_seconds)
+
+    # Try to build the service object — this can raise ImportError
+    # when the google-* libs aren't installed. Map that to SKIP so a
+    # base install (no gcal extras) doesn't surface a noisy FAIL.
+    try:
+        service = _build_calendar_service(token_path)
+    except ImportError as exc:
+        return CheckResult(
+            name="last-successful-gcal-sync",
+            status=Status.SKIP,
+            detail=(
+                f"google-api libraries not installed; "
+                f"pip install alfred-vault[gcal] to enable "
+                f"(import error: {str(exc)[:80]})"
+            ),
+            data={**payload, "libs_installed": False},
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Credentials.from_authorized_user_file can raise on a
+        # corrupted token file (json decode error). Map to FAIL with a
+        # clean operator-actionable message — the token file exists but
+        # is unreadable, just like the adapter's GCalNotAuthorized path.
+        msg = str(exc)[:_EXC_DETAIL_CAP]
+        return CheckResult(
+            name="last-successful-gcal-sync",
+            status=Status.FAIL,
+            detail=(
+                f"token file unreadable (run alfred gcal authorize): "
+                f"{msg}"
+            ),
+            data={
+                **payload,
+                "error_class": "token_load_failed",
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+            },
+        )
+
+    # Active call — lightweight: list one calendarList entry. Doesn't
+    # depend on a specific calendar_id being configured; just verifies
+    # the credentials can authenticate to GCal at all.
+    call_error: BaseException | None = None
+    try:
+        service.calendarList().list(maxResults=1).execute()
+    except BaseException as exc:  # noqa: BLE001
+        # BaseException to also catch the rare SystemExit-shaped errors
+        # some HTTP transports raise on TLS failures. The classifier
+        # below maps to WARN by default for anything-not-RefreshError-
+        # or-HttpError, so worst case is a noisy WARN — never a crash.
+        call_error = exc
 
     # Last-error suffix lookup — only consulted when we're about to
-    # emit WARN/FAIL. The OK path keeps the detail clean since "auth
-    # was refreshed within the last hour" is a strong-enough green
-    # signal that a stale error is just noise.
+    # emit WARN/FAIL. The OK path keeps the detail clean since a
+    # successful active call is a strong-enough green signal that a
+    # stale log error is noise.
     log_paths = _resolve_log_paths(raw)
     last_error = _scan_recent_failures(log_paths)
+
+    if call_error is None:
+        # OK — active call succeeded. Token works regardless of mtime.
+        # Detail includes the mtime as supporting context per
+        # "intentionally left blank" — operator sees "active probe OK"
+        # AND "last refresh was N hours ago" so a quietly-stale token
+        # is visible even when working.
+        return CheckResult(
+            name="last-successful-gcal-sync",
+            status=Status.OK,
+            detail=(
+                f"active probe ok; token last refreshed {age_h} ago "
+                f"({mtime_iso})"
+            ),
+            data={**payload, "active_probe": "ok"},
+        )
+
+    # Active call failed. Classify the exception.
+    status, error_class = _classify_active_call_outcome(call_error)
+    error_msg = str(call_error)[:_EXC_DETAIL_CAP]
+    exception_type = type(call_error).__name__
+
+    payload["active_probe"] = "failed"
+    payload["error_class"] = error_class
+    payload["exception_type"] = exception_type
+    payload["exception_message"] = str(call_error)
+
     if last_error is not None:
         payload["last_error"] = last_error
         code = last_error.get("error_code", "") or ""
@@ -338,30 +531,25 @@ def _check_last_successful_gcal_sync(raw: dict[str, Any]) -> CheckResult:
     else:
         error_suffix = ""
 
-    age_h = _format_age_hours(age_seconds)
-
-    if age_seconds < _GCAL_WARN_SECONDS:
+    # FAIL detail — auth-broken framing, actionable next step.
+    if status == Status.FAIL:
         return CheckResult(
             name="last-successful-gcal-sync",
-            status=Status.OK,
-            detail=f"last gcal sync {age_h} ago (token last refreshed {mtime_iso})",
-            data=payload,
-        )
-    if age_seconds < _GCAL_FAIL_SECONDS:
-        return CheckResult(
-            name="last-successful-gcal-sync",
-            status=Status.WARN,
+            status=Status.FAIL,
             detail=(
-                f"last gcal sync {age_h} ago (token may be stale){error_suffix}"
+                f"active probe failed ({error_class}; "
+                f"run alfred gcal authorize): {error_msg}{error_suffix}"
             ),
             data=payload,
         )
+
+    # WARN detail — couldn't-verify framing, operator awareness only.
     return CheckResult(
         name="last-successful-gcal-sync",
-        status=Status.FAIL,
+        status=Status.WARN,
         detail=(
-            f"last gcal sync {age_h} ago (auth likely revoked — "
-            f"run alfred gcal authorize){error_suffix}"
+            f"active probe could not verify ({error_class}; "
+            f"token last refreshed {age_h} ago): {error_msg}{error_suffix}"
         ),
         data=payload,
     )
