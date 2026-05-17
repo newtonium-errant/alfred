@@ -139,6 +139,17 @@ NAME_PARTICLES: frozenset[str] = frozenset({
 # order; first match wins. Order is most-specific-first so e.g.
 # "at a lecture by Hadot" matches the lecture pattern before falling
 # through to reading.
+#
+# WARN-2 hardening (2026-05-17): all patterns now anchor at start-of-text
+# (``\A\s*``) instead of word-boundary (``\b``). The pre-hardening
+# patterns would match a bare verb mid-phrase, e.g.
+# ``"I'm reading about watching paint dry"`` → WATCHING bare-verb
+# branch matched at the ``watching`` offset → source_type=video
+# (WRONG). Sentence-start anchoring eliminates this entire class of
+# false positives. Trade-off: greeted openings like ``"Hi Hypatia,
+# I'm reading X"`` no longer match — operator must lead with the verb
+# pattern. Andrew's actual openings are direct ("I'm reading X by Y"
+# as the first sentence), so the trade-off is acceptable.
 
 # "I'm reading X by Y" / variants — BOOK source type (or article/
 # substack when title contains URL / Substack hint, detected at infer
@@ -146,7 +157,7 @@ NAME_PARTICLES: frozenset[str] = frozenset({
 _READING_PATTERN = re.compile(
     r"""
     (?ix)
-    \b
+    \A\s*
     (?:
         i'?m\s+(?:currently\s+)?(?:reading|working\s+through|going\s+through)
       | currently\s+reading
@@ -167,7 +178,7 @@ _READING_PATTERN = re.compile(
 _WATCHING_PATTERN = re.compile(
     r"""
     (?ix)
-    \b
+    \A\s*
     (?:
         i'?m\s+(?:currently\s+)?watching
       | currently\s+watching
@@ -186,7 +197,7 @@ _WATCHING_PATTERN = re.compile(
 _LISTENING_PATTERN = re.compile(
     r"""
     (?ix)
-    \b
+    \A\s*
     (?:
         i'?m\s+(?:currently\s+)?listening\s+to
       | currently\s+listening\s+to
@@ -207,7 +218,7 @@ _LISTENING_PATTERN = re.compile(
 _CONVERSATION_PATTERN = re.compile(
     r"""
     (?ix)
-    \b
+    \A\s*
     (?:
         i'?m\s+in\s+conversation\s+with
       | i\s+am\s+in\s+conversation\s+with
@@ -228,7 +239,7 @@ _CONVERSATION_PATTERN = re.compile(
 _LECTURE_PATTERN = re.compile(
     r"""
     (?ix)
-    \b
+    \A\s*
     (?:
         i'?m\s+at\s+a\s+lecture\s+by
       | i\s+am\s+at\s+a\s+lecture\s+by
@@ -1106,6 +1117,54 @@ _OBSERVATIONS_DURING_HEADING: str = "## Observations During"
 _PERM_NOTES_SPAWNED_HEADING: str = "## Permanent Notes spawned"
 
 
+def _find_h2_section_start(body: str, heading: str) -> int:
+    """Return the start index of a line-anchored H2 heading in ``body``,
+    or -1 if not found.
+
+    WARN-1 hardening fix (2026-05-17). The pre-hardening code used
+    ``body.find(heading)`` which searches for the substring at any
+    offset. False-match surface: an H3 heading like ``### Observations
+    During Yesterday`` contains the substring ``## Observations During``
+    at offset+1 (because ``### Foo`` = ``#`` + ``## Foo``). A
+    substring-find would lock onto that and corrupt subsequent
+    section-bounded operations.
+
+    This helper enforces line-anchored detection:
+      * The heading must start at byte 0 of the body OR be preceded by
+        a newline character.
+      * The heading must be followed by end-of-line (newline or
+        end-of-body) — no extra ``#`` characters after the ``## Foo``
+        match (which would indicate H3+).
+
+    Pattern matches the migration script's regex shape (per
+    ``scripts/migrate_2026_05_16_meditations_zettels.py``:
+    ``re.compile(r"##\\s+Permanent\\s+Notes\\s+spawned\\s*\\n...")``).
+    """
+    search_from = 0
+    while True:
+        idx = body.find(heading, search_from)
+        if idx == -1:
+            return -1
+        # Line-anchored: must be at body start OR preceded by newline.
+        at_line_start = (idx == 0) or (body[idx - 1] == "\n")
+        # Line-anchored end: the heading must be followed by end-of-line
+        # (or end-of-body). NOT followed by another ``#`` character —
+        # that would indicate an H3+ heading (e.g. ``## Foo`` followed
+        # by ``#`` → actually ``### Foo`` if the prefix overlap held).
+        # In practice the after-byte should be ``\n`` or ``\r`` or
+        # whitespace. The pre-existing usage relies on ``\n``-followed.
+        after_idx = idx + len(heading)
+        ends_cleanly = (
+            after_idx == len(body)
+            or body[after_idx] in ("\n", "\r")
+            or body[after_idx].isspace()
+        )
+        if at_line_start and ends_cleanly:
+            return idx
+        # False match (e.g. inside an H3 heading) — keep searching.
+        search_from = idx + 1
+
+
 def _render_observations_for_session(
     topics: list[str],
     key_insights: list[str],
@@ -1172,8 +1231,10 @@ def _build_re_encounter_rewriter(
     today_heading = f"### {today_iso}"
 
     def _rewriter(body: str) -> str:
-        # Locate Observations During section.
-        obs_idx = body.find(_OBSERVATIONS_DURING_HEADING)
+        # Locate Observations During section — line-anchored detection
+        # so an H3 heading like ``### Observations During Yesterday``
+        # doesn't false-match (WARN-1 hardening fix, 2026-05-17).
+        obs_idx = _find_h2_section_start(body, _OBSERVATIONS_DURING_HEADING)
         if obs_idx == -1:
             # Section missing — pre-Phase-2 template or operator-edited
             # body. No-op rather than write to an arbitrary location.
@@ -1258,13 +1319,14 @@ def _find_next_top_heading(body: str, start_idx: int) -> int:
         # H1 or H2 (NOT H3 or deeper).
         if body[line_start:line_start + 2] == "# ":
             return line_start
-        if body[line_start:line_start + 3] == "## " and body[line_start:line_start + 4] != "## ":
-            # Defensive: catches the rare case where line starts with
-            # "## " but is actually "## " followed by a space (no text).
-            # The earlier check ``== "## "`` is the canonical one.
-            pass
         if body[line_start:line_start + 3] == "## ":
             return line_start
+        # NOTE-2 hardening fix (2026-05-17): removed dead
+        # ``body[start:start+3] == "## " and body[start:start+4] != "## "``
+        # block — the conjunction is impossible (a 3-char slice equaling
+        # ``"## "`` means body[start:start+4] is at minimum 4 chars,
+        # not the 3-char ``"## "``). The H2 detection happens on the
+        # canonical check above; the dead block was a no-op ``pass``.
         i = line_start
     return len(body)
 
@@ -1293,8 +1355,11 @@ def _build_permanent_notes_rewriter(
     bare_link = zettel_wikilink.strip()
 
     def _rewriter(body: str) -> str:
-        # Locate Permanent Notes spawned section.
-        perm_idx = body.find(_PERM_NOTES_SPAWNED_HEADING)
+        # Locate Permanent Notes spawned section — line-anchored
+        # detection (WARN-1 hardening fix, 2026-05-17). The
+        # pre-hardening ``body.find(heading)`` would false-match an
+        # H3 like ``### Permanent Notes spawned Yesterday`` at offset+1.
+        perm_idx = _find_h2_section_start(body, _PERM_NOTES_SPAWNED_HEADING)
         if perm_idx == -1:
             # Section missing — no-op. Conservative behaviour matches
             # the re-encounter rewriter: don't write to an arbitrary

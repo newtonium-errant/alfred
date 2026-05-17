@@ -77,7 +77,32 @@ def test_source_frontmatter_parses_cleanly() -> None:
 
 
 def test_source_frontmatter_shape() -> None:
-    """Frontmatter carries the Phase 2 field set per the brief."""
+    """Frontmatter carries the Phase 2 field set per the brief.
+
+    Template-default vs resolver-omit drift fix (NOTE-1 of the Phase 2
+    hardening pass, 2026-05-17): ``source_type`` and ``source_anchor``
+    are NOT in the template defaults. Reasoning:
+
+      * The resolver and extraction-loop already omit these fields from
+        ``set_fields`` when their values are empty (per the
+        "intentionally left blank" discipline — silent absence is
+        meaningful: parser couldn't infer / operator didn't dictate).
+      * If the template carried ``source_type: ""`` as a default,
+        ``vault_create``'s template-frontmatter merge would persist
+        the empty string regardless of the resolver's omit-discipline.
+        Drift between the two surfaces would silently land empty
+        strings on every new record.
+      * Additionally, ``source_anchor`` is a per-claim ZETTEL field
+        (set by the extraction LLM on derived zettels). It doesn't
+        semantically belong on ``source/`` records at all — the
+        source record represents the WORK, not any single observation
+        within it.
+
+    Fresh source records get ``source_type`` only when the parser
+    infers a shape (book / article / podcast / video / lecture /
+    conversation). When unset, the field is absent from frontmatter
+    entirely — operator can add it manually if needed.
+    """
     post = _parse_template()
     fm = post.metadata
     assert fm["type"] == "source"
@@ -89,20 +114,14 @@ def test_source_frontmatter_shape() -> None:
     assert fm["author"] == ""
     assert "url" in fm
     assert fm["url"] == ""
-    # Phase 2 NEW fields:
-    # ``source_type`` — populated by deliverable #3 shape-inference
-    # (book / article / substack / podcast / video / lecture /
-    # conversation). Empty default; operator override allowed.
-    assert "source_type" in fm
-    assert fm["source_type"] == ""
-    # ``source_anchor`` — populated by deliverable #2 anchor-preservation
-    # flow. Empty default at template level; per-record value set on
-    # spawned zettels (e.g. ``"p.23"`` for books, ``"0:15:30"`` for
-    # videos, ``"¶3"`` for articles). The source record itself carries
-    # the field as a template-shape pin; per-zettel anchor values land
-    # on derived zettels (see deliverable #2).
-    assert "source_anchor" in fm
-    assert fm["source_anchor"] == ""
+    # Phase 2 hardening (NOTE-1): source_type + source_anchor REMOVED
+    # from template defaults to prevent template/resolver drift. The
+    # resolver writes source_type to frontmatter when the parser
+    # infers a shape; otherwise the field is absent (per
+    # "intentionally left blank" discipline). source_anchor is a
+    # per-zettel field, not a per-source field — doesn't belong here.
+    assert "source_type" not in fm
+    assert "source_anchor" not in fm
     # Existing fields preserved.
     assert fm["status"] == "active"
     assert fm["mocs"] == []

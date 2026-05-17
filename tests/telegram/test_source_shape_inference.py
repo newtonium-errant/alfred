@@ -307,3 +307,87 @@ def test_resolver_does_not_overwrite_existing_source_type(
     src = frontmatter.load(vault / "source/Meditations.md")
     # Operator's audiobook value preserved.
     assert src.metadata["source_type"] == "audiobook"
+
+
+# --- WARN-2 hardening regression: sentence-start anchored patterns ------
+
+
+@pytest.mark.parametrize("text,expected_type,expected_title", [
+    # Pre-hardening bug case: bare ``watching`` mid-phrase in a
+    # reading opening → WATCHING bare-verb branch hijacked → wrong
+    # source_type. Post-hardening (\A\s* anchor): only the sentence-
+    # leading READING pattern matches.
+    (
+        "I'm reading about watching paint dry by Some Author",
+        "book", "about watching paint dry",
+    ),
+    # Mirror: ``reading`` mid-phrase in a listening opening.
+    (
+        "I'm listening to my own thinking about reading habits by Some Host",
+        "podcast", "my own thinking about reading habits",
+    ),
+    # Multi-verb chain: ``I'm at home`` doesn't start with any shape
+    # verb (it starts with ``I'm at`` but not ``I'm at a lecture by``).
+    # The mid-phrase ``watching the news`` and ``reading`` verbs are
+    # NOT at \A\s*, so neither matches. source_type stays "".
+    (
+        "I'm at home watching the news while reading by Some Author",
+        "", "",
+    ),
+])
+def test_shape_patterns_no_mid_phrase_false_positives(
+    text: str, expected_type: str, expected_title: str,
+) -> None:
+    """WARN-2 regression-pin (2026-05-17). Adversarial inputs where a
+    shape verb appears mid-phrase must NOT hijack the inference. Only
+    sentence-start (\\A\\s*) verbs match post-hardening.
+
+    The pre-hardening shape used ``\\b`` (word boundary) which matched
+    bare verbs anywhere in the text, producing false positives like
+    ``"I'm reading about watching paint dry"`` → source_type=video
+    (the WATCHING pattern's bare-verb branch grabbing ``watching``
+    mid-phrase).
+
+    Post-hardening: each pattern anchors at ``\\A\\s*`` so only the
+    verb that opens the text matters.
+    """
+    parsed = csa.parse_opening_anchors(text)
+    assert parsed.source_type == expected_type, (
+        f"source_type mismatch for {text!r}: "
+        f"expected {expected_type!r}, got {parsed.source_type!r}"
+    )
+    if expected_title:
+        assert parsed.title == expected_title
+
+
+def test_anchored_pattern_rejects_greeted_opening() -> None:
+    """Documentary test of the trade-off: greeted openings like
+    ``"Hi Hypatia, I'm reading X by Y"`` no longer match because the
+    verb is not at sentence-start. This is the explicit trade-off
+    of the WARN-2 hardening per the brief's option (a) — false-positive
+    elimination prioritised over greeted-opening tolerance.
+
+    Andrew's actual capture openings are direct ("I'm reading X by Y"
+    as the first sentence), so the trade-off is acceptable. If
+    real-use friction surfaces (operator regularly leads with a
+    greeting), the pattern can be extended to accept leading
+    greetings via a separate alternation branch.
+    """
+    parsed = csa.parse_opening_anchors(
+        "Hi Hypatia, I'm reading Meditations by Marcus Aurelius"
+    )
+    # Greeted opening doesn't match the anchored pattern.
+    assert parsed.source_type == ""
+    assert parsed.title == ""
+    assert parsed.author == ""
+
+
+def test_anchored_pattern_tolerates_leading_whitespace() -> None:
+    """``\\A\\s*`` allows leading whitespace before the verb — common
+    in user text that begins with a space or tab."""
+    parsed = csa.parse_opening_anchors(
+        "   I'm reading Meditations by Marcus Aurelius"
+    )
+    assert parsed.source_type == "book"
+    assert parsed.title == "Meditations"
+    assert parsed.author == "Marcus Aurelius"

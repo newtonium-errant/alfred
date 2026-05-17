@@ -489,3 +489,43 @@ async def test_extract_multi_zettel_batch_appends_each(
     for zettel_rel in result.created_paths:
         zettel_no_md = zettel_rel[:-3]
         assert f"[[{zettel_no_md}]]" in src_body
+
+
+# --- WARN-1 hardening regression: line-anchored section detection -------
+
+
+def test_perm_notes_rewriter_does_not_false_match_h3() -> None:
+    """WARN-1 regression-pin (2026-05-17). Body containing an H3
+    heading like ``### Permanent Notes spawned Yesterday`` must NOT
+    cause the rewriter to false-match on the substring ``##
+    Permanent Notes spawned`` at offset+1 within the H3 line.
+
+    Pre-hardening shape: ``body.find("## Permanent Notes spawned")``
+    would lock onto the H3-line's offset+1 (because ``### Foo`` =
+    ``#`` + ``## Foo``) and corrupt subsequent section-bounded
+    operations.
+
+    Post-hardening: ``_find_h2_section_start`` enforces
+    line-anchored detection — the H3 doesn't match.
+
+    The fixture body has NO real ``## Permanent Notes spawned`` H2
+    heading. Post-hardening, the rewriter detects no section and
+    returns body unchanged (the canonical "no section → no-op" path).
+    """
+    # Body with an H3 that contains the substring "## Permanent Notes
+    # spawned" at offset+1 within the H3 line — but NO real H2 heading.
+    body = (
+        "# Source Details\n\n"
+        "## Bibliographic Details\n\n"
+        "# Notes\n\n"
+        "### Permanent Notes spawned Yesterday\n\n"  # H3 — must NOT false-match
+        "Some prior content.\n\n"
+        "# External References\n"
+    )
+    rewriter = csa._build_permanent_notes_rewriter("[[zettel/X]]")
+    result = rewriter(body)
+    # No real H2 ``## Permanent Notes spawned`` → rewriter no-ops.
+    assert result == body, (
+        f"H3 ``### Permanent Notes spawned Yesterday`` false-matched "
+        f"the H2 anchor; rewriter corrupted body."
+    )

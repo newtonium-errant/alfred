@@ -4,8 +4,6 @@ name: "{{title}}"
 created: "{{date}}"
 author: ""
 url: ""
-source_type: ""
-source_anchor: ""
 status: active
 mocs: []
 tags: []

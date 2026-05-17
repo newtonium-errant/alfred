@@ -380,3 +380,86 @@ def test_append_handles_wikilink_input_form(tmp_path: Path) -> None:
     assert ok is True
     body = (vault / rel).read_text(encoding="utf-8")
     assert "### 2026-05-17" in body
+
+
+# --- WARN-1 hardening regression: line-anchored section detection -------
+
+
+def test_rewriter_does_not_false_match_h3_observations_during(
+    tmp_path: Path,
+) -> None:
+    """WARN-1 regression-pin (2026-05-17). Body containing an H3
+    heading like ``### Observations During Yesterday`` must NOT
+    cause the rewriter to false-match on the substring ``##
+    Observations During`` at offset+1 within the H3 line.
+
+    Pre-hardening shape: ``body.find("## Observations During")``
+    would lock onto the H3-line's offset+1 (because ``### Foo`` =
+    ``#`` + ``## Foo``) and corrupt subsequent section-bounded
+    operations.
+
+    Post-hardening: ``_find_h2_section_start`` enforces
+    line-anchored detection — the H3 doesn't match.
+
+    The fixture body has NO real ``## Observations During`` H2
+    heading. Post-hardening, the rewriter detects no section and
+    returns body unchanged (the canonical "no Observations During
+    section → no-op" path).
+    """
+    # Body with an H3 that contains the substring "## Observations
+    # During" at offset+1 within the H3 line — but NO real H2 heading.
+    body = (
+        "# Source Details\n\n"
+        "## Bibliographic Details\n\n"
+        "# Notes\n\n"
+        "### Observations During Yesterday\n\n"  # H3 — must NOT false-match
+        "Some prior content.\n\n"
+        "# External References\n"
+    )
+    rewriter = csa._build_re_encounter_rewriter(
+        "2026-05-17",
+        "- New insight\n\n_From [[session/cap]]_",
+    )
+    result = rewriter(body)
+    # No real H2 ``## Observations During`` → rewriter no-ops.
+    assert result == body, (
+        f"H3 ``### Observations During Yesterday`` false-matched the "
+        f"H2 anchor; rewriter corrupted body. before:\n{body}\n\n"
+        f"after:\n{result}"
+    )
+
+
+def test_find_h2_section_start_rejects_h3_false_match() -> None:
+    """Unit test on the line-anchor helper: H3 heading containing the
+    H2 substring must return -1."""
+    body = (
+        "# Top\n\n"
+        "### Observations During Yesterday\n\n"
+        "Some content.\n"
+    )
+    idx = csa._find_h2_section_start(body, "## Observations During")
+    assert idx == -1, (
+        f"H3 should NOT false-match H2 anchor; got idx={idx}"
+    )
+
+
+def test_find_h2_section_start_matches_real_h2() -> None:
+    """Sanity check: a real H2 heading at line start is detected."""
+    body = (
+        "# Top\n\n"
+        "## Observations During\n\n"
+        "Some content.\n"
+    )
+    idx = csa._find_h2_section_start(body, "## Observations During")
+    assert idx > 0
+    assert body[idx:idx + len("## Observations During")] == (
+        "## Observations During"
+    )
+
+
+def test_find_h2_section_start_matches_at_body_start() -> None:
+    """H2 heading at byte 0 of body is detected (edge case — no
+    preceding newline)."""
+    body = "## Observations During\n\nContent.\n"
+    idx = csa._find_h2_section_start(body, "## Observations During")
+    assert idx == 0
