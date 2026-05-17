@@ -678,6 +678,22 @@ async def on_end_zettel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     the choice.
 
     No-active-session case → "no active session." reply, same as /end.
+
+    Interaction with the memo branch (intentional, ratified
+    2026-05-16): if the session has ≤1 user message AND the
+    instance is Hypatia, the memo branch fires inside
+    :func:`alfred.telegram.capture_batch.process_capture_session`
+    BEFORE the discriminator runs. The override field still gets
+    stamped on the active dict + written to the memo'd session
+    record's frontmatter, but nothing on the memo path consults
+    it — memo is its own tier (atomic single-thought capture),
+    distinct from the zettel/note multi-message discrimination.
+    Operator wanting a 1-message thought to become a permanent
+    zettel is uncommon; memo wins for now. If real-use friction
+    surfaces (operator regularly types ``/end-zettel`` on
+    single-message sessions and wants the structured-extraction
+    path), the override could flow up to cancel the memo branch
+    — that's a follow-up commit, not part of Phase 1.x.
     """
     if not await _stamp_extract_target_override_on_active(
         update, ctx, override="zettel",

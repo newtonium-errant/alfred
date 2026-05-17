@@ -351,17 +351,26 @@ async def test_hypatia_anchored_override_note_forces_note(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source_anchor,override", [
-    ("",                       ""),
-    ("[[source/Random]]",      ""),
-    ("",                       "zettel"),
-    ("[[source/Meditations]]", "zettel"),
-    ("",                       "note"),
-    ("[[source/Foo]]",         "note"),
+@pytest.mark.parametrize("case_id,source_anchor,override", [
+    # ``case_id`` drives the per-case filename + short_id so the
+    # parametrize values can carry filesystem-hostile wikilink
+    # syntax (``[[source/X]]``) without leaking into the path.
+    # Earlier shape mixed the wikilink into f"Voice Session - {anchor}..."
+    # which produced filenames like ``Voice Session - [[source/Foo]]-note.md``
+    # — brackets break path operations and the file write never landed,
+    # causing FileNotFoundError on the subsequent read. Fix: case_id
+    # is the only thing that touches the filename; the anchor / override
+    # values flow into frontmatter via the dedicated kwargs.
+    ("none_none",         "",                       ""),
+    ("anchored_none",     "[[source/Random]]",      ""),
+    ("none_zettel",       "",                       "zettel"),
+    ("anchored_zettel",   "[[source/Meditations]]", "zettel"),
+    ("none_note",         "",                       "note"),
+    ("anchored_note",     "[[source/Foo]]",         "note"),
 ])
 async def test_salem_scope_always_creates_note_regardless(
     state_mgr, tmp_path,
-    source_anchor: str, override: str,
+    case_id: str, source_anchor: str, override: str,
 ) -> None:
     """Salem (anchor_scope="") always lands records in note/, regardless
     of source-anchor state or operator override. Scope-gated: Salem's
@@ -371,11 +380,11 @@ async def test_salem_scope_always_creates_note_regardless(
     """
     vault = _make_hypatia_vault(tmp_path)
     rel = _write_session_record(
-        vault, f"Voice Session - {source_anchor or 'none'}-{override or 'none'}",
+        vault, f"Voice Session salem {case_id}",
         source_wikilink=source_anchor,
         extract_target_override=override,
     )
-    short_id = f"slm{len(source_anchor)+len(override):05d}"
+    short_id = f"slm-{case_id}"
     _make_closed_session(state_mgr, short_id, rel)
 
     client = FakeAnthropicClient([
@@ -394,7 +403,7 @@ async def test_salem_scope_always_creates_note_regardless(
     assert result.skipped_reason == ""
     assert result.created_paths[0].startswith("note/"), (
         f"Salem path produced non-note record: {result.created_paths[0]} "
-        f"(source={source_anchor!r}, override={override!r})"
+        f"(case={case_id!r}, source={source_anchor!r}, override={override!r})"
     )
 
 
