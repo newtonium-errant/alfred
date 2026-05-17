@@ -117,13 +117,32 @@ NAME_PARTICLES: frozenset[str] = frozenset({
 
 # --- Opening pattern parsing ---------------------------------------------
 
-# "I'm reading X by Y", "I am reading X by Y", "Currently reading X by Y",
-# "I'm working through X by Y", "Reading X by Y", etc.
+# Source-type shape inference patterns (Phase 2 deliverable #3, 2026-05-17).
 #
-# Captures TITLE (group 1) and AUTHOR (group 2). The TITLE group is
-# non-greedy and anchored against " by " so a title containing " by "
-# itself (rare) would be truncated — acceptable trade-off vs. catching
-# the simple cases reliably.
+# Each pattern matches a "I'm <verb> X by Y" opening turn and infers the
+# source_type from the verb. The shape table:
+#
+#   reading           → book (default; or article/substack if title is a URL)
+#   watching          → video (default; or lecture if "at a lecture")
+#   listening to      → podcast
+#   in conversation /  → conversation (no required author author)
+#     talking with
+#   at a lecture by   → lecture (speaker is the "author")
+#
+# All patterns share the same {title, author} capture-group contract for
+# downstream parsing. ``author`` is optional for some shapes (conversation
+# is just "with Person" — interlocutor as author); the source-shape
+# inference is the new layer, not a re-architecture of the prior
+# {title, author} surface.
+#
+# The unified parser :func:`parse_opening_anchors` tries the patterns in
+# order; first match wins. Order is most-specific-first so e.g.
+# "at a lecture by Hadot" matches the lecture pattern before falling
+# through to reading.
+
+# "I'm reading X by Y" / variants — BOOK source type (or article/
+# substack when title contains URL / Substack hint, detected at infer
+# time).
 _READING_PATTERN = re.compile(
     r"""
     (?ix)
@@ -142,6 +161,131 @@ _READING_PATTERN = re.compile(
     """,
     re.VERBOSE,
 )
+
+# "I'm watching X by Y" / "I'm watching X" — VIDEO source type.
+# Author optional (many videos are channel-only, not byline-attributed).
+_WATCHING_PATTERN = re.compile(
+    r"""
+    (?ix)
+    \b
+    (?:
+        i'?m\s+(?:currently\s+)?watching
+      | currently\s+watching
+      | i\s+am\s+(?:currently\s+)?watching
+      | watching
+    )
+    \s+
+    (?P<title>.+?)
+    (?:\s+by\s+(?P<author>[A-Z][^.!?\n]+?))?
+    (?=[.!?\n]|$)
+    """,
+    re.VERBOSE,
+)
+
+# "I'm listening to X by Y" / variants — PODCAST source type.
+_LISTENING_PATTERN = re.compile(
+    r"""
+    (?ix)
+    \b
+    (?:
+        i'?m\s+(?:currently\s+)?listening\s+to
+      | currently\s+listening\s+to
+      | i\s+am\s+(?:currently\s+)?listening\s+to
+      | listening\s+to
+    )
+    \s+
+    (?P<title>.+?)
+    (?:\s+by\s+(?P<author>[A-Z][^.!?\n]+?))?
+    (?=[.!?\n]|$)
+    """,
+    re.VERBOSE,
+)
+
+# "I'm in conversation with X about Y" / "I'm talking with X about Y" /
+# "talking to X" — CONVERSATION source type. Author = interlocutor.
+# Title = topic ("about Y") OR interlocutor name (when no topic given).
+_CONVERSATION_PATTERN = re.compile(
+    r"""
+    (?ix)
+    \b
+    (?:
+        i'?m\s+in\s+conversation\s+with
+      | i\s+am\s+in\s+conversation\s+with
+      | i'?m\s+talking\s+(?:with|to)
+      | i\s+am\s+talking\s+(?:with|to)
+      | talking\s+(?:with|to)
+    )
+    \s+
+    (?P<author>[A-Z][^.!?\n]+?)
+    (?:\s+about\s+(?P<title>.+?))?
+    (?=[.!?\n]|$)
+    """,
+    re.VERBOSE,
+)
+
+# "I'm at a lecture by X" / "I'm at X's lecture" — LECTURE source type.
+# Speaker is the "author"; title is the lecture topic if given.
+_LECTURE_PATTERN = re.compile(
+    r"""
+    (?ix)
+    \b
+    (?:
+        i'?m\s+at\s+a\s+lecture\s+by
+      | i\s+am\s+at\s+a\s+lecture\s+by
+      | at\s+a\s+lecture\s+by
+    )
+    \s+
+    (?P<author>[A-Z][^.!?\n]+?)
+    (?:\s+on\s+(?P<title>.+?))?
+    (?=[.!?\n]|$)
+    """,
+    re.VERBOSE,
+)
+
+
+# Pattern → inferred source_type. Ordered tuples (pattern, inferred_type,
+# pattern_name_for_logging). The unified parser tries these in order;
+# first match wins. Most-specific patterns come first so e.g.
+# "at a lecture by Hadot" matches LECTURE before falling through to
+# READING.
+_SHAPE_PATTERNS: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (_LECTURE_PATTERN,      "lecture",      "lecture"),
+    (_CONVERSATION_PATTERN, "conversation", "conversation"),
+    (_LISTENING_PATTERN,    "podcast",      "listening"),
+    (_WATCHING_PATTERN,     "video",        "watching"),
+    (_READING_PATTERN,      "book",         "reading"),
+)
+
+
+# Hints that a "reading" title is actually an article/substack URL
+# rather than a book title. When the title matches one of these, infer
+# ``article`` instead of ``book`` for the source_type. The detection
+# is conservative — these hints are presence-of-URL-fragment.
+_ARTICLE_URL_HINTS: tuple[str, ...] = (
+    "://",          # any URL
+    ".com",         # bare domain
+    ".org",
+    ".net",
+    ".substack.com",
+    "/p/",          # Substack post path
+)
+
+
+def _refine_reading_source_type(title: str) -> str:
+    """Refine the ``book`` default for reading-pattern matches when the
+    title carries article/Substack URL hints.
+
+    Reading → book (default), unless title has a URL fragment → article.
+    Substack URLs are a sub-case of article (the locked plan calls them
+    out separately, but ``article`` is the schema-layer type; ``substack``
+    would be a sub-shape the SKILL teaches, not a separate type per the
+    type-minimalism guardrail).
+    """
+    lowered = (title or "").lower()
+    for hint in _ARTICLE_URL_HINTS:
+        if hint in lowered:
+            return "article"
+    return "book"
 
 # "This continues from [[note/X]]", "continuing from [[X]]",
 # "continuation of [[X]]". Captures the wikilink target (group 1).
@@ -163,11 +307,18 @@ _CONTINUES_PATTERN = re.compile(
 
 @dataclass(frozen=True)
 class OpeningAnchors:
-    """Parsed opening-turn anchors. All fields optional."""
+    """Parsed opening-turn anchors. All fields optional.
+
+    ``source_type`` (Phase 2 deliverable #3, 2026-05-17) carries the
+    inferred source shape from the opening-pattern verb:
+    book / article / podcast / video / lecture / conversation.
+    Empty string when no shape pattern matched.
+    """
 
     title: str = ""
     author: str = ""
     continues_from: str = ""
+    source_type: str = ""
 
 
 def parse_opening_anchors(opening_text: str) -> OpeningAnchors:
@@ -177,6 +328,17 @@ def parse_opening_anchors(opening_text: str) -> OpeningAnchors:
     strings denote "not detected". Multiple patterns can fire in a
     single text (a session can be both a continuation AND from a new
     source); they are independent regexes.
+
+    Phase 2 deliverable #3 (2026-05-17): source-shape inference. The
+    parser now tries multiple verb patterns (reading / watching /
+    listening / conversation / lecture) and infers ``source_type``
+    from whichever pattern matches first. See ``_SHAPE_PATTERNS`` for
+    the ordered iteration; most-specific patterns are tried first so
+    e.g. "at a lecture by Hadot" matches LECTURE before falling
+    through to READING.
+
+    Reading + URL-fragment-in-title → ``article`` (Substack sub-shape).
+    Reading + plain title → ``book`` (default).
     """
     if not opening_text:
         return OpeningAnchors()
@@ -184,18 +346,41 @@ def parse_opening_anchors(opening_text: str) -> OpeningAnchors:
     title = ""
     author = ""
     continues_from = ""
+    source_type = ""
 
-    reading_match = _READING_PATTERN.search(opening_text)
-    if reading_match:
-        title = _clean_title(reading_match.group("title"))
-        author = _clean_author(reading_match.group("author"))
+    # Try shape patterns in order; first match wins. The pattern that
+    # matched also drives the source_type inference.
+    for pattern, inferred_type, _name in _SHAPE_PATTERNS:
+        m = pattern.search(opening_text)
+        if not m:
+            continue
+        # Title and author groups: the new patterns make ``author``
+        # optional (videos / podcasts often have no byline; conversation
+        # has interlocutor-as-author with title-as-topic optional;
+        # lecture has speaker-as-author with topic optional). All
+        # patterns expose ``title`` + ``author`` groups so the parsing
+        # code is uniform — empty captures coerce to "".
+        title_raw = m.groupdict().get("title") or ""
+        author_raw = m.groupdict().get("author") or ""
+        title = _clean_title(title_raw) if title_raw else ""
+        author = _clean_author(author_raw) if author_raw else ""
+        # Refine the ``book`` default for reading-pattern matches when
+        # the title looks like a URL / Substack post (→ ``article``).
+        if inferred_type == "book" and title:
+            source_type = _refine_reading_source_type(title)
+        else:
+            source_type = inferred_type
+        break  # first match wins
 
     continues_match = _CONTINUES_PATTERN.search(opening_text)
     if continues_match:
         continues_from = continues_match.group("target").strip()
 
     return OpeningAnchors(
-        title=title, author=author, continues_from=continues_from,
+        title=title,
+        author=author,
+        continues_from=continues_from,
+        source_type=source_type,
     )
 
 
@@ -570,6 +755,7 @@ def resolve_or_create_source(
     author_wikilink: str = "",
     *,
     scope: str = "hypatia",
+    source_type: str = "",
 ) -> SourceRef | None:
     """Resolve a ``source/<Title>.md`` record or create it.
 
@@ -577,6 +763,16 @@ def resolve_or_create_source(
     the new record carries ``author: <wikilink>``; existing records are
     NOT mutated (the resolver doesn't touch pre-2026-05-16 free-text
     author fields — backward compat).
+
+    Phase 2 deliverable #3 (2026-05-17): ``source_type`` kwarg carries
+    the inferred shape from the opening-pattern verb
+    (book / article / podcast / video / lecture / conversation). When
+    non-empty AND the record is being CREATED (not resolved to an
+    existing record), the field lands in frontmatter so downstream
+    SKILL-layer logic can dispatch on the shape (page-anchored
+    observations for books, timestamps for AV, URL-anchored for
+    articles, etc.). When the source already exists, the existing
+    record's frontmatter is NOT mutated — operator-set values win.
     """
     if not title:
         return None
@@ -594,6 +790,13 @@ def resolve_or_create_source(
         # No wikilink resolved (e.g. ambiguous author) — keep free-text
         # for traceability, matches the legacy ``source`` records shape.
         set_fields["author"] = author_full
+    # Phase 2 source-shape inference. Empty source_type is omitted from
+    # frontmatter (no field at all) per the "intentionally left blank"
+    # discipline — silent absence is meaningful (parser couldn't infer
+    # a shape; operator can fill manually). Non-empty values land
+    # on creation.
+    if source_type:
+        set_fields["source_type"] = source_type
 
     try:
         result = ops.vault_create(
@@ -672,6 +875,11 @@ def resolve_session_anchors(
             author_full=parsed.author,
             author_wikilink=author_wikilink,
             scope=scope,
+            # Phase 2 deliverable #3 (2026-05-17): plumb inferred
+            # source_type through. Empty string when parser didn't
+            # match a shape pattern — resolver omits the field from
+            # frontmatter in that case.
+            source_type=parsed.source_type,
         )
 
     source_wikilink = ""
