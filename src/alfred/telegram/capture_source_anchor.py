@@ -1269,6 +1269,157 @@ def _find_next_top_heading(body: str, start_idx: int) -> int:
     return len(body)
 
 
+def _build_permanent_notes_rewriter(
+    zettel_wikilink: str,
+) -> Callable[[str], str]:
+    """Build a body_rewriter callable that appends a wikilink to the
+    source's ``## Permanent Notes spawned`` section.
+
+    Behaviour:
+      * If the wikilink already exists in the section (any form —
+        leading dash, no dash, etc.), no-op — return body unchanged
+        (idempotent).
+      * If ``## Permanent Notes spawned`` section is missing from the
+        body (pre-Phase-2 source), no-op — return body unchanged.
+      * Otherwise append ``- <wikilink>`` to the section, between the
+        existing content and the next H1/H2 heading.
+
+    The wikilink-presence check is conservative: it looks for the
+    bare wikilink form ``[[zettel/Title]]`` anywhere within the
+    section body — catches dash-prefixed and operator-edited forms
+    alike. This means re-runs are idempotent even if the operator
+    manually rewrote a bullet to include extra annotation.
+    """
+    bare_link = zettel_wikilink.strip()
+
+    def _rewriter(body: str) -> str:
+        # Locate Permanent Notes spawned section.
+        perm_idx = body.find(_PERM_NOTES_SPAWNED_HEADING)
+        if perm_idx == -1:
+            # Section missing — no-op. Conservative behaviour matches
+            # the re-encounter rewriter: don't write to an arbitrary
+            # location on operator-curated bodies.
+            return body
+
+        # Find section bounds. End of section = next H1/H2 heading.
+        section_start = perm_idx + len(_PERM_NOTES_SPAWNED_HEADING)
+        section_end = _find_next_top_heading(body, section_start)
+        section_body = body[section_start:section_end]
+
+        # Idempotency check — wikilink already present anywhere in
+        # the section body.
+        if bare_link in section_body:
+            return body
+
+        # Append ``- <wikilink>`` to the end of the section body.
+        # Preserve the section's trailing newline boundary so the
+        # next H1/H2 heading isn't glued to the new line.
+        new_section_body = (
+            section_body.rstrip("\n") + f"\n- {bare_link}\n"
+        )
+        # Re-establish a blank line between this section's content
+        # and the next heading. The right shape: section ends with
+        # exactly one blank line before the next H1/H2.
+        if not new_section_body.endswith("\n\n"):
+            new_section_body = new_section_body + "\n"
+
+        return body[:section_start] + new_section_body + body[section_end:]
+
+    return _rewriter
+
+
+def append_permanent_note_spawned(
+    vault_path: Path,
+    source_rel_path: str,
+    zettel_wikilink: str,
+    *,
+    scope: str = "hypatia",
+) -> bool:
+    """Append a zettel wikilink to a source record's ``## Permanent
+    Notes spawned`` section.
+
+    Phase 2 deliverable #5 (2026-05-17). Per the locked plan's
+    "Auto-maintenance behaviors" → #5: "when a ``zettel/`` is created
+    with ``source:`` set, Hypatia appends ``- [[zettel/Title]]`` to the
+    source's ``## Permanent Notes spawned``, idempotent."
+
+    Idempotent — if the wikilink already exists in the section
+    (any form, leading-dash or not), the call no-ops.
+
+    Pre-Phase-2 source records (missing the ``## Permanent Notes
+    spawned`` section) → no-op, returns False. Conservative
+    behaviour matches the re-encounter helper.
+
+    Returns True if the source body was updated; False on no-op
+    (idempotent skip, missing section, missing file, or failure).
+    Failure logged but never raised — capture-extract calls this
+    best-effort post-zettel-create; a write error doesn't block
+    the extraction flow.
+    """
+    rel_path = source_rel_path.lstrip("/")
+    if rel_path.startswith("[[") and rel_path.endswith("]]"):
+        rel_path = rel_path[2:-2]
+    if not rel_path.endswith(".md"):
+        rel_path = rel_path + ".md"
+    if not (vault_path / rel_path).exists():
+        log.info(
+            "talker.capture.perm_notes_source_missing",
+            source_rel_path=rel_path,
+            zettel_wikilink=zettel_wikilink,
+        )
+        return False
+
+    rewriter = _build_permanent_notes_rewriter(zettel_wikilink)
+    # Read pre-state to detect idempotent no-op (rewriter returns body
+    # unchanged when wikilink already present or section missing). We
+    # use byte-equality of the resulting body to drive the return
+    # value — the vault_edit call itself doesn't surface "no change".
+    try:
+        rec = ops.vault_read(vault_path, rel_path)
+        pre_body = rec.get("body", "")
+    except Exception:
+        pre_body = ""
+
+    try:
+        ops.vault_edit(
+            vault_path,
+            rel_path,
+            body_rewriter=rewriter,
+            scope=scope,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.capture.perm_notes_append_failed",
+            source_rel_path=rel_path,
+            zettel_wikilink=zettel_wikilink,
+            error=str(exc),
+        )
+        return False
+
+    # Confirm whether the rewriter actually changed the body (idempotent
+    # skip detection).
+    try:
+        rec = ops.vault_read(vault_path, rel_path)
+        post_body = rec.get("body", "")
+    except Exception:
+        post_body = pre_body
+
+    changed = post_body != pre_body
+    if changed:
+        log.info(
+            "talker.capture.perm_notes_append_done",
+            source_rel_path=rel_path,
+            zettel_wikilink=zettel_wikilink,
+        )
+    else:
+        log.info(
+            "talker.capture.perm_notes_append_idempotent_skip",
+            source_rel_path=rel_path,
+            zettel_wikilink=zettel_wikilink,
+        )
+    return changed
+
+
 def append_re_encounter_observation(
     vault_path: Path,
     source_rel_path: str,
@@ -1374,4 +1525,6 @@ __all__ = [
     "render_re_encounters_section",
     # Phase 2 re-encounter source-body append (2026-05-17).
     "append_re_encounter_observation",
+    # Phase 2 Permanent Notes spawned auto-append (2026-05-17).
+    "append_permanent_note_spawned",
 ]

@@ -696,6 +696,54 @@ async def extract_notes_from_capture(
             )
             continue
 
+    # Phase 2 deliverable #5 (2026-05-17): Permanent Notes spawned
+    # auto-append. For each zettel just created with a source/-anchored
+    # parent, idempotently append ``- [[zettel/<Title>]]`` to that
+    # source's ``## Permanent Notes spawned`` body section.
+    #
+    # Gated by:
+    #   * target_type == "zettel" (note/ records don't accrue to the
+    #     Permanent Notes spawned list — that section's semantics are
+    #     specifically zettel-only per the locked plan's "Permanent
+    #     Notes spawned maintenance" rule).
+    #   * source_wikilink non-empty (no source-anchor → no destination
+    #     to append to).
+    #
+    # Failure-isolated: each per-zettel append wraps in try/except —
+    # a missing source record or vault_edit failure on one zettel
+    # logs + continues without aborting the extraction.
+    if target_type == "zettel" and source_wikilink and created_paths:
+        try:
+            from . import capture_source_anchor as _csa
+            # Strip wikilink brackets to get the source rel_path.
+            for zettel_rel in created_paths:
+                # Each zettel's wikilink for the source's Permanent
+                # Notes spawned list — drop the .md suffix.
+                zettel_no_md = (
+                    zettel_rel[:-3] if zettel_rel.endswith(".md") else zettel_rel
+                )
+                zettel_wikilink = f"[[{zettel_no_md}]]"
+                try:
+                    _csa.append_permanent_note_spawned(
+                        vault_path=vault_path,
+                        source_rel_path=source_wikilink,
+                        zettel_wikilink=zettel_wikilink,
+                        scope=(anchor_scope or "hypatia"),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.info(
+                        "talker.extract.perm_notes_append_failed",
+                        zettel_rel=zettel_rel,
+                        source_wikilink=source_wikilink,
+                        error=str(exc),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "talker.extract.perm_notes_append_unhandled",
+                session_rel_path=session_rel,
+                error=str(exc),
+            )
+
     # Within-session cross-link pass. Computed AFTER all notes are
     # created so every peer has a real vault path to wikilink against.
     # Each note's ``related`` gets the peer wikilinks merged in
