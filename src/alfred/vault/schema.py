@@ -134,6 +134,14 @@ KNOWN_TYPES_HYPATIA: set[str] = {
     # category vs definitional zettel; book vs conversation vs podcast
     # source) lives in SKILL-layer templates, not the schema.
     "memo", "zettel", "MOC", "question", "research-pointer",
+    # Article (2026-05-17, operator-template #1 ship — Substack /
+    # Andrew Errant / future-venue published-writing records). Distinct
+    # from ``essay`` which is for source essays Andrew READS (those
+    # route to ``document/essay/`` and feed the /train voice-extraction
+    # workflow). ``article`` is for essays Andrew WRITES himself, with
+    # a Hot-Take / Story / Takeaway / CTA structure baked into the
+    # template. Lifecycle: draft → scheduled → published → archived.
+    "article",
 }
 
 
@@ -297,6 +305,13 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     "fiction-structure": {
         "outlining", "drafting", "revising", "complete",
     },
+    # Article (2026-05-17, operator-template #1 ship — Substack /
+    # Andrew Errant / future-venue published-writing). Lifecycle:
+    # ``draft`` (initial — operator writing), ``scheduled`` (queued
+    # for publication on a future date — Substack supports this
+    # natively), ``published`` (live), ``archived`` (operator-removed
+    # from active rotation, e.g. opinion superseded or venue retired).
+    "article": {"draft", "scheduled", "published", "archived"},
 }
 
 # Type → expected top-level directory
@@ -378,6 +393,13 @@ TYPE_DIRECTORY: dict[str, str] = {
     "MOC": "MOC",
     "question": "question",
     "research-pointer": "research-pointer",
+    # Article (2026-05-17, operator-template #1 ship) — routes to a
+    # dedicated ``article/`` top-level directory. Distinct from
+    # ``essay`` which routes to ``document/essay/`` (read-essays).
+    # The pair (article/ + document/essay/) keeps published-writing
+    # records and consumed-source-essays in different trees so the
+    # Substack-export workflow can scan a single directory.
+    "article": "article",
     # session, input have flexible placement
 }
 

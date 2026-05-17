@@ -159,6 +159,13 @@ def test_hypatia_create_types_shape() -> None:
         # (elevated atomic research actions). Capture-mode multi-message
         # extraction now targets zettel/ instead of note/.
         "memo", "zettel", "MOC", "question", "research-pointer",
+        # 2026-05-17 operator-template #1 ship — ``article`` records.
+        # Distinct from ``essay`` (source essays Andrew reads, routed
+        # to ``document/essay/``); ``article`` is essays Andrew WRITES
+        # himself (Substack / Andrew Errant / future venues), routed
+        # to ``article/``. Hypatia-only. Lifecycle:
+        # draft → scheduled → published → archived.
+        "article",
     }
 
 
@@ -198,6 +205,9 @@ def test_known_types_hypatia_is_separate_set() -> None:
         # 2026-05-16 Zettelkasten schema cutover (Phase 1). Same five
         # types as the HYPATIA_CREATE_TYPES pin above — keep in sync.
         "memo", "zettel", "MOC", "question", "research-pointer",
+        # 2026-05-17 operator-template #1 ship — ``article`` (Substack
+        # / Andrew Errant). Keep in sync with HYPATIA_CREATE_TYPES.
+        "article",
     }
     for t in schema.KNOWN_TYPES_HYPATIA:
         assert t not in schema.KNOWN_TYPES, (

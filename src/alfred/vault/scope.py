@@ -604,6 +604,12 @@ HYPATIA_CREATE_TYPES: set[str] = {
     #   - ``question``        — elevated atomic question records.
     #   - ``research-pointer`` — elevated atomic research actions.
     "memo", "zettel", "MOC", "question", "research-pointer",
+    # Article (2026-05-17, operator-template #1 ship). Hypatia-only —
+    # published-writing records for Substack / Andrew Errant / future
+    # venues. Distinct from ``essay`` (source essays Andrew reads, in
+    # the same scope). Operator creates via ``vault_create`` at draft
+    # time. Keep in sync with ``KNOWN_TYPES_HYPATIA`` in schema.py.
+    "article",
 }
 
 
