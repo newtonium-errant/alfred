@@ -288,6 +288,11 @@ _EXPECTED_HYPATIA_INSERT_AT_KEYS: set[str] = {
     "practice-session",
     # Phase 1 additions (2026-05-16, Zettelkasten cutover).
     "zettel", "MOC", "question", "research-pointer",
+    # Article co-write scope extension (2026-05-17). Andrew ratified
+    # Option B: Hypatia is a true co-writer on articles, not append-
+    # only. Operator-on-request mid-doc inserts on article records
+    # are now scope-allowed.
+    "article",
 }
 
 
@@ -312,6 +317,9 @@ _EXPECTED_HYPATIA_REPLACE_KEYS: set[str] = {
     "voice", "voice-cluster", "method",
     # Phase 1 additions (2026-05-16, Zettelkasten cutover).
     "zettel", "MOC", "question", "research-pointer",
+    # Article co-write scope extension (2026-05-17). Mirror of the
+    # insert_at entry above — full-Part rewrites on operator request.
+    "article",
     # practice-session deliberately OMITTED — history-preservation.
     # memo deliberately OMITTED — write-once-by-design.
     # essay / source / author NOT in replace allowlist — write-once

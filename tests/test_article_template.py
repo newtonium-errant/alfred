@@ -375,3 +375,166 @@ def test_article_cta_button_link_placeholder_present() -> None:
     with the actual button URL / inline link at publish-prep time."""
     body = _parse_template().content
     assert "CTA Button/Link" in body
+
+
+# --- Body-mutation scope (2026-05-17 co-write extension) -----------------
+#
+# Andrew ratified Option B: Hypatia is a true co-writer on articles,
+# not append-only. ``article`` belongs in both ``allow_body_insert_at``
+# and ``allow_body_replace`` under the Hypatia scope. Memo stays
+# write-once-by-design — explicit regression pin below.
+
+
+def test_hypatia_scope_allows_body_insert_at_on_article() -> None:
+    """Hypatia scope passes the body_insert_at gate for article records.
+
+    Operator-on-request flow: ``add a paragraph between graf 3 and 4
+    of Part 2 of [[article/Title]]``. Hypatia uses ``vault_edit`` with
+    ``body_insert_at={marker, position, content}`` and the scope gate
+    admits it.
+    """
+    scope.check_scope(
+        scope="hypatia", operation="body_insert_at", record_type="article",
+    )
+
+
+def test_hypatia_scope_allows_body_replace_on_article() -> None:
+    """Hypatia scope passes the body_replace gate for article records.
+
+    Operator-on-request flow: ``rewrite Part 3 of [[article/Title]]``.
+    Hypatia uses ``vault_edit`` with ``body_replace=<full new body>``
+    and the scope gate admits it.
+    """
+    scope.check_scope(
+        scope="hypatia", operation="body_replace", record_type="article",
+    )
+
+
+def test_hypatia_scope_still_denies_body_insert_at_on_memo() -> None:
+    """Regression-pin: ``memo`` stays write-once-by-design after the
+    article co-write extension. The article widening was the explicit
+    delta — memo MUST NOT silently ride along.
+
+    Memos are atomic single-thought captures (≤1 user message at
+    capture-mode close). The operator promotes a memo to a zettel
+    (new record) rather than mutating it. Any sweep that widens
+    memo's body-mutation scope is an unintended behavioural change
+    and should fire this test.
+    """
+    with pytest.raises(scope.ScopeError):
+        scope.check_scope(
+            scope="hypatia", operation="body_insert_at", record_type="memo",
+        )
+
+
+def test_hypatia_scope_still_denies_body_replace_on_memo() -> None:
+    """Regression-pin: ``memo`` stays write-once-by-design — body_replace
+    denied. Mirror of the body_insert_at regression test above."""
+    with pytest.raises(scope.ScopeError):
+        scope.check_scope(
+            scope="hypatia", operation="body_replace", record_type="memo",
+        )
+
+
+def test_talker_scope_still_denies_body_insert_at_on_article() -> None:
+    """``article`` is Hypatia-only — Salem's talker scope must NOT see
+    it. The body-mutation allowlist gate is a defense-in-depth pin:
+    even if a future bug routed an article through Salem, the scope
+    gate would refuse. (In practice ``article`` isn't in
+    KNOWN_TYPES_BY_SCOPE['talker'] either, so the upstream type-gate
+    fires first; this test pins the body-mutation gate independently.)
+    """
+    with pytest.raises(scope.ScopeError):
+        scope.check_scope(
+            scope="talker", operation="body_insert_at", record_type="article",
+        )
+
+
+def test_talker_scope_still_denies_body_replace_on_article() -> None:
+    """Mirror of the previous test: Salem refuses article body_replace."""
+    with pytest.raises(scope.ScopeError):
+        scope.check_scope(
+            scope="talker", operation="body_replace", record_type="article",
+        )
+
+
+# --- End-to-end vault_edit on article (integration with new scope) ------
+#
+# The check_scope tests above pin the scope-layer gate. These tests
+# exercise the full vault_edit code path: vault_create the article,
+# then vault_edit with body_insert_at / body_replace.
+
+
+def test_vault_edit_body_insert_at_on_article_under_hypatia(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: Hypatia creates an article + inserts a paragraph
+    mid-doc via vault_edit body_insert_at."""
+    vault = tmp_path / "vault"
+    (vault / "article").mkdir(parents=True)
+    ops.vault_create(
+        vault, "article", "Test Co-Write Article",
+        body=(
+            "# Part 1 Hot Take Headline\n\n"
+            "First paragraph.\n\n"
+            "Last paragraph of Part 1.\n\n"
+            "---\n"
+            "# Part 2 Story Headline\n\n"
+            "Story opens here.\n"
+        ),
+        scope="hypatia",
+    )
+    ops.vault_edit(
+        vault, "article/Test Co-Write Article.md",
+        body_insert_at={
+            "marker": "Last paragraph of Part 1.",
+            "position": "before",
+            "content": "Inserted paragraph between Hypatia and operator.",
+        },
+        scope="hypatia",
+    )
+    rec = ops.vault_read(vault, "article/Test Co-Write Article.md")
+    body = rec["body"]
+    assert "Inserted paragraph between Hypatia and operator." in body
+    # Order: inserted paragraph appears BEFORE the "Last paragraph"
+    # marker (position=before semantics).
+    assert body.index("Inserted paragraph") < body.index("Last paragraph")
+
+
+def test_vault_edit_body_replace_on_article_under_hypatia(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: Hypatia rewrites the full article body via
+    vault_edit body_replace.
+
+    Frontmatter is preserved across the rewrite — only the body
+    changes (per body_replace's contract).
+    """
+    vault = tmp_path / "vault"
+    (vault / "article").mkdir(parents=True)
+    ops.vault_create(
+        vault, "article", "Test Replace Article",
+        set_fields={"status": "draft", "subtitle": "An interesting take"},
+        body="# Old Title\n\nOld body content here.\n",
+        scope="hypatia",
+    )
+    new_body = (
+        "# Part 1 Hot Take Headline\n\n"
+        "Completely rewritten article body.\n\n"
+        "---\n"
+        "# Part 2 Story Headline\n\n"
+        "New story arc.\n"
+    )
+    ops.vault_edit(
+        vault, "article/Test Replace Article.md",
+        body_replace=new_body,
+        scope="hypatia",
+    )
+    rec = ops.vault_read(vault, "article/Test Replace Article.md")
+    # Body fully replaced.
+    assert "Completely rewritten article body" in rec["body"]
+    assert "Old body content" not in rec["body"]
+    # Frontmatter preserved — body_replace doesn't touch fields.
+    assert rec["frontmatter"]["status"] == "draft"
+    assert rec["frontmatter"]["subtitle"] == "An interesting take"
+    assert rec["frontmatter"]["type"] == "article"

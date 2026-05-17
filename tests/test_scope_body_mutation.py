@@ -106,6 +106,10 @@ def test_universal_deny_set_pinned_to_spec():
     # asymmetry — replace is DENIED to preserve practice-session as a
     # historical record.
     "practice-session",
+    # 2026-05-17 — article co-write scope extension. Hypatia is a true
+    # co-writer on articles: operator-on-request mid-doc inserts
+    # ("add a paragraph between graf 3 and 4 of Part 2") allowed.
+    "article",
 ])
 def test_hypatia_body_insert_at_allows_per_spec_types(allowed_type):
     check_scope("hypatia", "body_insert_at", record_type=allowed_type)
@@ -117,6 +121,10 @@ def test_hypatia_body_insert_at_allows_per_spec_types(allowed_type):
     # ``practice-session`` deliberately OMITTED here — the matrix
     # asymmetry is: insert_at allowed, replace DENIED. See the
     # body-mutation matrix table comment in scope.py for the rationale.
+    #
+    # 2026-05-17 — article co-write scope extension. Full-Part rewrites
+    # on operator request ("rewrite Part 3, keep the rest") allowed.
+    "article",
 ])
 def test_hypatia_body_replace_allows_per_spec_types(allowed_type):
     check_scope("hypatia", "body_replace", record_type=allowed_type)

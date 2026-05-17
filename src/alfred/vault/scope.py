@@ -37,7 +37,8 @@ class ScopeError(Exception):
 # | hypatia       | universal | note,concept,document,           | same set MINUS                |
 # |               |           | template,fiction-*,              | practice-session (history     |
 # |               |           | practice-session,zettel,MOC,     | preservation); memo not in    |
-# |               |           | question,research-pointer        | either matrix (write-once)    |
+# |               |           | question,research-pointer,       | either matrix (write-once)    |
+# |               |           | article                          |                               |
 # | talker(Salem) | universal | note,task,event(no-gcal-id)      | same — but refuses if         |
 # |               |           |                                  | event has gcal_event_id       |
 # | kalle         | universal | note,decision,principle,         | same set                      |
@@ -426,6 +427,16 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
             "MOC": True,
             "question": True,
             "research-pointer": True,
+            # Article co-write scope extension (2026-05-17). The
+            # article template + type shipped earlier today (b12b5e6 +
+            # c40e7a4) registered ``article`` in HYPATIA_CREATE_TYPES
+            # but omitted it from the body-mutation allowlists.
+            # Andrew ratified Option B: Hypatia is a true co-writer
+            # on articles, not append-only. Anchored mid-doc inserts
+            # (``add a paragraph between graf 3 and 4 of Part 2``) and
+            # full-body replaces (``rewrite Part 3``) are both
+            # operator-on-request workflows; both belong here.
+            "article": True,
         },
         "allow_body_replace": {
             "note": True,
@@ -466,6 +477,15 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
             "MOC": True,
             "question": True,
             "research-pointer": True,
+            # Article co-write scope extension (2026-05-17). Mirror of
+            # the insert_at entry above — Hypatia rewrites a full Part
+            # on operator request (e.g. ``rewrite Part 3, keep the
+            # rest``). The same Hypatia-only-by-default discipline
+            # applies: Salem's scope does not see ``article`` (it's
+            # outside HYPATIA_CREATE_TYPES + the canonical KNOWN_TYPES);
+            # operator's only path to article body mutation is via
+            # Hypatia.
+            "article": True,
         },
     },
     # Instructor executes natural-language directives parked in the
