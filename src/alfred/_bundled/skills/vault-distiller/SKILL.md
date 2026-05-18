@@ -220,6 +220,19 @@ tags: []
 ![[synthesis.base#Related]]
 ```
 
+**Intra-cluster contradiction check before adding synthesis N+1 (MUST):**
+
+Before creating a new synthesis on a topic that already has 2+ existing syntheses in the cluster, audit the existing siblings for cross-sibling contradictions:
+
+1. Read the existing synthesis records on the same topic (use `alfred vault list synthesis` or `alfred vault search --glob 'synthesis/*<topic-keyword>*.md'`).
+2. For each pair of existing siblings, check whether they make mutually-incompatible claims (different numeric thresholds, different mechanism descriptions, opposite causal directions, conflicting confidence levels on the same fact).
+3. If any pair disagrees, emit a `contradiction/` between them FIRST — with populated `claim_a` / `claim_b` / `source_a` / `source_b` per section 2.4. THEN consider whether the new synthesis is still warranted.
+4. Only proceed to add synthesis N+1 once the cluster is internally consistent OR the disagreements have been made explicit via contradiction records.
+
+Stacking new syntheses on top of mutually-contradictory siblings produces a cluster that LOOKS like consensus from any single record's vantage point but is actually three or four disagreeing positions piled together — and the disagreement is invisible to brief surfaces and synthesis-consolidation sweeps until somebody hand-audits the cluster.
+
+**Worked example (real, ongoing):** the Apple subscription cluster in Salem's vault has 3 syntheses making mutually-incompatible claims about Apple's auto-renewal trigger window — "30 days before", "45 days before", and "7 days before" are each asserted by a separate synthesis as the canonical figure. Distiller has shipped all 3 without emitting a `contradiction/` between them. Correct behaviour on synthesis #4 would be: pause; read the existing 3; observe the trigger-window disagreement; emit `contradiction/Apple Auto-Renewal Trigger Window Cited at Three Different Values Across Syntheses` with populated `claim_a` / `claim_b` (pick the two most-mutually-exclusive); only then assess whether synthesis #4 still belongs.
+
 ---
 
 ## 3. Extraction Rules by Source Type
