@@ -56,6 +56,144 @@ def _strip_html(html: str) -> str:
     return "\n".join(result).strip()
 
 
+# 2026-05-18 — image-only HTML bifurcation. Per Queue #11, the curator
+# was generating "Empty Email" records for senders whose emails are
+# pure image templates (marketing newsletters, transactional confirms
+# rendered as a single PNG). The HTML-strip pipeline correctly produced
+# an empty body — that part is working as intended — but the operator-
+# visible record carried no signal about WHY the body was empty, so
+# the distiller couldn't distinguish "image-only sender (legitimate
+# source-content limitation)" from "pipeline truncation bug." The
+# downstream consequence: 30+ per-sender "Empty-Record Sender"
+# syntheses generated as a compensation cycle.
+#
+# Fix: when post-strip body falls below ``_MIN_BODY_CHARS``, attempt
+# to synthesize a body from the raw HTML headers (``<img alt="…">``
+# alt-text + first ``_MAX_LINKS_IN_SYNTH`` ``<a href="…">`` anchors).
+# The synthesized body carries an explicit ``[image-only HTML; body
+# synthesized from headers]`` marker so the curator (and any downstream
+# grep) can distinguish image-only from bug-truncated.
+_MIN_BODY_CHARS = 30
+_MAX_ALT_TEXTS_IN_SYNTH = 8
+_MAX_LINKS_IN_SYNTH = 5
+_SYNTH_MARKER = "[image-only HTML; body synthesized from headers]"
+_IMG_ALT_RE = re.compile(
+    r"<img\b[^>]*\balt\s*=\s*(?:\"([^\"]*)\"|'([^']*)')",
+    flags=re.IGNORECASE,
+)
+_A_HREF_RE = re.compile(
+    r"<a\b[^>]*\bhref\s*=\s*(?:\"([^\"]*)\"|'([^']*)')[^>]*>(.*?)</a>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_alt_texts(html: str) -> list[str]:
+    """Return non-empty alt-text strings from ``<img alt="…">`` tags.
+
+    Trims whitespace, de-duplicates while preserving order, drops empty
+    strings (`alt=""` is common for spacer images and carries no signal).
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _IMG_ALT_RE.finditer(html):
+        alt = (m.group(1) or m.group(2) or "").strip()
+        if not alt:
+            continue
+        # Decode the same minimal entity set the strip path handles
+        # so synthesized text reads the same way the body would have.
+        alt = (
+            alt.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", '"')
+        )
+        if alt in seen:
+            continue
+        seen.add(alt)
+        out.append(alt)
+    return out
+
+
+def _extract_links(html: str) -> list[tuple[str, str]]:
+    """Return ``(href, anchor_text)`` pairs from ``<a href="…">…</a>`` tags.
+
+    Anchor text is HTML-stripped (image-only anchors are common — the
+    anchor wraps an ``<img>`` and has no direct text). De-duped on URL.
+    Empty hrefs and ``javascript:`` / ``mailto:`` are skipped — they
+    don't carry useful destination signal for the curator.
+    """
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for m in _A_HREF_RE.finditer(html):
+        href = (m.group(1) or m.group(2) or "").strip()
+        if not href:
+            continue
+        lower = href.lower()
+        if lower.startswith("javascript:") or lower.startswith("mailto:"):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        # Strip tags + collapse whitespace in the anchor body — the
+        # raw inner-HTML can contain images, spans, formatting tags
+        # whose text content is the only thing the operator cares about.
+        anchor_html = m.group(3) or ""
+        anchor_text = re.sub(r"<[^>]+>", " ", anchor_html)
+        anchor_text = re.sub(r"\s+", " ", anchor_text).strip()
+        out.append((href, anchor_text))
+    return out
+
+
+def _synthesize_body_from_headers(
+    html: str,
+    *,
+    subject: str,
+    from_addr: str,
+) -> str | None:
+    """Build a body from HTML headers when the strip produced no text.
+
+    Returns ``None`` when the HTML carries neither alt-text nor a usable
+    link — in that case there's nothing to synthesize from and the
+    caller should fall back to the empty body (operator + curator still
+    see the headers above the ``---`` separator).
+
+    The returned string is the synthesized body content (without the
+    headers above ``---`` — those are added by ``_build_markdown``).
+    Always starts with the synth marker so a grep for ``image-only HTML``
+    or ``body synthesized from headers`` surfaces every record that
+    went through this path.
+    """
+    alt_texts = _extract_alt_texts(html)[:_MAX_ALT_TEXTS_IN_SYNTH]
+    links = _extract_links(html)[:_MAX_LINKS_IN_SYNTH]
+    if not alt_texts and not links:
+        return None
+
+    lines: list[str] = [_SYNTH_MARKER, ""]
+    # Echo subject + from at the top of the synth body so the curator
+    # has a complete short-form description even if it skipped the
+    # markdown header lines (unlikely but defensive).
+    if subject:
+        lines.append(f"Subject: {subject}")
+    if from_addr:
+        lines.append(f"From: {from_addr}")
+    if subject or from_addr:
+        lines.append("")
+    if alt_texts:
+        lines.append("Image alt-text:")
+        for alt in alt_texts:
+            lines.append(f"- {alt}")
+        lines.append("")
+    if links:
+        lines.append("Links:")
+        for href, anchor in links:
+            if anchor:
+                lines.append(f"- {anchor}: {href}")
+            else:
+                lines.append(f"- {href}")
+    return "\n".join(lines).rstrip()
+
+
 def _build_markdown(data: dict) -> str:
     subject = data.get("subject", "No Subject")
     from_addr = data.get("from", "")
@@ -79,9 +217,46 @@ def _build_markdown(data: dict) -> str:
         lines.append(f"**Message-ID:** {message_id}")
     if in_reply_to:
         lines.append(f"**In-Reply-To:** {in_reply_to}")
-    # Strip HTML if body looks like it contains HTML tags
-    if body and "<" in body:
+    # Strip HTML if body looks like it contains HTML tags. Preserve the
+    # raw HTML for the image-only fallback in case the strip leaves us
+    # below the minimum-content threshold (2026-05-18, Queue #11).
+    raw_html = body if body and "<" in body else ""
+    if raw_html:
         body = _strip_html(body)
+    # Image-only fallback: when the post-strip body is too short to
+    # carry signal (default 30 chars), and the raw HTML has alt-text
+    # / link anchors to fall back to, synthesize a body from those.
+    # The synth marker is grep-able so post-hoc analysis can count
+    # the bifurcation rate across the inbox stream.
+    if raw_html and len(body) < _MIN_BODY_CHARS:
+        synth = _synthesize_body_from_headers(
+            raw_html, subject=subject, from_addr=from_addr,
+        )
+        if synth is not None:
+            log.info(
+                "webhook.body_synthesized_from_headers",
+                from_addr=from_addr or "",
+                subject=subject or "",
+                stripped_len=len(body),
+                synth_len=len(synth),
+            )
+            body = synth
+        else:
+            # Image-only fallback couldn't recover anything useful
+            # (no alt-text, no usable links). Emit an explicit
+            # "ran, nothing to do" signal so the empty body
+            # produces a grep-able record of the bifurcation path
+            # — per ``feedback_intentionally_left_blank.md``. The
+            # body remains empty; the curator sees the headers
+            # only and the operator can grep this event to count
+            # truly-empty sources.
+            log.info(
+                "webhook.body_synthesis_no_signal",
+                from_addr=from_addr or "",
+                subject=subject or "",
+                stripped_len=len(body),
+                raw_html_len=len(raw_html),
+            )
     lines.extend(["", "---", "", body])
     return "\n".join(lines)
 
