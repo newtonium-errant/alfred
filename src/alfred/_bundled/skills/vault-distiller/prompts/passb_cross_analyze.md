@@ -28,7 +28,7 @@ For each meta-insight you find:
 
 1. **Read the relevant records** using `alfred vault read` to get full context
 2. **Create a new learning record** using `alfred vault create`:
-   - **Contradictions:** Link `claim_a` and `claim_b` to the conflicting records, set `source_a` and `source_b` to describe each position
+   - **Contradictions:** Populate `claim_a` and `claim_b` with non-empty one-line summaries of each position, and `source_a` / `source_b` with wikilinks or descriptions of where each claim originates. All four MUST be non-empty strings — body-only contradictions break downstream Dataview queries and brief surfaces. See SKILL.md section 2.4 "Required frontmatter — contradictions".
    - **Assumptions:** Set `based_on` to the records that depend on this assumption
    - **Syntheses:** Set `cluster_sources` to all records that contribute to the insight
 

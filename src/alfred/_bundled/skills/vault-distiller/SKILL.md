@@ -176,6 +176,19 @@ The "phantom citation" failure mode IS real — curator/extractor agents do inve
 
 **Worked example (real, 2026-05-18):** distiller drafted `contradiction/Pizza Cake Comics Empty Email Cites Phantom Patreon HTML Synthesis Not Present in Vault` asserting that `synthesis/Patreon Creator Post Notifications Defeat HTML-to-Text Extraction Like Substack` was absent from the vault. Running `alfred vault search --glob 'synthesis/*Patreon*.md'` would have returned the file at `vault/synthesis/Patreon Creator Post Notifications Defeat HTML-to-Text Extraction Like Substack.md` — present since 2026-05-03. The contradiction was a false positive and had to be hand-deleted.
 
+**Required frontmatter — contradictions (MUST):**
+
+When `alfred vault create`-ing a contradiction record, populate ALL of these fields with non-empty values:
+
+- `claim_a` — quoted text or one-line summary of the first position (NOT empty string)
+- `claim_b` — quoted text or one-line summary of the conflicting position (NOT empty string)
+- `source_a` — wikilink to the record asserting claim A, or short description of where it came from
+- `source_b` — wikilink to the record asserting claim B, or short description
+
+Body-only contradictions with empty `claim_a` / `claim_b` / `source_a` / `source_b` break downstream Dataview queries, brief surfaces, and contradiction-resolution sweeps — the body content is invisible to the structured-query layer. If you have enough material to write the contradiction body, you have enough material to populate the four frontmatter slots; do it in the same `alfred vault create --set` invocation.
+
+**Worked example (real, 2026-05-16):** `contradiction/Culture Study Patreon Record Body Cites Synthesis Title Absent From Vault.md` shipped with a full body section but `claim_a: ''` and `claim_b: ''` in frontmatter. The contradiction is invisible to Dataview filters that select on populated claims, and to brief surfaces that quote the structured fields. Fix at creation time, not retroactively.
+
 ### 2.5 Synthesis
 
 ```yaml
@@ -274,7 +287,7 @@ Every learning record MUST link back to its sources:
 - **Decisions:** `based_on` → source records, `decided_by` → people, `session` → session record
 - **Assumptions:** `based_on` → source records where assumption was found
 - **Constraints:** `source` → description, link to source records via `related`
-- **Contradictions:** `source_a`, `source_b` → descriptions, `claim_a`, `claim_b` → the conflicting claims, link source records via `related`
+- **Contradictions:** `source_a`, `source_b` → descriptions, `claim_a`, `claim_b` → the conflicting claims, link source records via `related`. All four MUST be non-empty strings — see section 2.4 "Required frontmatter — contradictions"
 - **Synthesis:** `cluster_sources` → all source records that contributed
 
 Use `"[[path/Name]]"` wikilink format for all links. Example:
