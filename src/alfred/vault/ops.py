@@ -1072,6 +1072,10 @@ def vault_create(
                 _zhooks.mirror_supersedes_chain(
                     vault_path, rel_path, fm.get("supersedes"), scope=scope or "hypatia",
                 )
+            if fm.get("author"):
+                _zhooks.append_to_author_contents(
+                    vault_path, fm.get("author"), rel_path, scope=scope or "hypatia",
+                )
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "vault.zettel_hooks.dispatch_failed",
@@ -1361,6 +1365,10 @@ def vault_edit(
             if "supersedes" in fields_changed and fm.get("supersedes"):
                 _zhooks.mirror_supersedes_chain(
                     vault_path, rel_path, fm.get("supersedes"), scope=scope or "hypatia",
+                )
+            if "author" in fields_changed and fm.get("author"):
+                _zhooks.append_to_author_contents(
+                    vault_path, fm.get("author"), rel_path, scope=scope or "hypatia",
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning(

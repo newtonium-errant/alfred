@@ -57,6 +57,11 @@ _SUPERSEDED_BY_HEADING: str = "## Superseded by"
 #: does NOT auto-write content here — that's an operator-only zone.
 _SUPERSEDES_HEADING: str = "# Supersedes"
 
+#: Author body section where ``- [[zettel/Title]]`` bullets accumulate
+#: when zettels reference this author. Z-centric per the locked plan —
+#: sources never auto-append here.
+_AUTHOR_CONTENTS_HEADING: str = "# Contents"
+
 
 # ---------------------------------------------------------------------------
 # Shared body-section utilities (duplicated from capture_source_anchor.py)
@@ -377,6 +382,215 @@ def mirror_supersedes_chain(
     return True
 
 
+# ---------------------------------------------------------------------------
+# Author Contents auto-append (Deliverable B, locked-plan item 6)
+# ---------------------------------------------------------------------------
+
+
+def _build_author_contents_rewriter(
+    zettel_wikilink: str,
+) -> Callable[[str], str]:
+    """Build a body_rewriter that appends ``- <zettel_wikilink>`` to
+    the author's ``# Contents`` section.
+
+    Behaviour:
+      * Idempotent — checks for bare ``[[zettel/Title]]`` presence
+        anywhere in the section before appending.
+      * If ``# Contents`` section is missing, CREATE it at the end of
+        the body. Pre-Phase-3 person/org records may not have the
+        section; the auto-maintenance intent is to make the index
+        real on disk rather than silently dropping the signal.
+      * The section is Z-centric — only zettel wikilinks should land
+        here. Caller filters by ``record_type == "zettel"`` upstream;
+        this helper doesn't second-guess.
+      * Section is bounded by next H1/H2 (``_find_next_top_heading``).
+        Inline dataview blocks (``<!-- ```dataview ... ``` -->``)
+        inside the section are NOT preserved verbatim — bullets
+        append AFTER existing content, before the next heading, so
+        a dataview-only section gains a manual bullet list below
+        the comment block.
+    """
+    bare_link = zettel_wikilink.strip()
+    bullet = f"- {zettel_wikilink}"
+
+    def _rewriter(body: str) -> str:
+        contents_idx = _find_h2_or_h1_section_start(
+            body, _AUTHOR_CONTENTS_HEADING,
+        )
+        if contents_idx == -1:
+            # No # Contents section — append the section + first
+            # bullet at end-of-body.
+            tail = body.rstrip("\n")
+            if tail:
+                return (
+                    tail + "\n\n"
+                    + _AUTHOR_CONTENTS_HEADING + "\n\n"
+                    + bullet + "\n"
+                )
+            return _AUTHOR_CONTENTS_HEADING + "\n\n" + bullet + "\n"
+
+        section_start = contents_idx + len(_AUTHOR_CONTENTS_HEADING)
+        section_end = _find_next_top_heading(body, section_start)
+        section_body = body[section_start:section_end]
+
+        if bare_link in section_body:
+            # Idempotent — bullet already exists somewhere in section.
+            return body
+
+        new_section_body = section_body.rstrip("\n") + f"\n{bullet}\n"
+        if not new_section_body.endswith("\n\n"):
+            new_section_body = new_section_body + "\n"
+
+        return body[:section_start] + new_section_body + body[section_end:]
+
+    return _rewriter
+
+
+def _resolve_author_target(
+    vault_path: Path,
+    author_value: Any,
+) -> str | None:
+    """Resolve a zettel's ``author:`` field to an existing record's
+    rel_path, following the ``aliases:`` chain.
+
+    Returns the resolved rel_path (e.g. ``"person/Doe, Jane.md"``) or
+    None if no record can be located. Strategy:
+
+      1. Normalize the wikilink target (strips brackets, pipe-alias,
+         ``.md`` suffix).
+      2. If the target lacks a directory, prepend ``person/``
+         (the canonical author location). Operator may also point
+         at ``org/``, in which case the wikilink already includes the
+         directory.
+      3. If the file exists at that path, return it.
+      4. Otherwise scan ``person/`` for any record whose ``aliases:``
+         list contains the typed alias. The aliases field is a list
+         of names (NOT wikilinks); the comparison uses the bare
+         target (no directory prefix).
+
+    The aliases scan is bounded to ``person/`` only — author records
+    SHOULD be persons; if the operator points an author at an
+    org/project/etc. by exact path, step 3 catches it and step 4 is
+    skipped.
+    """
+    from . import ops as _ops
+
+    target = _normalize_wikilink_target(author_value)
+    if not target:
+        return None
+
+    # First, try exact path resolution.
+    if "/" in target:
+        # Operator-provided directory (e.g. ``org/Hypatia Tech``).
+        rel = f"{target}.md"
+        if (vault_path / rel).exists():
+            return rel
+        # Path doesn't exist — fall through to aliases scan only if
+        # the directory is person/ (the aliases convention is person-
+        # scoped).
+        if not target.startswith("person/"):
+            return None
+        bare_name = target.split("/", 1)[1]
+    else:
+        # No directory — default to person/.
+        rel = f"person/{target}.md"
+        if (vault_path / rel).exists():
+            return rel
+        bare_name = target
+
+    # Aliases scan in person/.
+    persons_dir = vault_path / "person"
+    if not persons_dir.is_dir():
+        return None
+    for md_path in persons_dir.glob("*.md"):
+        try:
+            rec = _ops.vault_read(vault_path, f"person/{md_path.name}")
+        except Exception:  # noqa: BLE001
+            continue
+        fm = rec.get("frontmatter") or {}
+        aliases = fm.get("aliases") or []
+        if not isinstance(aliases, list):
+            continue
+        for alias in aliases:
+            if str(alias).strip() == bare_name.strip():
+                return f"person/{md_path.name}"
+    return None
+
+
+def append_to_author_contents(
+    vault_path: Path,
+    author_value: Any,
+    new_zettel_rel_path: str,
+    *,
+    scope: str = "hypatia",
+) -> bool:
+    """Append ``- [[zettel/Title]]`` to the author record's
+    ``# Contents`` section.
+
+    Triggered post-write by ``vault_create`` / ``vault_edit`` when a
+    ``zettel/`` record gains a non-empty ``author:`` field.
+
+    Edge cases:
+      * ``author_value`` empty / not-a-wikilink → no-op, return False.
+      * Author record not found (after aliases scan) → log info,
+        return False. The new zettel's ``author:`` field survives;
+        manual reconciliation when the author record is created.
+      * Existing bullet present → idempotent no-op (helper rewriter
+        checks for ``[[zettel/Title]]`` presence in section).
+      * Missing ``# Contents`` section on author → section auto-
+        created at end of body.
+
+    Returns True when the author record was updated; False on no-op.
+    Failure-isolated — any unexpected exception logs + returns False.
+    """
+    from . import ops as _ops
+
+    target_normalized = _normalize_wikilink_target(author_value)
+    if not target_normalized:
+        return False
+
+    author_rel_path = _resolve_author_target(vault_path, author_value)
+    if author_rel_path is None:
+        log.info(
+            "vault.zettel_hooks.author_target_missing",
+            new_zettel_rel_path=new_zettel_rel_path,
+            author_value=str(author_value),
+        )
+        return False
+
+    new_zettel_no_md = (
+        new_zettel_rel_path[:-3]
+        if new_zettel_rel_path.endswith(".md")
+        else new_zettel_rel_path
+    )
+    zettel_wikilink = f"[[{new_zettel_no_md}]]"
+
+    rewriter = _build_author_contents_rewriter(zettel_wikilink)
+    try:
+        _ops.vault_edit(
+            vault_path,
+            author_rel_path,
+            body_rewriter=rewriter,
+            scope=scope,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "vault.zettel_hooks.author_append_failed",
+            new_zettel_rel_path=new_zettel_rel_path,
+            author_rel_path=author_rel_path,
+            error=str(exc),
+        )
+        return False
+
+    log.info(
+        "vault.zettel_hooks.author_contents_appended",
+        new_zettel_rel_path=new_zettel_rel_path,
+        author_rel_path=author_rel_path,
+    )
+    return True
+
+
 __all__ = [
     "mirror_supersedes_chain",
+    "append_to_author_contents",
 ]
