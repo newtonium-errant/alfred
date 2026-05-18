@@ -24,6 +24,8 @@ SORT file.name ASC
 
 # Notes
 
+# Supersedes
+
 # Follow Up Questions
 
 # Research Ideas
