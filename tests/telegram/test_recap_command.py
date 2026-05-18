@@ -135,20 +135,65 @@ def _seed_active_capture_session(
     session_type: str = "capture",
 ) -> dict[str, Any]:
     """Seed an active capture session in the state manager and return
-    the active dict so tests can verify it stays unmutated."""
+    the active dict so tests can verify it stays unmutated.
+
+    NOTE (2026-05-18 hardening): the ``transcript or [default]`` shape
+    used previously was a bug — ``[] or [default]`` evaluates to
+    ``[default]`` because empty list is falsy. Callers passing
+    ``transcript=[]`` to test the empty-transcript path would silently
+    get the 1-turn default, defeating the test. The
+    ``is None`` check below preserves the intended default-when-omitted
+    semantics while letting ``transcript=[]`` survive to the active
+    dict.
+    """
+    if transcript is None:
+        transcript = [
+            {"role": "user", "content": "I'm reading Meditations",
+             "_ts": "2026-05-18T10:00:00+00:00"},
+        ]
     active = {
         "session_id": "abc-uuid",
         "chat_id": chat_id,
         "started_at": "2026-05-18T10:00:00+00:00",
-        "transcript": transcript or [
-            {"role": "user", "content": "I'm reading Meditations",
-             "_ts": "2026-05-18T10:00:00+00:00"},
-        ],
+        "transcript": transcript,
         "_session_type": session_type,
     }
     state_mgr.state.setdefault("active_sessions", {})[str(chat_id)] = active
     state_mgr.save()
     return active
+
+
+# --- Helper regression-pin: transcript=[] survives to active dict --------
+
+
+def test_seed_helper_preserves_empty_transcript(state_mgr) -> None:
+    """Regression-pin (2026-05-18). The seed helper's ``transcript or
+    [default]`` shape used previously would silently substitute the
+    default 1-turn transcript when caller passed ``transcript=[]``
+    (because empty list is falsy in Python). That defeated the
+    ``test_recap_empty_transcript_returns_placeholder`` test below,
+    which relies on the seeded session actually having 0 turns.
+
+    Post-fix the helper uses ``if transcript is None`` so explicit
+    empty list survives. This pin catches accidental re-introduction
+    of the falsy-fallback bug class.
+    """
+    active = _seed_active_capture_session(state_mgr, transcript=[])
+    assert active["transcript"] == []
+    # Confirm round-trip through state_mgr.
+    stored = state_mgr.get_active(42)
+    assert stored is not None
+    assert stored["transcript"] == []
+
+
+def test_seed_helper_default_when_transcript_omitted(state_mgr) -> None:
+    """Companion pin: when caller OMITS ``transcript=`` entirely (or
+    passes ``None``), the default 1-turn transcript still kicks in.
+    The ``is None`` check above must preserve the historical
+    default-when-omitted behaviour."""
+    active = _seed_active_capture_session(state_mgr)
+    assert len(active["transcript"]) == 1
+    assert active["transcript"][0]["content"] == "I'm reading Meditations"
 
 
 # --- Capture-session gate ------------------------------------------------
