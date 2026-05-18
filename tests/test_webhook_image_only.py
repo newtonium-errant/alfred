@@ -176,9 +176,13 @@ def test_synthesize_caps_alt_texts_and_links():
         imgs + anchors, subject="x", from_addr="y@z.w",
     )
     assert synth is not None
-    # Default caps: 8 alts, 5 links.
-    assert synth.count("alt-") == 8
-    assert synth.count("link-") == 5
+    # Default caps: 8 alts, 5 links. Match the bullet-prefixed form
+    # (``- alt-N`` / ``- link-N``) so the literal ``Image alt-text:``
+    # section header (which contains the substring ``alt-``) doesn't
+    # spuriously satisfy the count — per code-reviewer findings on
+    # the original c1 ship of these tests.
+    assert synth.count("- alt-") == 8
+    assert synth.count("- link-") == 5
 
 
 # -----------------------------------------------------------------------------
@@ -355,14 +359,26 @@ def test_build_markdown_image_only_logs_synthesis_event():
 # -----------------------------------------------------------------------------
 
 
-def test_strip_html_image_only_still_returns_empty():
+def test_strip_html_image_only_still_returns_below_threshold():
     """The strip function itself is UNCHANGED. Image-only HTML still
-    produces an empty (or near-empty) string post-strip — the bifurcation
-    happens at the ``_build_markdown`` layer above. This regression
-    guard catches any future "fix" that tries to merge strip + synth.
+    produces a string short enough to trigger the synth bifurcation —
+    the bifurcation happens at the ``_build_markdown`` layer above.
+    This regression guard catches any future "fix" that tries to merge
+    strip + synth, OR a change that makes the strip extract significantly
+    more text from image-only HTML (which would defeat the threshold gate).
+
+    Note: the realistic Pizza Hut fixture has an ``<a>View order details</a>``
+    anchor whose inner text IS extractable by ``_strip_html`` (the strip
+    regex removes the ``<a>`` tag, leaving "View order details"). So the
+    post-strip output is not literally empty — it's short. The intent
+    we pin is: short enough that ``_build_markdown`` will route to the
+    synth path (< ``_MIN_BODY_CHARS`` == 30). Per code-reviewer findings
+    + ``feedback_worked_example_accuracy.md`` — pin the actual production
+    semantic ("below the synth threshold"), not the coincidental
+    "literally empty" assertion that breaks on realistic fixtures.
     """
     out = _strip_html(_pizza_hut_image_only_html())
-    # The Pizza Hut sample has no text content outside tags — empty
-    # output is expected. (Whitespace from tag boundaries is collapsed
-    # then stripped by the final `.strip()` call.)
-    assert out == ""
+    # Strip extracts only the anchor's inner text ("View order details");
+    # no <p>/<div>/<table> text content. Length is well under 30 chars
+    # → _build_markdown will trigger the synth fallback for this fixture.
+    assert len(out) < 30
