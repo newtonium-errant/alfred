@@ -1041,6 +1041,222 @@ def summary_to_dict(summary: StructuredSummary) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Brief recap (mid-session /recap, queue #10, 2026-05-18)
+# ---------------------------------------------------------------------------
+#
+# ``/recap brief`` (default) needs a lighter structured summary than the
+# end-of-session 7-bucket extraction. Brief is two buckets only —
+# topics + key_insights — so the cost is much lower and the reply is
+# fast for an operator who just wants "what threads am I on, what's
+# stood out?" mid-capture.
+#
+# ``/recap verbose`` reuses the full ``run_batch_structuring`` + 6
+# StructuredSummary buckets. The handler renders both via
+# ``render_recap_markdown`` (no ALFRED:DYNAMIC markers — recap output
+# is for Telegram reply, not vault embedding).
+
+
+@dataclass(frozen=True)
+class BriefRecap:
+    """Brief recap shape — 2 buckets only.
+
+    Distinct from ``StructuredSummary`` (6 buckets) because brief
+    recap intentionally narrows to the two surfaces an operator cares
+    about mid-capture: what subjects am I actively touching, and what
+    has stood out so far. The other four buckets (decisions, open
+    questions, action items, raw contradictions) are end-of-session
+    artefacts — mid-session the operator hasn't finished the thought.
+    """
+
+    topics: list[str] = field(default_factory=list)
+    key_insights: list[str] = field(default_factory=list)
+
+
+_BRIEF_RECAP_SYSTEM_PROMPT = """\
+You produce a brief mid-session recap of an in-progress capture \
+session. A capture session is a monologue — the user is dumping \
+thoughts without interruption. They've asked ``/recap`` mid-session \
+to see what they've touched so far.
+
+Two buckets only, via the ``emit_brief_recap`` tool:
+
+- topics: the main subjects the user is talking about so far \
+(2-5 short phrases). Threads they're working on. Leave empty if the \
+session is too thin to identify discrete topics.
+- key_insights: high-confidence insights that have stood out so far \
+(0-5 bullets). Novel framings or realisations they've voiced. Leave \
+empty if the session has been venting or exploratory; better empty \
+than fabricated.
+
+Be conservative. Never invent or editorialise. Every item must be \
+grounded in something the user actually said. Empty lists are legal \
+and often correct — the operator can see the bucket is empty and \
+draw their own conclusion ("haven't surfaced anything yet").
+"""
+
+
+_BRIEF_RECAP_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "emit_brief_recap",
+    "description": (
+        "Emit a brief mid-session recap. Call exactly once. Each bucket "
+        "must be a list of strings; empty lists are legal."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "topics": {"type": "array", "items": {"type": "string"}},
+            "key_insights": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["topics", "key_insights"],
+    },
+}
+
+
+async def run_brief_recap_structuring(
+    client: Any,
+    transcript: list[dict[str, Any]],
+    model: str,
+) -> BriefRecap:
+    """Cheaper sibling of ``run_batch_structuring`` — 2 buckets, 1024 max
+    tokens, lower temperature for stability.
+
+    Raises ``RuntimeError`` on tool-block absence; failure-isolation is
+    the caller's responsibility (the recap handler renders an error
+    message rather than crashing the user's chat).
+    """
+    flat = _flatten_transcript(transcript)
+    user_content = (
+        "Transcript so far:\n---\n" + (flat or "(empty)") + "\n---\n\n"
+        "Emit the brief recap via the emit_brief_recap tool."
+    )
+
+    response = await client.messages.create(**messages_create_kwargs(
+        model=model,
+        max_tokens=1024,
+        temperature=0.2,
+        system=[
+            {
+                "type": "text",
+                "text": _BRIEF_RECAP_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        messages=[{"role": "user", "content": user_content}],
+        tools=[_BRIEF_RECAP_TOOL_SCHEMA],
+        tool_choice={"type": "tool", "name": "emit_brief_recap"},
+    ))
+
+    content = getattr(response, "content", None) or []
+    tool_input: dict[str, Any] | None = None
+    for block in content:
+        btype = getattr(block, "type", None) or (
+            block.get("type") if isinstance(block, dict) else None
+        )
+        if btype != "tool_use":
+            continue
+        raw_input = getattr(block, "input", None) or (
+            block.get("input") if isinstance(block, dict) else None
+        )
+        if isinstance(raw_input, dict):
+            tool_input = raw_input
+            break
+
+    if tool_input is None:
+        raise RuntimeError(
+            "brief recap: no tool_use block in response"
+        )
+
+    def _strlist(key: str) -> list[str]:
+        raw = tool_input.get(key)
+        if not isinstance(raw, list):
+            return []
+        return [str(x).strip() for x in raw if x]
+
+    return BriefRecap(
+        topics=_strlist("topics"),
+        key_insights=_strlist("key_insights"),
+    )
+
+
+def render_recap_markdown(
+    summary: StructuredSummary | BriefRecap,
+    *,
+    mode: str,
+) -> str:
+    """Render a recap (brief or verbose) for Telegram reply.
+
+    Distinct from :func:`render_summary_markdown`:
+      * No ``<!-- ALFRED:DYNAMIC -->`` marker wrapping. Recap output is
+        a chat reply, NOT a vault-embedded summary the distiller needs
+        to strip.
+      * Brief mode renders 2 buckets (Topics, Key Insights). Verbose
+        renders the full 6 buckets — same as the end-of-session
+        summary but without the Re-encounters section (recap is
+        mid-session; re-encounter scan is post-close).
+      * Empty buckets render with ``(none)`` per the "intentionally
+        left blank" discipline — operator sees the empty buckets
+        explicitly so "nothing surfaced yet" is distinguishable from
+        "extraction silently dropped a bucket."
+
+    ``mode`` is exactly ``"brief"`` or ``"verbose"`` — the handler is
+    the only caller; it validates the operator's argument before
+    invoking.
+    """
+    lines: list[str] = []
+    if mode == "brief":
+        if not isinstance(summary, BriefRecap):
+            raise ValueError(
+                f"render_recap_markdown(mode='brief') expects BriefRecap, "
+                f"got {type(summary).__name__}"
+            )
+        lines.append("## Recap (brief)")
+        lines.append("")
+
+        def _section(heading: str, items: list[str]) -> None:
+            lines.append(f"### {heading}")
+            if not items:
+                lines.append("(none)")
+            else:
+                for item in items:
+                    lines.append(f"- {item}")
+            lines.append("")
+
+        _section("Topics", summary.topics)
+        _section("Key Insights", summary.key_insights)
+    elif mode == "verbose":
+        if not isinstance(summary, StructuredSummary):
+            raise ValueError(
+                f"render_recap_markdown(mode='verbose') expects "
+                f"StructuredSummary, got {type(summary).__name__}"
+            )
+        lines.append("## Recap (verbose)")
+        lines.append("")
+
+        def _section_full(heading: str, items: list[str]) -> None:
+            lines.append(f"### {heading}")
+            if not items:
+                lines.append("(none)")
+            else:
+                for item in items:
+                    lines.append(f"- {item}")
+            lines.append("")
+
+        _section_full("Topics", summary.topics)
+        _section_full("Decisions", summary.decisions)
+        _section_full("Open Questions", summary.open_questions)
+        _section_full("Action Items", summary.action_items)
+        _section_full("Key Insights", summary.key_insights)
+        _section_full("Raw Contradictions", summary.raw_contradictions)
+    else:
+        raise ValueError(
+            f"render_recap_markdown: mode must be 'brief' or 'verbose', "
+            f"got {mode!r}"
+        )
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 # Re-exports for the bot layer.
 __all__ = [
     "StructuredSummary",
@@ -1059,4 +1275,8 @@ __all__ = [
     "_memo_body_from_text",
     "_create_memo_record",
     "_MEMO_BRANCH_MAX_USER_TURNS",
+    # Brief recap (queue #10, 2026-05-18).
+    "BriefRecap",
+    "run_brief_recap_structuring",
+    "render_recap_markdown",
 ]

@@ -909,6 +909,151 @@ async def _call_extract_llm(
     return notes
 
 
+# ---------------------------------------------------------------------------
+# Mid-session recap (queue #10, 2026-05-18)
+# ---------------------------------------------------------------------------
+#
+# Operator's ``/recap`` command on an OPEN capture session.
+# Read-only summary; no record creation, no state mutation.
+#
+# Two modes:
+#   * ``brief`` (default) — cheap call via
+#     :func:`capture_batch.run_brief_recap_structuring` returning a 2-bucket
+#     BriefRecap (topics + key_insights).
+#   * ``verbose`` — same call as end-of-session structuring via
+#     :func:`capture_batch.run_batch_structuring` returning a 6-bucket
+#     StructuredSummary. No re-encounter scan (mid-session; the scan is a
+#     post-close operation that consults the vault for prior records
+#     anchored to the same source).
+#
+# Both modes render via :func:`capture_batch.render_recap_markdown` —
+# plain markdown without the ``<!-- ALFRED:DYNAMIC -->`` markers since
+# the output is a Telegram chat reply, not a vault-embedded summary.
+#
+# Failure-isolation: any LLM error returns a human-readable error
+# string rather than raising. The caller (the bot's ``/recap``
+# handler) renders the string directly to the operator.
+
+
+RECAP_MODE_BRIEF: Final[str] = "brief"
+RECAP_MODE_VERBOSE: Final[str] = "verbose"
+_RECAP_VALID_MODES: frozenset[str] = frozenset(
+    {RECAP_MODE_BRIEF, RECAP_MODE_VERBOSE}
+)
+
+
+def _empty_recap_markdown(mode: str) -> str:
+    """Render the no-transcript-yet placeholder. Per
+    ``feedback_intentionally_left_blank.md``: explicit "(nothing
+    surfaced yet)" rather than silent empty output. Operator who fires
+    ``/recap`` before they've said anything sees a clear signal.
+    """
+    label = "Recap (brief)" if mode == RECAP_MODE_BRIEF else "Recap (verbose)"
+    return (
+        f"## {label}\n\n"
+        f"(no captures yet — say something and re-run /recap)\n"
+    )
+
+
+async def summarize_capture_session_so_far(
+    client: Any,
+    transcript: list[dict[str, Any]],
+    model: str,
+    *,
+    mode: str = RECAP_MODE_BRIEF,
+) -> str:
+    """Produce a mid-session recap markdown string for an open capture
+    session. Read-only — no vault writes, no state mutation.
+
+    Args:
+      client: Anthropic SDK client (or fake conforming to the
+        ``client.messages.create`` shape).
+      transcript: in-progress capture transcript — list of turns from
+        the active session's ``transcript`` field.
+      model: anthropic model identifier. Brief mode is cheap; verbose
+        mode runs the full 6-bucket extraction.
+      mode: ``"brief"`` (default) or ``"verbose"``. Any other value
+        raises ``ValueError`` — the caller is expected to validate
+        the operator's argument before invoking.
+
+    Returns:
+      Markdown-formatted recap string ready for Telegram reply. Empty
+      transcript yields an explicit ``(no captures yet…)`` placeholder
+      per the "intentionally left blank" discipline.
+
+    Failure mode:
+      LLM call failure (network, parse error, missing tool_use block)
+      returns a human-readable error string. NEVER raises. The caller
+      doesn't need a try/except wrapper — the operator sees an
+      error message in chat, not a broken bot.
+    """
+    if mode not in _RECAP_VALID_MODES:
+        raise ValueError(
+            f"summarize_capture_session_so_far: mode must be 'brief' or "
+            f"'verbose', got {mode!r}"
+        )
+
+    # Empty-transcript early exit — no point calling the LLM for an
+    # empty session. Both modes use the same "(no captures yet)"
+    # placeholder shape.
+    if not transcript or all(
+        not _turn_has_text(t) for t in transcript
+    ):
+        return _empty_recap_markdown(mode)
+
+    # Local import keeps this module's surface tight + matches the
+    # pattern already used elsewhere for capture_batch imports.
+    from . import capture_batch as _cb
+
+    try:
+        if mode == RECAP_MODE_BRIEF:
+            summary = await _cb.run_brief_recap_structuring(
+                client, transcript, model,
+            )
+            return _cb.render_recap_markdown(summary, mode="brief")
+        # verbose
+        summary = await _cb.run_batch_structuring(
+            client, transcript, model,
+        )
+        return _cb.render_recap_markdown(summary, mode="verbose")
+    except Exception as exc:  # noqa: BLE001
+        # Operator-facing error string — never crash the chat handler.
+        log.warning(
+            "talker.capture.recap_failed",
+            mode=mode,
+            error=str(exc),
+        )
+        return (
+            f"## Recap ({mode})\n\n"
+            f"_Recap failed: {exc}_\n\n"
+            f"Try again or /end the session for a full summary.\n"
+        )
+
+
+def _turn_has_text(turn: dict[str, Any]) -> bool:
+    """True when ``turn`` is a user role with non-empty text content.
+
+    Mirrors the filter used by
+    :func:`capture_batch._count_user_turns`: same role + same content-
+    shape tolerance. Pulled out as a helper so the empty-transcript
+    early-exit in ``summarize_capture_session_so_far`` checks the
+    same predicate.
+    """
+    if turn.get("role") != "user":
+        return False
+    content = turn.get("content", "")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                btext = (block.get("text") or "").strip()
+                if btext:
+                    return True
+        return False
+    return bool(str(content).strip())
+
+
 __all__ = [
     "DEFAULT_MAX_NOTES",
     "ExtractResult",
@@ -919,4 +1064,8 @@ __all__ = [
     # Phase 1.x three-tier discriminator (2026-05-16).
     "_resolve_extract_target_type",
     "_OPERATOR_OVERRIDE_VALUES",
+    # Mid-session /recap (queue #10, 2026-05-18).
+    "summarize_capture_session_so_far",
+    "RECAP_MODE_BRIEF",
+    "RECAP_MODE_VERBOSE",
 ]
