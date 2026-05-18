@@ -491,6 +491,92 @@ class TestScopeMatch:
             calendarId="primary", maxResults=1
         )
 
+    def test_active_probe_substitutes_env_var_in_calendar_id(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """**Regression-pin (2026-05-18 post-merge WARN):**
+
+        ``raw['gcal']['alfred_calendar_id']`` can contain a ``${VAR}``
+        placeholder because the health-check entry point consumes
+        ``raw`` directly without routing through ``load_from_unified``'s
+        ``_substitute_env`` pass. Post-merge BIT after the scope-match
+        ship surfaced ``http_404`` on URL
+        ``/calendars/%24%7BALFRED_GCAL_CALENDAR_ID%7D/events`` — the
+        literal placeholder was being sent as the calendar ID.
+
+        Fix: probe applies ``os.path.expandvars`` before passing
+        ``calendarId`` to the API call. This test pins the substitution
+        path: a ``${ALFRED_GCAL_CALENDAR_ID}`` literal must resolve to
+        the env var's real value.
+        """
+        token_path = _make_token(tmp_path)
+        real_calendar_id = "test_cal_id@group.calendar.google.com"
+        monkeypatch.setenv("ALFRED_GCAL_CALENDAR_ID", real_calendar_id)
+        service = _make_service_mock(execute_return={"items": []})
+        monkeypatch.setattr(gh, "_build_calendar_service", lambda _p: service)
+
+        raw = {
+            "gcal": {
+                "enabled": True,
+                "token_path": str(token_path),
+                "alfred_calendar_id": "${ALFRED_GCAL_CALENDAR_ID}",
+            },
+            "logging": {"dir": str(tmp_path / "no_logs")},
+        }
+        result = gh._check_last_successful_gcal_sync(raw)
+        assert result.status == Status.OK
+
+        # Substituted: real env-var value, NOT the literal placeholder.
+        events_resource = service.events.return_value
+        events_resource.list.assert_called_once_with(
+            calendarId=real_calendar_id, maxResults=1
+        )
+        # Belt-and-suspenders: verify the literal placeholder did NOT
+        # appear in the kwargs. Catches a future regression that calls
+        # both forms (unlikely but cheap to pin).
+        call_kwargs = events_resource.list.call_args.kwargs
+        assert "${" not in call_kwargs["calendarId"], (
+            "calendarId must not contain a literal ${VAR} placeholder; "
+            f"got: {call_kwargs['calendarId']!r}"
+        )
+
+    def test_active_probe_falls_back_to_primary_when_env_var_unset(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When ``alfred_calendar_id`` is a ``${VAR}`` placeholder but
+        the env var is NOT set in the environment, fall back to
+        ``'primary'`` rather than 404-ing on the literal placeholder.
+
+        Degraded-config path: probe still verifies auth works even
+        when the operator's ``.env`` file is missing the var. Better
+        than sending the literal ``${ALFRED_GCAL_CALENDAR_ID}`` to
+        Google and getting a 404 from the URL-encoded placeholder.
+        """
+        token_path = _make_token(tmp_path)
+        monkeypatch.delenv("ALFRED_GCAL_CALENDAR_ID", raising=False)
+        service = _make_service_mock(execute_return={"items": []})
+        monkeypatch.setattr(gh, "_build_calendar_service", lambda _p: service)
+
+        raw = {
+            "gcal": {
+                "enabled": True,
+                "token_path": str(token_path),
+                "alfred_calendar_id": "${ALFRED_GCAL_CALENDAR_ID}",
+            },
+            "logging": {"dir": str(tmp_path / "no_logs")},
+        }
+        result = gh._check_last_successful_gcal_sync(raw)
+        assert result.status == Status.OK
+
+        events_resource = service.events.return_value
+        events_resource.list.assert_called_once_with(
+            calendarId="primary", maxResults=1
+        )
+
 
 # ---------------------------------------------------------------------------
 # FAIL path — auth-specific failure

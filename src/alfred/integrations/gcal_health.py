@@ -21,6 +21,19 @@ use, so the probe outcome matches the actual sync outcome. The 2026
 05-18 BIT regression that motivated this fix surfaced exactly that
 gap: probe FAIL while real-world sync was completing successfully.
 
+**``${VAR}`` substitution on ``alfred_calendar_id``:** the probe
+reads ``raw['gcal']['alfred_calendar_id']`` directly from the
+unprocessed config dict — health-check entry points consume ``raw``
+without routing through ``load_from_unified``'s ``_substitute_env``
+pass. So ``alfred_calendar_id: "${ALFRED_GCAL_CALENDAR_ID}"`` would
+land as a literal placeholder, producing a 404 on
+``/calendars/%24%7BALFRED_GCAL_CALENDAR_ID%7D/events`` (URL-encoded
+``${...}``). The call-site applies ``os.path.expandvars`` to handle
+this; when the referenced env var is unset, falls back to
+``'primary'`` so a degraded config still verifies auth rather than
+404-ing on a literal placeholder. Surfaced 2026-05-18 by post-merge
+BIT WARN immediately after the scope-match ship.
+
 **Pre-rework problem (mtime-only):** when Andrew has no event
 activity for >24h (vacation, weekend, just no calendar changes),
 the token file's mtime stays old even though the refresh token is
@@ -500,6 +513,25 @@ def _check_last_successful_gcal_sync(raw: dict[str, Any]) -> CheckResult:
     sync_calendar_id = (
         (raw.get("gcal", {}) or {}).get("alfred_calendar_id", "") or "primary"
     )
+    # Apply env-var substitution since the raw config dict bypasses the
+    # tool-specific ``load_from_unified`` path's ``_substitute_env`` pass.
+    # Health probes consume ``raw`` directly (see ``health_check``
+    # signature) so ``${VAR}`` placeholders stay literal otherwise. The
+    # 2026-05-18 post-fix regression hit a 404 on
+    # ``/calendars/%24%7BALFRED_GCAL_CALENDAR_ID%7D/events`` because
+    # this resolution step was missing — operator-visible on every BIT
+    # run. ``os.path.expandvars`` handles ``${VAR}`` (the Alfred config
+    # convention) identically to bash; when the env var is unset it
+    # leaves the literal in place, which we catch as the second-pass
+    # fallback to ``primary``.
+    if "${" in sync_calendar_id:
+        sync_calendar_id = os.path.expandvars(sync_calendar_id)
+        if "${" in sync_calendar_id:
+            # Env var was unset; expandvars left the literal. Fall back
+            # to ``primary`` so the probe still verifies auth on a
+            # degraded config rather than 404-ing on a literal
+            # placeholder.
+            sync_calendar_id = "primary"
     call_error: BaseException | None = None
     try:
         service.events().list(
