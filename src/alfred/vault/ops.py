@@ -1111,6 +1111,33 @@ def vault_create(
                 error=str(exc),
             )
 
+    # Inventory MOC dispatch (Phase 4 Sub-arc B, 2026-05-18). Fires
+    # for ``question`` + ``research-pointer`` creates so the
+    # ``MOC/_Open Questions.md`` + ``MOC/_Open Research Pointers.md``
+    # bullets land on first qualifying create. ``pre_fm=None`` flags
+    # a fresh create (truth-table left column = False), so any
+    # post-create predicate match → "add". The trigger-type gate
+    # lives inside ``dispatch_inventory_mocs`` (iterates the
+    # ``INVENTORY_MOC_DISPATCH`` table); this call site stays
+    # type-agnostic.
+    if record_type in ("question", "research-pointer"):
+        from . import zettel_hooks as _zhooks
+        try:
+            _zhooks.dispatch_inventory_mocs(
+                vault_path,
+                rel_path,
+                record_type,
+                pre_fm=None,
+                post_fm=dict(fm),
+                scope=scope or "hypatia",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "vault.zettel_hooks.dispatch_failed",
+                rel_path=rel_path,
+                error=str(exc),
+            )
+
     return out
 
 
@@ -1244,6 +1271,14 @@ def vault_edit(
     # existing_frontmatter.
     fm, body = _parse_record(file_path)
     record_type = fm.get("type", "")
+
+    # Snapshot pre-edit frontmatter for hooks that need to detect
+    # transitions (Phase 4 Sub-arc B inventory MOC pattern needs
+    # predicate(pre_fm) vs predicate(post_fm) — without the snapshot
+    # the in-place ``fm[k] = v`` below loses the pre-edit state).
+    # ``dict(fm)`` is a shallow copy — adequate because predicates
+    # only read top-level scalar fields like ``status``.
+    pre_edit_fm = dict(fm)
 
     if scope is not None:
         fields_list = (
@@ -1423,6 +1458,38 @@ def vault_edit(
                     vault_path, rel_path, record_type, fm.get("mocs"),
                     scope=scope or "hypatia",
                 )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "vault.zettel_hooks.dispatch_failed",
+                rel_path=rel_path,
+                error=str(exc),
+            )
+
+    # Inventory MOC dispatch (Phase 4 Sub-arc B, 2026-05-18). Fires
+    # on every edit of ``question`` / ``research-pointer`` records
+    # so status transitions can trigger add/remove against the
+    # corresponding inventory MOC. The predicate-pre vs predicate-
+    # post diff inside ``dispatch_inventory_mocs`` short-circuits
+    # the no-transition case to a "skipped" count (no write), so
+    # editing an unrelated field on a question is cheap.
+    #
+    # Unlike the topic-MOC dispatch above, this is NOT gated on
+    # ``fields_changed`` — the predicate only depends on ``status``,
+    # but we run the dispatch on every edit to be defensive against
+    # future predicates that may depend on multiple fields. The
+    # per-call cost is one predicate evaluation per matching
+    # dispatch entry; cheap.
+    if record_type in ("question", "research-pointer"):
+        from . import zettel_hooks as _zhooks
+        try:
+            _zhooks.dispatch_inventory_mocs(
+                vault_path,
+                rel_path,
+                record_type,
+                pre_fm=pre_edit_fm,
+                post_fm=dict(fm),
+                scope=scope or "hypatia",
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "vault.zettel_hooks.dispatch_failed",

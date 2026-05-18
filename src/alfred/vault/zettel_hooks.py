@@ -1,20 +1,34 @@
 """Zettel auto-maintenance hooks (Phase 3 + Phase 4, 2026-05-18).
 
 Per ``project_hypatia_zettelkasten_redesign.md`` "Auto-maintenance
-behaviors" items 6 + 7 + 8:
+behaviors" items 6 + 7 + 8 + the Sub-arc B inventory-MOC pattern:
 
   6. **Author Contents maintenance** (Phase 3): when a ``zettel/``
      is created with ``author:`` set, Hypatia appends
      ``- [[zettel/Title]]`` to the author's ``# Contents``.
      Sources NEVER auto-append to author Contents — only zettels do.
-  7. **MOC member maintenance** (Phase 4): when a ``zettel/`` /
-     ``source/`` / ``question/`` / ``research-pointer/`` record is
-     created or edited with a non-empty ``mocs:`` frontmatter list,
-     Hypatia appends ``- [[<type>/<Title>]]`` to each referenced
-     MOC's ``# Contents`` section. Operator-paced cleanup —
-     removing a MOC from the record's ``mocs:`` does NOT cascade
-     a remove from the MOC's Contents (consistent with the author
-     Contents append-only discipline).
+  7. **Topic-MOC member maintenance** (Phase 4 Sub-arc A): when a
+     ``zettel/`` / ``source/`` / ``question/`` / ``research-pointer/``
+     record is created or edited with a non-empty ``mocs:``
+     frontmatter list, Hypatia appends ``- [[<type>/<Title>]]`` to
+     each referenced MOC's ``# Contents`` section. Operator-paced
+     cleanup — removing a MOC from the record's ``mocs:`` does NOT
+     cascade a remove from the MOC's Contents (consistent with the
+     author Contents append-only discipline).
+  7b. **Inventory-MOC pattern** (Phase 4 Sub-arc B): the underscore-
+     prefix ``MOC/_<Name>.md`` convention marks system-maintained
+     inventory MOCs (parallel to ``_templates/`` and ``_bases/`` in
+     the scaffold). Unlike the topic-MOC append-only flow above,
+     inventory MOCs require REMOVAL CLEANUP on status transitions
+     — the whole point is "what's currently open". Auto-creates the
+     MOC record if absent (different from topic-MOC fail-open).
+     Two instances ship in Sub-arc B:
+       * ``MOC/_Open Questions.md`` — tracks ``question/`` records
+         with ``status in {"open", "refined"}``
+       * ``MOC/_Open Research Pointers.md`` — tracks
+         ``research-pointer/`` records with ``status == "open"``
+     The dispatch table is the registration surface; future
+     inventory MOCs extend the table without architectural change.
   8. **Supersede chain mirroring** (Phase 3): operator sets
      ``supersedes: [[OldZ]]`` on new zettel; Hypatia auto-mirrors
      ``superseded_by: [[NewZ]]`` to old zettel + adds
@@ -1039,9 +1053,389 @@ def dispatch_moc_appends(
     return appended
 
 
+# ---------------------------------------------------------------------------
+# Inventory MOC pattern (Phase 4 Sub-arc B, 2026-05-18)
+# ---------------------------------------------------------------------------
+#
+# Inventory MOCs are system-maintained ``MOC/_<Name>.md`` records that
+# track records matching a predicate (e.g. all questions with
+# ``status in {"open", "refined"}``). The underscore prefix marks the
+# file as Hypatia-owned, parallel to the existing ``_templates/`` /
+# ``_bases/`` scaffold convention. Operator owns ``MOC/<Topic> MOC.md``
+# (no underscore); Hypatia owns ``MOC/_<Name>.md``.
+#
+# Distinct from Sub-arc A's topic-MOC pattern in three ways:
+#
+#   1. **Removal cleanup REQUIRED.** When a record's status flips
+#      such that the predicate transitions from True to False, the
+#      bullet must be REMOVED from the inventory MOC. Append-only
+#      would let inventory MOCs decay into stale lies — defeats the
+#      "what's currently open" purpose.
+#   2. **Auto-create if absent.** Topic MOCs fail-open when the MOC
+#      doesn't exist (operator may cite a MOC pre-creation). Inventory
+#      MOCs Hypatia OWNS, so first qualifying record creates the file.
+#   3. **Registration via dispatch table** rather than frontmatter
+#      field. The trigger is a (record_type, predicate, target_moc)
+#      tuple, not a ``mocs:`` list — the operator doesn't choose
+#      which inventory MOC their question lands in; the predicate
+#      does.
+#
+# The dispatch table is the principal artifact. New inventory MOCs
+# extend ``INVENTORY_MOC_DISPATCH``; the runtime is dispatch-table-
+# driven and doesn't need code changes per new MOC instance.
+
+
+def _build_remove_bullet_rewriter(
+    member_wikilink: str,
+    *,
+    section_heading: str = "# Contents",
+) -> Callable[[str], str]:
+    """Build a body_rewriter that REMOVES the ``- <member_wikilink>``
+    bullet from the named section if present.
+
+    Mirror of :func:`_build_moc_contents_rewriter` for the inverse
+    direction. Pipe-alias tolerant — removes both plain
+    ``- [[zettel/X]]`` and ``- [[zettel/X|Display]]`` shapes pointing
+    at the same target stem.
+
+    Behaviour:
+      * Idempotent — if the bullet isn't there, returns the body
+        unchanged (no error).
+      * Removes ONLY the matching bullet line. Surrounding sibling
+        bullets, hierarchy structure, and other section content stay
+        intact.
+      * If removing the only bullet leaves an empty ``# Contents``
+        section, that's fine — the section header stays (preserves
+        the empty-placeholder-section discipline).
+      * Section is bounded by the next H1/H2 — same convention as the
+        append rewriters.
+
+    The remover only matches lines that START with ``- `` (a bullet)
+    and contain the target wikilink. Body prose containing the same
+    wikilink inline is preserved unchanged.
+    """
+    if not member_wikilink.startswith("[[") or not member_wikilink.endswith("]]"):
+        # Defensive: caller should pass a wikilink with brackets.
+        # Treat malformed input as a no-op rewriter.
+        return lambda body: body
+    target_stem = member_wikilink[2:-2]
+    if "|" in target_stem:
+        target_stem = target_stem.split("|", 1)[0]
+    target_stem = target_stem.strip()
+    if not target_stem:
+        return lambda body: body
+
+    # Pattern: a bullet line containing a wikilink to the target stem,
+    # optionally pipe-aliased. Anchored to line-start so prose
+    # references don't match.
+    bullet_re = re.compile(
+        r"^[ \t]*-[ \t]+\[\["
+        + re.escape(target_stem)
+        + r"(?:\|[^\]]*)?\]\][^\n]*\n?",
+        re.MULTILINE,
+    )
+
+    def _rewriter(body: str) -> str:
+        section_idx = _find_h2_or_h1_section_start(body, section_heading)
+        if section_idx == -1:
+            # No section means no bullet to remove.
+            return body
+        section_start = section_idx + len(section_heading)
+        section_end = _find_next_top_heading(body, section_start)
+        section_body = body[section_start:section_end]
+
+        new_section_body, count = bullet_re.subn("", section_body)
+        if count == 0:
+            # Bullet not present — idempotent no-op.
+            return body
+        return body[:section_start] + new_section_body + body[section_end:]
+
+    return _rewriter
+
+
+# ---------------------------------------------------------------------------
+# Inventory MOC dispatch table — the principal artifact.
+# ---------------------------------------------------------------------------
+#
+# Each entry: (record_type, predicate, moc_rel_path, moc_name).
+#
+#   * ``record_type``  — the trigger type. Hook only fires for records
+#                        of this type.
+#   * ``predicate``    — ``Callable[[dict], bool]`` taking the
+#                        post-edit frontmatter. True means "this
+#                        record belongs in the inventory MOC."
+#   * ``moc_rel_path`` — vault-relative path of the inventory MOC.
+#                        Must start with ``MOC/_`` per the underscore-
+#                        prefix discipline.
+#   * ``moc_name``     — the ``name`` frontmatter the auto-create flow
+#                        writes (i.e. the underscore-prefixed
+#                        filename stem; e.g. ``_Open Questions``).
+#
+# Two instances ship in Sub-arc B. Future inventory MOCs add entries
+# here without code changes elsewhere.
+INVENTORY_MOC_DISPATCH: tuple[tuple[str, Callable[[dict], bool], str, str], ...] = (
+    (
+        "question",
+        lambda fm: fm.get("status") in ("open", "refined"),
+        "MOC/_Open Questions.md",
+        "_Open Questions",
+    ),
+    (
+        "research-pointer",
+        lambda fm: fm.get("status") == "open",
+        "MOC/_Open Research Pointers.md",
+        "_Open Research Pointers",
+    ),
+)
+
+
+def _ensure_inventory_moc(
+    vault_path: Path,
+    moc_rel_path: str,
+    moc_name: str,
+    *,
+    scope: str = "hypatia",
+) -> bool:
+    """Create the inventory MOC at ``moc_rel_path`` if absent.
+
+    Returns True if the file now exists (either pre-existed or was
+    just created); False if creation failed.
+
+    Uses ``vault_create`` so the file goes through the canonical
+    validate-template-write path (frontmatter scaffolded from the
+    bundled ``_templates/MOC.md`` template; ``type: MOC`` set; the
+    template body — ``# Premise`` / ``# Contents`` / ``# Notes`` /
+    ``# Tags`` / ``# See Also`` — written verbatim). The name passed
+    to ``vault_create`` is the underscore-prefixed stem so the file
+    lands at ``MOC/_<Name>.md`` per ``TYPE_DIRECTORY``.
+
+    Failure-isolated: any exception during auto-create logs and
+    returns False so the caller can skip the per-bullet write
+    cleanly. The originating record's write (the question or
+    research-pointer that triggered the dispatch) is NEVER affected.
+    """
+    from . import ops as _ops
+
+    if (vault_path / moc_rel_path).exists():
+        return True
+
+    try:
+        _ops.vault_create(
+            vault_path,
+            "MOC",
+            moc_name,
+            scope=scope,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "vault.zettel_hooks.inventory_moc_create_failed",
+            moc_rel_path=moc_rel_path,
+            moc_name=moc_name,
+            error=str(exc),
+        )
+        return False
+
+    log.info(
+        "vault.zettel_hooks.inventory_moc_created",
+        moc_rel_path=moc_rel_path,
+        moc_name=moc_name,
+    )
+    return True
+
+
+def _apply_inventory_moc_action(
+    vault_path: Path,
+    moc_rel_path: str,
+    moc_name: str,
+    member_rel_path: str,
+    *,
+    action: str,
+    scope: str = "hypatia",
+) -> bool:
+    """Apply a single ``"add"`` or ``"remove"`` action against one
+    inventory MOC.
+
+    For ``"add"``: ensure the MOC exists (auto-create if absent),
+    then append the bullet via :func:`_build_moc_contents_rewriter`.
+
+    For ``"remove"``: if the MOC doesn't exist, no-op (nothing to
+    remove from). Otherwise remove the bullet via
+    :func:`_build_remove_bullet_rewriter`.
+
+    Returns True when the inventory MOC was modified (or auto-created
+    + written) on disk; False on no-op. Failure-isolated.
+    """
+    from . import ops as _ops
+
+    if action not in ("add", "remove"):
+        log.warning(
+            "vault.zettel_hooks.inventory_moc_unknown_action",
+            action=action,
+            moc_rel_path=moc_rel_path,
+        )
+        return False
+
+    member_no_md = (
+        member_rel_path[:-3]
+        if member_rel_path.endswith(".md")
+        else member_rel_path
+    )
+    member_wikilink = f"[[{member_no_md}]]"
+
+    if action == "add":
+        if not _ensure_inventory_moc(
+            vault_path, moc_rel_path, moc_name, scope=scope,
+        ):
+            return False
+        rewriter = _build_moc_contents_rewriter(member_wikilink)
+    else:  # action == "remove"
+        if not (vault_path / moc_rel_path).exists():
+            # Nothing to remove from. Idempotent.
+            return False
+        rewriter = _build_remove_bullet_rewriter(member_wikilink)
+
+    try:
+        _ops.vault_edit(
+            vault_path,
+            moc_rel_path,
+            body_rewriter=rewriter,
+            scope=scope,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "vault.zettel_hooks.inventory_moc_write_failed",
+            moc_rel_path=moc_rel_path,
+            member_rel_path=member_rel_path,
+            action=action,
+            error=str(exc),
+        )
+        return False
+
+    log.info(
+        "vault.zettel_hooks.inventory_moc_written",
+        moc_rel_path=moc_rel_path,
+        member_rel_path=member_rel_path,
+        action=action,
+    )
+    return True
+
+
+def dispatch_inventory_mocs(
+    vault_path: Path,
+    member_rel_path: str,
+    member_type: str,
+    *,
+    pre_fm: dict | None,
+    post_fm: dict,
+    scope: str = "hypatia",
+) -> dict[str, int]:
+    """Iterate the dispatch table and apply add/remove actions per
+    predicate transition.
+
+    Pre/post predicate truth table:
+
+      +--------------+--------------+-------------+
+      | predicate    | predicate    | action      |
+      | (pre_fm)     | (post_fm)    |             |
+      +--------------+--------------+-------------+
+      | False/missing| True         | add         |
+      | True         | False        | remove      |
+      | True         | True         | add (idem)  |
+      | False        | False        | no-op       |
+      +--------------+--------------+-------------+
+
+    For ``vault_create`` callers, ``pre_fm`` should be ``None`` (the
+    record didn't exist before this call). The truth table treats
+    ``None`` pre_fm as False for predicate evaluation, so a fresh
+    create with a qualifying status fires "add".
+
+    The "True → True" cell re-fires "add" intentionally — at the
+    helper level the append rewriter is idempotent (bullet-presence
+    check). The cost is one extra ``vault_edit`` call per touched
+    record per matching dispatch entry; the gain is that operator-
+    fixed broken MOC state (someone manually deleted the bullet)
+    self-heals on the next edit. Acceptable trade.
+
+    Returns a dict summarizing per-action counts:
+    ``{"added": N, "removed": M, "skipped": K}`` — informational,
+    used by the summary log line so operators can grep dispatch
+    activity.
+
+    Per ``feedback_intentionally_left_blank.md``: a summary log
+    fires per call (even when the dispatch table has no matching
+    entry for ``member_type``) so idle is distinguishable from
+    broken.
+
+    Failure-isolated at the per-entry level — one entry's auto-
+    create failure or write failure doesn't stop iteration over
+    the rest. (Currently the dispatch table has at most one entry
+    per record_type, so this is forward-compatible defense rather
+    than active concern.)
+    """
+    counts = {"added": 0, "removed": 0, "skipped": 0}
+    matched_entries = 0
+
+    for entry_type, predicate, moc_rel_path, moc_name in INVENTORY_MOC_DISPATCH:
+        if entry_type != member_type:
+            continue
+        matched_entries += 1
+
+        try:
+            was_true = bool(pre_fm and predicate(pre_fm))
+        except Exception:  # noqa: BLE001
+            was_true = False
+        try:
+            is_true = bool(predicate(post_fm))
+        except Exception:  # noqa: BLE001
+            is_true = False
+
+        if is_true:
+            success = _apply_inventory_moc_action(
+                vault_path,
+                moc_rel_path,
+                moc_name,
+                member_rel_path,
+                action="add",
+                scope=scope,
+            )
+            if success:
+                counts["added"] += 1
+            else:
+                counts["skipped"] += 1
+        elif was_true:
+            success = _apply_inventory_moc_action(
+                vault_path,
+                moc_rel_path,
+                moc_name,
+                member_rel_path,
+                action="remove",
+                scope=scope,
+            )
+            if success:
+                counts["removed"] += 1
+            else:
+                counts["skipped"] += 1
+        else:
+            # Neither predicate side fires — no-op.
+            counts["skipped"] += 1
+
+    log.info(
+        "vault.zettel_hooks.inventory_moc_dispatch_summary",
+        member_rel_path=member_rel_path,
+        member_type=member_type,
+        matched_entries=matched_entries,
+        added=counts["added"],
+        removed=counts["removed"],
+        skipped=counts["skipped"],
+    )
+    return counts
+
+
 __all__ = [
     "mirror_supersedes_chain",
     "append_to_author_contents",
     "append_to_moc_contents",
     "dispatch_moc_appends",
+    "dispatch_inventory_mocs",
+    "INVENTORY_MOC_DISPATCH",
 ]
