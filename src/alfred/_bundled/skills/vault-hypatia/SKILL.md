@@ -395,7 +395,7 @@ Zettelkasten frontmatter shapes (Phase 1, shipped 2026-05-16 — see the "Zettel
 
 - **`memo/<slug>.md`** — `type: memo`, `name`, `created`, `session: "[[session/...]]"` (pointer back to the originating capture); optional `tags`, `related`. No `status` field — memos are transient. Body: `# Memo` (raw user text) / `# Context` / `# Tags`. Auto-created by capture-mode when a session has ≤1 user message at /end.
 - **`zettel/<title>.md`** — `type: zettel`, `name`, `created`; optional `author: "[[author/<canonical>]]"`, `source: "[[source/<title>]]"`, `mocs: [...]`, `supersedes: "[[zettel/<old>]]"`, `superseded_by` (auto-set by the Phase 3 supersede mirror — see "Supersede chains + author Contents (Phase 3)" below), `tags`, `status: open | refined | superseded` (status is for category-shape zettels; most synthesis + definitional shapes omit it). Body: `# Premise` / `# Contents` (optional dataview) / `# Notes` / `# Supersedes` (Phase 3 scaffold — operator-only WHY-narrative when this zettel supersedes an older one) / `# Follow Up Questions` / `# Research Ideas` / `# External References` / `# Tags` / `# Indexing & MOCs`. One flexible template; three sub-shapes (synthesis / category / definitional) — see the catalog below.
-- **`MOC/<Topic MOC>.md`** — `type: MOC`, `name`, `created`; optional `parent_mocs: [...]`, `tags`. Body: `# Premise` (one-line scope statement) / `# Contents` (hierarchical member tree) / `# Notes` (optional) / `# Tags` / `# See Also`. Filename suffix `MOC` is convention (`Practical Stoicism MOC.md`). Operator-led — both creation AND member-list maintenance in Phase 1; auto-maintenance of `# Contents` from inbound `# Indexing & MOCs` wikilinks is Phase 4 work (deferred).
+- **`MOC/<Topic MOC>.md`** — `type: MOC`, `name`, `created`; optional `parent_mocs: [...]`, `tags`. Body: `# Premise` (one-line scope statement) / `# Contents` (member tree — Hypatia auto-appends flat `- [[<type>/<Title>]]` bullets per Phase 4 Sub-arc A; operator restructures into a hierarchical tree) / `# Notes` (optional) / `# Tags` / `# See Also`. Filename suffix `MOC` is convention (`Practical Stoicism MOC.md`). MOC creation is operator-led; member-list auto-append from inbound zettel/source/question/research-pointer `mocs:` frontmatter is shipped (Phase 4 Sub-arc A, 2026-05-18 — see "MOC member auto-append (Phase 4 Sub-arc A)" section below). Body `# Indexing & MOCs` parsing is NOT yet operational — only frontmatter `mocs:` triggers the append (Phase 4.x deferred extension).
 - **`question/<question text>.md`** — `type: question`, `name`, `created`, `status: open | refined | answered | superseded`; optional `origin_sources: [...]` (wikilinks to source/zettel that raised this question), `answered_by: "[[zettel/...]]"`, `mocs`, `tags`. Body: `# Question` / `# Why It Matters` / `# Origin` / `# Status` / `# Exploration` / `# Answer` / `# Tags` / `# Indexing & MOCs`. Operator-elevated.
 - **`research-pointer/<action>.md`** — `type: research-pointer`, `name`, `created`, `status: open | in-progress | completed | dropped`; optional `origin_sources: [...]`, `produces: [...]` (list of resulting records), `mocs`, `tags`. Body: `# Pointer` (one imperative line) / `# Why` / `# Origin` / `# Status` / `# Notes` / `# Tags` / `# Indexing & MOCs`. Operator-elevated.
 - **`author/<canonical scholarly name>.md`** — `type: author`, `name` (the full author name), `created`, `aliases: [...]` (bridges full-name wikilinks + alternate spellings + legacy last-name-only forms to the canonical filename); optional `tags`. Body: `# Summary` (terse identifier-fragments for canonical figures; substantive prose only when operator fills it) / `# Contents` (Z-centric — **Hypatia auto-appends flat `- [[zettel/Title]]` bullets** per zettel created with `author:` set, shipped Phase 3 2026-05-18; operator restructures the flat list into hierarchical trees when material density warrants) / `# Tags` / `# See Also` (operator-only). **Frontmatter is intentionally minimal — `era`, `school`, `description`, `last_name`, `status`, `related` are NOT used.** Author records are INDEX CARDS pointing to works, not biographies.
@@ -406,7 +406,7 @@ Operator-template frontmatter shape (shipped 2026-05-17 — see the "Article typ
 
 Source frontmatter shape (Phase 2, shipped 2026-05-17 — see the "Source records (Phase 2)" section below for full discipline):
 
-- **`source/<Title>.md`** — `type: source`, `name`, `created`, `status: active`; optional `author: "[[author/<canonical>]]"` (Hypatia auto-sets when opening pattern names an author), `source_type:` (one of `book | article | podcast | video | lecture | conversation` — Hypatia auto-sets from the opening-pattern verb; omitted from frontmatter when shape inference doesn't fire), `url:` (legal frontmatter field for online sources — operator-fillable; NOT auto-set by the resolver even when the opening turn contains a URL), `mocs: [...]`, `tags: [...]`. Body: `# Source Details` (`## Bibliographic Details` / `## Goal` / `## Overview`) + `# Notes` (`## Summary Statement` / `## Why It Matters` / `## Observations During` / `## Permanent Notes spawned`) + tail (`# External References` / `# Tags` / `# Indexing & MOCs`). Hypatia auto-creates on first source declaration; auto-maintains `## Observations During` on re-encounter and `## Permanent Notes spawned` on zettel-creation-with-source. Bibliographic Details / Summary Statement / Why It Matters / Tags / Indexing & MOCs are **operator-only** — Hypatia does NOT auto-write to them (Option A — no auto-scrape). `url:` is also operator-only; the resolver uses URL hints in the title to refine `source_type` (book → article) but does NOT extract the URL into the `url:` field.
+- **`source/<Title>.md`** — `type: source`, `name`, `created`, `status: active`; optional `author: "[[author/<canonical>]]"` (Hypatia auto-sets when opening pattern names an author), `source_type:` (one of `book | article | podcast | video | lecture | conversation` — Hypatia auto-sets from the opening-pattern verb; omitted from frontmatter when shape inference doesn't fire), `url:` (legal frontmatter field for online sources — operator-fillable; NOT auto-set by the resolver even when the opening turn contains a URL), `mocs: [...]` (operator-fills; Hypatia auto-mirrors to listed MOC `# Contents` per Phase 4 Sub-arc A), `tags: [...]`. Body: `# Source Details` (`## Bibliographic Details` / `## Goal` / `## Overview`) + `# Notes` (`## Summary Statement` / `## Why It Matters` / `## Observations During` / `## Permanent Notes spawned`) + tail (`# External References` / `# Tags` / `# Indexing & MOCs`). Hypatia auto-creates on first source declaration; auto-maintains `## Observations During` on re-encounter, `## Permanent Notes spawned` on zettel-creation-with-source, and listed MOCs' `# Contents` when `mocs:` is non-empty (Phase 4 Sub-arc A). Bibliographic Details / Summary Statement / Why It Matters / Tags body sections and the body `# Indexing & MOCs` section remain **operator-only** — Hypatia does NOT auto-write to body `# Indexing & MOCs` (the MOC auto-append trigger reads frontmatter `mocs:` ONLY; body parsing is Phase 4.x deferred). `url:` is also operator-only; the resolver uses URL hints in the title to refine `source_type` (book → article) but does NOT extract the URL into the `url:` field.
 
 Wikilinks in frontmatter are double-quoted: `"[[concept/Routes as Stories]]"`, not `[[concept/Routes as Stories]]`.
 
@@ -426,8 +426,8 @@ The Phase 1 design follows a **type-minimalism principle** Andrew ratified 2026-
 | `zettel/` | Atomic Zettelkasten record — specific topic, research-backed or considered reflection | Descriptive title (NO `Z - ` prefix forward) | Hypatia auto via capture-mode multi-message extraction WHEN session is source-anchored (or operator closed with `/end-zettel`); operator-curated subsequently |
 | `source/` | Running notes + commentary on consumed material | Title of the work (NO `S - ` prefix forward) | Hypatia auto via capture-mode source-anchor detection (Phase 1) + Phase 2 body enrichment (shape inference, anchor preservation, re-encounter growth, Permanent Notes spawned auto-append). See "Source records (Phase 2)" section below. |
 | `author/` | Index card → author's works + lateral linkage | Canonical scholarly name (see resolver below) | Hypatia auto at first source encounter |
-| `MOC/` | Map of Content — topic organizer | `<Topic> MOC.md` (suffix locked) | Operator-led (creation + member maintenance in Phase 1; auto-member-maintenance from inbound `# Indexing & MOCs` wikilinks is Phase 4 deferred) |
-| `question/` | Elevated atomic question for tracking | Question text itself | Operator-elevated from inline `# Follow Up Questions`; Hypatia-assisted via discoverability surfacing (Phase 4) |
+| `MOC/` | Map of Content — topic organizer | `<Topic> MOC.md` (suffix locked) | Creation operator-led; member-list auto-append shipped (Phase 4 Sub-arc A, 2026-05-18) — zettel/source/question/research-pointer records carrying `mocs:` frontmatter auto-append flat `- [[<type>/<Title>]]` bullets to the listed MOC's `# Contents` |
+| `question/` | Elevated atomic question for tracking | Question text itself | Operator-elevated from inline `# Follow Up Questions`; Hypatia-assisted via discoverability surfacing (Phase 4 discoverability sub-arc, deferred — distinct from the shipped Phase 4 Sub-arc A MOC member auto-append) |
 | `research-pointer/` | Elevated atomic research action | Action statement itself | Operator-elevated from inline `# Research Ideas`; Hypatia-assisted |
 
 **Critical distinction — the three-tier discriminator (CORRECTED 2026-05-16 post-Phase-1-ship).** `memo/`, `zettel/`, and `note/` are three distinct semantic tiers, not redundant types. Andrew's correction: *"Not all Hypatia notes are zettels. Not all capture sessions are zettels either. Notes need to exist as well, as my non-zettelkasten held 'fleeting notes'."*
@@ -568,28 +568,29 @@ Don't write a source-frame Premise into a zettel (or vice versa). The role flips
 
 **Auto-creation default.** When the capture-batch worker writes a zettel from a multi-message source-anchored capture (the discriminator's zettel branch), default to SYNTHESIS shape (synthesis-from-reading is the common case). Category-Z requires deliberate operator-curated cataloging; never auto-create one. Definitional-Z requires an explicit invocation pattern (e.g., *"Hypatia, make a zettel about [concept]"*); also never auto.
 
-### MOC records — operator-led (Phase 1)
+### MOC records — operator-creates, Hypatia-mirrors members (Phase 4 Sub-arc A)
 
 A MOC (Map of Content) is a topic organizer. Filename suffix is locked: `<Topic> MOC.md` (e.g., `Practical Stoicism MOC.md`, `Historical Fencing MOC.md`).
 
-- Body: `# Premise` (one-line scope statement) / `# Contents` (hierarchical member tree — zettels top-level, sources indented as children) / `# Notes` (optional operator narrative) / `# Tags` / `# See Also` (related MOCs).
-- **Operator-only in Phase 1.** Operator creates the MOC, operator fills `# Contents` with the member tree, operator maintains the hierarchy, operator writes `# Notes` / `# See Also`. Hypatia does NOT auto-append members on edit, does NOT restructure hierarchy, does NOT generate `# Notes` narrative.
-- **Auto-member-maintenance is Phase 4** (deferred). The plan: when a zettel or source is edited to add a wikilink to a MOC in its `# Indexing & MOCs` section, Hypatia would idempotently append `- [[zettel/Title]]` (or `- [[source/Title]]`) to the MOC's `# Contents`. Not shipped yet. Until then, the wikilink trail goes one direction only: zettel/source → MOC via `# Indexing & MOCs`; the MOC's `# Contents` is operator-maintained.
+- Body: `# Premise` (one-line scope statement) / `# Contents` (member tree — Hypatia auto-appends flat bullets, operator restructures hierarchy) / `# Notes` (optional operator narrative) / `# Tags` / `# See Also` (related MOCs).
+- **Creation is operator-led.** Operator creates the MOC record, sets `# Premise`, writes `# Notes` / `# See Also`. Hypatia does NOT create MOCs automatically and does NOT generate `# Notes` narrative.
+- **Member-list maintenance is Hypatia-mirrored (Phase 4 Sub-arc A, shipped 2026-05-18).** When operator creates or edits a zettel / source / question / research-pointer with a non-empty `mocs:` frontmatter list, Hypatia idempotently appends `- [[<type>/<Title>]]` to each listed MOC's `# Contents` section. The wikilink trail is now bidirectional: writer record → MOC via `mocs:` frontmatter; MOC ← writer record via the auto-appended bullet. See the dedicated "MOC member auto-append (Phase 4 Sub-arc A)" section below for the full discipline.
+- **Hierarchical restructuring is operator-only.** Hypatia appends flat bullets at the END of `# Contents`. Operator promotes them into the appropriate tree branch (zettels top-level, sources indented as children — Andrew's lived practice) when material density warrants. Hypatia does NOT preserve / restore that hierarchy on subsequent appends; future bullets always land flat at the section end.
 
-MOC auto-suggestion (surveyor cluster labels → MOC links) is Phase 5 work; pre-surveyor, operator fills `# Indexing & MOCs` manually.
+MOC auto-suggestion (surveyor cluster labels → MOC links) remains Phase 5 work; pre-surveyor, the operator decides which MOCs go in each writer record's `mocs:` field.
 
-If Andrew asks *"why didn't this zettel show up in the MOC's Contents?"* and the zettel has the MOC wikilink in `# Indexing & MOCs`, the honest answer is: auto-member-maintenance is Phase 4 (deferred). Suggest the operator action: append the wikilink to the MOC's `# Contents` directly, OR wait for Phase 4 to ship.
+If Andrew asks *"why didn't this zettel show up in the MOC's Contents?"* — first check whether the zettel's frontmatter `mocs:` field actually lists the MOC (the trigger is frontmatter-only as of Phase 4 Sub-arc A; the body `# Indexing & MOCs` section is NOT scanned). If `mocs:` does list it and the bullet is still absent, the most likely causes are: (a) the MOC record doesn't exist on disk (fail-open silent miss — see fail-open semantics below), or (b) the zettel pre-dates Phase 4 Sub-arc A and was never edited after the ship (the hook fires on `vault_create` / `vault_edit`, not retroactively). Suggest the operator action: re-save the zettel (any `vault_edit`, even a no-op set_fields, will re-fire the hook), OR confirm the MOC exists and append the wikilink to its `# Contents` manually.
 
 ### Question + research-pointer — operator-elevated atoms
 
 Most questions live INLINE in the `# Follow Up Questions` section of source or zettel records — that's the default. Elevation to a dedicated `question/` record happens when:
 
 - The question deserves tracking as its own atom (multi-session exploration, may produce a zettel as its answer).
-- Operator explicitly invokes via `/elevate-question` (Phase 4) or by asking Hypatia *"elevate that question to a record"*.
+- Operator explicitly invokes via `/elevate-question` (Phase 4 discoverability sub-arc, deferred) or by asking Hypatia *"elevate that question to a record"*.
 
 Same logic for `research-pointer/` records elevated from inline `# Research Ideas` sections. Both lifecycle statuses (open / refined / answered / superseded for questions; open / in-progress / completed / dropped for pointers) are operator-curated; Hypatia doesn't auto-transition.
 
-Phase 4 will ship discoverability — a scheduled scan of `# Follow Up Questions` vault-wide → digest surfaces uncovered questions → operator picks elevation candidates. Until then, elevation is fully manual.
+The Phase 4 discoverability sub-arc (separate from Phase 4 Sub-arc A which shipped 2026-05-18) will ship a scheduled scan of `# Follow Up Questions` vault-wide → digest surfaces uncovered questions → operator picks elevation candidates. Until then, elevation is fully manual. (Note: Phase 4 Sub-arc A — MOC member auto-append — IS shipped; only the question-elevation discoverability digest remains deferred under the broader Phase 4 banner.)
 
 ### Author resolver — canonical scholarly name with `aliases` bridge
 
@@ -646,12 +647,12 @@ Per the operator-only-zones discipline in the design memo:
 | Zone | Why |
 |---|---|
 | `# Contents` hierarchy restructuring (author records) | **Phase 3 (shipped 2026-05-18)** — Hypatia auto-appends FLAT `- [[zettel/Title]]` bullets at the end of `# Contents` on every zettel created with `author:` set. Operator restructures the flat list into hierarchical trees when material density warrants (per Andrew's lived practice — Fiore's hierarchical Contents with zettels at top + sources nested under each). Hypatia does NOT preserve / restore that hierarchy on subsequent appends; the operator owns the tree shape. Sources with `author:` set do NOT trigger this append — Z-centric per the locked plan (see "Supersede chains + author Contents (Phase 3)" below). |
-| `# Contents` maintenance (MOC records) | Phase 1: fully operator-owned. Hypatia neither appends members nor restructures the tree. Auto-append from inbound `# Indexing & MOCs` wikilinks is Phase 4 deferred. |
+| `# Contents` hierarchy restructuring (MOC records) | **Phase 4 Sub-arc A (shipped 2026-05-18)** — Hypatia auto-appends FLAT `- [[<type>/<Title>]]` bullets at the end of `# Contents` for every zettel / source / question / research-pointer created or edited with a non-empty `mocs:` frontmatter list. Operator restructures the flat list into hierarchical trees (zettels top-level, sources indented as children) when material density warrants. Hypatia does NOT preserve / restore that hierarchy on subsequent appends; the operator owns the tree shape. Body `# Indexing & MOCs` parsing is NOT yet operational — only frontmatter `mocs:` triggers the append (Phase 4.x deferred extension). |
 | `# Supersedes` body section (NEW zettel — WHY-narrative) | **Phase 3 (shipped 2026-05-18) operator-only zone.** When operator creates a new zettel with `supersedes: [[zettel/Old]]`, Hypatia auto-mirrors the chain onto the OLD zettel (`superseded_by:` frontmatter + `## Superseded by` H2 callout) but does NOT auto-write the WHY-paragraph on the new zettel's `# Supersedes` H1 section. That paragraph is Andrew's voice — *"like a comment that explains there was change, like an audit log for myself."* Hypatia leaves the section empty for operator-fill. The auto-mirrored `## Superseded by` callout on the OLD zettel is auto-maintained (Hypatia adds dated bullets); the NEW zettel's `# Supersedes` body is not. See the dedicated section below for the H1/H2 asymmetry rationale. |
 | Bibliographic details on source records (Option A — empty placeholders only) | Phase 2 (2026-05-17) ships the source template with `## Bibliographic Details` scaffolding present but empty; auto-scrape remains deferred. Operator fills citation / URL+byline / host+episode / etc. retrospectively per the per-shape conventions in "Source records (Phase 2)" above. Future Open Library / Google Books integration is Phase 2.5+ if friction surfaces with book-heavy workflow. |
 | Significance-interpretation in author `# Summary` | Interpretive significance is Andrew's voice. Auto-creation leaves Summary empty OR writes terse identifier-fragments only — never interpretation. |
 | `# See Also` entries (author + MOC) | Empty by default on auto-creation; operator fills with related authors / movements / schools / MOCs. |
-| Question + research-pointer elevation decisions | Operator decides which inline questions deserve elevation. Phase 4 discoverability digest surfaces candidates; operator picks. |
+| Question + research-pointer elevation decisions | Operator decides which inline questions deserve elevation. The Phase 4 discoverability sub-arc (deferred; distinct from Phase 4 Sub-arc A which shipped) will surface candidates via scheduled digest; operator picks. |
 | `# Tags` body section content (taxonomy choice) | Hypatia suggests tags; Andrew curates the canonical taxonomy. Don't impose new tag inventions on existing records without consent. |
 
 ---
@@ -853,7 +854,8 @@ The auto-append fires for **zettels only**. Notes (the non-anchored discriminato
 | `## Goal` / `## Overview` | Operator-only | Author's stated purpose / bibliographic context — Hypatia leaves empty at auto-creation. |
 | `## Summary Statement` / `## Why It Matters` | Operator-only (retrospective) | Filled after engagement — empty at first-encounter is the correct state. |
 | `# Tags` body section | Operator-only | Frontmatter `tags:` list is separate; the body section is operator-curated taxonomy. |
-| `# Indexing & MOCs` | Operator-only | MOC member auto-maintenance is Phase 4 (deferred); pre-Phase-4 the operator fills `# Indexing & MOCs` wikilinks and the MOC's `# Contents` separately. |
+| `# Indexing & MOCs` (body section) | Operator-only | Body `# Indexing & MOCs` parsing is NOT yet operational (Phase 4.x deferred extension). The shipped Phase 4 Sub-arc A trigger reads frontmatter `mocs:` ONLY — operator-fills `mocs:` in frontmatter to drive the MOC `# Contents` auto-append, and may additionally curate `# Indexing & MOCs` body wikilinks for Obsidian-graph navigation (independent surface, no auto-mirror). |
+| `mocs:` frontmatter (source / zettel / question / research-pointer) | Operator-only (writer-side); Hypatia auto-mirrors to MOC `# Contents` | The operator decides which MOCs the writer record belongs to and lists them in `mocs:`. On `vault_create` / `vault_edit`, the Phase 4 Sub-arc A hook auto-appends `- [[<type>/<Title>]]` to each listed MOC's `# Contents`. Idempotent, fail-open on missing MOC, no-cleanup on `mocs:` drop. See "MOC member auto-append (Phase 4 Sub-arc A)" below. |
 
 ### "Intentionally left blank" discipline for Phase 2 frontmatter
 
@@ -1066,9 +1068,105 @@ When operator creates a zettel with non-empty `author:` field, Hypatia's `append
 
 - Sources with `author:` set → no author Contents append (Z-centric).
 - Sources with `source:` set on derived zettels → DOES trigger Permanent Notes spawned append (Phase 2, separate hook).
-- MOCs, questions, research-pointers, memos created with `author:` or `supersedes:` set → no hooks fire (type-scoped to zettel records).
-- Notes (`note/`) created via the discriminator's not-anchored branch → no hooks fire (notes are not zettels).
+- MOCs, questions, research-pointers, memos created with `author:` or `supersedes:` set → no hooks fire (the author + supersede hooks are type-scoped to zettel records; the MOC member hook is type-scoped to `_MOC_TRIGGER_TYPES = {zettel, source, question, research-pointer}` — MOCs and memos do NOT trigger MOC appends either).
+- Notes (`note/`) created via the discriminator's not-anchored branch → no hooks fire (notes are not zettels and are not in `_MOC_TRIGGER_TYPES`).
 - Operator-direct edits to old zettel's `superseded_by:` field via `vault_edit` → no reverse mirror back to new zettel (the hook is one-way: new → old; not a bidirectional sync).
+
+---
+
+## MOC member auto-append (Phase 4 Sub-arc A, shipped 2026-05-18)
+
+Phase 4 Sub-arc A ships the third auto-maintenance hook in `src/alfred/vault/zettel_hooks.py`: when a zettel / source / question / research-pointer is created or edited with a non-empty `mocs:` frontmatter list, Hypatia idempotently appends `- [[<type>/<Title>]]` to each listed MOC's `# Contents` section. Like the Phase 2 source `## Permanent Notes spawned` append and the Phase 3 author `# Contents` append, this hook is **operator-driven, Hypatia-mirrored** — the operator decides which MOCs a writer record belongs to; Hypatia maintains the cross-record projection so the MOC's Contents stays accurate on disk.
+
+### Trigger types — what records fire the hook
+
+The hook is type-scoped to `_MOC_TRIGGER_TYPES = frozenset({"zettel", "source", "question", "research-pointer"})`. Memo records and MOC records are deliberately excluded:
+
+- **Memos** — fleeting and write-once-by-design; their template does NOT carry a `mocs:` field. MOC indexing doesn't fit the memo's transient role.
+- **MOCs themselves** — a MOC's MOC-to-MOC linkage surface is `parent_mocs:`, not `mocs:`. Tree-of-MOCs maintenance is Phase 5+ work.
+
+If you set `mocs:` on a memo or MOC and call `vault_create` / `vault_edit`, the dispatch emits a `vault.zettel_hooks.moc_dispatch_summary` log line with `reason="type_not_in_moc_trigger_types"` and no appends fire (per the `feedback_intentionally_left_blank.md` discipline — silence isn't ambiguous; the log line says "ran, nothing to do").
+
+### Bullet shape — flat, no date, type-aware
+
+The appended bullet is `- [[<type>/<Title>]]` where `<type>` matches the writer record's directory: `zettel/`, `source/`, `question/`, or `research-pointer/`. Distinct from the supersede `## Superseded by` bullets which carry dates — MOC `# Contents` bullets are a static index, supersede bullets are a temporal audit log. Type-aware so the MOC's Contents distinguishes a zettel from a source from an inline-elevated question at a glance.
+
+Example — `MOC/Practical Stoicism MOC.md` accumulating mixed-type members over time:
+
+```markdown
+# Contents
+
+- [[zettel/Dichotomy of Control as Foundation]]
+- [[source/Meditations]]
+- [[zettel/Memento Mori as Productivity Frame]]
+- [[question/What does "live according to nature" actually mean?]]
+- [[research-pointer/Compare Stoic + CBT cognitive reframing techniques]]
+```
+
+Operator restructures the flat list into a hierarchical tree (zettels top-level, sources indented as children — the Fiore-style pattern from Phase 3 author Contents) when the MOC's member count grows. Hypatia does NOT preserve / restore that hierarchy on subsequent appends; new bullets always land flat at the section end. The new bullet sits as a flat orphan; operator promotes it into the appropriate tree branch on next pass.
+
+### Idempotency — pipe-alias-aware bullet-presence check
+
+The hook checks for the bullet's presence in the MOC's `# Contents` section before appending. The check is **pipe-alias-aware**: `- [[zettel/Dichotomy of Control as Foundation]]`, `- [[zettel/Dichotomy of Control as Foundation|Dichotomy of Control]]`, and `- [[zettel/Dichotomy of Control as Foundation|the foundation argument]]` all count as the same bullet — the same bare wikilink target, different display aliases. The hook will NOT append a second bullet if the operator has already curated the wikilink with a pipe alias for readability.
+
+Re-runs of `vault_edit` on the same record (even with no actual content change, e.g., a no-op `set_fields`) are safe: the bullet stays singular in the MOC. Manual operator-edits to the MOC's `# Contents` (adding pipe aliases, restructuring into trees, indenting sources under zettels) don't get duplicated on next append.
+
+### Missing `# Contents` section auto-creates
+
+Pre-Phase-4-Sub-arc-A MOC records (created before 2026-05-18 and never edited since) may not have a `# Contents` heading even if the MOC body is otherwise populated. The hook auto-creates `# Contents` at the end of the body and appends the first bullet — matching the Phase 3 author Contents auto-create behaviour. Auto-maintenance intent is to make the index real on disk, not silently drop the signal.
+
+### Fail-open semantics — missing MOC does NOT block the writer record
+
+If the operator sets `mocs: ["[[MOC/Nonexistent Topic MOC]]"]` on a zettel and no `MOC/Nonexistent Topic MOC.md` record exists, the hook logs `vault.zettel_hooks.moc_target_missing` and returns False for that MOC. **The writer record (the zettel) is unaffected** — `vault_create` / `vault_edit` succeeds; the zettel lands on disk with the `mocs:` field intact; the missing-MOC append is the only thing that doesn't happen. Per-MOC failure isolation: if `mocs:` lists 4 MOCs and 1 is missing, the other 3 still get their bullets appended. The dispatch emits a `vault.zettel_hooks.moc_dispatch_summary` log line with `mocs_count=4 appended_count=3` so operators can see the partial-success state.
+
+This matches the broader "vault is canonical; cross-record mirroring is a projection" discipline — partial mirroring is better than abandoning the writer record because a MOC was missing.
+
+**Operator-paced reconciliation.** When the missing MOC gets created later (manually via `vault_create`), the hook does NOT retroactively populate it with historical zettels-that-cited-it. The append only fires on the writer record's next `vault_create` / `vault_edit`. If Andrew creates `MOC/Nonexistent Topic MOC.md` after the fact and wants the historical writer records to appear in its `# Contents`, the operator action is: (a) re-save each writer record (any `vault_edit`, even a no-op set_fields, re-fires the hook), OR (b) manually append the bullets to the new MOC's `# Contents`.
+
+### No-cleanup-on-drop — dropping a MOC from `mocs:` does NOT remove the bullet
+
+If the operator edits a zettel to remove a MOC from its `mocs:` list, the previously-appended bullet on that MOC's `# Contents` **stays**. The hook is append-only by design; there is no removal cleanup path. Operator-paced reconciliation: if the bullet should go, the operator manually deletes it from the MOC's `# Contents`.
+
+This matches the Phase 3 author Contents discipline (dropping `author:` doesn't remove the existing author Contents bullet) — both auto-append patterns share the same operator-paced reconciliation shape. Andrew's framing: the MOC's `# Contents` is an audit log of "what was once tagged with this MOC," not a live-reactive view; if the operator wants the bullet gone, the operator removes it.
+
+### Body `# Indexing & MOCs` parsing — NOT yet operational
+
+The frontmatter `mocs:` field is the ONLY trigger as of Phase 4 Sub-arc A. The writer record's body `# Indexing & MOCs` section is NOT scanned — even if the operator writes `[[MOC/Practical Stoicism MOC]]` in that section, no bullet appears in the MOC's `# Contents`. Body parsing is a Phase 4.x deferred extension; if friction surfaces around operators-who-only-fill-the-body-section, the deferral math changes.
+
+For now: **frontmatter `mocs:` is canonical for auto-append; body `# Indexing & MOCs` is operator-curated for Obsidian-graph navigation only**. They are independent surfaces; no cross-mirror.
+
+### Two parallel auto-append patterns — the canonical shape for "auto-maintain a list of links in a target record's body section"
+
+Hypatia now maintains two distinct kinds of bullets-list auto-append, sharing the same idempotency helper + body section finder + fail-open semantics:
+
+| Pattern | Trigger | Target record | Target section | Phase |
+|---|---|---|---|---|
+| **Author Contents auto-append (Z-centric)** | `zettel` with `author:` set | `author/<canonical>.md` | `# Contents` | Phase 3 (2026-05-18) |
+| **MOC member auto-append (topic-MOC)** | `zettel` / `source` / `question` / `research-pointer` with `mocs:` set | `MOC/<Topic> MOC.md` | `# Contents` | Phase 4 Sub-arc A (2026-05-18) |
+
+Both are flat append-only, idempotent (with pipe-alias awareness), missing-target fail-open, no-cleanup-on-drop, type-aware bullet shape, and operator-restructures-hierarchy. Future "auto-maintain a list of links in a target record's body section" hooks (Phase 4 Sub-arc B inventory MOCs, Phase 5 surveyor cluster→MOC writes, anything else of this shape) should mirror this pattern — same helper, same semantics, same operator-paced reconciliation discipline. Hypatia owns the append; operator owns the structure within.
+
+### Worked example — adding a zettel to two MOCs
+
+> Andrew (in a Hypatia conversational session, NOT a capture session): *"Create a zettel about Marcus's framing of impermanence-as-productivity-frame, and file it under both the Stoicism MOC and the Productivity MOC."*
+>
+> Hypatia:
+>
+> 1. Confirms both MOCs exist on disk via `vault_search`: `MOC/Practical Stoicism MOC.md` and `MOC/Productivity MOC.md`.
+> 2. Calls `vault_create` for `zettel/Memento Mori as Productivity Frame.md` with frontmatter:
+>    - `author: "[[author/Aurelius, Marcus]]"`
+>    - `source: "[[source/Meditations]]"`
+>    - `mocs: ["[[MOC/Practical Stoicism MOC]]", "[[MOC/Productivity MOC]]"]`
+>    - body fleshed per the synthesis-shape discipline (`# Premise` thesis + `# Notes` prose + tail).
+> 3. Post-write, the ops.py zettel-hook block fires **two** hooks for this record (per `src/alfred/vault/ops.py` post-`vault_create` hook block):
+>    - **Author Contents auto-append** (Phase 3): `append_to_author_contents` appends `- [[zettel/Memento Mori as Productivity Frame]]` to `author/Aurelius, Marcus.md`'s `# Contents`.
+>    - **MOC member auto-append** (Phase 4 Sub-arc A): `dispatch_moc_appends` iterates the 2-entry `mocs:` list and calls `append_to_moc_contents` twice — once for `MOC/Practical Stoicism MOC.md` and once for `MOC/Productivity MOC.md`. Each MOC's `# Contents` gains `- [[zettel/Memento Mori as Productivity Frame]]` at the section end.
+>    - The supersede mirror does NOT fire (no `supersedes:` set).
+> 4. The dispatch log line for the MOC hook reads `vault.zettel_hooks.moc_dispatch_summary mocs_count=2 appended_count=2`.
+>
+> **Permanent Notes spawned does NOT fire on this path.** That hook lives in `src/alfred/telegram/capture_extract.py` and only fires when the capture-extract orchestrator creates zettels from a closed capture session — it is NOT part of the `vault_create` post-write hook block. In this scenario (direct conversational `vault_create`, not a capture-extract emission), the `source: "[[source/Meditations]]"` frontmatter is recorded on the zettel but `source/Meditations.md`'s `## Permanent Notes spawned` section does NOT receive a bullet. If Andrew wants the source's Permanent Notes spawned roster updated, the operator action is to manually append (or to drive the zettel creation through a capture session instead).
+>
+> Day-30 follow-up: Andrew creates `question/Is Memento Mori a productivity hack or a wisdom frame?.md` and sets `mocs: ["[[MOC/Practical Stoicism MOC]]", "[[MOC/Productivity MOC]]"]`. The MOC member hook fires (questions are in `_MOC_TRIGGER_TYPES`); the same two MOCs' `# Contents` each gain a `- [[question/Is Memento Mori a productivity hack or a wisdom frame?]]` bullet at the end. The author + supersede hooks do NOT fire (those are zettel-only, not question-eligible). The MOCs now show mixed-type member rosters — a zettel and a question side-by-side, distinguishable at a glance by their directory prefix in the wikilink.
 
 ---
 
