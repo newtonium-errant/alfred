@@ -320,6 +320,11 @@ def build_app(
     # unknown-command behaviour; the underscore form works.
     app.add_handler(CommandHandler("end_zettel", on_end_zettel))
     app.add_handler(CommandHandler("end_note", on_end_note))
+    # Queue #10 (2026-05-18): /recap — mid-session summary on an OPEN
+    # capture session. Read-only; does not close the session. Default
+    # mode is brief (2 buckets); ``/recap verbose`` gives the full
+    # 6-bucket structured summary.
+    app.add_handler(CommandHandler("recap", on_recap))
     app.add_handler(CommandHandler("status", on_status))
     # Wk3 commit 5: explicit model overrides for the active session. Both
     # flip ``session.model`` on the active dict; the next ``run_turn`` reads
@@ -617,6 +622,114 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Hi — this is {config.instance.name}. Send a voice note or type a "
         "message and I'll reply. Use /end to close the current session, "
         "/status for stats."
+    )
+
+
+async def on_recap(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/recap — mid-session structured summary on an OPEN capture session.
+
+    Queue #10 (2026-05-18). Read-only: does NOT close the session, does
+    NOT create vault records, does NOT mutate session state. The
+    session stays open; operator continues capturing after seeing the
+    recap.
+
+    Argument parsing (via PTB ``context.args``):
+      * ``/recap``         → brief (default; 2 buckets — topics +
+                             key_insights)
+      * ``/recap brief``   → explicit brief
+      * ``/recap verbose`` → full 6-bucket structured summary (same
+                             extraction as ``/end`` produces, minus
+                             the re-encounter section — that's a
+                             post-close vault scan)
+      * Anything else      → help reply (no state change)
+
+    Capture-session gate:
+      * No active session → "(no active capture session — start with
+                            /capture first)" reply
+      * Active session but ``_session_type != "capture"`` → same
+                            no-active-capture message (the operator
+                            is in a regular chat session, not a
+                            capture monologue)
+
+    Failure path: LLM call failure is swallowed inside
+    :func:`alfred.telegram.capture_extract.summarize_capture_session_so_far`
+    — it returns an error-message markdown rather than raising. The
+    handler renders that directly. Operator sees an error in chat,
+    NEVER a broken bot.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
+    client: Any = ctx.application.bot_data[_KEY_CLIENT]
+    if not _is_allowed(update, config):
+        return
+    if update.message is None or update.effective_chat is None:
+        return
+
+    chat_id = update.effective_chat.id
+    active = state_mgr.get_active(chat_id)
+    if not active:
+        await update.message.reply_text(
+            "(no active capture session — start with /capture first)"
+        )
+        return
+    session_type = active.get("_session_type", "note")
+    if session_type != "capture":
+        # Active session exists but it's a regular chat session, not
+        # a capture monologue. Recap is capture-mode-specific.
+        await update.message.reply_text(
+            "(no active capture session — /recap works on capture "
+            "sessions. Start one with /capture, then mid-session "
+            "/recap shows what's been said so far.)"
+        )
+        return
+
+    # Argument parsing. PTB drops the leading slash + command word
+    # and gives us the remainder as ``ctx.args`` (split on whitespace).
+    # ``/recap`` → [], ``/recap brief`` → ["brief"], etc.
+    args = list(ctx.args) if ctx.args else []
+    if len(args) == 0:
+        mode = capture_extract.RECAP_MODE_BRIEF
+    elif len(args) == 1 and args[0].lower() in (
+        capture_extract.RECAP_MODE_BRIEF,
+        capture_extract.RECAP_MODE_VERBOSE,
+    ):
+        mode = args[0].lower()
+    else:
+        # Garbage args → help reply. Don't fire an LLM call on
+        # ambiguous intent.
+        await update.message.reply_text(
+            "usage: /recap (brief, default) | /recap brief | "
+            "/recap verbose"
+        )
+        return
+
+    transcript = list(active.get("transcript") or [])
+    model = config.anthropic.model or "claude-sonnet-4-6"
+    log.info(
+        "talker.recap.invoked",
+        chat_id=chat_id,
+        mode=mode,
+        transcript_turns=len(transcript),
+    )
+
+    # summarize_capture_session_so_far is failure-isolated — it
+    # returns an error markdown rather than raising. We forward the
+    # markdown directly to the operator. No try/except needed here.
+    md = await capture_extract.summarize_capture_session_so_far(
+        client=client,
+        transcript=transcript,
+        model=model,
+        mode=mode,
+    )
+    await update.message.reply_text(md)
+
+    # Read-only contract: confirm we didn't mutate the active session.
+    # (No state.save() call; no active dict mutations above.)
+    log.info(
+        "talker.recap.done",
+        chat_id=chat_id,
+        mode=mode,
+        reply_chars=len(md),
     )
 
 
