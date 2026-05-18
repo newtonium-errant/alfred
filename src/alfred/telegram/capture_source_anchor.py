@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from alfred.vault import ops
+from alfred.vault.zettel_hooks import _wikilink_target_present
 
 from .utils import get_logger
 
@@ -1346,11 +1347,16 @@ def _build_permanent_notes_rewriter(
       * Otherwise append ``- <wikilink>`` to the section, between the
         existing content and the next H1/H2 heading.
 
-    The wikilink-presence check is conservative: it looks for the
-    bare wikilink form ``[[zettel/Title]]`` anywhere within the
-    section body — catches dash-prefixed and operator-edited forms
-    alike. This means re-runs are idempotent even if the operator
-    manually rewrote a bullet to include extra annotation.
+    The wikilink-presence check tolerates both plain
+    ``[[zettel/Title]]`` and pipe-aliased ``[[zettel/Title|Display]]``
+    forms via :func:`alfred.vault.zettel_hooks._wikilink_target_present`
+    — same logical reference, no duplicate bullet either way.
+
+    Centralizing this idempotency check is the third site of the same
+    pattern (Phase 3 supersede mirror + Phase 3 author Contents append
+    were the prior two). The helper lives in ``vault.zettel_hooks``
+    because vault is the lower-level dependency; telegram-layer code
+    importing into vault.zettel_hooks is the established direction.
     """
     bare_link = zettel_wikilink.strip()
 
@@ -1371,9 +1377,11 @@ def _build_permanent_notes_rewriter(
         section_end = _find_next_top_heading(body, section_start)
         section_body = body[section_start:section_end]
 
-        # Idempotency check — wikilink already present anywhere in
-        # the section body.
-        if bare_link in section_body:
+        # Idempotency check — wikilink target already present
+        # anywhere in the section, tolerating pipe-aliased display
+        # forms (``[[zettel/Title|display]]`` counts as the same
+        # logical reference as ``[[zettel/Title]]``).
+        if _wikilink_target_present(section_body, bare_link):
             return body
 
         # Append ``- <wikilink>`` to the end of the section body.

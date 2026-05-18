@@ -119,6 +119,34 @@ def test_perm_notes_rewriter_idempotent_on_existing_link() -> None:
     assert result.count("[[zettel/On Stoicism]]") == 1
 
 
+def test_perm_notes_rewriter_idempotent_against_pipe_alias() -> None:
+    """Operator hand-edits an existing bullet to add a pipe-aliased
+    display name (``[[zettel/On Stoicism|the Stoic primer]]``). The
+    next auto-maintenance fire must NOT append a duplicate bullet —
+    pipe-aliased and plain forms reference the SAME logical target.
+
+    Regression pin for the third site of the pipe-alias idempotency
+    trap (Phase 2 perm-notes is the residual after Phase 3's
+    supersede mirror and author Contents append were fixed in commit
+    ``5161f16``). Closes the contract: every zettel auto-maintenance
+    surface now tolerates pipe-aliased existing forms via the
+    centralized helper ``_wikilink_target_present`` in
+    ``alfred.vault.zettel_hooks``.
+    """
+    body = _phase2_source_body().replace(
+        "## Permanent Notes spawned\n\n",
+        "## Permanent Notes spawned\n\n"
+        "- [[zettel/On Stoicism|the Stoic primer]]\n\n",
+    )
+    rewriter = csa._build_permanent_notes_rewriter("[[zettel/On Stoicism]]")
+    result = rewriter(body)
+    # No append happened — body unchanged.
+    assert result == body
+    # Bare target stem appears exactly once (the pipe-aliased
+    # existing bullet). No second bullet for the plain-form target.
+    assert result.count("[[zettel/On Stoicism") == 1
+
+
 def test_perm_notes_rewriter_appends_second_link_alongside_first() -> None:
     """Second distinct wikilink → appended below the first; both
     preserved."""
