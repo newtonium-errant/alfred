@@ -211,3 +211,190 @@ def test_handle_duplicate_explicit_pointer_writes_via_tag(tmp_path: Path):
     # Item 3: explicit pointer to item 1 → inherit "high".
     assert by_path["note/Item3.md"].andrew_priority == "high"
     assert by_path["note/Item3.md"].via == "duplicate-of-1"
+
+
+# -----------------------------------------------------------------------------
+# Confirmation message framing — N (item count) vs M (corpus row count)
+# regression tests for the 2026-05-18 friction-driven ship.
+#
+# Background: feb052c's email cluster fan-out is correct — when item N's
+# subject is a cluster of K near-identical records, one correction
+# legitimately fans out to K corpus rows. But the confirmation message
+# was rendering M (rows written) where it should have rendered N (items
+# the operator replied about), so 5 corrections that produced 6 corpus
+# rows surfaced as "6 corrections" — misleading the operator's count.
+#
+# The fix splits the count into ``corrections_count`` (N) and
+# ``confirmed_count``/``written_count`` (M); when M > N the message
+# surfaces both with the sibling delta. When M == N (no cluster fan-out)
+# the existing single-number format is preserved.
+# -----------------------------------------------------------------------------
+
+
+def _cluster_item(
+    num: int,
+    *,
+    priority: str,
+    cluster_record_paths: list[str],
+    sender: str = "viewpoint@example.com",
+) -> dict:
+    """An email item with a c5 cluster — correction fans out to all paths."""
+    base = _item(num, priority=priority, sender=sender)
+    base["record_path"] = cluster_record_paths[0]
+    base["cluster_record_paths"] = list(cluster_record_paths)
+    return base
+
+
+def test_handle_message_singleton_items_no_cluster_parenthetical(tmp_path: Path):
+    """N == M case: 3 singleton items, 3 corrections → 3 corpus rows.
+
+    Existing simple format must be preserved — no parenthetical, no
+    sibling counter. Regression guard against the framing fix
+    accidentally adding a parenthetical when there's no cluster fan-out.
+    """
+    cfg = _config(tmp_path)
+    _seed_batch(cfg, items=[
+        _item(1, priority="medium"),
+        _item(2, priority="high"),
+        _item(3, priority="low"),
+    ], message_ids=[100])
+
+    result = handle_daily_sync_reply(cfg, 100, "1 down, 2 down, 3 up")
+    assert result is not None
+    assert result["confirmed_count"] == 3
+    assert result["corrections_count"] == 3
+    msg = result["message"]
+    # Per-item path → "Calibration: applied N correction(s)."
+    assert "Calibration: applied 3 correction(s)." in msg
+    # No parenthetical mentioning corpus rows / cluster siblings.
+    assert "corpus rows" not in msg
+    assert "cluster sibling" not in msg
+
+
+def test_handle_message_cluster_expansion_5_emails_6_rows_1_sibling(tmp_path: Path):
+    """The Queue #12 friction case: 5 emails corrected, item 1 cluster=2.
+
+    Operator sent corrections for items 1-5. Item 1's subject was a
+    ViewPoint listing cluster with 2 records (cluster_record_paths
+    has 2 entries); the others are singletons. Fan-out writes
+    6 corpus rows total. The confirmation message must say
+    "5 correction(s) (6 corpus rows, including 1 cluster sibling(s))"
+    so the operator's mental count matches.
+    """
+    cfg = _config(tmp_path)
+    _seed_batch(cfg, items=[
+        _cluster_item(
+            1, priority="low",
+            cluster_record_paths=[
+                "note/ViewPointA.md",
+                "note/ViewPointB.md",
+            ],
+        ),
+        _item(2, priority="medium"),
+        _item(3, priority="low"),
+        _item(4, priority="medium"),
+        _item(5, priority="high"),
+    ], message_ids=[100])
+
+    result = handle_daily_sync_reply(
+        cfg, 100, "1 down, 2 down, 3 ok, 4 down, 5 down",
+    )
+    assert result is not None
+    # M (corpus rows): 2 (item 1's cluster) + 1 + 1 + 1 + 1 = 6
+    assert result["confirmed_count"] == 6
+    # N (operator-visible items): 5
+    assert result["corrections_count"] == 5
+    rows = list(iter_corrections(cfg.corpus.path))
+    assert len(rows) == 6
+    msg = result["message"]
+    # Headline asserts the 5-vs-6 framing fix.
+    assert (
+        "Calibration: applied 5 correction(s) "
+        "(6 corpus rows, including 1 cluster sibling(s))." in msg
+    )
+
+
+def test_handle_message_all_ok_with_cluster_expansion_surfaces_siblings(tmp_path: Path):
+    """All-ok (✅) path: same N-vs-M drift — same fix.
+
+    When ✅ confirms a batch where any email item is a cluster, the
+    confirmation "Calibration: confirmed all X item(s)" must surface
+    the cluster fan-out so the operator doesn't miscount. Three email
+    items, item 1 cluster=2 → N=3, M=4.
+    """
+    cfg = _config(tmp_path)
+    _seed_batch(cfg, items=[
+        _cluster_item(
+            1, priority="medium",
+            cluster_record_paths=[
+                "note/ClusterA.md",
+                "note/ClusterB.md",
+            ],
+        ),
+        _item(2, priority="medium"),
+        _item(3, priority="low"),
+    ], message_ids=[100])
+
+    result = handle_daily_sync_reply(cfg, 100, "✅")
+    assert result is not None
+    assert result["all_ok"] is True
+    assert result["confirmed_count"] == 4  # M (corpus rows)
+    assert result["corrections_count"] == 3  # N (items)
+    msg = result["message"]
+    assert (
+        "Calibration: confirmed all 3 item(s) "
+        "(4 corpus rows, including 1 cluster sibling(s))." in msg
+    )
+
+
+def test_handle_message_all_ok_no_cluster_keeps_simple_form(tmp_path: Path):
+    """All-ok path, no cluster fan-out → simple "confirmed all N item(s)".
+
+    Regression guard: the framing fix must NOT introduce a parenthetical
+    in the M == N case.
+    """
+    cfg = _config(tmp_path)
+    _seed_batch(cfg, items=[
+        _item(1, priority="medium"),
+        _item(2, priority="high"),
+    ], message_ids=[100])
+
+    result = handle_daily_sync_reply(cfg, 100, "✅")
+    assert result is not None
+    assert result["all_ok"] is True
+    assert result["confirmed_count"] == 2
+    assert result["corrections_count"] == 2
+    msg = result["message"]
+    assert "Calibration: confirmed all 2 item(s)." in msg
+    assert "corpus rows" not in msg
+    assert "cluster sibling" not in msg
+
+
+def test_handle_message_larger_cluster_K_equals_2_siblings(tmp_path: Path):
+    """K=2 siblings: item 1 has cluster of 3 records; one correction → 3 rows.
+
+    Beyond the original friction case (K=1) — exercise K=2 to confirm
+    the sibling-count math is correct.
+    """
+    cfg = _config(tmp_path)
+    _seed_batch(cfg, items=[
+        _cluster_item(
+            1, priority="medium",
+            cluster_record_paths=[
+                "note/A.md",
+                "note/B.md",
+                "note/C.md",
+            ],
+        ),
+        _item(2, priority="low"),
+    ], message_ids=[100])
+
+    result = handle_daily_sync_reply(cfg, 100, "1 down, 2 ok")
+    assert result is not None
+    assert result["confirmed_count"] == 4  # 3 (cluster) + 1
+    assert result["corrections_count"] == 2  # N = 2 items
+    msg = result["message"]
+    assert (
+        "Calibration: applied 2 correction(s) "
+        "(4 corpus rows, including 2 cluster sibling(s))." in msg
+    )

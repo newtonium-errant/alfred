@@ -1673,11 +1673,43 @@ def _compose_calibration_hint(
     return f" (Tip: {' or '.join(verbs)}.)"
 
 
+def _format_count_with_cluster_expansion(
+    *, corrections_count: int, written_count: int
+) -> str:
+    """Render the count phrase, surfacing cluster fan-out when it occurred.
+
+    When ``corrections_count == written_count`` (no cluster fan-out, or
+    only non-email items where 1 item == 1 row), returns the simple
+    ``"N item(s)"`` form. When ``written_count > corrections_count``
+    (email cluster fan-out wrote more corpus rows than operator-visible
+    items), surfaces both numbers + the sibling count so the operator
+    sees that their N corrections produced M rows — preventing the
+    "I sent 5 corrections but Alfred said 6" miscount friction.
+
+    2026-05-18 — operator-friction surface: morning calibration on 5
+    emails produced a "6 corrections" confirmation because item 1's
+    ViewPoint listing cluster had 2 siblings. The framing was misleading;
+    the underlying fan-out (feb052c) was correct.
+    """
+    if written_count <= corrections_count:
+        # Defensive ``<=``: should never be strictly less, but if it
+        # ever is (e.g. a future per-item resolver that produces zero
+        # rows but still counts as a correction), fall back to the
+        # simpler form rather than emitting a nonsense parenthetical.
+        return f"{corrections_count} item(s)"
+    siblings = written_count - corrections_count
+    return (
+        f"{corrections_count} item(s) "
+        f"({written_count} corpus rows, including {siblings} cluster sibling(s))"
+    )
+
+
 def _build_confirmation_body(
     *,
     parsed_all_ok: bool,
     applied_lines: list[str],
     written_count: int,
+    corrections_count: int,
     unparsed_item_numbers: list[int],
     raw_errors: list[str],
     execution_errors: list[str] | None = None,
@@ -1705,7 +1737,16 @@ def _build_confirmation_body(
     instead of burying them under the canned "didn't understand" hint.
     ``hint`` is item-type-aware (built by ``_compose_calibration_hint``);
     callers that don't pass one get the empty default.
+
+    2026-05-18 — ``corrections_count`` is N (operator-visible items
+    resolved) while ``written_count`` is M (corpus rows written).
+    When email cluster fan-out makes M > N, the message surfaces the
+    sibling count parenthetically so the operator's reply count matches
+    the confirmation. See ``_format_count_with_cluster_expansion``.
     """
+    count_phrase = _format_count_with_cluster_expansion(
+        corrections_count=corrections_count, written_count=written_count
+    )
     # all-ok shortcut stays terse — Andrew already knows what he confirmed.
     if parsed_all_ok:
         if written_count == 0 and not execution_errors:
@@ -1721,7 +1762,7 @@ def _build_confirmation_body(
             if remaining > 0:
                 lines.append(f"  ... and {remaining} more.")
             return "\n".join(lines)
-        head = f"Calibration: confirmed all {written_count} item(s)."
+        head = f"Calibration: confirmed all {count_phrase}."
         if not execution_errors:
             return head
         lines = [head, "Some items couldn't be applied:"]
@@ -1734,7 +1775,17 @@ def _build_confirmation_body(
 
     lines: list[str] = []
     if applied_lines:
-        lines.append(f"Calibration: applied {written_count} correction(s).")
+        # 2026-05-18 — count phrase replaces bare ``{written_count} correction(s)``
+        # so cluster fan-out (M > N) doesn't make the operator miscount.
+        if written_count > corrections_count:
+            siblings = written_count - corrections_count
+            lines.append(
+                f"Calibration: applied {corrections_count} correction(s) "
+                f"({written_count} corpus rows, including "
+                f"{siblings} cluster sibling(s))."
+            )
+        else:
+            lines.append(f"Calibration: applied {corrections_count} correction(s).")
         # Cap at 5 so the reply bubble doesn't get unwieldy on mobile.
         for line in applied_lines[:5]:
             lines.append(f"  {line}")
@@ -1986,7 +2037,8 @@ def handle_daily_sync_reply(
 
     parsed: ReplyParseResult = parse_reply(reply_text)
 
-    email_written = 0
+    email_written = 0  # corpus rows written (M — fans out across cluster siblings)
+    email_items_corrected = 0  # email ITEMS resolved (N — one per applied_lines line)
     attribution_written = 0
     proposal_written = 0  # propose-person c2
     pending_written = 0  # Pending Items Queue Phase 1
@@ -2054,6 +2106,7 @@ def handle_daily_sync_reply(
                     )
             if rows_written_this_item > 0:
                 email_written += rows_written_this_item
+                email_items_corrected += 1
                 applied_lines.append(
                     _format_email_applied_line(
                         item,
@@ -2186,6 +2239,7 @@ def handle_daily_sync_reply(
                         )
                 if rows_written_this_item > 0:
                     email_written += rows_written_this_item
+                    email_items_corrected += 1
                     applied_lines.append(
                         _format_email_applied_line(
                             email_item,
@@ -2285,6 +2339,19 @@ def handle_daily_sync_reply(
     written_count = (
         email_written + attribution_written + proposal_written + pending_written
     )
+    # 2026-05-18 — N (items corrected) vs M (corpus rows written). When
+    # an email correction lands on a c5 cluster of size K > 1, the corpus
+    # fan-out writes K rows for ONE operator-visible item. ``corrections_count``
+    # tracks the operator-visible total (N); ``written_count`` tracks the
+    # corpus-row total (M). _build_confirmation_body renders both when
+    # they diverge so the operator's count of emails-replied-to matches
+    # what the confirmation message says.
+    corrections_count = (
+        email_items_corrected
+        + attribution_written
+        + proposal_written
+        + pending_written
+    )
 
     # c3 — user-facing body. Per-item summary lines go in (capped at 5
     # so the Telegram reply stays readable on mobile), followed by a
@@ -2302,6 +2369,7 @@ def handle_daily_sync_reply(
         parsed_all_ok=parsed.all_ok,
         applied_lines=applied_lines,
         written_count=written_count,
+        corrections_count=corrections_count,
         unparsed_item_numbers=unparsed_item_numbers,
         raw_errors=errors,
         execution_errors=execution_errors,
@@ -2313,9 +2381,12 @@ def handle_daily_sync_reply(
         parent_message_id=parent_message_id,
         all_ok=parsed.all_ok,
         email_written=email_written,
+        email_items_corrected=email_items_corrected,
         attribution_written=attribution_written,
         proposal_written=proposal_written,
         pending_written=pending_written,
+        corrections_count=corrections_count,
+        written_count=written_count,
         unparsed=len(errors),
         execution_failures=len(execution_errors),
     )
@@ -2339,6 +2410,12 @@ def handle_daily_sync_reply(
     return {
         "confirmed_count": written_count,
         "email_count": email_written,
+        # 2026-05-18 — ``corrections_count`` exposes the operator-visible
+        # item total (N) alongside ``confirmed_count`` (M = corpus rows
+        # written). N <= M whenever email cluster fan-out occurs.
+        # Programmatic consumers (n8n hooks, dashboards) can use whichever
+        # framing they need without re-counting via ``email_count`` deltas.
+        "corrections_count": corrections_count,
         "attribution_count": attribution_written,
         "proposal_count": proposal_written,
         "pending_count": pending_written,
