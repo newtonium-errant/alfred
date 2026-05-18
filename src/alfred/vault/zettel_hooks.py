@@ -33,6 +33,7 @@ real on disk.
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable
@@ -169,6 +170,38 @@ def _normalize_wikilink_target(value: Any) -> str:
     return text.strip()
 
 
+def _wikilink_target_present(text: str, wikilink: str) -> bool:
+    """Detect whether ``wikilink`` is already referenced anywhere in
+    ``text``, tolerating pipe-alias display forms.
+
+    Treats ``[[zettel/Title]]`` and ``[[zettel/Title|Display]]`` as
+    the SAME logical reference. Without this tolerance, bare-substring
+    idempotency checks (``bare_link in section_body``) miss the pipe-
+    aliased form and append a duplicate bullet — the same idempotency
+    hole hit Phase 2 (Permanent Notes spawned auto-append) and both
+    Phase 3 hooks (superseded_by callout, author Contents append).
+    Centralizing the check here so future zettel auto-maintenance
+    hooks inherit the contract.
+
+    ``wikilink`` must include the full ``[[…]]`` brackets. Returns
+    True if the target stem (everything between ``[[`` and the
+    closing ``]]`` or first ``|``) appears in ``text`` under either
+    shape; False otherwise.
+    """
+    if not wikilink or not wikilink.startswith("[[") or not wikilink.endswith("]]"):
+        return False
+    target_stem = wikilink[2:-2]
+    if "|" in target_stem:
+        target_stem = target_stem.split("|", 1)[0]
+    target_stem = target_stem.strip()
+    if not target_stem:
+        return False
+    pattern = re.compile(
+        r"\[\[" + re.escape(target_stem) + r"(?:\|[^\]]*)?\]\]"
+    )
+    return bool(pattern.search(text))
+
+
 # ---------------------------------------------------------------------------
 # Supersede chain mirror (Deliverable A, locked-plan item 8)
 # ---------------------------------------------------------------------------
@@ -193,10 +226,10 @@ def _build_superseded_by_rewriter(
       * Otherwise append the bullet between the existing section
         content and the next H1/H2 heading.
 
-    The wikilink-presence check is conservative: it looks for the
-    bare ``[[zettel/Title]]`` form anywhere in the section body,
-    catching dash-prefixed bullets + operator-edited annotated
-    forms alike.
+    The wikilink-presence check tolerates both plain
+    ``[[zettel/Title]]`` and pipe-aliased ``[[zettel/Title|Display]]``
+    forms via :func:`_wikilink_target_present` — same logical
+    reference, no duplicate bullet either way.
     """
     bullet = f"- {new_zettel_wikilink} ({today_iso})"
     bare_link = new_zettel_wikilink.strip()
@@ -222,9 +255,10 @@ def _build_superseded_by_rewriter(
         section_end = _find_next_top_heading(body, section_start)
         section_body = body[section_start:section_end]
 
-        if bare_link in section_body:
+        if _wikilink_target_present(section_body, bare_link):
             # Idempotent — wikilink already recorded somewhere in
-            # the section. Don't duplicate the audit-log bullet.
+            # the section (plain OR pipe-aliased form). Don't
+            # duplicate the audit-log bullet.
             return body
 
         new_section_body = (
@@ -433,8 +467,9 @@ def _build_author_contents_rewriter(
         section_end = _find_next_top_heading(body, section_start)
         section_body = body[section_start:section_end]
 
-        if bare_link in section_body:
-            # Idempotent — bullet already exists somewhere in section.
+        if _wikilink_target_present(section_body, bare_link):
+            # Idempotent — bullet already exists somewhere in section
+            # (plain OR pipe-aliased form). Don't duplicate.
             return body
 
         new_section_body = section_body.rstrip("\n") + f"\n{bullet}\n"
@@ -446,6 +481,70 @@ def _build_author_contents_rewriter(
     return _rewriter
 
 
+def _normalize_lookup(text: str) -> str:
+    """Lowercase + collapse whitespace for case-insensitive alias compare.
+
+    Mirrors Phase 1's :func:`alfred.telegram.capture_source_anchor.
+    _normalize_lookup`. Reimplemented inline (not imported) to keep
+    the vault layer free of telegram-layer dependencies. If a third
+    site needs this normalisation, consolidate into a shared helper
+    in ``vault/`` then.
+    """
+    return " ".join((text or "").lower().split())
+
+
+def _scan_dir_for_alias(
+    vault_path: Path, dir_name: str, lookup_form: str,
+) -> str | None:
+    """Scan one vault subdirectory for a record whose filename stem,
+    ``name`` frontmatter, or ``aliases`` list matches ``lookup_form``.
+
+    Case-insensitive + whitespace-normalised compare via
+    :func:`_normalize_lookup`. Mirrors Phase 1's
+    :func:`_scan_authors_by_alias` shape. Returns rel_path
+    (``"<dir>/<filename>.md"``) on first match; None if no match or
+    directory absent.
+    """
+    # Lazy import to avoid the cycle (zettel_hooks ← ops at module
+    # import time would loop since ops imports zettel_hooks lazily
+    # inside the dispatch site).
+    from . import ops as _ops
+
+    scan_dir = vault_path / dir_name
+    if not scan_dir.is_dir():
+        return None
+
+    lookup_norm = _normalize_lookup(lookup_form)
+    if not lookup_norm:
+        return None
+
+    for md_path in sorted(scan_dir.glob("*.md")):
+        rel = f"{dir_name}/{md_path.name}"
+        try:
+            rec = _ops.vault_read(vault_path, rel)
+        except Exception:  # noqa: BLE001
+            continue
+        fm = rec.get("frontmatter") or {}
+
+        # Filename stem match.
+        if _normalize_lookup(md_path.stem) == lookup_norm:
+            return rel
+
+        # ``name`` frontmatter match.
+        name_field = str(fm.get("name") or "").strip()
+        if name_field and _normalize_lookup(name_field) == lookup_norm:
+            return rel
+
+        # ``aliases:`` list match.
+        aliases = fm.get("aliases")
+        if isinstance(aliases, list):
+            for alias in aliases:
+                alias_str = str(alias or "").strip()
+                if alias_str and _normalize_lookup(alias_str) == lookup_norm:
+                    return rel
+    return None
+
+
 def _resolve_author_target(
     vault_path: Path,
     author_value: Any,
@@ -453,67 +552,70 @@ def _resolve_author_target(
     """Resolve a zettel's ``author:`` field to an existing record's
     rel_path, following the ``aliases:`` chain.
 
-    Returns the resolved rel_path (e.g. ``"person/Doe, Jane.md"``) or
-    None if no record can be located. Strategy:
+    Returns the resolved rel_path (e.g. ``"author/Aurelius, Marcus.md"``
+    or ``"person/Doe, Jane.md"``) or None if no record can be located.
 
+    Strategy:
       1. Normalize the wikilink target (strips brackets, pipe-alias,
          ``.md`` suffix).
-      2. If the target lacks a directory, prepend ``person/``
-         (the canonical author location). Operator may also point
-         at ``org/``, in which case the wikilink already includes the
-         directory.
-      3. If the file exists at that path, return it.
-      4. Otherwise scan ``person/`` for any record whose ``aliases:``
-         list contains the typed alias. The aliases field is a list
-         of names (NOT wikilinks); the comparison uses the bare
-         target (no directory prefix).
+      2. If the target includes a directory prefix:
+         a. Try exact rel_path resolution first.
+         b. Failing that, scan THAT directory for an aliases-chain
+            match against the bare stem.
+      3. If the target has no directory prefix, try ``author/`` then
+         ``person/`` (in that order — Phase 1's canonical author
+         location is ``author/``; ``person/`` is back-compat for
+         operators who hand-write a wikilink against a person record
+         that's the author of a zettel, e.g. a colleague's notebook).
 
-    The aliases scan is bounded to ``person/`` only — author records
-    SHOULD be persons; if the operator points an author at an
-    org/project/etc. by exact path, step 3 catches it and step 4 is
-    skipped.
+    The ``author/`` and ``person/`` directories are both scanned for
+    aliases because:
+      * Phase 1 ratified ``author/`` as the canonical bibliographic-
+        author location (``capture_source_anchor.resolve_or_create_
+        author`` writes here).
+      * ``person/`` records may ALSO be authors when the operator is
+        writing zettels about a colleague's ideas; the resolver
+        accommodates both shapes rather than forcing the operator to
+        duplicate records.
+      * Operator-typed ``[[author/Marcus]]`` (short form) routes
+        through the ``author/`` aliases scan to find
+        ``author/Aurelius, Marcus.md`` with ``aliases: [Marcus]``.
+
+    Mirrors :func:`alfred.telegram.capture_source_anchor.
+    _scan_authors_by_alias` for compat with Phase 1's resolver. The
+    scan is O(N) over each scanned directory's ``.md`` files —
+    fine for hundreds, grows linearly.
     """
-    from . import ops as _ops
-
     target = _normalize_wikilink_target(author_value)
     if not target:
         return None
 
-    # First, try exact path resolution.
     if "/" in target:
-        # Operator-provided directory (e.g. ``org/Hypatia Tech``).
+        # Operator-provided directory (``author/X``, ``person/X``,
+        # ``org/X``, etc.).
         rel = f"{target}.md"
         if (vault_path / rel).exists():
             return rel
-        # Path doesn't exist — fall through to aliases scan only if
-        # the directory is person/ (the aliases convention is person-
-        # scoped).
-        if not target.startswith("person/"):
-            return None
-        bare_name = target.split("/", 1)[1]
-    else:
-        # No directory — default to person/.
-        rel = f"person/{target}.md"
+        # Path doesn't exist — fall through to aliases scan IN THE
+        # SAME directory the operator specified. Phase 1's canonical
+        # author location is ``author/``; ``person/`` is the back-
+        # compat shape. Other directories don't get an aliases scan
+        # (org/etc. aliases conventions aren't established).
+        dir_name, bare_name = target.split("/", 1)
+        if dir_name in ("author", "person"):
+            return _scan_dir_for_alias(vault_path, dir_name, bare_name)
+        return None
+
+    # No directory prefix — try canonical ``author/`` first, then
+    # ``person/`` for back-compat. Exact-path check at each layer
+    # before the aliases scan to short-circuit common cases.
+    for dir_name in ("author", "person"):
+        rel = f"{dir_name}/{target}.md"
         if (vault_path / rel).exists():
             return rel
-        bare_name = target
-
-    # Aliases scan in person/.
-    persons_dir = vault_path / "person"
-    if not persons_dir.is_dir():
-        return None
-    for md_path in persons_dir.glob("*.md"):
-        try:
-            rec = _ops.vault_read(vault_path, f"person/{md_path.name}")
-        except Exception:  # noqa: BLE001
-            continue
-        fm = rec.get("frontmatter") or {}
-        aliases = fm.get("aliases") or []
-        if not isinstance(aliases, list):
-            continue
-        for alias in aliases:
-            if str(alias).strip() == bare_name.strip():
-                return f"person/{md_path.name}"
+        scanned = _scan_dir_for_alias(vault_path, dir_name, target)
+        if scanned is not None:
+            return scanned
     return None
 
 

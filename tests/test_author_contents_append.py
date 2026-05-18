@@ -136,11 +136,41 @@ def _seed_source(
     return rel_path
 
 
+def _seed_author(
+    vault: Path,
+    name: str,
+    *,
+    aliases: list[str] | None = None,
+    body: str = "",
+) -> str:
+    """Write a minimal ``author/<name>.md`` via raw FS.
+
+    Phase 1's canonical author directory is ``author/`` (per
+    ``schema.py`` ``TYPE_DIRECTORY["author"] = "author"``). Bibliographic
+    authors live here; ``person/`` is a separate type for people in the
+    operator's personal network.
+    """
+    (vault / "author").mkdir(exist_ok=True)
+    fm: dict = {
+        "type": "author",
+        "name": name,
+        "created": "2026-05-18",
+        "aliases": aliases or [],
+        "tags": [],
+        "status": "active",
+    }
+    rel_path = f"author/{name}.md"
+    file_path = vault / rel_path
+    post = frontmatter.Post(body, **fm)
+    file_path.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+    return rel_path
+
+
 @pytest.fixture
 def hypatia_vault(tmp_path: Path) -> Path:
     vault = tmp_path / "vault"
     vault.mkdir()
-    for sub in ("zettel", "person", "org", "source", "_templates"):
+    for sub in ("zettel", "person", "org", "source", "author", "_templates"):
         (vault / sub).mkdir()
     src_template = get_scaffold_dir() / "_templates" / "zettel.md"
     dst_template = vault / "_templates" / "zettel.md"
@@ -160,18 +190,34 @@ def test_resolve_author_exact_person_match(hypatia_vault: Path) -> None:
     assert rel == "person/Doe, Jane.md"
 
 
-def test_resolve_author_bare_name_defaults_to_person(
+def test_resolve_author_bare_name_falls_through_to_person(
     hypatia_vault: Path,
 ) -> None:
+    """Bare names (no directory prefix) first try ``author/``; if
+    nothing matches there (including aliases scan), fall through to
+    ``person/`` for back-compat. Here only the ``person/`` record
+    exists, so the resolver lands there."""
     _seed_person(hypatia_vault, "Doe, Jane")
     rel = _resolve_author_target(hypatia_vault, "Doe, Jane")
     assert rel == "person/Doe, Jane.md"
 
 
-def test_resolve_author_via_alias(hypatia_vault: Path) -> None:
-    """Operator types alias name; resolver follows aliases chain."""
+def test_resolve_author_via_alias_in_person_dir(hypatia_vault: Path) -> None:
+    """Operator types alias name pointing at person/ directory; the
+    resolver scans person/ aliases lists. Back-compat path for
+    person-as-author records."""
     _seed_person(hypatia_vault, "Doe, Jane", aliases=["Jane Doe", "JD"])
-    # Typed wikilink uses an alias, not the canonical filename.
+    # Typed wikilink uses an alias against person/ directory.
+    rel = _resolve_author_target(hypatia_vault, "[[person/Jane Doe]]")
+    assert rel == "person/Doe, Jane.md"
+
+
+def test_resolve_author_bare_alias_falls_through_to_person(
+    hypatia_vault: Path,
+) -> None:
+    """Operator types a bare-name alias; resolver scans author/ first
+    (no records), then person/ aliases — finds the match."""
+    _seed_person(hypatia_vault, "Doe, Jane", aliases=["Jane Doe", "JD"])
     rel = _resolve_author_target(hypatia_vault, "[[Jane Doe]]")
     assert rel == "person/Doe, Jane.md"
 
@@ -192,6 +238,86 @@ def test_resolve_author_empty_returns_none(hypatia_vault: Path) -> None:
     assert _resolve_author_target(hypatia_vault, "") is None
     assert _resolve_author_target(hypatia_vault, None) is None
     assert _resolve_author_target(hypatia_vault, "[[]]") is None
+
+
+# ---------------------------------------------------------------------------
+# Author resolution — author/ directory (Phase 1 canonical location)
+# ---------------------------------------------------------------------------
+#
+# Phase 1 (capture_source_anchor.resolve_or_create_author) writes
+# bibliographic author records to ``author/`` not ``person/``. The
+# verifier NEEDS-FIX surfaced 2026-05-18: original Phase 3 resolver
+# only scanned ``person/``, so the production case of
+# ``zettel/X.md`` with ``author: [[author/Aurelius, Marcus]]``
+# silently no-op'd. Tests below pin the canonical author-dir flow.
+
+
+def test_resolve_author_exact_author_path(hypatia_vault: Path) -> None:
+    """The canonical Phase 1 form: zettel's author: field points at
+    ``author/Aurelius, Marcus``. Resolver finds it via exact-path
+    match (no aliases scan needed for the happy path)."""
+    _seed_author(hypatia_vault, "Aurelius, Marcus")
+    rel = _resolve_author_target(hypatia_vault, "[[author/Aurelius, Marcus]]")
+    assert rel == "author/Aurelius, Marcus.md"
+
+
+def test_resolve_author_aliased_short_form_in_author_dir(
+    hypatia_vault: Path,
+) -> None:
+    """Operator types a short-form wikilink (``[[author/Marcus]]``)
+    against an author/ record whose ``aliases:`` includes ``Marcus``.
+    The aliases scan in ``author/`` resolves to the canonical record.
+
+    This is the LOAD-BEARING production case the verifier flagged —
+    Phase 1 creates author records with the operator's typed form as
+    an alias entry, so short-form lookups must find the canonical
+    file via aliases."""
+    _seed_author(
+        hypatia_vault,
+        "Aurelius, Marcus",
+        aliases=["Marcus Aurelius", "Marcus"],
+    )
+    rel = _resolve_author_target(hypatia_vault, "[[author/Marcus]]")
+    assert rel == "author/Aurelius, Marcus.md"
+
+
+def test_resolve_author_aliased_full_form_in_author_dir(
+    hypatia_vault: Path,
+) -> None:
+    """Operator types the input form (``[[author/Marcus Aurelius]]``)
+    against a record stored in canonical form
+    (``author/Aurelius, Marcus.md``). The aliases scan resolves."""
+    _seed_author(
+        hypatia_vault,
+        "Aurelius, Marcus",
+        aliases=["Marcus Aurelius"],
+    )
+    rel = _resolve_author_target(hypatia_vault, "[[author/Marcus Aurelius]]")
+    assert rel == "author/Aurelius, Marcus.md"
+
+
+def test_resolve_author_unknown_in_author_dir_returns_none(
+    hypatia_vault: Path,
+) -> None:
+    """No author/ record AND no alias match → None. Fail-open path
+    that lets the new zettel survive on disk while the author record
+    can be manually reconciled."""
+    rel = _resolve_author_target(
+        hypatia_vault, "[[author/Nonexistent Person]]",
+    )
+    assert rel is None
+
+
+def test_resolve_author_bare_name_prefers_author_over_person(
+    hypatia_vault: Path,
+) -> None:
+    """When both author/ and person/ contain matching records for a
+    bare-name lookup, ``author/`` wins (Phase 1 canonical priority).
+    Operator can disambiguate by typing the directory prefix."""
+    _seed_author(hypatia_vault, "Aurelius, Marcus")
+    _seed_person(hypatia_vault, "Aurelius, Marcus")
+    rel = _resolve_author_target(hypatia_vault, "Aurelius, Marcus")
+    assert rel == "author/Aurelius, Marcus.md"
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +475,103 @@ def test_append_to_org_author(hypatia_vault: Path) -> None:
 
     org = vault_read(hypatia_vault, "org/Hypatia Tech.md")
     assert "- [[zettel/Whitepaper-Excerpt]]" in org["body"]
+
+
+def test_append_to_author_dir_record(hypatia_vault: Path) -> None:
+    """The canonical Phase 1 production case: zettel's author field
+    points at ``author/Aurelius, Marcus`` (the Phase 1 canonical
+    location). Hook appends the bullet to THAT record's # Contents.
+
+    This is the path the verifier flagged as silently no-op'ing
+    before this commit: original resolver only scanned person/, so
+    author/ records never received the auto-append."""
+    author_rel = _seed_author(
+        hypatia_vault,
+        "Aurelius, Marcus",
+        aliases=["Marcus Aurelius"],
+        body="# Bio\n\n# Contents\n\n",
+    )
+    new_rel = _seed_zettel(hypatia_vault, "Meditations-Excerpt-1")
+
+    result = append_to_author_contents(
+        hypatia_vault, "[[author/Aurelius, Marcus]]", new_rel,
+        scope="hypatia",
+    )
+    assert result is True
+
+    author = vault_read(hypatia_vault, author_rel)
+    assert "- [[zettel/Meditations-Excerpt-1]]" in author["body"]
+
+
+def test_append_to_author_dir_via_aliased_short_form(
+    hypatia_vault: Path,
+) -> None:
+    """Operator types short-form wikilink ``[[author/Marcus]]`` —
+    aliases scan resolves to canonical ``author/Aurelius, Marcus``
+    and the bullet lands on the CANONICAL record. Verifier-flagged
+    case: this whole path was unreachable before the fix."""
+    author_rel = _seed_author(
+        hypatia_vault,
+        "Aurelius, Marcus",
+        aliases=["Marcus Aurelius", "Marcus"],
+        body="# Bio\n\n# Contents\n\n",
+    )
+    new_rel = _seed_zettel(hypatia_vault, "Meditations-Excerpt-2")
+
+    result = append_to_author_contents(
+        hypatia_vault, "[[author/Marcus]]", new_rel, scope="hypatia",
+    )
+    assert result is True
+
+    author = vault_read(hypatia_vault, author_rel)
+    assert "- [[zettel/Meditations-Excerpt-2]]" in author["body"]
+
+
+def test_append_to_author_dir_missing_returns_false(
+    hypatia_vault: Path,
+) -> None:
+    """No author/ record + no alias match → fail-open. New zettel
+    survives; manual reconciliation when the author record is
+    created."""
+    new_rel = _seed_zettel(hypatia_vault, "Orphan-Z")
+    result = append_to_author_contents(
+        hypatia_vault, "[[author/Nonexistent]]", new_rel, scope="hypatia",
+    )
+    assert result is False
+
+
+def test_append_idempotent_against_pipe_aliased_existing(
+    hypatia_vault: Path,
+) -> None:
+    """Pipe-aliased existing bullet (operator hand-edited to add a
+    display name) does NOT cause a duplicate append. The wikilink-
+    target-present check tolerates both
+    ``[[zettel/Title]]`` and ``[[zettel/Title|Display]]`` as the
+    same logical reference.
+
+    Regression pin for the third recurrence of the pipe-alias
+    idempotency hole (Phase 2 + Phase 3 supersede + Phase 3 author
+    Contents all share this trap)."""
+    author_rel = _seed_author(
+        hypatia_vault, "Aurelius, Marcus",
+        body=(
+            "# Bio\n\n"
+            "# Contents\n\n"
+            "- [[zettel/Meditations-Excerpt-1|the first one]]\n"
+        ),
+    )
+    new_rel = _seed_zettel(hypatia_vault, "Meditations-Excerpt-1")
+
+    result = append_to_author_contents(
+        hypatia_vault, "[[author/Aurelius, Marcus]]", new_rel,
+        scope="hypatia",
+    )
+    # Result True is acceptable if a write happened, but the body
+    # MUST NOT now contain two bullets pointing at the same zettel.
+    author = vault_read(hypatia_vault, author_rel)
+    # Count occurrences of the bare target stem — should be exactly 1
+    # regardless of alias display form.
+    assert author["body"].count("[[zettel/Meditations-Excerpt-1") == 1
 
 
 # ---------------------------------------------------------------------------

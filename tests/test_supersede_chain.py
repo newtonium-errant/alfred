@@ -199,6 +199,25 @@ def test_superseded_by_rewriter_is_idempotent() -> None:
     assert out.count("[[zettel/New]]") == 1
 
 
+def test_superseded_by_rewriter_idempotent_against_pipe_alias() -> None:
+    """Operator hand-edits the audit bullet to add a display name:
+    ``- [[zettel/New|the better version]] (2026-05-18)``. The next
+    auto-maintenance fire must NOT append a second bullet for the
+    same target — the wikilink-target-present check tolerates pipe-
+    aliased display forms.
+
+    Regression pin for the recurring pipe-alias idempotency hole."""
+    body = (
+        "## Superseded by\n\n"
+        "- [[zettel/New|the better version]] (2026-05-18)\n"
+    )
+    rw = _build_superseded_by_rewriter("[[zettel/New]]", "2026-05-19")
+    out = rw(body)
+    # Target stem appears exactly once (the pipe-aliased existing
+    # form). No duplicate bullet appended.
+    assert out.count("[[zettel/New") == 1
+
+
 def test_superseded_by_rewriter_creates_missing_section() -> None:
     """Pre-Phase-3 zettels lacking the section get it appended at
     end of body — auto-maintenance intent is real-on-disk."""
