@@ -3,7 +3,8 @@
 Active-call probe rework (queue #8, 2026-05-17). Status mapping pinned
 here (matches the module docstring):
 
-  * OK   — active API call (``calendarList().list(maxResults=1)``)
+  * OK   — active API call
+           (``events().list(calendarId=<sync_calendar>, maxResults=1)``)
            succeeded. mtime info is supporting context in detail, not
            the gate.
   * WARN — active call raised a transient / network / unknown error,
@@ -16,9 +17,17 @@ here (matches the module docstring):
 
 The probe is mock-based: real OAuth + Google API calls aren't
 exercised. We monkey-patch ``_build_calendar_service`` to return a
-fake service whose ``calendarList().list(maxResults=1).execute()``
-returns dict-shaped success / raises specific exception classes for
-the failure paths.
+fake service whose
+``events().list(calendarId=..., maxResults=1).execute()`` returns
+dict-shaped success / raises specific exception classes for the
+failure paths.
+
+**Scope-match rationale (2026-05-18 regression-pin)** — the probe
+uses ``events().list``, NOT ``calendarList().list``, because the
+adapter authorizes only the ``calendar.events`` scope. The
+``test_active_probe_uses_events_list_not_calendar_list_*`` tests in
+``TestScopeMatch`` pin this so a future refactor that "simplifies"
+the probe to ``calendarList`` resurfaces the false-negative FAIL.
 """
 
 from __future__ import annotations
@@ -75,11 +84,18 @@ def _make_service_mock(
     execute_raises: BaseException | None = None,
 ) -> MagicMock:
     """Build a mock ``service`` object that exposes
-    ``.calendarList().list(maxResults=1).execute()``.
+    ``.events().list(calendarId=..., maxResults=1).execute()``.
 
     Either ``execute_return`` (success-path payload) OR
     ``execute_raises`` (exception to raise on .execute()) — caller
     chooses which.
+
+    Mirrors the production probe's call shape exactly, per the
+    scope-match rationale in the module docstring. The mock chain
+    accepts ANY ``calendarId`` value (the production code resolves
+    ``raw['gcal']['alfred_calendar_id']`` with a ``'primary'``
+    fallback); ``TestScopeMatch`` asserts on the exact ``calendarId``
+    that gets threaded through.
     """
     service = MagicMock()
     list_op = MagicMock()
@@ -87,9 +103,9 @@ def _make_service_mock(
         list_op.execute.side_effect = execute_raises
     else:
         list_op.execute.return_value = execute_return or {"items": []}
-    cal_list = MagicMock()
-    cal_list.list.return_value = list_op
-    service.calendarList.return_value = cal_list
+    events_resource = MagicMock()
+    events_resource.list.return_value = list_op
+    service.events.return_value = events_resource
     return service
 
 
@@ -299,6 +315,181 @@ class TestOkPath:
         result = gh._check_last_successful_gcal_sync(raw)
         assert result.status == Status.OK
         assert "last error" not in result.detail
+
+
+# ---------------------------------------------------------------------------
+# Scope-match regression-pin (2026-05-18 false-negative FAIL fix)
+# ---------------------------------------------------------------------------
+
+
+class TestScopeMatch:
+    """Pin the probe's API call shape to ``events().list``, NOT
+    ``calendarList().list``.
+
+    **Why this class exists** — the 2026-05-18 BIT showed ``[FAIL]``
+    on ``last-successful-gcal-sync`` with detail ``http_403; run
+    alfred gcal authorize: "Request had insufficient authentication
+    scopes"``, but the actual sync writer succeeded an hour later
+    creating an event. Root cause: the adapter authorizes only the
+    narrow ``calendar.events`` scope (see
+    ``alfred.integrations.gcal.DEFAULT_SCOPES``); ``calendarList``
+    requires the broader ``calendar.readonly`` scope. Probe was
+    out-of-scope while real sync was in-scope → false-negative FAIL.
+
+    These tests pin the production code to ``events().list``. A future
+    refactor that switches back to ``calendarList`` resurfaces the
+    bug — these tests would catch it.
+    """
+
+    def test_active_probe_uses_events_list_not_calendar_list_for_scope_match(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Verify the probe calls ``service.events().list``, NOT
+        ``service.calendarList().list``.
+
+        Mocks ``_build_calendar_service`` to return a fresh service
+        mock whose ``calendarList`` and ``events`` attributes are
+        both observable. Runs the probe and asserts ``events.list``
+        was called while ``calendarList`` was NOT.
+        """
+        token_path = _make_token(tmp_path)
+        service = MagicMock()
+        # Wire up events().list().execute() success path.
+        list_op = MagicMock()
+        list_op.execute.return_value = {"items": []}
+        events_resource = MagicMock()
+        events_resource.list.return_value = list_op
+        service.events.return_value = events_resource
+        # calendarList is also wired so attribute access works, but we
+        # assert below it's never CALLED.
+        cal_list_resource = MagicMock()
+        service.calendarList.return_value = cal_list_resource
+
+        monkeypatch.setattr(gh, "_build_calendar_service", lambda _p: service)
+
+        raw = {
+            "gcal": {
+                "enabled": True,
+                "token_path": str(token_path),
+                "alfred_calendar_id": "primary",
+            },
+            "logging": {"dir": str(tmp_path / "no_logs")},
+        }
+        result = gh._check_last_successful_gcal_sync(raw)
+
+        # Probe succeeded with the in-scope API.
+        assert result.status == Status.OK
+
+        # CORE PIN: events().list was called.
+        assert service.events.called, (
+            "Probe must call service.events() to stay inside the "
+            "calendar.events scope"
+        )
+        assert events_resource.list.called, (
+            "Probe must call .list() on the events resource"
+        )
+
+        # CORE PIN: calendarList() was NEVER called. A future refactor
+        # that adds ``calendarList`` re-introduces the scope-mismatch
+        # bug and trips this assertion.
+        assert not service.calendarList.called, (
+            "Probe must NOT call service.calendarList — that requires "
+            "calendar.readonly scope which the adapter doesn't "
+            "authorize. Use events.list instead (scope: calendar.events)."
+        )
+
+    def test_active_probe_passes_configured_calendar_id(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The probe threads ``raw['gcal']['alfred_calendar_id']`` into
+        the ``calendarId`` kwarg of ``events().list``.
+
+        Matches the same calendar the sync writers target, so probe
+        outcome tracks sync outcome.
+        """
+        token_path = _make_token(tmp_path)
+        service = _make_service_mock(execute_return={"items": []})
+        monkeypatch.setattr(gh, "_build_calendar_service", lambda _p: service)
+
+        configured_cal = "andrew.test@group.calendar.google.com"
+        raw = {
+            "gcal": {
+                "enabled": True,
+                "token_path": str(token_path),
+                "alfred_calendar_id": configured_cal,
+            },
+            "logging": {"dir": str(tmp_path / "no_logs")},
+        }
+        result = gh._check_last_successful_gcal_sync(raw)
+        assert result.status == Status.OK
+
+        # Inspect the call kwargs to the events resource's .list().
+        events_resource = service.events.return_value
+        events_resource.list.assert_called_once_with(
+            calendarId=configured_cal, maxResults=1
+        )
+
+    def test_active_probe_falls_back_to_primary_when_calendar_id_unset(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When ``alfred_calendar_id`` is missing or empty, fall back
+        to ``'primary'``.
+
+        Degraded-config path: probe still verifies auth works even when
+        the operator hasn't configured a specific sync calendar yet.
+        Better than blowing up with a KeyError.
+        """
+        token_path = _make_token(tmp_path)
+        service = _make_service_mock(execute_return={"items": []})
+        monkeypatch.setattr(gh, "_build_calendar_service", lambda _p: service)
+
+        # No ``alfred_calendar_id`` key at all.
+        raw = {
+            "gcal": {"enabled": True, "token_path": str(token_path)},
+            "logging": {"dir": str(tmp_path / "no_logs")},
+        }
+        result = gh._check_last_successful_gcal_sync(raw)
+        assert result.status == Status.OK
+
+        events_resource = service.events.return_value
+        events_resource.list.assert_called_once_with(
+            calendarId="primary", maxResults=1
+        )
+
+    def test_active_probe_falls_back_to_primary_when_calendar_id_empty(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Empty-string ``alfred_calendar_id`` also falls back to
+        ``'primary'``. Catches the misconfig where the field exists
+        but was never populated.
+        """
+        token_path = _make_token(tmp_path)
+        service = _make_service_mock(execute_return={"items": []})
+        monkeypatch.setattr(gh, "_build_calendar_service", lambda _p: service)
+
+        raw = {
+            "gcal": {
+                "enabled": True,
+                "token_path": str(token_path),
+                "alfred_calendar_id": "",  # explicitly empty
+            },
+            "logging": {"dir": str(tmp_path / "no_logs")},
+        }
+        result = gh._check_last_successful_gcal_sync(raw)
+        assert result.status == Status.OK
+
+        events_resource = service.events.return_value
+        events_resource.list.assert_called_once_with(
+            calendarId="primary", maxResults=1
+        )
 
 
 # ---------------------------------------------------------------------------

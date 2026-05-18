@@ -3,10 +3,23 @@
 Mirrors the brief / janitor / distiller / daily_sync / instructor
 ``last-successful-*`` daemon-liveness pattern but for the Google
 Calendar OAuth token. Active-call rework: probe makes a lightweight
-authenticated API call (``calendarList().list(maxResults=1)``) and
-maps the outcome to status. Prior mtime-only logic produced
-false-positive FAIL on idle days when token was still valid but
-hadn't been refreshed because no API activity touched it.
+authenticated API call (``events().list(calendarId=<configured sync
+calendar or 'primary'>, maxResults=1)``) and maps the outcome to
+status. Prior mtime-only logic produced false-positive FAIL on idle
+days when token was still valid but hadn't been refreshed because
+no API activity touched it.
+
+**Why ``events().list``, not ``calendarList().list``:** the adapter
+authorizes only the narrow ``calendar.events`` scope (see
+``alfred.integrations.gcal.DEFAULT_SCOPES``). ``calendarList().list``
+requires the broader ``calendar.readonly`` or ``calendar`` scope, so
+calling it under a ``calendar.events``-only token produces a 403
+"insufficient authentication scopes" error — a false-negative FAIL
+on a healthy system. ``events().list`` is in-scope and exercises the
+exact same code path the sync writers (insert / update / delete)
+use, so the probe outcome matches the actual sync outcome. The 2026
+05-18 BIT regression that motivated this fix surfaced exactly that
+gap: probe FAIL while real-world sync was completing successfully.
 
 **Pre-rework problem (mtime-only):** when Andrew has no event
 activity for >24h (vacation, weekend, just no calendar changes),
@@ -476,12 +489,22 @@ def _check_last_successful_gcal_sync(raw: dict[str, Any]) -> CheckResult:
             },
         )
 
-    # Active call — lightweight: list one calendarList entry. Doesn't
-    # depend on a specific calendar_id being configured; just verifies
-    # the credentials can authenticate to GCal at all.
+    # Active call — lightweight: list one events entry on the
+    # configured sync calendar (or ``primary`` as a safe fallback when
+    # the config field is unset). Uses ``events().list`` rather than
+    # ``calendarList().list`` to stay inside the narrow
+    # ``calendar.events`` scope that the adapter authorizes — see the
+    # module docstring for the scope-match rationale. This matches the
+    # exact code path the sync writers exercise (events.insert /
+    # update / delete), so probe outcome tracks real sync outcome.
+    sync_calendar_id = (
+        (raw.get("gcal", {}) or {}).get("alfred_calendar_id", "") or "primary"
+    )
     call_error: BaseException | None = None
     try:
-        service.calendarList().list(maxResults=1).execute()
+        service.events().list(
+            calendarId=sync_calendar_id, maxResults=1
+        ).execute()
     except BaseException as exc:  # noqa: BLE001
         # BaseException to also catch the rare SystemExit-shaped errors
         # some HTTP transports raise on TLS failures. The classifier
