@@ -984,6 +984,31 @@ def vault_create(
     _validate_list_fields(fm)
     _validate_required_fields(fm)
 
+    # Self-supersede rejection — fail fast before any I/O. Mirrors the
+    # near-match refusal pattern above (raise VaultError, no on-disk
+    # mutation). The zettel_hooks dispatcher post-write also defends
+    # against self-supersede (defense-in-depth), but raising here gives
+    # the operator a clear error rather than a swallowed warning. The
+    # check normalizes both forms — operator may have typed the
+    # ``supersedes:`` value as bare path or full wikilink.
+    if record_type == "zettel":
+        supersedes_raw = fm.get("supersedes")
+        if supersedes_raw:
+            from .zettel_hooks import _normalize_wikilink_target
+            target = _normalize_wikilink_target(supersedes_raw)
+            if target:
+                if "/" not in target:
+                    target = f"zettel/{target}"
+                expected_self = f"{directory}/{name}"
+                if target == expected_self:
+                    raise VaultError(
+                        f"Zettel cannot supersede itself: "
+                        f"supersedes={supersedes_raw!r} points at the "
+                        f"same record being created ({expected_self}). "
+                        f"Set supersedes: to the older zettel being "
+                        f"replaced, or remove the field if no chain."
+                    )
+
     # Resolve body
     if body is not None:
         final_body = body
@@ -1034,6 +1059,25 @@ def vault_create(
         gcal_sync = _extract_gcal_sync_status(hook_results)
         if gcal_sync is not None:
             out["gcal_sync"] = gcal_sync
+
+    # Zettel auto-maintenance hooks (Phase 3, 2026-05-18). Failure-
+    # isolated — every helper catches its own exceptions and logs;
+    # vault_create returns success even if a hook fails, because the
+    # canonical record (the new zettel) IS on disk. Cross-record
+    # mirroring is a projection, not part of the create contract.
+    if record_type == "zettel":
+        from . import zettel_hooks as _zhooks
+        try:
+            if fm.get("supersedes"):
+                _zhooks.mirror_supersedes_chain(
+                    vault_path, rel_path, fm.get("supersedes"), scope=scope or "hypatia",
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "vault.zettel_hooks.dispatch_failed",
+                rel_path=rel_path,
+                error=str(exc),
+            )
 
     return out
 
@@ -1304,6 +1348,26 @@ def vault_edit(
         gcal_sync = _extract_gcal_sync_status(hook_results)
         if gcal_sync is not None:
             out["gcal_sync"] = gcal_sync
+
+    # Zettel auto-maintenance hooks (Phase 3, 2026-05-18). Only fires
+    # when the relevant fields changed in THIS edit — re-runs against
+    # the same value are no-ops at the helper level, but skipping the
+    # dispatch entirely when fields_changed doesn't include them
+    # avoids cascading vault_edit calls on every minor edit. Failure-
+    # isolated to match vault_create's contract.
+    if record_type == "zettel":
+        from . import zettel_hooks as _zhooks
+        try:
+            if "supersedes" in fields_changed and fm.get("supersedes"):
+                _zhooks.mirror_supersedes_chain(
+                    vault_path, rel_path, fm.get("supersedes"), scope=scope or "hypatia",
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "vault.zettel_hooks.dispatch_failed",
+                rel_path=rel_path,
+                error=str(exc),
+            )
 
     return out
 
