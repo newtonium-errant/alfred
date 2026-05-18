@@ -1,4 +1,93 @@
-"""Simple webhook receiver — accepts POSTed email data and writes to vault inbox."""
+"""Simple webhook receiver — accepts POSTed email data and writes to vault inbox.
+
+Pipeline truncation audit (2026-05-18, Queue #11 Part B)
+========================================================
+
+The brief flagged "suspected character-limit truncation somewhere in
+the pipeline" as a separate failure mode adjacent to the image-only
+HTML bifurcation. A full per-layer walk found **no truncation point**
+in the Alfred-controlled pipeline. Each layer's audit conclusion:
+
+1. **n8n Outlook Trigger** — Microsoft Graph ``body.content`` field is
+   returned in full (the truncation-prone field is ``bodyPreview``,
+   capped at 255 chars; the trigger uses ``body.content``). No size
+   limit configured on the trigger node.
+
+2. **n8n Code node** ("Build Request Body") — executes
+   ``email.body?.content || ''`` then ``JSON.stringify(body)``. The
+   Code node has a per-execution memory cap (~512MB default) but no
+   silent string-length truncation. Verified against
+   ``workflows/email-to-alfred-ingest.json``.
+
+3. **n8n HTTP Request node** ("POST to Alfred Ingest") — uses axios
+   defaults internally; no body-size cap. Timeout 30s, retry-on-fail
+   enabled. No silent truncation.
+
+4. **Cloudflare Tunnel** (``webhook.ruralroutetransportation.ca``) —
+   Cloudflare's per-request body limit is 100MB on the free plan.
+   Far above any realistic email body. Out-of-band but checked.
+
+5. **Python webhook receiver** (``mail/webhook.py``, this module) —
+   reads ``self.rfile.read(content_length)`` — exact Content-Length
+   bytes from the socket. ``http.server.BaseHTTPRequestHandler`` has
+   NO built-in body-size limit. No ``MAX_CONTENT_LENGTH`` constant
+   in the codebase (verified by exhaustive grep). Full payload lands
+   in ``raw``, parsed by ``json.loads(raw)``.
+
+6. **HTML strip** (``_strip_html``) — operates on the full body
+   string. Stages are: style/script removal, block-tag → newline
+   conversion, tag stripping, entity decode, whitespace collapse.
+   No length-bounded operation. Verified by reading the function
+   end-to-end.
+
+7. **Markdown build** (``_build_markdown``) — interpolates the
+   (post-strip OR synthesized) body into the markdown template
+   unbounded. No truncation.
+
+8. **Inbox file write** (``out.write_text(md, encoding="utf-8")``)
+   — ``pathlib.Path.write_text`` writes the full string atomically.
+   No truncation.
+
+9. **Curator pipeline** (``curator/pipeline.py``) — ``inbox_content``
+   read via ``inbox_file.read_text(encoding="utf-8")`` (no limit),
+   interpolated into the LLM prompt via ``f"{inbox_content}"`` (no
+   limit), prompt written to a temp file via
+   ``prompt_file.write(prompt)`` (no limit), piped to the LLM
+   backend's stdin (no limit). The temp-file detour is explicitly
+   to avoid ARG_MAX, NOT to cap input size.
+
+10. **LLM backend** — Claude Code (``-p`` via stdin) has Anthropic
+    SDK's ~200k-token context limit (~600KB-1MB chars). OpenClaw
+    HTTP backend has provider-dependent limits but realistic
+    email bodies are far below any provider's cap.
+
+**Conclusion**: the "30+ Empty-Record Sender" syntheses are not
+caused by a Python pipeline truncation bug. The empty-body symptom
+is fully explained by:
+
+  (a) Image-only HTML emails — addressed by Part A's header-synth
+      fallback in this same file.
+  (b) HTML with content but no extractable text per the strip
+      regex's tag-handling rules (e.g., content nested inside
+      ``<table>`` cells with unusual attribute encodings, or
+      content where every text node is whitespace-only after
+      entity decode). These are also addressed by Part A's synth
+      path when the alt-text / link surface is non-empty.
+  (c) Genuinely empty HTML (rare — likely scam senders or broken
+      sender tools). These now log
+      ``webhook.body_synthesis_no_signal`` so the operator can
+      grep for and triage the bifurcation tail.
+
+**Open follow-up**: the IMAP fetcher path (``mail/fetcher.py``) uses
+a different ``_build_markdown`` with a rougher HTML strip
+(``re.sub(r"<[^>]+>", " ", content)``). It has no synthesis
+fallback. If/when an instance's primary ingest is IMAP rather
+than webhook, the same Part A treatment should be applied there.
+Tracked as a defer-with-reason rather than a blocker — operators
+report Gmail goes through webhook (per the empty inbox file pattern
+matching the webhook format, plus ``data/mail_state.json`` showing
+no IMAP-fetched seen IDs in the live instance).
+"""
 
 from __future__ import annotations
 
