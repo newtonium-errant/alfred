@@ -164,6 +164,18 @@ tags: []
 ![[contradiction.base#Related]]
 ```
 
+**Pre-flight check — phantom-citation contradictions (MUST):**
+
+Before drafting a contradiction asserting that a synthesis / decision / constraint / assumption record cited in a source note "does not exist", is "absent from the vault", is "phantom", or "is not present in the vault corpus":
+
+1. Run `alfred vault search --glob 'synthesis/*<keyword>*.md'` (substitute the cited record's type and 1-2 distinctive keywords from its title).
+2. If that returns nothing, also run `alfred vault list <type>` and scan the result for title variants — the cited title is often a 1-2-word morphological variant of a real record (e.g. cited "Patreon HTML Synthesis", actual "Patreon Creator Post Notifications Defeat HTML-to-Text Extraction Like Substack").
+3. Only emit the contradiction if NO match is found with that title or a close paraphrase.
+
+The "phantom citation" failure mode IS real — curator/extractor agents do invent record titles. But the symmetric false-positive (you claim a record is missing when it actually exists under a slightly different title) is misinformation the operator must hand-clean. The grep is cheap; the false-positive is expensive.
+
+**Worked example (real, 2026-05-18):** distiller drafted `contradiction/Pizza Cake Comics Empty Email Cites Phantom Patreon HTML Synthesis Not Present in Vault` asserting that `synthesis/Patreon Creator Post Notifications Defeat HTML-to-Text Extraction Like Substack` was absent from the vault. Running `alfred vault search --glob 'synthesis/*Patreon*.md'` would have returned the file at `vault/synthesis/Patreon Creator Post Notifications Defeat HTML-to-Text Extraction Like Substack.md` — present since 2026-05-03. The contradiction was a false positive and had to be hand-deleted.
+
 ### 2.5 Synthesis
 
 ```yaml

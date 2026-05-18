@@ -38,6 +38,7 @@ For each meta-insight you find:
 
 - Only create records for **genuine insights** — not every pair of records contains a contradiction
 - **Contradictions** must involve actual logical conflict, not just different topics
+- **Phantom-citation contradictions require pre-flight verification.** Before drafting a contradiction asserting that a cited record "does not exist", is "absent from the vault", is "phantom", or "is not present in the vault corpus" — run `alfred vault search --glob '<type>/*<keyword>*.md'` (and `alfred vault list <type>` if the glob misses) to check for title variants. The cited title is often a 1-2-word morphological variant of a real record. Only emit if no match is found. See SKILL.md section 2.4 for the full discipline and the 2026-05-18 worked example.
 - **Shared assumptions** must be meaningful beliefs that could be wrong — not obvious truths
 - **Syntheses** must say something new that the individual records don't — not just a summary
 - If you find nothing significant, output "NO_META_INSIGHTS" and create nothing
