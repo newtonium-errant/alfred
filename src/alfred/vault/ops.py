@@ -1060,11 +1060,20 @@ def vault_create(
         if gcal_sync is not None:
             out["gcal_sync"] = gcal_sync
 
-    # Zettel auto-maintenance hooks (Phase 3, 2026-05-18). Failure-
-    # isolated — every helper catches its own exceptions and logs;
-    # vault_create returns success even if a hook fails, because the
-    # canonical record (the new zettel) IS on disk. Cross-record
-    # mirroring is a projection, not part of the create contract.
+    # Zettel auto-maintenance hooks (Phase 3 + Phase 4, 2026-05-18).
+    # Failure-isolated — every helper catches its own exceptions and
+    # logs; vault_create returns success even if a hook fails, because
+    # the canonical record IS on disk. Cross-record mirroring is a
+    # projection, not part of the create contract.
+    #
+    # Phase 3 hooks (zettel-only): supersede chain mirror + author
+    # Contents append.
+    #
+    # Phase 4 hook (zettel + source + question + research-pointer):
+    # MOC member append. Triggered when the record's ``mocs:``
+    # frontmatter list is non-empty. The trigger-type gate lives
+    # inside ``dispatch_moc_appends`` so this call site stays
+    # type-agnostic.
     if record_type == "zettel":
         from . import zettel_hooks as _zhooks
         try:
@@ -1075,6 +1084,25 @@ def vault_create(
             if fm.get("author"):
                 _zhooks.append_to_author_contents(
                     vault_path, fm.get("author"), rel_path, scope=scope or "hypatia",
+                )
+            if fm.get("mocs"):
+                _zhooks.dispatch_moc_appends(
+                    vault_path, rel_path, record_type, fm.get("mocs"),
+                    scope=scope or "hypatia",
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "vault.zettel_hooks.dispatch_failed",
+                rel_path=rel_path,
+                error=str(exc),
+            )
+    elif record_type in ("source", "question", "research-pointer"):
+        from . import zettel_hooks as _zhooks
+        try:
+            if fm.get("mocs"):
+                _zhooks.dispatch_moc_appends(
+                    vault_path, rel_path, record_type, fm.get("mocs"),
+                    scope=scope or "hypatia",
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -1353,12 +1381,18 @@ def vault_edit(
         if gcal_sync is not None:
             out["gcal_sync"] = gcal_sync
 
-    # Zettel auto-maintenance hooks (Phase 3, 2026-05-18). Only fires
-    # when the relevant fields changed in THIS edit — re-runs against
-    # the same value are no-ops at the helper level, but skipping the
-    # dispatch entirely when fields_changed doesn't include them
-    # avoids cascading vault_edit calls on every minor edit. Failure-
-    # isolated to match vault_create's contract.
+    # Zettel auto-maintenance hooks (Phase 3 + Phase 4, 2026-05-18).
+    # Only fires when the relevant fields changed in THIS edit —
+    # re-runs against the same value are no-ops at the helper level,
+    # but skipping the dispatch entirely when fields_changed doesn't
+    # include them avoids cascading vault_edit calls on every minor
+    # edit. Failure-isolated to match vault_create's contract.
+    #
+    # Phase 4 (MOC member append) fires on the four trigger types
+    # (zettel + source + question + research-pointer) when ``mocs``
+    # is in fields_changed AND the post-edit value is non-empty.
+    # The trigger-type gate lives inside ``dispatch_moc_appends`` so
+    # this call site only needs to filter on fields_changed.
     if record_type == "zettel":
         from . import zettel_hooks as _zhooks
         try:
@@ -1369,6 +1403,25 @@ def vault_edit(
             if "author" in fields_changed and fm.get("author"):
                 _zhooks.append_to_author_contents(
                     vault_path, fm.get("author"), rel_path, scope=scope or "hypatia",
+                )
+            if "mocs" in fields_changed and fm.get("mocs"):
+                _zhooks.dispatch_moc_appends(
+                    vault_path, rel_path, record_type, fm.get("mocs"),
+                    scope=scope or "hypatia",
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "vault.zettel_hooks.dispatch_failed",
+                rel_path=rel_path,
+                error=str(exc),
+            )
+    elif record_type in ("source", "question", "research-pointer"):
+        from . import zettel_hooks as _zhooks
+        try:
+            if "mocs" in fields_changed and fm.get("mocs"):
+                _zhooks.dispatch_moc_appends(
+                    vault_path, rel_path, record_type, fm.get("mocs"),
+                    scope=scope or "hypatia",
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning(

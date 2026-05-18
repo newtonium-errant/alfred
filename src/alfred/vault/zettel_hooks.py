@@ -1,34 +1,42 @@
-"""Zettel auto-maintenance hooks (Phase 3, 2026-05-18).
+"""Zettel auto-maintenance hooks (Phase 3 + Phase 4, 2026-05-18).
 
 Per ``project_hypatia_zettelkasten_redesign.md`` "Auto-maintenance
-behaviors" items 6 + 8:
+behaviors" items 6 + 7 + 8:
 
-  6. **Author Contents maintenance**: when a ``zettel/`` is created
-     with ``author:`` set, Hypatia appends ``- [[zettel/Title]]`` to
-     the author's ``# Contents``. Sources NEVER auto-append to
-     author Contents — only zettels do.
-  8. **Supersede chain mirroring**: operator sets
+  6. **Author Contents maintenance** (Phase 3): when a ``zettel/``
+     is created with ``author:`` set, Hypatia appends
+     ``- [[zettel/Title]]`` to the author's ``# Contents``.
+     Sources NEVER auto-append to author Contents — only zettels do.
+  7. **MOC member maintenance** (Phase 4): when a ``zettel/`` /
+     ``source/`` / ``question/`` / ``research-pointer/`` record is
+     created or edited with a non-empty ``mocs:`` frontmatter list,
+     Hypatia appends ``- [[<type>/<Title>]]`` to each referenced
+     MOC's ``# Contents`` section. Operator-paced cleanup —
+     removing a MOC from the record's ``mocs:`` does NOT cascade
+     a remove from the MOC's Contents (consistent with the author
+     Contents append-only discipline).
+  8. **Supersede chain mirroring** (Phase 3): operator sets
      ``supersedes: [[OldZ]]`` on new zettel; Hypatia auto-mirrors
      ``superseded_by: [[NewZ]]`` to old zettel + adds
      ``## Superseded by`` body callout. Operator writes the WHY
      narrative in new zettel's ``## Supersedes`` callout.
 
-Both hooks fire from inside ``vault_create`` / ``vault_edit`` when
-the relevant frontmatter is set on a ``zettel/`` record. They are
-INTERNAL — not exposed to LLM agents, not registered through the
-event-hook registry. The pattern is the post-write callback used
-by the GCal event hooks but type-scoped to zettel records and
-purely local (no external syncer).
+All hooks fire from inside ``vault_create`` / ``vault_edit`` when
+the relevant frontmatter is set on the appropriate record type.
+They are INTERNAL — not exposed to LLM agents, not registered
+through the event-hook registry. The pattern is the post-write
+callback used by the GCal event hooks but type-scoped to
+zettelkasten records and purely local (no external syncer).
 
 Error model: every helper here is failure-isolated. Each catches
 its own exceptions and logs without propagating, so a hook failure
 NEVER breaks the originating ``vault_create`` / ``vault_edit`` —
 the vault is canonical, the cross-record mirroring is a projection.
-Pre-Phase-3 records without the expected scaffolding (missing
+Pre-Phase-3/4 records without the expected scaffolding (missing
 ``## Superseded by`` section in old zettel, missing ``# Contents``
-in author) are handled by appending the section if absent rather
-than no-op'ing — the mirroring intent is to make the audit log
-real on disk.
+in author/MOC) are handled by appending the section if absent
+rather than no-op'ing — the mirroring intent is to make the audit
+log real on disk.
 """
 
 from __future__ import annotations
@@ -62,6 +70,33 @@ _SUPERSEDES_HEADING: str = "# Supersedes"
 #: when zettels reference this author. Z-centric per the locked plan —
 #: sources never auto-append here.
 _AUTHOR_CONTENTS_HEADING: str = "# Contents"
+
+#: MOC body section where member bullets accumulate when zettels /
+#: sources / questions / research-pointers cite this MOC via their
+#: ``mocs:`` frontmatter list. Auto-maintained by the MOC member
+#: append hook (Phase 4). Operator owns hierarchy restructuring;
+#: Hypatia only appends flat bullets at the section tail.
+_MOC_CONTENTS_HEADING: str = "# Contents"
+
+#: Record types whose ``mocs:`` frontmatter triggers the MOC member
+#: append hook on ``vault_create`` / ``vault_edit``. All four
+#: Zettelkasten types that ship a ``mocs: []`` frontmatter field in
+#: their template are eligible:
+#:
+#:   * ``zettel``           — research-grounded atomic notes
+#:   * ``source``           — running notes on consumed material
+#:   * ``question``         — elevated atomic question records
+#:   * ``research-pointer`` — elevated atomic research actions
+#:
+#: Memo records are deliberately excluded — memos are fleeting and
+#: write-once-by-design; their fleeting nature means MOC indexing
+#: doesn't fit (per locked-plan; memos do NOT carry ``mocs:`` in their
+#: template). MOC records themselves are excluded too — a MOC's
+#: ``parent_mocs:`` field is the MOC-to-MOC linkage surface, not
+#: ``mocs:``; tree-of-MOCs maintenance is Phase 5+ work.
+_MOC_TRIGGER_TYPES: frozenset[str] = frozenset({
+    "zettel", "source", "question", "research-pointer",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -692,7 +727,321 @@ def append_to_author_contents(
     return True
 
 
+# ---------------------------------------------------------------------------
+# MOC member auto-append (Phase 4, locked-plan item 7)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_mocs_field(value: Any) -> list[str]:
+    """Coerce a frontmatter ``mocs:`` value to a list of normalized
+    wikilink-target strings (no brackets, no pipe-alias, no ``.md``
+    suffix).
+
+    Accepts (defense-in-depth for operator typos):
+      * List of wikilinks   — ``["[[MOC/Stoicism]]", "[[MOC/HEMA MOC]]"]``
+      * List of bare paths  — ``["MOC/Stoicism"]``
+      * Mixed list          — ``["[[MOC/X]]", "MOC/Y"]``
+      * Single string       — ``"[[MOC/Stoicism]]"`` (operator-typo:
+                              wrote scalar where template expects list)
+      * None / empty list / non-iterable → ``[]``
+
+    Returns the list of normalized targets, preserving the operator's
+    order and de-duplicating empty entries. Empty-string entries (a
+    ``mocs:`` list containing an empty placeholder) are dropped — they
+    don't represent a real MOC reference.
+
+    The output is ALWAYS a list (possibly empty) so callers can iterate
+    unconditionally.
+    """
+    if value is None:
+        return []
+    # Operator-typo defense: scalar string where the template expects
+    # a list. Coerce to single-element list before processing.
+    if isinstance(value, str):
+        normalized = _normalize_wikilink_target(value)
+        return [normalized] if normalized else []
+    # Non-iterable, non-string, non-None → defensive empty.
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[str] = []
+    for entry in value:
+        normalized = _normalize_wikilink_target(entry)
+        if normalized:
+            out.append(normalized)
+    return out
+
+
+def _build_moc_contents_rewriter(
+    member_wikilink: str,
+) -> Callable[[str], str]:
+    """Build a body_rewriter that appends ``- <member_wikilink>`` to a
+    MOC's ``# Contents`` section.
+
+    Mirrors :func:`_build_author_contents_rewriter` shape:
+      * Idempotent — checks for bare wikilink presence (pipe-alias
+        tolerant) anywhere in the section before appending.
+      * Auto-creates ``# Contents`` if absent (pre-Phase-4 MOC
+        records may not have the section if hand-authored without
+        the template; auto-maintenance intent is to make the index
+        real on disk).
+      * Appends FLAT at section tail — does NOT restructure existing
+        hierarchical Contents tree above the append point. Operator
+        owns the tree shape (per the operator-only-zones discipline);
+        Hypatia just adds the new bullet at the end of the section
+        so the operator can subsequently move it into the right
+        position in the hierarchy.
+      * Section bounded by next H1/H2 — H3 subsections are part of
+        the MOC's Contents (sub-trees) and NOT a section boundary.
+    """
+    bare_link = member_wikilink.strip()
+    bullet = f"- {member_wikilink}"
+
+    def _rewriter(body: str) -> str:
+        contents_idx = _find_h2_or_h1_section_start(
+            body, _MOC_CONTENTS_HEADING,
+        )
+        if contents_idx == -1:
+            # No # Contents section — append the section + first
+            # bullet at end-of-body. Conservative shape: one blank
+            # line before the heading, the heading, blank line, the
+            # bullet.
+            tail = body.rstrip("\n")
+            if tail:
+                return (
+                    tail + "\n\n"
+                    + _MOC_CONTENTS_HEADING + "\n\n"
+                    + bullet + "\n"
+                )
+            return _MOC_CONTENTS_HEADING + "\n\n" + bullet + "\n"
+
+        section_start = contents_idx + len(_MOC_CONTENTS_HEADING)
+        section_end = _find_next_top_heading(body, section_start)
+        section_body = body[section_start:section_end]
+
+        if _wikilink_target_present(section_body, bare_link):
+            # Idempotent — bullet already exists somewhere in the
+            # section (plain OR pipe-aliased form). Don't duplicate.
+            return body
+
+        new_section_body = section_body.rstrip("\n") + f"\n{bullet}\n"
+        if not new_section_body.endswith("\n\n"):
+            new_section_body = new_section_body + "\n"
+
+        return body[:section_start] + new_section_body + body[section_end:]
+
+    return _rewriter
+
+
+def _resolve_moc_target(
+    vault_path: Path,
+    moc_value: Any,
+) -> str | None:
+    """Resolve a record's ``mocs:`` entry to an existing MOC record's
+    rel_path.
+
+    Returns the resolved rel_path (e.g.
+    ``"MOC/Practical Stoicism MOC.md"``) or None if no record can be
+    located.
+
+    Strategy:
+      1. Normalize the wikilink target (strips brackets, pipe-alias,
+         ``.md`` suffix).
+      2. If the target includes a directory prefix:
+         a. Try exact rel_path resolution first.
+         b. Failing that, scan ``MOC/`` for aliases (back-compat for
+            operators who hand-wrote an aliased wikilink against
+            a MOC record with ``aliases:`` set; rare but legal).
+      3. If the target has no directory prefix, try ``MOC/<target>.md``
+         then scan ``MOC/`` aliases.
+
+    Unlike :func:`_resolve_author_target`, only the ``MOC/`` directory
+    is scanned — MOC records are a single canonical type with one home
+    directory. There's no second-directory fallback (author/ + person/
+    were paired in Phase 3 to accommodate person-as-author back-compat;
+    MOC has no analogous pairing).
+    """
+    target = _normalize_wikilink_target(moc_value)
+    if not target:
+        return None
+
+    if "/" in target:
+        # Operator-provided directory.
+        rel = f"{target}.md"
+        if (vault_path / rel).exists():
+            return rel
+        # Aliases scan IN THE SAME directory the operator specified.
+        # Only ``MOC/`` is scanned — other directories' aliases
+        # conventions aren't established for MOC-shaped lookups.
+        dir_name, bare_name = target.split("/", 1)
+        if dir_name == "MOC":
+            return _scan_dir_for_alias(vault_path, dir_name, bare_name)
+        return None
+
+    # No directory prefix — try ``MOC/<target>.md`` then aliases scan.
+    rel = f"MOC/{target}.md"
+    if (vault_path / rel).exists():
+        return rel
+    return _scan_dir_for_alias(vault_path, "MOC", target)
+
+
+def append_to_moc_contents(
+    vault_path: Path,
+    moc_value: Any,
+    member_rel_path: str,
+    *,
+    scope: str = "hypatia",
+) -> bool:
+    """Append ``- [[<type>/<Title>]]`` to a MOC's ``# Contents`` section.
+
+    Triggered by ``dispatch_moc_appends`` (one call per MOC entry in
+    the source record's ``mocs:`` list). The function operates on a
+    SINGLE MOC; the iteration over the ``mocs:`` list lives in
+    :func:`dispatch_moc_appends` so the per-call retry/log granularity
+    matches the per-call file write.
+
+    Edge cases:
+      * ``moc_value`` empty / not-a-wikilink → no-op, return False.
+      * MOC record not found → log info, return False. The new
+        zettel/source/question/research-pointer's ``mocs:`` field
+        survives on disk; manual reconciliation when the MOC record
+        is later created. (Common during forward-flow: operator types
+        ``[[MOC/Stoicism]]`` in a zettel before having created the
+        MOC record. Symmetric with Phase 3 author-missing fail-open.)
+      * Existing bullet present (plain or pipe-aliased) → idempotent
+        no-op (helper rewriter checks for ``[[<type>/<Title>]]``
+        presence in section).
+      * Missing ``# Contents`` section on MOC → section auto-created
+        at end of body.
+
+    Returns True when the MOC was updated; False on no-op.
+    Failure-isolated — any unexpected exception logs + returns False.
+    """
+    from . import ops as _ops
+
+    target_normalized = _normalize_wikilink_target(moc_value)
+    if not target_normalized:
+        return False
+
+    moc_rel_path = _resolve_moc_target(vault_path, moc_value)
+    if moc_rel_path is None:
+        log.info(
+            "vault.zettel_hooks.moc_target_missing",
+            member_rel_path=member_rel_path,
+            moc_value=str(moc_value),
+        )
+        return False
+
+    member_no_md = (
+        member_rel_path[:-3]
+        if member_rel_path.endswith(".md")
+        else member_rel_path
+    )
+    member_wikilink = f"[[{member_no_md}]]"
+
+    rewriter = _build_moc_contents_rewriter(member_wikilink)
+    try:
+        _ops.vault_edit(
+            vault_path,
+            moc_rel_path,
+            body_rewriter=rewriter,
+            scope=scope,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "vault.zettel_hooks.moc_append_failed",
+            member_rel_path=member_rel_path,
+            moc_rel_path=moc_rel_path,
+            error=str(exc),
+        )
+        return False
+
+    log.info(
+        "vault.zettel_hooks.moc_contents_appended",
+        member_rel_path=member_rel_path,
+        moc_rel_path=moc_rel_path,
+    )
+    return True
+
+
+def dispatch_moc_appends(
+    vault_path: Path,
+    member_rel_path: str,
+    member_type: str,
+    mocs_value: Any,
+    *,
+    scope: str = "hypatia",
+) -> int:
+    """Iterate a record's ``mocs:`` list, call
+    :func:`append_to_moc_contents` for each entry.
+
+    Returns the count of MOCs successfully appended (informational —
+    used by the dispatch-site log line so operators can see
+    "3 of 4 MOCs received the bullet, 1 was missing").
+
+    Type-gates against ``_MOC_TRIGGER_TYPES`` — calling with a
+    non-eligible record type is a no-op (returns 0). Empty / malformed
+    ``mocs_value`` is also a no-op (returns 0).
+
+    Per-MOC failure isolation: a single MOC that doesn't exist or
+    that throws during write produces a per-call log line + False
+    return from :func:`append_to_moc_contents`, but does NOT stop the
+    iteration. The next MOC in the list still gets processed. This
+    matches the "vault is canonical; cross-record mirroring is a
+    projection" discipline — partial mirroring is better than abandoning
+    the rest of the list because one MOC was missing.
+
+    Per the ``feedback_intentionally_left_blank.md`` discipline, this
+    emits a single ``vault.zettel_hooks.moc_dispatch_summary`` info
+    log per call so operators can distinguish "ran, nothing to do"
+    (empty mocs list, ineligible type) from "ran, dispatched N writes."
+    """
+    if member_type not in _MOC_TRIGGER_TYPES:
+        log.info(
+            "vault.zettel_hooks.moc_dispatch_summary",
+            member_rel_path=member_rel_path,
+            member_type=member_type,
+            mocs_count=0,
+            appended_count=0,
+            reason="type_not_in_moc_trigger_types",
+        )
+        return 0
+
+    moc_targets = _normalize_mocs_field(mocs_value)
+    if not moc_targets:
+        log.info(
+            "vault.zettel_hooks.moc_dispatch_summary",
+            member_rel_path=member_rel_path,
+            member_type=member_type,
+            mocs_count=0,
+            appended_count=0,
+            reason="empty_mocs_field",
+        )
+        return 0
+
+    appended = 0
+    for raw_target in moc_targets:
+        # Pass the bare target through ``append_to_moc_contents`` —
+        # which re-normalizes (idempotent) and resolves against the
+        # MOC/ directory + aliases scan.
+        success = append_to_moc_contents(
+            vault_path, raw_target, member_rel_path, scope=scope,
+        )
+        if success:
+            appended += 1
+
+    log.info(
+        "vault.zettel_hooks.moc_dispatch_summary",
+        member_rel_path=member_rel_path,
+        member_type=member_type,
+        mocs_count=len(moc_targets),
+        appended_count=appended,
+    )
+    return appended
+
+
 __all__ = [
     "mirror_supersedes_chain",
     "append_to_author_contents",
+    "append_to_moc_contents",
+    "dispatch_moc_appends",
 ]
