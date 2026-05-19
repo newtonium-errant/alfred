@@ -386,6 +386,22 @@ class Daemon:
             records,
         )
 
+        # Sub-arc D1 placement fix (2026-05-19): parallel observability
+        # gate for the cluster→MOC suggestion ``no_moc_dir`` state.
+        # Same bug shape as Sub-arc B's pre-65229ec placement: the D1
+        # fixup ship (de7db19) added a lifecycle latch but kept the
+        # emission inside Stage 8 (``_maybe_emit_moc_suggestions``),
+        # which lives BELOW the ``no_changed_clusters`` early-return at
+        # line ~404. On Hypatia's stable-vault sweeps (the common case),
+        # ``changed_semantic`` is empty → Stage 8 never runs → the
+        # log never emits despite the latch. Moving the observability
+        # call here mirrors the Sub-arc B placement and makes the
+        # no-MOC-dir state visible on every sweep cycle, not only
+        # cluster-change sweeps. Stage 8's PROPOSAL generation stays
+        # in place (it correctly runs only on cluster change); only
+        # the observability log moves.
+        self._gate_moc_suggestion_no_moc_dir_observability()
+
         # Stage 4: Label changed clusters.
         #
         # Scope to `changed_semantic` only. `cluster_members` below is built
@@ -793,6 +809,54 @@ class Daemon:
         # empty re-emits the log.
         self._entity_link_no_entities_logged = False
         return True
+
+    def _gate_moc_suggestion_no_moc_dir_observability(self) -> None:
+        """Phase 5 Sub-arc D1 placement-fix gate (2026-05-19) for the
+        cluster→MOC suggestion ``no_moc_dir`` state.
+
+        Architectural twin to
+        :meth:`_gate_entity_link_no_entities_observability` — same
+        once-per-lifecycle latch pattern, same placement above the
+        ``no_changed_clusters`` early-return in ``_cluster_and_label``.
+        Without this method, the D1 fixup ship (de7db19) only emits
+        when Stage 8 actually runs, and Stage 8 only runs on cluster
+        change. Hypatia's stable-vault sweeps short-circuit Stage 8
+        and the operator never sees the "vault has no MOC/ directory"
+        signal.
+
+        Gate semantics:
+          * If ``moc_suggestion.enabled`` is False: no-op. The
+            ``stage_disabled`` log inside ``_maybe_emit_moc_suggestions``
+            already covers the disabled-state observability surface.
+          * If ``MOC/`` is absent: emit
+            ``surveyor.moc_suggestion.no_moc_dir`` iff the latch was
+            previously False (first sweep in the absent state). Set
+            the latch True.
+          * If ``MOC/`` is present: reset the latch False so a later
+            directory removal re-emits. Defensive symmetry with the
+            Sub-arc B latch.
+
+        Returns ``None`` — placement-fix gate is observability-only,
+        no downstream decision is consumed from it. The Stage 8
+        proposal pipeline still owns its own ``no_candidates`` /
+        ``sweep_summary`` logging when it actually runs.
+        """
+        if not self.cfg.moc_suggestion.enabled:
+            return
+        moc_dir = self.cfg.vault.path / "MOC"
+        moc_dir_exists = moc_dir.is_dir()
+        if not moc_dir_exists:
+            if not self._moc_suggestion_no_moc_dir_logged:
+                log.info(
+                    "surveyor.moc_suggestion.no_moc_dir",
+                    vault_path=str(self.cfg.vault.path),
+                )
+                self._moc_suggestion_no_moc_dir_logged = True
+        else:
+            # Re-arm the latch on transition-back-to-present so a
+            # later directory removal re-emits the log. Defensive
+            # symmetry with the Sub-arc B entity-link latch.
+            self._moc_suggestion_no_moc_dir_logged = False
 
     def _link_entities_in_clusters(
         self,
@@ -1260,31 +1324,19 @@ class Daemon:
             queue_path = derive_default_queue_path(self.cfg.state.path)
 
         # Build the MOC index ONCE per sweep (vault read).
-        # ``build_existing_mocs_index`` returns ``(index, moc_dir_exists)``
-        # so the daemon can lifecycle-gate the no-MOC-dir log without
-        # the pure-logic suggester knowing about the latch state. Per
-        # ``feedback_intentionally_left_blank.md`` — silence-from-no-
-        # MOC-dir must surface distinctly from silence-from-failure;
-        # once-per-lifecycle keeps the log signal low while remaining
-        # grep-able.
-        existing_mocs, moc_dir_exists = build_existing_mocs_index(
+        # ``build_existing_mocs_index`` returns ``(index, moc_dir_exists)``.
+        # Stage 8 only runs when ``changed_semantic`` is non-empty (see
+        # caller in ``_cluster_and_label``); the no-MOC-dir
+        # observability log is emitted by
+        # :meth:`_gate_moc_suggestion_no_moc_dir_observability` at the
+        # Sub-arc B placement point ABOVE the ``no_changed_clusters``
+        # early-return, so it fires on every sweep cycle rather than
+        # only on cluster-change sweeps. We unpack ``moc_dir_exists``
+        # here but DELIBERATELY do not emit from this site — the
+        # placement-fix gate owns the emission and the latch.
+        existing_mocs, _moc_dir_exists = build_existing_mocs_index(
             self.cfg.vault.path,
         )
-        if not moc_dir_exists:
-            if not self._moc_suggestion_no_moc_dir_logged:
-                log.info(
-                    "surveyor.moc_suggestion.no_moc_dir",
-                    vault_path=str(self.cfg.vault.path),
-                )
-                self._moc_suggestion_no_moc_dir_logged = True
-        else:
-            # Re-arm the latch on transition-back-to-present so a
-            # later directory removal re-emits the log. Defensive —
-            # the directory typically only appears once (operator
-            # creates the first MOC) but the symmetry matches the
-            # ``stage_disabled`` latch and the ``entity_link_no_
-            # entities_logged`` latch (Sub-arc B).
-            self._moc_suggestion_no_moc_dir_logged = False
 
         all_proposals = []
         clusters_evaluated = 0

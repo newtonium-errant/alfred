@@ -24,7 +24,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
+from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import structlog
 import structlog.testing
@@ -202,18 +204,32 @@ async def test_disabled_log_latch_resets_when_stage_flips_on(
 
 
 # ---------------------------------------------------------------------------
-# no_moc_dir lifecycle-gated log (Sub-arc D1 fixup, 2026-05-19).
+# no_moc_dir lifecycle-gated log (Sub-arc D1 fixup + placement-fix).
 # ---------------------------------------------------------------------------
 #
-# Originally D1 emitted ``surveyor.moc_suggestion.no_moc_dir`` from
-# inside ``build_existing_mocs_index`` on every sweep, causing log
-# spam on vaults with no ``MOC/`` directory (Hypatia's current state).
-# Fixup pattern: suggester returns ``(index, moc_dir_exists)``; the
-# daemon owns the lifecycle-gated emission. Tests verify:
-#   1. First sweep with no MOC/ → log fires once
-#   2. Second sweep still missing MOC/ → log does NOT re-fire
-#   3. MOC/ created between sweeps → latch resets; later removal
-#      would re-emit (transition-back defense)
+# Two-stage backstory:
+#
+#   1. D1 ship (6984279) emitted ``surveyor.moc_suggestion.no_moc_dir``
+#      from inside ``build_existing_mocs_index`` on every sweep — log
+#      spam on vaults with no ``MOC/`` directory.
+#
+#   2. D1 fixup (de7db19) added a lifecycle latch but kept the emission
+#      INSIDE Stage 8 (``_maybe_emit_moc_suggestions``), which is gated
+#      by ``changed_semantic > 0`` — so on Hypatia's stable-vault
+#      sweeps the log STILL never emitted. Same bug shape as the
+#      pre-65229ec Sub-arc B placement gap.
+#
+#   3. Placement fix (this commit) moves the observability gate to
+#      :meth:`_gate_moc_suggestion_no_moc_dir_observability`, called
+#      ABOVE the ``no_changed_clusters`` early-return in
+#      ``_cluster_and_label``. Stage 8's PROPOSAL pipeline stays put
+#      (proposals only make sense on cluster change). Only the
+#      observability log moves.
+#
+# The latch tests below drive ``_gate_moc_suggestion_no_moc_dir_observability``
+# directly — that's where the emission lives now. The behaviour
+# contract (emit-once-per-lifecycle, reset-on-transition-back) is
+# unchanged; only the entry point moved.
 
 
 @pytest.mark.asyncio
@@ -221,16 +237,19 @@ async def test_no_moc_dir_log_fires_once_on_first_sweep(
     isolated_daemon, tmp_path: Path,
 ) -> None:
     """First sweep with no ``MOC/`` directory in the vault → log
-    ``surveyor.moc_suggestion.no_moc_dir`` exactly once."""
+    ``surveyor.moc_suggestion.no_moc_dir`` exactly once.
+
+    Drives the placement-fix gate directly (post-2026-05-19 ship);
+    the gate fires above the ``no_changed_clusters`` early-return so
+    the log emits regardless of whether cluster membership shifted
+    this sweep.
+    """
     # Vault has no MOC/ directory by default (fixture only mkdir's
     # the vault root). Stage is enabled.
     assert not (isolated_daemon.cfg.vault.path / "MOC").is_dir()
 
     with structlog.testing.capture_logs() as captured:
-        n = await isolated_daemon._maybe_emit_moc_suggestions(
-            cluster_members={}, all_changed=set(), records={},
-        )
-    assert n == 0
+        isolated_daemon._gate_moc_suggestion_no_moc_dir_observability()
 
     matches = [
         c for c in captured
@@ -254,15 +273,14 @@ async def test_no_moc_dir_log_does_not_re_fire_across_sweeps(
     """Subsequent sweeps while ``MOC/`` is still absent must NOT
     re-emit. The original D1 bug was per-sweep spam; this test pins
     the latch behaviour so a future refactor that moves the log
-    back into the suggester is caught."""
+    back into per-sweep emission is caught.
+    """
     assert not (isolated_daemon.cfg.vault.path / "MOC").is_dir()
 
     with structlog.testing.capture_logs() as captured:
         # Three sweeps; only the first should emit.
         for _ in range(3):
-            await isolated_daemon._maybe_emit_moc_suggestions(
-                cluster_members={}, all_changed=set(), records={},
-            )
+            isolated_daemon._gate_moc_suggestion_no_moc_dir_observability()
 
     matches = [
         c for c in captured
@@ -284,9 +302,7 @@ async def test_no_moc_dir_latch_resets_when_dir_appears(
     symmetry with the ``stage_disabled`` latch + the Sub-arc B
     ``entity_link_no_entities_logged`` latch."""
     # Sweep 1 — no MOC/ dir → log + latch set.
-    await isolated_daemon._maybe_emit_moc_suggestions(
-        cluster_members={}, all_changed=set(), records={},
-    )
+    isolated_daemon._gate_moc_suggestion_no_moc_dir_observability()
     assert isolated_daemon._moc_suggestion_no_moc_dir_logged is True
 
     # Operator creates MOC/ between sweeps.
@@ -298,9 +314,7 @@ async def test_no_moc_dir_latch_resets_when_dir_appears(
 
     # Sweep 2 — MOC/ now present → latch resets.
     with structlog.testing.capture_logs() as captured:
-        await isolated_daemon._maybe_emit_moc_suggestions(
-            cluster_members={}, all_changed=set(), records={},
-        )
+        isolated_daemon._gate_moc_suggestion_no_moc_dir_observability()
     assert isolated_daemon._moc_suggestion_no_moc_dir_logged is False, (
         "Latch must reset when MOC/ directory is observed on disk so "
         "a later transition back to absent re-emits the log"
@@ -321,9 +335,7 @@ async def test_no_moc_dir_latch_resets_when_dir_appears(
     import shutil
     shutil.rmtree(moc_dir)
     with structlog.testing.capture_logs() as captured2:
-        await isolated_daemon._maybe_emit_moc_suggestions(
-            cluster_members={}, all_changed=set(), records={},
-        )
+        isolated_daemon._gate_moc_suggestion_no_moc_dir_observability()
     sweep3_no_moc_dir = [
         c for c in captured2
         if c.get("event") == "surveyor.moc_suggestion.no_moc_dir"
@@ -332,6 +344,140 @@ async def test_no_moc_dir_latch_resets_when_dir_appears(
         "After latch reset (dir appeared) and a subsequent dir removal, "
         f"the no_moc_dir log must re-emit on the next sweep; got "
         f"{len(sweep3_no_moc_dir)} emissions"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression pin — placement-fix for the Hypatia smoke-test gap
+# (Sub-arc D1 no-moc-dir placement fix, 2026-05-19).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_moc_dir_gate_fires_even_when_no_clusters_changed(
+    isolated_daemon, tmp_path: Path,
+) -> None:
+    """Critical regression pin — Hypatia smoke test on the D1 fixup ship
+    (de7db19) caught the second placement gap: the no_moc_dir log
+    was emitted from inside ``_maybe_emit_moc_suggestions`` (Stage
+    8), which lives BELOW the ``daemon.no_changed_clusters`` early-
+    return inside ``_cluster_and_label``. On Hypatia's stable-vault
+    sweeps (clusterer reports ``changed_semantic=set()``) the early-
+    return short-circuited Stage 8 before it could emit, despite
+    the latch.
+
+    Same bug shape as the pre-65229ec Sub-arc B placement gap.
+
+    Pin: when ``clusterer.run()`` returns empty ``changed_semantic``
+    AND the vault has no ``MOC/`` directory, the
+    ``surveyor.moc_suggestion.no_moc_dir`` log MUST still emit (via
+    the gate above the early-return) AND ``_cluster_and_label``
+    returns cleanly via the ``no_changed_clusters`` path. A future
+    refactor that moves the gate back below the early-return trips
+    this assert.
+
+    Drives the real ``_cluster_and_label`` end-to-end with a mocked
+    clusterer so the placement is exercised by production code, not
+    a test-local mirror (per
+    ``feedback_log_emission_test_pattern.md``).
+    """
+    from alfred.surveyor.clusterer import ClusterResult
+    from alfred.surveyor.parser import VaultRecord
+
+    # Vault has no MOC/ directory by default (fixture only mkdir's
+    # vault root). Stage is enabled. Hypatia's canonical state.
+    assert not (isolated_daemon.cfg.vault.path / "MOC").is_dir()
+
+    # Hypatia-shaped records — only non-entity types so the Sub-arc B
+    # entity-link gate also fires (we don't assert on it here; we just
+    # want a realistic record map so ``_cluster_and_label`` doesn't
+    # trip on the no-records path).
+    records = {
+        "zettel/Foo.md": VaultRecord(
+            rel_path="zettel/Foo.md",
+            frontmatter={"type": "zettel", "name": "Foo"},
+            body="",
+            record_type="zettel",
+        ),
+        "zettel/Bar.md": VaultRecord(
+            rel_path="zettel/Bar.md",
+            frontmatter={"type": "zettel", "name": "Bar"},
+            body="",
+            record_type="zettel",
+        ),
+    }
+
+    # Wire mocks the placement-fix gate needs to reach. ``_cluster_and_label``
+    # consults embedder.get_all_embeddings() + clusterer.run(), then
+    # decides whether to short-circuit on no_changed_clusters BEFORE
+    # the gate fires. Mock both to produce the no-change shape.
+    isolated_daemon.embedder = MagicMock()
+    fake_paths = list(records.keys())
+    fake_vectors = np.zeros((len(fake_paths), 4), dtype=np.float32)
+    isolated_daemon.embedder.get_all_embeddings = MagicMock(
+        return_value=(fake_paths, fake_vectors),
+    )
+
+    isolated_daemon.clusterer = MagicMock()
+    empty_result = ClusterResult(
+        semantic={},
+        structural={},
+        changed_semantic=set(),
+        changed_structural=set(),
+    )
+    isolated_daemon.clusterer.run = MagicMock(return_value=empty_result)
+
+    # writer + labeler not exercised on the no_changed_clusters path
+    # but keep them mocked so any unexpected method call surfaces.
+    isolated_daemon.writer = MagicMock()
+    isolated_daemon.labeler = MagicMock()
+
+    with structlog.testing.capture_logs() as captured:
+        await isolated_daemon._cluster_and_label(records)
+
+    # Headline regression pin: the no_moc_dir observability log
+    # fired DESPITE the no_changed_clusters short-circuit. Catches a
+    # future refactor that moves the gate back into Stage 8.
+    obs_logs = [
+        c for c in captured
+        if c.get("event") == "surveyor.moc_suggestion.no_moc_dir"
+    ]
+    assert len(obs_logs) == 1, (
+        "no_moc_dir gate must emit on stable-cluster sweeps when "
+        f"MOC/ directory is absent; got events: "
+        f"{[c.get('event') for c in captured]}"
+    )
+    # Field shape sanity — same contract as the direct-helper tests.
+    assert obs_logs[0].get("vault_path") == str(
+        isolated_daemon.cfg.vault.path,
+    )
+    # Latch flipped — subsequent stable sweeps must not re-emit.
+    assert isolated_daemon._moc_suggestion_no_moc_dir_logged is True
+
+    # Sanity: the no_changed_clusters early-return is still reached.
+    # The placement-fix gate must NOT masquerade as a substitute for
+    # that log — it sits above and runs first.
+    no_changed_logs = [
+        c for c in captured
+        if c.get("event") == "daemon.no_changed_clusters"
+    ]
+    assert len(no_changed_logs) == 1, (
+        "no_changed_clusters log must still fire after the gate; "
+        f"got events: {[c.get('event') for c in captured]}"
+    )
+
+    # Order pin: gate emits BEFORE no_changed_clusters. Surfaces the
+    # placement contract directly so a regression that moves the
+    # gate back below the early-return reverses the order (or drops
+    # the gate emission entirely) and trips this assert.
+    events_in_order = [c.get("event") for c in captured]
+    gate_idx = events_in_order.index(
+        "surveyor.moc_suggestion.no_moc_dir",
+    )
+    no_changed_idx = events_in_order.index("daemon.no_changed_clusters")
+    assert gate_idx < no_changed_idx, (
+        "gate must emit BEFORE no_changed_clusters; event order was "
+        f"{events_in_order}"
     )
 
 
