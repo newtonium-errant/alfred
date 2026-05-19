@@ -169,6 +169,77 @@ class LoggingConfig:
 
 
 @dataclass
+class MocSuggestionConfig:
+    """Cluster→MOC suggestion mechanism (Phase 5 Sub-arc D1, 2026-05-19).
+
+    Per ``project_hypatia_zettelkasten_redesign.md`` Phase 5: when the
+    surveyor labels a cluster, propose adding cluster members to relevant
+    MOC ``# Contents``. Operator reviews via ``/moc-suggestions`` and
+    accepts via ``/accept-moc <id>`` (D2 ship). D1 emits suggestions to
+    an out-of-vault JSONL queue; D1 NEVER writes to the vault.
+
+    Mapping logic (ratified Q2):
+      * Primary signal: ``member_overlap`` — fraction of cluster members
+        that already cite the candidate MOC via their ``mocs:``
+        frontmatter list. High signal because operator has already
+        validated the membership; surveyor just generalizes.
+      * Tiebreaker: ``fuzzy_label`` Jaccard overlap between the cluster
+        label tag-set and the MOC filename tokens. Used only when
+        member-overlap returns zero candidates.
+      * Propose-new: when both signals return zero, emit a suggestion
+        with ``target_moc_rel_path=None`` + ``proposed_new_moc_name``
+        derived from the cluster label.
+
+    Lifecycle (ratified Q5):
+      * Pending stays pending until operator acts.
+      * Rejected persists indefinitely — negative-learning surface;
+        re-proposals of the same (members, target) hash are suppressed.
+      * Accepted-but-apply-failed flips back to pending.
+
+    Inventory-MOC filter (ratified Q7): ``MOC/_*.md`` paths NEVER appear
+    as suggestion targets or proposed-new names. Inventory MOCs are
+    predicate-driven, system-maintained per Phase 4 Sub-arc B.
+
+    Disabled by default for compatibility — Salem + KAL-LE configs don't
+    set this block, so the orchestrator's existing surveyor stays silent
+    on the new stage. Hypatia config sets ``enabled: true`` to opt in.
+    """
+
+    enabled: bool = False
+
+    #: Member-overlap threshold (fraction). 0.4 = at least 40% of cluster
+    #: members already cite the target MOC. Below this, no suggestion is
+    #: emitted on the member-overlap signal.
+    member_overlap_threshold: float = 0.4
+
+    #: Fuzzy-label Jaccard threshold (token-overlap on lowercased,
+    #: hyphen/underscore/space-split tokens). Tiebreaker only — consulted
+    #: when member-overlap returns zero candidates.
+    fuzzy_label_jaccard_threshold: float = 0.5
+
+    #: Minimum cluster size for suggestion eligibility. Singletons + tiny
+    #: clusters carry too little signal for MOC-grouping confidence. Set
+    #: explicitly here so the gate is independent of the labeler's
+    #: min_cluster_size_to_label (which is about LLM-cost gating, a
+    #: different concern).
+    min_cluster_size: int = 3
+
+    #: Per-sweep cap on new proposals emitted. Prevents a fan-out
+    #: cascade if the LLM labels a burst of new records.
+    max_proposals_per_sweep: int = 10
+
+    #: Per-target-MOC cap on pending proposals. Prevents queue inflation
+    #: against the same MOC across sweeps.
+    max_pending_per_target: int = 5
+
+    #: Optional explicit queue path. When None (default), the queue
+    #: derives from ``cfg.state.path.parent / "moc_suggestions.jsonl"``
+    #: — same convention as the audit log path derivation in
+    #: ``daemon.py:66-70``. Settable for tests + alternate deployments.
+    queue_path: str | None = None
+
+
+@dataclass
 class IdleTickConfig:
     """Surveyor idle-tick heartbeat — "intentionally left blank" liveness signal.
 
@@ -203,6 +274,7 @@ class PipelineConfig:
     logging: LoggingConfig
     idle_tick: IdleTickConfig = field(default_factory=IdleTickConfig)
     entity_link: EntityLinkConfig = field(default_factory=EntityLinkConfig)
+    moc_suggestion: MocSuggestionConfig = field(default_factory=MocSuggestionConfig)
     # Top-level opt-out flag. Distinct from the orchestrator's
     # configuration-by-presence gate: the orchestrator already skips
     # surveyor when the ``surveyor:`` block is entirely absent. This
@@ -287,6 +359,9 @@ def load_config(config_path: str | Path) -> PipelineConfig:
         logging=_build_dataclass(LoggingConfig, raw.get("logging")),
         idle_tick=_build_dataclass(IdleTickConfig, raw.get("idle_tick")),
         entity_link=_build_dataclass(EntityLinkConfig, raw.get("entity_link")),
+        moc_suggestion=_build_dataclass(
+            MocSuggestionConfig, raw.get("moc_suggestion"),
+        ),
     )
 
 
@@ -312,6 +387,9 @@ def load_from_unified(raw: dict) -> PipelineConfig:
         # Idle-tick lives under ``surveyor:``; defaulted-on if absent.
         idle_tick=_build_dataclass(IdleTickConfig, tool.get("idle_tick")),
         entity_link=_build_dataclass(EntityLinkConfig, tool.get("entity_link")),
+        moc_suggestion=_build_dataclass(
+            MocSuggestionConfig, tool.get("moc_suggestion"),
+        ),
         # Top-level opt-out — defaults True if absent.
         enabled=bool(tool.get("enabled", True)),
     )

@@ -46,6 +46,14 @@ class Daemon:
         # must surface distinctly from silence-from-failure; once-per-
         # lifecycle keeps the log signal low while remaining grep-able.
         self._entity_link_no_entities_logged: bool = False
+        # Phase 5 Sub-arc D1 (2026-05-19): once-per-lifecycle latch for
+        # the cluster→MOC suggestion stage when it's configured-off.
+        # Salem + KAL-LE leave ``moc_suggestion.enabled`` at the False
+        # default; without this gate every sweep would emit a noisy
+        # ``stage_disabled`` log. Resets to False if a future config
+        # reload flips the flag on (defensive; daemon doesn't currently
+        # reload mid-process, but the field is cheap).
+        self._moc_suggestion_disabled_logged: bool = False
 
         self.state = PipelineState(cfg.state.path)
         self.watcher = VaultWatcher(cfg.vault, cfg.watcher)
@@ -503,11 +511,29 @@ class Daemon:
         for err in failures:
             log.warning("daemon.cluster_label_error", error=str(err)[:200])
 
+        # Stage 8 (Phase 5 Sub-arc D1): cluster→MOC suggestion emission.
+        # Walks each labeled cluster and proposes which MOC(s) its
+        # members might belong to. Pure read of vault + record map +
+        # MOC index; persists to an out-of-vault JSONL queue. NEVER
+        # writes to the vault. The accept path lives in D2 (slash
+        # commands).
+        #
+        # Placed BEFORE the entity-link skip-gate because the
+        # suggestion stage doesn't depend on entity records — Hypatia
+        # (no entity types) needs it, Salem (entity-heavy) would also
+        # benefit but is currently disabled-by-default config.
+        suggestions_proposed = await self._maybe_emit_moc_suggestions(
+            cluster_members=cluster_members,
+            all_changed=all_changed,
+            records=records,
+        )
+
         log.info(
             "daemon.labeling_complete",
             clusters_processed=len(all_changed),
             failed=len(failures),
             concurrency=self.cfg.labeler.max_concurrent,
+            moc_suggestions_proposed=suggestions_proposed,
         )
 
         # Stage 5/6/7 skip — consumes the gate result evaluated right
@@ -1161,3 +1187,134 @@ class Daemon:
                 threshold=threshold,
                 max_per_record=max_per,
             )
+
+    # ---- Stage 8: cluster→MOC suggestion emission (Sub-arc D1) ----
+
+    async def _maybe_emit_moc_suggestions(
+        self,
+        *,
+        cluster_members: dict[int, list[str]],
+        all_changed: set[int],
+        records: dict[str, "VaultRecord"],
+    ) -> int:
+        """Walk labeled clusters, build candidate MOC suggestions, and
+        persist to the out-of-vault JSONL queue.
+
+        Returns the number of NEW proposals added (refreshes don't
+        count). Always returns 0 when the stage is disabled or when
+        no candidates are eligible — never raises to the caller.
+
+        Per ratified design D1 (2026-05-19), this stage produces
+        SUGGESTIONS only. The accept path (D2 slash commands) edits
+        each member record's ``mocs:`` frontmatter via canonical
+        ``vault_edit``, which triggers the Phase 4 Sub-arc A
+        member-append hook. No vault writes here.
+
+        Failure-isolated. A queue-write failure logs but doesn't
+        propagate so a surveyor sweep is never broken by a queue
+        I/O hiccup.
+        """
+        cfg = self.cfg.moc_suggestion
+        if not cfg.enabled:
+            # Per ``feedback_intentionally_left_blank.md``: silence-
+            # from-disabled must surface ONCE so an operator
+            # debugging "why are there no MOC suggestions?" can grep
+            # for this log line. Lifecycle-gated to keep the noise
+            # floor low.
+            if not self._moc_suggestion_disabled_logged:
+                log.info(
+                    "surveyor.moc_suggestion.stage_disabled",
+                    reason="moc_suggestion.enabled is False (default for Salem/KAL-LE; set true in config to enable)",
+                )
+                self._moc_suggestion_disabled_logged = True
+            return 0
+        # Re-arm the disabled-log latch in case the flag flips on
+        # mid-process (future config-reload safety; harmless today).
+        self._moc_suggestion_disabled_logged = False
+
+        from .moc_suggester import (
+            build_existing_mocs_index,
+            propose_moc_suggestions,
+        )
+        from .moc_suggestion_queue import (
+            derive_default_queue_path,
+            upsert_proposals,
+        )
+        from pathlib import Path as _Path
+
+        # Resolve queue path — config override OR derived from state.
+        if cfg.queue_path:
+            queue_path = _Path(cfg.queue_path)
+        else:
+            queue_path = derive_default_queue_path(self.cfg.state.path)
+
+        # Build the MOC index ONCE per sweep (vault read).
+        existing_mocs = build_existing_mocs_index(self.cfg.vault.path)
+
+        all_proposals = []
+        clusters_evaluated = 0
+        for cid in all_changed:
+            members = cluster_members.get(cid, [])
+            if len(members) < cfg.min_cluster_size:
+                continue
+            # Pull the cluster's tags from the just-written cluster
+            # state. ``label_cluster`` ran during this sweep, so the
+            # state has the freshest tags. Fall back to empty tag
+            # list when the cluster wasn't labeled (e.g., LLM call
+            # failed) — propose_new can still trigger off member
+            # paths even without tags (member-overlap signal is
+            # independent of tags).
+            cluster_key = f"semantic_{cid}"
+            cluster_state = self.state.clusters.get(cluster_key)
+            cluster_tags = list(cluster_state.label) if cluster_state else []
+
+            clusters_evaluated += 1
+            proposals = propose_moc_suggestions(
+                cluster_id=cid,
+                member_paths=members,
+                cluster_tags=cluster_tags,
+                records=records,
+                existing_mocs=existing_mocs,
+                member_overlap_threshold=cfg.member_overlap_threshold,
+                fuzzy_label_jaccard_threshold=cfg.fuzzy_label_jaccard_threshold,
+                min_cluster_size=cfg.min_cluster_size,
+            )
+            all_proposals.extend(proposals)
+
+        if not all_proposals:
+            # Empty-state per ``feedback_intentionally_left_blank.md``:
+            # if the stage ran but produced no candidates, say so
+            # explicitly. Distinguishes "ran, nothing eligible" from
+            # "didn't run at all."
+            log.info(
+                "surveyor.moc_suggestion.no_candidates",
+                clusters_evaluated=clusters_evaluated,
+                existing_moc_count=len(existing_mocs),
+                queue_path=str(queue_path),
+            )
+            return 0
+
+        try:
+            n_added, n_refreshed = upsert_proposals(
+                queue_path,
+                all_proposals,
+                max_pending_per_target=cfg.max_pending_per_target,
+                max_proposals_per_sweep=cfg.max_proposals_per_sweep,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "surveyor.moc_suggestion.upsert_failed",
+                queue_path=str(queue_path),
+                error=str(exc)[:200],
+            )
+            return 0
+
+        log.info(
+            "surveyor.moc_suggestion.sweep_summary",
+            clusters_evaluated=clusters_evaluated,
+            proposals_seen=len(all_proposals),
+            added=n_added,
+            refreshed=n_refreshed,
+            queue_path=str(queue_path),
+        )
+        return n_added
