@@ -395,7 +395,8 @@ Zettelkasten frontmatter shapes (Phase 1, shipped 2026-05-16 — see the "Zettel
 
 - **`memo/<slug>.md`** — `type: memo`, `name`, `created`, `session: "[[session/...]]"` (pointer back to the originating capture); optional `tags`, `related`. No `status` field — memos are transient. Body: `# Memo` (raw user text) / `# Context` / `# Tags`. Auto-created by capture-mode when a session has ≤1 user message at /end.
 - **`zettel/<title>.md`** — `type: zettel`, `name`, `created`; optional `author: "[[author/<canonical>]]"`, `source: "[[source/<title>]]"`, `mocs: [...]`, `supersedes: "[[zettel/<old>]]"`, `superseded_by` (auto-set by the Phase 3 supersede mirror — see "Supersede chains + author Contents (Phase 3)" below), `tags`, `status: open | refined | superseded` (status is for category-shape zettels; most synthesis + definitional shapes omit it). Body: `# Premise` / `# Contents` (optional dataview) / `# Notes` / `# Supersedes` (Phase 3 scaffold — operator-only WHY-narrative when this zettel supersedes an older one) / `# Follow Up Questions` / `# Research Ideas` / `# External References` / `# Tags` / `# Indexing & MOCs`. One flexible template; three sub-shapes (synthesis / category / definitional) — see the catalog below.
-- **`MOC/<Topic MOC>.md`** — `type: MOC`, `name`, `created`; optional `parent_mocs: [...]`, `tags`. Body: `# Premise` (one-line scope statement) / `# Contents` (member tree — Hypatia auto-appends flat `- [[<type>/<Title>]]` bullets per Phase 4 Sub-arc A; operator restructures into a hierarchical tree) / `# Notes` (optional) / `# Tags` / `# See Also`. Filename suffix `MOC` is convention (`Practical Stoicism MOC.md`). MOC creation is operator-led; member-list auto-append from inbound zettel/source/question/research-pointer `mocs:` frontmatter is shipped (Phase 4 Sub-arc A, 2026-05-18 — see "MOC member auto-append (Phase 4 Sub-arc A)" section below). Body `# Indexing & MOCs` parsing is NOT yet operational — only frontmatter `mocs:` triggers the append (Phase 4.x deferred extension).
+- **`MOC/<Topic MOC>.md`** (Topic MOC — operator-owned) — `type: MOC`, `name`, `created`; optional `parent_mocs: [...]`, `tags`. Body: `# Premise` (one-line scope statement) / `# Contents` (member tree — Hypatia auto-appends flat `- [[<type>/<Title>]]` bullets per Phase 4 Sub-arc A; operator restructures into a hierarchical tree) / `# Notes` (optional) / `# Tags` / `# See Also`. Filename suffix `MOC` is convention (`Practical Stoicism MOC.md`). Topic MOC creation is **operator-led**; member-list auto-append from inbound zettel/source/question/research-pointer `mocs:` frontmatter is shipped (Phase 4 Sub-arc A, 2026-05-18 — see "MOC member auto-append (Phase 4 Sub-arc A)" section below). Body `# Indexing & MOCs` parsing is NOT yet operational — only frontmatter `mocs:` triggers the append (Phase 4.x deferred extension). The underscore-prefix variant `MOC/_<Name>.md` is the parallel **inventory MOC** shape and is Hypatia-system-owned — see the row immediately below.
+- **`MOC/_<Name>.md`** (Inventory MOC — Hypatia-system-owned, Phase 4 Sub-arc B, shipped 2026-05-18) — `type: MOC`, `name` (the underscore-prefixed stem itself, e.g. `_Open Questions`), `created`; same body shape as the topic MOC above. The leading-underscore filename marks the record as **SYSTEM-MAINTAINED by Hypatia** — parallel to the scaffold's `_templates/` and `_bases/` convention. Operator does NOT hand-author `MOC/_*` files, does NOT manually curate their `# Contents`, does NOT freely rename them. Two instances ship today: `MOC/_Open Questions.md` (tracks every `question/` record with `status in {open, refined}`) and `MOC/_Open Research Pointers.md` (tracks every `research-pointer/` record with `status == open`). Hypatia AUTO-CREATES the record on first qualifying writer via the canonical `vault_create` path; auto-ADDs a bullet when a record's status flips INTO the predicate; auto-REMOVES the bullet when status flips OUT. See "Inventory MOC pattern (Phase 4 Sub-arc B)" section below for the dispatch table + truth-table semantics. **Critically: inventory MOCs are the ONE place Hypatia removes bullets** — every other MOC bullet flow (topic-MOC member append, author Contents append) is append-only with operator-paced cleanup.
 - **`question/<question text>.md`** — `type: question`, `name`, `created`, `status: open | refined | answered | superseded`; optional `origin_sources: [...]` (wikilinks to source/zettel that raised this question), `answered_by: "[[zettel/...]]"`, `mocs`, `tags`. Body: `# Question` / `# Why It Matters` / `# Origin` / `# Status` / `# Exploration` / `# Answer` / `# Tags` / `# Indexing & MOCs`. Operator-elevated.
 - **`research-pointer/<action>.md`** — `type: research-pointer`, `name`, `created`, `status: open | in-progress | completed | dropped`; optional `origin_sources: [...]`, `produces: [...]` (list of resulting records), `mocs`, `tags`. Body: `# Pointer` (one imperative line) / `# Why` / `# Origin` / `# Status` / `# Notes` / `# Tags` / `# Indexing & MOCs`. Operator-elevated.
 - **`author/<canonical scholarly name>.md`** — `type: author`, `name` (the full author name), `created`, `aliases: [...]` (bridges full-name wikilinks + alternate spellings + legacy last-name-only forms to the canonical filename); optional `tags`. Body: `# Summary` (terse identifier-fragments for canonical figures; substantive prose only when operator fills it) / `# Contents` (Z-centric — **Hypatia auto-appends flat `- [[zettel/Title]]` bullets** per zettel created with `author:` set, shipped Phase 3 2026-05-18; operator restructures the flat list into hierarchical trees when material density warrants) / `# Tags` / `# See Also` (operator-only). **Frontmatter is intentionally minimal — `era`, `school`, `description`, `last_name`, `status`, `related` are NOT used.** Author records are INDEX CARDS pointing to works, not biographies.
@@ -426,9 +427,10 @@ The Phase 1 design follows a **type-minimalism principle** Andrew ratified 2026-
 | `zettel/` | Atomic Zettelkasten record — specific topic, research-backed or considered reflection | Descriptive title (NO `Z - ` prefix forward) | Hypatia auto via capture-mode multi-message extraction WHEN session is source-anchored (or operator closed with `/end-zettel`); operator-curated subsequently |
 | `source/` | Running notes + commentary on consumed material | Title of the work (NO `S - ` prefix forward) | Hypatia auto via capture-mode source-anchor detection (Phase 1) + Phase 2 body enrichment (shape inference, anchor preservation, re-encounter growth, Permanent Notes spawned auto-append). See "Source records (Phase 2)" section below. |
 | `author/` | Index card → author's works + lateral linkage | Canonical scholarly name (see resolver below) | Hypatia auto at first source encounter |
-| `MOC/` | Map of Content — topic organizer | `<Topic> MOC.md` (suffix locked) | Creation operator-led; member-list auto-append shipped (Phase 4 Sub-arc A, 2026-05-18) — zettel/source/question/research-pointer records carrying `mocs:` frontmatter auto-append flat `- [[<type>/<Title>]]` bullets to the listed MOC's `# Contents` |
-| `question/` | Elevated atomic question for tracking | Question text itself | Operator-elevated from inline `# Follow Up Questions`; Hypatia-assisted via discoverability surfacing (Phase 4 discoverability sub-arc, deferred — distinct from the shipped Phase 4 Sub-arc A MOC member auto-append) |
-| `research-pointer/` | Elevated atomic research action | Action statement itself | Operator-elevated from inline `# Research Ideas`; Hypatia-assisted |
+| `MOC/` (topic) | Map of Content — operator-owned topic organizer | `<Topic> MOC.md` (no leading underscore; suffix locked) | Creation **operator-led**; member-list auto-append shipped (Phase 4 Sub-arc A, 2026-05-18) — zettel/source/question/research-pointer records carrying `mocs:` frontmatter auto-append flat `- [[<type>/<Title>]]` bullets to the listed MOC's `# Contents`. Append-only — Hypatia does NOT remove bullets when `mocs:` is later dropped from the writer record. |
+| `MOC/` (inventory) | Map of Content — Hypatia-system-maintained status snapshot | `_<Name>.md` (leading-underscore prefix mandatory; e.g. `_Open Questions.md`) | Hypatia **auto-creates** the file on first qualifying writer record via canonical `vault_create` path (Phase 4 Sub-arc B, shipped 2026-05-18). Auto-maintained by a dispatch table (`INVENTORY_MOC_DISPATCH` in `zettel_hooks.py`): on every `question/` or `research-pointer/` `vault_create` / `vault_edit`, the predicate is re-evaluated against the post-edit frontmatter; bullets are ADDED on predicate flips into True and REMOVED on flips into False. Two instances today: `_Open Questions` (question with `status in {open, refined}`) + `_Open Research Pointers` (research-pointer with `status == open`). Future inventory MOCs extend the dispatch table — pattern handles them with no architectural change. |
+| `question/` | Elevated atomic question for tracking | Question text itself | Operator-elevated from inline `# Follow Up Questions` (manual today); on create + every edit, Hypatia auto-mirrors the record into `MOC/_Open Questions.md` per status (Phase 4 Sub-arc B — see "Inventory MOC pattern" below). Inline-question scanning + digest surfacing (the *inline*-elevation discovery surface, separate from inventory) remains operator-paced; no scheduled digest yet. |
+| `research-pointer/` | Elevated atomic research action | Action statement itself | Operator-elevated from inline `# Research Ideas` (manual today); on create + every edit, Hypatia auto-mirrors the record into `MOC/_Open Research Pointers.md` per status (Phase 4 Sub-arc B). Inline-research-idea scanning + digest surfacing remains operator-paced; no scheduled digest yet. |
 
 **Critical distinction — the three-tier discriminator (CORRECTED 2026-05-16 post-Phase-1-ship).** `memo/`, `zettel/`, and `note/` are three distinct semantic tiers, not redundant types. Andrew's correction: *"Not all Hypatia notes are zettels. Not all capture sessions are zettels either. Notes need to exist as well, as my non-zettelkasten held 'fleeting notes'."*
 
@@ -581,16 +583,18 @@ MOC auto-suggestion (surveyor cluster labels → MOC links) remains Phase 5 work
 
 If Andrew asks *"why didn't this zettel show up in the MOC's Contents?"* — first check whether the zettel's frontmatter `mocs:` field actually lists the MOC (the trigger is frontmatter-only as of Phase 4 Sub-arc A; the body `# Indexing & MOCs` section is NOT scanned). If `mocs:` does list it and the bullet is still absent, the most likely causes are: (a) the MOC record doesn't exist on disk (fail-open silent miss — see fail-open semantics below), or (b) the zettel pre-dates Phase 4 Sub-arc A and was never edited after the ship (the hook fires on `vault_create` / `vault_edit`, not retroactively). Suggest the operator action: re-save the zettel (any `vault_edit`, even a no-op set_fields, will re-fire the hook), OR confirm the MOC exists and append the wikilink to its `# Contents` manually.
 
-### Question + research-pointer — operator-elevated atoms
+### Question + research-pointer — operator-elevated atoms; Hypatia mirrors open-state into inventory MOCs
 
 Most questions live INLINE in the `# Follow Up Questions` section of source or zettel records — that's the default. Elevation to a dedicated `question/` record happens when:
 
 - The question deserves tracking as its own atom (multi-session exploration, may produce a zettel as its answer).
-- Operator explicitly invokes via `/elevate-question` (Phase 4 discoverability sub-arc, deferred) or by asking Hypatia *"elevate that question to a record"*.
+- Operator explicitly asks Hypatia *"elevate that question to a record"*, or directly creates a `question/` record via `vault_create`.
 
-Same logic for `research-pointer/` records elevated from inline `# Research Ideas` sections. Both lifecycle statuses (open / refined / answered / superseded for questions; open / in-progress / completed / dropped for pointers) are operator-curated; Hypatia doesn't auto-transition.
+Same logic for `research-pointer/` records elevated from inline `# Research Ideas` sections. Both lifecycle statuses (open / refined / answered / superseded for questions; open / in-progress / completed / dropped for pointers) are operator-curated; Hypatia does NOT auto-transition status.
 
-The Phase 4 discoverability sub-arc (separate from Phase 4 Sub-arc A which shipped 2026-05-18) will ship a scheduled scan of `# Follow Up Questions` vault-wide → digest surfaces uncovered questions → operator picks elevation candidates. Until then, elevation is fully manual. (Note: Phase 4 Sub-arc A — MOC member auto-append — IS shipped; only the question-elevation discoverability digest remains deferred under the broader Phase 4 banner.)
+**Once a record is elevated, discoverability of its OPEN state is shipped (Phase 4 Sub-arc B, 2026-05-18).** On every `vault_create` / `vault_edit` of a `question/` or `research-pointer/` record, Hypatia re-evaluates the inventory predicate and mirrors the result into `MOC/_Open Questions.md` or `MOC/_Open Research Pointers.md` (auto-creating those files on first qualifying record). For a `question/`, a status flip `refined` → `answered` removes the bullet (because `answered` is outside the predicate set `{open, refined}`); a subsequent flip `answered` → `refined` adds it back (operator re-opens the question because the answer wasn't satisfactory). For a `research-pointer/`, the predicate is stricter — only `open` qualifies, so flipping to `in-progress` rolls the bullet off (the pointer is being worked, no longer in the backlog). The inventory MOC IS the discoverability surface for the existing elevated record corpus — open the file in Obsidian, get the live roster. See "Inventory MOC pattern (Phase 4 Sub-arc B)" section below.
+
+The DIFFERENT discoverability problem — scanning vault-wide inline `# Follow Up Questions` body sections to surface candidates for elevation (i.e., inline-to-elevated promotion) — remains operator-paced. No scheduled scan, no digest, no slash command yet. If you want to find unsurfaced inline questions across the corpus, run `vault_search` with `body_contains: "# Follow Up Questions"` and read by hand; that's the manual stand-in until a dedicated inline-elevation surface ships.
 
 ### Author resolver — canonical scholarly name with `aliases` bridge
 
@@ -652,7 +656,7 @@ Per the operator-only-zones discipline in the design memo:
 | Bibliographic details on source records (Option A — empty placeholders only) | Phase 2 (2026-05-17) ships the source template with `## Bibliographic Details` scaffolding present but empty; auto-scrape remains deferred. Operator fills citation / URL+byline / host+episode / etc. retrospectively per the per-shape conventions in "Source records (Phase 2)" above. Future Open Library / Google Books integration is Phase 2.5+ if friction surfaces with book-heavy workflow. |
 | Significance-interpretation in author `# Summary` | Interpretive significance is Andrew's voice. Auto-creation leaves Summary empty OR writes terse identifier-fragments only — never interpretation. |
 | `# See Also` entries (author + MOC) | Empty by default on auto-creation; operator fills with related authors / movements / schools / MOCs. |
-| Question + research-pointer elevation decisions | Operator decides which inline questions deserve elevation. The Phase 4 discoverability sub-arc (deferred; distinct from Phase 4 Sub-arc A which shipped) will surface candidates via scheduled digest; operator picks. |
+| Question + research-pointer elevation decisions (inline → top-level record) | Operator decides which inline questions deserve elevation. No scheduled inline-scan / digest is shipped yet; operator drives elevation manually (Hypatia assists when asked to "elevate that"). Note: ONCE elevated, the OPEN-state discoverability surface IS shipped (Phase 4 Sub-arc B inventory MOCs — see below). |
 | `# Tags` body section content (taxonomy choice) | Hypatia suggests tags; Andrew curates the canonical taxonomy. Don't impose new tag inventions on existing records without consent. |
 
 ---
@@ -1068,7 +1072,7 @@ When operator creates a zettel with non-empty `author:` field, Hypatia's `append
 
 - Sources with `author:` set → no author Contents append (Z-centric).
 - Sources with `source:` set on derived zettels → DOES trigger Permanent Notes spawned append (Phase 2, separate hook).
-- MOCs, questions, research-pointers, memos created with `author:` or `supersedes:` set → no hooks fire (the author + supersede hooks are type-scoped to zettel records; the MOC member hook is type-scoped to `_MOC_TRIGGER_TYPES = {zettel, source, question, research-pointer}` — MOCs and memos do NOT trigger MOC appends either).
+- MOCs, questions, research-pointers, memos created with `author:` or `supersedes:` set → the Phase 3 hooks (author Contents + supersede chain mirror) do NOT fire — those hooks are type-scoped to zettel records. The Sub-arc A topic-MOC member hook is type-scoped to `_MOC_TRIGGER_TYPES = {zettel, source, question, research-pointer}` — MOCs and memos do NOT trigger MOC appends. (Note: Sub-arc B's inventory MOC dispatch IS separate — it fires on every question/research-pointer create+edit regardless of which other frontmatter fields are set; see "Inventory MOC pattern (Phase 4 Sub-arc B)" below.)
 - Notes (`note/`) created via the discriminator's not-anchored branch → no hooks fire (notes are not zettels and are not in `_MOC_TRIGGER_TYPES`).
 - Operator-direct edits to old zettel's `superseded_by:` field via `vault_edit` → no reverse mirror back to new zettel (the hook is one-way: new → old; not a bidirectional sync).
 
@@ -1123,11 +1127,13 @@ This matches the broader "vault is canonical; cross-record mirroring is a projec
 
 **Operator-paced reconciliation.** When the missing MOC gets created later (manually via `vault_create`), the hook does NOT retroactively populate it with historical zettels-that-cited-it. The append only fires on the writer record's next `vault_create` / `vault_edit`. If Andrew creates `MOC/Nonexistent Topic MOC.md` after the fact and wants the historical writer records to appear in its `# Contents`, the operator action is: (a) re-save each writer record (any `vault_edit`, even a no-op set_fields, re-fires the hook), OR (b) manually append the bullets to the new MOC's `# Contents`.
 
-### No-cleanup-on-drop — dropping a MOC from `mocs:` does NOT remove the bullet
+### No-cleanup-on-drop — dropping a MOC from `mocs:` does NOT remove the bullet (TOPIC MOC scope only)
 
-If the operator edits a zettel to remove a MOC from its `mocs:` list, the previously-appended bullet on that MOC's `# Contents` **stays**. The hook is append-only by design; there is no removal cleanup path. Operator-paced reconciliation: if the bullet should go, the operator manually deletes it from the MOC's `# Contents`.
+If the operator edits a zettel to remove a topic MOC from its `mocs:` list, the previously-appended bullet on that topic MOC's `# Contents` **stays**. The Sub-arc A hook is append-only by design; there is no removal cleanup path on the topic-MOC flow. Operator-paced reconciliation: if the bullet should go, the operator manually deletes it from the topic MOC's `# Contents`.
 
-This matches the Phase 3 author Contents discipline (dropping `author:` doesn't remove the existing author Contents bullet) — both auto-append patterns share the same operator-paced reconciliation shape. Andrew's framing: the MOC's `# Contents` is an audit log of "what was once tagged with this MOC," not a live-reactive view; if the operator wants the bullet gone, the operator removes it.
+This matches the Phase 3 author Contents discipline (dropping `author:` doesn't remove the existing author Contents bullet) — both auto-append patterns share the same operator-paced reconciliation shape. Andrew's framing: the topic MOC's `# Contents` is an audit log of "what was once tagged with this MOC," not a live-reactive view; if the operator wants the bullet gone, the operator removes it.
+
+**Inventory MOCs (`MOC/_*.md`) have the OPPOSITE discipline.** The Sub-arc B inventory dispatch removes bullets when its predicate flips True → False, because inventory MOCs exist to answer "what's currently open right now?" — staleness defeats the surface. The no-cleanup-on-drop rule above is scoped to topic MOCs (Sub-arc A) + author Contents (Phase 3) ONLY. See "Inventory MOC pattern (Phase 4 Sub-arc B)" below for the bidirectional flow.
 
 ### Body `# Indexing & MOCs` parsing — NOT yet operational
 
@@ -1135,16 +1141,21 @@ The frontmatter `mocs:` field is the ONLY trigger as of Phase 4 Sub-arc A. The w
 
 For now: **frontmatter `mocs:` is canonical for auto-append; body `# Indexing & MOCs` is operator-curated for Obsidian-graph navigation only**. They are independent surfaces; no cross-mirror.
 
-### Two parallel auto-append patterns — the canonical shape for "auto-maintain a list of links in a target record's body section"
+### Three parallel auto-maintain patterns — the canonical shape for "auto-maintain a list of links in a target record's body section"
 
-Hypatia now maintains two distinct kinds of bullets-list auto-append, sharing the same idempotency helper + body section finder + fail-open semantics:
+Hypatia now maintains three distinct kinds of `# Contents` bullet flows. Two share an **operator-paced append-only** discipline (topic MOCs + author Contents); the third — inventory MOCs — adds **removal cleanup** because the whole point of an inventory is current accuracy. All three share the same idempotency helper + body-section finder; only the removal direction + auto-create policy diverge.
 
-| Pattern | Trigger | Target record | Target section | Phase |
-|---|---|---|---|---|
-| **Author Contents auto-append (Z-centric)** | `zettel` with `author:` set | `author/<canonical>.md` | `# Contents` | Phase 3 (2026-05-18) |
-| **MOC member auto-append (topic-MOC)** | `zettel` / `source` / `question` / `research-pointer` with `mocs:` set | `MOC/<Topic> MOC.md` | `# Contents` | Phase 4 Sub-arc A (2026-05-18) |
+| Pattern | Trigger | Target record | Target section | Removal on signal-loss? | Auto-create target if absent? | Phase |
+|---|---|---|---|---|---|---|
+| **Author Contents auto-append (Z-centric)** | `zettel` with `author:` set | `author/<canonical>.md` | `# Contents` | **NEVER** — operator-paced cleanup | NO — fail-open log + skip when author record is missing | Phase 3 (2026-05-18) |
+| **Topic-MOC member auto-append** | `zettel` / `source` / `question` / `research-pointer` with `mocs:` set | `MOC/<Topic> MOC.md` (no leading underscore) | `# Contents` | **NEVER** — operator-paced cleanup | NO — fail-open log + skip when MOC record is missing | Phase 4 Sub-arc A (2026-05-18) |
+| **Inventory MOC reflection** | `question/` / `research-pointer/` whose post-edit frontmatter matches a `INVENTORY_MOC_DISPATCH` predicate (`status` field today) | `MOC/_<Name>.md` (underscore-prefix mandatory) | `# Contents` | **YES** — on predicate flip True→False, bullet is removed | **YES** — auto-creates on first qualifying writer via canonical `vault_create` path | Phase 4 Sub-arc B (2026-05-18) |
 
-Both are flat append-only, idempotent (with pipe-alias awareness), missing-target fail-open, no-cleanup-on-drop, type-aware bullet shape, and operator-restructures-hierarchy. Future "auto-maintain a list of links in a target record's body section" hooks (Phase 4 Sub-arc B inventory MOCs, Phase 5 surveyor cluster→MOC writes, anything else of this shape) should mirror this pattern — same helper, same semantics, same operator-paced reconciliation discipline. Hypatia owns the append; operator owns the structure within.
+**Why the asymmetric removal discipline.** Topic MOCs and author Contents are OPERATOR-CURATED knowledge clusters — the bullet captures a historical relationship that retains value even after the originating frontmatter reference changes. Andrew's framing for Sub-arc A: *"the MOC's `# Contents` is an audit log of what was once tagged with this MOC, not a live-reactive view."* Inventory MOCs are the inverse — SYSTEM-MAINTAINED accuracy snapshots that exist to answer *"what's currently open right now?"*. A stale bullet in `MOC/_Open Questions.md` for a question whose status has flipped to `answered` would make the inventory MOC a lie, which defeats the surface entirely. Hence the carve-out: inventory MOCs (and ONLY inventory MOCs, identified by their underscore-prefix filename) get bidirectional maintenance.
+
+**Why the asymmetric auto-create discipline.** Topic MOCs are operator-owned creative artifacts — the operator decides when a topic deserves a MOC and writes the `# Premise`. Hypatia can't fabricate a MOC's framing, so fail-open is the right shape (record the intent, surface the missing target, defer creation to operator). Inventory MOCs have NO operator-creative content — they're a list, the predicate decides membership, the title is `_Open <Type>` (descriptive, not interpretive). So Hypatia auto-creates them on demand via the canonical `vault_create` path (which writes the `_templates/MOC.md` template body verbatim — operator can edit `# Premise` later if they want).
+
+Future "auto-maintain a list of links in a target record's body section" hooks (Phase 5 surveyor cluster→MOC writes, anything else of this shape) should pick which of the three patterns matches the semantics. Operator-curated audit-log shape → Sub-arc A. Predicate-driven accuracy snapshot shape → Sub-arc B. Per-author content roster (Z-centric) → Phase 3. Hypatia owns the bullet; the pattern choice determines whether removal + auto-create are part of the contract.
 
 ### Worked example — adding a zettel to two MOCs
 
@@ -1166,7 +1177,144 @@ Both are flat append-only, idempotent (with pipe-alias awareness), missing-targe
 >
 > **Permanent Notes spawned does NOT fire on this path.** That hook lives in `src/alfred/telegram/capture_extract.py` and only fires when the capture-extract orchestrator creates zettels from a closed capture session — it is NOT part of the `vault_create` post-write hook block. In this scenario (direct conversational `vault_create`, not a capture-extract emission), the `source: "[[source/Meditations]]"` frontmatter is recorded on the zettel but `source/Meditations.md`'s `## Permanent Notes spawned` section does NOT receive a bullet. If Andrew wants the source's Permanent Notes spawned roster updated, the operator action is to manually append (or to drive the zettel creation through a capture session instead).
 >
-> Day-30 follow-up: Andrew creates `question/Is Memento Mori a productivity hack or a wisdom frame?.md` and sets `mocs: ["[[MOC/Practical Stoicism MOC]]", "[[MOC/Productivity MOC]]"]`. The MOC member hook fires (questions are in `_MOC_TRIGGER_TYPES`); the same two MOCs' `# Contents` each gain a `- [[question/Is Memento Mori a productivity hack or a wisdom frame?]]` bullet at the end. The author + supersede hooks do NOT fire (those are zettel-only, not question-eligible). The MOCs now show mixed-type member rosters — a zettel and a question side-by-side, distinguishable at a glance by their directory prefix in the wikilink.
+> Day-30 follow-up: Andrew creates `question/Is Memento Mori a productivity hack or a wisdom frame?.md` and sets `mocs: ["[[MOC/Practical Stoicism MOC]]", "[[MOC/Productivity MOC]]"]` and `status: open`. Two hook families fire on this single `vault_create`:
+>
+> - **Topic-MOC member auto-append** (Sub-arc A) — questions are in `_MOC_TRIGGER_TYPES`; the same two topic MOCs' `# Contents` each gain a `- [[question/Is Memento Mori a productivity hack or a wisdom frame?]]` bullet at the end. The author + supersede hooks do NOT fire (those are zettel-only). The topic MOCs now show mixed-type member rosters — a zettel and a question side-by-side, distinguishable at a glance by their directory prefix in the wikilink.
+> - **Inventory MOC reflection** (Sub-arc B) — the `INVENTORY_MOC_DISPATCH` entry for `question/` evaluates `lambda fm: fm.get("status") in ("open", "refined")` against the post-create frontmatter; result is True; action is "add". `MOC/_Open Questions.md` is auto-created (file didn't exist before this writer) via the canonical `vault_create` path with `type: MOC` + `name: "_Open Questions"`, and then `- [[question/Is Memento Mori a productivity hack or a wisdom frame?]]` is appended to its `# Contents`. Both Sub-arc A and Sub-arc B fire **on the same `vault_create` call** — they are independent dispatchers.
+
+---
+
+## Inventory MOC pattern (Phase 4 Sub-arc B, shipped 2026-05-18)
+
+Phase 4 Sub-arc B ships the inventory MOC pattern in `src/alfred/vault/zettel_hooks.py`: a generalized predicate-driven discovery surface where records matching `(record_type, predicate)` are reflected into a system-maintained `MOC/_<Name>.md` file. This is **NOT** an extension of the topic-MOC member-append surface from Sub-arc A — it's a parallel hook flow with opposite removal discipline + opposite auto-create discipline (per the synthesis table above).
+
+Two instances ship today; future inventory MOCs are added by extending one table entry. Operator does NOT hand-author `MOC/_*` files; Hypatia owns the file end-to-end.
+
+### Underscore-prefix discipline — what marks a MOC as system-maintained
+
+The leading underscore in `MOC/_Open Questions.md` is **load-bearing**, not aesthetic. It is the operator-facing signal that says *"this file is Hypatia's responsibility; do not hand-edit the `# Contents` section."* The convention is intentionally parallel to the existing scaffold pattern:
+
+- `_templates/` — Hypatia-owned template body scaffolds
+- `_bases/` — Hypatia-owned Obsidian Dataview base views
+- `MOC/_*.md` — Hypatia-owned inventory snapshots (Sub-arc B)
+
+Filename rule: any `MOC/<Name>.md` where `<Name>` starts with `_` is an inventory MOC. Any `MOC/<Name>.md` where `<Name>` does NOT start with `_` is a topic MOC (operator-owned). The two share the `MOC/` directory + `type: MOC` frontmatter — the underscore is the discriminator.
+
+**If you (Hypatia) are asked to create a MOC by Andrew in a conversation**, default to the topic-MOC shape (no underscore) — that's operator-owned creative work. Only create a `MOC/_*.md` file if Andrew explicitly names the underscore-prefix form OR is asking for an inventory MOC by description (e.g., *"a MOC that shows all my open projects"*). Even then, prefer to add an entry to `INVENTORY_MOC_DISPATCH` via a code-layer ship (escalate to builder) rather than hand-author the file — the dispatch table is the registration surface, and a hand-authored `MOC/_*.md` with no dispatch entry will sit static and never get bullets appended/removed.
+
+### The dispatch table — `INVENTORY_MOC_DISPATCH` is the principal artifact
+
+Each table entry is a 4-tuple `(record_type, predicate, moc_rel_path, moc_name)`:
+
+- `record_type` — only edits to records of this type fire the entry's hook
+- `predicate` — `Callable[[dict], bool]` taking post-edit frontmatter; True means "belongs in this inventory MOC"
+- `moc_rel_path` — vault-relative path of the inventory MOC (MUST begin with `MOC/_`)
+- `moc_name` — `name` frontmatter passed to `vault_create` if auto-creation fires
+
+As of 2026-05-18, the table has exactly **two entries**:
+
+```python
+INVENTORY_MOC_DISPATCH = (
+    ("question",
+     lambda fm: fm.get("status") in ("open", "refined"),
+     "MOC/_Open Questions.md",
+     "_Open Questions"),
+    ("research-pointer",
+     lambda fm: fm.get("status") == "open",
+     "MOC/_Open Research Pointers.md",
+     "_Open Research Pointers"),
+)
+```
+
+Note the predicate divergence: `question/` records have a four-status lifecycle (`open | refined | answered | superseded`), and the inventory predicate counts BOTH `open` and `refined` as "still active" — a refined question is a sharpened one, still worth tracking. `research-pointer/` records have a different lifecycle (`open | in-progress | completed | dropped`), and the predicate is `status == open` — once it's `in-progress`, it's no longer in the open backlog (it's being worked) and rolls off the inventory.
+
+Future inventory MOCs land here as additional tuples. The dispatcher (`dispatch_inventory_mocs`) iterates the table and applies the truth table per entry; no code-elsewhere changes needed beyond the table grow.
+
+### Truth table — predicate transitions drive add/remove
+
+Each dispatch call evaluates `predicate(pre_fm)` and `predicate(post_fm)`. The four possibilities:
+
+| `predicate(pre_fm)` | `predicate(post_fm)` | Action |
+|---|---|---|
+| False / missing record (`pre_fm=None` on `vault_create`) | True | **ADD** bullet (auto-create inventory MOC if absent) |
+| True | False | **REMOVE** bullet |
+| True | True | ADD (idempotent re-fire — defensive self-heal if operator manually deleted bullet) |
+| False | False | No-op (logged with `skipped` increment) |
+
+Critical detail: the `vault_edit` site captures a `pre_edit_fm = dict(fm)` snapshot BEFORE applying `set_fields`, so the predicate-before-edit and predicate-after-edit are compared correctly even when the edit mutates the `status` field that the predicate reads. On `vault_create`, `pre_fm=None` is passed (the record didn't exist) — predicate-before evaluates as False by convention.
+
+The dispatcher runs on EVERY `vault_create` / `vault_edit` of a `question/` or `research-pointer/` record (it is NOT gated on `fields_changed`). The per-call cost is one predicate evaluation per matching dispatch entry (cheap) plus one `vault_edit` against the inventory MOC ONLY when the truth table fires an add or remove. Editing an unrelated field on a question whose status was already `open` and stays `open` short-circuits to "True→True idempotent add" — the bullet-presence check inside `_build_moc_contents_rewriter` no-ops the rewrite. (We re-fire rather than skip the True→True case so manually-deleted bullets self-heal on the next edit.)
+
+### Auto-create-if-absent — canonical `vault_create` path
+
+When a dispatch entry fires "add" and the target `MOC/_*.md` doesn't exist, `_ensure_inventory_moc` invokes `vault_create(vault_path, "MOC", moc_name, scope=...)`. This means:
+
+- The new file goes through the normal validate-template-write pipeline (`_validate_type` + scope check + template substitution).
+- The file lands at `MOC/_<Name>.md` per `TYPE_DIRECTORY` resolution + the underscore-prefixed stem.
+- The body is the bundled `_templates/MOC.md` template verbatim — `# Premise` / `# Contents` / `# Notes` / `# Tags` / `# See Also` sections all present, all empty.
+- Then the regular bullet-append rewriter runs on the freshly-created file, landing the first bullet under `# Contents`.
+
+Failure-isolated: if `vault_create` raises (scope denial, template missing, disk error), the auto-create logs `vault.zettel_hooks.inventory_moc_create_failed` and returns False. The originating writer record (the question or research-pointer that triggered the dispatch) is NEVER affected — its own `vault_create` / `vault_edit` already succeeded before the post-write hooks ran. Cross-record mirroring is a projection, not part of the create contract.
+
+### Removal cleanup — line-anchored bullet match, prose preserved
+
+When the predicate flips True → False, `_build_remove_bullet_rewriter` scans the inventory MOC's `# Contents` for a line matching the regex `^[ \t]*-[ \t]+\[\[<type>/<Title>(?:\|[^\]]*)?\]\][^\n]*\n?` (pipe-alias tolerant, line-anchored, MULTILINE). The matching line is removed; surrounding bullets, hierarchy structure, and `# Premise` / `# Notes` body content stay intact.
+
+**Prose preservation**: the removal regex is line-anchored to `^[ \t]*-[ \t]+`. If the operator wrote a sentence elsewhere in the MOC body that happens to mention `[[question/Is Memento Mori a productivity hack...]]` inline, that prose reference is NOT touched — only bullet-form occurrences in `# Contents` get removed.
+
+If removing the only bullet leaves an empty `# Contents` section, the heading stays (per the empty-section-preservation discipline elsewhere in this SKILL) and the file is left as `# Contents\n\n# Notes\n...`. That's an honest "no open records" signal; per `feedback_intentionally_left_blank.md`, the empty section reads as "ran, currently nothing open" — distinguishable from "broken / never ran" because the file's existence + its `_<Name>` filename announce the system-maintained intent.
+
+### Worked example — Day 1 create / Day 3 refine / Day 5 answer cycle
+
+> **Day 1 — Andrew elevates an inline question.** Andrew, while reading `source/Meditations.md`, says *"that question about whether 'live according to nature' is descriptive or prescriptive — elevate that to a record."* Hypatia calls:
+>
+> ```
+> vault_create(
+>     "question",
+>     "What does \"live according to nature\" actually mean?",
+>     fields={"status": "open",
+>             "origin_sources": ["[[source/Meditations]]"]},
+>     scope="hypatia",
+> )
+> ```
+>
+> Post-write, the ops.py inventory dispatch block fires (record type is `question/`). `pre_fm=None` so the truth-table left side is False; `predicate(post_fm)` checks `fm.get("status") in ("open", "refined")` → True. Action: **add**.
+>
+> `MOC/_Open Questions.md` doesn't exist yet — first elevated question in this vault. `_ensure_inventory_moc` calls `vault_create("MOC", "_Open Questions", scope="hypatia")`. The file lands at `MOC/_Open Questions.md` with the bundled MOC template body. Then `_build_moc_contents_rewriter` appends `- [[question/What does "live according to nature" actually mean?]]` under `# Contents`. Summary log: `vault.zettel_hooks.inventory_moc_dispatch_summary matched_entries=1 added=1 removed=0 skipped=0`.
+>
+> **Day 3 — Andrew refines the question.** Andrew opens the question record and edits the body's `# Exploration` section with sharper framing, then sets `status: refined` via `vault_edit(set_fields={"status": "refined"})`. The pre-edit snapshot captures `pre_fm = {"status": "open", ...}`; the post-edit `fm = {"status": "refined", ...}`. Both predicate evaluations are True (`{"open", "refined"}` covers both). Action: **add (idempotent)** — the bullet is already present, so the rewriter no-ops via the wikilink-presence check. The bullet stays singular.
+>
+> **Day 5 — Andrew answers the question with a zettel.** Andrew creates `zettel/The descriptive-prescriptive split in 'live according to nature'.md` and edits the question record: `vault_edit(set_fields={"status": "answered", "answered_by": "[[zettel/The descriptive-prescriptive split...]]"})`. Pre-edit snapshot: `status: refined` (predicate True). Post-edit: `status: answered` (predicate False — `"answered"` is NOT in `{"open", "refined"}`). Action: **remove**.
+>
+> `_build_remove_bullet_rewriter` matches the bullet line in `MOC/_Open Questions.md`'s `# Contents` and removes it. The MOC body is now whatever-other-bullets minus this one. Summary log: `inventory_moc_dispatch_summary matched_entries=1 added=0 removed=1 skipped=0`. The inventory MOC accurately reflects "no longer open."
+>
+> **Note on the answering zettel itself.** The zettel creation in Day 5 does NOT fire the inventory MOC dispatch (zettel is not in `INVENTORY_MOC_DISPATCH`). It DOES fire Phase 3 author Contents append (if `author:` set) and Phase 4 Sub-arc A topic-MOC member append (if `mocs:` set) per the usual zettel-hook flow.
+
+### When the operator manually removes a bullet from an inventory MOC
+
+If Andrew opens `MOC/_Open Questions.md` and manually deletes a bullet that should be there (the question is still `open`), the next `vault_edit` of that question record will re-add the bullet via the True → True idempotent re-fire. This is **intentional self-heal** — the inventory MOC's accuracy invariant takes precedence over manual edits.
+
+If Andrew manually adds a bullet that the predicate doesn't endorse (a question whose status is `answered`), Hypatia will NOT remove it on the next dispatch — the dispatcher only writes when a predicate transition occurs. The hand-added bullet stays static until the next dispatch fires + the predicate result diverges from the file state. Net effect: operator hand-edits to the bullet list are tolerated but not authoritative; the dispatcher's view of truth eventually wins on the next predicate-flipping edit.
+
+This shape mirrors the broader "vault is canonical; cross-record mirroring is a projection" discipline. The system-maintained projection re-projects on every relevant edit; the operator can intervene mid-cycle but the projection re-asserts on the next dispatch.
+
+### Future inventory MOCs — operator request flow
+
+If Andrew asks for a new inventory MOC ("I want a `MOC/_Active Sources.md` that lists all my in-progress source captures"), the response shape is:
+
+1. **Confirm scope** — what's the predicate? Status field? Combined status + recency? Authored-by-me-only?
+2. **Confirm the predicate is computable from frontmatter** — the dispatch table requires `Callable[[dict], bool]` over post-edit frontmatter. If the predicate needs to read the body section, escalate to builder (predicate signature would need to change).
+3. **Escalate to builder for the dispatch-table entry**. The table lives in code (`zettel_hooks.py`), not in any vault file. A new entry is a code-layer ship — builder adds the tuple, writes a regression test on the truth-table semantics, and confirms `_ensure_inventory_moc` auto-create works for the new shape.
+4. **Do NOT hand-author the `MOC/_*.md` file in advance** — the auto-create runs on first qualifying writer record. Pre-creating the file by hand leaves it sitting empty if no writer record currently qualifies, AND risks frontmatter divergence from what `vault_create` would have written.
+
+The dispatch table is the registration surface; the file is the projection. Don't write the projection without the registration.
+
+### Edge cases — what Sub-arc B does NOT do
+
+- **Status-validation override.** The inventory dispatcher reads `status` post-edit and trusts the value. If the operator typo's `status: opn` instead of `open`, the predicate evaluates as False (`"opn"` is not in `{"open", "refined"}`), and the record is NOT added to `_Open Questions`. This is correct — the inventory reflects what's actually in the frontmatter, not what the operator meant. The `_validate_status` gate in `ops.py` will catch the typo BEFORE the hook fires (raises VaultError on unknown status), but only if the type's status enum is registered in `STATUS_BY_TYPE`.
+- **Retroactive backfill.** When a new inventory MOC ships (e.g., when `_Active Sources.md` is added to the dispatch table), the dispatcher does NOT scan historical records to backfill the inventory. The MOC populates organically from the next qualifying `vault_create` / `vault_edit` per record. If Andrew wants the historical roster immediately, the operator action is to re-save each qualifying record (any `vault_edit` re-fires the dispatch).
+- **Cross-instance.** Inventory MOCs are scoped per-instance (Hypatia's vault, in Hypatia's `scope="hypatia"`). Salem and KAL-LE do not have `question/` or `research-pointer/` records — `_MOC_TRIGGER_TYPES` and `INVENTORY_MOC_DISPATCH` are zettelkasten-flavoured, and zettelkasten types are Hypatia-only per `HYPATIA_CREATE_TYPES` in `vault/scope.py`.
+- **Sub-arc C and slash commands.** The `/questions` and `/research-pointers` Telegram slash commands are a separate Sub-arc C ship in flight (will get its own SKILL audit when it lands). Sub-arc B is purely the vault-side dispatch; talker-surface query UX is Sub-arc C's domain.
 
 ---
 
