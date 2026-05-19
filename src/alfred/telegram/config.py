@@ -244,6 +244,40 @@ class InventoryViewsConfig:
 
 
 @dataclass
+class MocSuggestionsConfig:
+    """Per-instance gate for the ``/moc-suggestions`` + ``/accept-moc`` +
+    ``/reject-moc`` slash commands (Phase 5 Sub-arc D2, 2026-05-19).
+
+    Default ``False`` so Salem + KAL-LE never accidentally register the
+    commands. Hypatia opts in via
+    ``telegram.moc_suggestions.command_enabled: true`` in
+    ``config.hypatia.yaml`` because her vault is the only one running
+    the surveyor MOC-suggestion stage (D1 ship; ``surveyor.moc_suggestion.enabled=true``
+    in her config).
+
+    Conditional registration: when ``command_enabled=False`` (or the
+    ``moc_suggestions`` block is absent entirely), none of the three
+    slash commands are registered — Telegram's "unknown command"
+    behaviour fires for instances that legitimately don't have a queue.
+
+    Mirror of :class:`InventoryViewsConfig` + :class:`FictionConfig` +
+    :class:`VoiceTrainConfig` shape — same Hypatia-only-by-default
+    convention. See ``project_hypatia_zettelkasten_redesign.md`` Phase 5
+    Sub-arc D for the arc spec.
+    """
+
+    command_enabled: bool = False
+    #: Path to the surveyor's MOC suggestion JSONL queue. None means
+    #: derive from a sensible default at handler-call time — but the
+    #: handler needs an explicit hint because the bot doesn't have a
+    #: direct reference to the surveyor's state path. Operator sets
+    #: this in config.hypatia.yaml to match her surveyor.state.path
+    #: parent. Same pattern as :class:`VoiceTrainConfig.queue_path` —
+    #: explicit JSONL path operator-set per instance.
+    queue_path: str | None = None
+
+
+@dataclass
 class VoiceTrainConfig:
     """Per-instance gate for the ``/train`` + ``/method-source`` slash commands.
 
@@ -386,6 +420,13 @@ class TalkerConfig:
     # /research-pointers commands surface her question/ and
     # research-pointer/ records (types Salem + KAL-LE don't have).
     inventory_views: InventoryViewsConfig | None = None
+    # MOC suggestions gate — see :class:`MocSuggestionsConfig`.
+    # Default-OFF / None sentinel matching the inventory_views shape.
+    # Hypatia is Phase 5 Sub-arc D2's only opt-in; the
+    # /moc-suggestions + /accept-moc + /reject-moc commands consume
+    # the JSONL queue written by surveyor's Stage 8 (D1 ship). Salem +
+    # KAL-LE leave this block absent.
+    moc_suggestions: MocSuggestionsConfig | None = None
     # Path to the config file this TalkerConfig was loaded from. Carried
     # so lazy/late loaders (notably the inter-instance peer-tool dispatcher
     # in ``conversation._dispatch_peer_inter_instance_tool``) can re-read
@@ -417,6 +458,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "fiction": FictionConfig,
     "voice_train": VoiceTrainConfig,
     "inventory_views": InventoryViewsConfig,
+    "moc_suggestions": MocSuggestionsConfig,
 }
 
 
@@ -513,6 +555,14 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     if isinstance(inventory_views_raw, dict) and inventory_views_raw:
         built.inventory_views = _build(
             InventoryViewsConfig, inventory_views_raw,
+        )
+    # MOC suggestions — defaulted-OFF / None sentinel. Same shape as
+    # inventory_views. Block-absent means the /moc-suggestions +
+    # /accept-moc + /reject-moc commands are NOT registered.
+    moc_suggestions_raw = tool.get("moc_suggestions")
+    if isinstance(moc_suggestions_raw, dict) and moc_suggestions_raw:
+        built.moc_suggestions = _build(
+            MocSuggestionsConfig, moc_suggestions_raw,
         )
     # Synthetic ``_config_path`` key — set by the CLI in ``cmd_up`` /
     # other entry points before handing ``raw`` to the orchestrator,

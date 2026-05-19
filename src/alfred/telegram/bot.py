@@ -404,6 +404,25 @@ def build_app(
         )
         log.info("talker.bot.inventory_views_commands_registered")
 
+    # Phase 5 Sub-arc D2 (2026-05-19): /moc-suggestions + /accept-moc +
+    # /reject-moc — view + act on the cluster→MOC suggestion queue
+    # written by surveyor's Stage 8 (D1 ship). PTB requires
+    # ``[a-z0-9_]`` so the dash forms register as underscore aliases;
+    # the dash form falls through to Telegram's unknown-command
+    # behaviour on instances that don't have the underscore form
+    # registered. Hypatia-only via the ``moc_suggestions`` config
+    # gate; Salem + KAL-LE leave the block absent.
+    if (
+        config.moc_suggestions is not None
+        and config.moc_suggestions.command_enabled
+    ):
+        app.add_handler(
+            CommandHandler("moc_suggestions", on_moc_suggestions),
+        )
+        app.add_handler(CommandHandler("accept_moc", on_accept_moc))
+        app.add_handler(CommandHandler("reject_moc", on_reject_moc))
+        log.info("talker.bot.moc_suggestions_commands_registered")
+
     # Email-surfacing c2: Daily Sync slash commands. /calibrate fires
     # an out-of-cycle Daily Sync sample; /calibration_ok flips per-tier
     # confidence flags read by the (future) c3/c4/c5 surfacing layers.
@@ -879,6 +898,404 @@ async def on_research_pointers(
         update, ctx,
         record_type="research-pointer",
         command_name="/research-pointers",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 Sub-arc D2 (2026-05-19): /moc-suggestions + /accept-moc +
+# /reject-moc — view + act on the MOC suggestion queue.
+# ---------------------------------------------------------------------------
+#
+# Three commands consume one JSONL queue. ``/moc-suggestions`` is
+# read-only (lists pending grouped by target). ``/accept-moc <id>`` is
+# the write surface: edits each candidate member's ``mocs:`` frontmatter
+# to append the target MOC, triggering Phase 4 Sub-arc A's existing
+# hook → MOC's ``# Contents`` gets a wikilink. ``/reject-moc <id>``
+# flips status to ``rejected`` (no vault write; negative-learning
+# persists per ratified Q5).
+#
+# PTB only allows ``[a-z0-9_]`` in command names, so ``/accept-moc`` +
+# ``/reject-moc`` register as ``accept_moc`` + ``reject_moc`` (underscore
+# form). The docstring + reply messaging use the dash form for
+# operator readability.
+#
+# All three are gated on ``telegram.moc_suggestions.command_enabled:
+# true``. Hypatia opts in; Salem + KAL-LE leave the block absent so
+# Telegram's unknown-command behaviour fires.
+
+
+def _resolve_moc_suggestions_queue_path(
+    config: TalkerConfig,
+) -> str | None:
+    """Resolve the configured queue path.
+
+    Reads ``config.moc_suggestions.queue_path``. Returns None when the
+    config block is missing or the path is unset — bot handlers
+    interpret None as "command not properly configured" and reply with
+    a recognizable failure message rather than crashing.
+    """
+    if config.moc_suggestions is None:
+        return None
+    return config.moc_suggestions.queue_path
+
+
+async def on_moc_suggestions(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """/moc-suggestions — list pending MOC suggestions, grouped by target.
+
+    Read-only. Calls
+    :func:`alfred.telegram.moc_suggestion_views.collect_pending` (queue
+    file read, no writes) then renders the result as a grouped-by-MOC
+    Markdown reply via ``render_suggestions``.
+
+    Hypatia-only via the ``moc_suggestions`` config gate. Empty-state
+    per ``intentionally_left_blank``: explicit "no pending" message,
+    never a blank reply.
+
+    Failure isolation: any unexpected exception in collect/render path
+    logs and replies with a generic error rather than crashing the
+    handler. The queue is canonical; the slash command is a glance-
+    view.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        log.info(
+            "talker.bot.unauthorized",
+            user_id=update.effective_user.id if update.effective_user else None,
+            command="/moc-suggestions",
+        )
+        return
+    if update.message is None:
+        return
+
+    queue_path = _resolve_moc_suggestions_queue_path(config)
+    if queue_path is None:
+        await update.message.reply_text(
+            "❌ /moc-suggestions is not configured "
+            "(missing telegram.moc_suggestions.queue_path)."
+        )
+        log.warning(
+            "talker.bot.moc_suggestions_no_queue_path",
+            command="/moc-suggestions",
+        )
+        return
+
+    try:
+        from . import moc_suggestion_views as _msv
+        suggestions = _msv.collect_pending(queue_path)
+        reply = _msv.render_suggestions(suggestions)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.moc_suggestions_failed",
+            command="/moc-suggestions",
+            queue_path=queue_path,
+            error=str(exc),
+        )
+        await update.message.reply_text(
+            f"❌ Could not load MOC suggestions ({type(exc).__name__})"
+        )
+        return
+
+    # Cap defensively at 4000 chars to stay under Telegram's 4096 limit.
+    # If overflow, append a truncation note rather than silently chop.
+    truncated = False
+    if len(reply) > 4000:
+        reply = reply[:3950].rstrip() + "\n\n…(truncated; queue has more — see queue file directly)"
+        truncated = True
+
+    await update.message.reply_text(reply)
+
+    log.info(
+        "talker.bot.moc_suggestions_done",
+        command="/moc-suggestions",
+        suggestion_count=len(suggestions),
+        reply_chars=len(reply),
+        truncated=truncated,
+    )
+
+
+def _parse_id_argument(update: Update, command: str) -> str | None:
+    """Extract the suggestion id argument from ``/accept-moc <id>`` /
+    ``/reject-moc <id>``.
+
+    Returns None when no id is supplied (handler renders the usage hint).
+    Defensive against the message-text-is-None path; whitespace tolerant.
+    """
+    text = (update.message.text or "") if update.message else ""
+    parts = text.strip().split()
+    # parts[0] is the command itself (e.g. "/accept_moc"); parts[1:]
+    # carries any args. Ignore extras silently — the id is positional.
+    if len(parts) < 2:
+        return None
+    return parts[1].strip()
+
+
+async def on_accept_moc(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """/accept-moc <id> — apply a pending MOC suggestion.
+
+    Per the ratified Q3.5 design (b): the accept path edits each
+    candidate member record's ``mocs:`` frontmatter to append the
+    target MOC, triggering Phase 4 Sub-arc A's existing append hook
+    on the MOC's ``# Contents``. ONE write surface (member-side
+    frontmatter); the MOC body update is downstream of that.
+
+    For ``propose_new`` suggestions, the new MOC is created via
+    ``vault_create`` before iterating members.
+
+    State machine:
+      * Status pending → accepted (transitional). If queue's state
+        machine refuses (already non-pending), reply explains.
+      * vault_create (propose-new) or skip (existing target).
+      * Per-member vault_edit. Failures captured per-member; loop
+        continues so partial success is preserved.
+      * Final: status → applied if every member succeeded; else
+        pending with first error in ``last_apply_error``.
+
+    PTB registers this as ``accept_moc`` (underscore); operator types
+    ``/accept_moc <id>`` (underscore form). The dash form
+    ``/accept-moc`` falls through to Telegram's unknown-command
+    behaviour because PTB only accepts ``[a-z0-9_]`` in registrations.
+    See registration block in :func:`build_app`.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        log.info(
+            "talker.bot.unauthorized",
+            user_id=update.effective_user.id if update.effective_user else None,
+            command="/accept-moc",
+        )
+        return
+    if update.message is None:
+        return
+
+    suggestion_id = _parse_id_argument(update, "/accept-moc")
+    if suggestion_id is None:
+        await update.message.reply_text(
+            "Usage: `/accept-moc <id>` — id is the `ms-YYYYMMDD-xxxxxxxx` "
+            "value from /moc-suggestions."
+        )
+        return
+
+    queue_path = _resolve_moc_suggestions_queue_path(config)
+    if queue_path is None:
+        await update.message.reply_text(
+            "❌ /accept-moc is not configured "
+            "(missing telegram.moc_suggestions.queue_path)."
+        )
+        return
+
+    from . import moc_suggestion_views as _msv
+
+    try:
+        suggestion = _msv.lookup_suggestion(queue_path, suggestion_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.moc_lookup_failed",
+            command="/accept-moc",
+            suggestion_id=suggestion_id,
+            error=str(exc),
+        )
+        await update.message.reply_text(
+            f"❌ Could not load MOC suggestion queue ({type(exc).__name__})"
+        )
+        return
+
+    if suggestion is None:
+        await update.message.reply_text(
+            f"❌ No suggestion found with ID `{suggestion_id}`. "
+            "Use /moc-suggestions to list pending."
+        )
+        log.info(
+            "talker.bot.moc_accept_unknown_id",
+            suggestion_id=suggestion_id,
+        )
+        return
+
+    if suggestion.status != "pending":
+        await update.message.reply_text(
+            f"❌ Suggestion `{suggestion_id}` is `{suggestion.status}`, "
+            "not pending. Only pending suggestions can be accepted."
+        )
+        log.info(
+            "talker.bot.moc_accept_non_pending",
+            suggestion_id=suggestion_id,
+            current_status=suggestion.status,
+        )
+        return
+
+    # Apply path. Failures-isolated within ``apply_accept``; the
+    # function returns an ``ApplyResult`` regardless of outcome.
+    try:
+        result = _msv.apply_accept(
+            suggestion=suggestion,
+            queue_path=queue_path,
+            vault_path=Path(config.vault.path),
+            scope=config.instance.name.lower() if config.instance and config.instance.name else "hypatia",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.moc_apply_unhandled",
+            command="/accept-moc",
+            suggestion_id=suggestion_id,
+            error=str(exc),
+        )
+        await update.message.reply_text(
+            f"❌ Apply failed unexpectedly ({type(exc).__name__})."
+        )
+        return
+
+    # Render reply based on the ApplyResult shape.
+    if result.all_succeeded:
+        target_note = (
+            f"created new MOC `{result.target_label}`"
+            if result.new_moc_created
+            else f"target `{result.target_label}`"
+        )
+        reply = (
+            f"✓ Applied suggestion `{suggestion_id}` — "
+            f"added {result.members_total} member(s) to {target_note}."
+        )
+    elif result.new_moc_create_error:
+        reply = (
+            f"⚠️ Suggestion `{suggestion_id}` apply failed at MOC creation. "
+            f"Status reverted to pending. Error: `{result.first_error}`"
+        )
+    else:
+        succ = len(result.members_succeeded)
+        fail = len(result.members_failed)
+        reply = (
+            f"⚠️ Suggestion `{suggestion_id}` partially applied — "
+            f"{succ} succeeded, {fail} failed. Status reverted to "
+            f"pending with error: `{result.first_error}`"
+        )
+
+    await update.message.reply_text(reply)
+
+    log.info(
+        "talker.bot.moc_accept_done",
+        command="/accept-moc",
+        suggestion_id=suggestion_id,
+        members_succeeded=len(result.members_succeeded),
+        members_failed=len(result.members_failed),
+        new_moc_created=result.new_moc_created,
+        outcome=(
+            "applied" if result.all_succeeded
+            else "create_failed" if result.new_moc_create_error
+            else "partial"
+        ),
+    )
+
+
+async def on_reject_moc(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """/reject-moc <id> — flip a pending MOC suggestion to rejected.
+
+    No vault write. Status → rejected. Per ratified Q5,
+    rejected suggestions persist in the queue indefinitely so
+    surveyor's idempotent upsert never re-proposes the same
+    (members, target) pair — negative-learning surface.
+
+    PTB registers this as ``reject_moc`` (underscore); operator types
+    ``/reject_moc <id>``. The dash form falls through to Telegram's
+    unknown-command behaviour (PTB-imposed; same as /accept-moc).
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        log.info(
+            "talker.bot.unauthorized",
+            user_id=update.effective_user.id if update.effective_user else None,
+            command="/reject-moc",
+        )
+        return
+    if update.message is None:
+        return
+
+    suggestion_id = _parse_id_argument(update, "/reject-moc")
+    if suggestion_id is None:
+        await update.message.reply_text(
+            "Usage: `/reject-moc <id>` — id is the `ms-YYYYMMDD-xxxxxxxx` "
+            "value from /moc-suggestions."
+        )
+        return
+
+    queue_path = _resolve_moc_suggestions_queue_path(config)
+    if queue_path is None:
+        await update.message.reply_text(
+            "❌ /reject-moc is not configured "
+            "(missing telegram.moc_suggestions.queue_path)."
+        )
+        return
+
+    from . import moc_suggestion_views as _msv
+
+    try:
+        suggestion = _msv.lookup_suggestion(queue_path, suggestion_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.moc_lookup_failed",
+            command="/reject-moc",
+            suggestion_id=suggestion_id,
+            error=str(exc),
+        )
+        await update.message.reply_text(
+            f"❌ Could not load MOC suggestion queue ({type(exc).__name__})"
+        )
+        return
+
+    if suggestion is None:
+        await update.message.reply_text(
+            f"❌ No suggestion found with ID `{suggestion_id}`. "
+            "Use /moc-suggestions to list pending."
+        )
+        log.info(
+            "talker.bot.moc_reject_unknown_id",
+            suggestion_id=suggestion_id,
+        )
+        return
+
+    if suggestion.status != "pending":
+        await update.message.reply_text(
+            f"❌ Suggestion `{suggestion_id}` is `{suggestion.status}`, "
+            "not pending. Only pending suggestions can be rejected."
+        )
+        log.info(
+            "talker.bot.moc_reject_non_pending",
+            suggestion_id=suggestion_id,
+            current_status=suggestion.status,
+        )
+        return
+
+    success = _msv.reject_suggestion(
+        queue_path=queue_path, suggestion_id=suggestion_id,
+    )
+
+    if success:
+        target_label = (
+            suggestion.target_moc_rel_path
+            if suggestion.target_moc_rel_path
+            else f"new MOC: {suggestion.proposed_new_moc_name or '(unnamed)'}"
+        )
+        reply = (
+            f"✓ Rejected suggestion `{suggestion_id}` — "
+            f"target `{target_label}` will not be re-proposed."
+        )
+    else:
+        reply = (
+            f"❌ Could not reject `{suggestion_id}` "
+            "(state machine refused; check current status via /moc-suggestions)."
+        )
+
+    await update.message.reply_text(reply)
+
+    log.info(
+        "talker.bot.moc_reject_done",
+        command="/reject-moc",
+        suggestion_id=suggestion_id,
+        success=success,
     )
 
 
