@@ -54,6 +54,17 @@ class Daemon:
         # reload flips the flag on (defensive; daemon doesn't currently
         # reload mid-process, but the field is cheap).
         self._moc_suggestion_disabled_logged: bool = False
+        # Phase 5 Sub-arc D1 fixup (2026-05-19): same lifecycle-gate
+        # discipline for the "vault has no MOC/ directory" state. The
+        # original D1 ship emitted ``surveyor.moc_suggestion.no_moc_dir``
+        # from inside ``build_existing_mocs_index`` on every sweep, which
+        # caused log spam on Hypatia's current vault (no MOCs created
+        # yet). Same pattern inconsistency as the ``stage_disabled`` log
+        # above — both are structural-absence states, both must
+        # lifecycle-gate. Flipped to True after the first emission;
+        # reset to False whenever ``MOC/`` is observed on disk so a
+        # later transition back to absent re-emits.
+        self._moc_suggestion_no_moc_dir_logged: bool = False
 
         self.state = PipelineState(cfg.state.path)
         self.watcher = VaultWatcher(cfg.vault, cfg.watcher)
@@ -1249,7 +1260,31 @@ class Daemon:
             queue_path = derive_default_queue_path(self.cfg.state.path)
 
         # Build the MOC index ONCE per sweep (vault read).
-        existing_mocs = build_existing_mocs_index(self.cfg.vault.path)
+        # ``build_existing_mocs_index`` returns ``(index, moc_dir_exists)``
+        # so the daemon can lifecycle-gate the no-MOC-dir log without
+        # the pure-logic suggester knowing about the latch state. Per
+        # ``feedback_intentionally_left_blank.md`` — silence-from-no-
+        # MOC-dir must surface distinctly from silence-from-failure;
+        # once-per-lifecycle keeps the log signal low while remaining
+        # grep-able.
+        existing_mocs, moc_dir_exists = build_existing_mocs_index(
+            self.cfg.vault.path,
+        )
+        if not moc_dir_exists:
+            if not self._moc_suggestion_no_moc_dir_logged:
+                log.info(
+                    "surveyor.moc_suggestion.no_moc_dir",
+                    vault_path=str(self.cfg.vault.path),
+                )
+                self._moc_suggestion_no_moc_dir_logged = True
+        else:
+            # Re-arm the latch on transition-back-to-present so a
+            # later directory removal re-emits the log. Defensive —
+            # the directory typically only appears once (operator
+            # creates the first MOC) but the symmetry matches the
+            # ``stage_disabled`` latch and the ``entity_link_no_
+            # entities_logged`` latch (Sub-arc B).
+            self._moc_suggestion_no_moc_dir_logged = False
 
         all_proposals = []
         clusters_evaluated = 0

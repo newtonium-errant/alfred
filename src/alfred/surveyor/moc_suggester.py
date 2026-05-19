@@ -175,9 +175,24 @@ _CONTENTS_HEADING_RE: re.Pattern[str] = re.compile(
 _NEXT_HEADING_RE: re.Pattern[str] = re.compile(r"^#{1,2}\s+", re.MULTILINE)
 
 
-def build_existing_mocs_index(vault_path: Path) -> dict[str, ExistingMoc]:
+def build_existing_mocs_index(
+    vault_path: Path,
+) -> tuple[dict[str, ExistingMoc], bool]:
     """Scan ``<vault>/MOC/*.md`` and return a rel_path → ExistingMoc
-    map of every NON-INVENTORY MOC on disk.
+    map of every NON-INVENTORY MOC on disk, paired with a boolean
+    that reports whether the ``MOC/`` directory exists.
+
+    Returns ``(index, moc_dir_exists)`` so the caller can decide
+    whether to emit a lifecycle-gated "no MOC directory" log without
+    this function having to know about the daemon's latch state.
+    Per ``feedback_intentionally_left_blank.md`` + the Sub-arc D1
+    fixup (2026-05-19 code-reviewer note): the suggester is pure
+    logic — observability emission lives in the daemon, where the
+    per-instance lifecycle state lives.
+
+    When ``moc_dir_exists`` is False, ``index`` is empty by
+    definition. When it's True, ``index`` may still be empty (the
+    directory exists but holds no non-inventory MOCs).
 
     Inventory MOCs (``MOC/_*.md``) are filtered out here — they
     can't appear as candidate targets anyway, so excluding at the
@@ -192,15 +207,15 @@ def build_existing_mocs_index(vault_path: Path) -> dict[str, ExistingMoc]:
 
     Failure-isolated: any exception parsing a single MOC file logs
     a warning and skips that MOC; never raises to the caller.
-    Returns an empty dict if ``<vault>/MOC/`` doesn't exist.
     """
     moc_dir = vault_path / "MOC"
     if not moc_dir.is_dir():
-        log.info(
-            "surveyor.moc_suggestion.no_moc_dir",
-            vault_path=str(vault_path),
-        )
-        return {}
+        # No directory → caller logs the lifecycle-gated message.
+        # We DO NOT emit ``surveyor.moc_suggestion.no_moc_dir`` here;
+        # per-sweep emission was the pre-fixup behaviour and caused
+        # log spam every tick on vaults that have not yet created
+        # any MOCs (Hypatia's current state).
+        return ({}, False)
 
     index: dict[str, ExistingMoc] = {}
     for md_file in sorted(moc_dir.glob("*.md")):
@@ -228,7 +243,7 @@ def build_existing_mocs_index(vault_path: Path) -> dict[str, ExistingMoc]:
             name=name,
             contents_members=frozenset(contents_members),
         )
-    return index
+    return (index, True)
 
 
 def _extract_contents_member_paths(body: str) -> list[str]:

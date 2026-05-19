@@ -132,6 +132,9 @@ def isolated_daemon(tmp_path: Path):
     d._shutdown_requested = False
     d._entity_link_no_entities_logged = False
     d._moc_suggestion_disabled_logged = False
+    # Sub-arc D1 fixup (2026-05-19): mirror the no_moc_dir lifecycle
+    # latch initialization that ``Daemon.__init__`` does.
+    d._moc_suggestion_no_moc_dir_logged = False
     # State must support ``.clusters`` dict so the suggester can read
     # cluster labels.
     from alfred.surveyor.state import PipelineState
@@ -196,6 +199,140 @@ async def test_disabled_log_latch_resets_when_stage_flips_on(
         cluster_members={}, all_changed=set(), records={},
     )
     assert isolated_daemon._moc_suggestion_disabled_logged is False
+
+
+# ---------------------------------------------------------------------------
+# no_moc_dir lifecycle-gated log (Sub-arc D1 fixup, 2026-05-19).
+# ---------------------------------------------------------------------------
+#
+# Originally D1 emitted ``surveyor.moc_suggestion.no_moc_dir`` from
+# inside ``build_existing_mocs_index`` on every sweep, causing log
+# spam on vaults with no ``MOC/`` directory (Hypatia's current state).
+# Fixup pattern: suggester returns ``(index, moc_dir_exists)``; the
+# daemon owns the lifecycle-gated emission. Tests verify:
+#   1. First sweep with no MOC/ → log fires once
+#   2. Second sweep still missing MOC/ → log does NOT re-fire
+#   3. MOC/ created between sweeps → latch resets; later removal
+#      would re-emit (transition-back defense)
+
+
+@pytest.mark.asyncio
+async def test_no_moc_dir_log_fires_once_on_first_sweep(
+    isolated_daemon, tmp_path: Path,
+) -> None:
+    """First sweep with no ``MOC/`` directory in the vault → log
+    ``surveyor.moc_suggestion.no_moc_dir`` exactly once."""
+    # Vault has no MOC/ directory by default (fixture only mkdir's
+    # the vault root). Stage is enabled.
+    assert not (isolated_daemon.cfg.vault.path / "MOC").is_dir()
+
+    with structlog.testing.capture_logs() as captured:
+        n = await isolated_daemon._maybe_emit_moc_suggestions(
+            cluster_members={}, all_changed=set(), records={},
+        )
+    assert n == 0
+
+    matches = [
+        c for c in captured
+        if c.get("event") == "surveyor.moc_suggestion.no_moc_dir"
+    ]
+    assert len(matches) == 1, (
+        f"Expected exactly one no_moc_dir log emission on first sweep; "
+        f"got {len(matches)}: {matches}"
+    )
+    # Key field assertion — catches field rename / drop in future refactor.
+    assert "vault_path" in matches[0]
+    assert matches[0]["vault_path"] == str(isolated_daemon.cfg.vault.path)
+    # Latch is set after first emission.
+    assert isolated_daemon._moc_suggestion_no_moc_dir_logged is True
+
+
+@pytest.mark.asyncio
+async def test_no_moc_dir_log_does_not_re_fire_across_sweeps(
+    isolated_daemon, tmp_path: Path,
+) -> None:
+    """Subsequent sweeps while ``MOC/`` is still absent must NOT
+    re-emit. The original D1 bug was per-sweep spam; this test pins
+    the latch behaviour so a future refactor that moves the log
+    back into the suggester is caught."""
+    assert not (isolated_daemon.cfg.vault.path / "MOC").is_dir()
+
+    with structlog.testing.capture_logs() as captured:
+        # Three sweeps; only the first should emit.
+        for _ in range(3):
+            await isolated_daemon._maybe_emit_moc_suggestions(
+                cluster_members={}, all_changed=set(), records={},
+            )
+
+    matches = [
+        c for c in captured
+        if c.get("event") == "surveyor.moc_suggestion.no_moc_dir"
+    ]
+    assert len(matches) == 1, (
+        f"Latch must hold across multiple sweeps with no MOC/ "
+        f"directory; got {len(matches)} emissions across 3 sweeps: "
+        f"{matches}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_moc_dir_latch_resets_when_dir_appears(
+    isolated_daemon, tmp_path: Path,
+) -> None:
+    """Operator creates the first MOC between sweeps → latch resets
+    so a hypothetical later directory removal re-emits. Defensive
+    symmetry with the ``stage_disabled`` latch + the Sub-arc B
+    ``entity_link_no_entities_logged`` latch."""
+    # Sweep 1 — no MOC/ dir → log + latch set.
+    await isolated_daemon._maybe_emit_moc_suggestions(
+        cluster_members={}, all_changed=set(), records={},
+    )
+    assert isolated_daemon._moc_suggestion_no_moc_dir_logged is True
+
+    # Operator creates MOC/ between sweeps.
+    moc_dir = isolated_daemon.cfg.vault.path / "MOC"
+    moc_dir.mkdir()
+    (moc_dir / "First MOC.md").write_text(
+        "---\ntype: MOC\nname: First MOC\n---\n# Contents\n"
+    )
+
+    # Sweep 2 — MOC/ now present → latch resets.
+    with structlog.testing.capture_logs() as captured:
+        await isolated_daemon._maybe_emit_moc_suggestions(
+            cluster_members={}, all_changed=set(), records={},
+        )
+    assert isolated_daemon._moc_suggestion_no_moc_dir_logged is False, (
+        "Latch must reset when MOC/ directory is observed on disk so "
+        "a later transition back to absent re-emits the log"
+    )
+    # Sweep 2 itself does NOT emit no_moc_dir (dir exists now).
+    sweep2_no_moc_dir = [
+        c for c in captured
+        if c.get("event") == "surveyor.moc_suggestion.no_moc_dir"
+    ]
+    assert sweep2_no_moc_dir == [], (
+        "no_moc_dir must not fire when MOC/ directory is present"
+    )
+
+    # Sweep 3 — operator removes MOC/ (unusual but pin the symmetry).
+    # With the latch reset, the next no-MOC sweep must re-emit. This
+    # is the "transition-back-to-absent" defense — the latch isn't a
+    # daemon-lifetime one-shot, it's a state-change marker.
+    import shutil
+    shutil.rmtree(moc_dir)
+    with structlog.testing.capture_logs() as captured2:
+        await isolated_daemon._maybe_emit_moc_suggestions(
+            cluster_members={}, all_changed=set(), records={},
+        )
+    sweep3_no_moc_dir = [
+        c for c in captured2
+        if c.get("event") == "surveyor.moc_suggestion.no_moc_dir"
+    ]
+    assert len(sweep3_no_moc_dir) == 1, (
+        "After latch reset (dir appeared) and a subsequent dir removal, "
+        f"the no_moc_dir log must re-emit on the next sweep; got "
+        f"{len(sweep3_no_moc_dir)} emissions"
+    )
 
 
 # ---------------------------------------------------------------------------

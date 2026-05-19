@@ -595,7 +595,8 @@ def test_index_builder_filters_inventory_mocs(tmp_path: Path) -> None:
     (moc_dir / "_Open Questions.md").write_text(
         "---\ntype: MOC\nname: _Open Questions\n---\n# Contents\n"
     )
-    index = build_existing_mocs_index(tmp_path)
+    index, moc_dir_exists = build_existing_mocs_index(tmp_path)
+    assert moc_dir_exists is True
     assert "MOC/Stoicism MOC.md" in index
     assert "MOC/_Open Questions.md" not in index, (
         "Inventory MOC must be excluded from candidate index"
@@ -617,7 +618,8 @@ def test_index_builder_extracts_contents_members(tmp_path: Path) -> None:
         "# Tags\n"
         "- [[zettel/AFTER_CONTENTS]]\n"  # Bullet after # Contents section ends
     )
-    index = build_existing_mocs_index(tmp_path)
+    index, moc_dir_exists = build_existing_mocs_index(tmp_path)
+    assert moc_dir_exists is True
     moc = index["MOC/Test MOC.md"]
     assert "zettel/A" in moc.contents_members
     assert "zettel/B" in moc.contents_members
@@ -627,9 +629,30 @@ def test_index_builder_extracts_contents_members(tmp_path: Path) -> None:
 
 
 def test_index_builder_handles_missing_moc_dir(tmp_path: Path) -> None:
-    """Vault with no ``MOC/`` dir returns empty index — no crash."""
-    index = build_existing_mocs_index(tmp_path)
+    """Vault with no ``MOC/`` dir returns ``(empty index, False)``
+    — no crash, no log emission (the daemon owns the log).
+
+    Per the Sub-arc D1 fixup (2026-05-19): the pure-logic suggester
+    MUST NOT emit ``surveyor.moc_suggestion.no_moc_dir`` from this
+    function — the daemon's lifecycle-gated latch owns that
+    emission. Returning the boolean lets the caller decide.
+    """
+    import structlog.testing
+    with structlog.testing.capture_logs() as captured:
+        index, moc_dir_exists = build_existing_mocs_index(tmp_path)
     assert index == {}
+    assert moc_dir_exists is False
+    # Defensive — the suggester must NOT emit no_moc_dir from this
+    # path. If it does, the lifecycle-gate in the daemon is bypassed
+    # and we get per-sweep spam (the original D1 bug).
+    no_moc_dir_logs = [
+        c for c in captured
+        if c.get("event") == "surveyor.moc_suggestion.no_moc_dir"
+    ]
+    assert no_moc_dir_logs == [], (
+        "build_existing_mocs_index must not emit no_moc_dir — the "
+        "daemon's lifecycle-gated latch owns that emission"
+    )
 
 
 def test_index_builder_skips_corrupt_moc_file(tmp_path: Path) -> None:
@@ -643,7 +666,8 @@ def test_index_builder_skips_corrupt_moc_file(tmp_path: Path) -> None:
     (moc_dir / "Bad MOC.md").write_text(
         "---\ntype: MOC\nbad_yaml: [unclosed\n---\n# Contents\n"
     )
-    index = build_existing_mocs_index(tmp_path)
+    index, moc_dir_exists = build_existing_mocs_index(tmp_path)
+    assert moc_dir_exists is True
     # Good MOC loads; Bad MOC silently dropped.
     assert "MOC/Good MOC.md" in index
     # Bad MOC may or may not parse depending on python-frontmatter
