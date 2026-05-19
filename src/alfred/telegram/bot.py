@@ -385,6 +385,25 @@ def build_app(
         app.add_handler(CommandHandler("method_source", on_method_source))
         log.info("talker.bot.voice_train_commands_registered")
 
+    # Phase 4 Sub-arc C (2026-05-18): /questions + /research-pointers
+    # — grouped-by-MOC views over question/ and research-pointer/
+    # records with the same predicates that drive Sub-arc B's
+    # inventory MOCs. Hypatia-only via the ``inventory_views`` config
+    # gate; Salem + KAL-LE don't have these record types so the gate
+    # matches the data shape. PTB requires ``[a-z0-9_]`` so
+    # ``/research-pointers`` registers as ``research_pointers`` — the
+    # dash form falls through to Telegram's unknown-command behaviour
+    # on instances that don't have the underscore form registered.
+    if (
+        config.inventory_views is not None
+        and config.inventory_views.command_enabled
+    ):
+        app.add_handler(CommandHandler("questions", on_questions))
+        app.add_handler(
+            CommandHandler("research_pointers", on_research_pointers),
+        )
+        log.info("talker.bot.inventory_views_commands_registered")
+
     # Email-surfacing c2: Daily Sync slash commands. /calibrate fires
     # an out-of-cycle Daily Sync sample; /calibration_ok flips per-tier
     # confidence flags read by the (future) c3/c4/c5 surfacing layers.
@@ -730,6 +749,136 @@ async def on_recap(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=chat_id,
         mode=mode,
         reply_chars=len(md),
+    )
+
+
+async def _on_inventory_view(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    record_type: str,
+    command_name: str,
+) -> None:
+    """Shared handler body for ``/questions`` and ``/research-pointers``.
+
+    Phase 4 Sub-arc C (2026-05-18). Read-only — calls
+    :func:`alfred.telegram.inventory_views.collect_records` (vault
+    scan, no writes) then renders the result as a grouped-by-MOC
+    Markdown reply.
+
+    Cross-instance scope: this handler is only registered when
+    ``telegram.inventory_views.command_enabled: true`` in the
+    instance config. Salem + KAL-LE don't have ``question/`` or
+    ``research-pointer/`` records, so the registration gate matches
+    the data shape. Defensive fallback if the gate is misconfigured:
+    the empty-state message renders the same way regardless of
+    whether the underlying directories are missing or the records
+    just don't match the predicate.
+
+    Failure isolation: any unexpected exception in the collection /
+    rendering path logs and replies with a generic error rather
+    than crashing the handler. The vault is canonical; the slash
+    command is a glance-view.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        log.info(
+            "talker.bot.unauthorized",
+            user_id=update.effective_user.id if update.effective_user else None,
+            command=command_name,
+        )
+        return
+    if update.message is None:
+        return
+
+    # Per-group cap from config (default 20). Operator-tunable.
+    per_group_cap = 20
+    if (
+        config.inventory_views is not None
+        and config.inventory_views.per_group_cap
+    ):
+        per_group_cap = config.inventory_views.per_group_cap
+
+    try:
+        from . import inventory_views as _iv
+        records = _iv.collect_records(
+            Path(config.vault.path), record_type,
+        )
+        reply = _iv.render_inventory(
+            record_type, records, per_group_cap=per_group_cap,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.inventory_view_failed",
+            command=command_name,
+            record_type=record_type,
+            error=str(exc),
+        )
+        await update.message.reply_text(
+            f"❌ Could not load {record_type}s ({type(exc).__name__})"
+        )
+        return
+
+    # Telegram has a ~4096 char body limit. Cap defensively at 4000
+    # chars so we never trigger the per-message rejection; if the
+    # rendering overflows, append a truncation note rather than
+    # silently chopping (per intentionally_left_blank discipline).
+    truncated = False
+    if len(reply) > 4000:
+        reply = reply[:3950].rstrip() + "\n\n…(truncated; bump per_group_cap or see MOC/_*.md)"
+        truncated = True
+
+    await update.message.reply_text(reply)
+
+    log.info(
+        "talker.bot.inventory_view_done",
+        command=command_name,
+        record_type=record_type,
+        record_count=len(records),
+        reply_chars=len(reply),
+        truncated=truncated,
+    )
+
+
+async def on_questions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/questions — grouped-by-MOC list of question/ records with
+    ``status in {open, refined}``.
+
+    Read-only. Mirrors the data surfaced by
+    ``MOC/_Open Questions.md`` (Sub-arc B inventory MOC) but
+    grouped by topic-MOC membership rather than flat.
+
+    Hypatia-only via the ``inventory_views`` config gate.
+    """
+    await _on_inventory_view(
+        update, ctx,
+        record_type="question",
+        command_name="/questions",
+    )
+
+
+async def on_research_pointers(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """/research-pointers — grouped-by-MOC list of research-pointer/
+    records with ``status == open``.
+
+    PTB only allows ``[a-z0-9_]`` in command names so the
+    registration is ``research_pointers`` (underscore form). Users
+    typing ``/research-pointers`` (dash form) get the legacy
+    unknown-command behaviour; ``/research_pointers`` works. The
+    docstring + reply messaging use the dash form for naming
+    consistency with the directory.
+
+    Read-only. Mirrors the data surfaced by
+    ``MOC/_Open Research Pointers.md`` (Sub-arc B inventory MOC).
+
+    Hypatia-only via the ``inventory_views`` config gate.
+    """
+    await _on_inventory_view(
+        update, ctx,
+        record_type="research-pointer",
+        command_name="/research-pointers",
     )
 
 

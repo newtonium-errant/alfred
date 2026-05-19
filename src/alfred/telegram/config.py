@@ -211,6 +211,39 @@ class FictionConfig:
 
 
 @dataclass
+class InventoryViewsConfig:
+    """Per-instance gate for the ``/questions`` + ``/research-pointers``
+    slash commands (Phase 4 Sub-arc C, 2026-05-18).
+
+    Default ``False`` so Salem (and any other operational-vault instance)
+    never accidentally registers the commands. Hypatia opts in via
+    ``telegram.inventory_views.command_enabled: true`` in
+    ``config.hypatia.yaml`` because her vault layout has the
+    ``question/`` + ``research-pointer/`` directories these commands
+    surface.
+
+    Conditional registration: when ``command_enabled=False`` (or the
+    ``inventory_views`` block is absent entirely), neither slash
+    command is registered — Telegram's "unknown command" behaviour
+    fires for instances that legitimately don't surface inventory MOCs.
+
+    Mirror of :class:`FictionConfig` + :class:`VoiceTrainConfig` shape —
+    same Hypatia-only-by-default convention. See
+    ``project_hypatia_zettelkasten_redesign.md`` Sub-arc C for the
+    arc spec.
+    """
+
+    command_enabled: bool = False
+    # Per-MOC-group cap on rendered bullets. Default 20 — anything
+    # higher and the Telegram-side rendering starts to scroll past the
+    # operator's attention. Operator-tunable for low-density vaults
+    # that want everything in one view; high-density vaults can keep
+    # the default and rely on the MOC/_*.md inventory MOC for full
+    # state (the slash command is a glance-view, not exhaustive).
+    per_group_cap: int = 20
+
+
+@dataclass
 class VoiceTrainConfig:
     """Per-instance gate for the ``/train`` + ``/method-source`` slash commands.
 
@@ -347,6 +380,12 @@ class TalkerConfig:
     # only opt-in; Salem/KAL-LE adoption is a config flip when their
     # workflows need it.
     voice_train: VoiceTrainConfig | None = None
+    # Inventory views gate — see :class:`InventoryViewsConfig`.
+    # Default-OFF / None sentinel matching fiction + voice_train shape.
+    # Hypatia is Phase 4 Sub-arc C's only opt-in; the /questions +
+    # /research-pointers commands surface her question/ and
+    # research-pointer/ records (types Salem + KAL-LE don't have).
+    inventory_views: InventoryViewsConfig | None = None
     # Path to the config file this TalkerConfig was loaded from. Carried
     # so lazy/late loaders (notably the inter-instance peer-tool dispatcher
     # in ``conversation._dispatch_peer_inter_instance_tool``) can re-read
@@ -377,6 +416,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "vision": VisionConfig,
     "fiction": FictionConfig,
     "voice_train": VoiceTrainConfig,
+    "inventory_views": InventoryViewsConfig,
 }
 
 
@@ -466,6 +506,14 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     voice_train_raw = tool.get("voice_train")
     if isinstance(voice_train_raw, dict) and voice_train_raw:
         built.voice_train = _build(VoiceTrainConfig, voice_train_raw)
+    # Inventory views — defaulted-OFF / None sentinel. Same shape as
+    # fiction + voice_train. Block-absent means the /questions +
+    # /research-pointers commands are NOT registered.
+    inventory_views_raw = tool.get("inventory_views")
+    if isinstance(inventory_views_raw, dict) and inventory_views_raw:
+        built.inventory_views = _build(
+            InventoryViewsConfig, inventory_views_raw,
+        )
     # Synthetic ``_config_path`` key — set by the CLI in ``cmd_up`` /
     # other entry points before handing ``raw`` to the orchestrator,
     # carried through ``multiprocessing`` pickling to subprocess

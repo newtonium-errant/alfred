@@ -349,3 +349,35 @@ brief_digest_push:
 #     # max_buffer_seconds: 60                 # safety ceiling on debounce
 #     # queue_path: "/home/andrew/.alfred/<instance>/extraction_queue.jsonl"
 #     #   ^ defaults to ./data/<instance-slug>/extraction_queue.jsonl
+
+# ---------------------------------------------------------------------------
+# telegram.inventory_views — /questions + /research-pointers (Hypatia)
+# ---------------------------------------------------------------------------
+# Goes inside the ``telegram:`` block (not at top-level). Phase 4
+# Sub-arc C (2026-05-18) — Hypatia-only because the underlying types
+# (``question/`` + ``research-pointer/``) are in HYPATIA_CREATE_TYPES
+# only. Salem and KAL-LE legitimately don't have these record types.
+#
+# When enabled:
+#   * /questions — grouped-by-MOC Markdown list of question/ records
+#     with status in {open, refined}. Read-only.
+#   * /research-pointers — grouped-by-MOC list of research-pointer/
+#     records with status == open. Read-only. Registered at the bot
+#     layer as /research_pointers (underscore) per PTB constraints —
+#     the dash form falls through to Telegram's unknown-command
+#     behaviour.
+# When disabled (default): commands NOT registered.
+#
+# Mirrors the data surfaced by Sub-arc B's auto-maintained inventory
+# MOCs (MOC/_Open Questions.md + MOC/_Open Research Pointers.md) but
+# grouped by topic-MOC membership rather than flat. The slash command
+# is the glance-view-from-anywhere surface; the inventory MOC is the
+# vault-resident exhaustive surface.
+#
+# telegram:
+#   inventory_views:
+#     command_enabled: true
+#     # per_group_cap: 20    # default; bullets per MOC group before
+#     #                      # "+N more" hint fires. Tunable for
+#     #                      # high-density vaults; the inventory MOC
+#     #                      # remains the exhaustive surface.
