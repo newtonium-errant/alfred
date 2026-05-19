@@ -108,6 +108,8 @@ Surveyor doesn't use the agent backend. It has its own 4-stage pipeline:
 
 Vector store: Milvus Lite (file-based, `data/milvus_lite.db`).
 
+**Vault-state observability must fire ABOVE the `no_changed_clusters` early-return.** The `_cluster_and_label` method has an early-return when `changed_semantic=set()` (stable vault, no new cluster work). Any observability log that reports a VAULT-STATE OBSERVATION (e.g., "no entity record types in this vault," "no MOC/ directory yet") must be emitted BEFORE that early-return, otherwise stable-vault sweeps (the common case) silently skip the signal. Pattern hit twice on Phase 5 (Sub-arc B `entity_link_no_entities_in_vault` original placement → smoke-test fix; Sub-arc D1 `no_moc_dir` original placement → second fix). Distinction: PROPOSAL or LABELING work only makes sense on changed clusters and stays gated by the early-return; OBSERVABILITY OF VAULT STATE is independent of cluster-change and must surface every-sweep (latched once-per-lifecycle for non-spam). When adding any new surveyor observability event, ask: "is this signal about vault state (place above early-return) or about per-sweep work (place inside)?"
+
 ### Bundled Data (`src/alfred/_bundled/`)
 
 Shipped in the wheel. Located via `_data.py` using `importlib.resources`:
