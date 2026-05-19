@@ -682,12 +682,18 @@ def test_inventory_views_config_default_off() -> None:
 
 def test_inventory_views_load_from_unified_absent_block() -> None:
     """An instance config without the inventory_views block leaves
-    TalkerConfig.inventory_views = None — gates the registration."""
+    TalkerConfig.inventory_views = None — gates the registration.
+
+    ``instance.name`` is required by InstanceConfig (no default) per
+    ``feedback_hardcoding_and_alfred_naming.md`` — every valid YAML
+    config has it, so test fixtures must include it too. The existing
+    pattern is at ``test_bash_exec.py:559``."""
     from alfred.telegram.config import load_from_unified
     raw = {
         "telegram": {
             "bot_token": "DUMMY_TEST_TOKEN",
             "allowed_users": [42],
+            "instance": {"name": "Hypatia"},
         },
     }
     cfg = load_from_unified(raw)
@@ -695,11 +701,14 @@ def test_inventory_views_load_from_unified_absent_block() -> None:
 
 
 def test_inventory_views_load_from_unified_explicit_block() -> None:
+    """Explicit inventory_views block constructs the dataclass with
+    operator-set values."""
     from alfred.telegram.config import load_from_unified
     raw = {
         "telegram": {
             "bot_token": "DUMMY_TEST_TOKEN",
             "allowed_users": [42],
+            "instance": {"name": "Hypatia"},
             "inventory_views": {
                 "command_enabled": True,
                 "per_group_cap": 15,
