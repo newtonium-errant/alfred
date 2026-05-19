@@ -352,6 +352,21 @@ class Daemon:
         # Stage 3: Cluster
         result = self.clusterer.run(paths, vectors, records)
 
+        # Sub-arc B placement fix (2026-05-19): observability gate must
+        # fire BEFORE the no_changed_clusters early-return, otherwise
+        # the gate never emits on the exact vault it was designed for.
+        # Hypatia's first sweep (81 records embedded, clusterer reports
+        # changed_semantic=0 because the cluster state is stable) hit
+        # ``daemon.no_changed_clusters`` and short-circuited the
+        # function before reaching the original gate placement below
+        # the labeling fan-out. The gate is evaluated here so it runs
+        # regardless of whether stage 4 labeling has work to do; the
+        # skip-stage-5/6/7 decision is consumed at the bottom of this
+        # method where it would otherwise dispatch entity-link work.
+        entities_present = self._gate_entity_link_no_entities_observability(
+            records,
+        )
+
         # Stage 4: Label changed clusters.
         #
         # Scope to `changed_semantic` only. `cluster_members` below is built
@@ -495,16 +510,12 @@ class Daemon:
             concurrency=self.cfg.labeler.max_concurrent,
         )
 
-        # Stage 5/6/7 gate (Phase 5 Sub-arc B observability ship): vaults
-        # with no entity records (matter/person/org/project) silently
-        # no-op all three entity-link stages — there are no entity
-        # targets to link TO. Hypatia's vault is the canonical example.
-        # ``_gate_entity_link_no_entities_observability`` emits a single
-        # once-per-lifecycle log and returns False when entities are
-        # absent so stage 5/6/7 are skipped; returns True when entities
-        # are present (also resets the gate so re-emission works on a
-        # transition back to empty).
-        if not self._gate_entity_link_no_entities_observability(records):
+        # Stage 5/6/7 skip — consumes the gate result evaluated right
+        # after clustering (above the no_changed_clusters early-return).
+        # The gate already emitted its observability log (or held the
+        # latch) on the way in; this is purely the consumer-side
+        # decision to skip stage 5/6/7 when entities are absent.
+        if not entities_present:
             return
 
         # Stage 5: structured entity-link writeback. For each cluster whose

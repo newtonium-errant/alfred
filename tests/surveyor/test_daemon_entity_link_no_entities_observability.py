@@ -25,9 +25,11 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 from structlog.testing import capture_logs
 
+from alfred.surveyor.clusterer import ClusterResult
 from alfred.surveyor.config import (
     ClusteringConfig,
     EntityLinkConfig,
@@ -189,4 +191,108 @@ def test_second_sweep_still_no_entities_does_not_reemit(daemon):
     assert second_matches == [], (
         "expected no re-emission on second empty-state sweep, got: "
         f"{second_matches}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression pin — placement-fix for the Hypatia smoke-test gap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gate_fires_even_when_no_clusters_changed(daemon):
+    """Regression pin — Sub-arc B smoke test on Hypatia 2026-05-19
+    caught the original gate placement BELOW the
+    ``daemon.no_changed_clusters`` early-return inside
+    ``_cluster_and_label``. Hypatia's first sweep produced 81 embedded
+    records but the clusterer reported ``changed_semantic=set()``
+    (no membership shift since last tick), so the early-return
+    short-circuited the method before the gate could emit — exactly
+    the Hypatia case Sub-arc B was designed to surface.
+
+    Pin: when ``clusterer.run()`` returns a ClusterResult with empty
+    ``changed_semantic``, the gate MUST still emit the observability
+    log AND the function returns cleanly (via the no_changed_clusters
+    path). If a future refactor pushes the gate back below the early-
+    return, this test fails.
+
+    Drives the real ``_cluster_and_label`` end-to-end with a mocked
+    clusterer so the placement is exercised by production code, not
+    a test-local mirror (per ``feedback_log_emission_test_pattern.md``).
+    """
+    # Hypatia-shaped records: no entity types at all
+    records = {
+        "session/s1.md": _record("session/s1.md", "session"),
+        "session/s2.md": _record("session/s2.md", "session"),
+        "log/l1.md": _record("log/l1.md", "log"),
+    }
+
+    # Embedder returns non-None so we get past the early ``no_embeddings``
+    # return; the actual values don't matter because the mocked
+    # clusterer doesn't consume them meaningfully.
+    fake_paths = list(records.keys())
+    fake_vectors = np.zeros((len(fake_paths), 4), dtype=np.float32)
+    daemon.embedder.get_all_embeddings = MagicMock(
+        return_value=(fake_paths, fake_vectors),
+    )
+
+    # Clusterer returns the no-change shape: empty ``changed_semantic``.
+    # ``semantic`` map is empty too, matching what a fresh Hypatia sweep
+    # would produce. ``_cluster_and_label`` is expected to hit the gate
+    # (now placed above the early-return), then return via the
+    # ``no_changed_clusters`` log path.
+    empty_result = ClusterResult(
+        semantic={},
+        structural={},
+        changed_semantic=set(),
+        changed_structural=set(),
+    )
+    daemon.clusterer.run = MagicMock(return_value=empty_result)
+
+    with capture_logs() as captured:
+        await daemon._cluster_and_label(records)
+
+    # The observability gate fired despite no_changed_clusters short-
+    # circuit — the headline regression pin for the placement fix.
+    obs_logs = [
+        c for c in captured
+        if c.get("event") == "surveyor.entity_link_no_entities_in_vault"
+    ]
+    assert len(obs_logs) == 1, (
+        "gate must emit when entities absent even on stable-cluster "
+        f"sweeps; got events: {[c.get('event') for c in captured]}"
+    )
+    # Field shape sanity — same contract as the direct-helper test.
+    assert obs_logs[0].get("entity_types_searched") == [
+        "matter", "org", "person", "project",
+    ]
+    assert obs_logs[0].get("vault_path") == str(daemon.cfg.vault.path)
+
+    # Latch flipped — subsequent empty-entities sweeps would not
+    # re-emit.
+    assert daemon._entity_link_no_entities_logged is True
+
+    # Sanity: the no_changed_clusters early-return is still reached
+    # (the gate doesn't masquerade as a substitute for that log).
+    no_changed_logs = [
+        c for c in captured
+        if c.get("event") == "daemon.no_changed_clusters"
+    ]
+    assert len(no_changed_logs) == 1, (
+        "no_changed_clusters log must still fire after the gate; "
+        f"got events: {[c.get('event') for c in captured]}"
+    )
+
+    # Order pin: gate emits BEFORE no_changed_clusters. Surfaces the
+    # placement contract directly so a regression that moves the gate
+    # back below the early-return reverses the order (or drops the
+    # gate emission entirely) and trips this assert.
+    events_in_order = [c.get("event") for c in captured]
+    gate_idx = events_in_order.index(
+        "surveyor.entity_link_no_entities_in_vault",
+    )
+    no_changed_idx = events_in_order.index("daemon.no_changed_clusters")
+    assert gate_idx < no_changed_idx, (
+        f"gate must emit BEFORE no_changed_clusters; event order was "
+        f"{events_in_order}"
     )
