@@ -38,6 +38,14 @@ class Daemon:
     def __init__(self, cfg: PipelineConfig) -> None:
         self.cfg = cfg
         self._shutdown_requested = False
+        # Daemon-lifecycle gate for the entity-link no-entities-in-vault
+        # observability log (Phase 5 Sub-arc B). Flipped to True after the
+        # first emission; reset to False on any sweep that DOES find
+        # entity records so a transition back to empty re-emits. Per
+        # ``feedback_intentionally_left_blank.md``: silence-from-no-data
+        # must surface distinctly from silence-from-failure; once-per-
+        # lifecycle keeps the log signal low while remaining grep-able.
+        self._entity_link_no_entities_logged: bool = False
 
         self.state = PipelineState(cfg.state.path)
         self.watcher = VaultWatcher(cfg.vault, cfg.watcher)
@@ -487,6 +495,18 @@ class Daemon:
             concurrency=self.cfg.labeler.max_concurrent,
         )
 
+        # Stage 5/6/7 gate (Phase 5 Sub-arc B observability ship): vaults
+        # with no entity records (matter/person/org/project) silently
+        # no-op all three entity-link stages — there are no entity
+        # targets to link TO. Hypatia's vault is the canonical example.
+        # ``_gate_entity_link_no_entities_observability`` emits a single
+        # once-per-lifecycle log and returns False when entities are
+        # absent so stage 5/6/7 are skipped; returns True when entities
+        # are present (also resets the gate so re-emission works on a
+        # transition back to empty).
+        if not self._gate_entity_link_no_entities_observability(records):
+            return
+
         # Stage 5: structured entity-link writeback. For each cluster whose
         # membership changed, walk non-entity members and add typed
         # frontmatter links (related_matters / related_persons / related_orgs
@@ -677,6 +697,54 @@ class Daemon:
         display_name = _display_name_from_path(entity_path)
         corpus = _build_record_corpus(record.frontmatter, record.body)
         return _has_textual_presence(corpus, display_name)
+
+    def _gate_entity_link_no_entities_observability(
+        self,
+        records: dict[str, "VaultRecord"],
+    ) -> bool:
+        """Phase 5 Sub-arc B once-per-lifecycle observability gate for
+        the entity-link no-entities-in-vault state.
+
+        Hypatia's vault has no ``matter``/``person``/``org``/``project``
+        records, so all three entity-link helpers (cluster, noise,
+        backfill) silently no-op every sweep. Per
+        ``feedback_intentionally_left_blank.md``, silence-from-no-data
+        must be distinguishable from silence-from-failure: emit a
+        single ``surveyor.entity_link_no_entities_in_vault`` log when
+        we first observe the empty-entities state, suppress on
+        subsequent sweeps that stay empty.
+
+        Gate semantics:
+          * Returns ``True`` when entities are present → caller proceeds
+            with stage 5/6/7. Resets the lifecycle latch so a later
+            transition back to empty re-emits.
+          * Returns ``False`` when entities are absent → caller skips
+            stage 5/6/7. Emits the observability log iff the latch was
+            previously False (i.e. first sweep in the empty state).
+
+        Single emission point is at this gate (not per-cluster, not
+        per-sibling helper) so the three downstream helpers
+        (`_link_entities_in_clusters`, `_link_noise_points_to_entities`,
+        `_backfill_new_entities`) share the same observability surface.
+        """
+        from .labeler import ENTITY_RECORD_TYPES
+        has_entities = any(
+            r.record_type in ENTITY_RECORD_TYPES
+            for r in records.values()
+        )
+        if not has_entities:
+            if not self._entity_link_no_entities_logged:
+                log.info(
+                    "surveyor.entity_link_no_entities_in_vault",
+                    entity_types_searched=sorted(ENTITY_RECORD_TYPES),
+                    vault_path=str(self.cfg.vault.path),
+                )
+                self._entity_link_no_entities_logged = True
+            return False
+        # Entities present — reset the latch so a transition back to
+        # empty re-emits the log.
+        self._entity_link_no_entities_logged = False
+        return True
 
     def _link_entities_in_clusters(
         self,
