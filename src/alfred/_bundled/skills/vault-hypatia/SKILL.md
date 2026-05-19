@@ -429,8 +429,8 @@ The Phase 1 design follows a **type-minimalism principle** Andrew ratified 2026-
 | `author/` | Index card → author's works + lateral linkage | Canonical scholarly name (see resolver below) | Hypatia auto at first source encounter |
 | `MOC/` (topic) | Map of Content — operator-owned topic organizer | `<Topic> MOC.md` (no leading underscore; suffix locked) | Creation **operator-led**; member-list auto-append shipped (Phase 4 Sub-arc A, 2026-05-18) — zettel/source/question/research-pointer records carrying `mocs:` frontmatter auto-append flat `- [[<type>/<Title>]]` bullets to the listed MOC's `# Contents`. Append-only — Hypatia does NOT remove bullets when `mocs:` is later dropped from the writer record. |
 | `MOC/` (inventory) | Map of Content — Hypatia-system-maintained status snapshot | `_<Name>.md` (leading-underscore prefix mandatory; e.g. `_Open Questions.md`) | Hypatia **auto-creates** the file on first qualifying writer record via canonical `vault_create` path (Phase 4 Sub-arc B, shipped 2026-05-18). Auto-maintained by a dispatch table (`INVENTORY_MOC_DISPATCH` in `zettel_hooks.py`): on every `question/` or `research-pointer/` `vault_create` / `vault_edit`, the predicate is re-evaluated against the post-edit frontmatter; bullets are ADDED on predicate flips into True and REMOVED on flips into False. Two instances today: `_Open Questions` (question with `status in {open, refined}`) + `_Open Research Pointers` (research-pointer with `status == open`). Future inventory MOCs extend the dispatch table — pattern handles them with no architectural change. |
-| `question/` | Elevated atomic question for tracking | Question text itself | Operator-elevated from inline `# Follow Up Questions` (manual today); on create + every edit, Hypatia auto-mirrors the record into `MOC/_Open Questions.md` per status (Phase 4 Sub-arc B — see "Inventory MOC pattern" below). Inline-question scanning + digest surfacing (the *inline*-elevation discovery surface, separate from inventory) remains operator-paced; no scheduled digest yet. |
-| `research-pointer/` | Elevated atomic research action | Action statement itself | Operator-elevated from inline `# Research Ideas` (manual today); on create + every edit, Hypatia auto-mirrors the record into `MOC/_Open Research Pointers.md` per status (Phase 4 Sub-arc B). Inline-research-idea scanning + digest surfacing remains operator-paced; no scheduled digest yet. |
+| `question/` | Elevated atomic question for tracking | Question text itself | Operator-elevated from inline `# Follow Up Questions` (manual today); on create + every edit, Hypatia auto-mirrors the record into `MOC/_Open Questions.md` per status (Phase 4 Sub-arc B — see "Inventory MOC pattern" below). Operator-pull discovery via `/questions` slash command — grouped-by-MOC summary of every record with `status in {open, refined}` (Phase 4 Sub-arc C, 2026-05-18 — see "Inventory slash commands (Phase 4 Sub-arc C)" below). Inline-question scanning (the *inline*-elevation discovery surface, separate from elevated-inventory) remains operator-paced; no scheduled inline-scan digest yet. |
+| `research-pointer/` | Elevated atomic research action | Action statement itself | Operator-elevated from inline `# Research Ideas` (manual today); on create + every edit, Hypatia auto-mirrors the record into `MOC/_Open Research Pointers.md` per status (Phase 4 Sub-arc B). Operator-pull discovery via `/research-pointers` slash command — grouped-by-MOC summary of every record with `status == open` (Phase 4 Sub-arc C, 2026-05-18). Inline-research-idea scanning remains operator-paced; no scheduled inline-scan digest yet. |
 
 **Critical distinction — the three-tier discriminator (CORRECTED 2026-05-16 post-Phase-1-ship).** `memo/`, `zettel/`, and `note/` are three distinct semantic tiers, not redundant types. Andrew's correction: *"Not all Hypatia notes are zettels. Not all capture sessions are zettels either. Notes need to exist as well, as my non-zettelkasten held 'fleeting notes'."*
 
@@ -592,9 +592,12 @@ Most questions live INLINE in the `# Follow Up Questions` section of source or z
 
 Same logic for `research-pointer/` records elevated from inline `# Research Ideas` sections. Both lifecycle statuses (open / refined / answered / superseded for questions; open / in-progress / completed / dropped for pointers) are operator-curated; Hypatia does NOT auto-transition status.
 
-**Once a record is elevated, discoverability of its OPEN state is shipped (Phase 4 Sub-arc B, 2026-05-18).** On every `vault_create` / `vault_edit` of a `question/` or `research-pointer/` record, Hypatia re-evaluates the inventory predicate and mirrors the result into `MOC/_Open Questions.md` or `MOC/_Open Research Pointers.md` (auto-creating those files on first qualifying record). For a `question/`, a status flip `refined` → `answered` removes the bullet (because `answered` is outside the predicate set `{open, refined}`); a subsequent flip `answered` → `refined` adds it back (operator re-opens the question because the answer wasn't satisfactory). For a `research-pointer/`, the predicate is stricter — only `open` qualifies, so flipping to `in-progress` rolls the bullet off (the pointer is being worked, no longer in the backlog). The inventory MOC IS the discoverability surface for the existing elevated record corpus — open the file in Obsidian, get the live roster. See "Inventory MOC pattern (Phase 4 Sub-arc B)" section below.
+**Once a record is elevated, discoverability of its OPEN state is shipped on two complementary surfaces.**
 
-The DIFFERENT discoverability problem — scanning vault-wide inline `# Follow Up Questions` body sections to surface candidates for elevation (i.e., inline-to-elevated promotion) — remains operator-paced. No scheduled scan, no digest, no slash command yet. If you want to find unsurfaced inline questions across the corpus, run `vault_search` with `body_contains: "# Follow Up Questions"` and read by hand; that's the manual stand-in until a dedicated inline-elevation surface ships.
+- **Hypatia-push (Phase 4 Sub-arc B, 2026-05-18, vault-resident).** On every `vault_create` / `vault_edit` of a `question/` or `research-pointer/` record, Hypatia re-evaluates the inventory predicate and mirrors the result into `MOC/_Open Questions.md` or `MOC/_Open Research Pointers.md` (auto-creating those files on first qualifying record). For a `question/`, a status flip `refined` → `answered` removes the bullet (because `answered` is outside the predicate set `{open, refined}`); a subsequent flip `answered` → `refined` adds it back (operator re-opens the question because the answer wasn't satisfactory). For a `research-pointer/`, the predicate is stricter — only `open` qualifies, so flipping to `in-progress` rolls the bullet off (the pointer is being worked, no longer in the backlog). The inventory MOC is the always-on roster — open the file in Obsidian, get the live state. See "Inventory MOC pattern (Phase 4 Sub-arc B)" section below.
+- **Operator-pull (Phase 4 Sub-arc C, 2026-05-18, Telegram slash commands).** Andrew runs `/questions` or `/research-pointers` (typed as `/research_pointers` per PTB underscore constraint) mid-conversation and gets the same data grouped by topic-MOC membership rather than flat. Read-only — no vault writes, no state mutation. Empty-state explicit per `feedback_intentionally_left_blank.md`. The slash command IS the glance-view from anywhere (phone, no Obsidian needed); the inventory MOC is the exhaustive on-disk surface. Same predicates, two access modes. See "Inventory slash commands (Phase 4 Sub-arc C)" section below.
+
+The DIFFERENT discoverability problem — scanning vault-wide inline `# Follow Up Questions` body sections to surface candidates for elevation (i.e., inline-to-elevated promotion) — remains operator-paced. No scheduled scan, no digest, no slash command yet. If you want to find unsurfaced inline questions across the corpus, run `vault_search` with `body_contains: "# Follow Up Questions"` and read by hand; that's the manual stand-in until a dedicated inline-elevation surface ships. (The `/questions` slash command is for ALREADY-elevated `question/` records, NOT for inline-question candidates — different surface, different problem.)
 
 ### Author resolver — canonical scholarly name with `aliases` bridge
 
@@ -1314,7 +1317,118 @@ The dispatch table is the registration surface; the file is the projection. Don'
 - **Status-validation override.** The inventory dispatcher reads `status` post-edit and trusts the value. If the operator typo's `status: opn` instead of `open`, the predicate evaluates as False (`"opn"` is not in `{"open", "refined"}`), and the record is NOT added to `_Open Questions`. This is correct — the inventory reflects what's actually in the frontmatter, not what the operator meant. The `_validate_status` gate in `ops.py` will catch the typo BEFORE the hook fires (raises VaultError on unknown status), but only if the type's status enum is registered in `STATUS_BY_TYPE`.
 - **Retroactive backfill.** When a new inventory MOC ships (e.g., when `_Active Sources.md` is added to the dispatch table), the dispatcher does NOT scan historical records to backfill the inventory. The MOC populates organically from the next qualifying `vault_create` / `vault_edit` per record. If Andrew wants the historical roster immediately, the operator action is to re-save each qualifying record (any `vault_edit` re-fires the dispatch).
 - **Cross-instance.** Inventory MOCs are scoped per-instance (Hypatia's vault, in Hypatia's `scope="hypatia"`). Salem and KAL-LE do not have `question/` or `research-pointer/` records — `_MOC_TRIGGER_TYPES` and `INVENTORY_MOC_DISPATCH` are zettelkasten-flavoured, and zettelkasten types are Hypatia-only per `HYPATIA_CREATE_TYPES` in `vault/scope.py`.
-- **Sub-arc C and slash commands.** The `/questions` and `/research-pointers` Telegram slash commands are a separate Sub-arc C ship in flight (will get its own SKILL audit when it lands). Sub-arc B is purely the vault-side dispatch; talker-surface query UX is Sub-arc C's domain.
+- **Sub-arc C and slash commands.** The `/questions` and `/research-pointers` Telegram slash commands ship as Phase 4 Sub-arc C (2026-05-18) and live at the talker surface — see "Inventory slash commands (Phase 4 Sub-arc C)" section below for the full operator-pull view. Sub-arc B is purely the vault-side dispatch (Hypatia-push, vault-resident); Sub-arc C is the operator-pull complement (on-demand, mid-conversation, summarized). Both surfaces consult the same `INVENTORY_MOC_DISPATCH` predicates as single source of truth — a future predicate change in Sub-arc B's table propagates to both surfaces automatically.
+
+---
+
+## Inventory slash commands (Phase 4 Sub-arc C, shipped 2026-05-18)
+
+Phase 4 Sub-arc C ships two Telegram slash commands — `/questions` and `/research-pointers` — that surface the same data as Sub-arc B's inventory MOCs but as a fresh-rendered Telegram reply rather than a vault-resident Markdown file. The implementation lives at `src/alfred/telegram/inventory_views.py` (rendering) + `src/alfred/telegram/bot.py` (handlers + conditional registration). Read-only — no vault writes, no state mutation, no records created.
+
+### Two surfaces, same data — Hypatia-push vs operator-pull
+
+Sub-arc B and Sub-arc C are complementary access modes over the same set of records, NOT redundant implementations:
+
+| Property | Sub-arc B (inventory MOCs) | Sub-arc C (slash commands) |
+|---|---|---|
+| Surface | Vault-resident file (`MOC/_Open Questions.md`, `MOC/_Open Research Pointers.md`) | Telegram chat reply |
+| Access mode | **Hypatia-push** — always available in Obsidian, auto-maintained on every `question/` / `research-pointer/` write | **Operator-pull** — Andrew runs `/questions` or `/research_pointers` mid-conversation, gets a fresh render |
+| Grouping | Flat list under `# Contents` | Grouped by topic-MOC membership (operator-set `mocs:` frontmatter) |
+| Layout | Exhaustive (every qualifying record gets a bullet) | Capped at 20 records per MOC group; `+N more (open in vault)` hint when overflowing |
+| When to use | "What's currently open?" — open Obsidian, browse the file | "What's currently open?" — phone, no Obsidian needed, glance-view |
+
+Both consult the **same `INVENTORY_MOC_DISPATCH` predicates** as single source of truth — Sub-arc C's `_predicate_for_type` helper looks up the predicate from the same table that drives the Sub-arc B auto-maintenance. A future predicate change in the dispatch table (e.g., adding `status: refined` to the research-pointer set) flows to both surfaces automatically with zero additional code or prompt changes.
+
+### The two commands
+
+- `/questions` — grouped-by-MOC list of every `question/` record matching the dispatch predicate `status in ("open", "refined")`. Same predicate as `MOC/_Open Questions.md`.
+- `/research-pointers` — grouped-by-MOC list of every `research-pointer/` record matching the dispatch predicate `status == "open"`. Same predicate as `MOC/_Open Research Pointers.md`. **Registered under the underscore form `research_pointers` per PTB constraint — see PTB caveat below.**
+
+Both commands are Hypatia-only via the `telegram.inventory_views.command_enabled` config gate (defined as `InventoryViewsConfig` in `src/alfred/telegram/config.py`). Salem and KAL-LE don't have `question/` or `research-pointer/` records (those types are `HYPATIA_CREATE_TYPES` only), so the gate matches the data shape — when `command_enabled=False` or the `inventory_views` block is absent entirely, neither slash command is registered and Telegram's "unknown command" behaviour fires.
+
+### PTB underscore caveat — `/research-pointers` (dash) does NOT fire
+
+PTB's `CommandHandler` only allows `[a-z0-9_]` in command names — hyphens are illegal. The actual registration is `CommandHandler("research_pointers", ...)`. So:
+
+- **Operators MUST type `/research_pointers` (underscore)** for the handler to fire.
+- **Typing `/research-pointers` (dash)** falls through to Telegram's legacy unknown-command behaviour — the command does NOT fire.
+- **Same trap as `/method_source` and `/end_zettel`** already documented elsewhere in this SKILL.
+
+When you (Hypatia) mention the command to Andrew in chat, the **canonical operator-facing name is the dash form `/research-pointers`** — it's more readable as prose and matches the `research-pointer/` directory name. BUT clarify the typing form whenever it matters: *"`/research_pointers` (underscore, not dash — same PTB constraint as `/method_source` and `/end_zettel`)."* `/questions` is single-token so it has no underscore-vs-dash ambiguity.
+
+### Output format — grouped, capped, empty-state-explicit
+
+Non-empty render shape (worked example for `/questions`, assuming three records across two MOCs):
+
+```
+📋 Open Questions (3 total)
+
+## [[MOC/HEMA MOC]] (1)
+- [[question/Is the cross-step a Liechtenauer invention?]] (open, 2026-05-15)
+
+## [[MOC/Practical Stoicism MOC]] (1)
+- [[question/What does "live according to nature" actually mean?]] (refined, 2026-05-12)
+
+## Uncategorized (1)
+- [[question/Does meditation reduce ego defensiveness?]] (open, 2026-05-18)
+```
+
+Ordering invariants (confirmed against `inventory_views.py::render_inventory`):
+
+1. **Header line** — `📋 {Title} ({N} total)` where Title is `"Open Questions"` or `"Open Research Pointers"`.
+2. **Group ordering** — MOC keys sorted alphabetically by their stable normalized key (the `MOC/<Topic>` path); the **Uncategorized bucket goes LAST** (regardless of alphabetical position).
+3. **Within each group** — records sorted by `created` frontmatter date **newest-first** (descending; records with empty `created` sort to the bottom).
+4. **Per-group cap** — default 20 records per MOC group (operator-tunable via `inventory_views.per_group_cap` in config). If a group exceeds the cap, only the first `per_group_cap` records render and a summary line `- +{N} more (open in vault)` follows. The cap-overflow hint refers the operator back to Sub-arc B's vault-resident inventory MOC as the exhaustive surface.
+5. **Multi-MOC records** — a record with multiple `mocs:` entries appears under EACH MOC group (intentional — operator can see the same record from any of its membership perspectives). A record with empty `mocs:` lands in the `Uncategorized` bucket.
+6. **Bullet shape** — `- [[<type>/<Title>]] (<status>, <created>)`. The wikilink is clickable when the reply is opened in Obsidian (Telegram itself renders it as plain text with brackets).
+
+Empty case — explicit per `feedback_intentionally_left_blank.md`:
+
+```
+📋 No open questions. (Filter active: status in {open, refined})
+```
+
+(For `/research-pointers`: `📋 No open research pointers. (Filter active: status == open)`.)
+
+The filter-hint suffix matters — *"no records currently match this predicate"* is a meaningfully different signal from *"command broken / never ran."* The reply always renders SOMETHING; silence would be ambiguous.
+
+Failure case (predicate evaluation exception, frontmatter parse failure across the whole directory, vault path missing, etc.):
+
+```
+❌ Could not load questions (ExceptionTypeName)
+```
+
+The handler logs `talker.bot.inventory_view_failed` with the full exception detail and replies with a generic surface-level signal. The vault is canonical; the slash command is a glance-view — a failed glance shouldn't crash the conversation, but it MUST distinguish itself from the empty-state success case.
+
+### When to mention these commands to Andrew
+
+The operator-pull surface is the right answer when:
+
+- Andrew asks *"what are my open questions?"* / *"what's still open?"* / *"what am I tracking right now?"* — answer is *"`/questions` will give you the grouped-by-MOC list (or open `MOC/_Open Questions.md` for the flat exhaustive roster)."*
+- Andrew is on his phone and not in front of Obsidian — `/questions` is the only practical glance-view.
+- Andrew explicitly asks for the command — don't quote `/research-pointers` (dash) without clarifying the underscore typing form.
+
+The Hypatia-push surface is the right answer when:
+
+- Andrew is at his desk with Obsidian open and wants to browse the exhaustive list.
+- The slash command's per-group cap (20) is hit and the `+N more (open in vault)` hint fires — point him at `MOC/_Open Questions.md` / `MOC/_Open Research Pointers.md` for the un-capped roster.
+- A record needs to be modified (vault writes happen at the vault layer; the slash command is read-only).
+
+Don't try to do the slash command's job yourself by manually `vault_search`-ing and rendering the result inline — the slash command IS that surface, with the dispatch-predicate consistency guarantee baked in. If the operator wants the grouped-by-MOC view, route them at the command (which fires the bot's handler, runs the predicate, and renders the canonical shape) rather than improvising.
+
+### Cross-instance — Hypatia-only by design
+
+The `command_enabled: false` default in `InventoryViewsConfig` enforces the three-layer pattern (per CLAUDE.md "Three Layers — Code vs Config vs Prompt"): the same code ships to every instance, but only Hypatia's `config.hypatia.yaml` opts in. Salem and KAL-LE don't have `question/` or `research-pointer/` records (creation-blocked at the scope layer per `HYPATIA_CREATE_TYPES` in `vault/scope.py`); the gate ensures their bots never register handlers for commands whose data they can't surface. The defensive fallback inside `_on_inventory_view` (empty-state message renders the same way regardless of whether the underlying directories are missing or the records just don't match the predicate) backstops misconfiguration cases.
+
+### Future inventory slash commands — automatic from the dispatch table
+
+When a new entry lands in `INVENTORY_MOC_DISPATCH` (per the "Future inventory MOCs — operator request flow" in the Sub-arc B section above), it automatically becomes available to the slash-command rendering layer through `_predicate_for_type`. To expose a NEW slash command (e.g., `/active_sources` mirroring a hypothetical `_Active Sources.md` inventory MOC), the builder adds:
+
+1. A new dispatch tuple in `INVENTORY_MOC_DISPATCH` (vault-side auto-maintenance).
+2. A new `CommandHandler` registration in `bot.py` gated on the same `inventory_views.command_enabled` flag, calling `_on_inventory_view` with the new `record_type`.
+3. Title + empty-noun + filter-hint entries in `_TITLE_BY_TYPE` / `_EMPTY_NOUN_BY_TYPE` / `_EMPTY_HINT_BY_TYPE` in `inventory_views.py`.
+
+Predicate evaluation, collection, grouping, rendering, and capping all flow through the existing helpers — no architectural change. Surface a new slash command this way rather than building parallel rendering logic.
 
 ---
 
@@ -2598,7 +2712,7 @@ Treat the quoted text as context for "this." Don't echo the prefix back; don't a
 
 Two layers exist:
 
-- **Bot-level** (handled by the bot, not by you): `/end`, `/end_zettel`, `/end_note`, `/recap [brief|verbose]`, `/extract <short-id>`, `/brief <short-id>`, `/speed`, `/opus`, `/sonnet`, `/no_auto_escalate`, `/status`, `/fiction <title>`, `/train [--cluster <name>] [<text>]`, `/method_source [<text>]`. These are operator controls; the bot intercepts before you see the turn.
+- **Bot-level** (handled by the bot, not by you): `/end`, `/end_zettel`, `/end_note`, `/recap [brief|verbose]`, `/extract <short-id>`, `/brief <short-id>`, `/speed`, `/opus`, `/sonnet`, `/no_auto_escalate`, `/status`, `/fiction <title>`, `/train [--cluster <name>] [<text>]`, `/method_source [<text>]`, `/questions`, `/research_pointers`. These are operator controls; the bot intercepts before you see the turn.
 - **SKILL-level dispatch** (you detect in the message text and route): `/edit <path>`, `/plan <name>`, `/research <topic>`. These are not bot-registered in this Phase; you read the prefix in the turn and dispatch to the matching posture (see "Dispatch — picking the posture" above). The argument after the slash is what to operate on.
 
 Bot-level summary:
@@ -2617,6 +2731,8 @@ The bot router dispatches by command name (`brief` vs `recap`), so operator-side
 - `/fiction <title>` — scaffold a new fiction project; the bot creates the directory + element files; your turn opens with the project on disk. See "Posture — Fiction interlocutor" for orientation.
 - `/train [--cluster <name>] [<text>]` — voice-training shortcut; saves the most-recent long paste (or `<text>` after the command) as a voice fixture at `document/essay/<slug>.md` and queues async extraction to `voice/<slug>.md`. See "Voice/method profile ingestion" for full handling.
 - `/method_source [<text>]` — method/system ingestion shortcut; saves the most-recent long paste (or `<text>`) as a raw source at `source/<slug>.md` and queues async extraction to `method/<slug>.md`. Slash command MUST be typed with the underscore (PTB doesn't allow hyphens in `CommandHandler` names); `/method-source` falls through silently to unknown-command behavior. Don't quote `/method-source` to Andrew — that form fails. Hypatia accepts both spellings only in natural-language phrase recognition (see "Voice/method profile ingestion" → "Natural-language equivalents"); the slash command itself needs the underscore.
+- `/questions` — read-only grouped-by-MOC summary of every `question/` record with `status in {open, refined}`. Output is Markdown; bullets are Obsidian wikilinks (clickable when opened in Obsidian); empty case renders `📋 No open questions. (Filter active: status in {open, refined})` per `intentionally_left_blank` discipline. Same predicate as the Sub-arc B inventory MOC (`MOC/_Open Questions.md`); the slash command is the on-demand operator-pull mirror of the always-on Hypatia-push vault file. Hypatia-only via the `telegram.inventory_views.command_enabled` config gate (Salem + KAL-LE don't have `question/` records — `HYPATIA_CREATE_TYPES` only). Phase 4 Sub-arc C (2026-05-18). See "Inventory slash commands (Phase 4 Sub-arc C)" section below for the full operator-pull view.
+- `/research-pointers` — read-only grouped-by-MOC summary of every `research-pointer/` record with `status == open`. Same shape as `/questions` (Markdown grouped by topic-MOC, empty-state explicit, Hypatia-only-gated). **PTB constraint:** the dash form `/research-pointers` does NOT fire the handler — PTB's `CommandHandler` only allows `[a-z0-9_]`, so the registered command name is `research_pointers` (underscore). Operators MUST type `/research_pointers` for the slash command to actually route; the dash form falls through to Telegram's unknown-command behaviour. When you mention the command to Andrew in chat, use the operator-facing dash form (`/research-pointers` — more readable as prose, matches the directory name) BUT clarify the typing form whenever it matters: *"`/research_pointers` (underscore, not dash — same PTB constraint as `/method_source` and `/end_zettel`)."* Phase 4 Sub-arc C (2026-05-18).
 
 ---
 
