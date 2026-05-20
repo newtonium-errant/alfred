@@ -189,6 +189,68 @@ Body-only contradictions with empty `claim_a` / `claim_b` / `source_a` / `source
 
 **Worked example (real, 2026-05-16):** `contradiction/Culture Study Patreon Record Body Cites Synthesis Title Absent From Vault.md` shipped with a full body section but `claim_a: ''` and `claim_b: ''` in frontmatter. The contradiction is invisible to Dataview filters that select on populated claims, and to brief surfaces that quote the structured fields. Fix at creation time, not retroactively.
 
+**Intra-record contradictions — source_a / source_b disambiguation (MUST):**
+
+A contradiction is **intra-record** when claim_a and claim_b reference different aspects of the SAME source record (e.g., frontmatter field vs body section, two frontmatter fields against each other, description vs body Update, action_hint vs body directive, relationships context vs body content). Most curator-output contradictions Salem produces are intra-record — they catch the curator contradicting itself within one record it just created.
+
+For intra-record contradictions, `source_a` and `source_b` MUST both reference the same record path AND carry an **aspect-name suffix** distinguishing which slice of the record each claim comes from. Path-only without an aspect suffix is incomplete discipline — the reader cannot locate either claim inside the cited record.
+
+Aspect-name vocabulary (use the term that matches the record's actual structure):
+
+- **Structural regions:** `body`, `frontmatter`, `description`, `H1`, `Update section`, `Context section`, `Triage section`, `Indicators section`
+- **Frontmatter fields:** `frontmatter related`, `frontmatter related_persons`, `frontmatter related_orgs`, `frontmatter alfred_tags`, `frontmatter relationships`, `frontmatter description`, `frontmatter status`, `frontmatter action_hint`, `frontmatter priority_reasoning`, `frontmatter due`
+- **Indexed sub-paths when fields are lists:** `relationships[0]`, `relationships[0].context`, `relationships[0].target`, `related[0]`
+
+Pick the term that points the reader at the exact slice. Combine when needed (e.g., `body + description`, `frontmatter description and body`).
+
+**Worked example — canonical April 17 intra-record contradiction:**
+
+File: `vault/contradiction/Task Relationship Cites Unread OFW Message Content as Verification Trigger.md`. Both sources point at the same task record; the aspect suffix tells the reader which slice carries each claim:
+
+```yaml
+source_a: '[[task/Read and Respond to Jennifer Newton OFW Message 2026-04-09]] relationships block'
+source_b: '[[task/Read and Respond to Jennifer Newton OFW Message 2026-04-09]] body and description'
+```
+
+Same record path on both sides + `relationships block` vs `body and description` makes the disambiguation unambiguous. A reader investigating the contradiction can open the task and look at the exact two slices being compared without re-reading the whole record.
+
+Other accepted shapes (all real, all from `vault/contradiction/`):
+
+```yaml
+# Frontmatter vs body
+source_a: '[[note/HealthMyself Form Request from Dr Mark Johnston 2026-04-10]] frontmatter'
+source_b: '[[note/HealthMyself Form Request from Dr Mark Johnston 2026-04-10]] body Context'
+
+# Two frontmatter fields against each other
+source_a: '[[task/Top Up RBC Royal Bank Account]] frontmatter description field'
+source_b: '[[task/Top Up RBC Royal Bank Account]] frontmatter related field'
+
+# Description vs body section
+source_a: '[[task/Confirm Corneal Imaging Appointment 2026-04-28]] frontmatter description'
+source_b: '[[task/Confirm Corneal Imaging Appointment 2026-04-28]] body Update section'
+
+# Indexed relationship sub-path
+source_a: '[[note/Letters From the In-Between No 1 — Empty Email]] relationships[0]'
+source_b: '[[note/Letters From the In-Between No 1 — Empty Email]] relationships[1]'
+```
+
+**Worked example — incomplete discipline (DO NOT do this), 2026-05-19:**
+
+File: `vault/contradiction/OFW Task Relationship Context Cites Seven Dates While Targeting Single Prior Task.md`. The contradiction is genuine and `claim_a`/`claim_b` are populated, but both sources point at the same task path with NO aspect suffix:
+
+```yaml
+source_a: '[[task/Check OFW Message from Jennifer Newton 2026-05-18]]'
+source_b: '[[task/Check OFW Message from Jennifer Newton 2026-05-18]]'
+```
+
+A reader investigating cannot tell whether the conflict is frontmatter-vs-body, relationships-vs-description, two relationships entries against each other, or something else. Same-record-path-with-no-aspect-suffix is the intra-record analogue of empty `source_a`/`source_b` — same WARN-class violation. Correct form for this record would have been `source_a: '[[task/Check OFW Message from Jennifer Newton 2026-05-18]] relationships[0].context'` and `source_b: '[[task/Check OFW Message from Jennifer Newton 2026-05-18]] frontmatter related'` (or whichever field actually carries the seven-dates list).
+
+**Anti-pattern — fabricated aspect-names (DO NOT):**
+
+The aspect-name must correspond to a **real frontmatter field on the record** OR a **real structural region of the body**. Do not invent labels like `meta-claim`, `subtext`, `implicit framing`, or `tone` to manufacture a distinction. If the two claims do not have distinct structural anchors inside the record, ask yourself whether this is actually a contradiction at all:
+
+- **Reframe escape valve:** if the source distinction is genuinely non-obvious — both claims sit in the same paragraph of the same field, or the difference is interpretive rather than structural — that is a signal the observation belongs as a `synthesis` (a pattern noticed across the record) rather than a `contradiction` (two anchored positions in conflict). Reframe rather than fabricate. Per section 2.4 entry above, body-only contradictions are already a WARN violation; fabricated aspect-suffixes are the more-insidious version of the same failure mode because they LOOK disciplined while hiding the same gap.
+
 ### 2.5 Synthesis
 
 ```yaml
