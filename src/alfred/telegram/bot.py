@@ -1128,12 +1128,25 @@ async def on_accept_moc(
 
     # Apply path. Failures-isolated within ``apply_accept``; the
     # function returns an ``ApplyResult`` regardless of outcome.
+    #
+    # Scope plumbing: derive from the running instance's identity.
+    # Fail-loud rather than silent fallback to a single-instance literal
+    # per ``feedback_hardcoding_and_alfred_naming.md`` — the talker
+    # daemon never reaches this code without a populated
+    # ``config.instance.name`` (loader fails on missing instance block),
+    # but the defensive guard preserves that guarantee at the call site
+    # rather than silently routing a misconfigured instance through
+    # one instance's scope.
+    if not (config.instance and config.instance.name):
+        raise RuntimeError(
+            "config.instance.name required for /accept-moc scope plumbing"
+        )
     try:
         result = _msv.apply_accept(
             suggestion=suggestion,
             queue_path=queue_path,
             vault_path=Path(config.vault.path),
-            scope=config.instance.name.lower() if config.instance and config.instance.name else "hypatia",
+            scope=config.instance.name.lower(),
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(

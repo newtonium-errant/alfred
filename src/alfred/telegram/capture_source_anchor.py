@@ -22,8 +22,9 @@ Design notes:
       cross-linking is deferred to v2.
     * Re-encounter scan is recency-bounded (``RE_ENCOUNTER_SCAN_CAP``)
       to bound perf on large vaults.
-    * All resolver calls go through ``alfred.vault.ops`` with the
-      ``scope="hypatia"`` kwarg so the create-allowlist gate runs.
+    * All resolver calls go through ``alfred.vault.ops`` with a
+      caller-supplied ``scope`` kwarg (required) so the create-
+      allowlist gate runs.
     * Existing free-text ``author:`` fields on legacy source records
       are tolerated — the resolver checks for both wikilink and bare-
       string matches when deciding whether the source already has an
@@ -634,7 +635,7 @@ def resolve_or_create_author(
     vault_path: Path,
     author_full: str,
     *,
-    scope: str = "hypatia",
+    scope: str,
 ) -> AuthorRef | None:
     """Resolve an author via heuristic-canonical-filename + alias scan,
     or create the record if no match.
@@ -766,7 +767,7 @@ def resolve_or_create_source(
     author_full: str = "",
     author_wikilink: str = "",
     *,
-    scope: str = "hypatia",
+    scope: str,
     source_type: str = "",
 ) -> SourceRef | None:
     """Resolve a ``source/<Title>.md`` record or create it.
@@ -851,7 +852,7 @@ def resolve_session_anchors(
     vault_path: Path,
     opening_text: str,
     *,
-    scope: str = "hypatia",
+    scope: str,
 ) -> ResolvedAnchors:
     """Top-level resolver: parse opening turn → resolve/create records.
 
@@ -1406,7 +1407,7 @@ def append_permanent_note_spawned(
     source_rel_path: str,
     zettel_wikilink: str,
     *,
-    scope: str = "hypatia",
+    scope: str,
 ) -> bool:
     """Append a zettel wikilink to a source record's ``## Permanent
     Notes spawned`` section.
@@ -1501,7 +1502,7 @@ def append_re_encounter_observation(
     key_insights: list[str],
     session_rel_path: str,
     *,
-    scope: str = "hypatia",
+    scope: str,
 ) -> bool:
     """Append today's observation bullets to a source record's
     ``## Observations During`` section.

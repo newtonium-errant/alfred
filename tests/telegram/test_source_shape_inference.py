@@ -206,6 +206,7 @@ def test_resolver_writes_source_type_on_create(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     result = csa.resolve_session_anchors(
         vault, "I'm watching The Long Cut by Some Director",
+        scope="hypatia",
     )
     assert result.source_wikilink == "[[source/The Long Cut]]"
     assert result.source_created is True
@@ -217,6 +218,7 @@ def test_resolver_writes_book_for_reading(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     csa.resolve_session_anchors(
         vault, "I'm reading Meditations by Marcus Aurelius",
+        scope="hypatia",
     )
     src = frontmatter.load(vault / "source/Meditations.md")
     assert src.metadata["source_type"] == "book"
@@ -226,6 +228,7 @@ def test_resolver_writes_podcast_for_listening(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     csa.resolve_session_anchors(
         vault, "I'm listening to Acquired by Ben Gilbert",
+        scope="hypatia",
     )
     src = frontmatter.load(vault / "source/Acquired.md")
     assert src.metadata["source_type"] == "podcast"
@@ -238,6 +241,7 @@ def test_resolver_writes_conversation_for_in_conversation_with(
     # Topic-as-title routes through the title field.
     result = csa.resolve_session_anchors(
         vault, "I'm in conversation with Xian Niles about Fiore manuscripts",
+        scope="hypatia",
     )
     # The "title" here is the topic — that becomes the source filename.
     assert "source/Fiore manuscripts" in (result.source_wikilink or "")
@@ -249,6 +253,7 @@ def test_resolver_writes_lecture_for_at_a_lecture_by(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     csa.resolve_session_anchors(
         vault, "I'm at a lecture by Hadot on Stoic practice",
+        scope="hypatia",
     )
     src = frontmatter.load(vault / "source/Stoic practice.md")
     assert src.metadata["source_type"] == "lecture"
@@ -302,6 +307,7 @@ def test_resolver_does_not_overwrite_existing_source_type(
     # Re-encounter — resolver should find existing source, NOT mutate.
     result = csa.resolve_session_anchors(
         vault, "I'm reading Meditations by Marcus Aurelius",
+        scope="hypatia",
     )
     assert result.source_created is False
     src = frontmatter.load(vault / "source/Meditations.md")

@@ -326,7 +326,7 @@ def mirror_supersedes_chain(
     new_zettel_rel_path: str,
     supersedes_value: Any,
     *,
-    scope: str = "hypatia",
+    scope: str,
     today_iso: str | None = None,
 ) -> bool:
     """Mirror a new zettel's ``supersedes:`` field onto the old zettel's
@@ -673,7 +673,7 @@ def append_to_author_contents(
     author_value: Any,
     new_zettel_rel_path: str,
     *,
-    scope: str = "hypatia",
+    scope: str,
 ) -> bool:
     """Append ``- [[zettel/Title]]`` to the author record's
     ``# Contents`` section.
@@ -903,7 +903,7 @@ def append_to_moc_contents(
     moc_value: Any,
     member_rel_path: str,
     *,
-    scope: str = "hypatia",
+    scope: str,
 ) -> bool:
     """Append ``- [[<type>/<Title>]]`` to a MOC's ``# Contents`` section.
 
@@ -983,7 +983,7 @@ def dispatch_moc_appends(
     member_type: str,
     mocs_value: Any,
     *,
-    scope: str = "hypatia",
+    scope: str,
 ) -> int:
     """Iterate a record's ``mocs:`` list, call
     :func:`append_to_moc_contents` for each entry.
@@ -1194,7 +1194,7 @@ def _ensure_inventory_moc(
     moc_rel_path: str,
     moc_name: str,
     *,
-    scope: str = "hypatia",
+    scope: str,
 ) -> bool:
     """Create the inventory MOC at ``moc_rel_path`` if absent.
 
@@ -1250,7 +1250,7 @@ def _apply_inventory_moc_action(
     member_rel_path: str,
     *,
     action: str,
-    scope: str = "hypatia",
+    scope: str,
 ) -> bool:
     """Apply a single ``"add"`` or ``"remove"`` action against one
     inventory MOC.
@@ -1327,7 +1327,7 @@ def dispatch_inventory_mocs(
     *,
     pre_fm: dict | None,
     post_fm: dict,
-    scope: str = "hypatia",
+    scope: str,
 ) -> dict[str, int]:
     """Iterate the dispatch table and apply add/remove actions per
     predicate transition.

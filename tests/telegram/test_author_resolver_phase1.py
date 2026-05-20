@@ -219,7 +219,7 @@ def test_resolve_creates_canonical_filename(tmp_path: Path) -> None:
     """Auto-create lands at ``author/<canonical>.md`` with aliases for
     future-lookup bridging."""
     vault = _make_vault(tmp_path)
-    ref = csa.resolve_or_create_author(vault, "Marcus Aurelius")
+    ref = csa.resolve_or_create_author(vault, "Marcus Aurelius", scope="hypatia")
     assert ref is not None
     assert ref.rel_path == "author/Aurelius, Marcus.md"
     assert ref.created is True
@@ -235,8 +235,8 @@ def test_resolve_creates_canonical_filename(tmp_path: Path) -> None:
 def test_resolve_idempotent_on_second_lookup(tmp_path: Path) -> None:
     """Same input → same record, created=False."""
     vault = _make_vault(tmp_path)
-    first = csa.resolve_or_create_author(vault, "Carl Sagan")
-    second = csa.resolve_or_create_author(vault, "Carl Sagan")
+    first = csa.resolve_or_create_author(vault, "Carl Sagan", scope="hypatia")
+    second = csa.resolve_or_create_author(vault, "Carl Sagan", scope="hypatia")
     assert first is not None and second is not None
     assert first.rel_path == second.rel_path
     assert first.created is True
@@ -248,9 +248,9 @@ def test_resolve_finds_canonical_record_from_alias_form(tmp_path: Path) -> None:
     resolve to the same canonical record."""
     vault = _make_vault(tmp_path)
     # Create via the full-name form.
-    first = csa.resolve_or_create_author(vault, "Marcus Aurelius")
+    first = csa.resolve_or_create_author(vault, "Marcus Aurelius", scope="hypatia")
     # Now look up via the canonical form — should find the same record.
-    second = csa.resolve_or_create_author(vault, "Aurelius, Marcus")
+    second = csa.resolve_or_create_author(vault, "Aurelius, Marcus", scope="hypatia")
     assert first is not None and second is not None
     assert first.rel_path == second.rel_path
     assert second.created is False
@@ -271,7 +271,7 @@ def test_resolve_finds_legacy_last_name_only_record(tmp_path: Path) -> None:
     # Simulate the legacy record (pre-migration state).
     _write_author(vault, "Aurelius.md", "Marcus Aurelius", aliases=None)
 
-    ref = csa.resolve_or_create_author(vault, "Marcus Aurelius")
+    ref = csa.resolve_or_create_author(vault, "Marcus Aurelius", scope="hypatia")
     assert ref is not None
     # Matched the LEGACY record — no new canonical record auto-created.
     assert ref.rel_path == "author/Aurelius.md"
@@ -283,7 +283,7 @@ def test_resolve_finds_legacy_last_name_only_record(tmp_path: Path) -> None:
 def test_resolve_particle_name_canonical(tmp_path: Path) -> None:
     """Particle-preserving name creates a non-comma canonical file."""
     vault = _make_vault(tmp_path)
-    ref = csa.resolve_or_create_author(vault, "Fiore dei Liberi")
+    ref = csa.resolve_or_create_author(vault, "Fiore dei Liberi", scope="hypatia")
     assert ref is not None
     assert ref.rel_path == "author/Fiore dei Liberi.md"
     assert ref.created is True
@@ -297,7 +297,7 @@ def test_resolve_particle_name_canonical(tmp_path: Path) -> None:
 def test_resolve_single_name_historical_figure(tmp_path: Path) -> None:
     """``Aristotle`` → ``author/Aristotle.md`` (canonical = the name)."""
     vault = _make_vault(tmp_path)
-    ref = csa.resolve_or_create_author(vault, "Aristotle")
+    ref = csa.resolve_or_create_author(vault, "Aristotle", scope="hypatia")
     assert ref is not None
     assert ref.rel_path == "author/Aristotle.md"
     assert ref.created is True
@@ -305,8 +305,8 @@ def test_resolve_single_name_historical_figure(tmp_path: Path) -> None:
 
 def test_resolve_empty_author_returns_none(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
-    assert csa.resolve_or_create_author(vault, "") is None
-    assert csa.resolve_or_create_author(vault, "   ") is None
+    assert csa.resolve_or_create_author(vault, "", scope="hypatia") is None
+    assert csa.resolve_or_create_author(vault, "   ", scope="hypatia") is None
 
 
 # --- Last-name retired from auto-created records --------------------------
@@ -321,7 +321,7 @@ def test_auto_created_author_has_no_last_name_frontmatter(
     stops setting it.
     """
     vault = _make_vault(tmp_path)
-    ref = csa.resolve_or_create_author(vault, "Marcus Aurelius")
+    ref = csa.resolve_or_create_author(vault, "Marcus Aurelius", scope="hypatia")
     assert ref is not None
     rec = ops.vault_read(vault, ref.rel_path)
     assert "last_name" not in rec["frontmatter"]
@@ -334,7 +334,7 @@ def test_auto_created_author_does_not_set_status(tmp_path: Path) -> None:
     """Phase 1 author template strip dropped status; the resolver no
     longer writes ``status: active`` either."""
     vault = _make_vault(tmp_path)
-    ref = csa.resolve_or_create_author(vault, "Marcus Aurelius")
+    ref = csa.resolve_or_create_author(vault, "Marcus Aurelius", scope="hypatia")
     assert ref is not None
     rec = ops.vault_read(vault, ref.rel_path)
     # status field absent — the validator tolerates it (no entry in

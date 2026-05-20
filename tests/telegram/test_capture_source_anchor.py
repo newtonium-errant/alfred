@@ -163,6 +163,7 @@ def test_resolve_session_anchors_creates_source_and_author(tmp_path: Path) -> No
     vault = _make_vault(tmp_path)
     result = csa.resolve_session_anchors(
         vault, "I'm reading Meditations by Marcus Aurelius",
+        scope="hypatia",
     )
     assert result.source_wikilink == "[[source/Meditations]]"
     assert result.author_wikilink == "[[author/Aurelius, Marcus]]"
@@ -194,6 +195,7 @@ def test_resolve_session_anchors_jr_suffix(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     result = csa.resolve_session_anchors(
         vault, "Currently reading The Frame by Foo Bar Jr.",
+        scope="hypatia",
     )
     assert result.author_wikilink == "[[author/Bar, Foo]]"
     assert (vault / "author" / "Bar, Foo.md").exists()
@@ -202,8 +204,8 @@ def test_resolve_session_anchors_jr_suffix(tmp_path: Path) -> None:
 def test_resolve_session_anchors_idempotent(tmp_path: Path) -> None:
     """Second call resolves to existing canonical record — no double-create."""
     vault = _make_vault(tmp_path)
-    csa.resolve_session_anchors(vault, "I'm reading X by Y Smith")
-    again = csa.resolve_session_anchors(vault, "I'm reading X by Y Smith")
+    csa.resolve_session_anchors(vault, "I'm reading X by Y Smith", scope="hypatia")
+    again = csa.resolve_session_anchors(vault, "I'm reading X by Y Smith", scope="hypatia")
     assert again.source_wikilink == "[[source/X]]"
     # Canonical form: ``Smith, Y``.
     assert again.author_wikilink == "[[author/Smith, Y]]"
@@ -241,6 +243,7 @@ def test_resolve_session_anchors_same_lastname_different_first_creates_distinct(
     )
     result = csa.resolve_session_anchors(
         vault, "I'm reading Methodology by John Smith",
+        scope="hypatia",
     )
     # New author lands at distinct canonical filename — no collision.
     assert result.author_wikilink == "[[author/Smith, John]]"
@@ -252,7 +255,7 @@ def test_resolve_session_anchors_same_lastname_different_first_creates_distinct(
 
 def test_resolve_session_anchors_no_match(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
-    result = csa.resolve_session_anchors(vault, "rambling about plans")
+    result = csa.resolve_session_anchors(vault, "rambling about plans", scope="hypatia")
     assert result.source_wikilink == ""
     assert result.author_wikilink == ""
     assert result.continues_from == ""

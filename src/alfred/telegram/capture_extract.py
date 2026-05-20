@@ -724,11 +724,17 @@ async def extract_notes_from_capture(
                 )
                 zettel_wikilink = f"[[{zettel_no_md}]]"
                 try:
+                    # ``anchor_scope`` is guaranteed ``"hypatia"`` here:
+                    # ``target_type == "zettel"`` only resolves when the
+                    # discriminator at ``_resolve_extract_target_type``
+                    # took the Hypatia branch, which requires
+                    # ``anchor_scope == "hypatia"`` (Salem path returns
+                    # ``"note"`` and never reaches this hook).
                     _csa.append_permanent_note_spawned(
                         vault_path=vault_path,
                         source_rel_path=source_wikilink,
                         zettel_wikilink=zettel_wikilink,
-                        scope=(anchor_scope or "hypatia"),
+                        scope=anchor_scope,
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.info(

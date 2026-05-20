@@ -294,7 +294,7 @@ def apply_accept(
     suggestion: MocSuggestion,
     queue_path: str | Path,
     vault_path: Path,
-    scope: str = "hypatia",
+    scope: str,
 ) -> ApplyResult:
     """Execute the accept-path for one suggestion.
 
@@ -331,9 +331,9 @@ def apply_accept(
     point at any queue entry; if someone manually edited the queue
     to inject an inventory-MOC target, we refuse here.
 
-    All vault writes go through ``scope="hypatia"`` (default) so the
-    talker scope's ``edit`` allowance on the member records' types
-    governs. No new scope rules introduced.
+    All vault writes go through the caller-supplied ``scope`` (required)
+    so the talker scope's ``edit`` allowance on the member records'
+    types governs. No new scope rules introduced.
     """
     # Defense-in-depth (1/3): inventory MOC filter at apply time.
     # The suggester filters at propose time (D1); the queue persists

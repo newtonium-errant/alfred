@@ -989,6 +989,10 @@ async def process_capture_session(
             source_rel = anchors.source_wikilink.strip("[]")
             if not source_rel.endswith(".md"):
                 source_rel = source_rel + ".md"
+            # ``anchor_scope`` is guaranteed truthy here — the outer
+            # block only enters when ``anchors is not None``, and
+            # anchors only get resolved when ``anchor_scope`` was set
+            # (see the anchor-resolution gate above at L739).
             _csa.append_re_encounter_observation(
                 vault_path=vault_path,
                 source_rel_path=source_rel,
@@ -996,7 +1000,7 @@ async def process_capture_session(
                 topics=list(summary.topics),
                 key_insights=list(summary.key_insights),
                 session_rel_path=session_rel_path,
-                scope=(anchor_scope or "hypatia"),
+                scope=anchor_scope,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(

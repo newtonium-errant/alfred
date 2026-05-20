@@ -1074,21 +1074,38 @@ def vault_create(
     # frontmatter list is non-empty. The trigger-type gate lives
     # inside ``dispatch_moc_appends`` so this call site stays
     # type-agnostic.
-    if record_type == "zettel":
+    # Zettel hook dispatch needs a scope to route writes through the
+    # create-allowlist gate. The legacy unrestricted-create path
+    # (``scope is None``) is preserved for non-zettelkasten record
+    # types, but zettelkasten hooks require a scope. Log + skip rather
+    # than silently substituting a single-instance literal — per
+    # ``feedback_hardcoding_and_alfred_naming.md`` the fail-loud
+    # guarantee must not be weakened by a defensive default.
+    _zettel_hook_types = (
+        "zettel", "source", "question", "research-pointer",
+    )
+    if record_type in _zettel_hook_types and scope is None:
+        log.warning(
+            "vault.zettel_hooks.dispatch_skipped_no_scope",
+            rel_path=rel_path,
+            record_type=record_type,
+            reason="scope_required_for_zettelkasten_hooks",
+        )
+    elif record_type == "zettel":
         from . import zettel_hooks as _zhooks
         try:
             if fm.get("supersedes"):
                 _zhooks.mirror_supersedes_chain(
-                    vault_path, rel_path, fm.get("supersedes"), scope=scope or "hypatia",
+                    vault_path, rel_path, fm.get("supersedes"), scope=scope,
                 )
             if fm.get("author"):
                 _zhooks.append_to_author_contents(
-                    vault_path, fm.get("author"), rel_path, scope=scope or "hypatia",
+                    vault_path, fm.get("author"), rel_path, scope=scope,
                 )
             if fm.get("mocs"):
                 _zhooks.dispatch_moc_appends(
                     vault_path, rel_path, record_type, fm.get("mocs"),
-                    scope=scope or "hypatia",
+                    scope=scope,
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -1102,7 +1119,7 @@ def vault_create(
             if fm.get("mocs"):
                 _zhooks.dispatch_moc_appends(
                     vault_path, rel_path, record_type, fm.get("mocs"),
-                    scope=scope or "hypatia",
+                    scope=scope,
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -1119,8 +1136,9 @@ def vault_create(
     # post-create predicate match → "add". The trigger-type gate
     # lives inside ``dispatch_inventory_mocs`` (iterates the
     # ``INVENTORY_MOC_DISPATCH`` table); this call site stays
-    # type-agnostic.
-    if record_type in ("question", "research-pointer"):
+    # type-agnostic. Skipped when scope is None (handled by the
+    # zettelkasten-hooks-no-scope guard above).
+    if record_type in ("question", "research-pointer") and scope is not None:
         from . import zettel_hooks as _zhooks
         try:
             _zhooks.dispatch_inventory_mocs(
@@ -1129,7 +1147,7 @@ def vault_create(
                 record_type,
                 pre_fm=None,
                 post_fm=dict(fm),
-                scope=scope or "hypatia",
+                scope=scope,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -1428,21 +1446,37 @@ def vault_edit(
     # is in fields_changed AND the post-edit value is non-empty.
     # The trigger-type gate lives inside ``dispatch_moc_appends`` so
     # this call site only needs to filter on fields_changed.
-    if record_type == "zettel":
+    # Zettel hook dispatch needs a scope to route writes through the
+    # create-allowlist gate. The legacy unrestricted-edit path
+    # (``scope is None``) is preserved for non-zettelkasten record
+    # types, but zettelkasten hooks require a scope. Log + skip rather
+    # than silently substituting a single-instance literal — mirrors
+    # the same guard in ``vault_create`` above.
+    _zettel_hook_types = (
+        "zettel", "source", "question", "research-pointer",
+    )
+    if record_type in _zettel_hook_types and scope is None:
+        log.warning(
+            "vault.zettel_hooks.dispatch_skipped_no_scope",
+            rel_path=rel_path,
+            record_type=record_type,
+            reason="scope_required_for_zettelkasten_hooks",
+        )
+    elif record_type == "zettel":
         from . import zettel_hooks as _zhooks
         try:
             if "supersedes" in fields_changed and fm.get("supersedes"):
                 _zhooks.mirror_supersedes_chain(
-                    vault_path, rel_path, fm.get("supersedes"), scope=scope or "hypatia",
+                    vault_path, rel_path, fm.get("supersedes"), scope=scope,
                 )
             if "author" in fields_changed and fm.get("author"):
                 _zhooks.append_to_author_contents(
-                    vault_path, fm.get("author"), rel_path, scope=scope or "hypatia",
+                    vault_path, fm.get("author"), rel_path, scope=scope,
                 )
             if "mocs" in fields_changed and fm.get("mocs"):
                 _zhooks.dispatch_moc_appends(
                     vault_path, rel_path, record_type, fm.get("mocs"),
-                    scope=scope or "hypatia",
+                    scope=scope,
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -1456,7 +1490,7 @@ def vault_edit(
             if "mocs" in fields_changed and fm.get("mocs"):
                 _zhooks.dispatch_moc_appends(
                     vault_path, rel_path, record_type, fm.get("mocs"),
-                    scope=scope or "hypatia",
+                    scope=scope,
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning(
@@ -1478,8 +1512,9 @@ def vault_edit(
     # but we run the dispatch on every edit to be defensive against
     # future predicates that may depend on multiple fields. The
     # per-call cost is one predicate evaluation per matching
-    # dispatch entry; cheap.
-    if record_type in ("question", "research-pointer"):
+    # dispatch entry; cheap. Skipped when scope is None (handled by
+    # the zettelkasten-hooks-no-scope guard above).
+    if record_type in ("question", "research-pointer") and scope is not None:
         from . import zettel_hooks as _zhooks
         try:
             _zhooks.dispatch_inventory_mocs(
@@ -1488,7 +1523,7 @@ def vault_edit(
                 record_type,
                 pre_fm=pre_edit_fm,
                 post_fm=dict(fm),
-                scope=scope or "hypatia",
+                scope=scope,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(

@@ -869,7 +869,7 @@ async def peer_propose_event(
     summary: str = "",
     origin_context: str = "",
     config: "TransportConfig | None" = None,
-    self_name: str = "hypatia",
+    self_name: str,
     correlation_id: str | None = None,
 ) -> dict[str, Any]:
     """POST /canonical/event/propose-create on the named peer (sync create).
