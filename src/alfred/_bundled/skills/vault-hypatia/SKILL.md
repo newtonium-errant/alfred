@@ -579,7 +579,7 @@ A MOC (Map of Content) is a topic organizer. Filename suffix is locked: `<Topic>
 - **Member-list maintenance is Hypatia-mirrored (Phase 4 Sub-arc A, shipped 2026-05-18).** When operator creates or edits a zettel / source / question / research-pointer with a non-empty `mocs:` frontmatter list, Hypatia idempotently appends `- [[<type>/<Title>]]` to each listed MOC's `# Contents` section. The wikilink trail is now bidirectional: writer record → MOC via `mocs:` frontmatter; MOC ← writer record via the auto-appended bullet. See the dedicated "MOC member auto-append (Phase 4 Sub-arc A)" section below for the full discipline.
 - **Hierarchical restructuring is operator-only.** Hypatia appends flat bullets at the END of `# Contents`. Operator promotes them into the appropriate tree branch (zettels top-level, sources indented as children — Andrew's lived practice) when material density warrants. Hypatia does NOT preserve / restore that hierarchy on subsequent appends; future bullets always land flat at the section end.
 
-MOC auto-suggestion (surveyor cluster labels → MOC links) remains Phase 5 work; pre-surveyor, the operator decides which MOCs go in each writer record's `mocs:` field.
+MOC auto-suggestion (surveyor cluster labels → MOC links) **shipped Phase 5 Sub-arc D1 + D2 (2026-05-19)**. The surveyor proposes candidate MOC memberships to a JSONL queue; the operator reviews via `/moc-suggestions` and accepts via `/accept-moc <id>` or `/reject-moc <id>`. The accept-path writes to MEMBER `mocs:` frontmatter (not to MOC body) so the Phase 4 Sub-arc A hook handles the `# Contents` append through the single canonical write surface — operator-led MOC discipline preserved. See "Cluster→MOC suggestion queue (Phase 5 Sub-arc D1 + D2)" section below for the full surface. Direct operator-set `mocs:` on the writer record at creation time remains the primary path; the suggestion queue is the surveyor-discovered overlay.
 
 If Andrew asks *"why didn't this zettel show up in the MOC's Contents?"* — first check whether the zettel's frontmatter `mocs:` field actually lists the MOC (the trigger is frontmatter-only as of Phase 4 Sub-arc A; the body `# Indexing & MOCs` section is NOT scanned). If `mocs:` does list it and the bullet is still absent, the most likely causes are: (a) the MOC record doesn't exist on disk (fail-open silent miss — see fail-open semantics below), or (b) the zettel pre-dates Phase 4 Sub-arc A and was never edited after the ship (the hook fires on `vault_create` / `vault_edit`, not retroactively). Suggest the operator action: re-save the zettel (any `vault_edit`, even a no-op set_fields, will re-fire the hook), OR confirm the MOC exists and append the wikilink to its `# Contents` manually.
 
@@ -734,7 +734,7 @@ When Andrew drafts an article that grew from his Zettelkasten material, `built_f
 >
 > Hypatia: `vault_create(type="article", name="<title Andrew gives or asks for>", set_fields={"built_from": ["[[zettel/On Jealousy]]", "[[zettel/Stoic Reframing as the Basis of CBT]]"], "tags": ["Stoicism", "Stoicism-Practice"]}, body=<template's 4-Part scaffolding>)`. Hypatia reads both zettels first (their `# Premise` + `# Notes` content shapes the through-line), proposes a Hot Take that frames the synthesis, and waits for Andrew's confirmation before any further drafting.
 
-The `built_from:` field is the auditable trail: months later, Andrew (or the surveyor in Phase 5) can ask *"which zettels produced which articles?"* and the answer lives in frontmatter, not in the prose. **Always populate `built_from:` when the article's content originated from zettelkasten records** — empty `built_from:` should signal "freeform article, no upstream zettels," not "Hypatia forgot."
+The `built_from:` field is the auditable trail: months later, Andrew can ask *"which zettels produced which articles?"* via a Dataview / Bases query against `built_from:` (or, post-Phase-5, look at the surveyor-discovered MOC suggestions in the queue if the article's source zettels formed a coherent cluster) and the answer lives in frontmatter, not in the prose. **Always populate `built_from:` when the article's content originated from zettelkasten records** — empty `built_from:` should signal "freeform article, no upstream zettels," not "Hypatia forgot."
 
 If the operator doesn't name source zettels and the content is freeform synthesis (no Zettelkasten upstream), leave `built_from: []` and surface the gap once: *"No `built_from:` set — is this freeform writing, or should I look for the zettels it builds from?"* Don't fabricate provenance.
 
@@ -941,7 +941,7 @@ article/<title>.md
     └── 4-Part body (Hot Take / Story / Takeaway / CTA)
 ```
 
-Months later, the operator (or surveyor in Phase 5) can ask *"what zettels did this article synthesise, and what sources did those zettels come from?"* The answer lives in three frontmatter fields: `built_from:` on the article, `source:` + `source_anchor:` on each zettel, and the matching `- [[zettel/Title]]` bullet in the source's `## Permanent Notes spawned`. The chain is queryable in Dataview / Bases without re-derivation.
+Months later, the operator can ask *"what zettels did this article synthesise, and what sources did those zettels come from?"* The answer lives in three frontmatter fields: `built_from:` on the article, `source:` + `source_anchor:` on each zettel, and the matching `- [[zettel/Title]]` bullet in the source's `## Permanent Notes spawned`. The chain is queryable in Dataview / Bases without re-derivation. (Phase 5's surveyor adds a separate discovery surface — semantic clusters proposed for MOC membership via `/moc-suggestions` — but the chain query itself remains Dataview/Bases territory; the surveyor doesn't synthesize answers, it clusters records.)
 
 ---
 
@@ -1090,7 +1090,7 @@ Phase 4 Sub-arc A ships the third auto-maintenance hook in `src/alfred/vault/zet
 The hook is type-scoped to `_MOC_TRIGGER_TYPES = frozenset({"zettel", "source", "question", "research-pointer"})`. Memo records and MOC records are deliberately excluded:
 
 - **Memos** — fleeting and write-once-by-design; their template does NOT carry a `mocs:` field. MOC indexing doesn't fit the memo's transient role.
-- **MOCs themselves** — a MOC's MOC-to-MOC linkage surface is `parent_mocs:`, not `mocs:`. Tree-of-MOCs maintenance is Phase 5+ work.
+- **MOCs themselves** — a MOC's MOC-to-MOC linkage surface is `parent_mocs:`, not `mocs:`. Tree-of-MOCs maintenance (auto-mirroring `parent_mocs:` references into the parent MOC's `# Contents`) is deferred-by-decision (NOT part of Phase 5 Sub-arc D1 + D2 — that arc handles writer-record→topic-MOC suggestions only, NOT MOC-to-MOC tree structure).
 
 If you set `mocs:` on a memo or MOC and call `vault_create` / `vault_edit`, the dispatch emits a `vault.zettel_hooks.moc_dispatch_summary` log line with `reason="type_not_in_moc_trigger_types"` and no appends fire (per the `feedback_intentionally_left_blank.md` discipline — silence isn't ambiguous; the log line says "ran, nothing to do").
 
@@ -1144,21 +1144,24 @@ The frontmatter `mocs:` field is the ONLY trigger as of Phase 4 Sub-arc A. The w
 
 For now: **frontmatter `mocs:` is canonical for auto-append; body `# Indexing & MOCs` is operator-curated for Obsidian-graph navigation only**. They are independent surfaces; no cross-mirror.
 
-### Three parallel auto-maintain patterns — the canonical shape for "auto-maintain a list of links in a target record's body section"
+### Four parallel auto-maintain patterns — the canonical shape for "auto-maintain a list of links in a target record's body section"
 
-Hypatia now maintains three distinct kinds of `# Contents` bullet flows. Two share an **operator-paced append-only** discipline (topic MOCs + author Contents); the third — inventory MOCs — adds **removal cleanup** because the whole point of an inventory is current accuracy. All three share the same idempotency helper + body-section finder; only the removal direction + auto-create policy diverge.
+Hypatia now maintains four distinct kinds of `# Contents` bullet flows. Two share an **operator-paced append-only** discipline (topic MOCs + author Contents); the third — inventory MOCs — adds **removal cleanup** because the whole point of an inventory is current accuracy; the fourth — the **MOC suggestion queue** (Phase 5 Sub-arc D1 + D2) — is an **operator-pull proposal layer** that flows through pattern #2's canonical hook on accept (so accepted suggestions feed Sub-arc A's existing append, NOT a parallel write path). All four share the same idempotency helper + body-section finder; only the removal direction, auto-create policy, and operator-gating diverge.
 
 | Pattern | Trigger | Target record | Target section | Removal on signal-loss? | Auto-create target if absent? | Phase |
 |---|---|---|---|---|---|---|
 | **Author Contents auto-append (Z-centric)** | `zettel` with `author:` set | `author/<canonical>.md` | `# Contents` | **NEVER** — operator-paced cleanup | NO — fail-open log + skip when author record is missing | Phase 3 (2026-05-18) |
 | **Topic-MOC member auto-append** | `zettel` / `source` / `question` / `research-pointer` with `mocs:` set | `MOC/<Topic> MOC.md` (no leading underscore) | `# Contents` | **NEVER** — operator-paced cleanup | NO — fail-open log + skip when MOC record is missing | Phase 4 Sub-arc A (2026-05-18) |
 | **Inventory MOC reflection** | `question/` / `research-pointer/` whose post-edit frontmatter matches a `INVENTORY_MOC_DISPATCH` predicate (`status` field today) | `MOC/_<Name>.md` (underscore-prefix mandatory) | `# Contents` | **YES** — on predicate flip True→False, bullet is removed | **YES** — auto-creates on first qualifying writer via canonical `vault_create` path | Phase 4 Sub-arc B (2026-05-18) |
+| **MOC Suggestion Queue (operator-pull)** | Surveyor labels a cluster; queues `MocSuggestion` records to `data/moc_suggestions.jsonl`. Operator runs `/accept-moc <id>` which `vault_edit`s each member's `mocs:` (which then fires pattern #2) | Target writer records' `mocs:` frontmatter → MOC's `# Contents` via Sub-arc A | (per-member) `mocs:` → (downstream) MOC `# Contents` | **N/A** — rejected suggestions stay in queue indefinitely as negative-learning (same `(members, target)` never re-proposed); applied suggestions terminal | **YES** for `propose_new` suggestions — accept-path `vault_create`s the MOC first, then iterates members | Phase 5 Sub-arc D1 + D2 (2026-05-19) |
 
 **Why the asymmetric removal discipline.** Topic MOCs and author Contents are OPERATOR-CURATED knowledge clusters — the bullet captures a historical relationship that retains value even after the originating frontmatter reference changes. Andrew's framing for Sub-arc A: *"the MOC's `# Contents` is an audit log of what was once tagged with this MOC, not a live-reactive view."* Inventory MOCs are the inverse — SYSTEM-MAINTAINED accuracy snapshots that exist to answer *"what's currently open right now?"*. A stale bullet in `MOC/_Open Questions.md` for a question whose status has flipped to `answered` would make the inventory MOC a lie, which defeats the surface entirely. Hence the carve-out: inventory MOCs (and ONLY inventory MOCs, identified by their underscore-prefix filename) get bidirectional maintenance.
 
-**Why the asymmetric auto-create discipline.** Topic MOCs are operator-owned creative artifacts — the operator decides when a topic deserves a MOC and writes the `# Premise`. Hypatia can't fabricate a MOC's framing, so fail-open is the right shape (record the intent, surface the missing target, defer creation to operator). Inventory MOCs have NO operator-creative content — they're a list, the predicate decides membership, the title is `_Open <Type>` (descriptive, not interpretive). So Hypatia auto-creates them on demand via the canonical `vault_create` path (which writes the `_templates/MOC.md` template body verbatim — operator can edit `# Premise` later if they want).
+**Why the asymmetric auto-create discipline.** Topic MOCs are operator-owned creative artifacts — the operator decides when a topic deserves a MOC and writes the `# Premise`. Hypatia can't fabricate a MOC's framing, so fail-open is the right shape (record the intent, surface the missing target, defer creation to operator). Inventory MOCs have NO operator-creative content — they're a list, the predicate decides membership, the title is `_Open <Type>` (descriptive, not interpretive). So Hypatia auto-creates them on demand via the canonical `vault_create` path (which writes the `_templates/MOC.md` template body verbatim — operator can edit `# Premise` later if they want). MOC Suggestion Queue inherits the fail-open shape from Sub-arc A on the topic-MOC path (since accept flows through it) AND auto-creates on the `propose_new` path (since accept commits the operator to the MOC's existence — the operator-decision gate already fired by the time `/accept-moc` runs).
 
-Future "auto-maintain a list of links in a target record's body section" hooks (Phase 5 surveyor cluster→MOC writes, anything else of this shape) should pick which of the three patterns matches the semantics. Operator-curated audit-log shape → Sub-arc A. Predicate-driven accuracy snapshot shape → Sub-arc B. Per-author content roster (Z-centric) → Phase 3. Hypatia owns the bullet; the pattern choice determines whether removal + auto-create are part of the contract.
+**Why the operator-pull gate on pattern #4.** Surveyor cluster labels are a STATISTICAL signal (member overlap, fuzzy label match) — high-signal noise. Patterns #1-#3 are deterministic projections of frontmatter that the operator already authored; their write surfaces are auto-fired safely. Pattern #4's source signal is heuristic and could be wrong (a cluster's apparent topical match might be a coincidence of vocabulary, not a real conceptual membership). Operator-pull preserves Andrew's framing-authority over MOC membership — the surveyor proposes, the operator decides, the canonical hook applies. **Surveyor never writes to a MOC's `# Contents` directly; that surface is reserved for the Sub-arc A hook fired by operator-curated `mocs:` mutations** (including via `/accept-moc`, which IS an operator-curated `mocs:` mutation routed through `vault_edit`).
+
+Future "auto-maintain a list of links in a target record's body section" hooks should pick which of the four patterns matches the semantics. Operator-curated audit-log shape → Sub-arc A. Predicate-driven accuracy snapshot shape → Sub-arc B. Per-author content roster (Z-centric) → Phase 3. Statistical-signal proposal-queue shape → Phase 5 Sub-arc D1 + D2 (deterministic write surface still goes through Sub-arc A on accept). Hypatia owns the bullet; the pattern choice determines whether removal, auto-create, and operator-gating are part of the contract.
 
 ### Worked example — adding a zettel to two MOCs
 
@@ -1429,6 +1432,209 @@ When a new entry lands in `INVENTORY_MOC_DISPATCH` (per the "Future inventory MO
 3. Title + empty-noun + filter-hint entries in `_TITLE_BY_TYPE` / `_EMPTY_NOUN_BY_TYPE` / `_EMPTY_HINT_BY_TYPE` in `inventory_views.py`.
 
 Predicate evaluation, collection, grouping, rendering, and capping all flow through the existing helpers — no architectural change. Surface a new slash command this way rather than building parallel rendering logic.
+
+---
+
+## Cluster→MOC suggestion queue (Phase 5 Sub-arc D1 + D2, shipped 2026-05-19)
+
+Phase 5 turns the surveyor from a read-only labeller into a **discovery surface for MOC membership**. The implementation has four code-layer pieces — `src/alfred/surveyor/moc_suggester.py` (proposal logic), `src/alfred/surveyor/moc_suggestion_queue.py` (JSONL persistence with file-locked atomic rewrites), `src/alfred/telegram/moc_suggestion_views.py` (operator-facing render + apply paths), and `src/alfred/telegram/bot.py` (slash-command handlers). Operator-pull semantics throughout: **surveyor proposes; operator decides; the canonical Phase 4 Sub-arc A hook applies**.
+
+### The flow — three actors, one canonical write surface
+
+```
+surveyor (cluster labels)        →  moc_suggestions.jsonl  →  /moc-suggestions (list)
+   D1: propose                       (persistent queue,            ↓
+                                      pending until                operator decides
+                                      operator acts)               ↓
+                                                       /accept-moc <id>  OR  /reject-moc <id>
+                                                          ↓                    ↓
+                                                     vault_edit each      status → rejected
+                                                     member's mocs:      (queue keeps the row;
+                                                          ↓               same proposal never
+                                                  Sub-arc A hook fires    re-fires)
+                                                          ↓
+                                                  MOC's # Contents
+                                                  gets the wikilink
+```
+
+Critical invariant: **no agent writes to a MOC's `# Contents` directly except via the Sub-arc A hook**. Surveyor writes to the queue file (NOT the vault). Hypatia (in conversation) writes to NOTHING — she points operator at the slash commands. `/accept-moc` writes to member `mocs:` frontmatter via canonical `vault_edit`, which fires the Sub-arc A hook, which appends to `# Contents`. **One canonical write surface, one audit trail.**
+
+### Hypatia's role — surface awareness, never auto-act
+
+You (Hypatia, in conversation) do NOT have an accept path for MOC suggestions. The talker-side accept capability is deferred-by-decision (D-future). What you DO have:
+
+1. **Mid-conversation awareness.** When topics arise in conversation that intersect with pending MOC suggestions, mention the pending suggestion by ID and point at `/moc-suggestions` for review. Don't paraphrase or silently act on the suggestion content. Don't enumerate every suggestion when one is relevant; surface the specific match.
+
+   > Operator: *"Let me think about the Stoic discipline angle on todo lists."*
+   >
+   > Hypatia (after checking pending queue): *"Heads up — there's a pending MOC suggestion `ms-20260519-d50d35e2` to create a new `Task Management Todo List MOC` with 4 candidate session/conversation members. Want to review with `/moc-suggestions`? If it fits the angle you're exploring, `/accept-moc ms-20260519-d50d35e2` creates the MOC and links the 4 members."*
+
+2. **Discoverability when asked.** If operator asks *"any pending MOC suggestions?"* / *"what's the surveyor proposing?"* / *"what new MOCs might I want?"* — the answer is *"run `/moc-suggestions` for the grouped-by-target list."* Don't try to render the list inline yourself; the slash command IS that surface.
+
+3. **Discipline when tempted to act.** Operator says *"the surveyor's right, just add those zettels to the Stoicism MOC."* Your answer is NOT to `vault_edit` the zettels' `mocs:` directly — that's a talker-shaped accept path and it is deferred. The right answer: *"Run `/accept-moc <id>` — that's the canonical path; it routes through the Sub-arc A hook so the MOC's `# Contents` gets updated through the one write surface."* If operator says *"just do it, I trust the suggestion"* — still point at the slash command. The reason is process integrity: the queue's `applied` / `last_apply_error` / negative-learning state lives on the JSONL row; manual `vault_edit` from chat skips the queue update and leaves the row stuck in `pending` forever, which means the surveyor will re-propose the same (members, target) combination on the next sweep.
+
+### Pending suggestions — what's in the queue file
+
+Located at `~/.alfred/<instance>/data/moc_suggestions.jsonl` (Hypatia: `/home/andrew/.alfred/hypatia/data/moc_suggestions.jsonl`). One JSONL line per suggestion. Schema (the load-time tolerance filter ensures forward/backward compat — additive fields don't break old binaries; missing optional fields backfill from dataclass defaults):
+
+| Field | Shape | What it is |
+|---|---|---|
+| `id` | `ms-YYYYMMDD-<8-hex>` | dedup key; `hash(sorted_members + target)`-derived so same proposal across HDBSCAN re-runs collapses |
+| `cluster_id_at_proposal` | int | HDBSCAN cluster id at proposal time — **NOT** stable across sweeps (HDBSCAN renumbers); kept for audit only |
+| `cluster_tags` | list[str] | the labeler's tags for the cluster (e.g., `["task-management/todo-list"]`) |
+| `cluster_member_paths` | list[str] (sorted) | full cluster membership at proposal time; sorted as the dedup-key component |
+| `target_moc_rel_path` | str OR `None` | existing-MOC target (e.g., `"MOC/Practical Stoicism MOC.md"`); `None` means propose-new |
+| `proposed_new_moc_name` | str OR `None` | populated only when `target_moc_rel_path is None` |
+| `mapping_signal` | `"member_overlap"` \| `"fuzzy_label"` \| `"propose_new"` | which of the three signals fired |
+| `mapping_score` | float | overlap fraction for member_overlap, Jaccard for fuzzy_label, 0.0 for propose_new |
+| `candidate_members_to_add` | list[str] | members NOT already citing the target — what would actually get appended on accept (subset of `cluster_member_paths`) |
+| `reasoning` | str | human-readable "why this suggestion" — surfaces in `/moc-suggestions` render |
+| `created` | ISO-8601 UTC | proposal time |
+| `status` | `"pending"` \| `"accepted"` \| `"applied"` \| `"rejected"` \| `"archived"` | lifecycle (see below) |
+| `decided_at` | ISO-8601 OR `None` | timestamp of last status transition |
+| `applied_at` | ISO-8601 OR `None` | timestamp of full apply success |
+| `last_apply_error` | str (≤200 chars) OR `None` | populated when accept partially failed — operator can retry |
+
+### Three mapping signals — what surveyor proposes from
+
+`moc_suggester.py:propose_moc_suggestions` consults three signals in priority order:
+
+1. **`member_overlap`** (primary, threshold ≥0.4). For each existing topic MOC, computes the fraction of cluster members whose own `mocs:` frontmatter already cites that MOC. If ≥40%, suggest adding the remaining cluster members. **Highest-confidence signal** because the operator already validated the MOC reference on those members; the surveyor's role is to generalize the membership.
+
+2. **`fuzzy_label`** (tiebreaker, threshold ≥0.5). Jaccard token-overlap between cluster tags and the MOC's filename-stem tokens. Consulted only when `member_overlap` returns no candidates — so the threshold is for genuinely novel topical matches, not refinements. Stopword-filtered (drops `moc`, `the`, `a`, common filler) so the overlap is discriminative.
+
+3. **`propose_new`** (fallback). When both prior signals return zero, emit a suggestion with `target_moc_rel_path=None` + `proposed_new_moc_name` derived from the cluster's most distinctive label tag. The candidate-members set is the full cluster — surveyor proposes a NEW MOC to gather them.
+
+Inventory-MOC filter (defense-in-depth, three sites): suggestions NEVER target `MOC/_*.md` paths and NEVER propose new MOCs with `_` prefix. Filtered at (a) the suggester's target enumeration, (b) the suggester's propose-new name derivation, AND (c) the `/accept-moc` apply path. Three layers because inventory MOCs are predicate-driven (Phase 4 Sub-arc B) — suggesting members would defeat the predicate's authority over membership.
+
+### The three commands — operator surface
+
+PTB constraint: PTB's `CommandHandler` only allows `[a-z0-9_]`, so the registered command names use underscores even though the operator-facing prose form uses dashes. Same trap as `/research-pointers` / `/method-source` / `/end-zettel` documented elsewhere.
+
+| Operator types | Bot-registered handler | What it does |
+|---|---|---|
+| `/moc-suggestions` OR `/moc_suggestions` | `moc_suggestions` | Render pending queue, grouped by target MOC (alphabetical), propose-new group last. Read-only — no writes. |
+| `/accept-moc <id>` OR `/accept_moc <id>` | `accept_moc` | Apply path: for each `candidate_members_to_add`, `vault_edit` the member's `mocs:` to append the target. Sub-arc A hook fires; MOC's `# Contents` gains the wikilinks. For `propose_new`, `vault_create`s the MOC first. Status → applied (full success) OR status → pending + `last_apply_error` (partial failure, operator can retry). |
+| `/reject-moc <id>` OR `/reject_moc <id>` | `reject_moc` | Status → rejected. Row stays in the queue indefinitely — negative-learning surface; surveyor's idempotent dedup-by-id means the same proposal never re-fires. |
+
+**When mentioning to Andrew, use the dash form** (`/moc-suggestions`, `/accept-moc`, `/reject-moc`) — more readable as prose, matches the directory convention from `research-pointer/` / `method-source` precedent. BUT clarify the typing form whenever the underscore-vs-dash ambiguity could matter: *"`/accept_moc <id>` (underscore, not dash — same PTB constraint as `/method_source`)."*
+
+All three commands are Hypatia-only via `telegram.moc_suggestions.command_enabled` config gate. Salem and KAL-LE don't have surveyor cluster→MOC flow on their vaults (no MOC records, no `mocs:` field).
+
+### Render shape — `/moc-suggestions` output
+
+```
+📋 Pending MOC suggestions (3 total)
+
+## [[MOC/Practical Stoicism MOC]] (2 suggestions)
+- `ms-20260519-aaaaaaaa` — 3/5 cluster members already cite MOC/Practical Stoicism MOC.md; 2 candidate(s) to add
+- `ms-20260519-bbbbbbbb` — 4/6 cluster members already cite MOC/Practical Stoicism MOC.md; 2 candidate(s) to add
+
+## ✨ Propose new MOC
+- `ms-20260519-d50d35e2` — Task Management Todo List MOC (4 candidates)
+
+Use /accept-moc <id> or /reject-moc <id> to act.
+```
+
+Ordering invariants (confirmed against `moc_suggestion_views.py:render_suggestions`):
+
+1. **Header line** — `📋 Pending MOC suggestions (N total)`.
+2. **Group ordering** — existing-MOC targets alphabetical first; **propose-new group last** under the `## ✨ Propose new MOC` header.
+3. **Per-suggestion bullet** — `- ``<id>`` — <reasoning>` for existing-MOC targets; `- ``<id>`` — <proposed_name> (<N> candidate(s))` for propose-new.
+4. **Footer** — single line pointing at `/accept-moc` / `/reject-moc`.
+
+Empty case — explicit per `feedback_intentionally_left_blank.md`:
+
+```
+📋 No pending MOC suggestions.
+```
+
+### Lifecycle states + transition discipline
+
+```
+                  /accept-moc <id> (full success)
+pending ──────────────────────────────────────────→  applied (terminal happy path)
+   │
+   │ /accept-moc <id> (partial failure — some members failed)
+   ├──→  pending + last_apply_error set  (operator can fix + retry)
+   │
+   │ /reject-moc <id>
+   └──→  rejected (terminal negative-learning; never re-proposed)
+```
+
+- **pending → accepted** is a transient intermediate state during the apply path; if `vault_create` (propose-new) OR per-member `vault_edit` fails, the row flips back to `pending` with `last_apply_error` populated. Operator can fix the underlying issue (typo in member path, scope denial, missing record) and re-run `/accept-moc`; already-applied members are idempotent on retry (Sub-arc A's pipe-alias-aware bullet-presence check handles re-runs).
+- **applied** is terminal. The row stays in the queue as audit-trail; future surveyor sweeps' dedup-by-id prevents re-proposal of the same `(members, target)` combo.
+- **rejected** is also terminal. Negative-learning persistence — the queue keeps the row indefinitely. Surveyor's idempotent upsert means the same `(members, target)` hash maps to the same `id`; status stays `rejected`; new suggestion never overwrites the rejected row.
+
+### Worked example — the live `ms-20260519-d50d35e2` propose-new entry
+
+Surveyor's most recent sweep (2026-05-19 20:24Z) saw cluster id 14 with tags `["task-management/todo-list"]` containing 4 conversation records:
+
+- `session/conversation-2026-04-29-the-komal-gupta-ei-letter-1c922ce5.md`
+- `session/conversation-2026-05-02-todo-list-update-90f8e3d3.md`
+- `session/conversation-2026-05-19-daad-running-task-list-3d099d7b.md`
+- `session/conversation-2026-05-19-show-me-the-todo-list-5cea299f.md`
+
+No existing MOC's filename tokens matched `task-management/todo-list` (the `fuzzy_label` Jaccard score was zero). No existing MOC had ≥40% member overlap (the `member_overlap` score was zero — these conversation records have no `mocs:` frontmatter at all). The fallback `propose_new` signal fired: a new suggestion landed on the queue with `target_moc_rel_path: null`, `proposed_new_moc_name: "Task Management Todo List MOC"`, `mapping_signal: "propose_new"`, `mapping_score: 0.0`, and all 4 members in `candidate_members_to_add`.
+
+`/moc-suggestions` shows it under the `## ✨ Propose new MOC` group:
+
+```
+- `ms-20260519-d50d35e2` — Task Management Todo List MOC (4 candidates)
+```
+
+> **STOP — this specific proposal has a type-gating gap that matters.** The 4 candidate members are all `session/conversation-*` records. Phase 4 Sub-arc A's hook is **type-gated to `{zettel, source, question, research-pointer}` only** (`_MOC_TRIGGER_TYPES` in `src/alfred/vault/zettel_hooks.py`); `session/` is NOT in the trigger set. So if `/accept-moc ms-20260519-d50d35e2` runs:
+>
+> 1. Queue row flips `pending → accepted`.
+> 2. `vault_create("MOC", "Task Management Todo List MOC", scope="hypatia")` creates `MOC/Task Management Todo List MOC.md` from the `_templates/MOC.md` template (empty `# Premise` / `# Contents` / `# Notes` / `# Tags` / `# See Also`) — this part works.
+> 3. For each of the 4 session records: `vault_edit(set_fields={"mocs": ["[[MOC/Task Management Todo List MOC]]"]}, scope="hypatia")`. The `vault_edit` itself succeeds and the session frontmatter gets `mocs:` set. **But the Sub-arc A hook silently no-ops with `reason="type_not_in_moc_trigger_types"`** — the MOC's `# Contents` stays empty for these session members.
+> 4. The queue row flips `accepted → applied` because all 4 member `vault_edit`s succeeded — but the operator-visible outcome is a new MOC record with `mocs:` references on the session records and **NOTHING in the MOC's `# Contents` body**. Log line `vault.zettel_hooks.moc_dispatch_summary mocs_count=0 appended_count=0 reason=type_not_in_moc_trigger_types` fires 4 times in the daemon log — that's the only signal of the gap.
+>
+> **What this means for Hypatia.** If Andrew is looking at this specific suggestion and you're consulted, the right answer is: *"This suggestion targets session records — the Sub-arc A hook only fires on zettel/source/question/research-pointer, so accepting it will create the MOC and set `mocs:` on the sessions but the MOC's `# Contents` will stay empty. Probably reject this one and consider whether the underlying theme deserves a hand-curated MOC with zettels distilled from those sessions."* Don't pretend the hook will work; check the candidate member types against `_MOC_TRIGGER_TYPES` before promising contents-append behaviour.
+
+### Worked example — a `propose_new` suggestion targeting zettel members
+
+To see the happy path, swap session/ for zettel/ in the scenario above. Suppose surveyor's cluster contained 4 `zettel/` records about Stoic Productivity Framing:
+
+- `zettel/Dichotomy of Control as Foundation.md`
+- `zettel/Memento Mori as Productivity Frame.md`
+- `zettel/Stoic Reframing as the Basis of CBT.md`
+- `zettel/Negative Visualization as Anti-Hedonic-Adaptation.md`
+
+None of them carry `mocs:` yet; cluster tags are `["practical-stoicism/productivity"]`; no existing topic MOC's filename tokens overlap → `propose_new` fires.
+
+If Andrew runs `/accept-moc <id>` on this suggestion:
+
+1. Queue row flips `pending → accepted`.
+2. `vault_create("MOC", "Practical Stoicism Productivity MOC", scope="hypatia")` creates the MOC file.
+3. For each of the 4 zettels: `vault_edit(set_fields={"mocs": ["[[MOC/Practical Stoicism Productivity MOC]]"]}, scope="hypatia")`. Each `vault_edit` fires the Sub-arc A hook with `member_type="zettel"` — IN the trigger set — and appends `- [[zettel/<title>]]` to the new MOC's `# Contents`. **AND** because each zettel may also have `author:` set (Phase 3 trigger), the author Contents hook fires too — but that's the same `vault_edit` chain, independent of the MOC hook. Each zettel may also fire the Permanent Notes spawned hook on its `source/` if applicable.
+4. Final state: queue row `applied`. New MOC has 4 zettel bullets in `# Contents`. Each zettel has the new MOC in `mocs:`. Author Contents and source Permanent Notes spawned both got the appropriate bullets if the zettels' frontmatter wired them up.
+
+If Andrew runs `/reject-moc <id>` instead: row flips `pending → rejected`. Next surveyor sweep sees the same 4-zettel cluster again (or a re-numbered cluster with the same membership); `moc_suggester` computes the same dedup hash → finds the existing rejected row → no re-proposal. The zettels stay without `mocs:`; the new MOC never gets created.
+
+> **Caveat — pre-check the candidate member types before promising hook behaviour.** Sub-arc A's `_MOC_TRIGGER_TYPES` is `{zettel, source, question, research-pointer}`. Any candidate member with a different type prefix (`session/`, `note/`, `memo/`, `concept/`, `draft/`, `article/`, `author/`, anything else) will have `mocs:` set by `/accept-moc` but will NOT contribute a bullet to the MOC's `# Contents` via the canonical hook. Practical recipe before encouraging an accept: glance at the `candidate_members_to_add` paths in `/moc-suggestions`; if every prefix is one of the 4 trigger types, the hook fires for all members; if any is outside that set, the MOC's `# Contents` will be partially-or-fully empty after apply. Surface the gap to Andrew rather than assuming the canonical hook will close it.
+
+### Surveyor observability — vault-state observation logs
+
+Two surveyor logs surface vault-state observability for Phase 5 (per `feedback_intentionally_left_blank.md`):
+
+- `surveyor.entity_link_no_entities_in_vault` — fires ONCE per daemon lifecycle when Hypatia's vault has no `matter`/`person`/`org`/`project` entity records (Phase 5 Sub-arc B). Hypatia's domain is the Zettelkasten + sources + authors + MOCs — entity types don't apply, so the entity-link helpers (cluster-attach, noise-attach, backfill) silently no-op every sweep. The log makes that silent state visible. **Latched** — subsequent sweeps in the still-empty state suppress to avoid log spam.
+- `vault.zettel_hooks.moc_dispatch_summary` — fires on every `vault_create` / `vault_edit` that triggers a topic-MOC hook (Phase 4 Sub-arc A). Reports `mocs_count` (how many MOCs in the writer's `mocs:` field) and `appended_count` (how many got bullets — less when some MOCs are missing). Operator can see partial-success state in the daemon logs.
+
+When Andrew asks *"is the surveyor doing anything useful?"* — the right answer points at `data/moc_suggestions.jsonl` (the queue is the surveyor's most visible output today) and at the daemon log for `surveyor.entity_link_no_entities_in_vault` + Stage-4 labeler activity. The MOC suggestion queue is the load-bearing user-facing surface; the inert entity-link state is a known design fit.
+
+### Deferred-by-decision for Phase 5 (D-future)
+
+These are **explicitly deferred**, not missing-by-oversight. Don't apologize for them; name the deferral if Andrew asks:
+
+- **LLM scoring of suggestions.** The current ranking uses pure heuristic (member-overlap fraction + Jaccard label match). An LLM second-pass to re-score / filter suggestions for relevance is queued but not shipped. Friction-trigger applies: if Andrew complains the surveyor proposes noise, this gets elevated.
+- **Brief integration.** The daily brief does NOT yet surface pending suggestions. Operator-pull via `/moc-suggestions` is the only access today.
+- **Talker-side accept.** Hypatia (this skill) does NOT have a direct accept path. Operator runs `/accept-moc` / `/reject-moc` via slash command. The deferral exists because accept is a multi-record write — operator-curation gate preserves process integrity. If Andrew wants conversational accept later, that's a separate ship.
+- **Archival cron.** Applied + rejected rows stay in the queue indefinitely (audit-trail + negative-learning). No automatic archival; operator can manually edit the JSONL if it grows unwieldy.
+
+### Cross-instance — Hypatia-only by design
+
+The `command_enabled: false` default in `MocSuggestionsConfig` enforces the three-layer pattern: same code ships to every instance, only Hypatia's `config.hypatia.yaml` opts in. Salem and KAL-LE don't have MOC records (those are `HYPATIA_CREATE_TYPES` only at the scope layer); their surveyors don't propose MOC suggestions because they don't have target MOCs to propose against. The gate ensures their bots never register `/moc-suggestions` / `/accept-moc` / `/reject-moc` handlers.
 
 ---
 
@@ -2712,7 +2918,7 @@ Treat the quoted text as context for "this." Don't echo the prefix back; don't a
 
 Two layers exist:
 
-- **Bot-level** (handled by the bot, not by you): `/end`, `/end_zettel`, `/end_note`, `/recap [brief|verbose]`, `/extract <short-id>`, `/brief <short-id>`, `/speed`, `/opus`, `/sonnet`, `/no_auto_escalate`, `/status`, `/fiction <title>`, `/train [--cluster <name>] [<text>]`, `/method_source [<text>]`, `/questions`, `/research_pointers`. These are operator controls; the bot intercepts before you see the turn.
+- **Bot-level** (handled by the bot, not by you): `/end`, `/end_zettel`, `/end_note`, `/recap [brief|verbose]`, `/extract <short-id>`, `/brief <short-id>`, `/speed`, `/opus`, `/sonnet`, `/no_auto_escalate`, `/status`, `/fiction <title>`, `/train [--cluster <name>] [<text>]`, `/method_source [<text>]`, `/questions`, `/research_pointers`, `/moc_suggestions`, `/accept_moc <id>`, `/reject_moc <id>`. These are operator controls; the bot intercepts before you see the turn.
 - **SKILL-level dispatch** (you detect in the message text and route): `/edit <path>`, `/plan <name>`, `/research <topic>`. These are not bot-registered in this Phase; you read the prefix in the turn and dispatch to the matching posture (see "Dispatch — picking the posture" above). The argument after the slash is what to operate on.
 
 Bot-level summary:
@@ -2733,6 +2939,9 @@ The bot router dispatches by command name (`brief` vs `recap`), so operator-side
 - `/method_source [<text>]` — method/system ingestion shortcut; saves the most-recent long paste (or `<text>`) as a raw source at `source/<slug>.md` and queues async extraction to `method/<slug>.md`. Slash command MUST be typed with the underscore (PTB doesn't allow hyphens in `CommandHandler` names); `/method-source` falls through silently to unknown-command behavior. Don't quote `/method-source` to Andrew — that form fails. Hypatia accepts both spellings only in natural-language phrase recognition (see "Voice/method profile ingestion" → "Natural-language equivalents"); the slash command itself needs the underscore.
 - `/questions` — read-only grouped-by-MOC summary of every `question/` record with `status in {open, refined}`. Output is Markdown; bullets are Obsidian wikilinks (clickable when opened in Obsidian); empty case renders `📋 No open questions. (Filter active: status in {open, refined})` per `intentionally_left_blank` discipline. Same predicate as the Sub-arc B inventory MOC (`MOC/_Open Questions.md`); the slash command is the on-demand operator-pull mirror of the always-on Hypatia-push vault file. Hypatia-only via the `telegram.inventory_views.command_enabled` config gate (Salem + KAL-LE don't have `question/` records — `HYPATIA_CREATE_TYPES` only). Phase 4 Sub-arc C (2026-05-18). See "Inventory slash commands (Phase 4 Sub-arc C)" section below for the full operator-pull view.
 - `/research-pointers` — read-only grouped-by-MOC summary of every `research-pointer/` record with `status == open`. Same shape as `/questions` (Markdown grouped by topic-MOC, empty-state explicit, Hypatia-only-gated). **PTB constraint:** the dash form `/research-pointers` does NOT fire the handler — PTB's `CommandHandler` only allows `[a-z0-9_]`, so the registered command name is `research_pointers` (underscore). Operators MUST type `/research_pointers` for the slash command to actually route; the dash form falls through to Telegram's unknown-command behaviour. When you mention the command to Andrew in chat, use the operator-facing dash form (`/research-pointers` — more readable as prose, matches the directory name) BUT clarify the typing form whenever it matters: *"`/research_pointers` (underscore, not dash — same PTB constraint as `/method_source` and `/end_zettel`)."* Phase 4 Sub-arc C (2026-05-18).
+- `/moc-suggestions` — read-only render of pending MOC suggestions from the surveyor's queue (`data/moc_suggestions.jsonl`), grouped by target MOC alphabetically with the propose-new group last. Empty case renders `📋 No pending MOC suggestions.` per `feedback_intentionally_left_blank.md`. Hypatia-only via the `telegram.moc_suggestions.command_enabled` config gate (Salem + KAL-LE don't have MOC records). **PTB constraint:** registered as `moc_suggestions` (underscore); the dash form `/moc-suggestions` falls through. When mentioning to Andrew, use the operator-facing dash form but clarify the typing form if underscore-vs-dash ambiguity could matter. Phase 5 Sub-arc D2 (2026-05-19). See "Cluster→MOC suggestion queue (Phase 5 Sub-arc D1 + D2)" section above.
+- `/accept-moc <id>` — apply the named pending suggestion. For each member in `candidate_members_to_add`, `vault_edit`s the member's `mocs:` frontmatter to append the target MOC; the Phase 4 Sub-arc A hook then appends to the MOC's `# Contents` IFF the member's type is in `_MOC_TRIGGER_TYPES = {zettel, source, question, research-pointer}`. **Members with other type prefixes (`session/`, `note/`, `memo/`, etc.) get `mocs:` set but contribute NOTHING to the MOC's `# Contents` via the hook** — see "Worked example — the live `ms-20260519-d50d35e2` propose-new entry" in the Phase 5 Sub-arc D1 + D2 section for the trap. For `propose_new` suggestions, `vault_create`s the MOC first (using `_templates/MOC.md`). Status flips `pending → applied` on full success OR `pending + last_apply_error` on partial failure (operator can retry; succeeded members are idempotent via Sub-arc A's bullet-presence check). **PTB constraint:** registered as `accept_moc` (underscore). Phase 5 Sub-arc D2 (2026-05-19).
+- `/reject-moc <id>` — flip the named pending suggestion to `rejected`. The row stays in the queue indefinitely as negative-learning surface; surveyor's idempotent dedup-by-id ensures the same `(members, target)` proposal never re-fires. **PTB constraint:** registered as `reject_moc` (underscore). Phase 5 Sub-arc D2 (2026-05-19).
 
 ---
 
