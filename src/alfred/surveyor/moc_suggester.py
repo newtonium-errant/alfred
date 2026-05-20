@@ -314,11 +314,39 @@ def propose_moc_suggestions(
 
     ``now`` is injectable for deterministic testing; defaults to
     UTC now when None.
+
+    **Trigger-type filter (2026-05-19 fix for live-queue bug class
+    ``ms-20260519-d50d35e2``).** Surveyor clusters every embedded record
+    regardless of type, but Phase 4 Sub-arc A's MOC-member append hook
+    only fires for the four trigger types
+    (``zettel`` / ``source`` / ``question`` / ``research-pointer``,
+    canonical in ``vault/zettel_hooks._MOC_TRIGGER_TYPES``). A cluster
+    of session/ records would silently orphan its members on accept:
+    the bot's apply path writes ``mocs:`` frontmatter, but
+    ``dispatch_moc_appends`` short-circuits on non-trigger types and
+    the MOC's ``# Contents`` never gains the bullets. The filter
+    excludes non-trigger members from ``cluster_member_paths`` AND
+    ``candidate_members_to_add`` so proposals only include records the
+    accept path will actually mirror to the MOC body. Cross-tool
+    import (surveyor → vault) is lazy-imported below to avoid
+    module-load cycles; the runtime cost is negligible (one set lookup
+    per member, cached at function-entry).
     """
-    if len(member_paths) < min_cluster_size:
+    # Trigger-type filter — applied BEFORE size check + sort + scoring
+    # so every downstream calculation operates on the eligible-member
+    # subset. Lazy import inside the function to avoid surveyor↔vault
+    # module-load cycle risk; import resolves once-per-call and is
+    # cheap (Python interns the module after the first import).
+    from alfred.vault.zettel_hooks import _MOC_TRIGGER_TYPES
+    eligible_member_paths = [
+        p for p in member_paths
+        if _is_trigger_eligible(records.get(p), _MOC_TRIGGER_TYPES)
+    ]
+
+    if len(eligible_member_paths) < min_cluster_size:
         return []
 
-    sorted_members = sorted(member_paths)
+    sorted_members = sorted(eligible_member_paths)
     member_mocs: dict[str, set[str]] = {
         p: _extract_member_mocs(records.get(p))
         for p in sorted_members
@@ -428,6 +456,29 @@ def propose_moc_suggestions(
 # ---------------------------------------------------------------------------
 # Internal helpers.
 # ---------------------------------------------------------------------------
+
+
+def _is_trigger_eligible(record, trigger_types: frozenset[str]) -> bool:
+    """``True`` iff the member record's type is in the MOC-trigger set.
+
+    Records without a parseable type (parser failure, missing ``type``
+    frontmatter) are excluded — propose-time can't know whether the
+    accept path would mirror them to MOC ``# Contents``, and a
+    conservative exclude is correct (no silent orphans). Same defense
+    shape as the rest of the suggester's None-record handling
+    (degrade-to-exclude rather than crash).
+
+    ``trigger_types`` is passed explicitly so the call site can use
+    the lazy-imported ``_MOC_TRIGGER_TYPES`` without this helper needing
+    its own import of ``vault/zettel_hooks``. Decouples the helper
+    from the import-order concern.
+    """
+    if record is None:
+        return False
+    record_type = getattr(record, "record_type", None)
+    if not record_type:
+        return False
+    return record_type in trigger_types
 
 
 def _extract_member_mocs(record) -> set[str]:

@@ -58,6 +58,22 @@ def _zettel(mocs: list[str] | None = None) -> _FakeRecord:
     return _FakeRecord(frontmatter=fm)
 
 
+def _session(mocs: list[str] | None = None) -> _FakeRecord:
+    """Build a non-trigger-type fake record (``session/`` type).
+
+    Per the 2026-05-19 trigger-type filter (live queue bug ``ms-20260519-d50d35e2``):
+    cluster members of types NOT in ``_MOC_TRIGGER_TYPES`` must be
+    excluded from proposals because Phase 4 Sub-arc A's MOC append
+    hook short-circuits on non-trigger types — accepting a proposal
+    targeting session/ members would silently orphan them (frontmatter
+    written, MOC body never updated).
+    """
+    fm: dict = {"type": "session"}
+    if mocs is not None:
+        fm["mocs"] = mocs
+    return _FakeRecord(frontmatter=fm, record_type="session")
+
+
 def _fixed_now() -> datetime:
     """Deterministic timestamp for ID stability tests."""
     return datetime(2026, 5, 19, 14, 0, 0, tzinfo=timezone.utc)
@@ -497,6 +513,209 @@ def test_min_cluster_size_gate_short_circuits() -> None:
         now=_fixed_now(),
     )
     assert suggestions == []
+
+
+# ---------------------------------------------------------------------------
+# Trigger-type filter (regression pin — 2026-05-19 ratified Option A).
+# ---------------------------------------------------------------------------
+#
+# Live queue entry ``ms-20260519-d50d35e2`` had 4 session/ members in
+# ``cluster_member_paths``. On accept, the bot's apply path would have
+# written ``mocs:`` frontmatter to each session record, but Phase 4
+# Sub-arc A's ``dispatch_moc_appends`` short-circuits when the
+# record's type is NOT in ``vault/zettel_hooks._MOC_TRIGGER_TYPES``
+# (canonical set: zettel / source / question / research-pointer).
+# Result: frontmatter written, MOC ``# Contents`` never updated,
+# silently orphaned members.
+#
+# Fix (Option A ratified): filter at the suggester. Non-trigger types
+# still get clustered + labeled (they need alfred_tags), but no
+# MOC-suggestion proposals are emitted for clusters that contain
+# only non-trigger members, and mixed clusters produce proposals
+# whose member_paths + candidates_to_add carry only the trigger-
+# eligible subset.
+
+
+def test_trigger_type_filter_excludes_pure_non_trigger_cluster() -> None:
+    """Critical pin: a cluster of ALL session/ records produces NO
+    suggestions. The ``ms-20260519-d50d35e2`` shape can no longer
+    recur after this lands.
+
+    Before the fix: the function would happily build a propose-new
+    suggestion targeting all 4 session/ members; on accept, the
+    bot would write ``mocs:`` to each session/ record and the MOC's
+    ``# Contents`` would never receive the bullets (Phase 4 Sub-arc
+    A short-circuits on non-trigger types).
+    """
+    session_paths = [
+        "session/conversation-2026-05-15-task-management.md",
+        "session/conversation-2026-05-16-todo-discussion.md",
+        "session/conversation-2026-05-17-task-review.md",
+        "session/conversation-2026-05-18-priority-list.md",
+    ]
+    records = {p: _session([]) for p in session_paths}
+    suggestions = propose_moc_suggestions(
+        cluster_id=99,
+        member_paths=session_paths,
+        cluster_tags=["task-management", "todo-list"],
+        records=records,
+        existing_mocs={},
+        member_overlap_threshold=0.4,
+        fuzzy_label_jaccard_threshold=0.5,
+        min_cluster_size=3,
+        now=_fixed_now(),
+    )
+    # Filtered to ZERO trigger-eligible members → min_cluster_size
+    # gate fails → no suggestions. Propose-new path NEVER reached.
+    assert suggestions == [], (
+        "A cluster of pure non-trigger types (session/) must produce "
+        "no suggestions; otherwise accept would silently orphan members "
+        "(live queue bug ms-20260519-d50d35e2 shape)."
+    )
+
+
+def test_trigger_type_filter_mixed_cluster_keeps_only_trigger_members() -> None:
+    """Mixed cluster: 3 zettel + 2 session. Resulting suggestion
+    contains only the 3 zettel paths in ``cluster_member_paths`` AND
+    ``candidate_members_to_add``. The 2 session paths drop out at the
+    filter; they're still clustered + labeled by upstream surveyor
+    work (alfred_tags writeback still applies) but excluded from this
+    proposal because the accept path would orphan them.
+    """
+    zettel_paths = [
+        "zettel/A.md", "zettel/B.md", "zettel/C.md",
+    ]
+    session_paths = [
+        "session/session-X.md", "session/session-Y.md",
+    ]
+    member_paths = zettel_paths + session_paths
+    records = {
+        **{p: _zettel([]) for p in zettel_paths},
+        **{p: _session([]) for p in session_paths},
+    }
+    suggestions = propose_moc_suggestions(
+        cluster_id=42,
+        member_paths=member_paths,
+        cluster_tags=["stoicism"],
+        records=records,
+        existing_mocs={},  # no existing MOCs → propose-new path
+        member_overlap_threshold=0.4,
+        fuzzy_label_jaccard_threshold=0.5,
+        min_cluster_size=3,
+        now=_fixed_now(),
+    )
+    # Propose-new path triggers on the 3 trigger-eligible members.
+    assert len(suggestions) == 1
+    s = suggestions[0]
+    assert s.mapping_signal == "propose_new"
+    # cluster_member_paths post-filter: only the zettels.
+    assert set(s.cluster_member_paths) == set(zettel_paths), (
+        f"cluster_member_paths should carry only trigger-eligible types; "
+        f"got {s.cluster_member_paths}"
+    )
+    # candidate_members_to_add: same — only zettels eligible for the
+    # accept path's vault_edit.
+    assert set(s.candidate_members_to_add) == set(zettel_paths)
+    # Session paths absent from both fields.
+    for sp in session_paths:
+        assert sp not in s.cluster_member_paths
+        assert sp not in s.candidate_members_to_add
+    # Forensic: cluster_id_at_proposal still records the originating
+    # cluster (the filter narrows membership, not provenance).
+    assert s.cluster_id_at_proposal == 42
+
+
+def test_trigger_type_filter_single_trigger_member_below_min_size() -> None:
+    """Edge case: cluster has 1 zettel + 4 session/. After filter,
+    cluster_size=1 fails the min_cluster_size>=3 gate → no
+    suggestions emitted. Confirms the filter applies BEFORE the
+    size gate (post-filter size is what's checked)."""
+    member_paths = [
+        "zettel/Lonely.md",
+        "session/s1.md", "session/s2.md", "session/s3.md", "session/s4.md",
+    ]
+    records = {
+        "zettel/Lonely.md": _zettel([]),
+        "session/s1.md": _session([]),
+        "session/s2.md": _session([]),
+        "session/s3.md": _session([]),
+        "session/s4.md": _session([]),
+    }
+    suggestions = propose_moc_suggestions(
+        cluster_id=50,
+        member_paths=member_paths,
+        cluster_tags=["topic"],
+        records=records,
+        existing_mocs={},
+        member_overlap_threshold=0.4,
+        fuzzy_label_jaccard_threshold=0.5,
+        min_cluster_size=3,
+        now=_fixed_now(),
+    )
+    assert suggestions == [], (
+        "Post-filter cluster_size=1 must fail the min_cluster_size>=3 "
+        "gate; gate runs against the trigger-eligible subset, not the "
+        "pre-filter total."
+    )
+
+
+def test_trigger_type_filter_id_hash_reflects_post_filter_members() -> None:
+    """The suggestion ID is derived from ``sorted(cluster_member_paths)``.
+    Post-filter, the cluster_member_paths field carries only the
+    trigger-eligible subset, so the ID hash reflects that subset.
+    Critical: if surveyor re-runs and adds more session/ members to
+    the same cluster, the trigger-eligible subset hash is UNCHANGED
+    → idempotent re-upsert (same id) — non-trigger membership shift
+    can't drive duplicate proposals."""
+    zettel_paths = ["zettel/A.md", "zettel/B.md", "zettel/C.md"]
+
+    # Run 1: cluster has zettels + 2 sessions.
+    records_run1 = {
+        **{p: _zettel([]) for p in zettel_paths},
+        "session/X.md": _session([]),
+        "session/Y.md": _session([]),
+    }
+    s1 = propose_moc_suggestions(
+        cluster_id=7,
+        member_paths=zettel_paths + ["session/X.md", "session/Y.md"],
+        cluster_tags=["stoicism"],
+        records=records_run1,
+        existing_mocs={},
+        member_overlap_threshold=0.4,
+        fuzzy_label_jaccard_threshold=0.5,
+        min_cluster_size=3,
+        now=_fixed_now(),
+    )
+
+    # Run 2: cluster grows 3 MORE session/ records, but the trigger-
+    # eligible subset is unchanged.
+    records_run2 = {
+        **records_run1,
+        "session/W.md": _session([]),
+        "session/V.md": _session([]),
+        "session/U.md": _session([]),
+    }
+    s2 = propose_moc_suggestions(
+        cluster_id=7,
+        member_paths=zettel_paths + [
+            "session/X.md", "session/Y.md",
+            "session/W.md", "session/V.md", "session/U.md",
+        ],
+        cluster_tags=["stoicism"],
+        records=records_run2,
+        existing_mocs={},
+        member_overlap_threshold=0.4,
+        fuzzy_label_jaccard_threshold=0.5,
+        min_cluster_size=3,
+        now=_fixed_now(),
+    )
+
+    assert len(s1) == 1
+    assert len(s2) == 1
+    assert s1[0].id == s2[0].id, (
+        "Suggestion ID must be stable when non-trigger members shift; "
+        "the ID hashes the trigger-eligible subset only."
+    )
 
 
 # ---------------------------------------------------------------------------
