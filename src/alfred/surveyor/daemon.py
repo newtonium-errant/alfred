@@ -590,6 +590,21 @@ class Daemon:
             self._link_noise_points_to_entities(
                 noise_paths, records, paths, vectors,
             )
+        else:
+            # Sub-arc B+ parity (2026-05-21): explicit "ran, nothing
+            # to do" signal per ``feedback_intentionally_left_blank.md``.
+            # Reached when HDBSCAN produced zero noise points (every
+            # record fit some cluster). The clusterer.complete log
+            # only reports semantic_clusters / changed_semantic counts,
+            # not noise-point count — so without this signal, the
+            # operator can't distinguish "stage 6 ran with no work"
+            # from "stage 6 was skipped" from "stage 6 silently
+            # exploded." Per-sweep observation.
+            log.info(
+                "surveyor.entity_linking.no_noise_points",
+                semantic_cluster_count=len(set(result.semantic.values()) - {-1}),
+                total_clustered_paths=len(result.semantic),
+            )
 
         # Stage 7: backfill links FROM every non-entity record in the vault
         # TO each newly-created entity. This is the complement of the cluster
@@ -999,6 +1014,25 @@ class Daemon:
                 threshold=threshold,
                 max_per_record=max_per,
             )
+        else:
+            # Sub-arc B+ parity (2026-05-21): explicit "ran, nothing
+            # to do" signal per ``feedback_intentionally_left_blank.md``.
+            # Reached when changed clusters exist but none qualify
+            # (each candidate cluster has fewer than 2 members, or
+            # has no entity+regular pair). Per-sweep observation —
+            # distinct from Sub-arc B's vault-state
+            # ``no_entities_in_vault`` gate (latched once-per-lifecycle
+            # when entities are entirely absent from the vault). This
+            # event fires per-sweep when entities exist somewhere in
+            # the vault but no current cluster contains an
+            # entity/regular pair. Operator debugging "why did entity
+            # linking not run this tick" greps for this event.
+            log.info(
+                "surveyor.entity_linking.no_eligible_clusters",
+                changed_clusters_total=len(changed_cluster_ids),
+                threshold=threshold,
+                max_per_record=max_per,
+            )
 
     def _link_noise_points_to_entities(
         self,
@@ -1141,6 +1175,23 @@ class Daemon:
                 threshold=threshold,
                 max_per_record=max_per,
             )
+        else:
+            # Sub-arc B+ parity (2026-05-21): explicit "ran, nothing
+            # to do" signal per ``feedback_intentionally_left_blank.md``.
+            # Reached when ``noise_paths`` was non-empty (the caller's
+            # gate already filters that case — see site 4 below) but
+            # every noise record's lookup yielded ``record is None``
+            # or ``np_vec is None``. Per-sweep observation; signals a
+            # state-staleness condition (records map and vector store
+            # out of sync). Distinct from the no-noise-points case
+            # which is handled at the caller's ``if noise_paths:``
+            # gate via ``surveyor.entity_linking.no_noise_points``.
+            log.info(
+                "surveyor.entity_linking.no_vectored_noise_points",
+                noise_paths_total=len(noise_paths),
+                threshold=threshold,
+                max_per_record=max_per,
+            )
 
     def _backfill_new_entities(
         self,
@@ -1259,6 +1310,23 @@ class Daemon:
                 "daemon.entity_backfill_complete",
                 entities_processed=entities_processed,
                 links_added=total_added,
+                threshold=threshold,
+                max_per_record=max_per,
+            )
+        else:
+            # Sub-arc B+ parity (2026-05-21): explicit "ran, nothing
+            # to do" signal per ``feedback_intentionally_left_blank.md``.
+            # Reached when ``new_entity_paths`` is non-empty (the
+            # caller already gated on truthiness + backfill_enabled)
+            # but every candidate entry failed the per-entity
+            # readiness check (record absent, not in
+            # ENTITY_RECORD_TYPES, or no vector). Per-sweep observation;
+            # signals state-staleness between records map and vector
+            # store, or that the newly-added paths were filtered out
+            # by record-type discrimination upstream.
+            log.info(
+                "surveyor.entity_linking.no_vectored_entities_for_backfill",
+                new_entity_paths_total=len(new_entity_paths),
                 threshold=threshold,
                 max_per_record=max_per,
             )
