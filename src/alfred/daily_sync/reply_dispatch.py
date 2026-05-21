@@ -1318,6 +1318,7 @@ def _resolve_pending_item_correction(
                 item_id=item_id,
                 resolution_id=resolution_id,
                 peer_name=created_by,
+                self_instance=self_normalized,
                 raw_config=raw_config,
             )
     except _PendingItemResolveFailure as exc:
@@ -1416,9 +1417,19 @@ def _resolve_pending_item_via_peer(
     item_id: str,
     resolution_id: str,
     peer_name: str,
+    self_instance: str,
     raw_config: dict[str, Any] | None = None,
 ) -> str:
-    """Dispatch resolution to the originating peer."""
+    """Dispatch resolution to the originating peer.
+
+    ``self_instance`` is the running instance's normalized identity
+    (already validated non-empty by the calling correction handler).
+    It feeds the ``self_name`` field on the peer call so the audit
+    trail records the actual sender rather than a default. Per
+    ``feedback_hardcoding_and_alfred_naming.md`` (2026-04-26 sweep) +
+    the 2026-05-21 transport/client.py sibling-default sweep, the
+    transport helper now requires this kwarg explicitly.
+    """
     from alfred.transport.client import peer_resolve_pending_item
     from alfred.transport.config import load_from_unified as load_transport
     from alfred.transport.exceptions import TransportError
@@ -1430,6 +1441,7 @@ def _resolve_pending_item_via_peer(
         peer_name,
         item_id=item_id,
         resolution=resolution_id,
+        self_name=self_instance,
         config=transport_config,
     )
     try:

@@ -425,7 +425,7 @@ async def peer_send(
     payload: dict[str, Any],
     *,
     config: "TransportConfig | None" = None,
-    self_name: str = "salem",
+    self_name: str,
     correlation_id: str | None = None,
 ) -> dict[str, Any]:
     """POST /peer/send on the named peer's transport.
@@ -468,7 +468,7 @@ async def peer_query(
     fields: list[str] | None = None,
     filter: dict[str, Any] | None = None,  # noqa: A002
     config: "TransportConfig | None" = None,
-    self_name: str = "salem",
+    self_name: str,
     correlation_id: str | None = None,
 ) -> dict[str, Any]:
     """POST /peer/query on the named peer — typically SALEM asking SALEM.
@@ -506,7 +506,7 @@ async def peer_handshake(
     peer_name: str,
     *,
     config: "TransportConfig | None" = None,
-    self_name: str = "salem",
+    self_name: str,
 ) -> dict[str, Any]:
     """POST /peer/handshake on the named peer — capability discovery."""
     from .config import TransportConfig, load_config
@@ -532,7 +532,7 @@ async def peer_get_canonical_person(
     name: str,
     *,
     config: "TransportConfig | None" = None,
-    self_name: str = "kal-le",
+    self_name: str,
     correlation_id: str | None = None,
 ) -> dict[str, Any] | None:
     """GET /canonical/person/{name} on the named peer (typically Salem).
@@ -590,7 +590,7 @@ async def peer_get_canonical_record(
     name: str,
     *,
     config: "TransportConfig | None" = None,
-    self_name: str = "kal-le",
+    self_name: str,
     correlation_id: str | None = None,
 ) -> dict[str, Any] | None:
     """GET /canonical/{type}/{name} on the named peer (typically Salem).
@@ -649,7 +649,7 @@ async def peer_propose_canonical_record(
     proposed_fields: dict[str, Any] | None = None,
     source: str = "",
     config: "TransportConfig | None" = None,
-    self_name: str = "kal-le",
+    self_name: str,
     correlation_id: str | None = None,
 ) -> dict[str, Any]:
     """POST /canonical/{type}/propose on the named peer (queued shape).
@@ -743,7 +743,7 @@ async def peer_propose_canonical_person(
     proposed_fields: dict[str, Any] | None = None,
     source: str = "",
     config: "TransportConfig | None" = None,
-    self_name: str = "kal-le",
+    self_name: str,
     correlation_id: str | None = None,
 ) -> dict[str, Any]:
     """POST /canonical/person/propose on the named peer.
@@ -774,7 +774,7 @@ async def resolve_or_propose_canonical_record(
     proposed_fields: dict[str, Any] | None = None,
     source: str = "",
     config: "TransportConfig | None" = None,
-    self_name: str = "kal-le",
+    self_name: str,
 ) -> dict[str, Any]:
     """Generic high-level helper — GET, propose on 404, handle 409 race.
 
@@ -839,7 +839,7 @@ async def resolve_or_propose_canonical_person(
     proposed_fields: dict[str, Any] | None = None,
     source: str = "",
     config: "TransportConfig | None" = None,
-    self_name: str = "kal-le",
+    self_name: str,
 ) -> dict[str, Any]:
     """High-level helper — GET, then propose on 404, handle the 409 race.
 
@@ -1112,7 +1112,7 @@ async def peer_resolve_pending_item(
     *,
     item_id: str,
     resolution: str,
-    self_name: str = "salem",
+    self_name: str,
     resolved_at: str | None = None,
     config: "TransportConfig | None" = None,
     correlation_id: str | None = None,
@@ -1129,7 +1129,11 @@ async def peer_resolve_pending_item(
             local JSONL queue.
         resolution: The chosen resolution_option's id (``"noted"``,
             ``"show_me"``, etc.).
-        self_name: Salem's identity (default ``"salem"``).
+        self_name: This instance's identity — required, no default.
+            Salem is the only sender today (Daily Sync resolution
+            dispatch) but threading the value through avoids the
+            hardcoded-default antipattern flagged in
+            ``feedback_hardcoding_and_alfred_naming.md``.
         resolved_at: Optional caller-supplied iso8601 timestamp;
             defaults to "now" on the receiving side.
         config: Pre-loaded TransportConfig.
