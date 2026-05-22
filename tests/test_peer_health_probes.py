@@ -136,7 +136,7 @@ async def test_peer_handshake_warns_on_version_skew(outdated_peer_server):  # ty
     from alfred.transport.health import _check_peer_handshake
 
     result = await _check_peer_handshake(
-        raw={},
+        raw={"telegram": {"instance": {"name": "Salem"}}},
         peer_name="kal-le",
         peer_entry={"base_url": outdated_peer_server, "token": DUMMY_PEER_TOKEN},
     )
@@ -147,6 +147,10 @@ async def test_peer_handshake_warns_on_version_skew(outdated_peer_server):  # ty
 async def test_peer_handshake_fails_on_missing_token():
     from alfred.transport.health import _check_peer_handshake
 
+    # No ``telegram.instance.name`` needed here — the missing-token
+    # early-return at the top of ``_check_peer_handshake`` returns
+    # before ``_infer_self_name(raw)`` is reached, so the fail-loud
+    # contract on the latter doesn't apply on this path.
     result = await _check_peer_handshake(
         raw={},
         peer_name="kal-le",
@@ -159,7 +163,7 @@ async def test_peer_handshake_warns_on_unreachable():
     from alfred.transport.health import _check_peer_handshake
 
     result = await _check_peer_handshake(
-        raw={},
+        raw={"telegram": {"instance": {"name": "Salem"}}},
         peer_name="kal-le",
         peer_entry={"base_url": "http://127.0.0.1:65534", "token": DUMMY_PEER_TOKEN},
     )
@@ -231,6 +235,63 @@ def test_infer_self_name_salem():
 
 
 # ---------------------------------------------------------------------------
+# _infer_self_name fail-loud (Tier A #1.1 sweep — 2026-05-22)
+# ---------------------------------------------------------------------------
+# Regression-pin tests for the removal of the silent ``or "alfred"``
+# fallback in ``_infer_self_name``. Previously this helper would
+# silently fall back to ``"alfred"`` when ``telegram.instance.name``
+# was missing, then route through the legacy ``alfred → salem`` remap
+# — silently impersonating Salem on outbound peer requests. The fix
+# raises ``RuntimeError`` so the misconfiguration surfaces immediately.
+#
+# Reference: feedback_hardcoding_and_alfred_naming.md.
+
+
+def test_infer_self_name_fails_loud_when_telegram_block_missing():
+    """No telegram block at all → raise (not silent fallback to alfred → salem)."""
+    with pytest.raises(RuntimeError, match="telegram.instance.name is required"):
+        _infer_self_name({})
+
+
+def test_infer_self_name_fails_loud_when_instance_block_missing():
+    """telegram block present but no instance sub-block → raise."""
+    with pytest.raises(RuntimeError, match="telegram.instance.name is required"):
+        _infer_self_name({"telegram": {}})
+
+
+def test_infer_self_name_fails_loud_when_name_field_missing():
+    """telegram.instance present but no name → raise."""
+    with pytest.raises(RuntimeError, match="telegram.instance.name is required"):
+        _infer_self_name({"telegram": {"instance": {}}})
+
+
+def test_infer_self_name_fails_loud_when_name_empty_string():
+    """Empty-string name → raise (defensive: matches the contract)."""
+    with pytest.raises(RuntimeError, match="telegram.instance.name is required"):
+        _infer_self_name({"telegram": {"instance": {"name": ""}}})
+
+
+def test_infer_self_name_fails_loud_when_name_normalises_to_empty():
+    """Name like ``"..."`` strips to empty → raise (separate error message)."""
+    with pytest.raises(RuntimeError, match="normalises to empty"):
+        _infer_self_name({"telegram": {"instance": {"name": "..."}}})
+
+
+def test_infer_self_name_error_message_points_at_feedback_memo():
+    """Error message must reference the feedback memo so operators have a next step."""
+    with pytest.raises(RuntimeError) as exc_info:
+        _infer_self_name({})
+    assert "feedback_hardcoding_and_alfred_naming.md" in str(exc_info.value)
+
+
+def test_infer_self_name_hypatia_no_remap():
+    """Hypatia is its own normalised value — not affected by the alfred → salem remap."""
+    assert _infer_self_name(
+        {"telegram": {"instance": {"name": "Hypatia"}}},
+    ) == "hypatia"
+
+
+# ---------------------------------------------------------------------------
 # _run_peer_probes — filter behaviour
 # ---------------------------------------------------------------------------
 
@@ -248,6 +309,11 @@ async def test_peer_probes_filter_to_single_peer(peer_server):  # type: ignore[n
                 "stay-c": {"base_url": "http://127.0.0.1:65535", "token": "tok"},
             },
         },
+        # ``_check_peer_handshake`` calls ``_infer_self_name(raw)``,
+        # which now fail-louds when ``telegram.instance.name`` is
+        # missing (Tier A #1.1 sweep). Provide a value so the production
+        # code path under test still executes the handshake.
+        "telegram": {"instance": {"name": "Salem"}},
     }
     results = await _run_peer_probes(raw, filter_peer="kal-le")
     names = {r.name for r in results}
@@ -393,6 +459,11 @@ async def test_run_peer_probes_fails_when_env_var_unset(
                 },
             },
         },
+        # ``_check_peer_handshake`` → ``_infer_self_name`` requires this
+        # (Tier A #1.1 sweep). The test exercises auth-failure on an
+        # unresolved env placeholder; the self-name needs to be valid
+        # for the production code path to reach the auth check at all.
+        "telegram": {"instance": {"name": "Salem"}},
     }
 
     results = await _run_peer_probes(raw, filter_peer="kal-le")

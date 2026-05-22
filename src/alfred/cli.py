@@ -772,13 +772,33 @@ def cmd_transport(args: argparse.Namespace) -> None:
             wants_json=wants_json,
         ))
     if subcmd == "propose-person":
+        # ``--self`` defaults to None at the argparse layer (per the
+        # Tier A #1.1 hardcoded-literal sweep); if absent, derive the
+        # self-name from the loaded config's ``telegram.instance.name``
+        # so the dispatcher fails loud when neither the CLI flag nor
+        # the config supplies one, instead of silently impersonating a
+        # specific instance via a hardcoded fallback. See
+        # feedback_hardcoding_and_alfred_naming.md.
+        self_name_arg = getattr(args, "self_name", None)
+        if not self_name_arg:
+            from alfred.transport.health import _infer_self_name
+            try:
+                self_name_arg = _infer_self_name(raw)
+            except RuntimeError as exc:
+                print(
+                    "alfred transport propose-person: --self not given "
+                    "and could not derive from config: "
+                    f"{exc}",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
         sys.exit(tcli.cmd_propose_person(
             raw,
             peer=args.peer,
             name=args.name,
             fields=list(getattr(args, "field", []) or []),
             source=getattr(args, "source", ""),
-            self_name=getattr(args, "self_name", "kal-le"),
+            self_name=self_name_arg,
             wants_json=wants_json,
         ))
 

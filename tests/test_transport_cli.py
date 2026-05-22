@@ -374,3 +374,235 @@ def test_main_parser_accepts_transport_subcommands() -> None:
         ns = parser.parse_args(argv)
         assert ns.command == "transport"
         assert ns.transport_cmd == argv[1]
+
+
+# ---------------------------------------------------------------------------
+# propose-person --self default (Tier A #1.1 sweep — 2026-05-22)
+# ---------------------------------------------------------------------------
+# Regression-pin tests for the removal of the hardcoded ``default="kal-le"``
+# on the ``--self`` argparse argument + the matching dispatch-layer
+# fallback in ``cli.py``. Previously a missing ``--self`` flag silently
+# routed proposals as "kal-le" regardless of which instance was actually
+# making the call. The fix: argparse default is None; dispatch derives
+# the self-name from ``telegram.instance.name`` via ``_infer_self_name``
+# (fail-loud) when ``--self`` is not given.
+#
+# Reference: feedback_hardcoding_and_alfred_naming.md.
+
+
+def test_propose_person_self_arg_default_is_none() -> None:
+    """argparse ``--self`` defaults to None, not a literal instance string.
+
+    Catches reintroduction of ``default="kal-le"`` (or any sibling literal)
+    at the argparse layer.
+    """
+    from alfred.cli import build_parser
+
+    parser = build_parser()
+    ns = parser.parse_args([
+        "transport", "propose-person", "salem", "Bob",
+    ])
+    assert ns.self_name is None, (
+        "argparse default for --self must be None so the dispatcher "
+        "derives the self-name from telegram.instance.name; got a "
+        f"hardcoded literal {ns.self_name!r}. See "
+        "feedback_hardcoding_and_alfred_naming.md."
+    )
+
+
+def test_propose_person_self_arg_explicit_value_accepted() -> None:
+    """Explicit ``--self <name>`` flows through to the parsed namespace.
+
+    Catches over-correction (e.g. dropping the kwarg entirely or making
+    it required at the argparse layer).
+    """
+    from alfred.cli import build_parser
+
+    parser = build_parser()
+    ns = parser.parse_args([
+        "transport", "propose-person",
+        "--self", "hypatia",
+        "salem", "Bob",
+    ])
+    assert ns.self_name == "hypatia"
+
+
+def _dispatch_propose_setup(monkeypatch, raw_config):
+    """Shared mocks for the cmd_transport(propose-person) dispatch path.
+
+    Stubs both ``_load_unified_config`` and ``_setup_logging_from_config``
+    so the dispatcher reads our fixture and doesn't try to write a
+    log file under cwd.
+    """
+    monkeypatch.setattr(
+        "alfred.cli._load_unified_config", lambda _path: raw_config,
+    )
+    monkeypatch.setattr(
+        "alfred.cli._setup_logging_from_config",
+        lambda *args, **kwargs: None,
+    )
+
+
+def test_propose_person_dispatcher_derives_from_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys,
+) -> None:
+    """When ``--self`` is None, dispatcher infers from ``telegram.instance.name``.
+
+    Drives the cmd_transport dispatcher with a config that has a valid
+    ``telegram.instance.name`` and a parsed namespace with
+    ``self_name=None`` — asserts the dispatcher passes the derived
+    self-name (``"kal-le"``) to cmd_propose_person.
+    """
+    from alfred.cli import cmd_transport
+    import argparse
+
+    raw_config = {
+        "telegram": {"instance": {"name": "KAL-LE"}},
+        "transport": {
+            "server": {"host": "127.0.0.1", "port": 8899},
+            "state": {"path": str(tmp_path / "s.json")},
+            "peers": {
+                "salem": {
+                    "base_url": "http://127.0.0.1:65530",
+                    "token": "tok",
+                },
+            },
+        },
+    }
+    _dispatch_propose_setup(monkeypatch, raw_config)
+
+    # Capture the kwargs the dispatcher passes to cmd_propose_person.
+    captured: dict = {}
+
+    def _stub_cmd_propose_person(_raw, **kwargs) -> int:
+        captured.update(kwargs)
+        return 0
+
+    from alfred.transport import cli as transport_cli_mod
+    monkeypatch.setattr(transport_cli_mod, "cmd_propose_person", _stub_cmd_propose_person)
+
+    args = argparse.Namespace(
+        config=None,
+        json=True,
+        transport_cmd="propose-person",
+        peer="salem",
+        name="Bob",
+        field=[],
+        source="",
+        self_name=None,  # No --self given on CLI
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cmd_transport(args)
+    assert exit_info.value.code == 0
+
+    assert captured.get("self_name") == "kal-le", (
+        f"dispatcher should derive self_name from instance.name=KAL-LE "
+        f"(normalised to 'kal-le'); got {captured.get('self_name')!r}. "
+        "See feedback_hardcoding_and_alfred_naming.md."
+    )
+
+
+def test_propose_person_dispatcher_fails_loud_when_config_missing_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys,
+) -> None:
+    """When ``--self`` is None AND config has no instance.name → exit 2.
+
+    Catches the case where the silent fallback to ``"kal-le"`` is re-
+    introduced via a different default-handling path. Production paths
+    must surface the misconfiguration via the ``_infer_self_name``
+    RuntimeError.
+    """
+    from alfred.cli import cmd_transport
+    import argparse
+
+    # Config missing telegram.instance.name entirely.
+    raw_config = {
+        "transport": {
+            "server": {"host": "127.0.0.1", "port": 8899},
+            "state": {"path": str(tmp_path / "s.json")},
+            "peers": {
+                "salem": {
+                    "base_url": "http://127.0.0.1:65530",
+                    "token": "tok",
+                },
+            },
+        },
+    }
+    _dispatch_propose_setup(monkeypatch, raw_config)
+
+    args = argparse.Namespace(
+        config=None,
+        json=True,
+        transport_cmd="propose-person",
+        peer="salem",
+        name="Bob",
+        field=[],
+        source="",
+        self_name=None,
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cmd_transport(args)
+    assert exit_info.value.code == 2
+
+    err = capsys.readouterr().err
+    assert "could not derive from config" in err
+    assert "telegram.instance.name" in err
+
+
+def test_propose_person_dispatcher_explicit_self_wins_over_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Explicit ``--self`` overrides config-derived value.
+
+    Catches the (b)-option-vs-(a)-option mistake: if the dispatcher
+    always took the config value, the operator-override path would be
+    broken. Per the brief, option (b) was chosen specifically so
+    operators can cross-instance-test.
+    """
+    from alfred.cli import cmd_transport
+    import argparse
+
+    raw_config = {
+        "telegram": {"instance": {"name": "KAL-LE"}},
+        "transport": {
+            "server": {"host": "127.0.0.1", "port": 8899},
+            "state": {"path": str(tmp_path / "s.json")},
+            "peers": {
+                "salem": {
+                    "base_url": "http://127.0.0.1:65530",
+                    "token": "tok",
+                },
+            },
+        },
+    }
+    _dispatch_propose_setup(monkeypatch, raw_config)
+
+    captured: dict = {}
+
+    def _stub_cmd_propose_person(_raw, **kwargs) -> int:
+        captured.update(kwargs)
+        return 0
+
+    from alfred.transport import cli as transport_cli_mod
+    monkeypatch.setattr(transport_cli_mod, "cmd_propose_person", _stub_cmd_propose_person)
+
+    args = argparse.Namespace(
+        config=None,
+        json=True,
+        transport_cmd="propose-person",
+        peer="salem",
+        name="Bob",
+        field=[],
+        source="",
+        self_name="hypatia",  # Explicit override
+    )
+
+    with pytest.raises(SystemExit):
+        cmd_transport(args)
+
+    assert captured.get("self_name") == "hypatia", (
+        "explicit --self must take precedence over config-derived "
+        f"self-name; got {captured.get('self_name')!r}."
+    )

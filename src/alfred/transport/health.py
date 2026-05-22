@@ -440,13 +440,64 @@ def _check_peer_queue_depth(
 def _infer_self_name(raw: dict[str, Any]) -> str:
     """Return a peer-name-shaped identifier for this instance.
 
-    Salem defaults to ``"salem"``; KAL-LE defaults to ``"kal-le"``.
-    Reads ``telegram.instance.name`` + lowercases + strips dots.
+    Reads ``telegram.instance.name``, lowercases, and strips dots /
+    maps spaces to dashes to produce the canonical peer-key form
+    (``"salem"``, ``"kal-le"``, ``"hypatia"``).
+
+    **Fail-loud on missing name.** Previously this fell back silently to
+    ``"alfred"`` when ``telegram.instance.name`` was absent, which then
+    routed through the legacy ``"alfred" → "salem"`` remap — so any
+    instance that lost its ``instance.name`` block (or a test fixture
+    that forgot to set it) silently impersonated Salem on outbound peer
+    requests. The config-load layer already enforces ``instance.name``
+    as required (``InstanceConfig.name`` is a no-default field, raises
+    ``TypeError`` at load time per
+    ``feedback_hardcoding_and_alfred_naming.md``); any code path
+    reaching this helper with an empty name is a programmer error worth
+    surfacing rather than silently masking.
+
+    The explicit ``"alfred" → "salem"`` remap is **retained** —
+    ``InstanceConfig`` documents ``"Alfred"`` as a legacy default-name
+    install value that maps to Salem for peer-key purposes (mirrors
+    ``src/alfred/telegram/_compat.py:_normalize_instance_name``, which
+    is the canonical home of this normalisation). Removing the remap
+    here would break operators with an explicit ``name: "Alfred"`` in
+    their YAML (the documented default-name install path); only the
+    silent fallback is going away.
+
+    Raises:
+        RuntimeError: when ``telegram.instance.name`` is missing, empty,
+            or normalises to empty after stripping. The error message
+            names the required config field and points at the feedback
+            memo so the operator / test author has an obvious next
+            step.
     """
     tg = raw.get("telegram", {}) or {}
     inst = tg.get("instance", {}) or {}
-    name = str(inst.get("name") or "alfred").lower().replace(".", "").replace(" ", "-")
-    # Alfred default → salem for peer purposes.
+    raw_name = inst.get("name")
+    if not raw_name:
+        raise RuntimeError(
+            "telegram.instance.name is required for peer-protocol "
+            "self-name inference; got an empty / missing value. The "
+            "config-load layer (InstanceConfig.name) enforces this as "
+            "a required field — if you're hitting this from a test "
+            "fixture, add raw['telegram']['instance']['name'] (e.g. "
+            '"Salem", "KAL-LE", "Hypatia"). See '
+            "feedback_hardcoding_and_alfred_naming.md.",
+        )
+    name = str(raw_name).lower().replace(".", "").replace(" ", "-")
+    if not name:
+        raise RuntimeError(
+            f"telegram.instance.name={raw_name!r} normalises to empty "
+            "after dot / space stripping; cannot infer peer-protocol "
+            "self-name. See feedback_hardcoding_and_alfred_naming.md.",
+        )
+    # Legacy default-name install path: explicit ``name: "Alfred"``
+    # maps to the ``salem`` peer key. Mirrors
+    # ``telegram/_compat.py:_normalize_instance_name`` — the canonical
+    # home of this normalisation. Retained because the operator-visible
+    # contract still allows ``name: "Alfred"`` per InstanceConfig
+    # docstring, even though it's no longer the system default.
     if name == "alfred":
         return "salem"
     return name

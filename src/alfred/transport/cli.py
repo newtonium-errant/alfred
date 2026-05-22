@@ -460,7 +460,13 @@ def build_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="Free-text source attribution for the proposal audit trail",
     )
     propose_p.add_argument(
-        "--self", dest="self_name", default="kal-le",
-        help="This instance's name (default: kal-le)",
+        "--self", dest="self_name", default=None,
+        help=(
+            "This instance's name as the proposer "
+            '(e.g. "kal-le", "hypatia"). Defaults to '
+            "telegram.instance.name from the loaded config; pass "
+            "explicitly to override (e.g. operator-testing from a "
+            "different instance's perspective)."
+        ),
     )
     propose_p.add_argument("--json", action="store_true", default=False)
