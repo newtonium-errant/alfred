@@ -56,6 +56,39 @@ class _UpcomingItem:
     description: str | None
 
 
+# Closed-state denyset — records in any of these statuses are excluded
+# from Upcoming Events even when their date/due is in the future. Applies
+# to BOTH event and task records. ``cancelled`` and ``done`` are the
+# obvious cases; ``superseded`` is included because it's the standard
+# schema status for replaced records and would be equally noisy.
+#
+# Stored lowercase; the gate (`_is_closed_status`) normalises the input
+# via ``.casefold()`` so capitalised variants ("Cancelled", "CANCELLED")
+# also filter. Empty string and missing field are treated as OPEN — the
+# brief defaults to surfacing records and the gate is an explicit denyset
+# rather than a generic predicate.
+_CLOSED_STATUSES: frozenset[str] = frozenset(
+    {"cancelled", "done", "superseded"}
+)
+
+
+def _is_closed_status(value: Any) -> bool:
+    """Return True iff ``value`` represents a closed/triaged status.
+
+    Handles three shapes defensively:
+    - ``None`` / missing field → False (open by default)
+    - Empty string → False (open by default)
+    - Non-string scalar → False (don't crash on malformed frontmatter)
+    - String → casefolded compare against ``_CLOSED_STATUSES``
+    """
+    if not isinstance(value, str):
+        return False
+    normalised = value.strip().casefold()
+    if not normalised:
+        return False
+    return normalised in _CLOSED_STATUSES
+
+
 def _coerce_date(value: Any) -> date | None:
     """Best-effort coerce a frontmatter ``date``/``due`` value to a ``date``.
 
@@ -137,21 +170,27 @@ def _collect_items(
         if rec_type == "event":
             d = _event_date(fm)
         elif rec_type == "task":
-            # Phase 2 candidate #1 (2026-05-09 Batch C): drop closed-state
-            # tasks even when ``due`` is in the future. Pre-fix a task
-            # cancelled or completed weeks ago but with ``due`` set to a
-            # future date kept showing up in the brief — visual noise
-            # the operator had already triaged. Per the Phase 2 spec
-            # (project_brief_upcoming_events_phase2.md) ``cancelled`` and
-            # ``done`` are flagged; ``superseded`` is added here because
-            # it's the standard schema status for replaced records and
-            # would be equally noisy. Status comparison is case-sensitive
-            # to match how status is written elsewhere in the codebase
-            # (STATUS_BY_TYPE values are lowercase).
-            if fm.get("status") in {"cancelled", "done", "superseded"}:
-                continue
             d = _coerce_date(fm.get("due"))
         else:
+            continue
+        # Closed-state filter — applies to BOTH event and task records.
+        # Pre-fix the gate only fired on the task branch, leaving
+        # cancelled/done events visible in the brief; 2026-05-21
+        # operator marked an open-house event ``status: cancelled`` and
+        # 2026-05-22's brief still surfaced it. Per the dispatch
+        # (project_brief_cancelled_event_filter): events grew a status
+        # field once GCal sync went live (the cancel hook PATCHes GCal
+        # when ``status: cancelled``), so the schema reality now
+        # matches tasks. Use the shared ``_is_closed_status`` helper
+        # so the empty-string / missing-field / case-variant behaviour
+        # is identical across both code paths.
+        if _is_closed_status(fm.get("status")):
+            log.info(
+                "upcoming_events.closed_status_excluded",
+                path=str(path),
+                rec_type=rec_type,
+                status=fm.get("status"),
+            )
             continue
         if d is None:
             # Per ``feedback_intentionally_left_blank.md``: events

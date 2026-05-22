@@ -40,14 +40,24 @@ def _write_event(
     *,
     location: str | None = None,
     description: str | None = None,
+    status: str | None = None,
 ) -> None:
-    """Drop an event record into ``vault/event/{name}.md``."""
+    """Drop an event record into ``vault/event/{name}.md``.
+
+    ``status`` is optional — when None, the field is omitted entirely
+    (pre-Phase-A+ shape). Pass a string (``"cancelled"``, ``""``, etc.)
+    to exercise the closed-state filter on event records.
+    """
     lines = [
         "---",
         "type: event",
         f"name: {name}",
         f"date: {event_date}",
     ]
+    if status is not None:
+        # Quote to allow empty string and avoid YAML interpreting unquoted
+        # values. Single-quote is safe for the values exercised here.
+        lines.append(f"status: '{status}'")
     if location is not None:
         lines.append(f"location: {location}")
     if description is not None:
@@ -320,37 +330,167 @@ def test_task_without_status_field_still_included(vault: Path) -> None:
     assert "Status-less task" in out
 
 
-def test_event_status_does_not_trigger_task_filter(vault: Path) -> None:
-    """The Phase 2 #1 filter applies to TASKS ONLY. An event record
-    with future date is unchanged by the new gate.
+def test_event_with_cancelled_status_excluded(vault: Path) -> None:
+    """An event with ``status: cancelled`` and a future date must NOT
+    appear in the brief.
 
-    Today (Phase 1) events don't carry a ``status`` field at all, but
-    a future schema extension might. Per the spec: events go through
-    ``_event_date``, NOT the task branch where the closed-state check
-    lives. So even if an event eventually grows a ``status`` field
-    that happens to match the denyset, the brief renderer doesn't
-    apply the task-only gate to it. This test pins that scope."""
+    Regression pin for 2026-05-22 incident: operator (Andrew) marked
+    an open-house event ``status: cancelled`` on 2026-05-21 via
+    talker → vault_edit; 2026-05-22's morning brief still surfaced
+    it under "### This Week" because the pre-fix closed-state gate
+    only applied inside the ``task`` branch of ``_collect_items``,
+    not the ``event`` branch.
+
+    Post-fix the gate applies to BOTH branches via the shared
+    ``_is_closed_status`` helper. The schema reality justifying the
+    change: events grew a meaningful ``status`` field once GCal sync
+    went live — the cancel hook PATCHes the GCal event when the vault
+    record flips to ``status: cancelled``.
+    """
     target = TODAY + timedelta(days=3)
-    # Drop an event with a status that would match the task-side
-    # denyset, just to prove the task gate doesn't apply.
-    (vault / "event").mkdir(exist_ok=True)
-    (vault / "event" / "Workshop with status.md").write_text(
-        "---\n"
-        "type: event\n"
-        "name: Workshop with status\n"
-        f"date: {target.isoformat()}\n"
-        # Even if the operator someday added status to events, the
-        # task-side gate ignores it. Today this field is just inert.
-        "status: cancelled\n"
-        "created: 2026-04-01\n"
-        "tags: []\n"
-        "---\n\n"
-        "# Workshop with status\n",
-        encoding="utf-8",
+    _write_event(
+        vault, "Open House — 12636 Hwy 1",
+        target.isoformat(), status="cancelled",
     )
     out = render_upcoming_events_section(_default_config(), vault, TODAY)
-    assert "Workshop with status" in out
+    assert "Open House" not in out
+    # Brief should be empty (only this one record was written).
+    assert out == "No upcoming events."
+
+
+def test_event_with_done_status_excluded(vault: Path) -> None:
+    """An event with ``status: done`` is excluded. ``done`` isn't a
+    typical event status (events usually flip to ``cancelled`` rather
+    than ``done``), but the denyset is shared across record types and
+    coverage parity matters for refactor safety."""
+    target = TODAY + timedelta(days=5)
+    _write_event(
+        vault, "Workshop already done", target.isoformat(), status="done",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Workshop already done" not in out
+    assert out == "No upcoming events."
+
+
+def test_event_with_superseded_status_excluded(vault: Path) -> None:
+    """An event with ``status: superseded`` is excluded. Mirror of
+    the task-side test."""
+    target = TODAY + timedelta(days=10)
+    _write_event(
+        vault, "Replaced event", target.isoformat(), status="superseded",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Replaced event" not in out
+    assert out == "No upcoming events."
+
+
+def test_event_without_status_field_surfaces_normally(vault: Path) -> None:
+    """A pre-Phase-A+ event with no ``status`` field at all must
+    surface normally. ``fm.get("status")`` returns None; the shared
+    gate ``_is_closed_status`` treats None as open.
+
+    Locks in the inclusive default — absence is treated as "open",
+    not "closed". A future refactor that tightens the gate to a
+    status-allowlist would DROP these records, which is the wrong
+    default for the brief surface."""
+    target = TODAY + timedelta(days=4)
+    # status kwarg omitted entirely => no field in frontmatter
+    _write_event(vault, "Status-less event", target.isoformat())
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Status-less event" in out
     assert target.isoformat() in out
+
+
+def test_event_with_empty_status_string_surfaces_normally(
+    vault: Path,
+) -> None:
+    """An event with ``status: ""`` (explicit empty string in YAML)
+    must surface normally. Empty string is treated as open — same as
+    a missing field.
+
+    Real-world shape: a janitor edit that clears the status field
+    might leave it as an empty string rather than removing the line.
+    The brief shouldn't filter such a record."""
+    target = TODAY + timedelta(days=2)
+    _write_event(vault, "Empty status event", target.isoformat(), status="")
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Empty status event" in out
+    assert target.isoformat() in out
+
+
+def test_event_with_capitalised_cancelled_status_excluded(
+    vault: Path,
+) -> None:
+    """Defensive coverage: ``status: Cancelled`` (or any case
+    variant) MUST still filter. The shared gate normalises via
+    ``.casefold()`` so capitalised, uppercase, and mixed-case values
+    all match the denyset.
+
+    STATUS_BY_TYPE schema canonicalises to lowercase, but operator
+    edits via talker/vault_edit don't enforce case — a manual
+    ``status: Cancelled`` shouldn't escape the filter just because of
+    the typo class."""
+    target = TODAY + timedelta(days=3)
+    _write_event(
+        vault, "Capitalised cancelled", target.isoformat(),
+        status="Cancelled",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Capitalised cancelled" not in out
+    assert out == "No upcoming events."
+
+
+def test_future_dated_cancelled_event_excluded(vault: Path) -> None:
+    """A cancelled event whose date is still in the window must be
+    excluded — the cancellation overrides the upcoming-date qualifier.
+
+    Direct reproduction of the operator-flagged shape: a future
+    event marked cancelled but still within the 30-day window. This
+    test mirrors the exact failure mode rather than the unit-level
+    gate behavior."""
+    target = TODAY + timedelta(days=2)  # well within 30-day window
+    _write_event(
+        vault, "Future cancelled event", target.isoformat(),
+        status="cancelled",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert "Future cancelled event" not in out
+    assert "### This Week" not in out
+    assert out == "No upcoming events."
+
+
+def test_closed_status_emits_log_line(vault: Path) -> None:
+    """Per ``feedback_intentionally_left_blank.md`` + the
+    log-emission-test-pattern discipline: the closed-state filter
+    must emit a log line that operators can grep
+    (``upcoming_events.closed_status_excluded``).
+
+    Uses ``structlog.testing.capture_logs`` rather than caplog —
+    same pattern as ``test_event_with_neither_start_nor_date_skipped_with_log``
+    below; structlog's ConsoleRenderer and pytest's caplog don't
+    reliably interoperate through the LoggerFactory boundary.
+    """
+    from structlog.testing import capture_logs
+
+    target = TODAY + timedelta(days=3)
+    _write_event(
+        vault, "Cancelled with log", target.isoformat(),
+        status="cancelled",
+    )
+    with capture_logs() as captured:
+        out = render_upcoming_events_section(_default_config(), vault, TODAY)
+
+    assert "Cancelled with log" not in out
+    matches = [
+        c for c in captured
+        if c.get("event") == "upcoming_events.closed_status_excluded"
+    ]
+    assert len(matches) == 1, (
+        f"expected 1 closed_status_excluded log, got {len(matches)}: {captured}"
+    )
+    assert matches[0].get("rec_type") == "event"
+    assert matches[0].get("status") == "cancelled"
+    assert "Cancelled with log" in matches[0].get("path", "")
 
 
 # ---------------------------------------------------------------------------
