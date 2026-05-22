@@ -1270,6 +1270,42 @@ def vault_edit(
             f"separate edits or pick the surface that matches intent."
         )
 
+    # No-op detection — fail-loud when no mutation param is supplied.
+    # Per ``feedback_intentionally_left_blank.md``: silent success on
+    # a vault_edit that does nothing is indistinguishable from a real
+    # edit landing, and operator-visible only when they later notice
+    # the file body didn't change. The Hypatia 2026-05-21 incident
+    # (essay-planning conversation ``2026-05-21-depression-checklist-
+    # essay-planning-e166d40d.md``) cost ~5 turns of debugging on a
+    # vault_edit dispatched with ONLY ``path`` — tool_use input was
+    # max_tokens-truncated mid-emission, the ``body_append`` field
+    # never arrived. vault_edit returned ``{"path": ..., "fields_
+    # changed": []}`` with no error; Salem narrated success while
+    # the file body stayed at its pre-edit state.
+    #
+    # The actionable error names every accepted mutation kwarg so the
+    # model can see what failed and retry. This surfaces through the
+    # talker dispatcher's tool_result error field (see
+    # ``telegram/conversation.py:~2086`` for the dispatch path).
+    #
+    # ``body_rewriter`` IS counted as a mutation surface here — it
+    # writes the body even if the rewriter returns identical content
+    # (the ``fields_changed`` check at the write site filters that
+    # case). The no-op gate is "did the caller supply ANY mutation
+    # intent?", not "did the mutation produce a diff?"
+    has_set_fields = bool(set_fields)
+    has_append_fields = bool(append_fields)
+    has_body_mutation = len(active) >= 1
+    if not (has_set_fields or has_append_fields or has_body_mutation):
+        raise VaultError(
+            "vault_edit called with no mutation parameter — at least "
+            "one of set_fields, append_fields, body_append, "
+            "body_replace, body_insert_at, body_rewriter is required. "
+            "If the tool_use input was truncated mid-emission "
+            "(stop_reason=max_tokens), retry with a smaller payload "
+            "or split the operation across multiple edits."
+        )
+
     # Strip reserved frontmatter keys before scope check + downstream
     # processing. See ``_filter_reserved_keys`` for the rationale +
     # bug-class history (Hypatia DJ-tracker conversation 2026-05-04).

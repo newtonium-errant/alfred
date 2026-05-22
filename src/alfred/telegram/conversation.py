@@ -1914,6 +1914,92 @@ def _attribution_reason(session: Session) -> str:
     return "talker conversation turn"
 
 
+# Per-tool "minimal-keys-only" signatures used to detect tool_use inputs
+# that were max_tokens-truncated mid-emission. The check fires only when
+# stop_reason == "max_tokens" — without that signal the model may have
+# legitimately chosen a no-op shape and we don't want to false-positive
+# on it. (For vault_edit specifically, the no-op shape itself is denied
+# by the runtime gate in ``vault.ops.vault_edit``; the truncation
+# detector is a higher-quality SIGNAL — it tells the model the reason
+# was likely truncation, not a missing-action bug.)
+#
+# Each entry maps tool_name → ``{"identifier_keys": {...}, "action_keys":
+# {...}}``:
+#   * identifier_keys — keys the SDK emits first in JSON order (path,
+#     type, etc.) that on their own don't drive any mutation
+#   * action_keys — at least one MUST be present for the call to do
+#     anything; absence + stop_reason=max_tokens is the truncation
+#     signature
+#
+# Add entries here when a new tool surface exhibits the same failure
+# mode (long-body tool_use input mid-stream truncation).
+_TRUNCATION_DETECT_SIGNATURES: dict[str, dict[str, set[str]]] = {
+    "vault_edit": {
+        "identifier_keys": {"path"},
+        "action_keys": {
+            "set_fields",
+            "append_fields",
+            "body_append",
+            "body_replace",
+            "body_insert_at",
+        },
+    },
+}
+
+
+def _detect_truncated_tool_input(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    stop_reason: str,
+) -> dict[str, Any] | None:
+    """Detect a tool_use block whose input was likely max_tokens-truncated.
+
+    Returns a diagnostic dict suitable for logging + tool_result error
+    surfacing when the signature matches, otherwise ``None``.
+
+    The detection is intentionally conservative: it only fires when
+    ``stop_reason == "max_tokens"`` AND the tool_input carries the
+    tool's identifier keys (``path`` for vault_edit) without any
+    action keys (mutation params). Both conditions together indicate
+    the JSON emission ran out of budget after the prefix but before
+    the action params — the exact signature of the Hypatia 2026-05-21
+    essay-planning failure.
+
+    Per ``feedback_intentionally_left_blank.md``: silence is ambiguous;
+    when the SDK delivers a tool_use input that's structurally
+    incomplete, we surface that to both the operator (via log) and the
+    model (via tool_result.is_error) instead of letting the downstream
+    op crash with a confusing "missing required field" or — worse —
+    silently no-op.
+    """
+    if stop_reason != "max_tokens":
+        return None
+    sig = _TRUNCATION_DETECT_SIGNATURES.get(tool_name)
+    if sig is None:
+        return None
+    if not isinstance(tool_input, dict):
+        return None
+    keys = set(tool_input.keys())
+    action_keys = sig["action_keys"]
+    identifier_keys = sig["identifier_keys"]
+    has_action = bool(keys & action_keys)
+    has_identifier = bool(keys & identifier_keys)
+    if has_action:
+        return None
+    # No action keys present. If we ALSO have no identifier keys it's
+    # not really our truncation signature — probably a different
+    # malformation that the downstream op will surface clearly. Only
+    # fire when the prefix landed but the action tail didn't.
+    if not has_identifier:
+        return None
+    return {
+        "tool_name": tool_name,
+        "received_keys": sorted(keys),
+        "expected_action_keys": sorted(action_keys),
+        "stop_reason": stop_reason,
+    }
+
+
 async def _execute_tool(
     tool_name: str,
     tool_input: dict[str, Any],
@@ -2623,6 +2709,66 @@ async def run_turn(
                     iteration=iteration,
                     tool=tool_name,
                 )
+
+                # Truncation pre-check (Layer 2 of the Hypatia 2026-05-21
+                # essay-planning fix). When stop_reason=max_tokens AND
+                # this tool_use's input matches a known "identifier-only,
+                # no action keys" signature, surface the diagnosis BEFORE
+                # dispatch so the model and the operator see "tool_use
+                # input was truncated" rather than the downstream
+                # generic-error surface.
+                #
+                # Layer 1 (the no-op gate inside vault_edit) catches the
+                # same case and produces a usable error on its own — but
+                # the truncation-aware error is more actionable because
+                # it names the root cause. We synthesize the tool_result
+                # here, skip the dispatch entirely, log the diagnosis,
+                # and continue the loop. The next iteration lets the
+                # model retry with a smaller payload.
+                trunc_diag = _detect_truncated_tool_input(
+                    tool_name,
+                    tool_input if isinstance(tool_input, dict) else {},
+                    stop_reason,
+                )
+                if trunc_diag is not None:
+                    log.warning(
+                        "talker.tool.input_truncated",
+                        iteration=iteration,
+                        tool=tool_name,
+                        tool_use_id=tool_use_id,
+                        received_keys=trunc_diag["received_keys"],
+                        expected_action_keys=trunc_diag["expected_action_keys"],
+                        stop_reason=stop_reason,
+                        detail=(
+                            "tool_use input was likely max_tokens-"
+                            "truncated mid-emission — arrived with "
+                            "identifier keys only and no action params. "
+                            "Synthesising an error tool_result so the "
+                            "model can retry with a smaller payload. "
+                            "Recommend the operator consider raising "
+                            "anthropic.max_tokens if this recurs."
+                        ),
+                    )
+                    error_payload = {
+                        "error": (
+                            f"{tool_name} tool_use input was likely "
+                            f"max_tokens-truncated mid-emission — "
+                            f"arrived with only "
+                            f"{trunc_diag['received_keys']} (no "
+                            f"action keys from "
+                            f"{trunc_diag['expected_action_keys']}). "
+                            f"Retry with a smaller payload or split "
+                            f"the operation across multiple calls."
+                        ),
+                    }
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": _dumps(error_payload),
+                        "is_error": True,
+                    })
+                    continue
+
                 try:
                     result_str = await _execute_tool(
                         tool_name,
