@@ -231,10 +231,19 @@ async def run(
     """
     # Config + logging first — everything below assumes both.
     config = load_from_unified(raw)
+    # Pull rotation kwargs from the unified ``logging`` block so the
+    # talker honors the same per-file size cap as every other daemon.
+    # Without this, ``data/talker.log`` would grow unbounded while
+    # curator/janitor/distiller rotate.
+    from alfred.common.logging_handler import extract_rotation_config
+    _log_cfg = raw.get("logging", {}) if isinstance(raw, dict) else {}
+    _max_bytes, _backup_count = extract_rotation_config(_log_cfg)
     setup_logging(
         level=config.logging.level,
         log_file=config.logging.file,
         suppress_stdout=suppress_stdout,
+        max_bytes=_max_bytes,
+        backup_count=_backup_count,
     )
 
     reasons = _missing_config_reasons(config)

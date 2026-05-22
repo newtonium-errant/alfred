@@ -73,6 +73,22 @@ agent:
 logging:
   level: "INFO"
   dir: "./data"
+  # Size-based log rotation via Python's ``RotatingFileHandler``.
+  # Every per-tool log file (``curator.log``, ``surveyor.log``, etc.)
+  # is capped at ``max_bytes``; once the live file fills, it's rolled
+  # to ``<tool>.log.1`` and a fresh file opens. Up to ``backup_count``
+  # rotated copies are kept; older backups are deleted.
+  #
+  # Defaults: 100 MB x 5 backups = ~500 MB per tool, ~7.5 GB worst-case
+  # across ~15 daemons. Without rotation, ``surveyor.log`` was observed
+  # at 14 GB and ``alfred.log`` at 15 GB in routine operation (grep slow,
+  # tail painful). Omit the block entirely to take the defaults.
+  #
+  # Escape hatch: set ``max_bytes: 0`` to disable rotation if you'd
+  # rather manage rotation externally (logrotate, journald, etc.).
+  rotation:
+    max_bytes: 100000000  # 100 MB per file
+    backup_count: 5
 
 curator:
   inbox_dir: "inbox"

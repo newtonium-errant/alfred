@@ -13,22 +13,38 @@ from pathlib import Path
 
 import structlog
 
+from alfred.common.logging_handler import build_rotating_file_handler
+
 
 def setup_logging(
     level: str = "INFO",
     log_file: str | None = None,
     suppress_stdout: bool = False,
+    *,
+    max_bytes: int | None = None,
+    backup_count: int | None = None,
 ) -> None:
-    """Configure structlog + stdlib logging for the instructor daemon."""
+    """Configure structlog + stdlib logging for the instructor daemon.
+
+    ``max_bytes`` / ``backup_count`` control size-based rotation of the
+    log file via ``RotatingFileHandler``. ``None`` (the default) uses
+    the bundled policy in ``alfred.common.logging_handler``. The
+    orchestrator pulls these from ``raw["logging"]["rotation"]`` and
+    threads them through every daemon's runner.
+    """
     log_level = getattr(logging, level.upper(), logging.INFO)
 
     handlers: list[logging.Handler] = []
     if not suppress_stdout:
         handlers.append(logging.StreamHandler(sys.stdout))
     if log_file:
-        log_path = Path(log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(str(log_path), encoding="utf-8"))
+        handlers.append(
+            build_rotating_file_handler(
+                log_file,
+                max_bytes=max_bytes,
+                backup_count=backup_count,
+            )
+        )
 
     logging.basicConfig(
         format="%(message)s",

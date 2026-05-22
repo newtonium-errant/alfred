@@ -14,6 +14,21 @@ from pathlib import Path
 from typing import Any
 
 from alfred.daemon import is_running, read_pid, remove_pid as _remove_pid_file, write_pid as _write_pid_file
+from alfred.common.logging_handler import extract_rotation_config
+
+
+def _rotation_kwargs(log_cfg: dict) -> dict[str, int]:
+    """Return ``{"max_bytes": …, "backup_count": …}`` from a logging config dict.
+
+    Thin wrapper around ``alfred.common.logging_handler.extract_rotation_config``
+    that returns the result as a kwargs dict ready to splat into
+    ``setup_logging(..., **kwargs)``. Every runner below grabs
+    ``log_cfg`` already; this helper keeps the per-runner change one
+    line ("``**_rotation_kwargs(log_cfg)``") instead of repeating the
+    tuple-unpack inline.
+    """
+    max_bytes, backup_count = extract_rotation_config(log_cfg)
+    return {"max_bytes": max_bytes, "backup_count": backup_count}
 
 
 def _silence_stdio(log_file: str | None = None) -> None:
@@ -44,7 +59,7 @@ def _run_curator(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = F
     # short-circuits the post-processor. KAL-LE's config.kalle.yaml
     # leaves the block out by design.
     classifier_config = load_classifier(raw)
-    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.curator.daemon import run
     asyncio.run(run(config, Path(skills_dir), email_classifier_config=classifier_config))
 
@@ -58,7 +73,7 @@ def _run_janitor(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool = F
     from alfred.janitor.config import load_from_unified
     from alfred.janitor.utils import setup_logging
     config = load_from_unified(raw)
-    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.janitor.state import JanitorState
     from alfred.janitor.daemon import run_watch
     state = JanitorState(config.state.path, config.state.max_sweep_history)
@@ -75,7 +90,7 @@ def _run_distiller(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool =
     from alfred.distiller.config import load_from_unified
     from alfred.distiller.utils import setup_logging
     config = load_from_unified(raw)
-    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.distiller.state import DistillerState
     from alfred.distiller.daemon import run_watch
     state = DistillerState(config.state.path, config.state.max_run_history)
@@ -99,7 +114,7 @@ def _run_instructor(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool 
     from alfred.instructor.config import load_from_unified
     from alfred.instructor.utils import setup_logging
     config = load_from_unified(raw)
-    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.instructor.state import InstructorState
     from alfred.instructor.daemon import run as run_instructor_daemon
     state = InstructorState(config.state.path)
@@ -322,7 +337,7 @@ def _run_surveyor(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
         sys.exit(_MISSING_DEPS_EXIT)
 
     config = load_from_unified(raw)
-    setup_logging(level=log_cfg.get("level", "INFO"), log_file=f"{log_cfg.get('dir', './data')}/surveyor.log", suppress_stdout=suppress_stdout)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=f"{log_cfg.get('dir', './data')}/surveyor.log", suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     daemon = Daemon(config)
     asyncio.run(daemon.run())
 
@@ -384,7 +399,7 @@ def _run_bit(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     # doesn't need a bespoke logger.
     from alfred.brief.utils import setup_logging
     config = load_from_unified(raw)
-    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.bit.daemon import run_daemon
     asyncio.run(run_daemon(config, raw))
 
@@ -398,7 +413,7 @@ def _run_brief(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     from alfred.brief.config import load_from_unified
     from alfred.brief.utils import setup_logging
     config = load_from_unified(raw)
-    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.brief.daemon import run_daemon
     asyncio.run(run_daemon(config))
 
@@ -418,7 +433,7 @@ def _run_brief_digest_push(raw: dict[str, Any], suppress_stdout: bool = False) -
     # Reuse brief's setup_logging — same signature, no bespoke logger
     # needed. Keeps log format consistent with the receiver side.
     from alfred.brief.utils import setup_logging
-    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.brief.kalle_brief_daemon import (
         load_brief_digest_push_config,
         run_daemon,
@@ -458,6 +473,7 @@ def _run_digest(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
         level=log_cfg.get("level", "INFO"),
         log_file=log_file,
         suppress_stdout=suppress_stdout,
+        **_rotation_kwargs(log_cfg),
     )
     from alfred.digest.config import load_from_unified as load_dg
     from alfred.digest.daemon import run_daemon as run_dg_daemon
@@ -491,6 +507,7 @@ def _run_radar_day(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
         level=log_cfg.get("level", "INFO"),
         log_file=log_file,
         suppress_stdout=suppress_stdout,
+        **_rotation_kwargs(log_cfg),
     )
     from alfred.distiller.config import load_from_unified as load_distiller
     from alfred.distiller.radar_day_daemon import run_daemon as run_rd_daemon
@@ -531,6 +548,7 @@ def _run_friction_analyzer(
         level=log_cfg.get("level", "INFO"),
         log_file=log_file,
         suppress_stdout=suppress_stdout,
+        **_rotation_kwargs(log_cfg),
     )
     from alfred.daily_sync.config import load_from_unified as load_ds
     from alfred.daily_sync.friction_analyzer_daemon import (
@@ -567,6 +585,7 @@ def _run_pending_items_pusher(raw: dict[str, Any], suppress_stdout: bool = False
         level=log_cfg.get("level", "INFO"),
         log_file=log_file,
         suppress_stdout=suppress_stdout,
+        **_rotation_kwargs(log_cfg),
     )
     from alfred.pending_items.config import (
         load_from_unified as load_pending,
@@ -639,6 +658,7 @@ def _run_cloudflared(raw: dict[str, Any], suppress_stdout: bool = False) -> None
         level=log_cfg.get("level", "INFO"),
         log_file=log_file,
         suppress_stdout=suppress_stdout,
+        **_rotation_kwargs(log_cfg),
     )
     from alfred.cloudflared.config import load_from_unified
     from alfred.cloudflared.daemon import run as run_cloudflared
@@ -682,7 +702,7 @@ def _run_daily_sync(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     # Reuse brief's setup_logging — the signature matches and Daily
     # Sync doesn't need a bespoke logger.
     from alfred.brief.utils import setup_logging
-    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout)
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.daily_sync.config import load_from_unified as load_ds
     from alfred.daily_sync.daemon import run_daemon as run_ds_daemon
     config = load_ds(raw)

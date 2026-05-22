@@ -105,12 +105,25 @@ def _install_stub_tool_modules(
     def _load_from_unified(raw: dict[str, Any]) -> _StubConfig:
         return _StubConfig(state=_StubStateConfig(path=state_path))
 
-    def _setup_logging(level: str = "INFO", log_file: str = "", suppress_stdout: bool = False) -> None:
+    def _setup_logging(
+        level: str = "INFO",
+        log_file: str = "",
+        suppress_stdout: bool = False,
+        *,
+        # Accept the rotation kwargs the orchestrator's runners now
+        # splat in via ``_rotation_kwargs(log_cfg)``. The stub stores
+        # them so tests can assert on the rotation contract too if
+        # they want.
+        max_bytes: int | None = None,
+        backup_count: int | None = None,
+    ) -> None:
         captured["setup_logging_called"] = True
         captured["setup_logging_args"] = {
             "level": level,
             "log_file": log_file,
             "suppress_stdout": suppress_stdout,
+            "max_bytes": max_bytes,
+            "backup_count": backup_count,
         }
 
     async def _daemon_run(*args, **kwargs) -> None:

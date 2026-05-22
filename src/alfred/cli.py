@@ -94,12 +94,25 @@ def _setup_logging_from_config(raw: dict[str, Any], tool: str = "alfred", suppre
 
     Each tool's ``utils.setup_logging`` helper has an identical signature,
     so the choice to import curator's here is arbitrary — any of them work.
+
+    Rotation kwargs (``max_bytes`` / ``backup_count``) are pulled from
+    ``logging.rotation`` in the unified config and threaded through —
+    same plumbing as the orchestrator's per-daemon runners, so CLI
+    invocations and daemon runs honor the same rotation policy.
     """
     log_cfg = raw.get("logging", {})
     level = log_cfg.get("level", "INFO")
     log_dir = log_cfg.get("dir", "./data")
     from alfred.curator.utils import setup_logging
-    setup_logging(level=level, log_file=f"{log_dir}/{tool}.log", suppress_stdout=suppress_stdout)
+    from alfred.common.logging_handler import extract_rotation_config
+    max_bytes, backup_count = extract_rotation_config(log_cfg)
+    setup_logging(
+        level=level,
+        log_file=f"{log_dir}/{tool}.log",
+        suppress_stdout=suppress_stdout,
+        max_bytes=max_bytes,
+        backup_count=backup_count,
+    )
 
 
 # --- Subcommand handlers ---
