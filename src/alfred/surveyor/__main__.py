@@ -7,9 +7,35 @@ import signal
 import sys
 from pathlib import Path
 
+import yaml
+
+from alfred.common.logging_handler import extract_rotation_config
+
 from .config import load_config
 from .daemon import Daemon
 from .utils import setup_logging
+
+
+def _load_rotation_kwargs(config_path: Path) -> dict[str, int]:
+    """Pull rotation kwargs from the raw YAML's ``logging`` block.
+
+    Mirror of curator's ``__main__._load_rotation_kwargs`` — surveyor's
+    typed ``LoggingConfig`` is already schema-tolerant of unknown keys
+    (its ``_build_dataclass`` filters by field name), but ``rotation``
+    still doesn't reach ``setup_logging`` unless extracted here. Keeps
+    ``python -m alfred.surveyor`` aligned with the orchestrator's
+    rotation contract.
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    log_cfg = raw.get("logging") if isinstance(raw, dict) else None
+    if not isinstance(log_cfg, dict):
+        return {}
+    max_bytes, backup_count = extract_rotation_config(log_cfg)
+    return {"max_bytes": max_bytes, "backup_count": backup_count}
 
 
 def _load_env_file(env_path: Path | None = None) -> None:
@@ -36,7 +62,11 @@ def main() -> None:
         config_path = Path(sys.argv[1])
 
     cfg = load_config(config_path)
-    setup_logging(level=cfg.logging.level, log_file=cfg.logging.file)
+    setup_logging(
+        level=cfg.logging.level,
+        log_file=cfg.logging.file,
+        **_load_rotation_kwargs(config_path),
+    )
 
     daemon = Daemon(cfg)
 

@@ -440,6 +440,22 @@ def _build(cls: type, data: dict[str, Any]) -> Any:
     return cls(**kwargs)
 
 
+def _strip_logging_extras(log_raw: dict[str, Any]) -> dict[str, Any]:
+    """Drop keys from ``log_raw`` that ``LoggingConfig`` doesn't know about.
+
+    The unified ``logging`` block in config.yaml carries fields the
+    orchestrator consumes directly (``dir``, ``rotation``) that aren't
+    fields on the typed ``LoggingConfig`` dataclass (only ``level`` +
+    ``file``). Without this filter, ``_build(LoggingConfig, ...)``
+    crashes whenever an operator pulls ``config.yaml.example``'s
+    rotation block. Pre-dispatch strip keeps the typed config slim and
+    routes rotation through the orchestrator / ``__main__.py``
+    ``extract_rotation_config`` path.
+    """
+    known = set(LoggingConfig.__dataclass_fields__)
+    return {k: v for k, v in log_raw.items() if k in known}
+
+
 def load_config(path: str | Path = "config.yaml") -> DistillerConfig:
     """Load and parse config.yaml into DistillerConfig.
 
@@ -457,6 +473,8 @@ def load_config(path: str | Path = "config.yaml") -> DistillerConfig:
     raw = _substitute_env(raw or {})
     if "vault" in raw:
         raw["vault"] = normalize_vault_block(raw["vault"])
+    if isinstance(raw.get("logging"), dict):
+        raw["logging"] = _strip_logging_extras(raw["logging"])
     # Pattern miner is built manually for the same nested-state-key-
     # collision reason load_from_unified handles. Pop before _build
     # then re-attach.
@@ -503,6 +521,8 @@ def load_from_unified(raw: dict[str, Any]) -> DistillerConfig:
     log_dir = log_raw.pop("dir", "./data")
     if "file" not in log_raw:
         log_raw["file"] = f"{log_dir}/distiller.log"
+    # Strip orchestrator-only keys (``rotation``) before typed build.
+    log_raw = _strip_logging_extras(log_raw)
     built: dict[str, Any] = {
         "vault": normalize_vault_block(raw.get("vault", {})),
         "agent": raw.get("agent", {}),

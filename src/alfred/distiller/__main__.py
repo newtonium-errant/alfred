@@ -6,8 +6,33 @@ import argparse
 import sys
 from pathlib import Path
 
+import yaml
+
+from alfred.common.logging_handler import extract_rotation_config
+
 from .config import load_config
 from .utils import setup_logging
+
+
+def _load_rotation_kwargs(config_path: str) -> dict[str, int]:
+    """Pull rotation kwargs from the raw YAML's ``logging`` block.
+
+    Mirror of curator's ``__main__._load_rotation_kwargs`` — the typed
+    ``LoggingConfig`` dataclass doesn't carry ``rotation``, so the
+    ``python -m alfred.distiller`` entry point reads it from the raw
+    YAML to keep this code path aligned with the orchestrator's
+    rotation contract.
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    log_cfg = raw.get("logging") if isinstance(raw, dict) else None
+    if not isinstance(log_cfg, dict):
+        return {}
+    max_bytes, backup_count = extract_rotation_config(log_cfg)
+    return {"max_bytes": max_bytes, "backup_count": backup_count}
 
 
 def _add_config_arg(parser: argparse.ArgumentParser) -> None:
@@ -59,7 +84,11 @@ def main() -> None:
 
     # Load config
     config = load_config(args.config)
-    setup_logging(config.logging.level, config.logging.file)
+    setup_logging(
+        config.logging.level,
+        config.logging.file,
+        **_load_rotation_kwargs(args.config),
+    )
 
     from alfred._data import get_skills_dir
     skills_dir = get_skills_dir()

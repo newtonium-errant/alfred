@@ -489,3 +489,378 @@ def test_structlog_events_land_in_rotating_log_file(tmp_path: Path):
     contents = log_file.read_text(encoding="utf-8")
     assert "test.rotation.event" in contents
     assert "phase" in contents
+
+
+# ---------------------------------------------------------------------------
+# 7. ``__main__.py`` entry points thread rotation kwargs (Tier A #2.1 NOTE 1)
+# ---------------------------------------------------------------------------
+#
+# Each of curator/janitor/distiller/surveyor ships a ``__main__.py`` so
+# operators can invoke ``python -m alfred.<tool>`` outside the
+# orchestrator. Before this followup, those paths called
+# ``setup_logging(level=..., log_file=...)`` without rotation kwargs,
+# silently dropping the operator's ``logging.rotation`` config and
+# falling back to the bundled 100 MB × 5 default.
+#
+# The matrix below verifies each ``__main__.py`` defines a
+# ``_load_rotation_kwargs(config_path)`` helper and that helper
+# round-trips the YAML rotation block. The helper-level test is
+# sufficient (we don't subprocess-spawn ``python -m alfred.curator``
+# because that exercises asyncio loops + real daemons); the contract
+# is that the helper is THERE and threads kwargs into ``setup_logging``.
+
+import yaml
+
+
+MAIN_MODULE_ROTATION_SITES = [
+    ("curator", "alfred.curator.__main__"),
+    ("janitor", "alfred.janitor.__main__"),
+    ("distiller", "alfred.distiller.__main__"),
+    ("surveyor", "alfred.surveyor.__main__"),
+]
+
+
+@pytest.mark.parametrize("tool_name,module_path", MAIN_MODULE_ROTATION_SITES)
+def test_main_module_paths_thread_rotation(
+    tmp_path: Path, tool_name: str, module_path: str
+):
+    """Each ``__main__.py`` exposes ``_load_rotation_kwargs`` that
+    extracts the YAML ``logging.rotation`` block into kwargs ready to
+    splat into ``setup_logging``.
+
+    Per Tier A #2.1 NOTE 1: the ``python -m alfred.<tool>`` paths must
+    honor operator rotation config, same as the orchestrator. Tests the
+    helper, not the subprocess (no daemon loops in CI).
+    """
+    import importlib
+
+    mod = importlib.import_module(module_path)
+    assert hasattr(mod, "_load_rotation_kwargs"), (
+        f"{module_path} is missing ``_load_rotation_kwargs`` — the "
+        f"``python -m alfred.{tool_name}`` path will silently drop the "
+        f"operator's rotation config"
+    )
+
+    # Write a YAML with a rotation block and verify the helper extracts it.
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "logging": {
+                    "level": "INFO",
+                    "dir": "./data",
+                    "rotation": {"max_bytes": 7_777_777, "backup_count": 3},
+                }
+            }
+        )
+    )
+    kwargs = mod._load_rotation_kwargs(str(config_path))
+    assert kwargs == {"max_bytes": 7_777_777, "backup_count": 3}, (
+        f"{module_path}._load_rotation_kwargs returned {kwargs}, "
+        f"expected the YAML rotation block round-tripped"
+    )
+
+
+@pytest.mark.parametrize("tool_name,module_path", MAIN_MODULE_ROTATION_SITES)
+def test_main_module_paths_rotation_kwargs_defaults_on_missing(
+    tmp_path: Path, tool_name: str, module_path: str
+):
+    """When the YAML omits the rotation block, the helper returns the
+    bundled defaults — preserving the schema-tolerance contract.
+    """
+    import importlib
+
+    mod = importlib.import_module(module_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"logging": {"level": "INFO", "dir": "./data"}})
+    )
+    kwargs = mod._load_rotation_kwargs(str(config_path))
+    assert kwargs == {
+        "max_bytes": DEFAULT_MAX_BYTES,
+        "backup_count": DEFAULT_BACKUP_COUNT,
+    }
+
+
+@pytest.mark.parametrize("tool_name,module_path", MAIN_MODULE_ROTATION_SITES)
+def test_main_module_paths_rotation_kwargs_missing_file(
+    tmp_path: Path, tool_name: str, module_path: str
+):
+    """Helper degrades gracefully on a missing config file (returns
+    empty kwargs so ``setup_logging`` falls back to bundled defaults).
+    """
+    import importlib
+
+    mod = importlib.import_module(module_path)
+    missing = tmp_path / "does-not-exist.yaml"
+    kwargs = mod._load_rotation_kwargs(str(missing))
+    assert kwargs == {}
+
+
+# ---------------------------------------------------------------------------
+# 8. ``logging.rotation.policy_applied`` log emission (Tier A #2.1 NOTE 2)
+# ---------------------------------------------------------------------------
+#
+# Per ``feedback_intentionally_left_blank.md``: operators must be able
+# to distinguish "config honored, rotation disabled via ``max_bytes: 0``"
+# from "config silently dropped, default applied." The
+# ``logging.rotation.policy_applied`` event surfaces the resolved
+# policy at the tail of every ``setup_logging`` call. Per
+# ``feedback_log_emission_test_pattern.md``: the test MUST drive the
+# production code path AND assert on the captured event via
+# ``structlog.testing.capture_logs()``.
+
+
+def _flush_handlers() -> None:
+    """Flush every handler on the root logger.
+
+    The policy_applied event hits the RotatingFileHandler immediately,
+    but Python's file buffer may not flush to disk before the test
+    reads back. Explicit flush avoids racy reads.
+    """
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+
+
+_ANSI_RE = __import__("re").compile(r"\x1b\[[0-9;]*m")
+
+
+def _read_log(log_file: Path) -> str:
+    """Read the on-disk log file's contents, stripped of ANSI escapes.
+
+    Structlog's ``ConsoleRenderer`` wraps keys/values in ANSI color
+    sequences. Tests assert on plain ``key=value`` substrings — those
+    only survive if the ANSI is stripped first.
+    """
+    _flush_handlers()
+    if not log_file.exists():
+        return ""
+    raw = log_file.read_text(encoding="utf-8")
+    return _ANSI_RE.sub("", raw)
+
+
+def test_policy_applied_log_emitted_on_setup(tmp_path: Path):
+    """``setup_logging`` writes a ``logging.rotation.policy_applied``
+    event to the configured log file with the resolved policy fields.
+
+    Per ``feedback_log_emission_test_pattern.md`` — assertion drives
+    the production code path. Note: ``structlog.testing.capture_logs``
+    doesn't work here because ``setup_logging`` calls
+    ``structlog.configure`` mid-call, which clobbers the capture
+    instrumentation. The real production sink is the log file, so we
+    read it back.
+    """
+    from alfred.curator.utils import setup_logging
+
+    log_file = tmp_path / "curator.log"
+    setup_logging(
+        level="INFO",
+        log_file=str(log_file),
+        suppress_stdout=True,
+        max_bytes=88_888_888,
+        backup_count=4,
+    )
+    contents = _read_log(log_file)
+    # Event-name and key field assertions — catches drop-the-event
+    # AND drop-the-field refactor regressions.
+    assert "logging.rotation.policy_applied" in contents, (
+        f"expected ``logging.rotation.policy_applied`` event in {log_file}, "
+        f"got: {contents!r}"
+    )
+    assert "max_bytes=88888888" in contents
+    assert "backup_count=4" in contents
+    assert str(log_file) in contents
+    assert "rotation_enabled=True" in contents
+
+
+def test_policy_applied_log_emits_rotation_enabled_false_on_zero(tmp_path: Path):
+    """``max_bytes=0`` (the disable-rotation escape hatch) produces
+    ``rotation_enabled=False`` in the on-disk log line.
+
+    This is the principal observability win for the policy_applied
+    event — without it, an operator setting ``rotation.max_bytes: 0``
+    cannot distinguish honored-disabled from silently-dropped-default
+    in their log file.
+    """
+    from alfred.janitor.utils import setup_logging
+
+    log_file = tmp_path / "janitor.log"
+    setup_logging(
+        level="INFO",
+        log_file=str(log_file),
+        suppress_stdout=True,
+        max_bytes=0,
+        backup_count=5,
+    )
+    contents = _read_log(log_file)
+    assert "logging.rotation.policy_applied" in contents
+    assert "max_bytes=0" in contents
+    assert "backup_count=5" in contents
+    assert "rotation_enabled=False" in contents
+
+
+def test_policy_applied_log_emits_defaults_when_kwargs_absent(tmp_path: Path):
+    """The policy_applied event reports the RESOLVED values — so when
+    the caller omits the kwargs, the event shows the bundled defaults
+    (not ``None``).
+
+    This is what lets an operator confirm "config block was missing,
+    defaults applied" via the log line rather than guessing from
+    behavior.
+    """
+    from alfred.distiller.utils import setup_logging
+
+    log_file = tmp_path / "distiller.log"
+    setup_logging(
+        level="INFO",
+        log_file=str(log_file),
+        suppress_stdout=True,
+    )
+    contents = _read_log(log_file)
+    assert "logging.rotation.policy_applied" in contents
+    assert f"max_bytes={DEFAULT_MAX_BYTES}" in contents
+    assert f"backup_count={DEFAULT_BACKUP_COUNT}" in contents
+    assert "rotation_enabled=True" in contents
+
+
+def test_policy_applied_log_suppressed_when_no_log_file(tmp_path: Path):
+    """No log file → no policy_applied event (no file handler was wired,
+    nothing to report).
+
+    Pins the no-op contract: callers that suppress the file handler
+    (CLI smoke tests, etc.) don't crash and don't leave artifacts.
+    Asserts via the absence of the event file: a stray write would
+    have to land somewhere.
+    """
+    from alfred.brief.utils import setup_logging
+
+    # The function should complete cleanly without writing to any file.
+    setup_logging(
+        level="INFO",
+        log_file=None,
+        suppress_stdout=True,
+        max_bytes=100,
+        backup_count=2,
+    )
+    # Nothing under tmp_path should have been touched.
+    artifacts = list(tmp_path.iterdir())
+    assert artifacts == [], (
+        f"expected no files written when log_file=None, got: {artifacts}"
+    )
+
+
+@pytest.mark.parametrize("tool_name,module_path", SETUP_LOGGING_SITES)
+def test_policy_applied_log_emitted_for_every_tool(
+    tmp_path: Path, tool_name: str, module_path: str
+):
+    """Matrix pin: every tool's ``setup_logging`` emits the
+    policy_applied event to its log file.
+
+    A future refactor that drops the ``emit_rotation_policy_log`` call
+    from any single tool's setup_logging trips this matrix entry —
+    same shape as ``test_setup_logging_installs_rotating_handler_with_supplied_limits``,
+    different observability contract.
+    """
+    import importlib
+
+    mod = importlib.import_module(module_path)
+    log_file = tmp_path / f"{tool_name}.log"
+    mod.setup_logging(
+        level="INFO",
+        log_file=str(log_file),
+        suppress_stdout=True,
+        max_bytes=42_000_000,
+        backup_count=3,
+    )
+    contents = _read_log(log_file)
+    assert "logging.rotation.policy_applied" in contents, (
+        f"{tool_name}.setup_logging did not emit "
+        f"``logging.rotation.policy_applied`` to {log_file}; "
+        f"contents: {contents!r}"
+    )
+    assert "max_bytes=42000000" in contents
+    assert "backup_count=3" in contents
+    assert "rotation_enabled=True" in contents
+
+
+# ---------------------------------------------------------------------------
+# 9. Config loaders tolerate the ``logging.rotation`` block (NOTE 1 regression)
+# ---------------------------------------------------------------------------
+#
+# Pre-followup, curator/janitor/distiller's ``load_config`` and
+# ``load_from_unified`` crashed with ``TypeError: LoggingConfig.__init__()
+# got an unexpected keyword argument 'rotation'`` whenever the YAML
+# contained the example config's rotation block. The ``__main__.py``
+# fix is moot if the typed config layer can't load the file.
+
+
+CONFIG_LOAD_SITES = [
+    ("curator", "alfred.curator.config"),
+    ("janitor", "alfred.janitor.config"),
+    ("distiller", "alfred.distiller.config"),
+]
+
+
+@pytest.mark.parametrize("tool_name,module_path", CONFIG_LOAD_SITES)
+def test_load_config_tolerates_rotation_block(
+    tmp_path: Path, tool_name: str, module_path: str
+):
+    """``load_config`` (file-based) doesn't crash on the YAML rotation
+    block — keys not on ``LoggingConfig`` are silently stripped before
+    the typed build.
+
+    Surveyor's loader is omitted because its own ``_build_dataclass``
+    is already schema-tolerant of unknown keys (filters by field
+    name) — covered indirectly by the matrix in section 3.
+    """
+    import importlib
+
+    mod = importlib.import_module(module_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "logging": {
+                    "level": "INFO",
+                    "file": str(tmp_path / f"{tool_name}.log"),
+                    "rotation": {"max_bytes": 12345, "backup_count": 2},
+                }
+            }
+        )
+    )
+    # Should not raise.
+    cfg = mod.load_config(str(config_path))
+    assert cfg.logging.level == "INFO"
+    # The rotation block was stripped — the typed dataclass only
+    # carries level + file.
+    assert not hasattr(cfg.logging, "rotation")
+
+
+@pytest.mark.parametrize("tool_name,module_path", CONFIG_LOAD_SITES)
+def test_load_from_unified_tolerates_rotation_block(
+    tool_name: str, module_path: str
+):
+    """``load_from_unified`` (in-memory dict path used by orchestrator)
+    also tolerates the rotation block.
+
+    Same crash class — different load entry point.
+    """
+    import importlib
+
+    mod = importlib.import_module(module_path)
+    raw = {
+        tool_name: {},
+        "logging": {
+            "level": "INFO",
+            "dir": "./data",
+            "rotation": {"max_bytes": 100, "backup_count": 2},
+        },
+    }
+    # Surveyor needs vault in the unified dict; the three crash-prone
+    # tools (curator/janitor/distiller) accept missing vault by
+    # defaulting via normalize_vault_block.
+    cfg = mod.load_from_unified(raw)
+    assert cfg.logging.level == "INFO"

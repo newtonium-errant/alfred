@@ -42,6 +42,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import structlog
+
 # Default rotation policy — applied when the config omits the
 # ``logging.rotation`` block entirely. Picked from the original Tier A #2
 # task: 100 MB × 5 backups bounds disk use without rotating so often that
@@ -127,3 +129,73 @@ def extract_rotation_config(log_cfg: dict) -> tuple[int, int]:
     max_bytes = rotation.get("max_bytes", DEFAULT_MAX_BYTES)
     backup_count = rotation.get("backup_count", DEFAULT_BACKUP_COUNT)
     return max_bytes, backup_count
+
+
+def resolve_rotation_policy(
+    max_bytes: int | None,
+    backup_count: int | None,
+) -> tuple[int, int]:
+    """Resolve ``setup_logging``'s rotation kwargs to concrete ints.
+
+    Mirrors the resolution chain inside ``build_rotating_file_handler``:
+    ``None`` → module-level default → ``int(...)`` coercion → clamp
+    negatives to zero. Pulled out as a separate helper so the per-tool
+    ``setup_logging`` clones can emit the
+    ``logging.rotation.policy_applied`` event with the SAME resolved
+    values the handler ended up using — caller computes them once,
+    passes them to both ``build_rotating_file_handler`` and
+    ``emit_rotation_policy_log``.
+
+    Schema-tolerance: a stringy YAML value (``"100000000"``) coerces
+    cleanly; garbage raises ``ValueError`` at the conversion site, same
+    as the handler builder.
+    """
+    if max_bytes is None:
+        max_bytes = DEFAULT_MAX_BYTES
+    if backup_count is None:
+        backup_count = DEFAULT_BACKUP_COUNT
+    max_bytes = int(max_bytes)
+    backup_count = int(backup_count)
+    if max_bytes < 0:
+        max_bytes = 0
+    if backup_count < 0:
+        backup_count = 0
+    return max_bytes, backup_count
+
+
+def emit_rotation_policy_log(
+    log_file: str | Path | None,
+    max_bytes: int,
+    backup_count: int,
+) -> None:
+    """Emit a one-shot ``logging.rotation.policy_applied`` structlog event.
+
+    Called from the tail of every tool's ``setup_logging`` after
+    ``structlog.configure`` runs. Records the resolved rotation policy
+    (``max_bytes``, ``backup_count``, ``rotation_enabled``) so an
+    operator can grep ``data/<tool>.log`` and confirm whether their
+    config was honored.
+
+    Per ``feedback_intentionally_left_blank.md``: silence on rotation
+    policy is operationally ambiguous — an operator who sets
+    ``rotation.max_bytes: 0`` (the disable-rotation escape hatch) cannot
+    distinguish "config honored, disabled" from "config silently
+    dropped, default applied, not yet rotated." The explicit event
+    makes the two cases distinguishable via
+    ``rotation_enabled=True/False``.
+
+    ``log_file=None`` (the suppress-handler path) is a no-op — no file
+    handler was built, nothing to report. ``rotation_enabled`` is
+    explicit (``max_bytes > 0``) so the disabled case shows up as a
+    field, not as absence.
+    """
+    if log_file is None:
+        return
+    log = structlog.get_logger("alfred.logging")
+    log.info(
+        "logging.rotation.policy_applied",
+        max_bytes=int(max_bytes),
+        backup_count=int(backup_count),
+        log_file=str(log_file),
+        rotation_enabled=int(max_bytes) > 0,
+    )

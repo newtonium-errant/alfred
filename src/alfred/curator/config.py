@@ -192,6 +192,23 @@ def _build(cls: type, data: dict[str, Any]) -> Any:
     return cls(**kwargs)
 
 
+def _strip_logging_extras(log_raw: dict[str, Any]) -> dict[str, Any]:
+    """Drop keys from ``log_raw`` that ``LoggingConfig`` doesn't know about.
+
+    The unified ``logging`` block in config.yaml carries fields the
+    orchestrator consumes directly (``dir``, ``rotation``) that aren't
+    fields on the typed ``LoggingConfig`` dataclass (only ``level`` +
+    ``file``). Without this filter, ``_build(LoggingConfig, ...)``
+    crashes with ``TypeError: ... unexpected keyword argument
+    'rotation'`` whenever an operator pulls ``config.yaml.example``'s
+    rotation block. Pre-dispatch strip keeps the typed config slim and
+    routes rotation through the orchestrator / ``__main__.py``
+    ``extract_rotation_config`` path.
+    """
+    known = set(LoggingConfig.__dataclass_fields__)
+    return {k: v for k, v in log_raw.items() if k in known}
+
+
 def load_config(path: str | Path = "config.yaml") -> CuratorConfig:
     """Load and parse config.yaml into CuratorConfig."""
     from alfred.vault.config_helpers import normalize_vault_block
@@ -202,6 +219,11 @@ def load_config(path: str | Path = "config.yaml") -> CuratorConfig:
     raw = _substitute_env(raw or {})
     if "vault" in raw:
         raw["vault"] = normalize_vault_block(raw["vault"])
+    # Strip orchestrator-only logging keys (``rotation``, ``dir``) so
+    # ``_build(LoggingConfig, ...)`` doesn't crash on the example
+    # config's rotation block. See ``_strip_logging_extras``.
+    if isinstance(raw.get("logging"), dict):
+        raw["logging"] = _strip_logging_extras(raw["logging"])
     return _build(CuratorConfig, raw)
 
 
@@ -221,6 +243,10 @@ def load_from_unified(raw: dict[str, Any]) -> CuratorConfig:
     log_dir = log_raw.pop("dir", "./data")
     if "file" not in log_raw:
         log_raw["file"] = f"{log_dir}/curator.log"
+    # Drop ``rotation`` (orchestrator/__main__.py consume it separately
+    # via ``extract_rotation_config``) so ``_build(LoggingConfig, ...)``
+    # only sees fields it knows about.
+    log_raw = _strip_logging_extras(log_raw)
     top_level: dict[str, Any] = {
         "vault": vault_raw,
         "agent": raw.get("agent", {}),

@@ -86,6 +86,15 @@ logging:
   #
   # Escape hatch: set ``max_bytes: 0`` to disable rotation if you'd
   # rather manage rotation externally (logrotate, journald, etc.).
+  #
+  # Daemon-restart contract: rotation activates on next daemon startup.
+  # An already-running daemon keeps its existing FileHandler (no
+  # rotation) until restarted — ``alfred down && alfred up`` applies
+  # the new rotation policy. Each daemon emits a one-shot
+  # ``logging.rotation.policy_applied`` event at startup (grep
+  # ``data/<tool>.log``) so you can confirm config was honored. The
+  # truncate-existing-log step is operator-discretion — see CLAUDE.md's
+  # worktree+editable-install gotcha for the inode-preserving pattern.
   rotation:
     max_bytes: 100000000  # 100 MB per file
     backup_count: 5
