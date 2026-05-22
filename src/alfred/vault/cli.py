@@ -258,6 +258,21 @@ def cmd_edit(args: argparse.Namespace) -> None:
     set_fields = _parse_set_args(args.set)
     append_fields = _parse_set_args(args.append)
 
+    # Pre-validate that at least one mutation flag was supplied. Without
+    # this gate ``vault_edit`` fail-louds at Layer 1 (ops.py no-op gate,
+    # per the Hypatia 2026-05-21 incident — see
+    # ``feedback_intentionally_left_blank.md``), but the operator sees
+    # a JSON error wrapping the deeper ops-layer message that names
+    # programmatic kwargs (``set_fields``, ``body_replace``, …) rather
+    # than the CLI flags they actually invoked. Surfacing an actionable
+    # CLI-layer message here names the flags the operator forgot,
+    # before delegating to the Layer 1 gate.
+    if not (set_fields or append_fields or args.body_append or args.body_stdin):
+        _error(
+            "no edit specified — pass at least one of --set, --append, "
+            "--body-append, or --body-stdin",
+        )
+
     # Compute the union of frontmatter fields being written. Body-only
     # writes (--body-append, --body-stdin) are gated separately by
     # ``body_write`` — closes the Q3 body-write loophole where a scope

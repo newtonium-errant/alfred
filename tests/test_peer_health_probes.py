@@ -170,6 +170,59 @@ async def test_peer_handshake_warns_on_unreachable():
     assert result.status == Status.WARN
 
 
+async def test_peer_handshake_fails_gracefully_on_missing_instance_name(
+    peer_server,  # type: ignore[no-untyped-def]
+):
+    """When ``telegram.instance.name`` is missing, ``_infer_self_name``
+    fail-louds with RuntimeError (Tier A #1.1 contract). The handshake
+    probe must catch it and return a FAIL ``CheckResult`` so
+    ``health_check`` / ``alfred check --peer X`` surface a structured
+    error rather than propagating a raw traceback. Pins the
+    contract: misconfiguration → structured FAIL with the inference-
+    failure detail, never an unhandled exception.
+    """
+    from alfred.transport.health import _check_peer_handshake
+
+    result = await _check_peer_handshake(
+        raw={},  # no telegram.instance.name → triggers RuntimeError
+        peer_name="kal-le",
+        peer_entry={"base_url": peer_server, "token": DUMMY_PEER_TOKEN},
+    )
+    assert result.status == Status.FAIL
+    assert "self-name inference failed" in result.detail
+    # The wrapped RuntimeError message must surface so the operator
+    # sees the actual missing config field, not just an opaque "FAIL".
+    assert "telegram.instance.name" in result.detail
+
+
+async def test_run_peer_probes_fails_gracefully_on_missing_instance_name(
+    peer_server,  # type: ignore[no-untyped-def]
+):
+    """``_run_peer_probes`` against a config missing
+    ``telegram.instance.name`` must return a CheckResult (not raise).
+    Mirrors the integration path operators hit via
+    ``alfred check --peer X``.
+    """
+    from alfred.transport.health import _run_peer_probes
+
+    raw = {
+        "transport": {
+            "peers": {
+                "kal-le": {"base_url": peer_server, "token": DUMMY_PEER_TOKEN},
+            },
+        },
+        # No ``telegram.instance.name`` block — operator
+        # misconfiguration surface.
+    }
+    results = await _run_peer_probes(raw)
+    # peer-reachable doesn't need instance.name, so it succeeds; only
+    # peer-handshake hits the inference path.
+    handshake = [r for r in results if r.name == "peer-handshake:kal-le"]
+    assert len(handshake) == 1
+    assert handshake[0].status == Status.FAIL
+    assert "self-name inference failed" in handshake[0].detail
+
+
 # ---------------------------------------------------------------------------
 # queue-depth probe
 # ---------------------------------------------------------------------------

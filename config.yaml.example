@@ -92,9 +92,7 @@ logging:
   # rotation) until restarted — ``alfred down && alfred up`` applies
   # the new rotation policy. Each daemon emits a one-shot
   # ``logging.rotation.policy_applied`` event at startup (grep
-  # ``data/<tool>.log``) so you can confirm config was honored. The
-  # truncate-existing-log step is operator-discretion — see CLAUDE.md's
-  # worktree+editable-install gotcha for the inode-preserving pattern.
+  # ``data/<tool>.log``) so you can confirm config was honored.
   rotation:
     max_bytes: 100000000  # 100 MB per file
     backup_count: 5

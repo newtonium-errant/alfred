@@ -317,16 +317,36 @@ async def _check_peer_handshake(
             detail=f"peer '{peer_name}' has no token",
         )
 
+    # ``_infer_self_name`` fail-louds with RuntimeError when
+    # ``telegram.instance.name`` is missing / empty (Tier A #1.1, commit
+    # ``1bd0864``). The health-check surface must not let that propagate
+    # — ``_run_peer_probes`` → ``health_check`` aggregates ``CheckResult``
+    # objects and operators run ``alfred check --peer X`` to diagnose
+    # misconfiguration, so a raw traceback at this layer would obscure
+    # the very gap the probe is meant to surface. Convert the
+    # RuntimeError into a structured FAIL CheckResult that names the
+    # missing config field, mirroring the shape of the missing-token
+    # FAIL above.
+    try:
+        self_name = _infer_self_name(raw)
+    except RuntimeError as exc:
+        return CheckResult(
+            name=name,
+            status=Status.FAIL,
+            detail=f"self-name inference failed: {exc}",
+            data={"peer": peer_name},
+        )
+
     headers = {
         "Authorization": f"Bearer {token}",
-        "X-Alfred-Client": _infer_self_name(raw),
+        "X-Alfred-Client": self_name,
     }
     url = f"{base_url.rstrip('/')}/peer/handshake"
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.post(
                 url,
-                json={"from": _infer_self_name(raw), "protocol_version": 1},
+                json={"from": self_name, "protocol_version": 1},
                 headers=headers,
             )
     except (httpx.ConnectError, httpx.ConnectTimeout):

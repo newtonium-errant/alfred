@@ -195,3 +195,61 @@ class TestVaultEditNoOpDetection:
         )
         assert "status" in result["fields_changed"]
         assert "body" in result["fields_changed"]
+
+
+class TestCmdEditNoFlagsCLIGate:
+    """CLI-layer counterpart to the Layer 1 no-op gate above.
+
+    The dispatch surface is ``alfred vault edit <path>`` with no
+    mutation flag. Layer 1 already fail-louds with an actionable
+    error, but the operator-visible message names programmatic
+    kwargs (``set_fields``, ``body_replace``, …) — the CLI gate adds
+    a friendlier pre-validation that names the CLI flags they
+    actually invoked, before delegating to Layer 1.
+
+    See ``cmd_edit`` in ``src/alfred/vault/cli.py``.
+    """
+
+    def test_edit_with_no_mutation_flag_exits_with_actionable_message(
+        self,
+        tmp_vault: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ):
+        """``alfred vault edit some/path.md`` with no flags → non-zero
+        exit + actionable CLI-flag-naming message (not a traceback)."""
+        from alfred.vault.cli import cmd_edit
+        import argparse
+        import json
+
+        vault_create(
+            tmp_vault, "note", "CLI No-Flag Repro",
+            body="# Title\n\nOriginal.\n",
+        )
+        monkeypatch.setenv("ALFRED_VAULT_PATH", str(tmp_vault))
+        monkeypatch.delenv("ALFRED_VAULT_SCOPE", raising=False)
+
+        # Mirror argparse defaults: no --set, --append, --body-append,
+        # --body-stdin supplied.
+        args = argparse.Namespace(
+            path="note/CLI No-Flag Repro.md",
+            set=None,
+            append=None,
+            body_append=None,
+            body_stdin=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_edit(args)
+        # Non-zero exit per ``_error`` contract.
+        assert exc_info.value.code == 1
+
+        # Message names the CLI flags (operator's vocabulary), not
+        # programmatic kwargs.
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        msg = payload["error"]
+        assert "no edit specified" in msg
+        assert "--set" in msg
+        assert "--append" in msg
+        assert "--body-append" in msg
+        assert "--body-stdin" in msg
