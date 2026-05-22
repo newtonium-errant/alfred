@@ -10,7 +10,8 @@ mode: quick
 name: Alfred BIT 2026-04-27
 overall_status: ok
 process: '[[process/Alfred BIT]]'
-related_orgs: []
+related_orgs:
+- org/ElevenLabs.md
 relationships:
 - confidence: 1
   context: Same Alfred BIT run series

@@ -1,14 +1,42 @@
 ---
-type: run
-status: completed
-name: Alfred BIT 2026-05-16
-description: Alfred built-in test (health sweep)
-process: '[[process/Alfred BIT]]'
-trigger: scheduled
-started: '2026-05-16T05:55:02.484662-03:00'
+alfred_tags:
+- alfred/bit
 created: '2026-05-16'
-overall_status: ok
+description: Alfred built-in test (health sweep)
+janitor_note: LINK001 — [[process/Alfred BIT]] parent process record does not exist
+  in vault. Cannot unambiguously fix (creating the missing process record is outside
+  janitor scope, no canonical retarget candidate). Same pattern as process/Alfred
+  BIT 2026-05-07.md and 2026-05-21.md.
 mode: quick
+name: Alfred BIT 2026-05-16
+overall_status: ok
+process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 0.9
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-16.md
+  source_anchor: BIT run on 2026-05-16
+  target: process/Alfred BIT 2026-05-17.md
+  target_anchor: BIT run on 2026-05-17
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-16.md
+  source_anchor: '[run] Alfred BIT 2026-05-16'
+  target: process/Alfred BIT 2026-05-18.md
+  target_anchor: '[run] Alfred BIT 2026-05-18'
+  type: related-to
+started: '2026-05-16T05:55:02.484662-03:00'
+status: completed
+tags:
+- bit
+- health
+- bit/ok
+tool_counts:
+  fail: 0
+  ok: 12
+  skip: 0
+  warn: 0
 tools_checked:
 - curator
 - janitor
@@ -22,15 +50,8 @@ tools_checked:
 - daily_sync
 - cloudflared
 - gcal
-tool_counts:
-  ok: 12
-  warn: 0
-  fail: 0
-  skip: 0
-tags:
-- bit
-- health
-- bit/ok
+trigger: scheduled
+type: run
 ---
 
 # Alfred BIT 2026-05-16

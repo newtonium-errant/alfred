@@ -99,7 +99,8 @@ janitor_note: LINK001 — synthesis/Per-Tool Health Logs Dont Aggregate target e
   should relocate.
 project:
 - '[[project/Alfred]]'
-related_orgs: []
+related_orgs:
+- org/ElevenLabs.md
 relationships:
 - confidence: 0.8
   context: Both discuss Upstream Contribution process.

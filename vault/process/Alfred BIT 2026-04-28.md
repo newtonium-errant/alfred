@@ -11,7 +11,8 @@ mode: quick
 name: Alfred BIT 2026-04-28
 overall_status: ok
 process: '[[process/Alfred BIT]]'
-related_orgs: []
+related_orgs:
+- org/ElevenLabs.md
 started: '2026-04-28T05:55:04.029963-03:00'
 status: completed
 tags:

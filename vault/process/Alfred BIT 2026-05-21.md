@@ -1,57 +1,27 @@
 ---
 alfred_tags:
 - alfred/bit
-created: '2026-05-14'
+created: '2026-05-21'
 description: Alfred built-in test (health sweep)
-janitor_note: 'LINK001 — process target [[process/Alfred BIT]] does not exist in vault;
-  only run records (process/Alfred BIT YYYY-MM-DD.md) exist. DIR001 deterministic
-  scanner flag (type: run belongs in run/ directory). Same pattern as prior BIT run
-  records. Human action: create the parent process/Alfred BIT.md record OR move run
-  records to run/.'
+janitor_note: LINK001 — [[process/Alfred BIT]] parent process record does not exist
+  in vault. Cannot unambiguously fix (creating the missing process record is outside
+  janitor scope, no canonical retarget candidate). Same pattern as process/Alfred
+  BIT 2026-05-07.md and 2026-05-16.md.
 mode: quick
-name: Alfred BIT 2026-05-14
-overall_status: warn
+name: Alfred BIT 2026-05-21
+overall_status: ok
 process: '[[process/Alfred BIT]]'
-relationships:
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-05-14.md
-  source_anchor: '[run] Alfred BIT 2026-05-14'
-  target: process/Alfred BIT 2026-05-15.md
-  target_anchor: '[run] Alfred BIT 2026-05-15'
-  type: related-to
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-05-14.md
-  source_anchor: run Alfred BIT 2026-05-14
-  target: process/Alfred BIT 2026-05-16.md
-  target_anchor: run Alfred BIT 2026-05-16
-  type: related-to
-- confidence: 0.9
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-05-14.md
-  source_anchor: BIT run on 2026-05-14
-  target: process/Alfred BIT 2026-05-17.md
-  target_anchor: BIT run on 2026-05-17
-  type: related-to
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-05-14.md
-  source_anchor: '[run] Alfred BIT 2026-05-14'
-  target: process/Alfred BIT 2026-05-18.md
-  target_anchor: '[run] Alfred BIT 2026-05-18'
-  type: related-to
-started: '2026-05-14T05:55:01.839592-03:00'
+started: '2026-05-21T05:55:02.782885-03:00'
 status: completed
 tags:
 - bit
 - health
-- bit/warn
+- bit/ok
 tool_counts:
   fail: 0
-  ok: 8
+  ok: 12
   skip: 0
-  warn: 2
+  warn: 0
 tools_checked:
 - curator
 - janitor
@@ -63,77 +33,80 @@ tools_checked:
 - talker
 - transport
 - daily_sync
+- cloudflared
+- gcal
 trigger: scheduled
 type: run
 ---
 
-# Alfred BIT 2026-05-14
+# Alfred BIT 2026-05-21
 
 Generated at 0555 ADT.
 
 ## Summary
 
-Alfred BIT (quick) — [WARN]
-  started:  2026-05-14T08:55:00.078705+00:00
-  finished: 2026-05-14T08:55:01.839567+00:00
-  elapsed:  1761 ms
+Alfred BIT (quick) — [ OK ]
+  started:  2026-05-21T08:55:00.025966+00:00
+  finished: 2026-05-21T08:55:02.782738+00:00
+  elapsed:  2757 ms
 
-[ OK ] curator  (1442 ms)
+[ OK ] curator  (2252 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] inbox-dir — /home/andrew/alfred/vault/inbox
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (1052 ms) — count_tokens ok
-    [ OK ] last-successful-process — inbox empty; last process 29.3h ago
+    [ OK ] anthropic-auth  (2241 ms) — count_tokens ok
+    [ OK ] last-successful-process — inbox empty; last process 1.7h ago
 
-[ OK ] janitor  (1068 ms)
+[ OK ] janitor  (2356 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] state-file — data/janitor_state.json
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (982 ms) — count_tokens ok
-    [ OK ] last-successful-sweep — last sweep 0.5h ago
+    [ OK ] anthropic-auth  (1961 ms) — count_tokens ok
+    [ OK ] last-successful-sweep — last sweep 0.1h ago
 
-[ OK ] distiller  (959 ms)
+[ OK ] distiller  (1935 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] state-file — data/distiller_state.json
     [ OK ] candidate-threshold — 0.3
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (918 ms) — count_tokens ok
-    [ OK ] last-successful-extraction — last extraction 2.2h ago
+    [ OK ] anthropic-auth  (1830 ms) — count_tokens ok
+    [ OK ] last-successful-extraction — last extraction 2.1h ago
 
-[ OK ] instructor  (780 ms)
+[ OK ] instructor  (1046 ms)
     [ OK ] config-section — instructor section present
     [ OK ] state-path — data/instructor_state.json
     [ OK ] skill-file — /home/andrew/alfred/src/alfred/_bundled/skills/vault-instructor/SKILL.md
     [ OK ] pending-queue — pending queue length = 0
     [ OK ] retry-at-max — no records at max_retries=3
+    [ OK ] last-successful-poll — last poll: 2026-05-21T08:54:53.579239+00:00 (7s ago)
 
-[ OK ] surveyor  (206 ms)
+[ OK ] surveyor  (946 ms)
     [ OK ] ollama-reachable — HTTP 200
     [ OK ] milvus-lite — db: /home/andrew/alfred/data/milvus_lite.db
     [ OK ] openrouter-key — key set, model=qwen2.5:14b
     [ OK ] last-successful-cycle — last cycle 0.1h ago
 
-[WARN] brief  (408 ms)
+[ OK ] brief  (1224 ms)
     [ OK ] schedule-time — 06:00
     [ OK ] schedule-timezone — America/Halifax
     [ OK ] output-dir — /home/andrew/alfred/vault/run
     [ OK ] weather-api — HTTP 200
-    [WARN] last-successful-brief — last brief: 2026-05-12 (2d ago — one missed run)
+    [ OK ] last-successful-brief — last brief: 2026-05-20 (1d ago)
 
 [ OK ] mail  (0 ms)
     [ OK ] account:live — andrew.newton@live.ca on imap-mail.outlook.com
     [ OK ] inbox-dir — /home/andrew/alfred/vault/inbox
 
-[ OK ] talker  (259 ms)
+[ OK ] talker  (878 ms)
     [ OK ] bot-token — token present (46 chars)
     [ OK ] allowed-users — 1 user(s) allowlisted
     [ OK ] stt-key — groq key present
     [ OK ] tts-key — elevenlabs key present (51 chars)
     [ OK ] capture-handler-registered — capture_batch + capture_extract modules importable
     [ OK ] skill-capability-audit — all 5 tools advertised in skills/vault-talker/SKILL.md (instance=Salem, tool_set=talker)
-    [ OK ] anthropic-auth  (253 ms) — count_tokens ok
+    [ OK ] anthropic-auth  (872 ms) — count_tokens ok
 
-[ OK ] transport  (235 ms)
+[ OK ] transport  (1001 ms)
     [ OK ] config-section — transport section present
     [ OK ] token-configured — token length 64
     [ OK ] port-reachable — telegram_connected=True
@@ -146,22 +119,28 @@ Alfred BIT (quick) — [WARN]
     [ OK ] peer-handshake:hypatia — hypatia handshake ok (v1)
     [ OK ] peer-queue-depth:hypatia — hypatia depth=0 (warn at 100)
 
-[WARN] daily_sync  (6 ms)
+[ OK ] daily_sync  (1 ms)
     [ OK ] schedule-time — 09:00
     [ OK ] schedule-timezone — America/Halifax
     [ OK ] state-path — data/daily_sync_state.json
-    [WARN] last-successful-fire — last fire: 2026-05-12 (2d ago — one missed run)
+    [ OK ] last-successful-fire — last fire: 2026-05-20 (1d ago)
 
-Totals: ok=8 warn=2 fail=0 skip=0
+[ OK ] cloudflared  (36 ms)
+    [ OK ] last-successful-tunnel — tunnel connections active: 4
+
+[ OK ] gcal  (596 ms)
+    [ OK ] last-successful-gcal-sync — active probe ok; token last refreshed 39.7h ago (2026-05-19T17:14:15.533872Z)
+
+Totals: ok=12 warn=0 fail=0 skip=0
 
 ## Raw report (JSON)
 
 ```json
 {
   "mode": "quick",
-  "started_at": "2026-05-14T08:55:00.078705+00:00",
-  "finished_at": "2026-05-14T08:55:01.839567+00:00",
-  "overall_status": "warn",
+  "started_at": "2026-05-21T08:55:00.025966+00:00",
+  "finished_at": "2026-05-21T08:55:02.782738+00:00",
+  "overall_status": "ok",
   "tools": [
     {
       "tool": "curator",
@@ -198,7 +177,7 @@ Totals: ok=8 warn=2 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 1051.7654930008575,
+          "latency_ms": 2241.2776260171086,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -207,18 +186,18 @@ Totals: ok=8 warn=2 fail=0 skip=0
         {
           "name": "last-successful-process",
           "status": "ok",
-          "detail": "inbox empty; last process 29.3h ago",
+          "detail": "inbox empty; last process 1.7h ago",
           "latency_ms": null,
           "data": {
             "state_path": "data/curator_state.json",
-            "last_run": "2026-05-13T03:34:09.286637+00:00",
-            "elapsed_hours": 29.35,
+            "last_run": "2026-05-21T07:13:19.355534+00:00",
+            "elapsed_hours": 1.7,
             "inbox_has_pending": false
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 1441.8862570018973
+      "elapsed_ms": 2252.4227959802374
     },
     {
       "tool": "janitor",
@@ -255,7 +234,7 @@ Totals: ok=8 warn=2 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 981.8367060070159,
+          "latency_ms": 1960.7697010505944,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -264,17 +243,17 @@ Totals: ok=8 warn=2 fail=0 skip=0
         {
           "name": "last-successful-sweep",
           "status": "ok",
-          "detail": "last sweep 0.5h ago",
+          "detail": "last sweep 0.1h ago",
           "latency_ms": null,
           "data": {
             "state_path": "data/janitor_state.json",
-            "last_sweep": "2026-05-14T08:27:42.020259+00:00",
-            "elapsed_hours": 0.46
+            "last_sweep": "2026-05-21T08:48:45.620930+00:00",
+            "elapsed_hours": 0.1
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 1068.2724689977476
+      "elapsed_ms": 2356.478631030768
     },
     {
       "tool": "distiller",
@@ -320,7 +299,7 @@ Totals: ok=8 warn=2 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 917.5195260031614,
+          "latency_ms": 1830.4170640185475,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -329,17 +308,17 @@ Totals: ok=8 warn=2 fail=0 skip=0
         {
           "name": "last-successful-extraction",
           "status": "ok",
-          "detail": "last extraction 2.2h ago",
+          "detail": "last extraction 2.1h ago",
           "latency_ms": null,
           "data": {
             "state_path": "data/distiller_state.json",
-            "last_extraction": "2026-05-14T06:45:13.889090+00:00",
-            "elapsed_hours": 2.16
+            "last_extraction": "2026-05-21T06:46:07.448840+00:00",
+            "elapsed_hours": 2.15
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 958.8856560003478
+      "elapsed_ms": 1934.8388420185074
     },
     {
       "tool": "instructor",
@@ -386,10 +365,21 @@ Totals: ok=8 warn=2 fail=0 skip=0
           "detail": "no records at max_retries=3",
           "latency_ms": null,
           "data": {}
+        },
+        {
+          "name": "last-successful-poll",
+          "status": "ok",
+          "detail": "last poll: 2026-05-21T08:54:53.579239+00:00 (7s ago)",
+          "latency_ms": null,
+          "data": {
+            "state_path": "data/instructor_state.json",
+            "last_run_ts": "2026-05-21T08:54:53.579239+00:00",
+            "age_seconds": 7
+          }
         }
       ],
       "detail": "",
-      "elapsed_ms": 780.2579010021873
+      "elapsed_ms": 1045.8639230346307
     },
     {
       "tool": "surveyor",
@@ -433,17 +423,17 @@ Totals: ok=8 warn=2 fail=0 skip=0
           "latency_ms": null,
           "data": {
             "state_path": "data/surveyor_state.json",
-            "last_run": "2026-05-14T08:51:51.222422+00:00",
-            "elapsed_hours": 0.05
+            "last_run": "2026-05-21T08:51:10.954604+00:00",
+            "elapsed_hours": 0.06
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 205.7650780043332
+      "elapsed_ms": 946.3345939293504
     },
     {
       "tool": "brief",
-      "status": "warn",
+      "status": "ok",
       "results": [
         {
           "name": "schedule-time",
@@ -485,19 +475,19 @@ Totals: ok=8 warn=2 fail=0 skip=0
         },
         {
           "name": "last-successful-brief",
-          "status": "warn",
-          "detail": "last brief: 2026-05-12 (2d ago \u2014 one missed run)",
+          "status": "ok",
+          "detail": "last brief: 2026-05-20 (1d ago)",
           "latency_ms": null,
           "data": {
             "state_path": "data/brief_state.json",
-            "most_recent_date": "2026-05-12",
-            "today_local": "2026-05-14",
-            "days_old": 2
+            "most_recent_date": "2026-05-20",
+            "today_local": "2026-05-21",
+            "days_old": 1
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 407.53851699992083
+      "elapsed_ms": 1224.4798879837617
     },
     {
       "tool": "mail",
@@ -524,7 +514,7 @@ Totals: ok=8 warn=2 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 0.12326300202403218
+      "elapsed_ms": 0.27673994190990925
     },
     {
       "tool": "talker",
@@ -591,7 +581,7 @@ Totals: ok=8 warn=2 fail=0 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 253.44614101049956,
+          "latency_ms": 871.8850059667602,
           "data": {
             "model": "claude-sonnet-4-6",
             "probe": "count_tokens"
@@ -599,7 +589,7 @@ Totals: ok=8 warn=2 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 259.4437450024998
+      "elapsed_ms": 877.6926990831271
     },
     {
       "tool": "transport",
@@ -727,11 +717,11 @@ Totals: ok=8 warn=2 fail=0 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 235.1303530012956
+      "elapsed_ms": 1001.213726005517
     },
     {
       "tool": "daily_sync",
-      "status": "warn",
+      "status": "ok",
       "results": [
         {
           "name": "schedule-time",
@@ -763,22 +753,62 @@ Totals: ok=8 warn=2 fail=0 skip=0
         },
         {
           "name": "last-successful-fire",
-          "status": "warn",
-          "detail": "last fire: 2026-05-12 (2d ago \u2014 one missed run)",
+          "status": "ok",
+          "detail": "last fire: 2026-05-20 (1d ago)",
           "latency_ms": null,
           "data": {
             "state_path": "data/daily_sync_state.json",
-            "most_recent_date": "2026-05-12",
-            "today_local": "2026-05-14",
-            "days_old": 2
+            "most_recent_date": "2026-05-20",
+            "today_local": "2026-05-21",
+            "days_old": 1
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 5.871025990927592
+      "elapsed_ms": 1.0834219865500927
+    },
+    {
+      "tool": "cloudflared",
+      "status": "ok",
+      "results": [
+        {
+          "name": "last-successful-tunnel",
+          "status": "ok",
+          "detail": "tunnel connections active: 4",
+          "latency_ms": null,
+          "data": {
+            "metrics_url": "http://localhost:20241/metrics",
+            "enabled": true,
+            "ha_connections": 4
+          }
+        }
+      ],
+      "detail": "",
+      "elapsed_ms": 36.35635203681886
+    },
+    {
+      "tool": "gcal",
+      "status": "ok",
+      "results": [
+        {
+          "name": "last-successful-gcal-sync",
+          "status": "ok",
+          "detail": "active probe ok; token last refreshed 39.7h ago (2026-05-19T17:14:15.533872Z)",
+          "latency_ms": null,
+          "data": {
+            "token_path": "/home/andrew/alfred/data/secrets/gcal_token.json",
+            "enabled": true,
+            "last_refreshed": "2026-05-19T17:14:15.533872Z",
+            "age_seconds": 142846,
+            "active_probe": "ok"
+          }
+        }
+      ],
+      "detail": "",
+      "elapsed_ms": 595.8151520462707
     }
   ],
-  "elapsed_ms": 1760.8722470031353
+  "elapsed_ms": 2756.829226971604
 }
 ```
 
