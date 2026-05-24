@@ -9,6 +9,16 @@ KNOWN_TYPES: set[str] = {
     "location", "note", "decision", "process", "run", "event",
     "account", "asset", "conversation", "assumption", "constraint",
     "contradiction", "synthesis",
+    # Operator-preference V1 (2026-05-24, project_operator_preferences_v1).
+    # Cross-instance — Salem is the canonical authority for universal
+    # operator-preference records (Shape A action gates + Shape B voice
+    # directives that apply to ALL instances). Hypatia keeps local
+    # instance-application records in her own vault (``library-
+    # alexandria/preference/``); local-wins-over-canonical conflict
+    # resolution lives at the talker system-prompt assembly layer.
+    # KAL-LE has no preference records in V1 (not a heavy talker surface).
+    # See ``project_operator_preferences_v1.md`` for the full contract.
+    "preference",
 }
 
 # Stage 3.5: record types KAL-LE uses inside ``~/aftermath-lab/``. Kept
@@ -312,6 +322,13 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     # natively), ``published`` (live), ``archived`` (operator-removed
     # from active rotation, e.g. opinion superseded or venue retired).
     "article": {"draft", "scheduled", "published", "archived"},
+    # Operator-preference V1 (2026-05-24). Status flips between
+    # ``active`` (preference applies) and ``revoked`` (operator
+    # explicitly withdrew this preference). NOT a supersedes-chain —
+    # the revocation is a status mutation on the same record so the
+    # canonical/local resolver can read a single value per record.
+    # See ``project_operator_preferences_v1.md`` Hard Contract #4.
+    "preference": {"active", "revoked"},
 }
 
 # Type → expected top-level directory
@@ -400,6 +417,13 @@ TYPE_DIRECTORY: dict[str, str] = {
     # records and consumed-source-essays in different trees so the
     # Substack-export workflow can scan a single directory.
     "article": "article",
+    # Operator-preference V1 (2026-05-24, project_operator_preferences_v1).
+    # Salem canonical: ``vault/preference/<slug>.md``. Hypatia local
+    # instance-application: ``library-alexandria/preference/<slug>.md``.
+    # Both writers route through this entry — directory layout is
+    # consistent across instances; per-instance routing comes from the
+    # vault_path the caller passes to ``vault_create``.
+    "preference": "preference",
     # session, input have flexible placement
 }
 
@@ -494,6 +518,21 @@ LIST_FIELDS: set[str] = {
 
 # Required fields for all records
 REQUIRED_FIELDS: list[str] = ["type", "created"]
+
+# Per-type ADDITIONAL required fields. ``_validate_required_fields`` checks
+# the universal ``REQUIRED_FIELDS`` list above for every record, then
+# checks the per-type extras here when the record's type has an entry.
+#
+# Operator-preference V1 (2026-05-24): a preference record without
+# ``name`` is unaddressable; without ``shape`` the consumers can't
+# decide which dispatch path (action gate vs voice block) applies;
+# without ``scope`` the universal-vs-instance routing is ambiguous.
+# The ``matcher`` field is required ONLY for ``shape: action`` records
+# — that's a runtime gate inside the consumer module, not a schema
+# gate, because Shape B records legitimately have no matcher.
+REQUIRED_FIELDS_BY_TYPE: dict[str, list[str]] = {
+    "preference": ["name", "shape", "scope"],
+}
 
 # Types that use "subject" instead of "name" as their title field
 NAME_FIELD_BY_TYPE: dict[str, str] = {

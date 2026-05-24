@@ -72,6 +72,33 @@ _BODY_MUTATE_DENIED_TYPES: frozenset[str] = frozenset({
     # changing a learning record is a NEW assumption/decision that
     # supersedes the old one (distiller's natural workflow).
     "assumption", "decision", "constraint", "contradiction", "synthesis",
+    # Operator-preference V1 (2026-05-24). Preferences are operator-
+    # canonical commitments — body mutation via insert_at/replace
+    # would silently rewrite the source_quote / matcher / policy text
+    # that downstream consumers cite. The right path for changing a
+    # preference is ``status: revoked`` on the existing record + a
+    # new ``preference/`` record for the replacement (mirrors the
+    # supersede flow for decision records). See
+    # ``project_operator_preferences_v1.md`` Hard Contract #4.
+    "preference",
+})
+
+
+# Per-type delete deny set — operator-canonical types that even the
+# janitor (which holds the only ``delete: True`` permission besides
+# instructor) must NOT delete autonomously. Mirrors the body-mutation
+# deny set's reasoning: removing a preference record would silently
+# drop a forward-policy commitment from every consumer's view, and
+# the operator's recovery path (re-read the source conversation,
+# restate the commitment) is expensive. Operator can still delete
+# via direct filesystem access; this gate guards only the agent path.
+_DELETE_DENIED_TYPES: frozenset[str] = frozenset({
+    # Operator-preference V1 (2026-05-24). Per dispatch Hard Contract:
+    # "janitor cannot delete (preferences are operator-canonical, treat
+    # like decisions)." Status flip (``status: revoked``) is the
+    # authorised path for removing a preference from active effect;
+    # the record itself stays for audit.
+    "preference",
 })
 
 
@@ -543,6 +570,14 @@ TALKER_CREATE_TYPES: set[str] = {
     "session", "conversation", "assumption", "synthesis",
     "person",
     "org", "location", "project", "constraint", "contradiction",
+    # Operator-preference V1 (2026-05-24, project_operator_preferences_v1).
+    # Salem is the canonical authority for preference records — when the
+    # operator commits to a forward policy mid-conversation ("don't auto-
+    # track open-house events from now on"), Salem persists it as a
+    # ``preference/`` record. Hypatia is the other allowlisted writer
+    # (her own local instance-application records); KAL-LE is NOT —
+    # she's not a heavy talker surface in V1.
+    "preference",
 }
 
 
@@ -630,6 +665,16 @@ HYPATIA_CREATE_TYPES: set[str] = {
     # the same scope). Operator creates via ``vault_create`` at draft
     # time. Keep in sync with ``KNOWN_TYPES_HYPATIA`` in schema.py.
     "article",
+    # Operator-preference V1 (2026-05-24, project_operator_preferences_v1).
+    # Hypatia writes LOCAL instance-application preference records
+    # (``library-alexandria/preference/<slug>.md``) that override or
+    # extend Salem's canonical preferences for the Hypatia talker
+    # surface. Universal preferences (Shape B1 — applies to all
+    # instances) are Salem's authority; local instance preferences
+    # (Shape B2 ``applies_to_instance: Hypatia``) are Hypatia's
+    # authority. Conflict resolution: local wins. See
+    # ``project_operator_preferences_v1.md`` Hard Contract #6 + #8.
+    "preference",
 }
 
 
@@ -756,6 +801,26 @@ def check_scope(
     permission = rules.get(operation)
     if permission is None:
         raise ScopeError(f"Unknown operation: '{operation}'")
+
+    # Per-type delete denylist — operator-canonical types (preference
+    # records as of V1) that no agent scope may delete autonomously,
+    # even if its rules carry ``delete: True``. Mirrors the universal
+    # body-mutation deny set's reasoning; the recovery cost of an
+    # accidental delete is too high to gate via scope-level toggles
+    # alone. Applies to every scope; instructor included (operator-
+    # driven, but the watcher path runs without human-in-the-loop on
+    # each directive — too risky for canonical records). Operator
+    # retains filesystem-level delete.
+    if operation == "delete" and record_type in _DELETE_DENIED_TYPES:
+        raise ScopeError(
+            f"Delete of record type '{record_type}' is universally "
+            f"denied for agent scopes (operator-canonical — recovery "
+            f"cost too high to gate via per-scope toggle). The "
+            f"authorised path for removing a preference from active "
+            f"effect is ``status: revoked`` on the existing record; "
+            f"the record itself stays for audit. Operator may delete "
+            f"via direct filesystem access if truly needed."
+        )
 
     if permission is True:
         return

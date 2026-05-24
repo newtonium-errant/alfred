@@ -87,6 +87,12 @@ def test_universal_deny_set_pinned_to_spec():
     expected = {
         "session", "conversation", "capture", "run", "input",
         "assumption", "decision", "constraint", "contradiction", "synthesis",
+        # Operator-preference V1 (2026-05-24, project_operator_preferences_v1).
+        # Preferences are operator-canonical — body mutation via
+        # insert_at/replace would silently rewrite source_quote /
+        # matcher / policy text. Status flip (``status: revoked``)
+        # + new record is the supersede path; treat like decision.
+        "preference",
     }
     assert _BODY_MUTATE_DENIED_TYPES == expected
 

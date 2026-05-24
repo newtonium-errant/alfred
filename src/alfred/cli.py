@@ -926,6 +926,81 @@ def cmd_digest(args: argparse.Namespace) -> None:
     sys.exit(dcli.dispatch(raw, args))
 
 
+def cmd_prefs(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred prefs`` subcommands.
+
+    V1 ships ``rebuild-index`` only — projects active Shape A
+    preferences into ``data/operator_preferences.json`` (atomic write).
+    Future subcommands (``list``, ``inspect``, ``validate``) extend
+    the same dispatch shape.
+    """
+    raw: dict[str, Any] = {}
+    try:
+        raw = _load_unified_config(args.config)
+        _setup_logging_from_config(raw, tool="prefs", suppress_stdout=False)
+    except SystemExit:
+        raw = {}
+    except Exception:
+        raw = {}
+
+    subcmd = getattr(args, "prefs_cmd", None)
+    if subcmd == "rebuild-index":
+        from alfred.preferences.index import rebuild_index
+
+        vault_path = (raw.get("vault") or {}).get("path")
+        if not vault_path:
+            print(
+                "error: vault.path not configured in config.yaml",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        # Default index output path: <logging.dir>/operator_preferences.json
+        # (mirrors state-file defaults). Override via --output.
+        output_path = args.output
+        if output_path is None:
+            logging_dir = (raw.get("logging") or {}).get("dir", "./data")
+            output_path = str(
+                Path(logging_dir) / "operator_preferences.json"
+            )
+
+        # Pull the instance name if available (telegram.instance.name).
+        # None is tolerated — the index just stamps null. Per
+        # ``feedback_hardcoding_and_alfred_naming.md`` we never default
+        # this to a literal — let the index carry None when absent.
+        instance = (
+            ((raw.get("telegram") or {}).get("instance") or {}).get("name")
+        )
+
+        payload = rebuild_index(
+            vault_path=vault_path,
+            output_path=output_path,
+            instance=instance,
+        )
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "output_path": output_path,
+                    "active_count": len(payload.get("active_preferences", [])),
+                    "instance": instance,
+                },
+                indent=2,
+            )
+        )
+        sys.exit(0)
+
+    # Unknown / missing subcommand: print help shape.
+    print(
+        "usage: alfred prefs <subcommand>\n"
+        "Subcommands:\n"
+        "  rebuild-index  Rebuild data/operator_preferences.json from "
+        "vault preference/ records.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
 def cmd_vault(args: argparse.Namespace) -> None:
     # Route logs to a dedicated file sink. The vault CLI emits JSON on stdout
     # that calling agents parse, so logging MUST NOT leak to stdout.
@@ -3041,6 +3116,38 @@ def build_parser() -> argparse.ArgumentParser:
     from alfred.digest import cli as digest_cli
     digest_cli.build_subparser(sub)
 
+    # prefs — operator-preference V1 (project_operator_preferences_v1).
+    # Manages the JSON index that curator + brief consumers read for
+    # Shape A action gates. Voice preferences (Shape B) don't need an
+    # index — the talker reads them directly from the vault on each
+    # session start.
+    prefs_p = sub.add_parser(
+        "prefs",
+        help=(
+            "Operator-preference management — rebuild the action-gate "
+            "index (Shape A preferences). Voice preferences (Shape B) "
+            "are read directly from the vault by the talker."
+        ),
+    )
+    prefs_sub = prefs_p.add_subparsers(dest="prefs_cmd")
+    prefs_rebuild = prefs_sub.add_parser(
+        "rebuild-index",
+        help=(
+            "Rebuild data/operator_preferences.json from the active "
+            "preference/ records in the vault. Atomic write — old "
+            "index stays in place if the rebuild crashes."
+        ),
+    )
+    prefs_rebuild.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Override the index output path. Default: "
+            "<logging.dir>/operator_preferences.json (mirrors how "
+            "state files resolve their default location)."
+        ),
+    )
+
     return parser
 
 
@@ -3086,6 +3193,7 @@ def main() -> None:
         "digest": cmd_digest,
         "gcal": cmd_gcal,
         "fiction": cmd_fiction,
+        "prefs": cmd_prefs,
     }
 
     handler = handlers.get(args.command)

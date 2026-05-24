@@ -23,6 +23,7 @@ from .schema import (
     LIST_FIELDS,
     NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS,
+    REQUIRED_FIELDS_BY_TYPE,
     STATUS_BY_TYPE,
     TYPE_DIRECTORY,
 )
@@ -498,9 +499,27 @@ def _validate_list_fields(fields: dict) -> None:
 
 
 def _validate_required_fields(fm: dict) -> None:
+    """Validate universal + per-type required frontmatter fields.
+
+    Universal ``REQUIRED_FIELDS`` (``type``, ``created``) must be set on
+    every record. Per-type extras live in ``REQUIRED_FIELDS_BY_TYPE``
+    keyed by the record's ``type`` — operator-preference records
+    require ``name``/``shape``/``scope`` so consumers can dispatch
+    universal-vs-instance routing without defensive None-checks at
+    every read site. Fail-loud is correct: a preference record missing
+    ``shape`` would silently fall out of both dispatch paths (no error,
+    no observed behaviour change).
+    """
     for req in REQUIRED_FIELDS:
         if not fm.get(req):
             raise VaultError(f"Missing required field: {req}")
+    type_extras = REQUIRED_FIELDS_BY_TYPE.get(fm.get("type", ""), [])
+    for req in type_extras:
+        if not fm.get(req):
+            raise VaultError(
+                f"Missing required field for type '{fm.get('type')}': "
+                f"{req}"
+            )
 
 
 # Frontmatter field names that MUST NEVER be written into YAML

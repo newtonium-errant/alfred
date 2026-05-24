@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import json
+from pathlib import Path
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
@@ -1094,6 +1095,168 @@ def _pushback_directive(level: int) -> str:
 _DEFAULT_INSTANCE_TIMEZONE = "America/Halifax"
 
 
+# Canonical Salem vault path — the authoritative location for
+# universal (Shape B1) operator-preference records. Hypatia + KAL-LE
+# read this directory at session start in addition to their own
+# local vault (Shape B2 instance-application records). Salem reads
+# only her own vault. See project_operator_preferences_v1.md Hard
+# Contract #7 + #8 for the cross-instance read pattern.
+#
+# Hardcoded as an absolute path because the dispatch explicitly pins
+# it to ``/home/andrew/alfred/vault/preference/`` — peer-protocol
+# routing isn't used for V1 (filesystem read only). A future V2
+# multi-operator architecture (V.E.R.A.) would replace this with a
+# per-operator path resolver; for the single-operator V1 the
+# absolute path keeps the code-layer simple.
+_SALEM_CANONICAL_VAULT_PATH = Path("/home/andrew/alfred/vault")
+
+
+def load_voice_preferences_block(
+    vault_path: str | Path,
+    instance_name: str,
+    *,
+    canonical_vault_path: Path | None = None,
+) -> str | None:
+    """Build the Shape B (voice) preferences system block, or None if empty.
+
+    Loads Shape B preferences from the instance's local vault AND
+    (for non-Salem instances) Salem's canonical vault, applies
+    conflict resolution (local-wins-over-canonical), and returns the
+    concatenated body markdown. Returns None when no active voice
+    preferences apply — caller should omit the block entirely per
+    ``feedback_intentionally_left_blank.md`` (empty header is worse
+    than no header).
+
+    Args:
+        vault_path: the calling instance's vault root.
+        instance_name: instance identity (Salem / Hypatia / KAL-LE).
+            Case-insensitive comparisons used for both the "am I
+            Salem" branch and the ``applies_to_instance`` matching.
+        canonical_vault_path: optional override for Salem's vault
+            path. Defaults to ``_SALEM_CANONICAL_VAULT_PATH``. Tests
+            pass a tmp path here; production runs use the default.
+
+    Conflict resolution (Hard Contract #6): when a local record AND a
+    canonical record both apply, local wins. Match keys (in order):
+    1. ``cites_canonical`` — local's wikilink target equals
+       canonical's slug → local supersedes that canonical.
+    2. ``name`` slug match — local and canonical have the same
+       filename stem (rare but possible — symptomatic of operator
+       creating a local override without setting cites_canonical).
+
+    Both records are checked for ``applies_to_instance`` matching
+    (universal records pass through to every instance; instance
+    records only land in their target instance's block).
+    """
+    from alfred.preferences.loader import load_active_preferences
+
+    instance_lc = (instance_name or "").lower()
+    canonical = canonical_vault_path or _SALEM_CANONICAL_VAULT_PATH
+
+    # Load local preferences (always — Salem reads her own canonical
+    # vault here too, which is the same path as the canonical load
+    # for Salem — see filter below for the dedup).
+    try:
+        local_prefs = load_active_preferences(vault_path, shape="voice")
+    except Exception as exc:
+        log.warning(
+            "talker.preferences.local_load_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            vault_path=str(vault_path),
+        )
+        local_prefs = []
+
+    # Load canonical (Salem's) preferences when this instance is NOT
+    # Salem. Salem's local IS canonical — loading both would
+    # double-count. Compare via casefolded instance name.
+    if instance_lc == "salem":
+        canonical_prefs = []
+    else:
+        try:
+            canonical_prefs = load_active_preferences(canonical, shape="voice")
+        except Exception as exc:
+            log.warning(
+                "talker.preferences.canonical_load_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                canonical_path=str(canonical),
+            )
+            canonical_prefs = []
+
+    def _applies(pref) -> bool:
+        """True if this preference applies to the calling instance."""
+        if pref.scope == "universal" or pref.applies_to_instance is None:
+            return True
+        return (pref.applies_to_instance or "").lower() == instance_lc
+
+    local_applicable = [p for p in local_prefs if _applies(p)]
+    canonical_applicable = [p for p in canonical_prefs if _applies(p)]
+
+    # Conflict resolution: local wins. Build a set of canonical slugs
+    # superseded by any local record's ``cites_canonical`` field OR
+    # by a name-slug collision.
+    def _cited_slug(wikilink: str | None) -> str | None:
+        if not wikilink:
+            return None
+        s = wikilink.strip().strip("[]").strip()
+        if "/" in s:
+            s = s.rsplit("/", 1)[-1]
+        return s or None
+
+    superseded: set[str] = set()
+    local_slugs = {p.slug for p in local_applicable}
+    for p in local_applicable:
+        cited = _cited_slug(p.cites_canonical)
+        if cited:
+            superseded.add(cited)
+    # Slug collisions count as conflict (local wins).
+    for c in canonical_applicable:
+        if c.slug in local_slugs:
+            superseded.add(c.slug)
+
+    final = list(local_applicable) + [
+        c for c in canonical_applicable if c.slug not in superseded
+    ]
+
+    if not final:
+        log.info(
+            "talker.preferences.no_voice_block",
+            instance=instance_name,
+            local_loaded=len(local_prefs),
+            canonical_loaded=len(canonical_prefs),
+            detail="no active voice preferences apply — omitting system block",
+        )
+        return None
+
+    # Build the block body. Each preference contributes its full
+    # markdown body (which includes ``## Policy`` and any matcher-
+    # rationale section). The block header is the same for all
+    # instances; per-preference headers (``### <name>``) disambiguate
+    # in the rendered block.
+    parts: list[str] = ["## Operator voice preferences", ""]
+    for p in final:
+        parts.append(f"### {p.name or p.slug}")
+        body = (p.body or "").strip()
+        if body:
+            parts.append(body)
+        parts.append("")
+    # Drop trailing blank.
+    while parts and parts[-1] == "":
+        parts.pop()
+    text = "\n".join(parts)
+
+    log.info(
+        "talker.preferences.voice_block_built",
+        instance=instance_name,
+        active_count=len(final),
+        local_applicable=len(local_applicable),
+        canonical_applicable=len(canonical_applicable),
+        superseded=len(superseded),
+    )
+    return text
+
+
 def _build_today_block_text(
     now: _dt.datetime, instance_timezone: str,
 ) -> str:
@@ -1137,6 +1300,7 @@ def _build_system_blocks(
     vault_context_str: str,
     calibration_str: str | None = None,
     pushback_level: int | None = None,
+    voice_preferences_block: str | None = None,
     *,
     now: _dt.datetime | None = None,
     instance_timezone: str = _DEFAULT_INSTANCE_TIMEZONE,
@@ -1195,6 +1359,22 @@ def _build_system_blocks(
                 "## Alfred's calibration for this user\n\n"
                 + calibration_str
             ),
+            "cache_control": {"type": "ephemeral"},
+        })
+    # Operator-preference V1 (project_operator_preferences_v1) — Shape B
+    # voice directives. Inserted AFTER calibration so the calibration
+    # cache prefix doesn't churn when voice preferences change, BEFORE
+    # pushback (per dispatch). Empty / None block is omitted entirely
+    # rather than emitting an empty header — per ``feedback_intentionally_
+    # left_blank.md`` the absence here is meaningful: no active voice
+    # preferences → no block, and the operator notices the missing
+    # block at first observation. The block carries its own ``## Operator
+    # voice preferences`` header so callers pass concatenated policy
+    # bodies without re-deriving the heading.
+    if voice_preferences_block:
+        blocks.append({
+            "type": "text",
+            "text": voice_preferences_block,
             "cache_control": {"type": "ephemeral"},
         })
     if pushback_level is not None:
@@ -2539,11 +2719,32 @@ async def run_turn(
         )
         return CAPTURE_SENTINEL
 
+    # Operator-preference V1 (project_operator_preferences_v1) — Shape B
+    # voice block. Loaded per-turn rather than per-session because a
+    # preference change between turns should take effect on the next
+    # turn (cheap re-read; preferences are file-on-disk). Defensive:
+    # any load failure returns None and the block is omitted; the
+    # talker keeps running.
+    try:
+        voice_pref_block = load_voice_preferences_block(
+            vault_path=config.vault.path,
+            instance_name=config.instance.name,
+        )
+    except Exception as exc:
+        log.warning(
+            "talker.preferences.block_build_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            detail="continuing without voice preferences block",
+        )
+        voice_pref_block = None
+
     system_blocks = _build_system_blocks(
         system_prompt,
         vault_context_str,
         calibration_str=calibration_str,
         pushback_level=pushback_level,
+        voice_preferences_block=voice_pref_block,
     )
     vault_path = config.vault.path
     # Stage 3.5: pick the tool list per instance tool_set. Salem

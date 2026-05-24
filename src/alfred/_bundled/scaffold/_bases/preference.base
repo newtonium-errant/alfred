@@ -1,0 +1,50 @@
+filters:
+  and:
+    - type == "preference"
+    - status == "active"
+views:
+  - type: table
+    name: Active Preferences
+    description: Operator-canonical preferences currently in effect
+    order:
+      - file.name
+      - shape
+      - scope
+      - applies_to_instance
+    sort:
+      - property: shape
+        direction: ASC
+      - property: applies_to_instance
+        direction: ASC
+      - property: file.name
+        direction: ASC
+  - type: table
+    name: Voice Directives
+    description: Shape B preferences — talker system-prompt voice/style rules
+    filters:
+      and:
+        - shape == "voice"
+    order:
+      - file.name
+      - scope
+      - applies_to_instance
+    sort:
+      - property: applies_to_instance
+        direction: ASC
+      - property: file.name
+        direction: ASC
+  - type: table
+    name: Action Gates
+    description: Shape A preferences — extraction/inclusion gates
+    filters:
+      and:
+        - shape == "action"
+    order:
+      - file.name
+      - scope
+      - applies_to_instance
+    sort:
+      - property: applies_to_instance
+        direction: ASC
+      - property: file.name
+        direction: ASC

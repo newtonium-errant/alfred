@@ -104,6 +104,13 @@ def test_talker_create_types_shape():
         "session", "conversation", "assumption", "synthesis",
         "person",
         "org", "location", "project", "constraint", "contradiction",
+        # Operator-preference V1 (2026-05-24, project_operator_preferences_v1).
+        # Salem persists forward-policy commitments (Shape A action
+        # gates + Shape B universal voice directives) as preference/
+        # records. Hypatia also creates locally (her own instance-
+        # application records); KAL-LE does NOT — not a heavy talker
+        # surface in V1.
+        "preference",
     }
 
 
@@ -346,4 +353,10 @@ def test_universal_deny_set_unchanged_by_architecture_addition():
         "session", "conversation", "capture", "run", "input",
         "assumption", "decision", "constraint", "contradiction",
         "synthesis",
+        # Operator-preference V1 (2026-05-24). Preferences are
+        # operator-canonical commitments — body mutation via
+        # insert_at/replace would silently rewrite source_quote /
+        # matcher / policy text. Status flip + new record is the
+        # supersede path (mirrors decision).
+        "preference",
     })

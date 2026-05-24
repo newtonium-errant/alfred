@@ -17,6 +17,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from alfred.preferences.loader import Preference, load_active_preferences
+from alfred.preferences.matchers import evaluate
 from alfred.vault.mutation_log import log_mutation
 from alfred.vault.ops import VaultError, vault_create, vault_edit, vault_read
 
@@ -26,6 +28,106 @@ from .config import CuratorConfig
 from .utils import get_logger
 
 log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Operator-preference action gates (V1)
+# ---------------------------------------------------------------------------
+#
+# Curator stage 1 emits an entity manifest with mixed-type candidates
+# (person, org, event, project, etc.). The action-gate filter runs
+# BEFORE stage 2 creates anything, so a "skip open-house events"
+# preference cannot leave a half-created event in the vault if the
+# filter fires mid-pipeline.
+#
+# Per project_operator_preferences_v1.md Hard Contract #1+#2: V1
+# scope is event records via ``skip_event_if`` (the originating
+# 2026-05-21 friction). Future widening (skip_task_if,
+# skip_org_if) extends the dispatch dict — same shape.
+
+_CURATOR_RULE_BY_TYPE: dict[str, str] = {
+    "event": "skip_event_if",
+}
+
+
+def _apply_preference_filter(
+    manifest: list[dict],
+    prefs: list[Preference],
+) -> list[dict]:
+    """Filter the Stage 1 manifest against active action preferences.
+
+    Returns the manifest with skipped candidates removed. Logs one
+    ``curator.preference_filter_dropped`` per drop, carrying the
+    matched preference slug + the matcher reason, so the operator can
+    grep "why was this event silently dropped" against the daemon
+    log. Per ``feedback_intentionally_left_blank.md``: the empty-drop
+    case (zero drops applied) also emits a ``curator.preference_filter_run``
+    summary log with ``drops=0`` so an operator can distinguish
+    "filter ran, nothing matched" from "filter never ran."
+    """
+    if not prefs:
+        # No active preferences in this vault — filter is a no-op.
+        # Still emit the run signal so the operator-grep workflow can
+        # confirm the call site fired.
+        log.info(
+            "curator.preference_filter_run",
+            preferences_loaded=0,
+            candidates_in=len(manifest),
+            drops=0,
+        )
+        return list(manifest)
+
+    kept: list[dict] = []
+    drops = 0
+    for entity in manifest:
+        entity_type = entity.get("type", "")
+        rule = _CURATOR_RULE_BY_TYPE.get(entity_type)
+        if rule is None:
+            # No registered gate for this entity type — keep it.
+            kept.append(entity)
+            continue
+        candidate = {
+            "name": entity.get("name", ""),
+            "title": entity.get("name", ""),
+        }
+        # Apply each preference whose matcher targets this rule. First
+        # skip wins (operator only needs ONE preference to gate a
+        # candidate).
+        skipped_by: Preference | None = None
+        skipped_reason = ""
+        for pref in prefs:
+            matcher = pref.matcher or {}
+            if matcher.get("rule") != rule:
+                continue
+            if matcher.get("domain") not in (None, "curator"):
+                continue
+            result = evaluate(rule, matcher.get("args", {}), candidate)
+            if result.skip:
+                skipped_by = pref
+                skipped_reason = result.reason
+                break
+        if skipped_by is not None:
+            log.info(
+                "curator.preference_filter_dropped",
+                preference_slug=skipped_by.slug,
+                preference_name=skipped_by.name,
+                entity_type=entity_type,
+                entity_name=entity.get("name", ""),
+                rule=rule,
+                reason=skipped_reason,
+            )
+            drops += 1
+            continue
+        kept.append(entity)
+
+    log.info(
+        "curator.preference_filter_run",
+        preferences_loaded=len(prefs),
+        candidates_in=len(manifest),
+        drops=drops,
+        candidates_out=len(kept),
+    )
+    return kept
 
 
 @dataclass
@@ -706,6 +808,30 @@ async def run_pipeline(
         result.summary = "Stage 1 failed: no note created and no entities found"
         log.error("pipeline.s1_failed", file=filename)
         return result
+
+    # Stage 1.5: Operator-preference action filter (V1 — event-only).
+    # Runs BEFORE Stage 2 creates anything so a "skip open-house events"
+    # preference cannot leave a half-created event in the vault if the
+    # filter fires mid-pipeline. Loader hit per pipeline invocation is
+    # cheap (read on the order of N preference files) — no caching
+    # because the per-file invocation rate is low and operator-edited
+    # preferences need to be picked up on the next file.
+    try:
+        active_prefs = load_active_preferences(
+            config.vault.vault_path, shape="action",
+        )
+    except Exception as exc:
+        # Defensive: a preference-loader crash MUST NOT take down the
+        # curator. Log loudly + fall through with an empty preference
+        # list so the pipeline keeps running.
+        log.warning(
+            "pipeline.preference_load_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            detail="continuing without preference filter",
+        )
+        active_prefs = []
+    manifest = _apply_preference_filter(manifest, active_prefs)
 
     # Stage 2: Entity Resolution + Creation (pure Python)
     resolved = _resolve_entities(

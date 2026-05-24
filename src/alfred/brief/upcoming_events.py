@@ -33,10 +33,26 @@ from typing import Any
 
 import frontmatter
 
+from alfred.preferences.loader import Preference, load_active_preferences
+from alfred.preferences.matchers import evaluate
+
 from .config import UpcomingEventsConfig
 from .utils import get_logger
 
 log = get_logger(__name__)
+
+
+# Operator-preference V1 (project_operator_preferences_v1).
+# Per-type rule dispatch for the Upcoming Events section: each
+# candidate type checks the corresponding ``skip_brief_*`` rule.
+# Mirrors the curator pipeline's ``_CURATOR_RULE_BY_TYPE`` dispatch
+# shape — extending V1 to a new type (e.g. ``project``) means
+# adding the type→rule mapping here + registering the rule in
+# ``alfred.preferences.matchers.KNOWN_RULES``.
+_BRIEF_RULE_BY_TYPE: dict[str, str] = {
+    "event": "skip_brief_event_if",
+    "task": "skip_brief_task_if",
+}
 
 
 # Directories never worth scanning. Mirrors the conservative defaults the
@@ -157,14 +173,64 @@ def _iter_records(vault_path: Path) -> list[tuple[Path, dict]]:
     return out
 
 
+def _matches_skip_brief_preference(
+    fm: dict,
+    rec_type: str,
+    prefs: list[Preference],
+) -> tuple[bool, str, str]:
+    """Check the candidate against active brief-domain Shape A preferences.
+
+    Returns ``(skip, preference_slug, reason)``. ``skip=False`` means no
+    preference fired — the slug + reason are empty strings. ``skip=True``
+    means at least one preference matched; the slug names which one and
+    the reason carries the matcher's grep-able motivation.
+
+    Per project_operator_preferences_v1.md Hard Contract #1+#2 — V1
+    consumers in brief: events + tasks via ``skip_brief_event_if`` and
+    ``skip_brief_task_if``. The shared dispatch table
+    (``_BRIEF_RULE_BY_TYPE``) keeps both call sites symmetric;
+    extending to a new type means adding one mapping + one
+    KNOWN_RULES entry.
+    """
+    rule = _BRIEF_RULE_BY_TYPE.get(rec_type)
+    if rule is None:
+        return False, "", ""
+    candidate = {
+        "name": fm.get("name", ""),
+        "title": fm.get("title", "") or fm.get("name", ""),
+    }
+    for pref in prefs:
+        matcher = pref.matcher or {}
+        if matcher.get("rule") != rule:
+            continue
+        if matcher.get("domain") not in (None, "brief"):
+            continue
+        result = evaluate(rule, matcher.get("args", {}), candidate)
+        if result.skip:
+            return True, pref.slug, result.reason
+    return False, "", ""
+
+
 def _collect_items(
     vault_path: Path,
     today: date,
     max_days_ahead: int,
-) -> list[_UpcomingItem]:
-    """Pull events + tasks whose date/due falls in [today, today+max_days_ahead]."""
+    prefs: list[Preference] | None = None,
+) -> tuple[list[_UpcomingItem], int]:
+    """Pull events + tasks whose date/due falls in [today, today+max_days_ahead].
+
+    Returns ``(items, preference_filtered_count)``. The count is the
+    number of candidates dropped by the operator-preference gate (NOT
+    by date / status / missing-due filters — those are date/schema
+    semantics, not operator policy). The renderer appends a
+    ``"_N items filtered by operator preferences._"`` footer when
+    ``preference_filtered_count > 0`` so the operator sees the gate
+    fired without having to grep the daemon log.
+    """
     cutoff = today.toordinal() + max_days_ahead
     items: list[_UpcomingItem] = []
+    prefs = prefs or []
+    preference_filtered = 0
     for path, fm in _iter_records(vault_path):
         rec_type = fm.get("type")
         if rec_type == "event":
@@ -191,6 +257,25 @@ def _collect_items(
                 rec_type=rec_type,
                 status=fm.get("status"),
             )
+            continue
+        # Operator-preference action filter (V1, project_operator_
+        # preferences_v1). Runs AFTER closed-status (avoid double-
+        # logging records that would have been excluded anyway).
+        # Per-drop log carries the preference slug + reason for
+        # operator grep; per ``feedback_intentionally_left_blank.md``
+        # the per-sweep summary log fires later with the count.
+        skip, pref_slug, pref_reason = _matches_skip_brief_preference(
+            fm, rec_type, prefs,
+        )
+        if skip:
+            log.info(
+                "upcoming_events.preference_filtered",
+                path=str(path),
+                rec_type=rec_type,
+                preference_slug=pref_slug,
+                reason=pref_reason,
+            )
+            preference_filtered += 1
             continue
         if d is None:
             # Per ``feedback_intentionally_left_blank.md``: events
@@ -226,7 +311,7 @@ def _collect_items(
                 description=str(description) if description else None,
             )
         )
-    return items
+    return items, preference_filtered
 
 
 def _bucket(items: list[_UpcomingItem], today: date) -> dict[str, list[_UpcomingItem]]:
@@ -272,12 +357,36 @@ def render_upcoming_events_section(
     daemon uses that as a signal to omit the section entirely. A
     populated string (including the "No upcoming events." sentinel) means
     the section header should be emitted.
+
+    Operator-preference V1 (project_operator_preferences_v1): loads
+    Shape A action preferences and applies them via the brief-domain
+    rules (``skip_brief_event_if`` / ``skip_brief_task_if``). When any
+    preference fires, appends a footer line *"_N items filtered by
+    operator preferences._"* so the operator sees the gate effect
+    without grepping the daemon log. Empty / disabled section paths
+    don't fire the footer.
     """
     if not config.enabled:
         return ""
 
     vault = Path(vault_path)
-    items = _collect_items(vault, today, config.max_days_ahead)
+    # Load preferences once per render call. Failure to load is
+    # non-fatal: we log + continue with an empty preference list so
+    # the brief keeps shipping (degraded but visible) rather than
+    # blanking out.
+    try:
+        prefs = load_active_preferences(vault, shape="action")
+    except Exception as exc:
+        log.warning(
+            "upcoming_events.preference_load_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            detail="continuing without preference filter",
+        )
+        prefs = []
+    items, preference_filtered = _collect_items(
+        vault, today, config.max_days_ahead, prefs=prefs,
+    )
     buckets = _bucket(items, today)
 
     section_parts: list[str] = []
@@ -291,9 +400,28 @@ def render_upcoming_events_section(
         section_parts.append("")
 
     if not section_parts:
-        return "No upcoming events."
+        # Empty section sentinel — operator sees "ran, nothing to do"
+        # rather than a silent omission. Per
+        # ``feedback_intentionally_left_blank.md``. Footer-line for
+        # preference-filtered count is added BELOW the sentinel when
+        # preferences actually dropped something, so the empty render
+        # explains itself ("nothing scheduled, AND N items were
+        # filtered out by preferences").
+        body = "No upcoming events."
+        if preference_filtered > 0:
+            body += f"\n\n_{preference_filtered} item"
+            body += "s" if preference_filtered != 1 else ""
+            body += " filtered by operator preferences._"
+        return body
 
     # Drop trailing blank line for cleanliness.
     while section_parts and section_parts[-1] == "":
         section_parts.pop()
+    if preference_filtered > 0:
+        section_parts.append("")
+        section_parts.append(
+            f"_{preference_filtered} item"
+            + ("s" if preference_filtered != 1 else "")
+            + " filtered by operator preferences._"
+        )
     return "\n".join(section_parts)

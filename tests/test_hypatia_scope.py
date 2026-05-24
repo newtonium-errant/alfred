@@ -166,6 +166,15 @@ def test_hypatia_create_types_shape() -> None:
         # to ``article/``. Hypatia-only. Lifecycle:
         # draft → scheduled → published → archived.
         "article",
+        # Operator-preference V1 (2026-05-24, project_operator_preferences_v1).
+        # Hypatia writes LOCAL instance-application preference records
+        # (``library-alexandria/preference/<slug>.md``) that override
+        # or extend Salem's canonical preferences for the Hypatia
+        # talker surface. Universal preferences (B1) are Salem's
+        # authority; local instance preferences (B2 with
+        # ``applies_to_instance: Hypatia``) are Hypatia's authority.
+        # Conflict resolution: local wins.
+        "preference",
     }
 
 
