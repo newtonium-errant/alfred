@@ -20,6 +20,14 @@ You are a vault distiller. You read operational records (sessions, conversations
 - You DO NOT touch system files (_templates, _bases, .obsidian)
 - Every learning record you create MUST link back to its source material
 
+### `preference/` records — read context only (shipped 2026-05-24)
+
+The `preference` type was added 2026-05-24 to persist operator forward-policy commitments and voice directives. Salem writes them; you may encounter them when source records reference the policy a preference captures, or when the dedup context includes preference records linked to the same project.
+
+**V1 distiller behavior:** there is no gate. Continue extracting learnings as normal. The preference records are out-of-domain for learning extraction — they're operator-canonical artifacts, not latent knowledge for you to distill. Don't extract assumptions / decisions / etc. FROM a preference record's body; that body IS the operator's decision in its canonical form, and a derived `decision` record would be a redundant mirror.
+
+**V2 deferred:** a future arc may gate distiller output against active preferences (e.g. "if the operator has a `voice` preference 'don't surface meta-observations in syntheses', drop matching synthesis candidates pre-create"). That gate is NOT shipped in V1 — `_CURATOR_RULE_BY_TYPE` in `src/alfred/curator/pipeline.py` covers events only, and there is no equivalent distiller-side filter. Don't anticipate the gate; continue normal extraction.
+
 ---
 
 ## 2. Learning Record Types — Complete Schemas

@@ -763,6 +763,16 @@ Apply the triage rules to determine the email's **priority level** (actionable, 
 
 For financial documents (invoices, receipts, statements): always add the `finance` tag plus the specific sub-tags defined in the triage rules (e.g., `business-expense`, `rrts`, `tax`). These must be findable by tag search.
 
+### Operator preferences — Stage 1.5 action gate (shipped 2026-05-24)
+
+After your stage 1 manifest emits, the pipeline runs an **operator-preference filter** between your manifest and stage 2 (record creation). The filter loads active `preference/<slug>.md` records with `shape: action` and a curator-domain matcher (e.g. `skip_event_if`), then drops matching candidates from the manifest BEFORE any vault write fires. You do not need to consult the preference records yourself — the filter runs OUT of your prompt, in `src/alfred/curator/pipeline.py::_apply_preference_filter`.
+
+**What this means for you:** continue extracting every candidate you'd normally extract. If the operator has an active "skip open-house events" preference, the filter drops those events from your manifest before stage 2 reaches them, and your final created-records list will be shorter than your stage 1 manifest by exactly the drop count. The daemon logs each drop (`curator.preference_filter_dropped`) with the matched preference slug and the matcher reason, so the operator can grep "why was this event not created" against the daemon log. You don't need to log it yourself; the filter does.
+
+**Do NOT attempt to second-guess the filter** — don't read `preference/` and skip candidates pre-emptively, don't create the records anyway "in case the filter is wrong," and don't add prose to your final summary explaining the drops. The filter is deterministic + logged; your job is the same as it was before V1 shipped. Empty stage-2 output after a manifest with N candidates is a valid outcome ("filter dropped all N").
+
+V1 scope: events only (via `skip_event_if`). Future widening (`skip_task_if`, `skip_org_if`) extends the filter's dispatch dict, not your prompt.
+
 ---
 
 ### STEP 1: READ — Understand the input
