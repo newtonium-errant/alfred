@@ -3,6 +3,11 @@ alfred_tags:
 - alfred/bit
 created: '2026-05-22'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — [[process/Alfred BIT]] parent process record does not exist
+  in vault; only run records (process/Alfred BIT YYYY-MM-DD.md) exist. DIR001 deterministic
+  scanner flag (type: run belongs in run/ directory). Same pattern as prior BIT run
+  records. Human action: create the parent process/Alfred BIT.md record OR move run
+  records to run/.'
 mode: quick
 name: Alfred BIT 2026-05-22
 overall_status: ok

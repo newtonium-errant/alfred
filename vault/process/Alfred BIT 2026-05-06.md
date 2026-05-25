@@ -1,6 +1,6 @@
 ---
 alfred_tags:
-- alfred-bit/run
+- alfred/bit
 created: '2026-05-06'
 description: Alfred built-in test (health sweep)
 janitor_note: LINK001 — [[process/Alfred BIT]] target does not exist; the parent process

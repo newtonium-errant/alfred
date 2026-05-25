@@ -65,7 +65,8 @@ janitor_note: LINK001 — scanner false positive on YAML-escaped apostrophe; tar
   in autofix.py; logging warning.
 project:
 - '[[project/Alfred]]'
-related_orgs: []
+related_orgs:
+- org/Needs.md
 status: draft
 subtype: draft
 tags:

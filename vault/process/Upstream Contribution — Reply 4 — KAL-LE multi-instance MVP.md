@@ -177,7 +177,8 @@ janitor_note: 'LINK001 — scanner false positives in distiller_learnings: YAML-
   — Top Level. FM001/DIR001 are autofix-handled.'
 project:
 - '[[project/Alfred]]'
-related_orgs: []
+related_orgs:
+- org/Needs.md
 relationships:
 - confidence: 0.75
   context: Shared process Upstream Contribution

@@ -149,7 +149,8 @@ janitor_note: 'LINK001 — scanner false positives: [[decision/Salem Ghostwrites
   a name field) awaiting operator triage.'
 project:
 - '[[project/Alfred]]'
-related_orgs: []
+related_orgs:
+- org/Needs.md
 relationships:
 - confidence: 0.75
   context: Both discuss Upstream Contribution process.
