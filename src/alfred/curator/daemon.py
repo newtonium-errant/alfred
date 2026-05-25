@@ -4,8 +4,9 @@ Architecture: agent-writes-via-CLI. The agent uses ``alfred vault`` commands
 (via Bash tool) to create/modify vault files. Curator orchestrates:
 detect inbox → create session → invoke agent → read mutation log → mark processed → track state.
 
-For OpenClaw backends, uses a 4-stage pipeline (pipeline.py) for better quality.
-For non-CLI backends (Zo HTTP), falls back to snapshot/diff.
+Claude is the only backend (post backend-abstraction-collapse 2026-05-25).
+Vault changes are tracked via mutation-log JSONL injected via the
+``ALFRED_VAULT_SESSION`` env var; no snapshot/diff fallback needed.
 """
 
 from __future__ import annotations

@@ -261,7 +261,12 @@ async def _call_llm(
     # Post backend-abstraction-collapse (2026-05-25), Claude is the only
     # surviving agent backend. The openclaw branch (subprocess via
     # ``openclaw agent``) was retired in the same arc. Unknown backend
-    # names fail loud rather than silently degrading to empty output.
+    # names fail loud — silently returning empty output here would
+    # propagate as missing learn records with no signal in the log
+    # other than a single pipeline.unsupported_backend event, which
+    # is precisely the silent-degradation footgun the daemon-level
+    # ``_create_backend`` factory already raises against. Aligns with
+    # ``feedback_intentionally_left_blank.md``.
     if backend_name != "claude":
         log.error(
             "pipeline.unsupported_backend",
@@ -271,7 +276,12 @@ async def _call_llm(
                 "backend-abstraction-collapse; update agent.backend in config.yaml"
             ),
         )
-        return ""
+        raise ValueError(
+            f"Unknown distiller backend: {backend_name!r}. "
+            f"Supported backends: 'claude'. "
+            f"(zo / openclaw were removed in the backend-abstraction-collapse "
+            f"arc 2026-05-25; update agent.backend in your config.yaml)"
+        )
 
     from .backends.cli import ClaudeBackend
 
@@ -340,7 +350,9 @@ async def _stage1_extract(
 
     # Generate a unique temp file path for the manifest output.
     # The LLM will write its JSON manifest here instead of relying on stdout,
-    # which is polluted by OpenClaw's agent conversation/reasoning output.
+    # which can be polluted by the subprocess-backend's agent
+    # conversation/reasoning output (tool-use logs, intermediate
+    # commentary, etc.) interleaved with the final JSON.
     manifest_path = f"/tmp/alfred-distiller-{uuid.uuid4().hex[:12]}-manifest.json"
 
     prompt = template.format(
@@ -688,9 +700,10 @@ async def _stage3_create(
     # Snapshot created files before this call
     before_created = set(read_mutations(session_path).get("files_created", []))
 
-    # Filesystem snapshot fallback: the mutation log may not be written when
-    # the agent runs in a separate container (openclaw) that doesn't have
-    # ALFRED_VAULT_SESSION set. We diff the learn-type directory instead.
+    # Filesystem snapshot fallback: defensive backup in case the
+    # mutation log isn't written for this dispatch (subprocess-backend
+    # quirk, env var stripped by a wrapper, etc.). We diff the
+    # learn-type directory instead.
     vault_dir = config.vault.vault_path
     learn_dir = vault_dir / spec.learn_type
     before_files = set(learn_dir.glob("*.md")) if learn_dir.is_dir() else set()

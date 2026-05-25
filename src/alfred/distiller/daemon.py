@@ -47,10 +47,9 @@ log = get_logger(__name__)
 
 # Module-level idle-tick heartbeat — see ``alfred.common.heartbeat`` for
 # the rationale ("intentionally left blank" pattern). Counter is bumped
-# in :func:`run_extraction` for each learn record created (both the
-# pipeline path and the legacy single-call path). The heartbeat task is
-# spawned in :func:`run_watch` only when ``config.idle_tick.enabled`` is
-# True.
+# in :func:`run_extraction` for each learn record created. The heartbeat
+# task is spawned in :func:`run_watch` only when ``config.idle_tick.enabled``
+# is True.
 heartbeat: Heartbeat = Heartbeat(daemon_name="distiller", log=log)
 
 

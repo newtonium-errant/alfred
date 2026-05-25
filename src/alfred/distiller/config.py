@@ -56,7 +56,24 @@ class VaultConfig:
 @dataclass
 class ClaudeBackendConfig:
     command: str = "claude"
-    args: list[str] = field(default_factory=lambda: ["-p"])
+    # ``--exclude-dynamic-system-prompt-sections`` (Claude Code CLI):
+    # moves per-machine sections (cwd, env info, memory paths, git status)
+    # out of the system prompt and into the first user message. The
+    # documented purpose is to "improve cross-user prompt-cache reuse"
+    # — for the daemon use case (many ``claude -p`` dispatches per day
+    # against a stable system prompt) this also improves cache hit rate
+    # across consecutive dispatches from the SAME machine, since the
+    # volatile sections no longer break the system-prompt cache prefix.
+    # The flag is documented to only apply when the default system prompt
+    # is used (which the daemons do — we don't pass ``--system-prompt``).
+    # Per Q4 SKILL.md caching investigation 2026-05-25: cache_control
+    # breakpoints on user-prompt content (the SKILL.md text we send via
+    # stdin) are NOT controllable through the CLI surface — that would
+    # require an upstream Claude Code SDK feature. This flag is the
+    # available lever today.
+    args: list[str] = field(
+        default_factory=lambda: ["-p", "--exclude-dynamic-system-prompt-sections"]
+    )
     timeout: int = 600
     allowed_tools: list[str] = field(default_factory=lambda: ["Bash"])
 
