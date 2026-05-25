@@ -49,26 +49,17 @@ vault:
   ignore_files: [".gitkeep"]
 
 agent:
+  # Backend selector. Post backend-abstraction-collapse (2026-05-25),
+  # ``claude`` is the only supported value across curator / janitor /
+  # distiller — anything else fails loud at daemon startup. Future
+  # backends (Q3 MCP, local Ollama) extend the value set with a matching
+  # sub-block here.
   backend: "claude"
   claude:
     command: "claude"
     args: ["-p"]
     timeout: 600
     allowed_tools: ["Bash"]
-  zo:
-    url: "https://api.zo.computer/zo/ask"
-    method: "POST"
-    headers:
-      Authorization: "Bearer ${ZO_API_KEY}"
-    request_body_template:
-      message: "{prompt}"
-    response_content_path: "response.content"
-    timeout: 600
-  openclaw:
-    command: "openclaw"
-    args: []
-    workspace_mount: ""
-    timeout: 600
 
 logging:
   level: "INFO"

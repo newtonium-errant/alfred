@@ -1,10 +1,18 @@
-"""Curator pipeline test package.
+"""Curator test package.
 
-See ``conftest.py`` for the shared fake backend / seeded vault / seeded inbox
-fixtures. Tests are split by concern:
+Test surface (post backend-abstraction-collapse, 2026-05-25):
 
-- ``test_pipeline_stages.py`` — stage 1 → 4 happy-path coverage
-- ``test_pipeline_concurrency.py`` — parallel processing + failure semantics
-- ``test_vault_context.py`` — slim-context rendering contract
-- ``test_pipeline_errors.py`` — manifest parse, malformed stdout, edge cases
+- ``test_pipeline_attribution.py`` — Stage 2 ``_resolve_entities``
+  attribution-marker wrapping. Uses the pure-Python helper directly;
+  does NOT exercise the LLM-dispatch pipeline (deleted with the
+  OpenClaw backend).
+- ``test_vault_context.py`` — slim-context rendering contract.
+- ``test_idle_tick.py`` — heartbeat counter for empty-inbox runs.
+
+The OpenClaw-pipeline test files (test_pipeline_stages,
+test_pipeline_concurrency, test_pipeline_errors) plus the shared
+``conftest.py`` + ``_fakes.py`` were removed in the
+backend-abstraction-collapse arc. The 4-stage pipeline was
+OpenClaw-only by design; production runs the legacy single-call
+path via the Claude backend.
 """

@@ -1,44 +1,59 @@
-"""3-stage janitor pipeline — replaces the monolithic single-LLM-call approach.
+"""Janitor pipeline helpers — surviving utilities after backend collapse.
 
-Stage 1: AUTOFIX (pure Python) — fix deterministic issues without LLM
-Stage 2: LINK REPAIR (LLM, per-file) — fix broken wikilinks with candidate matching
-Stage 3: ENRICH (LLM, per-file) — fill stub records from vault context + public facts
+History: this module previously contained the 3-stage janitor pipeline
+(``run_pipeline`` + Stage 2 link-repair LLM + Stage 3 stub-enrich LLM)
+used only when ``agent.backend == "openclaw"``. The 3-stage path was
+OpenClaw-only by design; Claude (the production backend) always ran
+the legacy single-call path in ``daemon.py``.
+
+The backend-abstraction-collapse arc (2026-05-25) removed the OpenClaw
+backend and with it the dead pipeline orchestration. What survives here
+are the pure-Python helpers that other call sites still use:
+
+- :data:`STAGE_LOOKUP_NEVER_INDEX` + :func:`_stage_lookup_ignore_dirs`
+  — system-dir exclusion set for narrower lookups (separate from
+  scanner.py's record-validity index). Used today by
+  ``tests/test_vault_dont_scan_index_split.py`` to pin the
+  dont_scan_dirs vs. dont_index_dirs split contract.
+- :func:`_find_link_candidates` / :func:`_is_unambiguous_match` /
+  :func:`_fix_link_in_python` — pure-Python link-repair helpers. Today
+  reachable only through the deleted Stage 2 orchestration, but the
+  bodies are pure functions (no LLM dispatch) and are sufficient on
+  their own to fix unambiguous link breaks. A future re-introduction
+  of a link-repair pass should call these directly.
+- :func:`_format_candidates` — prompt-formatting helper for candidate
+  lists. Lightweight; left in place against future LLM re-introduction.
+- :func:`_collect_linked_records` — gathers a stub record's
+  inbound/outbound linked record bodies as a prompt context block.
+  Used by ``tests/test_vault_dont_scan_index_split.py`` to pin the
+  dont_scan vs dont_index lookup-dir contract.
+
+Future re-introduction of a multi-stage pipeline (Q3 MCP migration or
+similar) should either re-add the orchestration here or move these
+helpers into more-aptly-named modules (e.g. ``links.py``,
+``link_repair.py``). The deliberate choice to leave them in
+``pipeline.py`` is to avoid introducing new files in a pure-subtractive
+cleanup commit.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import re
-import uuid
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .state import JanitorState
 
 from alfred.vault.mutation_log import log_mutation
 from alfred.vault.ops import VaultError, vault_read, vault_search
 
-from .autofix import (
-    autofix_issues,
-    flag_unenrichable_stubs,
-    flag_unresolved_links,
-)
-from .backends import VAULT_CLI_REFERENCE
-from .backends.openclaw import _clear_agent_sessions, _sync_workspace_claude_md
 from .config import JanitorConfig
-from .issues import Issue, IssueCode
 from .parser import extract_wikilinks
 from .utils import get_logger
 
 log = get_logger(__name__)
 
 
-# Vault-system infrastructure dirs that Stage 2 candidate search and
-# Stage 3 inbound-context lookup MUST always skip, regardless of the
+# Vault-system infrastructure dirs that link-candidate search and
+# stub inbound-context lookup MUST always skip, regardless of the
 # operator's ``dont_index_dirs`` config:
 #
 # - ``_templates`` / ``_bases`` / ``_docs`` — scaffold + Dataview views,
@@ -79,124 +94,8 @@ def _stage_lookup_ignore_dirs(config: JanitorConfig) -> list[str]:
     return operator + [d for d in STAGE_LOOKUP_NEVER_INDEX if d not in operator]
 
 
-@dataclass
-class PipelineResult:
-    """Result from the 3-stage janitor pipeline."""
-
-    success: bool = False
-    files_fixed: int = 0
-    files_flagged: int = 0
-    links_repaired: int = 0
-    stubs_enriched: int = 0
-    summary: str = ""
-
-
-def _load_stage_prompt(stage_file: str) -> str:
-    """Load a stage prompt from the bundled skills directory."""
-    from alfred._data import get_skills_dir
-
-    prompt_path = get_skills_dir() / "vault-janitor" / "prompts" / stage_file
-    if not prompt_path.exists():
-        log.warning("pipeline.prompt_not_found", path=str(prompt_path))
-        return ""
-    return prompt_path.read_text(encoding="utf-8")
-
-
-def _load_type_schema(record_type: str) -> str:
-    """Load the reference template for a specific record type."""
-    from alfred._data import get_skills_dir
-
-    refs_dir = get_skills_dir() / "vault-janitor" / "references"
-    # Try exact match first, then learn-* prefix for learning types
-    for candidate_name in [f"{record_type}.md", f"learn-{record_type}.md"]:
-        candidate = refs_dir / candidate_name
-        if candidate.exists():
-            return candidate.read_text(encoding="utf-8")
-    return f"(no schema reference found for type '{record_type}')"
-
-
-async def _call_llm(
-    prompt: str,
-    config: JanitorConfig,
-    session_path: str,
-    stage_label: str,
-    scope: str = "janitor",
-) -> str:
-    """Make an isolated OpenClaw call and return stdout.
-
-    Handles session clearing, workspace sync, subprocess exec with
-    --local --json, and timeout.
-
-    ``scope`` selects the ALFRED_VAULT_SCOPE the agent sees; defaults
-    to ``"janitor"`` (used by Stage 2 link repair). Stage 3 enrichment
-    passes ``"janitor_enrich"`` to widen the field allowlist to the
-    enrichment set while still blocking create/move/delete.
-    """
-    oc = config.agent.openclaw
-    session_id = f"janitor-{stage_label}-{uuid.uuid4().hex[:8]}"
-
-    _clear_agent_sessions(oc.agent_id)
-    _sync_workspace_claude_md(oc.agent_id, str(config.vault.vault_path))
-
-    cmd = [
-        oc.command, "agent", *oc.args,
-        "--agent", oc.agent_id,
-        "--session-id", session_id,
-        "--message", prompt,
-        "--local", "--json",
-    ]
-
-    env = {
-        **os.environ,
-        "ALFRED_VAULT_PATH": str(config.vault.vault_path),
-        "ALFRED_VAULT_SCOPE": scope,
-        "ALFRED_VAULT_SESSION": session_path,
-    }
-
-    log.info(
-        "pipeline.llm_call",
-        stage=stage_label,
-        agent_id=oc.agent_id,
-        session_id=session_id,
-    )
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=oc.timeout,
-        )
-    except asyncio.TimeoutError:
-        log.error("pipeline.llm_timeout", stage=stage_label, timeout=oc.timeout)
-        return ""
-    except FileNotFoundError:
-        log.error("pipeline.command_not_found", command=oc.command)
-        return ""
-
-    raw = stdout_bytes.decode("utf-8", errors="replace")
-    err = stderr_bytes.decode("utf-8", errors="replace")
-
-    if proc.returncode != 0:
-        log.warning(
-            "pipeline.llm_nonzero_exit",
-            stage=stage_label,
-            code=proc.returncode,
-            stderr=err[:500],
-            stdout_tail=raw[-2000:] if raw else "",
-        )
-        return raw
-
-    log.info("pipeline.llm_completed", stage=stage_label, stdout_len=len(raw))
-    return raw
-
-
 # ---------------------------------------------------------------------------
-# Stage 2: Link Repair (LLM for ambiguous cases)
+# Link-repair helpers (pure Python — formerly Stage 2 utilities)
 # ---------------------------------------------------------------------------
 
 
@@ -318,137 +217,12 @@ def _fix_link_in_python(
     return True
 
 
-# Cap Stage 2 LLM calls per sweep. Upstream observed 374 link issues in a
-# single runaway sweep burning hundreds of dollars; this caps per-sweep cost
-# to at most MAX_ISSUES_PER_SWEEP LLM calls. Unambiguous Python fixes still
-# run for all issues; only the LLM-routed ambiguous cases are capped.
-MAX_ISSUES_PER_SWEEP = 15
-
-
-async def _stage2_link_repair(
-    link_issues: list[Issue],
-    config: JanitorConfig,
-    session_path: str,
-) -> tuple[int, list[Issue]]:
-    """Stage 2: Repair broken wikilinks.
-
-    Returns ``(repaired_count, unresolved_issues)``. Unresolved issues are
-    the LINK001 entries whose target file was not modified by Stage 2
-    (either because no unambiguous Python fix was possible and the LLM
-    call didn't change the file, or the scanner message had no extractable
-    target). The caller flags these via ``autofix.flag_unresolved_links``
-    so the deterministic janitor_note prose is owned by Python.
-    """
-    if not link_issues:
-        return 0, []
-
-    if len(link_issues) > MAX_ISSUES_PER_SWEEP:
-        log.warning(
-            "pipeline.s2_capped",
-            total=len(link_issues),
-            processing=MAX_ISSUES_PER_SWEEP,
-        )
-        link_issues = link_issues[:MAX_ISSUES_PER_SWEEP]
-
-    vault_path = config.vault.vault_path
-    # Use dont_index_dirs for candidate-search scope: link repair must
-    # consider every record that *could* be a valid target, including
-    # records under dont_scan_dirs (session/, note/, etc.). The legacy
-    # ``ignore_dirs`` reading would skip those — silently widening the
-    # "no candidate found" outcome and leaving real candidates unresolved.
-    # Union with STAGE_LOOKUP_NEVER_INDEX so vault-system infrastructure
-    # dirs (_templates, .obsidian, inbox/processed, ...) are never
-    # offered as link candidates, regardless of operator config.
-    ignore_dirs = _stage_lookup_ignore_dirs(config)
-    template = _load_stage_prompt("stage2_link_repair.md")
-    repaired = 0
-    unresolved: list[Issue] = []
-
-    for issue in link_issues:
-        # Extract broken target from message: "Broken wikilink: [[target]]"
-        match = re.search(r"\[\[([^\]]+)\]\]", issue.message)
-        if not match:
-            log.warning("pipeline.s2_no_target", file=issue.file, message=issue.message)
-            unresolved.append(issue)
-            continue
-        broken_target = match.group(1)
-
-        # Find candidates
-        candidates = _find_link_candidates(broken_target, vault_path, ignore_dirs)
-
-        # Try unambiguous Python fix first
-        unambiguous = _is_unambiguous_match(broken_target, candidates)
-        if unambiguous:
-            if _fix_link_in_python(issue.file, broken_target, unambiguous, vault_path, session_path):
-                log.info(
-                    "pipeline.s2_fixed_python",
-                    file=issue.file,
-                    old=broken_target,
-                    new=unambiguous,
-                )
-                repaired += 1
-                continue
-
-        # Annotate the issue with a candidate count so ``flag_unresolved_links``
-        # can mention "{n} candidate(s) found" without re-running the search.
-        # detail is a free-form string; the flag helper greps for "\d+ candidate".
-        issue.detail = f"{len(candidates)} candidate(s) found"
-
-        # Ambiguous or no match -- send to LLM if we have candidates and a template
-        if not template:
-            log.warning("pipeline.s2_no_template", file=issue.file)
-            unresolved.append(issue)
-            continue
-
-        candidates_text = _format_candidates(candidates)
-        candidate_names = ", ".join(c.get("name", c["path"]) for c in candidates[:10])
-
-        prompt = template.format(
-            file_path=issue.file,
-            broken_target=broken_target,
-            candidates=candidates_text,
-            candidate_names=candidate_names,
-            vault_cli_reference=VAULT_CLI_REFERENCE,
-        )
-
-        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', broken_target.replace(' ', '-').replace('/', '-'))[:30]
-        stage_label = f"s2-link-{safe_name}"
-
-        # Snapshot file mtime before the LLM call so we only count
-        # repairs that actually changed the file. Upstream 44cf675: the
-        # mutation log can't be trusted for cross-container backends
-        # (openclaw-wrapper HTTP API has no ALFRED_VAULT_SESSION), so we
-        # use filesystem mtime as the authoritative "did anything happen"
-        # signal. Prevents the counter from double-counting Python-path
-        # fixes (which already incremented above) or inflating on no-op
-        # LLM calls.
-        target_path = config.vault.vault_path / issue.file
-        before_mtime = target_path.stat().st_mtime if target_path.exists() else 0.0
-
-        await _call_llm(prompt, config, session_path, stage_label)
-
-        after_mtime = target_path.stat().st_mtime if target_path.exists() else 0.0
-        if after_mtime > before_mtime:
-            repaired += 1
-            log.info("pipeline.s2_llm_repair", file=issue.file, target=broken_target)
-        else:
-            log.info(
-                "pipeline.s2_llm_no_change",
-                file=issue.file,
-                target=broken_target,
-            )
-            unresolved.append(issue)
-
-    log.info(
-        "pipeline.s2_complete",
-        repaired=repaired,
-        unresolved=len(unresolved),
-    )
-    return repaired, unresolved
-
-
 def _format_candidates(candidates: list[dict]) -> str:
-    """Format candidate matches for the LLM prompt."""
+    """Format candidate matches for a prompt block.
+
+    Retained for future LLM re-introduction; the deleted Stage 2
+    orchestration was its only caller.
+    """
     if not candidates:
         return "(no candidates found -- the target may need to be created or is a typo)"
 
@@ -467,7 +241,7 @@ def _format_candidates(candidates: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: Enrich Stubs (LLM, per-file)
+# Stub-context helpers (pure Python — formerly Stage 3 utilities)
 # ---------------------------------------------------------------------------
 
 
@@ -481,7 +255,7 @@ def _collect_linked_records(
     Returns a formatted text block with the content of linked records.
 
     ``ignore_dirs`` should be sourced from ``config.vault.dont_index_dirs``
-    (NOT ``dont_scan_dirs``). The Stage 3 enrichment pass needs the full
+    (NOT ``dont_scan_dirs``). The stub-enrichment use case needs the full
     set of records that link TO the stub for context — including records
     in dont_scan_dirs which are still legitimate inbound linkers. See
     ``alfred.vault.config_helpers`` for the split rationale.
@@ -541,299 +315,3 @@ def _collect_linked_records(
         return "(no linked records found)"
 
     return "\n---\n".join(parts)
-
-
-async def _stage3_enrich(
-    stub_issues: list[Issue],
-    config: JanitorConfig,
-    session_path: str,
-    state: "JanitorState | None" = None,
-) -> tuple[int, list[Issue]]:
-    """Stage 3: Enrich stub records.
-
-    Returns ``(enriched_count, unresolved_stubs)``. Unresolved stubs are
-    the STUB001 entries whose target file was NOT modified by Stage 3
-    (stale, read-failed, skipped by the per-sweep cap, template-missing,
-    or an LLM call that didn't bump mtime). Callers flag these via
-    :func:`autofix.flag_unenrichable_stubs` so the deterministic
-    janitor_note prose is owned by Python, matching the LINK001 pattern.
-
-    Upstream #15: filters out stubs that have exhausted their enrichment
-    attempts (state permitting), sorts the remaining by last_scanned DESC
-    then linked-record count DESC (more context = better enrichment odds),
-    and caps the list to config.sweep.max_stubs_per_sweep. Each attempt
-    increments state.files[file].enrichment_attempts so repeat failures on
-    unchanged content eventually mark the file stale.
-    """
-    if not stub_issues:
-        return 0, []
-
-    vault_path = config.vault.vault_path
-    # Use dont_index_dirs for Stage 3 inbound-context lookup: a stub's
-    # context should include EVERY record that links to it, including
-    # records under dont_scan_dirs (which are still legitimate linkers).
-    # See _collect_linked_records docstring for the split rationale.
-    # Union with STAGE_LOOKUP_NEVER_INDEX so raw email bodies under
-    # inbox/processed/ and template placeholders never pollute the
-    # enrichment context.
-    ignore_dirs = _stage_lookup_ignore_dirs(config)
-    max_stubs = config.sweep.max_stubs_per_sweep
-    max_attempts = config.sweep.max_enrichment_attempts
-    template = _load_stage_prompt("stage3_enrich.md")
-    if not template:
-        log.warning("pipeline.s3_no_template")
-        # No template means we can't enrich anything — every stub is
-        # unresolved so Q6's fallback still fires.
-        return 0, list(stub_issues)
-
-    unresolved: list[Issue] = []
-
-    # Filter out stubs whose enrichment has gone stale (N consecutive
-    # failures on the same content hash). A hash change elsewhere in the
-    # pipeline calls state.reset_enrichment_staleness() to reopen the file.
-    # Stale stubs are unresolved — Stage 3 won't retry them until content
-    # changes, so the janitor_note keeps them visible in the interim.
-    if state is not None:
-        filtered: list[Issue] = []
-        for issue in stub_issues:
-            if state.is_enrichment_stale(issue.file):
-                log.debug(
-                    "pipeline.s3_skip_stale",
-                    file=issue.file,
-                    msg="enrichment stale, skipping until content changes",
-                )
-                unresolved.append(issue)
-                continue
-            filtered.append(issue)
-        stub_issues = filtered
-
-    if not stub_issues:
-        log.info("pipeline.s3_all_stale", msg="all stubs stale, nothing to enrich")
-        return 0, unresolved
-
-    # Sort newest-scanned first, then by linked-record count (descending).
-    # The sort tuple is (last_scanned, -linked_count) and we reverse=True,
-    # giving DESC,DESC ordering.
-    def _stub_sort_key(issue: Issue) -> tuple[str, int]:
-        last_scanned = ""
-        linked_count = 0
-        if state is not None and issue.file in state.files:
-            last_scanned = state.files[issue.file].last_scanned
-        try:
-            raw_text = (vault_path / issue.file).read_text(encoding="utf-8")
-            linked_count = len(extract_wikilinks(raw_text))
-        except (OSError, UnicodeDecodeError):
-            pass
-        return (last_scanned, -linked_count)
-
-    stub_issues.sort(key=_stub_sort_key, reverse=True)
-
-    if len(stub_issues) > max_stubs:
-        log.info(
-            "pipeline.s3_capped",
-            total=len(stub_issues),
-            processing=max_stubs,
-        )
-        # Over-cap stubs are unresolved for this sweep — the cap skipped
-        # them so the fallback flag keeps them visible.
-        unresolved.extend(stub_issues[max_stubs:])
-        stub_issues = stub_issues[:max_stubs]
-
-    enriched = 0
-
-    for issue in stub_issues:
-        file_path = issue.file
-
-        # Read the stub record
-        try:
-            record = vault_read(vault_path, file_path)
-        except VaultError:
-            log.warning("pipeline.s3_read_failed", file=file_path)
-            # A read failure still counts as an enrichment attempt so a
-            # permanently-broken file stops pinning Stage 3 capacity.
-            if state is not None:
-                state.record_enrichment_attempt(file_path, max_attempts)
-            unresolved.append(issue)
-            continue
-
-        fm = record["frontmatter"]
-        record_type = fm.get("type", "")
-        record_name = fm.get("name", "") or fm.get("subject", "") or Path(file_path).stem
-
-        # Load the type-specific schema reference
-        type_schema = _load_type_schema(record_type) if record_type else "(unknown type)"
-
-        # Collect linked records for context
-        linked_records = _collect_linked_records(file_path, vault_path, ignore_dirs)
-
-        # Format current record content
-        record_content = json.dumps(record, indent=2, default=str)
-
-        prompt = template.format(
-            file_path=file_path,
-            record_type=record_type,
-            record_name=record_name,
-            record_content=record_content,
-            type_schema=type_schema,
-            linked_records=linked_records,
-            vault_cli_reference=VAULT_CLI_REFERENCE,
-        )
-
-        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', record_name.replace(' ', '-'))[:30]
-        stage_label = f"s3-enrich-{safe_name}"
-
-        # Snapshot mtime before the LLM call so we only count as
-        # enriched when the file actually changed. Matches the LINK001
-        # pattern — mtime is the authoritative "did anything happen"
-        # signal across backends.
-        target_path = vault_path / file_path
-        before_mtime = target_path.stat().st_mtime if target_path.exists() else 0.0
-
-        # Stage 3 runs under the ``janitor_enrich`` scope so the
-        # allowlist covers description/role/email/etc. without opening
-        # up the narrower Stage 1/2 ``janitor`` scope.
-        await _call_llm(prompt, config, session_path, stage_label, scope="janitor_enrich")
-
-        after_mtime = target_path.stat().st_mtime if target_path.exists() else 0.0
-
-        # Record the attempt so Stage 3 stops retrying the same unchanged
-        # stub forever. A content-hash change elsewhere resets this counter.
-        if state is not None:
-            state.record_enrichment_attempt(file_path, max_attempts)
-
-        if after_mtime > before_mtime:
-            enriched += 1
-            log.info("pipeline.s3_enriched", file=file_path, type=record_type)
-        else:
-            log.info(
-                "pipeline.s3_llm_no_change",
-                file=file_path,
-                type=record_type,
-            )
-            unresolved.append(issue)
-
-    log.info(
-        "pipeline.s3_complete",
-        enriched=enriched,
-        unresolved=len(unresolved),
-    )
-    return enriched, unresolved
-
-
-# ---------------------------------------------------------------------------
-# Pipeline entry point
-# ---------------------------------------------------------------------------
-
-
-async def run_pipeline(
-    issues: list[Issue],
-    config: JanitorConfig,
-    session_path: str,
-    state: "JanitorState | None" = None,
-) -> PipelineResult:
-    """Run the 3-stage janitor pipeline on a list of issues.
-
-    Args:
-        issues: Issues detected by the structural scanner.
-        config: Janitor configuration.
-        session_path: Path to the mutation log session file.
-        state: Optional janitor state for Stage 3 enrichment staleness
-            tracking and cost caps (upstream #15).
-
-    Returns:
-        PipelineResult with success status and details.
-    """
-    result = PipelineResult()
-    vault_path = config.vault.vault_path
-
-    log.info("pipeline.start", issues=len(issues))
-
-    # Partition issues by stage. All codes here are handled deterministically
-    # by the Stage 1 autofix module — either fixed directly or flagged via
-    # janitor_note. SEM001-004 and learn-type DUP001 are routed to autofix
-    # so the LLM never sees them (the LLM can still produce SEM005-006 for
-    # semantic drift it detects itself). Entity-type DUP001 still falls
-    # through to the agent's triage-task path.
-    autofix_codes = {
-        IssueCode.MISSING_REQUIRED_FIELD,
-        IssueCode.INVALID_TYPE_VALUE,
-        IssueCode.INVALID_STATUS_VALUE,
-        IssueCode.INVALID_FIELD_TYPE,
-        IssueCode.WRONG_DIRECTORY,
-        IssueCode.ORPHANED_RECORD,
-        IssueCode.DUPLICATE_NAME,
-        IssueCode.STALE_ACTIVE_PROJECT,
-        IssueCode.STALE_TODO_TASK,
-        IssueCode.STALE_ACTIVE_CONVERSATION,
-        IssueCode.STALE_ACTIVE_PERSON,
-    }
-    autofix_issues_list = [i for i in issues if i.code in autofix_codes]
-    link_issues = [i for i in issues if i.code == IssueCode.BROKEN_WIKILINK]
-    stub_issues = [i for i in issues if i.code == IssueCode.STUB_RECORD]
-
-    # Stage 1: Autofix (pure Python)
-    log.info("pipeline.s1_start", issues=len(autofix_issues_list))
-    fixed, flagged, skipped = autofix_issues(
-        autofix_issues_list,
-        vault_path,
-        session_path,
-    )
-    result.files_fixed = len(fixed)
-    result.files_flagged = len(flagged)
-
-    log.info(
-        "pipeline.s1_complete",
-        fixed=len(fixed),
-        flagged=len(flagged),
-        skipped=len(skipped),
-    )
-
-    # Stage 2: Link Repair (LLM for ambiguous, Python for unambiguous).
-    # Unresolved LINK001 issues (no unambiguous Python fix and the LLM
-    # call didn't modify the file) are flagged via
-    # ``flag_unresolved_links`` so the deterministic janitor_note prose
-    # lives in Python, not the SKILL. Pipeline tallies them into the
-    # existing ``files_flagged`` counter.
-    log.info("pipeline.s2_start", issues=len(link_issues))
-    result.links_repaired, unresolved_links = await _stage2_link_repair(
-        link_issues, config, session_path,
-    )
-    if unresolved_links:
-        unresolved_flagged = flag_unresolved_links(
-            unresolved_links, vault_path, session_path,
-        )
-        result.files_flagged += len(unresolved_flagged)
-
-    # Stage 3: Enrich stubs (LLM, per-file)
-    # Pass state so the stage can filter stale stubs, apply the per-sweep
-    # cap, and record each attempt. Upstream #15.
-    # Unresolved STUB001s (stale, over-cap, read-failed, LLM no-op, or
-    # template missing) are flagged via ``flag_unenrichable_stubs`` so the
-    # deterministic janitor_note prose lives in Python and the stub stays
-    # visible between sweeps. Mirrors the LINK001 unresolved path above.
-    log.info("pipeline.s3_start", issues=len(stub_issues))
-    result.stubs_enriched, unresolved_stubs = await _stage3_enrich(
-        stub_issues, config, session_path, state=state,
-    )
-    if unresolved_stubs:
-        unresolved_stub_flagged = flag_unenrichable_stubs(
-            unresolved_stubs, vault_path, session_path,
-        )
-        result.files_flagged += len(unresolved_stub_flagged)
-
-    result.success = True
-    result.summary = (
-        f"Autofix: {len(fixed)} fixed, {len(flagged)} flagged, {len(skipped)} skipped. "
-        f"Links: {result.links_repaired} repaired. "
-        f"Stubs: {result.stubs_enriched} enriched."
-    )
-
-    log.info(
-        "pipeline.complete",
-        fixed=result.files_fixed,
-        flagged=result.files_flagged,
-        links_repaired=result.links_repaired,
-        stubs_enriched=result.stubs_enriched,
-    )
-
-    return result

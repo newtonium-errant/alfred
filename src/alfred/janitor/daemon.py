@@ -1,17 +1,18 @@
-"""Sweep orchestrator — two-phase scan + fix pipeline.
+"""Sweep orchestrator — two-phase scan + agent-fix.
 
-For OpenClaw backends, uses a 3-stage pipeline (pipeline.py) for better quality:
-  Stage 1: AUTOFIX (pure Python) — deterministic fixes
-  Stage 2: LINK REPAIR (LLM per-file) — broken wikilinks
-  Stage 3: ENRICH (LLM per-file) — stub records
-
-For other backends, falls back to the legacy single-LLM-call approach.
+Phase 1 (structural scan): pure-Python issue detection.
+Phase 2 (agent fix, optional): hand the issue report + affected records
+to the configured agent backend in one call. Post backend-abstraction-
+collapse (2026-05-25), Claude is the only surviving backend; the
+OpenClaw-only 3-stage pipeline (pipeline.py) was retired in the same
+arc. The link-repair / stub-enrich helpers survive as pure-Python
+utilities under ``janitor.pipeline`` (kept for cross-references in
+tests + a future re-introduction).
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,18 +22,14 @@ import frontmatter
 from alfred.common.heartbeat import Heartbeat
 from alfred.common.schedule import compute_next_fire
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
-from alfred.vault.ops import is_ignored_path
 
 from .backends import BaseBackend, BackendResult, build_issue_report
 from .triage import collect_open_triage_tasks, format_open_triage_block
 from .backends.cli import ClaudeBackend
-from .backends.http import ZoBackend
-from .backends.openclaw import OpenClawBackend
 from .config import JanitorConfig
 from .context import build_vault_context
 from .issues import FixLogEntry, Issue, SweepResult, Severity
 from .parser import parse_file
-from .pipeline import run_pipeline
 from .scanner import run_structural_scan
 from .state import JanitorState
 from .superseded_marker import run_superseded_marker_sweep
@@ -47,11 +44,6 @@ log = get_logger(__name__)
 # heartbeat task is spawned in :func:`run_watch` only when
 # ``config.idle_tick.enabled`` is True.
 heartbeat: Heartbeat = Heartbeat(daemon_name="janitor", log=log)
-
-
-def _use_pipeline(config: JanitorConfig) -> bool:
-    """Check if the 3-stage pipeline should be used (OpenClaw backend only)."""
-    return config.agent.backend == "openclaw"
 
 
 def _load_skill(skills_dir: Path) -> str:
@@ -73,56 +65,28 @@ def _load_skill(skills_dir: Path) -> str:
 
 
 def _create_backend(config: JanitorConfig) -> BaseBackend:
-    """Instantiate the configured backend."""
+    """Instantiate the configured backend.
+
+    Post backend-abstraction-collapse (2026-05-25): only the Claude CLI
+    backend survives. The factory still takes a ``backend_name`` and
+    fails loud on anything else so a config typo / stale yaml /
+    re-introduced backend name fails at startup rather than silently
+    defaulting. Per ``feedback_intentionally_left_blank.md``.
+
+    BaseBackend + the factory pattern remain in place so re-introducing
+    a backend (Q3 MCP, local Ollama, etc.) is a pure-extend: add a new
+    branch + a sibling module in ``backends/`` — no architectural
+    re-work.
+    """
     backend_name = config.agent.backend
     if backend_name == "claude":
         return ClaudeBackend(config.agent.claude)
-    elif backend_name == "zo":
-        return ZoBackend(config.agent.zo)
-    elif backend_name == "openclaw":
-        return OpenClawBackend(config.agent.openclaw)
-    else:
-        raise ValueError(f"Unknown backend: {backend_name}")
-
-
-def snapshot_vault(vault_path: Path, ignore_dirs: list[str] | None = None) -> dict[str, str]:
-    """Capture SHA-256 checksums of all .md files in the vault."""
-    ignore = set(ignore_dirs or [])
-    checksums: dict[str, str] = {}
-
-    for md_file in vault_path.rglob("*.md"):
-        rel = md_file.relative_to(vault_path)
-        if is_ignored_path(rel, ignore):
-            continue
-        try:
-            content = md_file.read_bytes()
-            checksums[str(rel).replace("\\", "/")] = hashlib.sha256(content).hexdigest()
-        except OSError:
-            continue
-
-    return checksums
-
-
-def diff_vault(
-    before: dict[str, str],
-    after: dict[str, str],
-) -> tuple[list[str], list[str], list[str]]:
-    """Compare two vault snapshots. Returns (created, modified, deleted)."""
-    created: list[str] = []
-    modified: list[str] = []
-    deleted: list[str] = []
-
-    for path, checksum in after.items():
-        if path not in before:
-            created.append(path)
-        elif before[path] != checksum:
-            modified.append(path)
-
-    for path in before:
-        if path not in after:
-            deleted.append(path)
-
-    return created, modified, deleted
+    raise ValueError(
+        f"Unknown janitor backend: {backend_name!r}. "
+        f"Supported backends: 'claude'. "
+        f"(zo / openclaw were removed in the backend-abstraction-collapse "
+        f"arc 2026-05-25; update agent.backend in your config.yaml)"
+    )
 
 
 def _build_affected_records(
@@ -230,191 +194,121 @@ async def run_sweep(
 
     # Phase 2: Fix (only if fix_mode and not structural_only)
     if fix_mode and not structural_only:
-        if _use_pipeline(config):
-            # 3-stage pipeline for OpenClaw backend
-            session_path = create_session_file()
+        # Claude is the only surviving backend post backend-abstraction-
+        # collapse (2026-05-25). The OpenClaw-only 3-stage pipeline was
+        # retired in the same arc; the legacy single-call agent path is
+        # now the only path. Claude always supports mutation-log-based
+        # vault access via env-var injection — no snapshot/diff fallback
+        # path needed.
+        skill_text = _load_skill(skills_dir)
+        if not skill_text:
+            log.warning("sweep.no_skill", msg="No SKILL.md found — skipping agent fix")
+        else:
+            backend = _create_backend(config)
+            vault_path = config.vault.vault_path
 
-            pipeline_result = await run_pipeline(
-                issues=issues,
-                config=config,
-                session_path=session_path,
-                state=state,
+            # Batch issues if too many
+            max_per_call = config.sweep.max_files_per_agent_call
+            affected_files = list({i.file for i in issues})
+
+            # Layer 3: surface existing open triage tasks so the agent
+            # can skip already-queued candidates. Computed once per sweep.
+            open_triage_tasks = collect_open_triage_tasks(vault_path)
+            open_triage_block = format_open_triage_block(
+                open_triage_tasks,
+                seen_ids=state.triage_ids_seen,
             )
 
-            mutations = read_mutations(session_path)
-            created = mutations["files_created"]
-            modified = mutations["files_modified"]
-            deleted = mutations["files_deleted"]
+            for batch_start in range(0, len(affected_files), max_per_call):
+                batch_files = set(affected_files[batch_start:batch_start + max_per_call])
+                batch_issues = [i for i in issues if i.file in batch_files]
 
-            # Layer 3: record any newly-created triage task IDs in state so
-            # they cannot be re-surfaced on the next sweep even if closed.
-            # Heartbeat log below makes every fix-mode sweep visible in
-            # janitor.log even when `created` is empty, so a "no activity"
-            # scenario shows up as an absence of this event rather than an
-            # absence of the downstream `daemon.triage_id_recorded` event.
-            log.info("daemon.triage_scan", created_count=len(created), sweep_id=sweep_id)
-            _record_triage_ids_from_created(created, config.vault.vault_path, state)
+                issue_report = build_issue_report(batch_issues)
+                affected_records = _build_affected_records(batch_issues, vault_path)
 
-            # Audit log
-            audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
-            audit_path = str(Path(config.state.path).parent / "vault_audit.log")
-            append_to_audit_log(audit_path, "janitor", audit_mutations, detail=sweep_id)
+                # Claude (the only surviving backend post 2026-05-25) always
+                # uses the mutation log — env_overrides feed scope + session
+                # path into the agent subprocess.
+                session_path = create_session_file()
+                backend.env_overrides = {
+                    "ALFRED_VAULT_PATH": str(vault_path),
+                    "ALFRED_VAULT_SCOPE": "janitor",
+                    "ALFRED_VAULT_SESSION": session_path,
+                }
 
-            # Cleanup is the LAST session-related operation — read mutations,
-            # act on them, then cleanup. Avoids brittleness if future changes
-            # want to read session-derived data during the helper.
-            cleanup_session_file(session_path)
-
-            result.files_fixed += len(modified) + len(created)
-            result.files_deleted += len(deleted)
-            result.agent_invoked = True
-
-            for f in modified:
-                state.add_fix_log(FixLogEntry(
+                # Invoke agent
+                log.info(
+                    "sweep.agent_invoke",
                     sweep_id=sweep_id,
-                    action="fixed",
-                    file=f,
-                    detail=f"Pipeline: {pipeline_result.summary[:200]}",
-                ))
-            for f in created:
-                state.add_fix_log(FixLogEntry(
-                    sweep_id=sweep_id,
-                    action="fixed",
-                    file=f,
-                    detail="Created by pipeline",
-                ))
-            for f in deleted:
-                state.add_fix_log(FixLogEntry(
-                    sweep_id=sweep_id,
-                    action="deleted",
-                    file=f,
-                    detail="Deleted by pipeline",
-                ))
-
-            if not pipeline_result.success:
-                log.error(
-                    "sweep.pipeline_failed",
-                    sweep_id=sweep_id,
-                    summary=pipeline_result.summary[:500],
+                    batch_files=len(batch_files),
+                    batch_issues=len(batch_issues),
                 )
-        else:
-            # Legacy path for Claude and Zo backends
-            skill_text = _load_skill(skills_dir)
-            if not skill_text:
-                log.warning("sweep.no_skill", msg="No SKILL.md found — skipping agent fix")
-            else:
-                backend = _create_backend(config)
-                vault_path = config.vault.vault_path
-                use_mutation_log = isinstance(backend, (ClaudeBackend, OpenClawBackend))
-
-                # Batch issues if too many
-                max_per_call = config.sweep.max_files_per_agent_call
-                affected_files = list({i.file for i in issues})
-
-                # Layer 3: surface existing open triage tasks so the agent
-                # can skip already-queued candidates. Computed once per sweep.
-                open_triage_tasks = collect_open_triage_tasks(vault_path)
-                open_triage_block = format_open_triage_block(
-                    open_triage_tasks,
-                    seen_ids=state.triage_ids_seen,
+                agent_result = await backend.process(
+                    skill_text=skill_text,
+                    issue_report=issue_report,
+                    affected_records=affected_records,
+                    vault_path=str(vault_path),
+                    open_triage_block=open_triage_block,
                 )
 
-                for batch_start in range(0, len(affected_files), max_per_call):
-                    batch_files = set(affected_files[batch_start:batch_start + max_per_call])
-                    batch_issues = [i for i in issues if i.file in batch_files]
+                # Determine what changed via the mutation log.
+                mutations = read_mutations(session_path)
+                created = mutations["files_created"]
+                modified = mutations["files_modified"]
+                deleted = mutations["files_deleted"]
 
-                    issue_report = build_issue_report(batch_issues)
-                    affected_records = _build_affected_records(batch_issues, vault_path)
+                # Layer 3: record any newly-created triage task IDs in
+                # state so they cannot be re-surfaced on the next sweep
+                # even if the human closes or deletes them. Handles the
+                # empty-created case naturally (loop is a no-op).
+                # Heartbeat log below makes every fix-mode sweep visible
+                # in janitor.log even when `created` is empty.
+                log.info("daemon.triage_scan", created_count=len(created), sweep_id=sweep_id)
+                _record_triage_ids_from_created(created, vault_path, state)
 
-                    session_path = None
-                    if use_mutation_log:
-                        session_path = create_session_file()
-                        backend.env_overrides = {
-                            "ALFRED_VAULT_PATH": str(vault_path),
-                            "ALFRED_VAULT_SCOPE": "janitor",
-                            "ALFRED_VAULT_SESSION": session_path,
-                        }
-                    else:
-                        before = snapshot_vault(vault_path, config.vault.ignore_dirs)
+                # Audit log
+                audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
+                audit_path = str(Path(config.state.path).parent / "vault_audit.log")
+                append_to_audit_log(audit_path, "janitor", audit_mutations, detail=sweep_id)
 
-                    # Invoke agent
-                    log.info(
-                        "sweep.agent_invoke",
+                # Cleanup is the LAST session-related operation — read
+                # mutations, act on them, then cleanup. Avoids brittleness
+                # if future changes read session-derived data in helpers.
+                cleanup_session_file(session_path)
+
+                result.files_fixed += len(modified) + len(created)
+                result.files_deleted += len(deleted)
+                result.agent_invoked = True
+
+                # Log actions
+                for f in modified:
+                    state.add_fix_log(FixLogEntry(
                         sweep_id=sweep_id,
-                        batch_files=len(batch_files),
-                        batch_issues=len(batch_issues),
+                        action="fixed",
+                        file=f,
+                        detail="Modified by agent",
+                    ))
+                for f in deleted:
+                    state.add_fix_log(FixLogEntry(
+                        sweep_id=sweep_id,
+                        action="deleted",
+                        file=f,
+                        detail="Deleted by agent",
+                    ))
+                for f in created:
+                    state.add_fix_log(FixLogEntry(
+                        sweep_id=sweep_id,
+                        action="fixed",
+                        file=f,
+                        detail="Created by agent",
+                    ))
+
+                if not agent_result.success:
+                    log.error(
+                        "sweep.agent_failed",
+                        sweep_id=sweep_id,
+                        summary=agent_result.summary[:500],
                     )
-                    agent_result = await backend.process(
-                        skill_text=skill_text,
-                        issue_report=issue_report,
-                        affected_records=affected_records,
-                        vault_path=str(vault_path),
-                        open_triage_block=open_triage_block,
-                    )
-
-                    # Determine what changed
-                    if use_mutation_log and session_path:
-                        mutations = read_mutations(session_path)
-                        created = mutations["files_created"]
-                        modified = mutations["files_modified"]
-                        deleted = mutations["files_deleted"]
-                    else:
-                        after = snapshot_vault(vault_path, config.vault.ignore_dirs)
-                        created, modified, deleted = diff_vault(before, after)
-
-                    # Layer 3: record any newly-created triage task IDs in
-                    # state so they cannot be re-surfaced on the next sweep
-                    # even if the human closes or deletes them. Handles the
-                    # empty-created case naturally (loop is a no-op).
-                    # Heartbeat log below makes every fix-mode sweep visible
-                    # in janitor.log even when `created` is empty.
-                    log.info("daemon.triage_scan", created_count=len(created), sweep_id=sweep_id)
-                    _record_triage_ids_from_created(created, vault_path, state)
-
-                    # Audit log
-                    audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
-                    audit_path = str(Path(config.state.path).parent / "vault_audit.log")
-                    append_to_audit_log(audit_path, "janitor", audit_mutations, detail=sweep_id)
-
-                    # Cleanup is the LAST session-related operation — read
-                    # mutations, act on them, then cleanup. Avoids brittleness
-                    # if future changes read session-derived data in helpers.
-                    if use_mutation_log and session_path:
-                        cleanup_session_file(session_path)
-
-                    result.files_fixed += len(modified) + len(created)
-                    result.files_deleted += len(deleted)
-                    result.agent_invoked = True
-
-                    # Log actions
-                    for f in modified:
-                        state.add_fix_log(FixLogEntry(
-                            sweep_id=sweep_id,
-                            action="fixed",
-                            file=f,
-                            detail="Modified by agent",
-                        ))
-                    for f in deleted:
-                        state.add_fix_log(FixLogEntry(
-                            sweep_id=sweep_id,
-                            action="deleted",
-                            file=f,
-                            detail="Deleted by agent",
-                        ))
-                    for f in created:
-                        state.add_fix_log(FixLogEntry(
-                            sweep_id=sweep_id,
-                            action="fixed",
-                            file=f,
-                            detail="Created by agent",
-                        ))
-
-                    if not agent_result.success:
-                        log.error(
-                            "sweep.agent_failed",
-                            sweep_id=sweep_id,
-                            summary=agent_result.summary[:500],
-                        )
 
     log.info(
         "sweep.complete",

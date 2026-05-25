@@ -1,16 +1,17 @@
-"""Extraction orchestrator — two-phase scan + agent extraction pipeline.
+"""Extraction orchestrator — two-phase scan + multi-stage pipeline.
 
-For OpenClaw backends, uses a multi-stage pipeline (pipeline.py):
-  Pass A: EXTRACT (LLM per-source) → DEDUP (Python) → CREATE (LLM per-learning)
-  Pass B: Cross-learning meta-analysis (contradictions, syntheses across records)
+Pass A: EXTRACT (LLM per-source) -> DEDUP (Python) -> CREATE (LLM per-learning)
+Pass B: Cross-learning meta-analysis (contradictions, syntheses across records)
 
-For other backends, falls back to the legacy single-LLM-call approach.
+Post backend-abstraction-collapse (2026-05-25), Claude is the only
+surviving agent backend; the previous Zo-only legacy single-call
+fallback was retired in the same arc. The multi-stage pipeline
+(``pipeline.py``) is now the only path.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,6 @@ from pathlib import Path
 from alfred.common.heartbeat import Heartbeat
 from alfred.common.schedule import compute_next_fire
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
-from alfred.vault.ops import is_ignored_path
 
 from .backends import (
     BaseBackend,
@@ -28,8 +28,6 @@ from .backends import (
     format_source_records,
 )
 from .backends.cli import ClaudeBackend
-from .backends.http import ZoBackend
-from .backends.openclaw import OpenClawBackend
 from .candidates import (
     ExtractionBatch,
     ScoredCandidate,
@@ -56,16 +54,6 @@ log = get_logger(__name__)
 heartbeat: Heartbeat = Heartbeat(daemon_name="distiller", log=log)
 
 
-def _use_pipeline(config: DistillerConfig) -> bool:
-    """Check if the multi-stage pipeline should be used.
-
-    The pipeline (per-source extraction → dedup → create → meta-analysis)
-    is supported for Claude and OpenClaw backends. Zo uses the legacy
-    single-call path because it has its own filesystem access.
-    """
-    return config.agent.backend in ("claude", "openclaw")
-
-
 def _load_skill(skills_dir: Path) -> str:
     """Load SKILL.md and all reference templates into a single text block."""
     skill_path = skills_dir / "vault-distiller" / "SKILL.md"
@@ -87,60 +75,28 @@ def _load_skill(skills_dir: Path) -> str:
 
 
 def _create_backend(config: DistillerConfig) -> BaseBackend:
-    """Instantiate the configured backend."""
+    """Instantiate the configured backend.
+
+    Post backend-abstraction-collapse (2026-05-25): only the Claude CLI
+    backend survives. The factory still takes a ``backend_name`` and
+    fails loud on anything else so a config typo / stale yaml /
+    re-introduced backend name fails at startup rather than silently
+    defaulting. Per ``feedback_intentionally_left_blank.md``.
+
+    BaseBackend + the factory pattern remain in place so re-introducing
+    a backend (Q3 MCP, local Ollama, etc.) is a pure-extend: add a new
+    branch + a sibling module in ``backends/`` — no architectural
+    re-work.
+    """
     backend_name = config.agent.backend
     if backend_name == "claude":
         return ClaudeBackend(config.agent.claude)
-    elif backend_name == "zo":
-        return ZoBackend(config.agent.zo)
-    elif backend_name == "openclaw":
-        return OpenClawBackend(config.agent.openclaw)
-    else:
-        raise ValueError(f"Unknown backend: {backend_name}")
-
-
-def snapshot_vault(
-    vault_path: Path, ignore_dirs: list[str] | None = None
-) -> dict[str, str]:
-    """Capture SHA-256 checksums of all .md files in the vault."""
-    ignore = set(ignore_dirs or [])
-    checksums: dict[str, str] = {}
-
-    for md_file in vault_path.rglob("*.md"):
-        rel = md_file.relative_to(vault_path)
-        if is_ignored_path(rel, ignore):
-            continue
-        try:
-            content = md_file.read_bytes()
-            checksums[str(rel).replace("\\", "/")] = hashlib.sha256(
-                content
-            ).hexdigest()
-        except OSError:
-            continue
-
-    return checksums
-
-
-def diff_vault(
-    before: dict[str, str],
-    after: dict[str, str],
-) -> tuple[list[str], list[str], list[str]]:
-    """Compare two vault snapshots. Returns (created, modified, deleted)."""
-    created: list[str] = []
-    modified: list[str] = []
-    deleted: list[str] = []
-
-    for path, checksum in after.items():
-        if path not in before:
-            created.append(path)
-        elif before[path] != checksum:
-            modified.append(path)
-
-    for path in before:
-        if path not in after:
-            deleted.append(path)
-
-    return created, modified, deleted
+    raise ValueError(
+        f"Unknown distiller backend: {backend_name!r}. "
+        f"Supported backends: 'claude'. "
+        f"(zo / openclaw were removed in the backend-abstraction-collapse "
+        f"arc 2026-05-25; update agent.backend in your config.yaml)"
+    )
 
 
 def _get_project_description(
@@ -393,209 +349,101 @@ async def run_extraction(
         for batch in batches:
             await _run_v2_shadow(batch, config, run_id)
 
-    if _use_pipeline(config):
-        # Multi-stage pipeline for OpenClaw backend
-        session_path = create_session_file()
-        any_created = False
+    # Multi-stage pipeline (Claude is the only surviving agent backend
+    # post backend-abstraction-collapse 2026-05-25; the OpenClaw share
+    # of this path was retired in the same arc, and the Zo legacy
+    # single-call fallback that used to follow was deleted too).
+    session_path = create_session_file()
+    any_created = False
 
-        for batch in batches:
-            log.info(
-                "extraction.pipeline_invoke",
-                run_id=run_id,
-                project=batch.project or "(ungrouped)",
-                sources=len(batch.source_records),
+    for batch in batches:
+        log.info(
+            "extraction.pipeline_invoke",
+            run_id=run_id,
+            project=batch.project or "(ungrouped)",
+            sources=len(batch.source_records),
+        )
+
+        pipeline_result = await run_pipeline(
+            batch=batch,
+            config=config,
+            session_path=session_path,
+        )
+
+        result.candidates_processed += pipeline_result.candidates_processed
+
+        # Merge records_created counts
+        for lt, count in pipeline_result.records_created.items():
+            result.records_created[lt] = (
+                result.records_created.get(lt, 0) + count
             )
+            any_created = True
 
-            pipeline_result = await run_pipeline(
-                batch=batch,
-                config=config,
-                session_path=session_path,
-            )
-
-            result.candidates_processed += pipeline_result.candidates_processed
-
-            # Merge records_created counts
-            for lt, count in pipeline_result.records_created.items():
-                result.records_created[lt] = (
-                    result.records_created.get(lt, 0) + count
-                )
-                any_created = True
-
-            # Update source file states
-            mutations = read_mutations(session_path)
-            created = mutations["files_created"]
-            source_paths = [sc.record.rel_path for sc in batch.source_records]
-
-            for f in created:
-                learn_type = "unknown"
-                for lt in config.extraction.learn_types:
-                    if f.startswith(f"{lt}/"):
-                        learn_type = lt
-                        break
-
-                state.add_log_entry(
-                    ExtractionLogEntry(
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                        run_id=run_id,
-                        action="created",
-                        learn_type=learn_type,
-                        learn_file=f,
-                        source_files=source_paths,
-                        detail=f"Pipeline: {batch.project or 'ungrouped'} batch",
-                    )
-                )
-                # Idle-tick counter — one learn record created = one event.
-                heartbeat.record_event()
-
-            for sc in batch.source_records:
-                learn_paths = [
-                    f
-                    for f in created
-                    if any(f.startswith(f"{lt}/") for lt in config.extraction.learn_types)
-                ]
-                state.update_file(
-                    sc.record.rel_path, sc.md5, learn_paths,
-                    body_hash=sc.body_hash,
-                )
-
-            # Refresh MD5s after pipeline may have written distiller_signals /
-            # distiller_learnings back to source files (prevents re-qualify loop).
-            recompute_source_md5s(batch.source_records, vault_path, state)
-
-            if not pipeline_result.success:
-                log.error(
-                    "extraction.pipeline_failed",
-                    run_id=run_id,
-                    summary=pipeline_result.summary[:500],
-                )
-
-        # Pass B: Cross-learning meta-analysis (runs once after all batches)
-        if any_created:
-            log.info("extraction.passb_start", run_id=run_id)
-            meta_created = await run_meta_analysis(config, session_path)
-            if meta_created > 0:
-                result.records_created["meta"] = meta_created
-
-        # Final audit and cleanup
+        # Update source file states
         mutations = read_mutations(session_path)
-        audit_mutations = {
-            "files_created": mutations["files_created"],
-            "files_modified": mutations["files_modified"],
-            "files_deleted": mutations["files_deleted"],
-        }
-        audit_path = str(Path(config.state.path).parent / "vault_audit.log")
-        append_to_audit_log(audit_path, "distiller", audit_mutations, detail=run_id)
-        cleanup_session_file(session_path)
+        created = mutations["files_created"]
+        source_paths = [sc.record.rel_path for sc in batch.source_records]
 
-    else:
-        # Legacy path for Claude and Zo backends
-        skill_text = _load_skill(skills_dir)
-        if not skill_text:
-            log.warning("extraction.no_skill", msg="No SKILL.md found — skipping agent")
-            state.add_run(result)
-            state.save()
-            return result
+        for f in created:
+            learn_type = "unknown"
+            for lt in config.extraction.learn_types:
+                if f.startswith(f"{lt}/"):
+                    learn_type = lt
+                    break
 
-        backend = _create_backend(config)
-        use_mutation_log = isinstance(backend, (ClaudeBackend, OpenClawBackend))
-
-        for batch in batches:
-            project_desc = _get_project_description(vault_path, batch.project)
-
-            prompt = build_extraction_prompt(
-                skill_text=skill_text,
-                vault_path=str(vault_path),
-                project_name=batch.project,
-                project_description=project_desc,
-                existing_learns_formatted=format_existing_learns(batch.existing_learns),
-                source_records_formatted=format_source_records(batch.source_records),
-            )
-
-            session_path = None
-            if use_mutation_log:
-                session_path = create_session_file()
-                backend.env_overrides = {
-                    "ALFRED_VAULT_PATH": str(vault_path),
-                    "ALFRED_VAULT_SCOPE": "distiller",
-                    "ALFRED_VAULT_SESSION": session_path,
-                }
-            else:
-                before = snapshot_vault(vault_path, config.vault.ignore_dirs)
-
-            log.info(
-                "extraction.agent_invoke",
-                run_id=run_id,
-                project=batch.project or "(ungrouped)",
-                sources=len(batch.source_records),
-            )
-
-            agent_result = await backend.process(
-                prompt=prompt,
-                vault_path=str(vault_path),
-            )
-
-            if use_mutation_log and session_path:
-                mutations = read_mutations(session_path)
-                created = mutations["files_created"]
-                modified = mutations["files_modified"]
-                deleted = mutations["files_deleted"]
-                cleanup_session_file(session_path)
-            else:
-                after = snapshot_vault(vault_path, config.vault.ignore_dirs)
-                created, modified, deleted = diff_vault(before, after)
-
-            audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
-            audit_path = str(Path(config.state.path).parent / "vault_audit.log")
-            append_to_audit_log(audit_path, "distiller", audit_mutations, detail=run_id)
-
-            result.candidates_processed += len(batch.source_records)
-
-            source_paths = [sc.record.rel_path for sc in batch.source_records]
-            for f in created:
-                learn_type = "unknown"
-                for lt in config.extraction.learn_types:
-                    if f.startswith(f"{lt}/"):
-                        learn_type = lt
-                        break
-
-                result.records_created[learn_type] = (
-                    result.records_created.get(learn_type, 0) + 1
-                )
-
-                state.add_log_entry(
-                    ExtractionLogEntry(
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                        run_id=run_id,
-                        action="created",
-                        learn_type=learn_type,
-                        learn_file=f,
-                        source_files=source_paths,
-                        detail=f"Extracted from {batch.project or 'ungrouped'} batch",
-                    )
-                )
-                # Idle-tick counter — one learn record created = one event.
-                heartbeat.record_event()
-
-            for sc in batch.source_records:
-                learn_paths = [
-                    f
-                    for f in created
-                    if any(f.startswith(f"{lt}/") for lt in config.extraction.learn_types)
-                ]
-                state.update_file(
-                    sc.record.rel_path, sc.md5, learn_paths,
-                    body_hash=sc.body_hash,
-                )
-
-            # Refresh MD5s after legacy agent path may have written back to source files.
-            recompute_source_md5s(batch.source_records, vault_path, state)
-
-            if not agent_result.success:
-                log.error(
-                    "extraction.agent_failed",
+            state.add_log_entry(
+                ExtractionLogEntry(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
                     run_id=run_id,
-                    summary=agent_result.summary[:500],
+                    action="created",
+                    learn_type=learn_type,
+                    learn_file=f,
+                    source_files=source_paths,
+                    detail=f"Pipeline: {batch.project or 'ungrouped'} batch",
                 )
+            )
+            # Idle-tick counter — one learn record created = one event.
+            heartbeat.record_event()
+
+        for sc in batch.source_records:
+            learn_paths = [
+                f
+                for f in created
+                if any(f.startswith(f"{lt}/") for lt in config.extraction.learn_types)
+            ]
+            state.update_file(
+                sc.record.rel_path, sc.md5, learn_paths,
+                body_hash=sc.body_hash,
+            )
+
+        # Refresh MD5s after pipeline may have written distiller_signals /
+        # distiller_learnings back to source files (prevents re-qualify loop).
+        recompute_source_md5s(batch.source_records, vault_path, state)
+
+        if not pipeline_result.success:
+            log.error(
+                "extraction.pipeline_failed",
+                run_id=run_id,
+                summary=pipeline_result.summary[:500],
+            )
+
+    # Pass B: Cross-learning meta-analysis (runs once after all batches)
+    if any_created:
+        log.info("extraction.passb_start", run_id=run_id)
+        meta_created = await run_meta_analysis(config, session_path)
+        if meta_created > 0:
+            result.records_created["meta"] = meta_created
+
+    # Final audit and cleanup
+    mutations = read_mutations(session_path)
+    audit_mutations = {
+        "files_created": mutations["files_created"],
+        "files_modified": mutations["files_modified"],
+        "files_deleted": mutations["files_deleted"],
+    }
+    audit_path = str(Path(config.state.path).parent / "vault_audit.log")
+    append_to_audit_log(audit_path, "distiller", audit_mutations, detail=run_id)
+    cleanup_session_file(session_path)
 
     log.info(
         "extraction.complete",

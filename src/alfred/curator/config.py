@@ -64,45 +64,24 @@ class ClaudeBackendConfig:
 
 
 @dataclass
-class ZoBackendConfig:
-    url: str = ""
-    method: str = "POST"
-    headers: dict[str, str] = field(default_factory=dict)
-    request_body_template: dict[str, Any] = field(default_factory=dict)
-    response_content_path: str = "response.content"
-    timeout: int = 300
+class AgentConfig:
+    """Agent backend selector.
 
+    Post backend-abstraction-collapse (2026-05-25): ``claude`` is the
+    only surviving backend. The ``backend`` field is retained as a
+    fail-loud guard against stale config values (zo / openclaw /
+    hermes are rejected at startup by ``_create_backend``) and to
+    leave the door open for future re-introductions (Q3 MCP / local
+    Ollama agent backend) which would extend the field's value set.
 
-@dataclass
-class OpenClawBackendConfig:
-    command: str = "openclaw"
-    args: list[str] = field(default_factory=list)
-    workspace_mount: str = ""
-    timeout: int = 300
-    agent_id: str = "vault-curator"
-
-
-@dataclass
-class HermesBackendConfig:
-    """Hermes HTTP backend config — sends prompts to a persistent Background
-    Hermes agent via its webui API (POST /api/chat/start → SSE stream).
-
-    ``url`` defaults to the empty string; at runtime the HermesBackend falls
-    back to the ``HERMES_BG_URL`` env var, and finally to
-    ``http://hermes-bg:8787`` (docker service name). Ref upstream 8e2673c.
+    ZoBackendConfig / OpenClawBackendConfig / HermesBackendConfig
+    dataclasses were removed in the same arc; if a re-introduced
+    backend needs its own config block, add a fresh dataclass + a
+    field here in the same commit.
     """
 
-    url: str = ""
-    timeout: int = 300
-
-
-@dataclass
-class AgentConfig:
     backend: str = "claude"
     claude: ClaudeBackendConfig = field(default_factory=ClaudeBackendConfig)
-    zo: ZoBackendConfig = field(default_factory=ZoBackendConfig)
-    openclaw: OpenClawBackendConfig = field(default_factory=OpenClawBackendConfig)
-    hermes: HermesBackendConfig = field(default_factory=HermesBackendConfig)
 
 
 @dataclass
@@ -171,9 +150,6 @@ _DATACLASS_MAP: dict[str, type] = {
     "vault": VaultConfig,
     "agent": AgentConfig,
     "claude": ClaudeBackendConfig,
-    "zo": ZoBackendConfig,
-    "openclaw": OpenClawBackendConfig,
-    "hermes": HermesBackendConfig,
     "watcher": WatcherConfig,
     "state": StateConfig,
     "logging": LoggingConfig,

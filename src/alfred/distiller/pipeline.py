@@ -12,11 +12,9 @@ Pass B — Cross-learning meta-analysis:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
-import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -260,145 +258,64 @@ async def _call_llm(
         "ALFRED_VAULT_SESSION": session_path,
     }
 
-    if backend_name == "claude":
-        from .backends.cli import ClaudeBackend
-
-        backend = ClaudeBackend(config.agent.claude, env_overrides=env_overrides)
-        log.info("pipeline.llm_call", stage=stage_label, backend="claude")
-
-        result = await backend.process(prompt=prompt, vault_path=vault_path)
-
-        if not result.success:
-            # Enrich the failure log with stdout diagnostics. The backend's
-            # summary alone reads "Exit code 1: " when both stdout and stderr
-            # are empty — we surface the first 200 chars of stdout (rate-limit
-            # messages and similar errors front-load) plus a tail for grep.
-            raw_stdout = result.stdout or ""
-            raw_stderr = result.stderr or ""
-            if raw_stdout:
-                detail = raw_stdout[:200]
-            elif raw_stderr:
-                detail = raw_stderr[:200]
-            else:
-                detail = "(no output)"
-            enriched_summary = f"Exit code 1: {detail}"
-            log.warning(
-                "pipeline.llm_failed",
-                stage=stage_label,
-                summary=enriched_summary[:500],
-                backend_summary=result.summary[:500],
-                stdout_tail=raw_stdout[-2000:] if raw_stdout else "",
-                stderr=raw_stderr[:500],
-            )
-            # Return raw stdout (may be empty) rather than the backend's
-            # error-summary string like "Exit code 1: ". The caller's
-            # "if not manifest and stdout" guard short-circuits parsing when
-            # stdout is empty; previously we returned "Exit code 1: " (13
-            # chars) which passed the guard and produced a noisy
-            # pipeline.manifest_parse_failed stdout_len=13 log entry with
-            # no real signal.
-            return raw_stdout
-        log.info(
-            "pipeline.llm_completed",
-            stage=stage_label,
-            stdout_len=len(result.summary),
+    # Post backend-abstraction-collapse (2026-05-25), Claude is the only
+    # surviving agent backend. The openclaw branch (subprocess via
+    # ``openclaw agent``) was retired in the same arc. Unknown backend
+    # names fail loud rather than silently degrading to empty output.
+    if backend_name != "claude":
+        log.error(
+            "pipeline.unsupported_backend",
+            backend=backend_name,
+            msg=(
+                "Distiller pipeline only supports 'claude' post 2026-05-25 "
+                "backend-abstraction-collapse; update agent.backend in config.yaml"
+            ),
         )
-        return result.summary
-
-    elif backend_name == "openclaw":
-        from .backends.openclaw import (
-            _clear_agent_sessions,
-            _sync_workspace_claude_md,
-        )
-
-        oc = config.agent.openclaw
-        session_id = f"distiller-{stage_label}-{uuid.uuid4().hex[:8]}"
-
-        _clear_agent_sessions(oc.agent_id)
-        _sync_workspace_claude_md(oc.agent_id, vault_path)
-
-        # Write prompt to a temp file and pass via reference to avoid
-        # OSError: [Errno 7] Argument list too long when the prompt
-        # (which includes full record content) exceeds the OS arg limit.
-        prompt_file = None
-        try:
-            prompt_file = tempfile.NamedTemporaryFile(
-                mode="w",
-                prefix=f"alfred-distiller-{stage_label}-",
-                suffix=".md",
-                delete=False,
-                encoding="utf-8",
-            )
-            prompt_file.write(prompt)
-            prompt_file.close()
-            prompt_path = prompt_file.name
-        except OSError:
-            log.error("pipeline.prompt_file_write_failed", stage=stage_label)
-            return ""
-
-        cmd = [
-            oc.command, "agent", *oc.args,
-            "--agent", oc.agent_id,
-            "--session-id", session_id,
-            "--message", f"Follow the instructions in {prompt_path}",
-            "--local", "--json",
-        ]
-
-        env = {**os.environ, **env_overrides}
-
-        log.info(
-            "pipeline.llm_call",
-            stage=stage_label,
-            backend="openclaw",
-            agent_id=oc.agent_id,
-            session_id=session_id,
-            prompt_file=prompt_path,
-        )
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=oc.timeout,
-            )
-        except asyncio.TimeoutError:
-            log.error("pipeline.llm_timeout", stage=stage_label, timeout=oc.timeout)
-            return ""
-        except FileNotFoundError:
-            log.error("pipeline.command_not_found", command=oc.command)
-            return ""
-        finally:
-            if prompt_file is not None:
-                try:
-                    os.unlink(prompt_path)
-                except OSError:
-                    pass
-
-        raw = stdout_bytes.decode("utf-8", errors="replace")
-        err = stderr_bytes.decode("utf-8", errors="replace")
-
-        if proc.returncode != 0:
-            log.warning(
-                "pipeline.llm_nonzero_exit",
-                stage=stage_label,
-                code=proc.returncode,
-                stderr=err[:500],
-                stdout_tail=raw[-2000:] if raw else "",
-            )
-            return raw
-
-        log.info("pipeline.llm_completed", stage=stage_label, stdout_len=len(raw))
-        return raw
-
-    else:
-        log.error("pipeline.unsupported_backend", backend=backend_name,
-                  msg="Pipeline requires 'claude' or 'openclaw' backend")
         return ""
+
+    from .backends.cli import ClaudeBackend
+
+    backend = ClaudeBackend(config.agent.claude, env_overrides=env_overrides)
+    log.info("pipeline.llm_call", stage=stage_label, backend="claude")
+
+    result = await backend.process(prompt=prompt, vault_path=vault_path)
+
+    if not result.success:
+        # Enrich the failure log with stdout diagnostics. The backend's
+        # summary alone reads "Exit code 1: " when both stdout and stderr
+        # are empty — we surface the first 200 chars of stdout (rate-limit
+        # messages and similar errors front-load) plus a tail for grep.
+        raw_stdout = result.stdout or ""
+        raw_stderr = result.stderr or ""
+        if raw_stdout:
+            detail = raw_stdout[:200]
+        elif raw_stderr:
+            detail = raw_stderr[:200]
+        else:
+            detail = "(no output)"
+        enriched_summary = f"Exit code 1: {detail}"
+        log.warning(
+            "pipeline.llm_failed",
+            stage=stage_label,
+            summary=enriched_summary[:500],
+            backend_summary=result.summary[:500],
+            stdout_tail=raw_stdout[-2000:] if raw_stdout else "",
+            stderr=raw_stderr[:500],
+        )
+        # Return raw stdout (may be empty) rather than the backend's
+        # error-summary string like "Exit code 1: ". The caller's
+        # "if not manifest and stdout" guard short-circuits parsing when
+        # stdout is empty; previously we returned "Exit code 1: " (13
+        # chars) which passed the guard and produced a noisy
+        # pipeline.manifest_parse_failed stdout_len=13 log entry with
+        # no real signal.
+        return raw_stdout
+    log.info(
+        "pipeline.llm_completed",
+        stage=stage_label,
+        stdout_len=len(result.summary),
+    )
+    return result.summary
 
 
 # ---------------------------------------------------------------------------

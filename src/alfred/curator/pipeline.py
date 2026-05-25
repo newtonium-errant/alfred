@@ -1,30 +1,45 @@
-"""4-stage curator pipeline — replaces the monolithic single-call approach.
+"""Curator pipeline helpers — surviving utilities after backend collapse.
 
-Stage 1: ANALYZE + WRITE NOTE (LLM) — short prompt, creates one note, returns JSON entity manifest
-Stage 2: ENTITY RESOLUTION (pure Python) — deduplicate & create entities via vault ops
-Stage 3: INTERLINK (pure Python) — wire up wikilinks between note and entities
-Stage 4: ENRICH ENTITIES (LLM, per-entity) — fill body + frontmatter for each entity
+History: this module previously contained the 4-stage curator pipeline
+(``run_pipeline`` + Stage 1 LLM ``_call_llm`` + Stages 2-4) used only when
+``agent.backend == "openclaw"``. The 4-stage path was OpenClaw-only by
+design; Claude (the production backend) always ran the legacy single-call
+path in ``daemon.py``.
+
+The backend-abstraction-collapse arc (2026-05-25) removed the OpenClaw
+backend and with it the dead pipeline orchestration. What survives here
+are the pure-Python helpers that other call sites still use:
+
+- :func:`_apply_preference_filter` — Stage 1.5 operator-preference gate
+  (V1 ``skip_event_if``). Today called only from
+  ``tests/preferences/test_curator_preference_filter.py``; the live
+  curator daemon's legacy single-call path doesn't currently invoke it
+  (that re-wiring is a separate arc). Kept here because the operator
+  preferences V1 contract is still load-bearing — the next-gen curator
+  agent (whatever shape it takes) MUST re-enter through this gate, so
+  the helper has to stay reachable.
+- :func:`_resolve_entities` + supporting helpers (:func:`_normalize_name`,
+  :func:`_entity_exists`) — Stage 2 entity-resolution logic. Used by
+  ``tests/curator/test_pipeline_attribution.py`` to pin the
+  attribution-marker wrapping contract on agent-inferred entity bodies.
+  Pure Python — reachable from any future Stage-2 caller.
+
+Future re-introduction of a multi-stage pipeline (Q3 MCP migration or
+similar) should either re-add the orchestration here or move these
+helpers into a more-aptly-named module (e.g. ``entity_resolver.py``).
+The deliberate choice to leave them in ``pipeline.py`` is to avoid
+introducing new files in a pure-subtractive cleanup commit.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
-import os
-import re
-import tempfile
-import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
 
-from alfred.preferences.loader import Preference, load_active_preferences
+from alfred.preferences.loader import Preference
 from alfred.preferences.matchers import evaluate
 from alfred.vault.mutation_log import log_mutation
-from alfred.vault.ops import VaultError, vault_create, vault_edit, vault_read
+from alfred.vault.ops import VaultError, vault_create
 
-from .backends import VAULT_CLI_REFERENCE
-from .backends.openclaw import OpenClawBackend, _clear_agent_sessions, sync_workspace_claude_md
-from .config import CuratorConfig
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -34,11 +49,10 @@ log = get_logger(__name__)
 # Operator-preference action gates (V1)
 # ---------------------------------------------------------------------------
 #
-# Curator stage 1 emits an entity manifest with mixed-type candidates
-# (person, org, event, project, etc.). The action-gate filter runs
-# BEFORE stage 2 creates anything, so a "skip open-house events"
-# preference cannot leave a half-created event in the vault if the
-# filter fires mid-pipeline.
+# Entity manifests carry mixed-type candidates (person, org, event,
+# project, etc.). The action-gate filter runs BEFORE entity creation so
+# a "skip open-house events" preference cannot leave a half-created
+# event in the vault if the filter fires mid-flow.
 #
 # Per project_operator_preferences_v1.md Hard Contract #1+#2: V1
 # scope is event records via ``skip_event_if`` (the originating
@@ -54,7 +68,7 @@ def _apply_preference_filter(
     manifest: list[dict],
     prefs: list[Preference],
 ) -> list[dict]:
-    """Filter the Stage 1 manifest against active action preferences.
+    """Filter an entity manifest against active action preferences.
 
     Returns the manifest with skipped candidates removed. Logs one
     ``curator.preference_filter_dropped`` per drop, carrying the
@@ -130,336 +144,8 @@ def _apply_preference_filter(
     return kept
 
 
-@dataclass
-class PipelineResult:
-    """Result from the 4-stage pipeline."""
-
-    success: bool = False
-    note_path: str = ""
-    entities_created: list[str] = field(default_factory=list)
-    entities_existing: list[str] = field(default_factory=list)
-    entities_enriched: list[str] = field(default_factory=list)
-    summary: str = ""
-
-
-# Entity types that don't benefit from LLM enrichment (too simple)
-_SKIP_ENRICH_TYPES = {"location", "event"}
-
-
-def _load_stage_prompt(stage_file: str) -> str:
-    """Load a stage prompt from the bundled skills directory."""
-    from alfred._data import get_skills_dir
-
-    prompt_path = get_skills_dir() / "vault-curator" / "prompts" / stage_file
-    if not prompt_path.exists():
-        log.warning("pipeline.prompt_not_found", path=str(prompt_path))
-        return ""
-    return prompt_path.read_text(encoding="utf-8")
-
-
-def _load_user_profile(vault_path: Path) -> str:
-    """Load the vault owner's profile for entity relevance filtering.
-
-    Searches for a user-profile.md in the vault root first, then falls back
-    to common locations.
-    """
-    candidates = [
-        vault_path / "user-profile.md",
-        Path.home() / ".config" / "alfred" / "user-profile.md",
-    ]
-    for path in candidates:
-        if path.exists():
-            try:
-                text = path.read_text(encoding="utf-8")
-                if text.strip():
-                    return text
-            except OSError:
-                continue
-    return "(no user profile available — use your best judgement about relevance)"
-
-
-def _extract_entities_from_text(text: str) -> list[dict] | None:
-    """Find a JSON object with an ``entities`` array anywhere in text.
-
-    Uses brace-depth tracking to handle nested objects. Returns the parsed
-    list, or None if no match found.
-    """
-    for match in re.finditer(r'\{[^{}]*"entities"\s*:\s*\[', text):
-        start = match.start()
-        depth = 0
-        for i in range(start, len(text)):
-            if text[i] == '{':
-                depth += 1
-            elif text[i] == '}':
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start:i + 1]
-                    try:
-                        data = json.loads(candidate)
-                        if isinstance(data.get("entities"), list):
-                            return data["entities"]
-                    except json.JSONDecodeError:
-                        continue
-                    break
-    return None
-
-
-def _parse_entity_manifest(stdout: str) -> list[dict]:
-    """Extract the JSON entity manifest from LLM stdout.
-
-    Searches in order:
-      1. Markdown fenced code blocks (```json ... ```) — the preferred
-         fallback when the model can't (or won't) use the Write tool.
-      2. Raw JSON with ``"entities"`` anywhere in the output.
-      3. Entire stdout parsed as a JSON document.
-
-    Ref upstream f4dea8c — model-agnostic prompts may include the manifest
-    inline inside a ```json block instead of writing to the temp file.
-    """
-    if not stdout or '"entities"' not in stdout:
-        log.warning("pipeline.manifest_parse_failed", stdout_len=len(stdout))
-        return []
-
-    # Tier 1: Extract from markdown code blocks (```json ... ```)
-    for block_match in re.finditer(r'```(?:json)?\s*\n(.*?)\n```', stdout, re.DOTALL):
-        block = block_match.group(1).strip()
-        if '"entities"' in block:
-            result = _extract_entities_from_text(block)
-            if result is not None:
-                return result
-
-    # Tier 2: Find JSON with "entities" anywhere in the raw output
-    result = _extract_entities_from_text(stdout)
-    if result is not None:
-        return result
-
-    # Tier 3: Try to parse the entire stdout as JSON
-    try:
-        data = json.loads(stdout.strip())
-        if isinstance(data.get("entities"), list):
-            return data["entities"]
-    except (json.JSONDecodeError, AttributeError):
-        pass
-
-    log.warning("pipeline.manifest_parse_failed", stdout_len=len(stdout))
-    return []
-
-
-def _find_created_note(stdout: str, session_path: str) -> str:
-    """Find the note path created in Stage 1 by reading the mutation log."""
-    from alfred.vault.mutation_log import read_mutations
-
-    mutations = read_mutations(session_path)
-    for path in mutations.get("files_created", []):
-        if path.startswith("note/"):
-            return path
-    return ""
-
-
-async def _call_llm(
-    prompt: str,
-    config: CuratorConfig,
-    session_path: str,
-    stage_label: str,
-) -> str:
-    """Make an isolated OpenClaw call and return stdout.
-
-    Handles session clearing, workspace sync, subprocess exec with
-    --local --json, and timeout.
-    """
-    oc = config.agent.openclaw
-    session_id = f"curator-{stage_label}-{uuid.uuid4().hex[:8]}"
-
-    # Clear previous session state
-    _clear_agent_sessions(oc.agent_id)
-
-    # Ensure workspace has latest vault CLAUDE.md
-    sync_workspace_claude_md(oc.agent_id, str(config.vault.vault_path))
-
-    # Write prompt to a temp file and pass via stdin to avoid
-    # OSError: [Errno 7] Argument list too long when the prompt
-    # (which includes full inbox content) exceeds the OS arg limit.
-    prompt_file = None
-    try:
-        prompt_file = tempfile.NamedTemporaryFile(
-            mode="w",
-            prefix=f"alfred-curator-{stage_label}-",
-            suffix=".md",
-            delete=False,
-            encoding="utf-8",
-        )
-        prompt_file.write(prompt)
-        prompt_file.close()
-        prompt_path = prompt_file.name
-    except OSError:
-        log.error("pipeline.prompt_file_write_failed", stage=stage_label)
-        return ""
-
-    cmd = [
-        oc.command, "agent", *oc.args,
-        "--agent", oc.agent_id,
-        "--session-id", session_id,
-        "--message", f"Follow the instructions in {prompt_path}",
-        "--local", "--json",
-    ]
-
-    env = {
-        **os.environ,
-        "ALFRED_VAULT_PATH": str(config.vault.vault_path),
-        "ALFRED_VAULT_SCOPE": "curator",
-        "ALFRED_VAULT_SESSION": session_path,
-    }
-
-    log.info(
-        "pipeline.llm_call",
-        stage=stage_label,
-        agent_id=oc.agent_id,
-        session_id=session_id,
-        prompt_file=prompt_path,
-    )
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=oc.timeout,
-        )
-    except asyncio.TimeoutError:
-        log.error("pipeline.llm_timeout", stage=stage_label, timeout=oc.timeout)
-        return ""
-    except FileNotFoundError:
-        log.error("pipeline.command_not_found", command=oc.command)
-        return ""
-    finally:
-        # Clean up prompt temp file
-        if prompt_file is not None:
-            try:
-                os.unlink(prompt_path)
-            except OSError:
-                pass
-
-    raw = stdout_bytes.decode("utf-8", errors="replace")
-    err = stderr_bytes.decode("utf-8", errors="replace")
-
-    if proc.returncode != 0:
-        log.warning(
-            "pipeline.llm_nonzero_exit",
-            stage=stage_label,
-            code=proc.returncode,
-            stderr=err[:500],
-            stdout_tail=raw[-2000:] if raw else "",
-        )
-        return raw  # Return whatever output we got — note may still have been created
-
-    log.info("pipeline.llm_completed", stage=stage_label, stdout_len=len(raw))
-    return raw
-
-
 # ---------------------------------------------------------------------------
-# Stage 1: Analyze + Write Note (LLM)
-# ---------------------------------------------------------------------------
-
-
-async def _stage1_analyze(
-    inbox_content: str,
-    inbox_filename: str,
-    vault_context_text: str,
-    config: CuratorConfig,
-    session_path: str,
-) -> tuple[str, list[dict]]:
-    """Stage 1: LLM creates a note and returns an entity manifest.
-
-    Returns (note_path, entity_manifest).
-
-    The LLM is instructed to write the entity manifest JSON to a temp file
-    rather than stdout, because OpenClaw's stdout contains the full agent
-    conversation mixed in, making JSON extraction unreliable.  We fall back
-    to stdout parsing if the temp file is missing or unreadable.
-    """
-    template = _load_stage_prompt("stage1_analyze.md")
-    if not template:
-        return "", []
-
-    # Generate a unique manifest file path for the LLM to write to
-    manifest_id = uuid.uuid4().hex[:12]
-    manifest_path = f"/tmp/alfred-curator-{manifest_id}-manifest.json"
-
-    prompt = template.format(
-        vault_cli_reference=VAULT_CLI_REFERENCE,
-        vault_context=vault_context_text,
-        inbox_filename=inbox_filename,
-        inbox_content=inbox_content,
-        manifest_path=manifest_path,
-        user_profile=_load_user_profile(config.vault.vault_path),
-    )
-
-    max_attempts = 3
-    note_path = ""
-    manifest: list[dict] = []
-
-    for attempt in range(1, max_attempts + 1):
-        stdout = await _call_llm(prompt, config, session_path, "s1-analyze")
-
-        # Find the note that was created via mutation log (only on first attempt)
-        if not note_path:
-            note_path = _find_created_note(stdout, session_path)
-            if not note_path:
-                log.warning("pipeline.s1_no_note_created", file=inbox_filename)
-
-        # Try to read the entity manifest from the temp file first
-        try:
-            manifest_file = Path(manifest_path)
-            if manifest_file.exists():
-                raw_json = manifest_file.read_text(encoding="utf-8").strip()
-                data = json.loads(raw_json)
-                if isinstance(data.get("entities"), list):
-                    manifest = data["entities"]
-                    log.info(
-                        "pipeline.manifest_from_file",
-                        path=manifest_path,
-                        entities=len(manifest),
-                    )
-        except (json.JSONDecodeError, OSError, KeyError) as e:
-            log.warning("pipeline.manifest_file_read_failed", path=manifest_path, error=str(e))
-        finally:
-            # Clean up the temp manifest file
-            try:
-                Path(manifest_path).unlink(missing_ok=True)
-            except OSError:
-                pass
-
-        # Fallback: parse entity manifest from stdout if file method failed
-        if not manifest:
-            manifest = _parse_entity_manifest(stdout)
-            if manifest:
-                log.info("pipeline.manifest_from_stdout", entities=len(manifest))
-
-        if manifest:
-            break
-
-        if attempt < max_attempts:
-            log.warning(
-                "pipeline.s1_manifest_retry",
-                file=inbox_filename,
-                attempt=attempt,
-                max_attempts=max_attempts,
-            )
-
-    log.info(
-        "pipeline.s1_complete",
-        note_path=note_path,
-        entities_found=len(manifest),
-    )
-    return note_path, manifest
-
-
-# ---------------------------------------------------------------------------
-# Stage 2: Entity Resolution + Creation (pure Python)
+# Entity resolution (Stage 2 helpers)
 # ---------------------------------------------------------------------------
 
 
@@ -477,8 +163,9 @@ def _entity_exists(vault_path: Path, entity_type: str, name: str) -> str | None:
 
     Returns the canonical rel_path as it lives on disk (preserving the
     existing file's casing) if a case-insensitive stem match is found,
-    otherwise None. This prevents Stage 2 from creating duplicate records
-    like ``org/PocketPills.md`` when ``org/Pocketpills.md`` already exists.
+    otherwise None. This prevents the entity-resolution stage from
+    creating duplicate records like ``org/PocketPills.md`` when
+    ``org/Pocketpills.md`` already exists.
     """
     from alfred.vault.schema import TYPE_DIRECTORY
 
@@ -498,9 +185,16 @@ def _resolve_entities(
     vault_path: Path,
     session_path: str,
 ) -> dict[str, str]:
-    """Stage 2: For each entity in the manifest, check if it exists or create it.
+    """For each entity in a manifest, check if it exists or create it.
 
-    Returns a map: "type/Name" -> rel_path (e.g. "person/John Smith" -> "person/John Smith.md")
+    Returns a map: "type/Name" -> rel_path (e.g. "person/John Smith" ->
+    "person/John Smith.md"). Mutates the vault via ``vault_create``,
+    appending to the mutation log at ``session_path`` for each
+    successful create.
+
+    Agent-inferred bodies (manifest carries a ``body`` field) are
+    wrapped in BEGIN_INFERRED markers and emit an
+    ``attribution_audit`` frontmatter entry per c4 (calibration audit).
     """
     from alfred.vault.schema import TYPE_DIRECTORY
 
@@ -531,10 +225,10 @@ def _resolve_entities(
             log.info("pipeline.s2_entity_exists", entity=entity_key)
             continue
 
-        # Use the full body from the Stage 1 manifest if provided (upstream
-        # cbedd04 schema shift: Stage 1 now emits complete markdown bodies,
-        # not stubs). Fall back to description-as-body for manifests emitted
-        # before the schema shift landed (e.g., in-flight retries).
+        # Use the full body from the manifest if provided (upstream
+        # cbedd04 schema shift: manifests carry complete markdown bodies,
+        # not stubs). Fall back to description-as-body for manifests
+        # emitted before the schema shift landed (e.g., in-flight retries).
         manifest_body = entity.get("body", "")
         if manifest_body and manifest_body.strip():
             body = manifest_body
@@ -551,22 +245,22 @@ def _resolve_entities(
                 v = v.strip('"')
             set_fields[k] = v
 
-        # Calibration audit gap (c4): Stage 1's manifest body is
-        # composed by the curator agent (LLM) from the inbox content,
-        # so the body that lands here is agent-inferred. Wrap it in
-        # BEGIN_INFERRED markers and append an audit_entry to
-        # frontmatter. Only wrap when there's actual body content (a
-        # bare ``# {name}`` placeholder is template scaffold, not
-        # inference — we still wrap because the model's *choice* of
-        # name/description IS the inference, and the wrap-vs-skip
-        # decision is "did the model write prose here?").
+        # Calibration audit gap (c4): the manifest body is composed by
+        # the curator agent (LLM) from inbox content, so the body that
+        # lands here is agent-inferred. Wrap it in BEGIN_INFERRED
+        # markers and append an audit_entry to frontmatter. Only wrap
+        # when there's actual body content (a bare ``# {name}``
+        # placeholder is template scaffold, not inference — we still
+        # wrap because the model's *choice* of name/description IS the
+        # inference, and the wrap-vs-skip decision is "did the model
+        # write prose here?").
         from alfred.vault import attribution
         if body and body.strip():
             wrapped_body, audit_entry = attribution.with_inferred_marker(
                 body,
                 section_title=name or entity_key,
                 agent="curator",
-                reason=f"curator stage 2 entity create (inbox source)",
+                reason="curator stage 2 entity create (inbox source)",
             )
             body = wrapped_body
             existing_audit = set_fields.get("attribution_audit")
@@ -591,10 +285,11 @@ def _resolve_entities(
             log.info("pipeline.s2_entity_created", entity=entity_key, path=rel_path)
         except VaultError as e:
             details = getattr(e, "details", None) or {}
-            # Near-match collision: vault_create refused because a record with
-            # a matching casefolded name already exists. Reuse the canonical
-            # path from the structured error details so downstream stages
-            # reference the existing record instead of dropping the entity.
+            # Near-match collision: vault_create refused because a record
+            # with a matching casefolded name already exists. Reuse the
+            # canonical path from the structured error details so
+            # downstream callers reference the existing record instead
+            # of dropping the entity.
             if details.get("reason") == "near_match" and details.get("canonical_path"):
                 canonical_path = details["canonical_path"]
                 resolved[entity_key] = canonical_path
@@ -611,297 +306,3 @@ def _resolve_entities(
                 resolved[entity_key] = f"{directory}/{name}.md"
 
     return resolved
-
-
-# ---------------------------------------------------------------------------
-# Stage 3: Interlink (pure Python)
-# ---------------------------------------------------------------------------
-
-
-def _interlink(
-    note_path: str,
-    resolved_entities: dict[str, str],
-    manifest: list[dict],
-    vault_path: Path,
-    session_path: str,
-) -> None:
-    """Stage 3: Wire up wikilinks between the note and all entities."""
-    if not note_path:
-        return
-
-    # Build wikilink-style references (without .md extension)
-    entity_links = []
-    for entity_key in resolved_entities:
-        entity_links.append(f"[[{entity_key}]]")
-
-    # Edit the note to add related links to all entities
-    if entity_links:
-        try:
-            vault_edit(
-                vault_path,
-                note_path,
-                set_fields={"related": entity_links},
-            )
-            log_mutation(session_path, "edit", note_path)
-            log.info("pipeline.s3_note_linked", note=note_path, links=len(entity_links))
-        except VaultError as e:
-            log.warning("pipeline.s3_note_link_failed", error=str(e))
-
-    # Edit each entity to add a related link back to the note
-    note_link = f"[[{note_path.removesuffix('.md')}]]"
-    for entity_key, entity_rel_path in resolved_entities.items():
-        try:
-            vault_edit(
-                vault_path,
-                entity_rel_path,
-                append_fields={"related": note_link},
-            )
-            log_mutation(session_path, "edit", entity_rel_path)
-        except VaultError as e:
-            log.warning(
-                "pipeline.s3_entity_link_failed",
-                entity=entity_key,
-                error=str(e),
-            )
-
-    log.info("pipeline.s3_complete", entities_linked=len(resolved_entities))
-
-
-# ---------------------------------------------------------------------------
-# Stage 4: Enrich Entities (LLM, per-entity)
-# ---------------------------------------------------------------------------
-
-
-async def _stage4_enrich(
-    inbox_content: str,
-    inbox_filename: str,
-    note_path: str,
-    resolved_entities: dict[str, str],
-    manifest: list[dict],
-    config: CuratorConfig,
-    session_path: str,
-) -> list[str]:
-    """Stage 4: Enrich each entity with LLM. Returns list of enriched entity paths.
-
-    Calibration audit gap (c4): Stage 4 enrichment writes happen INSIDE
-    the curator agent (subprocess via ``_call_llm`` → ``alfred vault
-    edit``). Wrapping the agent-composed body would require either a
-    post-process pass that diffs entity records before+after this call,
-    or threading attribution-marker semantics through the ``alfred
-    vault`` CLI itself. Deferred to a follow-up — Stage 2's direct
-    ``vault_create`` (above) already wraps the body the agent has the
-    most influence over (the entity's initial composition); Stage 4's
-    refinements layer on top and inherit the existing marker pair.
-    """
-    template = _load_stage_prompt("stage4_enrich.md")
-    if not template:
-        return []
-
-    vault_path = config.vault.vault_path
-    enriched: list[str] = []
-
-    # Build a lookup from entity_key to manifest entry
-    manifest_by_key: dict[str, dict] = {}
-    for entity in manifest:
-        from alfred.vault.schema import TYPE_DIRECTORY
-
-        etype = entity.get("type", "")
-        ename = _normalize_name(entity.get("name", ""), etype)
-        directory = TYPE_DIRECTORY.get(etype, etype)
-        key = f"{directory}/{ename}"
-        manifest_by_key[key] = entity
-
-    for entity_key, entity_rel_path in resolved_entities.items():
-        # Determine entity type from the key
-        parts = entity_key.split("/", 1)
-        if len(parts) != 2:
-            continue
-        entity_dir, entity_name = parts
-
-        # Look up the manifest entry for this entity
-        manifest_entry = manifest_by_key.get(entity_key, {})
-        entity_type = manifest_entry.get("type", entity_dir)
-
-        # Skip types that don't benefit from enrichment
-        if entity_type in _SKIP_ENRICH_TYPES:
-            log.info("pipeline.s4_skip", entity=entity_key, reason="type_skip_list")
-            continue
-
-        # Read current entity content
-        try:
-            record = vault_read(vault_path, entity_rel_path)
-            entity_content = json.dumps(record, indent=2, default=str)
-        except VaultError:
-            entity_content = "(could not read)"
-
-        # Determine if this is a new entity (was it created in Stage 2?)
-        # Check if it's in the entities_created list we'll track
-        is_new = entity_key not in {
-            k for k, v in resolved_entities.items()
-            if _entity_exists(vault_path, entity_type, entity_name.split("/")[-1] if "/" in entity_name else entity_name) and entity_key != k
-        }
-
-        prompt = template.format(
-            vault_cli_reference=VAULT_CLI_REFERENCE,
-            inbox_filename=inbox_filename,
-            inbox_content=inbox_content,
-            note_path=note_path,
-            entity_path=entity_rel_path,
-            entity_type=entity_type,
-            is_new="yes" if is_new else "no (existing record)",
-            entity_content=entity_content,
-        )
-
-        # Sanitize entity name for the stage label
-        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', entity_name.replace(' ', '-'))[:30]
-        stage_label = f"s4-{entity_type}-{safe_name}"
-
-        await _call_llm(prompt, config, session_path, stage_label)
-        enriched.append(entity_rel_path)
-
-        log.info("pipeline.s4_enriched", entity=entity_key)
-
-    log.info("pipeline.s4_complete", enriched=len(enriched))
-    return enriched
-
-
-# ---------------------------------------------------------------------------
-# Pipeline entry point
-# ---------------------------------------------------------------------------
-
-
-async def run_pipeline(
-    inbox_file: Path,
-    inbox_content: str,
-    vault_context_text: str,
-    config: CuratorConfig,
-    session_path: str,
-) -> PipelineResult:
-    """Run the 4-stage curator pipeline on a single inbox file.
-
-    Args:
-        inbox_file: Path to the inbox file being processed.
-        inbox_content: Text content of the inbox file.
-        vault_context_text: Pre-built vault context prompt text.
-        config: Curator configuration.
-        session_path: Path to the mutation log session file.
-
-    Returns:
-        PipelineResult with success status and details.
-    """
-    filename = inbox_file.name
-    result = PipelineResult()
-
-    log.info("pipeline.start", file=filename)
-
-    # Stage 1: Analyze + Write Note (LLM)
-    note_path, manifest = await _stage1_analyze(
-        inbox_content=inbox_content,
-        inbox_filename=filename,
-        vault_context_text=vault_context_text,
-        config=config,
-        session_path=session_path,
-    )
-    result.note_path = note_path
-
-    if not note_path and not manifest:
-        result.summary = "Stage 1 failed: no note created and no entities found"
-        log.error("pipeline.s1_failed", file=filename)
-        return result
-
-    # Stage 1.5: Operator-preference action filter (V1 — event-only).
-    # Runs BEFORE Stage 2 creates anything so a "skip open-house events"
-    # preference cannot leave a half-created event in the vault if the
-    # filter fires mid-pipeline. Loader hit per pipeline invocation is
-    # cheap (read on the order of N preference files) — no caching
-    # because the per-file invocation rate is low and operator-edited
-    # preferences need to be picked up on the next file.
-    try:
-        active_prefs = load_active_preferences(
-            config.vault.vault_path, shape="action",
-        )
-    except Exception as exc:
-        # Defensive: a preference-loader crash MUST NOT take down the
-        # curator. Log loudly + fall through with an empty preference
-        # list so the pipeline keeps running.
-        log.warning(
-            "pipeline.preference_load_failed",
-            error=str(exc),
-            error_type=type(exc).__name__,
-            detail="continuing without preference filter",
-        )
-        active_prefs = []
-    manifest = _apply_preference_filter(manifest, active_prefs)
-
-    # Stage 2: Entity Resolution + Creation (pure Python)
-    resolved = _resolve_entities(
-        manifest=manifest,
-        vault_path=config.vault.vault_path,
-        session_path=session_path,
-    )
-
-    # Classify entities as created vs existing
-    for entity_key, entity_path in resolved.items():
-        parts = entity_key.split("/", 1)
-        if len(parts) == 2:
-            entity_name = parts[1]
-            entity_type_dir = parts[0]
-            # If the entity existed before Stage 2 started, it's existing
-            # We can check by looking at the manifest — entities that were created
-            # in this stage are new
-            from alfred.vault.schema import TYPE_DIRECTORY
-
-            # Reverse lookup: find the type from the directory
-            type_for_dir = {v: k for k, v in TYPE_DIRECTORY.items()}.get(entity_type_dir, entity_type_dir)
-            if _entity_exists(config.vault.vault_path, type_for_dir, entity_name):
-                # It exists now; could be new or existing — we don't track this precisely,
-                # but the mutation log does. For reporting, assume entities in mutation log
-                # as "create" are new.
-                pass
-        result.entities_created.append(entity_path)
-
-    # Stage 3: Interlink (pure Python)
-    _interlink(
-        note_path=note_path,
-        resolved_entities=resolved,
-        manifest=manifest,
-        vault_path=config.vault.vault_path,
-        session_path=session_path,
-    )
-
-    # Stage 4: Enrich Entities (LLM, per-entity)
-    # Gated behind config flag — skipping saves one LLM call per entity.
-    # Entities retain their stub content from Stage 2 (which already includes
-    # the description from the manifest). Ref: ssdavidai/alfred#14
-    if not config.skip_entity_enrichment:
-        enriched = await _stage4_enrich(
-            inbox_content=inbox_content,
-            inbox_filename=filename,
-            note_path=note_path,
-            resolved_entities=resolved,
-            manifest=manifest,
-            config=config,
-            session_path=session_path,
-        )
-        result.entities_enriched = enriched
-    else:
-        log.info("pipeline.s4_skipped", reason="skip_entity_enrichment=True")
-        enriched = []
-        result.entities_enriched = []
-
-    result.success = True
-    result.summary = (
-        f"Created note: {note_path}, "
-        f"resolved {len(resolved)} entities, "
-        f"enriched {len(enriched)} entities"
-    )
-
-    log.info(
-        "pipeline.complete",
-        file=filename,
-        note=note_path,
-        entities_resolved=len(resolved),
-        entities_enriched=len(enriched),
-    )
-
-    return result

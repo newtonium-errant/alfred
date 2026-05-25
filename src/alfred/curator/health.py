@@ -40,7 +40,7 @@ _CURATOR_STALE_WARN_HOURS = 24
 _CURATOR_STALE_FAIL_HOURS = 48
 
 
-_KNOWN_BACKENDS = ("claude", "zo", "openclaw", "hermes")
+_KNOWN_BACKENDS = ("claude",)
 
 
 def _check_vault(raw: dict[str, Any]) -> list[CheckResult]:

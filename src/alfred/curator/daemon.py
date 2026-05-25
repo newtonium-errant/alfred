@@ -25,16 +25,12 @@ from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file,
 
 from .backends import BaseBackend
 from .backends.cli import ClaudeBackend
-from .backends.hermes import HermesBackend
-from .backends.http import ZoBackend
-from .backends.openclaw import OpenClawBackend
 from .config import CuratorConfig
 from .context import build_vault_context, extract_sender_email, gather_sender_context
-from .pipeline import run_pipeline
 from .state import StateManager
 from .utils import get_logger
 from .watcher import InboxWatcher
-from .writer import diff_vault, mark_processed, snapshot_vault
+from .writer import mark_processed
 
 # Email classifier (per-instance, opt-in) — post-processor that adds
 # ``priority`` + ``action_hint`` frontmatter fields to email-derived
@@ -72,35 +68,28 @@ def _load_skill(skills_dir: Path) -> str:
 
 
 def _create_backend(config: CuratorConfig) -> BaseBackend:
-    """Instantiate the configured backend with vault env vars for CLI backends."""
+    """Instantiate the configured backend.
+
+    Post backend-abstraction-collapse (2026-05-25): only the Claude CLI
+    backend survives. The factory still takes a ``backend_name`` and
+    fails loud on anything else so a config typo / stale yaml /
+    re-introduced backend name fails at startup rather than silently
+    defaulting. Per ``feedback_intentionally_left_blank.md``.
+
+    BaseBackend + the factory pattern remain in place so re-introducing
+    a backend (Q3 MCP, local Ollama, etc.) is a pure-extend: add a new
+    branch + a sibling module in ``backends/`` — no architectural
+    re-work.
+    """
     backend_name = config.agent.backend
     if backend_name == "claude":
         return ClaudeBackend(config.agent.claude)
-    elif backend_name == "zo":
-        return ZoBackend(config.agent.zo)
-    elif backend_name == "openclaw":
-        return OpenClawBackend(config.agent.openclaw)
-    elif backend_name == "hermes":
-        # Hermes is HTTP-based like Zo. No env-var-based vault access;
-        # the Hermes agent is expected to drive the alfred vault CLI
-        # itself. Ref upstream 8e2673c.
-        return HermesBackend(
-            config.agent.hermes,
-            vault_path=config.vault.path,
-            scope="curator",
-        )
-    else:
-        raise ValueError(f"Unknown backend: {backend_name}")
-
-
-def _is_cli_backend(backend: BaseBackend) -> bool:
-    """Check if backend supports env-var-based vault access (CLI backends)."""
-    return isinstance(backend, (ClaudeBackend, OpenClawBackend))
-
-
-def _use_pipeline(config: CuratorConfig) -> bool:
-    """Check if the 4-stage pipeline should be used (OpenClaw backend only)."""
-    return config.agent.backend == "openclaw"
+    raise ValueError(
+        f"Unknown curator backend: {backend_name!r}. "
+        f"Supported backends: 'claude'. "
+        f"(zo / openclaw / hermes were removed in the backend-abstraction-"
+        f"collapse arc 2026-05-25; update agent.backend in your config.yaml)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -231,71 +220,39 @@ async def _process_file(
     vault_path_str = str(config.vault.vault_path)
     session_path = create_session_file()
 
-    if _use_pipeline(config):
-        # 4-stage pipeline for OpenClaw backend
-        pipeline_result = await run_pipeline(
-            inbox_file=inbox_file,
-            inbox_content=inbox_content,
-            vault_context_text=context_text,
-            config=config,
-            session_path=session_path,
-        )
+    # Claude is the only surviving backend post backend-abstraction-collapse
+    # (2026-05-25). It always supports mutation-log-based vault access via
+    # env-var injection — no snapshot/diff fallback path needed. The
+    # OpenClaw-only 4-stage pipeline (curator/pipeline.py) was retired in
+    # the same arc; the legacy single-call path is now the only path.
+    backend.env_overrides = {
+        "ALFRED_VAULT_PATH": vault_path_str,
+        "ALFRED_VAULT_SCOPE": "curator",
+        "ALFRED_VAULT_SESSION": session_path,
+    }
 
-        mutations = read_mutations(session_path)
-        files_created = mutations["files_created"]
-        files_modified = mutations["files_modified"]
-        cleanup_session_file(session_path)
+    result = await backend.process(
+        inbox_content=inbox_content,
+        skill_text=skill_text,
+        vault_context=context_text,
+        inbox_filename=filename,
+        vault_path=vault_path_str,
+    )
 
-        # Audit log
-        audit_path = str(Path(config.state.path).parent / "vault_audit.log")
-        append_to_audit_log(audit_path, "curator", mutations, detail=filename)
+    mutations = read_mutations(session_path)
+    files_created = mutations["files_created"]
+    files_modified = mutations["files_modified"]
+    cleanup_session_file(session_path)
 
-        if not pipeline_result.success:
-            log.error("daemon.pipeline_failed", file=filename, summary=pipeline_result.summary[:500])
+    # Audit log
+    audit_path = str(Path(config.state.path).parent / "vault_audit.log")
+    append_to_audit_log(audit_path, "curator", mutations, detail=filename)
 
-        if not files_created and not files_modified:
-            log.warning("daemon.no_changes", file=filename)
-    else:
-        # Legacy path for Claude and Zo backends
-        use_mutation_log = _is_cli_backend(backend)
+    if not result.success:
+        log.error("daemon.agent_failed", file=filename, summary=result.summary[:500])
 
-        if use_mutation_log:
-            backend.env_overrides = {
-                "ALFRED_VAULT_PATH": vault_path_str,
-                "ALFRED_VAULT_SCOPE": "curator",
-                "ALFRED_VAULT_SESSION": session_path,
-            }
-        else:
-            before = snapshot_vault(config.vault.vault_path, ignore_dirs=config.vault.ignore_dirs)
-
-        result = await backend.process(
-            inbox_content=inbox_content,
-            skill_text=skill_text,
-            vault_context=context_text,
-            inbox_filename=filename,
-            vault_path=vault_path_str,
-        )
-
-        if use_mutation_log:
-            mutations = read_mutations(session_path)
-            files_created = mutations["files_created"]
-            files_modified = mutations["files_modified"]
-            cleanup_session_file(session_path)
-        else:
-            after = snapshot_vault(config.vault.vault_path, ignore_dirs=config.vault.ignore_dirs)
-            files_created, files_modified = diff_vault(before, after)
-            mutations = {"files_created": files_created, "files_modified": files_modified, "files_deleted": []}
-            cleanup_session_file(session_path)
-
-        # Audit log
-        audit_path = str(Path(config.state.path).parent / "vault_audit.log")
-        append_to_audit_log(audit_path, "curator", mutations, detail=filename)
-
-        if not result.success:
-            log.error("daemon.agent_failed", file=filename, summary=result.summary[:500])
-
-        if not files_created and not files_modified:
-            log.warning("daemon.no_changes", file=filename)
+    if not files_created and not files_modified:
+        log.warning("daemon.no_changes", file=filename)
 
     # Mark processed and move (skip if agent already moved the file)
     if inbox_file.exists():

@@ -62,30 +62,26 @@ class ClaudeBackendConfig:
 
 
 @dataclass
-class ZoBackendConfig:
-    url: str = ""
-    method: str = "POST"
-    headers: dict[str, str] = field(default_factory=dict)
-    request_body_template: dict[str, Any] = field(default_factory=dict)
-    response_content_path: str = "response.content"
-    timeout: int = 600
-
-
-@dataclass
-class OpenClawBackendConfig:
-    command: str = "openclaw"
-    args: list[str] = field(default_factory=list)
-    workspace_mount: str = ""
-    timeout: int = 600
-    agent_id: str = "vault-distiller"
-
-
-@dataclass
 class AgentConfig:
+    """Agent backend selector.
+
+    Post backend-abstraction-collapse (2026-05-25): ``claude`` is the
+    only surviving backend. ZoBackendConfig / OpenClawBackendConfig
+    dataclasses were removed in the same arc. Re-introducing a backend
+    (Q3 MCP / local Ollama / etc.) extends this dataclass with a new
+    field + a matching sibling module under ``backends/``.
+
+    Note: the distiller's V2 non-agentic extractor (used when
+    ``extraction.use_deterministic_v2`` is True or when the Anthropic
+    SDK direct path is enabled) is configured via
+    :class:`AnthropicConfig` and :class:`ExtractionConfig`, not through
+    this dataclass. The two paths are independent — ``agent`` selects
+    the agentic CLI backend, ``extraction`` selects the non-agentic
+    extractor backend.
+    """
+
     backend: str = "claude"
     claude: ClaudeBackendConfig = field(default_factory=ClaudeBackendConfig)
-    zo: ZoBackendConfig = field(default_factory=ZoBackendConfig)
-    openclaw: OpenClawBackendConfig = field(default_factory=OpenClawBackendConfig)
 
 
 @dataclass
@@ -408,8 +404,6 @@ _DATACLASS_MAP: dict[str, type] = {
     "vault": VaultConfig,
     "agent": AgentConfig,
     "claude": ClaudeBackendConfig,
-    "zo": ZoBackendConfig,
-    "openclaw": OpenClawBackendConfig,
     "anthropic": AnthropicConfig,
     "extraction": ExtractionConfig,
     "deep_extraction_schedule": ScheduleConfig,

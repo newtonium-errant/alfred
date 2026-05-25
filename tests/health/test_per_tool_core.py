@@ -26,11 +26,14 @@ from alfred.health.types import CheckResult, Status
 from alfred.janitor import health as janitor_health
 
 
-def _base_config(vault_path: Path, backend: str = "zo") -> dict[str, Any]:
+def _base_config(vault_path: Path, backend: str = "claude") -> dict[str, Any]:
     """A minimal raw config dict pointing at ``vault_path``.
 
-    Default backend is ``zo`` so the anthropic probe is skipped unless
-    the test explicitly switches to claude — keeps these tests offline.
+    Default backend is ``claude`` — the only surviving agent backend
+    post backend-abstraction-collapse (2026-05-25). The
+    :func:`_stub_anthropic_auth` autouse fixture short-circuits the
+    anthropic probe so tests stay offline by default. Tests that need
+    to verify the probe semantics override the stub explicitly.
     """
     return {
         "vault": {"path": str(vault_path)},
@@ -45,6 +48,29 @@ def _base_config(vault_path: Path, backend: str = "zo") -> dict[str, Any]:
             "state": {"path": str(vault_path.parent / "distiller_state.json")},
         },
     }
+
+
+@pytest.fixture(autouse=True)
+def _stub_anthropic_auth(monkeypatch):
+    """Stub the anthropic auth probe across all three tool-health modules.
+
+    With the backend-collapse contract (only ``claude`` is known),
+    the default ``_base_config`` switches from ``backend="zo"`` to
+    ``backend="claude"``, which triggers the anthropic probe in every
+    health check. Without this autouse stub, every default-backend
+    test would either hit the network or fail because the env lacks
+    an API key. Tests that want to verify probe semantics monkeypatch
+    over this stub explicitly.
+    """
+    async def _ok(api_key, model="claude-haiku-4-5"):  # noqa: ANN001
+        return CheckResult(name="anthropic-auth", status=Status.OK, detail="stubbed")
+
+    monkeypatch.setattr(curator_health, "check_anthropic_auth", _ok)
+    monkeypatch.setattr(janitor_health, "check_anthropic_auth", _ok)
+    monkeypatch.setattr(distiller_health, "check_anthropic_auth", _ok)
+    monkeypatch.setattr(curator_health, "resolve_api_key", lambda raw: "stub-key")
+    monkeypatch.setattr(janitor_health, "resolve_api_key", lambda raw: "stub-key")
+    monkeypatch.setattr(distiller_health, "resolve_api_key", lambda raw: "stub-key")
 
 
 @pytest.fixture
@@ -135,6 +161,10 @@ class TestCuratorHealth:
         vault: Path,
     ) -> None:
         # If we accidentally probed, our stub would record a call.
+        # Non-claude backends (here ``zo``, which is now an "unknown"
+        # backend per the 2026-05-25 backend-collapse contract — but
+        # still semantically non-claude) must NOT trigger the
+        # anthropic probe.
         called = {"n": 0}
 
         async def _counting(api_key, model="claude-haiku-4-5"):  # noqa: ANN001

@@ -55,24 +55,6 @@ def _check_command(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def _register_openclaw_agents(vault_path: str) -> None:
-    """Register required OpenClaw agents for Alfred."""
-    agents = ["vault-curator", "vault-janitor", "vault-distiller", "worker"]
-    print("\n  Registering OpenClaw agents...")
-    for agent in agents:
-        result = subprocess.run(
-            ["openclaw", "agents", "add", agent, "--workspace", vault_path, "--non-interactive"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            print(f"    [OK] {agent}")
-        elif "already exists" in (result.stdout + result.stderr).lower():
-            print(f"    [OK] {agent} (already registered)")
-        else:
-            msg = (result.stderr or result.stdout).strip()[:120]
-            print(f"    [!!] {agent}: {msg}")
-
-
 def _check_temporal() -> bool:
     """Check if Temporal server is reachable at 127.0.0.1:7233."""
     import socket
@@ -166,34 +148,19 @@ def run_quickstart() -> None:
     else:
         do_scaffold = _prompt("\nCopy vault scaffold (templates, bases, config)?", "y").lower() in ("y", "yes")
 
-    # 3. Agent backend
-    backend_idx = _prompt_choice(
-        "Which agent backend?",
-        ["Claude Code (requires `claude` on PATH)", "Zo Computer (HTTP API)", "OpenClaw (requires `openclaw` on PATH)"],
-        default=1,
-    )
-    backend_map = {1: "claude", 2: "zo", 3: "openclaw"}
-    backend = backend_map[backend_idx]
+    # 3. Agent backend. Post backend-abstraction-collapse (2026-05-25),
+    # Claude is the only supported agent backend across the daemons.
+    # The previous Zo / OpenClaw options were retired in that arc; the
+    # operator-facing prompt no longer offers them.
+    backend = "claude"
+    zo_api_key = ""  # Retained for env-substitution compatibility only.
 
     # 4. Validate backend
-    zo_api_key = ""
-    if backend == "claude":
-        if _check_command("claude"):
-            print("  [OK] `claude` found on PATH")
-        else:
-            print("  [!!] `claude` not found on PATH -- install Claude Code first")
-
-    elif backend == "zo":
-        zo_api_key = _prompt("  Enter your ZO_API_KEY")
-        if not zo_api_key:
-            print("  [!!] No API key provided -- you'll need to set ZO_API_KEY in .env")
-
-    elif backend == "openclaw":
-        if _check_command("openclaw"):
-            print("  [OK] `openclaw` found on PATH")
-            _register_openclaw_agents(vault_path)
-        else:
-            print("  [!!] `openclaw` not found on PATH")
+    print("\nAgent backend: Claude Code")
+    if _check_command("claude"):
+        print("  [OK] `claude` found on PATH")
+    else:
+        print("  [!!] `claude` not found on PATH -- install Claude Code first")
 
     # 5. Surveyor
     enable_surveyor = _prompt("\nEnable surveyor? (requires Ollama + OpenRouter) [y/N]", "n").lower() in ("y", "yes")

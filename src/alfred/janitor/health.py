@@ -27,7 +27,7 @@ from alfred.health.anthropic_auth import check_anthropic_auth, resolve_api_key
 from alfred.health.types import CheckResult, Status, ToolHealth
 
 
-_KNOWN_BACKENDS = ("claude", "zo", "openclaw")
+_KNOWN_BACKENDS = ("claude",)
 
 
 # Stale-threshold calibrations for the last-successful-sweep probe.
