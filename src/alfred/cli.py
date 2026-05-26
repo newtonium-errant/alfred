@@ -636,21 +636,42 @@ def cmd_distiller(args: argparse.Namespace) -> None:
     from alfred._data import get_skills_dir
     skills_dir = get_skills_dir()
 
-    # Inject ALFRED_VAULT_AUDIT_LOG so promote-proposal /
-    # discard-proposal can write to the unified vault audit log.
-    # Mirrors the cmd_vault (issue #64) precedent: resolve
-    # ``<logging.dir>/vault_audit.log`` from the unified config, set
-    # env var before delegating to per-subcommand handlers. Respect
-    # a caller-set override (test harnesses, one-off invocations).
-    # Only set on subcommands that actually mutate (promote-proposal,
-    # discard-proposal) — other distiller subcommands don't need the
-    # audit context and shouldn't pay the env-mutation cost.
+    # Resolve audit-log path so promote-proposal / discard-proposal
+    # can write to the unified vault audit log. Mirrors the cmd_vault
+    # (issue #64) precedent: ``<logging.dir>/vault_audit.log`` from
+    # the unified config. Respect a caller-set
+    # ``ALFRED_VAULT_AUDIT_LOG`` override (test harnesses, one-off
+    # invocations). Only resolve on subcommands that actually mutate
+    # — other distiller subcommands don't need the audit context.
+    #
+    # V1 of the env-var → function-arg refactor: build a
+    # :class:`VaultContext` and pass to the handlers; also mirror to
+    # env for backward-compat with not-yet-migrated consumers. V2
+    # drops the env-var write.
+    from alfred.vault.context import (
+        ENV_VAULT_AUDIT_LOG,
+        ENV_VAULT_PATH,
+        ENV_VAULT_SCOPE,
+        ENV_VAULT_SESSION,
+        VaultContext,
+    )
+
+    distiller_ctx: VaultContext | None = None
     if args.distiller_cmd in ("promote-proposal", "discard-proposal"):
         log_cfg = raw.get("logging", {}) or {}
         log_dir = log_cfg.get("dir", "./data")
-        audit_path = Path(log_dir) / "vault_audit.log"
-        if not os.environ.get("ALFRED_VAULT_AUDIT_LOG"):
-            os.environ["ALFRED_VAULT_AUDIT_LOG"] = str(audit_path)
+        resolved_audit = os.environ.get(ENV_VAULT_AUDIT_LOG) or str(
+            Path(log_dir) / "vault_audit.log"
+        )
+        if not os.environ.get(ENV_VAULT_AUDIT_LOG):
+            # Mirror to env for backward-compat (V1).
+            os.environ[ENV_VAULT_AUDIT_LOG] = resolved_audit
+        distiller_ctx = VaultContext(
+            vault_path=os.environ.get(ENV_VAULT_PATH) or None,
+            scope=os.environ.get(ENV_VAULT_SCOPE) or None,
+            session_path=os.environ.get(ENV_VAULT_SESSION) or None,
+            audit_log_path=resolved_audit,
+        )
 
     from alfred.distiller import cli as dcli
     subcmd = args.distiller_cmd
@@ -700,6 +721,7 @@ def cmd_distiller(args: argparse.Namespace) -> None:
             to=args.to,
             strip_scaffolding=not args.no_strip_scaffolding,
             fingerprint=args.fingerprint,
+            vault_context=distiller_ctx,
         )
     elif subcmd == "discard-proposal":
         dcli.cmd_discard_proposal(
@@ -707,6 +729,7 @@ def cmd_distiller(args: argparse.Namespace) -> None:
             slug=args.slug,
             reason=args.reason,
             fingerprint=args.fingerprint,
+            vault_context=distiller_ctx,
         )
     else:
         print(f"Unknown distiller subcommand: {subcmd}")
@@ -1019,32 +1042,58 @@ def cmd_vault(args: argparse.Namespace) -> None:
 
     # Issue #64 — direct CLI invocations bypassed ``vault_audit.log``
     # because mutation logging required ``ALFRED_VAULT_SESSION`` (only
-    # set by agent backends). Wire the audit-log path into the
-    # environment here so ``vault/cli.py``'s ``_log_or_audit`` helper
-    # can append-to-audit-log when no session is active. Mirrors the
-    # ``cmd_exec`` precedent (cli.py:942): ``logging.dir`` is the
-    # per-instance-correct parent (Salem -> ``./data``, KAL-LE ->
+    # set by agent backends). Build a :class:`VaultContext` here so
+    # ``vault/cli.py``'s ``_log_or_audit`` helper can append-to-audit-
+    # log when no session is active. Mirrors the ``cmd_exec``
+    # precedent (cli.py:942): ``logging.dir`` is the per-instance-
+    # correct parent (Salem -> ``./data``, KAL-LE ->
     # ``/home/andrew/.alfred/kalle/data``).
     #
-    # Only set the env var if we successfully loaded the unified config
-    # — without a known logging.dir we'd be writing to an arbitrary
-    # path which is worse than the legacy no-op behavior. The CLI
-    # fallback in vault/cli.py treats an absent env var as "no audit
-    # context" and silently no-ops, preserving the contract for
-    # standalone test invocations that don't go through this dispatcher.
+    # V1 of the env-var → function-arg refactor (see
+    # ``src/alfred/vault/context.py`` module docstring): the
+    # ``VaultContext`` threads the resolved audit path down to the
+    # handler as a typed kwarg. We also write the env var here for
+    # backward-compat — subprocess consumers and not-yet-migrated
+    # in-process consumers still need it. V2 drops the env-var write
+    # once the consumer migration tail closes.
+    from alfred.vault.context import (
+        ENV_VAULT_AUDIT_LOG,
+        ENV_VAULT_PATH,
+        ENV_VAULT_SCOPE,
+        ENV_VAULT_SESSION,
+        VaultContext,
+    )
+
+    # Resolve audit-log path from config when available.
+    audit_log_path_str: str | None = None
     if raw:
         log_cfg = raw.get("logging", {}) or {}
         log_dir = log_cfg.get("dir", "./data")
-        audit_path = Path(log_dir) / "vault_audit.log"
-        # Respect a caller-set ALFRED_VAULT_AUDIT_LOG override (lets
-        # tests / one-off invocations point at a different path without
-        # rewriting config). Convention matches ALFRED_VAULT_PATH /
-        # ALFRED_VAULT_SCOPE / ALFRED_VAULT_SESSION precedence.
-        if not os.environ.get("ALFRED_VAULT_AUDIT_LOG"):
-            os.environ["ALFRED_VAULT_AUDIT_LOG"] = str(audit_path)
+        audit_log_path_str = str(Path(log_dir) / "vault_audit.log")
+
+    # Respect a caller-set ALFRED_VAULT_AUDIT_LOG override (lets tests /
+    # one-off invocations point at a different path without rewriting
+    # config). Convention matches ALFRED_VAULT_PATH / ALFRED_VAULT_SCOPE
+    # / ALFRED_VAULT_SESSION precedence.
+    env_override = os.environ.get(ENV_VAULT_AUDIT_LOG)
+    if env_override:
+        audit_log_path_str = env_override
+    elif audit_log_path_str:
+        # Mirror to env for backward-compat (V1). Subprocess consumers
+        # and not-yet-migrated in-process consumers still read from
+        # env. V2 drops this write once all consumers thread through
+        # ``VaultContext`` directly.
+        os.environ[ENV_VAULT_AUDIT_LOG] = audit_log_path_str
+
+    ctx = VaultContext(
+        vault_path=os.environ.get(ENV_VAULT_PATH) or None,
+        scope=os.environ.get(ENV_VAULT_SCOPE) or None,
+        session_path=os.environ.get(ENV_VAULT_SESSION) or None,
+        audit_log_path=audit_log_path_str,
+    )
 
     from alfred.vault.cli import handle_vault_command
-    handle_vault_command(args)
+    handle_vault_command(args, vault_context=ctx)
 
 
 def cmd_exec(args: argparse.Namespace) -> None:
@@ -1630,26 +1679,50 @@ def cmd_scaffold(args: argparse.Namespace) -> None:
     except Exception:
         pass
 
-    # Inject ALFRED_VAULT_AUDIT_LOG only on mutating subcommands.
+    # Resolve audit-log path only on mutating subcommands.
     # ``--dry-run`` wins over ``--apply`` if both passed (matches the
     # precedence in cmd_sync), so we re-check both flags here for
     # parity. ``scaffold_cmd == "sync"`` is the only mutating path
     # today; future ``alfred scaffold ...`` subcommands that mutate
     # should be added to the tuple.
+    #
+    # V1 of the env-var → function-arg refactor: build a
+    # :class:`VaultContext` and thread it down through
+    # ``scaffold_cli.dispatch``. Also mirror to env for backward-compat
+    # with the legacy ``os.environ.get("ALFRED_VAULT_AUDIT_LOG")`` path
+    # in case any out-of-tree consumer still reads it. V2 drops the
+    # env-var write.
+    from alfred.vault.context import (
+        ENV_VAULT_AUDIT_LOG,
+        ENV_VAULT_PATH,
+        ENV_VAULT_SCOPE,
+        ENV_VAULT_SESSION,
+        VaultContext,
+    )
+
     sub = getattr(args, "scaffold_cmd", None)
     apply_flag = bool(getattr(args, "apply", False))
     dry_run_flag = bool(getattr(args, "dry_run", False))
     will_mutate = sub == "sync" and apply_flag and not dry_run_flag
+    scaffold_ctx: VaultContext | None = None
     if will_mutate and raw:
         log_cfg = raw.get("logging", {}) or {}
         log_dir = log_cfg.get("dir", "./data")
-        audit_path = Path(log_dir) / "vault_audit.log"
-        if not os.environ.get("ALFRED_VAULT_AUDIT_LOG"):
-            os.environ["ALFRED_VAULT_AUDIT_LOG"] = str(audit_path)
+        resolved_audit = os.environ.get(ENV_VAULT_AUDIT_LOG) or str(
+            Path(log_dir) / "vault_audit.log"
+        )
+        if not os.environ.get(ENV_VAULT_AUDIT_LOG):
+            os.environ[ENV_VAULT_AUDIT_LOG] = resolved_audit
+        scaffold_ctx = VaultContext(
+            vault_path=os.environ.get(ENV_VAULT_PATH) or None,
+            scope=os.environ.get(ENV_VAULT_SCOPE) or None,
+            session_path=os.environ.get(ENV_VAULT_SESSION) or None,
+            audit_log_path=resolved_audit,
+        )
 
     from alfred.scaffold import cli as scaffold_cli
 
-    code = scaffold_cli.dispatch(args, raw)
+    code = scaffold_cli.dispatch(args, raw, vault_context=scaffold_ctx)
     sys.exit(code)
 
 

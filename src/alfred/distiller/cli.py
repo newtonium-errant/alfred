@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .backfill import cmd_backfill as _cmd_backfill_inner
 from .candidates import scan_candidates, group_by_project
@@ -13,6 +14,9 @@ from .config import DistillerConfig
 from .daemon import run_extraction, run_watch
 from .state import DistillerState
 from .utils import get_logger
+
+if TYPE_CHECKING:
+    from alfred.vault.context import VaultContext
 
 log = get_logger(__name__)
 
@@ -523,20 +527,28 @@ def cmd_mine_patterns(
         )
 
 
-def _resolve_audit_log_path() -> str | None:
+def _resolve_audit_log_path(
+    vault_context: "VaultContext | None" = None,
+) -> str | None:
     """Resolve the per-instance vault audit log path.
 
-    Read from the ``ALFRED_VAULT_AUDIT_LOG`` env var the parent
-    dispatcher (``cmd_distiller`` in ``src/alfred/cli.py``) injects
-    before delegating. Mirrors the issue #64 ``cmd_vault`` precedent:
-    audit-log writes go to ``<logging.dir>/vault_audit.log`` resolved
-    from the unified config. Returns None when the env var is absent
-    (CLI invoked outside the dispatcher — e.g. standalone test path);
-    the caller treats that as "no audit context" and silently skips
-    the audit-log write, preserving legacy behavior.
+    V1 of the env-var → function-arg refactor: prefer the explicit
+    ``vault_context.audit_log_path`` when supplied by the dispatcher;
+    fall back to :meth:`VaultContext.from_env` (with deprecation log)
+    when none threaded through. Mirrors the issue #64 ``cmd_vault``
+    precedent: audit-log writes go to ``<logging.dir>/vault_audit.log``
+    resolved from the unified config. Returns None when neither path
+    is set (CLI invoked outside the dispatcher — e.g. standalone test
+    path); the caller treats that as "no audit context" and silently
+    skips the audit-log write, preserving legacy behavior.
     """
-    val = os.environ.get("ALFRED_VAULT_AUDIT_LOG", "")
-    return val or None
+    from alfred.vault.context import VaultContext as _VaultContext
+
+    if vault_context is not None:
+        return vault_context.audit_log_path
+    return _VaultContext.from_env(
+        caller="distiller.cli._resolve_audit_log_path"
+    ).audit_log_path
 
 
 def _find_proposal_by_slug(
@@ -592,6 +604,7 @@ def cmd_promote_proposal(
     to: str | None = None,
     strip_scaffolding: bool = True,
     fingerprint: str | None = None,
+    vault_context: "VaultContext | None" = None,
 ) -> None:
     """Promote a Phase 4 pattern-miner proposal to a canonical record.
 
@@ -792,10 +805,10 @@ def cmd_promote_proposal(
     entry.promoted_at = now_iso
     state.save()
 
-    # Audit-log write — best-effort. Missing env var = no audit
+    # Audit-log write — best-effort. Missing context = no audit
     # context, silent skip (preserves legacy contract for standalone
     # / test invocations outside the dispatcher).
-    audit_path = _resolve_audit_log_path()
+    audit_path = _resolve_audit_log_path(vault_context)
     if audit_path:
         # WARN-3 cure (2026-05-11): use the canonical
         # ``build_audit_mutations`` helper rather than constructing
@@ -833,6 +846,7 @@ def cmd_discard_proposal(
     slug: str,
     reason: str | None = None,
     fingerprint: str | None = None,
+    vault_context: "VaultContext | None" = None,
 ) -> None:
     """Discard a Phase 4 pattern-miner proposal.
 
@@ -917,7 +931,7 @@ def cmd_discard_proposal(
     entry.discarded_reason = reason or ""
     state.save()
 
-    audit_path = _resolve_audit_log_path()
+    audit_path = _resolve_audit_log_path(vault_context)
     if audit_path:
         # WARN-3 cure (2026-05-11): canonical helper, same as the
         # promote path above.

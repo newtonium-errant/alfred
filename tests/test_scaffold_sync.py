@@ -909,9 +909,17 @@ class TestCmdScaffoldDispatcherWiring:
         monkeypatch: pytest.MonkeyPatch,
         captured: dict,
     ) -> None:
-        """Capture ALFRED_VAULT_AUDIT_LOG at dispatch-time."""
-        def _stub(_args: argparse.Namespace, _raw: dict) -> int:
+        """Capture ALFRED_VAULT_AUDIT_LOG at dispatch-time.
+
+        Stub accepts ``**kwargs`` so the V1 ``vault_context`` typed
+        thread-through doesn't break the env-var-only contract pin —
+        these tests pin the V1 backward-compat mirror to env, not the
+        VaultContext kwarg shape. The VaultContext path is pinned by
+        ``test_vault_context.py``.
+        """
+        def _stub(_args: argparse.Namespace, _raw: dict, **_kwargs) -> int:
             captured["audit_log"] = os.environ.get("ALFRED_VAULT_AUDIT_LOG")
+            captured["vault_context"] = _kwargs.get("vault_context")
             return 0
         monkeypatch.setattr("alfred.scaffold.cli.dispatch", _stub)
 
@@ -1093,3 +1101,89 @@ class TestCmdScaffoldDispatcherWiring:
             cmd_scaffold(args)
 
         assert captured["audit_log"] == override
+
+    def test_dispatcher_threads_vault_context_kwarg(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """V1 contract: ``cmd_scaffold`` builds a ``VaultContext`` and
+        passes it to ``scaffold_cli.dispatch(args, raw,
+        vault_context=...)`` when the subcommand is mutating.
+
+        Pins the typed thread-through alongside the legacy env-var
+        mirror. Both must work in V1; V2 drops the env-var mirror
+        once consumer migration tail closes.
+        """
+        from alfred.cli import cmd_scaffold
+        from alfred.vault.context import VaultContext
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        log_dir = tmp_path / "data"
+        config = tmp_path / "config.yaml"
+        self._write_config(config, log_dir=str(log_dir), vault_path=vault)
+
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+        captured: dict = {}
+        self._stub_dispatch(monkeypatch, captured)
+
+        args = argparse.Namespace(
+            command="scaffold",
+            config=str(config),
+            scaffold_cmd="sync",
+            apply=True,
+            dry_run=False,
+            force=False,
+            include=None,
+            exclude=None,
+            vault_path=None,
+        )
+        with pytest.raises(SystemExit):
+            cmd_scaffold(args)
+
+        ctx = captured["vault_context"]
+        assert isinstance(ctx, VaultContext)
+        assert ctx.audit_log_path == str(log_dir / "vault_audit.log")
+
+    def test_dry_run_does_not_thread_vault_context(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """V1 contract: ``--dry-run`` (implicit or explicit) skips the
+        VaultContext build — no audit-mutation happens, so threading
+        the context would be wasted work AND a process-global env-var
+        write.
+
+        Mirrors the existing env-var-injection-skipped-on-dry-run pin
+        above for the typed kwarg shape.
+        """
+        from alfred.cli import cmd_scaffold
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        log_dir = tmp_path / "data"
+        config = tmp_path / "config.yaml"
+        self._write_config(config, log_dir=str(log_dir), vault_path=vault)
+
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+        captured: dict = {}
+        self._stub_dispatch(monkeypatch, captured)
+
+        args = argparse.Namespace(
+            command="scaffold",
+            config=str(config),
+            scaffold_cmd="sync",
+            apply=False,  # implicit dry-run
+            dry_run=False,
+            force=False,
+            include=None,
+            exclude=None,
+            vault_path=None,
+        )
+        with pytest.raises(SystemExit):
+            cmd_scaffold(args)
+
+        # vault_context kwarg is None on dry-run paths.
+        assert captured["vault_context"] is None

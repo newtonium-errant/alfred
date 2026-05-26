@@ -21,7 +21,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -35,6 +35,9 @@ from alfred.scaffold.sync import (
     apply_sync,
     scan_scaffold,
 )
+
+if TYPE_CHECKING:
+    from alfred.vault.context import VaultContext
 
 log = structlog.get_logger(__name__)
 
@@ -115,7 +118,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> None:
     )
 
 
-def dispatch(args: argparse.Namespace, raw_config: dict[str, Any]) -> int:
+def dispatch(
+    args: argparse.Namespace,
+    raw_config: dict[str, Any],
+    *,
+    vault_context: "VaultContext | None" = None,
+) -> int:
     """Dispatch the right ``scaffold`` subcommand. Returns exit code.
 
     Args:
@@ -124,10 +132,15 @@ def dispatch(args: argparse.Namespace, raw_config: dict[str, Any]) -> int:
             handler can resolve ``vault.path`` and ``logging.dir``
             without re-parsing). Empty dict acceptable if the caller
             couldn't load config; ``--vault-path`` is the manual escape.
+        vault_context: Typed dispatcher-state from
+            :func:`alfred.cli.cmd_scaffold`. When supplied the
+            audit-log path is read from this object instead of from
+            ``ALFRED_VAULT_AUDIT_LOG``. None → legacy env-fallback
+            (V1 backward-compat).
     """
     sub = getattr(args, "scaffold_cmd", None)
     if sub == "sync":
-        return cmd_sync(args, raw_config)
+        return cmd_sync(args, raw_config, vault_context=vault_context)
     print("usage: alfred scaffold sync [--apply] [--include ...] [--exclude ...] [--force]")
     return 1
 
@@ -173,8 +186,18 @@ def _resolve_filter(
     return default
 
 
-def cmd_sync(args: argparse.Namespace, raw_config: dict[str, Any]) -> int:
-    """Execute ``alfred scaffold sync``. Returns exit code (0 OK, 1 error)."""
+def cmd_sync(
+    args: argparse.Namespace,
+    raw_config: dict[str, Any],
+    *,
+    vault_context: "VaultContext | None" = None,
+) -> int:
+    """Execute ``alfred scaffold sync``. Returns exit code (0 OK, 1 error).
+
+    ``vault_context`` carries the audit-log path resolved by the
+    dispatcher (V1 typed thread-through). When None, falls back to
+    :meth:`VaultContext.from_env` with deprecation log.
+    """
     # Resolve vault dir. --vault-path wins over config; config is
     # required iff --vault-path absent.
     vault_path_arg = getattr(args, "vault_path", None)
@@ -309,7 +332,18 @@ def cmd_sync(args: argparse.Namespace, raw_config: dict[str, Any]) -> int:
         try:
             from alfred.vault.mutation_log import append_to_audit_log
 
-            audit_path = os.environ.get("ALFRED_VAULT_AUDIT_LOG")
+            # V1 of env-var → function-arg refactor: prefer typed
+            # ``vault_context.audit_log_path``, fall back to
+            # ``VaultContext.from_env()`` (with deprecation log)
+            # when dispatcher didn't supply one.
+            if vault_context is not None:
+                audit_path = vault_context.audit_log_path
+            else:
+                from alfred.vault.context import VaultContext as _VC
+                audit_path = _VC.from_env(
+                    caller="scaffold.cli.cmd_sync",
+                ).audit_log_path
+
             if audit_path:
                 detail = (
                     f"include={','.join(include)} "

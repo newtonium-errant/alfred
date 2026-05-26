@@ -453,9 +453,18 @@ class TestCmdVaultDispatcherWiring:
         ``ALFRED_VAULT_AUDIT_LOG`` at call time. The dispatcher's
         contract is "set the env var BEFORE delegating," so capturing
         from inside the stub pins the right ordering.
+
+        Stub accepts ``**kwargs`` so the V1 ``vault_context`` typed
+        thread-through doesn't break the env-var-only contract pin —
+        these tests pin the V1 backward-compat mirror to env, not the
+        VaultContext kwarg shape. The VaultContext path is pinned by
+        ``test_vault_context.py``.
         """
-        def _stub(_args: argparse.Namespace) -> None:
+        def _stub(_args: argparse.Namespace, **_kwargs) -> None:
             captured["audit_log"] = os.environ.get("ALFRED_VAULT_AUDIT_LOG")
+            # Also capture the V1 vault_context kwarg shape so future
+            # regressions in dispatcher resolution surface here too.
+            captured["vault_context"] = _kwargs.get("vault_context")
         monkeypatch.setattr(
             "alfred.vault.cli.handle_vault_command", _stub,
         )
@@ -547,5 +556,40 @@ class TestCmdVaultDispatcherWiring:
 
         # Override preserved; dispatcher didn't clobber.
         assert captured["audit_log"] == override
+
+    def test_dispatcher_threads_vault_context_kwarg(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """V1 contract: ``cmd_vault`` builds a ``VaultContext`` and
+        passes it to ``handle_vault_command(args, vault_context=...)``.
+
+        Pins the typed thread-through alongside the legacy env-var
+        mirror. Both must work in V1; V2 drops the env-var mirror
+        once consumer migration tail closes.
+        """
+        from alfred.cli import cmd_vault
+        from alfred.vault.context import VaultContext
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        log_dir = tmp_path / "data"
+        config = tmp_path / "config.yaml"
+        self._write_config(config, log_dir=str(log_dir), vault_path=vault)
+
+        monkeypatch.delenv("ALFRED_VAULT_AUDIT_LOG", raising=False)
+        captured: dict = {}
+        self._stub_handle(monkeypatch, captured)
+
+        cmd_vault(self._make_args(config))
+
+        # V1: vault_context kwarg is present AND its audit_log_path
+        # field matches what env-var carries (the two paths agree
+        # during V1's backward-compat overlap).
+        ctx = captured["vault_context"]
+        assert isinstance(ctx, VaultContext)
+        assert ctx.audit_log_path == str(log_dir / "vault_audit.log")
+        assert ctx.audit_log_path == captured["audit_log"]
 
 

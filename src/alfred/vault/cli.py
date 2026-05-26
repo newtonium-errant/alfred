@@ -8,19 +8,56 @@ import os
 import sys
 from pathlib import Path
 
+from .context import VaultContext
 from .mutation_log import append_to_audit_log, build_audit_mutations, log_mutation
 from .ops import VaultError, vault_context, vault_create, vault_delete, vault_edit, vault_list, vault_move, vault_read, vault_search
 from .retype import vault_retype
 from .scope import ScopeError, check_scope
 from .snapshot import SnapshotError, get_status, init_repo, restore_file, take_snapshot
 
+# Module-level holder for the per-call ``VaultContext`` threaded down
+# from ``cmd_vault`` via :func:`handle_vault_command`. ``None`` means
+# the dispatcher didn't supply one — handlers fall back to
+# ``VaultContext.from_env()`` and emit a deprecation log so the V2
+# migration cycle can grep for remaining env-only call sites.
+#
+# Module-level state is intentional here (NOT thread-local) — the CLI
+# is single-threaded per-process, the dispatcher runs once at top of
+# the call chain, and the alternative (threading a kwarg through every
+# subcommand handler signature) would churn every test fixture without
+# changing the V1 semantics. V2 may revisit if the handler signatures
+# get touched for other reasons. See ``src/alfred/vault/context.py``
+# module docstring for the V1 vs V2 split.
+_dispatcher_context: VaultContext | None = None
+
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 
+def _ctx() -> VaultContext:
+    """Resolve the active vault context for this handler invocation.
+
+    Precedence:
+      1. If the dispatcher (``cmd_vault``) threaded a context via
+         :func:`handle_vault_command`, return it.
+      2. Otherwise fall back to :meth:`VaultContext.from_env` with a
+         deprecation log. This is the V1 backward-compat path for
+         legacy entry points (direct ``alfred vault ...`` invocation
+         outside the dispatcher, test-only module-level imports,
+         scripts that call handler functions directly).
+
+    V2 will tighten this once the dispatcher always supplies a
+    context.
+    """
+    if _dispatcher_context is not None:
+        return _dispatcher_context
+    return VaultContext.from_env(caller="vault.cli._ctx")
+
+
 def _vault_path() -> Path:
-    p = _env("ALFRED_VAULT_PATH")
+    ctx = _ctx()
+    p = ctx.vault_path or ""
     if not p:
         print(json.dumps({"error": "ALFRED_VAULT_PATH not set"}))
         sys.exit(1)
@@ -32,24 +69,25 @@ def _vault_path() -> Path:
 
 
 def _scope() -> str | None:
-    return _env("ALFRED_VAULT_SCOPE") or None
+    return _ctx().scope
 
 
 def _session() -> str | None:
-    return _env("ALFRED_VAULT_SESSION") or None
+    return _ctx().session_path
 
 
 def _audit_log_path() -> str | None:
     """Audit-log destination for direct CLI invocations.
 
-    Set by the top-level ``cmd_vault`` dispatcher
-    (``src/alfred/cli.py``) to the per-instance ``logging.dir /
-    vault_audit.log``. Absent when ``alfred vault ...`` is invoked
-    outside the dispatcher (e.g. direct module-level test
-    invocations); in that case ``_log_or_audit`` silently no-ops,
-    preserving legacy behavior.
+    Threaded down from the top-level ``cmd_vault`` dispatcher
+    (``src/alfred/cli.py``) via :class:`VaultContext` (V1 path) or
+    read back from the ``ALFRED_VAULT_AUDIT_LOG`` env var (legacy
+    fallback). Absent when ``alfred vault ...`` is invoked outside
+    the dispatcher (e.g. direct module-level test invocations); in
+    that case ``_log_or_audit`` silently no-ops, preserving legacy
+    behavior.
     """
-    return _env("ALFRED_VAULT_AUDIT_LOG") or None
+    return _ctx().audit_log_path
 
 
 def _single_mutation_dict(op: str, path: str, **extra: str) -> dict:
@@ -573,24 +611,46 @@ def build_vault_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--restore", metavar="PATH", default=None, help="Restore a file from previous commit")
 
 
-def handle_vault_command(args: argparse.Namespace) -> None:
-    """Dispatch to the correct vault subcommand handler."""
-    handlers = {
-        "read": cmd_read,
-        "search": cmd_search,
-        "list": cmd_list,
-        "context": cmd_context,
-        "create": cmd_create,
-        "edit": cmd_edit,
-        "move": cmd_move,
-        "delete": cmd_delete,
-        "retype": cmd_retype,
-        "triage-id": cmd_triage_id,
-        "snapshot": cmd_snapshot,
-    }
-    handler = handlers.get(args.vault_cmd)
-    if handler:
-        handler(args)
-    else:
-        print(json.dumps({"error": f"Unknown vault subcommand: {args.vault_cmd}"}))
-        sys.exit(1)
+def handle_vault_command(
+    args: argparse.Namespace,
+    *,
+    vault_context: VaultContext | None = None,
+) -> None:
+    """Dispatch to the correct vault subcommand handler.
+
+    ``vault_context`` is the V1 typed thread-through replacing
+    ``os.environ`` injection by ``cmd_vault``. When supplied, all
+    downstream subcommand handlers see it via :func:`_ctx`. When
+    ``None`` (legacy entry point), handlers fall back to
+    :meth:`VaultContext.from_env` with a deprecation log. The
+    dispatcher still writes the env vars during V1 for cross-process
+    safety, so the fallback resolves correctly even in legacy
+    invocation paths.
+    """
+    global _dispatcher_context
+    prev_ctx = _dispatcher_context
+    _dispatcher_context = vault_context
+    try:
+        handlers = {
+            "read": cmd_read,
+            "search": cmd_search,
+            "list": cmd_list,
+            "context": cmd_context,
+            "create": cmd_create,
+            "edit": cmd_edit,
+            "move": cmd_move,
+            "delete": cmd_delete,
+            "retype": cmd_retype,
+            "triage-id": cmd_triage_id,
+            "snapshot": cmd_snapshot,
+        }
+        handler = handlers.get(args.vault_cmd)
+        if handler:
+            handler(args)
+        else:
+            print(json.dumps({"error": f"Unknown vault subcommand: {args.vault_cmd}"}))
+            sys.exit(1)
+    finally:
+        # Restore prior context so nested invocations (test harnesses,
+        # repeated dispatches in same process) don't see stale state.
+        _dispatcher_context = prev_ctx
