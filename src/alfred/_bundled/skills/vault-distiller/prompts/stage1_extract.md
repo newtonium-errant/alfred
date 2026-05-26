@@ -129,5 +129,6 @@ The JSON object must have this structure:
 - **Do NOT duplicate** existing learnings listed above
 - Focus on **actionable knowledge that would be lost** if not captured
 - It is OK to output an empty list if no significant learnings are found
+- **Pass tagging:** every learning extracted by this prompt belongs to **Pass-A** (per-source extraction). When the downstream summary emits `CREATED | <type> | <path> | <reason>` lines for records derived from this manifest, those lines MUST end with a ` | pass=A` suffix per SKILL.md section 7. The tag is the operator's observability hook for measuring Pass-A vs Pass-B synthesis emission distribution over time.
 
 {vault_cli_reference}

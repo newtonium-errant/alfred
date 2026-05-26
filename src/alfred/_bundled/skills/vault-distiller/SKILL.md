@@ -312,6 +312,77 @@ Correct behaviour on the next synthesis on this topic (whether labelled "compoun
 
 Reproduce this disagreement yourself: `grep -n "Indeterminate\|alternative explanations\|mutually exclusive\|compound" vault/synthesis/Empty-Email\ Mechanisms\ Compound*.md` (returns the S2-disputes-S1 prose) and `grep -n "either\|or\|indeterminate" vault/synthesis/Empty-Email\ Cause\ Is\ Indeterminate*.md` (returns the disjunctive framing).
 
+**Cluster-saturation pre-emission gate (MUST):**
+
+Before emitting any new synthesis, run this four-step check against the existing cluster siblings. The cluster you're emitting into is defined by overlap with existing syntheses on **either of two axes**: (a) substantial overlap of `cluster_sources` entries (≥2 shared entries with an existing synthesis, OR ≥50% overlap when the smaller list has <4 entries), OR (b) substantial overlap of `related` references plus shared topical keywords in the title. A cluster is NOT defined by sharing a single source record — that threshold over-fires and would suppress legitimate Layer 3 falsifications.
+
+Once you've identified the cluster, work through the gate in order. The first matching condition wins:
+
+1. **Saturation record check.** Search the cluster for any synthesis whose title contains "Has Reached Analytic Saturation", "Saturation", or "Closed-Pending-" (use `alfred vault search --glob 'synthesis/*Saturation*.md'` and read the matches). If a saturation record exists for this cluster, **SUPPRESS** the new emission unless the new observation (i) explicitly contradicts the saturation diagnosis with new evidence the saturation record did not have, or (ii) marks resolution of the saturating condition (the awaited operational signal arrived, the named engineering intervention shipped, etc.). If you proceed under (i) or (ii), frame the new record as a contradiction or resolution-marker against the saturation synthesis, not as a fresh Layer 1.
+
+2. **Layer 3 absorption check.** Read the cluster's existing Layer 3 meta-syntheses (the highest-level classifications — partitioning records, taxonomies, "X Divides Into N Classes", "X Cluster Has N Layers" framings). If a Layer 3 classification already covers the new observation — the new pattern slots into an existing class without modifying it — **SUPPRESS**. If the new observation falsifies the Layer 3 classification (doesn't fit any of its named classes), the observation IS worth emitting, but frame it as a Layer 3 challenge (a `contradiction/` against the Layer 3 record, or a new Layer 3 synthesis that names the prior partition's gap) — NOT as a fresh Layer 1 synthesis on the cluster.
+
+3. **Sibling-recency check.** If a sibling Layer 1 synthesis with overlapping `cluster_sources` and confidence ≥ medium exists in the cluster with `created` date within the past 30 days, **SUPPRESS** unless the new observation introduces evidence the sibling did not have (new source records that postdate the sibling, a falsifying counter-example, a numeric threshold the sibling stated as unknown). "Slightly different phrasing of the same insight" is NOT new evidence; "same pattern, different cluster_sources entries" is also NOT new evidence — that's the recurrence shape the gate is targeting.
+
+4. **Pass.** If none of the above match — no saturation record, no covering Layer 3, no recent sibling with overlapping sources — proceed with normal synthesis emission.
+
+**Calibration thresholds and their tradeoffs:**
+
+- The `≥2 shared cluster_sources OR ≥50% overlap` threshold for cluster membership is the load-bearing calibration knob. Lower (e.g. ≥1 shared source) over-fires and suppresses Layer 3 falsifications that legitimately reuse a single source from a saturated cluster to challenge the saturation. Higher (e.g. ≥3 shared sources) under-fires and lets the narrow-v1-class recurrences through whenever the LLM cycles in a fresh fifth `cluster_source` to look distinct.
+- The 30-day sibling-recency window is calibrated against the observed narrow-v1 cadence (four siblings in 24 days). Patterns that genuinely re-emerge after a 30+ day gap are more likely to carry new evidence and warrant a fresh emission; the gate intentionally permits them.
+- The escape valve in all four steps is **new evidence**, not **new framing**. Re-phrasing an existing insight with different rhetorical scaffolding is the failure mode this gate is targeting; the gate must NOT be defeated by rewording. If the only new thing is the wording, the emission is suppressed.
+
+**Required output when suppressing (MUST):**
+
+Suppression is not silent — silence reads as broken to the operator. For every synthesis you would have emitted but suppressed under steps 1-3, emit a structured suppression line to your final output, parallel to the `CREATED |` lines specified in section 7:
+
+```
+SUPPRESSED | synthesis | <title-you-would-have-used> | reason=<saturation_record|layer3_absorbed|recent_sibling> | cluster=<short-cluster-label> | existing=<wikilink-to-suppressing-record> | pass=B
+```
+
+Examples:
+
+```
+SUPPRESSED | synthesis | Narrow-V1 Pattern Recurs in Phase 2 Hub Decision | reason=recent_sibling | cluster=narrow-v1-deferral | existing=[[synthesis/Stage 3.5 Multi-Instance Decisions Ship Deliberately-Narrowed V1 With Named Deferrals]] | pass=B
+SUPPRESSED | synthesis | New Empty-Record Sender Confirmed | reason=layer3_absorbed | cluster=pipeline-quality | existing=[[synthesis/Apparent Curator Quality Failures Divide Into Bug Intentional-Design and Real-World-Lifecycle Classes]] | pass=B
+SUPPRESSED | synthesis | Multi-Instance Deferral Continues | reason=saturation_record | cluster=multi-instance-topology | existing=[[synthesis/Multi-Instance Topology Cluster Has Reached Analytic Saturation]] | pass=B
+```
+
+The `reason=` slug is one of three fixed values: `saturation_record`, `layer3_absorbed`, `recent_sibling`. The `cluster=` value is your short topical label (kebab-case, no quotes). The `existing=` value is the wikilink to the specific record that triggered suppression (the saturation record, the absorbing Layer 3, or the recent sibling). The `pass=B` suffix is fixed — only Pass-B emission can suppress under this gate (see section 7 for the Pass-A vs Pass-B observability tagging). Per `feedback_intentionally_left_blank.md`: this output is what lets the operator distinguish "no synthesis emitted because suppressed-by-saturation" from "no synthesis emitted because no pattern surfaced."
+
+**Worked example (real, the recurrence this gate is designed to prevent — walking step 3):**
+
+The narrow-v1 cluster shipped four sibling syntheses across 24 days (2026-04-25, 2026-05-04, 2026-05-11, 2026-05-19), each restating "ship narrowest workable v1 contract and defer breadth pending real usage" with substantially overlapping decision records as `cluster_sources`. Documented in `vault/contradiction/Narrow-V1 Pattern Re-Synthesized Four Times in 24 Days Despite Saturation Records Already Diagnosing the Loop.md` (2026-05-25). Step 3 (sibling-recency) is the step that fires unambiguously on this cluster; step 1 (saturation) does NOT, because no saturation record exists for the narrow-v1 cluster itself — the prior saturation records (`Pipeline-Quality Synthesis Cluster Has Reached Analytic Saturation`, `Multi-Instance Topology Cluster Has Reached Analytic Saturation`) belong to different clusters with disjoint `cluster_sources`. That cross-cluster non-applicability is itself instructive: saturation-record suppression is per-cluster, not vault-global.
+
+Walking the gate against the 2026-05-19 emission (the most recent of the four, drafted while the 2026-05-04 and 2026-05-11 siblings already existed):
+
+- **Cluster identification** (read the actual frontmatter of all three sibling records to compute this):
+  - 2026-05-04 sibling `cluster_sources`: Peer Protocol v1, Phase 1 Hub, Instructor v1, Maximum Eight (4 entries).
+  - 2026-05-11 sibling `cluster_sources`: Peer Protocol v1, Instructor v1, Maximum Eight, Phase 1 Hub (4 entries — same set, different order).
+  - 2026-05-19 candidate `cluster_sources`: Phase 1 Hub, Instructor v1, Peer Protocol v1, Cross-Instance Tokens, Instance-Specific Record Types (5 entries).
+  - Overlap with 2026-05-04: 3 shared entries (Peer Protocol v1, Phase 1 Hub, Instructor v1). 3 ≥ 2 → cluster-membership threshold met.
+  - Overlap with 2026-05-11: 3 shared entries (same three). Cluster-membership threshold met.
+
+- **Step 1 (saturation record):** search for `synthesis/*Saturation*.md` whose cluster the candidate joins. The two existing saturation records (Pipeline-Quality, Multi-Instance Topology) have disjoint `cluster_sources` from the narrow-v1 candidate — they belong to a pipeline-noise/sender cluster and a multi-instance-topology cluster respectively. **Step 1 does NOT fire.** A naive reading "saturation records exist anywhere → suppress" would be wrong and would over-suppress legitimate Layer 1 falsifications on unrelated clusters; the gate's cluster-membership threshold is what prevents that.
+
+- **Step 2 (Layer 3 absorption):** the narrow-v1 cluster has no Layer 3 partitioning record (no "Narrow-V1 Class Divides Into N Classes" or equivalent taxonomy). **Step 2 does NOT fire.**
+
+- **Step 3 (sibling-recency):** the 2026-05-11 sibling (`Alfred v1 Architecture Decisions Ship the Narrowest Workable Contract and Defer Breadth Pending Real Usage`, confidence medium) was created 8 days before the 2026-05-19 candidate; the 2026-05-04 sibling (confidence high) was created 15 days before. Both within the 30-day window. Both at confidence ≥ medium. Both with ≥2 shared `cluster_sources` (3 each). The 2026-05-19 candidate introduces no source records that postdate the siblings, no falsifying counter-example, no numeric threshold the siblings stated as unknown — the only new content is a substituted source pair (Cross-Instance Tokens, Instance-Specific Record Types replacing Maximum Eight) and rephrased rationale. Substituted sources of the same kind asserting the same insight is the "same pattern, different cluster_sources entries" shape this step calls out. **SUPPRESS at step 3.**
+
+- **Expected output:** `SUPPRESSED | synthesis | Stage 3.5 Multi-Instance Decisions Ship Deliberately-Narrowed V1 With Named Deferrals | reason=recent_sibling | cluster=narrow-v1-deferral | existing=[[synthesis/Alfred v1 Architecture Decisions Ship the Narrowest Workable Contract and Defer Breadth Pending Real Usage]] | pass=B`
+
+The 2026-05-04 sibling against the 2026-04-25 sibling walks identically (9 days apart, 4-of-4 source overlap). The 2026-05-11 sibling against the 2026-04-25 sibling: 16 days, 4-of-4 source overlap — also step-3 SUPPRESS. Had this gate been in place, three of the four siblings would have been SUPPRESSED outputs instead of CREATED records, and the contradiction record would not have been needed.
+
+**Worked example (hypothetical, clearly marked — showing the escape valve where the gate does NOT fire):**
+
+Suppose a fifth narrow-v1-shaped synthesis candidate is drafted in 2026-07, two months after the last sibling, citing as one of its sources a new decision record `decision/Peer Protocol v2 Removes Localhost Restriction After Six Months of Audit-Log Evidence`. That candidate would carry ≥2 shared `cluster_sources` with the 2026-05-19 sibling (Peer Protocol v1, Instructor v1, etc., are still in the list) — cluster-membership confirmed. Step 1 still does not fire (no saturation record on this cluster). Step 2 still does not fire (no Layer 3 partition exists). Step 3: the sibling-recency window (30 days) has elapsed by the 2026-07 emission date, AND — even within window — the candidate introduces new evidence the siblings did not have (the Peer Protocol v2 decision, which is a source record that postdates every sibling and represents the deferred-phase decision the original narrow-v1 syntheses said was waiting on real usage). Both clauses of step 3's exception are independently satisfied. **PASS the gate; emit normally.**
+
+This is the load-bearing distinction between "new evidence" and "new framing." If the same 2026-07 candidate had instead cited Peer Protocol v1 (the old source, already in every sibling's list) and offered only rephrased rationale, step 3's exception would NOT trigger and the gate would suppress.
+
+**Anti-pattern — gate-defeating reframes (DO NOT):**
+
+The gate is defeated if you reframe a suppressed-recurrence as a "meta-synthesis about the recurrence" without that being load-bearing. If the suppression diagnosis itself is the new insight (e.g., "I notice this cluster keeps producing the same shape — that's itself a pattern"), the correct emission is a contradiction or a Layer 3 meta-synthesis that names the recurrence as the finding, NOT a fresh Layer 1 dressed up with a "meta" framing. The `vault/contradiction/Narrow-V1 Pattern Re-Synthesized Four Times...` record IS the legitimate version of that move — it's a contradiction record, not another sibling synthesis.
+
 ---
 
 ## 3. Extraction Rules by Source Type
@@ -393,15 +464,24 @@ decided_by: ["[[person/Henry Mellor]]"]
 
 ## 7. Output Format
 
-After creating all records, output a structured summary:
+After creating all records, output a structured summary. `CREATED |` lines report records you wrote; `SUPPRESSED |` lines report syntheses you would have emitted but stopped at the section 2.5 cluster-saturation pre-emission gate. Per `feedback_intentionally_left_blank.md`, both must appear — silent suppression reads as broken to the operator.
 
 ```
 CREATED: assumption: N, decision: N, constraint: N, contradiction: N, synthesis: N
+SUPPRESSED: synthesis: N
 
-CREATED | assumption | assumption/Timber Pricing Stable Through Q2.md | Implied in session discussion about Eagle Farm budgeting
-CREATED | decision | decision/Use Colorbond for Eagle Farm Roof.md | Explicitly agreed in conversation between Henry and supplier
-CREATED | constraint | constraint/Eagle Farm DA Approval Required Before June.md | Mentioned in project review session
+CREATED | assumption | assumption/Timber Pricing Stable Through Q2.md | Implied in session discussion about Eagle Farm budgeting | pass=A
+CREATED | decision | decision/Use Colorbond for Eagle Farm Roof.md | Explicitly agreed in conversation between Henry and supplier | pass=A
+CREATED | constraint | constraint/Eagle Farm DA Approval Required Before June.md | Mentioned in project review session | pass=A
+CREATED | synthesis | synthesis/Narrow-V1 Across Stage 3.5 Decisions.md | Cross-cluster pattern across four sibling decisions | pass=B
+SUPPRESSED | synthesis | Stage 3.5 Multi-Instance Decisions Recur | reason=recent_sibling | cluster=narrow-v1-deferral | existing=[[synthesis/Alfred v1 Architecture Decisions Ship the Narrowest Workable Contract and Defer Breadth Pending Real Usage]] | pass=B
 ```
+
+**Pass tagging (Pass-A vs Pass-B observability):** every `CREATED |` and `SUPPRESSED |` line MUST end with a `pass=A` or `pass=B` suffix. Pass-A is per-source extraction (one source record in, one JSON manifest out — produced by `stage1_extract.md` / `stage3_create.md`); Pass-B is cross-learning meta-analysis (cluster of existing learnings in, meta-records out — produced by `passb_cross_analyze.md`). The operator greps for these suffixes to measure cross-Pass synthesis emission distribution; absence of the tag breaks the measurement. Apply `pass=A` when running under Pass-A prompts, `pass=B` under Pass-B prompts. SUPPRESSED lines always carry `pass=B` because the cluster-saturation gate fires only in Pass-B (Pass-A has no equivalent gate yet — that's a deferred follow-up).
+
+If you suppressed nothing, omit the `SUPPRESSED:` count line. If you created nothing, the `CREATED:` count line should still appear with zeros so the operator can distinguish "ran, nothing to do" from "ran, broke before reporting" (the universal intentionally-left-blank discipline).
+
+The `SUPPRESSED |` line format is fixed at: `SUPPRESSED | <type> | <title-you-would-have-used> | reason=<slug> | cluster=<short-label> | existing=<wikilink> | pass=B`. The `reason=` slug is one of `saturation_record`, `layer3_absorbed`, `recent_sibling` (see section 2.5 for the gate that produces each).
 
 ---
 
@@ -409,8 +489,10 @@ CREATED | constraint | constraint/Eagle Farm DA Approval Required Before June.md
 
 - **Invent learnings** not supported by source text — every learning must trace to specific content
 - **Duplicate existing records** — check the dedup context carefully
+- **Re-emit a saturated cluster's pattern under a new title** — the section 2.5 cluster-saturation pre-emission gate is the load-bearing dedup check for syntheses. Bypassing the gate by rewording the insight (same pattern, fresh rhetorical scaffolding, slightly shuffled `cluster_sources`) is the documented narrow-v1 failure mode. If you would have suppressed but emitted anyway, that's the anti-pattern.
 - **Modify source records** — you are read-only on operational records
 - **Touch system files** — never modify _templates/, _bases/, .obsidian/
 - **Create vague learnings** — "Team might need more resources" is too vague. Be specific.
 - **Over-extract** — Not every sentence is a learning. Focus on actionable knowledge that would be lost if not captured.
 - **Mix types** — A decision is not an assumption. A constraint is not a contradiction. Use the right type.
+- **Silently suppress without reporting** — when the cluster-saturation gate fires, emit the `SUPPRESSED |` line per section 7. No-output-where-output-was-expected is a different failure shape than the suppression being correct, and the operator needs to see the suppression to trust the gate.
