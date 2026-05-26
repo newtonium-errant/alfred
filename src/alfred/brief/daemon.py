@@ -13,6 +13,7 @@ from .config import BriefConfig
 from .health_section import render_health_section
 from .peer_digests import render_peer_digests_section
 from .renderer import render_brief, serialize_record
+from .routine_section import render_routine_section
 from .state import BriefRun, StateManager
 from .utils import get_logger
 from .operations import format_operations_section
@@ -123,13 +124,27 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
             peer_canonical_names=config.peer_digests.peer_canonical_names,
         )
 
+    # Today's Routines — Salem-only Phase 1. Renders the body of
+    # ``vault/daily/<today>.md`` (written by the routine daemon at
+    # 05:59 Halifax). High-attention slot per dispatch — time-anchored
+    # actions for the day belong above the retrospective Operations
+    # summary so the reader sees what to DO before what was. Empty
+    # string when no salem instance / no daily note expected — but
+    # render_routine_section always returns a non-empty sentinel string
+    # per intentionally-left-blank, so this stays in the section list
+    # unconditionally (no enable/disable gate yet; Phase 2 may add one
+    # via brief config).
+    routines_md = render_routine_section(Path(config.vault_path), today_local)
+
     # Section order is load-bearing: Health first (readers scan top-down;
     # critical status gets the highest priority real estate), Weather
-    # second (time-sensitive but non-operational), Operations third
-    # (retrospective summary — less time-sensitive than the others).
-    # Upcoming Events fourth because it's forward-looking — useful
-    # context once the reader has absorbed current state, but lower
-    # priority than health/weather/now-state summaries.
+    # second (time-sensitive but non-operational), Today's Routines
+    # third (time-anchored actions for the day — surfaces critical
+    # routines with their times above the retrospective ops summary),
+    # Operations fourth (retrospective summary — less time-sensitive
+    # than the others). Upcoming Events fifth because it's forward-
+    # looking — useful context once the reader has absorbed current
+    # state, but lower priority than health/weather/now-state summaries.
     # Peer Digests last (before signature) because they represent OTHER
     # instances' takes on their own state — informational, not actionable
     # by Salem's reader on their own. Sits AFTER Upcoming Events so the
@@ -138,6 +153,7 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     sections = [
         ("Health", health_md),
         ("Weather", weather_md),
+        ("Today's Routines", routines_md),
         ("Operations", ops_md),
     ]
     if upcoming_md:
