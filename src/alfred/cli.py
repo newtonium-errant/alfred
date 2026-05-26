@@ -1726,6 +1726,51 @@ def cmd_scaffold(args: argparse.Namespace) -> None:
     sys.exit(code)
 
 
+def cmd_routine(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred routine`` subcommands.
+
+    Phase 1: ``done`` (log completion), ``run-now`` (force-build today's
+    aggregator note), ``status`` (last run + schedule). All commands are
+    Salem-only — non-Salem instances raise ScopeError per the
+    feature_routine_phase1 contract.
+    """
+    raw = _load_unified_config(args.config)
+    wants_json = bool(getattr(args, "json", False))
+    _setup_logging_from_config(raw, tool="routine", suppress_stdout=wants_json)
+
+    from alfred.routine.config import load_from_unified
+    from alfred.routine import cli as rcli
+    from alfred.vault.scope import ScopeError
+
+    config = load_from_unified(raw)
+    subcmd = getattr(args, "routine_cmd", None)
+
+    try:
+        if subcmd == "done":
+            code = rcli.cmd_done(
+                config,
+                record_name=args.record,
+                item_text=args.item,
+                wants_json=wants_json,
+            )
+        elif subcmd == "run-now":
+            code = rcli.cmd_run_now(config, wants_json=wants_json)
+        elif subcmd == "status":
+            code = rcli.cmd_status(config, wants_json=wants_json)
+        else:
+            print("Usage: alfred routine {done|run-now|status}")
+            sys.exit(1)
+    except ScopeError as exc:
+        if wants_json:
+            import json
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+        else:
+            print(f"Refused: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    sys.exit(code)
+
+
 def cmd_bit(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred bit`` subcommands (run-now / status / history)."""
     raw = _load_unified_config(args.config)
@@ -3039,6 +3084,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print what would be enqueued without writing to the queue.",
     )
 
+    # routine — Salem-only daily routine tracker (Phase 1)
+    routine_p = sub.add_parser(
+        "routine",
+        help="Salem daily-routine tracker (done / run-now / status)",
+    )
+    routine_sub = routine_p.add_subparsers(dest="routine_cmd")
+    routine_done = routine_sub.add_parser(
+        "done",
+        help="Log a routine item as completed today",
+    )
+    routine_done.add_argument(
+        "record",
+        help="Routine record name (e.g. 'For Self Health')",
+    )
+    routine_done.add_argument(
+        "item",
+        help="Item text within the routine (e.g. 'Dog Walk')",
+    )
+    routine_done.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+    routine_run = routine_sub.add_parser(
+        "run-now",
+        help="Force-build today's daily aggregator note now",
+    )
+    routine_run.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+    routine_status = routine_sub.add_parser(
+        "status",
+        help="Show last aggregator run + schedule summary",
+    )
+    routine_status.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+
     # bit — built-in test daemon
     bit_p = sub.add_parser("bit", help="Alfred built-in test (BIT) subcommands")
     bit_sub = bit_p.add_subparsers(dest="bit_cmd")
@@ -3260,6 +3341,7 @@ def main() -> None:
         "check": cmd_check,
         "check-tool-schemas": cmd_check_tool_schemas,
         "bit": cmd_bit,
+        "routine": cmd_routine,
         "audit": cmd_audit,
         "scaffold": cmd_scaffold,
         "reviews": cmd_reviews,
