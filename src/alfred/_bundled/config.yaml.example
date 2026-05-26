@@ -13,7 +13,10 @@ vault:
   # ``dont_index_dirs`` — directories that should NOT contribute records
   #   to janitor's valid-wikilink-target stem index. Default empty: any
   #   on-disk record is a valid link target unless explicitly excluded.
-  dont_scan_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "inbox/processed"]
+  # ``daily/`` is a derivative directory written by the routine daemon
+  # at 05:59 Halifax; the brief reads it at 06:00. Skip it from janitor
+  # scans — it's not user-authored content.
+  dont_scan_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "inbox/processed", "daily"]
   dont_index_dirs: []
   ignore_files: [".gitkeep"]
 
@@ -76,6 +79,23 @@ distiller:
   state:
     path: "./data/distiller_state.json"
     max_run_history: 20
+
+# Routine — Salem-only daily routine tracker (Phase 1). See
+# ``config.yaml.example`` for full documentation. Salem-only: the
+# daemon refuses to start on any other instance and exits 78 so the
+# orchestrator auto-restart loop skips cleanly. Omit this block on
+# Hypatia / KAL-LE instances.
+routine:
+  enabled: true
+  schedule:
+    time: "05:59"
+    timezone: "America/Halifax"
+  output:
+    directory: "daily"
+    name_template: "{date}"
+  state:
+    path: "./data/routine_state.json"
+    max_history: 30
 
 surveyor:
   watcher:

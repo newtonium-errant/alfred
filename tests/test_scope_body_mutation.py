@@ -93,6 +93,12 @@ def test_universal_deny_set_pinned_to_spec():
         # matcher / policy text. Status flip (``status: revoked``)
         # + new record is the supersede path; treat like decision.
         "preference",
+        # Routine Phase 1 (2026-05-26). Body is auto-rendered from
+        # the bundled template; operational state lives in frontmatter
+        # (items + completion_log). insert_at / replace would silently
+        # rewrite the template-driven sections — completion mutation
+        # routes through ``alfred routine done``.
+        "routine",
     }
     assert _BODY_MUTATE_DENIED_TYPES == expected
 

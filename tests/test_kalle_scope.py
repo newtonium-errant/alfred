@@ -359,4 +359,10 @@ def test_universal_deny_set_unchanged_by_architecture_addition():
         # matcher / policy text. Status flip + new record is the
         # supersede path (mirrors decision).
         "preference",
+        # Routine Phase 1 (2026-05-26). Body is auto-rendered from the
+        # bundled template; operational state lives in frontmatter
+        # (items + completion_log). insert_at / replace are wrong
+        # tools — completion mutation routes through
+        # ``alfred routine done``.
+        "routine",
     })

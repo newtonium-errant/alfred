@@ -418,6 +418,35 @@ def _run_brief(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     asyncio.run(run_daemon(config))
 
 
+def _run_routine(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """Routine daemon process entry point.
+
+    Salem-only Phase 1: the daemon's own start guard refuses non-Salem
+    instances and exits 78 so the auto-restart loop skips cleanly.
+    The orchestrator auto-start gate also guards on the ``routine``
+    config block presence, so non-Salem instances that omit the block
+    never reach this runner.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/routine.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    # Reuse brief.utils.setup_logging — same signature, no bespoke
+    # logger needed (the routine daemon writes structured events that
+    # match the brief log format).
+    from alfred.brief.utils import setup_logging
+    from alfred.routine.config import load_from_unified
+    config = load_from_unified(raw)
+    setup_logging(
+        level=log_cfg.get("level", "INFO"),
+        log_file=log_file,
+        suppress_stdout=suppress_stdout,
+        **_rotation_kwargs(log_cfg),
+    )
+    from alfred.routine.daemon import run_daemon
+    asyncio.run(run_daemon(config))
+
+
 def _run_brief_digest_push(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Brief-digest pusher daemon entry point (V.E.R.A. content arc sender).
 
@@ -809,6 +838,7 @@ TOOL_RUNNERS = {
     "radar_day": _run_radar_day,
     "friction_analyzer": _run_friction_analyzer,
     "cloudflared": _run_cloudflared,
+    "routine": _run_routine,
 }
 
 
@@ -870,6 +900,19 @@ def run_all(
             tools.append("mail")
         if "brief" in raw:
             tools.append("brief")
+        # Routine daemon (Salem-only Phase 1) auto-starts when the
+        # config has a ``routine:`` block. The daemon's own start guard
+        # refuses non-Salem instances and exits 78 so auto-restart
+        # skips cleanly — but the operator's intent is "do I want a
+        # routine daemon spinning?" which is the block-presence gate.
+        # Honour explicit ``enabled: false`` opt-out for symmetry with
+        # other tools.
+        if "routine" in raw:
+            routine_block = raw.get("routine") or {}
+            if isinstance(routine_block, dict) and routine_block.get("enabled") is False:
+                skipped.append(("routine", "explicitly_disabled"))
+            else:
+                tools.append("routine")
         # BIT daemon auto-starts when the config has a ``bit`` section
         # OR when the brief is configured (BIT is a brief pre-check —
         # it makes no sense to have brief without BIT). Explicit
@@ -1016,7 +1059,7 @@ def run_all(
         # ``test_dispatcher_two_arg_branch_matches_two_arg_tools`` in
         # ``tests/orchestrator/test_tool_dispatch.py`` so a missing
         # entry trips a test rather than a TypeError on first spawn.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared", "routine"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

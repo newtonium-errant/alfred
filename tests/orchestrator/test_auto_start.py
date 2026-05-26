@@ -428,6 +428,78 @@ def test_unknown_tool_in_only_exits_nonzero(
     assert "Unknown tool: bogus_tool" in out
 
 
+def test_routine_section_triggers_routine_tool(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """``routine:`` block in config triggers routine auto-start.
+
+    Salem-only is enforced at the daemon-start guard, not at the
+    orchestrator gate — the orchestrator just respects "block present
+    ⇒ start." Non-Salem instances should omit the block (the bundled
+    config examples document this).
+    """
+    raw = orchestrator_raw_config
+    raw["routine"] = {}
+
+    all_fakes_with_routine = dict(ALL_FAKES)
+    all_fakes_with_routine["routine"] = fake_runner_2arg
+    _wire_touch_files(raw, orch_dirs, list(all_fakes_with_routine))
+    install_per_tool_fakes({
+        t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
+        for t in all_fakes_with_routine
+    })
+
+    fire_sentinel_after(0.6)
+    orchestrator.run_all(
+        raw, only=None, skills_dir=orch_dirs["skills"],
+        pid_path=orch_dirs["pid_path"], live_mode=False,
+    )
+
+    for _ in range(30):
+        started = _read_started_tools(orch_dirs["data"])
+        if "routine" in started:
+            break
+        time.sleep(0.05)
+
+    assert "routine" in started, f"routine not started, got {started}"
+
+
+def test_routine_enabled_false_skips_routine_tool(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """``routine: {enabled: false}`` explicitly skips routine."""
+    raw = orchestrator_raw_config
+    raw["routine"] = {"enabled": False}
+
+    all_fakes_with_routine = dict(ALL_FAKES)
+    all_fakes_with_routine["routine"] = fake_runner_2arg
+    _wire_touch_files(raw, orch_dirs, list(all_fakes_with_routine))
+    install_per_tool_fakes({
+        t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
+        for t in all_fakes_with_routine
+    })
+
+    fire_sentinel_after(0.6)
+    orchestrator.run_all(
+        raw, only=None, skills_dir=orch_dirs["skills"],
+        pid_path=orch_dirs["pid_path"], live_mode=False,
+    )
+
+    # Give other tools time to start so the absence of routine is
+    # observable.
+    for _ in range(30):
+        started = _read_started_tools(orch_dirs["data"])
+        if {"curator", "janitor", "distiller"}.issubset(started):
+            break
+        time.sleep(0.05)
+
+    assert "routine" not in started, (
+        f"routine should be skipped when enabled=false, got {started}"
+    )
+
+
 def test_mail_and_brief_sections_trigger_their_tools(
     orchestrator_raw_config, orch_dirs, fast_sleep,
     install_per_tool_fakes, fire_sentinel_after,

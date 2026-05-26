@@ -44,7 +44,11 @@ vault:
   # ``dont_index_dirs`` defaulting to empty, i.e. the bug fix).
   # Configs that set BOTH legacy + new should prefer the new keys —
   # ``dont_scan_dirs`` wins when both are present.
-  dont_scan_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox"]
+  # ``daily/`` is a derivative directory written by the routine daemon
+  # at 05:59 Halifax; the brief reads it at 06:00. Skip it from janitor
+  # scans — it's not user-authored content, it's a per-day aggregator
+  # snapshot.
+  dont_scan_dirs: ["_templates", "_bases", "_docs", ".obsidian", "view", "session", "inbox", "daily"]
   dont_index_dirs: []
   ignore_files: [".gitkeep"]
 
@@ -636,6 +640,35 @@ bit:
     name_template: "Alfred BIT {date}"
   state:
     path: "./data/bit_state.json"
+    max_history: 30
+
+# Routine — Salem-only daily routine tracker (Phase 1).
+#
+# Replaces Trello-style daily templates with a vault-native record set.
+# Each ``routine/<name>.md`` defines a cadence (daily/weekly/every_n_days/
+# monthly/every_n_months) and a list of items with priority
+# (critical/tracked/aspirational). The daemon fires at 05:59 Halifax
+# (one minute before the brief) and writes ``vault/daily/<date>.md``
+# aggregating every routine that fires today, grouped by priority.
+# The brief reads that file and inlines it as the "Today's Routines"
+# section between Weather and Operations.
+#
+# Salem-only: the daemon refuses to start on any other instance
+# (telegram.instance.name != "Salem" → exit 78). Hypatia and KAL-LE
+# should leave this block absent in their config.<instance>.yaml.
+#
+# Phase 2 will surface ``alfred routine done <record> <item>`` through
+# Telegram and may relax the Salem-only constraint.
+routine:
+  enabled: true
+  schedule:
+    time: "05:59"                   # 1 minute before brief at 06:00
+    timezone: "America/Halifax"
+  output:
+    directory: "daily"              # ``vault/daily/<date>.md`` lives here
+    name_template: "{date}"
+  state:
+    path: "./data/routine_state.json"
     max_history: 30
 
 surveyor:

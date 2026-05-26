@@ -50,6 +50,11 @@ EXPECTED_TOOLS = {
     # the other daemons. Auto-starts on instances with
     # ``cloudflared.enabled: true``.
     "cloudflared",
+    # Routine Phase 1 (Salem-only) — daily routine aggregator that
+    # fires at 05:59 Halifax (one minute before brief at 06:00) and
+    # writes ``vault/daily/<date>.md`` for the brief to read. Daemon's
+    # own start guard refuses non-Salem instances and exits 78.
+    "routine",
 }
 
 TWO_ARG_TOOLS = {
@@ -59,6 +64,7 @@ TWO_ARG_TOOLS = {
     "radar_day",
     "friction_analyzer",
     "cloudflared",
+    "routine",
 }
 THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "instructor", "talker"}
 
