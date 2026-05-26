@@ -81,6 +81,18 @@ _BODY_MUTATE_DENIED_TYPES: frozenset[str] = frozenset({
     # supersede flow for decision records). See
     # ``project_operator_preferences_v1.md`` Hard Contract #4.
     "preference",
+    # Routine (2026-05-26, Phase 1). The body is auto-rendered from
+    # the bundled template (``# Items`` / ``# History`` placeholder
+    # sections pointing readers at the frontmatter source-of-truth);
+    # the operational state lives in the ``items`` / ``completion_log``
+    # frontmatter fields. Mid-document insertion and full rewrite are
+    # both wrong tools — completion-log mutation goes through
+    # ``alfred routine done`` (which appends a date string to the
+    # frontmatter list), and item additions go through ``vault_edit``
+    # set_fields on ``items``. The right path for changing the rendered
+    # body sections is editing the template itself, not a body rewrite
+    # on a record.
+    "routine",
 })
 
 

@@ -763,6 +763,50 @@ _DEFINITIONS: list[TypeDefinition] = [
         statuses=frozenset({"draft", "scheduled", "published", "archived"}),
         available_in_scopes=frozenset({"hypatia"}),
     ),
+
+    # Routine (2026-05-26, Phase 1 — replaces Andrew's Trello daily
+    # templates). Salem-only canonical type: a routine defines a set
+    # of recurring items (daily walks, weekly chores, monthly check-ins,
+    # critical medication reminders) with per-item priority and an
+    # append-only completion_log. The aggregator daemon reads all active
+    # routine records each morning at 05:59 Halifax and writes a
+    # derivative ``vault/daily/<date>.md`` note grouping items by
+    # priority (Critical / Tracked / Aspirational). Brief integration
+    # surfaces that note at 06:00 in the "Today's Routines" section.
+    #
+    # Cadence: a small dict on each record (see ``routine/cadence.py``)
+    # — six shapes: daily, weekly (by weekday list), every_n_days
+    # (with anchor), monthly (day-of-month, supports 'last'), monthly
+    # (nth weekday), every_n_months (with anchor). Routed through a
+    # hand-rolled dispatcher rather than rrule — six shapes cover every
+    # operator template and the implementation is ~80 lines vs the
+    # dateutil dependency.
+    #
+    # Required fields: ``name`` (display title — appears in brief
+    # section), ``cadence`` (dict — without it the aggregator cannot
+    # decide whether today is a fire day), ``items`` (list of dicts —
+    # the unit of work being scheduled). The optional ``completion_log``
+    # frontmatter accumulates per-item ISO date strings on each
+    # ``alfred routine done <record> <item>`` call.
+    #
+    # Body is auto-rendered by the operator from the template (template
+    # provides a placeholder ``# Items`` / ``# History`` section
+    # pointing readers at the frontmatter source-of-truth). The type is
+    # included in ``_BODY_MUTATE_DENIED_TYPES`` so insert_at / replace
+    # are universally forbidden — agents touch the completion_log
+    # via the CLI, not via body rewrites.
+    #
+    # Status set: ``active`` (firing), ``archived`` (operator-paused;
+    # retained for completion-log audit but skipped by the aggregator).
+    # Salem-only — Hypatia and KAL-LE have no use case in V1; future
+    # instances may opt in by adding ``available_in_scopes`` entries.
+    TypeDefinition(
+        name="routine",
+        directory="routine",
+        statuses=frozenset({"active", "archived"}),
+        required_fields=("name", "cadence", "items"),
+        available_in_scopes=frozenset({SCOPE_CANONICAL}),
+    ),
 ]
 
 
@@ -978,6 +1022,16 @@ LIST_FIELDS: set[str] = {
     # genuinely new — operators may type a single skill as a string
     # and rely on the create-time coerce.
     "skills_practiced",
+    # Routine (2026-05-26, Phase 1). ``items`` is a list of dicts —
+    # the unit of scheduled work. ``completion_log`` is a dict-of-lists
+    # at runtime, but operators will hand-edit the YAML and may
+    # accidentally drop the outer list shape on a value. Coerce-from-
+    # scalar at the top-level keeps the aggregator robust against
+    # those shapes (single-string completion_log value collapses to
+    # one-element list; same for items). Per-item value-list mutation
+    # is owned by ``alfred routine done`` in ``routine/cli.py``.
+    "items",
+    "completion_log",
 }
 
 # Required fields for all records
