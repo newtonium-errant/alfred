@@ -145,13 +145,31 @@ def test_starter_registry_yaml_parses_with_three_instances(
     """The shipped starter registry text MUST parse via load_registry
     so an operator's ``cp instances.yaml.example ~/.alfred/instances.yaml``
     one-shot works without further hand-editing for a default-shape
-    install."""
+    install.
+
+    Config paths are RELATIVE (per Phase 1 polish 2026-05-28 +
+    feedback_hardcoding_and_alfred_naming.md): the starter file
+    must not ship operator-specific absolute paths like
+    ``/home/andrew/alfred/config.yaml``. Operators who clone the
+    repo + run ``alfred instance up`` from the project root get a
+    working registry without per-machine editing.
+    """
     registry = tmp_path / "instances.yaml"
     registry.write_text(STARTER_REGISTRY_YAML, encoding="utf-8")
     instances = load_registry(registry)
     assert len(instances) == 3
     names = {i.name for i in instances}
     assert names == {"salem", "kal-le", "hypatia"}
+    # Pin the relative-path convention. A future regression that
+    # re-introduces ``/home/andrew/alfred/...`` literals (or any
+    # other absolute operator-specific path) surfaces here rather
+    # than in a downstream operator-bootstrap failure.
+    for inst in instances:
+        assert inst.config.startswith("./"), (
+            f"Instance {inst.name!r} config {inst.config!r} should be "
+            f"a relative path (./config.yaml shape) — absolute operator-"
+            f"specific paths violate feedback_hardcoding_and_alfred_naming."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +373,59 @@ def test_run_verb_failure_carries_short_stderr_in_summary(
     assert rc == 1
     assert "KAL-LE: FAILED" in summary
     assert "ImportError" in summary
+
+
+def test_run_verb_timeout_produces_distinct_summary_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wedged subprocess → ``TimeoutExpired`` caught + distinct summary
+    shape (``Display: TIMEOUT (30s wedge — check <config-path>)``).
+
+    Operator-grep target for "which instance is wedged?" workflows.
+    Distinct from the FAILED shape because the diagnostic pivot is
+    different: FAILED = subprocess returned non-zero exit (we have
+    stderr to inspect); TIMEOUT = subprocess never returned (we have
+    cwd + config path to inspect).
+
+    Pinned per code-reviewer NOTE #3 (2026-05-28): without the
+    timeout, a wedged config-load on one instance would hang the
+    whole fan-out loop until the operator killed the wrapper from
+    another terminal. 30s is bounded enough that the operator-
+    visible feedback loop stays tight.
+    """
+    import subprocess as _subprocess
+
+    def _raise_timeout(*args, **kwargs):
+        # subprocess.TimeoutExpired signature: cmd, timeout, output=None, stderr=None
+        raise _subprocess.TimeoutExpired(
+            cmd=args[0] if args else "fake-cmd",
+            timeout=30,
+        )
+
+    monkeypatch.setattr(
+        "alfred.instance_set.subprocess.run", _raise_timeout,
+    )
+    monkeypatch.setattr(
+        "alfred.instance_set.check_running", lambda inst: None,
+    )
+
+    inst = Instance(
+        name="hypatia",
+        display="Hypatia",
+        config="/path/to/config.hypatia.yaml",
+        enabled=True,
+    )
+    rc, summary = run_verb(inst, "down", [])
+    assert rc == 1
+    # Distinct canary phrase + config path surfaced for operator
+    # diagnosis. Disjoint from the FAILED canary so debugging targets
+    # the right surface.
+    assert "Hypatia: TIMEOUT" in summary
+    assert "30s wedge" in summary
+    assert "/path/to/config.hypatia.yaml" in summary
+    # FAILED canary MUST NOT fire — TIMEOUT and FAILED are disjoint
+    # signals per the per-section log-canary discipline.
+    assert "FAILED" not in summary
 
 
 # ---------------------------------------------------------------------------

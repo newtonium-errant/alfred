@@ -2267,7 +2267,8 @@ def cmd_instance_status_all(args: argparse.Namespace) -> None:
         # Each subprocess returns its own JSON object; we wrap
         # them by instance name. Failures land as ``{"error": ...}``
         # entries so the operator can spot per-instance issues.
-        import json
+        # ``json`` is imported at module level (line 6); the local
+        # import was redundant — dropped 2026-05-28 per reviewer NOTE.
         from alfred.instance_set import _build_subprocess_cmd
         payload: dict[str, Any] = {}
         for inst in enabled:

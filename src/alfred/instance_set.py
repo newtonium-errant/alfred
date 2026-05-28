@@ -264,7 +264,29 @@ def run_verb(
             )
 
     cmd = _build_subprocess_cmd(instance, verb, extra_args)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # Subprocess timeout — bounds the wrapper against a wedged
+    # config-load on one instance hanging the whole fan-out. 30s is
+    # generous for the normal case: ``up`` daemonizes + returns in
+    # <1s, ``down``/``status`` reads PID file + returns in <1s. A
+    # timeout firing means something is genuinely wrong (corrupt
+    # config, locked file, network call inside config load) — the
+    # operator wants to know NOW rather than wait indefinitely. The
+    # best-effort fan-out shape continues to the next instance after
+    # this one's timeout summary is returned.
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        # Distinct from the FAILED line — the operator-grep target
+        # for "which instance is wedged?" workflows. Carries the
+        # configured timeout value + config path so the operator can
+        # diagnose without re-running with --verbose.
+        return (
+            1,
+            f"{instance.display}: TIMEOUT "
+            f"(30s wedge — check {instance.config})",
+        )
 
     if proc.returncode != 0:
         # Failure path — short stderr excerpt for the summary line.
@@ -437,21 +459,26 @@ STARTER_REGISTRY_YAML = """\
 # Set ``enabled: false`` to drain an instance from fan-out without
 # deleting the row.
 #
+# Config paths are relative by convention — they resolve against the
+# cwd at the moment ``alfred instance ...`` runs. Typical launch:
+# ``cd <project-root> && alfred instance up``. Operators with a
+# non-cwd launch convention should rewrite these as absolute paths.
+#
 # Order is preserved in operator-facing output, so put the most-
 # critical instance first.
 
 instances:
   - name: salem
     display: Salem
-    config: /home/andrew/alfred/config.yaml
+    config: ./config.yaml
     enabled: true
   - name: kal-le
     display: KAL-LE
-    config: /home/andrew/alfred/config.kalle.yaml
+    config: ./config.kalle.yaml
     enabled: true
   - name: hypatia
     display: Hypatia
-    config: /home/andrew/alfred/config.hypatia.yaml
+    config: ./config.hypatia.yaml
     enabled: true
 """
 
