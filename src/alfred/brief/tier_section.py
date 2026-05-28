@@ -39,6 +39,7 @@ import yaml
 from alfred.tier.compute import (
     OPEN_STATUSES,
     TierResult,
+    coerce_due_date,
     compute_effective_tier,
 )
 
@@ -190,6 +191,25 @@ def _iter_task_records(vault_path: Path) -> list[tuple[Path, dict, str]]:
             )
             continue
         fm = dict(post.metadata or {})
+        # Type filter — defensive against stray non-task records in
+        # ``vault/task/``. Templates, janitor-rescue stubs, or operator
+        # hand-edits that drop a wrong-type file into the directory
+        # would otherwise render as phantom tasks in the brief.
+        #
+        # Per ``feedback_intentionally_left_blank.md`` + the recurring
+        # silent-skip antipattern: every ``continue`` gets a named log
+        # event so operators reading the tier-section logs can
+        # distinguish "no tasks at this tier" from "task dir had files
+        # the filter dropped." The skip carries the actual frontmatter
+        # ``type`` so the operator can grep + fix the misplaced record.
+        record_type = fm.get("type")
+        if record_type != "task":
+            log.info(
+                "brief.tier_section.non_task_skipped",
+                path=str(path),
+                type=record_type,
+            )
+            continue
         name = str(fm.get("name") or path.stem)
         out.append((path, fm, name))
     return out
@@ -216,9 +236,7 @@ def _format_due_distance(due: Any, now: datetime) -> str:
     (days == 0); otherwise we render days (the operator-facing
     granularity for task deadlines).
     """
-    from alfred.tier.compute import _coerce_due_date
-
-    parsed = _coerce_due_date(due)
+    parsed = coerce_due_date(due)
     if parsed is None:
         return ""
     delta_days = (parsed - now.date()).days
@@ -331,8 +349,7 @@ def render_tier_section(
     # next deadline surfaces at the top of each bucket.
     def _sort_key(item: tuple[str, TierResult, dict[str, Any]]):
         name, _result, fm = item
-        from alfred.tier.compute import _coerce_due_date
-        due = _coerce_due_date(fm.get("due"))
+        due = coerce_due_date(fm.get("due"))
         # None-due sorts last within bucket; (1, "") trick — bool
         # comparison: due-present (False == 0) < due-absent (True == 1).
         return (due is None, due or date.max, name.lower())

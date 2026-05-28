@@ -17,6 +17,7 @@ from .compute import (
     OPEN_STATUSES,
     PRIORITY_TO_BASE_TIER,
     TierResult,
+    coerce_due_date,
     compute_effective_tier,
     derive_base_tier_from_priority,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "OPEN_STATUSES",
     "PRIORITY_TO_BASE_TIER",
     "TierResult",
+    "coerce_due_date",
     "compute_effective_tier",
     "derive_base_tier_from_priority",
 ]

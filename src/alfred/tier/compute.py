@@ -137,13 +137,20 @@ def _coerce_tier_int(value: Any) -> int | None:
     return n
 
 
-def _coerce_due_date(value: Any) -> date | None:
+def coerce_due_date(value: Any) -> date | None:
     """Coerce a frontmatter ``due`` value to a ``date``.
 
     PyYAML parses ``due: 2026-05-28`` as a ``date`` object directly; the
     isoformat-string branch handles operator-edited records where the
     field came in as a quoted string (``due: '2026-05-28'``). datetime
     instances are normalised to their date component.
+
+    Public API (promoted from ``_coerce_due_date`` 2026-05-28, Phase 2
+    cleanup): the render layer in ``alfred.brief.tier_section`` parses
+    ``due`` for two distinct purposes (distance formatting + sort
+    keying), and a future tier-CLI surface or a related render path
+    has the same need. One canonical helper > N copies of the parser
+    threaded through inline calls or duplicated in closures.
     """
     if isinstance(value, datetime):
         return value.date()
@@ -202,7 +209,7 @@ def compute_effective_tier(
     except (TypeError, ValueError):
         escalate_at_days = None
 
-    due = _coerce_due_date(task_fm.get("due"))
+    due = coerce_due_date(task_fm.get("due"))
 
     # --- 3. Compute effective_tier ---------------------------------
     # No due date — base tier holds. Annotate the source so the render
@@ -291,6 +298,7 @@ __all__ = [
     "OPEN_STATUSES",
     "PRIORITY_TO_BASE_TIER",
     "TierResult",
+    "coerce_due_date",
     "compute_effective_tier",
     "derive_base_tier_from_priority",
 ]

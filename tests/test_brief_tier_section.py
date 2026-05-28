@@ -454,10 +454,12 @@ def test_body_only_file_is_not_a_parse_failure(tmp_path: Path) -> None:
     with structlog.testing.capture_logs() as captured:
         render_tier_section(tmp_path, NOW)
     parse_fails = [c for c in captured if c.get("event") == "brief.tier_section.parse_failed"]
-    # Body-only file has no frontmatter at all → not flagged. The body-
-    # only file gets a default ``status=todo`` (per ``_is_open``) and
-    # no ``base_tier`` (defaulting to T3), so it WILL surface in the
-    # T3 bucket — but as a "valid no-fields task," not a parse failure.
+    # Body-only file has no frontmatter at all → not flagged as
+    # parse-failed. (Phase 2 cleanup 2026-05-28: the body-only file
+    # IS now skipped at the type-filter gate with a
+    # ``non_task_skipped`` log event since its ``fm.get("type")`` is
+    # None, not "task" — but the parse-failed gate is the one this
+    # test was written to pin and it still holds at zero.)
     assert len(parse_fails) == 0
 
 
@@ -480,6 +482,88 @@ def test_validator_handles_unicode_decode_error(tmp_path: Path) -> None:
     parse_fails = [c for c in captured if c.get("event") == "brief.tier_section.parse_failed"]
     assert len(parse_fails) == 1
     assert "utf-8" in parse_fails[0]["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Type filter — non-task records in vault/task/ are skipped + logged
+# ---------------------------------------------------------------------------
+
+
+def test_non_task_file_in_task_dir_skipped(tmp_path: Path) -> None:
+    """A record with ``type: note`` dropped into ``vault/task/`` (template,
+    janitor-rescue, operator hand-edit mistake) MUST NOT render as a
+    phantom task. Phase 2 cleanup 2026-05-28 — defensive type filter.
+
+    Per ``feedback_intentionally_left_blank.md`` + the silent-skip
+    antipattern: the skip emits a named ``non_task_skipped`` log event
+    carrying the path + actual frontmatter ``type`` so operators
+    reading the tier-section logs can grep for stray-type records and
+    fix the misplaced file.
+    """
+    _write_task(
+        tmp_path, "Stray Note",
+        {"type": "note", "status": "active", "created": "2026-05-01"},
+    )
+    _write_task(
+        tmp_path, "Real Task",
+        {"type": "task", "status": "todo", "base_tier": 2, "created": "2026-05-01"},
+    )
+    with structlog.testing.capture_logs() as captured:
+        body = render_tier_section(tmp_path, NOW)
+
+    # Stray-note record absent from render — no phantom tier line.
+    assert "Stray Note" not in body
+    # Real task still renders normally.
+    assert "Real Task" in body
+
+    # Log event fires with path + the actual type value.
+    skips = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.non_task_skipped"
+    ]
+    assert len(skips) == 1
+    assert skips[0]["type"] == "note"
+    assert "Stray Note.md" in skips[0]["path"]
+
+
+def test_unknown_type_skipped(tmp_path: Path) -> None:
+    """A record with ``type:`` MISSING entirely (a body-only file that
+    parsed clean past the validator, or an operator hand-edit that
+    dropped the field) MUST NOT render as a phantom task. The skip
+    log carries ``type=None`` so the operator can distinguish
+    "wrong type" from "no type at all" via the log payload."""
+    # Body-only file: passes the YAML validator (no leading ``---``
+    # = body-only is valid) AND lands with empty frontmatter, so
+    # ``fm.get("type")`` is None.
+    task_dir = tmp_path / "task"
+    task_dir.mkdir(parents=True)
+    (task_dir / "BodyOnlyNoType.md").write_text(
+        "# Body Only\n\nNo frontmatter at all.\n",
+        encoding="utf-8",
+    )
+    _write_task(
+        tmp_path, "Real Task",
+        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
+    )
+    with structlog.testing.capture_logs() as captured:
+        body = render_tier_section(tmp_path, NOW)
+
+    # Body-only record absent from render.
+    assert "BodyOnlyNoType" not in body
+    assert "Body Only" not in body
+    # Real task still renders.
+    assert "Real Task" in body
+
+    # Log event fires with type=None — operator can grep
+    # ``type=None`` to find records missing the type field
+    # entirely vs ``type=note`` to find wrong-type records.
+    skips = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.non_task_skipped"
+    ]
+    assert len(skips) == 1
+    assert skips[0]["type"] is None
+    assert "BodyOnlyNoType.md" in skips[0]["path"]
 
 
 # ---------------------------------------------------------------------------
