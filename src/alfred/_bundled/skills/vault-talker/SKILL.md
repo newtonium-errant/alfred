@@ -104,13 +104,72 @@ The types you can create in this tool are narrow on purpose — keep records wel
 
 | Type | For |
 |---|---|
-| `task` | Something Andrew needs to do. Fields that matter: `status` (default `todo`), `due` (ISO date if he named one), `priority` (`low`/`medium`/`high`/`urgent`), `project` (wikilink if one's in scope), `remind_at` (ISO 8601 UTC timestamp — see **Setting Reminders** below). |
+| `task` | Something Andrew needs to do. Fields that matter: `status` (default `todo`), `due` (ISO date if he named one), `priority` (`low`/`medium`/`high`/`urgent`), `project` (wikilink if one's in scope), `remind_at` (ISO 8601 UTC timestamp — see **Setting Reminders** below). Optional tier fields: `base_tier` (int 1/2/3), `escalate_to` (int), `escalate_at_days` (int) — see **Task tiers and deadline-relative escalation** below. |
 | `note` | Captured thought, observation, reference, or summary. Fields: `subtype` (`idea`/`learning`/`research`/`meeting-notes`/`reference`), `project` (wikilink if applicable), `related` (wikilinks to anything obviously relevant). |
 | `decision` | An explicit choice with rationale. Fields: `confidence` (`low`/`medium`/`high`), `project` (wikilink), `decided_by` (list — for voice sessions this is almost always `["[[person/Andrew Newton]]"]`). |
 | `event` | A dated thing happening. **Required: `start` and `end`** as ISO 8601 datetimes with timezone offset (e.g. `'2026-06-27T16:00:00-03:00'`). Optional: `participants`, `location`, `project`, plus `date` (ISO date) and `time` (human-readable, e.g. `4:00 PM`) which the morning brief still reads. The `name` field becomes the GCal event title — keep it clean: **do NOT append the date to `name`** (GCal already shows the date in its own UI). See **Event datetimes** + **Events and the calendar sync** below for full shape. |
 | `person` | An individual Andrew has named for the first time (family, colleague, vendor, professional). Fields that matter: `aliases` (list, common short forms), `role` (their job/relationship in one phrase), `org` (wikilink if employed/affiliated), `email`, `phone`, `description` (1-2 sentences if Andrew gave context). Only fill the fields he actually provided — don't invent. |
 
 For exact frontmatter shapes beyond these headline fields, trust the CLI — it validates on create and fills reasonable defaults. If you want to know what an existing record of the same type looks like, `vault_search` for one and `vault_read` it.
+
+### Task tiers and deadline-relative escalation (shipped 2026-05-28)
+
+The 3-tier task system layers a deadline-relative escalation rule over the `task` record type. The brief's **Open Tasks by Tier** section (above Today's Routines) renders three buckets:
+
+- **Tier 1 — the *now* queue.** Time-critical, action-today.
+- **Tier 2 — the *soon* queue.** On the radar, not urgent today.
+- **Tier 3 — the *someday* queue.** Aspirational, no deadline pressure.
+
+Tier is **a function of the task plus time-to-deadline**, not a fixed property — that's the framework Andrew ratified 2026-05-27. A weekly invoicing task is base tier 2 on Tuesday and escalates to tier 1 by Friday; a biweekly payroll task is base tier 2 on cycle-open and escalates to tier 1 the day before deadline. The talker sets *base* tier + escalation; the brief renders the *effective* tier.
+
+**Three new optional task frontmatter fields:**
+
+- `base_tier` (int, one of `1` / `2` / `3`) — the operator-set tier. T1 = now, T2 = soon, T3 = someday.
+- `escalate_to` (int, one of `1` / `2` / `3`) — the tier the task escalates to as `due` approaches. Default when omitted: `max(1, base_tier - 1)` — one tier up, capped at T1.
+- `escalate_at_days` (int) — how many days before `due` the escalation fires. **Opt-in per task: omitting this field means the task never escalates, even with a `due`.** Set it when Andrew implies deadline-relative urgency ("becomes tier 1 three days out"); leave it off when the deadline is a hard cap without escalation.
+
+**DO NOT write `tier: N`.** Records authored before 2026-05-28 used an ad-hoc `tier:` field — that field name is **not** canonical. The canonical name is `base_tier:`. A migration is renaming existing records today; future writes must use `base_tier`. If you find yourself typing `set_fields={"tier": 1}` — stop, rewrite as `set_fields={"base_tier": 1}`.
+
+**`priority` and `base_tier` are orthogonal but related.** `priority` (`urgent` / `high` / `medium` / `low`) is intrinsic importance — used for reminder fallback templates and sort tiebreakers. `base_tier` is the operator-set tier intent. When `base_tier` is unset on a task, the brief derives one from `priority` per the `alfred.tier.PRIORITY_TO_BASE_TIER` mapping (current values: `urgent → 1`, `high → 2`, `medium → 2`, `low → 3`; the import-path name is source-of-truth — if the mapping ever drifts, the SKILL value here will lag). The brief annotates a derived tier as `T<n> (from priority)` so the operator can see the fallback fired. **Prefer setting `base_tier` explicitly** when Andrew has stated a tier intent; let derivation handle pre-migration tasks and operator-imported records without an explicit tier signal.
+
+**`effective_tier` is computed at brief-render time and is NEVER written to the record.** That name is reserved for the compute module's return value. You may DISCUSS the effective tier when Andrew asks "what tier is X right now" — but DO NOT call `set_fields={"effective_tier": 1}`. The record stays canonical; the brief shows the projection.
+
+**Past-due tasks always render at `escalate_to`** regardless of `escalate_at_days`. A missed deadline is by definition past the escalation window. If Andrew asks why an overdue task shows at a higher tier than its `base_tier`, that's the reason — even with no `escalate_at_days` set, past-due forces the escalation.
+
+**Brief render shapes** (so you can describe what the operator will see):
+
+- Plain (base tier, no annotation): `- [ ] [[task/Reading]] — T3`
+- Priority-derived base: `- [ ] [[task/Some Task]] — T2 (from priority)`
+- Escalated (deadline-driven): `- [ ] [[task/RRTS Payroll]] — T2→T1 (due 2026-05-28, 18h)`
+- Overdue: `- [ ] [[task/Late Task]] — T2→T1 (overdue 2d)`
+
+**Status filter.** The brief's tier section shows only tasks with `status` in `{todo, active, blocked}`. `done` and `cancelled` are excluded. If Andrew asks why a closed task no longer appears in the tier brief, that's the filter — flip `status` back to `todo` to re-surface it.
+
+**Where the operator sees this.** The morning brief has a section titled exactly `Open Tasks by Tier` (above the Today's Routines section). When Andrew asks "where will I see this?" — name that section.
+
+**Worked example A — simple base tier set:**
+
+> Andrew: *"Make this task tier 1."*
+>
+> Salem: `vault_edit set_fields={"base_tier": 1}`. Replies: *"Done — base tier 1 set. Will render in the Tier 1 bucket of `Open Tasks by Tier` on the next brief."*
+
+**Worked example B — deadline-relative escalation (RRTS Invoicing pattern):**
+
+> Andrew: *"RRTS invoicing — base tier 2, escalates to tier 1 three days before the deadline."*
+>
+> Salem: `vault_edit set_fields={"base_tier": 2, "escalate_to": 1, "escalate_at_days": 3}` on `task/RRTS Invoicing.md`. The `due` field already carries the next cycle's deadline. Replies: *"Done — base 2, escalates to 1 inside the 3-day window before `due`. Brief will render `T2` outside the window, then `T2→T1 (due <date>, <Nd>)` once the deadline is ≤3 days out."*
+
+**Worked example C — standing T3 practice with no deadline:**
+
+> Andrew: *"Reading is a standing tier 3 practice — no deadline."*
+>
+> Salem: `vault_edit set_fields={"base_tier": 3}` on `task/Reading.md`. Leaves `due`, `escalate_to`, `escalate_at_days`, and `priority` untouched. Replies: *"Done — base tier 3, no escalation (no `due`, no `escalate_at_days`). Will render `T3` on the brief indefinitely until you change it."*
+>
+> No `escalate_at_days` means no escalation fires — appropriate for aspirational practices that shouldn't be promoted by clock pressure.
+
+**When Andrew describes deadline-relative escalation without numbers**, ask one short clarifying question to pin the threshold: *"Base tier and escalate-to are clear (2→1). How many days before due should it escalate — 1, 3, 7?"* Don't guess; the threshold is per-task and operator-specific.
+
+**Sequencing on bulk tier-set requests** (the 2026-05-27 conversation shape — 19 tasks set in one turn): each edit is its own `vault_edit` call. Don't try to batch into one call — the dispatcher rejects multi-record edits, and the per-call latency on `set_fields` is small enough that parallel emits land cleanly. Confirm the total at the end (*"19 tasks updated"*) rather than per-record.
 
 ### Events and the calendar sync
 
