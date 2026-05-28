@@ -182,7 +182,28 @@ def _check_body_mutation_allowed(
 
 # Operation → {scope: checker_function}
 # Checkers receive (operation, rel_path, record_type) and raise ScopeError if denied.
-
+#
+# Operation taxonomy:
+#
+#   * Top-level CRUD verbs (``read``, ``search``, ``list``, ``context``,
+#     ``create``, ``edit``, ``move``, ``delete``) each get an entry in
+#     every scope's rules dict.
+#   * Body-mutation tools (``body_insert_at``, ``body_replace``) each
+#     get their own per-type allowlist dict per the c1 matrix above.
+#   * ``body_append`` rides on the binary ``allow_body_writes`` flag.
+#   * ``unset`` rides on ``edit`` — there is no separate
+#     ``allow_unset`` flag. Field removal via ``vault edit --unset
+#     <field>`` (or programmatic ``vault_edit(unset_fields=[...])``)
+#     gates through ``check_scope("edit", ..., fields=[...])`` with
+#     the unset target names included in ``fields``. A scope whose
+#     ``edit`` permission is True can unset any field; a scope under
+#     ``field_allowlist`` can only unset fields in its allowlist;
+#     a scope with ``edit: False`` cannot unset at all.
+#
+#     The refusal-to-unset-REQUIRED_FIELDS gate lives in ``ops.py``
+#     (vault_edit), not here — required-field protection is a schema
+#     concern, not a per-scope policy. Mirroring it at this layer
+#     would duplicate logic across every scope's rules dict.
 SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
     "curator": {
         "read": True,
@@ -527,6 +548,60 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
             "article": True,
         },
     },
+    # Migration scope — one-shot operational scripts under
+    # ``scripts/migrate_*.py`` that perform schema rewrites against the
+    # LIVE vault. NOT a daemon scope: this scope is never assigned to a
+    # long-running process; the migration script sets it for the
+    # duration of one CLI session and the audit log records every write
+    # under tool="cli" with the script's session ID for traceability.
+    #
+    # ``unset`` rides on ``edit`` in this scope (no separate verb in
+    # SCOPE_RULES): any scope whose ``edit`` permission is ``True`` or
+    # passes a field-allowlist check can call ``vault edit --unset
+    # <field>``, with the same fields-against-allowlist gate.
+    # Migration scope sets ``edit: True`` so all fields are unset-able
+    # (no allowlist). Refusing to unset REQUIRED_FIELDS happens at the
+    # ``ops.py`` layer, not here — a scope-layer carve-out for
+    # required fields would duplicate the schema gate.
+    #
+    # ``create`` is type-narrowed via ``migration_types_only`` →
+    # ``MIGRATION_CREATE_TYPES``. The set covers operational records
+    # the tier Phase 1 migration needs (task + routine) plus the five
+    # canonical learning types so future migrations covering schema
+    # rewrites on epistemic records work without scope amendments.
+    # Auto-generated transcripts (session / conversation / capture /
+    # input / run) + operator-canonical types (event / preference /
+    # person / org / location) are NOT in the allowlist — a migration
+    # accidentally creating one of those types fails loud at the scope
+    # gate (not just the type-validator gate, which would only catch
+    # unknown types). ``move`` + ``delete`` stay denied to avoid
+    # accidental destructive moves during migration; if a future
+    # migration genuinely needs to move records, the script can call
+    # ``vault retype`` (which has its own per-call gate) instead of
+    # widening this scope.
+    "migration": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": "migration_types_only",
+        "edit": True,
+        "move": False,
+        "delete": False,
+        # Migration scripts write structured bodies on routine/task
+        # records (e.g. appending a "Migration note" section to a
+        # cancelled task). body_append is the canonical surface.
+        "allow_body_writes": True,
+        # body_insert_at + body_replace deliberately NOT enabled for
+        # the migration scope — migrations either set frontmatter,
+        # unset frontmatter, or body_append. Mid-document insertion
+        # and full-body rewrite are higher-risk surfaces appropriate
+        # for the interactive instructor path, not for automation
+        # against the live vault. If a future migration genuinely
+        # needs them, widen here with explicit per-type allowlist.
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
     # Instructor executes natural-language directives parked in the
     # ``alfred_instructions`` frontmatter field. Broader than janitor
     # (may create + move + write bodies; no frontmatter allowlist) but
@@ -687,6 +762,45 @@ HYPATIA_CREATE_TYPES: set[str] = {
     # authority. Conflict resolution: local wins. See
     # ``project_operator_preferences_v1.md`` Hard Contract #6 + #8.
     "preference",
+}
+
+
+# Migration create allowlist — operational scripts under
+# ``scripts/migrate_*.py`` may only create records of these types.
+# Mirrors the narrowing rationale of TALKER_CREATE_TYPES /
+# KALLE_CREATE_TYPES / HYPATIA_CREATE_TYPES — type-narrowing the
+# create surface keeps automation from accidentally producing
+# auto-generated transcripts (session / conversation / capture /
+# input / run) or operator-canonical records (event / preference /
+# person / org / location) that need explicit operator review.
+#
+# Current entries:
+#   - ``task``    : Operational records the migration scripts read +
+#                   rewrite. Tier Phase 1 migration uses this for
+#                   the standing-practices task cancellation flow.
+#   - ``routine`` : Recurring-action records. Tier Phase 1 migration
+#                   creates a ``routine/Standing Practices.md``
+#                   aggregator for the migrated practices.
+#   - Five canonical learning types (assumption / decision /
+#                   constraint / contradiction / synthesis) —
+#                   forward-looking room for future migrations that
+#                   need to seed epistemic atoms when rewriting their
+#                   schema. Not currently used by any shipped migration.
+#
+# Adding a new type here requires: (a) a concrete migration use case,
+# (b) confirmation the type is NOT in any universal-deny set, (c)
+# review that the scope-layer add doesn't undermine an existing
+# per-instance type registry's authority. See SCOPE_RULES["migration"]
+# for the canonical reference + ``check_scope`` ``migration_types_only``
+# branch for the gate handler.
+MIGRATION_CREATE_TYPES: set[str] = {
+    "task",
+    "routine",
+    "assumption",
+    "decision",
+    "constraint",
+    "contradiction",
+    "synthesis",
 }
 
 
@@ -865,6 +979,26 @@ def check_scope(
             raise ScopeError(
                 f"Scope '{scope}' can only create talker types "
                 f"({', '.join(sorted(TALKER_CREATE_TYPES))}). Got: '{record_type}'"
+            )
+        return
+
+    if permission == "migration_types_only":
+        # Migration scripts may only create the types in
+        # MIGRATION_CREATE_TYPES (task / routine / 5 learning types).
+        # See MIGRATION_CREATE_TYPES docstring for rationale; bare
+        # ``"create": True`` was rejected in code review because a
+        # typo migration accidentally creating a ``session`` or
+        # ``event`` record would silently produce an auto-generated-
+        # transcript-shaped record that no operator review path
+        # caught. The narrow allowlist fails loud at this gate
+        # instead.
+        if record_type not in MIGRATION_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create migration types "
+                f"({', '.join(sorted(MIGRATION_CREATE_TYPES))}). "
+                f"Got: '{record_type}'. If a future migration needs "
+                f"this type, extend MIGRATION_CREATE_TYPES in scope.py "
+                f"with a comment naming the migration's use case."
             )
         return
 

@@ -77,6 +77,12 @@ def read_mutations(session_path: str) -> dict:
             created.append(file_path)
         elif op == "edit":
             modified.append(file_path)
+        elif op == "unset":
+            # Field-removal entry. Same files_modified bucket as
+            # ``edit`` — the file changed, the audit-log op-string
+            # distinguishes the operator intent. Added 2026-05-28
+            # alongside the ``vault edit --unset`` capability.
+            modified.append(file_path)
         elif op == "move":
             # Move = delete old + create new
             deleted.append(file_path)
@@ -128,6 +134,16 @@ def build_audit_mutations(op: str, path: str, **extra: str) -> dict:
       * ``"discard"`` — proposal removed without canonical replacement.
         ``path`` is the inbox file. Maps to one ``files_deleted``.
         CLI-only op (distiller/cli.py:cmd_discard_proposal).
+      * ``"unset"`` — frontmatter field(s) removed from the record
+        at ``path``. Maps to one entry in ``files_modified`` (the
+        file itself is modified — the unset distinction lives in the
+        operator-visible op-string and in the ``fields`` extra a
+        caller may pass on the session-log entry). Added 2026-05-28
+        alongside the ``vault edit --unset`` capability. Same bucket
+        as ``"edit"`` because the file-state-change is identical
+        (modify, not create/delete); the separate op-string surfaces
+        operator intent in the audit log without inflating the
+        bucket count.
 
     Unknown op-strings produce an empty dict (no buckets filled). The
     audit-log append is a no-op on an empty bucket set, so passing an
@@ -164,6 +180,11 @@ def build_audit_mutations(op: str, path: str, **extra: str) -> dict:
     elif op == "discard":
         # discard-proposal = delete inbox only.
         deleted.append(path)
+    elif op == "unset":
+        # unset = frontmatter-field-removal. Same file-state-change
+        # bucket as ``edit`` (modify), distinct op-string for operator
+        # intent visibility in the audit log.
+        modified.append(path)
     return {
         "files_created": created,
         "files_modified": modified,

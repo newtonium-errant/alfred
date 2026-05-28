@@ -295,6 +295,17 @@ def cmd_edit(args: argparse.Namespace) -> None:
     vault = _vault_path()
     set_fields = _parse_set_args(args.set)
     append_fields = _parse_set_args(args.append)
+    # argparse's ``action="append"`` returns ``None`` when the flag is
+    # absent (default=None above). Normalise to an empty list so the
+    # downstream code can treat it as a list uniformly.
+    #
+    # ``getattr`` with default-None defends against synthetic
+    # ``argparse.Namespace`` instances that don't include the new
+    # field (test harnesses that pre-date the 2026-05-28 unset-
+    # capability ship). Real argparse-built namespaces always carry
+    # the field (registered in ``build_vault_parser``); this is
+    # belt-and-suspenders for forward-compat hand-rolled Namespaces.
+    unset_fields: list[str] = list(getattr(args, "unset", None) or [])
 
     # Pre-validate that at least one mutation flag was supplied. Without
     # this gate ``vault_edit`` fail-louds at Layer 1 (ops.py no-op gate,
@@ -305,30 +316,44 @@ def cmd_edit(args: argparse.Namespace) -> None:
     # than the CLI flags they actually invoked. Surfacing an actionable
     # CLI-layer message here names the flags the operator forgot,
     # before delegating to the Layer 1 gate.
-    if not (set_fields or append_fields or args.body_append or args.body_stdin):
+    if not (
+        set_fields or append_fields or unset_fields
+        or args.body_append or args.body_stdin
+    ):
         _error(
             "no edit specified — pass at least one of --set, --append, "
-            "--body-append, or --body-stdin",
+            "--unset, --body-append, or --body-stdin",
         )
 
-    # Compute the union of frontmatter fields being written. Body-only
-    # writes (--body-append, --body-stdin) are gated separately by
-    # ``body_write`` — closes the Q3 body-write loophole where a scope
-    # with a narrow field allowlist could bypass it by rewriting the
-    # body. ``field_allowlist`` still fails closed when empty for
-    # frontmatter-carrying edits, so a pure body-write case must not
-    # appear as "no fields" against an allowlist scope. We signal that
-    # here by only passing ``fields`` when the caller actually supplied
-    # frontmatter keys.
-    fields_list = list((set_fields or {}).keys()) + list((append_fields or {}).keys())
+    # Compute the union of frontmatter fields being written OR unset.
+    # ``--unset`` rides on the ``edit`` operation: a scope with a
+    # field-allowlist gate restricts which fields you can unset to
+    # the same set you're permitted to edit. Threading unset names
+    # into ``fields_list`` validates both write-side (set/append) and
+    # remove-side (unset) field names against the same allowlist in
+    # one pass.
+    #
+    # Body-only writes (--body-append, --body-stdin) are gated
+    # separately by ``body_write`` — closes the Q3 body-write loophole
+    # where a scope with a narrow field allowlist could bypass it by
+    # rewriting the body. ``field_allowlist`` still fails closed when
+    # empty for frontmatter-carrying edits, so a pure body-write case
+    # must not appear as "no fields" against an allowlist scope. We
+    # signal that here by only passing ``fields`` when the caller
+    # actually supplied frontmatter keys.
+    fields_list = (
+        list((set_fields or {}).keys())
+        + list((append_fields or {}).keys())
+        + unset_fields
+    )
 
     # Detect whether a body write was requested so scope can veto.
     body_write_requested = bool(args.body_stdin or args.body_append)
 
-    # When the caller is doing a pure body write (no --set / --append),
-    # skip the field allowlist check — there are no fields to validate
-    # and the allowlist rule would otherwise fail closed on the empty
-    # fields list. The body_write gate below still applies.
+    # When the caller is doing a pure body write (no --set / --append /
+    # --unset), skip the field allowlist check — there are no fields
+    # to validate and the allowlist rule would otherwise fail closed
+    # on the empty fields list. The body_write gate below still applies.
     try:
         if fields_list:
             check_scope(
@@ -363,12 +388,42 @@ def cmd_edit(args: argparse.Namespace) -> None:
             vault, args.path,
             set_fields=set_fields or None,
             append_fields=append_fields or None,
+            unset_fields=unset_fields or None,
             body_append=body_append,
         )
-        _log_or_audit(
-            "edit", result["path"],
-            fields=result["fields_changed"],
+        # Audit-log emission: distinguish set/append/body edits from
+        # unset operations in the operator-visible op-string. Per
+        # 2026-05-28 ratification, ``unset`` is a separate op-kind in
+        # the audit log so operators can grep on intent (what got
+        # removed) distinctly from what got modified-by-write.
+        #
+        # When a single CLI call combines both write-side and remove-
+        # side mutations, emit BOTH log lines so the audit trail
+        # captures each operator intent. The fields list on each
+        # entry names exactly the keys touched by that op-kind.
+        write_side_fields = (
+            list((set_fields or {}).keys())
+            + list((append_fields or {}).keys())
         )
+        if body_write_requested:
+            write_side_fields.append("body")
+        # Filter unset_fields to those that actually changed (the
+        # ops-layer no-op log already fired for already-absent keys;
+        # we don't double-emit a CLI log for them). ``fields_changed``
+        # from the result includes only keys that actually mutated.
+        actually_unset = [
+            k for k in unset_fields if k in result["fields_changed"]
+        ]
+        if actually_unset:
+            _log_or_audit(
+                "unset", result["path"],
+                fields=actually_unset,
+            )
+        if write_side_fields:
+            _log_or_audit(
+                "edit", result["path"],
+                fields=write_side_fields,
+            )
         _output(result)
     except VaultError as e:
         _error(str(e))
@@ -532,6 +587,18 @@ def build_vault_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("path", help="Relative path to the record")
     p.add_argument("--set", action="append", metavar="field=value", help="Set a frontmatter field")
     p.add_argument("--append", action="append", metavar="field=value", help="Append to a list field")
+    p.add_argument(
+        "--unset",
+        action="append",
+        metavar="field",
+        default=None,
+        help=(
+            "Remove a frontmatter field entirely (repeatable). Distinct "
+            "from --set field=null which keeps the key with a null value. "
+            "Refuses to remove REQUIRED_FIELDS; emits an info log on "
+            "already-absent fields (idempotent no-op)."
+        ),
+    )
     p.add_argument("--body-append", default=None, help="Text to append to body")
     p.add_argument("--body-stdin", action="store_true", help="Read body append content from stdin")
 

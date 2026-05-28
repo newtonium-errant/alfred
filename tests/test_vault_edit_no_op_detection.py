@@ -21,6 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import structlog
 
 from alfred.vault.ops import VaultError, vault_create, vault_edit
 
@@ -41,6 +42,11 @@ class TestVaultEditNoOpDetection:
         # supply on retry).
         assert "no mutation parameter" in msg
         assert "set_fields" in msg
+        # ``unset_fields`` joined the no-mutation gate 2026-05-28 alongside
+        # the field-removal capability — the error must name it so a
+        # model emitting set_fields and unset_fields combined that
+        # gets max_tokens-truncated AFTER path knows what's missing.
+        assert "unset_fields" in msg
         assert "body_append" in msg
         assert "body_replace" in msg
         assert "body_insert_at" in msg
@@ -229,17 +235,28 @@ class TestCmdEditNoFlagsCLIGate:
         monkeypatch.setenv("ALFRED_VAULT_PATH", str(tmp_vault))
         monkeypatch.delenv("ALFRED_VAULT_SCOPE", raising=False)
 
-        # Mirror argparse defaults: no --set, --append, --body-append,
-        # --body-stdin supplied.
+        # Mirror argparse defaults: no --set, --append, --unset,
+        # --body-append, --body-stdin supplied.
         args = argparse.Namespace(
             path="note/CLI No-Flag Repro.md",
             set=None,
             append=None,
+            unset=None,
             body_append=None,
             body_stdin=False,
         )
-        with pytest.raises(SystemExit) as exc_info:
-            cmd_edit(args)
+        # ``cmd_edit`` calls ``_vault_path`` → ``_ctx`` → ``from_env``
+        # which emits a structured ``vault_context.env_fallback`` log
+        # line. In isolated-test runs structlog uses default config
+        # (PrintLogger → stdout), which would interleave with the JSON
+        # payload from ``_error`` and break ``json.loads(out)``.
+        # ``capture_logs`` intercepts at structlog's processor chain,
+        # so only the JSON output reaches stdout. Pattern matches
+        # ``feedback_structlog_assertion_patterns.md`` for stdout-
+        # parsing tests on CLI handlers that internally emit logs.
+        with structlog.testing.capture_logs():
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_edit(args)
         # Non-zero exit per ``_error`` contract.
         assert exc_info.value.code == 1
 
@@ -251,5 +268,10 @@ class TestCmdEditNoFlagsCLIGate:
         assert "no edit specified" in msg
         assert "--set" in msg
         assert "--append" in msg
+        # ``--unset`` joined the no-mutation gate 2026-05-28 alongside
+        # the field-removal capability; the error message must name
+        # it so an operator who forgot to pass any flag sees unset as
+        # an option.
+        assert "--unset" in msg
         assert "--body-append" in msg
         assert "--body-stdin" in msg

@@ -1234,6 +1234,7 @@ def vault_edit(
     *,
     set_fields: dict | None = None,
     append_fields: dict | None = None,
+    unset_fields: list[str] | None = None,
     body_append: str | None = None,
     body_rewriter: Callable[[str], str] | None = None,
     body_insert_at: dict | None = None,
@@ -1241,6 +1242,28 @@ def vault_edit(
     scope: str | None = None,
 ) -> dict:
     """Edit a vault record. Returns {path, fields_changed}.
+
+    Frontmatter mutation surfaces (any combination allowed in one call;
+    each maps to a distinct field-level operation):
+
+      * ``set_fields: dict`` — overwrite (or add) frontmatter keys.
+      * ``append_fields: dict`` — append values to list-shaped fields.
+      * ``unset_fields: list[str]`` — REMOVE frontmatter keys entirely.
+        Distinct from ``set_fields={k: None}`` which sets ``k: null``;
+        unset drops the key. Validation gate:
+
+          - Unsetting any field in ``REQUIRED_FIELDS`` (universal) OR
+            the type-specific ``REQUIRED_FIELDS_BY_TYPE`` set raises
+            ``VaultError`` — required fields are load-bearing for the
+            schema gate; removal would silently corrupt the record.
+          - Unsetting a field that's already absent emits a structured
+            ``vault.edit.unset_no_op`` info log and is otherwise a
+            no-op. The field is NOT added to ``fields_changed`` in
+            that case — the no-op log is the operator-visible signal.
+          - Unsetting an unknown field (one not currently present in
+            the frontmatter) follows the same no-op-log path as
+            already-absent; no distinction is made because both shapes
+            are "field is not in the dict before the call."
 
     Body-mutation surfaces (mutually exclusive — pick at most one per
     call):
@@ -1268,7 +1291,10 @@ def vault_edit(
     silently would surprise the operator and complicate audit.
 
     Optional ``scope`` runs ``check_scope`` before the write; default
-    ``None`` preserves historical unrestricted behavior.
+    ``None`` preserves historical unrestricted behavior. ``unset``
+    rides on the ``edit`` operation — scopes with field-allowlist
+    edit gates apply the same allowlist to unset targets (you can
+    only unset fields you're allowed to edit).
     """
     # Mutual-exclusion gate FIRST — fail fast before any I/O. The
     # gate covers all four body-mutation surfaces; calibration writer
@@ -1314,15 +1340,16 @@ def vault_edit(
     # intent?", not "did the mutation produce a diff?"
     has_set_fields = bool(set_fields)
     has_append_fields = bool(append_fields)
+    has_unset_fields = bool(unset_fields)
     has_body_mutation = len(active) >= 1
-    if not (has_set_fields or has_append_fields or has_body_mutation):
+    if not (has_set_fields or has_append_fields or has_unset_fields or has_body_mutation):
         raise VaultError(
             "vault_edit called with no mutation parameter — at least "
-            "one of set_fields, append_fields, body_append, "
-            "body_replace, body_insert_at, body_rewriter is required. "
-            "If the tool_use input was truncated mid-emission "
-            "(stop_reason=max_tokens), retry with a smaller payload "
-            "or split the operation across multiple edits."
+            "one of set_fields, append_fields, unset_fields, "
+            "body_append, body_replace, body_insert_at, body_rewriter "
+            "is required. If the tool_use input was truncated mid-"
+            "emission (stop_reason=max_tokens), retry with a smaller "
+            "payload or split the operation across multiple edits."
         )
 
     # Strip reserved frontmatter keys before scope check + downstream
@@ -1354,8 +1381,16 @@ def vault_edit(
     pre_edit_fm = dict(fm)
 
     if scope is not None:
+        # Unset targets share the ``edit`` field-allowlist gate — a
+        # scope that can only edit certain fields can only unset those
+        # same fields. Threaded into the same ``fields`` list so
+        # ``check_scope("edit", ..., fields=[...])`` validates both
+        # write-side (set/append) and remove-side (unset) field names
+        # against the allowlist in one pass.
         fields_list = (
-            list((set_fields or {}).keys()) + list((append_fields or {}).keys())
+            list((set_fields or {}).keys())
+            + list((append_fields or {}).keys())
+            + list(unset_fields or [])
         )
         body_write_requested = (
             body_append is not None or body_rewriter is not None
@@ -1406,6 +1441,79 @@ def vault_edit(
                 existing.append(v)
             else:
                 fm[k] = [existing, v]
+            fields_changed.append(k)
+
+    # Unset fields (remove frontmatter keys entirely). Runs AFTER
+    # set+append so a single edit call that both sets and unsets is
+    # deterministic — set/append-then-unset semantics. Combining
+    # ``--set foo=x --unset foo`` on the same field is an operator
+    # contradiction; we honour the unset (executed last) and let the
+    # operator see the resulting absence. Combined ``--set foo=null
+    # --unset foo`` resolves the same way.
+    #
+    # Validation gate: refuse to unset REQUIRED_FIELDS (universal) or
+    # type-specific required fields. Operators who genuinely need to
+    # change a record's type or created date have other paths
+    # (vault_retype for type, vault_edit set_fields={"created": ...}
+    # for the timestamp). Unsetting either would silently corrupt the
+    # record's schema; fail-loud is the right shape per
+    # ``feedback_intentionally_left_blank.md``.
+    if unset_fields:
+        # Resolve the union of required fields BEFORE iterating the
+        # unset list.
+        #
+        # Naming: ``pre_unset_type`` is read AFTER the set/append loop
+        # but BEFORE this unset loop runs. The set/append loop above
+        # is allowed to mutate ``type`` itself (via ``set_fields={
+        # "type": ...}`` — an operator-driven retype-via-edit shape),
+        # so ``pre_unset_type`` reflects the POST-SET record type. This
+        # is the desired semantics: an edit that calls
+        # ``set_fields={"type": "task"}, unset_fields=[<some_field>]``
+        # checks <some_field> against task's REQUIRED_FIELDS_BY_TYPE,
+        # not the pre-set type's. Otherwise a retype-via-edit could
+        # silently let the post-set type's required field be unset
+        # because the pre-set type didn't require it.
+        #
+        # The coerce/validate step BELOW re-reads ``record_type`` to
+        # cover the same post-set-mutation case for status/list-field
+        # validation; the unset gate just reads the same picture
+        # earlier in the function.
+        pre_unset_type = fm.get("type", "")
+        type_specific_required = set(
+            REQUIRED_FIELDS_BY_TYPE.get(pre_unset_type, [])
+        )
+        protected = set(REQUIRED_FIELDS) | type_specific_required
+
+        for k in unset_fields:
+            if k in protected:
+                raise VaultError(
+                    f"unset_fields refuses to remove required field "
+                    f"'{k}' from {rel_path} (universal REQUIRED_FIELDS "
+                    f"or type-specific REQUIRED_FIELDS_BY_TYPE[{pre_unset_type!r}]). "
+                    f"Required fields are load-bearing for the schema "
+                    f"gate; removing them would silently corrupt the "
+                    f"record. If you need to change the field value, "
+                    f"use set_fields instead."
+                )
+            if k not in fm:
+                # No-op log per ``feedback_intentionally_left_blank.md``
+                # — operators need to distinguish "field was removed"
+                # from "field was already absent." Both shapes are
+                # valid (idempotent re-runs); the log emits the
+                # discriminator. Field NOT added to fields_changed —
+                # nothing actually changed on disk for this key.
+                log.info(
+                    "vault.edit.unset_no_op",
+                    path=rel_path,
+                    field=k,
+                    detail=(
+                        "unset requested but field is not present in "
+                        "frontmatter; idempotent no-op. The record's "
+                        "on-disk state is unchanged for this key."
+                    ),
+                )
+                continue
+            del fm[k]
             fields_changed.append(k)
 
     # Coerce + validate after edits — re-read record_type in case
