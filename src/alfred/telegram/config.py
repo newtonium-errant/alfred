@@ -278,6 +278,37 @@ class MocSuggestionsConfig:
 
 
 @dataclass
+class TodayCommandConfig:
+    """Per-instance gate for the ``/today`` slash command (Tier Phase 2A,
+    2026-05-28).
+
+    Default ``False`` so no instance accidentally registers the command —
+    Salem opts in via ``telegram.today_command.enabled: true`` in
+    ``config.yaml`` because the surface composes Salem-specific sections
+    (tier, routines, upcoming events). KAL-LE / Hypatia leave the block
+    absent.
+
+    The command is a glance-view mini-brief: composes the tier section,
+    today's routines, and upcoming events as a single Telegram reply.
+    Read-only — no vault writes, no session record.
+
+    Mirror of :class:`InventoryViewsConfig` + :class:`VoiceTrainConfig`
+    shape — same default-off-by-block-absence convention so health probes
+    can distinguish "block absent" from "block present, command disabled".
+
+    ``timezone`` defaults to ``America/Halifax`` (Salem's tz) since the
+    talker config doesn't carry a system timezone today. Operator-tunable
+    per instance for future opt-ins.
+    """
+
+    enabled: bool = False
+    #: IANA timezone for the ``now`` instant used by the tier compute
+    #: + routines/upcoming-events date selection. Defaults to Salem's
+    #: tz since Phase 2A is Salem-only.
+    timezone: str = "America/Halifax"
+
+
+@dataclass
 class VoiceTrainConfig:
     """Per-instance gate for the ``/train`` + ``/method-source`` slash commands.
 
@@ -427,6 +458,13 @@ class TalkerConfig:
     # the JSONL queue written by surveyor's Stage 8 (D1 ship). Salem +
     # KAL-LE leave this block absent.
     moc_suggestions: MocSuggestionsConfig | None = None
+    # Today-command gate — see :class:`TodayCommandConfig`. Default-OFF
+    # / None sentinel matching the inventory_views + moc_suggestions
+    # shape. Salem is Tier Phase 2A's only opt-in; the /today command
+    # composes the brief's tier + routines + upcoming-events sections
+    # as a glance-view mini-brief. KAL-LE / Hypatia leave the block
+    # absent.
+    today_command: TodayCommandConfig | None = None
     # Path to the config file this TalkerConfig was loaded from. Carried
     # so lazy/late loaders (notably the inter-instance peer-tool dispatcher
     # in ``conversation._dispatch_peer_inter_instance_tool``) can re-read
@@ -459,6 +497,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "voice_train": VoiceTrainConfig,
     "inventory_views": InventoryViewsConfig,
     "moc_suggestions": MocSuggestionsConfig,
+    "today_command": TodayCommandConfig,
 }
 
 
@@ -563,6 +602,16 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     if isinstance(moc_suggestions_raw, dict) and moc_suggestions_raw:
         built.moc_suggestions = _build(
             MocSuggestionsConfig, moc_suggestions_raw,
+        )
+    # Today command — defaulted-OFF / None sentinel. Same shape as
+    # inventory_views + moc_suggestions. Block-absent means the
+    # /today command is NOT registered. Tier Phase 2A is Salem-only;
+    # KAL-LE / Hypatia leave the block absent and Telegram's
+    # unknown-command behaviour fires.
+    today_command_raw = tool.get("today_command")
+    if isinstance(today_command_raw, dict) and today_command_raw:
+        built.today_command = _build(
+            TodayCommandConfig, today_command_raw,
         )
     # Synthetic ``_config_path`` key — set by the CLI in ``cmd_up`` /
     # other entry points before handing ``raw`` to the orchestrator,

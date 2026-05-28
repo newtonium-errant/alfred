@@ -25,6 +25,16 @@ import structlog
 log = structlog.get_logger(__name__)
 
 
+# Canonical header text for the brief's routines section. Hoisted to a
+# module-level constant 2026-05-28 (Tier Phase 2A code-reviewer NOTE)
+# so the ``/today`` slash command composer + any other downstream
+# surface that mirrors the brief's section headers reads from one
+# source of truth. A future refactor that renames the header (e.g.
+# adding day-of-week prefix) updates this constant and every
+# consumer follows.
+SECTION_HEADER = "Today's Routines"
+
+
 _SENTINEL = "*(no routines due today — the routine daemon either has not run yet or no routines fire on this day)*"
 
 
@@ -82,4 +92,4 @@ def render_routine_section(vault_path: Path, today: date) -> str:
     return body + "\n"
 
 
-__all__ = ["render_routine_section"]
+__all__ = ["SECTION_HEADER", "render_routine_section"]

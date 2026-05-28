@@ -42,6 +42,16 @@ from .utils import get_logger
 log = get_logger(__name__)
 
 
+# Canonical header text for the brief's Upcoming Events section.
+# Hoisted to a module-level constant 2026-05-28 (Tier Phase 2A
+# code-reviewer NOTE) so the ``/today`` slash command composer + any
+# other downstream surface that mirrors the brief's section headers
+# reads from one source of truth. A future refactor that renames the
+# header (e.g. "Upcoming Calendar") updates this constant and every
+# consumer follows.
+SECTION_HEADER = "Upcoming Events"
+
+
 # Operator-preference V1 (project_operator_preferences_v1).
 # Per-type rule dispatch for the Upcoming Events section: each
 # candidate type checks the corresponding ``skip_brief_*`` rule.

@@ -404,6 +404,18 @@ def build_app(
         )
         log.info("talker.bot.inventory_views_commands_registered")
 
+    # Tier Phase 2A (2026-05-28): /today — Salem-only glance-view
+    # mini-brief composing tier + routines + upcoming-events sections
+    # as one Telegram reply. Salem opts in via
+    # ``telegram.today_command.enabled: true``; KAL-LE / Hypatia leave
+    # the block absent and Telegram's unknown-command behaviour fires.
+    if (
+        config.today_command is not None
+        and config.today_command.enabled
+    ):
+        app.add_handler(CommandHandler("today", on_today))
+        log.info("talker.bot.today_command_registered")
+
     # Phase 5 Sub-arc D2 (2026-05-19): /moc-suggestions + /accept-moc +
     # /reject-moc — view + act on the cluster→MOC suggestion queue
     # written by surveyor's Stage 8 (D1 ship). PTB requires
@@ -898,6 +910,93 @@ async def on_research_pointers(
         update, ctx,
         record_type="research-pointer",
         command_name="/research-pointers",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tier Phase 2A (2026-05-28): /today — Salem-only glance-view mini-brief
+# ---------------------------------------------------------------------------
+#
+# Composes the brief's tier + routines + upcoming-events sections as a
+# single Telegram reply. Read-only — no vault writes, no session record.
+# Salem-only via the ``today_command`` config gate; KAL-LE / Hypatia
+# leave the block absent and Telegram's unknown-command behaviour fires.
+
+
+async def on_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/today`` — glance-view mini-brief (tier + routines + upcoming).
+
+    Salem-only Phase 2A (Tier system 2026-05-28). Composes the same
+    three sections the morning brief surfaces at the top, re-rendered
+    live from current vault state. The operator types ``/today`` from
+    their phone mid-afternoon and sees what's still on the list,
+    what routines are due, and what's coming up.
+
+    Read-only: does NOT write to the vault, does NOT mutate session
+    state, does NOT create or edit records. Matches the
+    glance-view-as-separate-surface rationale in
+    ``inventory_views.py:8-25``.
+
+    Hypatia / KAL-LE leave the ``today_command`` config block absent —
+    the registration gate at :func:`build_app` skips this handler
+    entirely, so ``/today`` on a non-Salem instance falls through to
+    Telegram's "unknown command" behaviour.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        log.info(
+            "talker.bot.unauthorized",
+            user_id=update.effective_user.id if update.effective_user else None,
+            command="/today",
+        )
+        return
+    if update.message is None:
+        return
+
+    # Defensive: handler may be invoked directly (e.g. from tests or a
+    # future routing layer) without the config gate firing in
+    # build_app. Re-check here so the handler stays correct in
+    # isolation and the gate's "registration absent" semantics still
+    # hold when the call shape changes.
+    if config.today_command is None or not config.today_command.enabled:
+        log.info(
+            "talker.bot.today_command_not_configured",
+            user_id=update.effective_user.id if update.effective_user else None,
+        )
+        return
+
+    # Compose the mini-brief. ``now`` is resolved in the instance's
+    # configured timezone (defaults to Salem's America/Halifax). The
+    # tier section uses the full datetime instant for deadline-distance
+    # math; routines + upcoming events use the date.
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(config.today_command.timezone)
+    now_local = datetime.now(tz)
+
+    try:
+        from . import today_command as _tc
+        reply = _tc.compose_today_reply(
+            Path(config.vault.path),
+            now_local,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.today_command_failed",
+            error_type=exc.__class__.__name__,
+            error=str(exc),
+        )
+        await update.message.reply_text(
+            f"❌ Could not compose /today ({type(exc).__name__})"
+        )
+        return
+
+    await update.message.reply_text(reply)
+
+    log.info(
+        "talker.bot.today_command_done",
+        reply_chars=len(reply),
+        date=now_local.date().isoformat(),
     )
 
 
