@@ -70,6 +70,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import frontmatter
 
@@ -182,6 +183,15 @@ class MigrationPlan:
     # Sub-task 1
     tier_renames: list[TierRename] = field(default_factory=list)
     tier_already_renamed: list[str] = field(default_factory=list)
+    # Records carrying a non-int ``tier:`` value (e.g. operator hand-
+    # edit produced ``tier: high``). The discovery loop refuses to
+    # auto-rename these — coercing a string to an int is a data-loss
+    # risk — but per ``feedback_intentionally_left_blank.md`` silent
+    # skip leaves the operator without a ground-truth count to
+    # compare against. The dry-run report surfaces this bucket as a
+    # WARNING so hand-edit is visible BEFORE the live run runs.
+    # Each entry: (rel_path, the raw value as parsed by YAML).
+    tier_invalid: list[tuple[str, Any]] = field(default_factory=list)
 
     # Sub-task 2
     escalation_sets: list[EscalationSet] = field(default_factory=list)
@@ -215,15 +225,22 @@ def _load_frontmatter(path: Path) -> dict:
 
 def discover_tier_renames(
     vault: Path,
-) -> tuple[list[TierRename], list[str]]:
+) -> tuple[list[TierRename], list[str], list[tuple[str, Any]]]:
     """Scan ``vault/task/*.md`` for legacy ``tier:`` field.
 
-    Returns ``(pending, already_renamed)``:
-      * ``pending`` — records carrying ``tier:`` (with or without
-        ``base_tier:``; both-present is the partial-state case the
-        rename will converge).
+    Returns ``(pending, already_renamed, invalid)``:
+      * ``pending`` — records carrying a valid int ``tier:`` (with
+        or without ``base_tier:``; both-present is the partial-state
+        case the rename will converge).
       * ``already_renamed`` — records with ``base_tier:`` AND no
         ``tier:`` (idempotency-skip).
+      * ``invalid`` — records carrying ``tier:`` with a non-int value
+        (e.g. operator hand-edit produced ``tier: high``). Each entry
+        is ``(rel_path, raw_value)``. The migration refuses to coerce
+        — surfacing the records explicitly per
+        ``feedback_intentionally_left_blank.md`` so the operator can
+        hand-edit BEFORE the live run, rather than discover a silent
+        skip post-migration.
 
     Records with NEITHER field are silently skipped — they're records
     that never participated in the tier system. The dry-run report
@@ -234,8 +251,9 @@ def discover_tier_renames(
     task_dir = vault / "task"
     pending: list[TierRename] = []
     already: list[str] = []
+    invalid: list[tuple[str, Any]] = []
     if not task_dir.is_dir():
-        return pending, already
+        return pending, already, invalid
 
     for path in sorted(task_dir.glob("*.md")):
         fm = _load_frontmatter(path)
@@ -245,15 +263,19 @@ def discover_tier_renames(
         if has_tier:
             tier_value = fm.get("tier")
             if not isinstance(tier_value, int):
-                # Operator hand-edit produced a non-int tier — skip
-                # the rename and surface to operator via the report.
-                # The dry-run output's "tier-rename" section will
-                # omit this record; operator sees the gap.
+                # Operator hand-edit produced a non-int tier — refuse
+                # to auto-rename (coercing string to int is data-loss
+                # risk) AND surface explicitly so the operator can
+                # hand-fix the record before the live run. Per
+                # ``feedback_intentionally_left_blank.md``: silent skip
+                # leaves no ground-truth count for the operator to
+                # compare against.
+                invalid.append((rel_path, tier_value))
                 continue
             pending.append(TierRename(rel_path=rel_path, tier_value=tier_value))
         elif has_base_tier:
             already.append(rel_path)
-    return pending, already
+    return pending, already, invalid
 
 
 def discover_escalation_targets(
@@ -353,7 +375,11 @@ def build_plan(vault: Path) -> MigrationPlan:
     plan = MigrationPlan()
 
     # Sub-task 1
-    plan.tier_renames, plan.tier_already_renamed = discover_tier_renames(vault)
+    (
+        plan.tier_renames,
+        plan.tier_already_renamed,
+        plan.tier_invalid,
+    ) = discover_tier_renames(vault)
 
     # Sub-task 2
     plan.escalation_sets, plan.escalation_missing_records = discover_escalation_targets(vault)
@@ -405,6 +431,19 @@ def print_plan(plan: MigrationPlan, vault: Path, *, dry_run: bool) -> None:
             f"{len(plan.tier_already_renamed)} record(s) already use "
             f"base_tier:)"
         )
+    if plan.tier_invalid:
+        # Per ``feedback_intentionally_left_blank.md``: surface non-int
+        # tier values explicitly so the operator can hand-edit before
+        # the live run rather than discover the silent skip post-
+        # migration. The migration refuses to auto-coerce (data-loss
+        # risk).
+        print(
+            f"  WARNING: "
+            f"{len(plan.tier_invalid)} record(s) with non-int tier "
+            f"values — hand-edit required:"
+        )
+        for rel_path, raw_value in plan.tier_invalid:
+            print(f"    {rel_path}  (tier: {raw_value!r})")
     print()
 
     # --- Sub-task 2
@@ -473,7 +512,6 @@ def _alfred_vault_cmd(
     verb: str,
     *args: str,
     env: dict[str, str],
-    vault_path: Path,
     stdin: str | None = None,
 ) -> dict:
     """Invoke ``python -m alfred.cli vault <verb> <args>`` as a subprocess.
@@ -571,7 +609,7 @@ def _build_subprocess_env(vault: Path) -> dict[str, str]:
 
 
 def _apply_tier_rename(
-    entry: TierRename, env: dict[str, str], vault: Path,
+    entry: TierRename, env: dict[str, str],
 ) -> None:
     """Execute one tier→base_tier rename via subprocess.
 
@@ -587,12 +625,11 @@ def _apply_tier_rename(
         "--set", f"base_tier={entry.tier_value}",
         "--unset", "tier",
         env=env,
-        vault_path=vault,
     )
 
 
 def _apply_escalation_set(
-    entry: EscalationSet, env: dict[str, str], vault: Path,
+    entry: EscalationSet, env: dict[str, str],
 ) -> None:
     """Execute one escalation-fields set via subprocess.
 
@@ -606,12 +643,11 @@ def _apply_escalation_set(
         "--set", f"escalate_to={entry.escalate_to}",
         "--set", f"escalate_at_days={entry.escalate_at_days}",
         env=env,
-        vault_path=vault,
     )
 
 
 def _apply_routine_create(
-    env: dict[str, str], vault: Path,
+    env: dict[str, str],
 ) -> None:
     """Create the ``Standing Practices`` routine via subprocess.
 
@@ -638,13 +674,12 @@ def _apply_routine_create(
         "--set", "completion_log={}",
         "--body-stdin",
         env=env,
-        vault_path=vault,
         stdin=ROUTINE_BODY,
     )
 
 
 def _apply_task_cancel(
-    entry: TaskCancel, env: dict[str, str], vault: Path,
+    entry: TaskCancel, env: dict[str, str],
 ) -> None:
     """Cancel one standing-practice task + append migration note.
 
@@ -660,7 +695,6 @@ def _apply_task_cancel(
         "--set", f"cancelled_at={MIGRATION_DATE}",
         "--body-append", TASK_CANCEL_BODY_APPEND,
         env=env,
-        vault_path=vault,
     )
 
 
@@ -674,6 +708,22 @@ def apply_plan(
       * ``escalation_set``         — records where escalation fields set
       * ``routine_created``        — 0 or 1
       * ``tasks_cancelled``        — count of standing-practice cancels
+
+    Mid-stream failure: if any subprocess invocation raises
+    ``RuntimeError`` (the failure shape ``_alfred_vault_cmd`` produces
+    on non-zero CLI exit), prints a structured partial-migration
+    sentinel naming the total records ALREADY written + a recovery
+    pointer, then re-raises so ``main`` can surface a non-zero exit.
+    Per ``feedback_intentionally_left_blank.md``: a mid-stream failure
+    without operator-facing signal would leave the operator staring
+    at a Python traceback with no idea what shipped vs. what didn't.
+    The sentinel is grep-able as ``PARTIAL MIGRATION`` so a future
+    operator-facing dashboard can spot it.
+
+    Idempotency holds across the partial state: the previously-shipped
+    skip-already-renamed / skip-already-cancelled / skip-routine-
+    exists logic means a re-run skips the records that DID land and
+    retries the failed one.
     """
     env = _build_subprocess_env(vault)
     counters = {
@@ -683,38 +733,55 @@ def apply_plan(
         "tasks_cancelled":        0,
     }
 
-    # Sub-task 1
-    for entry in plan.tier_renames:
-        print(f"  renaming tier → base_tier: {entry.rel_path}")
-        _apply_tier_rename(entry, env, vault)
-        counters["tier_renamed"] += 1
+    try:
+        # Sub-task 1
+        for entry in plan.tier_renames:
+            print(f"  renaming tier → base_tier: {entry.rel_path}")
+            _apply_tier_rename(entry, env)
+            counters["tier_renamed"] += 1
 
-    # Sub-task 2
-    for entry in plan.escalation_sets:
+        # Sub-task 2
+        for entry in plan.escalation_sets:
+            print(
+                f"  setting escalation fields: {entry.rel_path} "
+                f"(base_tier={entry.base_tier}, "
+                f"escalate_to={entry.escalate_to}, "
+                f"escalate_at_days={entry.escalate_at_days})"
+            )
+            _apply_escalation_set(entry, env)
+            counters["escalation_set"] += 1
+
+        # Sub-task 3 — routine first (so the body-append on cancelled
+        # tasks can reference an existing record), then task cancels.
+        if plan.routine_to_create:
+            print(
+                f"  creating routine: "
+                f"routine/{STANDING_PRACTICES_ROUTINE}.md "
+                f"(cadence: daily, items: {len(STANDING_PRACTICE_TASKS)})"
+            )
+            _apply_routine_create(env)
+            counters["routine_created"] = 1
+
+        for entry in plan.task_cancels:
+            print(f"  cancelling task: {entry.rel_path}")
+            _apply_task_cancel(entry, env)
+            counters["tasks_cancelled"] += 1
+    except RuntimeError:
+        # Partial-state sentinel — operator-facing AND grep-able.
+        # Sum counters so the operator sees the count of records the
+        # migration landed before failure. Re-raise so the caller
+        # surfaces a non-zero exit code; the partial state is now
+        # legible and idempotent re-runs converge.
+        total_written = sum(counters.values())
         print(
-            f"  setting escalation fields: {entry.rel_path} "
-            f"(base_tier={entry.base_tier}, "
-            f"escalate_to={entry.escalate_to}, "
-            f"escalate_at_days={entry.escalate_at_days})"
+            f"\n--- PARTIAL MIGRATION — {total_written} record(s) "
+            f"written before failure ---"
         )
-        _apply_escalation_set(entry, env, vault)
-        counters["escalation_set"] += 1
-
-    # Sub-task 3 — routine first (so the body-append on cancelled
-    # tasks can reference an existing record), then task cancels.
-    if plan.routine_to_create:
         print(
-            f"  creating routine: "
-            f"routine/{STANDING_PRACTICES_ROUTINE}.md "
-            f"(cadence: daily, items: {len(STANDING_PRACTICE_TASKS)})"
+            "--- Recovery: re-run the script; idempotency will skip "
+            "completed records and retry the failed one. ---"
         )
-        _apply_routine_create(env, vault)
-        counters["routine_created"] = 1
-
-    for entry in plan.task_cancels:
-        print(f"  cancelling task: {entry.rel_path}")
-        _apply_task_cancel(entry, env, vault)
-        counters["tasks_cancelled"] += 1
+        raise
 
     return counters
 
@@ -786,7 +853,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print("--- APPLYING ---")
-    counters = apply_plan(plan, vault)
+    try:
+        counters = apply_plan(plan, vault)
+    except RuntimeError as exc:
+        # ``apply_plan`` already printed the partial-migration sentinel
+        # + recovery pointer before re-raising. Emit a tail line with
+        # the underlying cause (summary string from
+        # ``_alfred_vault_cmd`` carries exit code + stderr/stdout
+        # excerpt per builder.md "Subprocess Failure Logging") and
+        # surface non-zero exit so a CI / wrapper / operator script
+        # can detect the failure.
+        print(f"--- Failure cause: {exc}", file=sys.stderr)
+        return 1
     print()
     print("Migration complete:")
     print(f"  tier renamed:             {counters['tier_renamed']}")

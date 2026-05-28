@@ -141,7 +141,7 @@ def _build_fixture_vault(tmp_path: Path) -> Path:
 class TestTierRenameDiscovery:
     def test_rename_pending_records_found(self, tmp_path: Path) -> None:
         vault = _build_fixture_vault(tmp_path)
-        pending, already = mig.discover_tier_renames(vault)
+        pending, already, invalid = mig.discover_tier_renames(vault)
         # The 3 T1/T2/T3 records + Reading + Exercise + the
         # RRTS escalation targets (NOT — those don't have tier:).
         # Reading/Exercise carry tier: 3 in the fixture so they ARE
@@ -158,19 +158,22 @@ class TestTierRenameDiscovery:
         # pending; should be in the idempotency-skip list.
         assert "task/Already Migrated.md" not in names
         assert "task/Already Migrated.md" in already
+        # No non-int tier records in the base fixture.
+        assert invalid == []
 
     def test_tier_value_preserved(self, tmp_path: Path) -> None:
         """Pin that the int tier value carries through to base_tier
         unchanged — the rename is purely a key change."""
         vault = _build_fixture_vault(tmp_path)
-        pending, _ = mig.discover_tier_renames(vault)
+        pending, _, _ = mig.discover_tier_renames(vault)
         by_path = {p.rel_path: p.tier_value for p in pending}
         assert by_path["task/T1 RRTS Onboarding.md"] == 1
         assert by_path["task/T2 Misc Followup.md"] == 2
         assert by_path["task/T3 Aspirational Goal.md"] == 3
 
     def test_no_task_dir_returns_empty(self, tmp_path: Path) -> None:
-        """No ``task/`` dir → empty pending + empty already, no crash.
+        """No ``task/`` dir → empty pending + empty already + empty
+        invalid, no crash.
 
         Per ``feedback_intentionally_left_blank.md``: empty discovery
         on a missing-dir fixture must return empty buckets cleanly
@@ -178,22 +181,54 @@ class TestTierRenameDiscovery:
         with the unconditional "nothing pending" sentinel."""
         empty = tmp_path / "empty-vault"
         empty.mkdir()
-        pending, already = mig.discover_tier_renames(empty)
+        pending, already, invalid = mig.discover_tier_renames(empty)
         assert pending == []
         assert already == []
+        assert invalid == []
 
-    def test_non_int_tier_value_skipped(self, tmp_path: Path) -> None:
+    def test_non_int_tier_value_surfaces_to_invalid_bucket(
+        self, tmp_path: Path,
+    ) -> None:
         """Operator hand-edit produced ``tier: high`` (string) — the
-        rename refuses to coerce. Record stays in the pending-discovery
-        loop but is NOT added to the pending list; operator sees the
-        record-shaped gap in the dry-run and can fix manually."""
+        rename refuses to coerce. The record surfaces in the
+        ``invalid`` bucket (with the raw value preserved) so the
+        operator sees an explicit hand-edit-required flag in the
+        dry-run report.
+
+        Per ``feedback_intentionally_left_blank.md``: silent skip
+        leaves no ground-truth count; the explicit bucket gives the
+        operator a non-zero signal."""
         vault = tmp_path / "vault"
         vault.mkdir()
         (vault / "task").mkdir()
         _write_task(vault, "Bad Tier String", extra_fm={"tier": "high"})
-        pending, already = mig.discover_tier_renames(vault)
+        pending, already, invalid = mig.discover_tier_renames(vault)
         assert pending == []
         assert already == []
+        # Record surfaces in invalid bucket with the raw value
+        # preserved so the operator's dry-run report can name the
+        # specific bad value.
+        assert len(invalid) == 1
+        rel_path, raw_value = invalid[0]
+        assert rel_path == "task/Bad Tier String.md"
+        assert raw_value == "high"
+
+    def test_multiple_non_int_tier_values_all_surface(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two records with bad tier values → both in ``invalid``.
+        Pin the per-record visibility (the WARNING block in
+        print_plan iterates over invalid)."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "task").mkdir()
+        _write_task(vault, "Bad String", extra_fm={"tier": "high"})
+        _write_task(vault, "Bad List", extra_fm={"tier": "[1, 2]"})
+        _, _, invalid = mig.discover_tier_renames(vault)
+        assert len(invalid) == 2
+        paths = {p for p, _ in invalid}
+        assert "task/Bad String.md" in paths
+        assert "task/Bad List.md" in paths
 
 
 # --- Plan-build (sub-task 2) ----------------------------------------------
@@ -443,7 +478,7 @@ class TestSubprocessCommandShape:
         )
         env: dict = {}
         with patch.object(mig, "_alfred_vault_cmd") as mocked:
-            mig._apply_tier_rename(entry, env, vault)
+            mig._apply_tier_rename(entry, env)
         mocked.assert_called_once()
         call_args = mocked.call_args
         # Verb is first positional
@@ -472,7 +507,7 @@ class TestSubprocessCommandShape:
         )
         env: dict = {}
         with patch.object(mig, "_alfred_vault_cmd") as mocked:
-            mig._apply_escalation_set(entry, env, vault)
+            mig._apply_escalation_set(entry, env)
         mocked.assert_called_once()
         call_args = mocked.call_args
         assert call_args.args[0] == "edit"
@@ -494,7 +529,7 @@ class TestSubprocessCommandShape:
         vault.mkdir()
         env: dict = {}
         with patch.object(mig, "_alfred_vault_cmd") as mocked:
-            mig._apply_routine_create(env, vault)
+            mig._apply_routine_create(env)
         mocked.assert_called_once()
         call_args = mocked.call_args
         # First positional is verb, then "routine", then name
@@ -529,7 +564,7 @@ class TestSubprocessCommandShape:
         vault.mkdir()
         env: dict = {}
         with patch.object(mig, "_alfred_vault_cmd") as mocked:
-            mig._apply_routine_create(env, vault)
+            mig._apply_routine_create(env)
         flat = list(mocked.call_args.args[3:])
         items_value = next(v for v in flat if v.startswith("items="))
         # Each of the 5 practices is in an aspirational item.
@@ -553,7 +588,7 @@ class TestSubprocessCommandShape:
         )
         env: dict = {}
         with patch.object(mig, "_alfred_vault_cmd") as mocked:
-            mig._apply_task_cancel(entry, env, vault)
+            mig._apply_task_cancel(entry, env)
         mocked.assert_called_once()
         call_args = mocked.call_args
         assert call_args.args[0] == "edit"
@@ -591,14 +626,62 @@ class TestApplyPlanCounters:
         assert counters["tasks_cancelled"] == 2
 
     def test_idempotent_rerun_zero_counters(self, tmp_path: Path) -> None:
-        """When the plan is fully empty (e.g. re-run after a prior
-        successful migration), counters are all zero. Mimics the
-        already-migrated steady state."""
-        empty = tmp_path / "empty-vault"
-        empty.mkdir()
-        plan = mig.build_plan(empty)
+        """When the plan is fully empty after a prior successful
+        migration, counters are all zero.
+
+        Concrete fixture shape for "fully-migrated steady state":
+          * Routine ``Standing Practices.md`` already exists
+            (idempotency-skip: routine_to_create=False).
+          * Task records already carry ``base_tier:`` and NO
+            ``tier:`` (idempotency-skip: tier_already_renamed
+            populated, tier_renames empty).
+          * Standing-practice tasks already carry ``status:
+            cancelled`` AND ``cancelled_at:`` (idempotency-skip:
+            tasks_already_cancelled populated, task_cancels empty).
+          * No RRTS records at all (escalation_sets empty AND
+            escalation_missing_records populated — but missing
+            records don't contribute to apply counters either way).
+
+        Pin per code-reviewer NOTE 2026-05-28: the original test
+        used a totally-empty vault, which had ``routine_to_create=
+        True`` because the routine file was absent. The "fully-
+        migrated" fixture below is the actual steady state."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "task").mkdir()
+        (vault / "routine").mkdir()
+
+        # Routine already created — sub-task 3 routine creation skips.
+        (vault / "routine" / "Standing Practices.md").write_text(
+            "---\ntype: routine\nname: Standing Practices\n"
+            "created: '2026-05-28'\ncadence: {type: daily}\n"
+            "items: []\nstatus: active\n---\n\n# Standing Practices\n",
+            encoding="utf-8",
+        )
+
+        # Tasks already cancelled (status + cancelled_at present)
+        # — sub-task 3 task-cancel skips.
+        for practice in mig.STANDING_PRACTICE_TASKS:
+            _write_task(
+                vault, practice,
+                base_tier=3,
+                status="cancelled",
+                cancelled_at=mig.MIGRATION_DATE,
+            )
+
+        # An extra task already carrying base_tier (no tier:) —
+        # sub-task 1 idempotency-skip.
+        _write_task(vault, "Already Renamed", base_tier=2)
+
+        plan = mig.build_plan(vault)
+        # Sanity: nothing pending across all three sub-tasks.
+        assert plan.tier_renames == []
+        assert plan.escalation_sets == []
+        assert plan.routine_to_create is False
+        assert plan.task_cancels == []
+
         with patch.object(mig, "_alfred_vault_cmd"):
-            counters = mig.apply_plan(plan, empty)
+            counters = mig.apply_plan(plan, vault)
         assert counters == {
             "tier_renamed":           0,
             "escalation_set":         0,
@@ -740,3 +823,193 @@ class TestModuleConstants:
         )
         assert "Migration note" in mig.TASK_CANCEL_BODY_APPEND
         assert mig.MIGRATION_DATE in mig.TASK_CANCEL_BODY_APPEND
+
+
+# --- tier_invalid rendering (reviewer WARN 2a) ----------------------------
+
+
+class TestTierInvalidRendering:
+    """Per reviewer NOTE 2a (2026-05-28): non-int ``tier:`` values
+    surface in the dry-run report as a WARNING block with the
+    specific records + raw values named. The hand-edit-required
+    flag is the operator's explicit signal to fix the data BEFORE
+    the live run.
+    """
+
+    def test_invalid_warning_block_lists_each_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Two records with non-int tier values → WARNING block
+        names both with their raw values."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "task").mkdir()
+        (vault / "routine").mkdir()
+        _write_task(vault, "Bad String", extra_fm={"tier": "high"})
+        _write_task(vault, "Bad List", extra_fm={"tier": "[1, 2]"})
+        plan = mig.build_plan(vault)
+        mig.print_plan(plan, vault, dry_run=True)
+        out = capsys.readouterr().out
+
+        # WARNING block fires under sub-task 1.
+        assert "WARNING" in out
+        assert "non-int tier values" in out
+        assert "hand-edit required" in out
+        # Both record paths named.
+        assert "task/Bad String.md" in out
+        assert "task/Bad List.md" in out
+        # Raw values rendered via repr() so an operator can spot
+        # exactly what's wrong (string vs list vs other type).
+        assert "'high'" in out
+
+    def test_no_invalid_no_warning_block(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """No non-int tier values → no WARNING block (the WARNING is
+        the explicit signal, NOT the default state)."""
+        vault = _build_fixture_vault(tmp_path)
+        plan = mig.build_plan(vault)
+        mig.print_plan(plan, vault, dry_run=True)
+        out = capsys.readouterr().out
+        # No tier-invalid WARNING. (Sub-task 2's WARNING for missing
+        # RRTS targets isn't present either because the fixture
+        # populates both Invoicing + Payroll.)
+        assert "non-int tier values" not in out
+
+
+# --- Partial migration handling (reviewer WARN 2b) ------------------------
+
+
+class TestPartialMigrationHandling:
+    """Per reviewer NOTE 2b (2026-05-28): mid-stream subprocess
+    failure surfaces an operator-facing partial-migration sentinel
+    + recovery pointer, then re-raises so the caller can return a
+    non-zero exit code. Pin the print path AND the re-raise contract.
+    """
+
+    def test_runtime_error_mid_subtask_prints_partial_sentinel(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """When ``_alfred_vault_cmd`` raises on the Nth record of
+        sub-task 1, the script:
+          * prints the partial-migration sentinel naming the count
+            of records ALREADY written (N-1)
+          * prints the recovery pointer
+          * re-raises so the caller surfaces non-zero exit
+        """
+        vault = _build_fixture_vault(tmp_path)
+        plan = mig.build_plan(vault)
+
+        # Fail on the 3rd subprocess invocation (after 2 records
+        # have landed successfully). Counter for tier_renamed will
+        # be 2 at the point of failure.
+        call_count = {"n": 0}
+
+        def _flaky_cmd(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 3:
+                raise RuntimeError(
+                    "alfred vault edit failed: Exit code 1: "
+                    "simulated CLI failure (stderr='', stdout_tail='', "
+                    "cmd=['python', '-m', 'alfred.cli', 'vault', 'edit', "
+                    "'task/T3 Aspirational Goal.md'])"
+                )
+            return {}
+
+        with patch.object(mig, "_alfred_vault_cmd", side_effect=_flaky_cmd):
+            with pytest.raises(RuntimeError):
+                mig.apply_plan(plan, vault)
+
+        out = capsys.readouterr().out
+        # Partial-migration sentinel fires with the count of
+        # records-before-failure.
+        assert "PARTIAL MIGRATION" in out
+        assert "2 record(s) written before failure" in out
+        # Recovery pointer present.
+        assert "re-run the script" in out
+        assert "idempotency will skip" in out
+
+    def test_main_returns_one_on_runtime_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """End-to-end: ``main(["--vault", <vault>])`` returns 1 (not 0)
+        when ``apply_plan`` raises. The dry-run path is unaffected
+        — only live-run-with-failure surfaces non-zero exit.
+
+        Pin the ``main`` integration so a refactor that catches the
+        RuntimeError in the wrong place silently returns 0 and
+        deceives a CI / wrapper script downstream."""
+        vault = _build_fixture_vault(tmp_path)
+
+        def _always_fail(*args, **kwargs):
+            raise RuntimeError("simulated subprocess failure")
+
+        with patch.object(mig, "_alfred_vault_cmd", side_effect=_always_fail):
+            rc = mig.main(["--vault", str(vault)])
+        assert rc == 1
+        # Sentinel + failure-cause line both printed. Consume the
+        # buffer ONCE — capsys.readouterr() resets the captures,
+        # so calling it twice would lose the second stream.
+        captured = capsys.readouterr()
+        assert "PARTIAL MIGRATION" in captured.out
+        # The "Failure cause:" tail line goes to stderr per main()'s
+        # contract — keeps the failure detail in the operator's
+        # error-stream view distinct from the progress logs.
+        assert "Failure cause:" in captured.err
+
+    def test_rerun_after_partial_converges_via_idempotency(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Pin the idempotency contract that makes the partial-
+        migration recovery shape work in practice: after a partial
+        failure, re-running the script with the same vault state
+        SHOULD plan only the unfinished records.
+
+        Concrete shape: simulate that sub-task 1 partially completed
+        (2 records renamed, 3 still pending). The re-run's
+        ``build_plan`` should show only 3 pending renames + the 2
+        already-renamed records in the idempotency-skip list."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "task").mkdir()
+        (vault / "routine").mkdir()
+        # Two records ALREADY renamed (base_tier set, no tier).
+        _write_task(vault, "Already Done 1", base_tier=1)
+        _write_task(vault, "Already Done 2", base_tier=2)
+        # Three records STILL pending (tier set, no base_tier).
+        _write_task(vault, "Still Pending 1", tier=1)
+        _write_task(vault, "Still Pending 2", tier=2)
+        _write_task(vault, "Still Pending 3", tier=3)
+
+        plan = mig.build_plan(vault)
+        # Only the 3 pending records show up in tier_renames.
+        pending_paths = {p.rel_path for p in plan.tier_renames}
+        assert pending_paths == {
+            "task/Still Pending 1.md",
+            "task/Still Pending 2.md",
+            "task/Still Pending 3.md",
+        }
+        # The 2 already-renamed records are in the idempotency-skip.
+        assert set(plan.tier_already_renamed) == {
+            "task/Already Done 1.md",
+            "task/Already Done 2.md",
+        }
+
+
+# --- _alfred_vault_cmd signature (reviewer NOTE 3) -------------------------
+
+
+class TestAlfredVaultCmdSignature:
+    """Per reviewer NOTE 3: the ``vault_path`` kwarg was unused
+    documentation noise; dropped 2026-05-28. Pin the signature so a
+    future re-add surfaces here as a regression."""
+
+    def test_signature_does_not_accept_vault_path(self) -> None:
+        """``_alfred_vault_cmd(vault_path=...)`` should raise
+        TypeError — the kwarg is no longer part of the signature."""
+        import inspect
+        sig = inspect.signature(mig._alfred_vault_cmd)
+        assert "vault_path" not in sig.parameters
+        # Sanity: ``env`` IS still a kwarg.
+        assert "env" in sig.parameters
+        assert "stdin" in sig.parameters
