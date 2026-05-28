@@ -737,7 +737,19 @@ def _apply_routine_create(
         "--set", "status=active",
         "--set", f"cadence={json.dumps({'type': 'daily'})}",
         "--set", f"items={json.dumps(items)}",
-        "--set", "completion_log={}",
+        # completion_log MUST be an empty list, NOT an empty dict.
+        # Discovered 2026-05-28 live run: ``completion_log={}`` (dict)
+        # fails the schema validator with ``"must be a list, got dict"``
+        # — ``completion_log`` is in ``LIST_FIELDS`` (schema.py:1066)
+        # per the 2026-05-26 Phase 1 routine ship. The aggregator
+        # later mutates it as a dict-of-lists at runtime, but the
+        # create-time write needs the list shape to pass the
+        # ``_validate_list_fields`` gate. The existing routine
+        # fixtures on disk (e.g. ``For Self Health.md``) ship with
+        # ``completion_log: {}`` — schema-tolerant for reads but
+        # NOT a valid create-time write shape. We write ``[]`` and
+        # the runtime/aggregator coerces as needed.
+        "--set", "completion_log=[]",
         "--body-stdin",
         env=env,
         stdin=ROUTINE_BODY,
