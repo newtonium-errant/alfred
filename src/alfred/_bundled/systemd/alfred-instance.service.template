@@ -1,0 +1,17 @@
+[Unit]
+Description=Algernon (<DISPLAY>) — Alfred daemon set for the <DISPLAY> instance
+After=network.target
+PartOf=algernon.target
+
+[Service]
+Type=simple
+WorkingDirectory=<ALFRED_REPO>
+ExecStart=<ALFRED_REPO>/.venv/bin/python -m alfred --config <CONFIG_PATH> up --_internal-foreground
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=default.target algernon.target

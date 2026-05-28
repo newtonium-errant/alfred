@@ -32,3 +32,23 @@ def get_example_env() -> Path:
 
 def get_tui_js_path() -> Path:
     return get_bundled_dir() / "tui_js" / "index.js"
+
+
+def get_systemd_dir() -> Path:
+    """Return the bundled systemd-templates directory.
+
+    Contains:
+      * ``alfred-instance.service.template`` — per-instance unit file
+        rendered once per registry entry by the installer at
+        ``alfred.scripts.install_systemd_units``. Placeholders:
+        ``<DISPLAY>``, ``<ALFRED_REPO>``, ``<CONFIG_PATH>``.
+      * ``algernon.target`` — platform-level target the installer
+        rewrites with per-instance ``Wants=`` lines from the
+        registry (placeholder: ``<WANTS_LINE>``).
+
+    Shipped 2026-05-29 (autonomy ship) — closes the host-reboot-
+    survival gap. WSL2 with ``systemd=true`` runs user systemd
+    natively; the installer enables linger so the units survive
+    the operator's terminal session ending.
+    """
+    return get_bundled_dir() / "systemd"

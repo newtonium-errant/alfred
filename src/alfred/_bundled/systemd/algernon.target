@@ -1,0 +1,15 @@
+[Unit]
+Description=Algernon platform — all enabled instances
+# <WANTS_LINE> is rewritten by ``alfred.scripts.install_systemd_units``
+# at install time using the operator's ``~/.alfred/instances.yaml``
+# registry. The shipped placeholder ensures the file structure is
+# correct (operators reading the bundle see what the contract shape
+# should be) while leaving the per-instance dependency list to the
+# install-time substitution. A registry change (instance added /
+# removed / disabled) requires re-running the installer to refresh
+# the installed target — same source-of-truth pattern as the
+# ``alfred instance up`` fan-out.
+<WANTS_LINE>
+
+[Install]
+WantedBy=default.target
