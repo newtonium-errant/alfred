@@ -34,6 +34,7 @@ from typing import Any
 
 import frontmatter  # type: ignore[import-untyped]
 import structlog
+import yaml
 
 from alfred.tier.compute import (
     OPEN_STATUSES,
@@ -55,6 +56,87 @@ _NO_TASKS_OVERALL = (
 )
 
 
+def _validate_frontmatter_yaml(path: Path) -> str | None:
+    """Pre-validate a record's YAML frontmatter block.
+
+    Returns ``None`` if the file is well-formed (or has no frontmatter
+    at all — body-only files are valid). Returns a short error string
+    on failure so the caller can log it and skip the record.
+
+    **Why this wrapper exists** (2026-05-28, post-ship fix to commit
+    ``91504ea``): ``python-frontmatter`` is lenient on invalid YAML —
+    when the frontmatter block fails to parse, ``frontmatter.load``
+    silently returns an empty / partial metadata dict instead of
+    raising. The original ship's ``except Exception`` block around
+    ``frontmatter.load`` was unreachable in practice; broken-YAML
+    task records would silently render as zero-fielded entries
+    instead of triggering the ``parse_failed`` log line operators
+    rely on to distinguish "no tasks at this tier" from "tasks
+    exist but the file is broken." Per
+    ``feedback_intentionally_left_blank.md``: silence-where-failure-
+    should-be-visible is the antipattern this layer was built to
+    prevent. Routing through ``yaml.safe_load`` on the extracted
+    block gives us the explicit raise we need.
+
+    The pre-validation does NOT replace ``frontmatter.load``; the
+    happy-path still uses it for the metadata + body split. We
+    only use ``yaml.safe_load`` as a structural gate.
+
+    File-shape rules:
+
+    - No leading ``---`` line → no frontmatter; body-only file. Valid.
+      (Not a task-record shape we'd typically see, but we don't
+      want to fail-flag it here — let downstream filters drop it.)
+    - Leading ``---`` with a matching closing ``---`` → extract the
+      block and ``yaml.safe_load`` it. Raise on YAML errors.
+    - Leading ``---`` with NO closing ``---`` (truncated file) →
+      treat as broken; the operator's editor likely crashed mid-edit.
+    - I/O errors → broken; log and skip.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"read failed: {exc}"
+    except UnicodeDecodeError as exc:
+        return f"not utf-8: {exc}"
+
+    # No frontmatter at all is valid — body-only files exist and
+    # shouldn't be flagged as broken at this layer.
+    if not text.startswith("---"):
+        return None
+
+    # Find the closing ``---`` line. PyYAML's frontmatter convention
+    # is a leading line ``---\n`` and a closing line ``---\n``; the
+    # block in between is the YAML payload. We scan line-by-line from
+    # line 1 (skipping the opener) to handle CRLF tolerantly.
+    lines = text.splitlines()
+    if len(lines) < 2 or lines[0].strip() != "---":
+        # Shouldn't happen given the ``startswith("---")`` check,
+        # but defensive — a leading ``---`` not followed by a newline
+        # (e.g., ``---title:`` with no break) is malformed.
+        return "frontmatter opener malformed (no newline after leading ---)"
+
+    close_idx: int | None = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            close_idx = idx
+            break
+
+    if close_idx is None:
+        return "frontmatter block not closed (no trailing --- found)"
+
+    block = "\n".join(lines[1:close_idx])
+    try:
+        yaml.safe_load(block)
+    except yaml.YAMLError as exc:
+        # Compact the error to one line — yaml.YAMLError str() can be
+        # multi-line and would clutter the structured log payload.
+        first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        return f"yaml: {first_line}"
+
+    return None
+
+
 def _iter_task_records(vault_path: Path) -> list[tuple[Path, dict, str]]:
     """Yield ``(path, frontmatter_dict, name)`` for every task record.
 
@@ -64,6 +146,14 @@ def _iter_task_records(vault_path: Path) -> list[tuple[Path, dict, str]]:
     here; status filtering is done at the bucket-population step so
     a future caller (e.g. a CLI ``alfred tier list``) can scan ALL
     tasks without re-walking.
+
+    Parse-failure detection routes through ``_validate_frontmatter_yaml``
+    (a pre-pass over the raw YAML block) BEFORE handing the file to
+    ``frontmatter.load``. The library is lenient on invalid YAML —
+    silently returning empty metadata — so without this pre-pass the
+    parse-failure log line below would be unreachable in practice.
+    See ``_validate_frontmatter_yaml`` docstring for the full
+    rationale.
     """
     task_dir = vault_path / "task"
     if not task_dir.is_dir():
@@ -79,13 +169,24 @@ def _iter_task_records(vault_path: Path) -> list[tuple[Path, dict, str]]:
 
     out: list[tuple[Path, dict, str]] = []
     for path in sorted(task_dir.glob("*.md")):
-        try:
-            post = frontmatter.load(str(path))
-        except Exception as exc:  # noqa: BLE001
+        validation_error = _validate_frontmatter_yaml(path)
+        if validation_error is not None:
             log.warning(
                 "brief.tier_section.parse_failed",
                 path=str(path),
-                error=str(exc),
+                error=validation_error,
+            )
+            continue
+        try:
+            post = frontmatter.load(str(path))
+        except Exception as exc:  # noqa: BLE001
+            # Defensive: a YAML payload that passes ``yaml.safe_load``
+            # but trips ``frontmatter.load`` is unexpected — log the
+            # event class so we can spot it in production telemetry.
+            log.warning(
+                "brief.tier_section.parse_failed",
+                path=str(path),
+                error=f"frontmatter.load: {exc}",
             )
             continue
         fm = dict(post.metadata or {})

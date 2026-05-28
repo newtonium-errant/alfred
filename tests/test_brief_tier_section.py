@@ -357,15 +357,32 @@ def test_within_bucket_sort_by_due_ascending(tmp_path: Path) -> None:
 
 
 def test_unparseable_record_logs_and_continues(tmp_path: Path) -> None:
-    """A record that fails to parse should be skipped with a log line."""
+    """A record with truncated frontmatter (no closing ``---``) is the
+    test case the original ship's ``except Exception`` block was
+    supposed to cover.
+
+    ``python-frontmatter`` is lenient on invalid YAML — it does NOT
+    raise on broken frontmatter; it silently returns empty / partial
+    metadata. The fix (commit follow-up to ``91504ea``) introduces
+    ``_validate_frontmatter_yaml`` which runs ``yaml.safe_load`` over
+    the extracted block before handing to ``frontmatter.load``. This
+    test pins the realistic "operator's editor crashed mid-edit"
+    case — file starts with ``---`` but the closer is missing.
+
+    See ``feedback_intentionally_left_blank.md``: parse failures
+    MUST surface to operators so they can distinguish "no tasks at
+    this tier" from "tasks exist but file is broken."
+    """
     task_dir = tmp_path / "task"
     task_dir.mkdir(parents=True)
-    # Write a deliberately broken frontmatter file.
-    (task_dir / "Broken.md").write_text(
+    # Truncated frontmatter — no closing ``---``. This is the failure
+    # mode operators most commonly hit (editor crash, partial save,
+    # incomplete copy-paste).
+    (task_dir / "Truncated.md").write_text(
         "---\nstatus: todo\nbase_tier: [unclosed\n",
         encoding="utf-8",
     )
-    # And a valid one to confirm the render continues.
+    # And a valid one to confirm the render continues past the failure.
     _write_task(
         tmp_path, "Valid Task",
         {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
@@ -375,6 +392,94 @@ def test_unparseable_record_logs_and_continues(tmp_path: Path) -> None:
     assert "Valid Task" in body
     parse_fails = [c for c in captured if c.get("event") == "brief.tier_section.parse_failed"]
     assert len(parse_fails) == 1
+    # Pin the error-string shape so a refactor doesn't drop the
+    # "frontmatter not closed" diagnostic detail.
+    assert "not closed" in parse_fails[0]["error"]
+
+
+def test_invalid_yaml_inside_closed_frontmatter_logs(tmp_path: Path) -> None:
+    """Frontmatter block IS properly closed by ``---`` but the YAML
+    inside is malformed.
+
+    Per builder.md rule #7 (tokenizer-fallback fixture coverage):
+    each failure mode of the new validation path needs its own
+    fixture. This case exercises the ``yaml.safe_load`` raise path
+    in ``_validate_frontmatter_yaml``, distinct from the
+    "not-closed" path above.
+
+    Realistic failure shape: operator pasted a snippet with a
+    leading ``[`` they meant to remove. Common copy-paste artefact.
+    """
+    task_dir = tmp_path / "task"
+    task_dir.mkdir(parents=True)
+    # Properly delimited frontmatter, but the YAML payload itself is
+    # broken (unclosed flow-sequence inside a value).
+    (task_dir / "BadYaml.md").write_text(
+        "---\nstatus: todo\nbase_tier: [1, 2\n---\n\n# Body\n",
+        encoding="utf-8",
+    )
+    _write_task(
+        tmp_path, "Valid Task",
+        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
+    )
+    with structlog.testing.capture_logs() as captured:
+        body = render_tier_section(tmp_path, NOW)
+    assert "Valid Task" in body
+    parse_fails = [c for c in captured if c.get("event") == "brief.tier_section.parse_failed"]
+    assert len(parse_fails) == 1
+    # Pin the yaml-error prefix so a refactor doesn't drop the
+    # ``yaml: ...`` diagnostic detail.
+    assert parse_fails[0]["error"].startswith("yaml: ")
+
+
+def test_body_only_file_is_not_a_parse_failure(tmp_path: Path) -> None:
+    """A file with no frontmatter at all is valid (body-only). It
+    should NOT trigger ``parse_failed``.
+
+    Per builder.md rule #7: the validator's "no leading ``---``"
+    branch is a happy-path-yes-but-skip-validation case; pin it
+    so a future refactor doesn't accidentally flag body-only files
+    as broken.
+    """
+    task_dir = tmp_path / "task"
+    task_dir.mkdir(parents=True)
+    (task_dir / "BodyOnly.md").write_text(
+        "# Just a body\n\nNo frontmatter at all.\n",
+        encoding="utf-8",
+    )
+    _write_task(
+        tmp_path, "Valid Task",
+        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
+    )
+    with structlog.testing.capture_logs() as captured:
+        render_tier_section(tmp_path, NOW)
+    parse_fails = [c for c in captured if c.get("event") == "brief.tier_section.parse_failed"]
+    # Body-only file has no frontmatter at all → not flagged. The body-
+    # only file gets a default ``status=todo`` (per ``_is_open``) and
+    # no ``base_tier`` (defaulting to T3), so it WILL surface in the
+    # T3 bucket — but as a "valid no-fields task," not a parse failure.
+    assert len(parse_fails) == 0
+
+
+def test_validator_handles_unicode_decode_error(tmp_path: Path) -> None:
+    """Non-UTF-8 file → caught by ``UnicodeDecodeError`` branch in
+    the validator. Realistic surface: operator pasted from a Word
+    document and got a non-UTF-8 encoding."""
+    task_dir = tmp_path / "task"
+    task_dir.mkdir(parents=True)
+    # Write raw bytes that are not valid UTF-8 (start with a Latin-1
+    # accented byte then a partial multi-byte sequence).
+    (task_dir / "BadEncoding.md").write_bytes(b"---\nname: \xe9\xff\xff\n---\n")
+    _write_task(
+        tmp_path, "Valid Task",
+        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
+    )
+    with structlog.testing.capture_logs() as captured:
+        body = render_tier_section(tmp_path, NOW)
+    assert "Valid Task" in body
+    parse_fails = [c for c in captured if c.get("event") == "brief.tier_section.parse_failed"]
+    assert len(parse_fails) == 1
+    assert "utf-8" in parse_fails[0]["error"].lower()
 
 
 # ---------------------------------------------------------------------------
