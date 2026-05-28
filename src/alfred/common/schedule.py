@@ -167,6 +167,108 @@ def compute_next_fire(config: ScheduleConfig, now: datetime) -> datetime:
     )
 
 
+def compute_today_fire(
+    config: ScheduleConfig, now: datetime,
+) -> datetime:
+    """Return TODAY's fire time in the configured timezone, regardless
+    of whether ``now`` is before or after it.
+
+    Distinct from :func:`compute_next_fire`, which always returns a
+    fire time *after* ``now`` (so a post-fire-window ``now`` returns
+    tomorrow's target). This helper returns today's target unconditionally
+    — needed for the daemon-catch-up shape where a daemon boots after
+    today's window has already passed and needs to check "should I
+    catch up?"
+
+    Weekly schedules: returns today's target if today matches
+    ``day_of_week`` (whether or not the time has passed); otherwise
+    returns the next matching weekday's target. The catch-up shape
+    only fires when today is the scheduled day, so a non-matching
+    weekday returns a future target the caller will ignore.
+
+    ``now`` MUST be timezone-aware — same contract as
+    :func:`compute_next_fire`.
+    """
+    if now.tzinfo is None:
+        raise ValueError(
+            "compute_today_fire requires tz-aware 'now'; "
+            "pass datetime.now(ZoneInfo(...)) or similar"
+        )
+
+    tz = ZoneInfo(config.timezone)
+    hour, minute = _parse_hhmm(config.time)
+    local_now = now.astimezone(tz)
+
+    if config.day_of_week is None:
+        # Daily schedule — today's target regardless of past/future.
+        return local_now.replace(
+            hour=hour, minute=minute, second=0, microsecond=0,
+        )
+
+    # Weekly schedule — if today matches day_of_week, return today's
+    # target; otherwise delegate to compute_next_fire (the catch-up
+    # caller only acts when today's target is in the past, which
+    # implies a same-day match — non-matching weekdays return a future
+    # target the caller won't act on).
+    target_weekday = parse_day_of_week(config.day_of_week)
+    if local_now.weekday() == target_weekday:
+        return local_now.replace(
+            hour=hour, minute=minute, second=0, microsecond=0,
+        )
+    return compute_next_fire(config, now)
+
+
+def should_catchup_today(
+    config: ScheduleConfig,
+    now: datetime,
+    already_fired_today: bool,
+) -> tuple[bool, datetime, float]:
+    """Decide whether a daemon should fire immediately on boot to
+    catch up on a missed scheduled fire.
+
+    Returns ``(should_catchup, today_target, delay_seconds)``:
+      * ``should_catchup`` — True iff today's scheduled fire window
+        has passed AND the daemon's state shows no successful fire
+        for today.
+      * ``today_target`` — today's scheduled fire time in the
+        configured timezone (the "intended_fire_time" the daemon
+        will log).
+      * ``delay_seconds`` — non-negative; how late ``now`` is vs.
+        ``today_target``. 0.0 if ``now`` is at-or-before the target.
+
+    The caller is responsible for the actual fire — this is a pure
+    decision helper. Two callers in V1:
+
+      * ``brief.daemon.run_daemon`` — checks
+        ``state_mgr.state.has_brief_for_date(today_iso)`` to derive
+        ``already_fired_today``.
+      * ``daily_sync.daemon.run_daemon`` — checks
+        ``state.get("last_fired_date") == today_iso``.
+
+    Per ``feedback_intentionally_left_blank.md``: the catch-up path
+    is observability-load-bearing. Each daemon's catch-up log event
+    (``brief.daemon.catchup_fired`` / ``daily_sync.daemon.catchup_fired``)
+    surfaces ``delay_seconds`` as a top-level field so operators can
+    count incidents and characterise their lateness distribution
+    via grep.
+
+    Shipped 2026-05-28 after a host restart mid-morning caused the
+    brief + daily_sync daemons to miss their windows; both probes
+    reported FAIL even though the daemons were alive and would have
+    fired had the host been up at 06:00 / 09:00 ADT. The catch-up
+    closes the false-FAIL class.
+    """
+    today_target = compute_today_fire(config, now)
+    # Convert now to the same tz for clean subtraction (both
+    # tz-aware ⇒ subtraction is straightforward).
+    local_now = now.astimezone(today_target.tzinfo)
+    delay = (local_now - today_target).total_seconds()
+    delay_seconds = max(0.0, delay)
+    window_passed = local_now > today_target
+    should = window_passed and not already_fired_today
+    return should, today_target, delay_seconds
+
+
 # Default re-check cadence for ``sleep_until``. Each chunk costs one
 # wakeup + wall-clock read; 60s is a negligible per-day overhead
 # (~1440 chunks) and keeps early/late fires bounded to <= one chunk

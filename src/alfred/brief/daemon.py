@@ -7,7 +7,11 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from alfred.common.schedule import compute_next_fire, sleep_until
+from alfred.common.schedule import (
+    compute_next_fire,
+    should_catchup_today,
+    sleep_until,
+)
 
 from .config import BriefConfig
 from .health_section import render_health_section
@@ -268,6 +272,50 @@ async def run_daemon(config: BriefConfig) -> None:
 
     state_mgr = StateManager(config.state.path)
     state_mgr.load()
+
+    # Catch-up-on-startup (2026-05-28): if the daemon boots after
+    # today's scheduled fire window has passed AND state shows no
+    # successful fire today, fire immediately before entering the
+    # normal sleep loop. Closes the false-FAIL class where a host
+    # restart mid-day leaves the daemon sleeping until tomorrow
+    # while probes correctly flag the missed window.
+    #
+    # Per ``feedback_intentionally_left_blank.md``: the catch-up path
+    # is observability-load-bearing — emit ``brief.daemon.catchup_fired``
+    # so operators can count incidents and characterise the lateness
+    # distribution via grep on the log.
+    try:
+        tz_boot = ZoneInfo(config.schedule.timezone)
+        now_boot = datetime.now(tz_boot)
+        today_iso_boot = now_boot.date().isoformat()
+        already_fired = state_mgr.state.has_brief_for_date(today_iso_boot)
+        should_catch, intended_fire, delay_seconds = should_catchup_today(
+            config.schedule, now_boot, already_fired,
+        )
+        if should_catch:
+            log.info(
+                "brief.daemon.catchup_fired",
+                date=today_iso_boot,
+                intended_fire_time=intended_fire.isoformat(),
+                actual_fire_time=now_boot.isoformat(),
+                delay_seconds=round(delay_seconds, 1),
+            )
+            try:
+                path = await generate_brief(config, state_mgr)
+                if path:
+                    log.info("brief.daemon.catchup_generated", path=path)
+            except Exception as exc:
+                # Mirror the scheduled-fire failure capture pattern
+                # (record_error + log + swallow). Daemons must not
+                # crash; the BIT probe will surface the failure via
+                # state.last_error.
+                state_mgr.record_error(f"{type(exc).__name__}: {exc}")
+                log.exception("brief.daemon.catchup_error")
+    except Exception:  # noqa: BLE001
+        # Defensive: the catch-up decision helper raising (e.g.
+        # malformed schedule config) MUST NOT prevent the daemon
+        # from entering its normal loop. Log + continue.
+        log.exception("brief.daemon.catchup_decision_failed")
 
     while True:
         tz = ZoneInfo(config.schedule.timezone)

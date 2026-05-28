@@ -10,7 +10,9 @@ import pytest
 from alfred.common.schedule import (
     ScheduleConfig,
     compute_next_fire,
+    compute_today_fire,
     parse_day_of_week,
+    should_catchup_today,
     sleep_until,
 )
 
@@ -470,3 +472,152 @@ async def test_sleep_until_tz_aware_target_in_halifax() -> None:
     assert fake.now() >= target
     expected_s = (target - start).total_seconds()
     assert elapsed == pytest.approx(expected_s, abs=60.0)
+
+
+# ---------------------------------------------------------------------------
+# compute_today_fire — today's target regardless of past/future
+# ---------------------------------------------------------------------------
+
+
+def test_compute_today_fire_daily_returns_today_target_even_when_past() -> None:
+    """Distinct from compute_next_fire: today's target stays today's
+    even when ``now`` is past it. This is the 'has the window passed?'
+    helper the catch-up shape needs."""
+    cfg = ScheduleConfig(time="06:00", timezone="America/Halifax")
+    halifax = ZoneInfo("America/Halifax")
+    now = datetime(2026, 5, 28, 10, 30, tzinfo=halifax)  # after 06:00
+    target = compute_today_fire(cfg, now)
+    assert target.date() == datetime(2026, 5, 28).date()
+    assert target.hour == 6
+    assert target.minute == 0
+    assert target.tzinfo == halifax
+
+
+def test_compute_today_fire_daily_returns_today_target_when_future() -> None:
+    """Pre-window case: today's target stays today's."""
+    cfg = ScheduleConfig(time="06:00", timezone="America/Halifax")
+    halifax = ZoneInfo("America/Halifax")
+    now = datetime(2026, 5, 28, 3, 0, tzinfo=halifax)  # before 06:00
+    target = compute_today_fire(cfg, now)
+    assert target.date() == datetime(2026, 5, 28).date()
+    assert target.hour == 6
+
+
+def test_compute_today_fire_weekly_today_matches() -> None:
+    """Weekly schedule, today IS the target day: returns today's
+    time regardless of pre/post-window."""
+    # 2026-05-28 is a Thursday.
+    cfg = ScheduleConfig(
+        time="09:00", timezone="America/Halifax", day_of_week="thursday",
+    )
+    halifax = ZoneInfo("America/Halifax")
+    now = datetime(2026, 5, 28, 14, 0, tzinfo=halifax)  # Thu, post-window
+    target = compute_today_fire(cfg, now)
+    assert target.date() == datetime(2026, 5, 28).date()
+    assert target.hour == 9
+
+
+def test_compute_today_fire_weekly_today_does_not_match_delegates() -> None:
+    """Weekly schedule, today is NOT the target day: delegates to
+    compute_next_fire (returns next matching weekday's target). The
+    catch-up caller checks 'is now past today's target?' — for a
+    non-matching weekday, the delegated future target won't be in
+    the past, so the caller takes the no-op branch."""
+    # 2026-05-28 is a Thursday; ask for Monday.
+    cfg = ScheduleConfig(
+        time="09:00", timezone="America/Halifax", day_of_week="monday",
+    )
+    halifax = ZoneInfo("America/Halifax")
+    now = datetime(2026, 5, 28, 14, 0, tzinfo=halifax)
+    target = compute_today_fire(cfg, now)
+    # Next Monday is 2026-06-01.
+    assert target.date() == datetime(2026, 6, 1).date()
+
+
+def test_compute_today_fire_naive_now_raises() -> None:
+    cfg = ScheduleConfig(time="06:00", timezone="America/Halifax")
+    with pytest.raises(ValueError, match="tz-aware"):
+        compute_today_fire(cfg, datetime(2026, 5, 28, 10, 0))
+
+
+# ---------------------------------------------------------------------------
+# should_catchup_today — catch-up decision helper
+# ---------------------------------------------------------------------------
+
+
+def test_should_catchup_window_passed_and_not_fired_today() -> None:
+    """The canonical incident shape: daemon boots after today's window
+    passed, state shows no fire today → catch-up fires.
+
+    Includes delay_seconds rounded to whole-second granularity so
+    operator-grep on the log can characterise lateness distribution
+    (e.g. 'how many catch-ups were >1h late this week?').
+    """
+    cfg = ScheduleConfig(time="06:00", timezone="America/Halifax")
+    halifax = ZoneInfo("America/Halifax")
+    now = datetime(2026, 5, 28, 10, 30, tzinfo=halifax)  # 4.5h after 06:00
+    should, target, delay = should_catchup_today(
+        cfg, now, already_fired_today=False,
+    )
+    assert should is True
+    assert target.hour == 6
+    assert target.minute == 0
+    # 4h30m = 16200s.
+    assert delay == pytest.approx(16200.0, abs=1.0)
+
+
+def test_should_catchup_window_passed_but_already_fired_today() -> None:
+    """Idempotent case: daemon restart AFTER a successful fire today
+    doesn't re-fire."""
+    cfg = ScheduleConfig(time="06:00", timezone="America/Halifax")
+    halifax = ZoneInfo("America/Halifax")
+    now = datetime(2026, 5, 28, 10, 30, tzinfo=halifax)
+    should, _target, _delay = should_catchup_today(
+        cfg, now, already_fired_today=True,
+    )
+    assert should is False
+
+
+def test_should_catchup_window_not_yet_passed() -> None:
+    """Normal case: daemon boots before today's window — proceed to
+    sleep loop, no catch-up."""
+    cfg = ScheduleConfig(time="06:00", timezone="America/Halifax")
+    halifax = ZoneInfo("America/Halifax")
+    now = datetime(2026, 5, 28, 3, 0, tzinfo=halifax)  # before 06:00
+    should, target, delay = should_catchup_today(
+        cfg, now, already_fired_today=False,
+    )
+    assert should is False
+    # Target is still today's 06:00.
+    assert target.hour == 6
+    # No delay (we're before the target).
+    assert delay == 0.0
+
+
+def test_should_catchup_exact_minute_no_catchup() -> None:
+    """Boundary: ``now`` exactly AT the scheduled fire minute → the
+    normal sleep loop handles it (sleep_seconds <= 0 → immediate fire
+    at the loop's top). The catch-up shape only triggers when ``now``
+    is strictly AFTER the target so the normal loop's natural
+    short-sleep path stays canonical for at-target boots."""
+    cfg = ScheduleConfig(time="06:00", timezone="America/Halifax")
+    halifax = ZoneInfo("America/Halifax")
+    now = datetime(2026, 5, 28, 6, 0, tzinfo=halifax)  # exactly 06:00
+    should, _target, delay = should_catchup_today(
+        cfg, now, already_fired_today=False,
+    )
+    assert should is False
+    assert delay == 0.0
+
+
+def test_should_catchup_one_second_past_window_fires() -> None:
+    """One second past the window → catch-up fires. Pins the strict
+    inequality boundary."""
+    cfg = ScheduleConfig(time="06:00", timezone="America/Halifax")
+    halifax = ZoneInfo("America/Halifax")
+    now = datetime(2026, 5, 28, 6, 0, 1, tzinfo=halifax)
+    should, _target, delay = should_catchup_today(
+        cfg, now, already_fired_today=False,
+    )
+    assert should is True
+    assert delay == pytest.approx(1.0, abs=0.5)

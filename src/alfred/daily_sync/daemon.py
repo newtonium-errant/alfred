@@ -30,7 +30,11 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
-from alfred.common.schedule import compute_next_fire, sleep_until
+from alfred.common.schedule import (
+    compute_next_fire,
+    should_catchup_today,
+    sleep_until,
+)
 
 from . import (
     attribution_section,
@@ -347,6 +351,61 @@ async def run_daemon(
         user_id=user_id,
         vault=str(vault_path),
     )
+
+    # Catch-up-on-startup (2026-05-28): if the daemon boots after
+    # today's scheduled fire window has passed AND state shows no
+    # fire today, fire immediately before entering the normal sleep
+    # loop. Closes the false-FAIL class where a host restart mid-day
+    # leaves the daemon sleeping until tomorrow.
+    #
+    # Per ``feedback_intentionally_left_blank.md``: emit
+    # ``daily_sync.daemon.catchup_fired`` so operators can count
+    # incidents and characterise lateness distribution via grep.
+    try:
+        tz_boot = ZoneInfo(config.schedule.timezone)
+        now_boot = datetime.now(tz_boot)
+        today_boot = now_boot.date()
+        today_iso_boot = today_boot.isoformat()
+        state_boot = load_state(config.state.path)
+        already_fired = (
+            state_boot.get("last_fired_date") == today_iso_boot
+        )
+        should_catch, intended_fire, delay_seconds = should_catchup_today(
+            config.schedule, now_boot, already_fired,
+        )
+        if should_catch:
+            log.info(
+                "daily_sync.daemon.catchup_fired",
+                date=today_iso_boot,
+                intended_fire_time=intended_fire.isoformat(),
+                actual_fire_time=now_boot.isoformat(),
+                delay_seconds=round(delay_seconds, 1),
+            )
+            try:
+                result = await fire_once(
+                    config, vault_path, user_id, today=today_boot,
+                    raw_config=raw_config,
+                )
+                log.info(
+                    "daily_sync.daemon.catchup_completed",
+                    date=today_iso_boot,
+                    items=result["items_count"],
+                    message_ids=result["message_ids"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Mirror the scheduled-fire failure capture: record
+                # the error into state so the BIT probe surfaces it;
+                # swallow so the daemon enters the normal loop.
+                record_error_on_state(
+                    config.state.path,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                log.exception("daily_sync.daemon.catchup_error")
+    except Exception:  # noqa: BLE001
+        # Defensive: catch-up decision helper raising (e.g. malformed
+        # schedule config) MUST NOT prevent the daemon from entering
+        # its normal loop. Log + continue.
+        log.exception("daily_sync.daemon.catchup_decision_failed")
 
     while True:
         tz = ZoneInfo(config.schedule.timezone)
