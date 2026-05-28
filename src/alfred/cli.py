@@ -2271,9 +2271,37 @@ def cmd_instance_status_all(args: argparse.Namespace) -> None:
         # import was redundant — dropped 2026-05-28 per reviewer NOTE.
         from alfred.instance_set import _build_subprocess_cmd
         payload: dict[str, Any] = {}
+        any_timed_out = False
         for inst in enabled:
             cmd = _build_subprocess_cmd(inst, "status", ["--json"])
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            # Subprocess timeout per the canonical pattern in
+            # ``instance_set.run_verb`` (instance_set.py:267-289):
+            # a wedged config-load on one instance would otherwise
+            # hang the whole fan-out. 30s is generous (``status``
+            # reads PID file + config in <1s normally); a timeout
+            # firing means corrupt config / locked file / network
+            # call inside config load and the operator wants to
+            # know NOW. Best-effort fan-out continues to the next
+            # instance after the timeout entry lands in payload.
+            #
+            # Diagnostic pivot per the canonical comment block:
+            # FAILED has stderr to inspect (subprocess returned
+            # non-zero); TIMEOUT has cwd + config path to inspect
+            # (subprocess never returned, so stderr is empty).
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                payload[inst.name] = {
+                    "timeout": True,
+                    "config": inst.config,
+                    "message": (
+                        f"30s wedge — check {inst.config}"
+                    ),
+                }
+                any_timed_out = True
+                continue
             if proc.returncode == 0 and proc.stdout.strip():
                 try:
                     payload[inst.name] = json.loads(proc.stdout)
@@ -2291,15 +2319,39 @@ def cmd_instance_status_all(args: argparse.Namespace) -> None:
                     ),
                 }
         print(json.dumps(payload, indent=2, default=str))
+        if any_timed_out:
+            sys.exit(1)
         return
 
     if verbose:
         # Concatenate full ``alfred status`` per instance with headers.
         from alfred.instance_set import _build_subprocess_cmd
+        any_timed_out = False
         for inst in enabled:
-            print(f"=== {inst.display} ===")
             cmd = _build_subprocess_cmd(inst, "status", [])
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            # Subprocess timeout per the canonical pattern in
+            # ``instance_set.run_verb`` (instance_set.py:267-289).
+            # Same wedge surface as the --json branch above.
+            # Diagnostic pivot: FAILED has stderr (subprocess
+            # returned non-zero); TIMEOUT has cwd + config path
+            # (subprocess never returned).
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                # Emit a distinct TIMEOUT header rather than the
+                # standard ``=== <Display> ===`` block — operator
+                # scanning the verbose output spots wedged instances
+                # immediately without re-reading the section body.
+                print(
+                    f"=== {inst.display}: TIMEOUT "
+                    f"(30s wedge — check {inst.config}) ==="
+                )
+                print()
+                any_timed_out = True
+                continue
+            print(f"=== {inst.display} ===")
             if proc.stdout:
                 print(proc.stdout.rstrip())
             if proc.returncode != 0:
@@ -2309,6 +2361,8 @@ def cmd_instance_status_all(args: argparse.Namespace) -> None:
                 if stderr:
                     print(f"[stderr]\n{stderr}")
             print()
+        if any_timed_out:
+            sys.exit(1)
         return
 
     # Default: one-line-per-instance.

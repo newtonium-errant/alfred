@@ -733,3 +733,145 @@ def test_instance_status_verbose_aggregates_with_section_headers(
     # Per-instance status content surfaces.
     assert "SALEM_FULL_STATUS" in out
     assert "KALLE_FULL_STATUS" in out
+
+
+def test_status_all_json_branch_timeout_continues_aggregate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """``--json`` branch — when one instance's subprocess times out,
+    the aggregate continues to the next instance, the timeout entry
+    lands in the payload with the canonical shape, and the overall
+    exit code is 1.
+
+    Mirrors the canonical TIMEOUT pattern in ``instance_set.run_verb``
+    (instance_set.py:267-289). Pinned per the polish-arc dispatch
+    2026-05-28 — without the timeout, a wedged config-load on one
+    instance would hang the whole --json fan-out indefinitely."""
+    import json as _json
+    import subprocess as _subprocess
+    from alfred.cli import cmd_instance_status_all
+
+    registry = tmp_path / "instances.yaml"
+    _write_registry(registry, [
+        {"name": "salem", "display": "Salem",
+         "config": "/path/to/salem.yaml", "enabled": True},
+        {"name": "kal-le", "display": "KAL-LE",
+         "config": "/path/to/kalle.yaml", "enabled": True},
+    ])
+
+    def _fake_run(cmd, **kw):
+        # KAL-LE times out; Salem succeeds with valid JSON.
+        config_idx = cmd.index("--config")
+        config = cmd[config_idx + 1]
+        if "kalle" in config:
+            raise _subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+        return _fake_proc(
+            stdout='{"daemon": {"running": true, "pid": 41450}}',
+            returncode=0,
+        )
+
+    # JSON branch uses subprocess.run from cli.py's import — patch
+    # the cli.py reference (matches the verbose-branch test's
+    # mock site).
+    monkeypatch.setattr("alfred.cli.subprocess.run", _fake_run)
+    monkeypatch.setattr(
+        "alfred.instance_set.check_running", lambda inst: None,
+    )
+
+    args = argparse.Namespace(
+        instance_cmd="status",
+        registry=str(registry),
+        verbose=False,
+        json=True,
+    )
+    # Aggregate exit-code reflects timeout as failure — sys.exit(1)
+    # raises SystemExit caught here.
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_instance_status_all(args)
+    assert exc_info.value.code == 1
+
+    out = capsys.readouterr().out
+    payload = _json.loads(out)
+
+    # Salem's successful status surfaced in the payload.
+    assert "salem" in payload
+    assert payload["salem"].get("daemon", {}).get("running") is True
+    assert payload["salem"]["daemon"]["pid"] == 41450
+
+    # KAL-LE's timeout surfaced with the canonical shape: timeout
+    # flag + config path. Distinct from the ``error`` shape used for
+    # non-zero-exit failures — the diagnostic-pivot lives in the key
+    # name (``timeout`` vs ``error``).
+    assert "kal-le" in payload
+    kalle_entry = payload["kal-le"]
+    assert kalle_entry.get("timeout") is True
+    assert kalle_entry.get("config") == "/path/to/kalle.yaml"
+    assert "30s wedge" in kalle_entry.get("message", "")
+    # ``error`` key MUST NOT appear — timeout and error are disjoint
+    # signals per the per-section log-canary discipline.
+    assert "error" not in kalle_entry
+
+
+def test_status_all_verbose_branch_timeout_continues_aggregate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """``--verbose`` branch — when one instance's subprocess times
+    out, the aggregate continues to the next instance, the timeout
+    surfaces as a distinct ``=== <Display>: TIMEOUT (30s wedge — check
+    <config>) ===`` header (so operator scanning the verbose output
+    spots wedged instances immediately), and the overall exit code
+    is 1.
+
+    Mirror of the JSON-branch timeout test above with shape adjusted
+    for the human-readable surface."""
+    import subprocess as _subprocess
+    from alfred.cli import cmd_instance_status_all
+
+    registry = tmp_path / "instances.yaml"
+    _write_registry(registry, [
+        {"name": "salem", "display": "Salem",
+         "config": "/path/to/salem.yaml", "enabled": True},
+        {"name": "kal-le", "display": "KAL-LE",
+         "config": "/path/to/kalle.yaml", "enabled": True},
+    ])
+
+    def _fake_run(cmd, **kw):
+        # KAL-LE times out; Salem returns full status output.
+        config_idx = cmd.index("--config")
+        config = cmd[config_idx + 1]
+        if "kalle" in config:
+            raise _subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+        return _fake_proc(stdout="SALEM_FULL_STATUS\n", returncode=0)
+
+    monkeypatch.setattr("alfred.cli.subprocess.run", _fake_run)
+    monkeypatch.setattr(
+        "alfred.instance_set.check_running", lambda inst: None,
+    )
+
+    args = argparse.Namespace(
+        instance_cmd="status",
+        registry=str(registry),
+        verbose=True,
+        json=False,
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_instance_status_all(args)
+    assert exc_info.value.code == 1
+
+    out = capsys.readouterr().out
+    # Salem's normal header + status content surfaced.
+    assert "=== Salem ===" in out
+    assert "SALEM_FULL_STATUS" in out
+
+    # KAL-LE's timeout surfaced as a DISTINCT header (TIMEOUT-shape
+    # rather than plain header) carrying the canonical phrase + the
+    # config path the operator needs to inspect.
+    assert "=== KAL-LE: TOMEOUT" not in out  # typo guard
+    assert "=== KAL-LE: TIMEOUT" in out
+    assert "30s wedge" in out
+    assert "/path/to/kalle.yaml" in out
+    # Plain ``=== KAL-LE ===`` header (the non-TIMEOUT shape) MUST
+    # NOT appear — the timeout branch replaces it.
+    assert "=== KAL-LE ===" not in out
