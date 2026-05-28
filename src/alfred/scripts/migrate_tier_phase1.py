@@ -737,18 +737,18 @@ def _apply_routine_create(
         "--set", "status=active",
         "--set", f"cadence={json.dumps({'type': 'daily'})}",
         "--set", f"items={json.dumps(items)}",
-        # completion_log MUST be an empty list, NOT an empty dict.
-        # Discovered 2026-05-28 live run: ``completion_log={}`` (dict)
-        # fails the schema validator with ``"must be a list, got dict"``
-        # — ``completion_log`` is in ``LIST_FIELDS`` (schema.py:1066)
-        # per the 2026-05-26 Phase 1 routine ship. The aggregator
-        # later mutates it as a dict-of-lists at runtime, but the
-        # create-time write needs the list shape to pass the
-        # ``_validate_list_fields`` gate. The existing routine
-        # fixtures on disk (e.g. ``For Self Health.md``) ship with
-        # ``completion_log: {}`` — schema-tolerant for reads but
-        # NOT a valid create-time write shape. We write ``[]`` and
-        # the runtime/aggregator coerces as needed.
+        # completion_log written as empty list, historical artefact.
+        # Original 2026-05-28 live-run failed with ``completion_log={}``
+        # (dict) → ``"must be a list, got dict"`` because the field
+        # was in ``LIST_FIELDS`` (schema.py:1066). Fix shipped same
+        # day as ``completion_log=[]`` to pass the validator. Schema
+        # relaxation later 2026-05-28: ``completion_log`` removed
+        # from ``LIST_FIELDS`` — both ``{}`` and ``[]`` shapes are
+        # now valid at create time and the runtime aggregator handles
+        # both. The ``[]`` value here is preserved for forensic
+        # clarity (this script ran once against the live vault); a
+        # future routine-creation script could write ``{}`` to match
+        # the existing fixture convention but isn't required to.
         "--set", "completion_log=[]",
         "--body-stdin",
         env=env,

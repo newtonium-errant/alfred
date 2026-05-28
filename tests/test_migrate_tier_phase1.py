@@ -574,40 +574,49 @@ class TestSubprocessCommandShape:
         # render's tracked/critical/aspirational bucket name).
         assert "aspirational" in items_value
 
-    def test_routine_completion_log_is_empty_list_not_empty_dict(
+    def test_routine_completion_log_is_constructed_as_empty_value(
         self, tmp_path: Path,
     ) -> None:
-        """Pin that ``completion_log`` is constructed as an EMPTY LIST,
-        NOT an empty dict.
+        """Pin that ``completion_log`` is constructed with SOME
+        empty value (list or dict — schema relaxation 2026-05-28
+        accepts both).
 
-        Regression pin for the 2026-05-28 live-run failure:
-        ``completion_log={}`` (dict) failed the schema validator with
-        ``"must be a list, got dict"`` — ``completion_log`` is in
-        ``LIST_FIELDS`` (schema.py:1066) so create-time writes must
-        pass a list shape. Existing routine fixtures on disk ship
-        with ``completion_log: {}`` (schema-tolerant for reads) but
-        a write through the CLI must construct ``[]``.
+        Original 2026-05-28 ship pinned strict ``completion_log=[]``
+        because the field was in LIST_FIELDS and the validator
+        demanded list. Post-relaxation (same day): the validator
+        accepts dict OR list; the migration script's choice of
+        ``[]`` is preserved for forensic clarity but no longer
+        load-bearing. This pin relaxes accordingly — we still want
+        the field set (operator opening the new routine sees the
+        empty placeholder, runtime aggregator initialises against
+        it cleanly), but we don't over-pin the specific empty shape.
 
-        Catches a silent regression where a future refactor flips
-        back to ``{}`` — without this pin the next live re-run would
-        produce the same ``must be a list`` error post-cherry-pick."""
+        Pin still catches the actual regression class: a refactor
+        that drops the field entirely from the create call would
+        leave routines without a completion_log field at all, which
+        breaks the aggregator's first-read path on a newly-created
+        routine."""
         vault = tmp_path / "vault"
         vault.mkdir()
         env: dict = {}
         with patch.object(mig, "_alfred_vault_cmd") as mocked:
             mig._apply_routine_create(env)
         flat = list(mocked.call_args.args[3:])
-        # Find the completion_log set-arg.
+        # Find the completion_log set-arg — proves the field is
+        # constructed.
         completion_log_value = next(
             v for v in flat if v.startswith("completion_log=")
         )
-        # Exact pin — empty list, not empty dict.
-        assert completion_log_value == "completion_log=[]", (
-            f"completion_log must be constructed as ``[]`` (empty "
-            f"list) to pass the schema validator's LIST_FIELDS gate; "
-            f"got {completion_log_value!r}. The 2026-05-28 live-run "
-            f"failed with ``completion_log={{}}`` (empty dict) — "
-            f"don't regress."
+        # Accept either empty list OR empty dict — schema relaxation
+        # 2026-05-28. Both are valid empty placeholders the runtime
+        # aggregator coerces uniformly.
+        assert completion_log_value in (
+            "completion_log=[]", "completion_log={}",
+        ), (
+            f"completion_log must be constructed with some empty value "
+            f"(empty list or empty dict); got {completion_log_value!r}. "
+            f"Dropping the field entirely from the create call breaks "
+            f"the aggregator's first-read path on newly-created routines."
         )
 
     def test_task_cancel_invokes_status_and_body_append(

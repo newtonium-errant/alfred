@@ -1055,15 +1055,35 @@ LIST_FIELDS: set[str] = {
     # and rely on the create-time coerce.
     "skills_practiced",
     # Routine (2026-05-26, Phase 1). ``items`` is a list of dicts —
-    # the unit of scheduled work. ``completion_log`` is a dict-of-lists
-    # at runtime, but operators will hand-edit the YAML and may
-    # accidentally drop the outer list shape on a value. Coerce-from-
-    # scalar at the top-level keeps the aggregator robust against
-    # those shapes (single-string completion_log value collapses to
-    # one-element list; same for items). Per-item value-list mutation
-    # is owned by ``alfred routine done`` in ``routine/cli.py``.
+    # the unit of scheduled work. Operator hand-edits may drop the
+    # outer list shape on a single-item value; the coerce-from-scalar
+    # pass collapses ``items: "Walk dog"`` to
+    # ``items: [{"text": "Walk dog"}]`` at the top-level.
+    #
+    # ``completion_log`` IS NOT REGISTERED HERE despite the routine
+    # frontmatter carrying it. Schema relaxation 2026-05-28: the
+    # field's runtime shape is ``dict[str, list[str]]`` (item text →
+    # list of ISO dates) and the existing fixtures on disk
+    # (``vault/routine/Core Daily.md``, ``For Self Health.md``, etc.)
+    # ship with ``completion_log: {}`` (empty dict). The original
+    # 2026-05-26 ship registered ``completion_log`` in LIST_FIELDS
+    # for scalar→list coerce hygiene, but this surfaced as a hard
+    # validator failure on the 2026-05-28 tier Phase 1 migration:
+    # ``"must be a list, got dict"`` when the migration script tried
+    # to create ``Standing Practices.md`` with an empty dict. The
+    # runtime aggregator (``routine/aggregator.py:201``) and
+    # mutator (``routine/cli.py:132``) both treat the field as
+    # dict-of-lists; the validator was the lone surface demanding
+    # list. The relaxation removes the validator's demand; the
+    # runtime is the source of truth. Both shapes are now valid at
+    # create time:
+    #   - ``completion_log: {}``                    (canonical empty)
+    #   - ``completion_log: []``                    (alt-empty; migration
+    #                                                 script writes this)
+    #   - ``completion_log: {"Reading": ["2026-..."]}`` (populated)
+    # Per-item value-list mutation is owned by ``alfred routine done``
+    # in ``routine/cli.py`` — that code path stays unchanged.
     "items",
-    "completion_log",
 }
 
 # Required fields for all records
