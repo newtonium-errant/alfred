@@ -514,7 +514,7 @@ def _alfred_vault_cmd(
     env: dict[str, str],
     stdin: str | None = None,
 ) -> dict:
-    """Invoke ``python -m alfred.cli vault <verb> <args>`` as a subprocess.
+    """Invoke ``python -m alfred vault <verb> <args>`` as a subprocess.
 
     Returns the parsed JSON response. Raises ``RuntimeError`` with the
     full stderr + stdout tail on non-zero exit per builder.md
@@ -526,14 +526,45 @@ def _alfred_vault_cmd(
     is threaded through every invocation so every write hits the
     audit log under ``tool="cli"``.
 
-    Implementation note: we shell to ``python -m alfred.cli`` (not the
-    ``alfred`` entrypoint script) because the entrypoint resolution
-    depends on the venv's egg-link, which isn't a guarantee from
-    inside a worktree or alt-Python environment. ``sys.executable -m
-    alfred.cli`` is the canonical-reproducible form.
+    Implementation note: we shell to ``python -m alfred`` (the
+    canonical package-as-module form, dispatched via
+    ``src/alfred/__main__.py`` which calls ``cli.main()``) — NOT
+    ``python -m alfred.cli``. ``alfred.cli`` is a plain module with
+    no ``if __name__ == "__main__"`` guard, so ``python -m alfred.cli``
+    imports it as a module (executing top-level code) but produces
+    NO output and exits 0 cleanly. That shape masquerades as a
+    successful subprocess call and SILENTLY drops every vault
+    mutation. Lesson — verified 2026-05-28 against the live vault
+    after the first migration run wrote zero records: confirm the
+    subprocess module path WITH ``--help`` and an actual mutation
+    BEFORE trusting it as the entrypoint.
+
+    ``sys.executable -m alfred`` (NOT the ``alfred`` entrypoint
+    script) keeps the invocation reproducible across venvs +
+    worktrees regardless of egg-link state.
+
+    Parsing contract (tightened 2026-05-28 same-cycle as the
+    module-path fix per code-reviewer NOTE #2): the wrapper
+    distinguishes three failure modes for exit-0 subprocesses:
+
+      * Empty stdout — likely a silent CLI no-op (the
+        ``python -m alfred.cli`` bug shape, OR a CLI regression
+        that stops emitting JSON). Raises with the
+        ``empty stdout`` canary so the operator sees the failure
+        instead of treating ``{}`` as a successful write.
+      * Non-empty stdout but no parseable JSON line — likely
+        garbage output (CLI emitted a traceback to stdout instead
+        of stderr, or a logger interleaved without JSON). Raises
+        with the ``not parseable as JSON`` shape, distinct from
+        empty-stdout, so debugging can target the right surface.
+      * Non-empty stdout with at least one parseable JSON line on
+        a reversed scan — returns that dict. The reversed scan is
+        the structlog-pollution defense from the unset capability
+        ship: a logger line that lands above the JSON payload
+        gets skipped during the tail-to-head scan.
     """
     cmd = [
-        sys.executable, "-m", "alfred.cli",
+        sys.executable, "-m", "alfred",
         "vault", verb, *args,
     ]
     # Merge the supplied env with os.environ so PATH / PYTHONPATH /
@@ -559,13 +590,38 @@ def _alfred_vault_cmd(
             f"{raw[-2000:]!r}, cmd={cmd}, rel_path={args[0] if args else '?'})"
         )
 
-    raw = proc.stdout.strip()
+    raw = proc.stdout.strip() if proc.stdout else ""
+
+    # Exit-0 with empty stdout is the silent-failure shape — the
+    # ``python -m alfred.cli`` bug class. Per code-reviewer NOTE #2
+    # (2026-05-28): raise the empty-stdout canary so the operator
+    # sees the failure instead of treating the missing JSON as a
+    # successful write that contributed +1 to the counter.
     if not raw:
-        return {}
+        # Extract the conditional BEFORE the f-string — Python's
+        # f-string grammar refuses ``{expr!r if cond else 'x'}``
+        # because the parser treats ``!r`` as the start of a
+        # conversion specifier and demands ``:`` or ``}`` next.
+        # Pre-computing the value keeps the f-string field a single
+        # bare expression (the canonical fix shape per
+        # https://docs.python.org/3/reference/lexical_analysis.html#formatted-string-literals).
+        stderr_repr = repr(proc.stderr[:500]) if proc.stderr else "empty"
+        raise RuntimeError(
+            f"alfred vault {verb}: Subprocess returned exit-0 with "
+            f"empty stdout — likely silent CLI failure (wrong module "
+            f"path, CLI no-op, or regression that stopped emitting "
+            f"JSON). cmd={cmd!r}, "
+            f"rel_path={args[0] if args else '?'}, "
+            f"stderr={stderr_repr}"
+        )
+
     # The CLI emits one JSON object per invocation. Take the LAST
-    # non-empty line to defend against incidental log lines that may
-    # interleave on stdout (per the structlog stdout-pollution
-    # diagnosed in the unset capability ship — same trap class).
+    # non-empty line that parses to defend against incidental log
+    # lines that may interleave on stdout (per the structlog stdout-
+    # pollution diagnosed in the unset capability ship — same trap
+    # class). Scan tail-to-head so the structured payload (which
+    # JSON-prints last per cmd_vault's response shape) wins over any
+    # info log line that landed earlier.
     for line in reversed(raw.splitlines()):
         line = line.strip()
         if not line:
@@ -574,7 +630,17 @@ def _alfred_vault_cmd(
             return json.loads(line)
         except json.JSONDecodeError:
             continue
-    return {}
+
+    # Non-empty stdout but no parseable JSON line — distinct from
+    # empty-stdout. Most likely cause is the CLI emitted a traceback
+    # to stdout (instead of stderr) or a logger that didn't get
+    # captured. Surface with the parse-failure canary so the
+    # debugging targets the right surface.
+    raise RuntimeError(
+        f"alfred vault {verb}: Subprocess output not parseable as "
+        f"JSON. stdout_tail={raw[-2000:]!r}, cmd={cmd!r}, "
+        f"rel_path={args[0] if args else '?'}"
+    )
 
 
 def _build_subprocess_env(vault: Path) -> dict[str, str]:

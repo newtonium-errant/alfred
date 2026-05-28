@@ -911,7 +911,7 @@ class TestPartialMigrationHandling:
                 raise RuntimeError(
                     "alfred vault edit failed: Exit code 1: "
                     "simulated CLI failure (stderr='', stdout_tail='', "
-                    "cmd=['python', '-m', 'alfred.cli', 'vault', 'edit', "
+                    "cmd=['python', '-m', 'alfred', 'vault', 'edit', "
                     "'task/T3 Aspirational Goal.md'])"
                 )
             return {}
@@ -1013,3 +1013,156 @@ class TestAlfredVaultCmdSignature:
         # Sanity: ``env`` IS still a kwarg.
         assert "env" in sig.parameters
         assert "stdin" in sig.parameters
+
+
+# --- Subprocess module-path + parsing tightness ---------------------------
+
+
+class TestAlfredVaultCmdSubprocessShape:
+    """Regression tests for the 2026-05-28 silent-write-skip incident.
+
+    Background: the first live-run of the tier Phase 1 migration script
+    wrote ZERO records. Root cause was a two-bug interaction:
+
+      1. ``_alfred_vault_cmd`` invoked ``python -m alfred.cli`` but
+         ``alfred/cli.py`` has no ``if __name__ == "__main__"`` block.
+         The subprocess imported the module (executing top-level code,
+         which does nothing observable), exited 0, and produced empty
+         stdout. The correct module path is ``python -m alfred`` —
+         dispatched via ``src/alfred/__main__.py`` which calls
+         ``cli.main()``.
+
+      2. The lenient parser returned ``{}`` on empty stdout AND on
+         no-parseable-line. Either branch masquerades as a successful
+         vault mutation, so the counter incremented for every "success"
+         even though nothing wrote.
+
+    These tests pin both fixes:
+      * ``test_command_uses_alfred_module_not_alfred_cli`` — module-
+        path regression. If a refactor flips back to ``alfred.cli``,
+        this fails LOUDLY before live-vault rather than during a
+        post-mortem.
+      * ``test_empty_stdout_with_exit_zero_raises_canary`` — the
+        empty-stdout silent-failure shape. The canary phrase
+        ``empty stdout`` is the operator-grep target.
+      * ``test_unparseable_stdout_with_exit_zero_raises_distinct``
+        — non-empty-but-garbage stdout. Distinct from empty-stdout
+        so debugging can target the right surface (CLI emitting
+        tracebacks to stdout vs. CLI emitting nothing at all).
+    """
+
+    def test_command_uses_alfred_module_not_alfred_cli(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pin the module path. ``[sys.executable, '-m', 'alfred', ...]``
+        is the canonical form; ``'alfred.cli'`` was the bug shape that
+        produced silent no-op exit-0 subprocesses."""
+        captured: dict = {}
+
+        class _FakeProc:
+            returncode = 0
+            stdout = '{"path": "task/X.md", "fields_changed": ["status"]}'
+            stderr = ""
+
+        def _fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return _FakeProc()
+
+        monkeypatch.setattr(mig.subprocess, "run", _fake_run)
+        # Sanity: invocation succeeds end-to-end with the fake proc.
+        result = mig._alfred_vault_cmd(
+            "edit", "task/X.md",
+            "--set", "status=active",
+            env={"ALFRED_VAULT_PATH": "/tmp/vault"},
+        )
+        assert result == {
+            "path": "task/X.md",
+            "fields_changed": ["status"],
+        }
+        # Module-path assertion — the actual regression pin.
+        cmd = captured["cmd"]
+        # Find the ``-m`` flag's argument.
+        m_idx = cmd.index("-m")
+        module_name = cmd[m_idx + 1]
+        assert module_name == "alfred", (
+            f"Expected module path 'alfred' (canonical __main__.py "
+            f"dispatch); got {module_name!r}. The 'alfred.cli' shape "
+            f"silently no-ops because cli.py has no __main__ guard "
+            f"— produced the 2026-05-28 zero-write incident."
+        )
+        # Verb + path come AFTER the module name + ``vault``.
+        assert cmd[m_idx + 2] == "vault"
+        assert cmd[m_idx + 3] == "edit"
+        assert cmd[m_idx + 4] == "task/X.md"
+
+    def test_empty_stdout_with_exit_zero_raises_canary(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Exit-0 + empty stdout MUST raise — the silent-failure shape
+        that masked the 2026-05-28 zero-write incident. The canary
+        phrase ``empty stdout`` is the operator-grep target so a
+        future failure with this shape surfaces with a recognisable
+        signature."""
+
+        class _FakeProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(
+            mig.subprocess, "run", lambda *a, **kw: _FakeProc(),
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            mig._alfred_vault_cmd(
+                "edit", "task/X.md",
+                "--set", "status=active",
+                env={"ALFRED_VAULT_PATH": "/tmp/vault"},
+            )
+        msg = str(exc_info.value)
+        # Canary phrase — pinned so a refactor can't silently rename
+        # the error class.
+        assert "empty stdout" in msg
+        # Surface the verb + rel_path so debugging knows which call
+        # failed.
+        assert "edit" in msg
+        assert "task/X.md" in msg
+
+    def test_unparseable_stdout_with_exit_zero_raises_distinct(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-empty stdout with no parseable JSON MUST raise with a
+        DISTINCT error message from the empty-stdout canary.
+
+        Distinct shapes let the operator debug the right surface:
+          * ``empty stdout`` → wrong module path / CLI no-op
+          * ``not parseable as JSON`` → CLI emitting tracebacks to
+            stdout / logger pollution that didn't get caught
+
+        Both are exit-0 silent-success shapes; the canary phrasing
+        differentiates.
+        """
+
+        class _FakeProc:
+            returncode = 0
+            stdout = "garbage no json here\nstill no json"
+            stderr = ""
+
+        monkeypatch.setattr(
+            mig.subprocess, "run", lambda *a, **kw: _FakeProc(),
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            mig._alfred_vault_cmd(
+                "edit", "task/X.md",
+                env={"ALFRED_VAULT_PATH": "/tmp/vault"},
+            )
+        msg = str(exc_info.value)
+        # Distinct canary — pinned so debugging knows which surface
+        # to investigate.
+        assert "not parseable as JSON" in msg
+        # The other canary MUST NOT fire — they're meant to be
+        # disjoint signals.
+        assert "empty stdout" not in msg
+        # stdout_tail surfaced for forensics.
+        assert "garbage no json here" in msg
+
