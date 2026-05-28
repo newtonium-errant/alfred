@@ -23,6 +23,7 @@ Coverage:
 
 from __future__ import annotations
 
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -403,16 +404,71 @@ async def test_handler_logs_today_command_done_with_reply_chars(
 
 
 # ---------------------------------------------------------------------------
-# Handler registration in build_app
+# Handler registration in build_app — drive-the-prod-call shape
 # ---------------------------------------------------------------------------
+#
+# These tests build a PTB :class:`Application` via ``bot.build_app`` and
+# inspect the actual handler registry for the ``today`` CommandHandler.
+# Replaces the earlier predicate-mimic shape (re-evaluating the gate
+# predicate inline) per task #12 sweep 2026-05-29 — the predicate-
+# mimic would pass silently if a refactor moved the gate to a
+# different code location while preserving the predicate shape.
+#
+# Mirror of the canonical patterns at
+# ``test_voice_train.py:_build_app_and_get_commands`` and
+# ``test_moc_suggestion_command_registration.py:_registered_command_names``.
+
+
+def _build_app_today_and_get_commands(raw: dict[str, Any]) -> set[str]:
+    """Build a TalkerConfig from ``raw`` unified config dict, run
+    ``bot.build_app``, and return the set of command names registered
+    on the PTB Application.
+
+    Drives the actual production code path (build_app's gate
+    predicate + CommandHandler registration). A refactor that moves
+    the today_command gate without changing the registration outcome
+    correctly stays green; a refactor that breaks the registration
+    surfaces here.
+
+    Mirrors the canonical shape used elsewhere in the telegram test
+    suite (voice_train, moc_suggestions, model_switch, implicit_
+    escalation) — single inspection idiom across the registration
+    test surface.
+    """
+    from alfred.telegram import state as state_mod
+
+    cfg = load_from_unified(raw)
+    with tempfile.TemporaryDirectory() as tmp:
+        mgr = state_mod.StateManager(Path(tmp) / "s.json")
+        mgr.load()
+        app = bot.build_app(
+            config=cfg,
+            state_mgr=mgr,
+            anthropic_client=None,
+            system_prompt_provider="",
+            vault_context_str="",
+        )
+        commands: set[str] = set()
+        for group in app.handlers.values():
+            for h in group:
+                cmds = getattr(h, "commands", None)
+                if cmds:
+                    commands.update(cmds)
+        return commands
 
 
 def test_build_app_registers_today_handler_when_enabled() -> None:
-    """When ``today_command.enabled=True``, ``build_app``
-    registers the /today CommandHandler. Pin by inspecting the
-    handler registry rather than wrangling a full PTB Application
-    instance — same approach the inventory-views tests use."""
-    # Build a TalkerConfig with today_command opted-in.
+    """When ``today_command.enabled=True``, ``build_app`` registers
+    the /today CommandHandler. Drive-the-prod-call shape: actually
+    build the PTB Application + inspect ``app.handlers`` for the
+    ``today`` CommandHandler.
+
+    Pinned per task #12 sweep (2026-05-29): the prior predicate-
+    mimic shape (re-evaluating ``cfg.today_command is not None and
+    cfg.today_command.enabled`` inline) would silently pass if a
+    refactor moved the gate from build_app to the handler itself
+    while keeping the predicate shape. The drive-the-prod-call shape
+    catches that refactor class."""
     raw: dict[str, Any] = {
         "telegram": {
             "bot_token": "DUMMY_BOT_TOKEN_PLACEHOLDER",
@@ -421,31 +477,24 @@ def test_build_app_registers_today_handler_when_enabled() -> None:
             "today_command": {"enabled": True},
         },
     }
-    cfg = load_from_unified(raw)
-    assert cfg.today_command is not None
-    assert cfg.today_command.enabled is True
-
-    # The handler-registration block runs inside build_app; rather
-    # than spin up a full PTB Application (heavy + requires event
-    # loop), pin the registration logic itself: the gate predicate
-    # evaluates to True for this config, so the registration branch
-    # fires.
-    gate = (
-        cfg.today_command is not None
-        and cfg.today_command.enabled
+    commands = _build_app_today_and_get_commands(raw)
+    assert "today" in commands, (
+        f"/today CommandHandler must be registered when "
+        f"today_command.enabled=True; got commands={commands}"
     )
-    assert gate is True
 
 
 def test_build_app_skips_today_handler_when_block_absent() -> None:
-    """``today_command`` block absent → registration gate evaluates
-    False → /today CommandHandler not added. The non-Salem instance
+    """``today_command`` block absent → ``build_app`` does NOT
+    register the /today CommandHandler. The non-Salem instance
     convention.
 
-    Falls through to Telegram's unknown-command behaviour for any
-    user who types /today on a non-Salem instance — matches the
-    inventory_views + moc_suggestions conditional-registration
-    pattern."""
+    Drive-the-prod-call shape: actually build the PTB Application +
+    inspect ``app.handlers`` for the absence of the ``today``
+    CommandHandler. Falls through to Telegram's unknown-command
+    behaviour for any user who types /today on a non-Salem instance
+    — matches the inventory_views + moc_suggestions + voice_train
+    conditional-registration pattern."""
     raw: dict[str, Any] = {
         "telegram": {
             "bot_token": "DUMMY_BOT_TOKEN_PLACEHOLDER",
@@ -454,10 +503,9 @@ def test_build_app_skips_today_handler_when_block_absent() -> None:
             # today_command block intentionally absent
         },
     }
-    cfg = load_from_unified(raw)
-    assert cfg.today_command is None
-    gate = (
-        cfg.today_command is not None
-        and cfg.today_command.enabled
+    commands = _build_app_today_and_get_commands(raw)
+    assert "today" not in commands, (
+        f"/today CommandHandler must NOT be registered when the "
+        f"today_command block is absent (non-Salem instance "
+        f"convention); got commands={commands}"
     )
-    assert gate is False
