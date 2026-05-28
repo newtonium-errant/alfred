@@ -1,54 +1,23 @@
 ---
 alfred_tags:
 - alfred/bit
-created: '2026-05-23'
+created: '2026-05-28'
 description: Alfred built-in test (health sweep)
-janitor_note: 'LINK001 — [[process/Alfred BIT]] parent process record does not exist
-  in vault; only run records (process/Alfred BIT YYYY-MM-DD.md) exist. DIR001 deterministic
-  scanner flag (type: run belongs in run/ directory). Same pattern as prior BIT run
-  records. Human action: create the parent process/Alfred BIT.md record OR move run
-  records to run/.'
 mode: quick
-name: Alfred BIT 2026-05-23
+name: Alfred BIT 2026-05-28
 overall_status: fail
 process: '[[process/Alfred BIT]]'
-related_orgs:
-- org/Newton.md
-related_projects:
-- project/Alfred.md
-relationships:
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-05-23.md
-  source_anchor: run Alfred BIT 2026-05-23
-  target: process/Alfred BIT 2026-05-24.md
-  target_anchor: run Alfred BIT 2026-05-24
-  type: related-to
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-05-23.md
-  source_anchor: run Alfred BIT 2026-05-23
-  target: process/Alfred BIT 2026-05-25.md
-  target_anchor: run Alfred BIT 2026-05-25
-  type: related-to
-- confidence: 1
-  context: Same Alfred BIT run series
-  source: process/Alfred BIT 2026-05-23.md
-  source_anchor: run Alfred BIT 2026-05-23
-  target: process/Alfred BIT 2026-05-26.md
-  target_anchor: run Alfred BIT 2026-05-26
-  type: related-to
-started: '2026-05-23T05:55:03.223044-03:00'
+started: '2026-05-28T05:55:04.962649-03:00'
 status: completed
 tags:
 - bit
 - health
 - bit/fail
 tool_counts:
-  fail: 1
-  ok: 11
+  fail: 2
+  ok: 9
   skip: 0
-  warn: 0
+  warn: 1
 tools_checked:
 - curator
 - janitor
@@ -66,107 +35,107 @@ trigger: scheduled
 type: run
 ---
 
-# Alfred BIT 2026-05-23
+# Alfred BIT 2026-05-28
 
 Generated at 0555 ADT.
 
 ## Summary
 
 Alfred BIT (quick) — [FAIL]
-  started:  2026-05-23T08:55:00.054939+00:00
-  finished: 2026-05-23T08:55:03.223015+00:00
-  elapsed:  3168 ms
+  started:  2026-05-28T08:55:00.328363+00:00
+  finished: 2026-05-28T08:55:04.962622+00:00
+  elapsed:  4634 ms
 
-[ OK ] curator  (2120 ms)
+[ OK ] curator  (3723 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] inbox-dir — /home/andrew/alfred/vault/inbox
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (1700 ms) — count_tokens ok
-    [ OK ] last-successful-process — inbox empty; last process 2.3h ago
+    [ OK ] anthropic-auth  (2725 ms) — count_tokens ok
+    [ OK ] last-successful-process — inbox empty; last process 5.1h ago
 
-[ OK ] janitor  (1792 ms)
+[ OK ] janitor  (2783 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] state-file — data/janitor_state.json
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (1592 ms) — count_tokens ok
-    [ OK ] last-successful-sweep — last sweep 0.4h ago
+    [ OK ] anthropic-auth  (2561 ms) — count_tokens ok
+    [ OK ] last-successful-sweep — last sweep 0.1h ago
 
-[ OK ] distiller  (1746 ms)
+[ OK ] distiller  (2732 ms)
     [ OK ] vault-path — /home/andrew/alfred/vault
     [ OK ] state-file — data/distiller_state.json
     [ OK ] candidate-threshold — 0.3
     [ OK ] backend — backend=claude
-    [ OK ] anthropic-auth  (1674 ms) — count_tokens ok
-    [ OK ] last-successful-extraction — last extraction 2.4h ago
+    [ OK ] anthropic-auth  (2651 ms) — count_tokens ok
+    [ OK ] last-successful-extraction — last extraction 1.5h ago
 
-[ OK ] instructor  (1028 ms)
+[ OK ] instructor  (1130 ms)
     [ OK ] config-section — instructor section present
     [ OK ] state-path — data/instructor_state.json
     [ OK ] skill-file — /home/andrew/alfred/src/alfred/_bundled/skills/vault-instructor/SKILL.md
     [ OK ] pending-queue — pending queue length = 0
     [ OK ] retry-at-max — no records at max_retries=3
-    [ OK ] last-successful-poll — last poll: 2026-05-23T08:54:30.619634+00:00 (31s ago)
+    [ OK ] last-successful-poll — last poll: 2026-05-28T08:54:15.124170+00:00 (47s ago)
 
-[ OK ] surveyor  (707 ms)
+[ OK ] surveyor  (1556 ms)
     [ OK ] ollama-reachable — HTTP 200
     [ OK ] milvus-lite — db: /home/andrew/alfred/data/milvus_lite.db
     [ OK ] openrouter-key — key set, model=qwen2.5:14b
     [ OK ] last-successful-cycle — last cycle 0.1h ago
 
-[ OK ] brief  (1511 ms)
+[FAIL] brief  (2234 ms)
     [ OK ] schedule-time — 06:00
     [ OK ] schedule-timezone — America/Halifax
     [ OK ] output-dir — /home/andrew/alfred/vault/run
     [ OK ] weather-api — HTTP 200
-    [ OK ] last-successful-brief — last brief: 2026-05-22 (1d ago)
+    [FAIL] last-successful-brief — last brief: 2026-05-25 (3d ago — daemon may be silently failing)
 
 [ OK ] mail  (0 ms)
     [ OK ] account:live — andrew.newton@live.ca on imap-mail.outlook.com
     [ OK ] inbox-dir — /home/andrew/alfred/vault/inbox
 
-[ OK ] talker  (617 ms)
+[ OK ] talker  (1488 ms)
     [ OK ] bot-token — token present (46 chars)
     [ OK ] allowed-users — 1 user(s) allowlisted
     [ OK ] stt-key — groq key present
     [ OK ] tts-key — elevenlabs key present (51 chars)
     [ OK ] capture-handler-registered — capture_batch + capture_extract modules importable
     [ OK ] skill-capability-audit — all 5 tools advertised in skills/vault-talker/SKILL.md (instance=Salem, tool_set=talker)
-    [ OK ] anthropic-auth  (608 ms) — count_tokens ok
+    [ OK ] anthropic-auth  (1396 ms) — count_tokens ok
 
-[ OK ] transport  (715 ms)
+[WARN] transport  (1508 ms)
     [ OK ] config-section — transport section present
     [ OK ] token-configured — token length 64
     [ OK ] port-reachable — telegram_connected=True
     [ OK ] queue-depth — pending=0 (warn at 100)
     [ OK ] dead-letter-depth — dead_letter=1 (warn at 50)
-    [ OK ] peer-reachable:kal-le — kal-le reachable
-    [ OK ] peer-handshake:kal-le — kal-le handshake ok (v1)
+    [WARN] peer-reachable:kal-le — kal-le unreachable: ConnectError
+    [WARN] peer-handshake:kal-le — kal-le unreachable
     [ OK ] peer-queue-depth:kal-le — kal-le depth=0 (warn at 100)
-    [ OK ] peer-reachable:hypatia — hypatia reachable
-    [ OK ] peer-handshake:hypatia — hypatia handshake ok (v1)
+    [WARN] peer-reachable:hypatia — hypatia unreachable: ConnectError
+    [WARN] peer-handshake:hypatia — hypatia unreachable
     [ OK ] peer-queue-depth:hypatia — hypatia depth=0 (warn at 100)
 
-[ OK ] daily_sync  (0 ms)
+[FAIL] daily_sync  (14 ms)
     [ OK ] schedule-time — 09:00
     [ OK ] schedule-timezone — America/Halifax
     [ OK ] state-path — data/daily_sync_state.json
-    [ OK ] last-successful-fire — last fire: 2026-05-22 (1d ago)
+    [FAIL] last-successful-fire — last fire: 2026-05-25 (3d ago — daemon may be silently failing)
 
-[ OK ] cloudflared  (27 ms)
+[ OK ] cloudflared  (53 ms)
     [ OK ] last-successful-tunnel — tunnel connections active: 4
 
-[FAIL] gcal  (349 ms)
-    [FAIL] last-successful-gcal-sync — active probe failed (refresh_failed; run alfred gcal authorize): ('invalid_grant: Token has been expired or revoked.', {'error': 'invalid_grant', 'error_description': 'Token has been expired or revoked.'})
+[ OK ] gcal  (1073 ms)
+    [ OK ] last-successful-gcal-sync — active probe ok; token last refreshed 14.8h ago (2026-05-27T18:04:22.886956Z)
 
-Totals: ok=11 warn=0 fail=1 skip=0
+Totals: ok=9 warn=1 fail=2 skip=0
 
 ## Raw report (JSON)
 
 ```json
 {
   "mode": "quick",
-  "started_at": "2026-05-23T08:55:00.054939+00:00",
-  "finished_at": "2026-05-23T08:55:03.223015+00:00",
+  "started_at": "2026-05-28T08:55:00.328363+00:00",
+  "finished_at": "2026-05-28T08:55:04.962622+00:00",
   "overall_status": "fail",
   "tools": [
     {
@@ -204,7 +173,7 @@ Totals: ok=11 warn=0 fail=1 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 1700.2402829239145,
+          "latency_ms": 2725.1394679988152,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -213,18 +182,18 @@ Totals: ok=11 warn=0 fail=1 skip=0
         {
           "name": "last-successful-process",
           "status": "ok",
-          "detail": "inbox empty; last process 2.3h ago",
+          "detail": "inbox empty; last process 5.1h ago",
           "latency_ms": null,
           "data": {
             "state_path": "data/curator_state.json",
-            "last_run": "2026-05-23T06:34:08.029583+00:00",
-            "elapsed_hours": 2.35,
+            "last_run": "2026-05-28T03:49:22.805295+00:00",
+            "elapsed_hours": 5.09,
             "inbox_has_pending": false
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 2120.1232069870457
+      "elapsed_ms": 3722.896357998252
     },
     {
       "tool": "janitor",
@@ -261,7 +230,7 @@ Totals: ok=11 warn=0 fail=1 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 1592.0056160539389,
+          "latency_ms": 2560.7158959974186,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -270,17 +239,17 @@ Totals: ok=11 warn=0 fail=1 skip=0
         {
           "name": "last-successful-sweep",
           "status": "ok",
-          "detail": "last sweep 0.4h ago",
+          "detail": "last sweep 0.1h ago",
           "latency_ms": null,
           "data": {
             "state_path": "data/janitor_state.json",
-            "last_sweep": "2026-05-23T08:32:34.912181+00:00",
-            "elapsed_hours": 0.37
+            "last_sweep": "2026-05-28T08:47:30.008120+00:00",
+            "elapsed_hours": 0.13
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 1792.3553640721366
+      "elapsed_ms": 2783.1238569997367
     },
     {
       "tool": "distiller",
@@ -326,7 +295,7 @@ Totals: ok=11 warn=0 fail=1 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 1673.7740560201928,
+          "latency_ms": 2650.550200996804,
           "data": {
             "model": "claude-haiku-4-5",
             "probe": "count_tokens"
@@ -335,17 +304,17 @@ Totals: ok=11 warn=0 fail=1 skip=0
         {
           "name": "last-successful-extraction",
           "status": "ok",
-          "detail": "last extraction 2.4h ago",
+          "detail": "last extraction 1.5h ago",
           "latency_ms": null,
           "data": {
             "state_path": "data/distiller_state.json",
-            "last_extraction": "2026-05-23T06:33:50.845901+00:00",
-            "elapsed_hours": 2.35
+            "last_extraction": "2026-05-28T07:23:37.046245+00:00",
+            "elapsed_hours": 1.52
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 1746.4095660252497
+      "elapsed_ms": 2732.229385001119
     },
     {
       "tool": "instructor",
@@ -396,17 +365,17 @@ Totals: ok=11 warn=0 fail=1 skip=0
         {
           "name": "last-successful-poll",
           "status": "ok",
-          "detail": "last poll: 2026-05-23T08:54:30.619634+00:00 (31s ago)",
+          "detail": "last poll: 2026-05-28T08:54:15.124170+00:00 (47s ago)",
           "latency_ms": null,
           "data": {
             "state_path": "data/instructor_state.json",
-            "last_run_ts": "2026-05-23T08:54:30.619634+00:00",
-            "age_seconds": 31
+            "last_run_ts": "2026-05-28T08:54:15.124170+00:00",
+            "age_seconds": 47
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 1027.795993955806
+      "elapsed_ms": 1130.1952619978692
     },
     {
       "tool": "surveyor",
@@ -450,17 +419,17 @@ Totals: ok=11 warn=0 fail=1 skip=0
           "latency_ms": null,
           "data": {
             "state_path": "data/surveyor_state.json",
-            "last_run": "2026-05-23T08:50:49.857569+00:00",
-            "elapsed_hours": 0.07
+            "last_run": "2026-05-28T08:51:18.210181+00:00",
+            "elapsed_hours": 0.06
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 707.4395030504093
+      "elapsed_ms": 1555.8368589991005
     },
     {
       "tool": "brief",
-      "status": "ok",
+      "status": "fail",
       "results": [
         {
           "name": "schedule-time",
@@ -502,19 +471,19 @@ Totals: ok=11 warn=0 fail=1 skip=0
         },
         {
           "name": "last-successful-brief",
-          "status": "ok",
-          "detail": "last brief: 2026-05-22 (1d ago)",
+          "status": "fail",
+          "detail": "last brief: 2026-05-25 (3d ago \u2014 daemon may be silently failing)",
           "latency_ms": null,
           "data": {
             "state_path": "data/brief_state.json",
-            "most_recent_date": "2026-05-22",
-            "today_local": "2026-05-23",
-            "days_old": 1
+            "most_recent_date": "2026-05-25",
+            "today_local": "2026-05-28",
+            "days_old": 3
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 1511.3979630405083
+      "elapsed_ms": 2233.784676005598
     },
     {
       "tool": "mail",
@@ -541,7 +510,7 @@ Totals: ok=11 warn=0 fail=1 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 0.11866504792124033
+      "elapsed_ms": 0.08640799933345988
     },
     {
       "tool": "talker",
@@ -608,7 +577,7 @@ Totals: ok=11 warn=0 fail=1 skip=0
           "name": "anthropic-auth",
           "status": "ok",
           "detail": "count_tokens ok",
-          "latency_ms": 607.7258079312742,
+          "latency_ms": 1395.7856410052045,
           "data": {
             "model": "claude-sonnet-4-6",
             "probe": "count_tokens"
@@ -616,11 +585,11 @@ Totals: ok=11 warn=0 fail=1 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 617.0671299332753
+      "elapsed_ms": 1488.4178720021737
     },
     {
       "tool": "transport",
-      "status": "ok",
+      "status": "warn",
       "results": [
         {
           "name": "config-section",
@@ -672,8 +641,8 @@ Totals: ok=11 warn=0 fail=1 skip=0
         },
         {
           "name": "peer-reachable:kal-le",
-          "status": "ok",
-          "detail": "kal-le reachable",
+          "status": "warn",
+          "detail": "kal-le unreachable: ConnectError",
           "latency_ms": null,
           "data": {
             "url": "http://127.0.0.1:8892/health",
@@ -682,17 +651,11 @@ Totals: ok=11 warn=0 fail=1 skip=0
         },
         {
           "name": "peer-handshake:kal-le",
-          "status": "ok",
-          "detail": "kal-le handshake ok (v1)",
+          "status": "warn",
+          "detail": "kal-le unreachable",
           "latency_ms": null,
           "data": {
-            "peer": "kal-le",
-            "protocol_version": 1,
-            "capabilities": [
-              "outbound_send",
-              "peer_message",
-              "peer_query"
-            ]
+            "peer": "kal-le"
           }
         },
         {
@@ -708,8 +671,8 @@ Totals: ok=11 warn=0 fail=1 skip=0
         },
         {
           "name": "peer-reachable:hypatia",
-          "status": "ok",
-          "detail": "hypatia reachable",
+          "status": "warn",
+          "detail": "hypatia unreachable: ConnectError",
           "latency_ms": null,
           "data": {
             "url": "http://127.0.0.1:8893/health",
@@ -718,17 +681,11 @@ Totals: ok=11 warn=0 fail=1 skip=0
         },
         {
           "name": "peer-handshake:hypatia",
-          "status": "ok",
-          "detail": "hypatia handshake ok (v1)",
+          "status": "warn",
+          "detail": "hypatia unreachable",
           "latency_ms": null,
           "data": {
-            "peer": "hypatia",
-            "protocol_version": 1,
-            "capabilities": [
-              "outbound_send",
-              "peer_message",
-              "peer_query"
-            ]
+            "peer": "hypatia"
           }
         },
         {
@@ -744,11 +701,11 @@ Totals: ok=11 warn=0 fail=1 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 714.6243490278721
+      "elapsed_ms": 1507.5595439993776
     },
     {
       "tool": "daily_sync",
-      "status": "ok",
+      "status": "fail",
       "results": [
         {
           "name": "schedule-time",
@@ -780,19 +737,19 @@ Totals: ok=11 warn=0 fail=1 skip=0
         },
         {
           "name": "last-successful-fire",
-          "status": "ok",
-          "detail": "last fire: 2026-05-22 (1d ago)",
+          "status": "fail",
+          "detail": "last fire: 2026-05-25 (3d ago \u2014 daemon may be silently failing)",
           "latency_ms": null,
           "data": {
             "state_path": "data/daily_sync_state.json",
-            "most_recent_date": "2026-05-22",
-            "today_local": "2026-05-23",
-            "days_old": 1
+            "most_recent_date": "2026-05-25",
+            "today_local": "2026-05-28",
+            "days_old": 3
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 0.4534239415079355
+      "elapsed_ms": 13.549424998927861
     },
     {
       "tool": "cloudflared",
@@ -811,34 +768,31 @@ Totals: ok=11 warn=0 fail=1 skip=0
         }
       ],
       "detail": "",
-      "elapsed_ms": 27.169264038093388
+      "elapsed_ms": 53.09517499699723
     },
     {
       "tool": "gcal",
-      "status": "fail",
+      "status": "ok",
       "results": [
         {
           "name": "last-successful-gcal-sync",
-          "status": "fail",
-          "detail": "active probe failed (refresh_failed; run alfred gcal authorize): ('invalid_grant: Token has been expired or revoked.', {'error': 'invalid_grant', 'error_description': 'Token has been expired or revoked.'})",
+          "status": "ok",
+          "detail": "active probe ok; token last refreshed 14.8h ago (2026-05-27T18:04:22.886956Z)",
           "latency_ms": null,
           "data": {
             "token_path": "/home/andrew/alfred/data/secrets/gcal_token.json",
             "enabled": true,
-            "last_refreshed": "2026-05-19T17:14:15.533872Z",
-            "age_seconds": 315646,
-            "active_probe": "failed",
-            "error_class": "refresh_failed",
-            "exception_type": "RefreshError",
-            "exception_message": "('invalid_grant: Token has been expired or revoked.', {'error': 'invalid_grant', 'error_description': 'Token has been expired or revoked.'})"
+            "last_refreshed": "2026-05-27T18:04:22.886956Z",
+            "age_seconds": 53440,
+            "active_probe": "ok"
           }
         }
       ],
       "detail": "",
-      "elapsed_ms": 349.2122549796477
+      "elapsed_ms": 1073.0265020029037
     }
   ],
-  "elapsed_ms": 3168.087701080367
+  "elapsed_ms": 4634.268162000808
 }
 ```
 

@@ -78,6 +78,15 @@ project:
 related_orgs: []
 related_projects:
 - project/Alfred.md
+relationships:
+- confidence: 0.85
+  context: Vertical divergence audit mentions codebase state
+  source: process/Upstream Contribution — Reply 12 — Vertical Divergence Audit.md
+  source_anchor: codebase vertical divergence
+  target: synthesis/Talker Is 2026-Native While Daemons Remain 2024-Bound in Same
+    Codebase.md
+  target_anchor: Talker is 2026-native while Daemons remain 2024-bound in same codebase
+  type: related-to
 status: draft
 subtype: draft
 tags:

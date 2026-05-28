@@ -74,6 +74,11 @@ distiller_learnings:
 distiller_signals: constraint:2, contradiction:3
 intent: Upstream contribution report for ssdavidai/alfred — draft, awaiting Andrew's
   review
+janitor_note: LINK001 — [[preference/use-keyboard-friendly-labels]] referenced in
+  the body as a worked example for cites_canonical override; the slug is illustrative
+  within the upstream contribution draft and no such preference record exists in the
+  vault. FM001/DIR001 — record is type=note stored under process/ as a writing-arc
+  grouping convention; deterministic scanner flags expected, no janitor action.
 project:
 - '[[project/Alfred]]'
 related_orgs: []

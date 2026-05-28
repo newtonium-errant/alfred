@@ -1,12 +1,20 @@
 ---
 alfred_tags:
-- testing/alfred-bit
+- alfred/bit
 created: '2026-05-25'
 description: Alfred built-in test (health sweep)
 mode: quick
 name: Alfred BIT 2026-05-25
 overall_status: fail
 process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-25.md
+  source_anchor: run Alfred BIT 2026-05-25
+  target: process/Alfred BIT 2026-05-26.md
+  target_anchor: run Alfred BIT 2026-05-26
+  type: related-to
 started: '2026-05-25T05:55:02.845864-03:00'
 status: completed
 tags:

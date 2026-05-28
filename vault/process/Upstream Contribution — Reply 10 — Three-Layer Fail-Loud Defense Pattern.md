@@ -1,6 +1,6 @@
 ---
 alfred_tags:
-- software/vault_edit
+- tool/input-truncation
 created: '2026-05-25'
 distiller_learnings:
 - '[[synthesis/Schema Evolution in One Consumer Silently Invalidates Assumptions in
