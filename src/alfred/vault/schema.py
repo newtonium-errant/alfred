@@ -1005,6 +1005,38 @@ EVENT_GCAL_FIELDS: tuple[str, ...] = (
     "gcal_title",
 )
 
+# Optional frontmatter fields on ``task`` records that participate in
+# the 3-tier task system (Phase 1 ship 2026-05-28). Salem-only by
+# virtue of brief integration — non-Salem instances simply don't
+# populate these fields and the brief never reaches the render path.
+#
+#   - ``base_tier``         (int 1/2/3) — intrinsic tier the operator
+#     sets. T1 = now / time-critical; T2 = soon / on the radar;
+#     T3 = someday / aspirational.
+#   - ``escalate_to``       (int)       — tier the task escalates to as
+#     the deadline approaches. Default when omitted:
+#     ``max(1, base_tier - 1)`` (one tier up, capped at T1).
+#   - ``escalate_at_days``  (int)       — days BEFORE ``due`` when the
+#     escalation fires. **Opt-in per task**: omitting means the task
+#     never escalates, even when ``due`` is set. Past-due tasks always
+#     render at ``escalate_to`` regardless of this field.
+#
+# The ``due`` field (already standard on task records) is the deadline
+# the escalation is relative to. ``priority`` (urgent/high/medium/low)
+# is orthogonal — it's intrinsic-importance, not urgency, and is used
+# only as a fallback to derive ``base_tier`` for pre-migration tasks
+# that lack the field. See ``alfred.tier.compute`` for the full
+# computation contract.
+#
+# ``effective_tier`` is computed at brief-render time and is **never
+# written to the record**. The brief shows the projection; the record
+# stays canonical.
+TIER_FIELDS: tuple[str, ...] = (
+    "base_tier",
+    "escalate_to",
+    "escalate_at_days",
+)
+
 # Fields that should be lists
 LIST_FIELDS: set[str] = {
     "tags", "aliases", "related", "relationships", "participants",

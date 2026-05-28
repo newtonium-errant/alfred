@@ -15,6 +15,8 @@ from .peer_digests import render_peer_digests_section
 from .renderer import render_brief, serialize_record
 from .routine_section import render_routine_section
 from .state import BriefRun, StateManager
+from .tier_section import SECTION_HEADER as TIER_SECTION_HEADER
+from .tier_section import render_tier_section
 from .utils import get_logger
 from .operations import format_operations_section
 from .upcoming_events import render_upcoming_events_section
@@ -124,6 +126,17 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
             peer_canonical_names=config.peer_digests.peer_canonical_names,
         )
 
+    # Open Tasks by Tier — Salem-only Phase 1 (2026-05-28). Live vault
+    # scan over ``vault/task/*.md``, filters open tasks, computes
+    # ``effective_tier`` per task (deadline-relative escalation), renders
+    # three buckets T1/T2/T3. Unlike the routine section's filesystem
+    # handoff, tier is a pure projection of current task records + now;
+    # no aggregator daemon writes a derivative file. ``render_tier_section``
+    # always returns a non-empty string per intentionally-left-blank, so
+    # this stays in the section list unconditionally.
+    now_local = datetime.now(ZoneInfo(config.schedule.timezone))
+    tier_md = render_tier_section(Path(config.vault_path), now_local)
+
     # Today's Routines — Salem-only Phase 1. Renders the body of
     # ``vault/daily/<today>.md`` (written by the routine daemon at
     # 05:59 Halifax). High-attention slot per dispatch — time-anchored
@@ -138,21 +151,25 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
 
     # Section order is load-bearing: Health first (readers scan top-down;
     # critical status gets the highest priority real estate), Weather
-    # second (time-sensitive but non-operational), Today's Routines
-    # third (time-anchored actions for the day — surfaces critical
-    # routines with their times above the retrospective ops summary),
-    # Operations fourth (retrospective summary — less time-sensitive
-    # than the others). Upcoming Events fifth because it's forward-
-    # looking — useful context once the reader has absorbed current
-    # state, but lower priority than health/weather/now-state summaries.
-    # Peer Digests last (before signature) because they represent OTHER
-    # instances' takes on their own state — informational, not actionable
-    # by Salem's reader on their own. Sits AFTER Upcoming Events so the
-    # principal's own forward calendar is the immediately-actionable
-    # surface and peer chatter follows.
+    # second (time-sensitive but non-operational), Open Tasks by Tier
+    # third (deadline-driven actionable queue — T1 tasks are the most
+    # attention-critical line of the brief; ratified 2026-05-28 to sit
+    # above Routines because a missed payroll deadline outranks today's
+    # habit-anchor checklist), Today's Routines fourth (recurring
+    # practice anchors — time-anchored but lower stakes than deadline-
+    # driven tasks), Operations fifth (retrospective summary — less
+    # time-sensitive than the others). Upcoming Events sixth because
+    # it's forward-looking — useful context once the reader has absorbed
+    # current state, but lower priority than health/weather/now-state
+    # summaries. Peer Digests last (before signature) because they
+    # represent OTHER instances' takes on their own state — informational,
+    # not actionable by Salem's reader on their own. Sits AFTER Upcoming
+    # Events so the principal's own forward calendar is the immediately-
+    # actionable surface and peer chatter follows.
     sections = [
         ("Health", health_md),
         ("Weather", weather_md),
+        (TIER_SECTION_HEADER, tier_md),
         ("Today's Routines", routines_md),
         ("Operations", ops_md),
     ]
