@@ -1,0 +1,29 @@
+# Algernon instance registry — fan-out target for
+# ``alfred instance up | down | status``.
+#
+# Copy this file into place:
+#     cp instances.yaml.example ~/.alfred/instances.yaml
+#
+# Then edit as needed for your installation. Each entry needs:
+#   - ``name`` (lowercase slug, e.g. ``salem``, ``kal-le``)
+#   - ``display`` (operator-facing name, e.g. ``Salem``, ``KAL-LE``)
+#   - ``config`` (absolute path to the instance's config.yaml)
+#   - ``enabled`` (optional, defaults to ``true``) — set to ``false``
+#     to drain an instance from fan-out without deleting the row
+#
+# Order is preserved in operator-facing output, so put the most-
+# critical instance first (Salem here, by convention).
+
+instances:
+  - name: salem
+    display: Salem
+    config: /home/andrew/alfred/config.yaml
+    enabled: true
+  - name: kal-le
+    display: KAL-LE
+    config: /home/andrew/alfred/config.kalle.yaml
+    enabled: true
+  - name: hypatia
+    display: Hypatia
+    config: /home/andrew/alfred/config.hypatia.yaml
+    enabled: true

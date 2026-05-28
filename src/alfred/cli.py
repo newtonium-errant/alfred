@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -2034,8 +2035,24 @@ def cmd_instance(args: argparse.Namespace) -> None:
     user has to set real token values).
     """
     subcmd = getattr(args, "instance_cmd", None)
+    # Phase 1 Algernon platform wrapper (2026-05-28): the ``instance``
+    # namespace gained ``up``/``down``/``status`` sub-verbs for
+    # fan-out across all registered instances. Dispatch them to
+    # their dedicated handlers; the existing ``new`` flow stays
+    # unchanged below.
+    if subcmd == "up":
+        return cmd_instance_up_all(args)
+    if subcmd == "down":
+        return cmd_instance_down_all(args)
+    if subcmd == "status":
+        return cmd_instance_status_all(args)
     if subcmd != "new":
-        print("Usage: alfred instance new <name>")
+        print(
+            "Usage: alfred instance new <name>\n"
+            "       alfred instance up\n"
+            "       alfred instance down\n"
+            "       alfred instance status [--verbose] [--json]"
+        )
         sys.exit(1)
 
     name = args.instance_name.strip().lower()
@@ -2134,6 +2151,174 @@ def cmd_instance(args: argparse.Namespace) -> None:
     print(f"       pip install -e {Path.cwd()}")
     print(f"  6. Launch:")
     print(f"       alfred --config {config_path} up --only talker,instructor,brief_digest_push")
+
+
+# ---------------------------------------------------------------------------
+# Algernon platform wrapper — fan-out across all instances (Phase 1, 2026-05-28)
+# ---------------------------------------------------------------------------
+#
+# ``alfred instance up | down | status`` fans the corresponding verb out
+# across every enabled instance in the registry (``~/.alfred/instances.yaml``).
+# Suppressed top-level aliases ``up-all`` / ``down-all`` / ``status-all``
+# preserve quick muscle-memory typing without cluttering ``--help``.
+#
+# Per the Phase 1 design (Plan agent, 2026-05-28): subprocess-shells the
+# per-instance command. Idempotency-friendly — pre-check on PID file
+# presence treats ``already-running`` as success per ratified decision
+# #1. Failure on one instance doesn't block the rest; the wrapper
+# continues fan-out best-effort and reports an aggregate pass/fail
+# summary at the end.
+
+
+def _load_registry_or_exit(args: argparse.Namespace):
+    """Load the instance registry or exit cleanly with operator-actionable
+    error.
+
+    Handles two failure shapes:
+      * Missing registry file — points the operator at the
+        ``instances.yaml.example`` starter.
+      * Malformed YAML / missing fields — surfaces the
+        ValueError message verbatim so the operator can fix
+        the bad row.
+    """
+    from alfred.instance_set import load_registry
+    registry_path = getattr(args, "registry", None)
+    path = Path(registry_path) if registry_path else None
+    try:
+        return load_registry(path)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        print(
+            "        Bootstrap the registry: "
+            "``cp instances.yaml.example ~/.alfred/instances.yaml`` "
+            "from the alfred project root.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def cmd_instance_up_all(args: argparse.Namespace) -> None:
+    """``alfred instance up`` — start every enabled instance.
+
+    Per ratified Phase 1 decision: ``already-running`` counts as
+    OK. The per-line summary distinguishes ``started`` from
+    ``already-running`` so the operator can see the state
+    distribution at a glance.
+    """
+    from alfred.instance_set import (
+        format_summary_sentinel,
+        run_verb_across_set,
+    )
+    instances = _load_registry_or_exit(args)
+    results, exit_code = run_verb_across_set(instances, "up")
+    for _, summary in results:
+        print(summary)
+    print(format_summary_sentinel("up", results))
+    sys.exit(exit_code)
+
+
+def cmd_instance_down_all(args: argparse.Namespace) -> None:
+    """``alfred instance down`` — stop every enabled instance.
+
+    Per-line summary distinguishes ``stopped`` (was running →
+    stopped) from ``was not running`` (idle, no change) so the
+    operator sees which instances actually shed PIDs.
+    """
+    from alfred.instance_set import (
+        format_summary_sentinel,
+        run_verb_across_set,
+    )
+    instances = _load_registry_or_exit(args)
+    results, exit_code = run_verb_across_set(instances, "down")
+    for _, summary in results:
+        print(summary)
+    print(format_summary_sentinel("down", results))
+    sys.exit(exit_code)
+
+
+def cmd_instance_status_all(args: argparse.Namespace) -> None:
+    """``alfred instance status`` — report running state across all
+    enabled instances.
+
+    Default: one-line-per-instance summary. ``--verbose``: concatenate
+    full ``alfred status`` output per instance with section headers
+    (``=== Salem ===``). ``--json``: aggregate per-instance ``--json``
+    blobs into one top-level dict keyed by instance name.
+    """
+    verbose = bool(getattr(args, "verbose", False))
+    as_json = bool(getattr(args, "json", False))
+    if verbose and as_json:
+        print(
+            "error: --verbose and --json are mutually exclusive "
+            "(--verbose prints human-readable; --json prints "
+            "machine-readable).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    instances = _load_registry_or_exit(args)
+    enabled = [i for i in instances if i.enabled]
+
+    if as_json:
+        # Aggregate per-instance ``alfred status --json`` blobs.
+        # Each subprocess returns its own JSON object; we wrap
+        # them by instance name. Failures land as ``{"error": ...}``
+        # entries so the operator can spot per-instance issues.
+        import json
+        from alfred.instance_set import _build_subprocess_cmd
+        payload: dict[str, Any] = {}
+        for inst in enabled:
+            cmd = _build_subprocess_cmd(inst, "status", ["--json"])
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and proc.stdout.strip():
+                try:
+                    payload[inst.name] = json.loads(proc.stdout)
+                except json.JSONDecodeError as exc:
+                    payload[inst.name] = {
+                        "error": f"JSON parse failure: {exc}",
+                        "stdout_tail": proc.stdout[-500:],
+                    }
+            else:
+                payload[inst.name] = {
+                    "error": (
+                        proc.stderr.splitlines()[0]
+                        if proc.stderr.strip()
+                        else f"exit code {proc.returncode}"
+                    ),
+                }
+        print(json.dumps(payload, indent=2, default=str))
+        return
+
+    if verbose:
+        # Concatenate full ``alfred status`` per instance with headers.
+        from alfred.instance_set import _build_subprocess_cmd
+        for inst in enabled:
+            print(f"=== {inst.display} ===")
+            cmd = _build_subprocess_cmd(inst, "status", [])
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.stdout:
+                print(proc.stdout.rstrip())
+            if proc.returncode != 0:
+                # Verbose mode keeps stderr visible too — operator
+                # debugging needs all the diagnostic surface.
+                stderr = (proc.stderr or "").rstrip()
+                if stderr:
+                    print(f"[stderr]\n{stderr}")
+            print()
+        return
+
+    # Default: one-line-per-instance.
+    from alfred.instance_set import (
+        format_summary_sentinel,
+        run_verb_across_set,
+    )
+    results, _ = run_verb_across_set(instances, "status")
+    for _, summary in results:
+        print(summary)
+    print(format_summary_sentinel("status", results))
 
 
 def cmd_mail(args: argparse.Namespace) -> None:
@@ -3131,10 +3316,14 @@ def build_parser() -> argparse.ArgumentParser:
     bit_hist.add_argument("--limit", type=int, default=10)
     bit_hist.add_argument("--json", action="store_true", default=False, help="Emit JSON")
 
-    # instance — Stage 3.5 multi-instance scaffolding
+    # instance — Stage 3.5 multi-instance scaffolding + Algernon
+    # platform wrapper (Phase 1, 2026-05-28)
     instance_p = sub.add_parser(
         "instance",
-        help="Multi-instance scaffolding (new, list — Stage 3.5)",
+        help=(
+            "Multi-instance management — new (scaffold) + "
+            "up/down/status (fan-out across registered instances)"
+        ),
     )
     instance_sub = instance_p.add_subparsers(dest="instance_cmd")
     inst_new = instance_sub.add_parser(
@@ -3145,6 +3334,60 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true", default=False,
         help="Overwrite an existing config.<name>.yaml",
     )
+
+    # Phase 1 Algernon platform wrapper sub-verbs. The ``--registry``
+    # flag is on each subcommand so the operator can override the
+    # default ``~/.alfred/instances.yaml`` for testing or alt-installs.
+    inst_up = instance_sub.add_parser(
+        "up", help="Start every enabled instance in the registry",
+    )
+    inst_up.add_argument(
+        "--registry", default=None,
+        help="Override the registry path (default: ~/.alfred/instances.yaml)",
+    )
+    inst_down = instance_sub.add_parser(
+        "down", help="Stop every enabled instance in the registry",
+    )
+    inst_down.add_argument(
+        "--registry", default=None,
+        help="Override the registry path (default: ~/.alfred/instances.yaml)",
+    )
+    inst_status = instance_sub.add_parser(
+        "status",
+        help="Show running state per enabled instance",
+    )
+    inst_status.add_argument(
+        "--registry", default=None,
+        help="Override the registry path (default: ~/.alfred/instances.yaml)",
+    )
+    inst_status.add_argument(
+        "--verbose", action="store_true", default=False,
+        help=(
+            "Concatenate full ``alfred status`` output per instance "
+            "with section headers instead of the one-line summary"
+        ),
+    )
+    inst_status.add_argument(
+        "--json", action="store_true", default=False,
+        help=(
+            "Aggregate per-instance ``alfred status --json`` blobs "
+            "into one top-level dict keyed by instance name"
+        ),
+    )
+
+    # Suppressed top-level aliases — preserve muscle-memory typing
+    # for ``alfred up-all`` / ``alfred down-all`` / ``alfred status-all``
+    # without cluttering ``--help`` per ratified Phase 1 decision #2.
+    # These dispatch to the same handlers as the canonical
+    # ``alfred instance ...`` form.
+    up_all = sub.add_parser("up-all", help=argparse.SUPPRESS)
+    up_all.add_argument("--registry", default=None, help=argparse.SUPPRESS)
+    down_all = sub.add_parser("down-all", help=argparse.SUPPRESS)
+    down_all.add_argument("--registry", default=None, help=argparse.SUPPRESS)
+    status_all = sub.add_parser("status-all", help=argparse.SUPPRESS)
+    status_all.add_argument("--registry", default=None, help=argparse.SUPPRESS)
+    status_all.add_argument("--verbose", action="store_true", default=False, help=argparse.SUPPRESS)
+    status_all.add_argument("--json", action="store_true", default=False, help=argparse.SUPPRESS)
 
     # mail
     mail_p = sub.add_parser("mail", help="Email fetcher subcommands")
@@ -3320,6 +3563,13 @@ def main() -> None:
         "up": cmd_up,
         "down": cmd_down,
         "status": cmd_status,
+        # Algernon platform wrapper Phase 1 (2026-05-28) — suppressed
+        # top-level aliases for ``alfred instance up | down | status``.
+        # Dispatch to the same handlers as the canonical form per
+        # ratified Phase 1 decision #2.
+        "up-all": cmd_instance_up_all,
+        "down-all": cmd_instance_down_all,
+        "status-all": cmd_instance_status_all,
         "curator": cmd_curator,
         "email-classifier": cmd_email_classifier,
         "janitor": cmd_janitor,
