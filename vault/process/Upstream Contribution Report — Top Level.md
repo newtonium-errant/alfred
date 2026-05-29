@@ -210,6 +210,7 @@ project:
 related_orgs:
 - org/GitHub.md
 - org/ElevenLabs.md
+- org/Substack.md
 relationships:
 - confidence: 0.85
   context: Shared process topic

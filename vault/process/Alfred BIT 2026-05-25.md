@@ -3,6 +3,11 @@ alfred_tags:
 - alfred/bit
 created: '2026-05-25'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — [[process/Alfred BIT]] parent process record does not exist
+  in vault; only Alfred BIT run records exist. Same pattern as Alfred BIT 2026-05-12
+  and Morning Brief run records (parent process record never created). Human action:
+  create process/Alfred BIT.md OR retarget the process field. (DIR001 also reported
+  — record has type=run but lives in process/; expected autofix.py to handle deterministically.)'
 mode: quick
 name: Alfred BIT 2026-05-25
 overall_status: fail
@@ -14,6 +19,13 @@ relationships:
   source_anchor: run Alfred BIT 2026-05-25
   target: process/Alfred BIT 2026-05-26.md
   target_anchor: run Alfred BIT 2026-05-26
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-25.md
+  source_anchor: run Alfred BIT 2026-05-25
+  target: process/Alfred BIT 2026-05-28.md
+  target_anchor: run Alfred BIT 2026-05-28
   type: related-to
 started: '2026-05-25T05:55:02.845864-03:00'
 status: completed

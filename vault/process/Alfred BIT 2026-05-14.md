@@ -41,6 +41,55 @@ relationships:
   target: process/Alfred BIT 2026-05-18.md
   target_anchor: '[run] Alfred BIT 2026-05-18'
   type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-14.md
+  source_anchor: run Alfred BIT 2026-05-14
+  target: process/Alfred BIT 2026-05-19.md
+  target_anchor: run Alfred BIT 2026-05-19
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-14.md
+  source_anchor: run Alfred BIT 2026-05-14
+  target: process/Alfred BIT 2026-05-20.md
+  target_anchor: run Alfred BIT 2026-05-20
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-14.md
+  source_anchor: run Alfred BIT 2026-05-14
+  target: process/Alfred BIT 2026-05-21.md
+  target_anchor: run Alfred BIT 2026-05-21
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-14.md
+  source_anchor: run Alfred BIT 2026-05-14
+  target: process/Alfred BIT 2026-05-22.md
+  target_anchor: run Alfred BIT 2026-05-22
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-14.md
+  source_anchor: run Alfred BIT 2026-05-14
+  target: process/Alfred BIT 2026-05-27.md
+  target_anchor: run Alfred BIT 2026-05-27
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-14.md
+  source_anchor: run Alfred BIT 2026-05-14
+  target: process/Alfred BIT 2026-05-28.md
+  target_anchor: run Alfred BIT 2026-05-28
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-05-14.md
+  source_anchor: run Alfred BIT 2026-05-14
+  target: process/Alfred BIT 2026-05-29.md
+  target_anchor: run Alfred BIT 2026-05-29
+  type: related-to
 started: '2026-05-14T05:55:01.839592-03:00'
 status: completed
 tags:
