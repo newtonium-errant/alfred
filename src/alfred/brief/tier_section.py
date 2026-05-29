@@ -74,7 +74,7 @@ doesn't need to change.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +84,8 @@ import yaml
 
 from alfred.tier.compute import (
     OPEN_STATUSES,
+    compute_auto_routine_candidates,
+    compute_auto_routine_t2_candidates,
     compute_auto_t1_candidates,
 )
 from alfred.tier.daily_curation import (
@@ -123,6 +125,17 @@ T3_EMPTY_PROMPT = (
 )
 ROLLOVER_HEADER = "### Rollover from yesterday (incomplete)"
 T2_POOL_HEADER = "### T2 selection pool"
+
+# Phase 2A Ship B (2026-05-29): routine-origin tier surfaces.
+#
+# T2 ramp items from routine due_patterns render in a subsection between
+# the curated T2 bucket and the T2 selection pool. The auto-routine T2
+# items aren't curated yet (operator hasn't confirmed) — the prompt
+# names the canonical talker reply for confirmation.
+T2_AUTO_ROUTINE_HEADER = "#### Auto-surfaced (from routines)"
+T2_ROUTINE_CONFIRM_PROMPT = (
+    '*(reply "T2 confirm" to keep on today\'s list)*'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +262,32 @@ def _is_open(fm: dict[str, Any]) -> bool:
     return status.lower() in OPEN_STATUSES
 
 
+def _format_due_date(due_iso: str) -> str:
+    """Format an ISO date as ``"Mon Jun 1"``-style display string.
+
+    Phase 2A Ship B (2026-05-29): routine-origin tier renders include
+    the actual due date in the line head per the dispatch's worked
+    example. Returns the raw ISO string on parse failure so the brief
+    never silently swallows a date display.
+
+    Example:
+      ``_format_due_date("2026-06-01")`` → ``"Mon Jun 1"``
+      ``_format_due_date("not-a-date")`` → ``"not-a-date"`` (fallback)
+    """
+    try:
+        d = date.fromisoformat(due_iso)
+    except (ValueError, TypeError):
+        return due_iso
+    # ``%a`` = abbreviated weekday (Mon), ``%b`` = abbreviated month
+    # (Jun), ``%-d`` = day without leading zero. Use Python's
+    # platform-neutral form (``%d`` then strip leading zero) since
+    # ``%-d`` is Linux-only.
+    weekday = d.strftime("%a")
+    month = d.strftime("%b")
+    day = str(d.day)  # no leading zero
+    return f"{weekday} {month} {day}"
+
+
 def _wikilink_to_record_name(wikilink: str) -> str | None:
     """Extract the record name from a ``[[task/Name]]`` wikilink.
 
@@ -278,27 +317,64 @@ def _wikilink_to_record_name(wikilink: str) -> str | None:
 def _render_t1_entry(
     entry: T1T2Entry,
     auto_t1_reason_by_name: dict[str, str],
+    auto_t1_reason_by_routine_key: dict[tuple[str, str], str],
+    auto_t1_due_iso_by_routine_key: dict[tuple[str, str], str],
 ) -> str:
     """Render one T1 line.
 
-    Confirm-affordance logic:
-      * If the entry's ``confirmed`` is ``True`` → render bare (operator
-        has signed off; no prompt needed).
+    Origin discrimination:
+      * Task-origin (``entry.task`` populated) — renders as
+        ``- [ ] [[task/Name]] — due today  *(confirm)*``. Reason
+        lookup keyed on record name.
+      * Routine-origin (``entry.routine_item`` populated) — renders as
+        ``- [ ] <text> — due <date> (<reason>, from
+        [[routine/<record>]])  *(confirm)*`` when an auto-T1 candidate
+        matches (date + reason inline); otherwise
+        ``- [ ] <text> (from [[routine/<record>]])`` for operator-
+        added entries the auto layer doesn't know about.
+
+    Confirm-affordance logic (same for both origins):
+      * If ``confirmed is True`` → render bare (operator signed off).
       * Else → append :data:`T1_CONFIRM_PROMPT` so the talker reply
-        pattern is visible in the brief.
+        pattern is visible.
 
     Surface reason (``due today`` / ``due tomorrow`` / ``escalate
-    window ...``) is taken from ``auto_t1_reason_by_name`` when the
-    entry matches an auto-T1 candidate; otherwise rendered without a
-    reason annotation (operator manually added a T1 entry that wasn't
-    auto-surfaced).
+    window ...``) comes from the auto-T1 candidate map when the entry
+    matches one; otherwise no reason annotation (operator manually
+    added a T1 entry that wasn't auto-surfaced).
+
+    Worked example (the canonical dispatch shape):
+      ``- [ ] Garbage Out — due Fri May 29 (escalate window (1d before
+      due), from [[routine/Weekly Chores]])  *(confirm? reply "T1 confirm")*``
     """
-    record_name = _wikilink_to_record_name(entry.task) or ""
-    reason = auto_t1_reason_by_name.get(record_name, "")
-    if reason:
-        head = f"- [ ] {entry.task} — {reason}"
+    # Routine-origin discrimination — exactly one of task / routine_item
+    # is populated per the T1T2Entry invariant.
+    if entry.routine_item is not None:
+        record = str(entry.routine_item.get("record", ""))
+        text = str(entry.routine_item.get("text", ""))
+        reason = auto_t1_reason_by_routine_key.get((record, text), "")
+        due_iso = auto_t1_due_iso_by_routine_key.get((record, text), "")
+        if reason and due_iso:
+            head = (
+                f"- [ ] {text} — due {_format_due_date(due_iso)} "
+                f"({reason}, from [[routine/{record}]])"
+            )
+        elif reason:
+            head = (
+                f"- [ ] {text} — {reason}, from [[routine/{record}]]"
+            )
+        else:
+            head = f"- [ ] {text} (from [[routine/{record}]])"
     else:
-        head = f"- [ ] {entry.task}"
+        # Task-origin path (the original Tier-V2 Ship 1 shape).
+        task_str = entry.task or ""
+        record_name = _wikilink_to_record_name(task_str) or ""
+        reason = auto_t1_reason_by_name.get(record_name, "")
+        if reason:
+            head = f"- [ ] {task_str} — {reason}"
+        else:
+            head = f"- [ ] {task_str}"
+
     if entry.confirmed is True:
         return head
     # Auto-surfaced (confirmed=False) OR operator-added (confirmed=None)
@@ -308,8 +384,49 @@ def _render_t1_entry(
 
 
 def _render_t2_entry(entry: T1T2Entry) -> str:
-    """Render one T2 line — bare wikilink (no confirm affordance)."""
-    return f"- [ ] {entry.task}"
+    """Render one curated T2 line — bare wikilink (or routine reference)
+    with no confirm affordance.
+
+    Origin discrimination matches :func:`_render_t1_entry` but without
+    the confirm prompt (T2 entries are operator-curated; the add itself
+    is the confirmation).
+    """
+    if entry.routine_item is not None:
+        record = str(entry.routine_item.get("record", ""))
+        text = str(entry.routine_item.get("text", ""))
+        return f"- [ ] {text} (from [[routine/{record}]])"
+    return f"- [ ] {entry.task or ''}"
+
+
+def _render_auto_t2_routine_entry(candidate: Any) -> str:
+    """Render one auto-surfaced T2 routine candidate line.
+
+    ``candidate`` is an :class:`alfred.tier.compute.AutoT1Candidate`
+    with ``origin == "routine"``. Renders as:
+
+      ``- [ ] <text> — due <date> (<reason>, from
+      [[routine/<record>]])  *(reply "T2 confirm" to keep on today's
+      list)*``
+
+    matching the dispatch's worked example for the
+    :data:`T2_AUTO_ROUTINE_HEADER` subsection.
+
+    Phase 2A Ship B contract: this is the ONLY auto-surface in the
+    tier section that renders WITHOUT being merged into curated state.
+    The brief shows it; the operator confirms via talker; Ship D writes
+    the curation back via ``save_tier_curation``. Curation read-side
+    stability stays intact (this render is a pure projection of
+    compute-layer output).
+    """
+    record = candidate.routine_record or ""
+    text = candidate.item_text or candidate.name
+    reason = candidate.surface_reason
+    due_display = _format_due_date(candidate.due_iso)
+    return (
+        f"- [ ] {text} — due {due_display} "
+        f"({reason}, from [[routine/{record}]])"
+        f"  {T2_ROUTINE_CONFIRM_PROMPT}"
+    )
 
 
 def _render_t3_entry(entry: T3Entry) -> str:
@@ -322,18 +439,38 @@ def _render_t3_entry(entry: T3Entry) -> str:
 
 def _merge_auto_t1_into_curated(
     curated_t1: list[T1T2Entry],
-    auto_t1_candidates: list[Any],  # list[AutoT1Candidate]
-) -> tuple[list[T1T2Entry], dict[str, str]]:
-    """Merge auto-T1 candidates with operator-curated T1 entries.
+    auto_t1_task_candidates: list[Any],     # list[AutoT1Candidate] origin=task
+    auto_t1_routine_candidates: list[Any],  # list[AutoT1Candidate] origin=routine
+) -> tuple[
+    list[T1T2Entry],
+    dict[str, str],
+    dict[tuple[str, str], str],
+    dict[tuple[str, str], str],
+]:
+    """Merge auto-T1 candidates (both task + routine origin) with
+    operator-curated T1 entries.
 
-    Returns ``(merged_t1, reason_by_name)``:
+    Returns ``(merged_t1, reason_by_name, reason_by_routine_key,
+    due_iso_by_routine_key)``:
       * ``merged_t1`` — curated_t1 entries kept verbatim (operator
-        wins on the per-entry confirmed state). Auto-T1 candidates
+        wins on the per-entry confirmed state). Auto-T1 task candidates
         NOT already in curated_t1 are appended as ``confirmed=False``
-        entries with ``source="auto-due"``.
-      * ``reason_by_name`` — map of record-name → canonical surface
-        reason string (``"due today"`` / etc.). Used by
-        :func:`_render_t1_entry` to inline the reason text.
+        entries with ``source="auto-due"``. Auto-T1 routine candidates
+        NOT already in curated_t1 are appended with
+        ``source="auto-due-routine"``.
+      * ``reason_by_name`` — map of task-record-name → canonical
+        surface reason string. Used by :func:`_render_t1_entry`'s
+        task-origin branch to inline the reason text.
+      * ``reason_by_routine_key`` — map of ``(record, text)`` tuple →
+        canonical surface reason string. Used by the routine-origin
+        branch.
+      * ``due_iso_by_routine_key`` — map of ``(record, text)`` tuple →
+        ISO due-date string. Used by the routine-origin branch to
+        inline the formatted due date per the dispatch worked example.
+
+    Dedup keys:
+      * Task-origin: record name (via wikilink parse).
+      * Routine-origin: ``(routine_record, item_text)`` tuple.
 
     Cross-Ship contract: this merge is read-side only — the resulting
     list reflects what the brief SHOULD show, not what the operator's
@@ -342,37 +479,73 @@ def _merge_auto_t1_into_curated(
     :func:`save_tier_curation`).
     """
     reason_by_name: dict[str, str] = {}
-    for cand in auto_t1_candidates:
-        # ``cand.name`` is the record name (frontmatter ``name`` or
-        # file stem). Match against curated entries via the wikilink
-        # parse to keep names canonical.
+    for cand in auto_t1_task_candidates:
         reason_by_name[cand.name] = cand.surface_reason
 
-    curated_names = set()
+    reason_by_routine_key: dict[tuple[str, str], str] = {}
+    due_iso_by_routine_key: dict[tuple[str, str], str] = {}
+    for cand in auto_t1_routine_candidates:
+        # ``cand.routine_record`` + ``cand.item_text`` populated for
+        # routine-origin (Ship A contract). Defensive fallback to name
+        # for the item_text key in case a future variant omits it.
+        record = cand.routine_record or ""
+        text = cand.item_text or cand.name
+        key = (record, text)
+        reason_by_routine_key[key] = cand.surface_reason
+        due_iso_by_routine_key[key] = cand.due_iso
+
+    # Build dedup sets from curated entries — separate sets for task
+    # vs routine origin keep the discriminated-union clean.
+    curated_task_names: set[str] = set()
+    curated_routine_keys: set[tuple[str, str]] = set()
     for entry in curated_t1:
-        rec_name = _wikilink_to_record_name(entry.task)
-        if rec_name:
-            curated_names.add(rec_name)
+        if entry.routine_item is not None:
+            record = str(entry.routine_item.get("record", ""))
+            text = str(entry.routine_item.get("text", ""))
+            curated_routine_keys.add((record, text))
+        elif entry.task is not None:
+            rec_name = _wikilink_to_record_name(entry.task)
+            if rec_name:
+                curated_task_names.add(rec_name)
 
     merged: list[T1T2Entry] = list(curated_t1)
-    for cand in auto_t1_candidates:
-        if cand.name in curated_names:
+
+    # Task-origin auto-T1 candidates not yet curated.
+    for cand in auto_t1_task_candidates:
+        if cand.name in curated_task_names:
             continue
-        # Auto-surfaced entry not yet curated — synthesize a transient
-        # T1T2Entry for render only (this is NOT persisted; the
-        # talker writes through ``save_tier_curation`` per Ship 4).
         wikilink = f"[[task/{cand.name}]]"
         merged.append(T1T2Entry(
             task=wikilink,
             source="auto-due",
             confirmed=False,
         ))
-    return merged, reason_by_name
+
+    # Routine-origin auto-T1 candidates not yet curated.
+    for cand in auto_t1_routine_candidates:
+        record = cand.routine_record or ""
+        text = cand.item_text or cand.name
+        if (record, text) in curated_routine_keys:
+            continue
+        merged.append(T1T2Entry(
+            routine_item={"record": record, "text": text},
+            source="auto-due-routine",
+            confirmed=False,
+        ))
+
+    return (
+        merged,
+        reason_by_name,
+        reason_by_routine_key,
+        due_iso_by_routine_key,
+    )
 
 
 def _render_curated_shortlists(
     curation: DailyCuration | None,
-    auto_t1_candidates: list[Any],
+    auto_t1_task_candidates: list[Any],
+    auto_t1_routine_candidates: list[Any],
+    auto_t2_routine_candidates: list[Any],
 ) -> str:
     """Compose the three ``### T1 / T2 / T3`` subsections.
 
@@ -380,13 +553,31 @@ def _render_curated_shortlists(
     ``tier_curation`` block yet), we still surface auto-T1 candidates
     + empty-bucket prompts so the operator's first brief of the day
     is actionable.
+
+    Phase 2A Ship B (2026-05-29): T1 merges both task-origin AND
+    routine-origin auto candidates. T2 grows an
+    :data:`T2_AUTO_ROUTINE_HEADER` subsection BELOW the curated T2
+    bucket — auto-surfaced routine items that are inside their T2 ramp
+    window but the operator hasn't yet confirmed via talker.
+
+    Auto-T2-routine items dedup against curated T1 + T2: if the
+    operator has already curated the (record, text) into either tier,
+    suppress the auto-T2-routine render line (the curated entry
+    already covers it).
     """
     curated_t1: list[T1T2Entry] = curation.t1 if curation else []
     curated_t2: list[T1T2Entry] = curation.t2 if curation else []
     curated_t3: list[T3Entry] = curation.t3 if curation else []
 
-    merged_t1, reason_by_name = _merge_auto_t1_into_curated(
-        curated_t1, auto_t1_candidates,
+    (
+        merged_t1,
+        reason_by_name,
+        reason_by_routine_key,
+        due_iso_by_routine_key,
+    ) = _merge_auto_t1_into_curated(
+        curated_t1,
+        auto_t1_task_candidates,
+        auto_t1_routine_candidates,
     )
 
     # --- T1 -----------------------------------------------------------
@@ -399,7 +590,12 @@ def _render_curated_shortlists(
         t1_lines.append("")
     else:
         for entry in merged_t1:
-            t1_lines.append(_render_t1_entry(entry, reason_by_name))
+            t1_lines.append(_render_t1_entry(
+                entry,
+                reason_by_name,
+                reason_by_routine_key,
+                due_iso_by_routine_key,
+            ))
         t1_lines.append("")
 
     # --- T2 -----------------------------------------------------------
@@ -410,6 +606,30 @@ def _render_curated_shortlists(
     else:
         for entry in curated_t2:
             t2_lines.append(_render_t2_entry(entry))
+        t2_lines.append("")
+
+    # Auto-surfaced T2-routine subsection — dedup against curated T1
+    # (operator may have confirmed already at T1) + curated T2.
+    curated_routine_keys: set[tuple[str, str]] = set()
+    for entry in curated_t1 + curated_t2:
+        if entry.routine_item is not None:
+            curated_routine_keys.add((
+                str(entry.routine_item.get("record", "")),
+                str(entry.routine_item.get("text", "")),
+            ))
+    visible_auto_t2: list[Any] = []
+    for cand in auto_t2_routine_candidates:
+        record = cand.routine_record or ""
+        text = cand.item_text or cand.name
+        if (record, text) in curated_routine_keys:
+            continue
+        visible_auto_t2.append(cand)
+
+    if visible_auto_t2:
+        t2_lines.append(T2_AUTO_ROUTINE_HEADER)
+        t2_lines.append("")
+        for cand in visible_auto_t2:
+            t2_lines.append(_render_auto_t2_routine_entry(cand))
         t2_lines.append("")
 
     # --- T3 -----------------------------------------------------------
@@ -559,6 +779,14 @@ def _render_rollover_section(
 
     incomplete: list[tuple[str, str]] = []  # (tier_label, wikilink)
     for entry in yesterday_curation.t1:
+        # Phase 2A Ship B: routine-origin entries don't roll over —
+        # the next cycle resolves naturally via the routine's
+        # due_pattern. Skip them silently (the routine's compute
+        # surface will re-fire next morning if still due).
+        if entry.routine_item is not None:
+            continue
+        if entry.task is None:
+            continue
         rec_name = _wikilink_to_record_name(entry.task)
         if rec_name is None:
             continue
@@ -568,6 +796,10 @@ def _render_rollover_section(
         if status is None or status in OPEN_STATUSES:
             incomplete.append(("T1", entry.task))
     for entry in yesterday_curation.t2:
+        if entry.routine_item is not None:
+            continue
+        if entry.task is None:
+            continue
         rec_name = _wikilink_to_record_name(entry.task)
         if rec_name is None:
             continue
@@ -622,9 +854,17 @@ def render_tier_section(
     # --- 1. Read today's curation ---------------------------------
     curation = load_daily_curation(vault_path, today)
 
-    # --- 2. Compute auto-T1 candidates ----------------------------
-    auto_t1_candidates = compute_auto_t1_candidates(vault_path, now)
-    auto_t1_record_names = {c.name for c in auto_t1_candidates}
+    # --- 2. Compute auto-T1 / auto-T2 candidates ------------------
+    # Task-origin (the original Ship 2 surface).
+    auto_t1_task_candidates = compute_auto_t1_candidates(vault_path, now)
+    # Routine-origin T1 + T2 ramp (Phase 2A Ship B, 2026-05-29).
+    auto_t1_routine_candidates = compute_auto_routine_candidates(
+        vault_path, now,
+    )
+    auto_t2_routine_candidates = compute_auto_routine_t2_candidates(
+        vault_path, now,
+    )
+    auto_t1_record_names = {c.name for c in auto_t1_task_candidates}
 
     # --- 3. Read yesterday's curation for rollover ----------------
     yesterday = today - timedelta(days=1)
@@ -635,20 +875,29 @@ def render_tier_section(
     status_by_name = _build_status_lookup(records)
 
     # Build the curated-name sets for the selection-pool exclusion.
+    # Only task-origin curated entries pollute these sets — routine-
+    # origin entries don't shadow task-pool entries.
     curated_t1_names: set[str] = set()
     curated_t2_names: set[str] = set()
     if curation is not None:
         for e in curation.t1:
-            n = _wikilink_to_record_name(e.task)
-            if n:
-                curated_t1_names.add(n)
+            if e.task is not None:
+                n = _wikilink_to_record_name(e.task)
+                if n:
+                    curated_t1_names.add(n)
         for e in curation.t2:
-            n = _wikilink_to_record_name(e.task)
-            if n:
-                curated_t2_names.add(n)
+            if e.task is not None:
+                n = _wikilink_to_record_name(e.task)
+                if n:
+                    curated_t2_names.add(n)
 
     # --- 5. Compose render --------------------------------------------
-    shortlists = _render_curated_shortlists(curation, auto_t1_candidates)
+    shortlists = _render_curated_shortlists(
+        curation,
+        auto_t1_task_candidates,
+        auto_t1_routine_candidates,
+        auto_t2_routine_candidates,
+    )
     pool = _render_t2_selection_pool(
         records,
         auto_t1_record_names,
@@ -673,7 +922,9 @@ def render_tier_section(
         curated_t1=len(curation.t1) if curation else 0,
         curated_t2=len(curation.t2) if curation else 0,
         curated_t3=len(curation.t3) if curation else 0,
-        auto_t1_count=len(auto_t1_candidates),
+        auto_t1_task_count=len(auto_t1_task_candidates),
+        auto_t1_routine_count=len(auto_t1_routine_candidates),
+        auto_t2_routine_count=len(auto_t2_routine_candidates),
         rollover_present=bool(rollover),
         yesterday_curation_loaded=yesterday_curation is not None,
     )
@@ -684,8 +935,10 @@ __all__ = [
     "ROLLOVER_HEADER",
     "SECTION_HEADER",
     "T1_CONFIRM_PROMPT",
+    "T2_AUTO_ROUTINE_HEADER",
     "T2_EMPTY_PROMPT",
     "T2_POOL_HEADER",
+    "T2_ROUTINE_CONFIRM_PROMPT",
     "T3_EMPTY_PROMPT",
     "render_tier_section",
 ]

@@ -773,3 +773,338 @@ def test_aggregator_drops_malformed_tier_curation_and_logs(
     ]
     assert len(events) == 1
     assert events[0]["actual_type"] == "str"
+
+
+# ===========================================================================
+# Phase 2A Ship B — routine-section dedup + cycle-aware annotation
+# ===========================================================================
+#
+# Items with ``due_pattern`` whose ``today`` falls in their T1/T2 window
+# are HANDED OFF to the tier section (skipped from Critical/Tracked
+# render). Items with ``due_pattern`` but outside the windows render
+# with cycle-aware annotation (replaces gap-based annotation).
+#
+# NOW = 2026-05-28 (Thursday). Tests use this as the "today" reference.
+
+
+_NOW_THU_2026_05_28 = date(2026, 5, 28)
+
+
+def _read_body(vault: Path, today_iso: str) -> str:
+    """Read the daily file body after run_aggregator_once."""
+    daily_file = vault / "daily" / f"{today_iso}.md"
+    return daily_file.read_text(encoding="utf-8")
+
+
+def test_item_in_t1_window_skipped_from_render(tmp_path: Path) -> None:
+    """Item with due_pattern + escalate_at_days=1, due tomorrow (Fri) →
+    T1 window → SKIPPED from Critical render (tier section will surface)."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Weekly Chores", {
+        "type": "routine",
+        "status": "active",
+        "name": "Weekly Chores",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Garbage Out",
+                "priority": "critical",
+                "due_pattern": {"type": "weekly", "day": "fri"},
+                "escalate_at_days": 1,
+            },
+            # Sibling item without due_pattern — should still render.
+            {"text": "Sibling Item", "priority": "critical"},
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    # Item handed off — NOT in body.
+    assert "Garbage Out" not in body
+    # Sibling renders normally.
+    assert "Sibling Item" in body
+
+
+def test_item_in_t2_window_skipped_from_render(tmp_path: Path) -> None:
+    """Item with surface_at_days=5, escalate_at_days=0, monthly day=1 →
+    today 2026-05-28 → due 2026-06-01 → days_to_due=4 → T2 window →
+    SKIPPED."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Recurring Bills", {
+        "type": "routine",
+        "status": "active",
+        "name": "Recurring Bills",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Pay Clinic Rental",
+                "priority": "critical",
+                "due_pattern": {"type": "monthly", "day": 1},
+                "surface_at_days": 5,
+                "escalate_at_days": 0,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    assert "Pay Clinic Rental" not in body
+
+
+def test_item_outside_windows_renders_normally(tmp_path: Path) -> None:
+    """Item with surface_at_days=5, escalate_at_days=0, monthly day=1 →
+    today 2026-05-23 (8 days before 1st) → OUTSIDE both windows →
+    renders in routine section."""
+    vault = tmp_path / "vault"
+    # 2026-05-23: days_to_due = 9 (since due = 2026-06-01); outside
+    # surface_at_days=5 window.
+    today = date(2026, 5, 23)
+    _write_routine(vault, "Recurring Bills", {
+        "type": "routine",
+        "status": "active",
+        "name": "Recurring Bills",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Pay Clinic Rental",
+                "priority": "tracked",
+                "due_pattern": {"type": "monthly", "day": 1},
+                "surface_at_days": 5,
+                "escalate_at_days": 0,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    # Item RENDERS (outside windows).
+    assert "Pay Clinic Rental" in body
+
+
+def test_item_without_due_pattern_renders_unchanged(tmp_path: Path) -> None:
+    """Pre-Phase-2A items (no due_pattern) render unchanged — Walk Fergus
+    shape stays in routine section with gap-based annotation."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Daily Self-Care", {
+        "type": "routine",
+        "status": "active",
+        "name": "Daily Self-Care",
+        "cadence": {"type": "daily"},
+        "items": [
+            {"text": "Walk Fergus", "priority": "tracked"},
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    assert "Walk Fergus" in body
+    # Gap-based annotation (no completions → sentinel).
+    assert "no completions yet" in body
+
+
+def test_aspirational_items_never_handed_off(tmp_path: Path) -> None:
+    """Aspirational items NEVER hand off to tier section even if they
+    accidentally have due_pattern — defensive carve-out (operator-stated:
+    T3 is self-care intentions, not deadline work)."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Aspirational Items", {
+        "type": "routine",
+        "status": "active",
+        "name": "Aspirational Items",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Read for an hour",
+                "priority": "aspirational",
+                # Defensive: even if operator adds due_pattern, T3 doesn't
+                # hand off. (Realistically aspirational items shouldn't
+                # carry due_pattern; this is the carve-out test.)
+                "due_pattern": {"type": "weekly", "day": "fri"},
+                "escalate_at_days": 1,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    assert "Read for an hour" in body
+
+
+def test_cycle_aware_annotation_done_this_cycle(tmp_path: Path) -> None:
+    """Tracked item with due_pattern, completion log shows completion
+    in current cycle → annotation: ``*(done this cycle)*``."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Weekly Chores", {
+        "type": "routine",
+        "status": "active",
+        "name": "Weekly Chores",
+        "cadence": {"type": "daily"},
+        "completion_log": {
+            "Vacuum": ["2026-05-26"],  # Mon this week
+        },
+        "items": [
+            # NO escalate_at_days → never tier-surfaces → routine section
+            # with cycle-aware annotation.
+            {
+                "text": "Vacuum",
+                "priority": "tracked",
+                "due_pattern": {"type": "weekly", "day": "fri"},
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    assert "Vacuum" in body
+    assert "*(done this cycle)*" in body
+
+
+def test_cycle_aware_annotation_due_in_n_days(tmp_path: Path) -> None:
+    """Tracked item with due_pattern, no completions, due in 5+ days →
+    annotation: ``*(due in Nd)*``."""
+    vault = tmp_path / "vault"
+    # NOW = 2026-05-28 Thu; monthly day=10 → due 2026-06-10 → 13 days.
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Monthly", {
+        "type": "routine",
+        "status": "active",
+        "name": "Monthly",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Quarterly Review",
+                "priority": "tracked",
+                "due_pattern": {"type": "monthly", "day": 10},
+                # NB: no escalate_at_days → no tier handoff. Stays in
+                # routine section with cycle-aware annotation.
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    assert "Quarterly Review" in body
+    assert "due in 13d" in body
+
+
+def test_cycle_aware_annotation_due_today(tmp_path: Path) -> None:
+    """Tracked item with due_pattern, no completions, due today →
+    annotation: ``*(due today)*`` (consistent with tier phrasing)."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    # monthly day=28 → due 2026-05-28 = today.
+    _write_routine(vault, "Monthly", {
+        "type": "routine",
+        "status": "active",
+        "name": "Monthly",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Some Habit",
+                "priority": "tracked",
+                "due_pattern": {"type": "monthly", "day": 28},
+                # No escalate_at_days → routine section + cycle annotation.
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    assert "Some Habit" in body
+    assert "*(due today)*" in body
+
+
+def test_cycle_aware_annotation_due_tomorrow(tmp_path: Path) -> None:
+    """Tracked item, due_pattern weekly day=fri (tomorrow), no
+    completions → annotation: ``*(due tomorrow)*``."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Weekly", {
+        "type": "routine",
+        "status": "active",
+        "name": "Weekly",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Friday Habit",
+                "priority": "tracked",
+                "due_pattern": {"type": "weekly", "day": "fri"},
+                # No escalate_at_days → routine section + cycle annotation.
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    assert "Friday Habit" in body
+    assert "*(due tomorrow)*" in body
+
+
+def test_handed_off_to_tier_log_event_fires(tmp_path: Path) -> None:
+    """The ``routine.aggregator.handed_off_to_tier`` log event fires
+    per skip with item_text + tier + days_to_due + routine_record."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Weekly Chores", {
+        "type": "routine",
+        "status": "active",
+        "name": "Weekly Chores",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Garbage Out",
+                "priority": "critical",
+                "due_pattern": {"type": "weekly", "day": "fri"},
+                "escalate_at_days": 1,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    events = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+    ]
+    assert len(events) == 1
+    e = events[0]
+    assert e["item_text"] == "Garbage Out"
+    assert e["tier"] == 1
+    assert e["days_to_due"] == 1
+    assert e["routine_record"] == "Weekly Chores"
+
+
+def test_handed_off_log_fires_for_t2_handoff(tmp_path: Path) -> None:
+    """Same log event fires for T2 handoffs — ``tier=2``."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Bills", {
+        "type": "routine",
+        "status": "active",
+        "name": "Bills",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Pay Clinic Rental",
+                "priority": "critical",
+                "due_pattern": {"type": "monthly", "day": 1},
+                "surface_at_days": 5,
+                "escalate_at_days": 0,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    events = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+    ]
+    assert len(events) == 1
+    assert events[0]["tier"] == 2
+    assert events[0]["days_to_due"] == 4

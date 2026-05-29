@@ -37,8 +37,10 @@ from alfred.brief.tier_section import (
     ROLLOVER_HEADER,
     SECTION_HEADER,
     T1_CONFIRM_PROMPT,
+    T2_AUTO_ROUTINE_HEADER,
     T2_EMPTY_PROMPT,
     T2_POOL_HEADER,
+    T2_ROUTINE_CONFIRM_PROMPT,
     T3_EMPTY_PROMPT,
     render_tier_section,
 )
@@ -197,7 +199,10 @@ def test_empty_vault_logs_rendered_event(tmp_path: Path) -> None:
     e = events[0]
     assert e["scanned"] == 0
     assert e["curation_loaded"] is False
-    assert e["auto_t1_count"] == 0
+    # Phase 2A Ship B: log event split task vs routine origin counts.
+    assert e["auto_t1_task_count"] == 0
+    assert e["auto_t1_routine_count"] == 0
+    assert e["auto_t2_routine_count"] == 0
     assert e["rollover_present"] is False
 
 
@@ -824,5 +829,408 @@ def test_render_logs_rendered_event_with_counts(tmp_path: Path) -> None:
     assert e["curated_t1"] == 0
     assert e["curated_t2"] == 1
     assert e["curated_t3"] == 1
-    assert e["auto_t1_count"] == 1
+    # Phase 2A Ship B: task vs routine origin counts split.
+    assert e["auto_t1_task_count"] == 1
+    assert e["auto_t1_routine_count"] == 0
     assert e["scanned"] == 1
+
+
+# ===========================================================================
+# Phase 2A Ship B — routine-origin render integration
+# ===========================================================================
+#
+# The brief now consumes compute_auto_routine_candidates +
+# compute_auto_routine_t2_candidates and renders routine-origin items
+# with origin-aware shape (item-text + reason + routine-record wikilink
+# in parentheses), plus a NEW ``#### Auto-surfaced (from routines)``
+# subsection inside T2 for ramp-window items.
+
+
+def _write_routine(
+    vault_path: Path,
+    filename: str,
+    fm_yaml: str,
+) -> Path:
+    """Helper: seed a tmp vault with one routine record at
+    ``routine/<filename>``."""
+    routine_dir = vault_path / "routine"
+    routine_dir.mkdir(parents=True, exist_ok=True)
+    path = routine_dir / filename
+    path.write_text(f"---\n{fm_yaml}---\n\n# body\n", encoding="utf-8")
+    return path
+
+
+def test_routine_auto_t1_renders_with_routine_wikilink_and_confirm(
+    tmp_path: Path,
+) -> None:
+    """Routine item due tomorrow with ``escalate_at_days: 1`` →
+    auto-T1 surface, render shape: ``- [ ] <text> — <reason>, from
+    [[routine/<record>]]  *(confirm? reply "T1 confirm")*``.
+
+    NOW = 2026-05-28 (Thu). weekly day=fri → due 2026-05-29 (tomorrow).
+    days_to_due=1, escalate=1 → T1 window."""
+    _write_routine(
+        tmp_path,
+        "Weekly Chores.md",
+        "type: routine\nstatus: active\nname: Weekly Chores\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Garbage Out\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: weekly\n"
+        "    day: fri\n"
+        "  escalate_at_days: 1\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Routine wikilink + item text + reason all surface.
+    assert "Garbage Out" in body
+    assert "due tomorrow" in body
+    assert "[[routine/Weekly Chores]]" in body
+    # Auto-surfaced (not yet confirmed) gets the confirm prompt.
+    assert T1_CONFIRM_PROMPT in body
+    # Render shape: ``- [ ] Garbage Out — due tomorrow, from [[routine/Weekly Chores]]``
+    t1_lines = [
+        ln for ln in body.splitlines()
+        if "Garbage Out" in ln and "[[routine/Weekly Chores]]" in ln
+    ]
+    assert len(t1_lines) == 1
+    assert "due tomorrow, from [[routine/Weekly Chores]]" in t1_lines[0]
+
+
+def test_routine_auto_t2_renders_in_auto_surfaced_subsection(
+    tmp_path: Path,
+) -> None:
+    """Routine item with ``surface_at_days: 5`` + ``escalate_at_days: 0``,
+    monthly day=1, today=2026-05-28 → due 2026-06-01 → days_to_due=4 →
+    T2 ramp surface.
+
+    Renders under the NEW ``#### Auto-surfaced (from routines)``
+    subsection inside the T2 bucket. The line carries the
+    :data:`T2_ROUTINE_CONFIRM_PROMPT` (talker-reply pattern)."""
+    _write_routine(
+        tmp_path,
+        "Recurring Bills.md",
+        "type: routine\nstatus: active\nname: Recurring Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Pay Clinic Rental to Hussein Rafih\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 1\n"
+        "  surface_at_days: 5\n"
+        "  escalate_at_days: 0\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    assert T2_AUTO_ROUTINE_HEADER in body
+    # The T2 auto subsection sits inside the T2 bucket — verify
+    # ordering: T2 header → auto-surfaced subsection.
+    t2_idx = body.index("### T2 — On the radar")
+    auto_idx = body.index(T2_AUTO_ROUTINE_HEADER)
+    assert t2_idx < auto_idx
+    # The auto-T2-routine confirm prompt fires.
+    assert T2_ROUTINE_CONFIRM_PROMPT in body
+    # Item rendered with reason + routine wikilink.
+    assert "Pay Clinic Rental" in body
+    assert "surface window (4d before due)" in body
+    assert "[[routine/Recurring Bills]]" in body
+
+
+def test_t2_auto_routine_header_constant_pinned() -> None:
+    """Cross-agent contract: Ship D SKILL quotes this verbatim."""
+    assert T2_AUTO_ROUTINE_HEADER == "#### Auto-surfaced (from routines)"
+
+
+def test_t2_routine_confirm_prompt_constant_pinned() -> None:
+    """Cross-agent contract: Ship D SKILL quotes this verbatim."""
+    assert T2_ROUTINE_CONFIRM_PROMPT == (
+        '*(reply "T2 confirm" to keep on today\'s list)*'
+    )
+
+
+def test_curated_t1_routine_item_renders_correctly(tmp_path: Path) -> None:
+    """Operator-curated T1 entry with ``routine_item`` shape +
+    ``confirmed: true`` renders as bare (no confirm prompt) — same
+    visual treatment as a task-origin entry the operator has
+    confirmed."""
+    # Seed the routine record + auto-T1 candidate.
+    _write_routine(
+        tmp_path,
+        "Weekly Chores.md",
+        "type: routine\nstatus: active\nname: Weekly Chores\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Garbage Out\n"
+        "  due_pattern:\n"
+        "    type: weekly\n"
+        "    day: fri\n"
+        "  escalate_at_days: 1\n",
+    )
+    # Pre-curate the entry with confirmed=true.
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - routine_item:\n"
+            "      record: Weekly Chores\n"
+            "      text: Garbage Out\n"
+            "    source: auto-due-routine\n"
+            "    confirmed: true\n"
+            "t2: []\n"
+            "t3: []\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Find the T1 line containing the item.
+    t1_lines = [
+        ln for ln in body.splitlines()
+        if "Garbage Out" in ln and "[[routine/Weekly Chores]]" in ln
+    ]
+    assert len(t1_lines) == 1
+    # Confirmed=True → NO confirm prompt on the line.
+    assert T1_CONFIRM_PROMPT not in t1_lines[0]
+    # Reason + routine wikilink still surface.
+    assert "due tomorrow" in t1_lines[0]
+
+
+def test_curated_t1_task_shape_still_renders_after_extension(
+    tmp_path: Path,
+) -> None:
+    """Backward compat: task-shape curated T1 entries still render
+    correctly after the discriminated-union extension."""
+    _write_task(
+        tmp_path,
+        "Steph Yang ROE",
+        {
+            "type": "task",
+            "status": "todo",
+            "name": "Steph Yang ROE",
+            "due": "2026-05-28",
+        },
+    )
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - task: '[[task/Steph Yang ROE]]'\n"
+            "    source: auto-due\n"
+            "    confirmed: true\n"
+            "t2: []\n"
+            "t3: []\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Task-shape line renders.
+    assert "[[task/Steph Yang ROE]]" in body
+    # Confirmed=true → no confirm prompt on the line.
+    t1_lines = [
+        ln for ln in body.splitlines()
+        if "[[task/Steph Yang ROE]]" in ln
+    ]
+    assert len(t1_lines) == 1
+    assert T1_CONFIRM_PROMPT not in t1_lines[0]
+
+
+def test_routine_auto_t1_already_in_curated_t1_no_duplicate(
+    tmp_path: Path,
+) -> None:
+    """Auto-T1 routine candidate dedupped against curated T1 by
+    ``(record, text)`` tuple — no double-render."""
+    _write_routine(
+        tmp_path,
+        "Weekly Chores.md",
+        "type: routine\nstatus: active\nname: Weekly Chores\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Garbage Out\n"
+        "  due_pattern:\n"
+        "    type: weekly\n"
+        "    day: fri\n"
+        "  escalate_at_days: 1\n",
+    )
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - routine_item:\n"
+            "      record: Weekly Chores\n"
+            "      text: Garbage Out\n"
+            "    source: auto-due-routine\n"
+            "    confirmed: true\n"
+            "t2: []\n"
+            "t3: []\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Only ONE line should contain "Garbage Out" with the routine wikilink.
+    matches = [
+        ln for ln in body.splitlines()
+        if "Garbage Out" in ln and "[[routine/Weekly Chores]]" in ln
+    ]
+    assert len(matches) == 1
+
+
+def test_routine_auto_t2_dedupped_against_curated_t1(tmp_path: Path) -> None:
+    """If an auto-T2-routine candidate matches a curated T1 routine
+    entry (operator confirmed at T1), the T2-auto subsection
+    SUPPRESSES the duplicate render."""
+    _write_routine(
+        tmp_path,
+        "Recurring Bills.md",
+        "type: routine\nstatus: active\nname: Recurring Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Pay Clinic Rental\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 1\n"
+        "  surface_at_days: 5\n"
+        "  escalate_at_days: 0\n",
+    )
+    # Operator confirmed at T1 ahead of schedule (e.g. "I want to pay early").
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - routine_item:\n"
+            "      record: Recurring Bills\n"
+            "      text: Pay Clinic Rental\n"
+            "    source: operator\n"
+            "    confirmed: true\n"
+            "t2: []\n"
+            "t3: []\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Auto-T2 subsection header should NOT surface (the only candidate
+    # was deduped against curated T1).
+    assert T2_AUTO_ROUTINE_HEADER not in body
+    # T1 line for the item DOES surface (curated).
+    assert "Pay Clinic Rental" in body
+    assert "[[routine/Recurring Bills]]" in body
+
+
+def test_routine_log_emission_split_counts(tmp_path: Path) -> None:
+    """The ``brief.tier_section.rendered`` log event reports task /
+    routine T1 / routine T2 counts separately so operators can grep
+    each surface."""
+    _write_routine(
+        tmp_path,
+        "Weekly Chores.md",
+        "type: routine\nstatus: active\nname: Weekly Chores\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Garbage Out\n"
+        "  due_pattern:\n"
+        "    type: weekly\n"
+        "    day: fri\n"
+        "  escalate_at_days: 1\n"
+        "- text: Pay Clinic Rental\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 1\n"
+        "  surface_at_days: 5\n"
+        "  escalate_at_days: 0\n",
+    )
+    with structlog.testing.capture_logs() as captured:
+        render_tier_section(tmp_path, NOW)
+    events = [
+        c for c in captured if c.get("event") == "brief.tier_section.rendered"
+    ]
+    assert len(events) == 1
+    e = events[0]
+    # One routine T1 candidate (Garbage Out, due tomorrow).
+    assert e["auto_t1_routine_count"] == 1
+    # One routine T2 candidate (Pay Clinic Rental, 4d before due).
+    assert e["auto_t2_routine_count"] == 1
+    assert e["auto_t1_task_count"] == 0
+
+
+def test_routine_auto_t1_includes_formatted_due_date(tmp_path: Path) -> None:
+    """Phase 2A Ship B worked-example shape: the T1 routine line
+    embeds the formatted due date in the head.
+
+    NOW = 2026-05-28 Thu. weekly day=fri → due 2026-05-29 (Friday).
+    Format: ``- [ ] <text> — due Fri May 29 (<reason>, from
+    [[routine/<record>]])  *(confirm)*``.
+
+    Pinned per the dispatch worked example so a date-format regression
+    surfaces here, not in operator-facing brief drift."""
+    _write_routine(
+        tmp_path,
+        "Weekly Chores.md",
+        "type: routine\nstatus: active\nname: Weekly Chores\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Garbage Out\n"
+        "  due_pattern:\n"
+        "    type: weekly\n"
+        "    day: fri\n"
+        "  escalate_at_days: 1\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Formatted date appears in the head, BEFORE the parenthetical.
+    assert "due Fri May 29" in body
+    # Inside the parenthetical: reason + from-wikilink.
+    assert "(due tomorrow, from [[routine/Weekly Chores]])" in body
+
+
+def test_routine_auto_t2_includes_formatted_due_date(tmp_path: Path) -> None:
+    """Same dispatch worked-example shape for the T2 auto subsection.
+
+    Format: ``- [ ] <text> — due Mon Jun 1 (<reason>, from
+    [[routine/<record>]])  *(reply "T2 confirm" ...)*``."""
+    _write_routine(
+        tmp_path,
+        "Recurring Bills.md",
+        "type: routine\nstatus: active\nname: Recurring Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Pay Clinic Rental\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 1\n"
+        "  surface_at_days: 5\n"
+        "  escalate_at_days: 0\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    assert "due Mon Jun 1" in body
+    assert (
+        "(surface window (4d before due), "
+        "from [[routine/Recurring Bills]])"
+    ) in body
+
+
+def test_routine_t1_entry_excluded_from_rollover(tmp_path: Path) -> None:
+    """Yesterday's curation with a routine_item T1 entry is NOT
+    surfaced in today's rollover section — routine items don't roll
+    over because the next cycle naturally surfaces via due_pattern."""
+    _write_daily(
+        tmp_path,
+        "2026-05-27",  # yesterday
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - routine_item:\n"
+            "      record: Weekly Chores\n"
+            "      text: Garbage Out\n"
+            "    source: auto-due-routine\n"
+            "    confirmed: true\n"
+            "  - task: '[[task/Bug List]]'\n"
+            "    source: operator\n"
+            "t2: []\n"
+            "t3: []\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    assert ROLLOVER_HEADER in body
+    rollover_section = body.split(ROLLOVER_HEADER)[1]
+    # Routine entry NOT in rollover.
+    assert "Garbage Out" not in rollover_section
+    assert "[[routine/Weekly Chores]]" not in rollover_section
+    # Task entry IS in rollover (still applies).
+    assert "[[task/Bug List]]" in rollover_section

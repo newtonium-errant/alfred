@@ -42,9 +42,26 @@ are stable surfaces for Ships 2 + 4 to consume):
 
 Shape notes (load-bearing):
 
-  * **T1/T2 entries use ``task:`` (wikilink string).** T1/T2 are
-    operator-selected subsets of the open task pool — every entry
-    must point at a concrete ``task/`` record.
+  * **T1/T2 entries carry EITHER ``task:`` (wikilink string) OR
+    ``routine_item:`` (discriminated-union dict).** The ``task:``
+    shape points at a concrete ``task/`` record:
+
+        - task: "[[task/Steph Yang ROE]]"
+          source: "auto-due"
+
+    The ``routine_item:`` shape (added 2026-05-29 Phase 2A Ship B)
+    points at a recurring item inside a ``routine/`` record:
+
+        - routine_item: {record: "Recurring Bills + Admin", text: "Pay Clinic Rental ..."}
+          source: "auto-due-routine"
+          confirmed: true
+
+    Decision #1 (Plan-ratified): discriminated-union via separate
+    keys, NOT a hybrid ``task: [[routine/X#item]]`` overload. The
+    operator-curated entry preserves the routine-record + item-text
+    structure so the brief render layer can reconstruct the wikilink
+    cleanly. Exactly one of the two keys is populated; ``to_dict``
+    drops the absent shape for clean YAML.
   * **T3 entries use ``item:`` (free-text string).** T3 is intentions,
     not necessarily tasks — the operator types "walk Fergus" or "read
     for an hour" which is a routine-item-name OR an ad-hoc one-liner,
@@ -56,12 +73,15 @@ Shape notes (load-bearing):
     surfaced from due dates start with ``confirmed: false``;
     operator confirmation via talker flips to ``true``. T2/T3 entries
     have no ``confirmed`` field (operator add IS the confirmation).
-  * **``source`` is a five-value enum** (canonical strings — Ship 4's
-    SKILL will quote these verbatim):
-    - ``"auto-due"`` — surfaced from due-today/tomorrow
-    - ``"auto-escalate"`` — surfaced from the ``escalate_at_days`` window
+  * **``source`` is a six-value enum** for T1/T2 (canonical strings —
+    Ship 4's SKILL will quote these verbatim):
+    - ``"auto-due"`` — task-origin: surfaced from due-today/tomorrow
+    - ``"auto-escalate"`` — task-origin: ``escalate_at_days`` window
+    - ``"auto-due-routine"`` — routine-origin T1 (Ship B): the routine
+      item's ``due_pattern`` resolves into the T1 window
+    - ``"auto-surface-routine"`` — routine-origin T2 ramp (Ship B):
+      the item's ``surface_at_days`` window opens before T1 escalation
     - ``"operator"`` — explicit operator add via talker
-    - ``"aspirational"`` — picked from today's routine Aspirational items
     - ``"rollover"`` — pre-populated from yesterday's incomplete (T1/T2 only)
   * **``rollover_from`` is optional.** Present when the curation was
     pre-populated from yesterday's daily file; absent when the curation
@@ -101,9 +121,16 @@ log = structlog.get_logger(__name__)
 # unknown sources are tolerated (a future Ship 5/6 may add new
 # canonical values without breaking the loader) but the load logs an
 # info event so operators can spot drift.
+#
+# Phase 2A Ship B (2026-05-29) added ``"auto-due-routine"`` +
+# ``"auto-surface-routine"`` for routine-origin T1/T2 entries. Ship D
+# SKILL must quote these verbatim — the talker recognises operator
+# replies based on these source-string distinctions.
 T1_T2_SOURCES: frozenset[str] = frozenset({
     "auto-due",
     "auto-escalate",
+    "auto-due-routine",
+    "auto-surface-routine",
     "operator",
     "rollover",
 })
@@ -122,27 +149,64 @@ T3_SOURCES: frozenset[str] = frozenset({
 
 @dataclass
 class T1T2Entry:
-    """One T1 or T2 selection — points at a concrete ``task/`` record.
+    """One T1 or T2 selection — discriminated union over origin.
 
-    ``task`` is the wikilink string (e.g. ``"[[task/Steph Yang ROE]]"``).
-    ``source`` is one of :data:`T1_T2_SOURCES`. ``confirmed`` is T1-only
-    + optional (auto-surfaced T1 starts ``False``; operator confirmation
-    flips to ``True``); for T2 entries it stays ``None`` (operator-add
-    IS the confirmation, no separate flag needed).
+    Phase 2A Ship B (2026-05-29) extended the entry shape to support
+    routine-origin items via a discriminated-union pattern:
+
+      * ``task`` populated, ``routine_item`` None — task-origin entry
+        (the original Tier-V2 Ship 1 shape). ``task`` is the wikilink
+        string (e.g. ``"[[task/Steph Yang ROE]]"``).
+      * ``routine_item`` populated, ``task`` None — routine-origin
+        entry. ``routine_item`` is a dict with keys ``record`` (the
+        routine record name, e.g. ``"Recurring Bills + Admin"``) and
+        ``text`` (the item's text, e.g. ``"Pay Clinic Rental ..."``).
+        The brief render layer reconstructs the
+        ``[[routine/<record>]]`` wikilink + item-text inline.
+
+    ``source`` is one of :data:`T1_T2_SOURCES`. The source string
+    discriminates origin: ``"auto-due"`` / ``"auto-escalate"`` are
+    task-origin; ``"auto-due-routine"`` / ``"auto-surface-routine"``
+    are routine-origin. ``"operator"`` + ``"rollover"`` may be either.
+
+    ``confirmed`` is T1-only + optional (auto-surfaced T1 starts
+    ``False``; operator confirmation via talker flips to ``True``);
+    for T2 entries it stays ``None`` (operator-add IS the confirmation,
+    no separate flag needed).
+
+    Invariant (load-bearing — Ship D SKILL must honour): exactly one
+    of ``task`` / ``routine_item`` is populated. The loader is
+    tolerant of edge cases (both set, neither set) but logs the
+    anomaly; ``to_dict`` always serializes exactly one shape for
+    clean YAML.
     """
 
-    task: str
-    source: str
+    task: str | None = None
+    routine_item: dict[str, Any] | None = None
+    source: str = "operator"
     confirmed: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to the YAML-shaped dict.
 
-        Drops ``confirmed=None`` so T2 entries (which never carry the
-        field) don't emit ``confirmed: null`` in the YAML — keeps the
-        on-disk shape clean.
+        Emits exactly one of ``task`` / ``routine_item`` (drops the
+        absent shape so the YAML stays clean — no ``task: null`` or
+        ``routine_item: null`` clutter). Drops ``confirmed=None`` so
+        T2 entries (which never carry the field) don't emit
+        ``confirmed: null``.
+
+        Precedence (defensive — should not fire in practice): if both
+        ``task`` and ``routine_item`` are set, ``task`` wins. The
+        invariant says exactly one is populated; this fallback
+        preserves operator data on the existing-task case rather
+        than dropping it.
         """
-        out: dict[str, Any] = {"task": self.task, "source": self.source}
+        out: dict[str, Any] = {}
+        if self.task is not None:
+            out["task"] = self.task
+        elif self.routine_item is not None:
+            out["routine_item"] = self.routine_item
+        out["source"] = self.source
         if self.confirmed is not None:
             out["confirmed"] = self.confirmed
         return out
@@ -151,13 +215,36 @@ class T1T2Entry:
     def from_dict(cls, data: dict[str, Any]) -> T1T2Entry:
         """Build from a YAML-loaded dict.
 
+        Discriminated-union parse:
+          * ``task`` present → task-origin entry.
+          * ``routine_item`` dict present → routine-origin entry.
+          * Both absent → empty entry (loader-tolerant; the caller's
+            T1T2-list parser already filters entries missing both
+            shapes via :meth:`DailyCuration._parse_t12_list`).
+
         Schema-tolerance per the CLAUDE.md load-time contract: unknown
         keys are silently ignored so a future Ship that adds a field
         doesn't break the loader.
         """
+        task_raw = data.get("task")
+        routine_item_raw = data.get("routine_item")
+        # Discriminate: prefer task when both are present (matches
+        # to_dict precedence). Most operator hand-edits will set
+        # exactly one.
+        task: str | None = None
+        routine_item: dict[str, Any] | None = None
+        if isinstance(task_raw, str) and task_raw.strip():
+            task = task_raw
+        elif isinstance(routine_item_raw, dict):
+            # Defensive shape validation — require record + text keys.
+            record = routine_item_raw.get("record")
+            text = routine_item_raw.get("text")
+            if isinstance(record, str) and isinstance(text, str):
+                routine_item = {"record": record, "text": text}
         return cls(
-            task=str(data.get("task", "")),
-            source=str(data.get("source", "")),
+            task=task,
+            routine_item=routine_item,
+            source=str(data.get("source", "operator")),
             confirmed=(
                 bool(data["confirmed"]) if "confirmed" in data else None
             ),
@@ -251,7 +338,19 @@ class DailyCuration:
             for entry in raw:
                 if not isinstance(entry, dict):
                     continue
-                if "task" not in entry or "source" not in entry:
+                # Discriminated-union: require source + EITHER task or
+                # routine_item. Entries with neither shape are silently
+                # dropped (operator hand-edit corruption defense).
+                if "source" not in entry:
+                    continue
+                has_task = (
+                    isinstance(entry.get("task"), str)
+                    and entry.get("task").strip()
+                )
+                has_routine_item = isinstance(
+                    entry.get("routine_item"), dict
+                )
+                if not (has_task or has_routine_item):
                     continue
                 out.append(T1T2Entry.from_dict(entry))
             return out

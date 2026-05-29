@@ -47,7 +47,8 @@ import structlog
 from alfred.brief.renderer import serialize_record
 
 from .cadence import CadenceError, is_due
-from .config import RoutineConfig
+from .config import DuePattern, RoutineConfig
+from .due import is_done_in_current_cycle, resolve_due_date
 from .state import RoutineRun, StateManager
 
 log = structlog.get_logger(__name__)
@@ -162,6 +163,111 @@ def _format_tracked_annotation(
     return f"*(last: {days_since} days ago)*"
 
 
+def _format_cycle_aware_annotation(
+    item_text: str,
+    due_pattern: DuePattern,
+    completion_log: dict,
+    today: date,
+) -> str | None:
+    """Compose a cycle-aware annotation for an item with ``due_pattern``.
+
+    Phase 2A Ship B (2026-05-29): items with ``due_pattern`` carry a
+    semantic notion of "cycle" (the period containing the next due
+    date). The gap-based annotation isn't meaningful for these items
+    because their completion windows are tied to the recurrence, not
+    elapsed days since last touch.
+
+    Returns one of:
+      * ``"*(done this cycle)*"`` — operator has completed in the
+        current cycle (e.g. Garbage Day done Wed for Thu pickup).
+      * ``"*(due in Nd)*"`` — not yet done; surfaces the time-to-due
+        signal so the operator can plan ahead even when the item
+        isn't yet inside the tier-surface windows.
+      * ``"*(due today)*"`` / ``"*(due tomorrow)*"`` — surface for
+        0 / 1 days to due (consistent with tier-section phrasing).
+      * ``"*(overdue by Nd)*"`` — a corner case: items WITH
+        ``due_pattern`` but no ``escalate_at_days`` never tier-surface,
+        so they CAN go past due without escalation. The annotation
+        flags it so the operator sees the miss.
+
+        NB: ``resolve_due_date`` always returns the NEXT upcoming
+        due date (today or later); past-due detection compares the
+        most recent completion against the most-recent-passed cycle
+        boundary.
+      * ``None`` — pattern malformed (resolver returned None); caller
+        falls back to the gap-based annotation. This preserves
+        operator visibility when the pattern itself can't resolve.
+    """
+    due = resolve_due_date(due_pattern, today)
+    if due is None:
+        return None
+
+    completion_dates = _parse_log_dates(completion_log.get(item_text, []))
+
+    # Done in current cycle → terminal state for this cycle.
+    if is_done_in_current_cycle(due_pattern, completion_dates, today):
+        return "*(done this cycle)*"
+
+    days_to_due = (due - today).days
+    if days_to_due == 0:
+        return "*(due today)*"
+    if days_to_due == 1:
+        return "*(due tomorrow)*"
+    if days_to_due > 1:
+        return f"*(due in {days_to_due}d)*"
+
+    # days_to_due < 0 — should not normally happen because
+    # resolve_due_date returns the next upcoming due. Defensive
+    # fallback: present as overdue (operator can fix the pattern).
+    return f"*(overdue by {abs(days_to_due)}d)*"
+
+
+def _decide_tier_handoff(
+    due_pattern: DuePattern,
+    surface_at_days: int | None,
+    escalate_at_days: int | None,
+    today: date,
+) -> int | None:
+    """Decide if the item should be handed off to the tier section.
+
+    Returns:
+      * ``1`` — item is in the T1 window (``[0, escalate_at_days]``);
+        tier section will surface it. Aggregator SKIPs the render.
+      * ``2`` — item is in the T2 window
+        (``(escalate_at_days, surface_at_days]``); tier section will
+        surface it. Aggregator SKIPs the render.
+      * ``None`` — item is OUTSIDE both windows OR has no
+        ``escalate_at_days``; the routine section renders it normally
+        (with cycle-aware annotation per Item 4).
+
+    Mirrors the window math in :mod:`alfred.tier.compute`'s
+    ``_compute_auto_routine``. Don't introduce variance here — the
+    two layers must agree exactly on which items hand off vs.
+    render-in-routine-section.
+    """
+    if escalate_at_days is None:
+        return None
+    due = resolve_due_date(due_pattern, today)
+    if due is None:
+        return None
+    days_to_due = (due - today).days
+    if days_to_due < 0:
+        # resolve_due_date always returns >= today; this branch is
+        # defensive only. No tier handoff for overdue items (they
+        # never auto-surfaced and the routine section will flag them
+        # via the cycle-aware annotation).
+        return None
+    if 0 <= days_to_due <= escalate_at_days:
+        return 1
+    if (
+        surface_at_days is not None
+        and surface_at_days > escalate_at_days
+        and escalate_at_days < days_to_due <= surface_at_days
+    ):
+        return 2
+    return None
+
+
 def _collect_items_for_today(
     records: list[tuple[Path, dict, str]],
     today: date,
@@ -239,6 +345,57 @@ def _collect_items_for_today(
                 )
                 priority = "tracked"
 
+            # Phase 2A Ship B (2026-05-29): parse due_pattern + tier
+            # window fields so we can (a) hand off to tier section + skip
+            # rendering here, (b) swap to cycle-aware annotation when the
+            # item has a due_pattern but stays in the routine section.
+            #
+            # Aspirational items are NEVER handed off (operator-stated:
+            # T3 is for self-care intentions, not deadline-driven work).
+            # Defensive: only Critical/Tracked items with due_pattern
+            # qualify for tier handoff.
+            due_pattern = DuePattern.from_dict(raw_item.get("due_pattern"))
+            surface_raw = raw_item.get("surface_at_days")
+            try:
+                surface_at_days = (
+                    int(surface_raw) if surface_raw is not None else None
+                )
+            except (TypeError, ValueError):
+                surface_at_days = None
+            escalate_raw = raw_item.get("escalate_at_days")
+            try:
+                escalate_at_days = (
+                    int(escalate_raw) if escalate_raw is not None else None
+                )
+            except (TypeError, ValueError):
+                escalate_at_days = None
+
+            if (
+                due_pattern is not None
+                and priority != "aspirational"
+            ):
+                handoff_tier = _decide_tier_handoff(
+                    due_pattern, surface_at_days, escalate_at_days, today,
+                )
+                if handoff_tier is not None:
+                    due = resolve_due_date(due_pattern, today)
+                    days_to_due = (
+                        (due - today).days if due is not None else None
+                    )
+                    log.info(
+                        "routine.aggregator.handed_off_to_tier",
+                        item_text=text,
+                        tier=handoff_tier,
+                        days_to_due=days_to_due,
+                        routine_record=name,
+                        detail=(
+                            "routine item with due_pattern surfaces via "
+                            "tier section instead of routine section; "
+                            "dedup skip per Phase 2A Ship B."
+                        ),
+                    )
+                    continue
+
             time_str = ""
             if priority == "critical":
                 raw_time = raw_item.get("time")
@@ -247,14 +404,24 @@ def _collect_items_for_today(
 
             annotation: str | None = None
             if priority == "tracked":
-                gap_raw = raw_item.get("warn_after_gap_days", DEFAULT_TRACKED_GAP_DAYS)
-                try:
-                    gap = int(gap_raw)
-                except (TypeError, ValueError):
-                    gap = DEFAULT_TRACKED_GAP_DAYS
-                annotation = _format_tracked_annotation(
-                    text, completion_log, gap, today,
-                )
+                # Cycle-aware annotation when due_pattern present (Ship B
+                # Item 4); fall back to gap-based annotation when no
+                # pattern OR pattern fails to resolve.
+                if due_pattern is not None:
+                    annotation = _format_cycle_aware_annotation(
+                        text, due_pattern, completion_log, today,
+                    )
+                if annotation is None:
+                    gap_raw = raw_item.get(
+                        "warn_after_gap_days", DEFAULT_TRACKED_GAP_DAYS,
+                    )
+                    try:
+                        gap = int(gap_raw)
+                    except (TypeError, ValueError):
+                        gap = DEFAULT_TRACKED_GAP_DAYS
+                    annotation = _format_tracked_annotation(
+                        text, completion_log, gap, today,
+                    )
 
             items_by_text[text] = {
                 "text": text,
@@ -514,6 +681,8 @@ def run_aggregator_once(
 
 __all__ = [
     "DEFAULT_TRACKED_GAP_DAYS",
+    "_decide_tier_handoff",
+    "_format_cycle_aware_annotation",
     "_load_existing_tier_curation",
     "render_daily_body",
     "run_aggregator_once",

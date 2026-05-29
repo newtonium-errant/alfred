@@ -47,10 +47,18 @@ TODAY = date(2026, 5, 29)
 
 def test_t1_t2_sources_pinned() -> None:
     """Stable contract — Ship 4 SKILL references these verbatim. A
-    change here = update Ship 4 in lockstep."""
+    change here = update Ship 4 in lockstep.
+
+    Phase 2A Ship B (2026-05-29) added ``auto-due-routine`` +
+    ``auto-surface-routine`` for routine-origin T1/T2 entries.
+    Ship D SKILL must quote these verbatim — the talker discriminates
+    operator replies based on the source-string distinction.
+    """
     assert T1_T2_SOURCES == frozenset({
         "auto-due",
         "auto-escalate",
+        "auto-due-routine",
+        "auto-surface-routine",
         "operator",
         "rollover",
     })
@@ -416,3 +424,192 @@ def test_save_tier_curation_emits_saved_log_event(
     assert e["t2_count"] == 1
     assert e["t3_count"] == 1
     assert e["has_rollover"] is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A Ship B — T1T2Entry discriminated-union (routine_item)
+# ---------------------------------------------------------------------------
+#
+# Adds routine-origin entry support to T1T2Entry. The data layer must:
+#   - Round-trip both ``task``-only AND ``routine_item``-only shapes
+#   - Drop the absent shape on ``to_dict`` (clean YAML)
+#   - Tolerate edge cases (loader-defensive)
+#   - Accept the new source enum values via load path
+
+
+def test_t1_t2_entry_round_trip_routine_item_shape() -> None:
+    """Round-trip a routine-origin T1 entry: routine_item dict +
+    source ``auto-due-routine`` + confirmed True.
+
+    Cross-Ship contract: Ship B brief render, Ship D SKILL, and the
+    talker writer all rely on this shape. A drift here breaks the
+    routine-tier integration end-to-end."""
+    e = T1T2Entry(
+        routine_item={
+            "record": "Recurring Bills + Admin",
+            "text": "Pay Clinic Rental to Hussein Rafih",
+        },
+        source="auto-due-routine",
+        confirmed=True,
+    )
+    out = T1T2Entry.from_dict(e.to_dict())
+    assert out == e
+
+
+def test_t1_t2_entry_routine_item_to_dict_drops_task_key() -> None:
+    """``to_dict`` emits exactly ONE shape — drops the absent ``task``
+    key so the YAML stays clean (no ``task: null`` clutter)."""
+    e = T1T2Entry(
+        routine_item={"record": "Bills", "text": "Pay Rent"},
+        source="auto-due-routine",
+        confirmed=False,
+    )
+    d = e.to_dict()
+    assert "task" not in d
+    assert d["routine_item"] == {"record": "Bills", "text": "Pay Rent"}
+    assert d["source"] == "auto-due-routine"
+    assert d["confirmed"] is False
+
+
+def test_t1_t2_entry_task_to_dict_drops_routine_item_key() -> None:
+    """Backward compat: task-origin entry's ``to_dict`` drops the
+    absent ``routine_item`` key."""
+    e = T1T2Entry(task="[[task/Old]]", source="operator")
+    d = e.to_dict()
+    assert "routine_item" not in d
+    assert d == {"task": "[[task/Old]]", "source": "operator"}
+
+
+def test_t1_t2_entry_task_shape_still_works_for_backward_compat() -> None:
+    """Existing Tier-V2 Ship 1 task-shape entries must still round-trip
+    after the Phase 2A Ship B schema extension."""
+    e = T1T2Entry(
+        task="[[task/Steph Yang ROE]]",
+        source="auto-due",
+        confirmed=True,
+    )
+    out = T1T2Entry.from_dict(e.to_dict())
+    assert out == e
+    assert out.task == "[[task/Steph Yang ROE]]"
+    assert out.routine_item is None
+
+
+def test_t1_t2_entry_from_dict_routine_item_missing_record_or_text_drops() -> None:
+    """Defensive: ``routine_item`` dict missing required keys is
+    treated as absent (caller's list-filter drops the whole entry)."""
+    e = T1T2Entry.from_dict({
+        "routine_item": {"record": "Bills"},  # missing 'text'
+        "source": "auto-due-routine",
+    })
+    assert e.routine_item is None
+    # No task either — empty discriminated state.
+    assert e.task is None
+
+
+def test_t1_t2_entry_from_dict_both_shapes_set_task_wins() -> None:
+    """Edge case: if both ``task`` and ``routine_item`` are set, ``task``
+    wins (documented precedence). Defensive against operator hand-edit
+    corruption — preserves the existing task-shape data."""
+    e = T1T2Entry.from_dict({
+        "task": "[[task/X]]",
+        "routine_item": {"record": "R", "text": "T"},
+        "source": "operator",
+    })
+    assert e.task == "[[task/X]]"
+    assert e.routine_item is None
+
+
+def test_daily_curation_list_filter_accepts_routine_item_entry() -> None:
+    """The ``DailyCuration._parse_t12_list`` filter (load-time guard)
+    accepts entries with ``routine_item`` + source — the dispatch
+    contract for Ship D writer paths."""
+    raw = {
+        "t1": [
+            {
+                "routine_item": {"record": "Bills", "text": "Pay Rent"},
+                "source": "auto-due-routine",
+                "confirmed": True,
+            },
+            {
+                "task": "[[task/Mixed]]",
+                "source": "operator",
+            },
+        ],
+        "t2": [],
+        "t3": [],
+    }
+    cur = DailyCuration.from_dict(raw)
+    assert len(cur.t1) == 2
+    # First entry is routine-origin.
+    assert cur.t1[0].routine_item == {"record": "Bills", "text": "Pay Rent"}
+    assert cur.t1[0].source == "auto-due-routine"
+    # Second is task-origin.
+    assert cur.t1[1].task == "[[task/Mixed]]"
+
+
+def test_daily_curation_list_filter_drops_entries_missing_both_shapes() -> None:
+    """Defensive: an entry with neither ``task`` nor ``routine_item``
+    (just ``source``) is silently dropped — operator hand-edit
+    corruption defense."""
+    raw = {
+        "t1": [
+            {"source": "operator"},  # no task, no routine_item → drop
+            {
+                "task": "[[task/Valid]]",
+                "source": "operator",
+            },
+        ],
+        "t2": [],
+        "t3": [],
+    }
+    cur = DailyCuration.from_dict(raw)
+    assert len(cur.t1) == 1
+    assert cur.t1[0].task == "[[task/Valid]]"
+
+
+def test_t1_t2_entry_new_source_enum_values_accepted_by_loader() -> None:
+    """Phase 2A Ship B added ``auto-due-routine`` +
+    ``auto-surface-routine`` source values. The loader is tolerant —
+    unknown sources don't crash; but these specific values must round-
+    trip cleanly since the writer path and SKILL pin them."""
+    for source_value in ("auto-due-routine", "auto-surface-routine"):
+        e = T1T2Entry(
+            routine_item={"record": "Bills", "text": "Pay Rent"},
+            source=source_value,
+        )
+        out = T1T2Entry.from_dict(e.to_dict())
+        assert out.source == source_value
+
+
+def test_daily_curation_round_trip_with_routine_entries() -> None:
+    """Full DailyCuration round-trip including a mix of task + routine
+    T1 entries + T2 routine entry."""
+    cur = DailyCuration(
+        t1=[
+            T1T2Entry(
+                task="[[task/Steph Yang ROE]]",
+                source="auto-due",
+                confirmed=True,
+            ),
+            T1T2Entry(
+                routine_item={
+                    "record": "Weekly Chores",
+                    "text": "Garbage Out",
+                },
+                source="auto-due-routine",
+                confirmed=False,
+            ),
+        ],
+        t2=[
+            T1T2Entry(
+                routine_item={
+                    "record": "Recurring Bills + Admin",
+                    "text": "Pay Clinic Rental ...",
+                },
+                source="auto-surface-routine",
+            ),
+        ],
+        t3=[],
+    )
+    round_tripped = DailyCuration.from_dict(cur.to_dict())
+    assert round_tripped == cur
