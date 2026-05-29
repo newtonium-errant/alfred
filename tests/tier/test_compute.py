@@ -406,3 +406,482 @@ def test_auto_t1_candidate_is_dataclass() -> None:
     assert c.name == "X"
     assert c.due_iso == "2026-05-28"
     assert c.surface_reason == "due today"
+    # Phase 2A Ship A: origin defaults to "task" for backward-compat.
+    assert c.origin == "task"
+    assert c.routine_record is None
+    assert c.item_text is None
+
+
+def test_auto_t1_candidate_routine_origin_fields() -> None:
+    """Phase 2A Ship A: routine-origin candidates carry
+    routine_record + item_text. Pin the discriminated-union shape so
+    Ship B + Ship D drift surfaces here."""
+    c = AutoT1Candidate(
+        path="routine/Recurring Bills + Admin.md",
+        name="Pay Clinic Rental to Hussein Rafih",
+        due_iso="2026-06-01",
+        surface_reason="due today",
+        origin="routine",
+        routine_record="Recurring Bills + Admin",
+        item_text="Pay Clinic Rental to Hussein Rafih",
+    )
+    assert c.origin == "routine"
+    assert c.routine_record == "Recurring Bills + Admin"
+    assert c.item_text == "Pay Clinic Rental to Hussein Rafih"
+
+
+# ===========================================================================
+# Phase 2A Ship A — compute_auto_routine_candidates (T1 window)
+# ===========================================================================
+#
+# Test surface per dispatch:
+#   11. routine item due tomorrow, escalate_at_days=1 → T1 (1 in [0,1])
+#   12. routine item due today, escalate_at_days=0 → T1 (0 in [0,0])
+#   13. routine item done in current cycle → NOT surfaced
+#   14. escalate_at_days absent → NOT surfaced
+# Plus boundary pins (no due_pattern, archived routine, alfred_triage).
+
+
+from alfred.tier.compute import (  # noqa: E402
+    compute_auto_routine_candidates,
+    compute_auto_routine_t2_candidates,
+)
+
+
+def _write_routine(
+    tmp_path: Path, filename: str, fm_yaml: str, body: str = "# body\n",
+) -> Path:
+    """Helper: seed a tmp vault with one routine record at routine/<filename>."""
+    vault = tmp_path / "vault"
+    routine_dir = vault / "routine"
+    routine_dir.mkdir(parents=True, exist_ok=True)
+    (routine_dir / filename).write_text(
+        f"---\n{fm_yaml}---\n\n{body}",
+        encoding="utf-8",
+    )
+    return vault
+
+
+def test_auto_routine_due_tomorrow_with_escalate_at_1_surfaces_t1(
+    tmp_path: Path,
+) -> None:
+    """Garbage Day shape: weekly day=fri, escalate_at_days=1, today
+    Thursday → due tomorrow → T1 'due tomorrow'."""
+    # NOW = 2026-05-28 (Thursday). weekly day=fri → due 2026-05-29.
+    vault = _write_routine(
+        tmp_path,
+        "Weekly Chores.md",
+        "type: routine\nstatus: active\nname: Weekly Chores\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Garbage Out\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: weekly\n"
+        "    day: fri\n"
+        "  escalate_at_days: 1\n",
+    )
+    result = compute_auto_routine_candidates(vault, NOW)
+    assert len(result) == 1
+    c = result[0]
+    assert c.origin == "routine"
+    assert c.routine_record == "Weekly Chores"
+    assert c.item_text == "Garbage Out"
+    assert c.name == "Garbage Out"
+    assert c.due_iso == "2026-05-29"
+    assert c.surface_reason == "due tomorrow"
+    assert c.path == "routine/Weekly Chores.md"
+
+
+def test_auto_routine_due_today_with_escalate_at_0_surfaces_t1(
+    tmp_path: Path,
+) -> None:
+    """Clinic Rental shape: monthly day=28 (= NOW's date 2026-05-28),
+    escalate_at_days=0 → due today → T1 'due today'."""
+    vault = _write_routine(
+        tmp_path,
+        "Recurring Bills.md",
+        "type: routine\nstatus: active\nname: Recurring Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Pay Clinic Rental\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 28\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_candidates(vault, NOW)
+    assert len(result) == 1
+    assert result[0].surface_reason == "due today"
+    assert result[0].due_iso == "2026-05-28"
+
+
+def test_auto_routine_done_in_current_cycle_not_surfaced(
+    tmp_path: Path,
+) -> None:
+    """Item done this cycle → NOT surfaced (operator already
+    completed; should disappear until next cycle's window opens).
+    Today 2026-05-28, monthly day=28 due today, completion log shows
+    completion today → cycle = May → done → skip."""
+    vault = _write_routine(
+        tmp_path,
+        "Recurring Bills.md",
+        "type: routine\nstatus: active\nname: Recurring Bills\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  Pay Clinic Rental:\n"
+        "  - '2026-05-28'\n"
+        "items:\n"
+        "- text: Pay Clinic Rental\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 28\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_routine_escalate_at_days_absent_not_surfaced(
+    tmp_path: Path,
+) -> None:
+    """Walk Fergus shape: no escalate_at_days → never tier-surfaces.
+    The item with due_pattern but no escalate_at_days lives in the
+    routines section only, not the tier section."""
+    vault = _write_routine(
+        tmp_path,
+        "Daily Self-Care.md",
+        "type: routine\nstatus: active\nname: Daily Self-Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Walk Fergus\n"
+        "  priority: tracked\n"
+        "  due_pattern:\n"
+        "    type: weekly\n"
+        "    day: thu\n",
+        # NB: no escalate_at_days field.
+    )
+    result = compute_auto_routine_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_routine_no_due_pattern_not_surfaced(tmp_path: Path) -> None:
+    """Item without ``due_pattern`` → never surfaces (no deadline)."""
+    vault = _write_routine(
+        tmp_path,
+        "Daily Self-Care.md",
+        "type: routine\nstatus: active\nname: Daily Self-Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Brush Teeth\n"
+        "  priority: tracked\n",
+    )
+    result = compute_auto_routine_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_routine_archived_status_excluded(tmp_path: Path) -> None:
+    """Archived routine → all items excluded regardless of windows."""
+    vault = _write_routine(
+        tmp_path,
+        "Old Routine.md",
+        "type: routine\nstatus: archived\nname: Old Routine\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Should Not Surface\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 28\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_routine_alfred_triage_excluded(tmp_path: Path) -> None:
+    """alfred_triage: True on the routine record → defensive skip
+    (mirrors the task-path filter; routines shouldn't be triage-
+    flagged but defense-in-depth)."""
+    vault = _write_routine(
+        tmp_path,
+        "Triaged Routine.md",
+        "type: routine\nstatus: active\nname: Triaged Routine\n"
+        "alfred_triage: true\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Pay Clinic Rental\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 28\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_routine_wrong_type_excluded(tmp_path: Path) -> None:
+    """Defensive: non-routine type under ``routine/`` is skipped."""
+    vault = _write_routine(
+        tmp_path,
+        "Stray.md",
+        "type: note\nname: Stray\n"
+        "items:\n"
+        "- text: Should Not Surface\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 28\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_routine_no_routine_dir_returns_empty(tmp_path: Path) -> None:
+    """No vault/routine/ directory → empty list."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    result = compute_auto_routine_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_routine_no_log_emissions(tmp_path: Path) -> None:
+    """compute_auto_routine_candidates is a pure projection — no
+    log emissions. Per-sweep observability lives at the caller."""
+    vault = _write_routine(
+        tmp_path,
+        "R.md",
+        "type: routine\nstatus: active\nname: R\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: X\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 28\n"
+        "  escalate_at_days: 0\n",
+    )
+    with structlog.testing.capture_logs() as captured:
+        compute_auto_routine_candidates(vault, NOW)
+    # Pure compute → no logs.
+    assert captured == []
+
+
+# ===========================================================================
+# Phase 2A Ship A — compute_auto_routine_t2_candidates (T2 ramp window)
+# ===========================================================================
+#
+# Test surface per dispatch:
+#   15. surface_at_days=5, due in 4 days, escalate_at_days=0 → T2
+#       (4 in (0, 5])
+#   16. (Plan-ratified per dispatch's closing line): T2 window =
+#       (escalate_at_days, surface_at_days]. With escalate=0,
+#       surface=5, days_to_due=1 → in (0, 5] → SURFACED as T2.
+#       The dispatch's bullet text contradicts the formula; trust
+#       the formula since "re-verify during build" was explicit.
+#
+# Plus boundary pins (surface_at_days <= escalate_at_days → no T2,
+# done-in-cycle skip, surface_at_days absent → no T2).
+
+
+def test_auto_routine_t2_surface_4d_with_surface_5_escalate_0(
+    tmp_path: Path,
+) -> None:
+    """Pay Clinic Rental shape: monthly day=1, surface_at_days=5,
+    escalate_at_days=0. Today = 2026-05-28 → due 2026-06-01 →
+    days_to_due=4 → T2 window (0, 5] contains 4 → SURFACE.
+
+    Reason format: 'surface window (4d before due)' — the LIVE
+    days_to_due value, not the surface_at_days outer bound."""
+    vault = _write_routine(
+        tmp_path,
+        "Recurring Bills.md",
+        "type: routine\nstatus: active\nname: Recurring Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Pay Clinic Rental\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 1\n"
+        "  surface_at_days: 5\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_t2_candidates(vault, NOW)
+    assert len(result) == 1
+    c = result[0]
+    assert c.surface_reason == "surface window (4d before due)"
+    assert c.due_iso == "2026-06-01"
+    assert c.origin == "routine"
+    assert c.routine_record == "Recurring Bills"
+    assert c.item_text == "Pay Clinic Rental"
+
+
+def test_auto_routine_t2_at_day_1_surface_5_escalate_0_does_surface(
+    tmp_path: Path,
+) -> None:
+    """Plan-ratified boundary: surface_at_days=5, escalate_at_days=0,
+    days_to_due=1 → (0, 5] contains 1 → SURFACES as T2.
+
+    The dispatch's bullet text said 'NOT surfaced as T2' but the
+    closing-line Plan formula 'T2 window = (escalate_at_days,
+    surface_at_days]' contradicts. Per the dispatch's explicit
+    'Re-verify the boundary semantics during build' directive,
+    trust the formula: days_to_due=1, escalate=0, surface=5 →
+    0 < 1 <= 5 → T2."""
+    # NOW = 2026-05-28. monthly day=29 → due 2026-05-29 → days_to_due=1.
+    vault = _write_routine(
+        tmp_path,
+        "Recurring Bills.md",
+        "type: routine\nstatus: active\nname: Recurring Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Item Due Tomorrow\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 29\n"
+        "  surface_at_days: 5\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_t2_candidates(vault, NOW)
+    assert len(result) == 1
+    assert result[0].surface_reason == "surface window (1d before due)"
+
+
+def test_auto_routine_t2_at_day_5_boundary_inclusive(
+    tmp_path: Path,
+) -> None:
+    """Boundary inclusive: days_to_due=5, surface_at_days=5 → SURFACE
+    (matches the operator's worked example: 27th appears for 1st-due
+    when surface_at_days=5)."""
+    # NOW = 2026-05-28. monthly day=2 → due 2026-06-02 → days_to_due=5.
+    vault = _write_routine(
+        tmp_path,
+        "Bills.md",
+        "type: routine\nstatus: active\nname: Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Due In 5d\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 2\n"
+        "  surface_at_days: 5\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_t2_candidates(vault, NOW)
+    assert len(result) == 1
+    assert result[0].surface_reason == "surface window (5d before due)"
+
+
+def test_auto_routine_t2_at_day_6_outside_window_no_surface(
+    tmp_path: Path,
+) -> None:
+    """Outside window: days_to_due=6, surface_at_days=5 → NO T2."""
+    # NOW = 2026-05-28. monthly day=3 → due 2026-06-03 → days_to_due=6.
+    vault = _write_routine(
+        tmp_path,
+        "Bills.md",
+        "type: routine\nstatus: active\nname: Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Due In 6d\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 3\n"
+        "  surface_at_days: 5\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_t2_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_routine_t2_at_day_0_t1_window_not_t2(tmp_path: Path) -> None:
+    """days_to_due=0 → T1 window, NOT T2 (the strict-above-escalate
+    gate excludes day 0 from T2)."""
+    # NOW = 2026-05-28. monthly day=28 → due 2026-05-28 → days_to_due=0.
+    vault = _write_routine(
+        tmp_path,
+        "Bills.md",
+        "type: routine\nstatus: active\nname: Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Due Today\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 28\n"
+        "  surface_at_days: 5\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_t2_candidates(vault, NOW)
+    assert result == []
+    # The same item DOES surface as T1.
+    t1_result = compute_auto_routine_candidates(vault, NOW)
+    assert len(t1_result) == 1
+    assert t1_result[0].surface_reason == "due today"
+
+
+def test_auto_routine_t2_surface_le_escalate_no_t2_window(
+    tmp_path: Path,
+) -> None:
+    """Garbage Day shape: surface_at_days <= escalate_at_days → T1-only
+    item (no T2 ramp); T2 surface returns empty."""
+    vault = _write_routine(
+        tmp_path,
+        "Weekly Chores.md",
+        "type: routine\nstatus: active\nname: Weekly Chores\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Garbage Out\n"
+        "  due_pattern:\n"
+        "    type: weekly\n"
+        "    day: fri\n"
+        "  surface_at_days: 1\n"  # equal to escalate → no T2
+        "  escalate_at_days: 1\n",
+    )
+    result = compute_auto_routine_t2_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_routine_t2_surface_at_days_absent_no_t2(
+    tmp_path: Path,
+) -> None:
+    """surface_at_days absent → no T2 ramp (item is T1-only)."""
+    vault = _write_routine(
+        tmp_path,
+        "Weekly Chores.md",
+        "type: routine\nstatus: active\nname: Weekly Chores\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Garbage Out\n"
+        "  due_pattern:\n"
+        "    type: weekly\n"
+        "    day: fri\n"
+        "  escalate_at_days: 1\n",
+    )
+    result = compute_auto_routine_t2_candidates(vault, NOW)
+    assert result == []
+
+
+def test_auto_routine_t2_done_in_cycle_not_surfaced(tmp_path: Path) -> None:
+    """Item already completed this cycle → T2 also skips (operator
+    has resolved; should not nag)."""
+    # monthly day=1 due 2026-06-01; days_to_due=4 → would surface T2.
+    # Completion log shows completion 2026-06-01 → cycle = June → done.
+    vault = _write_routine(
+        tmp_path,
+        "Bills.md",
+        "type: routine\nstatus: active\nname: Bills\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  Pay Clinic Rental:\n"
+        "  - '2026-06-01'\n"
+        "items:\n"
+        "- text: Pay Clinic Rental\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 1\n"
+        "  surface_at_days: 5\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_t2_candidates(vault, NOW)
+    assert result == []

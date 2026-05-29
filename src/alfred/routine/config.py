@@ -4,6 +4,49 @@ Mirrors ``brief/config.py`` / ``bit/config.py`` — typed dataclasses,
 ``load_from_unified`` builder, hand-rolled construction (we avoid the
 generic ``_build`` helper to sidestep the ``_DATACLASS_MAP`` collision
 + empty-dict traps per project CLAUDE.md).
+
+Routine record schema (2026-05-29 Phase 2A Ship A):
+
+  * Item dataclass surfaces the item-level fields routine records
+    carry under ``items:`` — text, priority, time, warn_after_gap_days,
+    plus the deadline-bearing extension fields ``due_pattern``,
+    ``surface_at_days``, ``escalate_at_days``.
+
+  * DuePattern dataclass describes the recurrence shape for items
+    that have a recurring deadline (e.g. monthly clinic rent, weekly
+    garbage day). Six pattern types (``weekly``, ``biweekly``,
+    ``monthly``, ``every_n_days``, ``monthly_nth_weekday``,
+    ``weekly_soft``) mirror the cadence dispatcher's vocabulary but
+    operate at the per-ITEM layer (each routine item can have its
+    own deadline; the routine itself fires per its top-level cadence).
+
+These dataclasses do NOT replace the aggregator's existing dict-based
+``raw_items`` parse — the aggregator continues to read items as dicts
+for backward compatibility. The dataclasses are the canonical typed
+surface for tier compute (``compute_auto_routine_candidates`` +
+``compute_auto_routine_t2_candidates``) and Ship B's brief render
+layer.
+
+T1 / T2 window semantics (operator-stated, Plan-ratified):
+
+  * ``escalate_at_days`` absent → item never auto-surfaces in tier
+    (the Walk-Fergus daily-routine shape — no deadline, just
+    surface-by-cadence in the brief's routines section).
+  * ``escalate_at_days`` PRESENT + ``surface_at_days`` absent or
+    ``<= escalate_at_days`` → T1-only window (the Garbage-Day shape:
+    ``escalate_at_days: 1`` means T1 on the day before due).
+  * ``surface_at_days > escalate_at_days`` → T2 ramp + T1 escalation
+    (the Pay-Clinic-Rental shape: ``surface_at_days: 5`` +
+    ``escalate_at_days: 0`` means T2 appears 5 days out, then T1
+    on the due day itself).
+
+  T1 window: ``[0, escalate_at_days]`` (days_to_due in this inclusive range)
+  T2 window: ``(escalate_at_days, surface_at_days]`` (strictly above
+             escalate, inclusive of surface)
+
+  ``escalate_at_days: 0`` is a load-bearing edge case (T1 fires only
+  on the due date itself, e.g. clinic rent on the 1st). T2 in that
+  case covers days 1..surface_at_days inclusive.
 """
 
 from __future__ import annotations
@@ -26,6 +69,186 @@ DEFAULT_TIME = "05:59"
 # normalised form (``_normalize_instance_name`` output) that passes
 # the guard.
 REQUIRED_INSTANCE = "salem"
+
+
+# Canonical due_pattern.type values — Ship D SKILL will quote these
+# verbatim so the talker recognises operator phrasing. A rename here
+# = update SKILL in lockstep. Each value's semantics + required
+# auxiliary fields are documented on DuePattern.from_dict.
+DUE_PATTERN_TYPES: frozenset[str] = frozenset({
+    "weekly",
+    "biweekly",
+    "monthly",
+    "every_n_days",
+    "monthly_nth_weekday",
+    "weekly_soft",
+})
+
+
+@dataclass
+class DuePattern:
+    """Recurring-deadline pattern for a routine item.
+
+    Schema discriminator: ``type`` — one of :data:`DUE_PATTERN_TYPES`.
+    Auxiliary fields per type:
+
+      * ``weekly``           — ``day`` (weekday name, e.g. ``"thu"``)
+      * ``biweekly``         — ``day`` + ``anchor`` (ISO date of a
+                               reference week's matching weekday;
+                               the cycle alternates every 14 days)
+      * ``monthly``          — ``day`` (1-31 or ``"last"``)
+      * ``every_n_days``     — ``n`` (positive int) + ``anchor``
+                               (ISO date the cycle counts from)
+      * ``monthly_nth_weekday`` — ``n`` (1, 2, 3, 4 or -1 for "last")
+                               + ``weekday`` (weekday name)
+      * ``weekly_soft``      — no auxiliary fields needed; the
+                               "due" date is the end of the current
+                               ISO week (Sunday)
+
+    All auxiliary fields default to ``None``; per-type validation
+    happens in :mod:`alfred.routine.due` where the pattern is
+    resolved to a concrete next-due date.
+
+    ``soft`` is a duplicate signal to ``type == "weekly_soft"`` —
+    pre-Phase-2A operator YAML may carry ``soft: true`` as an
+    annotation on ``type: weekly``. Treated as equivalent at
+    resolution time; new YAML should prefer ``type: weekly_soft``.
+    """
+
+    type: str
+    day: str | int | None = None
+    anchor: str | None = None
+    n: int | None = None
+    weekday: str | None = None
+    soft: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Any) -> DuePattern | None:
+        """Parse a YAML-loaded dict into a DuePattern.
+
+        Returns ``None`` when:
+          * ``data`` is not a dict (defensive against operator
+            hand-edit corruption — e.g. ``due_pattern: weekly``
+            instead of ``due_pattern: {type: weekly, day: thu}``).
+          * ``type`` is missing or not in :data:`DUE_PATTERN_TYPES`.
+
+        Per the schema-tolerance contract (CLAUDE.md load() rule):
+        unknown auxiliary fields are silently dropped. Tested at
+        the dataclass-construction boundary so a future schema
+        addition (e.g. ``year`` for annual deadlines) doesn't
+        break existing operator YAML.
+        """
+        if not isinstance(data, dict):
+            return None
+        type_raw = data.get("type")
+        if not isinstance(type_raw, str) or type_raw not in DUE_PATTERN_TYPES:
+            return None
+        # ``day`` may be a string (weekday name, "last") OR int 1-31.
+        day = data.get("day")
+        anchor = data.get("anchor")
+        n = data.get("n")
+        weekday = data.get("weekday")
+        soft_raw = data.get("soft")
+        return cls(
+            type=type_raw,
+            day=day if isinstance(day, (str, int)) else None,
+            anchor=str(anchor) if anchor is not None else None,
+            n=int(n) if isinstance(n, int) else None,
+            weekday=str(weekday) if isinstance(weekday, str) else None,
+            soft=bool(soft_raw) if soft_raw is not None else False,
+        )
+
+
+@dataclass
+class Item:
+    """One routine item — the per-list-entry shape carried under
+    ``items:`` in a routine record's frontmatter.
+
+    Existing fields (Phase 1):
+      * ``text`` — operator-facing line (e.g. ``"Walk Fergus"``)
+      * ``priority`` — ``"critical"`` / ``"tracked"`` / ``"aspirational"``
+      * ``time`` — optional HH:MM string for critical items
+      * ``warn_after_gap_days`` — tracked-item gap threshold
+
+    Phase 2A extension (deadline-bearing items):
+      * ``due_pattern`` — recurring-deadline shape (see :class:`DuePattern`)
+      * ``surface_at_days`` — T2 ramp threshold (days before due when
+        the item starts surfacing as a T2 candidate)
+      * ``escalate_at_days`` — T1 escalation threshold (days before
+        due when the item moves to T1)
+
+    See module docstring for the T1/T2 window math + the three
+    operator-stated semantics combinations.
+    """
+
+    text: str
+    priority: str
+    time: str | None = None
+    warn_after_gap_days: int | None = None
+    due_pattern: DuePattern | None = None
+    surface_at_days: int | None = None
+    escalate_at_days: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Item | None:
+        """Parse a YAML-loaded dict into an Item.
+
+        Returns ``None`` when:
+          * ``data`` is not a dict.
+          * ``text`` is missing or empty (an item without text
+            can't be rendered or completion-tracked).
+
+        Per the schema-tolerance contract: unknown frontmatter fields
+        are silently dropped. ``priority`` defaults to ``"tracked"``
+        when absent (matches the aggregator's existing fallback at
+        ``raw_item.get("priority") or "tracked"``).
+
+        ``due_pattern`` parses defensively — a malformed pattern
+        becomes ``None`` rather than raising, so a single bad item
+        doesn't taint the whole routine record's parse. Per
+        ``feedback_intentionally_left_blank.md`` the consumer
+        emits a structured log on the drop.
+        """
+        if not isinstance(data, dict):
+            return None
+        text = data.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        priority = str(data.get("priority") or "tracked").lower()
+        time_raw = data.get("time")
+        time = (
+            str(time_raw).strip() if isinstance(time_raw, str) and time_raw.strip()
+            else None
+        )
+        warn_raw = data.get("warn_after_gap_days")
+        try:
+            warn = int(warn_raw) if warn_raw is not None else None
+        except (TypeError, ValueError):
+            warn = None
+        due_pattern = DuePattern.from_dict(data.get("due_pattern"))
+        surface_raw = data.get("surface_at_days")
+        try:
+            surface_at_days = (
+                int(surface_raw) if surface_raw is not None else None
+            )
+        except (TypeError, ValueError):
+            surface_at_days = None
+        escalate_raw = data.get("escalate_at_days")
+        try:
+            escalate_at_days = (
+                int(escalate_raw) if escalate_raw is not None else None
+            )
+        except (TypeError, ValueError):
+            escalate_at_days = None
+        return cls(
+            text=text.strip(),
+            priority=priority,
+            time=time,
+            warn_after_gap_days=warn,
+            due_pattern=due_pattern,
+            surface_at_days=surface_at_days,
+            escalate_at_days=escalate_at_days,
+        )
 
 
 @dataclass
@@ -123,11 +346,14 @@ def load_from_unified(raw: dict[str, Any]) -> RoutineConfig:
 
 
 __all__ = [
-    "RoutineConfig",
-    "OutputConfig",
-    "StateConfig",
     "DEFAULT_TIME",
     "DEFAULT_TIMEZONE",
+    "DUE_PATTERN_TYPES",
+    "DuePattern",
+    "Item",
+    "OutputConfig",
     "REQUIRED_INSTANCE",
+    "RoutineConfig",
+    "StateConfig",
     "load_from_unified",
 ]

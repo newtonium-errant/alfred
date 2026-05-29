@@ -1,4 +1,4 @@
-"""Tier computation — pure projection over task frontmatter (V2).
+"""Tier computation — pure projection over task + routine frontmatter (V2).
 
 Tier-V2 reframes tier as a **daily curation ritual** stored in
 ``vault/daily/<date>.md`` rather than persistent per-task attributes.
@@ -6,13 +6,26 @@ See :mod:`alfred.tier.daily_curation` for the data layer + Ship 2's
 ``alfred.brief.tier_section`` for the render that consumes both this
 auto-T1 surface and the operator-curated shortlists.
 
-The only compute primitive V2 needs is **auto-T1 candidate discovery**:
-"which open tasks should be presented as T1 candidates this morning?"
-The brief renderer reads this list, marks them as T1 auto-candidates,
-and the operator confirms-or-drops via talker.
+Compute primitives for V2 (three auto-surfaces):
 
-Auto-surface criteria (in priority order — short-circuits on first
-match):
+  * :func:`compute_auto_t1_candidates` — open ``task/*.md`` records
+    whose ``due`` is today/tomorrow OR inside the
+    ``escalate_at_days`` window.
+  * :func:`compute_auto_routine_candidates` (Phase 2A Ship A,
+    2026-05-29) — items inside ``routine/*.md`` records whose
+    ``due_pattern`` resolves to a date inside the T1 window
+    ``[0, escalate_at_days]``. The Pay-Clinic-Rental shape:
+    ``surface_at_days: 5`` + ``escalate_at_days: 0`` puts the
+    item in T2 on the 27th through 31st, then T1 on the 1st.
+  * :func:`compute_auto_routine_t2_candidates` (Ship A) — same scan,
+    but the T2 window ``(escalate_at_days, surface_at_days]``.
+
+The brief renderer (Ship B) reads all three and merges them with
+operator-curated shortlists; the operator confirms-or-drops via
+talker (Ship D SKILL).
+
+Auto-surface criteria for tasks (in priority order —
+short-circuits on first match):
 
   * ``due`` is today → reason ``"due today"``
   * ``due`` is tomorrow → reason ``"due tomorrow"``
@@ -24,6 +37,27 @@ Defensive filters: parse failures, non-task ``type:``, closed
 ``status:``, ``alfred_triage: True`` (janitor-generated records that
 go to the Daily Sync Triage Queue, not the tier section).
 
+Auto-surface criteria for routine items (Phase 2A Ship A):
+
+  * Item has ``due_pattern`` (recurring deadline) AND
+    ``escalate_at_days`` set (absent ``escalate_at_days`` means the
+    item is daily-routine surface only — Walk Fergus shape, never
+    auto-tiered).
+  * ``resolve_due_date(pattern, today)`` succeeds.
+  * The item is NOT done in the current cycle (per
+    :func:`alfred.routine.due.is_done_in_current_cycle`).
+
+  T1 window: ``[0, escalate_at_days]`` (days_to_due in inclusive range)
+  T2 window: ``(escalate_at_days, surface_at_days]`` (strictly above
+             escalate, inclusive of surface) — only fires when
+             ``surface_at_days > escalate_at_days``.
+
+  Reason strings for routine items:
+    * ``"due today"`` (days_to_due == 0)
+    * ``"due tomorrow"`` (days_to_due == 1)
+    * ``"escalate window (Nd before due)"`` (T1, days > 1)
+    * ``"surface window (Nd before due)"`` (T2 candidate)
+
 V1 retired (2026-05-29 Ship 3). The per-task ``base_tier`` /
 ``escalate_to`` / priority-fallback projection through the prior
 ``compute_effective_tier`` function is gone, along with the
@@ -34,10 +68,11 @@ constant. The 24 existing ``base_tier`` records remain on disk
 operator curates them daily or runs the backfill).
 
 Reason strings (``"due today"`` / ``"due tomorrow"`` / ``"escalate
-window (Nd before due)"``) are stable contract surface for Ship 2's
-brief render + Ship 4's SKILL (SKILL quotes the strings verbatim so
-the talker recognises operator replies). Change the strings here =
-update Ship 2 + Ship 4 in lockstep.
+window (Nd before due)"`` / ``"surface window (Nd before due)"``) are
+stable contract surface for Ship 2's brief render + Ship D's SKILL
+(SKILL quotes the strings verbatim so the talker recognises operator
+replies). Change the strings here = update Ship B + Ship D in
+lockstep.
 """
 
 from __future__ import annotations
@@ -91,29 +126,62 @@ def coerce_due_date(value: Any) -> date | None:
 
 @dataclass
 class AutoT1Candidate:
-    """One task that auto-surfaces as a T1 candidate this morning.
+    """One auto-surfaced T1 (or T2 ramp) candidate this morning.
 
-    ``path`` is the vault-relative path (e.g. ``"task/RRTS Payroll.md"``)
-    — Ship 2's brief uses this to construct the wikilink. ``name`` is
-    the operator-facing display string (from frontmatter ``name`` or
-    file stem). ``due_iso`` is the task's deadline as an ISO date
-    string (always present — a candidate without a due date wouldn't
-    have triggered the auto-surface). ``surface_reason`` is the
-    canonical reason string Ship 2 renders inline:
+    ``path`` is the vault-relative path — Ship 2's brief uses this
+    to construct the wikilink. For tasks: ``"task/RRTS Payroll.md"``;
+    for routine items: ``"routine/Recurring Bills + Admin.md"``
+    (the routine record itself; the item is identified by the
+    ``item_text`` field).
+
+    ``name`` is the operator-facing display string. For tasks: the
+    task record's ``name`` (or file stem). For routine items: the
+    item's ``text`` field (e.g. ``"Pay Clinic Rental ..."``).
+
+    ``due_iso`` is the deadline as an ISO date string (always present
+    — a candidate without a resolvable due date wouldn't have
+    triggered the auto-surface).
+
+    ``surface_reason`` is the canonical reason string Ship 2 renders
+    inline:
 
       * ``"due today"``
       * ``"due tomorrow"``
       * ``"escalate window (Nd before due)"`` — N is the
         ``escalate_at_days`` value (e.g. ``"escalate window (3d
         before due)"`` for a task with ``escalate_at_days: 3``).
+      * ``"surface window (Nd before due)"`` — Phase 2A Ship A T2
+        ramp. N is the days-to-due when the item entered the T2
+        window (NOT the ``surface_at_days`` value — the latter is
+        the window's outer bound, the former is "how close are we
+        right now").
+
+    Phase 2A Ship A discriminated-union fields:
+
+      * ``origin`` — ``"task"`` (default, backward-compatible) or
+        ``"routine"``. Ship B's brief uses this to pick the right
+        wikilink + item-text rendering path.
+      * ``routine_record`` — populated only when ``origin == "routine"``;
+        the routine record's name (e.g. ``"Recurring Bills + Admin"``).
+        Allows the brief to render ``[[routine/<record>]]`` and the
+        item text together.
+      * ``item_text`` — populated only when ``origin == "routine"``;
+        the item's ``text`` field. The brief renders this as the
+        operator-facing line item (the routine record name + item
+        text together identify a specific completion target).
 
     Reason strings are stable contract per the module docstring.
+    Ship B + Ship D both depend on these field names — rename here
+    = update both in lockstep.
     """
 
     path: str
     name: str
     due_iso: str
     surface_reason: str
+    origin: str = "task"
+    routine_record: str | None = None
+    item_text: str | None = None
 
 
 def compute_auto_t1_candidates(
@@ -229,9 +297,275 @@ def compute_auto_t1_candidates(
     return candidates
 
 
+# ---------------------------------------------------------------------------
+# Phase 2A Ship A — auto-surface for routine items with due_pattern
+# ---------------------------------------------------------------------------
+#
+# Routine items can carry a recurring deadline via ``due_pattern`` +
+# ``escalate_at_days`` + (optionally) ``surface_at_days``. The two
+# functions below scan ``vault/routine/*.md``, iterate each record's
+# items, resolve the next due date via :func:`alfred.routine.due.
+# resolve_due_date`, and emit AutoT1Candidates for items inside the
+# respective T1 or T2 window.
+#
+# Window math (operator-stated, Plan-ratified):
+#   T1 window: ``[0, escalate_at_days]`` (inclusive)
+#   T2 window: ``(escalate_at_days, surface_at_days]`` (strict-above
+#              escalate, inclusive of surface) — only when
+#              ``surface_at_days > escalate_at_days``.
+#
+# The Pay-Clinic-Rental shape (surface_at_days=5, escalate_at_days=0,
+# monthly day=1) yields:
+#   * days_to_due = 0  → T1 ("due today")
+#   * days_to_due 1..5 → T2 ("surface window (Nd before due)")
+#   * days_to_due > 5  → no surface
+#
+# The Garbage-Day shape (escalate_at_days=1, weekly day=thu) yields:
+#   * days_to_due = 0 (Thu) → T1 ("due today")
+#   * days_to_due = 1 (Wed) → T1 ("due tomorrow")
+#   * days_to_due > 1       → no surface (no T2 ramp configured)
+#
+# Items with no ``escalate_at_days`` (Walk Fergus, daily-routine
+# items) NEVER auto-surface in tier; they live in the routines
+# section of the brief.
+
+
+def compute_auto_routine_candidates(
+    vault_path: Path, now: datetime,
+) -> list[AutoT1Candidate]:
+    """Walk ``vault/routine/*.md`` and return routine items
+    auto-surfacing in the T1 window.
+
+    Filter logic (in this exact order — short-circuits on first
+    rejection per item):
+
+      1. Frontmatter parse failure → skip the whole record silently.
+      2. ``type != "routine"`` → skip (defensive against stray files).
+      3. ``status`` archived → skip the whole record (the routine is
+         retired; items don't surface).
+      4. ``alfred_triage is True`` on the routine record → skip
+         (defense-in-depth — routines shouldn't be triage-flagged
+         in practice, but mirror the task-path defensive filter).
+      5. For each item in ``items``:
+         a. Item missing ``due_pattern`` → skip (not deadline-bearing).
+         b. Item missing ``escalate_at_days`` → skip (Walk-Fergus
+            shape: surface-by-cadence in routines section, never
+            auto-tier).
+         c. ``resolve_due_date`` returns None → skip (malformed
+            pattern; log already emitted by resolver).
+         d. ``days_to_due`` not in T1 window ``[0,
+            escalate_at_days]`` → skip.
+         e. ``is_done_in_current_cycle`` → skip (operator has
+            already completed this cycle's instance).
+
+    Returns AutoT1Candidates with ``origin="routine"``,
+    ``routine_record`` + ``item_text`` populated, ``path`` set to
+    the routine record's vault-relative path.
+
+    Sorted by ``due_iso`` ascending then ``name`` (item text)
+    case-insensitive — deterministic order for Ship B's brief
+    render.
+
+    Per ``feedback_intentionally_left_blank``: pure-compute path,
+    no log emissions. Callers (Ship B brief render) emit the
+    "ran, here's the count" log.
+    """
+    return _compute_auto_routine(vault_path, now, window="t1")
+
+
+def compute_auto_routine_t2_candidates(
+    vault_path: Path, now: datetime,
+) -> list[AutoT1Candidate]:
+    """Walk ``vault/routine/*.md`` and return routine items
+    auto-surfacing in the T2 ramp window.
+
+    Same filter logic as :func:`compute_auto_routine_candidates`,
+    but the window check is:
+
+      ``escalate_at_days < days_to_due <= surface_at_days``
+
+    AND the item must satisfy ``surface_at_days > escalate_at_days``
+    (otherwise it's a T1-only item per ratified semantics).
+
+    Reason string: ``"surface window (Nd before due)"`` where N is
+    the current ``days_to_due`` value (NOT ``surface_at_days``).
+    The brief renders this so the operator sees how close the
+    deadline is right now, not the window's outer bound.
+
+    Returns AutoT1Candidates with the same shape as
+    :func:`compute_auto_routine_candidates`. The discriminator is
+    ``surface_reason`` (``"surface window ..."`` vs
+    ``"escalate window ..."`` / ``"due today"`` / ``"due tomorrow"``).
+    """
+    return _compute_auto_routine(vault_path, now, window="t2")
+
+
+def _compute_auto_routine(
+    vault_path: Path, now: datetime, *, window: str,
+) -> list[AutoT1Candidate]:
+    """Shared scan + filter for T1 / T2 routine surfaces.
+
+    ``window`` is ``"t1"`` or ``"t2"`` — selects the days-to-due
+    window check + reason-string format.
+
+    Implementation note: split into a private helper rather than
+    inlining in each public function so the routine-record scan +
+    item filter + completion-cycle check stay in one place. Tests
+    invoke the public functions; future ships that need a new
+    surface (e.g. "next-week preview") would add a third public
+    function reusing the same scan.
+    """
+    import frontmatter  # type: ignore[import-untyped]
+
+    # Lazy imports — avoid the top-level circular hazard between
+    # ``alfred.tier.compute`` and ``alfred.routine.due`` / config.
+    # Both modules import from alfred.tier.compute (via cadence
+    # symbol re-use) on the routine side; the lazy import here
+    # keeps the tier-compute load order clean.
+    from alfred.routine.config import Item
+    from alfred.routine.due import (
+        is_done_in_current_cycle,
+        resolve_due_date,
+    )
+
+    routine_dir = vault_path / "routine"
+    if not routine_dir.is_dir():
+        return []
+
+    today_local = now.date()
+
+    candidates: list[AutoT1Candidate] = []
+    for record_path in sorted(routine_dir.glob("*.md")):
+        try:
+            post = frontmatter.load(str(record_path))
+        except Exception:  # noqa: BLE001
+            continue
+        fm = dict(post.metadata or {})
+        if fm.get("type") != "routine":
+            continue
+        # Status filter — archived routines don't surface. Other
+        # statuses (active, or unset which defaults to active) are
+        # in-scope.
+        status = str(fm.get("status") or "active").lower()
+        if status == "archived":
+            continue
+        if fm.get("alfred_triage") is True:
+            continue
+        record_name = str(fm.get("name") or record_path.stem)
+        raw_items = fm.get("items") or []
+        if not isinstance(raw_items, list):
+            continue
+
+        # Completion log: dict mapping item text → list of date
+        # values (operator's hand-edits sometimes use ISO strings;
+        # the parser normalises both).
+        completion_log = fm.get("completion_log") or {}
+        if not isinstance(completion_log, dict):
+            completion_log = {}
+
+        rel_path = f"routine/{record_path.name}"
+
+        for raw_item in raw_items:
+            item = Item.from_dict(raw_item)
+            if item is None:
+                continue
+            if item.due_pattern is None:
+                continue
+            if item.escalate_at_days is None:
+                continue
+            due = resolve_due_date(item.due_pattern, today_local)
+            if due is None:
+                continue
+            days_to_due = (due - today_local).days
+            # Past-due is out-of-scope for the auto-surface — the
+            # operator's already missed the deadline and the next
+            # cycle's window is what should surface. resolve_due_date
+            # always returns >= today so days_to_due >= 0 always.
+
+            reason: str | None = None
+            if window == "t1":
+                if 0 <= days_to_due <= item.escalate_at_days:
+                    if days_to_due == 0:
+                        reason = "due today"
+                    elif days_to_due == 1:
+                        reason = "due tomorrow"
+                    else:
+                        reason = (
+                            f"escalate window "
+                            f"({item.escalate_at_days}d before due)"
+                        )
+            else:  # window == "t2"
+                surface = item.surface_at_days
+                if (
+                    surface is not None
+                    and surface > item.escalate_at_days
+                    and item.escalate_at_days < days_to_due <= surface
+                ):
+                    reason = f"surface window ({days_to_due}d before due)"
+
+            if reason is None:
+                continue
+
+            # Skip items already completed in the current cycle.
+            # Resolving completion dates from the routine's
+            # completion_log map; only checked when we have a
+            # candidate to filter (otherwise wasted work).
+            completion_dates = _parse_item_completion_dates(
+                completion_log.get(item.text, [])
+            )
+            if is_done_in_current_cycle(
+                item.due_pattern, completion_dates, today_local,
+            ):
+                continue
+
+            candidates.append(AutoT1Candidate(
+                path=rel_path,
+                name=item.text,
+                due_iso=due.isoformat(),
+                surface_reason=reason,
+                origin="routine",
+                routine_record=record_name,
+                item_text=item.text,
+            ))
+
+    candidates.sort(key=lambda c: (c.due_iso, c.name.lower()))
+    return candidates
+
+
+def _parse_item_completion_dates(raw: Any) -> list[date]:
+    """Parse a completion_log entry value into a list of dates.
+
+    Operator YAML carries completion_log values as ISO strings OR
+    date objects depending on whether PyYAML's date parser fired.
+    Both forms accepted. Malformed entries silently dropped (the
+    cycle check just sees a shorter list).
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[date] = []
+    for v in raw:
+        if isinstance(v, datetime):
+            out.append(v.date())
+            continue
+        if isinstance(v, date):
+            out.append(v)
+            continue
+        if isinstance(v, str):
+            try:
+                out.append(date.fromisoformat(v.strip()[:10]))
+                continue
+            except ValueError:
+                pass
+        # Silently skip — defensive against operator hand-edit
+        # corruption.
+    return out
+
+
 __all__ = [
     "AutoT1Candidate",
     "OPEN_STATUSES",
     "coerce_due_date",
+    "compute_auto_routine_candidates",
+    "compute_auto_routine_t2_candidates",
     "compute_auto_t1_candidates",
 ]

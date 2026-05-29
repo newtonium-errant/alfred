@@ -27,6 +27,8 @@ from .compute import (
     OPEN_STATUSES,
     AutoT1Candidate,
     coerce_due_date,
+    compute_auto_routine_candidates,
+    compute_auto_routine_t2_candidates,
     compute_auto_t1_candidates,
 )
 from .daily_curation import (
@@ -48,6 +50,8 @@ __all__ = [
     "T3Entry",
     "T3_SOURCES",
     "coerce_due_date",
+    "compute_auto_routine_candidates",
+    "compute_auto_routine_t2_candidates",
     "compute_auto_t1_candidates",
     "load_daily_curation",
     "save_tier_curation",
