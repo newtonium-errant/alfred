@@ -16,18 +16,38 @@ from .compute import (
     DEFAULT_ESCALATION_GAP,
     OPEN_STATUSES,
     PRIORITY_TO_BASE_TIER,
+    AutoT1Candidate,
     TierResult,
     coerce_due_date,
+    compute_auto_t1_candidates,
     compute_effective_tier,
     derive_base_tier_from_priority,
 )
+from .daily_curation import (
+    DailyCuration,
+    T1T2Entry,
+    T1_T2_SOURCES,
+    T3Entry,
+    T3_SOURCES,
+    load_daily_curation,
+    save_tier_curation,
+)
 
 __all__ = [
+    "AutoT1Candidate",
     "DEFAULT_ESCALATION_GAP",
+    "DailyCuration",
     "OPEN_STATUSES",
     "PRIORITY_TO_BASE_TIER",
+    "T1T2Entry",
+    "T1_T2_SOURCES",
+    "T3Entry",
+    "T3_SOURCES",
     "TierResult",
     "coerce_due_date",
+    "compute_auto_t1_candidates",
     "compute_effective_tier",
     "derive_base_tier_from_priority",
+    "load_daily_curation",
+    "save_tier_curation",
 ]

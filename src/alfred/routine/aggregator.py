@@ -343,6 +343,66 @@ def render_daily_body(
     return "\n".join(sections)
 
 
+def _load_existing_tier_curation(file_path: Path) -> dict | None:
+    """Preserve any pre-existing ``tier_curation`` block when re-writing
+    the daily file.
+
+    Added 2026-05-29 (Tier-V2 Ship 1) to close a race: the talker may
+    pre-edit ``vault/daily/<date>.md`` with curation BEFORE the routine
+    aggregator's 05:59 fire. The aggregator's pre-V2 write path would
+    silently overwrite the curation. Now the aggregator does
+    read-preserve-write — the curation survives.
+
+    Read-side only: returns the parsed block as a dict or ``None`` when
+    absent/malformed. The write path calls this once, merges into the
+    new frontmatter dict, and only the routine aggregator's own keys
+    (``type``, ``date``, ``routines_contributing``, ``critical_pending``)
+    are owned by the aggregator. Tier curation is owned by Ship 2/4 +
+    :mod:`alfred.tier.daily_curation` — this helper just preserves it.
+
+    Race tolerance:
+      * File doesn't exist → return None (first-run; no curation to
+        preserve).
+      * File exists but parse fails → return None (corrupt file; the
+        aggregator's overwrite is the recovery path). Logged at warning.
+      * File exists, parses, no ``tier_curation`` key → return None
+        (clean aggregator-only state). NOT a defect.
+      * File exists, parses, ``tier_curation`` is not a dict → return
+        None (defensive against operator hand-edit corruption).
+        Logged at warning so the operator sees the drop.
+      * File exists, parses, ``tier_curation`` is a dict → return the
+        dict verbatim. The aggregator caller merges into its
+        frontmatter dict before writing.
+    """
+    if not file_path.exists():
+        return None
+    try:
+        post = frontmatter.load(str(file_path))
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "routine.aggregator.tier_curation_load_failed",
+            path=str(file_path),
+            error=str(exc),
+        )
+        return None
+    raw = post.metadata.get("tier_curation") if post.metadata else None
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        log.warning(
+            "routine.aggregator.tier_curation_wrong_type",
+            path=str(file_path),
+            actual_type=type(raw).__name__,
+            detail=(
+                "``tier_curation`` frontmatter key is not a dict — "
+                "treating as absent. Operator hand-edit may have "
+                "corrupted the block."
+            ),
+        )
+        return None
+    return raw
+
+
 def run_aggregator_once(
     config: RoutineConfig,
     today: date,
@@ -353,6 +413,14 @@ def run_aggregator_once(
 
     ``state_mgr`` is optional — when provided, the run is recorded in
     state. Callers that just want to render (e.g. tests) may pass None.
+
+    Read-preserve-write contract (added 2026-05-29 Tier-V2 Ship 1):
+    if a pre-existing ``vault/daily/<date>.md`` carries a
+    ``tier_curation`` frontmatter block (talker pre-edit before the
+    aggregator's morning fire), the block is preserved verbatim in
+    the new write. The aggregator's own keys (``type``, ``date``,
+    ``routines_contributing``, ``critical_pending``) + the body
+    content are recomputed from scratch each fire.
     """
     vault_path = Path(config.vault_path)
     iso = today.isoformat()
@@ -379,20 +447,43 @@ def run_aggregator_once(
             scanned=len(records),
         )
 
+    # Resolve the output path BEFORE rendering so the
+    # read-preserve-write of any pre-existing tier_curation can pick
+    # up the file (the same path the write step lands at).
+    name = config.output.name_template.replace("{date}", iso)
+    rel_path = f"{config.output.directory}/{name}.md"
+    file_path = vault_path / rel_path
+
+    # Preserve any pre-existing tier_curation block. Talker may have
+    # pre-edited the daily file before the 05:59 aggregator fire; or
+    # the operator may have run ``alfred routine`` manually mid-day
+    # to refresh the aggregator side without touching the curation.
+    preserved_curation = _load_existing_tier_curation(file_path)
+
     body = render_daily_body(items, no_routines_overall)
-    fm = {
+    fm: dict[str, Any] = {
         "type": "daily",
         "date": iso,
         "routines_contributing": contributing,
         "critical_pending": critical_pending,
     }
+    if preserved_curation is not None:
+        fm["tier_curation"] = preserved_curation
+        log.info(
+            "routine.aggregator.preserved_tier_curation",
+            path=rel_path,
+            date=iso,
+            detail=(
+                "pre-existing ``tier_curation`` block preserved in the "
+                "aggregator's write. Talker pre-edit OR mid-day "
+                "operator refresh likely cause; either way the curation "
+                "stays intact."
+            ),
+        )
     content = serialize_record(fm, body)
 
     # Write the file (overwrite on stale-tolerated re-runs; the daemon
     # only fires once per day, but CLI re-runs may stomp).
-    name = config.output.name_template.replace("{date}", iso)
-    rel_path = f"{config.output.directory}/{name}.md"
-    file_path = vault_path / rel_path
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(content, encoding="utf-8")
 
@@ -423,6 +514,7 @@ def run_aggregator_once(
 
 __all__ = [
     "DEFAULT_TRACKED_GAP_DAYS",
+    "_load_existing_tier_curation",
     "render_daily_body",
     "run_aggregator_once",
 ]

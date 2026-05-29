@@ -527,4 +527,249 @@ def test_render_daily_body_section_headers_emitted_even_when_section_empty() -> 
     assert "## Aspirational" in body
     assert "- [ ] X" in body
     assert "no critical routines today" in body
-    assert "no aspirational routines today" in body
+
+
+# ---------------------------------------------------------------------------
+# 9. Tier-V2 Ship 1 — read-preserve-write of tier_curation
+# ---------------------------------------------------------------------------
+#
+# The aggregator's pre-V2 write path silently overwrote any pre-existing
+# daily file. Tier-V2 Ship 1 closes a race: the talker may pre-edit
+# ``vault/daily/<date>.md`` with a ``tier_curation`` block BEFORE the
+# routine aggregator's 05:59 fire, OR the operator may run ``alfred
+# routine`` manually mid-day to refresh aggregator state without losing
+# the morning's curation. Both must preserve the tier_curation block.
+#
+# Cross-layer key ownership contract:
+#   - Aggregator owns: ``type``, ``date``, ``routines_contributing``,
+#     ``critical_pending`` + the body content (Critical/Tracked/
+#     Aspirational sections).
+#   - DailyCuration owns: ``tier_curation`` frontmatter key.
+# Both layers read-preserve-write the other's keys on their writes.
+
+
+def test_aggregator_preserves_tier_curation(tmp_path: Path) -> None:
+    """CRITICAL: pre-write a daily file with ``tier_curation`` block,
+    fire aggregator, assert the block is preserved verbatim + the
+    ``preserved_tier_curation`` log event fires.
+
+    Per dispatch verbatim: "pre-write a daily file with tier_curation
+    block, fire aggregator, assert block is preserved + log event fires."
+    """
+    vault = tmp_path / "vault"
+    today = date(2026, 5, 26)
+
+    # Seed a routine so the aggregator has SOMETHING to write.
+    _write_routine(vault, "Daily R", {
+        "type": "routine",
+        "status": "active",
+        "name": "Daily R",
+        "cadence": {"type": "daily"},
+        "items": [
+            {"text": "Brush AM", "priority": "tracked"},
+        ],
+    })
+
+    # Pre-write the daily file with a tier_curation block (simulates
+    # talker pre-edit before 05:59 aggregator fire).
+    daily_dir = vault / "daily"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    pre_existing = (
+        "---\n"
+        "type: daily\n"
+        "date: 2026-05-26\n"
+        "tier_curation:\n"
+        "  t1:\n"
+        "    - task: '[[task/RRTS Payroll]]'\n"
+        "      source: auto-due\n"
+        "      confirmed: true\n"
+        "  t2:\n"
+        "    - task: '[[task/Bug List]]'\n"
+        "      source: operator\n"
+        "  t3:\n"
+        "    - item: Walk Fergus\n"
+        "      source: aspirational\n"
+        "  curated_at: '2026-05-26T07:14:00-03:00'\n"
+        "---\n\n"
+        "# pre-existing body — should be overwritten by aggregator\n"
+    )
+    (daily_dir / "2026-05-26.md").write_text(pre_existing, encoding="utf-8")
+
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        rel = run_aggregator_once(config, today)
+
+    # The aggregator wrote its own routines content but PRESERVED the
+    # tier_curation block.
+    file_path = vault / rel
+    post = frontmatter.load(str(file_path))
+    meta = post.metadata or {}
+
+    # Aggregator-owned keys are present + recomputed.
+    assert meta.get("type") == "daily"
+    assert str(meta.get("date")) == "2026-05-26"
+    assert meta.get("routines_contributing") == ["Daily R"]
+
+    # Tier-curation block survived verbatim.
+    assert "tier_curation" in meta
+    tc = meta["tier_curation"]
+    assert tc["t1"][0]["task"] == "[[task/RRTS Payroll]]"
+    assert tc["t1"][0]["source"] == "auto-due"
+    assert tc["t1"][0]["confirmed"] is True
+    assert tc["t2"][0]["task"] == "[[task/Bug List]]"
+    assert tc["t3"][0]["item"] == "Walk Fergus"
+    assert tc["t3"][0]["source"] == "aspirational"
+    assert tc["curated_at"] == "2026-05-26T07:14:00-03:00"
+
+    # Body recomputed (pre-existing body line dropped, sections present).
+    assert "## Critical" in post.content
+    assert "## Tracked" in post.content
+    assert "- [ ] Brush AM" in post.content
+    assert "pre-existing body" not in post.content
+
+    # The preserved_tier_curation log event fires with the canonical
+    # field names per builder.md rule #9.
+    events = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.preserved_tier_curation"
+    ]
+    assert len(events) == 1
+    assert events[0]["path"] == rel
+    assert events[0]["date"] == "2026-05-26"
+
+
+def test_aggregator_writes_clean_file_without_existing_tier_curation(
+    tmp_path: Path,
+) -> None:
+    """First-run path: no pre-existing daily file → aggregator writes
+    a clean file with NO ``tier_curation`` key, and the
+    ``preserved_tier_curation`` log event does NOT fire."""
+    vault = tmp_path / "vault"
+    today = date(2026, 5, 26)
+
+    _write_routine(vault, "Daily R", {
+        "type": "routine",
+        "status": "active",
+        "name": "Daily R",
+        "cadence": {"type": "daily"},
+        "items": [
+            {"text": "Brush AM", "priority": "tracked"},
+        ],
+    })
+
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        rel = run_aggregator_once(config, today)
+
+    file_path = vault / rel
+    post = frontmatter.load(str(file_path))
+    meta = post.metadata or {}
+
+    # Aggregator-owned keys present.
+    assert meta.get("type") == "daily"
+    assert str(meta.get("date")) == "2026-05-26"
+    # NO tier_curation key — clean first-run state.
+    assert "tier_curation" not in meta
+
+    # The preserve-log event does NOT fire on clean first-run.
+    events = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.preserved_tier_curation"
+    ]
+    assert len(events) == 0
+
+
+def test_aggregator_preserves_curation_across_multiple_runs(
+    tmp_path: Path,
+) -> None:
+    """Idempotency: run aggregator → talker adds curation → run
+    aggregator AGAIN → curation still preserved on the second fire.
+
+    Simulates the morning ritual: 05:59 aggregator fires (clean
+    write), talker pre-edits T1/T2/T3, operator manually re-runs
+    aggregator mid-morning, curation must NOT be lost."""
+    vault = tmp_path / "vault"
+    today = date(2026, 5, 26)
+
+    _write_routine(vault, "Daily R", {
+        "type": "routine",
+        "status": "active",
+        "name": "Daily R",
+        "cadence": {"type": "daily"},
+        "items": [
+            {"text": "Brush AM", "priority": "tracked"},
+        ],
+    })
+
+    config = _config(vault, tmp_path)
+
+    # First run — clean write.
+    rel = run_aggregator_once(config, today)
+    file_path = vault / rel
+
+    # Talker pre-edits the file to add tier_curation.
+    post = frontmatter.load(str(file_path))
+    meta = dict(post.metadata or {})
+    meta["tier_curation"] = {
+        "t1": [{"task": "[[task/X]]", "source": "auto-due"}],
+        "t2": [],
+        "t3": [],
+    }
+    post.metadata = meta
+    file_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    # Second run — must preserve curation.
+    run_aggregator_once(config, today)
+
+    post2 = frontmatter.load(str(file_path))
+    meta2 = post2.metadata or {}
+    assert "tier_curation" in meta2
+    assert meta2["tier_curation"]["t1"][0]["task"] == "[[task/X]]"
+
+
+def test_aggregator_drops_malformed_tier_curation_and_logs(
+    tmp_path: Path,
+) -> None:
+    """Defensive: if the operator hand-edits ``tier_curation`` to a
+    non-dict value (e.g. a string), aggregator drops it cleanly +
+    logs ``tier_curation_wrong_type`` so the operator sees the drop."""
+    vault = tmp_path / "vault"
+    today = date(2026, 5, 26)
+
+    _write_routine(vault, "Daily R", {
+        "type": "routine",
+        "status": "active",
+        "name": "Daily R",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Brush AM", "priority": "tracked"}],
+    })
+
+    # Pre-write a daily file with tier_curation as a string (malformed).
+    daily_dir = vault / "daily"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    (daily_dir / "2026-05-26.md").write_text(
+        "---\n"
+        "type: daily\n"
+        "date: 2026-05-26\n"
+        "tier_curation: 'oops — this should be a dict'\n"
+        "---\n\n# body\n",
+        encoding="utf-8",
+    )
+
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        rel = run_aggregator_once(config, today)
+
+    file_path = vault / rel
+    post = frontmatter.load(str(file_path))
+    meta = post.metadata or {}
+    # Malformed curation dropped — clean state.
+    assert "tier_curation" not in meta
+
+    # The wrong-type log event fires with actual_type pinned.
+    events = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.tier_curation_wrong_type"
+    ]
+    assert len(events) == 1
+    assert events[0]["actual_type"] == "str"

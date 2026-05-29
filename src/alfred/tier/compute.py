@@ -1,7 +1,29 @@
 """Tier computation — pure projection over task frontmatter.
 
-The 3-tier task system (ratified 2026-05-28) layers a deadline-relative
-escalation rule over the existing ``task`` record type. Tier semantics:
+**Tier-V2 transition note (2026-05-29).** This module is mid-migration
+from V1 (persistent per-task ``base_tier``/``escalate_to`` attributes)
+to V2 (daily-curation ritual in ``vault/daily/<date>.md`` — see
+``alfred.tier.daily_curation``).
+
+V1 symbols are kept in place during Ship 1 because ``brief/tier_section.py``
++ ``telegram/today_command.py`` still import them; dropping now would
+break the brief daemon + ``/today`` at module-import time. Ship 2's
+``tier_section.py`` rewrite will drop V1 symbols in the same commit
+that switches the render to consume ``DailyCuration``. **DO NOT add
+new V1 callers** — every new tier consumer should read from
+``daily_curation.load_daily_curation`` + the new V2 surface
+:func:`compute_auto_t1_candidates`.
+
+V2 reframes tier as a daily-curation ritual:
+- **T1** — imminent deadline (today/tomorrow). Auto-surfaced
+  via :func:`compute_auto_t1_candidates`; operator-confirmed.
+- **T2** — work-getting-ahead OR maintenance task being put off.
+  Operator-selected from the open-task pool.
+- **T3** — self-care intentions for today. Operator-picked from the
+  routine's Aspirational items OR free-text additions.
+
+The old V1 framing below describes the deprecated per-task tier
+attribute model. Kept for reference until Ship 2 drops it:
 
 - **Tier 1** — the *now* queue. Time-critical, action-today.
 - **Tier 2** — the *soon* queue. On the radar, not urgent today.
@@ -73,7 +95,9 @@ annotation derivation in lockstep.
 from __future__ import annotations
 
 from collections import namedtuple
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 
@@ -293,12 +317,184 @@ def _compose_base_reason(base_source: str, note: str) -> str:
     return f"base ({note}; {base_source})"
 
 
+# ---------------------------------------------------------------------------
+# Tier-V2 surface — auto-T1 candidate discovery (2026-05-29 Ship 1)
+# ---------------------------------------------------------------------------
+#
+# The V2 model lifts tier selection out of per-task attributes and into
+# the daily curation ritual stored in ``vault/daily/<date>.md``. The
+# only auto-surface compute layer needs to provide is "which tasks
+# should be presented as T1 candidates this morning?" — Ship 2's brief
+# renderer reads this list, marks them as T1 auto-candidates, and the
+# operator confirms-or-drops via talker.
+#
+# Compute scope:
+#   * Scan ``vault/task/*.md`` (mirrors the brief's existing
+#     ``_iter_task_records`` shape — defensive YAML pre-validation +
+#     type filter + open-status filter).
+#   * For each open task, decide if it should auto-surface as T1 today:
+#     - ``due`` is today or tomorrow → surface (reason: ``"due today"``
+#       / ``"due tomorrow"``).
+#     - ``escalate_at_days`` is set + ``due`` is within that window →
+#       surface (reason: ``"escalate window (Nd before due)"``).
+#   * Defensive ``alfred_triage`` filter — janitor-generated triage
+#     records are NOT tier-rankable work, must never auto-surface.
+#     Per ``feedback_tier_semantics_andrew_model`` 2026-05-29.
+#
+# The returned candidates feed Ship 2's brief render. Ship 4's SKILL
+# update will teach the talker the operator-confirm phrase grammar.
+# Both downstream consumers reference the canonical reason strings
+# verbatim — change the strings here = update Ship 2 + Ship 4 in
+# lockstep.
+
+
+@dataclass
+class AutoT1Candidate:
+    """One task that auto-surfaces as a T1 candidate this morning.
+
+    ``path`` is the vault-relative path (e.g. ``"task/RRTS Payroll.md"``)
+    — Ship 2's brief uses this to construct the wikilink. ``name`` is
+    the operator-facing display string (from frontmatter ``name`` or
+    file stem). ``due_iso`` is the task's deadline as an ISO date
+    string (always present — a candidate without a due date wouldn't
+    have triggered the auto-surface). ``surface_reason`` is the
+    canonical reason string Ship 2 renders inline:
+
+      * ``"due today"``
+      * ``"due tomorrow"``
+      * ``"escalate window (Nd before due)"`` — N is the
+        ``escalate_at_days`` value (e.g. ``"escalate window (3d before due)"``
+        for a task with ``escalate_at_days: 3``).
+
+    Reason strings are stable contract per the module docstring.
+    """
+
+    path: str
+    name: str
+    due_iso: str
+    surface_reason: str
+
+
+def compute_auto_t1_candidates(
+    vault_path: Path, now: datetime,
+) -> list[AutoT1Candidate]:
+    """Walk ``vault/task/*.md`` and return tasks auto-surfacing as T1.
+
+    Filter logic (in this exact order — short-circuits on first
+    rejection):
+
+      1. Frontmatter parse failure → skip silently. Ship 2's brief
+         renders parse failures separately; this compute path is
+         "what auto-surfaces" and a broken record can't.
+      2. ``type != "task"`` → skip. Defensive against stray files.
+      3. ``status`` NOT in :data:`OPEN_STATUSES` → skip. Done/cancelled
+         tasks aren't tier-rankable.
+      4. ``alfred_triage is True`` → skip. Janitor triage records go
+         to the Daily Sync friction list (separate ship), not the
+         tier section. Per the operator-stated semantics 2026-05-29.
+      5. ``due`` missing or unparseable → skip. No deadline → can't
+         auto-surface.
+      6. ``due`` is today → surface with reason ``"due today"``.
+      7. ``due`` is tomorrow → surface with reason ``"due tomorrow"``.
+      8. ``due`` is more than 1 day out BUT inside the
+         ``escalate_at_days`` window → surface with reason
+         ``"escalate window (Nd before due)"``.
+      9. Otherwise → skip (deadline too far out).
+
+    ``now`` is the caller-supplied reference instant. The function uses
+    only ``now.date()`` for date math; the time component is irrelevant
+    here (the brief daemon passes ``datetime.now(tz)`` for parity with
+    the V1 ``compute_effective_tier`` signature).
+
+    Returns the candidate list sorted by ``due_iso`` ascending then
+    by ``name`` — deterministic order so Ship 2's brief render stays
+    stable across consecutive aggregator runs on the same morning.
+
+    Per ``feedback_intentionally_left_blank``: this function emits no
+    log lines itself (compute path is pure); each call-site that uses
+    the result is responsible for the "ran, here's the count" log.
+    Tests assert the no-logs invariant via ``capture_logs``.
+    """
+    import frontmatter  # type: ignore[import-untyped]
+
+    task_dir = vault_path / "task"
+    if not task_dir.is_dir():
+        return []
+
+    today_local = now.date()
+    tomorrow_local = today_local + timedelta(days=1)
+
+    candidates: list[AutoT1Candidate] = []
+    for path in sorted(task_dir.glob("*.md")):
+        try:
+            post = frontmatter.load(str(path))
+        except Exception:  # noqa: BLE001
+            continue
+        fm = dict(post.metadata or {})
+        if fm.get("type") != "task":
+            continue
+        status = str(fm.get("status") or "todo").lower()
+        if status not in OPEN_STATUSES:
+            continue
+        if fm.get("alfred_triage") is True:
+            continue
+        due = coerce_due_date(fm.get("due"))
+        if due is None:
+            continue
+
+        reason: str | None = None
+        if due == today_local:
+            reason = "due today"
+        elif due == tomorrow_local:
+            reason = "due tomorrow"
+        else:
+            # Check the escalate_at_days window.
+            escalate_at_days_raw = fm.get("escalate_at_days")
+            try:
+                escalate_at_days = (
+                    int(escalate_at_days_raw)
+                    if escalate_at_days_raw is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                escalate_at_days = None
+            if escalate_at_days is not None and escalate_at_days > 0:
+                days_to_due = (due - today_local).days
+                # The 0-day + 1-day cases were caught above. The
+                # escalate window is "more than 1 day but within the
+                # window" — gate on ``2 <= days_to_due <= escalate_at_days``.
+                # (A task ``escalate_at_days: 1`` is already covered by
+                # the tomorrow-branch; only ``escalate_at_days >= 2``
+                # produces NEW surfacings here.)
+                if 2 <= days_to_due <= escalate_at_days:
+                    reason = (
+                        f"escalate window ({escalate_at_days}d before due)"
+                    )
+
+        if reason is None:
+            continue
+
+        name = str(fm.get("name") or path.stem)
+        rel_path = f"task/{path.name}"
+        candidates.append(AutoT1Candidate(
+            path=rel_path,
+            name=name,
+            due_iso=due.isoformat(),
+            surface_reason=reason,
+        ))
+
+    candidates.sort(key=lambda c: (c.due_iso, c.name.lower()))
+    return candidates
+
+
 __all__ = [
+    "AutoT1Candidate",
     "DEFAULT_ESCALATION_GAP",
     "OPEN_STATUSES",
     "PRIORITY_TO_BASE_TIER",
     "TierResult",
     "coerce_due_date",
+    "compute_auto_t1_candidates",
     "compute_effective_tier",
     "derive_base_tier_from_priority",
 ]
