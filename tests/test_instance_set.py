@@ -132,6 +132,116 @@ def test_load_registry_missing_required_field_raises(tmp_path: Path) -> None:
     assert "#0" in msg
 
 
+def test_load_registry_rejects_path_traversal_name(tmp_path: Path) -> None:
+    """Names with path-traversal characters are rejected at load time.
+
+    Regression pin for the code-reviewer MUST-FIX on the systemd-units
+    ship (2026-05-29): a registry entry with
+    ``name: "../../etc/systemd/system/evil"`` would produce
+    ``install_dir / "alfred-../../etc/systemd/system/evil.service"`` —
+    pathlib resolves OUTSIDE the install dir, potentially writing to
+    system systemd. Gate lives at the registry-load layer so every
+    consumer (installer + future scripts + ``alfred instance up | down
+    | status``) inherits the protection."""
+    registry = tmp_path / "instances.yaml"
+    _write_registry(registry, [
+        {
+            "name": "../../etc/systemd/system/evil",
+            "display": "Evil",
+            "config": "./config.yaml",
+        },
+    ])
+    with pytest.raises(ValueError) as exc_info:
+        load_registry(registry)
+    msg = str(exc_info.value)
+    # Error names the entry index + offending value + the regex so
+    # the operator can fix the registry without grepping the loader.
+    assert "invalid" in msg.lower()
+    assert "#0" in msg
+    assert "../../etc/systemd/system/evil" in msg
+    assert "^[a-z0-9][a-z0-9-]*$" in msg
+
+
+def test_load_registry_rejects_other_unsafe_name_shapes(
+    tmp_path: Path,
+) -> None:
+    """Pin per-shape coverage on the canonical regex's failure modes.
+
+    Each shape would either traverse the filesystem (``/``, ``.``,
+    leading-dot), carry shell metachars (``$``, `` ``, ``;``), or
+    smuggle uppercase / underscore (which systemd permits but the
+    Algernon convention rejects for filename-uniformity).
+    """
+    bad_names = [
+        # Path traversal
+        "../escape",
+        "salem/sub",
+        ".hidden",
+        # Leading hyphen (looks like CLI flag if surfaced)
+        "-flag",
+        # Shell metachars
+        "name with space",
+        "name;rm -rf",
+        "name$EVIL",
+        # Mixed case + underscore (rejected by canonical regex; systemd
+        # allows them but the Algernon convention enforces lowercase
+        # alphanumeric + hyphen for filename-uniformity).
+        "Salem",
+        "kal_le",
+        # Empty + None
+        "",
+    ]
+    for bad in bad_names:
+        registry = tmp_path / "instances.yaml"
+        _write_registry(registry, [
+            {
+                "name": bad,
+                "display": "Test",
+                "config": "./config.yaml",
+            },
+        ])
+        with pytest.raises(ValueError) as exc_info:
+            load_registry(registry)
+        assert "invalid" in str(exc_info.value).lower(), (
+            f"Name {bad!r} should have been rejected but the error "
+            f"didn't carry the ``invalid`` canary: {exc_info.value}"
+        )
+
+
+def test_load_registry_accepts_canonical_instance_names(
+    tmp_path: Path,
+) -> None:
+    """Positive case: the three production instance names (``salem``,
+    ``kal-le``, ``hypatia``) all pass the regex. Also pin a few
+    forward-looking shapes (single-letter, all-digits-after-letter,
+    long-hyphenated) so a future operator's instance name doesn't
+    get unexpectedly rejected."""
+    good_names = [
+        # Live production instances.
+        "salem", "kal-le", "hypatia",
+        # Forward-looking shapes.
+        "x",                       # single letter
+        "stay-c",                  # hyphenated short
+        "instance-2026-05",        # date-suffixed
+        "a1b2c3",                  # mixed alphanumeric
+        "kal-le-test-2",           # multi-hyphen
+    ]
+    for good in good_names:
+        registry = tmp_path / "instances.yaml"
+        _write_registry(registry, [
+            {
+                "name": good,
+                "display": "Test",
+                "config": "./config.yaml",
+            },
+        ])
+        instances = load_registry(registry)
+        assert len(instances) == 1, (
+            f"Name {good!r} should have been accepted but load failed"
+        )
+        assert instances[0].name == good
+
+
 def test_default_registry_path_is_home_alfred_instances() -> None:
     """Pin the canonical default — operators reading the docs trust
     ``~/.alfred/instances.yaml`` and a refactor that silently moves

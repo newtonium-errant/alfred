@@ -81,6 +81,49 @@ class Instance:
     enabled: bool = True
 
 
+#: Canonical instance-name regex — matches systemd's own unit-name
+#: regex shape (``[a-z0-9][a-z0-9-]*``). All existing names (``salem``,
+#: ``kal-le``, ``hypatia``) pass; the ``STARTER_REGISTRY_YAML`` slugs
+#: match. Refuses any character that could traverse the filesystem
+#: (``/``, ``.``, backslash) or carry shell metachars.
+#:
+#: Added 2026-05-29 (code-reviewer MUST-FIX on the systemd-units ship):
+#: ``install_systemd_units`` writes one file per registry entry to
+#: ``~/.config/systemd/user/alfred-<name>.service``. A registry entry
+#: with ``name: "../../etc/systemd/system/evil"`` would produce
+#: ``install_dir / "alfred-../../etc/systemd/system/evil.service"``
+#: — pathlib resolves OUTSIDE the install dir, potentially writing
+#: to system systemd. Threat is low (registry is operator-editable,
+#: not network-exposed) but the gate lives at the registry-load
+#: layer rather than the installer call site so EVERY consumer
+#: (current installer + future scripts + ``alfred instance up | down
+#: | status`` paths) inherits the protection.
+import re as _re
+
+_INSTANCE_NAME_RE = _re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def _validate_instance_name(name: str, *, idx: int, source: str) -> None:
+    """Refuse names that don't match the canonical regex.
+
+    Raises ``ValueError`` naming the offending entry index + invalid
+    value + the regex so the operator can fix the registry without
+    grepping the loader source. Fail-loud — silent normalization
+    would lose the path-traversal protection.
+    """
+    if not isinstance(name, str) or not _INSTANCE_NAME_RE.match(name):
+        raise ValueError(
+            f"Registry at {source}: instance entry #{idx} has invalid "
+            f"``name`` value {name!r}. Must match the canonical regex "
+            f"``^[a-z0-9][a-z0-9-]*$`` (lowercase alphanumeric + hyphens "
+            f"only; must start with alphanumeric). Names are used as "
+            f"filename components (e.g. systemd unit files at "
+            f"``~/.config/systemd/user/alfred-<name>.service``) so any "
+            f"character that could traverse the filesystem or carry "
+            f"shell metachars is refused at load time."
+        )
+
+
 def load_registry(path: Path | None = None) -> list[Instance]:
     """Load the instance registry from ``path`` (default:
     ``~/.alfred/instances.yaml``).
@@ -90,13 +133,21 @@ def load_registry(path: Path | None = None) -> list[Instance]:
     rendering per-instance lines so the operator sees a stable
     layout across runs.
 
+    Per-entry validation runs at load time:
+      * ``name`` MUST match ``^[a-z0-9][a-z0-9-]*$`` (canonical
+        systemd unit-name regex). Refuses path-traversal +
+        shell-metachar shapes that could let a malformed registry
+        entry escape the install dir at write time. See
+        :func:`_validate_instance_name` for the rationale.
+
     Raises:
       * ``FileNotFoundError`` (re-raised with a clear message) if
         the registry doesn't exist. The operator-facing CLI catches
         this and surfaces an actionable error.
       * ``ValueError`` if the YAML is malformed at a structural
         level (missing ``instances`` key, or an instance entry
-        missing one of the required fields).
+        missing one of the required fields), OR if any entry's
+        ``name`` fails the canonical regex check.
     """
     target = path or DEFAULT_REGISTRY_PATH
     if not target.exists():
@@ -133,8 +184,13 @@ def load_registry(path: Path | None = None) -> list[Instance]:
                     f"missing required field ``{required}``. "
                     f"Got keys: {sorted(entry.keys())}."
                 )
+        name = str(entry["name"])
+        # Path-traversal + shell-metachar guard at the load layer —
+        # protects every consumer (installer + future scripts +
+        # ``alfred instance up | down | status``) with one gate.
+        _validate_instance_name(name, idx=idx, source=str(target))
         instances.append(Instance(
-            name=str(entry["name"]),
+            name=name,
             display=str(entry["display"]),
             config=str(entry["config"]),
             enabled=bool(entry.get("enabled", True)),
