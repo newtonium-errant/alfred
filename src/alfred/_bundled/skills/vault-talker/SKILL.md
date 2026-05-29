@@ -104,7 +104,7 @@ The types you can create in this tool are narrow on purpose — keep records wel
 
 | Type | For |
 |---|---|
-| `task` | Something Andrew needs to do. Fields that matter: `status` (default `todo`), `due` (ISO date if he named one), `priority` (`low`/`medium`/`high`/`urgent`), `project` (wikilink if one's in scope), `remind_at` (ISO 8601 UTC timestamp — see **Setting Reminders** below). Optional tier fields: `base_tier` (int 1/2/3), `escalate_to` (int), `escalate_at_days` (int) — see **Task tiers and deadline-relative escalation** below. |
+| `task` | Something Andrew needs to do. Fields that matter: `status` (default `todo`), `due` (ISO date if he named one), `priority` (`low`/`medium`/`high`/`urgent`), `project` (wikilink if one's in scope), `remind_at` (ISO 8601 UTC timestamp — see **Setting Reminders** below). Optional `escalate_at_days` (int) — "surface earlier than today/tomorrow" knob for tasks that need prep lead time; see **Task tiers — daily curation ritual** below. |
 | `note` | Captured thought, observation, reference, or summary. Fields: `subtype` (`idea`/`learning`/`research`/`meeting-notes`/`reference`), `project` (wikilink if applicable), `related` (wikilinks to anything obviously relevant). |
 | `decision` | An explicit choice with rationale. Fields: `confidence` (`low`/`medium`/`high`), `project` (wikilink), `decided_by` (list — for voice sessions this is almost always `["[[person/Andrew Newton]]"]`). |
 | `event` | A dated thing happening. **Required: `start` and `end`** as ISO 8601 datetimes with timezone offset (e.g. `'2026-06-27T16:00:00-03:00'`). Optional: `participants`, `location`, `project`, plus `date` (ISO date) and `time` (human-readable, e.g. `4:00 PM`) which the morning brief still reads. The `name` field becomes the GCal event title — keep it clean: **do NOT append the date to `name`** (GCal already shows the date in its own UI). See **Event datetimes** + **Events and the calendar sync** below for full shape. |
@@ -112,84 +112,172 @@ The types you can create in this tool are narrow on purpose — keep records wel
 
 For exact frontmatter shapes beyond these headline fields, trust the CLI — it validates on create and fills reasonable defaults. If you want to know what an existing record of the same type looks like, `vault_search` for one and `vault_read` it.
 
-### Task tiers and deadline-relative escalation (shipped 2026-05-28)
+### Task tiers — daily curation ritual (V2, shipped 2026-05-29)
 
-The 3-tier task system layers a deadline-relative escalation rule over the `task` record type. The brief's **Open Tasks by Tier** section (above Today's Routines) renders three buckets:
+Tier is a **daily curation ritual**, not a persistent task attribute. Each morning Salem presents materials (auto-T1 candidates + T2 selection pool + yesterday's rollover) in the brief's **Open Tasks by Tier** section; the operator replies via Telegram to pick that day's T1/T2/T3 shortlists; Salem writes the selections into `vault/daily/<date>.md` under a `tier_curation` frontmatter block. The brief renders the curated shortlists from that point forward that day. Tomorrow morning the cycle restarts from a clean slate (with rollover indicators for yesterday's incomplete T1/T2).
 
-- **Tier 1 — the *now* queue.** Time-critical, action-today.
-- **Tier 2 — the *soon* queue.** On the radar, not urgent today.
-- **Tier 3 — the *someday* queue.** Aspirational, no deadline pressure.
+This V2 model replaces the V1 per-task `base_tier` / `escalate_to` fields (shipped 2026-05-28 and dropped 2026-05-29 — Ships 1-3 of the Tier-V2 arc). The compute primitives `PRIORITY_TO_BASE_TIER`, `derive_base_tier_from_priority`, and `compute_effective_tier` are **gone**.
 
-Tier is **a function of the task plus time-to-deadline**, not a fixed property — that's the framework Andrew ratified 2026-05-27. A weekly invoicing task is base tier 2 on Tuesday and escalates to tier 1 by Friday; a biweekly payroll task is base tier 2 on cycle-open and escalates to tier 1 the day before deadline. The talker sets *base* tier + escalation; the brief renders the *effective* tier.
+**Tier semantics (operator-stated, verbatim from `feedback_tier_semantics_andrew_model`):**
 
-**Three new optional task frontmatter fields:**
+- **T1 — imminent deadline.** Hard deadline today or tomorrow, must act. Auto-surfaced from `due` (today/tomorrow) plus the `escalate_at_days` window. Operator confirms each unless already done.
+- **T2 — on the radar.** May have a deadline but further out than today/tomorrow; "work getting ahead" or "maintenance task being put off." Operator-curated from the T2 selection pool.
+- **T3 — self-care for today.** Personal/self-care intentions for mental health day-to-day (walk Fergus, exercise, music, reading). Operator-curated each morning from the routine's Aspirational items or as ad-hoc additions. **T3 is NEVER a "low priority" fallback bucket** — it's the operator's deliberate self-care list.
 
-- `base_tier` (int, one of `1` / `2` / `3`) — the operator-set tier. T1 = now, T2 = soon, T3 = someday.
-- `escalate_to` (int, one of `1` / `2` / `3`) — the tier the task escalates to as `due` approaches. Default when omitted: `max(1, base_tier - 1)` — one tier up, capped at T1.
-- `escalate_at_days` (int) — how many days before `due` the escalation fires. **Opt-in per task: omitting this field means the task never escalates, even with a `due`.** Set it when Andrew implies deadline-relative urgency ("becomes tier 1 three days out"); leave it off when the deadline is a hard cap without escalation.
+**Load-bearing design principle — don't lean on operator memory.** Anywhere the system would force Andrew to remember something is a feature opportunity for the system to handle. The auto-T1 surface, `escalate_at_days` knob, rollover indicators, and the daily file persistence all exist for this reason. When designing a response, ask: "am I making Andrew remember something Salem could surface?" If yes, surface it.
 
-**DO NOT write `tier: N`.** Records authored before 2026-05-28 used an ad-hoc `tier:` field — that field name is **not** canonical. The canonical name is `base_tier:`. A migration is renaming existing records today; future writes must use `base_tier`. If you find yourself typing `set_fields={"tier": 1}` — stop, rewrite as `set_fields={"base_tier": 1}`.
+#### The four operator reply patterns
 
-**`priority` and `base_tier` are orthogonal but related.** `priority` (`urgent` / `high` / `medium` / `low`) is intrinsic importance — used for reminder fallback templates and sort tiebreakers. `base_tier` is the operator-set tier intent. When `base_tier` is unset on a task, the brief derives one from `priority` per the `alfred.tier.PRIORITY_TO_BASE_TIER` mapping (current values: `urgent → 1`, `high → 2`, `medium → 2`, `low → 3`; the import-path name is source-of-truth — if the mapping ever drifts, the SKILL value here will lag). The brief annotates a derived tier as `T<n> (from priority)` so the operator can see the fallback fired. **Prefer setting `base_tier` explicitly** when Andrew has stated a tier intent; let derivation handle pre-migration tasks and operator-imported records without an explicit tier signal.
+Salem must parse these free-text patterns from operator Telegram messages. The patterns are matched flexibly (case-insensitive, comma-or-"and"-separated lists) — `T1 confirm RRTS Payroll`, `t1 confirm rrts payroll and steph yang roe`, and `T1 confirm RRTS Payroll, Steph Yang ROE` are all equivalent.
 
-**`effective_tier` is computed at brief-render time and is NEVER written to the record.** That name is reserved for the compute module's return value. You may DISCUSS the effective tier when Andrew asks "what tier is X right now" — but DO NOT call `set_fields={"effective_tier": 1}`. The record stays canonical; the brief shows the projection.
+1. **`T1 confirm <task name>[, <task name>...]`** — confirms one or more auto-surfaced T1 candidates. Optional `drop <name>` to decline a candidate (`T1 confirm RRTS Payroll, drop Pay Visa`).
+2. **`T2 add <task name>[, <task name>...]`** — appends operator-picked tasks to today's T2 shortlist. Task names match against the T2 selection pool (open `todo`/`active` tasks, NOT `alfred_triage`).
+3. **`T3 add <free-text item>[, <free-text item>...]`** — appends free-text intentions to today's T3 shortlist. **Items are NOT wikilinks** — they're intentions ("walk Fergus", "read for an hour"), some of which may map back to Aspirational routine items but the data layer doesn't enforce that.
+4. **`T1/T2/T3 remove <name|item>`** — removes from the corresponding shortlist. T1/T2 takes a task name; T3 takes the free-text item string.
 
-**Past-due tasks always render at `escalate_to`** regardless of `escalate_at_days`. A missed deadline is by definition past the escalation window. If Andrew asks why an overdue task shows at a higher tier than its `base_tier`, that's the reason — even with no `escalate_at_days` set, past-due forces the escalation.
+#### Write contract — read-modify-write on `vault/daily/<date>.md`
 
-**Brief render shapes** (so you can describe what the operator will see):
+Salem writes to today's daily file via `vault_edit set_fields={"tier_curation": <full_block>}`. The `tier_curation` block lives in the frontmatter alongside the routine aggregator's `routines_contributing` / `critical_pending` / `date` / `type: daily` keys — Salem must preserve every other key (the routine aggregator's read-preserve-write contract).
 
-- Plain (base tier, no annotation): `- [ ] [[task/Some Task]] — T3`
-- Priority-derived base: `- [ ] [[task/Some Task]] — T2 (from priority)`
-- Escalated (deadline-driven): `- [ ] [[task/RRTS Payroll]] — T2→T1 (due 2026-05-28, 18h)`
-- Overdue: `- [ ] [[task/Late Task]] — T2→T1 (overdue 2d)`
+**The pattern** (read existing → mutate the in-memory dict → write the full block back):
 
-**Status filter.** The brief's tier section shows only tasks with `status` in `{todo, active, blocked}`. `done` and `cancelled` are excluded. If Andrew asks why a closed task no longer appears in the tier brief, that's the filter — flip `status` back to `todo` to re-surface it.
+1. `vault_read path="daily/<today>.md"` → frontmatter dict including any existing `tier_curation` block (or `None` if un-curated today).
+2. Build the updated block in memory: copy existing `t1` / `t2` / `t3` arrays, append/remove operator picks, refresh `curated_at`.
+3. `vault_edit set_fields={"tier_curation": <full_block>}` — `set_fields` overwrites the `tier_curation` key with the new dict; all OTHER frontmatter keys (`type` / `date` / `routines_contributing` / `critical_pending` / `alfred_tags`) are preserved because `set_fields` is a key-level overwrite, not a record-level replace.
 
-**Where the operator sees this.** The morning brief has a section titled exactly `Open Tasks by Tier` (above the Today's Routines section). When Andrew asks "where will I see this?" — name that section.
+**Why read-modify-write, not `append_fields`:** `append_fields` would append a new entry to a list-shaped field, but `tier_curation` is a dict (not a list), so list-append doesn't apply. The whole-block overwrite is the correct shape — Ship 1 (`tier/daily_curation.py:save_tier_curation`) uses the same read-modify-write discipline.
 
-**Worked example A — simple base tier set:**
+**`tier_curation` block schema** (the cross-Ship contract; anchored to `alfred.tier.daily_curation.DailyCuration.to_dict`):
 
-> Andrew: *"Make this task tier 1."*
->
-> Salem: `vault_edit set_fields={"base_tier": 1}`. Replies: *"Done — base tier 1 set. Will render in the Tier 1 bucket of `Open Tasks by Tier` on the next brief."*
-
-**Worked example B — deadline-relative escalation (RRTS Invoicing pattern):**
-
-> Andrew: *"RRTS invoicing — base tier 2, escalates to tier 1 three days before the deadline."*
->
-> Salem: `vault_edit set_fields={"base_tier": 2, "escalate_to": 1, "escalate_at_days": 3}` on `task/RRTS Invoicing.md`. The `due` field already carries the next cycle's deadline. Replies: *"Done — base 2, escalates to 1 inside the 3-day window before `due`. Brief will render `T2` outside the window, then `T2→T1 (due <date>, <Nd>)` once the deadline is ≤3 days out."*
-
-**Worked example C — standing practice (post-migration canonical pattern):**
-
-**Trigger phrasings:** *"Add reading to my standing practices."* / *"Make X a standing practice."* / *"I want to add Y as a daily aspirational anchor."*
-
-**DO NOT create a T3 task for standing practices.** The 2026-05-28 migration moved the five historical standing-practice tasks (Reading, Writing, Playing Music, Listening to Music, Exercise) into `[[routine/Standing Practices]]` and cancelled the origin task records. T3 tasks were the pre-migration safe pattern; tasks now represent deadline-driven work (including low-importance deadline-bearing items via `priority: low` → `base_tier: 3` derivation), not recurring practices. A standing practice has no `due` and no completion semantics — closing it doesn't fit the task model.
-
-**Correct action — append to the Standing Practices routine via `append_fields`:**
-
-```
-vault_edit
-  path: routine/Standing Practices.md
-  append_fields: {"items": {"text": "<Name>", "priority": "aspirational"}}
+```yaml
+tier_curation:
+  t1:
+    - task: "[[task/Steph Yang ROE]]"
+      source: "operator"          # or "auto-due" / "auto-escalate" / "rollover"
+      confirmed: true              # T1-only; auto-surfaced starts false, operator-confirm flips true
+  t2:
+    - task: "[[task/Connect QBO API — RRTS]]"
+      source: "operator"
+  t3:
+    - item: "Walk Fergus"
+      source: "operator-adhoc"
+  curated_at: "2026-05-29T07:14:00-03:00"
+  rollover_from: "2026-05-28"     # optional — present when pre-populated from yesterday
 ```
 
-Routine items live in the `items:` frontmatter list — each entry is a dict with `text` (the practice name) and `priority` (one of `aspirational` / `tracked` / `critical`; standing practices are always `aspirational`). `append_fields` adds one entry to the existing list in a single edit — no read-modify-write, no race with the routine aggregator. The routine aggregator picks up the change on its next daily run (~05:59 ADT) and the new item surfaces in the Aspirational bucket of the daily routine file + the brief's **Today's Routines** section.
+Field-shape rules (verify against the dataclass before drafting examples):
 
-> Andrew: *"Add 'meditation' to my standing practices."*
+- **T1/T2 entries carry `task:` (a wikilink string).** Source enum values: `auto-due`, `auto-escalate`, `operator`, `rollover` (the canonical T1/T2 set in `T1_T2_SOURCES`).
+- **T3 entries carry `item:` (a free-text string), NOT `task:`.** Source enum values: `aspirational`, `operator`, `operator-adhoc` (the canonical T3 set in `T3_SOURCES`). **T3 has no `rollover` source** — T3 is fresh-each-day per the spec.
+- **`confirmed: true` is T1-only and optional.** T2/T3 entries have no confirmed field — the operator-add IS the confirmation.
+- Source enum values + field names are stable contract surface pinned by tests. If they drift in `daily_curation.py`, this SKILL needs a follow-up sweep.
+
+#### `escalate_at_days` SURVIVES — surface-earlier knob
+
+The V1 `base_tier` and `escalate_to` fields are gone, but `escalate_at_days` survives as a per-task hint for "surface earlier than today/tomorrow." A task with `escalate_at_days: 3` auto-surfaces in the morning brief as a T1 candidate **3 days before its `due`**, not just on the day-of or day-before. This is the "don't lean on operator memory" principle in action: an invoicing task that needs 3 days of prep work should appear in the operator's morning queue 3 days out, not the morning it's due.
+
+**Example:** `task/RRTS Invoicing.md` has `due: 2026-06-02` and `escalate_at_days: 3`. On 2026-05-30 (3 days before due) it auto-surfaces in the T1 candidates with reason `"escalate window (3d before due)"`. Operator confirms via `T1 confirm RRTS Invoicing` if they want to act on it that day; otherwise it'll re-surface tomorrow.
+
+When Andrew names a recurring task that needs lead time ("RRTS invoicing needs 3 days head's-up", "tax filing wants a week"), set `escalate_at_days` on it. **Do NOT set `base_tier` or `escalate_to` — those fields are V1 obsolete.**
+
+#### The brief surface — render shapes operator will see
+
+The morning brief has a section titled exactly `Open Tasks by Tier` (single source of truth in `alfred.brief.tier_section.SECTION_HEADER`). It renders three subsections of curated shortlists followed by materials:
+
+```
+### T1 — Imminent deadlines (auto-surfaced — confirm or drop)
+- [ ] [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
+- [ ] [[task/Pay Clinic Rental]] — due tomorrow
+
+### T2 — On the radar
+*(empty — reply "T2 add <items from selection pool below or anywhere>")*
+
+### T3 — Self-care for today
+*(empty — pick from Aspirational routines below or add new — reply "T3 add walk Fergus")*
+
+---
+
+### T2 selection pool
+(open `todo`/`active` tasks, NOT auto-T1, NOT alfred_triage)
+- [[task/RRTS Bug List — Burn Through]]
+- [[task/Set Up QuickBooks Online Developer Access for RRTS Website]]
+
+### Rollover from yesterday (incomplete)
+- T2: [[task/Connect QBO API — RRTS]] *(uncompleted yesterday)*
+```
+
+**The empty-bucket prompt strings, rollover header, and pool header are stable verbatim contracts** pinned in `alfred.brief.tier_section` as `T1_CONFIRM_PROMPT`, `T2_EMPTY_PROMPT`, `T3_EMPTY_PROMPT`, `ROLLOVER_HEADER`, `T2_POOL_HEADER`. Salem recognises these strings in the brief to know which reply pattern is expected. If the strings ever change at the code layer, this SKILL needs a follow-up sweep.
+
+#### Worked example A — operator-named T1 add (and auto-T1 confirm)
+
+Two sub-patterns share this example because the write path differs only in the `source` enum value.
+
+**(A.1) Operator names a task to add to T1** (the pattern from the 2026-05-29 motivating conversation — Andrew said *"Add Steph Yang ROE to T1"*):
+
+> Andrew: *"Add Steph Yang ROE to T1"* (or equivalently *"T1 Steph Yang ROE"*)
 >
-> Salem: `vault_edit path="routine/Standing Practices.md" append_fields={"items": {"text": "Meditation", "priority": "aspirational"}}`. Replies: *"Added Meditation to `[[routine/Standing Practices]]`. Will surface in tomorrow's brief under Today's Routines (Aspirational bucket)."*
+> Salem (internal): `vault_read path="daily/<today>.md"` → gets the current `tier_curation` block (or `None` if today's curation is still empty — the first T1 add of the day creates the block from scratch). Locate the task in the vault: `vault_search` for "Steph Yang ROE" → `task/Steph Yang ROE.md`. Build the updated block: append a fresh `T1T2Entry`-shaped dict to `t1` with `task: "[[task/Steph Yang ROE]]"`, `source: "operator"` (the operator named it explicitly, not confirming an auto-surface), `confirmed: true` (operator-add IS the confirmation). Write back via `vault_edit path="daily/<today>.md" set_fields={"tier_curation": {...full block...}}` — all other frontmatter keys (`type` / `date` / `routines_contributing` / `critical_pending` / `alfred_tags`) preserved.
+>
+> Replies: *"Added Steph Yang ROE to today's T1."*
 
-**Negative-pattern confirmation — body mutation is denied on routine records.** Routine is in the universal body-mutation deny set (see **Body mutation — three surfaces** below — `body_insert_at` and `body_replace` both refuse). Frontmatter mutation via `set_fields` / `append_fields` is the only authorised path. If you find yourself reaching for `body_insert_at` on a routine record to slot an item in mid-list — STOP. The body is auto-rendered from the template (`# Items` / `# History` placeholder sections pointing at the frontmatter); operational state lives in the `items:` frontmatter list. Edit the list, not the body.
+**(A.2) Operator confirms an auto-surfaced T1 candidate** (the pattern shown verbatim in the brief's empty-bucket prompt `T1_CONFIRM_PROMPT`):
 
-**Why the positive path works and the body path doesn't — two-gate scope model.** Frontmatter mutation (`set_fields` / `append_fields`) and body mutation (`body_insert_at` / `body_replace`) ride on **separate scope gates**. The positive Example C path goes through the `edit` gate (`check_scope("edit", ...)`), which the talker scope permits across all types — that's why `append_fields={"items": {...}}` on a routine record lands. The body-mutation denial above is a different gate (`_BODY_MUTATE_DENIED_TYPES` — protects routine's auto-rendered body content from agent-side rewrites). The two gates are independent: a type can be permitted at the frontmatter level AND denied at the body level simultaneously, which is exactly the routine case. When debugging a scope refusal, check WHICH gate fired — the message names the rule.
+> Andrew (after seeing this morning's brief render an auto-T1 candidate with `*(confirm? reply "T1 confirm")*`): *"T1 confirm <task name>"*
+>
+> Salem (internal): same read-modify-write pattern, but `source: "auto-due"` (or `"auto-escalate"` if the candidate surfaced from the `escalate_at_days` window — the brief's reason annotation tells you which). Auto-T1 candidates are NOT pre-persisted in `tier_curation.t1`; the candidate exists only in the brief's render-side composition until the operator confirms it. Salem's write adds the fresh entry with `confirmed: true`.
+>
+> Replies: *"Confirmed <task name> in today's T1. Brief will render it without the confirm prompt from here forward."*
 
-**Negative-pattern confirmation — DO NOT recreate the migrated task records.** If Andrew names one of the five originals (Reading / Writing / Playing Music / Listening to Music / Exercise) as a standing practice, that item is ALREADY in `[[routine/Standing Practices]]` — don't append a duplicate, don't re-create the cancelled `task/Reading.md`-style record. Search `routine/Standing Practices.md` first; if the item is already listed, confirm without writing: *"`Reading` is already a standing practice in `[[routine/Standing Practices]]` — nothing to add."*
+#### Worked example B — T2 add
 
-**`priority: low` is for deadline-bearing low-importance tasks, not standing practices.** After the migration, the `PRIORITY_TO_BASE_TIER` mapping above still resolves `low → 3` for tasks — but that derivation is for things like *"low-priority task to renew domain by Aug 1"*, not for *"reading is a daily practice."* Practices go on the routine; deadline-bearing items stay as tasks. If Andrew names a recurring practice with a deadline-like phrasing (rare — *"daily meditation by 9am"*), ask one clarifying question: *"Routine record (no completion, daily aspirational surface) or task with `remind_at` (one-shot daily reminder)?"*
+> Andrew: *"T2 add Connect QBO API and RRTS Schedule"*
+>
+> Salem (internal): `vault_read path="daily/2026-05-29.md"`. The operator's free-text names need to match canonical task names; Salem does fuzzy matching against the T2 selection pool (open `todo`/`active` tasks). "Connect QBO API" → `task/Connect QBO API — RRTS.md`; "RRTS Schedule" → `task/RRTS Schedule Page — Build.md`. Append two entries to `tier_curation.t2`:
+>
+> ```yaml
+> - task: "[[task/Connect QBO API — RRTS]]"
+>   source: "operator"
+> - task: "[[task/RRTS Schedule Page — Build]]"
+>   source: "operator"
+> ```
+>
+> Write back via `vault_edit set_fields={"tier_curation": {...}}`. Replies: *"Added 2 tasks to today's T2: Connect QBO API — RRTS, RRTS Schedule Page — Build."*
+>
+> **When a name doesn't unambiguously match a pool task** (e.g., Andrew says "T2 add the QBO one" and there are three QBO-named tasks open), ask one clarifying question with the candidates — don't guess.
 
-**When Andrew describes deadline-relative escalation without numbers**, ask one short clarifying question to pin the threshold: *"Base tier and escalate-to are clear (2→1). How many days before due should it escalate — 1, 3, 7?"* Don't guess; the threshold is per-task and operator-specific.
+#### Worked example C — T3 add (ad-hoc self-care intention)
 
-**Sequencing on bulk tier-set requests** (the 2026-05-27 conversation shape — 19 tasks set in one turn): each edit is its own `vault_edit` call. Don't try to batch into one call — the dispatcher rejects multi-record edits, and the per-call latency on `set_fields` is small enough that parallel emits land cleanly. Confirm the total at the end (*"19 tasks updated"*) rather than per-record.
+> Andrew: *"T3 add walk Fergus"*
+>
+> Salem (internal): `vault_read path="daily/2026-05-29.md"`. T3 items are free-text intentions, NOT wikilinks. Append one entry to `tier_curation.t3`:
+>
+> ```yaml
+> - item: "walk Fergus"
+>   source: "operator-adhoc"
+> ```
+>
+> `source: "operator-adhoc"` because the operator typed "walk Fergus" as a free-text one-liner. (The `aspirational` source is reserved for picks from the T3 selection pool — items pulled from the day's routine Aspirational bucket. Free-text additions go to `operator-adhoc` even if they happen to overlap with non-Aspirational routine items like Core Daily's `tracked` Walk Fergus — the operator didn't pick from a presented list, they typed.) Write back. Replies: *"Added 'walk Fergus' to today's T3."*
+
+#### Negative-pattern call-outs (DO NOT)
+
+**DO NOT write `base_tier` on task records.** That field is V1 obsolete. The 24 historical migrated tasks (created during the 2026-05-28 V1 ship) still carry inert `base_tier` values; **leave them alone** — Ship 5 backfill will clean them up. If Andrew says "tier 1 this task," DO NOT translate that to `vault_edit set_fields={"base_tier": 1}` on the task record — translate it to a T1 add on today's daily file's `tier_curation` block (Worked example A pattern, but with `source: "operator"` because the operator named it explicitly rather than confirming an auto-surface).
+
+**DO NOT write `escalate_to` on task records.** Also V1 obsolete. The V2 surface has no `escalate_to` field — the escalation target is implicitly T1 (every escalate-window surface is a T1 candidate). If Andrew names an escalation rule, set `escalate_at_days` only.
+
+**DO NOT route `alfred_triage: true` records into any tier list.** Janitor-generated dedup-decision tasks (titles starting `Triage - ...` with `alfred_triage: true` in frontmatter) are not priority-ranked work and don't belong in T1/T2/T3. They route to the 9am Daily Sync's `### Triage Queue ({count})` section (single source of truth in `alfred.daily_sync.triage_section.SECTION_HEADER_TEMPLATE`). If Andrew asks about triage items, point at the Daily Sync — *"Triage items live in the 9am Daily Sync's Triage Queue section. There are N open ones."*
+
+**DO NOT create new T3 tasks for recurring practices.** Recurring practices (Reading, Writing, Exercise, etc.) live in `routine/Standing Practices.md` as Aspirational items — the morning brief surfaces them as the T3 selection pool. T3 in tier_curation is for **today-only ad-hoc intentions** ("walk Fergus today", "read for an hour today"), not standing-practice creation. If Andrew names a new recurring practice, append it to `routine/Standing Practices.md` items list via `append_fields` (the post-migration canonical pattern — see **Standing Practices** below if a dedicated section exists, otherwise: `vault_edit path="routine/Standing Practices.md" append_fields={"items": {"text": "<Name>", "priority": "aspirational"}}`).
+
+#### Standing Practices — append to the routine, not a T3 task
+
+When Andrew asks to **add a recurring practice** (not a today-only intention), the canonical home is `routine/Standing Practices.md`'s items list. This is distinct from T3 curation:
+
+- **Today-only intention** ("T3 add walk Fergus") → write to `tier_curation.t3` on today's daily file (Worked example C above).
+- **Recurring practice** ("add meditation to my standing practices") → `vault_edit path="routine/Standing Practices.md" append_fields={"items": {"text": "Meditation", "priority": "aspirational"}}`. The routine aggregator picks up the addition on its next daily run (~05:59 ADT); the item then appears in tomorrow's T3 selection pool and Today's Routines (Aspirational bucket).
+
+**Routine body mutation is denied.** Routine records are in `_BODY_MUTATE_DENIED_TYPES` — `body_insert_at` and `body_replace` both refuse. Frontmatter mutation via `set_fields` / `append_fields` is the only authorised path. The two-gate scope model: frontmatter mutation rides on `check_scope("edit", ...)` which the talker scope permits across all types; body mutation rides on the per-type deny set. A type can be permitted at frontmatter level AND denied at body level simultaneously, which is exactly the routine case. When debugging a scope refusal, check WHICH gate fired — the message names the rule.
+
+**DO NOT recreate the migrated task records.** Reading, Writing, Playing Music, Listening to Music, and Exercise were originally tasks; the 2026-05-28 migration moved them into `routine/Standing Practices.md` and cancelled the origin task records. If Andrew names one of the five as a standing practice, that item is ALREADY in the routine — search first; if listed, confirm without writing: *"`Reading` is already a standing practice in `[[routine/Standing Practices]]` — nothing to add."*
 
 ### Events and the calendar sync
 
@@ -1036,12 +1124,12 @@ Andrew can invoke these directly from Telegram. They're handled by the bot layer
 - `/end` — close the current session; transcript is persisted and the distiller picks it up later.
 - `/extract <short-id>` — pull standalone notes from a closed capture session.
 - `/brief <short-id>` — send a ~300-word audio summary of a closed capture session via ElevenLabs TTS.
-- `/today` — glance-view mini-brief composed in a single Telegram reply: **Open Tasks by Tier** + **Today's Routines** + **Upcoming Events**. Salem-only (gated by `telegram.today_command.enabled` in `config.yaml`; default-disabled per-instance, currently on for Salem). Shipped 2026-05-28.
+- `/today` — glance-view mini-brief composed in a single Telegram reply: **Open Tasks by Tier** + **Upcoming Events**. Salem-only (gated by `telegram.today_command.enabled` in `config.yaml`; default-disabled per-instance, currently on for Salem). Shipped 2026-05-28; routines section dropped 2026-05-29 in the Tier-V2 arc (Ship 3 scope refinement — routines live in the morning brief, `/today` is the mid-day glance focused on tier + calendar).
 - `/speed [0.7-1.2]` — adjust TTS speed for this instance. `/speed` alone reports current + last 3 history entries. `/speed default` resets to 1.0. Per-(instance, user) — Salem and STAY-C each have their own stored value.
 - `/opus`, `/sonnet`, `/no_auto_escalate` — model-override controls for the active session.
 - `/status` — debug helper showing session stats.
 
-**Conversational affordance for `/today`.** When Andrew asks something `/today` would answer — *"what's on my today list?"* / *"what's on my plate right now?"* / *"give me the rundown for today"* — you CAN suggest the command as a faster path: *"You can type `/today` for the glance view — Open Tasks by Tier + Today's Routines + Upcoming Events in one reply."* Then answer his actual question from `vault_search` / `vault_read` as you normally would, in case he prefers your synthesised answer over the structured view. **Do NOT pre-emptively offer `/today` on unrelated messages.** It's an operator-tool surface, not a default-suggest; mention it only when his framing maps directly to the three sections it composes.
+**Conversational affordance for `/today`.** When Andrew asks something `/today` would answer — *"what's on my today list?"* / *"what's on my plate right now?"* / *"what's my tier list?"* — you CAN suggest the command as a faster path: *"You can type `/today` for the glance view — Open Tasks by Tier + Upcoming Events in one reply."* Then answer his actual question from `vault_search` / `vault_read` as you normally would, in case he prefers your synthesised answer over the structured view. **Do NOT pre-emptively offer `/today` on unrelated messages.** It's an operator-tool surface, not a default-suggest; mention it only when his framing maps directly to the two sections it composes. **If Andrew asks about routines via `/today`** — *"why don't my routines show in /today anymore?"* — that's the Ship 3 scope refinement: routines live in the morning brief now, `/today` is the mid-day tier+calendar glance. Point him at the morning brief's `Today's Routines` section (which still renders Critical / Tracked / Aspirational buckets unchanged).
 
 ---
 
