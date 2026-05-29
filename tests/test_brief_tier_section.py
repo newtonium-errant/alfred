@@ -1,601 +1,828 @@
-"""Tests for ``alfred.brief.tier_section`` — vault scan + tier render.
+"""Tests for ``alfred.brief.tier_section`` — V2 render (2026-05-29).
 
-Covers:
-- Empty task/ directory → three buckets + sentinels (intentionally-left-blank).
-- Open vs closed status filtering — done/cancelled excluded; blocked included.
-- Per-task render shape: bare / priority-derived / escalated / overdue.
-- Per-bucket sorting by due date.
-- Log emissions per builder.md rule #9.
+V1's per-task ``compute_effective_tier``-driven render is gone; V2
+reads the daily-curation block (``vault/daily/<date>.md`` →
+``tier_curation`` frontmatter) and composes:
+
+  * Curated shortlists (T1/T2/T3) at the top with empty-bucket prompts
+    that name the talker-reply pattern (Ship 4 SKILL contract).
+  * T2 selection pool (materials) below the separator.
+  * Rollover from yesterday's incomplete T1/T2 (suppressed when
+    yesterday's file is absent).
+
+Test surface per Ship 2 dispatch:
+  1. Curated shortlists render from ``vault/daily/<date>.md``
+  2. Empty buckets surface canonical prompt text
+  3. Auto-T1 candidates surface with confirm affordance
+  4. Auto-T1 candidates already curated with ``confirmed: true`` are
+     bare (no confirm prompt)
+  5. T2 selection pool excludes auto-T1 + alfred_triage + curated T1/T2
+  6. Rollover section detects yesterday's incomplete T1/T2
+  7. Rollover SUPPRESSED if yesterday's file missing
+  8. T3 rollover NOT surfaced (skip-by-design)
+  9. **CRITICAL** read-side stability — render twice = identical output
+  10. ``alfred_triage_skipped`` log event fires per skip
+  11. Empty vault — all sentinels surface correctly
+  12. Prompt-phrase constants pinned (Ship 4 SKILL contract)
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from textwrap import dedent
 
-import pytest
 import structlog
 
-from alfred.brief.tier_section import SECTION_HEADER, render_tier_section
+from alfred.brief.tier_section import (
+    ROLLOVER_HEADER,
+    SECTION_HEADER,
+    T1_CONFIRM_PROMPT,
+    T2_EMPTY_PROMPT,
+    T2_POOL_HEADER,
+    T3_EMPTY_PROMPT,
+    render_tier_section,
+)
 
 
-# Reference instant for deterministic tests.
+# Reference instant: 2026-05-28 13:00 UTC. Today = 2026-05-28,
+# Tomorrow = 2026-05-29, Yesterday = 2026-05-27.
 NOW = datetime(2026, 5, 28, 13, 0, 0, tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Fixture helpers
+# ---------------------------------------------------------------------------
 
 
 def _write_task(
     vault_path: Path,
     name: str,
-    frontmatter: dict,
-    body: str = "",
+    fm: dict,
 ) -> Path:
-    """Write a task record under ``<vault>/task/<name>.md``."""
+    """Write a task record under ``vault/task/<name>.md``."""
     task_dir = vault_path / "task"
     task_dir.mkdir(parents=True, exist_ok=True)
-    fm_lines = ["---"]
-    for k, v in frontmatter.items():
+    lines = ["---"]
+    for k, v in fm.items():
         if isinstance(v, list):
             if not v:
-                fm_lines.append(f"{k}: []")
+                lines.append(f"{k}: []")
             else:
-                fm_lines.append(f"{k}:")
+                lines.append(f"{k}:")
                 for item in v:
-                    fm_lines.append(f"- {item}")
+                    lines.append(f"- {item}")
         elif v is None:
-            fm_lines.append(f"{k}: null")
+            lines.append(f"{k}: null")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, str):
+            lines.append(f"{k}: {v!r}")
         else:
-            fm_lines.append(f"{k}: {v!r}" if isinstance(v, str) else f"{k}: {v}")
-    fm_lines.append("---")
-    fm_lines.append("")
-    fm_lines.append(body)
+            lines.append(f"{k}: {v}")
+    lines.append("---")
+    lines.append("")
     path = task_dir / f"{name}.md"
-    path.write_text("\n".join(fm_lines), encoding="utf-8")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _write_daily(
+    vault_path: Path,
+    iso_date: str,
+    tier_curation_yaml: str | None,
+) -> Path:
+    """Write a daily file under ``vault/daily/<iso_date>.md``.
+
+    ``tier_curation_yaml`` is the indented YAML body for the
+    ``tier_curation:`` key (excluding the key itself). Pass ``None``
+    to omit the block entirely (a daily file written by the routine
+    aggregator with no operator curation yet).
+    """
+    daily_dir = vault_path / "daily"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["---", "type: daily", f"date: {iso_date}"]
+    if tier_curation_yaml is not None:
+        lines.append("tier_curation:")
+        # Indent each line by 2 spaces to nest under the key.
+        for body_line in tier_curation_yaml.splitlines():
+            lines.append(f"  {body_line}")
+    lines.append("---")
+    lines.append("")
+    lines.append("# body")
+    path = daily_dir / f"{iso_date}.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
     return path
 
 
 # ---------------------------------------------------------------------------
-# Section header constant
+# 1. Section header + cross-agent contract constants
 # ---------------------------------------------------------------------------
 
 
 def test_section_header_pinned() -> None:
-    """The section name is operator-facing; pin it so a rename surfaces."""
+    """The brief daemon wraps the section under ``## {SECTION_HEADER}``.
+
+    Renaming here would break the daemon's section-list wiring; pin
+    so a typo surfaces immediately.
+    """
     assert SECTION_HEADER == "Open Tasks by Tier"
 
 
+def test_t1_confirm_prompt_pinned() -> None:
+    """Ship 4 SKILL quotes this verbatim — pin to surface drift."""
+    assert T1_CONFIRM_PROMPT == '*(confirm? reply "T1 confirm")*'
+
+
+def test_t2_empty_prompt_pinned() -> None:
+    """Ship 4 SKILL contract."""
+    assert T2_EMPTY_PROMPT == (
+        '*(empty — reply "T2 add <items from selection pool below or '
+        'anywhere>")*'
+    )
+
+
+def test_t3_empty_prompt_pinned() -> None:
+    """Ship 4 SKILL contract."""
+    assert T3_EMPTY_PROMPT == (
+        '*(empty — pick from Aspirational routines below or add new — '
+        'reply "T3 add walk Fergus")*'
+    )
+
+
+def test_rollover_header_pinned() -> None:
+    assert ROLLOVER_HEADER == "### Rollover from yesterday (incomplete)"
+
+
+def test_t2_pool_header_pinned() -> None:
+    assert T2_POOL_HEADER == "### T2 selection pool"
+
+
 # ---------------------------------------------------------------------------
-# Empty / no tasks
+# 2. Empty vault — sentinels + intentionally-left-blank
 # ---------------------------------------------------------------------------
 
 
-def test_no_task_dir_renders_buckets_with_sentinels(tmp_path: Path) -> None:
-    """No ``vault/task/`` directory → render full three-bucket sentinel."""
+def test_empty_vault_renders_all_sentinels(tmp_path: Path) -> None:
+    """No task/ dir, no daily file → all three buckets get empty
+    prompts, T2 pool sentinel, rollover suppressed."""
+    body = render_tier_section(tmp_path, NOW)
+
+    # Three curated headers always emit.
+    assert "### T1 — Imminent deadlines" in body
+    assert "### T2 — On the radar" in body
+    assert "### T3 — Self-care for today" in body
+
+    # T1 has the no-candidates sentinel (no auto-T1 + no curation).
+    assert "*(no T1 candidates today)*" in body
+    # T2 + T3 empty-bucket prompts surface verbatim.
+    assert T2_EMPTY_PROMPT in body
+    assert T3_EMPTY_PROMPT in body
+
+    # T2 selection pool header + sentinel.
+    assert T2_POOL_HEADER in body
+    assert "selection pool is empty" in body
+
+    # Rollover suppressed entirely (no yesterday file).
+    assert ROLLOVER_HEADER not in body
+
+
+def test_empty_vault_logs_rendered_event(tmp_path: Path) -> None:
+    """Even cold-start emits the ``rendered`` log event."""
     with structlog.testing.capture_logs() as captured:
-        body = render_tier_section(tmp_path, NOW)
-
-    assert "### Tier 1" in body
-    assert "### Tier 2" in body
-    assert "### Tier 3" in body
-    assert "no open tasks" in body.lower()
-    # Log pin: no_task_dir event fires.
-    matches = [c for c in captured if c.get("event") == "brief.tier_section.no_task_dir"]
-    assert len(matches) == 1
-
-
-def test_empty_task_dir_renders_buckets_with_sentinels(tmp_path: Path) -> None:
-    (tmp_path / "task").mkdir()
-    with structlog.testing.capture_logs() as captured:
-        body = render_tier_section(tmp_path, NOW)
-    assert "### Tier 1" in body
-    assert "### Tier 2" in body
-    assert "### Tier 3" in body
-    assert "no open tasks at any tier" in body
-    # Log pin: no_open_tasks event fires (different signal from no_task_dir —
-    # task dir exists but no records, so we scan 0 records).
-    matches = [c for c in captured if c.get("event") == "brief.tier_section.no_open_tasks"]
-    assert len(matches) == 1
-    assert matches[0]["scanned"] == 0
-
-
-def test_all_done_tasks_renders_no_open_sentinel(tmp_path: Path) -> None:
-    """Records exist but all are done/cancelled → no_open_tasks sentinel."""
-    _write_task(
-        tmp_path, "Done Task",
-        {"type": "task", "status": "done", "base_tier": 1, "created": "2026-05-01"},
-    )
-    _write_task(
-        tmp_path, "Cancelled Task",
-        {"type": "task", "status": "cancelled", "base_tier": 2, "created": "2026-05-01"},
-    )
-    with structlog.testing.capture_logs() as captured:
-        body = render_tier_section(tmp_path, NOW)
-    assert "no open tasks at any tier" in body
-    matches = [c for c in captured if c.get("event") == "brief.tier_section.no_open_tasks"]
-    assert len(matches) == 1
-    assert matches[0]["scanned"] == 2  # both records scanned but filtered out
+        render_tier_section(tmp_path, NOW)
+    events = [
+        c for c in captured if c.get("event") == "brief.tier_section.rendered"
+    ]
+    assert len(events) == 1
+    e = events[0]
+    assert e["scanned"] == 0
+    assert e["curation_loaded"] is False
+    assert e["auto_t1_count"] == 0
+    assert e["rollover_present"] is False
 
 
 # ---------------------------------------------------------------------------
-# Status filtering — open statuses
+# 3. Curated shortlists — render from tier_curation block
 # ---------------------------------------------------------------------------
 
 
-def test_blocked_status_surfaces_in_queue(tmp_path: Path) -> None:
-    """Per dispatch ratification: blocked tasks must surface."""
-    _write_task(
-        tmp_path, "Blocked Task",
-        {"type": "task", "status": "blocked", "base_tier": 2, "created": "2026-05-01"},
+def test_curated_t1_t2_t3_render_from_daily_file(tmp_path: Path) -> None:
+    """Operator-curated shortlists surface verbatim under the three
+    headers."""
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - task: '[[task/Steph Yang ROE]]'\n"
+            "    source: operator\n"
+            "    confirmed: true\n"
+            "t2:\n"
+            "  - task: '[[task/RRTS Bug List]]'\n"
+            "    source: operator\n"
+            "t3:\n"
+            "  - item: Walk Fergus\n"
+            "    source: aspirational\n"
+        ),
     )
     body = render_tier_section(tmp_path, NOW)
-    assert "Blocked Task" in body
+
+    # T1 entry — confirmed=True → bare (no confirm prompt).
+    assert "[[task/Steph Yang ROE]]" in body
+    # T1 confirm prompt should NOT appear because confirmed=true.
+    t1_section = body.split("### T2")[0]
+    assert T1_CONFIRM_PROMPT not in t1_section
+
+    # T2 entry — bare wikilink, no confirm.
+    assert "[[task/RRTS Bug List]]" in body
+
+    # T3 entry — free-text item, no confirm.
+    assert "Walk Fergus" in body
+    # T3 empty prompt should NOT surface (T3 has content).
+    assert T3_EMPTY_PROMPT not in body
 
 
-def test_todo_status_surfaces(tmp_path: Path) -> None:
-    _write_task(
-        tmp_path, "Todo Task",
-        {"type": "task", "status": "todo", "base_tier": 3, "created": "2026-05-01"},
+def test_curated_empty_buckets_show_prompts(tmp_path: Path) -> None:
+    """Daily file exists but all three buckets are empty arrays →
+    operator gets the prompts."""
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml="t1: []\nt2: []\nt3: []\n",
     )
     body = render_tier_section(tmp_path, NOW)
-    assert "Todo Task" in body
-
-
-def test_active_status_surfaces(tmp_path: Path) -> None:
-    _write_task(
-        tmp_path, "Active Task",
-        {"type": "task", "status": "active", "base_tier": 1, "created": "2026-05-01"},
-    )
-    body = render_tier_section(tmp_path, NOW)
-    assert "Active Task" in body
-
-
-def test_missing_status_treated_as_todo(tmp_path: Path) -> None:
-    """Forward-compat: operator-authored records without status surface."""
-    _write_task(
-        tmp_path, "No Status Task",
-        {"type": "task", "base_tier": 2, "created": "2026-05-01"},
-    )
-    body = render_tier_section(tmp_path, NOW)
-    assert "No Status Task" in body
-
-
-def test_done_status_excluded(tmp_path: Path) -> None:
-    _write_task(
-        tmp_path, "Open Task",
-        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
-    )
-    _write_task(
-        tmp_path, "Closed Task",
-        {"type": "task", "status": "done", "base_tier": 1, "created": "2026-05-01"},
-    )
-    body = render_tier_section(tmp_path, NOW)
-    assert "Open Task" in body
-    assert "Closed Task" not in body
+    assert "*(no T1 candidates today)*" in body
+    assert T2_EMPTY_PROMPT in body
+    assert T3_EMPTY_PROMPT in body
 
 
 # ---------------------------------------------------------------------------
-# Render shape — annotations
+# 4. Auto-T1 candidates — surface with confirm affordance
 # ---------------------------------------------------------------------------
 
 
-def test_bare_render_for_base_tier_no_due(tmp_path: Path) -> None:
-    """Base-tier-set, no due → bare ``T<n>`` annotation."""
+def test_auto_t1_due_today_surfaces_with_confirm_prompt(
+    tmp_path: Path,
+) -> None:
+    """Task due today → auto-T1 → renders with ``due today`` reason +
+    confirm prompt (it wasn't pre-curated)."""
     _write_task(
-        tmp_path, "Standing Task",
-        {"type": "task", "status": "todo", "base_tier": 3, "created": "2026-05-01"},
-    )
-    body = render_tier_section(tmp_path, NOW)
-    assert "- [ ] [[task/Standing Task]] — T3" in body
-    # Should NOT have a parenthetical (bare).
-    line = next(L for L in body.splitlines() if "Standing Task" in L)
-    assert "(" not in line
-
-
-def test_priority_derived_annotation(tmp_path: Path) -> None:
-    """Pre-migration task with priority but no base_tier → '(from priority)'."""
-    _write_task(
-        tmp_path, "Legacy Task",
-        {"type": "task", "status": "todo", "priority": "high", "created": "2026-05-01"},
-    )
-    body = render_tier_section(tmp_path, NOW)
-    assert "[[task/Legacy Task]] — T2 (from priority)" in body
-
-
-def test_escalated_render_shape(tmp_path: Path) -> None:
-    """Escalated → ``T<base>→T<eff> (due <date>, <distance>)``."""
-    _write_task(
-        tmp_path, "Payroll",
+        tmp_path,
+        "RRTS Payroll",
         {
             "type": "task",
             "status": "todo",
-            "base_tier": 2,
-            "due": "2026-05-30",
-            "escalate_at_days": 3,
-            "created": "2026-05-01",
-        },
-    )
-    body = render_tier_section(tmp_path, NOW)
-    # Find the line.
-    line = next(L for L in body.splitlines() if "Payroll" in L)
-    assert "T2→T1" in line
-    assert "due 2026-05-30" in line
-    assert "2d" in line
-
-
-def test_overdue_render_shape(tmp_path: Path) -> None:
-    """Overdue → ``T<base>→T<eff> (overdue Nd)``, no 'due <date>' since
-    the date is in the past and 'overdue' is more useful framing."""
-    _write_task(
-        tmp_path, "Late Task",
-        {
-            "type": "task",
-            "status": "todo",
-            "base_tier": 3,
-            "due": "2026-05-25",
-            "created": "2026-05-01",
-        },
-    )
-    body = render_tier_section(tmp_path, NOW)
-    line = next(L for L in body.splitlines() if "Late Task" in L)
-    assert "T3→T2" in line
-    assert "overdue 3d" in line
-
-
-def test_same_day_due_renders_hours(tmp_path: Path) -> None:
-    """Same-day due renders hours-to-end-of-day instead of '0d'."""
-    _write_task(
-        tmp_path, "Today Task",
-        {
-            "type": "task",
-            "status": "todo",
-            "base_tier": 2,
+            "name": "RRTS Payroll",
             "due": "2026-05-28",
-            "escalate_at_days": 1,
-            "created": "2026-05-01",
         },
     )
     body = render_tier_section(tmp_path, NOW)
-    line = next(L for L in body.splitlines() if "Today Task" in L)
-    assert "T2→T1" in line
-    # Hours format — should have an "Nh" token.
-    assert "h)" in line
+    assert "[[task/RRTS Payroll]]" in body
+    assert "due today" in body
+    # Confirm prompt must surface for auto-surfaced (un-curated) entry.
+    assert T1_CONFIRM_PROMPT in body
 
 
-# ---------------------------------------------------------------------------
-# Bucketing — tasks land in the right T1/T2/T3 sections
-# ---------------------------------------------------------------------------
-
-
-def test_tasks_bucket_by_effective_tier(tmp_path: Path) -> None:
-    """Escalation should place a task in its EFFECTIVE bucket, not base."""
+def test_auto_t1_due_tomorrow_uses_correct_reason(tmp_path: Path) -> None:
+    """Reason annotation differs by surface — tomorrow gets ``due
+    tomorrow``."""
     _write_task(
-        tmp_path, "Aspirational",
-        {"type": "task", "status": "todo", "base_tier": 3, "created": "2026-05-01"},
-    )
-    _write_task(
-        tmp_path, "Escalated",
+        tmp_path,
+        "Pay Clinic Rental",
         {
             "type": "task",
             "status": "todo",
-            "base_tier": 3,
+            "name": "Pay Clinic Rental",
             "due": "2026-05-29",
-            "escalate_at_days": 2,
-            "escalate_to": 1,
-            "created": "2026-05-01",
         },
     )
     body = render_tier_section(tmp_path, NOW)
-
-    # Find each task's bucket by line position.
-    lines = body.splitlines()
-    t1_idx = lines.index("### Tier 1")
-    t2_idx = lines.index("### Tier 2")
-    t3_idx = lines.index("### Tier 3")
-
-    escalated_idx = next(i for i, L in enumerate(lines) if "Escalated" in L)
-    aspirational_idx = next(i for i, L in enumerate(lines) if "Aspirational" in L)
-
-    assert t1_idx < escalated_idx < t2_idx
-    assert t3_idx < aspirational_idx
+    assert "due tomorrow" in body
 
 
-def test_empty_bucket_renders_sentinel(tmp_path: Path) -> None:
-    """A bucket with no tasks emits a sentinel — three-bucket render is
-    unconditional per intentionally-left-blank."""
+def test_auto_t1_already_confirmed_renders_bare(tmp_path: Path) -> None:
+    """Auto-surfaced task already in curated T1 with ``confirmed: true``
+    renders bare — operator signed off, no prompt needed."""
     _write_task(
-        tmp_path, "Only T1",
-        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
+        tmp_path,
+        "Steph Yang ROE",
+        {
+            "type": "task",
+            "status": "todo",
+            "name": "Steph Yang ROE",
+            "due": "2026-05-28",
+        },
+    )
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - task: '[[task/Steph Yang ROE]]'\n"
+            "    source: auto-due\n"
+            "    confirmed: true\n"
+            "t2: []\n"
+            "t3: []\n"
+        ),
     )
     body = render_tier_section(tmp_path, NOW)
-    assert "### Tier 1" in body
-    assert "Only T1" in body
-    assert "### Tier 2" in body
-    assert "no open tasks at Tier 2" in body
-    assert "### Tier 3" in body
-    assert "no open tasks at Tier 3" in body
+    # T1 entry surfaces with the reason but NO confirm prompt.
+    assert "[[task/Steph Yang ROE]]" in body
+    assert "due today" in body
+    # Confirm prompt should NOT appear for confirmed=true entries.
+    # Find the T1 line specifically.
+    t1_lines = [
+        ln for ln in body.splitlines()
+        if "[[task/Steph Yang ROE]]" in ln
+    ]
+    assert len(t1_lines) == 1
+    assert T1_CONFIRM_PROMPT not in t1_lines[0]
+
+
+def test_auto_t1_curated_but_unconfirmed_still_shows_prompt(
+    tmp_path: Path,
+) -> None:
+    """Auto-T1 candidate pre-recorded with ``confirmed: false`` (talker
+    surfaced it but operator hasn't replied yet) → still shows the
+    confirm prompt."""
+    _write_task(
+        tmp_path,
+        "Some Task",
+        {
+            "type": "task",
+            "status": "todo",
+            "name": "Some Task",
+            "due": "2026-05-28",
+        },
+    )
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - task: '[[task/Some Task]]'\n"
+            "    source: auto-due\n"
+            "    confirmed: false\n"
+            "t2: []\n"
+            "t3: []\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    t1_lines = [
+        ln for ln in body.splitlines()
+        if "[[task/Some Task]]" in ln
+    ]
+    assert len(t1_lines) == 1
+    assert T1_CONFIRM_PROMPT in t1_lines[0]
 
 
 # ---------------------------------------------------------------------------
-# Sorting — within bucket, by due date ascending
+# 5. T2 selection pool — exclusions
 # ---------------------------------------------------------------------------
 
 
-def test_within_bucket_sort_by_due_ascending(tmp_path: Path) -> None:
-    """Earliest due first; no-due last; tiebreak by name."""
+def test_t2_pool_excludes_auto_t1(tmp_path: Path) -> None:
+    """Auto-T1 candidates must NOT appear in the T2 pool — they're
+    already surfaced above."""
+    # Two tasks: one auto-T1 (due today), one open with no due date.
     _write_task(
-        tmp_path, "Far Due",
+        tmp_path,
+        "Due Today Task",
         {
-            "type": "task", "status": "todo", "base_tier": 2,
-            "due": "2026-06-15", "created": "2026-05-01",
+            "type": "task",
+            "status": "todo",
+            "name": "Due Today Task",
+            "due": "2026-05-28",
         },
     )
     _write_task(
-        tmp_path, "Soon Due",
+        tmp_path,
+        "Open Task A",
         {
-            "type": "task", "status": "todo", "base_tier": 2,
-            "due": "2026-06-01", "created": "2026-05-01",
-        },
-    )
-    _write_task(
-        tmp_path, "No Due",
-        {
-            "type": "task", "status": "todo", "base_tier": 2,
-            "created": "2026-05-01",
+            "type": "task",
+            "status": "todo",
+            "name": "Open Task A",
         },
     )
     body = render_tier_section(tmp_path, NOW)
-    lines = body.splitlines()
-    soon_idx = next(i for i, L in enumerate(lines) if "Soon Due" in L)
-    far_idx = next(i for i, L in enumerate(lines) if "Far Due" in L)
-    no_idx = next(i for i, L in enumerate(lines) if "No Due" in L)
-    assert soon_idx < far_idx < no_idx
+    pool_section = body.split(T2_POOL_HEADER)[1]
+    assert "Open Task A" in pool_section
+    assert "Due Today Task" not in pool_section
 
 
-# ---------------------------------------------------------------------------
-# Robustness — bad records don't crash the render
-# ---------------------------------------------------------------------------
-
-
-def test_unparseable_record_logs_and_continues(tmp_path: Path) -> None:
-    """A record with truncated frontmatter (no closing ``---``) is the
-    test case the original ship's ``except Exception`` block was
-    supposed to cover.
-
-    ``python-frontmatter`` is lenient on invalid YAML — it does NOT
-    raise on broken frontmatter; it silently returns empty / partial
-    metadata. The fix (commit follow-up to ``91504ea``) introduces
-    ``_validate_frontmatter_yaml`` which runs ``yaml.safe_load`` over
-    the extracted block before handing to ``frontmatter.load``. This
-    test pins the realistic "operator's editor crashed mid-edit"
-    case — file starts with ``---`` but the closer is missing.
-
-    See ``feedback_intentionally_left_blank.md``: parse failures
-    MUST surface to operators so they can distinguish "no tasks at
-    this tier" from "tasks exist but file is broken."
-    """
-    task_dir = tmp_path / "task"
-    task_dir.mkdir(parents=True)
-    # Truncated frontmatter — no closing ``---``. This is the failure
-    # mode operators most commonly hit (editor crash, partial save,
-    # incomplete copy-paste).
-    (task_dir / "Truncated.md").write_text(
-        "---\nstatus: todo\nbase_tier: [unclosed\n",
-        encoding="utf-8",
-    )
-    # And a valid one to confirm the render continues past the failure.
+def test_t2_pool_excludes_alfred_triage_with_log(tmp_path: Path) -> None:
+    """``alfred_triage: true`` records skipped from T2 pool + named
+    log event fires per skip."""
     _write_task(
-        tmp_path, "Valid Task",
-        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
+        tmp_path,
+        "Triage Record",
+        {
+            "type": "task",
+            "status": "todo",
+            "name": "Triage Record",
+            "alfred_triage": True,
+        },
+    )
+    _write_task(
+        tmp_path,
+        "Normal Task",
+        {
+            "type": "task",
+            "status": "todo",
+            "name": "Normal Task",
+        },
     )
     with structlog.testing.capture_logs() as captured:
         body = render_tier_section(tmp_path, NOW)
-    assert "Valid Task" in body
-    parse_fails = [c for c in captured if c.get("event") == "brief.tier_section.parse_failed"]
-    assert len(parse_fails) == 1
-    # Pin the error-string shape so a refactor doesn't drop the
-    # "frontmatter not closed" diagnostic detail.
-    assert "not closed" in parse_fails[0]["error"]
+    pool_section = body.split(T2_POOL_HEADER)[1]
+    assert "Normal Task" in pool_section
+    assert "Triage Record" not in pool_section
+
+    # Log event pinned.
+    events = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.alfred_triage_skipped"
+    ]
+    assert len(events) == 1
+    assert events[0]["name"] == "Triage Record"
 
 
-def test_invalid_yaml_inside_closed_frontmatter_logs(tmp_path: Path) -> None:
-    """Frontmatter block IS properly closed by ``---`` but the YAML
-    inside is malformed.
-
-    Per builder.md rule #7 (tokenizer-fallback fixture coverage):
-    each failure mode of the new validation path needs its own
-    fixture. This case exercises the ``yaml.safe_load`` raise path
-    in ``_validate_frontmatter_yaml``, distinct from the
-    "not-closed" path above.
-
-    Realistic failure shape: operator pasted a snippet with a
-    leading ``[`` they meant to remove. Common copy-paste artefact.
-    """
-    task_dir = tmp_path / "task"
-    task_dir.mkdir(parents=True)
-    # Properly delimited frontmatter, but the YAML payload itself is
-    # broken (unclosed flow-sequence inside a value).
-    (task_dir / "BadYaml.md").write_text(
-        "---\nstatus: todo\nbase_tier: [1, 2\n---\n\n# Body\n",
-        encoding="utf-8",
+def test_t2_pool_excludes_curated_t1_and_t2(tmp_path: Path) -> None:
+    """Operator-curated T1/T2 entries must NOT appear in the pool —
+    they're in the shortlists already."""
+    _write_task(
+        tmp_path,
+        "Curated T1 Task",
+        {"type": "task", "status": "todo", "name": "Curated T1 Task"},
     )
     _write_task(
-        tmp_path, "Valid Task",
-        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
-    )
-    with structlog.testing.capture_logs() as captured:
-        body = render_tier_section(tmp_path, NOW)
-    assert "Valid Task" in body
-    parse_fails = [c for c in captured if c.get("event") == "brief.tier_section.parse_failed"]
-    assert len(parse_fails) == 1
-    # Pin the yaml-error prefix so a refactor doesn't drop the
-    # ``yaml: ...`` diagnostic detail.
-    assert parse_fails[0]["error"].startswith("yaml: ")
-
-
-def test_body_only_file_is_not_a_parse_failure(tmp_path: Path) -> None:
-    """A file with no frontmatter at all is valid (body-only). It
-    should NOT trigger ``parse_failed``.
-
-    Per builder.md rule #7: the validator's "no leading ``---``"
-    branch is a happy-path-yes-but-skip-validation case; pin it
-    so a future refactor doesn't accidentally flag body-only files
-    as broken.
-    """
-    task_dir = tmp_path / "task"
-    task_dir.mkdir(parents=True)
-    (task_dir / "BodyOnly.md").write_text(
-        "# Just a body\n\nNo frontmatter at all.\n",
-        encoding="utf-8",
+        tmp_path,
+        "Curated T2 Task",
+        {"type": "task", "status": "todo", "name": "Curated T2 Task"},
     )
     _write_task(
-        tmp_path, "Valid Task",
-        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
+        tmp_path,
+        "Pool Candidate",
+        {"type": "task", "status": "todo", "name": "Pool Candidate"},
     )
-    with structlog.testing.capture_logs() as captured:
-        render_tier_section(tmp_path, NOW)
-    parse_fails = [c for c in captured if c.get("event") == "brief.tier_section.parse_failed"]
-    # Body-only file has no frontmatter at all → not flagged as
-    # parse-failed. (Phase 2 cleanup 2026-05-28: the body-only file
-    # IS now skipped at the type-filter gate with a
-    # ``non_task_skipped`` log event since its ``fm.get("type")`` is
-    # None, not "task" — but the parse-failed gate is the one this
-    # test was written to pin and it still holds at zero.)
-    assert len(parse_fails) == 0
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - task: '[[task/Curated T1 Task]]'\n"
+            "    source: operator\n"
+            "    confirmed: true\n"
+            "t2:\n"
+            "  - task: '[[task/Curated T2 Task]]'\n"
+            "    source: operator\n"
+            "t3: []\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    pool_section = body.split(T2_POOL_HEADER)[1]
+    assert "Pool Candidate" in pool_section
+    assert "Curated T1 Task" not in pool_section
+    assert "Curated T2 Task" not in pool_section
 
 
-def test_validator_handles_unicode_decode_error(tmp_path: Path) -> None:
-    """Non-UTF-8 file → caught by ``UnicodeDecodeError`` branch in
-    the validator. Realistic surface: operator pasted from a Word
-    document and got a non-UTF-8 encoding."""
-    task_dir = tmp_path / "task"
-    task_dir.mkdir(parents=True)
-    # Write raw bytes that are not valid UTF-8 (start with a Latin-1
-    # accented byte then a partial multi-byte sequence).
-    (task_dir / "BadEncoding.md").write_bytes(b"---\nname: \xe9\xff\xff\n---\n")
+def test_t2_pool_excludes_closed_statuses(tmp_path: Path) -> None:
+    """Done / cancelled tasks must NOT appear in the pool."""
     _write_task(
-        tmp_path, "Valid Task",
-        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
+        tmp_path,
+        "Done Task",
+        {"type": "task", "status": "done", "name": "Done Task"},
     )
-    with structlog.testing.capture_logs() as captured:
-        body = render_tier_section(tmp_path, NOW)
-    assert "Valid Task" in body
-    parse_fails = [c for c in captured if c.get("event") == "brief.tier_section.parse_failed"]
-    assert len(parse_fails) == 1
-    assert "utf-8" in parse_fails[0]["error"].lower()
+    _write_task(
+        tmp_path,
+        "Open Task",
+        {"type": "task", "status": "active", "name": "Open Task"},
+    )
+    body = render_tier_section(tmp_path, NOW)
+    pool_section = body.split(T2_POOL_HEADER)[1]
+    assert "Open Task" in pool_section
+    assert "Done Task" not in pool_section
 
 
 # ---------------------------------------------------------------------------
-# Type filter — non-task records in vault/task/ are skipped + logged
+# 6. Rollover from yesterday — incomplete T1/T2 detection
 # ---------------------------------------------------------------------------
 
 
-def test_non_task_file_in_task_dir_skipped(tmp_path: Path) -> None:
-    """A record with ``type: note`` dropped into ``vault/task/`` (template,
-    janitor-rescue, operator hand-edit mistake) MUST NOT render as a
-    phantom task. Phase 2 cleanup 2026-05-28 — defensive type filter.
-
-    Per ``feedback_intentionally_left_blank.md`` + the silent-skip
-    antipattern: the skip emits a named ``non_task_skipped`` log event
-    carrying the path + actual frontmatter ``type`` so operators
-    reading the tier-section logs can grep for stray-type records and
-    fix the misplaced file.
-    """
+def test_rollover_detects_incomplete_t1_and_t2(tmp_path: Path) -> None:
+    """Yesterday's T1/T2 entries whose tasks are still open today
+    surface in the rollover section with tier labels."""
+    # Task records — both open today (yesterday's curation pointed at
+    # them; they didn't get done).
     _write_task(
-        tmp_path, "Stray Note",
-        {"type": "note", "status": "active", "created": "2026-05-01"},
+        tmp_path,
+        "QBO API",
+        {"type": "task", "status": "todo", "name": "QBO API"},
     )
     _write_task(
-        tmp_path, "Real Task",
-        {"type": "task", "status": "todo", "base_tier": 2, "created": "2026-05-01"},
+        tmp_path,
+        "Bug List",
+        {"type": "task", "status": "active", "name": "Bug List"},
+    )
+
+    # Yesterday's curation pointed at both.
+    _write_daily(
+        tmp_path,
+        "2026-05-27",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - task: '[[task/QBO API]]'\n"
+            "    source: operator\n"
+            "    confirmed: true\n"
+            "t2:\n"
+            "  - task: '[[task/Bug List]]'\n"
+            "    source: operator\n"
+            "t3:\n"
+            "  - item: Walk Fergus\n"
+            "    source: aspirational\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+
+    assert ROLLOVER_HEADER in body
+    rollover_section = body.split(ROLLOVER_HEADER)[1]
+    assert "T1: [[task/QBO API]]" in rollover_section
+    assert "T2: [[task/Bug List]]" in rollover_section
+    assert "uncompleted yesterday" in rollover_section
+    # T3 must NOT roll over (skip-by-design).
+    assert "Walk Fergus" not in rollover_section
+
+
+def test_rollover_skips_completed_tasks(tmp_path: Path) -> None:
+    """Yesterday's T1/T2 entries whose tasks are now done/cancelled
+    do NOT surface in rollover."""
+    _write_task(
+        tmp_path,
+        "Done Yesterday",
+        {"type": "task", "status": "done", "name": "Done Yesterday"},
+    )
+    _write_task(
+        tmp_path,
+        "Still Open",
+        {"type": "task", "status": "todo", "name": "Still Open"},
+    )
+    _write_daily(
+        tmp_path,
+        "2026-05-27",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - task: '[[task/Done Yesterday]]'\n"
+            "    source: operator\n"
+            "  - task: '[[task/Still Open]]'\n"
+            "    source: operator\n"
+            "t2: []\n"
+            "t3: []\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    rollover_section = body.split(ROLLOVER_HEADER)[1]
+    assert "Still Open" in rollover_section
+    assert "Done Yesterday" not in rollover_section
+
+
+def test_rollover_suppressed_when_yesterday_missing(tmp_path: Path) -> None:
+    """No yesterday daily file → rollover section completely absent
+    + suppression log fires."""
+    _write_task(
+        tmp_path,
+        "Some Task",
+        {"type": "task", "status": "todo", "name": "Some Task"},
     )
     with structlog.testing.capture_logs() as captured:
         body = render_tier_section(tmp_path, NOW)
+    assert ROLLOVER_HEADER not in body
+    events = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.rollover_suppressed_no_yesterday"
+    ]
+    assert len(events) == 1
 
-    # Stray-note record absent from render — no phantom tier line.
-    assert "Stray Note" not in body
-    # Real task still renders normally.
-    assert "Real Task" in body
 
-    # Log event fires with path + the actual type value.
-    skips = [
+def test_rollover_t3_entries_skipped_by_design(tmp_path: Path) -> None:
+    """T3 is today's intentions — does NOT roll over. Yesterday's T3
+    entries are silently dropped from the rollover scan."""
+    _write_daily(
+        tmp_path,
+        "2026-05-27",
+        tier_curation_yaml=(
+            "t1: []\n"
+            "t2: []\n"
+            "t3:\n"
+            "  - item: Read for an hour\n"
+            "    source: aspirational\n"
+            "  - item: Walk Fergus\n"
+            "    source: operator-adhoc\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Yesterday's block existed → header surfaces; but all entries
+    # were T3 → no rollover lines → sentinel surfaces.
+    assert ROLLOVER_HEADER in body
+    rollover_section = body.split(ROLLOVER_HEADER)[1]
+    assert "Walk Fergus" not in rollover_section
+    assert "Read for an hour" not in rollover_section
+    # "all completed" sentinel — yesterday had a block, but no
+    # T1/T2 entries to roll → render shows the empty-rollover sentinel.
+    assert (
+        "all completed" in rollover_section
+        or "nothing to roll over" in rollover_section
+    )
+
+
+def test_rollover_all_completed_emits_sentinel(tmp_path: Path) -> None:
+    """Yesterday had T1/T2 entries but all are done today → rollover
+    section has the header + 'all completed' sentinel (NOT suppressed;
+    operator can distinguish 'no yesterday' from 'yesterday tracked,
+    all done')."""
+    _write_task(
+        tmp_path,
+        "Finished A",
+        {"type": "task", "status": "done", "name": "Finished A"},
+    )
+    _write_daily(
+        tmp_path,
+        "2026-05-27",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - task: '[[task/Finished A]]'\n"
+            "    source: operator\n"
+            "t2: []\n"
+            "t3: []\n"
+        ),
+    )
+    body = render_tier_section(tmp_path, NOW)
+    assert ROLLOVER_HEADER in body
+    rollover_section = body.split(ROLLOVER_HEADER)[1]
+    assert "Finished A" not in rollover_section
+    assert "all completed" in rollover_section
+
+
+# ---------------------------------------------------------------------------
+# 7. CRITICAL — read-side stability (refresh preserves curation)
+# ---------------------------------------------------------------------------
+
+
+def test_brief_refresh_preserves_curation(tmp_path: Path) -> None:
+    """Render twice with same inputs → identical output. The read
+    path MUST be a pure projection over the curation block; no
+    silent rewrites, no re-derivation, no timestamp drift.
+
+    Per Ship 2 dispatch (item 9, CRITICAL): when the operator
+    triggers ``/today`` or the brief regenerates mid-day, the
+    curated shortlists must be byte-stable as long as
+    ``tier_curation`` hasn't changed.
+    """
+    _write_task(
+        tmp_path,
+        "Task A",
+        {
+            "type": "task",
+            "status": "todo",
+            "name": "Task A",
+            "due": "2026-05-28",
+        },
+    )
+    _write_task(
+        tmp_path,
+        "Task B",
+        {"type": "task", "status": "todo", "name": "Task B"},
+    )
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t1:\n"
+            "  - task: '[[task/Task A]]'\n"
+            "    source: auto-due\n"
+            "    confirmed: true\n"
+            "t2:\n"
+            "  - task: '[[task/Some Other]]'\n"
+            "    source: operator\n"
+            "t3:\n"
+            "  - item: Walk Fergus\n"
+            "    source: aspirational\n"
+        ),
+    )
+
+    body1 = render_tier_section(tmp_path, NOW)
+    body2 = render_tier_section(tmp_path, NOW)
+    body3 = render_tier_section(tmp_path, NOW)
+    assert body1 == body2 == body3
+
+
+# ---------------------------------------------------------------------------
+# 8. Parse-failure handling stays defensive
+# ---------------------------------------------------------------------------
+
+
+def test_parse_failed_task_logged_and_skipped(tmp_path: Path) -> None:
+    """A corrupt task record is skipped + a ``parse_failed`` log fires.
+    Render does NOT crash."""
+    task_dir = tmp_path / "task"
+    task_dir.mkdir(parents=True)
+    (task_dir / "Corrupt.md").write_text(
+        "---\n[invalid yaml\n---\n", encoding="utf-8",
+    )
+    _write_task(
+        tmp_path,
+        "Good Task",
+        {"type": "task", "status": "todo", "name": "Good Task"},
+    )
+    with structlog.testing.capture_logs() as captured:
+        body = render_tier_section(tmp_path, NOW)
+    pool_section = body.split(T2_POOL_HEADER)[1]
+    assert "Good Task" in pool_section
+    events = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.parse_failed"
+    ]
+    assert len(events) == 1
+
+
+def test_non_task_type_logged_and_skipped(tmp_path: Path) -> None:
+    """A file in ``task/`` with ``type != task`` is skipped + logged."""
+    _write_task(
+        tmp_path,
+        "Stray",
+        {"type": "note", "status": "todo", "name": "Stray"},
+    )
+    _write_task(
+        tmp_path,
+        "Real Task",
+        {"type": "task", "status": "todo", "name": "Real Task"},
+    )
+    with structlog.testing.capture_logs() as captured:
+        body = render_tier_section(tmp_path, NOW)
+    pool_section = body.split(T2_POOL_HEADER)[1]
+    assert "Real Task" in pool_section
+    assert "Stray" not in pool_section
+    events = [
         c for c in captured
         if c.get("event") == "brief.tier_section.non_task_skipped"
     ]
-    assert len(skips) == 1
-    assert skips[0]["type"] == "note"
-    assert "Stray Note.md" in skips[0]["path"]
-
-
-def test_unknown_type_skipped(tmp_path: Path) -> None:
-    """A record with ``type:`` MISSING entirely (a body-only file that
-    parsed clean past the validator, or an operator hand-edit that
-    dropped the field) MUST NOT render as a phantom task. The skip
-    log carries ``type=None`` so the operator can distinguish
-    "wrong type" from "no type at all" via the log payload."""
-    # Body-only file: passes the YAML validator (no leading ``---``
-    # = body-only is valid) AND lands with empty frontmatter, so
-    # ``fm.get("type")`` is None.
-    task_dir = tmp_path / "task"
-    task_dir.mkdir(parents=True)
-    (task_dir / "BodyOnlyNoType.md").write_text(
-        "# Body Only\n\nNo frontmatter at all.\n",
-        encoding="utf-8",
-    )
-    _write_task(
-        tmp_path, "Real Task",
-        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
-    )
-    with structlog.testing.capture_logs() as captured:
-        body = render_tier_section(tmp_path, NOW)
-
-    # Body-only record absent from render.
-    assert "BodyOnlyNoType" not in body
-    assert "Body Only" not in body
-    # Real task still renders.
-    assert "Real Task" in body
-
-    # Log event fires with type=None — operator can grep
-    # ``type=None`` to find records missing the type field
-    # entirely vs ``type=note`` to find wrong-type records.
-    skips = [
-        c for c in captured
-        if c.get("event") == "brief.tier_section.non_task_skipped"
-    ]
-    assert len(skips) == 1
-    assert skips[0]["type"] is None
-    assert "BodyOnlyNoType.md" in skips[0]["path"]
+    assert len(events) == 1
 
 
 # ---------------------------------------------------------------------------
-# Log emission pin — successful render
+# 9. Composition / shape — separator + section ordering
 # ---------------------------------------------------------------------------
 
 
-def test_rendered_event_emits_bucket_counts(tmp_path: Path) -> None:
-    """Per builder.md rule #9: pin the rendered log line and its fields."""
+def test_render_includes_separator_between_shortlists_and_pool(
+    tmp_path: Path,
+) -> None:
+    """The render shape is: shortlists → ``---`` → pool → (rollover).
+    The ``---`` separator anchors the curated/materials split."""
+    body = render_tier_section(tmp_path, NOW)
+    # The separator appears between the last shortlist section
+    # (### T3) and the T2 pool header.
+    idx_t3 = body.index("### T3")
+    idx_sep = body.index("\n---\n", idx_t3)
+    idx_pool = body.index(T2_POOL_HEADER, idx_sep)
+    assert idx_t3 < idx_sep < idx_pool
+
+
+def test_render_logs_rendered_event_with_counts(tmp_path: Path) -> None:
+    """The ``rendered`` log event surfaces counts for observability —
+    operators grep ``brief.tier_section.rendered`` to see what landed."""
     _write_task(
-        tmp_path, "T1 Task",
-        {"type": "task", "status": "todo", "base_tier": 1, "created": "2026-05-01"},
+        tmp_path,
+        "A",
+        {
+            "type": "task",
+            "status": "todo",
+            "name": "A",
+            "due": "2026-05-28",
+        },
     )
-    _write_task(
-        tmp_path, "T2 Task",
-        {"type": "task", "status": "todo", "base_tier": 2, "created": "2026-05-01"},
-    )
-    _write_task(
-        tmp_path, "T3 Task A",
-        {"type": "task", "status": "todo", "base_tier": 3, "created": "2026-05-01"},
-    )
-    _write_task(
-        tmp_path, "T3 Task B",
-        {"type": "task", "status": "todo", "base_tier": 3, "created": "2026-05-01"},
+    _write_daily(
+        tmp_path,
+        "2026-05-28",
+        tier_curation_yaml=(
+            "t1: []\n"
+            "t2:\n"
+            "  - task: '[[task/B]]'\n"
+            "    source: operator\n"
+            "t3:\n"
+            "  - item: Walk\n"
+            "    source: aspirational\n"
+        ),
     )
     with structlog.testing.capture_logs() as captured:
         render_tier_section(tmp_path, NOW)
-    matches = [c for c in captured if c.get("event") == "brief.tier_section.rendered"]
-    assert len(matches) == 1
-    rec = matches[0]
-    assert rec["scanned"] == 4
-    assert rec["open_count"] == 4
-    assert rec["t1"] == 1
-    assert rec["t2"] == 1
-    assert rec["t3"] == 2
+    events = [
+        c for c in captured if c.get("event") == "brief.tier_section.rendered"
+    ]
+    assert len(events) == 1
+    e = events[0]
+    assert e["curation_loaded"] is True
+    assert e["curated_t1"] == 0
+    assert e["curated_t2"] == 1
+    assert e["curated_t3"] == 1
+    assert e["auto_t1_count"] == 1
+    assert e["scanned"] == 1

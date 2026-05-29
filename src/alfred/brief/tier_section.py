@@ -1,34 +1,79 @@
-"""Brief integration — render the "Open Tasks by Tier" section.
+"""Brief integration — render the "Open Tasks by Tier" section (V2).
 
-Scans ``vault/task/*.md`` at brief-render time, filters open tasks
-(status in ``OPEN_STATUSES``), computes ``effective_tier`` per task via
-``alfred.tier.compute``, and renders three buckets (T1 / T2 / T3) with
-per-task annotations.
+Tier-V2 reframes tier as a **daily curation ritual** stored in
+``vault/daily/<date>.md`` (the ``tier_curation`` frontmatter block —
+see :mod:`alfred.tier.daily_curation`). This module reads that block
+plus the open-task pool and composes a two-section render: **curated
+shortlists** at the top + **materials** (T2 selection pool + rollover
+from yesterday's incomplete) below.
 
-Unlike the routine section (which reads a derivative file written by
-the routine daemon), the tier section is a **live vault scan**. Tier
-is a pure projection of current task records + current time — no
-aggregation state, no daily handoff file.
+The V1 surface (per-task ``base_tier``/``escalate_to`` projection
+through :func:`alfred.tier.compute.compute_effective_tier`) is gone
+from this module. V1 SYMBOLS remain in :mod:`alfred.tier.compute`
+because :mod:`alfred.telegram.today_command` still imports them — Ship
+3 rewrites that module and atomically drops V1.
 
-Per ``feedback_intentionally_left_blank.md`` every bucket emits its
-header unconditionally; empty buckets emit a sentinel string so the
-operator can distinguish "no tasks at this tier" from "broken render."
+Render shape (the section body — the brief renderer wraps it under
+``## Open Tasks by Tier``):
 
-Render shape per task:
+    ### T1 — Imminent deadlines (auto-surfaced — confirm or drop)
+    - [ ] [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
+    - [ ] [[task/Pay Clinic Rental]] — due tomorrow
 
-  - Plain (base tier, no annotation):
-      ``- [ ] [[task/Reading]] — T3``
-  - Escalated (deadline-driven):
-      ``- [ ] [[task/RRTS Payroll]] — T2→T1 (due 2026-05-28, 18h)``
-  - Priority-derived base (pre-migration tasks):
-      ``- [ ] [[task/Some Task]] — T2 (from priority)``
-  - Overdue:
-      ``- [ ] [[task/Late Task]] — T2→T1 (overdue 2d)``
+    ### T2 — On the radar
+    *(empty — reply "T2 add <items from selection pool below or anywhere>")*
+
+    ### T3 — Self-care for today
+    *(empty — pick from Aspirational routines below or add new — reply "T3 add walk Fergus")*
+
+    ---
+
+    ### T2 selection pool
+    (open ``todo``/``active`` tasks, NOT auto-T1, NOT alfred_triage)
+    - [[task/RRTS Bug List — Burn Through]]
+    - [[task/Set Up QuickBooks Online Developer Access for RRTS Website]]
+
+    ### Rollover from yesterday (incomplete)
+    - T2: [[task/Connect QBO API — RRTS]] *(uncompleted yesterday)*
+
+Read path (per dispatch — three vault reads + one auto-T1 compute):
+
+  1. ``load_daily_curation(vault_path, today)`` — today's
+     ``tier_curation`` block. ``None`` when un-curated yet
+     (operator's "selection pool" mode); populated when talker has
+     already curated.
+  2. ``compute_auto_t1_candidates(vault_path, now)`` — the auto-T1
+     surface (due today / due tomorrow / inside ``escalate_at_days``
+     window). Used to merge auto-candidates with operator-curated T1
+     entries + surface the confirm affordance.
+  3. ``load_daily_curation(vault_path, today - 1 day)`` — yesterday's
+     curation, for rollover detection. Each yesterday-T1/T2 entry is
+     checked against the current task record's status; incomplete
+     entries surface in the Rollover section.
+  4. Open-task pool scan over ``vault/task/*.md`` for the T2 selection
+     pool (status in OPEN_STATUSES, NOT ``alfred_triage``, NOT in
+     today's auto-T1 set, NOT already-curated T1/T2).
+
+Cross-agent contract — operator-facing prompt phrases:
+
+The :data:`T1_CONFIRM_PROMPT` / :data:`T2_EMPTY_PROMPT` /
+:data:`T3_EMPTY_PROMPT` / :data:`ROLLOVER_HEADER` / :data:`T2_POOL_HEADER`
+module-level constants are quoted verbatim by Ship 4's SKILL so the
+talker recognises the operator-reply pattern. Renaming these here =
+update SKILL in lockstep. Pinned via tests.
+
+Read-side stability (CRITICAL for refresh): when the operator triggers
+``/today`` or the brief regenerates mid-day, the curated shortlists
+must be byte-stable as long as ``tier_curation`` hasn't changed. The
+render is a pure projection over the block — no re-derivation, no
+silent rewrites. The :func:`render_tier_section` signature stays the
+same as V1 (``vault_path, now``) so the daemon + ``/today`` wiring
+doesn't need to change.
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,61 +83,63 @@ import yaml
 
 from alfred.tier.compute import (
     OPEN_STATUSES,
-    TierResult,
-    coerce_due_date,
-    compute_effective_tier,
+    compute_auto_t1_candidates,
+)
+from alfred.tier.daily_curation import (
+    DailyCuration,
+    T1T2Entry,
+    T3Entry,
+    load_daily_curation,
 )
 
 log = structlog.get_logger(__name__)
 
 
-# Section header constant — referenced from the brief daemon's section
-# list. Single source of truth so a rename here propagates without
-# search-and-replace in daemon.py.
+# ---------------------------------------------------------------------------
+# Section header — referenced by ``brief/daemon.py`` + ``today_command.py``.
+# Single source of truth so a rename here propagates without grep-replace.
+# ---------------------------------------------------------------------------
+
 SECTION_HEADER = "Open Tasks by Tier"
 
-_NO_TASKS_OVERALL = (
-    "*(no open tasks at any tier — `task/` directory is empty or all "
-    "tasks are done/cancelled)*"
+
+# ---------------------------------------------------------------------------
+# Operator-facing prompt phrases — CROSS-AGENT CONTRACT
+#
+# Ship 4 SKILL imports + quotes these verbatim so the talker recognises
+# the canonical reply patterns ("T1 confirm", "T2 add ...", "T3 add ...").
+# A rename here MUST be matched by a SKILL update in the same arc — code
+# + prompt are two sides of the same contract.
+# ---------------------------------------------------------------------------
+
+T1_CONFIRM_PROMPT = '*(confirm? reply "T1 confirm")*'
+T2_EMPTY_PROMPT = (
+    '*(empty — reply "T2 add <items from selection pool below or anywhere>")*'
 )
+T3_EMPTY_PROMPT = (
+    '*(empty — pick from Aspirational routines below or add new — '
+    'reply "T3 add walk Fergus")*'
+)
+ROLLOVER_HEADER = "### Rollover from yesterday (incomplete)"
+T2_POOL_HEADER = "### T2 selection pool"
+
+
+# ---------------------------------------------------------------------------
+# YAML pre-validation — reused from V1 (python-frontmatter is lenient on
+# bad YAML and silently returns empty metadata; we want the explicit raise
+# so the parse-failed log line stays reachable).
+# ---------------------------------------------------------------------------
 
 
 def _validate_frontmatter_yaml(path: Path) -> str | None:
     """Pre-validate a record's YAML frontmatter block.
 
-    Returns ``None`` if the file is well-formed (or has no frontmatter
-    at all — body-only files are valid). Returns a short error string
-    on failure so the caller can log it and skip the record.
-
-    **Why this wrapper exists** (2026-05-28, post-ship fix to commit
-    ``91504ea``): ``python-frontmatter`` is lenient on invalid YAML —
-    when the frontmatter block fails to parse, ``frontmatter.load``
-    silently returns an empty / partial metadata dict instead of
-    raising. The original ship's ``except Exception`` block around
-    ``frontmatter.load`` was unreachable in practice; broken-YAML
-    task records would silently render as zero-fielded entries
-    instead of triggering the ``parse_failed`` log line operators
-    rely on to distinguish "no tasks at this tier" from "tasks
-    exist but the file is broken." Per
-    ``feedback_intentionally_left_blank.md``: silence-where-failure-
-    should-be-visible is the antipattern this layer was built to
-    prevent. Routing through ``yaml.safe_load`` on the extracted
-    block gives us the explicit raise we need.
-
-    The pre-validation does NOT replace ``frontmatter.load``; the
-    happy-path still uses it for the metadata + body split. We
-    only use ``yaml.safe_load`` as a structural gate.
-
-    File-shape rules:
-
-    - No leading ``---`` line → no frontmatter; body-only file. Valid.
-      (Not a task-record shape we'd typically see, but we don't
-      want to fail-flag it here — let downstream filters drop it.)
-    - Leading ``---`` with a matching closing ``---`` → extract the
-      block and ``yaml.safe_load`` it. Raise on YAML errors.
-    - Leading ``---`` with NO closing ``---`` (truncated file) →
-      treat as broken; the operator's editor likely crashed mid-edit.
-    - I/O errors → broken; log and skip.
+    Returns ``None`` when well-formed (or no frontmatter at all);
+    returns a short error string on failure. ``python-frontmatter`` is
+    lenient on invalid YAML — without this pre-pass, broken records
+    would silently render as zero-fielded entries instead of triggering
+    the parse_failed log line operators rely on. See V1's history at
+    commit ``91504ea`` for the underlying gotcha.
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -101,20 +148,11 @@ def _validate_frontmatter_yaml(path: Path) -> str | None:
     except UnicodeDecodeError as exc:
         return f"not utf-8: {exc}"
 
-    # No frontmatter at all is valid — body-only files exist and
-    # shouldn't be flagged as broken at this layer.
     if not text.startswith("---"):
         return None
 
-    # Find the closing ``---`` line. PyYAML's frontmatter convention
-    # is a leading line ``---\n`` and a closing line ``---\n``; the
-    # block in between is the YAML payload. We scan line-by-line from
-    # line 1 (skipping the opener) to handle CRLF tolerantly.
     lines = text.splitlines()
     if len(lines) < 2 or lines[0].strip() != "---":
-        # Shouldn't happen given the ``startswith("---")`` check,
-        # but defensive — a leading ``---`` not followed by a newline
-        # (e.g., ``---title:`` with no break) is malformed.
         return "frontmatter opener malformed (no newline after leading ---)"
 
     close_idx: int | None = None
@@ -130,31 +168,30 @@ def _validate_frontmatter_yaml(path: Path) -> str | None:
     try:
         yaml.safe_load(block)
     except yaml.YAMLError as exc:
-        # Compact the error to one line — yaml.YAMLError str() can be
-        # multi-line and would clutter the structured log payload.
-        first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        first_line = (
+            str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        )
         return f"yaml: {first_line}"
 
     return None
 
 
+# ---------------------------------------------------------------------------
+# Task-record iteration — yields (path, fm, name) tuples
+# ---------------------------------------------------------------------------
+
+
 def _iter_task_records(vault_path: Path) -> list[tuple[Path, dict, str]]:
-    """Yield ``(path, frontmatter_dict, name)`` for every task record.
+    """Walk ``vault/task/*.md`` and yield non-broken task records.
 
-    Walks ``<vault>/task/*.md`` in sorted order. Skips files that fail
-    to parse — emits a single log line per failure so operators see
-    the skip rather than a silent drop. Does NOT filter by status
-    here; status filtering is done at the bucket-population step so
-    a future caller (e.g. a CLI ``alfred tier list``) can scan ALL
-    tasks without re-walking.
+    Filters at this layer:
+      * Skip parse-failed records (logged at warning).
+      * Skip non-task ``type:`` (logged at info — defensive against
+        stray templates / janitor stubs).
 
-    Parse-failure detection routes through ``_validate_frontmatter_yaml``
-    (a pre-pass over the raw YAML block) BEFORE handing the file to
-    ``frontmatter.load``. The library is lenient on invalid YAML —
-    silently returning empty metadata — so without this pre-pass the
-    parse-failure log line below would be unreachable in practice.
-    See ``_validate_frontmatter_yaml`` docstring for the full
-    rationale.
+    Does NOT filter by ``status`` here; callers filter at the
+    bucket-population step so a future surface (e.g. ``alfred tier
+    list``) could scan ALL tasks without re-walking.
     """
     task_dir = vault_path / "task"
     if not task_dir.is_dir():
@@ -162,8 +199,7 @@ def _iter_task_records(vault_path: Path) -> list[tuple[Path, dict, str]]:
             "brief.tier_section.no_task_dir",
             path=str(task_dir),
             detail=(
-                "vault/task/ directory does not exist — emitting the "
-                "no-tasks-overall sentinel."
+                "vault/task/ does not exist — selection pool will be empty."
             ),
         )
         return []
@@ -181,9 +217,6 @@ def _iter_task_records(vault_path: Path) -> list[tuple[Path, dict, str]]:
         try:
             post = frontmatter.load(str(path))
         except Exception as exc:  # noqa: BLE001
-            # Defensive: a YAML payload that passes ``yaml.safe_load``
-            # but trips ``frontmatter.load`` is unexpected — log the
-            # event class so we can spot it in production telemetry.
             log.warning(
                 "brief.tier_section.parse_failed",
                 path=str(path),
@@ -191,17 +224,6 @@ def _iter_task_records(vault_path: Path) -> list[tuple[Path, dict, str]]:
             )
             continue
         fm = dict(post.metadata or {})
-        # Type filter — defensive against stray non-task records in
-        # ``vault/task/``. Templates, janitor-rescue stubs, or operator
-        # hand-edits that drop a wrong-type file into the directory
-        # would otherwise render as phantom tasks in the brief.
-        #
-        # Per ``feedback_intentionally_left_blank.md`` + the recurring
-        # silent-skip antipattern: every ``continue`` gets a named log
-        # event so operators reading the tier-section logs can
-        # distinguish "no tasks at this tier" from "task dir had files
-        # the filter dropped." The skip carries the actual frontmatter
-        # ``type`` so the operator can grep + fix the misplaced record.
         record_type = fm.get("type")
         if record_type != "task":
             log.info(
@@ -218,9 +240,7 @@ def _iter_task_records(vault_path: Path) -> list[tuple[Path, dict, str]]:
 def _is_open(fm: dict[str, Any]) -> bool:
     """Return True if the task's status is in ``OPEN_STATUSES``.
 
-    Missing ``status`` is treated as ``"todo"`` (forward-compat with
-    operator-authored task records that omit the field — todo is the
-    safest default for "show in queue").
+    Missing ``status`` is treated as ``"todo"`` (forward-compat).
     """
     status = fm.get("status") or "todo"
     if not isinstance(status, str):
@@ -228,187 +248,443 @@ def _is_open(fm: dict[str, Any]) -> bool:
     return status.lower() in OPEN_STATUSES
 
 
-def _format_due_distance(due: Any, now: datetime) -> str:
-    """Render a human-readable time-to-due string.
+def _wikilink_to_record_name(wikilink: str) -> str | None:
+    """Extract the record name from a ``[[task/Name]]`` wikilink.
 
-    Returns ``"3d"``, ``"18h"``, ``"overdue 2d"``, or ``""`` if ``due``
-    is missing / unparseable. Hours only surface when ``due`` is today
-    (days == 0); otherwise we render days (the operator-facing
-    granularity for task deadlines).
+    Returns ``None`` on malformed input (no ``[[…]]`` or no ``task/``
+    prefix). Used to map curated T1/T2 ``task:`` strings back to the
+    task pool for rollover-status checking + auto-T1 dedup.
     """
-    parsed = coerce_due_date(due)
-    if parsed is None:
-        return ""
-    delta_days = (parsed - now.date()).days
-    if delta_days < 0:
-        return f"overdue {abs(delta_days)}d"
-    if delta_days == 0:
-        # Same-day — show hours-to-end-of-day as the granularity. We
-        # treat ``due`` as "end of day" for hours calculation since the
-        # field is date-only in the vault.
-        end_of_day = datetime.combine(parsed, datetime.max.time()).replace(
-            tzinfo=now.tzinfo,
-        )
-        hours = max(0, int((end_of_day - now).total_seconds() // 3600))
-        return f"{hours}h"
-    return f"{delta_days}d"
+    if not isinstance(wikilink, str):
+        return None
+    s = wikilink.strip()
+    if not (s.startswith("[[") and s.endswith("]]")):
+        return None
+    inner = s[2:-2].strip()
+    if "/" not in inner:
+        return None
+    type_part, _, name_part = inner.partition("/")
+    if type_part.strip() != "task":
+        return None
+    return name_part.strip()
 
 
-def _format_task_line(
-    name: str,
-    result: TierResult,
-    fm: dict[str, Any],
-    now: datetime,
+# ---------------------------------------------------------------------------
+# Curated-shortlist render
+# ---------------------------------------------------------------------------
+
+
+def _render_t1_entry(
+    entry: T1T2Entry,
+    auto_t1_reason_by_name: dict[str, str],
 ) -> str:
-    """Render one ``- [ ] [[task/Name]] — T<n> (annotation)`` line.
+    """Render one T1 line.
 
-    The annotation shape depends on the tier-computation outcome:
+    Confirm-affordance logic:
+      * If the entry's ``confirmed`` is ``True`` → render bare (operator
+        has signed off; no prompt needed).
+      * Else → append :data:`T1_CONFIRM_PROMPT` so the talker reply
+        pattern is visible in the brief.
 
-    - ``base_tier == effective_tier`` AND base was "set" → bare
-      ``T<n>`` (no parenthetical).
-    - ``base_tier == effective_tier`` AND base was derived from
-      priority → ``T<n> (from priority)``.
-    - ``base_tier != effective_tier`` → ``T<base>→T<eff> (due <date>,
-      <distance>)`` or ``T<base>→T<eff> (overdue <n>d)``.
+    Surface reason (``due today`` / ``due tomorrow`` / ``escalate
+    window ...``) is taken from ``auto_t1_reason_by_name`` when the
+    entry matches an auto-T1 candidate; otherwise rendered without a
+    reason annotation (operator manually added a T1 entry that wasn't
+    auto-surfaced).
     """
-    wikilink = f"[[task/{name}]]"
-
-    if result.base_tier == result.effective_tier:
-        # Non-escalated case. Decide if the base derivation deserves
-        # an annotation (priority-fallback) or stays bare.
-        if "from priority" in result.reason:
-            return f"- [ ] {wikilink} — T{result.base_tier} (from priority)"
-        return f"- [ ] {wikilink} — T{result.base_tier}"
-
-    # Escalated case. Compose the deadline-relative annotation.
-    distance = _format_due_distance(fm.get("due"), now)
-    due_raw = fm.get("due")
-    due_str = ""
-    if due_raw is not None:
-        # Render the date portion only (the field is date-shaped per
-        # the schema; if a string slipped through, slice to ISO).
-        if isinstance(due_raw, str):
-            due_str = due_raw.strip()[:10]
-        else:
-            due_str = str(due_raw)[:10]
-
-    parts: list[str] = []
-    if "overdue" in distance:
-        parts.append(distance)
+    record_name = _wikilink_to_record_name(entry.task) or ""
+    reason = auto_t1_reason_by_name.get(record_name, "")
+    if reason:
+        head = f"- [ ] {entry.task} — {reason}"
     else:
-        if due_str:
-            parts.append(f"due {due_str}")
-        if distance:
-            parts.append(distance)
-
-    annotation = ", ".join(parts) if parts else ""
-    arrow = f"T{result.base_tier}→T{result.effective_tier}"
-    if annotation:
-        return f"- [ ] {wikilink} — {arrow} ({annotation})"
-    return f"- [ ] {wikilink} — {arrow}"
+        head = f"- [ ] {entry.task}"
+    if entry.confirmed is True:
+        return head
+    # Auto-surfaced (confirmed=False) OR operator-added (confirmed=None)
+    # both get the confirm affordance — the prompt names the canonical
+    # talker-reply pattern.
+    return f"{head}  {T1_CONFIRM_PROMPT}"
 
 
-def _render_bucket(tier: int, lines: list[str]) -> str:
-    """Compose ``### Tier <n>\n\n- [ ] ...\n`` for one bucket.
+def _render_t2_entry(entry: T1T2Entry) -> str:
+    """Render one T2 line — bare wikilink (no confirm affordance)."""
+    return f"- [ ] {entry.task}"
 
-    Always emits the header — per intentionally-left-blank, the
-    operator sees three section headers every brief so an empty bucket
-    is distinguishable from a broken render.
+
+def _render_t3_entry(entry: T3Entry) -> str:
+    """Render one T3 line — bare free-text item (no confirm affordance).
+
+    Note T3 entries carry ``item:`` (free-text) not ``task:`` (wikilink).
     """
-    out = [f"### Tier {tier}", ""]
-    if not lines:
-        out.append(f"*(no open tasks at Tier {tier})*")
+    return f"- [ ] {entry.item}"
+
+
+def _merge_auto_t1_into_curated(
+    curated_t1: list[T1T2Entry],
+    auto_t1_candidates: list[Any],  # list[AutoT1Candidate]
+) -> tuple[list[T1T2Entry], dict[str, str]]:
+    """Merge auto-T1 candidates with operator-curated T1 entries.
+
+    Returns ``(merged_t1, reason_by_name)``:
+      * ``merged_t1`` — curated_t1 entries kept verbatim (operator
+        wins on the per-entry confirmed state). Auto-T1 candidates
+        NOT already in curated_t1 are appended as ``confirmed=False``
+        entries with ``source="auto-due"``.
+      * ``reason_by_name`` — map of record-name → canonical surface
+        reason string (``"due today"`` / etc.). Used by
+        :func:`_render_t1_entry` to inline the reason text.
+
+    Cross-Ship contract: this merge is read-side only — the resulting
+    list reflects what the brief SHOULD show, not what the operator's
+    curation block contains. The persisted curation is left
+    untouched (Ship 4's talker writes confirmations back via
+    :func:`save_tier_curation`).
+    """
+    reason_by_name: dict[str, str] = {}
+    for cand in auto_t1_candidates:
+        # ``cand.name`` is the record name (frontmatter ``name`` or
+        # file stem). Match against curated entries via the wikilink
+        # parse to keep names canonical.
+        reason_by_name[cand.name] = cand.surface_reason
+
+    curated_names = set()
+    for entry in curated_t1:
+        rec_name = _wikilink_to_record_name(entry.task)
+        if rec_name:
+            curated_names.add(rec_name)
+
+    merged: list[T1T2Entry] = list(curated_t1)
+    for cand in auto_t1_candidates:
+        if cand.name in curated_names:
+            continue
+        # Auto-surfaced entry not yet curated — synthesize a transient
+        # T1T2Entry for render only (this is NOT persisted; the
+        # talker writes through ``save_tier_curation`` per Ship 4).
+        wikilink = f"[[task/{cand.name}]]"
+        merged.append(T1T2Entry(
+            task=wikilink,
+            source="auto-due",
+            confirmed=False,
+        ))
+    return merged, reason_by_name
+
+
+def _render_curated_shortlists(
+    curation: DailyCuration | None,
+    auto_t1_candidates: list[Any],
+) -> str:
+    """Compose the three ``### T1 / T2 / T3`` subsections.
+
+    When curation is ``None`` (un-curated state — file missing or no
+    ``tier_curation`` block yet), we still surface auto-T1 candidates
+    + empty-bucket prompts so the operator's first brief of the day
+    is actionable.
+    """
+    curated_t1: list[T1T2Entry] = curation.t1 if curation else []
+    curated_t2: list[T1T2Entry] = curation.t2 if curation else []
+    curated_t3: list[T3Entry] = curation.t3 if curation else []
+
+    merged_t1, reason_by_name = _merge_auto_t1_into_curated(
+        curated_t1, auto_t1_candidates,
+    )
+
+    # --- T1 -----------------------------------------------------------
+    t1_lines = [
+        "### T1 — Imminent deadlines (auto-surfaced — confirm or drop)",
+        "",
+    ]
+    if not merged_t1:
+        t1_lines.append("*(no T1 candidates today)*")
+        t1_lines.append("")
+    else:
+        for entry in merged_t1:
+            t1_lines.append(_render_t1_entry(entry, reason_by_name))
+        t1_lines.append("")
+
+    # --- T2 -----------------------------------------------------------
+    t2_lines = ["### T2 — On the radar", ""]
+    if not curated_t2:
+        t2_lines.append(T2_EMPTY_PROMPT)
+        t2_lines.append("")
+    else:
+        for entry in curated_t2:
+            t2_lines.append(_render_t2_entry(entry))
+        t2_lines.append("")
+
+    # --- T3 -----------------------------------------------------------
+    t3_lines = ["### T3 — Self-care for today", ""]
+    if not curated_t3:
+        t3_lines.append(T3_EMPTY_PROMPT)
+        t3_lines.append("")
+    else:
+        for entry in curated_t3:
+            t3_lines.append(_render_t3_entry(entry))
+        t3_lines.append("")
+
+    return "\n".join(t1_lines + t2_lines + t3_lines)
+
+
+# ---------------------------------------------------------------------------
+# T2 selection pool — open tasks NOT auto-T1, NOT alfred_triage, NOT curated
+# ---------------------------------------------------------------------------
+
+
+def _render_t2_selection_pool(
+    records: list[tuple[Path, dict, str]],
+    auto_t1_record_names: set[str],
+    curated_t1_record_names: set[str],
+    curated_t2_record_names: set[str],
+) -> str:
+    """Compose the ``### T2 selection pool`` subsection (materials).
+
+    The pool surfaces tasks the operator might want to add to T2.
+    Filters (in order):
+      1. ``status`` in :data:`OPEN_STATUSES`
+      2. NOT ``alfred_triage: True`` (logged per skip)
+      3. NOT in today's auto-T1 set (already in T1 shortlist)
+      4. NOT already in curated T1 (operator confirmed) or T2 (operator
+         picked)
+
+    Empty-pool path emits a sentinel line per intentionally-left-blank.
+    """
+    pool: list[tuple[str, Path]] = []  # (display_name, path) for sort
+    alfred_triage_skipped = 0
+    for path, fm, name in records:
+        if not _is_open(fm):
+            continue
+        if fm.get("alfred_triage") is True:
+            log.info(
+                "brief.tier_section.alfred_triage_skipped",
+                path=str(path),
+                name=name,
+                detail=(
+                    "janitor-generated triage record is not "
+                    "tier-rankable work; surfaces in Daily Sync "
+                    "instead."
+                ),
+            )
+            alfred_triage_skipped += 1
+            continue
+        if name in auto_t1_record_names:
+            continue
+        if name in curated_t1_record_names:
+            continue
+        if name in curated_t2_record_names:
+            continue
+        pool.append((name, path))
+
+    pool.sort(key=lambda np: np[0].lower())
+
+    out = [
+        T2_POOL_HEADER,
+        (
+            "(open `todo`/`active` tasks, NOT auto-T1, NOT "
+            "alfred_triage)"
+        ),
+        "",
+    ]
+    if not pool:
+        out.append("*(selection pool is empty — no other open tasks)*")
         out.append("")
         return "\n".join(out)
-    out.extend(lines)
+    for name, _path in pool:
+        out.append(f"- [[task/{name}]]")
     out.append("")
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Rollover from yesterday — incomplete T1 / T2 entries
+# ---------------------------------------------------------------------------
+
+
+def _build_status_lookup(
+    records: list[tuple[Path, dict, str]],
+) -> dict[str, str]:
+    """Build a ``{record_name: status_lower}`` map from the task pool.
+
+    Used by the rollover scan to check whether yesterday's T1/T2
+    entries are still open today. Missing entries are NOT in the
+    lookup (the task may have been deleted/moved; rollover treats
+    those as "incomplete-and-missing" — surfaced with a note).
+    """
+    lookup: dict[str, str] = {}
+    for _path, fm, name in records:
+        status = fm.get("status") or "todo"
+        if isinstance(status, str):
+            lookup[name] = status.lower()
+    return lookup
+
+
+def _render_rollover_section(
+    yesterday_curation: DailyCuration | None,
+    status_by_name: dict[str, str],
+) -> str:
+    """Compose the ``### Rollover from yesterday (incomplete)`` subsection.
+
+    Logic:
+      * If ``yesterday_curation`` is ``None`` (no yesterday daily file
+        OR no ``tier_curation`` block) → return empty string (the
+        section is suppressed entirely — rollover is opt-in by data
+        existence, not unconditional like the curated shortlists).
+      * Walk yesterday's T1 + T2 entries. For each:
+          - Parse the wikilink to a record name.
+          - Look up the current status.
+          - If status is missing OR in OPEN_STATUSES → incomplete,
+            surface in rollover.
+          - Otherwise (done/cancelled today) → completed, skip.
+
+    T3 is NOT included in rollover per dispatch — T3 is today's
+    intentions, picked fresh each day.
+
+    Empty-rollover path (yesterday had a block, but everything was
+    completed) → surface the header + sentinel rather than suppress,
+    so the operator can distinguish "no yesterday file" (suppressed)
+    from "yesterday tracked, all done" (header + sentinel).
+    """
+    if yesterday_curation is None:
+        # Section suppressed entirely. Per intentionally-left-blank,
+        # we DO emit a log signal so the operator can grep the brief
+        # log for "did rollover run?" — the suppression here is
+        # render-level only.
+        log.info(
+            "brief.tier_section.rollover_suppressed_no_yesterday",
+            detail=(
+                "yesterday's daily file is absent or has no "
+                "tier_curation block; rollover section omitted."
+            ),
+        )
+        return ""
+
+    incomplete: list[tuple[str, str]] = []  # (tier_label, wikilink)
+    for entry in yesterday_curation.t1:
+        rec_name = _wikilink_to_record_name(entry.task)
+        if rec_name is None:
+            continue
+        status = status_by_name.get(rec_name)
+        # Missing OR open → incomplete (treat missing as "task may have
+        # been moved/deleted; flag to operator").
+        if status is None or status in OPEN_STATUSES:
+            incomplete.append(("T1", entry.task))
+    for entry in yesterday_curation.t2:
+        rec_name = _wikilink_to_record_name(entry.task)
+        if rec_name is None:
+            continue
+        status = status_by_name.get(rec_name)
+        if status is None or status in OPEN_STATUSES:
+            incomplete.append(("T2", entry.task))
+
+    out = [ROLLOVER_HEADER, ""]
+    if not incomplete:
+        out.append(
+            "*(yesterday's tracked items all completed — nothing to "
+            "roll over)*"
+        )
+        out.append("")
+        return "\n".join(out)
+    for tier_label, wikilink in incomplete:
+        out.append(
+            f"- {tier_label}: {wikilink} *(uncompleted yesterday)*"
+        )
+    out.append("")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 
 def render_tier_section(
     vault_path: Path,
     now: datetime,
 ) -> str:
-    """Scan ``vault/task/*.md`` and render the brief's tier section.
+    """Render the brief's ``Open Tasks by Tier`` section body (V2).
 
-    ``now`` is the reference instant for tier computation — pass
-    ``datetime.now(tz)`` from the brief daemon; tests pass a fixture.
-    Always returns a non-empty string per intentionally-left-blank.
+    ``now`` is the reference instant — passed by the brief daemon at
+    fire time + by ``/today`` at request time. ``now.date()`` is "today"
+    for the curation lookup.
+
+    Always returns a non-empty string per
+    ``feedback_intentionally_left_blank``: even the cold-start case
+    (no vault, no curation, no records) emits an explicit "ran,
+    nothing to do" composition.
+
+    Read-side stability: this function is a pure projection over the
+    inputs (today's curation + auto-T1 candidates + yesterday's
+    curation + task pool snapshot). Called twice with identical inputs
+    it returns identical output — Ship 4 talker reads + writes
+    curation separately; this render never mutates the block.
     """
+    today = now.date()
+
+    # --- 1. Read today's curation ---------------------------------
+    curation = load_daily_curation(vault_path, today)
+
+    # --- 2. Compute auto-T1 candidates ----------------------------
+    auto_t1_candidates = compute_auto_t1_candidates(vault_path, now)
+    auto_t1_record_names = {c.name for c in auto_t1_candidates}
+
+    # --- 3. Read yesterday's curation for rollover ----------------
+    yesterday = today - timedelta(days=1)
+    yesterday_curation = load_daily_curation(vault_path, yesterday)
+
+    # --- 4. Scan task pool ----------------------------------------
     records = _iter_task_records(vault_path)
+    status_by_name = _build_status_lookup(records)
 
-    open_records: list[tuple[str, TierResult, dict[str, Any]]] = []
-    for _path, fm, name in records:
-        if not _is_open(fm):
-            continue
-        result = compute_effective_tier(fm, now)
-        open_records.append((name, result, fm))
+    # Build the curated-name sets for the selection-pool exclusion.
+    curated_t1_names: set[str] = set()
+    curated_t2_names: set[str] = set()
+    if curation is not None:
+        for e in curation.t1:
+            n = _wikilink_to_record_name(e.task)
+            if n:
+                curated_t1_names.add(n)
+        for e in curation.t2:
+            n = _wikilink_to_record_name(e.task)
+            if n:
+                curated_t2_names.add(n)
 
-    # Sort within bucket: by due-date ascending (overdue first, then
-    # soonest), then by name. Deterministic + operator-useful — the
-    # next deadline surfaces at the top of each bucket.
-    def _sort_key(item: tuple[str, TierResult, dict[str, Any]]):
-        name, _result, fm = item
-        due = coerce_due_date(fm.get("due"))
-        # None-due sorts last within bucket; (1, "") trick — bool
-        # comparison: due-present (False == 0) < due-absent (True == 1).
-        return (due is None, due or date.max, name.lower())
+    # --- 5. Compose render --------------------------------------------
+    shortlists = _render_curated_shortlists(curation, auto_t1_candidates)
+    pool = _render_t2_selection_pool(
+        records,
+        auto_t1_record_names,
+        curated_t1_names,
+        curated_t2_names,
+    )
+    rollover = _render_rollover_section(yesterday_curation, status_by_name)
 
-    buckets: dict[int, list[str]] = {1: [], 2: [], 3: []}
-    for name, result, fm in sorted(open_records, key=_sort_key):
-        line = _format_task_line(name, result, fm, now)
-        # Defensive: an out-of-range effective_tier shouldn't reach
-        # this branch (compute clamps to 1/2/3) but if it does, drop
-        # the line into the closest valid bucket and log.
-        target = result.effective_tier
-        if target not in buckets:
-            log.warning(
-                "brief.tier_section.invalid_effective_tier",
-                name=name,
-                effective_tier=target,
-                base_tier=result.base_tier,
-                reason=result.reason,
-            )
-            target = 3
-        buckets[target].append(line)
+    # Compose with separator between shortlists and materials. Rollover
+    # is appended only when non-empty (suppressed when yesterday's
+    # file is absent).
+    parts = [shortlists, "---", "", pool]
+    if rollover:
+        parts.append(rollover)
 
-    if not open_records:
-        # Three empty bucket headers + top-level sentinel per
-        # intentionally-left-blank so "ran, nothing to do" is
-        # distinguishable from "broken."
-        log.info(
-            "brief.tier_section.no_open_tasks",
-            scanned=len(records),
-            detail=(
-                "task/ directory scanned but no records have status in "
-                "{todo, active, blocked}. Emitting unconditional buckets "
-                "with sentinels."
-            ),
-        )
-        body = (
-            f"{_NO_TASKS_OVERALL}\n\n"
-            f"{_render_bucket(1, [])}\n"
-            f"{_render_bucket(2, [])}\n"
-            f"{_render_bucket(3, [])}"
-        )
-        return body
-
-    sections = [
-        _render_bucket(1, buckets[1]),
-        _render_bucket(2, buckets[2]),
-        _render_bucket(3, buckets[3]),
-    ]
-    body = "\n".join(sections)
+    body = "\n".join(parts)
 
     log.info(
         "brief.tier_section.rendered",
         scanned=len(records),
-        open_count=len(open_records),
-        t1=len(buckets[1]),
-        t2=len(buckets[2]),
-        t3=len(buckets[3]),
+        curation_loaded=curation is not None,
+        curated_t1=len(curation.t1) if curation else 0,
+        curated_t2=len(curation.t2) if curation else 0,
+        curated_t3=len(curation.t3) if curation else 0,
+        auto_t1_count=len(auto_t1_candidates),
+        rollover_present=bool(rollover),
+        yesterday_curation_loaded=yesterday_curation is not None,
     )
     return body
 
 
-__all__ = ["SECTION_HEADER", "render_tier_section"]
+__all__ = [
+    "ROLLOVER_HEADER",
+    "SECTION_HEADER",
+    "T1_CONFIRM_PROMPT",
+    "T2_EMPTY_PROMPT",
+    "T2_POOL_HEADER",
+    "T3_EMPTY_PROMPT",
+    "render_tier_section",
+]
