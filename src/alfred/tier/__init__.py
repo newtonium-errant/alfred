@@ -1,27 +1,33 @@
-"""Tier — 3-tier task system with deadline-relative escalation.
+"""Tier — V2 daily curation ritual (2026-05-29).
 
-Phase 1 (2026-05-28). Salem-only by virtue of brief integration (each
-instance's brief scans its own vault; non-Salem instances have no tasks
-using these fields).
+Tier-V2 reframes tier as a daily curation ritual stored in
+``vault/daily/<date>.md`` rather than persistent per-task attributes.
+The operator picks each day's T1 / T2 / T3 shortlists in the morning
+via talker; the brief renders the curated lists going forward that day.
 
-This module is a **pure read-side projection** over ``vault/task/*.md``
-records. ``effective_tier`` is computed at brief-render time from
-``base_tier``, ``due``, ``escalate_at_days``, and ``escalate_to`` — it is
-**never written back** to the record. See ``compute.py`` for the
-computation contract and ``alfred.brief.tier_section`` for the render
-layer.
+Two layers:
+
+  * :mod:`alfred.tier.compute` — auto-T1 candidate discovery (which
+    open tasks should the operator be prompted to confirm as T1 today)
+    + the ``coerce_due_date`` / ``OPEN_STATUSES`` primitives.
+  * :mod:`alfred.tier.daily_curation` — the data layer for the
+    ``tier_curation`` frontmatter block (typed dataclasses +
+    load/save helpers).
+
+The render layer lives at :mod:`alfred.brief.tier_section` (composes
+auto-T1 + curated shortlists + T2 selection pool + rollover).
+
+V1 (per-task ``base_tier`` / ``escalate_to`` / priority-fallback
+projection) was retired in Ship 3 (2026-05-29). The migration script
+``scripts/migrate_tier_phase1.py`` is preserved for the deferred
+backfill of the 24 existing ``base_tier`` records (Ship 5).
 """
 
 from .compute import (
-    DEFAULT_ESCALATION_GAP,
     OPEN_STATUSES,
-    PRIORITY_TO_BASE_TIER,
     AutoT1Candidate,
-    TierResult,
     coerce_due_date,
     compute_auto_t1_candidates,
-    compute_effective_tier,
-    derive_base_tier_from_priority,
 )
 from .daily_curation import (
     DailyCuration,
@@ -35,19 +41,14 @@ from .daily_curation import (
 
 __all__ = [
     "AutoT1Candidate",
-    "DEFAULT_ESCALATION_GAP",
     "DailyCuration",
     "OPEN_STATUSES",
-    "PRIORITY_TO_BASE_TIER",
     "T1T2Entry",
     "T1_T2_SOURCES",
     "T3Entry",
     "T3_SOURCES",
-    "TierResult",
     "coerce_due_date",
     "compute_auto_t1_candidates",
-    "compute_effective_tier",
-    "derive_base_tier_from_priority",
     "load_daily_curation",
     "save_tier_curation",
 ]

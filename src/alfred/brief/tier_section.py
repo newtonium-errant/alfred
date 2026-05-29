@@ -8,10 +8,11 @@ shortlists** at the top + **materials** (T2 selection pool + rollover
 from yesterday's incomplete) below.
 
 The V1 surface (per-task ``base_tier``/``escalate_to`` projection
-through :func:`alfred.tier.compute.compute_effective_tier`) is gone
-from this module. V1 SYMBOLS remain in :mod:`alfred.tier.compute`
-because :mod:`alfred.telegram.today_command` still imports them — Ship
-3 rewrites that module and atomically drops V1.
+through ``compute_effective_tier``) is gone from this module and from
+:mod:`alfred.tier.compute` itself (Ship 3 atomic drop, 2026-05-29 —
+last-consumer-rewrite ratified pattern #22). The migration script
+``scripts/migrate_tier_phase1.py`` is preserved for the deferred
+backfill of the 24 existing ``base_tier`` records (Ship 5).
 
 Render shape (the section body — the brief renderer wraps it under
 ``## Open Tasks by Tier``):

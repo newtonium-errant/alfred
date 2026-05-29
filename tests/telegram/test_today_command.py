@@ -1,8 +1,13 @@
-"""Tier Phase 2A — /today slash command tests (2026-05-28).
+"""Tier Phase 2A — /today slash command tests (originally 2026-05-28;
+scope refined 2026-05-29 Ship 3).
 
 Per the dispatch spec:
-  * /today — Salem-only glance-view mini-brief composing the tier,
-    routines, and upcoming-events sections as one Telegram reply
+  * /today — Salem-only glance-view mini-brief composing the tier
+    and upcoming-events sections as one Telegram reply
+  * **Routines section dropped in Ship 3** — duplicating the brief's
+    routines surface in /today muddled the glance-view's purpose;
+    operators read routines from the morning brief or via the routine
+    CLI surface
   * Read-only — no vault writes, no session record
   * Config-gated via ``telegram.today_command.enabled: true``
   * Salem-only: KAL-LE / Hypatia leave the block absent so Telegram's
@@ -13,12 +18,13 @@ Coverage:
   * Handler dispatches when enabled=True
   * Handler no-ops when enabled=False (defensive in-handler gate)
   * Handler no-ops on non-allowlisted user (access control parity)
-  * Composed body contains the three section headers
-  * Section ordering matches the morning brief (tier → routines → events)
+  * Composed body contains the TWO section headers (tier + events)
+  * Composed body does NOT contain a routines section header (Ship 3 pin)
+  * Section ordering matches the morning brief (tier → events)
   * Body length under the Telegram cap (under 4000 chars sanity check)
   * compose_today_reply pure-helper covers: tier header present,
-    routines header present, upcoming-events header present, ordering
-    preserved, defensive truncation when body would overflow
+    upcoming-events header present, ordering preserved, defensive
+    truncation when body would overflow
 """
 
 from __future__ import annotations
@@ -146,11 +152,31 @@ def test_compose_includes_tier_section_header(salem_vault: Path) -> None:
     assert "## Open Tasks by Tier" in body
 
 
-def test_compose_includes_routines_section_header(salem_vault: Path) -> None:
-    """Mirror of the brief daemon's ``Today's Routines`` section header."""
+def test_compose_excludes_routines_section_header(salem_vault: Path) -> None:
+    """Ship 3 scope refinement (2026-05-29): routines section is NOT
+    in /today. Operators read routines from the morning brief or the
+    routine CLI surface, not /today.
+
+    Pinned so a future re-introduction surfaces immediately. If you
+    find yourself wanting to add routines back, ask the operator
+    whether the glance-view purpose changed — the original Phase 2A
+    ship had routines + the Ship 3 drop was deliberate scope
+    refinement, not an oversight."""
     now = datetime(2026, 5, 28, 14, 0, tzinfo=HALIFAX)
     body = compose_today_reply(salem_vault, now)
-    assert "## Today's Routines" in body
+    assert "## Today's Routines" not in body
+    # Defensive: the routines render function shouldn't even be
+    # importable from the today_command module post-Ship 3.
+    from alfred.telegram import today_command as _tc
+    assert not hasattr(_tc, "render_routine_section"), (
+        "today_command.render_routine_section was re-introduced — "
+        "Ship 3 dropped this binding deliberately. Confirm operator "
+        "intent before adding routines back."
+    )
+    assert not hasattr(_tc, "ROUTINES_SECTION_HEADER"), (
+        "today_command.ROUTINES_SECTION_HEADER was re-introduced — "
+        "Ship 3 dropped this binding deliberately."
+    )
 
 
 def test_compose_includes_upcoming_events_section_header(
@@ -163,17 +189,19 @@ def test_compose_includes_upcoming_events_section_header(
 
 
 def test_compose_section_ordering_matches_brief(salem_vault: Path) -> None:
-    """Sections appear in the canonical brief order: tier → routines →
+    """Sections appear in the canonical brief order: tier →
     upcoming events. Pinned so a refactor that reorders silently
-    surfaces here."""
+    surfaces here.
+
+    Ship 3 (2026-05-29): routines section dropped from /today; this
+    test now pins the two-section ordering."""
     now = datetime(2026, 5, 28, 14, 0, tzinfo=HALIFAX)
     body = compose_today_reply(salem_vault, now)
     tier_idx = body.index("## Open Tasks by Tier")
-    routines_idx = body.index("## Today's Routines")
     events_idx = body.index("## Upcoming Events")
-    assert tier_idx < routines_idx < events_idx, (
+    assert tier_idx < events_idx, (
         f"Section ordering must match the brief: tier ({tier_idx}) → "
-        f"routines ({routines_idx}) → events ({events_idx})"
+        f"events ({events_idx})"
     )
 
 
@@ -199,11 +227,11 @@ def test_compose_uses_intentionally_left_blank_sentinels_when_empty(
     body = compose_today_reply(salem_vault, now)
     # Each section header has its body below it — pin that the
     # body following each header is non-empty (the sentinel string
-    # from each section's render path).
+    # from each section's render path). Ship 3: routines dropped;
+    # only two headers now.
     lines = body.splitlines()
     headers = [
         "## Open Tasks by Tier",
-        "## Today's Routines",
         "## Upcoming Events",
     ]
     for header in headers:
@@ -220,29 +248,28 @@ def test_compose_uses_intentionally_left_blank_sentinels_when_empty(
         )
 
 
-def test_compose_all_three_renders_failing_emits_combined_sentinels(
+def test_compose_both_renders_failing_emits_combined_sentinels(
     salem_vault: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Combined-failure pin: when ALL THREE section render functions
-    raise, the composed body MUST carry all three
+    """Combined-failure pin: when BOTH section render functions
+    raise, the composed body MUST carry both
     ``*(<section> render failed; see brief log)*`` sentinels — not
     silently drop sections — AND the total body length stays under
     ``_TELEGRAM_BODY_CAP``.
 
-    Pinned per code-reviewer boundary-coverage gap (2026-05-28). The
-    per-section try/except blocks each emit a sentinel; this test
-    exercises the combined-failure path end-to-end through the
-    composition + truncation logic. Without this pin, a refactor
-    that swallows exceptions silently or emits empty strings on
-    failure would only surface during real-vault edge cases where
-    all three renders happen to fail at once."""
+    Pinned per code-reviewer boundary-coverage gap (2026-05-28).
+    Ship 3 (2026-05-29) — routines section dropped, so this test
+    now pins the two-section combined-failure path. The
+    per-section try/except blocks each emit a sentinel; this
+    test exercises the combined-failure path end-to-end through
+    the composition + truncation logic. Without this pin, a
+    refactor that swallows exceptions silently or emits empty
+    strings on failure would only surface during real-vault edge
+    cases where both renders happen to fail at once."""
     from alfred.telegram import today_command as _tc
 
     def _raise_for_tier(*args, **kwargs):
         raise RuntimeError("tier render simulated failure")
-
-    def _raise_for_routines(*args, **kwargs):
-        raise RuntimeError("routines render simulated failure")
 
     def _raise_for_upcoming(*args, **kwargs):
         raise RuntimeError("upcoming events render simulated failure")
@@ -250,7 +277,6 @@ def test_compose_all_three_renders_failing_emits_combined_sentinels(
     # Patch in the today_command module's namespace — that's where
     # the compose path looks them up via the from-import binding.
     monkeypatch.setattr(_tc, "render_tier_section", _raise_for_tier)
-    monkeypatch.setattr(_tc, "render_routine_section", _raise_for_routines)
     monkeypatch.setattr(
         _tc, "render_upcoming_events_section", _raise_for_upcoming,
     )
@@ -258,22 +284,26 @@ def test_compose_all_three_renders_failing_emits_combined_sentinels(
     now = datetime(2026, 5, 28, 14, 0, tzinfo=HALIFAX)
     body = compose_today_reply(salem_vault, now)
 
-    # All three sentinels present — no silent drop per
+    # Both sentinels present — no silent drop per
     # intentionally-left-blank discipline.
     assert "*(tier render failed; see brief log)*" in body
-    assert "*(routines render failed; see brief log)*" in body
     assert "*(upcoming events render failed; see brief log)*" in body
+
+    # Routines sentinel must NOT appear — routines section is gone
+    # in Ship 3, so a routines render failure can't surface.
+    assert "*(routines render failed; see brief log)*" not in body
 
     # Section headers still emit so the operator's mental model of
     # the brief surface stays intact (failed section ≠ missing
     # section).
     assert "## Open Tasks by Tier" in body
-    assert "## Today's Routines" in body
     assert "## Upcoming Events" in body
+    # Routines header NOT in body.
+    assert "## Today's Routines" not in body
 
     # Combined-failure body length stays under the Telegram cap.
-    # Pins the truncation-path correctness for the worst case (three
-    # error sentinels rather than three full section bodies; should
+    # Pins the truncation-path correctness for the worst case (two
+    # error sentinels rather than two full section bodies; should
     # be well under cap, but explicit assertion guards against a
     # future refactor that inflates the per-section sentinel text).
     assert len(body) < _tc._TELEGRAM_BODY_CAP
@@ -331,10 +361,17 @@ async def test_handler_dispatches_when_enabled(salem_vault: Path) -> None:
     await bot.on_today(update, ctx)
     update.message.reply_text.assert_called_once()
     reply = update.message.reply_text.call_args[0][0]
-    # Composed reply carries the three section headers.
+    # Composed reply carries the TWO section headers (Ship 3 scope
+    # refinement, 2026-05-29 — routines dropped from /today; lives
+    # in the morning brief or via the routine CLI surface).
     assert "## Open Tasks by Tier" in reply
-    assert "## Today's Routines" in reply
     assert "## Upcoming Events" in reply
+    # Parallel scope-refinement pin: routines section MUST NOT
+    # appear in the handler-dispatched reply. Mirrors the
+    # test_compose_excludes_routines_section_header pin —
+    # belt-and-suspenders covering both the pure composer + the
+    # end-to-end handler dispatch path.
+    assert "## Today's Routines" not in reply
 
 
 @pytest.mark.asyncio

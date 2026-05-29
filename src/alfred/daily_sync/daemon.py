@@ -43,6 +43,7 @@ from . import (
     friction_section,
     pending_items_section,
     radar_section,
+    triage_section,
 )
 from .assembler import assemble_message
 from .config import DailySyncConfig
@@ -255,6 +256,16 @@ async def fire_once(
             Path(config.friction_analyzer.log_path).expanduser().resolve(),
         )
     friction_section.register()
+    # Triage Queue section (Tier-V2 Ship 3, 2026-05-29): reads
+    # vault/task/*.md and surfaces records flagged
+    # ``alfred_triage: True``. Priority 24 — between friction (23) and
+    # attribution (25). Registered unconditionally — when no triage
+    # records exist, the provider emits the "no triage items today"
+    # sentinel per intentionally-left-blank. Vault path is the same
+    # one attribution_section uses, so we can call set_vault_path
+    # with the already-resolved variable.
+    triage_section.set_vault_path(vault_path)
+    triage_section.register()
 
     body = assemble_message(config, today)
     items = email_section.consume_last_batch()
@@ -263,6 +274,7 @@ async def fire_once(
     pending_items = pending_items_section.consume_last_batch()
     radar_items = radar_section.consume_last_batch()
     friction_items = friction_section.consume_last_batch()
+    triage_items = triage_section.consume_last_batch()
 
     log.info(
         "daily_sync.assembled",
@@ -273,6 +285,7 @@ async def fire_once(
         pending_items_count=len(pending_items),
         radar_items_count=len(radar_items),
         friction_items_count=len(friction_items),
+        triage_items_count=len(triage_items),
         body_length=len(body),
         manual=manual,
         dedupe_key=dedupe_key,
