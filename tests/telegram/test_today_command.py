@@ -276,7 +276,14 @@ def test_compose_both_renders_failing_emits_combined_sentinels(
 
     # Patch in the today_command module's namespace — that's where
     # the compose path looks them up via the from-import binding.
-    monkeypatch.setattr(_tc, "render_tier_section", _raise_for_tier)
+    # 2026-05-30: tier section is now the curated-only render
+    # (render_curated_tier_section_for_today + load_daily_curation),
+    # not render_tier_section. Patch BOTH the load + render to
+    # cover the try/except surface: if either raises, the
+    # *(tier render failed; see brief log)* sentinel must surface.
+    monkeypatch.setattr(
+        _tc, "render_curated_tier_section_for_today", _raise_for_tier,
+    )
     monkeypatch.setattr(
         _tc, "render_upcoming_events_section", _raise_for_upcoming,
     )
@@ -546,3 +553,142 @@ def test_build_app_skips_today_handler_when_block_absent() -> None:
         f"today_command block is absent (non-Salem instance "
         f"convention); got commands={commands}"
     )
+
+
+# ===========================================================================
+# 2026-05-30 curated-only refinement — compose_today_reply switches from
+# render_tier_section (full materials) to render_curated_tier_section_for_today
+# (operator-committed view only).
+# ===========================================================================
+
+
+def test_compose_today_reply_uses_curated_render_not_full_materials(
+    salem_vault: Path,
+) -> None:
+    """compose_today_reply MUST call render_curated_tier_section_for_today,
+    NOT render_tier_section.
+
+    Scope refinement (2026-05-30): the /today surface is the
+    operator-committed view. The full materials view (auto-T1 +
+    selection pool + rollover + confirm prompts) stays in the morning
+    brief only. Pinned via call-site monkeypatch: assert
+    render_curated_tier_section_for_today is invoked, while
+    render_tier_section is NOT imported on the today_command module.
+    """
+    from alfred.telegram import today_command as _tc
+    # The curated render function MUST be bound on the module —
+    # imported via from-import so it's available for monkeypatching
+    # in the failure-pin test below.
+    assert hasattr(_tc, "render_curated_tier_section_for_today")
+    # The old full-materials render function must NOT be bound on
+    # the today_command module (operator-stated scope refinement).
+    assert not hasattr(_tc, "render_tier_section"), (
+        "render_tier_section must NOT be imported on today_command "
+        "after the 2026-05-30 curated-only refinement. The /today "
+        "surface uses render_curated_tier_section_for_today only."
+    )
+
+    # Drive: call compose_today_reply with a mock curated render and
+    # verify it's invoked.
+    captured_args: list = []
+
+    def _spy_curated(curation):
+        captured_args.append(curation)
+        return "### T1 — (no items yet)\n\n### T2 — (no items yet)\n\n### T3 — (no items yet)\n"
+
+    import unittest.mock
+    with unittest.mock.patch.object(
+        _tc, "render_curated_tier_section_for_today",
+        side_effect=_spy_curated,
+    ):
+        now = datetime(2026, 5, 30, 10, 0, tzinfo=HALIFAX)
+        compose_today_reply(salem_vault, now)
+    # The spy was invoked exactly once (one tier render per /today
+    # call).
+    assert len(captured_args) == 1
+
+
+def test_compose_today_reply_curated_render_receives_loaded_curation(
+    salem_vault: Path,
+) -> None:
+    """compose_today_reply loads daily_curation FIRST, then passes
+    the result to render_curated_tier_section_for_today.
+
+    Verified by pre-writing a daily file with a curation block and
+    spying on the render call to confirm the curation object reached
+    it."""
+    from alfred.telegram import today_command as _tc
+
+    # Pre-write a daily file with a curated T1 entry.
+    daily_dir = salem_vault / "daily"
+    daily_dir.mkdir(exist_ok=True)
+    (daily_dir / "2026-05-30.md").write_text(
+        "---\n"
+        "type: daily\n"
+        "date: 2026-05-30\n"
+        "tier_curation:\n"
+        "  t1:\n"
+        "    - task: '[[task/Curated Today]]'\n"
+        "      source: operator\n"
+        "      confirmed: true\n"
+        "  t2: []\n"
+        "  t3: []\n"
+        "---\n\n# body\n",
+        encoding="utf-8",
+    )
+
+    captured_curation = []
+
+    def _spy(curation):
+        captured_curation.append(curation)
+        return "stub"
+
+    import unittest.mock
+    with unittest.mock.patch.object(
+        _tc, "render_curated_tier_section_for_today", side_effect=_spy,
+    ):
+        now = datetime(2026, 5, 30, 10, 0, tzinfo=HALIFAX)
+        compose_today_reply(salem_vault, now)
+
+    # The curation loaded from the daily file reached the render.
+    assert len(captured_curation) == 1
+    curation = captured_curation[0]
+    assert curation is not None
+    assert len(curation.t1) == 1
+    assert curation.t1[0].task == "[[task/Curated Today]]"
+
+
+def test_compose_today_reply_curated_render_handles_missing_daily_file(
+    salem_vault: Path,
+) -> None:
+    """When no daily file exists for today, load_daily_curation
+    returns None and the curated render gets None — empty-bucket
+    sentinels surface."""
+    # salem_vault has empty daily/ — no file for 2026-05-30.
+    now = datetime(2026, 5, 30, 10, 0, tzinfo=HALIFAX)
+    body = compose_today_reply(salem_vault, now)
+    # All three empty-bucket sentinels surface end-to-end.
+    assert "### T1 — (no items yet)" in body
+    assert "### T2 — (no items yet)" in body
+    assert "### T3 — (no items yet)" in body
+
+
+def test_compose_today_reply_end_to_end_excludes_materials_surfaces(
+    salem_vault: Path,
+) -> None:
+    """End-to-end pin: the composed body does NOT contain morning-
+    brief-only surfaces (selection pool header, auto-T2-routine
+    subsection header, rollover header)."""
+    now = datetime(2026, 5, 30, 10, 0, tzinfo=HALIFAX)
+    body = compose_today_reply(salem_vault, now)
+    # Morning-brief materials surfaces MUST NOT appear in /today.
+    assert "### T2 selection pool" not in body
+    assert "#### Auto-surfaced (from routines)" not in body
+    assert "### Rollover from yesterday (incomplete)" not in body
+    # Confirm prompts also absent.
+    assert '*(confirm? reply "T1 confirm")*' not in body
+    assert '*(reply "T2 confirm" to keep on today\'s list)*' not in body
+    # The composer still emits the section headers (operator's mental
+    # model of the brief carries over).
+    assert "## Open Tasks by Tier" in body
+    assert "## Upcoming Events" in body

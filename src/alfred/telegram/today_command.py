@@ -1,37 +1,44 @@
-"""Composition helper for the ``/today`` slash command (Tier-V2 Ship 3,
-2026-05-29; originally shipped Phase 2A 2026-05-28).
+"""Composition helper for the ``/today`` slash command.
 
 The ``/today`` command is a Salem-only glance-view mini-brief composing
-the brief's TIER section (open tasks by curated shortlist + selection
-pool + rollover) and the UPCOMING EVENTS section into one Telegram
-reply. Read-only; no vault writes, no session record.
+the curated tier shortlists + the UPCOMING EVENTS section into one
+Telegram reply. Read-only; no vault writes, no session record.
 
-**Scope refinement (Ship 3, 2026-05-29).** The routines section was
-dropped from ``/today``. Routines live in the morning brief or via
-the routine system surface (``alfred routine show``) — duplicating
-them in ``/today`` confused the glance-view's purpose. The tier
-section + events are the two surfaces the operator actually wants
-on demand: "what's still on my plate today" + "what's coming up."
-If you're looking for routines, read this morning's brief or open
-Obsidian; ``/today`` no longer surfaces them.
+**Scope refinement history:**
+
+  * **Ship 3 (2026-05-29)** dropped the routines section from
+    ``/today``. Routines live in the morning brief or via the routine
+    system surface (``alfred routine show``).
+  * **2026-05-30 curated-only refinement.** Tier section narrowed
+    from the full morning-brief surface (curated + auto-surface +
+    selection pool + rollover + confirm prompts) to the curated-only
+    view via :func:`alfred.brief.tier_section.render_curated_tier_section_for_today`.
+    Operator-stated purpose: ``/today`` is the operator-committed
+    view ("what did I sign up for today"), NOT the materials view
+    ("what could I add to today"). The full materials surface lives
+    in the morning brief; ``/today`` is the focused-commit glance.
 
 Why ``/today`` instead of just re-using the brief file:
 
   1. **Glance-view from anywhere.** Operator can ``/today`` from a phone
      without opening Obsidian to read this morning's brief. Especially
-     valuable mid-afternoon when "what's still on the list?" is a more
+     valuable mid-afternoon when "what did I commit to today" is a more
      useful surface than "what was the brief at 06:00?"
   2. **Live data, not snapshot.** Each section re-renders from the
-     current vault state. A task closed at 14:00 is gone from the tier
-     bucket by ``/today`` at 14:01.
-  3. **Same render functions as the brief.** The composition imports
-     ``brief.tier_section.render_tier_section`` and
-     ``brief.upcoming_events.render_upcoming_events_section`` directly
-     — single source of truth for "what does the tier render look
-     like?" If the brief changes the render, ``/today`` changes too.
+     current vault state. The curated shortlists reflect the latest
+     ``tier_curation`` block (e.g. talker edits an entry at 14:00,
+     ``/today`` at 14:01 shows the updated list).
+  3. **Curated-render reuses the brief's per-entry primitives.** The
+     composition imports
+     ``brief.tier_section.render_curated_tier_section_for_today``
+     which shares the per-entry helpers (``_render_t2_entry`` /
+     ``_render_t3_entry``) with the morning brief. A render-shape
+     change on the brief side propagates here through the shared
+     helpers — single source of truth for "what does a curated entry
+     look like."
 
 Operator-facing section ordering matches the morning brief: tier first
-(deadline-driven actionable), upcoming events second (forward-looking
+(curated commitments), upcoming events second (forward-looking
 calendar). Each section is preceded by its ``## Header`` line so the
 operator's mental model of the brief carries over.
 
@@ -39,8 +46,10 @@ Telegram has a ~4096 character body limit. The composer caps the reply
 defensively at 4000 characters; if both sections together exceed
 that, the overflow is truncated with a notice. Empirical from spot
 checks on the morning brief: typical Salem composition runs ~1500-2500
-characters, well under cap. Truncation is a defensive guard for edge
-cases (40+ open tasks across all tiers + a packed calendar week).
+characters, well under cap. The curated-only narrowing pushes typical
+size DOWN further (~200-500 chars for tier alone vs ~1500+ for the
+full materials view) so truncation is now genuinely an edge-case
+guard.
 """
 
 from __future__ import annotations
@@ -53,12 +62,13 @@ import structlog
 from alfred.brief.config import UpcomingEventsConfig
 from alfred.brief.tier_section import (
     SECTION_HEADER as TIER_SECTION_HEADER,
-    render_tier_section,
+    render_curated_tier_section_for_today,
 )
 from alfred.brief.upcoming_events import (
     SECTION_HEADER as UPCOMING_EVENTS_SECTION_HEADER,
     render_upcoming_events_section,
 )
+from alfred.tier.daily_curation import load_daily_curation
 
 log = structlog.get_logger(__name__)
 
@@ -87,14 +97,15 @@ def compose_today_reply(
 ) -> str:
     """Compose the ``/today`` mini-brief reply.
 
-    Calls the two brief render functions in the canonical ordering
-    (tier → upcoming events) and joins them with Markdown
-    ``## Header`` lines so the visual shape matches the morning
-    brief's top sections.
+    Calls the curated tier render + the upcoming events render in
+    the canonical ordering (tier → upcoming events) and joins them
+    with Markdown ``## Header`` lines so the visual shape matches
+    the morning brief's top sections.
 
-    ``now`` is the reference instant for the tier section's deadline
-    math + the date selection for events. Caller (the bot handler)
-    computes ``datetime.now(ZoneInfo(config.today_command.timezone))``.
+    ``now`` is the reference instant — used for ``today`` date
+    selection in the curation load + events render. Caller (the bot
+    handler) computes
+    ``datetime.now(ZoneInfo(config.today_command.timezone))``.
 
     Cap: returns at most ``_TELEGRAM_BODY_CAP`` characters. Overflow
     is truncated with an explicit notice per intentionally-left-blank
@@ -107,20 +118,31 @@ def compose_today_reply(
     unconditionally — two section headers always emit, two
     sentinel bodies render below them when appropriate.
 
+    **Curated-only tier surface** (2026-05-30 refinement). The tier
+    section is the operator-committed view — auto-T1 candidates, T2
+    selection pool, auto-T2-routine subsection, rollover, and confirm
+    prompts all live ONLY in the morning brief. ``/today`` shows
+    only what the operator has signed up for today via talker
+    curation. Operator workflow gap surfaced 2026-05-30: the full
+    materials view in ``/today`` muddled the glance-view's purpose
+    ("what's on my plate" vs "what could I add").
+
     **Routines NOT included** (Ship 3 scope refinement, 2026-05-29).
-    Routines live in the morning brief or via ``alfred routine show``
-    — duplicating them here muddled the glance-view purpose. If the
-    operator asks about routines via talker, the response should
-    point at the brief or the routine CLI surface, not ``/today``.
+    Routines live in the morning brief or via ``alfred routine show``.
 
     Read-only — no vault writes, no state mutation. Pure
-    composition over the two section renders.
+    composition over the curated tier load + events render.
     """
     today_local = now.date()
 
-    # Tier section — full datetime instant for deadline math.
+    # Tier section — curated-only view via the daily curation block.
+    # Per 2026-05-30 scope refinement: NOT the full materials view
+    # (no auto-T1 / no selection pool / no rollover / no confirm
+    # prompts). The curated render is a pure projection over the
+    # tier_curation frontmatter block.
     try:
-        tier_body = render_tier_section(vault_path, now)
+        curation = load_daily_curation(vault_path, today_local)
+        tier_body = render_curated_tier_section_for_today(curation)
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "today_command.tier_render_failed",

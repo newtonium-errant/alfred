@@ -931,6 +931,90 @@ def render_tier_section(
     return body
 
 
+def render_curated_tier_section_for_today(
+    daily_curation: DailyCuration | None,
+) -> str:
+    """Render the ``/today`` curated-only tier section body.
+
+    Operator-committed view for the ``/today`` slash command (2026-05-30
+    scope refinement). Renders ONLY the operator-curated T1/T2/T3
+    shortlists from the daily_curation block — no auto-T1 candidates,
+    no T2 selection pool, no auto-T2-routine subsection, no rollover,
+    no confirm prompts. Operator already committed; the view's purpose
+    is "what's on my plate right now" not "what should I commit to."
+
+    Contrast with :func:`render_tier_section` (the full materials view
+    the morning brief uses): that function consumes the same
+    daily_curation PLUS auto-T1 candidates + selection pool + rollover
+    + confirm affordances. The two surfaces share the per-entry
+    rendering primitives (:func:`_render_t2_entry`,
+    :func:`_render_t3_entry`) so the shape of a single curated entry
+    stays consistent across both views.
+
+    Empty-bucket convention (per ``feedback_intentionally_left_blank``,
+    Andrew-ratified 2026-05-30): header-suffix sentinel
+    ``### T1 — (no items yet)`` keeps all three headers visible while
+    distinguishing "operator hasn't curated yet" from "broken render."
+    The morning brief uses a separate per-bucket sentinel line — the
+    ``/today`` view prefers the suffix because the operator-committed
+    framing means an empty bucket reads as "nothing committed to T2
+    yet" rather than "what's available for T2."
+
+    When ``daily_curation`` is ``None`` (no daily file exists yet for
+    today, e.g. running ``/today`` before the 06:00 brief / 05:59
+    aggregator has fired), all three buckets render with the empty-
+    suffix sentinel so the operator sees the same shape they'd see
+    after a deliberate empty curation.
+
+    Cross-Ship contract: T1/T2/T3 entries render identically to the
+    morning brief's curated section (same per-entry helpers), minus
+    the confirm prompts that fire on auto-surfaced candidates the
+    operator hasn't yet committed to. A render-shape change on the
+    morning brief side propagates here through the shared helpers.
+    """
+    curated_t1 = daily_curation.t1 if daily_curation else []
+    curated_t2 = daily_curation.t2 if daily_curation else []
+    curated_t3 = daily_curation.t3 if daily_curation else []
+
+    def _bucket(header_label: str, entries: list, render_entry) -> list[str]:
+        """Compose one bucket's lines.
+
+        Empty bucket → header-suffix sentinel only (single line +
+        trailing blank). Populated → header + entries + trailing
+        blank. The shared shape keeps the three-bucket render
+        rhythm uniform.
+        """
+        if not entries:
+            return [f"### {header_label} — (no items yet)", ""]
+        out = [f"### {header_label}", ""]
+        for entry in entries:
+            out.append(render_entry(entry))
+        out.append("")
+        return out
+
+    # Reuse the existing per-entry helpers — they already discriminate
+    # task vs routine_item shape WITHOUT confirm prompts, which is
+    # exactly what ``/today`` wants. T1 uses :func:`_render_t2_entry`
+    # (NOT :func:`_render_t1_entry`) because the T1 render path with
+    # confirm/reason annotations is for the auto-surfaced morning-brief
+    # view, not the operator-committed ``/today`` view.
+    lines: list[str] = []
+    lines.extend(_bucket("T1", curated_t1, _render_t2_entry))
+    lines.extend(_bucket("T2", curated_t2, _render_t2_entry))
+    lines.extend(_bucket("T3", curated_t3, _render_t3_entry))
+
+    body = "\n".join(lines).rstrip() + "\n"
+
+    log.info(
+        "brief.tier_section.rendered_curated_for_today",
+        curation_loaded=daily_curation is not None,
+        curated_t1=len(curated_t1),
+        curated_t2=len(curated_t2),
+        curated_t3=len(curated_t3),
+    )
+    return body
+
+
 __all__ = [
     "ROLLOVER_HEADER",
     "SECTION_HEADER",
@@ -940,5 +1024,6 @@ __all__ = [
     "T2_POOL_HEADER",
     "T2_ROUTINE_CONFIRM_PROMPT",
     "T3_EMPTY_PROMPT",
+    "render_curated_tier_section_for_today",
     "render_tier_section",
 ]

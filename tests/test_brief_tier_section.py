@@ -42,7 +42,13 @@ from alfred.brief.tier_section import (
     T2_POOL_HEADER,
     T2_ROUTINE_CONFIRM_PROMPT,
     T3_EMPTY_PROMPT,
+    render_curated_tier_section_for_today,
     render_tier_section,
+)
+from alfred.tier.daily_curation import (
+    DailyCuration,
+    T1T2Entry,
+    T3Entry,
 )
 
 
@@ -1234,3 +1240,306 @@ def test_routine_t1_entry_excluded_from_rollover(tmp_path: Path) -> None:
     assert "[[routine/Weekly Chores]]" not in rollover_section
     # Task entry IS in rollover (still applies).
     assert "[[task/Bug List]]" in rollover_section
+
+
+# ===========================================================================
+# render_curated_tier_section_for_today — /today curated-only view
+# ===========================================================================
+#
+# Scope refinement 2026-05-30: the /today slash command renders ONLY
+# operator-curated entries (no auto-T1, no T2 selection pool, no
+# auto-T2-routine subsection, no rollover, no confirm prompts).
+# Empty-bucket convention: header-suffix sentinel
+# ``### T1 — (no items yet)``.
+
+
+def test_curated_for_today_all_three_tiers_populated_renders_entries(
+    tmp_path: Path,
+) -> None:
+    """Curated entries in all 3 tiers → bucket headers without
+    ``— (no items yet)`` suffix; each bucket carries the entries."""
+    curation = DailyCuration(
+        t1=[
+            T1T2Entry(
+                task="[[task/Complete Personal Taxes — Andrew Newton]]",
+                source="operator",
+                confirmed=True,
+            ),
+            T1T2Entry(
+                task="[[task/RRTS Corporate Taxes — Awaiting Accountant]]",
+                source="operator",
+                confirmed=True,
+            ),
+        ],
+        t2=[
+            T1T2Entry(
+                task=(
+                    "[[task/Prep Blue Cross Call List for Medical "
+                    "Admin Handoff]]"
+                ),
+                source="operator",
+            ),
+        ],
+        t3=[
+            T3Entry(item="dog walk", source="operator-adhoc"),
+        ],
+    )
+    body = render_curated_tier_section_for_today(curation)
+    # Three plain headers, no "(no items yet)" suffix when populated.
+    assert "### T1\n" in body
+    assert "### T2\n" in body
+    assert "### T3\n" in body
+    assert "### T1 — (no items yet)" not in body
+    assert "### T2 — (no items yet)" not in body
+    assert "### T3 — (no items yet)" not in body
+    # All operator-committed entries render as bare wikilinks /
+    # free text. No confirm prompts.
+    assert (
+        "- [ ] [[task/Complete Personal Taxes — Andrew Newton]]" in body
+    )
+    assert (
+        "- [ ] [[task/RRTS Corporate Taxes — Awaiting Accountant]]" in body
+    )
+    assert (
+        "- [ ] [[task/Prep Blue Cross Call List for Medical "
+        "Admin Handoff]]"
+    ) in body
+    assert "- [ ] dog walk" in body
+    # No confirm prompts in the curated-only view.
+    assert T1_CONFIRM_PROMPT not in body
+    assert T2_ROUTINE_CONFIRM_PROMPT not in body
+
+
+def test_curated_for_today_t1_only_populated_other_buckets_show_sentinel(
+    tmp_path: Path,
+) -> None:
+    """Mixed-population: T1 has entries; T2 + T3 show the
+    header-suffix sentinel so all three buckets stay visible."""
+    curation = DailyCuration(
+        t1=[
+            T1T2Entry(
+                task="[[task/Solo T1 Entry]]",
+                source="operator",
+                confirmed=True,
+            ),
+        ],
+        t2=[],
+        t3=[],
+    )
+    body = render_curated_tier_section_for_today(curation)
+    # T1 populated → plain header.
+    assert "### T1\n" in body
+    assert "- [ ] [[task/Solo T1 Entry]]" in body
+    # T2 + T3 empty → suffix sentinel.
+    assert "### T2 — (no items yet)" in body
+    assert "### T3 — (no items yet)" in body
+    # Plain ``### T2\n`` / ``### T3\n`` must NOT appear (the suffix
+    # ate the bare header).
+    assert "### T2\n" not in body
+    assert "### T3\n" not in body
+
+
+def test_curated_for_today_none_curation_renders_all_sentinels(
+    tmp_path: Path,
+) -> None:
+    """``daily_curation = None`` (no daily file yet, e.g. /today before
+    the 06:00 brief / 05:59 aggregator fires) → all three buckets
+    render the header-suffix sentinel. Operator sees the same shape
+    they'd see after a deliberate empty curation."""
+    body = render_curated_tier_section_for_today(None)
+    assert "### T1 — (no items yet)" in body
+    assert "### T2 — (no items yet)" in body
+    assert "### T3 — (no items yet)" in body
+    # No bare wikilinks anywhere (defense against accidental
+    # population on the None branch).
+    assert "[[task/" not in body
+    assert "[[routine/" not in body
+
+
+def test_curated_for_today_routine_origin_entry_renders_with_from_wikilink(
+    tmp_path: Path,
+) -> None:
+    """Routine-origin T1/T2 entries render with the
+    ``- [ ] <text> (from [[routine/<record>]])`` shape — matches the
+    brief's curated routine-entry shape (shared via the per-entry
+    helper). NO confirm prompts."""
+    curation = DailyCuration(
+        t1=[
+            T1T2Entry(
+                routine_item={
+                    "record": "Recurring Bills + Admin",
+                    "text": "Pay Clinic Rental to Hussein Rafih",
+                },
+                source="auto-due-routine",
+                confirmed=True,
+            ),
+        ],
+        t2=[
+            T1T2Entry(
+                routine_item={
+                    "record": "Weekly Chores",
+                    "text": "Garbage Out",
+                },
+                source="auto-surface-routine",
+            ),
+        ],
+        t3=[],
+    )
+    body = render_curated_tier_section_for_today(curation)
+    # Routine-origin shape: <text> (from [[routine/<record>]])
+    assert (
+        "- [ ] Pay Clinic Rental to Hussein Rafih "
+        "(from [[routine/Recurring Bills + Admin]])"
+    ) in body
+    assert (
+        "- [ ] Garbage Out (from [[routine/Weekly Chores]])"
+    ) in body
+    # No confirm prompts — operator already committed.
+    assert T1_CONFIRM_PROMPT not in body
+    assert T2_ROUTINE_CONFIRM_PROMPT not in body
+
+
+def test_curated_for_today_t3_free_text_renders_without_wikilink(
+    tmp_path: Path,
+) -> None:
+    """T3 entries are free-text intentions — render as
+    ``- [ ] <item>`` with no wikilink wrap."""
+    curation = DailyCuration(
+        t1=[],
+        t2=[],
+        t3=[
+            T3Entry(item="dog walk", source="operator-adhoc"),
+            T3Entry(item="Read for an hour", source="aspirational"),
+        ],
+    )
+    body = render_curated_tier_section_for_today(curation)
+    assert "- [ ] dog walk" in body
+    assert "- [ ] Read for an hour" in body
+    # T3 entries do NOT wrap in [[wikilink]] form — free text only.
+    assert "[[dog walk]]" not in body
+    assert "[[task/dog walk]]" not in body
+
+
+def test_curated_for_today_does_not_consume_auto_t1_candidates(
+    tmp_path: Path,
+) -> None:
+    """The curated render is a PURE PROJECTION over daily_curation —
+    it does NOT scan the vault for auto-T1 candidates.
+
+    Verified by passing daily_curation=None with auto-T1-eligible
+    tasks present on disk (they'd surface in the morning brief's
+    materials view). Since render_curated_tier_section_for_today
+    takes ONLY the curation, no vault scan happens; the rendered
+    body has nothing about those tasks."""
+    # Seed a task that WOULD surface as auto-T1 in the morning
+    # brief (due today, escalate_at_days=1 → T1 candidate).
+    # _write_task is defined earlier in this module.
+    _write_task(
+        tmp_path,
+        "Auto T1 Eligible Task",
+        {
+            "type": "task",
+            "status": "todo",
+            "name": "Auto T1 Eligible Task",
+            "due": "2026-05-28",  # today
+            "escalate_at_days": 1,
+        },
+    )
+    # Render the curated-only view with NO curation block.
+    body = render_curated_tier_section_for_today(None)
+    # The task must NOT appear — curated-only view doesn't scan
+    # for auto-surfaced candidates.
+    assert "Auto T1 Eligible Task" not in body
+    assert "[[task/Auto T1 Eligible Task]]" not in body
+
+
+def test_curated_for_today_does_not_render_t2_selection_pool(
+    tmp_path: Path,
+) -> None:
+    """T2 selection pool (open tasks NOT in auto-T1) is morning-brief
+    only. /today curated view never surfaces it."""
+    # Seed multiple open tasks (would populate the morning brief's
+    # T2 selection pool).
+    _write_task(
+        tmp_path,
+        "Open Pool Task A",
+        {"type": "task", "status": "todo", "name": "Open Pool Task A"},
+    )
+    _write_task(
+        tmp_path,
+        "Open Pool Task B",
+        {"type": "task", "status": "active", "name": "Open Pool Task B"},
+    )
+    body = render_curated_tier_section_for_today(None)
+    # T2 selection-pool header / contents NOT in the curated view.
+    assert T2_POOL_HEADER not in body
+    assert "selection pool" not in body.lower()
+    assert "Open Pool Task A" not in body
+    assert "Open Pool Task B" not in body
+
+
+def test_curated_for_today_does_not_render_auto_t2_routine_subsection(
+    tmp_path: Path,
+) -> None:
+    """The morning brief's #### Auto-surfaced (from routines) T2
+    ramp subsection does NOT appear in /today curated view."""
+    body = render_curated_tier_section_for_today(None)
+    # The header constant must NOT appear in the curated body.
+    assert T2_AUTO_ROUTINE_HEADER not in body
+    # The "Auto-surfaced" phrasing also absent (defense against the
+    # constant text being rebuilt rather than imported).
+    assert "Auto-surfaced" not in body
+
+
+def test_curated_for_today_emits_rendered_log_event_with_counts(
+    tmp_path: Path,
+) -> None:
+    """Per builder.md rule #9: log emission pinned via
+    structlog.testing.capture_logs."""
+    curation = DailyCuration(
+        t1=[
+            T1T2Entry(
+                task="[[task/A]]", source="operator", confirmed=True,
+            ),
+            T1T2Entry(
+                task="[[task/B]]", source="operator", confirmed=True,
+            ),
+        ],
+        t2=[],
+        t3=[
+            T3Entry(item="walk", source="aspirational"),
+        ],
+    )
+    with structlog.testing.capture_logs() as captured:
+        render_curated_tier_section_for_today(curation)
+    events = [
+        c for c in captured
+        if c.get("event")
+        == "brief.tier_section.rendered_curated_for_today"
+    ]
+    assert len(events) == 1
+    e = events[0]
+    assert e["curation_loaded"] is True
+    assert e["curated_t1"] == 2
+    assert e["curated_t2"] == 0
+    assert e["curated_t3"] == 1
+
+
+def test_curated_for_today_none_curation_log_event_curation_loaded_false(
+    tmp_path: Path,
+) -> None:
+    """When daily_curation is None, the log event reports
+    ``curation_loaded=False`` so operators can grep the signal."""
+    with structlog.testing.capture_logs() as captured:
+        render_curated_tier_section_for_today(None)
+    events = [
+        c for c in captured
+        if c.get("event")
+        == "brief.tier_section.rendered_curated_for_today"
+    ]
+    assert len(events) == 1
+    e = events[0]
+    assert e["curation_loaded"] is False
+    assert e["curated_t1"] == 0
+    assert e["curated_t2"] == 0
+    assert e["curated_t3"] == 0
