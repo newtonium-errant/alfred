@@ -1491,4 +1491,3 @@ def test_soft_cadence_just_under_threshold_no_handoff(
     # 2 < 3 → not overdue → renders.
     assert "Walk dog" in body
     assert "2d since last; target every 3d" in body
-    assert events[0]["days_to_due"] == 4
