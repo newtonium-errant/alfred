@@ -687,6 +687,37 @@ These are conservative defaults — the item won't crowd the morning brief, but 
 >
 > Note the routine `name` is a short title for the RECORD, distinct from the item `text`. A single-item routine is the common B2 starter shape; operator adds more items later via B3 (or via direct `vault_edit` until B3 ships).
 
+##### Worked example A2 — Same phrasing, one word flips it to HARD
+
+This pair makes the SOFT-vs-HARD discrimination crisp. Same phrasing as Example A above, but with the one cue word ("deadline") that flips the cadence type:
+
+> Andrew: *"Create a routine: walk the dog every 3 days with a hard deadline"*
+>
+> Salem (internal): Cadence word "every 3 days" → routine. The phrase "hard deadline" is the cue word per the SOFT-vs-HARD discrimination table — flip to HARD cadence. "Every 3 days" maps to `due_pattern: {type: every_n_days, n: 3, anchor: <today ISO>}` per the grammar table. Anchor defaults to today for `every_n_days` per the anchor inference rule. No explicit escalation knobs supplied → apply the defaults (`escalate_at_days: 0`, `surface_at_days: 1`):
+>
+> ```yaml
+> vault_create:
+>   type: routine
+>   name: "Walk Dog Routine"
+>   set_fields:
+>     cadence:
+>       type: daily                 # aggregator evaluates daily
+>     items:
+>       - text: "Walk dog"
+>         priority: tracked         # tracked, not aspirational — deadline language elevates the priority signal
+>         due_pattern:
+>           type: every_n_days
+>           n: 3
+>           anchor: "2026-05-30"    # today's ISO date — operator's "starting today" default
+>         escalate_at_days: 0       # T1 fires on the due date
+>         surface_at_days: 1        # T2 hints day before
+>     completion_log: {}
+> ```
+>
+> Reply: *"Created `[[routine/Walk Dog Routine]]` — `Walk dog` every 3 days with a hard deadline. T1 fires on the due date; T2 hints the day before. Mark done by saying 'I walked the dog' anytime."*
+>
+> **Compare with Example A**: the ONE-word delta ("with a hard deadline") swaps `target_cadence_days: 3` (T3 auto-suggest path) for `due_pattern: {type: every_n_days, n: 3, anchor: "2026-05-30"}` + `escalate_at_days: 0` + `surface_at_days: 1` (T1/T2 auto-surface path), and bumps `priority` from `aspirational` (self-care intention) to `tracked` (deadline-driven work). If the operator's phrasing is genuinely ambiguous between A and A2 (neither "should" nor "deadline" appears), default SOFT per the discrimination table.
+
 ##### Worked example B — HARD cadence weekly
 
 > Andrew: *"Make a weekly routine for laundry on Sundays"*

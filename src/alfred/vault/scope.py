@@ -705,10 +705,19 @@ TALKER_CREATE_TYPES: set[str] = {
     # ``talker_routine_completion`` scope; B2 adds the create surface.
     # B3 will add item-level editing of EXISTING routines (cadence
     # adjustment, add/remove items in place); until then, item-level
-    # changes go via CLI or a fresh vault_edit. ``routine`` is Salem-
-    # only at the schema layer (``available_in_scopes`` carries only
-    # ``SCOPE_CANONICAL``); the type validator gate refuses
-    # non-Salem creates regardless of this allowlist entry.
+    # changes go via CLI or a fresh vault_edit.
+    #
+    # **Per-instance isolation is SINGLE-GATE, not belt-and-suspenders**
+    # (review-clarified 2026-05-30). ``routine`` is tagged
+    # ``available_in_scopes=frozenset({SCOPE_CANONICAL})`` in schema.py
+    # — that means the TYPE VALIDATOR (``_validate_type`` via
+    # ``known_types(scope)``) accepts ``routine`` under EVERY scope
+    # (canonical types union with per-scope extensions for every named
+    # scope). The non-Salem refusal lives ONLY at the scope layer:
+    # ``kalle_types_only`` / ``hypatia_types_only`` reject ``routine``
+    # because it isn't in ``KALLE_CREATE_TYPES`` / ``HYPATIA_CREATE_TYPES``.
+    # Don't expect belt-and-suspenders defense from the validator —
+    # the scope gate is the only enforcement surface.
     "routine",
 }
 

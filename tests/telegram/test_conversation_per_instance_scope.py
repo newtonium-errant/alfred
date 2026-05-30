@@ -494,14 +494,33 @@ async def test_routine_in_vault_create_tool_schema_enum(tmp_path):
     drops the payload at the SDK validator level with no model-
     visible explanation. Pin both the constant and the enum stay in
     lockstep.
+
+    **Drift-proof shape (code-reviewer NOTE 2026-05-30):** the
+    assertion checks the full set-difference between
+    ``TALKER_CREATE_TYPES`` and the enum, NOT just a literal
+    ``"routine" in enum_values``. The literal-membership shape pinned
+    THIS addition but would have let the next constant addition
+    silently lag the enum and produce the same silent-SDK-reject
+    failure pattern the pre-2026-05-30 enum lag produced for
+    ``org`` / ``location`` adds. The set-difference shape surfaces
+    ANY missing type, including future additions, with a message
+    naming the gap.
     """
+    from alfred.vault.scope import TALKER_CREATE_TYPES
+
     # The schema lives at module-import time, no fixture needed.
     schema = next(
         t for t in conversation.TALKER_VAULT_TOOLS
         if t["name"] == "vault_create"
     )
     enum_values = schema["input_schema"]["properties"]["type"]["enum"]
-    assert "routine" in enum_values, (
-        f"vault_create enum must list 'routine' for B2 conversational "
-        f"routine creation; got enum={enum_values!r}"
+    missing = TALKER_CREATE_TYPES - set(enum_values)
+    assert not missing, (
+        f"vault_create tool schema enum lags TALKER_CREATE_TYPES "
+        f"(missing: {sorted(missing)!r}). Every type in "
+        f"TALKER_CREATE_TYPES MUST also appear in the enum, or the "
+        f"Anthropic SDK validator drops the model's payload before "
+        f"the dispatcher ever sees it — silent failure with no "
+        f"model-visible explanation. Update the enum in "
+        f"src/alfred/telegram/conversation.py to match."
     )

@@ -88,11 +88,17 @@ def test_talker_create_allows_routine():
     # routines" section documents the operator-language → cadence /
     # due_pattern / target_cadence_days mapping.
     #
-    # Schema-layer Salem-only constraint (``available_in_scopes ==
-    # frozenset({SCOPE_CANONICAL})`` in schema.py) means the type
-    # validator gate refuses non-Salem instances regardless; this
-    # scope test confirms the talker allowlist permits the create
-    # op for the Salem path.
+    # Per-instance isolation is SINGLE-GATE (review-clarified
+    # 2026-05-30): ``routine`` is tagged with ``SCOPE_CANONICAL`` in
+    # schema.py, which means the type validator accepts it under
+    # EVERY named scope (canonical types union with per-scope
+    # extensions for kalle / hypatia / talker). The non-Salem
+    # refusal lives ONLY at the scope layer:
+    # ``kalle_types_only`` / ``hypatia_types_only`` reject ``routine``
+    # because it isn't in ``KALLE_CREATE_TYPES`` /
+    # ``HYPATIA_CREATE_TYPES``. This test pins the Salem-path
+    # allowlist; the KAL-LE / Hypatia rejection paths are pinned
+    # separately in test_kalle_scope.py / test_hypatia_scope.py.
     check_scope("talker", "create", record_type="routine")
 
 

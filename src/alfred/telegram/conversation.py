@@ -125,16 +125,30 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
                     # conversational routine record creation; the
                     # SKILL's "Creating routines" section documents
                     # the cadence + due_pattern + target_cadence_days
-                    # grammar. Routine type is Salem-only at the
-                    # schema layer; the validator + scope gates both
-                    # refuse non-Salem creates regardless of this
-                    # enum entry.
+                    # grammar. Routine type is canonical (Salem-
+                    # native); per-instance isolation is SINGLE-GATE
+                    # via the scope layer's ``kalle_types_only`` /
+                    # ``hypatia_types_only`` handlers, which reject
+                    # canonical types like ``routine`` that aren't in
+                    # ``KALLE_CREATE_TYPES`` / ``HYPATIA_CREATE_TYPES``.
+                    # The type validator does NOT refuse non-Salem
+                    # creates of ``routine`` — it accepts canonical
+                    # types under every named scope. See scope.py's
+                    # ``routine`` comment for the per-instance-isolation
+                    # walkthrough.
                     "enum": [
                         "task", "note", "decision", "event", "person",
                         "org", "location", "project",
                         "session", "conversation",
                         "assumption", "constraint", "contradiction",
                         "synthesis",
+                        # ``preference`` (operator-preference V1,
+                        # 2026-05-24) lagged the enum until the
+                        # B2 review's tightened lockstep pin
+                        # (set-difference vs literal-membership)
+                        # surfaced the drift on 2026-05-30. Added
+                        # here so the enum mirrors TALKER_CREATE_TYPES.
+                        "preference",
                         "routine",
                     ],
                     "description": (
