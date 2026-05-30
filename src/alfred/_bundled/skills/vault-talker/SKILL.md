@@ -579,9 +579,9 @@ The two grammars look similar enough that the LLM occasionally conflates them:
 
 When the phrasing is genuinely ambiguous (rare but possible — *"walk the dog"* with no tense marker), ask one clarifying question: *"Just to confirm — did you walk the dog already, or are you planning to today?"* Then route on the operator's clarification.
 
-#### Scope is narrow — completion only, not general routine editing
+#### Scope is narrow — completion only
 
-The `routine_done` tool routes through the `talker_routine_completion` scope which permits ONLY the `completion_log` field on routine records. If Andrew asks to change a routine's cadence ("change Walk dog to every 4 days"), cadence type ("make this a weekly instead of daily routine"), or add/remove items — those land in Phase 2B B3 (conversational routine editing). For now, tell the operator: *"I can mark routines done conversationally, but changing the cadence / item list still needs a direct edit via `vault_edit` (or the CLI). Want me to do that with `vault_edit`?"*
+The `routine_done` tool routes through the `talker_routine_completion` scope which permits ONLY the `completion_log` field on routine records. For adjusting an item's cadence, renaming, adding new items, or removing items, use the `routine_item` tool documented in the **Adjusting routines** section below — `routine_done` is the dedicated mark-done path and stays narrow.
 
 ### Creating routines (Phase 2B B2, shipped 2026-05-30)
 
@@ -659,7 +659,7 @@ When the operator under-specifies the escalation knobs for a HARD-cadence item:
 - `escalate_at_days: 0` — push to T1 on the due date itself.
 - `surface_at_days: 1` — start hinting at T2 one day before.
 
-These are conservative defaults — the item won't crowd the morning brief, but it WILL surface the day before + on the day. Operator can adjust later via B3 (conversational routine editing) or direct `vault_edit`.
+These are conservative defaults — the item won't crowd the morning brief, but it WILL surface the day before + on the day. Operator can adjust later via the `routine_item edit` tool path (see **Adjusting routines** below).
 
 #### Worked examples
 
@@ -685,7 +685,7 @@ These are conservative defaults — the item won't crowd the morning brief, but 
 >
 > Reply: *"Created `[[routine/Walk Dog Routine]]` — `Walk dog` with a 3-day soft cadence. It'll auto-suggest in tomorrow's brief if you haven't done it in 3 days. Mark done by saying 'I walked the dog' anytime."*
 >
-> Note the routine `name` is a short title for the RECORD, distinct from the item `text`. A single-item routine is the common B2 starter shape; operator adds more items later via B3 (or via direct `vault_edit` until B3 ships).
+> Note the routine `name` is a short title for the RECORD, distinct from the item `text`. A single-item routine is the common starter shape; operator adds more items later via the `routine_item add` tool path (see **Adjusting routines** below).
 
 ##### Worked example A2 — Same phrasing, one word flips it to HARD
 
@@ -794,11 +794,206 @@ This pair makes the SOFT-vs-HARD discrimination crisp. Same phrasing as Example 
 >
 > Salem (now disambiguated): creates a routine with `cadence: {type: daily}` and a single item with `due_pattern: {type: weekly, day: <pick a day OR ask back>}`. If Andrew didn't specify the weekday, ask: *"Which day of the week?"* — `weekly` requires the `day` field per `_resolve_weekly`.
 
-#### Scope is record-creation only — item-level editing is B3
+#### Distinguishing new routine vs new item on existing routine
 
-B2 ships ROUTINE-RECORD CREATION. Editing an existing routine's items (adding a new item, removing one, changing cadence on an existing item) is B3's domain. If Andrew names a new item for an EXISTING routine ("add 'water plants' to my Self Care routine"), respond with the same B3-pending message from the "Marking routines done" section: *"I can create new routine records and mark items done conversationally, but adding items to an existing routine still needs a direct edit via `vault_edit` (or the CLI). Want me to do that with `vault_edit`?"*
+The disambiguation is:
+- *"new routine"* / first item on a fresh recurring practice → `vault_create type=routine` (this section).
+- *"add item to existing routine"* → `routine_item action=add` (**Adjusting routines** below).
+- *"edit existing item's cadence / text / priority"* → `routine_item action=edit` (**Adjusting routines** below).
+- *"remove item from existing routine"* → `routine_item action=remove` (**Adjusting routines** below).
 
-The disambiguation is: "new routine" → B2 path (this section). "Add item to existing routine" → `vault_edit append_fields={"items": {...}}` path. "Edit existing item's cadence" → `vault_edit set_fields={"items": <full new list>}` (read-modify-write — `set_fields` on the `items` key overwrites the whole list, so the model must preserve unchanged items).
+DO NOT use `vault_edit` to mutate items / completion_log on routine records — the `routine_item` tool is the only authorised path (routes through the narrow `talker_routine_item` scope; `vault_edit` would route through the broad talker scope which doesn't allow this kind of edit on routine records via the `talker_routine_completion_only` / `talker_routine_item_only` enforcement).
+
+### Adjusting routines (Phase 2B B3, shipped 2026-05-30)
+
+Item-level CRUD on EXISTING routine records — add an item, remove one, or edit one's cadence / text / priority. The `routine_item` tool routes through the `talker_routine_item` scope which permits ONLY `items` + `completion_log` mutations on routine records.
+
+For NEW routines, use `vault_create type=routine` (Creating routines section above). For ROUTINE COMPLETIONS, use `routine_done` (Marking routines done section earlier). This section is for changes to an existing routine's items list.
+
+#### The `routine_item` tool — three actions
+
+The tool takes an `action` field (`add` / `remove` / `edit`) plus `item` (the item text — for `add`, this is the NEW text; for `remove` / `edit`, this is the EXISTING text), optionally `record` (the routine record name — REQUIRED for `add`; optional for `remove`/`edit` with vault-wide fuzzy fallback), and an optional `fields` dict per action.
+
+```yaml
+# Add a new item to an existing routine.
+routine_item:
+  action: add
+  record: "Self Care"              # REQUIRED for add (no fuzzy fallback)
+  item: "Read 30 minutes"          # NEW item text
+  fields:                          # optional
+    priority: aspirational
+    target_cadence_days: 1         # soft cadence — every day
+
+# Remove an item (with completion_log cleanup).
+routine_item:
+  action: remove
+  record: "Self Care"              # optional (fuzzy fallback by item)
+  item: "Walk dog"
+
+# Edit an item's fields.
+routine_item:
+  action: edit
+  record: "Self Care"              # optional (fuzzy fallback by item)
+  item: "Walk dog"
+  fields:
+    target_cadence_days: 2         # change soft cadence 3 → 2
+```
+
+#### Grammar to recognise
+
+**Add:**
+- *"Add [item] to my [routine name] routine"*
+- *"Put [item] in [routine name]"*
+- *"[item] should be part of my [routine name]"*
+- Multi-item in one turn: *"Add X and Y to [routine name]"* → call `routine_item action=add` ONCE PER ITEM in sequence (per-action canary; mirrors B1's multi-item completion pattern).
+
+**Remove:**
+- *"Remove [item] from [routine name]"*
+- *"Take [item] off my [routine name]"*
+- *"Drop [item] from [routine name]"*
+- *"I don't need [item] anymore"* / *"stop tracking [item]"*
+
+**Edit cadence:**
+- *"Change [item] to every [N] days"* → `fields.target_cadence_days: N` (default SOFT per the discrimination table)
+- *"[item] should be every other day instead"* → `fields.target_cadence_days: 2`
+- *"Make [item] biweekly Thursdays"* → `fields.due_pattern: {type: biweekly, day: thu, anchor: <ask back>}` + `fields.clear_target_cadence_days: true` if the item currently has soft cadence
+
+**Edit escalation:**
+- *"[item] should escalate after [N] days instead of [M]"* → `fields.escalate_at_days: N`
+- *"[item] should surface [N] days before instead of [M]"* → `fields.surface_at_days: N`
+- *"Push [item]'s escalation earlier"* → ASK BACK for the specific value (don't guess what "earlier" means).
+
+**Edit text (rename):**
+- *"Rename [item] to [new name]"* → `fields.text: <new name>`
+- *"Call [item] [new name] instead"* → same
+- (Completion log history migrates atomically — operator doesn't lose the per-day-done record under the new key.)
+
+**Edit priority:**
+- *"Make [item] critical instead of tracked"* → `fields.priority: critical`
+- *"[item] should be aspirational"* → `fields.priority: aspirational`
+
+#### Routing on the canary `kind` discriminator
+
+The tool result is JSON with a `kind` field. Always route on it:
+
+- **`"added"`** / **`"removed"`** / **`"edited"`** — operation succeeded; reply confirming what changed (name the record + item + the specific change).
+- **`"ambiguous_item"`** — multiple matches. Tool carries `candidates: [{record, item}, ...]`. **ASK BACK with a numbered list, do NOT guess.** Mirror the keyboard-friendly numbered format the rest of the SKILL uses:
+  > *"That matches a few items — which one?* (1) `Walk dog` from `Self Care`; (2) `Walk to coffee shop` from `Daily Self-Care`. *Reply with the number."*
+- **`"unknown_item"`** — no matching item. Tool carries `available_items` (first 20). Tell the operator + offer to add it as a NEW item if appropriate (`routine_item action=add` follow-up call).
+- **`"unknown_record"`** — explicit record name not found, OR (for `add`) empty record. Ask the operator which routine the item belongs to.
+- **`"cadence_conflict"`** — operator wants to switch hard ↔ soft cadence mode without explicit clear flag. **ASK BACK naming the conflict + offer to add the clear flag**:
+  > *"`Walk dog` currently uses a hard deadline (`due_pattern`). Switching to soft cadence (`target_cadence_days: 2`) would clear the deadline + the escalation knobs. Confirm?"*
+  If operator confirms → re-call with `fields.clear_due_pattern: true` (or `fields.clear_target_cadence_days: true` for the opposite direction).
+- **`"duplicate_item"`** — `add` with text matching an existing item. Tell the operator + ask whether they meant to EDIT the existing item instead.
+- **`"invalid_field"`** — operator-supplied value failed validation (negative `target_cadence_days`, malformed `due_pattern` JSON, unknown `priority` value, etc.). Tell the operator the validation error verbatim — the message names the specific field + the problem.
+
+#### Worked examples
+
+##### Worked example A — Add a new item to existing routine
+
+> Andrew: *"Add 'read 30 min' to my Self Care routine"*
+>
+> Salem (internal): Action is `add`. Record is explicit ("Self Care"). New item text is "read 30 min". No cadence supplied — operator may set later. Build the call:
+>
+> ```yaml
+> routine_item:
+>   action: add
+>   record: "Self Care"
+>   item: "read 30 min"
+> ```
+>
+> Tool returns: `{"kind": "added", "record": "Self Care", "item": "read 30 min", ...}`.
+>
+> Reply: *"Added `read 30 min` to `[[routine/Self Care]]`. No cadence set — it'll show up in the routine's daily aggregator section. Want me to set a soft cadence (e.g. every 3 days) so it auto-suggests in the brief when you haven't done it?"*
+
+##### Worked example B — Remove with completion_log cleanup
+
+> Andrew: *"Remove walk dog from my Self Care routine"*
+>
+> Salem (internal): Action is `remove`. Record + item both supplied. Build the call:
+>
+> ```yaml
+> routine_item:
+>   action: remove
+>   record: "Self Care"
+>   item: "walk dog"
+> ```
+>
+> Tool returns: `{"kind": "removed", "record": "Self Care", "item": "Walk dog", "removed_completion_dates": ["2026-05-28", "2026-05-29", "2026-05-30"], ...}` — note the fuzzy match canonicalised `walk dog` → `Walk dog` (the verbatim item text) and stripped 3 completion log entries atomically with the items-list mutation.
+>
+> Reply: *"Removed `Walk dog` from `[[routine/Self Care]]` (3 completion log entries dropped)."*
+
+##### Worked example C — Edit cadence (soft → soft, no conflict)
+
+> Andrew: *"Change walk dog to every 2 days"*
+>
+> Salem (internal): Action is `edit`. "every 2 days" is `target_cadence_days: 2`. No "deadline" cue → SOFT cadence (per the discrimination table from the Creating routines section). Vault-wide fuzzy on item: "walk dog" → resolves to `Walk dog` on `Self Care`. The existing item currently has `target_cadence_days: 3` (also SOFT) — same mode, no conflict.
+>
+> ```yaml
+> routine_item:
+>   action: edit
+>   item: "walk dog"
+>   fields:
+>     target_cadence_days: 2
+> ```
+>
+> Tool returns: `{"kind": "edited", "record": "Self Care", "item": "Walk dog", "fields_changed": ["target_cadence_days"], ...}`.
+>
+> Reply: *"Updated `Walk dog` in `[[routine/Self Care]]` — soft cadence now every 2 days (was 3)."*
+
+##### Worked example D — Edit cadence soft → hard (requires clear flag)
+
+> Andrew: *"Walk dog should have a hard Thursday deadline"*
+>
+> Salem (internal): Action is `edit`. "hard...deadline" cues HARD cadence with `due_pattern: {type: weekly, day: thu}`. Existing item has `target_cadence_days: 2` (soft) — cadence-mode switch, conflict. The tool will REJECT this without `clear_target_cadence_days: true` AND first call will surface the `cadence_conflict` canary. Either:
+>
+>   (a) Call once, get conflict canary, ask back, then re-call with the flag.
+>   (b) Anticipate the conflict (since I know the existing state) and ask back BEFORE calling the tool.
+>
+> Path (b) is the preferred grammar — the operator's "should have a hard deadline" implies they understand the swap; confirming makes the swap explicit.
+>
+> Reply: *"`Walk dog` currently uses soft cadence (`target_cadence_days: 2`). Switching to a hard weekly deadline would clear the soft cadence. Confirm?"*
+>
+> Andrew: *"yes"*
+>
+> Salem (now confirmed):
+>
+> ```yaml
+> routine_item:
+>   action: edit
+>   item: "walk dog"
+>   fields:
+>     due_pattern: {type: weekly, day: thu}
+>     escalate_at_days: 0        # default — T1 on the due day
+>     surface_at_days: 1         # default — T2 day before
+>     clear_target_cadence_days: true
+> ```
+>
+> Tool returns: `{"kind": "edited", "fields_changed": ["due_pattern", "escalate_at_days", "surface_at_days", "target_cadence_days (cleared)"], ...}`.
+>
+> Reply: *"Updated `Walk dog` — now a hard weekly deadline on Thursdays. T1 fires on Thursday, T2 hints Wednesday. Soft cadence cleared."*
+
+##### Worked example E — Rename with completion_log migration
+
+> Andrew: *"Rename walk dog to dog walk"*
+>
+> Salem (internal): Action is `edit`. Operator's intent is just the text rename — no cadence change. The `fields.text` field handles the rename + the tool migrates `completion_log[Walk dog] → completion_log[dog walk]` atomically (history preserved under the new key).
+>
+> ```yaml
+> routine_item:
+>   action: edit
+>   item: "walk dog"
+>   fields:
+>     text: "dog walk"
+> ```
+>
+> Tool returns: `{"kind": "edited", "record": "Self Care", "item": "Walk dog", "renamed_to": "dog walk", "fields_changed": ["text"], ...}`.
+>
+> Reply: *"Renamed `Walk dog` → `dog walk` in `[[routine/Self Care]]`. Completion history preserved under the new key."*
+
+#### Scope is items + completion_log only
+
+The `routine_item` tool routes through the `talker_routine_item` scope which permits ONLY the `items` + `completion_log` fields. Other routine fields (top-level `cadence`, `status`, `name`, `alfred_tags`, etc.) remain OUT of bounds. If the operator wants to change the routine's firing rhythm itself ("make Self Care fire only on Mondays") OR rename the routine record OR archive a routine, those aren't conversational yet — direct CLI / file-edit is the path.
 
 ### Events and the calendar sync
 

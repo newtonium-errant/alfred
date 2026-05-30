@@ -1731,8 +1731,10 @@ def cmd_routine(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred routine`` subcommands.
 
     Phase 1: ``done`` (log completion), ``run-now`` (force-build today's
-    aggregator note), ``status`` (last run + schedule). All commands are
-    Salem-only — non-Salem instances raise ScopeError per the
+    aggregator note), ``status`` (last run + schedule). Phase 2B B3
+    (2026-05-30): ``item add/remove/edit`` for item-level CRUD on
+    existing routine records. All commands are Salem-only —
+    non-Salem instances raise ScopeError per the
     feature_routine_phase1 contract.
     """
     raw = _load_unified_config(args.config)
@@ -1777,8 +1779,83 @@ def cmd_routine(args: argparse.Namespace) -> None:
             code = rcli.cmd_run_now(config, wants_json=wants_json)
         elif subcmd == "status":
             code = rcli.cmd_status(config, wants_json=wants_json)
+        elif subcmd == "item":
+            # Phase 2B B3 (2026-05-30) — item-level CRUD subverb tree.
+            # Three actions (add / remove / edit) discriminated by
+            # ``routine_item_action`` argparse dest.
+            action = getattr(args, "routine_item_action", None)
+            if action == "add":
+                code = rcli.cmd_item_add(
+                    config,
+                    record_name=getattr(args, "record", ""),
+                    item_text=getattr(args, "text", ""),
+                    wants_json=wants_json,
+                    priority=getattr(args, "priority", None),
+                    target_cadence_days=getattr(
+                        args, "target_cadence_days", None,
+                    ),
+                    surface_at_days=getattr(
+                        args, "surface_at_days", None,
+                    ),
+                    escalate_at_days=getattr(
+                        args, "escalate_at_days", None,
+                    ),
+                    due_pattern=getattr(args, "due_pattern", None),
+                )
+            elif action in ("remove", "edit"):
+                # Both share the two-positional-form pattern from B1's
+                # ``alfred routine done`` — first positional is either
+                # the record name (when --item present) or the item
+                # text (vault-wide fuzzy mode).
+                record_or_item = getattr(args, "record_or_item", "")
+                item_arg = getattr(args, "item", None)
+                if item_arg is None:
+                    record_name_arg = ""
+                    item_text_arg = record_or_item
+                else:
+                    record_name_arg = record_or_item
+                    item_text_arg = item_arg
+                if action == "remove":
+                    code = rcli.cmd_item_remove(
+                        config,
+                        record_name=record_name_arg,
+                        item_text=item_text_arg,
+                        wants_json=wants_json,
+                    )
+                else:  # edit
+                    code = rcli.cmd_item_edit(
+                        config,
+                        record_name=record_name_arg,
+                        item_text=item_text_arg,
+                        wants_json=wants_json,
+                        new_text=getattr(args, "new_text", None),
+                        priority=getattr(args, "priority", None),
+                        target_cadence_days=getattr(
+                            args, "target_cadence_days", None,
+                        ),
+                        surface_at_days=getattr(
+                            args, "surface_at_days", None,
+                        ),
+                        escalate_at_days=getattr(
+                            args, "escalate_at_days", None,
+                        ),
+                        due_pattern=getattr(args, "due_pattern", None),
+                        clear_due_pattern=getattr(
+                            args, "clear_due_pattern", False,
+                        ),
+                        clear_target_cadence_days=getattr(
+                            args, "clear_target_cadence_days", False,
+                        ),
+                    )
+            else:
+                print(
+                    "Usage: alfred routine item {add|remove|edit} ..."
+                )
+                sys.exit(1)
         else:
-            print("Usage: alfred routine {done|run-now|status}")
+            print(
+                "Usage: alfred routine {done|run-now|status|item}"
+            )
             sys.exit(1)
     except ScopeError as exc:
         if wants_json:
@@ -3346,7 +3423,7 @@ def build_parser() -> argparse.ArgumentParser:
     # routine — Salem-only daily routine tracker (Phase 1)
     routine_p = sub.add_parser(
         "routine",
-        help="Salem daily-routine tracker (done / run-now / status)",
+        help="Salem daily-routine tracker (done / run-now / status / item)",
     )
     routine_sub = routine_p.add_subparsers(dest="routine_cmd")
     routine_done = routine_sub.add_parser(
@@ -3404,6 +3481,195 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show last aggregator run + schedule summary",
     )
     routine_status.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+
+    # Phase 2B B3 (2026-05-30) — ``alfred routine item <action>``
+    # tree. Three actions (add / remove / edit) for item-level
+    # operations on existing routine records. Each shares the
+    # canary-on---json + Salem-only + fuzzy-match contract from B1's
+    # ``alfred routine done``.
+    routine_item_p = routine_sub.add_parser(
+        "item",
+        help="Item-level CRUD on existing routines (add / remove / edit)",
+    )
+    routine_item_sub = routine_item_p.add_subparsers(
+        dest="routine_item_action",
+    )
+
+    # --- item add ---
+    item_add = routine_item_sub.add_parser(
+        "add",
+        help="Append a new item to a routine's items list",
+    )
+    item_add.add_argument(
+        "record",
+        help=(
+            "Routine record name (REQUIRED for add — vault-wide fuzzy "
+            "doesn't apply when adding a NEW item that doesn't exist "
+            "anywhere)."
+        ),
+    )
+    item_add.add_argument(
+        "text",
+        help="New item's text (e.g. 'Walk dog').",
+    )
+    item_add.add_argument(
+        "--priority",
+        choices=["critical", "tracked", "aspirational"],
+        default=None,
+        help="Item priority. Defaults to 'tracked' when omitted.",
+    )
+    item_add.add_argument(
+        "--target-cadence-days",
+        dest="target_cadence_days",
+        type=int, default=None,
+        help=(
+            "Soft cadence target — item surfaces in T3 auto-suggest "
+            "when days_since_last_completed >= N. Mutually exclusive "
+            "with --due-pattern."
+        ),
+    )
+    item_add.add_argument(
+        "--due-pattern",
+        dest="due_pattern",
+        default=None,
+        help=(
+            "Hard cadence shape as JSON. Example: "
+            "'{\"type\":\"weekly\",\"day\":\"thu\"}'. See "
+            "alfred.routine.config.DUE_PATTERN_TYPES for the six "
+            "valid types. Mutually exclusive with "
+            "--target-cadence-days."
+        ),
+    )
+    item_add.add_argument(
+        "--surface-at-days",
+        dest="surface_at_days",
+        type=int, default=None,
+        help=(
+            "T2 ramp threshold (days before due). Requires "
+            "--due-pattern."
+        ),
+    )
+    item_add.add_argument(
+        "--escalate-at-days",
+        dest="escalate_at_days",
+        type=int, default=None,
+        help=(
+            "T1 escalation threshold (days before due). 0 = T1 fires "
+            "on the due date itself. Requires --due-pattern."
+        ),
+    )
+    item_add.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+
+    # --- item remove ---
+    item_remove = routine_item_sub.add_parser(
+        "remove",
+        help=(
+            "Remove an item from a routine. Strips completion_log "
+            "entries for that item atomically."
+        ),
+    )
+    item_remove.add_argument(
+        "record_or_item",
+        help=(
+            "Routine record name (e.g. 'For Self Health') OR — when "
+            "<item> is omitted — the item text to fuzzy-match "
+            "vault-wide. Mirrors B1's two-positional form."
+        ),
+    )
+    item_remove.add_argument(
+        "item",
+        nargs="?",
+        default=None,
+        help=(
+            "Item text within the routine. Omit to treat "
+            "<record_or_item> as the item text and do a vault-wide "
+            "fuzzy match."
+        ),
+    )
+    item_remove.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+
+    # --- item edit ---
+    item_edit = routine_item_sub.add_parser(
+        "edit",
+        help=(
+            "Edit one item's fields. Rename (--text NEW) migrates "
+            "completion_log atomically."
+        ),
+    )
+    item_edit.add_argument(
+        "record_or_item",
+        help="Routine record name OR (when <item> omitted) item text.",
+    )
+    item_edit.add_argument(
+        "item",
+        nargs="?",
+        default=None,
+        help=(
+            "Item text within the routine. Omit to treat "
+            "<record_or_item> as the item text and do a vault-wide "
+            "fuzzy match."
+        ),
+    )
+    item_edit.add_argument(
+        "--text",
+        dest="new_text",
+        default=None,
+        help=(
+            "Rename the item to this text. Migrates completion_log "
+            "key from old text to new atomically."
+        ),
+    )
+    item_edit.add_argument(
+        "--priority",
+        choices=["critical", "tracked", "aspirational"],
+        default=None,
+    )
+    item_edit.add_argument(
+        "--target-cadence-days",
+        dest="target_cadence_days",
+        type=int, default=None,
+    )
+    item_edit.add_argument(
+        "--due-pattern",
+        dest="due_pattern",
+        default=None,
+    )
+    item_edit.add_argument(
+        "--surface-at-days",
+        dest="surface_at_days",
+        type=int, default=None,
+    )
+    item_edit.add_argument(
+        "--escalate-at-days",
+        dest="escalate_at_days",
+        type=int, default=None,
+    )
+    item_edit.add_argument(
+        "--clear-due-pattern",
+        dest="clear_due_pattern",
+        action="store_true", default=False,
+        help=(
+            "Strip due_pattern + escalate_at_days + surface_at_days "
+            "from the item. Required when switching hard → soft "
+            "cadence (operator opt-in for the mode change)."
+        ),
+    )
+    item_edit.add_argument(
+        "--clear-target-cadence-days",
+        dest="clear_target_cadence_days",
+        action="store_true", default=False,
+        help=(
+            "Strip target_cadence_days from the item. Required when "
+            "switching soft → hard cadence."
+        ),
+    )
+    item_edit.add_argument(
         "--json", action="store_true", default=False, help="Emit JSON",
     )
 

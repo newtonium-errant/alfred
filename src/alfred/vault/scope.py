@@ -409,6 +409,34 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "allow_body_insert_at": {},
         "allow_body_replace": {},
     },
+    # Phase 2B B3 (2026-05-30) — Conversational routine item-CRUD scope.
+    # Broader than ``talker_routine_completion`` (B1's narrow scope):
+    # the ``items`` AND ``completion_log`` fields are mutable atomically
+    # via this scope so that text-rename can migrate completion_log
+    # keys (history preserved under new key) + remove can strip dead
+    # completion_log entries.
+    #
+    # All other routine fields (cadence top-level, status, alfred_tags,
+    # etc.) remain OUT of bounds — the talker can't change a routine's
+    # firing rhythm or rename the record via this path. Those land
+    # in separate ships (rename) or are covered by the broader
+    # ``talker`` scope's general edit (alfred_tags via surveyor).
+    "talker_routine_item": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": False,
+        "edit": "talker_routine_item_only",
+        "move": False,
+        "delete": False,
+        # Routine records are in _BODY_MUTATE_DENIED_TYPES regardless,
+        # but pin body-write off here too for defense-in-depth +
+        # operator-visible scope clarity (mirrors B1's narrow scope).
+        "allow_body_writes": False,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
     # Stage 3.5: KAL-LE — coding instance operating on the
     # aftermath-lab vault. Broader than talker because curation
     # legitimately adds pattern/principle records and edits bodies;
@@ -756,6 +784,38 @@ TALKER_CREATE_TYPES: set[str] = {
 # the whole edit.
 TALKER_COMPLETION_LOG_TYPES: set[str] = {"routine"}
 TALKER_COMPLETION_LOG_FIELDS: set[str] = {"completion_log"}
+
+
+# Phase 2B B3 (2026-05-30) — Conversational routine item-CRUD scope.
+#
+# B1 shipped per-item completion (``talker_routine_completion`` scope,
+# completion_log only). B3 widens the talker's routine surface to
+# include item-level add/remove/edit operations. Both fields must be
+# mutable atomically: ``items`` for the add/remove/edit itself, and
+# ``completion_log`` because text-renames migrate keys (old_text →
+# new_text preserves history) and removes strip dead entries.
+#
+# The two scopes coexist intentionally:
+#   * ``talker_routine_completion`` — narrow B1 path, marks-done only.
+#     Used by the ``routine_done`` tool subprocess.
+#   * ``talker_routine_item`` (NEW) — broader B3 path, items + completion_log
+#     atomic mutations. Used by the ``routine_item`` tool subprocess.
+#
+# Why two scopes instead of widening B1's to cover B3's surface? The
+# B1 scope is documented as "completion only" in operator-facing prose
+# (SKILL's "Scope is narrow" subsection); widening it would make the
+# scope label misleading. Two scopes with two tool paths keeps the
+# operator-facing semantics crisp + the per-tool gate matches its
+# documented contract.
+#
+# Other fields (cadence top-level, status, name, alfred_tags, etc.)
+# remain OUT of bounds for this scope — the talker can't change a
+# routine's firing rhythm or rename it via this path. Those land in
+# separate ships if friction surfaces (renaming) or are covered by
+# the broader talker scope's general edit permission (alfred_tags
+# already works there for the surveyor-driven tagging path).
+TALKER_ROUTINE_ITEM_TYPES: set[str] = {"routine"}
+TALKER_ROUTINE_ITEM_FIELDS: set[str] = {"items", "completion_log"}
 
 
 # Stage 3.5: record types KAL-LE may create. Superset of talker
@@ -1110,6 +1170,41 @@ def check_scope(
                 f"completion path narrows to ``completion_log`` only; "
                 f"Phase 2B B3 will widen this for general conversational "
                 f"editing."
+            )
+        return
+
+    if permission == "talker_routine_item_only":
+        # Phase 2B B3 (2026-05-30) — Conversational item-CRUD gate.
+        # Same three-check shape as ``talker_routine_completion_only``
+        # above (type-restriction + fail-closed-on-missing-fields +
+        # field-allowlist subset). The allowlist is broader: items
+        # AND completion_log, since text-rename + remove both mutate
+        # both fields atomically.
+        if record_type and record_type not in TALKER_ROUTINE_ITEM_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit record types "
+                f"({', '.join(sorted(TALKER_ROUTINE_ITEM_TYPES))}). "
+                f"Got: '{record_type}'. Use the regular 'talker' scope "
+                f"for general conversational edits to other types."
+            )
+        if fields is None:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(TALKER_ROUTINE_ITEM_FIELDS))}); "
+                f"caller did not supply the field list."
+            )
+        rejected = [
+            f for f in fields if f not in TALKER_ROUTINE_ITEM_FIELDS
+        ]
+        if rejected:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(TALKER_ROUTINE_ITEM_FIELDS))}). "
+                f"Rejected: {', '.join(rejected)}. The conversational "
+                f"item-CRUD path narrows to ``items`` + ``completion_log`` "
+                f"only; other routine fields (cadence, status, etc.) "
+                f"need a separate ship if conversational mutation is "
+                f"required."
             )
         return
 

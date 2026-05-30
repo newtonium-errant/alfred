@@ -490,3 +490,135 @@ def test_talker_routine_completion_constants_pinned():
     )
     assert TALKER_COMPLETION_LOG_TYPES == {"routine"}
     assert TALKER_COMPLETION_LOG_FIELDS == {"completion_log"}
+
+
+# ===========================================================================
+# Phase 2B B3 (2026-05-30) — talker_routine_item narrow scope
+# ===========================================================================
+#
+# Mirrors B1's talker_routine_completion shape. Broader allowlist:
+# items + completion_log (so atomic add/remove/edit can mutate both
+# fields in the same write — text-rename migrates completion_log
+# keys, remove strips dead entries).
+
+
+def test_talker_routine_item_allows_items_field_on_routine():
+    """Happy path — type=routine + fields=[items] passes."""
+    check_scope(
+        "talker_routine_item",
+        "edit",
+        record_type="routine",
+        fields=["items"],
+    )
+
+
+def test_talker_routine_item_allows_completion_log_field_on_routine():
+    """Happy path — type=routine + fields=[completion_log] passes.
+
+    This overlap with the B1 talker_routine_completion scope is
+    intentional: B3's edit path (rename + remove) mutates BOTH
+    items AND completion_log atomically. The scope allows
+    completion_log too so the same write satisfies the gate."""
+    check_scope(
+        "talker_routine_item",
+        "edit",
+        record_type="routine",
+        fields=["completion_log"],
+    )
+
+
+def test_talker_routine_item_allows_items_plus_completion_log_atomically():
+    """Rename + remove paths mutate items AND completion_log in the
+    same write. The scope must accept both in one fields= list."""
+    check_scope(
+        "talker_routine_item",
+        "edit",
+        record_type="routine",
+        fields=["items", "completion_log"],
+    )
+
+
+def test_talker_routine_item_rejects_non_allowlist_field():
+    """Other routine fields (cadence top-level, status, name,
+    alfred_tags) remain out of bounds for this narrow scope."""
+    for bad_field in ("cadence", "status", "name", "alfred_tags"):
+        with pytest.raises(ScopeError, match="allowlist"):
+            check_scope(
+                "talker_routine_item",
+                "edit",
+                record_type="routine",
+                fields=[bad_field],
+            )
+
+
+def test_talker_routine_item_rejects_mixed_allowed_and_disallowed():
+    """Subset check — even one disallowed field in the list rejects
+    the whole edit. Mirror of B1's behaviour."""
+    with pytest.raises(ScopeError, match="allowlist"):
+        check_scope(
+            "talker_routine_item",
+            "edit",
+            record_type="routine",
+            fields=["items", "cadence"],
+        )
+
+
+def test_talker_routine_item_rejects_items_on_non_routine_types():
+    """The scope is type-narrowed to routine — items field on a task
+    or person record is rejected (defends against the talker pointing
+    at the wrong record type via this scope)."""
+    for bad_type in ("task", "person", "note"):
+        with pytest.raises(ScopeError, match="record types"):
+            check_scope(
+                "talker_routine_item",
+                "edit",
+                record_type=bad_type,
+                fields=["items"],
+            )
+
+
+def test_talker_routine_item_fails_closed_on_missing_fields():
+    """When fields=None, the scope fails closed (no fields supplied
+    means no allowlist check possible). Mirror of B1."""
+    with pytest.raises(ScopeError, match="did not supply"):
+        check_scope(
+            "talker_routine_item",
+            "edit",
+            record_type="routine",
+            fields=None,
+        )
+
+
+def test_talker_routine_item_denies_create_move_delete():
+    """The narrow scope ONLY permits edit (of items + completion_log
+    on routine). Create / move / delete all denied."""
+    for op in ("create", "move", "delete"):
+        with pytest.raises(ScopeError, match="denied"):
+            check_scope(
+                "talker_routine_item",
+                op,
+                record_type="routine",
+            )
+
+
+def test_talker_routine_item_denies_body_writes():
+    """Body writes denied per the allow_body_writes=False setting."""
+    with pytest.raises(ScopeError, match="body"):
+        check_scope(
+            "talker_routine_item",
+            "edit",
+            record_type="routine",
+            fields=["items"],
+            body_write=True,
+        )
+
+
+def test_talker_routine_item_constants_pinned():
+    """Cross-agent contract pin — TALKER_ROUTINE_ITEM_TYPES +
+    TALKER_ROUTINE_ITEM_FIELDS exported + carry expected values."""
+    from alfred.vault.scope import (
+        TALKER_ROUTINE_ITEM_FIELDS,
+        TALKER_ROUTINE_ITEM_TYPES,
+    )
+    assert TALKER_ROUTINE_ITEM_TYPES == {"routine"}
+    assert TALKER_ROUTINE_ITEM_FIELDS == {"items", "completion_log"}

@@ -93,6 +93,38 @@ DONE_KIND_TIMEOUT = "timeout"
 DONE_KIND_SUBPROCESS_ERROR = "subprocess_error"
 
 
+# ---------------------------------------------------------------------------
+# Phase 2B B3 (2026-05-30) — Conversational item-CRUD canary kinds
+# ---------------------------------------------------------------------------
+#
+# Cross-agent contract — the structured JSON discriminator the talker
+# subprocess wrapper consumes to decide what to say back to the user
+# after an add/remove/edit on a routine record's items list.
+#
+# Three success kinds (one per action) so the SKILL can phrase the
+# operator-facing confirmation correctly ("Added X to <routine>" vs
+# "Removed X from <routine>" vs "Updated X on <routine>"). Six
+# failure / refusal kinds (mostly mirroring B1's DONE_KIND_* shape):
+# unknown_record, unknown_item, ambiguous_item, plus three B3-specific:
+# cadence_conflict (mutual-exclusion violation without explicit clear
+# flag), duplicate_item (add with text matching existing), invalid_field
+# (operator-supplied value fails type/range validation).
+#
+# Rename any of these = update SKILL.md's "Adjusting routines" section
+# in lockstep + the talker subprocess dispatcher's lazy import.
+# Set-difference lockstep pin lives in
+# ``tests/telegram/test_conversation_routine_item.py``.
+ITEM_KIND_ADDED = "added"
+ITEM_KIND_REMOVED = "removed"
+ITEM_KIND_EDITED = "edited"
+ITEM_KIND_UNKNOWN_RECORD = "unknown_record"
+ITEM_KIND_UNKNOWN_ITEM = "unknown_item"
+ITEM_KIND_AMBIGUOUS_ITEM = "ambiguous_item"
+ITEM_KIND_CADENCE_CONFLICT = "cadence_conflict"
+ITEM_KIND_DUPLICATE_ITEM = "duplicate_item"
+ITEM_KIND_INVALID_FIELD = "invalid_field"
+
+
 def _check_salem_only(config: RoutineConfig) -> None:
     """Raise ScopeError unless the active instance is Salem.
 
@@ -965,6 +997,16 @@ __all__ = [
     "cmd_done",
     "cmd_run_now",
     "cmd_status",
+    # Phase 2B B3 — re-export of the item-CRUD handlers from
+    # cli_items.py (deferred import at the bottom of this module
+    # to avoid circular-import deadlock with cli_items.py importing
+    # B1 helpers + canary constants from here). Same source-of-truth
+    # pattern as cmd_done above — the routine subsystem's CLI surface
+    # is now bigger than fits one module, but the import-path stays
+    # unified.
+    "cmd_item_add",
+    "cmd_item_remove",
+    "cmd_item_edit",
     # Phase 2B B1 cross-agent contract — canary kind discriminator
     # constants. Talker subprocess wrapper imports these so the
     # raw-string literals don't drift between layers. SKILL.md's
@@ -979,4 +1021,28 @@ __all__ = [
     "DONE_KIND_FUTURE_DATE_REJECTED",
     "DONE_KIND_TIMEOUT",
     "DONE_KIND_SUBPROCESS_ERROR",
+    # Phase 2B B3 — item-CRUD canary kinds. Same lockstep pattern
+    # as DONE_KIND_*; SKILL.md's "Adjusting routines" section quotes
+    # the string values verbatim; rename here = update SKILL.md +
+    # the talker dispatcher import in lockstep.
+    "ITEM_KIND_ADDED",
+    "ITEM_KIND_REMOVED",
+    "ITEM_KIND_EDITED",
+    "ITEM_KIND_UNKNOWN_RECORD",
+    "ITEM_KIND_UNKNOWN_ITEM",
+    "ITEM_KIND_AMBIGUOUS_ITEM",
+    "ITEM_KIND_CADENCE_CONFLICT",
+    "ITEM_KIND_DUPLICATE_ITEM",
+    "ITEM_KIND_INVALID_FIELD",
 ]
+
+
+# Phase 2B B3 — deferred import of the item-CRUD handlers from
+# cli_items.py. Placed at the BOTTOM of the module so cli_items.py's
+# import of the canary constants + helpers from this module
+# (`from .cli import ITEM_KIND_*, _check_salem_only, ...`) resolves
+# against the already-defined symbols above. Circular import works
+# because Python's import machinery resolves the partially-loaded
+# `cli` module when `cli_items` imports from it — every symbol
+# cli_items.py needs is defined above this line.
+from .cli_items import cmd_item_add, cmd_item_edit, cmd_item_remove  # noqa: E402, F401

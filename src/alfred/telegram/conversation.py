@@ -434,6 +434,122 @@ _ROUTINE_DONE_TOOL_SCHEMA = {
 }
 
 
+# Phase 2B B3 (2026-05-30) — ``routine_item`` schema.
+#
+# Salem-only tool for item-level CRUD on existing routine records.
+# Three actions discriminated by the ``action`` field
+# (add / remove / edit). The dispatch in ``_execute_tool`` invokes
+# ``alfred routine item <action>`` as a subprocess with the
+# ``talker_routine_item`` scope.
+#
+# Cross-agent contract: the SKILL ``Adjusting routines`` section
+# recognises operator phrasing for all three actions + builds the
+# ``routine_item`` tool call. The canary discriminator (``kind``) in
+# the response shapes Salem's reply (added / removed / edited /
+# ambiguous → ask back / cadence_conflict → ask back with explicit
+# clear-flag offer / etc).
+#
+# Mutually-exclusive cadence enforcement at write time, NOT at read
+# time — see ``cli_items.py``'s ``_check_cadence_conflict_on_edit``
+# for the precedence rule.
+_ROUTINE_ITEM_TOOL_SCHEMA = {
+    "name": "routine_item",
+    "description": (
+        "Item-level CRUD on existing routine records. Salem-only "
+        "(the routine subsystem is Salem-only in Phase 1/2). Three "
+        "actions discriminated by the ``action`` field:\n"
+        "  * 'add' — append new item to a routine's items list. "
+        "Requires ``record`` (vault-wide fuzzy doesn't apply when "
+        "adding a NEW item that doesn't exist anywhere).\n"
+        "  * 'remove' — delete one item by text match. Strips "
+        "completion_log entries atomically. ``record`` optional "
+        "(vault-wide fuzzy applies).\n"
+        "  * 'edit' — change fields on one item by text match. "
+        "Rename (``fields.text``) migrates completion_log key "
+        "atomically. ``record`` optional.\n"
+        "\n"
+        "Returns a structured ``kind`` discriminator you MUST route "
+        "on:\n"
+        "  * 'added' / 'removed' / 'edited' — operation succeeded; "
+        "reply confirming the change\n"
+        "  * 'ambiguous_item' — multiple matches; ASK BACK with the "
+        "numbered candidate list (do NOT guess)\n"
+        "  * 'unknown_item' / 'unknown_record' — no match; tell the "
+        "operator + list alternatives if helpful\n"
+        "  * 'cadence_conflict' — operator wants to switch hard ↔ "
+        "soft cadence mode without explicit clear flag. ASK BACK "
+        "naming the conflict + offer to add the clear flag\n"
+        "  * 'duplicate_item' (add only) — text matches existing "
+        "item; ask back\n"
+        "  * 'invalid_field' — operator-supplied value failed "
+        "validation (e.g. negative cadence days); tell the operator "
+        "the validation error\n"
+        "\n"
+        "Mutually-exclusive cadence: each item carries EITHER "
+        "``target_cadence_days`` (soft, T3 auto-suggest) OR "
+        "``due_pattern`` (hard, T1/T2 auto-surface), never both. "
+        "Switching modes on an existing item requires the "
+        "``fields.clear_due_pattern`` or "
+        "``fields.clear_target_cadence_days`` flag set to true.\n"
+        "\n"
+        "DO NOT mutate routine items via ``vault_edit`` directly — "
+        "this tool is the only authorised path because it goes "
+        "through the talker_routine_item narrow scope."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["add", "remove", "edit"],
+                "description": (
+                    "Which CRUD action. 'add' requires record + "
+                    "item (item becomes the new text). 'remove' / "
+                    "'edit' require item; record optional (vault-"
+                    "wide fuzzy fallback)."
+                ),
+            },
+            "item": {
+                "type": "string",
+                "description": (
+                    "Item text. For 'add', this is the NEW item's "
+                    "text. For 'remove' / 'edit', this is the "
+                    "EXISTING item's text — fuzzy-matched (substring "
+                    "+ stem-tolerant)."
+                ),
+            },
+            "record": {
+                "type": "string",
+                "description": (
+                    "Routine record name (e.g. 'For Self Health'). "
+                    "REQUIRED for 'add'. Optional for 'remove' / "
+                    "'edit' — omit to fuzzy-match the item across "
+                    "all active routines vault-wide."
+                ),
+            },
+            "fields": {
+                "type": "object",
+                "description": (
+                    "Per-action field bundle. For 'add' / 'edit': "
+                    "``priority`` ('critical'/'tracked'/'aspirational'), "
+                    "``target_cadence_days`` (int > 0; soft cadence), "
+                    "``due_pattern`` (dict per DUE_PATTERN_TYPES; "
+                    "hard cadence), ``surface_at_days`` (int > 0; "
+                    "T2 ramp), ``escalate_at_days`` (int >= 0; T1 "
+                    "escalation). 'edit'-only: ``text`` (new item "
+                    "text — rename, migrates completion_log), "
+                    "``clear_due_pattern`` (bool; switch hard → "
+                    "soft), ``clear_target_cadence_days`` (bool; "
+                    "switch soft → hard). Omit entirely for 'remove' "
+                    "(no fields needed)."
+                ),
+            },
+        },
+        "required": ["action", "item"],
+    },
+}
+
+
 # ``bash_exec`` schema — the executor module (c6) supplies the safety
 # logic; this is just the LLM-facing contract. Placeholder ``execute:
 # False`` default is the fail-closed shape — if anyone constructs the
@@ -794,6 +910,8 @@ HYPATIA_VAULT_TOOLS: list[dict[str, Any]] = [
 SALEM_VAULT_TOOLS: list[dict[str, Any]] = [
     *TALKER_VAULT_TOOLS,
     _ROUTINE_DONE_TOOL_SCHEMA,
+    # Phase 2B B3 (2026-05-30) — item-level CRUD on existing routines.
+    _ROUTINE_ITEM_TOOL_SCHEMA,
 ]
 
 
@@ -1891,6 +2009,277 @@ async def _dispatch_routine_done(
     return _dumps(parsed)
 
 
+# --- routine_item dispatch (Phase 2B B3, 2026-05-30) ---------------------
+#
+# Conversational item-CRUD path. Subprocess-invokes ``python -m alfred
+# routine item <action>`` with ``ALFRED_VAULT_SCOPE=talker_routine_item``
+# threaded through the env. Same adapter shape as
+# ``_dispatch_routine_done`` — tool-set gating up-front, argv build,
+# canary parse, failure logging per builder.md.
+
+
+async def _dispatch_routine_item(
+    *,
+    tool_input: dict[str, Any],
+    session: Session,
+    config: TalkerConfig | None,
+) -> str:
+    """Dispatch one ``routine_item`` tool_use block.
+
+    Salem-only. Subprocess invokes ``python -m alfred routine item
+    <action>`` with the ``talker_routine_item`` scope. The CLI emits
+    structured JSON with a canary ``kind`` discriminator
+    (added / removed / edited / unknown_record / unknown_item /
+    ambiguous_item / cadence_conflict / duplicate_item /
+    invalid_field) — Salem routes on it.
+
+    Argv build per action:
+      * add: ``[..., 'routine', 'item', 'add', record, text, --json,
+        + optional --priority / --target-cadence-days /
+        --due-pattern JSON / --surface-at-days / --escalate-at-days]``
+      * remove: ``[..., 'routine', 'item', 'remove', record, item,
+        --json]`` (record may be empty → vault-wide fuzzy via the
+        one-positional form ``[..., 'remove', item, --json]``)
+      * edit: ``[..., 'routine', 'item', 'edit', record, item, --json,
+        + optional --text / --priority / --target-cadence-days /
+        --due-pattern JSON / --surface-at-days / --escalate-at-days /
+        --clear-due-pattern / --clear-target-cadence-days]``
+    """
+    import asyncio
+    import json
+    import os
+    import subprocess
+    import sys
+
+    # Phase 2B B3 — canary kind constants. Lazy-imported to keep
+    # conversation-module import-time minimal. Importing the
+    # constants (rather than raw literals) locks rename-discipline.
+    from alfred.routine.cli import (
+        DONE_KIND_SUBPROCESS_ERROR,
+        DONE_KIND_TIMEOUT,
+    )
+
+    # --- Tool-set gating -------------------------------------------------
+    tool_set = ""
+    if config is not None:
+        tool_set = (config.instance.tool_set or "").lower()
+    if tool_set in {"kalle", "hypatia"}:
+        log.warning(
+            "talker.routine_item.wrong_tool_set",
+            tool_set=tool_set,
+            session_id=session.session_id,
+        )
+        return _dumps({
+            "error": (
+                "routine_item is Salem-only — routine subsystem refuses "
+                "non-Salem instances"
+            ),
+            "tool_set": tool_set,
+        })
+
+    # --- Argument parsing ------------------------------------------------
+    if not isinstance(tool_input, dict):
+        return _dumps({
+            "error": "routine_item requires a dict tool_input",
+        })
+    action = tool_input.get("action", "")
+    item = tool_input.get("item", "")
+    record = tool_input.get("record", "") or ""
+    fields = tool_input.get("fields") or {}
+    if action not in ("add", "remove", "edit"):
+        return _dumps({
+            "error": (
+                f"routine_item action must be add/remove/edit; "
+                f"got {action!r}"
+            ),
+        })
+    if not isinstance(item, str) or not item.strip():
+        return _dumps({
+            "error": "routine_item requires a non-empty 'item'",
+        })
+    if not isinstance(fields, dict):
+        return _dumps({
+            "error": (
+                f"routine_item 'fields' must be a dict; got "
+                f"{type(fields).__name__}"
+            ),
+        })
+
+    # --- Build argv ------------------------------------------------------
+    argv: list[str] = [
+        sys.executable, "-m", "alfred", "routine", "item", action,
+    ]
+
+    if action == "add":
+        # add: record is REQUIRED + text is item.
+        if not isinstance(record, str) or not record.strip():
+            # The CLI also rejects empty record on add (returns
+            # unknown_record canary); we forward the operator-facing
+            # error explicitly here so the talker doesn't even spawn
+            # the subprocess for an obviously-broken call.
+            return _dumps({
+                "error": (
+                    "routine_item action=add requires 'record' (the "
+                    "routine to add the item to). Vault-wide fuzzy "
+                    "doesn't apply when adding a NEW item."
+                ),
+                "kind": "unknown_record",
+            })
+        argv.extend([record.strip(), item.strip()])
+    else:
+        # remove / edit: two-positional form when record is supplied,
+        # one-positional form (vault-wide fuzzy on item) when not.
+        if isinstance(record, str) and record.strip():
+            argv.extend([record.strip(), item.strip()])
+        else:
+            argv.append(item.strip())
+
+    # --- Append --fields-style flags from the fields dict ---------------
+    # The CLI accepts each field as its own --flag; we serialise back
+    # from the operator's nested ``fields`` dict to the flag form.
+    if action in ("add", "edit"):
+        priority = fields.get("priority")
+        if isinstance(priority, str) and priority.strip():
+            argv.extend(["--priority", priority.strip()])
+        for flag_name, field_key in (
+            ("--target-cadence-days", "target_cadence_days"),
+            ("--surface-at-days", "surface_at_days"),
+            ("--escalate-at-days", "escalate_at_days"),
+        ):
+            val = fields.get(field_key)
+            if val is not None:
+                argv.extend([flag_name, str(val)])
+        due_pattern = fields.get("due_pattern")
+        if due_pattern is not None:
+            # Always JSON-serialise the dict — the CLI's
+            # _validate_due_pattern accepts JSON-string OR dict, but
+            # the CLI form crosses subprocess boundary so we must
+            # encode as string.
+            if isinstance(due_pattern, dict):
+                argv.extend([
+                    "--due-pattern", json.dumps(due_pattern),
+                ])
+            else:
+                # String form pass-through (operator may have already
+                # supplied a JSON literal — but typically it's a dict
+                # from the model).
+                argv.extend(["--due-pattern", str(due_pattern)])
+
+    if action == "edit":
+        new_text = fields.get("text")
+        if isinstance(new_text, str) and new_text.strip():
+            argv.extend(["--text", new_text.strip()])
+        if fields.get("clear_due_pattern"):
+            argv.append("--clear-due-pattern")
+        if fields.get("clear_target_cadence_days"):
+            argv.append("--clear-target-cadence-days")
+
+    argv.append("--json")
+
+    log.info(
+        "talker.routine_item.invoke",
+        session_id=session.session_id,
+        action=action,
+        item=item[:200],
+        record=record[:200] if record else "",
+        field_keys=sorted(fields.keys()) if fields else [],
+    )
+
+    # --- Subprocess execution -------------------------------------------
+    def _run() -> subprocess.CompletedProcess:
+        # NOTE: ``ALFRED_VAULT_SCOPE`` here is forward-compat plumbing
+        # (mirror of routine_done dispatcher's note). The CLI's
+        # item-CRUD path uses frontmatter.dumps + yaml-preserve
+        # directly (not vault_edit), so the env var isn't consulted
+        # by the current code path. The narrow scope gate fires at
+        # the SCOPE_RULES table level; a future ship that routes
+        # item-CRUD through vault_edit would have the env var
+        # immediately available.
+        env = {
+            **os.environ,
+            "ALFRED_VAULT_SCOPE": "talker_routine_item",
+        }
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    try:
+        proc = await asyncio.to_thread(_run)
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "talker.routine_item.timeout",
+            session_id=session.session_id,
+            argv=argv,
+        )
+        return _dumps({
+            "error": "routine_item timed out (30s)",
+            "kind": DONE_KIND_TIMEOUT,
+        })
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.routine_item.subprocess_crashed",
+            session_id=session.session_id,
+            error=str(exc),
+        )
+        return _dumps({
+            "error": f"routine_item subprocess crashed: {exc}",
+            "kind": DONE_KIND_SUBPROCESS_ERROR,
+        })
+
+    raw_stdout = (proc.stdout or "").strip()
+    raw_stderr = (proc.stderr or "").strip()
+
+    # --- Parse the canary JSON ------------------------------------------
+    # Reversed-line scan per the structlog-pollution defense pattern.
+    parsed: dict[str, Any] | None = None
+    if raw_stdout:
+        for line in reversed(raw_stdout.splitlines()):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                parsed = json.loads(stripped)
+                break
+            except json.JSONDecodeError:
+                continue
+
+    # --- Failure contract: non-zero exit WITHOUT a canary ---------------
+    if parsed is None or not isinstance(parsed, dict) or "kind" not in parsed:
+        log.warning(
+            "talker.routine_item.nonzero_exit_no_canary",
+            session_id=session.session_id,
+            code=proc.returncode,
+            stderr=raw_stderr[:500],
+            stdout_tail=raw_stdout[-2000:] if raw_stdout else "",
+            argv=argv,
+        )
+        return _dumps({
+            "error": (
+                f"routine_item failed without canary: exit "
+                f"{proc.returncode}; "
+                f"stderr={raw_stderr[:300]!r}; "
+                f"stdout={raw_stdout[-300:]!r}"
+            ),
+            "kind": DONE_KIND_SUBPROCESS_ERROR,
+        })
+
+    # --- Success/canary path: return parsed JSON verbatim ---------------
+    log.info(
+        "talker.routine_item.result",
+        session_id=session.session_id,
+        action=action,
+        kind=parsed.get("kind"),
+        ok=parsed.get("ok"),
+        record=parsed.get("record", ""),
+        item=parsed.get("item", "")[:200] if isinstance(parsed.get("item"), str) else "",
+    )
+    return _dumps(parsed)
+
+
 # --- Inter-instance peer tool dispatch (Phase A) -------------------------
 #
 # KAL-LE and Hypatia route ``query_canonical`` + the four ``propose_*``
@@ -2589,6 +2978,17 @@ async def _execute_tool(
     # Salem can route on it.
     if tool_name == "routine_done":
         return await _dispatch_routine_done(
+            tool_input=tool_input,
+            session=session,
+            config=config,
+        )
+
+    # ``routine_item`` (Salem, Phase 2B B3 2026-05-30) — item-level
+    # CRUD on existing routines (add / remove / edit). Same dispatch
+    # shape as ``routine_done``; routes via subprocess against the
+    # ``talker_routine_item`` scope.
+    if tool_name == "routine_item":
+        return await _dispatch_routine_item(
             tool_input=tool_input,
             session=session,
             config=config,
