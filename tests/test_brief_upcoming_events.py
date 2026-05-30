@@ -22,7 +22,11 @@ from typing import Any
 import pytest
 
 from alfred.brief.config import UpcomingEventsConfig, load_from_unified
-from alfred.brief.upcoming_events import render_upcoming_events_section
+from alfred.brief.upcoming_events import (
+    _bucket,
+    _UpcomingItem,
+    render_upcoming_events_section,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -707,3 +711,309 @@ def test_event_with_start_as_yaml_datetime_value(vault: Path) -> None:
     out = render_upcoming_events_section(_default_config(), vault, TODAY)
     assert "YAMLDateTime" in out
     assert target.isoformat() in out
+
+
+# ---------------------------------------------------------------------------
+# scope="today_tomorrow" — /today Telegram slash-command surface
+#
+# Per the 2026-05-30 scope refinement (mirrors the same-day curated-only
+# tier surface narrowing): /today renders Upcoming Events with
+# ``scope="today_tomorrow"`` so the glance-view shows only today +
+# tomorrow. The morning brief retains the full 7-day window — only
+# /today is narrowed. Operator framing: "what's on my plate immediately"
+# vs "what's on the schedule for the next week".
+#
+# Tests cover:
+#   1. Today + tomorrow buckets render; +3d / +7d events absent.
+#   2. ``### This Week`` / ``### Later`` headers NEVER appear in
+#      today_tomorrow scope output.
+#   3. Default scope (no kwarg) preserves existing three-bucket
+#      behavior — regression pin for the morning brief.
+#   4. ``_bucket`` direct call with scope="today_tomorrow" returns
+#      exactly two buckets.
+#   5. Window clamp is renderer-enforced: even if config carries
+#      max_days_ahead=30, today_tomorrow scope drops +2d events.
+#   6. Empty buckets in today_tomorrow scope fall through to the
+#      "No upcoming events." sentinel (intentionally-left-blank pin
+#      mirroring the brief-scope behavior).
+# ---------------------------------------------------------------------------
+
+
+def test_today_tomorrow_scope_renders_today_and_tomorrow_only(
+    vault: Path,
+) -> None:
+    """Fixture vault has events on today, tomorrow, +3d, +7d. Only
+    today + tomorrow appear in today_tomorrow scope output."""
+    today_event = "Today Lunch"
+    tomorrow_event = "Tomorrow Standup"
+    three_days_event = "Three Days Out"
+    week_event = "Week Out"
+    _write_event(vault, today_event, TODAY.isoformat())
+    _write_event(vault, tomorrow_event, (TODAY + timedelta(days=1)).isoformat())
+    _write_event(vault, three_days_event, (TODAY + timedelta(days=3)).isoformat())
+    _write_event(vault, week_event, (TODAY + timedelta(days=7)).isoformat())
+
+    out = render_upcoming_events_section(
+        _default_config(), vault, TODAY, scope="today_tomorrow",
+    )
+    # Today + Tomorrow records present.
+    assert today_event in out
+    assert tomorrow_event in out
+    # +3d and +7d records ABSENT — clamped out by the 1-day window.
+    assert three_days_event not in out
+    assert week_event not in out
+
+
+def test_today_tomorrow_scope_never_emits_this_week_or_later_headers(
+    vault: Path,
+) -> None:
+    """Pin the visible-header contract: the two non-applicable headers
+    NEVER appear in today_tomorrow scope output, even if events exist
+    that would have populated them under brief scope."""
+    _write_event(vault, "Today Item", TODAY.isoformat())
+    _write_event(vault, "Tomorrow Item", (TODAY + timedelta(days=1)).isoformat())
+    # +3d event — would land in "This Week" under brief scope.
+    _write_event(vault, "Three Days", (TODAY + timedelta(days=3)).isoformat())
+    # +10d event — would land in "Later" under brief scope.
+    _write_event(vault, "Ten Days", (TODAY + timedelta(days=10)).isoformat())
+
+    out = render_upcoming_events_section(
+        _default_config(), vault, TODAY, scope="today_tomorrow",
+    )
+    # Today + Tomorrow headers present.
+    assert "### Today" in out
+    assert "### Tomorrow" in out
+    # NEVER the brief-scope headers — these are the regression pin.
+    assert "### This Week" not in out
+    assert "### Later" not in out
+
+
+def test_today_tomorrow_scope_window_clamp_overrides_config(
+    vault: Path,
+) -> None:
+    """Pin the clamp contract: even when config.max_days_ahead=30, the
+    today_tomorrow scope hard-clamps the window to 1 day. Operator's
+    narrow-view choice wins over per-instance config widening."""
+    # Config says 30 days; scope says 1.
+    config = UpcomingEventsConfig(enabled=True, max_days_ahead=30)
+    # +2d event — would be in the 30-day window but NOT in the 1-day
+    # clamp.
+    _write_event(vault, "Two Days Out", (TODAY + timedelta(days=2)).isoformat())
+    _write_event(vault, "Today Item", TODAY.isoformat())
+
+    out = render_upcoming_events_section(
+        config, vault, TODAY, scope="today_tomorrow",
+    )
+    assert "Today Item" in out
+    # +2d event clamped out despite 30-day config.
+    assert "Two Days Out" not in out
+
+
+def test_default_scope_preserves_three_bucket_behavior(vault: Path) -> None:
+    """Regression pin: the default scope (no kwarg) — used by the
+    morning brief daemon — preserves the existing Today / This Week /
+    Later three-bucket behavior. Mirrors
+    ``test_today_bucket_populated`` + ``test_this_week_bucket_three_
+    days_out`` + ``test_later_bucket_twenty_days_out`` in a single
+    fixture so the default-scope contract is pinned end-to-end."""
+    _write_event(vault, "Today Event", TODAY.isoformat())
+    _write_event(vault, "Midweek Event", (TODAY + timedelta(days=3)).isoformat())
+    _write_event(vault, "Far Event", (TODAY + timedelta(days=20)).isoformat())
+
+    # No scope kwarg — defaults to "brief".
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    # All three brief-scope headers present.
+    assert "### Today" in out
+    assert "### This Week" in out
+    assert "### Later" in out
+    # The Tomorrow header NEVER appears in brief scope (regression
+    # pin against an accidental scope-leak in either direction).
+    assert "### Tomorrow" not in out
+    # All three events visible.
+    assert "Today Event" in out
+    assert "Midweek Event" in out
+    assert "Far Event" in out
+
+
+def test_brief_scope_explicit_kwarg_matches_default(vault: Path) -> None:
+    """Pin that explicitly passing ``scope="brief"`` produces identical
+    output to omitting the kwarg. Catches any regression where the
+    default-binding diverges from the named-binding (e.g. a refactor
+    that introduces a separate default path)."""
+    _write_event(vault, "Today", TODAY.isoformat())
+    _write_event(vault, "Week", (TODAY + timedelta(days=3)).isoformat())
+
+    out_default = render_upcoming_events_section(
+        _default_config(), vault, TODAY,
+    )
+    out_explicit = render_upcoming_events_section(
+        _default_config(), vault, TODAY, scope="brief",
+    )
+    assert out_default == out_explicit
+
+
+def test_bucket_direct_today_tomorrow_returns_two_buckets() -> None:
+    """Direct ``_bucket`` call with scope="today_tomorrow" — assert
+    two-bucket shape (Today + Tomorrow keys; no This Week / Later).
+    Pins the internal contract so a refactor that adds a third bucket
+    in today_tomorrow scope surfaces here rather than at render time."""
+    items = [
+        _UpcomingItem(
+            date_iso=TODAY.isoformat(),
+            name="Today A",
+            location=None,
+            description=None,
+        ),
+        _UpcomingItem(
+            date_iso=(TODAY + timedelta(days=1)).isoformat(),
+            name="Tomorrow B",
+            location=None,
+            description=None,
+        ),
+        # +5d — should be defensively dropped (not in any bucket).
+        _UpcomingItem(
+            date_iso=(TODAY + timedelta(days=5)).isoformat(),
+            name="Far C",
+            location=None,
+            description=None,
+        ),
+    ]
+    buckets = _bucket(items, TODAY, scope="today_tomorrow")
+    assert set(buckets.keys()) == {"Today", "Tomorrow"}
+    assert len(buckets["Today"]) == 1
+    assert buckets["Today"][0].name == "Today A"
+    assert len(buckets["Tomorrow"]) == 1
+    assert buckets["Tomorrow"][0].name == "Tomorrow B"
+
+
+def test_bucket_direct_default_scope_returns_three_buckets() -> None:
+    """Regression pin for the default ``_bucket`` shape — same three
+    keys (Today / This Week / Later) the daemon has consumed since
+    Phase 1."""
+    items = [
+        _UpcomingItem(
+            date_iso=TODAY.isoformat(),
+            name="Today A",
+            location=None,
+            description=None,
+        ),
+    ]
+    buckets = _bucket(items, TODAY)
+    assert set(buckets.keys()) == {"Today", "This Week", "Later"}
+
+
+def test_today_tomorrow_scope_empty_fixture_emits_sentinel(
+    vault: Path,
+) -> None:
+    """No events at all → today_tomorrow scope falls through to the
+    "No upcoming events." sentinel — same intentionally-left-blank
+    behavior as brief scope. Pin so a refactor doesn't silently drop
+    the sentinel on the narrow-scope path."""
+    out = render_upcoming_events_section(
+        _default_config(), vault, TODAY, scope="today_tomorrow",
+    )
+    assert out == "No upcoming events."
+
+
+def test_today_tomorrow_scope_only_far_events_emits_sentinel(
+    vault: Path,
+) -> None:
+    """Events exist but all are beyond the 1-day clamp → sentinel
+    fires (operator sees "section ran, nothing in scope" rather than
+    a silent omission)."""
+    _write_event(vault, "Three Days", (TODAY + timedelta(days=3)).isoformat())
+    _write_event(vault, "Ten Days", (TODAY + timedelta(days=10)).isoformat())
+    out = render_upcoming_events_section(
+        _default_config(), vault, TODAY, scope="today_tomorrow",
+    )
+    assert out == "No upcoming events."
+    # Far events NOT mentioned in the body.
+    assert "Three Days" not in out
+    assert "Ten Days" not in out
+
+
+def test_today_tomorrow_scope_only_today_renders_today_header_only(
+    vault: Path,
+) -> None:
+    """Empty Tomorrow bucket → Tomorrow header omitted (existing empty-
+    bucket-omit behavior preserved across scopes)."""
+    _write_event(vault, "Just Today", TODAY.isoformat())
+    out = render_upcoming_events_section(
+        _default_config(), vault, TODAY, scope="today_tomorrow",
+    )
+    assert "### Today" in out
+    assert "Just Today" in out
+    # Tomorrow bucket empty → its header omitted.
+    assert "### Tomorrow" not in out
+
+
+def test_today_tomorrow_scope_only_tomorrow_renders_tomorrow_header_only(
+    vault: Path,
+) -> None:
+    """Mirror of the previous test — empty Today bucket, populated
+    Tomorrow bucket. Pin both empty-bucket edges."""
+    _write_event(
+        vault, "Just Tomorrow", (TODAY + timedelta(days=1)).isoformat(),
+    )
+    out = render_upcoming_events_section(
+        _default_config(), vault, TODAY, scope="today_tomorrow",
+    )
+    assert "### Tomorrow" in out
+    assert "Just Tomorrow" in out
+    assert "### Today" not in out
+
+
+# ---------------------------------------------------------------------------
+# compose_today_reply smoke — pin the call-site wiring
+#
+# The today_command.compose_today_reply composer is the only production
+# call site that uses scope="today_tomorrow". Smoke test asserts the
+# render output's events section contains only the narrow-scope
+# headers + never the brief-scope headers. Keeps the wiring honest
+# against a future refactor that drops the kwarg.
+# ---------------------------------------------------------------------------
+
+
+def test_compose_today_reply_uses_today_tomorrow_scope(
+    vault: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: ``compose_today_reply`` renders the Upcoming Events
+    section with today_tomorrow scope — output contains ``### Today``
+    and/or ``### Tomorrow`` but NEVER ``### This Week`` or ``### Later``.
+
+    Fixture loads events on today, tomorrow, +3d, +7d. Without the
+    scope wiring, the brief-scope render would surface "This Week"
+    header (the +3d event lands there).
+    """
+    from datetime import datetime
+
+    from alfred.telegram.today_command import compose_today_reply
+
+    # Set up the directory shape compose_today_reply expects.
+    (vault / "daily").mkdir(exist_ok=True)
+    # No daily curation file → tier section renders the empty-curation
+    # sentinel. That's fine; we're testing the upcoming-events section
+    # wiring, not the tier section.
+
+    # Events across the brief-scope buckets.
+    _write_event(vault, "Today Lunch", TODAY.isoformat())
+    _write_event(vault, "Tomorrow Standup", (TODAY + timedelta(days=1)).isoformat())
+    _write_event(vault, "Three Days Out", (TODAY + timedelta(days=3)).isoformat())
+    _write_event(vault, "Seven Days Out", (TODAY + timedelta(days=7)).isoformat())
+
+    # Compose at TODAY's instant — pass a `now` datetime matching TODAY.
+    now = datetime(TODAY.year, TODAY.month, TODAY.day, 9, 0, 0)
+    out = compose_today_reply(vault, now)
+
+    # Today-tomorrow scope headers present.
+    assert "### Today" in out
+    assert "### Tomorrow" in out
+    # Brief-scope headers NEVER appear — the regression pin.
+    assert "### This Week" not in out
+    assert "### Later" not in out
+    # +3d and +7d events absent from output.
+    assert "Three Days Out" not in out
+    assert "Seven Days Out" not in out
+    # Today + Tomorrow events present.
+    assert "Today Lunch" in out
+    assert "Tomorrow Standup" in out

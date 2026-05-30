@@ -127,6 +127,15 @@ def compose_today_reply(
     materials view in ``/today`` muddled the glance-view's purpose
     ("what's on my plate" vs "what could I add").
 
+    **Today + tomorrow events only** (2026-05-30 refinement). The
+    Upcoming Events section is rendered with ``scope="today_tomorrow"``
+    — clamps the window to 1 day ahead and reshapes the output into
+    Today / Tomorrow buckets. The morning brief retains the full
+    7-day window (Today / This Week / Later); only the glance-view
+    is narrowed. Same operator workflow framing as the curated-only
+    tier surface above — ``/today`` is for "what's on my plate
+    immediately," not "what's on the schedule for the next week."
+
     **Routines NOT included** (Ship 3 scope refinement, 2026-05-29).
     Routines live in the morning brief or via ``alfred routine show``.
 
@@ -156,13 +165,18 @@ def compose_today_reply(
     # configured ``brief.upcoming_events`` block; ``/today`` deliberately
     # uses a default-on synthesised config so the operator gets the
     # forward calendar slice even if they've never configured the
-    # brief. Defaults to the brief's V1 forward window (7 days) —
-    # matches operator expectations on the brief.
+    # brief. ``scope="today_tomorrow"`` narrows the window to today +
+    # tomorrow only (clamps ``max_days_ahead`` to 1 + reshapes the
+    # output into Today / Tomorrow buckets) per the 2026-05-30
+    # ``/today`` scope refinement — operator wanted only the immediate
+    # calendar slice in the glance-view. The morning brief retains the
+    # full 7-day window; only the glance-view is narrowed.
     try:
         upcoming_body = render_upcoming_events_section(
             UpcomingEventsConfig(enabled=True),
             vault_path,
             today_local,
+            scope="today_tomorrow",
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(

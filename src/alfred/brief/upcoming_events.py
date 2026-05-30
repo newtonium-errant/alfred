@@ -14,14 +14,28 @@ Sources:
 ``remind_at`` is intentionally NOT a source here — it already drives the
 outbound transport scheduler and would create duplicate user-visible noise.
 
-Buckets (relative to ``today``):
+Buckets depend on the caller-supplied ``scope`` kwarg on
+``render_upcoming_events_section``:
+
+``scope="brief"`` (default, used by the morning brief daemon):
 - **Today** — ``date == today``
 - **This Week** — ``today < date <= today + 7d``
 - **Later** — ``today + 7d < date <= today + max_days_ahead``
 
-Empty buckets are omitted. If all three are empty, the renderer emits a
-literal "No upcoming events." marker so operators know the section ran
-rather than crashing silently.
+``scope="today_tomorrow"`` (used by the ``/today`` Telegram slash
+command since 2026-05-30 — operator wanted only the immediate calendar
+slice in the glance-view; the morning brief retains the full 7-day
+window):
+- **Today** — ``date == today``
+- **Tomorrow** — ``date == today + 1d``
+
+In ``today_tomorrow`` mode the effective ``max_days_ahead`` is clamped
+to ``1`` regardless of what the config carries — the operator's narrow-
+view choice wins over any per-instance config widening.
+
+Empty buckets are omitted. If all visible buckets are empty, the
+renderer emits a literal "No upcoming events." marker so operators
+know the section ran rather than crashing silently.
 """
 
 from __future__ import annotations
@@ -29,7 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import frontmatter
 
@@ -324,14 +338,54 @@ def _collect_items(
     return items, preference_filtered
 
 
-def _bucket(items: list[_UpcomingItem], today: date) -> dict[str, list[_UpcomingItem]]:
-    """Split items into Today / This Week / Later buckets."""
-    buckets: dict[str, list[_UpcomingItem]] = {
+def _bucket(
+    items: list[_UpcomingItem],
+    today: date,
+    *,
+    scope: Literal["brief", "today_tomorrow"] = "brief",
+) -> dict[str, list[_UpcomingItem]]:
+    """Split items into per-scope buckets.
+
+    ``scope="brief"`` (default) — three buckets:
+      * **Today** — ``date == today``
+      * **This Week** — ``today < date <= today + 7d``
+      * **Later** — ``today + 7d < date``
+
+    ``scope="today_tomorrow"`` — two buckets:
+      * **Today** — ``date == today``
+      * **Tomorrow** — ``date == today + 1d``
+
+    In ``today_tomorrow`` mode items dated beyond ``today + 1d`` will not
+    appear in any bucket — but caller is expected to have clamped
+    ``max_days_ahead`` to ``1`` before ``_collect_items`` ran, so such
+    items shouldn't reach this function in the first place. The
+    defensive drop here is a belt-and-braces guard so a future caller
+    that bypasses the clamp doesn't silently leak items into a
+    non-existent "Later" bucket.
+    """
+    today_ord = today.toordinal()
+    if scope == "today_tomorrow":
+        buckets: dict[str, list[_UpcomingItem]] = {
+            "Today": [],
+            "Tomorrow": [],
+        }
+        tomorrow_ord = today_ord + 1
+        for item in items:
+            item_ord = date.fromisoformat(item.date_iso).toordinal()
+            if item_ord == today_ord:
+                buckets["Today"].append(item)
+            elif item_ord == tomorrow_ord:
+                buckets["Tomorrow"].append(item)
+            # else: defensively dropped (see docstring).
+        for key in buckets:
+            buckets[key].sort(key=lambda x: (x.date_iso, x.name))
+        return buckets
+
+    buckets = {
         "Today": [],
         "This Week": [],
         "Later": [],
     }
-    today_ord = today.toordinal()
     week_ord = today_ord + 7
     for item in items:
         item_ord = date.fromisoformat(item.date_iso).toordinal()
@@ -360,6 +414,8 @@ def render_upcoming_events_section(
     config: UpcomingEventsConfig,
     vault_path: str | Path,
     today: date,
+    *,
+    scope: Literal["brief", "today_tomorrow"] = "brief",
 ) -> str:
     """Render the Upcoming Events section body markdown.
 
@@ -368,16 +424,45 @@ def render_upcoming_events_section(
     populated string (including the "No upcoming events." sentinel) means
     the section header should be emitted.
 
+    ``scope`` (default ``"brief"``) selects the bucket shape:
+
+      * ``"brief"`` — three buckets (Today / This Week / Later) over
+        ``config.max_days_ahead`` days. Used by the morning brief
+        daemon — unchanged behavior since Phase 1.
+      * ``"today_tomorrow"`` — two buckets (Today / Tomorrow) over a
+        clamped window of 1 day ahead, regardless of
+        ``config.max_days_ahead``. Used by the ``/today`` Telegram
+        slash command since 2026-05-30 — operator wanted only the
+        immediate calendar slice in the glance-view. The clamp is
+        applied at render time so the caller doesn't need to know
+        the brief's default window.
+
     Operator-preference V1 (project_operator_preferences_v1): loads
     Shape A action preferences and applies them via the brief-domain
     rules (``skip_brief_event_if`` / ``skip_brief_task_if``). When any
     preference fires, appends a footer line *"_N items filtered by
     operator preferences._"* so the operator sees the gate effect
     without grepping the daemon log. Empty / disabled section paths
-    don't fire the footer.
+    don't fire the footer. Preference filtering applies symmetrically
+    in both scopes — the preference layer is scope-agnostic.
     """
     if not config.enabled:
         return ""
+
+    # Scope-specific window clamp. The brief scope keeps the operator's
+    # configured ``max_days_ahead`` (default 30, common operator value
+    # 30 for the morning brief); the today_tomorrow scope hard-clamps
+    # to 1 so the operator's narrow-view choice wins over any
+    # per-instance config widening. Clamping at collect time (rather
+    # than only at bucket time) means the inner loop doesn't pull in
+    # records the renderer would only throw away — keeps the
+    # _UpcomingItem build cheap.
+    if scope == "today_tomorrow":
+        effective_max_days = 1
+        bucket_order: tuple[str, ...] = ("Today", "Tomorrow")
+    else:
+        effective_max_days = config.max_days_ahead
+        bucket_order = ("Today", "This Week", "Later")
 
     vault = Path(vault_path)
     # Load preferences once per render call. Failure to load is
@@ -395,12 +480,12 @@ def render_upcoming_events_section(
         )
         prefs = []
     items, preference_filtered = _collect_items(
-        vault, today, config.max_days_ahead, prefs=prefs,
+        vault, today, effective_max_days, prefs=prefs,
     )
-    buckets = _bucket(items, today)
+    buckets = _bucket(items, today, scope=scope)
 
     section_parts: list[str] = []
-    for bucket_name in ("Today", "This Week", "Later"):
+    for bucket_name in bucket_order:
         bucket_items = buckets[bucket_name]
         if not bucket_items:
             continue
