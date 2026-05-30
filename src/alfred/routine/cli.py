@@ -721,32 +721,45 @@ def cmd_done(
 
     if not appended:
         # Idempotent no-op: skip the write entirely (no point
-        # round-tripping the same content). Fire BOTH log events:
+        # round-tripping the same content). Fire BOTH log events
+        # ONLY in plain-text mode:
         #   * ``routine.cli.done`` with ``appended=False`` — the
         #     pre-B1 contract, pinned by regression test
-        #     ``test_done_emits_log_event``. Preserved verbatim so
-        #     the observability surface stays backwards-compatible.
+        #     ``test_done_emits_log_event``. Preserved verbatim for
+        #     plain-text invocations so the observability surface
+        #     stays backwards-compatible.
         #   * ``routine.cli.done.idempotent_noop`` — the B1 addition,
         #     finer-grained signal that the canary path took the
-        #     idempotent branch (distinct from the
-        #     ``routine.cli.done`` event for the success path).
-        # Emit the canary so the talker sees "ok but no-op" and can
-        # phrase the response accordingly.
-        log.info(
-            "routine.cli.done",
-            record=resolved_record,
-            item=item_text,
-            date=iso,
-            appended=False,
-            path=str(path.relative_to(vault_path)),
-        )
-        log.info(
-            "routine.cli.done.idempotent_noop",
-            record=resolved_record,
-            item=item_text,
-            date=iso,
-            path=str(path.relative_to(vault_path)),
-        )
+        #     idempotent branch.
+        #
+        # **Why suppress on ``wants_json``**: structlog's default sink
+        # writes log events to stdout in CLI process context, which
+        # interleaves the rendered log line with the JSON canary
+        # output. The talker subprocess wrapper expects single-line
+        # parseable JSON on stdout (per the reversed-LINE-scan
+        # pattern in :func:`alfred.telegram.conversation.
+        # _dispatch_routine_done`); the structlog line breaks that
+        # contract. The canary JSON IS the structured event for
+        # JSON-mode invocations — the ``kind`` field carries the same
+        # ``success`` / ``idempotent_noop`` signal the log events
+        # convey. Tests that need to pin the structlog emission use
+        # ``wants_json=False`` paths.
+        if not wants_json:
+            log.info(
+                "routine.cli.done",
+                record=resolved_record,
+                item=item_text,
+                date=iso,
+                appended=False,
+                path=str(path.relative_to(vault_path)),
+            )
+            log.info(
+                "routine.cli.done.idempotent_noop",
+                record=resolved_record,
+                item=item_text,
+                date=iso,
+                path=str(path.relative_to(vault_path)),
+            )
         return _emit_canary(
             wants_json=wants_json,
             kind=DONE_KIND_IDEMPOTENT_NOOP,
@@ -779,14 +792,22 @@ def cmd_done(
     out = f"---\n{fm_yaml}---\n\n{new_post.content}\n"
     path.write_text(out, encoding="utf-8")
 
-    log.info(
-        "routine.cli.done",
-        record=resolved_record,
-        item=item_text,
-        date=iso,
-        appended=appended,
-        path=str(path.relative_to(vault_path)),
-    )
+    # Suppress the legacy ``routine.cli.done`` structlog event in
+    # JSON mode — structlog's stdout sink would interleave with the
+    # JSON canary and break wrapper / test parseability. The canary
+    # IS the structured event in JSON mode. See ``_emit_canary``
+    # docstring + the idempotent-branch comment above for the full
+    # rationale. Plain-text mode keeps emitting the log line per
+    # the regression-pin ``test_done_emits_log_event``.
+    if not wants_json:
+        log.info(
+            "routine.cli.done",
+            record=resolved_record,
+            item=item_text,
+            date=iso,
+            appended=appended,
+            path=str(path.relative_to(vault_path)),
+        )
     return _emit_canary(
         wants_json=wants_json,
         kind=DONE_KIND_SUCCESS,
@@ -824,6 +845,30 @@ def _emit_canary(
     path}`` OR ``{ok: False, error}``. New shape is the union: every
     field that COULD be useful is present, the canary tells the
     caller which fields apply.
+
+    **Single-line JSON contract.** The JSON payload is emitted as
+    ``json.dumps(body)`` with NO ``indent`` argument — produces a
+    single line. Two reasons (both surfaced by failing tests on the
+    first B1 ship):
+
+      1. The talker subprocess wrapper in
+         :mod:`alfred.telegram.conversation` does a reversed-LINE scan
+         (mirroring the ``migrate_tier_phase1.py`` structlog-pollution
+         defense pattern). A pretty-printed multi-line payload puts
+         ``{`` and ``}`` on separate lines; neither line parses as
+         standalone JSON; the wrapper falls through to the
+         "no parseable canary" failure path.
+      2. Test fixtures use ``json.loads(capsys.readouterr().out)`` to
+         pin the canary contract. Multi-line stdout (especially when
+         the legacy ``routine.cli.done`` structlog event interleaves
+         with the canary) makes that parse fail unpredictably.
+
+    The trade-off: single-line JSON is less human-readable when an
+    operator runs ``alfred routine done X Y --json`` and reads the
+    output directly. The plain-text mode (when ``wants_json=False``)
+    is the human-readable surface; ``--json`` is the
+    machine-readable / wrapper surface and prioritises
+    parseability.
     """
     ok = exit_code == 0
     if wants_json:
@@ -832,7 +877,9 @@ def _emit_canary(
         if not ok or kind == DONE_KIND_IDEMPOTENT_NOOP:
             body["error" if not ok else "message"] = message
         body.update(payload)
-        print(json.dumps(body, indent=2))
+        # Single-line JSON — see docstring for the rationale (subprocess
+        # wrapper line-scan + test fixture parseability).
+        print(json.dumps(body))
     else:
         # Plain-text: success / idempotent_noop go to stdout; error
         # canaries go to stderr.
