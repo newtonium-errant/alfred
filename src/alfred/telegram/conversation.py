@@ -103,7 +103,9 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
             "Create a new vault record. Use when the user explicitly asks to "
             "save something (task, note, decision, event) or names a new "
             "person, organisation, location, or project that doesn't yet "
-            "have its own record. The record name is the filename stem."
+            "have its own record. The record name is the filename stem. "
+            "``routine`` is for recurring practices — see the SKILL's "
+            "'Creating routines' section for cadence + due_pattern grammar."
         ),
         "input_schema": {
             "type": "object",
@@ -119,19 +121,31 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
                     # and addresses; ``project``, ``constraint``, and
                     # ``contradiction`` round out the conversational
                     # surface for kick-off + reflection turns.
+                    # ``routine`` added 2026-05-30 (Phase 2B B2) for
+                    # conversational routine record creation; the
+                    # SKILL's "Creating routines" section documents
+                    # the cadence + due_pattern + target_cadence_days
+                    # grammar. Routine type is Salem-only at the
+                    # schema layer; the validator + scope gates both
+                    # refuse non-Salem creates regardless of this
+                    # enum entry.
                     "enum": [
                         "task", "note", "decision", "event", "person",
                         "org", "location", "project",
                         "session", "conversation",
                         "assumption", "constraint", "contradiction",
                         "synthesis",
+                        "routine",
                     ],
                     "description": (
                         "Record type. Use ``person`` for individuals, "
                         "``org`` for businesses/groups, ``location`` "
                         "for places/addresses, ``project`` for new "
-                        "initiatives Andrew kicks off, and the learn "
-                        "types (``assumption``, ``constraint``, "
+                        "initiatives Andrew kicks off, ``routine`` "
+                        "for recurring practices (daily / weekly / "
+                        "monthly cadence; see SKILL's 'Creating "
+                        "routines' section), and the learn types "
+                        "(``assumption``, ``constraint``, "
                         "``contradiction``, ``synthesis``) when "
                         "surfacing latent knowledge."
                     ),

@@ -316,3 +316,192 @@ def test_every_shipped_tool_set_is_a_valid_scope_key():
             f"dispatcher's check_scope({tool_set!r}, ...) call would "
             f"raise ScopeError on every tool invocation."
         )
+
+
+# --- Phase 2B B2 (2026-05-30): Conversational routine creation -----------
+
+
+@pytest.mark.asyncio
+async def test_salem_dispatcher_creates_routine_via_vault_create(tmp_path):
+    """End-to-end happy path: Salem creates a ``routine`` record via the
+    ``vault_create`` dispatcher.
+
+    The route is identical to ``test_salem_dispatcher_routes_to_talker_
+    scope_for_note`` (same tool, same path), but exercises the new B2
+    scope widening — ``routine`` was added to ``TALKER_CREATE_TYPES``.
+
+    Required frontmatter for routine records: ``name`` (set
+    automatically by ops.vault_create from the ``name`` arg),
+    ``cadence`` (dict — top-level "is the routine firing today"
+    rhythm), ``items`` (list of dicts — the operational unit). The
+    ``set_fields`` payload supplies the latter two.
+
+    Asserted:
+      * Result has ``path`` field starting with ``routine/`` (Salem's
+        canonical routine directory per schema.py TYPE_DIRECTORY).
+      * File actually landed on disk at the expected path.
+    """
+    config = _make_config(
+        tmp_path, instance_name="Salem", tool_set="talker",
+    )
+    sess = _make_session()
+    state = StateManager(config.session.state_path)
+
+    result = await conversation._execute_tool(
+        tool_name="vault_create",
+        tool_input={
+            "type": "routine",
+            "name": "B2 Test Routine",
+            "set_fields": {
+                # Top-level cadence — fires daily so the aggregator
+                # always evaluates per-item rules. Mirrors the
+                # production Core Daily routine's cadence shape.
+                "cadence": {"type": "daily"},
+                # Single item with a soft-cadence target — the
+                # canonical "walk the dog every 3 days" shape that
+                # the SKILL's worked example A documents.
+                "items": [
+                    {
+                        "text": "Test item",
+                        "priority": "aspirational",
+                        "target_cadence_days": 3,
+                    },
+                ],
+            },
+        },
+        vault_path=config.vault.path,
+        state=state,
+        session=sess,
+        config=config,
+    )
+    parsed = json.loads(result)
+    # Success path — no scope/validator error in the response.
+    assert "error" not in parsed, parsed
+    assert "path" in parsed, parsed
+    assert parsed["path"].startswith("routine/"), parsed
+    # File materialized on disk.
+    created = Path(config.vault.path) / parsed["path"]
+    assert created.is_file(), f"routine record not on disk at {created}"
+
+
+@pytest.mark.asyncio
+async def test_salem_dispatcher_creates_routine_with_due_pattern_item(
+    tmp_path,
+):
+    """Hard-cadence path: routine item carries a ``due_pattern`` dict
+    instead of ``target_cadence_days``. Mirrors the SKILL's worked
+    example C shape (biweekly with anchor + escalate_at_days).
+
+    Pins that the dispatcher passes nested dicts through without
+    flattening — the routine aggregator's ``Item.from_dict`` parses
+    the per-item ``due_pattern`` sub-dict directly.
+    """
+    config = _make_config(
+        tmp_path, instance_name="Salem", tool_set="talker",
+    )
+    sess = _make_session()
+    state = StateManager(config.session.state_path)
+
+    result = await conversation._execute_tool(
+        tool_name="vault_create",
+        tool_input={
+            "type": "routine",
+            "name": "Hard Cadence Test",
+            "set_fields": {
+                "cadence": {"type": "daily"},
+                "items": [
+                    {
+                        "text": "Garbage out",
+                        "priority": "critical",
+                        # Source-of-truth verified against
+                        # alfred.routine.config.DuePattern.from_dict:
+                        # singular ``day`` (NOT plural ``days``);
+                        # value is a 3-letter weekday name.
+                        "due_pattern": {
+                            "type": "biweekly",
+                            "day": "thu",
+                            "anchor": "2026-05-28",
+                        },
+                        "escalate_at_days": 1,
+                    },
+                ],
+            },
+        },
+        vault_path=config.vault.path,
+        state=state,
+        session=sess,
+        config=config,
+    )
+    parsed = json.loads(result)
+    assert "error" not in parsed, parsed
+    assert parsed["path"].startswith("routine/"), parsed
+
+
+@pytest.mark.asyncio
+async def test_salem_dispatcher_rejects_routine_without_required_fields(
+    tmp_path,
+):
+    """Routine record created WITHOUT the required ``cadence`` /
+    ``items`` frontmatter is rejected at the schema-validator gate.
+
+    Pins that the validator's required-field check applies on the
+    talker create path — the scope widening doesn't bypass schema
+    validation. Even though the routine schema requires ``name`` +
+    ``cadence`` + ``items``, this test omits both ``cadence`` and
+    ``items`` and asserts the error mentions the missing fields."""
+    config = _make_config(
+        tmp_path, instance_name="Salem", tool_set="talker",
+    )
+    sess = _make_session()
+    state = StateManager(config.session.state_path)
+
+    result = await conversation._execute_tool(
+        tool_name="vault_create",
+        tool_input={
+            "type": "routine",
+            "name": "Missing Required Fields",
+            "set_fields": {},  # No cadence, no items.
+        },
+        vault_path=config.vault.path,
+        state=state,
+        session=sess,
+        config=config,
+    )
+    parsed = json.loads(result)
+    # Validator-layer error returned to the model — the scope-layer
+    # didn't suppress it. Error message names the missing required
+    # field(s) so Salem can ask the operator for the missing info.
+    assert "error" in parsed, parsed
+    # ``cadence`` is among the required fields per schema.py:807;
+    # the validator's message names it explicitly. (The exact phrasing
+    # is "missing required field" + the field name.)
+    err = parsed["error"].lower()
+    assert "cadence" in err or "items" in err or "required" in err, (
+        f"Expected validator error mentioning cadence/items/required; got: {parsed!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_routine_in_vault_create_tool_schema_enum(tmp_path):
+    """The ``vault_create`` tool schema enum must include ``routine``
+    so the Anthropic SDK doesn't validation-reject the model's
+    ``type: routine`` payload BEFORE the dispatcher ever sees it.
+
+    Pre-B2 the enum lagged ``TALKER_CREATE_TYPES`` (the enum listed
+    14 types; the constant had 15 incl. preference; B2 adds the 16th:
+    routine). The enum is a soft rail in the schema layer — the
+    scope check is the load-bearing gate — but a missing enum entry
+    drops the payload at the SDK validator level with no model-
+    visible explanation. Pin both the constant and the enum stay in
+    lockstep.
+    """
+    # The schema lives at module-import time, no fixture needed.
+    schema = next(
+        t for t in conversation.TALKER_VAULT_TOOLS
+        if t["name"] == "vault_create"
+    )
+    enum_values = schema["input_schema"]["properties"]["type"]["enum"]
+    assert "routine" in enum_values, (
+        f"vault_create enum must list 'routine' for B2 conversational "
+        f"routine creation; got enum={enum_values!r}"
+    )

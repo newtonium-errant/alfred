@@ -697,6 +697,19 @@ TALKER_CREATE_TYPES: set[str] = {
     # (her own local instance-application records); KAL-LE is NOT —
     # she's not a heavy talker surface in V1.
     "preference",
+    # Routine Phase 2B B2 (2026-05-30) — conversational routine record
+    # creation. Salem can now create new ``routine`` records via
+    # ``vault_create`` when the operator names a new recurring practice
+    # mid-conversation ("create a routine: walk the dog every 3 days").
+    # B1 already shipped per-item completion via the narrow
+    # ``talker_routine_completion`` scope; B2 adds the create surface.
+    # B3 will add item-level editing of EXISTING routines (cadence
+    # adjustment, add/remove items in place); until then, item-level
+    # changes go via CLI or a fresh vault_edit. ``routine`` is Salem-
+    # only at the schema layer (``available_in_scopes`` carries only
+    # ``SCOPE_CANONICAL``); the type validator gate refuses
+    # non-Salem creates regardless of this allowlist entry.
+    "routine",
 }
 
 

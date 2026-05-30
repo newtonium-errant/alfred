@@ -81,6 +81,33 @@ def test_talker_create_allows_contradiction():
     check_scope("talker", "create", record_type="contradiction")
 
 
+def test_talker_create_allows_routine():
+    # Added 2026-05-30 (Phase 2B B2 — conversational routine creation):
+    # Salem creates ``routine`` records when the operator names a new
+    # recurring practice mid-conversation. The SKILL's "Creating
+    # routines" section documents the operator-language → cadence /
+    # due_pattern / target_cadence_days mapping.
+    #
+    # Schema-layer Salem-only constraint (``available_in_scopes ==
+    # frozenset({SCOPE_CANONICAL})`` in schema.py) means the type
+    # validator gate refuses non-Salem instances regardless; this
+    # scope test confirms the talker allowlist permits the create
+    # op for the Salem path.
+    check_scope("talker", "create", record_type="routine")
+
+
+def test_talker_create_routine_is_in_TALKER_CREATE_TYPES_constant():
+    # Direct constant pin — the ``vault_create`` tool schema enum in
+    # ``conversation.py`` mirrors this set. Drift between the two
+    # would let Salem name a routine but get refused at the scope
+    # gate (or vice versa). Pre-2026-05-30 the enum lagged the
+    # constant by several days for ``org`` / ``location`` adds; this
+    # pin surfaces that class of drift if the constant grows again
+    # without the enum following.
+    from alfred.vault.scope import TALKER_CREATE_TYPES
+    assert "routine" in TALKER_CREATE_TYPES
+
+
 # ---- field_allowlist (janitor edit, the new Option E rule) ------------------
 
 
