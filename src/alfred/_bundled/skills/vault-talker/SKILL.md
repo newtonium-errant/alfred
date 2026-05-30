@@ -152,33 +152,124 @@ Salem writes to today's daily file via `vault_edit set_fields={"tier_curation": 
 ```yaml
 tier_curation:
   t1:
-    - task: "[[task/Steph Yang ROE]]"
-      source: "operator"          # or "auto-due" / "auto-escalate" / "rollover"
-      confirmed: true              # T1-only; auto-surfaced starts false, operator-confirm flips true
+    - task: "[[task/Steph Yang ROE]]"     # task-origin
+      source: "operator"                   # or "auto-due" / "auto-escalate" / "rollover"
+      confirmed: true                      # T1-only; auto-surfaced starts false, operator-confirm flips true
+    - routine_item:                        # routine-origin (Ship B, 2026-05-29)
+        record: "Recurring Bills + Admin"
+        text: "Pay Clinic Rental to Hussein Rafih"
+      source: "auto-due-routine"
+      confirmed: true
   t2:
     - task: "[[task/Connect QBO API — RRTS]]"
       source: "operator"
+    - routine_item:
+        record: "Recurring Bills + Admin"
+        text: "Pay Clinic Rental to Hussein Rafih"
+      source: "auto-surface-routine"       # T2 ramp before T1 escalation
   t3:
     - item: "Walk Fergus"
       source: "operator-adhoc"
   curated_at: "2026-05-29T07:14:00-03:00"
-  rollover_from: "2026-05-28"     # optional — present when pre-populated from yesterday
+  rollover_from: "2026-05-28"             # optional — present when pre-populated from yesterday
 ```
+
+The two T2 entries above (`task:` form + `routine_item:` form) illustrate the discriminated union — both shapes coexist in the same list, parsed by `T1T2Entry.from_dict` via the routing rule "task-string takes precedence; routine_item dict otherwise; missing both is silently dropped."
 
 Field-shape rules (verify against the dataclass before drafting examples):
 
-- **T1/T2 entries carry `task:` (a wikilink string).** Source enum values: `auto-due`, `auto-escalate`, `operator`, `rollover` (the canonical T1/T2 set in `T1_T2_SOURCES`).
-- **T3 entries carry `item:` (a free-text string), NOT `task:`.** Source enum values: `aspirational`, `operator`, `operator-adhoc` (the canonical T3 set in `T3_SOURCES`). **T3 has no `rollover` source** — T3 is fresh-each-day per the spec.
+- **T1/T2 entries are a discriminated union** over origin — exactly one of `task:` or `routine_item:` is populated per entry (Ship B, 2026-05-29):
+    - **Task-origin** carries `task: "[[task/Name]]"` (wikilink string). This is the original Tier-V2 Ship 1 shape — one-shot task records.
+    - **Routine-origin** carries `routine_item: {record: "<RoutineName>", text: "<ItemText>"}` (dict). This is the Phase 2A Ship B addition — recurring items inside a `routine/` record. The brief render layer reconstructs the `[[routine/<record>]]` wikilink + item text inline; the operator never types the wikilink shape.
+- **Source enum values** (six-value `T1_T2_SOURCES` set in `alfred.tier.daily_curation`):
+    - `auto-due` — task-origin: surfaced from `due` today/tomorrow
+    - `auto-escalate` — task-origin: `escalate_at_days` window
+    - `auto-due-routine` — routine-origin T1: the item's `due_pattern` resolves into the T1 window (Ship B)
+    - `auto-surface-routine` — routine-origin T2 ramp: the item's `surface_at_days` window opens before T1 escalation (Ship B)
+    - `operator` — explicit operator add via talker
+    - `rollover` — pre-populated from yesterday's incomplete (T1/T2 only)
+- **Routine-origin entries do NOT roll over.** Per Ship B, when yesterday's routine-origin T1/T2 entry is incomplete, the rollover section silently skips it — the routine's compute surface (`compute_auto_routine_candidates` / `compute_auto_routine_t2_candidates`) re-fires the next morning if the item is still due. Task-origin entries DO roll over as before.
+- **T3 entries carry `item:` (a free-text string), NOT `task:` or `routine_item:`.** Source enum values: `aspirational`, `operator`, `operator-adhoc` (the canonical T3 set in `T3_SOURCES`). **T3 has no `rollover` source** — T3 is fresh-each-day per the spec.
 - **`confirmed: true` is T1-only and optional.** T2/T3 entries have no confirmed field — the operator-add IS the confirmation.
 - Source enum values + field names are stable contract surface pinned by tests. If they drift in `daily_curation.py`, this SKILL needs a follow-up sweep.
 
 #### `escalate_at_days` SURVIVES — surface-earlier knob
 
-The V1 `base_tier` and `escalate_to` fields are gone, but `escalate_at_days` survives as a per-task hint for "surface earlier than today/tomorrow." A task with `escalate_at_days: 3` auto-surfaces in the morning brief as a T1 candidate **3 days before its `due`**, not just on the day-of or day-before. This is the "don't lean on operator memory" principle in action: an invoicing task that needs 3 days of prep work should appear in the operator's morning queue 3 days out, not the morning it's due.
+The V1 `base_tier` and `escalate_to` fields are gone, but `escalate_at_days` survives as a "surface earlier than today/tomorrow" knob — on both **task records** (per-task `escalate_at_days` frontmatter field) AND **routine items** (per-item `escalate_at_days` key inside the routine's `items:` list). The semantics are the same in both surfaces: the item auto-surfaces as a T1 candidate when `due - today ≤ escalate_at_days`. This is the "don't lean on operator memory" principle in action: an invoicing item that needs 3 days of prep work should appear in the operator's morning queue 3 days out, not the morning it's due.
 
-**Example:** `task/RRTS Invoicing.md` has `due: 2026-06-02` and `escalate_at_days: 3`. On 2026-05-30 (3 days before due) it auto-surfaces in the T1 candidates with reason `"escalate window (3d before due)"`. Operator confirms via `T1 confirm RRTS Invoicing` if they want to act on it that day; otherwise it'll re-surface tomorrow.
+**Task-record example:** `task/RRTS Invoicing.md` has `due: 2026-06-02` and `escalate_at_days: 3`. On 2026-05-30 (3 days before due) it auto-surfaces in the T1 candidates with reason `"escalate window (3d before due)"`. Operator confirms via `T1 confirm RRTS Invoicing` if they want to act on it that day; otherwise it'll re-surface tomorrow.
 
-When Andrew names a recurring task that needs lead time ("RRTS invoicing needs 3 days head's-up", "tax filing wants a week"), set `escalate_at_days` on it. **Do NOT set `base_tier` or `escalate_to` — those fields are V1 obsolete.**
+When Andrew names a recurring **one-shot** task that needs lead time ("the Steph Yang ROE needs 3 days head's-up before due"), set `escalate_at_days` on the task. When Andrew names a **recurring** item that needs lead time ("garbage day is Thursday, surface it Wednesday"), the right home is a routine item — see **Routine-origin tier entries** below. **Do NOT set `base_tier` or `escalate_to` on either surface — those fields are V1 obsolete.**
+
+#### Routine-origin tier entries — Phase 2A Ship B (shipped 2026-05-29)
+
+Routines now carry recurring-deadline items. A routine item with a `due_pattern` (e.g. weekly Thursday for garbage day, monthly 1st for clinic rent) auto-surfaces in the brief's tier section the same way a task with `due` + `escalate_at_days` does — but the underlying data lives in `routine/<Name>.md` under `items:`, not in a one-shot `task/` record. The brief composes both surfaces (task-origin + routine-origin) into the same T1/T2 buckets.
+
+**Why this matters operationally.** Pre-Ship-A, the talker would respond to *"make Pay Clinic Rental a recurring T2-on-the-27th, T1-on-the-1st task"* with a refusal — *"there's no recurring task primitive."* Ship A added it; Ship B wired the brief render; Ship D (this update) teaches the talker the new shape. The right home for "appears as T2 on the 27th, upgrades to T1 on the 1st" is a routine item with a `due_pattern` + `surface_at_days` + `escalate_at_days`, NOT a one-shot task with hand-set `base_tier`.
+
+##### `due_pattern` schema — six pattern types
+
+A routine item's `due_pattern` is a dict with a `type` discriminator + per-type auxiliary fields. The six canonical type values live in `alfred.routine.config.DUE_PATTERN_TYPES` (frozenset; the source of truth — quote these via the import-path-name, not by re-listing values that may drift):
+
+- `weekly` — auxiliary: `day` (weekday abbreviation, e.g. `"thu"`)
+- `biweekly` — auxiliary: `day` + `anchor` (ISO date of a reference week's matching weekday; cycle alternates every 14 days)
+- `monthly` — auxiliary: `day` (1-31 or the string `"last"`)
+- `every_n_days` — auxiliary: `n` (positive int) + `anchor` (ISO date the cycle counts from)
+- `monthly_nth_weekday` — auxiliary: `n` (1, 2, 3, 4, or -1 for "last") + `weekday` (weekday name)
+- `weekly_soft` — no auxiliary fields; the "due" date is the end of the current ISO week (Sunday). Soft deadlines for items the operator wants to nudge weekly but not strictly police.
+
+Auxiliary fields default to `None`; per-type validation happens in `alfred.routine.due` where the pattern resolves to a concrete next-due date. The schema-tolerance contract applies: a malformed `due_pattern` becomes `None` rather than raising, so a single bad item doesn't taint the whole routine record's parse.
+
+##### T1 / T2 window math — three operator-stated combinations
+
+Each routine item composes its tier surface via three fields: `due_pattern`, `surface_at_days`, `escalate_at_days`. The semantics (operator-stated, Plan-ratified — verified verbatim against `alfred.routine.config` module docstring):
+
+- **`escalate_at_days` ABSENT → item never auto-surfaces in tier.** This is the Walk-Fergus / daily-routine shape — no deadline, surfaces by cadence in the brief's routines section but NOT in the tier section. Reading and the other Aspirational items in `routine/Standing Practices.md` are this shape.
+- **`escalate_at_days` PRESENT + `surface_at_days` absent or `≤ escalate_at_days` → T1-only window** (the Garbage-Day shape). The item surfaces directly as a T1 candidate when inside the escalation window; no T2 ramp.
+- **`surface_at_days > escalate_at_days` → T2 ramp + T1 escalation** (the Pay-Clinic-Rental shape). The item surfaces as a T2 candidate (in the `T2_AUTO_ROUTINE_HEADER` subsection — see below) when `due - today ≤ surface_at_days`, then promotes to T1 when `due - today ≤ escalate_at_days`.
+
+Window boundaries (verified against the module docstring):
+
+- T1 window: `[0, escalate_at_days]` (days_to_due in this inclusive range)
+- T2 window: `(escalate_at_days, surface_at_days]` (strictly above escalate, inclusive of surface)
+- `escalate_at_days: 0` is a load-bearing edge case — T1 fires only on the due date itself (e.g. clinic rent on the 1st). T2 in that case covers days 1..surface_at_days inclusive.
+- `escalate_at_days: 1` means T1 on the day BEFORE due (e.g. garbage Wed for Thu pickup).
+
+##### Routine-origin render shapes the operator will see
+
+The brief's T1 bucket renders routine-origin entries inline with task-origin entries. Each routine-origin T1 line carries the item text, the formatted due date, the reason, and the originating routine record:
+
+> **Note on the `[[routine/Recurring Bills + Admin]]` references below**: this record is created by the Ship E migration (the operator-run step closing the Routine Phase 2A arc) and holds the four migrated items `Pay Clinic Rental to Hussein Rafih`, `Garbage Day`, `RRTS Invoicing`, `RRTS Payroll`. Pre-Ship-E it does NOT exist in the vault — the examples below describe the post-Ship-E render state. If the operator references one of these items pre-migration, consult before creating a new routine record (see the **DO NOT create one-shot `task` records for recurring items** call-out below for the operator-confirm protocol).
+
+```
+### T1 — Imminent deadlines (auto-surfaced — confirm or drop)
+- [ ] Garbage Day — due Fri May 29 (escalate window (1d before due), from [[routine/Recurring Bills + Admin]])  *(confirm? reply "T1 confirm")*
+```
+
+The brief's T2 bucket has a **new dedicated subsection** for routine-origin auto-T2 candidates, rendered BELOW the curated T2 entries and ABOVE the `T2_POOL_HEADER`:
+
+```
+### T2 — On the radar
+*(empty — reply "T2 add <items from selection pool below or anywhere>")*
+
+#### Auto-surfaced (from routines)
+- [ ] Pay Clinic Rental to Hussein Rafih — due Mon Jun 1 (surface window (5d before due), from [[routine/Recurring Bills + Admin]])  *(reply "T2 confirm" to keep on today's list)*
+```
+
+**Two new exported constants** (Ship B, in `alfred.brief.tier_section`):
+- `T2_AUTO_ROUTINE_HEADER = "#### Auto-surfaced (from routines)"` — the heading line for the auto-T2-routine subsection.
+- `T2_ROUTINE_CONFIRM_PROMPT = '*(reply "T2 confirm" to keep on today\'s list)*'` — the canary string at the end of each auto-T2-routine line.
+
+These join the existing five exported constants (`T1_CONFIRM_PROMPT`, `T2_EMPTY_PROMPT`, `T3_EMPTY_PROMPT`, `ROLLOVER_HEADER`, `T2_POOL_HEADER`) as stable verbatim contracts. Salem recognises these strings in the brief to know which reply pattern is expected for each surface. If any rename at the code layer, this SKILL needs a follow-up sweep.
+
+##### Routine-origin reply patterns the talker must parse
+
+The verb grammar is the same as task-origin — `T1 confirm <item text>` and `T2 confirm <item text>` — but the write shape differs. When the operator's named item matches a routine-origin auto-surface (rather than a task-origin one), the talker writes a `routine_item` entry instead of a `task` entry. Disambiguation:
+
+- The brief renders routine-origin lines with `from [[routine/<RecordName>]]` suffix — read it to find the originating routine record.
+- If the operator's free-text matches an auto-surfaced routine candidate's item text, write the `routine_item: {record, text}` shape with `source: "auto-due-routine"` (for T1 confirm) or `source: "auto-surface-routine"` (for T2 confirm).
+- If the operator's free-text matches a task-origin auto-T1 candidate, write the `task: "[[task/Name]]"` shape with `source: "auto-due"` or `"auto-escalate"`.
+- When an item text could match either origin (unusual but possible — Salem should prefer the auto-surfaced candidate that was actually rendered in this morning's brief; if both rendered, ask one clarifying question naming both candidates).
 
 #### The brief surface — render shapes operator will see
 
@@ -206,7 +297,7 @@ The morning brief has a section titled exactly `Open Tasks by Tier` (single sour
 - T2: [[task/Connect QBO API — RRTS]] *(uncompleted yesterday)*
 ```
 
-**The empty-bucket prompt strings, rollover header, and pool header are stable verbatim contracts** pinned in `alfred.brief.tier_section` as `T1_CONFIRM_PROMPT`, `T2_EMPTY_PROMPT`, `T3_EMPTY_PROMPT`, `ROLLOVER_HEADER`, `T2_POOL_HEADER`. Salem recognises these strings in the brief to know which reply pattern is expected. If the strings ever change at the code layer, this SKILL needs a follow-up sweep.
+**The empty-bucket prompt strings, rollover header, pool header, and routine-T2 affordances are stable verbatim contracts** pinned in `alfred.brief.tier_section` as `T1_CONFIRM_PROMPT`, `T2_EMPTY_PROMPT`, `T3_EMPTY_PROMPT`, `ROLLOVER_HEADER`, `T2_POOL_HEADER`, plus the two Ship B additions `T2_AUTO_ROUTINE_HEADER` and `T2_ROUTINE_CONFIRM_PROMPT` (see **Routine-origin tier entries** above for the routine-specific shapes). Salem recognises these strings in the brief to know which reply pattern is expected. If any string changes at the code layer, this SKILL needs a follow-up sweep.
 
 #### Worked example A — operator-named T1 add (and auto-T1 confirm)
 
@@ -258,6 +349,67 @@ Two sub-patterns share this example because the write path differs only in the `
 >
 > `source: "operator-adhoc"` because the operator typed "walk Fergus" as a free-text one-liner. (The `aspirational` source is reserved for picks from the T3 selection pool — items pulled from the day's routine Aspirational bucket. Free-text additions go to `operator-adhoc` even if they happen to overlap with non-Aspirational routine items like Core Daily's `tracked` Walk Fergus — the operator didn't pick from a presented list, they typed.) Write back. Replies: *"Added 'walk Fergus' to today's T3."*
 
+#### Worked example D — Routine T1 confirm
+
+> Andrew (Wednesday morning after seeing this morning's brief render a routine-origin auto-T1 line, e.g.: *"- [ ] Garbage Day — due Thu May 29 (escalate window (1d before due), from [[routine/Recurring Bills + Admin]])  *(confirm? reply "T1 confirm")*"*): *"T1 confirm Garbage Day"*
+>
+> Salem (internal): `vault_read path="daily/<today>.md"` → gets the current `tier_curation` block (or `None` if first curation of the day). The brief surface tells Salem the originating routine is `Recurring Bills + Admin` and the item text is `Garbage Day` — read those off the rendered line, not from a vault lookup. Build the updated block: append a fresh `T1T2Entry` with the routine_item shape:
+>
+> ```yaml
+> - routine_item:
+>     record: "Recurring Bills + Admin"
+>     text: "Garbage Day"
+>   source: "auto-due-routine"
+>   confirmed: true
+> ```
+>
+> Write back via `vault_edit path="daily/<today>.md" set_fields={"tier_curation": {...full block...}}`. All OTHER frontmatter keys (`type` / `date` / `routines_contributing` / `critical_pending` / `alfred_tags`) preserved. Replies: *"Confirmed Garbage Day in today's T1. Brief will render it without the confirm prompt from here forward."*
+
+#### Worked example E — Routine T2 confirm
+
+> Andrew (5 days before clinic rent due, seeing the brief's `#### Auto-surfaced (from routines)` subsection under T2): *"T2 confirm Pay Clinic Rental"*
+>
+> Salem (internal): `vault_read path="daily/<today>.md"`. The brief's auto-T2-routine line shows `from [[routine/Recurring Bills + Admin]]` — Salem reads the originating routine off the line. The operator said "Pay Clinic Rental" (loose match against the rendered item text "Pay Clinic Rental to Hussein Rafih"); resolve by reading the auto-T2 candidate's full text from the brief rendering. Build the updated block: append a fresh `T1T2Entry` to `tier_curation.t2`:
+>
+> ```yaml
+> - routine_item:
+>     record: "Recurring Bills + Admin"
+>     text: "Pay Clinic Rental to Hussein Rafih"
+>   source: "auto-surface-routine"
+> ```
+>
+> No `confirmed` field — T2 entries are operator-curated; the add IS the confirmation. Write back. Replies: *"Confirmed Pay Clinic Rental in today's T2. Brief will keep it on today's list; it'll promote to T1 automatically when the escalation window opens."*
+>
+> **When the operator's free-text matches both an auto-T2-routine candidate AND a separate task-origin item** (rare), ask one clarifying question naming both candidates rather than guessing — the discriminator at write time is which shape (`task` vs `routine_item`) to populate.
+
+#### Worked example F — Negative pattern: DO NOT create one-shot recurring task records
+
+This is the pattern Andrew explicitly surfaced in the 2026-05-29 motivating conversation: *"Are you able to mark that as a recurring task that appears as T2 on the 27th of every month and upgrades to T1 on the 1st of every month?"* The pre-Ship-A talker said "no recurring primitive exists" and offered to set `base_tier` / `escalate_to` / `escalate_at_days` on a one-shot task as a workaround. **That workaround is now wrong** — Ship A added the recurring primitive at the routine-item layer.
+
+> Andrew: *"Make Pay Clinic Rental a recurring task — appears as T2 on the 27th, upgrades to T1 on the 1st."*
+>
+> **WRONG** (the pre-Ship-A workaround — DO NOT do this):
+>
+> Salem creates / edits `task/Pay Clinic Rental to Hussein Rafih.md` with `base_tier: 2`, `escalate_to: 1`, `escalate_at_days: 4`, `due: 2026-06-01`. This is wrong on two counts: (a) `base_tier` / `escalate_to` are V1 obsolete fields, and (b) a one-shot task record cannot represent recurrence — next cycle's due date won't auto-advance.
+>
+> **RIGHT** (Ship A canonical pattern):
+>
+> Salem identifies the right routine record (the routine for recurring bills + admin items — `routine/Recurring Bills + Admin.md` is the canonical home after the Ship E migration runs; for items that don't fit an existing routine, ask the operator before creating a new routine record). Then `vault_edit append_fields={"items": ...}` adding the item with a `due_pattern` + `surface_at_days` + `escalate_at_days`:
+>
+> ```yaml
+> - text: "Pay Clinic Rental to Hussein Rafih"
+>   priority: tracked
+>   due_pattern:
+>     type: monthly
+>     day: 1
+>   surface_at_days: 5         # T2 appears 5 days out (the 27th of the prior month, approximately)
+>   escalate_at_days: 0        # T1 fires on the due date itself (the 1st)
+> ```
+>
+> Window math check: `surface_at_days: 5` and `escalate_at_days: 0` satisfies `surface > escalate` → T2 ramp + T1 escalation (the Pay-Clinic-Rental shape from the window-math section above). T2 covers days 1..5 inclusive; T1 fires only on the due date itself. Replies: *"Added Pay Clinic Rental to `[[routine/Recurring Bills + Admin]]` as a monthly-1st item. It'll auto-surface as T2 starting 5 days out, then escalate to T1 on the 1st. Next cycle resolves automatically from the `due_pattern` — no need to re-mark it recurring each month."*
+>
+> The exact `surface_at_days` value depends on operator phrasing. *"Appears on the 27th"* for a monthly-1st item is approximately 5 days out (May has 31 days, April has 30 days — the count varies). When the operator names a specific calendar date, translate to days-before-due and confirm: *"5 days before the 1st puts T2 surfacing on the 27th of a 31-day month, the 26th of a 30-day month — close enough?"*
+
 #### Negative-pattern call-outs (DO NOT)
 
 **DO NOT write `base_tier` on task records.** That field is V1 obsolete. The 24 historical migrated tasks (created during the 2026-05-28 V1 ship) still carry inert `base_tier` values; **leave them alone** — Ship 5 backfill will clean them up. If Andrew says "tier 1 this task," DO NOT translate that to `vault_edit set_fields={"base_tier": 1}` on the task record — translate it to a T1 add on today's daily file's `tier_curation` block (Worked example A pattern, but with `source: "operator"` because the operator named it explicitly rather than confirming an auto-surface).
@@ -265,6 +417,8 @@ Two sub-patterns share this example because the write path differs only in the `
 **DO NOT write `escalate_to` on task records.** Also V1 obsolete. The V2 surface has no `escalate_to` field — the escalation target is implicitly T1 (every escalate-window surface is a T1 candidate). If Andrew names an escalation rule, set `escalate_at_days` only.
 
 **DO NOT route `alfred_triage: true` records into any tier list.** Janitor-generated dedup-decision tasks (titles starting `Triage - ...` with `alfred_triage: true` in frontmatter) are not priority-ranked work and don't belong in T1/T2/T3. They route to the 9am Daily Sync's `### Triage Queue ({count})` section (single source of truth in `alfred.daily_sync.triage_section.SECTION_HEADER_TEMPLATE`). If Andrew asks about triage items, point at the Daily Sync — *"Triage items live in the 9am Daily Sync's Triage Queue section. There are N open ones."*
+
+**DO NOT create one-shot `task` records for recurring items.** This is the Ship A/B/D contract: recurring deadlines live in `routine/<RoutineName>.md` as items with a `due_pattern` (six canonical types via `alfred.routine.config.DUE_PATTERN_TYPES`), NOT as one-shot `task/` records with hand-set tier or escalation hints. If Andrew names a recurring deadline ("X is due monthly on the 1st" / "Y is weekly Thursday"), the right path is `vault_edit append_fields={"items": ...}` on the matching routine record — NEVER `vault_create type=task ...`. See **Worked example F** above for the full pattern + the WRONG-vs-RIGHT contrast. If no existing routine matches the item's domain (admin item but no "Recurring Bills + Admin" routine yet, e.g. pre-Ship-E vault state), ask the operator before creating a new routine record — *"This doesn't fit any existing routine. Should I add it to `[[routine/<closest existing>]]` or create a new routine record for `<category>`?"*
 
 **DO NOT create new T3 tasks for recurring practices.** Recurring practices (Reading, Writing, Exercise, etc.) live in `routine/Standing Practices.md` as Aspirational items — the morning brief surfaces them as the T3 selection pool. T3 in tier_curation is for **today-only ad-hoc intentions** ("walk Fergus today", "read for an hour today"), not standing-practice creation. If Andrew names a new recurring practice, append it to `routine/Standing Practices.md` items list via `append_fields` (the post-migration canonical pattern — see **Standing Practices** below if a dedicated section exists, otherwise: `vault_edit path="routine/Standing Practices.md" append_fields={"items": {"text": "<Name>", "priority": "aspirational"}}`).
 
