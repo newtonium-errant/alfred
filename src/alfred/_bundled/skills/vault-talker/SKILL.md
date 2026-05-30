@@ -433,6 +433,156 @@ When Andrew asks to **add a recurring practice** (not a today-only intention), t
 
 **DO NOT recreate the migrated task records.** Reading, Writing, Playing Music, Listening to Music, and Exercise were originally tasks; the 2026-05-28 migration moved them into `routine/Standing Practices.md` and cancelled the origin task records. If Andrew names one of the five as a standing practice, that item is ALREADY in the routine — search first; if listed, confirm without writing: *"`Reading` is already a standing practice in `[[routine/Standing Practices]]` — nothing to add."*
 
+### Marking routines done (Phase 2B B1, shipped 2026-05-30)
+
+When Andrew says he did one of his routine items, log the completion. The dedicated tool is **`routine_done`** — DO NOT use `vault_edit` to mutate `completion_log` directly. The tool runs through the `talker_routine_completion` narrow scope, fuzzy-matches the item across active routines, and returns a structured `kind` discriminator you route on.
+
+#### Grammar to recognise
+
+- **Direct completion** — *"done X"*, *"X done"*, *"finished X"*, *"completed X"*, *"X is done"*
+- **First-person verb** — *"I walked the dog"*, *"I exercised"*, *"I read for 30 min"*, *"I meditated"*. Operator typically uses past tense + subject "I" + verb that matches the item's action.
+- **Multi-item in one turn** — *"done X and Y"*, *"I did X then Y"*, *"finished X, Y, and Z"* → call `routine_done` ONCE PER ITEM in sequence (no batch). The dispatch is per-item because each may match a different routine + each gets its own canary response.
+- **Back-dating phrases** — *"X yesterday"*, *"I walked the dog yesterday"* (today minus 1 day); *"did X two days ago"* / *"three days ago"* (today minus N); *"X last Tuesday"* / *"on Monday"* (most-recent-past matching weekday, NOT next Tuesday). Resolve the date deterministically and pass it as `completed_at: "YYYY-MM-DD"`.
+- **Negative pattern** — *"I walked the dog yesterday but NOT today"* → fire ONE `routine_done` for yesterday only. Do NOT also fire one for today. Read carefully — the negation is the operator's explicit instruction.
+
+#### The tool input shape
+
+```yaml
+routine_done:
+  item: "Walk dog"          # required — fuzzy-matched (substring + stem)
+  record: "Self Care"       # OPTIONAL — omit for vault-wide fuzzy match
+  completed_at: "2026-05-29"  # OPTIONAL — YYYY-MM-DD; omit for today
+```
+
+**Prefer vault-wide fuzzy match** (omit `record`). The operator's voice phrasing rarely names the originating routine ("I walked the dog" not "I walked the dog from Self Care"); the vault-wide fuzzy is what makes the conversational surface ergonomic. Pass `record` only when (a) the operator explicitly named the routine, OR (b) a vault-wide fuzzy returned `ambiguous_item` and the operator's clarifying reply named the routine.
+
+#### Routing on the canary `kind` discriminator
+
+The tool result is JSON with a `kind` field. Always route on it:
+
+- **`"success"`** — completion logged. Reply confirming: *"Logged `Walk dog` in `Self Care` for today."* (vary the phrasing, but include item name + record + date so the operator can verify). For back-dated completions, name the date explicitly: *"Logged `Walk dog` for 2026-05-29."*
+- **`"idempotent_noop"`** — already logged for that date. Reply gently: *"You've already logged `Walk dog` for today — no double-write."* Don't apologise; this is the expected idempotent shape.
+- **`"ambiguous_item"`** — multiple matches. Tool result carries `candidates: [{record, item}, ...]`. **ASK BACK with a numbered list, do NOT guess.** Mirror the keyboard-friendly numbered format the rest of the SKILL uses for ambiguity:
+  > *"That matches a few items — which one?* (1) `Walk dog` from `Self Care`; (2) `Walk to coffee shop` from `Daily Self-Care`. *Reply with the number."*
+
+  When the operator replies *"1"* (or *"the first one"* / *"Walk dog"* / etc.), re-call `routine_done` with `record` populated to disambiguate.
+- **`"unknown_item"`** — no matching active routine item. Tool result carries `available_items` (first 20). Tell the operator: *"I don't have `'<query>'` in any active routine. Should I add it as a new routine item, or did you mean something else?"* DO NOT auto-create — wait for the operator's instruction.
+- **`"unknown_record"`** — explicit `record` was given but the routine file doesn't exist. Rare (only fires when YOU passed a `record` arg). Means the previous turn's disambiguation lookup got the routine name wrong; re-fuzzy with vault-wide.
+- **`"future_date_rejected"`** — `completed_at` was after today. Tell the operator + ask back: *"I can't log a completion for a future date. Did you mean today, or an earlier date?"*
+
+#### Worked example A — Direct first-person completion
+
+> Andrew: *"I walked the dog this morning"*
+>
+> Salem (internal): `routine_done item="walked the dog"` (vault-wide fuzzy; no `completed_at` → today).
+>
+> Tool returns: `{"kind": "success", "record": "Self Care", "item": "Walk dog", "date": "2026-05-30", ...}` — the fuzzy matcher stem-normalised "walked the dog" → "walk dog" → matched the canonical item text.
+>
+> Reply: *"Logged `Walk dog` in `Self Care` for today."*
+
+#### Worked example B — Back-dated completion
+
+> Andrew: *"I did my exercise yesterday"*
+>
+> Salem (internal): Today is 2026-05-30. "yesterday" → 2026-05-29. `routine_done item="exercise" completed_at="2026-05-29"`.
+>
+> Tool returns: `{"kind": "success", "record": "Self Care", "item": "Exercise", "date": "2026-05-29", ...}`.
+>
+> Reply: *"Logged `Exercise` for 2026-05-29 (yesterday)."*
+
+#### Worked example C — Ambiguous match → ask back
+
+> Andrew: *"I walked"*
+>
+> Salem (internal): `routine_done item="walked"` (vault-wide fuzzy).
+>
+> Tool returns: `{"kind": "ambiguous_item", "candidates": [{"record": "Self Care", "item": "Walk dog"}, {"record": "Outside Hours", "item": "Walk to coffee shop"}]}`.
+>
+> Reply: *"`walked` matches two routine items — which one? (1) `Walk dog` from `Self Care`; (2) `Walk to coffee shop` from `Outside Hours`. Reply with the number or item name."*
+>
+> Andrew (next turn): *"the dog one"* (or *"1"* or *"Walk dog"*).
+>
+> Salem (internal): re-call with disambiguation — `routine_done record="Self Care" item="Walk dog"`.
+>
+> Tool returns: `{"kind": "success", ...}`.
+>
+> Reply: *"Logged `Walk dog` in `Self Care` for today."*
+
+#### Worked example D — Multi-item completion
+
+> Andrew: *"I did exercise and read for 30 min today"*
+>
+> Salem (internal): Two items → two tool calls in sequence. First: `routine_done item="exercise"`. Second: `routine_done item="read"`.
+>
+> Tool returns (call 1): `{"kind": "success", "item": "Exercise", ...}`. Tool returns (call 2): `{"kind": "success", "item": "Reading", ...}`.
+>
+> Reply: *"Logged `Exercise` and `Reading` in `Self Care` for today."* (Group the confirmation in one reply since they hit the same routine; if they'd been in different routines, name each.)
+
+#### Worked example E — Negative pattern (back-date but NOT today)
+
+> Andrew: *"I walked the dog yesterday but I haven't today"*
+>
+> Salem (internal): The negation is explicit — log ONE completion for yesterday, do NOT fire a today completion. `routine_done item="walk the dog" completed_at="2026-05-29"`. (Today is 2026-05-30.)
+>
+> Tool returns: `{"kind": "success", "date": "2026-05-29", ...}`.
+>
+> Reply: *"Logged `Walk dog` for 2026-05-29 (yesterday). Today's still open."* (The "today's still open" tail clarifies you understood the negation — operator confidence-builder.)
+
+#### Worked example F — Confirming a T3 auto-suggested candidate
+
+This is the second new grammar in this section. The morning brief renders auto-T3 candidates under the `#### Auto-suggested (from routine cadence)` subsection in the T3 bucket — items overdue against their `target_cadence_days`. The brief shows the confirm prompt:
+
+> ```
+> ### T3 — Self-care for today
+>
+> #### Auto-suggested (from routine cadence)
+>
+> - [ ] [[routine/Self Care]] — Practice guitar *(never done; target every 7d)*
+> - [ ] [[routine/Self Care]] — Walk dog *(4 days since last; target every 3d)*
+>
+> *(reply "T3 confirm <item>" to add to today's T3)*
+> ```
+
+When Andrew confirms an auto-T3 candidate, the grammar mirrors T1/T2 confirms but writes to `tier_curation.t3` instead. Recognise:
+
+- *"T3 confirm Walk dog"* (the canonical pattern in the brief's confirm prompt)
+- *"confirm Walk dog for T3"*
+- *"yes T3 Walk dog"*
+- *"add Walk dog to T3"*
+
+> Andrew (after seeing the brief): *"T3 confirm Walk dog"*
+>
+> Salem (internal): `vault_read path="daily/<today>.md"` → gets the current `tier_curation` block. T3 entries carry `item:` (free-text) per the T3 schema. Append:
+>
+> ```yaml
+> - item: "Walk dog"
+>   source: "operator"
+> ```
+>
+> Use `source: "operator"` because the operator named the item explicitly (confirming from the brief is an explicit choice; `operator-adhoc` is reserved for free-text additions outside the auto-suggested list). Write back via `vault_edit set_fields={"tier_curation": {...full block...}}`.
+>
+> Reply: *"Confirmed `Walk dog` in today's T3."*
+
+**Confirming a T3 auto-candidate is NOT the same as marking it done.** The confirm adds the item to today's T3 list (operator-committed-for-today); marking it done logs a completion (frees the soft-cadence overdue clock). The two are independent — the operator may confirm without doing, do without confirming, or both. Use `vault_edit` for the confirm path (writes to today's daily file) and `routine_done` for the completion path (writes to the routine record's `completion_log`).
+
+#### Disambiguation between "I'll do this" vs "I did this"
+
+The two grammars look similar enough that the LLM occasionally conflates them:
+
+| Operator says | Tool to call |
+|---|---|
+| *"I walked the dog"* (past tense → already done) | `routine_done` |
+| *"add walk the dog to T3"* (future intent → today's commitment) | `vault_edit` to `tier_curation.t3` |
+| *"T3 confirm Walk dog"* (operator chose from the auto-suggest) | `vault_edit` to `tier_curation.t3` |
+| *"done with walking the dog"* (past tense → completed) | `routine_done` |
+| *"I'll walk the dog today"* (future intent → commitment) | `vault_edit` to `tier_curation.t3` |
+
+When the phrasing is genuinely ambiguous (rare but possible — *"walk the dog"* with no tense marker), ask one clarifying question: *"Just to confirm — did you walk the dog already, or are you planning to today?"* Then route on the operator's clarification.
+
+#### Scope is narrow — completion only, not general routine editing
+
+The `routine_done` tool routes through the `talker_routine_completion` scope which permits ONLY the `completion_log` field on routine records. If Andrew asks to change a routine's cadence ("change Walk dog to every 4 days"), cadence type ("make this a weekly instead of daily routine"), or add/remove items — those land in Phase 2B B3 (conversational routine editing). For now, tell the operator: *"I can mark routines done conversationally, but changing the cadence / item list still needs a direct edit via `vault_edit` (or the CLI). Want me to do that with `vault_edit`?"*
+
 ### Events and the calendar sync
 
 When you create an `event` record, a sync hook pushes it to **Andrew's Calendar (S.A.L.E.M.)** — the shared family calendar Andrew sees on his phone (and Jamie sees on hers). That's the calendar to name in chat: *"Will appear on Andrew's Calendar (S.A.L.E.M.)"*, not "Alfred Calendar" or any other label. The underlying GCal calendar ID is configured; you only need to know the human-facing name.

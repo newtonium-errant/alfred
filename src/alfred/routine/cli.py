@@ -2,10 +2,11 @@
 
 Phase 1 commands:
 
-  - ``alfred routine done <record> <item>`` — append today's date to
-    ``completion_log[item]`` on the routine record. Single source of
-    truth for date-append semantics; Phase 2 will surface this through
-    Telegram.
+  - ``alfred routine done [<record>] <item>`` — append a completion date
+    to ``completion_log[item]`` on the routine record. Single source of
+    truth for date-append semantics. The ``<record>`` argument is
+    OPTIONAL since Phase 2B B1 (2026-05-30): when omitted, the CLI does
+    a vault-wide fuzzy match across all active routine records.
   - ``alfred routine run-now`` — force-build today's daily aggregator
     note. Useful for ad-hoc operator runs + testing.
   - ``alfred routine status`` — print last run + schedule summary.
@@ -21,11 +22,32 @@ ScopeError on mismatch. The aggregator daemon's start-guard handles
 the same check separately; the CLI guard exists so an operator
 invoking ``alfred routine done`` on a non-Salem instance gets a
 visible refusal rather than silently mutating the wrong vault.
+
+Phase 2B B1 additions (2026-05-30):
+
+  - ``--completed-at YYYY-MM-DD`` flag on ``done`` for back-dating.
+    Validated ≤ today (no future completion). Default: today (in
+    ``config.schedule.timezone``).
+  - Structured JSON canary discriminator on ``--json`` output:
+    ``kind`` ∈ {success, unknown_record, unknown_item, ambiguous_item,
+    idempotent_noop, future_date_rejected}. The structured shape
+    exists so the talker subprocess wrapper can return canary results
+    to the LLM without parsing free-text error messages. Pre-B1 the
+    JSON shape was ``{ok: True | False, error: ...}``; the new
+    ``kind`` field augments that; the ``ok`` field stays for backwards
+    compat with any existing scripted consumers.
+  - Vault-wide fuzzy item match: when ``<record>`` is omitted (or
+    explicitly empty), scan every active routine's items for
+    substring + stem-tolerant matches on ``item.text``. 0 matches →
+    ``unknown_item``; 1 → use it; 2+ → ``ambiguous_item`` (returns
+    the candidate list so the talker can ask back).
 """
 
 from __future__ import annotations
 
+import re
 import sys
+from dataclasses import dataclass
 from datetime import date as date_type, datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +64,25 @@ from .config import REQUIRED_INSTANCE, RoutineConfig
 from .state import StateManager
 
 log = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B B1 (2026-05-30) — Conversational completion canary kinds
+# ---------------------------------------------------------------------------
+#
+# Cross-agent contract — the structured JSON discriminator the talker
+# subprocess wrapper consumes to decide what to say back to the user.
+# String-typed for forward-compat with the talker's JSON parsing path
+# (the SKILL recognises these literal values verbatim).
+#
+# Rename any of these = update SKILL.md's "Marking routines done"
+# section in lockstep + the talker subprocess dispatcher.
+DONE_KIND_SUCCESS = "success"
+DONE_KIND_UNKNOWN_RECORD = "unknown_record"
+DONE_KIND_UNKNOWN_ITEM = "unknown_item"
+DONE_KIND_AMBIGUOUS_ITEM = "ambiguous_item"
+DONE_KIND_IDEMPOTENT_NOOP = "idempotent_noop"
+DONE_KIND_FUTURE_DATE_REJECTED = "future_date_rejected"
 
 
 def _check_salem_only(config: RoutineConfig) -> None:
@@ -108,6 +149,206 @@ def _today_iso(tz_name: str) -> str:
     return datetime.now(tz).date().isoformat()
 
 
+# ---------------------------------------------------------------------------
+# Phase 2B B1 — fuzzy item match across the vault's active routines
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ItemCandidate:
+    """One (record_name, item_text) pair surfaced by the fuzzy match.
+
+    ``record_name`` is the bare filename stem (no ``routine/`` prefix,
+    no ``.md`` extension) — what the operator-facing UI displays.
+    ``item_text`` is the verbatim item ``text`` field from the routine
+    record's ``items`` list.
+    """
+    record_name: str
+    item_text: str
+
+
+#: Stop-words filtered out of fuzzy-match token sets. Operator
+#: phrasing like "I walked the dog" carries function words that don't
+#: contribute to matching ("I", "the"). Keep this list small — every
+#: addition reduces the chance of a legitimate signal making it
+#: through. Match by exact-token-equality (post-stemming).
+_FUZZY_STOPWORDS: frozenset[str] = frozenset({
+    "i", "the", "a", "an", "to", "my", "for", "on", "in", "at",
+    "and", "or", "but", "of",
+})
+
+
+def _fuzzy_stem(value: str) -> str:
+    """Normalise a string for stem-tolerant matching.
+
+    Lowercases, strips punctuation, collapses whitespace, stems EVERY
+    word against a small English suffix list (``-ing``, ``-ed``,
+    ``-s``), and joins. So "I walked the dog" → "i walk the dog";
+    "Exercising" → "exercis"; "Brush Teeth" → "brush teeth".
+
+    Stop-words are NOT removed here — caller (``_matches_item``)
+    handles stop-word filtering when token-set-comparing because the
+    raw stemmed form is also useful for substring fallback checks.
+
+    Pure function — used both by the per-item match check and by the
+    fuzzy candidate scan. Tests pin the behavior.
+    """
+    cleaned = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    if not cleaned:
+        return ""
+    parts = cleaned.split()
+    out: list[str] = []
+    for word in parts:
+        stemmed = word
+        for suffix in ("ing", "ed", "s"):
+            if len(word) > len(suffix) + 1 and word.endswith(suffix):
+                stemmed = word[: -len(suffix)]
+                break
+        out.append(stemmed)
+    return " ".join(out)
+
+
+def _matches_item(query: str, item_text: str) -> bool:
+    """True if ``query`` matches ``item_text`` per the fuzzy rules.
+
+    Three checks (any pass → match):
+      1. Case-insensitive substring on the raw text (the strict
+         "operator typed a substring of the canonical text" case —
+         e.g. "Walk dog" in the brief is rendered exactly that way).
+      2. Stem-normalised substring (the operator's phrasing differs in
+         verb conjugation: "exercised" vs "Exercise" → stems to
+         "exercis" in both, substring matches).
+      3. Token-set overlap: stop-words filtered, then every
+         non-stop-word token in EITHER the query's or the item's
+         stem-normalised form must appear in the other. So
+         "I walked the dog" → tokens {walk, dog} (after stop-word
+         filter), "Walk dog" → tokens {walk, dog}, equal sets →
+         match. "I walked" → {walk} ⊂ {walk, dog} → match (single
+         word matches a multi-word item if it's a non-stop content
+         word).
+
+    The three-check ladder is intentionally generous on the operator's
+    side. False-positives (matching the wrong item) surface to the
+    ``ambiguous_item`` canary — the operator gets asked back rather
+    than silently wronged.
+    """
+    if not query or not item_text:
+        return False
+    if query.casefold() in item_text.casefold():
+        return True
+    qstem = _fuzzy_stem(query)
+    istem = _fuzzy_stem(item_text)
+    if not qstem or not istem:
+        return False
+    if qstem in istem or istem in qstem:
+        return True
+    # Token-set overlap with stop-word filter.
+    q_tokens = {
+        t for t in qstem.split() if t and t not in _FUZZY_STOPWORDS
+    }
+    i_tokens = {
+        t for t in istem.split() if t and t not in _FUZZY_STOPWORDS
+    }
+    if not q_tokens or not i_tokens:
+        return False
+    # Single-direction containment (either set is subset of the
+    # other) → match. Mutual non-empty overlap is the looser shape
+    # but produces too many false positives ("walk the cat" matching
+    # "Walk dog" via shared "walk").
+    return q_tokens <= i_tokens or i_tokens <= q_tokens
+
+
+def _iter_active_routine_items(vault_path: Path) -> list[_ItemCandidate]:
+    """Walk ``vault/routine/*.md`` and yield every (record, item) pair
+    from ``status: active`` routines.
+
+    Defensive: parse failures and malformed shapes silently skip
+    (mirrors the aggregator's tolerance pattern). Empty list returned
+    when ``routine/`` doesn't exist (fresh vault). Per
+    ``feedback_intentionally_left_blank`` the empty case is the
+    caller's problem to render — this helper just returns the data.
+    """
+    routine_dir = vault_path / "routine"
+    if not routine_dir.is_dir():
+        return []
+    out: list[_ItemCandidate] = []
+    for path in sorted(routine_dir.glob("*.md")):
+        try:
+            post = frontmatter.load(str(path))
+        except Exception:  # noqa: BLE001
+            continue
+        fm = dict(post.metadata or {})
+        if str(fm.get("status") or "active").lower() == "archived":
+            continue
+        record_name = str(fm.get("name") or path.stem)
+        raw_items = fm.get("items") or []
+        if not isinstance(raw_items, list):
+            continue
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            text = str(raw.get("text") or "").strip()
+            if not text:
+                continue
+            out.append(_ItemCandidate(record_name=record_name, item_text=text))
+    return out
+
+
+def _fuzzy_match_vault_wide(
+    vault_path: Path, item_query: str,
+) -> tuple[list[_ItemCandidate], list[_ItemCandidate]]:
+    """Vault-wide fuzzy match for an item.
+
+    Returns ``(matches, all_candidates)``:
+      * ``matches`` — the subset that matches ``item_query`` per
+        :func:`_matches_item`. May be empty (no match), 1 (use it), or
+        2+ (ambiguous, caller asks back).
+      * ``all_candidates`` — the full active-routine item inventory.
+        Surfaced alongside matches so the canary JSON output can show
+        the operator what was available (helpful when ``matches`` is
+        empty — they see they typed something not in the vault).
+    """
+    all_candidates = _iter_active_routine_items(vault_path)
+    matches = [
+        c for c in all_candidates if _matches_item(item_query, c.item_text)
+    ]
+    return matches, all_candidates
+
+
+def _validate_completed_at(
+    completed_at: str | None,
+    tz_name: str,
+) -> tuple[str, str | None]:
+    """Resolve + validate the completed-at date.
+
+    Returns ``(iso, error)``: ``iso`` is the resolved YYYY-MM-DD
+    string (today when input was None), ``error`` is a human-readable
+    rejection message (e.g. "completed_at 2027-01-01 is in the
+    future") or None on success.
+
+    Future-dating is rejected per dispatch. Operator clamping behavior:
+    today's date in the configured timezone is the upper bound
+    (inclusive). A completed_at exactly equal to today is allowed.
+    """
+    iso_today = _today_iso(tz_name)
+    if completed_at is None or not completed_at.strip():
+        return iso_today, None
+    try:
+        parsed = date_type.fromisoformat(completed_at.strip()[:10])
+    except ValueError:
+        return iso_today, (
+            f"completed_at {completed_at!r} is not a valid ISO date "
+            f"(expected YYYY-MM-DD)"
+        )
+    today = date_type.fromisoformat(iso_today)
+    if parsed > today:
+        return iso_today, (
+            f"completed_at {parsed.isoformat()} is in the future "
+            f"(today is {iso_today}); rejecting"
+        )
+    return parsed.isoformat(), None
+
+
 def cmd_done(
     config: RoutineConfig,
     record_name: str,
@@ -115,17 +356,154 @@ def cmd_done(
     *,
     wants_json: bool = False,
     today_override: str | None = None,
+    completed_at: str | None = None,
 ) -> int:
-    """Append today's date to ``completion_log[item_text]`` on the record.
+    """Append a completion date to ``completion_log[item_text]`` on the
+    record.
 
-    Returns exit code (0 on success, 1 on failure). Idempotent — re-runs
-    with the same (record, item, date) are no-ops at the data layer.
+    ``record_name`` may be empty/whitespace to trigger vault-wide fuzzy
+    match against all active routines' items.
+
+    ``completed_at`` is an optional YYYY-MM-DD string (Phase 2B B1).
+    None / empty → today. Future dates → rejected with
+    ``DONE_KIND_FUTURE_DATE_REJECTED``.
+
+    Returns exit code (0 on success or idempotent_noop, 1 on every
+    other canary). Idempotent — re-runs with the same (record, item,
+    date) are no-ops at the data layer (no duplicate date appended).
+
+    On ``wants_json``: emits a structured payload with a ``kind``
+    discriminator (one of the ``DONE_KIND_*`` constants) so the talker
+    subprocess wrapper can route on it without parsing free-text
+    error messages.
     """
     _check_salem_only(config)
     vault_path = Path(config.vault_path)
-    path = _routine_path(vault_path, record_name)
 
-    iso = today_override or _today_iso(config.schedule.timezone)
+    # ---- Resolve completed_at + validate not-future ------------------
+    # ``today_override`` is the legacy test-only knob (a single ISO
+    # date string treated as "today"); ``completed_at`` is the new
+    # operator-facing back-date flag. When both are supplied, the
+    # explicit ``completed_at`` wins (operator intent over test
+    # fixture) — but we use the override as the today-anchor for the
+    # future-date check so test fixtures freeze time predictably.
+    tz_name = config.schedule.timezone
+    if today_override:
+        # Override "today" with the test-supplied date for the
+        # future-date check + the default-when-completed_at-None path.
+        iso_today_str = today_override
+    else:
+        iso_today_str = _today_iso(tz_name)
+    if completed_at is None or not str(completed_at).strip():
+        iso = iso_today_str
+        date_error: str | None = None
+    else:
+        try:
+            parsed = date_type.fromisoformat(
+                str(completed_at).strip()[:10]
+            )
+        except ValueError:
+            return _emit_canary(
+                wants_json=wants_json,
+                kind=DONE_KIND_FUTURE_DATE_REJECTED,
+                exit_code=1,
+                message=(
+                    f"completed_at {completed_at!r} is not a valid "
+                    f"ISO date (expected YYYY-MM-DD)"
+                ),
+                payload={"completed_at_input": completed_at},
+            )
+        anchor = date_type.fromisoformat(iso_today_str)
+        if parsed > anchor:
+            return _emit_canary(
+                wants_json=wants_json,
+                kind=DONE_KIND_FUTURE_DATE_REJECTED,
+                exit_code=1,
+                message=(
+                    f"completed_at {parsed.isoformat()} is in the "
+                    f"future (today is {iso_today_str}); rejecting"
+                ),
+                payload={
+                    "completed_at": parsed.isoformat(),
+                    "today": iso_today_str,
+                },
+            )
+        iso = parsed.isoformat()
+
+    # ---- Resolve record (strict-by-name OR vault-wide fuzzy) ---------
+    # Two paths: (a) operator supplied ``record_name`` → strict lookup,
+    # fall through to fuzzy on THAT record's items only; (b) operator
+    # omitted ``record_name`` → vault-wide fuzzy across all active
+    # routines.
+    resolved_path: Path | None = None
+    resolved_record: str = ""
+    if record_name and record_name.strip():
+        try:
+            resolved_path = _routine_path(vault_path, record_name)
+            resolved_record = record_name
+        except FileNotFoundError:
+            return _emit_canary(
+                wants_json=wants_json,
+                kind=DONE_KIND_UNKNOWN_RECORD,
+                exit_code=1,
+                message=(
+                    f"Routine record {record_name!r} not found under "
+                    f"{vault_path / 'routine'}"
+                ),
+                payload={"record_name_input": record_name},
+            )
+    else:
+        # Vault-wide fuzzy: find the record by item text.
+        matches, all_candidates = _fuzzy_match_vault_wide(
+            vault_path, item_text,
+        )
+        if not matches:
+            return _emit_canary(
+                wants_json=wants_json,
+                kind=DONE_KIND_UNKNOWN_ITEM,
+                exit_code=1,
+                message=(
+                    f"No active routine item matches {item_text!r}. "
+                    f"Available items: "
+                    f"{', '.join(c.item_text for c in all_candidates[:20])}"
+                    f"{' (showing first 20)' if len(all_candidates) > 20 else ''}"
+                ),
+                payload={
+                    "item_text_input": item_text,
+                    "available_count": len(all_candidates),
+                    "available_items": [
+                        {"record": c.record_name, "item": c.item_text}
+                        for c in all_candidates
+                    ],
+                },
+            )
+        if len(matches) > 1:
+            return _emit_canary(
+                wants_json=wants_json,
+                kind=DONE_KIND_AMBIGUOUS_ITEM,
+                exit_code=1,
+                message=(
+                    f"{item_text!r} matches {len(matches)} routine items. "
+                    f"Ask back with the candidate list."
+                ),
+                payload={
+                    "item_text_input": item_text,
+                    "candidates": [
+                        {"record": c.record_name, "item": c.item_text}
+                        for c in matches
+                    ],
+                },
+            )
+        # Exactly one match — use it.
+        chosen = matches[0]
+        resolved_record = chosen.record_name
+        item_text = chosen.item_text  # canonicalise to verbatim text
+        resolved_path = _routine_path(vault_path, chosen.record_name)
+
+    assert resolved_path is not None  # narrowing
+    path = resolved_path
+
+    # ---- Load record + completion_log --------------------------------
     post = frontmatter.load(str(path))
     fm = dict(post.metadata or {})
 
@@ -162,38 +540,103 @@ def cmd_done(
         else:
             completion_log[str(key)] = []
 
-    existing = completion_log.get(item_text, [])
-
-    # Validate the item actually exists on this routine — strict path
-    # so the operator catches typos early. (Compare against item.text
-    # values in ``items``.)
+    # ---- Verify item exists on this specific record ------------------
+    # When record_name was supplied explicitly, the strict + fuzzy
+    # cascade applies: strict text-equality first, then fuzzy on the
+    # record's items. When record_name was empty (vault-wide fuzzy
+    # already canonicalised item_text above), this is just a sanity
+    # pass — item_text WILL be in known_texts by construction.
     raw_items = fm.get("items") or []
     if not isinstance(raw_items, list):
         raw_items = []
-    known_texts = {
-        str((it or {}).get("text") or "").strip()
-        for it in raw_items
-        if isinstance(it, dict)
-    }
+    known_items: list[_ItemCandidate] = []
+    for it in raw_items:
+        if not isinstance(it, dict):
+            continue
+        t = str((it or {}).get("text") or "").strip()
+        if t:
+            known_items.append(
+                _ItemCandidate(record_name=resolved_record, item_text=t)
+            )
+    known_texts = {c.item_text for c in known_items}
     if item_text not in known_texts:
-        message = (
-            f"Item {item_text!r} not found in routine {record_name!r}. "
-            f"Known items: {sorted(known_texts) if known_texts else '(none)'}"
-        )
-        if wants_json:
-            import json
-            print(json.dumps({"ok": False, "error": message}, indent=2))
-        else:
-            print(message, file=sys.stderr)
-        return 1
+        # Fall through to fuzzy match on THIS record's items.
+        on_record_matches = [
+            c for c in known_items if _matches_item(item_text, c.item_text)
+        ]
+        if not on_record_matches:
+            return _emit_canary(
+                wants_json=wants_json,
+                kind=DONE_KIND_UNKNOWN_ITEM,
+                exit_code=1,
+                message=(
+                    f"Item {item_text!r} not found on routine "
+                    f"{resolved_record!r}. Known items: "
+                    f"{sorted(known_texts) if known_texts else '(none)'}"
+                ),
+                payload={
+                    "item_text_input": item_text,
+                    "record": resolved_record,
+                    "known_items": sorted(known_texts),
+                },
+            )
+        if len(on_record_matches) > 1:
+            return _emit_canary(
+                wants_json=wants_json,
+                kind=DONE_KIND_AMBIGUOUS_ITEM,
+                exit_code=1,
+                message=(
+                    f"{item_text!r} matches {len(on_record_matches)} "
+                    f"items on {resolved_record!r}. Ask back."
+                ),
+                payload={
+                    "item_text_input": item_text,
+                    "record": resolved_record,
+                    "candidates": [
+                        {"record": c.record_name, "item": c.item_text}
+                        for c in on_record_matches
+                    ],
+                },
+            )
+        # Exactly one fuzzy match on this record — canonicalise.
+        item_text = on_record_matches[0].item_text
 
-    # Idempotent: only append when today's date isn't already in the list.
+    # ---- Idempotent append -------------------------------------------
+    existing = completion_log.get(item_text, [])
     if iso in existing:
         new_list = existing
         appended = False
     else:
         new_list = existing + [iso]
         appended = True
+
+    if not appended:
+        # Idempotent no-op: skip the write entirely (no point
+        # round-tripping the same content). Emit the canary so the
+        # talker sees "ok but no-op" and can phrase the response
+        # accordingly (e.g. "you've already logged that for today").
+        log.info(
+            "routine.cli.done.idempotent_noop",
+            record=resolved_record,
+            item=item_text,
+            date=iso,
+            path=str(path.relative_to(vault_path)),
+        )
+        return _emit_canary(
+            wants_json=wants_json,
+            kind=DONE_KIND_IDEMPOTENT_NOOP,
+            exit_code=0,
+            message=(
+                f"Already logged: {resolved_record} / {item_text} @ {iso}"
+            ),
+            payload={
+                "record": resolved_record,
+                "item": item_text,
+                "date": iso,
+                "path": str(path.relative_to(vault_path)),
+                "appended": False,
+            },
+        )
 
     completion_log[item_text] = new_list
     fm["completion_log"] = completion_log
@@ -213,27 +656,67 @@ def cmd_done(
 
     log.info(
         "routine.cli.done",
-        record=record_name,
+        record=resolved_record,
         item=item_text,
         date=iso,
         appended=appended,
         path=str(path.relative_to(vault_path)),
     )
-    if wants_json:
-        import json
-        print(json.dumps({
-            "ok": True,
-            "record": record_name,
+    return _emit_canary(
+        wants_json=wants_json,
+        kind=DONE_KIND_SUCCESS,
+        exit_code=0,
+        message=f"Logged: {resolved_record} / {item_text} @ {iso}",
+        payload={
+            "record": resolved_record,
             "item": item_text,
             "date": iso,
-            "appended": appended,
             "path": str(path.relative_to(vault_path)),
-        }, indent=2))
-    elif appended:
-        print(f"Logged: {record_name} / {item_text} @ {iso}")
+            "appended": True,
+        },
+    )
+
+
+def _emit_canary(
+    *,
+    wants_json: bool,
+    kind: str,
+    exit_code: int,
+    message: str,
+    payload: dict[str, Any],
+) -> int:
+    """Emit either JSON (canary discriminator) or plain text + return.
+
+    JSON shape carries ``ok`` (back-compat with pre-B1 consumers),
+    ``kind`` (the new B1 discriminator constant), ``error`` (when
+    exit_code != 0 OR kind == idempotent_noop, the human-readable
+    message), plus a payload-flat union of the canary-specific
+    fields. The ``ok`` field is True for success AND
+    idempotent_noop — both are non-error states from the caller's
+    POV.
+
+    Pre-B1 the JSON shape was ``{ok, record, item, date, appended,
+    path}`` OR ``{ok: False, error}``. New shape is the union: every
+    field that COULD be useful is present, the canary tells the
+    caller which fields apply.
+    """
+    ok = exit_code == 0
+    if wants_json:
+        import json
+        body: dict[str, Any] = {"ok": ok, "kind": kind}
+        if not ok or kind == DONE_KIND_IDEMPOTENT_NOOP:
+            body["error" if not ok else "message"] = message
+        body.update(payload)
+        print(json.dumps(body, indent=2))
     else:
-        print(f"Already logged today: {record_name} / {item_text} @ {iso}")
-    return 0
+        # Plain-text: success / idempotent_noop go to stdout; error
+        # canaries go to stderr.
+        stream = sys.stderr if not ok else sys.stdout
+        prefix = (
+            "" if ok else f"[{kind}] "
+        )
+        print(f"{prefix}{message}", file=stream)
+    return exit_code
 
 
 def cmd_run_now(

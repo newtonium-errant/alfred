@@ -377,6 +377,38 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
             "note": True, "task": True, "event": True,
         },
     },
+    # Phase 2B B1 (2026-05-30) — Conversational completion narrow scope.
+    # Tighter than ``talker``: only the ``completion_log`` field on
+    # ``routine`` records may be mutated; everything else (create,
+    # other types, other fields, body writes) is denied. Used by the
+    # ``routine_done`` talker tool subprocess path; the talker scope
+    # itself stays broad for the rest of its surface.
+    #
+    # Read/search/list/context stay on so the tool can resolve the
+    # routine record + look at existing completion_log entries before
+    # appending. ``edit`` is the special permission
+    # ``talker_routine_completion_only`` which combines type-restriction
+    # AND field-allowlist enforcement.
+    #
+    # Phase 2B B3 will likely widen this for general conversational
+    # editing of routine fields; until then this scope is the
+    # narrow conversational-completion surface.
+    "talker_routine_completion": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": False,
+        "edit": "talker_routine_completion_only",
+        "move": False,
+        "delete": False,
+        # Routine records are in _BODY_MUTATE_DENIED_TYPES regardless,
+        # but pin body-write off here too for defense-in-depth +
+        # operator-visible scope clarity.
+        "allow_body_writes": False,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
     # Stage 3.5: KAL-LE — coding instance operating on the
     # aftermath-lab vault. Broader than talker because curation
     # legitimately adds pattern/principle records and edits bodies;
@@ -666,6 +698,42 @@ TALKER_CREATE_TYPES: set[str] = {
     # she's not a heavy talker surface in V1.
     "preference",
 }
+
+
+# Phase 2B B1 (2026-05-30) — Conversational completion narrow scope.
+#
+# When the talker invokes the ``routine_done`` tool path (conversational
+# completion of a routine item), the underlying mutation is a tightly
+# scoped frontmatter edit on a ``routine`` record: append the completion
+# date to ``completion_log[item_text]``. The talker scope's broad
+# ``edit: True`` permission would allow much more than this — e.g.
+# rewriting ``due_pattern``, removing ``items``, mutating ``cadence``.
+# The conversational completion path should NEVER need any of that.
+#
+# Rather than narrowing the existing ``talker`` scope (which would risk
+# breaking other talker tools that legitimately edit non-completion
+# fields on other types), this ship adds a SEPARATE scope
+# ``talker_routine_completion`` modeled on the ``janitor`` /
+# ``janitor_enrich`` precedent: same agent, narrower surface, used by
+# one specific tool path.
+#
+# Phase 2B B3 (deferred per dispatch) may widen this for general
+# conversational editing of routine records (e.g., changing
+# ``warn_after_gap_days`` via voice). Until then, only ``completion_log``
+# may be touched.
+#
+# The two sets below are the canonical contract:
+#   * ``TALKER_COMPLETION_LOG_TYPES`` — record types this scope may edit
+#     (just ``routine``; mutating a task's completion_log would be a
+#     category error since tasks don't carry one).
+#   * ``TALKER_COMPLETION_LOG_FIELDS`` — frontmatter fields this scope
+#     may write (just ``completion_log``).
+#
+# Both sets are enforced together via the ``talker_routine_completion_only``
+# permission handler in :func:`check_scope`. Either check failing fails
+# the whole edit.
+TALKER_COMPLETION_LOG_TYPES: set[str] = {"routine"}
+TALKER_COMPLETION_LOG_FIELDS: set[str] = {"completion_log"}
 
 
 # Stage 3.5: record types KAL-LE may create. Superset of talker
@@ -979,6 +1047,47 @@ def check_scope(
             raise ScopeError(
                 f"Scope '{scope}' can only create talker types "
                 f"({', '.join(sorted(TALKER_CREATE_TYPES))}). Got: '{record_type}'"
+            )
+        return
+
+    if permission == "talker_routine_completion_only":
+        # Phase 2B B1 (2026-05-30) — Conversational completion narrow
+        # gate. Three checks, all must pass:
+        #   1. ``record_type`` must be in TALKER_COMPLETION_LOG_TYPES.
+        #      Defends against the talker's conversational-completion
+        #      path accidentally pointing at a task or person record.
+        #   2. ``fields`` must be supplied (fail-closed — same shape as
+        #      generic field_allowlist below).
+        #   3. ``fields`` must be a subset of TALKER_COMPLETION_LOG_FIELDS.
+        #      Defends against an LLM hallucination that decided to
+        #      also adjust ``cadence`` or ``items`` in the same edit.
+        # Frontmatter check is the narrow-gate path; the broader
+        # ``edit`` permission ``True`` on the regular ``talker`` scope
+        # is unaffected.
+        if record_type and record_type not in TALKER_COMPLETION_LOG_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit record types "
+                f"({', '.join(sorted(TALKER_COMPLETION_LOG_TYPES))}). "
+                f"Got: '{record_type}'. Use the regular 'talker' scope "
+                f"for general conversational edits to other types."
+            )
+        if fields is None:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(TALKER_COMPLETION_LOG_FIELDS))}); "
+                f"caller did not supply the field list."
+            )
+        rejected = [
+            f for f in fields if f not in TALKER_COMPLETION_LOG_FIELDS
+        ]
+        if rejected:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(TALKER_COMPLETION_LOG_FIELDS))}). "
+                f"Rejected: {', '.join(rejected)}. The conversational "
+                f"completion path narrows to ``completion_log`` only; "
+                f"Phase 2B B3 will widen this for general conversational "
+                f"editing."
             )
         return
 

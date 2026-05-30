@@ -322,6 +322,90 @@ _KALLE_VAULT_CREATE_TOOL = {
 }
 
 
+# Phase 2B B1 (2026-05-30) — ``routine_done`` schema.
+#
+# Salem-only tool that lets the talker log a routine-item completion in
+# response to conversational phrasing ("I walked the dog", "exercise
+# done", "I read for 30 min last Tuesday"). The dispatch in
+# ``_execute_tool`` invokes ``alfred routine done`` as a subprocess
+# (the CLI is the single source of truth for the completion_log mutation
+# semantics; reusing it via subprocess avoids duplicating the
+# frontmatter round-trip + idempotency logic).
+#
+# Tight scope: the talker tool can ONLY log completions, NOT mutate
+# other routine fields (cadence, items, due_pattern, etc.). The
+# subprocess invocation uses ``ALFRED_VAULT_SCOPE=talker_routine_completion``
+# (added in scope.py same ship) so even if the CLI grows new mutation
+# paths in the future, this surface stays narrow.
+#
+# Cross-agent contract: the SKILL ``Marking routines done`` section
+# recognises the conversational phrasings and calls this tool. The
+# canary discriminator (``kind``) in the response shapes Salem's reply
+# (success / ambiguous → ask back with candidates / unknown_item /
+# idempotent_noop / future_date_rejected).
+_ROUTINE_DONE_TOOL_SCHEMA = {
+    "name": "routine_done",
+    "description": (
+        "Log a routine item as completed. Salem-only tool (the routine "
+        "subsystem is Salem-only in Phase 1/2). Use this when the "
+        "operator says they did something on their list of routines "
+        "(e.g. 'I walked the dog', 'exercise done', 'I read for an "
+        "hour yesterday', 'finished my meditation'). The tool fuzzy-"
+        "matches the item across all active routines — pass just "
+        "``item`` for vault-wide match (preferred for most operator "
+        "phrasings), or pass ``record`` + ``item`` to target a "
+        "specific routine. Returns a structured ``kind`` discriminator "
+        "you MUST route on:\n"
+        "  * 'success' — completion logged; reply confirming\n"
+        "  * 'idempotent_noop' — already logged today; tell the "
+        "operator gently\n"
+        "  * 'ambiguous_item' — multiple matches; ASK BACK with the "
+        "numbered candidate list (do NOT guess)\n"
+        "  * 'unknown_item' — no matching item; tell the operator + "
+        "list known items if helpful\n"
+        "  * 'unknown_record' — explicit record name not found\n"
+        "  * 'future_date_rejected' — ``completed_at`` is in the "
+        "future; ask the operator to clarify\n"
+        "Back-dating supported via ``completed_at`` (YYYY-MM-DD). "
+        "Default is today. Use 'yesterday' → today−1, 'two days ago' "
+        "→ today−2, 'last Tuesday' → most-recent-past-Tuesday, etc. "
+        "DO NOT mutate completion_log via vault_edit directly — this "
+        "tool is the only authorised path because it goes through "
+        "the talker_routine_completion narrow scope."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "item": {
+                "type": "string",
+                "description": (
+                    "The item text the operator named. Fuzzy match "
+                    "(substring + stem-tolerant) — operator phrasing "
+                    "doesn't need to be exact."
+                ),
+            },
+            "record": {
+                "type": "string",
+                "description": (
+                    "OPTIONAL: routine record name (e.g. 'For Self "
+                    "Health'). Omit to fuzzy-match the item across "
+                    "all active routines vault-wide (preferred)."
+                ),
+            },
+            "completed_at": {
+                "type": "string",
+                "description": (
+                    "OPTIONAL: YYYY-MM-DD back-date for the "
+                    "completion. Omit for today. Future dates "
+                    "rejected by the CLI."
+                ),
+            },
+        },
+        "required": ["item"],
+    },
+}
+
+
 # ``bash_exec`` schema — the executor module (c6) supplies the safety
 # logic; this is just the LLM-facing contract. Placeholder ``execute:
 # False`` default is the fail-closed shape — if anyone constructs the
@@ -674,8 +758,19 @@ HYPATIA_VAULT_TOOLS: list[dict[str, Any]] = [
 # Salem must NOT get the inter-instance tools — Salem IS the canonical
 # authority. Routing Salem through ``propose_*`` would cause every
 # vault_create to round-trip through the transport against itself.
+# Salem-only tool set — base TALKER_VAULT_TOOLS plus Salem-specific
+# tools (currently just ``routine_done``, Phase 2B B1 2026-05-30).
+# Hypatia + KAL-LE inherit ``*TALKER_VAULT_TOOLS`` separately without
+# the Salem-specific tools — keeping this distinct lets us widen
+# Salem's surface without leaking tools into the other instances.
+SALEM_VAULT_TOOLS: list[dict[str, Any]] = [
+    *TALKER_VAULT_TOOLS,
+    _ROUTINE_DONE_TOOL_SCHEMA,
+]
+
+
 VAULT_TOOLS_BY_SET: dict[str, list[dict[str, Any]]] = {
-    "talker": TALKER_VAULT_TOOLS,
+    "talker": SALEM_VAULT_TOOLS,
     "kalle": KALLE_VAULT_TOOLS,
     "hypatia": HYPATIA_VAULT_TOOLS,
 }
@@ -1529,6 +1624,222 @@ async def _dispatch_bash_exec(
     return _dumps(result)
 
 
+# --- routine_done dispatch (Phase 2B B1, 2026-05-30) ---------------------
+#
+# Conversational completion path. Subprocess-invokes ``python -m alfred
+# routine done`` with ``ALFRED_VAULT_SCOPE=talker_routine_completion``
+# threaded through the env. The CLI is the single source of truth for
+# the completion_log mutation semantics — this dispatcher is just the
+# adapter between the Anthropic tool_use schema and the subprocess.
+#
+# Salem-only: the routine subsystem refuses non-Salem instances at the
+# CLI's ``_check_salem_only`` guard. We also tool-set-gate here as a
+# second line of defence (mirror of ``_dispatch_bash_exec``'s
+# tool-set-gating shape) so a Hypatia or KAL-LE that somehow received
+# the tool gets a structured refusal rather than a crash.
+
+
+async def _dispatch_routine_done(
+    *,
+    tool_input: dict[str, Any],
+    session: Session,
+    config: TalkerConfig | None,
+) -> str:
+    """Dispatch one ``routine_done`` tool_use block.
+
+    Salem-only. Subprocess invokes ``python -m alfred routine done``
+    with the ``talker_routine_completion`` scope. The CLI emits
+    structured JSON with a canary ``kind`` discriminator
+    (success / unknown_record / unknown_item / ambiguous_item /
+    idempotent_noop / future_date_rejected) — Salem routes on it.
+
+    Adapter shape (mirrors ``_dispatch_bash_exec``):
+      1. Tool-set gating. Only Salem (tool_set == "" → talker default,
+         OR explicit "talker"/"salem") may invoke. Other instances
+         get a structured refusal.
+      2. Argument parsing. Validates ``item`` is present + non-empty.
+       ``record`` + ``completed_at`` are optional.
+      3. Subprocess call. Uses ``sys.executable -m alfred routine done``
+         (canonical __main__.py dispatch — NEVER ``alfred.cli`` per
+         the 2026-05-28 silent-no-op-skip incident — same lesson as
+         migrate_tier_phase1.py's subprocess wrapper).
+      4. JSON parse. The CLI emits one JSON object per invocation;
+         reversed-line scan returns the last parseable line (the
+         structlog-pollution defense pattern from
+         migrate_tier_phase1.py).
+      5. Subprocess-failure-contract logging. Non-zero exit with a
+         ``kind`` canary is normal (operator-recoverable refusal);
+         only non-zero WITHOUT a canary is logged as a real failure
+         per builder.md (stdout_tail sentinel + stderr).
+    """
+    import asyncio
+    import json
+    import os
+    import subprocess
+    import sys
+
+    # --- Tool-set gating -------------------------------------------------
+    # Salem's ``tool_set`` is either unset (legacy default → talker)
+    # or explicitly "talker"/"salem". KAL-LE → "kalle", Hypatia →
+    # "hypatia". Refuse explicitly on the latter two even though they
+    # shouldn't see this tool in their list.
+    tool_set = ""
+    if config is not None:
+        tool_set = (config.instance.tool_set or "").lower()
+    if tool_set in {"kalle", "hypatia"}:
+        log.warning(
+            "talker.routine_done.wrong_tool_set",
+            tool_set=tool_set,
+            session_id=session.session_id,
+        )
+        return _dumps({
+            "error": (
+                "routine_done is Salem-only — routine subsystem refuses "
+                "non-Salem instances"
+            ),
+            "tool_set": tool_set,
+        })
+
+    # --- Argument parsing ------------------------------------------------
+    if not isinstance(tool_input, dict):
+        return _dumps({
+            "error": "routine_done requires a dict tool_input",
+        })
+    item = tool_input.get("item", "")
+    record = tool_input.get("record", "") or ""
+    completed_at = tool_input.get("completed_at", "") or ""
+    if not isinstance(item, str) or not item.strip():
+        return _dumps({
+            "error": "routine_done requires a non-empty 'item'",
+        })
+
+    # --- Build argv ------------------------------------------------------
+    # Two forms:
+    #   python -m alfred routine done <record> <item> [--completed-at]
+    #   python -m alfred routine done <item>          [--completed-at]
+    argv: list[str] = [
+        sys.executable, "-m", "alfred", "routine", "done",
+    ]
+    if isinstance(record, str) and record.strip():
+        argv.append(record.strip())
+    argv.append(item.strip())
+    if isinstance(completed_at, str) and completed_at.strip():
+        argv.extend(["--completed-at", completed_at.strip()])
+    argv.append("--json")
+
+    log.info(
+        "talker.routine_done.invoke",
+        session_id=session.session_id,
+        item=item[:200],
+        record=record[:200] if record else "",
+        completed_at=completed_at or "(today)",
+    )
+
+    # --- Subprocess execution -------------------------------------------
+    # asyncio-friendly subprocess.run wrapper — keeps the event loop
+    # unblocked. The CLI runs in milliseconds (one frontmatter parse +
+    # write); a 30-second timeout is generous.
+    def _run() -> subprocess.CompletedProcess:
+        # Inherit env + add the narrow scope. The CLI doesn't currently
+        # use ALFRED_VAULT_SCOPE on the routine done path (it bypasses
+        # vault_edit), but plumbing it through is the forward-compat
+        # path for when B3 widens the surface to general edits + needs
+        # to go through scope.check_scope.
+        env = {**os.environ, "ALFRED_VAULT_SCOPE": "talker_routine_completion"}
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    try:
+        proc = await asyncio.to_thread(_run)
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "talker.routine_done.timeout",
+            session_id=session.session_id,
+            argv=argv,
+        )
+        return _dumps({
+            "error": "routine_done timed out (30s)",
+            "kind": "timeout",
+        })
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.routine_done.subprocess_crashed",
+            session_id=session.session_id,
+            error=str(exc),
+        )
+        return _dumps({
+            "error": f"routine_done subprocess crashed: {exc}",
+            "kind": "subprocess_error",
+        })
+
+    raw_stdout = (proc.stdout or "").strip()
+    raw_stderr = (proc.stderr or "").strip()
+
+    # --- Parse the canary JSON ------------------------------------------
+    # Reversed-line scan returns the LAST parseable JSON line per the
+    # structlog-pollution defense (migrate_tier_phase1.py pattern).
+    parsed: dict[str, Any] | None = None
+    if raw_stdout:
+        for line in reversed(raw_stdout.splitlines()):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                parsed = json.loads(stripped)
+                break
+            except json.JSONDecodeError:
+                continue
+
+    # --- Failure contract: non-zero exit WITHOUT a canary ---------------
+    # Canary returns (success / unknown_record / unknown_item /
+    # ambiguous_item / idempotent_noop / future_date_rejected) exit
+    # with codes 0 or 1, but ALWAYS produce JSON with a ``kind``.
+    # A non-zero exit WITHOUT a parseable canary is a real subprocess
+    # failure (e.g. import error, Salem-only guard rejection) and
+    # gets the builder.md subprocess-failure logging treatment.
+    if parsed is None or not isinstance(parsed, dict) or "kind" not in parsed:
+        # Real failure — log per the contract.
+        log.warning(
+            "talker.routine_done.nonzero_exit_no_canary",
+            session_id=session.session_id,
+            code=proc.returncode,
+            stderr=raw_stderr[:500],
+            stdout_tail=raw_stdout[-2000:] if raw_stdout else "",
+            argv=argv,
+        )
+        return _dumps({
+            "error": (
+                f"routine_done failed without canary: exit "
+                f"{proc.returncode}; "
+                f"stderr={raw_stderr[:300]!r}; "
+                f"stdout={raw_stdout[-300:]!r}"
+            ),
+            "kind": "subprocess_error",
+        })
+
+    # --- Success/canary path: return parsed JSON verbatim ---------------
+    log.info(
+        "talker.routine_done.result",
+        session_id=session.session_id,
+        kind=parsed.get("kind"),
+        ok=parsed.get("ok"),
+        record=parsed.get("record", ""),
+        item=parsed.get("item", "")[:200] if isinstance(parsed.get("item"), str) else "",
+        date=parsed.get("date", ""),
+    )
+    # Note: per-session vault_ops bookkeeping skipped here — the
+    # vault audit log + the talker.routine_done.result log line
+    # above cover observability. A future ship can widen
+    # _dispatch_routine_done's signature to thread the StateManager
+    # if session.vault_ops tracking becomes load-bearing.
+    return _dumps(parsed)
+
+
 # --- Inter-instance peer tool dispatch (Phase A) -------------------------
 #
 # KAL-LE and Hypatia route ``query_canonical`` + the four ``propose_*``
@@ -2215,6 +2526,18 @@ async def _execute_tool(
     # error returns, and subprocess-failure-contract logging.
     if tool_name == "bash_exec":
         return await _dispatch_bash_exec(
+            tool_input=tool_input,
+            session=session,
+            config=config,
+        )
+
+    # ``routine_done`` (Salem, Phase 2B B1 2026-05-30) — conversational
+    # completion. Subprocess-invokes ``alfred routine done`` with the
+    # ``talker_routine_completion`` scope. The CLI's structured JSON
+    # output (canary ``kind`` discriminator) is returned verbatim so
+    # Salem can route on it.
+    if tool_name == "routine_done":
+        return await _dispatch_routine_done(
             tool_input=tool_input,
             session=session,
             config=config,

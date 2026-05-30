@@ -1611,8 +1611,14 @@ def test_t3_auto_section_header_emits_when_candidates_present(
 
     Fixture: NOW = 2026-05-28; Self Care has Walk dog target=3 never
     completed → max overdue → surfaces. Brief should render the
-    auto-T3 subsection with the header + the entry + confirm prompt
-    + talker-deferred note.
+    auto-T3 subsection with the header + the entry + confirm prompt.
+
+    Phase 2B B1 (2026-05-30): the ``T3_AUTO_TALKER_DEFERRED_NOTE``
+    ILB acknowledgement is RETIRED — talker companion shipped this
+    same ship, so the deferred-note copy is no longer accurate. The
+    constant is preserved (back-compat) but the render loop omits
+    it. See ``test_t3_auto_talker_deferred_note_no_longer_rendered``
+    for the regression pin.
     """
     _write_routine(
         tmp_path,
@@ -1631,9 +1637,43 @@ def test_t3_auto_section_header_emits_when_candidates_present(
     # Never-completed → "never done" label, NOT a day count.
     assert "never done" in body
     assert "target every 3d" in body
-    # Confirm prompt + talker-deferred note both fire below candidates.
+    # Confirm prompt fires below candidates — still load-bearing.
     assert T3_AUTO_CONFIRM_PROMPT in body
-    assert T3_AUTO_TALKER_DEFERRED_NOTE in body
+    # ILB deferred note RETIRED 2026-05-30 — see regression test below.
+    assert T3_AUTO_TALKER_DEFERRED_NOTE not in body
+
+
+def test_t3_auto_talker_deferred_note_no_longer_rendered(
+    tmp_path: Path,
+) -> None:
+    """Phase 2B B1 (2026-05-30) — regression pin for the ILB
+    acknowledgement retirement. The deferred-note constant is
+    preserved for backwards-compat but MUST NOT appear in the
+    rendered brief output (the copy claims the talker companion
+    'ships in Phase 2B B1' which is now stale — B1 has shipped).
+
+    Fires across both auto-T3-only and curated+auto cases."""
+    # Auto-T3 only.
+    _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Walk dog\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Sanity: the auto-T3 subsection DID render (candidates present).
+    assert T3_AUTO_SECTION_HEADER in body
+    assert T3_AUTO_CONFIRM_PROMPT in body
+    # The retired ILB note is gone.
+    assert T3_AUTO_TALKER_DEFERRED_NOTE not in body
+    # Also negative-pinned: the operator-facing claim "ships in Phase
+    # 2B B1" should not appear ANYWHERE in the body (would indicate
+    # someone rendered the deferred note via a different code path).
+    assert "ships in Phase 2B B1" not in body
 
 
 def test_t3_auto_section_header_absent_when_no_candidates(

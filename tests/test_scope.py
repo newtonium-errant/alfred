@@ -330,3 +330,130 @@ def test_talker_canonical_types_still_allowed_on_salem():
     check_scope("talker", "create", record_type="org")
     check_scope("talker", "create", record_type="location")
     check_scope("talker", "create", record_type="event")
+
+
+# ===========================================================================
+# Phase 2B B1 (2026-05-30) — talker_routine_completion narrow scope
+# ===========================================================================
+#
+# The conversational completion path (routine_done tool subprocess
+# invocation) routes through this scope. Three checks together:
+#   * record_type must be 'routine'
+#   * fields must be supplied (fail-closed)
+#   * fields must all be in {completion_log}
+
+
+def test_talker_routine_completion_allows_completion_log_on_routine():
+    """Happy path — type=routine + fields=[completion_log] passes."""
+    check_scope(
+        "talker_routine_completion",
+        "edit",
+        record_type="routine",
+        fields=["completion_log"],
+    )
+
+
+def test_talker_routine_completion_rejects_non_completion_log_field():
+    """type=routine but field outside the allowlist → rejected."""
+    with pytest.raises(ScopeError, match="allowlist"):
+        check_scope(
+            "talker_routine_completion",
+            "edit",
+            record_type="routine",
+            fields=["items"],
+        )
+    with pytest.raises(ScopeError, match="allowlist"):
+        check_scope(
+            "talker_routine_completion",
+            "edit",
+            record_type="routine",
+            fields=["cadence"],
+        )
+    # Even mixed allowed + non-allowed → rejected (subset check).
+    with pytest.raises(ScopeError, match="allowlist"):
+        check_scope(
+            "talker_routine_completion",
+            "edit",
+            record_type="routine",
+            fields=["completion_log", "cadence"],
+        )
+
+
+def test_talker_routine_completion_rejects_completion_log_on_non_routine():
+    """field=completion_log but type != routine → rejected.
+
+    Defense against the talker pointing at a task or person record
+    via the completion-log scope."""
+    with pytest.raises(ScopeError, match="record types"):
+        check_scope(
+            "talker_routine_completion",
+            "edit",
+            record_type="task",
+            fields=["completion_log"],
+        )
+    with pytest.raises(ScopeError, match="record types"):
+        check_scope(
+            "talker_routine_completion",
+            "edit",
+            record_type="person",
+            fields=["completion_log"],
+        )
+
+
+def test_talker_routine_completion_fails_closed_on_missing_fields():
+    """When fields=None, the scope fails closed (no fields supplied
+    means no allowlist check possible)."""
+    with pytest.raises(ScopeError, match="did not supply"):
+        check_scope(
+            "talker_routine_completion",
+            "edit",
+            record_type="routine",
+            fields=None,
+        )
+
+
+def test_talker_routine_completion_denies_create_move_delete():
+    """The narrow scope ONLY permits edit (of completion_log on
+    routine). Create / move / delete all denied."""
+    with pytest.raises(ScopeError, match="denied"):
+        check_scope(
+            "talker_routine_completion",
+            "create",
+            record_type="routine",
+        )
+    with pytest.raises(ScopeError, match="denied"):
+        check_scope(
+            "talker_routine_completion",
+            "move",
+            record_type="routine",
+        )
+    with pytest.raises(ScopeError, match="denied"):
+        check_scope(
+            "talker_routine_completion",
+            "delete",
+            record_type="routine",
+        )
+
+
+def test_talker_routine_completion_denies_body_writes():
+    """Body writes denied per the allow_body_writes=False setting on
+    this scope."""
+    with pytest.raises(ScopeError, match="body"):
+        check_scope(
+            "talker_routine_completion",
+            "edit",
+            record_type="routine",
+            fields=["completion_log"],
+            body_write=True,
+        )
+
+
+def test_talker_routine_completion_constants_pinned():
+    """Cross-agent contract pin — the constants are exported + carry
+    the expected values."""
+    from alfred.vault.scope import (
+        TALKER_COMPLETION_LOG_FIELDS,
+        TALKER_COMPLETION_LOG_TYPES,
+    )
+    assert TALKER_COMPLETION_LOG_TYPES == {"routine"}
+    assert TALKER_COMPLETION_LOG_FIELDS == {"completion_log"}

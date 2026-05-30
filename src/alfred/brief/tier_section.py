@@ -150,12 +150,17 @@ T2_ROUTINE_CONFIRM_PROMPT = (
 # ``T3_EMPTY_PROMPT`` sentinel.
 #
 # ``T3_AUTO_CONFIRM_PROMPT`` is the talker reply pattern Phase 2B B1
-# will recognise (``T3 confirm <item text>``). Wire is operator-axis
-# only in this ship — talker SKILL extension lives in Phase 2B B1.
-# Per ``feedback_operator_vs_user_axis``: the ILB acknowledgement
-# (``T3_AUTO_TALKER_DEFERRED_NOTE``) surfaces in the brief so the
-# operator-readable surface doesn't silently drop the User-axis
-# deferral.
+# recognises (``T3 confirm <item text>``). The talker SKILL +
+# ``routine_done`` tool path shipped 2026-05-30; the prompt is now
+# actionable (pre-B1 the prompt was operator-axis only).
+#
+# ``T3_AUTO_TALKER_DEFERRED_NOTE`` is RETIRED as of Phase 2B B1.
+# The constant is preserved for backwards-compat (downstream
+# consumers may have grepped for it), but the brief render loop
+# deliberately omits it from the output — the deferred-note copy
+# is no longer accurate now that the talker companion has shipped.
+# Per the ILB-acknowledgement-retirement pattern: when the deferred
+# capability lands, retire the acknowledgement in the same ship.
 #
 # ``T3_AUTO_DAYS_SINCE_NEVER_LABEL`` is the per-item display string
 # for items with empty completion_log (never completed). Keeps the
@@ -660,10 +665,13 @@ def _render_curated_shortlists(
     ``T3_EMPTY_PROMPT`` (the auto candidates fill the bucket).
 
     Operator-axis ILB acknowledgement
-    (:data:`T3_AUTO_TALKER_DEFERRED_NOTE`) appends to the auto-T3
-    subsection so the operator-readable surface doesn't silently
-    drop the User-axis deferral. Per
-    ``feedback_operator_vs_user_axis``.
+    (:data:`T3_AUTO_TALKER_DEFERRED_NOTE`) RETIRED 2026-05-30 when
+    Phase 2B B1 shipped the talker T3 confirm grammar + the
+    ``routine_done`` conversational completion tool. The deferred
+    note is no longer rendered in the auto-T3 subsection; the
+    constant is preserved for backwards-compat but the render loop
+    deliberately omits it. The auto-T3 subsection now emits only
+    the confirm prompt after the candidate list.
     """
     auto_t3_routine_candidates = auto_t3_routine_candidates or []
     curated_t1: list[T1T2Entry] = curation.t1 if curation else []
@@ -767,13 +775,16 @@ def _render_curated_shortlists(
         t3_lines.append("")
         t3_lines.append(T3_AUTO_CONFIRM_PROMPT)
         t3_lines.append("")
-        # ILB acknowledgement for the deferred talker grammar — per
-        # ``feedback_operator_vs_user_axis``: the operator-readable
-        # surface must surface the User-axis deferral so the
-        # operator sees that the talker can't yet act on this
-        # subsection.
-        t3_lines.append(T3_AUTO_TALKER_DEFERRED_NOTE)
-        t3_lines.append("")
+        # ILB acknowledgement RETIRED 2026-05-30 — Phase 2B B1 ships
+        # the talker T3 confirm grammar + the conversational
+        # completion path (``routine_done`` tool). The deferred-note
+        # line is no longer accurate; rendering it would be stale
+        # operator-facing copy. The constant
+        # ``T3_AUTO_TALKER_DEFERRED_NOTE`` is preserved for backwards-
+        # compat with any downstream consumer that may have grepped
+        # for it, but the render loop deliberately doesn't emit it.
+        # See ``project_routine_followups.md`` Phase 2B B1 handoff
+        # note for the contract retirement.
     if not has_curated_t3 and not has_auto_t3:
         t3_lines.append(T3_EMPTY_PROMPT)
         t3_lines.append("")

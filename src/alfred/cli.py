@@ -1748,11 +1748,30 @@ def cmd_routine(args: argparse.Namespace) -> None:
 
     try:
         if subcmd == "done":
+            # Phase 2B B1 (2026-05-30) — arg routing:
+            #   * Both args supplied → (record_name, item_text)
+            #     (the operator named both — the strict-then-fuzzy
+            #     cascade applies inside cmd_done)
+            #   * Only first arg supplied → ("", item_text) →
+            #     vault-wide fuzzy match
+            # ``args.item`` is None when the operator passed just one
+            # positional; argparse's nargs='?' default.
+            record_or_item = getattr(args, "record_or_item", "")
+            item = getattr(args, "item", None)
+            if item is None:
+                # Single-positional form: treat the first arg as the
+                # item text + empty record (triggers vault-wide fuzzy).
+                record_name_arg = ""
+                item_text_arg = record_or_item
+            else:
+                record_name_arg = record_or_item
+                item_text_arg = item
             code = rcli.cmd_done(
                 config,
-                record_name=args.record,
-                item_text=args.item,
+                record_name=record_name_arg,
+                item_text=item_text_arg,
                 wants_json=wants_json,
+                completed_at=getattr(args, "completed_at", None),
             )
         elif subcmd == "run-now":
             code = rcli.cmd_run_now(config, wants_json=wants_json)
@@ -3332,15 +3351,43 @@ def build_parser() -> argparse.ArgumentParser:
     routine_sub = routine_p.add_subparsers(dest="routine_cmd")
     routine_done = routine_sub.add_parser(
         "done",
-        help="Log a routine item as completed today",
+        help="Log a routine item as completed (default: today)",
     )
+    # Phase 2B B1 (2026-05-30): make ``record`` optional. When omitted,
+    # the CLI does a vault-wide fuzzy match on the item text across all
+    # active routines. Two forms accepted:
+    #   alfred routine done "For Self Health" "Dog Walk"
+    #   alfred routine done "Dog Walk"          # vault-wide fuzzy
+    # Argparse can't natively express "optional positional with a
+    # required second positional", so the first arg is named
+    # ``record_or_item``; the cmd_routine dispatcher routes by
+    # presence of ``item``.
     routine_done.add_argument(
-        "record",
-        help="Routine record name (e.g. 'For Self Health')",
+        "record_or_item",
+        help=(
+            "Routine record name (e.g. 'For Self Health') OR — when "
+            "<item> is omitted — the item text to fuzzy-match vault-wide."
+        ),
     )
     routine_done.add_argument(
         "item",
-        help="Item text within the routine (e.g. 'Dog Walk')",
+        nargs="?",
+        default=None,
+        help=(
+            "Item text within the routine (e.g. 'Dog Walk'). Omit to "
+            "treat <record_or_item> as the item text and do a vault-wide "
+            "fuzzy match."
+        ),
+    )
+    routine_done.add_argument(
+        "--completed-at",
+        dest="completed_at",
+        default=None,
+        help=(
+            "Back-date the completion to this YYYY-MM-DD date. "
+            "Defaults to today (in config.schedule.timezone). "
+            "Future dates rejected."
+        ),
     )
     routine_done.add_argument(
         "--json", action="store_true", default=False, help="Emit JSON",
