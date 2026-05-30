@@ -1678,6 +1678,20 @@ async def _dispatch_routine_done(
     import subprocess
     import sys
 
+    # Phase 2B B1 (2026-05-30) — canary kind constants. Imported here
+    # rather than at module level because the CLI module is heavyish;
+    # lazy import keeps the conversation-module import-time minimal.
+    # Importing the constants (rather than using raw string literals)
+    # locks the rename-discipline: a future rename of, say,
+    # ``DONE_KIND_SUBPROCESS_ERROR`` to ``DONE_KIND_DISPATCH_FAILURE``
+    # will fail-loud at this import line rather than silently
+    # producing a different canary value in the talker's response.
+    # Per WARN-3 reviewer-flagged 2026-05-30.
+    from alfred.routine.cli import (
+        DONE_KIND_SUBPROCESS_ERROR,
+        DONE_KIND_TIMEOUT,
+    )
+
     # --- Tool-set gating -------------------------------------------------
     # Salem's ``tool_set`` is either unset (legacy default → talker)
     # or explicitly "talker"/"salem". KAL-LE → "kalle", Hypatia →
@@ -1740,11 +1754,20 @@ async def _dispatch_routine_done(
     # unblocked. The CLI runs in milliseconds (one frontmatter parse +
     # write); a 30-second timeout is generous.
     def _run() -> subprocess.CompletedProcess:
-        # Inherit env + add the narrow scope. The CLI doesn't currently
-        # use ALFRED_VAULT_SCOPE on the routine done path (it bypasses
-        # vault_edit), but plumbing it through is the forward-compat
-        # path for when B3 widens the surface to general edits + needs
-        # to go through scope.check_scope.
+        # Inherit env + add the narrow scope.
+        #
+        # NOTE: ``ALFRED_VAULT_SCOPE`` here is forward-compat plumbing
+        # — the routine done CLI path bypasses ``vault_edit`` (it
+        # rewrites the frontmatter directly via ``frontmatter.dumps``
+        # because the per-key completion_log mutation doesn't fit the
+        # ``set_fields`` shape), so the env var is NOT consulted by
+        # the current CLI invocation. The narrow scope gate
+        # (``talker_routine_completion`` in ``SCOPE_RULES``) fires at
+        # the table level — its effects materialise when B3 widens
+        # the routing through ``vault_edit`` and the scope check
+        # actually runs. Plumbing the env var now means B3 is a
+        # scope-only change rather than a dispatcher-plumbing change
+        # too. WARN-2 reviewer note 2026-05-30.
         env = {**os.environ, "ALFRED_VAULT_SCOPE": "talker_routine_completion"}
         return subprocess.run(
             argv,
@@ -1764,7 +1787,7 @@ async def _dispatch_routine_done(
         )
         return _dumps({
             "error": "routine_done timed out (30s)",
-            "kind": "timeout",
+            "kind": DONE_KIND_TIMEOUT,
         })
     except Exception as exc:  # noqa: BLE001
         log.warning(
@@ -1774,7 +1797,7 @@ async def _dispatch_routine_done(
         )
         return _dumps({
             "error": f"routine_done subprocess crashed: {exc}",
-            "kind": "subprocess_error",
+            "kind": DONE_KIND_SUBPROCESS_ERROR,
         })
 
     raw_stdout = (proc.stdout or "").strip()
@@ -1819,7 +1842,7 @@ async def _dispatch_routine_done(
                 f"stderr={raw_stderr[:300]!r}; "
                 f"stdout={raw_stdout[-300:]!r}"
             ),
-            "kind": "subprocess_error",
+            "kind": DONE_KIND_SUBPROCESS_ERROR,
         })
 
     # --- Success/canary path: return parsed JSON verbatim ---------------

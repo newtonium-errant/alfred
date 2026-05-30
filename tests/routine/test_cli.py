@@ -724,6 +724,98 @@ def test_done_fuzzy_archived_routines_excluded(tmp_path: Path) -> None:
     assert code == 1
 
 
+def test_vault_wide_fuzzy_resolves_path_when_frontmatter_name_differs_from_stem(
+    tmp_path: Path,
+) -> None:
+    """WARN-1 regression pin (2026-05-30) — vault-wide fuzzy must
+    survive routines whose frontmatter ``name:`` differs from their
+    file stem.
+
+    Pre-fix shape: ``_iter_active_routine_items`` set ``record_name =
+    fm.get('name') or path.stem``, then the vault-wide-fuzzy success
+    branch re-resolved via ``_routine_path(vault_path, record_name)``
+    — which does file-stem lookup. When ``name:`` differed from the
+    stem, the path lookup crashed with uncaught FileNotFoundError.
+
+    Fix: ``_ItemCandidate`` now carries the resolved ``path``
+    directly; the success branch consumes ``chosen.path`` rather than
+    re-resolving. Same path the scanner already opened — guaranteed
+    to exist.
+
+    Fixture: ``routine/Foo.md`` with frontmatter ``name: 'Bar Care'``.
+    Operator says 'I did walk dog'; expect success canary (file
+    written, completion logged), NOT a FileNotFoundError crash."""
+    import json
+
+    from alfred.routine.cli import DONE_KIND_SUCCESS
+
+    vault = tmp_path / "vault"
+    # File stem 'Foo' but frontmatter name 'Bar Care' — the mismatch
+    # the pre-fix code couldn't handle.
+    _write_routine(vault, "Foo", {
+        "type": "routine",
+        "status": "active",
+        "name": "Bar Care",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Walk dog", "priority": "aspirational"}],
+    })
+    config = _config(vault, tmp_path)
+
+    # Empty record → vault-wide fuzzy. The candidate's record_name
+    # will be 'Bar Care' (from frontmatter), but the file lives at
+    # routine/Foo.md.
+    code = cmd_done(
+        config, "", "Walk dog",
+        today_override="2026-05-30",
+        wants_json=True,
+    )
+    # Must succeed — the canary kind is 'success', NOT a crash.
+    assert code == 0
+    payload = json.loads(__import__("sys").stdout.getvalue()) if False else None
+    # Simpler: verify the file was actually written via the
+    # filesystem rather than capsys (the test's _config uses real
+    # stdout; capsys not requested for this regression test by
+    # design — we're testing the no-crash invariant + the write
+    # landed at the right path).
+    post = frontmatter.load(str(vault / "routine" / "Foo.md"))
+    log = post.metadata["completion_log"]
+    assert log["Walk dog"] == ["2026-05-30"]
+
+
+def test_vault_wide_fuzzy_returns_canary_with_display_name_when_name_differs(
+    tmp_path: Path, capsys,
+) -> None:
+    """Companion to the path-resolution test above: when the canary
+    JSON surfaces the matched record, it reports the OPERATOR-FACING
+    display name (frontmatter ``name``), not the file stem. The
+    talker's response phrasing comes from this field."""
+    import json
+
+    from alfred.routine.cli import DONE_KIND_SUCCESS
+
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Foo", {
+        "type": "routine",
+        "status": "active",
+        "name": "Bar Care",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Walk dog", "priority": "aspirational"}],
+    })
+    config = _config(vault, tmp_path)
+
+    code = cmd_done(
+        config, "", "Walk dog",
+        today_override="2026-05-30",
+        wants_json=True,
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kind"] == DONE_KIND_SUCCESS
+    # Display name comes from frontmatter — NOT 'Foo' (file stem).
+    assert payload["record"] == "Bar Care"
+    assert payload["item"] == "Walk dog"
+
+
 # ---------------------------------------------------------------------------
 # Fuzzy match unit tests (helpers exposed for direct testing)
 # ---------------------------------------------------------------------------

@@ -83,6 +83,14 @@ DONE_KIND_UNKNOWN_ITEM = "unknown_item"
 DONE_KIND_AMBIGUOUS_ITEM = "ambiguous_item"
 DONE_KIND_IDEMPOTENT_NOOP = "idempotent_noop"
 DONE_KIND_FUTURE_DATE_REJECTED = "future_date_rejected"
+# Dispatcher-only canary kinds — emitted by the talker subprocess
+# wrapper in :mod:`alfred.telegram.conversation` when the subprocess
+# itself fails (the CLI can't produce these because they describe
+# states OUTSIDE the CLI's runtime). Still belong in the canary
+# contract because the talker routes on the same ``kind`` discriminator
+# regardless of which layer produced the value.
+DONE_KIND_TIMEOUT = "timeout"
+DONE_KIND_SUBPROCESS_ERROR = "subprocess_error"
 
 
 def _check_salem_only(config: RoutineConfig) -> None:
@@ -156,15 +164,31 @@ def _today_iso(tz_name: str) -> str:
 
 @dataclass
 class _ItemCandidate:
-    """One (record_name, item_text) pair surfaced by the fuzzy match.
+    """One (record_name, item_text, path) tuple surfaced by the fuzzy
+    match.
 
-    ``record_name`` is the bare filename stem (no ``routine/`` prefix,
-    no ``.md`` extension) — what the operator-facing UI displays.
+    ``record_name`` is the OPERATOR-FACING display name — taken from
+    the record's frontmatter ``name`` if present, else the file stem.
+    What the brief renders / the talker echoes back to the operator.
+
     ``item_text`` is the verbatim item ``text`` field from the routine
     record's ``items`` list.
+
+    ``path`` is the resolved on-disk path. Captured here at scan time
+    (rather than re-resolved later via ``_routine_path(record_name)``)
+    because ``record_name`` may NOT match the file stem when the
+    operator has set a frontmatter ``name:`` that differs from the
+    filename. The pre-fix shape recomputed
+    ``_routine_path(vault_path, chosen.record_name)`` in the
+    vault-wide-fuzzy success branch, which crashed with an uncaught
+    ``FileNotFoundError`` whenever an active routine had
+    ``name: <X>`` with X ≠ file-stem. The reviewer flagged the bug
+    2026-05-30; the fix is to carry the already-resolved path here
+    rather than re-derive it.
     """
     record_name: str
     item_text: str
+    path: Path
 
 
 #: Stop-words filtered out of fuzzy-match token sets. Operator
@@ -178,13 +202,42 @@ _FUZZY_STOPWORDS: frozenset[str] = frozenset({
 })
 
 
+#: Vowel set used for the conservative ``-ed`` / ``-ing`` restore-``-e``
+#: heuristic. Excludes ``y`` deliberately — Porter-stemmer-style: ``y``
+#: at word-end behaves as a vowel for English morphology ("played" →
+#: "play", NOT "playe"), so the restore-``-e`` rule treats trailing
+#: ``y`` as already-vowelic and skips restoration.
+_VOWELS: frozenset[str] = frozenset("aeiou")
+
+
 def _fuzzy_stem(value: str) -> str:
     """Normalise a string for stem-tolerant matching.
 
     Lowercases, strips punctuation, collapses whitespace, stems EVERY
     word against a small English suffix list (``-ing``, ``-ed``,
-    ``-s``), and joins. So "I walked the dog" → "i walk the dog";
-    "Exercising" → "exercis"; "Brush Teeth" → "brush teeth".
+    ``-s``), and joins. Three rules:
+
+      * **``-s``** — strip only when the char before ``-s`` is NEITHER
+        ``e`` (``exercise`` / ``pause`` / ``tense`` end in ``-se``,
+        not plural ``-s``) NOR another ``s`` (``class`` / ``glass``
+        end in ``-ss``, not plural ``-s``). This preserves the
+        bug-fix from the first B1 ship: ``exercise`` stayed
+        ``exercis`` because the original ``-s`` rule was too greedy.
+      * **``-ed``** — strip the suffix, then if the resulting stem
+        ends in ``<vowel><consonant-not-y>`` (a CVC ending in a
+        non-``y`` consonant), restore the silent ``-e``: ``exercised``
+        → strip → ``exercis`` → restore → ``exercise``; ``walked`` →
+        strip → ``walk`` (ends in ``lk`` consonant-consonant) → no
+        restore → ``walk``. The non-``y`` exclusion handles
+        ``played`` → ``play`` (ends in ``y``, treated as vowel for
+        this check) → no restore.
+      * **``-ing``** — same restore-``-e`` heuristic as ``-ed``:
+        ``noting`` → strip → ``not`` → restore → ``note``; ``walking``
+        → strip → ``walk`` → no restore → ``walk``.
+
+    Per-suffix length floor: ``len(word) > len(suffix) + 1`` (so
+    ``red``, length 3, doesn't get stripped to ``r`` because
+    ``3 > 2 + 1`` is False).
 
     Stop-words are NOT removed here — caller (``_matches_item``)
     handles stop-word filtering when token-set-comparing because the
@@ -199,13 +252,69 @@ def _fuzzy_stem(value: str) -> str:
     parts = cleaned.split()
     out: list[str] = []
     for word in parts:
-        stemmed = word
-        for suffix in ("ing", "ed", "s"):
-            if len(word) > len(suffix) + 1 and word.endswith(suffix):
-                stemmed = word[: -len(suffix)]
-                break
-        out.append(stemmed)
+        out.append(_stem_word(word))
     return " ".join(out)
+
+
+def _stem_word(word: str) -> str:
+    """Stem one whitespace-stripped lowercased word.
+
+    Implements the three rules documented on :func:`_fuzzy_stem`. Pure
+    function; tests pin the per-word behavior independently of the
+    multi-word stem pipeline.
+    """
+    # ``-ing`` (check first because "-ed" / "-s" don't apply to words
+    # ending in "-ing": "walking" doesn't end in "ed" or "s").
+    if len(word) > 4 and word.endswith("ing"):
+        stem = word[:-3]
+        return _maybe_restore_silent_e(stem)
+    # ``-ed`` (check before ``-s`` because "-ed" ends in "d" not "s",
+    # so the order is structurally independent; we still pick ``-ed``
+    # first because operator past-tense phrasing is more common than
+    # plural-form phrasing for routine items).
+    if len(word) > 3 and word.endswith("ed"):
+        stem = word[:-2]
+        return _maybe_restore_silent_e(stem)
+    # ``-s`` — conservative strip per the docstring above.
+    if len(word) > 2 and word.endswith("s"):
+        before_s = word[-2]
+        # ``-se`` (exercise, pause, tense) and ``-ss`` (class, glass)
+        # are not plurals — leave the word alone.
+        if before_s not in ("e", "s"):
+            return word[:-1]
+    return word
+
+
+def _maybe_restore_silent_e(stem: str) -> str:
+    """If ``stem`` ends in ``<vowel><consonant-not-y>``, append ``-e``.
+
+    The CVC-ending-in-non-y-consonant pattern catches the
+    silent-``e`` words ("exercise", "note", "like", "live") whose
+    past-tense / present-participle strip the silent ``-e`` along
+    with the suffix. Restoring it normalises ``exercised`` /
+    ``exercising`` back to ``exercise`` for matching purposes.
+
+    Edge cases:
+      * Stem ends in ``y`` (post-strip): ``play`` from ``played`` —
+        ``y`` is vowel-like → no restore. Correct — ``play`` is the
+        base verb.
+      * Stem ends in vowel-vowel (rare): no restore (not a CVC).
+      * Stem is too short (< 2 chars): no restore. The pattern needs
+        two chars to check.
+    """
+    if len(stem) < 2:
+        return stem
+    last = stem[-1]
+    second_last = stem[-2]
+    # CVC-with-non-y-consonant pattern: position -2 is a vowel,
+    # position -1 is a consonant that isn't ``y``.
+    if (
+        second_last in _VOWELS
+        and last not in _VOWELS
+        and last != "y"
+    ):
+        return stem + "e"
+    return stem
 
 
 def _matches_item(query: str, item_text: str) -> bool:
@@ -216,8 +325,10 @@ def _matches_item(query: str, item_text: str) -> bool:
          "operator typed a substring of the canonical text" case —
          e.g. "Walk dog" in the brief is rendered exactly that way).
       2. Stem-normalised substring (the operator's phrasing differs in
-         verb conjugation: "exercised" vs "Exercise" → stems to
-         "exercis" in both, substring matches).
+         verb conjugation: "exercised" stems to "exercise" via
+         strip ``-ed`` + restore silent ``-e``; "Exercise" stays
+         "exercise" (the ``-s`` rule preserves ``-se`` endings) —
+         substring matches).
       3. Token-set overlap: stop-words filtered, then every
          non-stop-word token in EITHER the query's or the item's
          stem-normalised form must appear in the other. So
@@ -290,7 +401,11 @@ def _iter_active_routine_items(vault_path: Path) -> list[_ItemCandidate]:
             text = str(raw.get("text") or "").strip()
             if not text:
                 continue
-            out.append(_ItemCandidate(record_name=record_name, item_text=text))
+            out.append(_ItemCandidate(
+                record_name=record_name,
+                item_text=text,
+                path=path,
+            ))
     return out
 
 
@@ -318,23 +433,34 @@ def _fuzzy_match_vault_wide(
 def _validate_completed_at(
     completed_at: str | None,
     tz_name: str,
+    *,
+    today_override: str | None = None,
 ) -> tuple[str, str | None]:
     """Resolve + validate the completed-at date.
 
     Returns ``(iso, error)``: ``iso`` is the resolved YYYY-MM-DD
     string (today when input was None), ``error`` is a human-readable
     rejection message (e.g. "completed_at 2027-01-01 is in the
-    future") or None on success.
+    future" or "completed_at 'foo' is not a valid ISO date") or None
+    on success.
 
-    Future-dating is rejected per dispatch. Operator clamping behavior:
-    today's date in the configured timezone is the upper bound
-    (inclusive). A completed_at exactly equal to today is allowed.
+    ``today_override`` (when supplied) takes precedence over the
+    timezone-derived today for the future-date check + the
+    default-when-empty value. Used by test fixtures that need to
+    freeze the today-anchor while still exercising the validation
+    logic. Production callers pass None → ``_today_iso(tz_name)``
+    is used.
+
+    Future-dating is rejected per dispatch. Operator clamping
+    behavior: today's date in the configured timezone is the upper
+    bound (inclusive). A completed_at exactly equal to today is
+    allowed.
     """
-    iso_today = _today_iso(tz_name)
-    if completed_at is None or not completed_at.strip():
+    iso_today = today_override or _today_iso(tz_name)
+    if completed_at is None or not str(completed_at).strip():
         return iso_today, None
     try:
-        parsed = date_type.fromisoformat(completed_at.strip()[:10])
+        parsed = date_type.fromisoformat(str(completed_at).strip()[:10])
     except ValueError:
         return iso_today, (
             f"completed_at {completed_at!r} is not a valid ISO date "
@@ -383,52 +509,28 @@ def cmd_done(
     # ---- Resolve completed_at + validate not-future ------------------
     # ``today_override`` is the legacy test-only knob (a single ISO
     # date string treated as "today"); ``completed_at`` is the new
-    # operator-facing back-date flag. When both are supplied, the
-    # explicit ``completed_at`` wins (operator intent over test
-    # fixture) — but we use the override as the today-anchor for the
-    # future-date check so test fixtures freeze time predictably.
-    tz_name = config.schedule.timezone
-    if today_override:
-        # Override "today" with the test-supplied date for the
-        # future-date check + the default-when-completed_at-None path.
-        iso_today_str = today_override
-    else:
-        iso_today_str = _today_iso(tz_name)
-    if completed_at is None or not str(completed_at).strip():
-        iso = iso_today_str
-        date_error: str | None = None
-    else:
-        try:
-            parsed = date_type.fromisoformat(
-                str(completed_at).strip()[:10]
-            )
-        except ValueError:
-            return _emit_canary(
-                wants_json=wants_json,
-                kind=DONE_KIND_FUTURE_DATE_REJECTED,
-                exit_code=1,
-                message=(
-                    f"completed_at {completed_at!r} is not a valid "
-                    f"ISO date (expected YYYY-MM-DD)"
-                ),
-                payload={"completed_at_input": completed_at},
-            )
-        anchor = date_type.fromisoformat(iso_today_str)
-        if parsed > anchor:
-            return _emit_canary(
-                wants_json=wants_json,
-                kind=DONE_KIND_FUTURE_DATE_REJECTED,
-                exit_code=1,
-                message=(
-                    f"completed_at {parsed.isoformat()} is in the "
-                    f"future (today is {iso_today_str}); rejecting"
-                ),
-                payload={
-                    "completed_at": parsed.isoformat(),
-                    "today": iso_today_str,
-                },
-            )
-        iso = parsed.isoformat()
+    # operator-facing back-date flag. The validator helper handles
+    # both — today_override (when supplied) wins as the today-anchor
+    # for the future-date check, completed_at is the explicit
+    # back-date input. NOTE-2 cleanup 2026-05-30 — the inline
+    # validation logic that used to live here was duplicating the
+    # helper; refactored to a single call site.
+    iso, date_error = _validate_completed_at(
+        completed_at,
+        config.schedule.timezone,
+        today_override=today_override,
+    )
+    if date_error is not None:
+        return _emit_canary(
+            wants_json=wants_json,
+            kind=DONE_KIND_FUTURE_DATE_REJECTED,
+            exit_code=1,
+            message=date_error,
+            payload={
+                "completed_at_input": completed_at,
+                "today": iso,
+            },
+        )
 
     # ---- Resolve record (strict-by-name OR vault-wide fuzzy) ---------
     # Two paths: (a) operator supplied ``record_name`` → strict lookup,
@@ -494,11 +596,16 @@ def cmd_done(
                     ],
                 },
             )
-        # Exactly one match — use it.
+        # Exactly one match — use it. Carry ``chosen.path`` directly
+        # rather than re-resolving via ``_routine_path(record_name)``:
+        # the latter does file-stem lookup, which crashes with
+        # FileNotFoundError when the routine carries a frontmatter
+        # ``name:`` different from the file stem. WARN-1 fix
+        # 2026-05-30 — see ``_ItemCandidate.path`` docstring.
         chosen = matches[0]
         resolved_record = chosen.record_name
         item_text = chosen.item_text  # canonicalise to verbatim text
-        resolved_path = _routine_path(vault_path, chosen.record_name)
+        resolved_path = chosen.path
 
     assert resolved_path is not None  # narrowing
     path = resolved_path
@@ -555,9 +662,11 @@ def cmd_done(
             continue
         t = str((it or {}).get("text") or "").strip()
         if t:
-            known_items.append(
-                _ItemCandidate(record_name=resolved_record, item_text=t)
-            )
+            known_items.append(_ItemCandidate(
+                record_name=resolved_record,
+                item_text=t,
+                path=path,
+            ))
     known_texts = {c.item_text for c in known_items}
     if item_text not in known_texts:
         # Fall through to fuzzy match on THIS record's items.
@@ -612,9 +721,25 @@ def cmd_done(
 
     if not appended:
         # Idempotent no-op: skip the write entirely (no point
-        # round-tripping the same content). Emit the canary so the
-        # talker sees "ok but no-op" and can phrase the response
-        # accordingly (e.g. "you've already logged that for today").
+        # round-tripping the same content). Fire BOTH log events:
+        #   * ``routine.cli.done`` with ``appended=False`` — the
+        #     pre-B1 contract, pinned by regression test
+        #     ``test_done_emits_log_event``. Preserved verbatim so
+        #     the observability surface stays backwards-compatible.
+        #   * ``routine.cli.done.idempotent_noop`` — the B1 addition,
+        #     finer-grained signal that the canary path took the
+        #     idempotent branch (distinct from the
+        #     ``routine.cli.done`` event for the success path).
+        # Emit the canary so the talker sees "ok but no-op" and can
+        # phrase the response accordingly.
+        log.info(
+            "routine.cli.done",
+            record=resolved_record,
+            item=item_text,
+            date=iso,
+            appended=False,
+            path=str(path.relative_to(vault_path)),
+        )
         log.info(
             "routine.cli.done.idempotent_noop",
             record=resolved_record,
@@ -786,3 +911,25 @@ def cmd_status(config: RoutineConfig, *, wants_json: bool = False) -> int:
         print("Last run:      never")
     print(f"Runs recorded: {len(state_mgr.state.runs)}")
     return 0
+
+
+__all__ = [
+    # Public command handlers (consumed by alfred.cli's cmd_routine).
+    "cmd_done",
+    "cmd_run_now",
+    "cmd_status",
+    # Phase 2B B1 cross-agent contract — canary kind discriminator
+    # constants. Talker subprocess wrapper imports these so the
+    # raw-string literals don't drift between layers. SKILL.md's
+    # "Marking routines done" section quotes the string values
+    # verbatim; rename here = update SKILL.md + the talker
+    # dispatcher import in lockstep.
+    "DONE_KIND_SUCCESS",
+    "DONE_KIND_UNKNOWN_RECORD",
+    "DONE_KIND_UNKNOWN_ITEM",
+    "DONE_KIND_AMBIGUOUS_ITEM",
+    "DONE_KIND_IDEMPOTENT_NOOP",
+    "DONE_KIND_FUTURE_DATE_REJECTED",
+    "DONE_KIND_TIMEOUT",
+    "DONE_KIND_SUBPROCESS_ERROR",
+]
