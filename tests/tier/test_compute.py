@@ -885,3 +885,456 @@ def test_auto_routine_t2_done_in_cycle_not_surfaced(tmp_path: Path) -> None:
     )
     result = compute_auto_routine_t2_candidates(vault, NOW)
     assert result == []
+
+
+# ===========================================================================
+# Phase 2A-soft-cadence (2026-05-30) — compute_auto_t3_candidates
+# ===========================================================================
+#
+# Test surface per dispatch:
+#   * never-completed soft-cadence item → overdue_ratio = inf → ranks first
+#   * sorted by overdue_ratio descending
+#   * boundary at days_since == target_cadence_days → SURFACE (inclusive)
+#   * days_since == target - 1 → NOT surfaced
+#   * dataclass shape: AutoT3Candidate fields present + sane
+#   * pure-compute: no log emissions
+#   * mirror with aggregator._decide_tier_handoff T3 branch — identical
+#     inputs → identical decisions (regression pin for
+#     feedback_two_layer_window_math_mirror)
+
+
+from alfred.tier.compute import (  # noqa: E402
+    AutoT3Candidate,
+    compute_auto_t3_candidates,
+)
+
+
+def test_auto_t3_candidate_is_dataclass() -> None:
+    """Pin dataclass shape — fields present, types as documented."""
+    c = AutoT3Candidate(
+        path="routine/Self Care.md",
+        routine_record="Self Care",
+        item_text="Walk dog",
+        target_cadence_days=3,
+        days_since_last_completed=4,
+        overdue_ratio=4 / 3,
+    )
+    assert c.path == "routine/Self Care.md"
+    assert c.routine_record == "Self Care"
+    assert c.item_text == "Walk dog"
+    assert c.target_cadence_days == 3
+    assert c.days_since_last_completed == 4
+    assert c.overdue_ratio == pytest.approx(4 / 3)
+
+
+def test_compute_auto_t3_empty_vault_returns_empty_list(
+    tmp_path: Path,
+) -> None:
+    """No routine dir → empty list (no crash)."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    result = compute_auto_t3_candidates(vault, NOW)
+    assert result == []
+
+
+def test_compute_auto_t3_never_completed_treated_as_max_overdue(
+    tmp_path: Path,
+) -> None:
+    """Item with target_cadence_days but no completion_log →
+    overdue_ratio = ``inf`` → ranks first. Never-completed contract."""
+    vault = _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Practice guitar\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 7\n",
+    )
+    result = compute_auto_t3_candidates(vault, NOW)
+    assert len(result) == 1
+    cand = result[0]
+    assert cand.item_text == "Practice guitar"
+    assert cand.routine_record == "Self Care"
+    assert cand.target_cadence_days == 7
+    assert cand.days_since_last_completed is None
+    assert cand.overdue_ratio == float("inf")
+
+
+def test_compute_auto_t3_sorted_by_overdue_ratio_descending(
+    tmp_path: Path,
+) -> None:
+    """Three items with different overdue ratios → sort descending.
+
+    Fixture (NOW = 2026-05-28):
+      * Item A: target=3, last 8 days ago → ratio 8/3 ≈ 2.67
+      * Item B: target=7, last 8 days ago → ratio 8/7 ≈ 1.14
+      * Item C: target=10, never completed → ratio inf
+
+    Expected sort order: C (inf), A (2.67), B (1.14).
+    """
+    vault = _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  Item A:\n"
+        "  - '2026-05-20'\n"  # 8 days ago vs NOW=2026-05-28
+        "  Item B:\n"
+        "  - '2026-05-20'\n"  # 8 days ago
+        "items:\n"
+        "- text: Item A\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n"
+        "- text: Item B\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 7\n"
+        "- text: Item C\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 10\n",
+    )
+    result = compute_auto_t3_candidates(vault, NOW)
+    assert len(result) == 3
+    # Order: C (inf), A (~2.67), B (~1.14).
+    assert result[0].item_text == "Item C"
+    assert result[0].overdue_ratio == float("inf")
+    assert result[1].item_text == "Item A"
+    assert result[1].overdue_ratio == pytest.approx(8 / 3)
+    assert result[2].item_text == "Item B"
+    assert result[2].overdue_ratio == pytest.approx(8 / 7)
+
+
+def test_compute_auto_t3_threshold_at_one_inclusive(
+    tmp_path: Path,
+) -> None:
+    """Boundary pin: ratio exactly 1.0 surfaces (days_since == target,
+    inclusive); ratio 0.99 (days_since == target - 1) does NOT.
+
+    Fixture:
+      * Item Exactly: target=4, last 4 days ago → ratio 1.0 → SURFACE.
+      * Item Below: target=5, last 4 days ago → ratio 0.8 → SKIP.
+    """
+    vault = _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  Item Exactly:\n"
+        "  - '2026-05-24'\n"  # 4 days ago vs NOW=2026-05-28
+        "  Item Below:\n"
+        "  - '2026-05-24'\n"  # 4 days ago, target 5 → below
+        "items:\n"
+        "- text: Item Exactly\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 4\n"
+        "- text: Item Below\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 5\n",
+    )
+    result = compute_auto_t3_candidates(vault, NOW)
+    # Only Item Exactly surfaces.
+    names = {c.item_text for c in result}
+    assert names == {"Item Exactly"}
+    assert result[0].overdue_ratio == pytest.approx(1.0)
+
+
+def test_compute_auto_t3_due_pattern_wins_when_both_set(
+    tmp_path: Path,
+) -> None:
+    """Item with BOTH due_pattern AND target_cadence_days → due_pattern
+    wins → NOT surfaced in T3 compute. Mutually-exclusive precedence
+    enforced at the compute layer (the aggregator emits the operator-
+    facing warn log; this compute path defensively matches the same
+    outcome silently)."""
+    vault = _write_routine(
+        tmp_path,
+        "Mixed Modes.md",
+        "type: routine\nstatus: active\nname: Mixed Modes\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Ambiguous Item\n"
+        "  priority: tracked\n"
+        "  due_pattern:\n"
+        "    type: weekly\n"
+        "    day: thu\n"
+        "  escalate_at_days: 0\n"
+        "  target_cadence_days: 7\n",
+    )
+    result = compute_auto_t3_candidates(vault, NOW)
+    assert result == [], (
+        "Items with both due_pattern AND target_cadence_days should "
+        "NOT surface in T3 compute — due_pattern wins per the "
+        "mutually-exclusive precedence rule."
+    )
+
+
+def test_compute_auto_t3_archived_routine_excluded(tmp_path: Path) -> None:
+    """Archived routines: items NOT surfaced (mirror of T1/T2 scan)."""
+    vault = _write_routine(
+        tmp_path,
+        "Old.md",
+        "type: routine\nstatus: archived\nname: Old\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Walk dog\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    assert compute_auto_t3_candidates(vault, NOW) == []
+
+
+def test_compute_auto_t3_alfred_triage_excluded(tmp_path: Path) -> None:
+    """Defense-in-depth: alfred_triage on routine record → skip."""
+    vault = _write_routine(
+        tmp_path,
+        "Triaged.md",
+        "type: routine\nstatus: active\nname: Triaged\n"
+        "alfred_triage: true\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Walk dog\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    assert compute_auto_t3_candidates(vault, NOW) == []
+
+
+def test_compute_auto_t3_negative_target_excluded(tmp_path: Path) -> None:
+    """Defensive: target_cadence_days <= 0 → skip (undefined semantics
+    for the overdue ratio)."""
+    vault = _write_routine(
+        tmp_path,
+        "Bad.md",
+        "type: routine\nstatus: active\nname: Bad\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Walk dog\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 0\n"
+        "- text: Walk Fergus\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: -3\n",
+    )
+    assert compute_auto_t3_candidates(vault, NOW) == []
+
+
+def test_compute_auto_t3_item_without_target_cadence_excluded(
+    tmp_path: Path,
+) -> None:
+    """Item with no target_cadence_days → not in scope for T3 compute
+    (it's a regular routine item)."""
+    vault = _write_routine(
+        tmp_path,
+        "Daily.md",
+        "type: routine\nstatus: active\nname: Daily\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Walk Fergus\n"
+        "  priority: tracked\n",
+    )
+    assert compute_auto_t3_candidates(vault, NOW) == []
+
+
+def test_compute_auto_t3_no_log_emissions(tmp_path: Path) -> None:
+    """Pure-compute path → no log emissions. Mirror of the T1/T2
+    no-log invariants."""
+    vault = _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Practice guitar\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 7\n",
+    )
+    with structlog.testing.capture_logs() as captured:
+        compute_auto_t3_candidates(vault, NOW)
+    # No log lines from compute.
+    compute_emissions = [
+        c for c in captured
+        if c.get("event", "").startswith("tier.compute")
+        or c.get("event", "").startswith("compute_auto_t3")
+    ]
+    assert compute_emissions == []
+
+
+def test_compute_auto_t3_ties_broken_by_item_text_alpha(
+    tmp_path: Path,
+) -> None:
+    """Two items with identical overdue_ratio → tie broken by
+    item_text case-insensitive ascending."""
+    vault = _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        # Both never completed → ratio inf → tied → alpha sort.
+        "- text: Z Last\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 7\n"
+        "- text: A First\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 7\n"
+        "- text: M Middle\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 7\n",
+    )
+    result = compute_auto_t3_candidates(vault, NOW)
+    names = [c.item_text for c in result]
+    assert names == ["A First", "M Middle", "Z Last"]
+
+
+# ---------------------------------------------------------------------------
+# Mirror predicate pin (regression for
+# feedback_two_layer_window_math_mirror)
+#
+# Both layers must agree on the T3 handoff predicate
+# (``days_since >= target_cadence_days``). If the compute path
+# surfaces an item, the aggregator must suppress it; if the
+# aggregator suppresses, the compute path must surface.
+# ---------------------------------------------------------------------------
+
+
+def test_mirror_decide_tier_handoff_t3_matches_compute_auto_t3(
+    tmp_path: Path,
+) -> None:
+    """Side-by-side: identical inputs → identical decisions.
+
+    For each of three fixture cases (overdue, exactly-at-boundary,
+    within-window), assert that:
+      * The aggregator's ``_decide_tier_handoff`` returns ``3`` iff
+        the compute path produces a candidate.
+      * The aggregator returns ``None`` iff the compute path skips.
+
+    This is the canonical mirror pin per
+    ``feedback_two_layer_window_math_mirror``. A future refactor
+    that drifts one layer's predicate fires this test."""
+    from datetime import date as _date
+
+    from alfred.routine.aggregator import _decide_tier_handoff
+
+    today = _date(2026, 5, 28)
+
+    # --- Case 1: overdue (4 days since, target 3) → handoff + surface
+    completion_log = {"X": ["2026-05-24"]}  # 4 days ago
+    handoff = _decide_tier_handoff(
+        due_pattern=None,
+        surface_at_days=None,
+        escalate_at_days=None,
+        today=today,
+        target_cadence_days=3,
+        completion_log=completion_log,
+        item_text="X",
+        routine_record="Mirror Pin",
+    )
+    assert handoff == 3
+
+    vault1 = _write_routine(
+        tmp_path / "case1",
+        "Mirror Pin.md",
+        "type: routine\nstatus: active\nname: Mirror Pin\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  X:\n"
+        "  - '2026-05-24'\n"
+        "items:\n"
+        "- text: X\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    candidates1 = compute_auto_t3_candidates(vault1, NOW)
+    assert len(candidates1) == 1
+    assert candidates1[0].item_text == "X"
+
+    # --- Case 2: exactly at boundary (3 days since, target 3)
+    completion_log_2 = {"X": ["2026-05-25"]}  # 3 days ago
+    handoff_2 = _decide_tier_handoff(
+        due_pattern=None,
+        surface_at_days=None,
+        escalate_at_days=None,
+        today=today,
+        target_cadence_days=3,
+        completion_log=completion_log_2,
+        item_text="X",
+        routine_record="Mirror Pin",
+    )
+    assert handoff_2 == 3
+
+    vault2 = _write_routine(
+        tmp_path / "case2",
+        "Mirror Pin.md",
+        "type: routine\nstatus: active\nname: Mirror Pin\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  X:\n"
+        "  - '2026-05-25'\n"
+        "items:\n"
+        "- text: X\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    candidates2 = compute_auto_t3_candidates(vault2, NOW)
+    assert len(candidates2) == 1
+
+    # --- Case 3: within window (2 days since, target 3) → both skip
+    completion_log_3 = {"X": ["2026-05-26"]}  # 2 days ago
+    handoff_3 = _decide_tier_handoff(
+        due_pattern=None,
+        surface_at_days=None,
+        escalate_at_days=None,
+        today=today,
+        target_cadence_days=3,
+        completion_log=completion_log_3,
+        item_text="X",
+        routine_record="Mirror Pin",
+    )
+    assert handoff_3 is None
+
+    vault3 = _write_routine(
+        tmp_path / "case3",
+        "Mirror Pin.md",
+        "type: routine\nstatus: active\nname: Mirror Pin\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  X:\n"
+        "  - '2026-05-26'\n"
+        "items:\n"
+        "- text: X\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    candidates3 = compute_auto_t3_candidates(vault3, NOW)
+    assert candidates3 == []
+
+    # --- Case 4: never completed → handoff (treat as max overdue) +
+    # surface (treat as max overdue).
+    handoff_4 = _decide_tier_handoff(
+        due_pattern=None,
+        surface_at_days=None,
+        escalate_at_days=None,
+        today=today,
+        target_cadence_days=3,
+        completion_log={},
+        item_text="X",
+        routine_record="Mirror Pin",
+    )
+    assert handoff_4 == 3
+
+    vault4 = _write_routine(
+        tmp_path / "case4",
+        "Mirror Pin.md",
+        "type: routine\nstatus: active\nname: Mirror Pin\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: X\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    candidates4 = compute_auto_t3_candidates(vault4, NOW)
+    assert len(candidates4) == 1
+    assert candidates4[0].days_since_last_completed is None

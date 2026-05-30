@@ -41,6 +41,11 @@ from alfred.brief.tier_section import (
     T2_EMPTY_PROMPT,
     T2_POOL_HEADER,
     T2_ROUTINE_CONFIRM_PROMPT,
+    T3_AUTO_ANNOTATION_TEMPLATE,
+    T3_AUTO_CONFIRM_PROMPT,
+    T3_AUTO_DAYS_SINCE_NEVER_LABEL,
+    T3_AUTO_SECTION_HEADER,
+    T3_AUTO_TALKER_DEFERRED_NOTE,
     T3_EMPTY_PROMPT,
     render_curated_tier_section_for_today,
     render_tier_section,
@@ -1543,3 +1548,310 @@ def test_curated_for_today_none_curation_log_event_curation_loaded_false(
     assert e["curated_t1"] == 0
     assert e["curated_t2"] == 0
     assert e["curated_t3"] == 0
+
+
+# ===========================================================================
+# Phase 2A-soft-cadence (2026-05-30) — T3 auto-suggest from routine cadence
+# ===========================================================================
+#
+# Test surface per dispatch:
+#   * Constants pinning (cross-agent contract for Phase 2B B1 SKILL).
+#   * Subhead appears when auto-T3 candidates present.
+#   * NO subhead when no auto-T3 candidates (don't pollute empty).
+#   * Curated-only when no auto candidates (backward-compat).
+#   * Render line shape: ``- [ ] [[routine/<record>]] — <item> *(...)*``
+#   * Never-completed items use the "never done" label.
+#   * Ordering: curated entries FIRST, then auto subsection BELOW.
+#   * ILB acknowledgement (talker deferred note) surfaces in the brief.
+#   * Log emission carries the auto_t3_routine_count field.
+
+
+def test_t3_auto_section_header_constant_pinned() -> None:
+    """Cross-agent contract: Phase 2B B1 SKILL quotes this verbatim."""
+    assert T3_AUTO_SECTION_HEADER == "#### Auto-suggested (from routine cadence)"
+
+
+def test_t3_auto_confirm_prompt_constant_pinned() -> None:
+    """Cross-agent contract: Phase 2B B1 SKILL quotes this verbatim."""
+    assert T3_AUTO_CONFIRM_PROMPT == (
+        '*(reply "T3 confirm <item>" to add to today\'s T3)*'
+    )
+
+
+def test_t3_auto_days_since_never_label_pinned() -> None:
+    """Cross-agent contract: render layer + SKILL both reference."""
+    assert T3_AUTO_DAYS_SINCE_NEVER_LABEL == "never done"
+
+
+def test_t3_auto_annotation_template_pinned() -> None:
+    """Cross-agent contract: render-format string. Caller formats via
+    ``.format(days_since=..., target=...)``."""
+    assert T3_AUTO_ANNOTATION_TEMPLATE == (
+        "*({days_since} days since last; target every {target}d)*"
+    )
+    # Sanity: template substitutes correctly.
+    formatted = T3_AUTO_ANNOTATION_TEMPLATE.format(days_since=4, target=3)
+    assert formatted == "*(4 days since last; target every 3d)*"
+
+
+def test_t3_auto_talker_deferred_note_pinned() -> None:
+    """ILB acknowledgement surfaces the User-axis deferral. Phase 2B
+    B1 ships the talker companion; this string operator-facing
+    documents the gap."""
+    # The note mentions the deferred Phase + the operator-side fallback.
+    assert "Phase 2B B1" in T3_AUTO_TALKER_DEFERRED_NOTE
+    assert "alfred routine done" in T3_AUTO_TALKER_DEFERRED_NOTE
+
+
+def test_t3_auto_section_header_emits_when_candidates_present(
+    tmp_path: Path,
+) -> None:
+    """Routine record with a never-completed soft-cadence item →
+    auto-T3 subsection renders.
+
+    Fixture: NOW = 2026-05-28; Self Care has Walk dog target=3 never
+    completed → max overdue → surfaces. Brief should render the
+    auto-T3 subsection with the header + the entry + confirm prompt
+    + talker-deferred note.
+    """
+    _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Walk dog\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    assert T3_AUTO_SECTION_HEADER in body
+    assert "[[routine/Self Care]]" in body
+    assert "Walk dog" in body
+    # Never-completed → "never done" label, NOT a day count.
+    assert "never done" in body
+    assert "target every 3d" in body
+    # Confirm prompt + talker-deferred note both fire below candidates.
+    assert T3_AUTO_CONFIRM_PROMPT in body
+    assert T3_AUTO_TALKER_DEFERRED_NOTE in body
+
+
+def test_t3_auto_section_header_absent_when_no_candidates(
+    tmp_path: Path,
+) -> None:
+    """No routine records with target_cadence_days → no auto-T3
+    subsection. The T3 bucket falls through to either curated
+    entries or the T3_EMPTY_PROMPT sentinel.
+
+    Sanity pin against polluting the brief with an "auto-suggested:
+    nothing" header (distinct from T1 / T2 which always emit a
+    bucket header).
+    """
+    _write_routine(
+        tmp_path,
+        "Daily.md",
+        "type: routine\nstatus: active\nname: Daily\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        # No target_cadence_days — out of scope for auto-T3.
+        "- text: Walk Fergus\n"
+        "  priority: tracked\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    assert T3_AUTO_SECTION_HEADER not in body, (
+        "Empty auto-T3 should NOT emit the subsection header — "
+        "polluting the brief with 'auto-suggested: nothing' was "
+        "the bug shape this contract pin prevents."
+    )
+    # T3_EMPTY_PROMPT still fires (no curated T3 either).
+    assert T3_EMPTY_PROMPT in body
+
+
+def test_t3_curated_only_when_no_auto_candidates(
+    tmp_path: Path,
+) -> None:
+    """Backward-compat with current T3 render: curated T3 entries
+    surface normally; NO auto subsection appears.
+
+    Fixture: daily file has a curated T3 entry; no routine records
+    with target_cadence_days.
+    """
+    _write_daily(
+        tmp_path, "2026-05-28",
+        "t1: []\nt2: []\nt3:\n"
+        "- {item: Walk Fergus, source: manual}\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Curated entry surfaces.
+    assert "Walk Fergus" in body
+    # No auto subsection (no candidates).
+    assert T3_AUTO_SECTION_HEADER not in body
+    # T3_EMPTY_PROMPT NOT fired (curated T3 populated).
+    assert T3_EMPTY_PROMPT not in body
+
+
+def test_t3_curated_plus_auto_renders_curated_first_then_auto(
+    tmp_path: Path,
+) -> None:
+    """Case D from the empty-state contract: curated T3 + auto-T3 →
+    curated entries render FIRST, auto subsection BELOW. The
+    operator's choices lead; auto-suggestions support."""
+    # Curated T3 entry.
+    _write_daily(
+        tmp_path, "2026-05-28",
+        "t1: []\nt2: []\nt3:\n"
+        "- {item: Read 30 minutes, source: manual}\n",
+    )
+    # Auto-T3 candidate (never-completed soft-cadence item).
+    _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Walk dog\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Both surfaces present.
+    assert "Read 30 minutes" in body
+    assert "Walk dog" in body
+    assert T3_AUTO_SECTION_HEADER in body
+    # Order: curated first, then auto subhead. Compare positions.
+    curated_idx = body.index("Read 30 minutes")
+    auto_idx = body.index(T3_AUTO_SECTION_HEADER)
+    walk_idx = body.index("Walk dog")
+    assert curated_idx < auto_idx < walk_idx, (
+        "Curated T3 entries must render BEFORE the auto-suggested "
+        "subsection (operator's choices lead)."
+    )
+
+
+def test_t3_auto_render_line_shape_with_days_count(
+    tmp_path: Path,
+) -> None:
+    """Render shape pin for completed-at-least-once items:
+    ``- [ ] [[routine/<record>]] — <item> *(Nd days since last;
+    target every Md)*``"""
+    _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  Walk dog:\n"
+        "  - '2026-05-24'\n"  # 4 days ago vs NOW=2026-05-28; target 3
+        "items:\n"
+        "- text: Walk dog\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    # Find the Walk dog line in the body.
+    walk_lines = [
+        ln for ln in body.splitlines()
+        if "Walk dog" in ln and "[[routine/Self Care]]" in ln
+    ]
+    assert len(walk_lines) == 1
+    line = walk_lines[0]
+    # Render shape: includes record wikilink + item text + annotation.
+    assert line.startswith("- [ ] [[routine/Self Care]] — Walk dog ")
+    assert "*(4 days since last; target every 3d)*" in line
+
+
+def test_t3_auto_render_line_shape_never_completed(
+    tmp_path: Path,
+) -> None:
+    """Never-completed items use the "never done" label instead of a
+    day count — keeps the operator's eye drawn to the "this has
+    never been done" signal (distinct from "0 days since last")."""
+    _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Practice guitar\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 7\n",
+    )
+    body = render_tier_section(tmp_path, NOW)
+    practice_lines = [
+        ln for ln in body.splitlines()
+        if "Practice guitar" in ln and "[[routine/Self Care]]" in ln
+    ]
+    assert len(practice_lines) == 1
+    line = practice_lines[0]
+    # "never done" label appears INSTEAD of "N days since last".
+    assert "never done" in line
+    assert "target every 7d" in line
+    # NOT the day-count format.
+    assert "days since last" not in line
+
+
+def test_t3_auto_subsection_silently_omitted_with_curated_present(
+    tmp_path: Path,
+) -> None:
+    """Case A from the empty-state contract: curated T3 populated +
+    auto-T3 empty → curated entries render BUT NO auto subsection
+    header. Pin against the noise-pollution shape."""
+    _write_daily(
+        tmp_path, "2026-05-28",
+        "t1: []\nt2: []\nt3:\n"
+        "- {item: Walk Fergus, source: manual}\n",
+    )
+    # No routine records with target_cadence_days — auto-T3 is empty.
+    body = render_tier_section(tmp_path, NOW)
+    assert "Walk Fergus" in body
+    assert T3_AUTO_SECTION_HEADER not in body
+    assert T3_AUTO_CONFIRM_PROMPT not in body
+    assert T3_AUTO_TALKER_DEFERRED_NOTE not in body
+    # T3_EMPTY_PROMPT NOT fired (curated populated).
+    assert T3_EMPTY_PROMPT not in body
+
+
+def test_t3_log_emission_carries_auto_t3_routine_count(
+    tmp_path: Path,
+) -> None:
+    """Per ``feedback_log_emission_test_pattern``: the
+    ``brief.tier_section.rendered`` log event MUST carry the
+    ``auto_t3_routine_count`` field — operator can grep for it +
+    a future refactor that drops the field surfaces here."""
+    _write_routine(
+        tmp_path,
+        "Self Care.md",
+        "type: routine\nstatus: active\nname: Self Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Walk dog\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    with structlog.testing.capture_logs() as captured:
+        render_tier_section(tmp_path, NOW)
+    events = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.rendered"
+    ]
+    assert len(events) == 1
+    assert "auto_t3_routine_count" in events[0]
+    assert events[0]["auto_t3_routine_count"] == 1
+
+
+def test_t3_log_emission_carries_auto_t3_routine_count_when_empty(
+    tmp_path: Path,
+) -> None:
+    """Mirror of the above pin: the field MUST be present even when
+    the auto-T3 bucket is empty (value 0). Distinguishes "ran with
+    zero candidates" from "field dropped from log."""
+    # Empty vault — no routine records.
+    with structlog.testing.capture_logs() as captured:
+        render_tier_section(tmp_path, NOW)
+    events = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.rendered"
+    ]
+    assert len(events) == 1
+    assert "auto_t3_routine_count" in events[0]
+    assert events[0]["auto_t3_routine_count"] == 0

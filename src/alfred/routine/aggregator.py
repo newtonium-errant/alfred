@@ -222,11 +222,64 @@ def _format_cycle_aware_annotation(
     return f"*(overdue by {abs(days_to_due)}d)*"
 
 
+def _format_soft_cadence_annotation(
+    item_text: str,
+    completion_log: dict,
+    target_cadence_days: int,
+    today: date,
+) -> str | None:
+    """Compose a soft-cadence annotation string.
+
+    Phase 2A-soft-cadence (2026-05-30): items with
+    ``target_cadence_days`` that are NOT overdue (so they stay in the
+    routine section — the T3 handoff would have intercepted overdue
+    items) get a "Nd since last; target every Nd" annotation. Operator
+    sees how close to the cadence boundary they are at a glance.
+
+    Returns:
+      * ``"*(Nd since last; target every Nd)*"`` — most recent
+        completion N days ago, within target.
+      * ``"*(done today; target every Nd)*"`` — completion today.
+      * ``"*(no completions yet; target every Nd)*"`` — empty log
+        (defensive: this state SHOULD have been intercepted by the
+        T3 handoff which treats never-completed as max overdue, but
+        if a future refactor changes that contract the annotation
+        still works).
+      * ``None`` — defensive against non-positive target (shouldn't
+        reach this helper but mirrors the
+        ``_format_tracked_annotation`` defensive return).
+    """
+    if not isinstance(target_cadence_days, int) or target_cadence_days <= 0:
+        return None
+    log_dates = _parse_log_dates(completion_log.get(item_text, []))
+    if not log_dates:
+        return (
+            f"*(no completions yet; target every "
+            f"{target_cadence_days}d)*"
+        )
+    most_recent = max(log_dates)
+    days_since = (today - most_recent).days
+    if days_since < 0:
+        # Future-dated completion — clamp.
+        days_since = 0
+    if days_since == 0:
+        return f"*(done today; target every {target_cadence_days}d)*"
+    return (
+        f"*({days_since}d since last; target every "
+        f"{target_cadence_days}d)*"
+    )
+
+
 def _decide_tier_handoff(
-    due_pattern: DuePattern,
+    due_pattern: DuePattern | None,
     surface_at_days: int | None,
     escalate_at_days: int | None,
     today: date,
+    *,
+    target_cadence_days: int | None = None,
+    completion_log: dict | None = None,
+    item_text: str = "",
+    routine_record: str = "",
 ) -> int | None:
     """Decide if the item should be handed off to the tier section.
 
@@ -236,16 +289,103 @@ def _decide_tier_handoff(
       * ``2`` — item is in the T2 window
         (``(escalate_at_days, surface_at_days]``); tier section will
         surface it. Aggregator SKIPs the render.
-      * ``None`` — item is OUTSIDE both windows OR has no
-        ``escalate_at_days``; the routine section renders it normally
-        (with cycle-aware annotation per Item 4).
+      * ``3`` — item is overdue against its soft cadence
+        (``target_cadence_days``); tier section's T3 auto-suggest
+        subsection will surface it. Aggregator SKIPs the render.
+        (Phase 2A-soft-cadence, 2026-05-30.)
+      * ``None`` — item is OUTSIDE all windows OR has neither
+        ``escalate_at_days`` nor ``target_cadence_days``; the routine
+        section renders it normally (with cycle-aware annotation per
+        Item 4, OR with soft-cadence annotation when the item carries
+        ``target_cadence_days`` but is within its cadence window).
+
+    Phase 2A-soft-cadence keyword args (all optional; backward-compat
+    with existing call sites that only pass T1/T2 fields):
+      * ``target_cadence_days`` — the item's soft cadence target.
+        When set AND ``days_since_last_completed >= target``, returns
+        ``3``. Mutually exclusive with ``due_pattern``: when BOTH are
+        provided, ``due_pattern`` wins and a single warn log
+        ``routine.item_both_cadence_modes`` fires naming the record
+        + item text. Validator-level rule, NOT a load failure — the
+        operator's record still parses and renders; the warn flags
+        the configuration ambiguity so they can resolve it.
+      * ``completion_log`` — record-level completion log dict (mapping
+        item_text → list of dates). Used to compute days-since for
+        the T3 predicate. Defensive default ``None`` → treated as
+        empty dict → never-completed items still surface (the T3
+        compute path treats never-completed as max overdue).
+      * ``item_text`` — item's text (lookup key into completion_log).
+      * ``routine_record`` — routine record name (operator-facing
+        identifier for the warn log).
 
     Mirrors the window math in :mod:`alfred.tier.compute`'s
-    ``_compute_auto_routine``. Don't introduce variance here — the
-    two layers must agree exactly on which items hand off vs.
-    render-in-routine-section.
+    ``_compute_auto_routine`` (T1/T2) and ``compute_auto_t3_candidates``
+    (T3). Don't introduce variance here — the two layers must agree
+    exactly on which items hand off vs. render-in-routine-section.
+    Per ``feedback_two_layer_window_math_mirror``; regression-pin in
+    ``tests/tier/test_compute.py`` (T3 mirror) and
+    ``tests/routine/test_aggregator.py`` (T1/T2 mirror).
     """
-    if escalate_at_days is None:
+    # Mutually-exclusive validator: both cadence modes set → warn +
+    # prefer due_pattern. The warn fires HERE (not at the T3 compute
+    # path) because this is the once-per-aggregate-pass call site;
+    # the compute path runs per-brief-fire + per-/today and would
+    # spam the log. Per the dispatch's "validator-level rule, not a
+    # load-failure" framing — operator sees the signal but the record
+    # still works.
+    if (
+        due_pattern is not None
+        and target_cadence_days is not None
+    ):
+        log.warning(
+            "routine.item_both_cadence_modes",
+            routine_record=routine_record,
+            item_text=item_text,
+            due_pattern_type=getattr(due_pattern, "type", None),
+            target_cadence_days=target_cadence_days,
+            detail=(
+                "item carries BOTH ``due_pattern`` (deadline-bearing) "
+                "AND ``target_cadence_days`` (soft-cadence). These are "
+                "mutually exclusive semantics; preferring ``due_pattern`` "
+                "(deadline wins). Operator should remove "
+                "``target_cadence_days`` from the item to resolve the "
+                "ambiguity."
+            ),
+        )
+        # due_pattern wins — fall through to the T1/T2 branches below;
+        # target_cadence_days is ignored for this dispatch.
+
+    # ---- Phase 2A-soft-cadence T3 branch -------------------------
+    # Only fires when due_pattern is absent (the precedence rule
+    # above means due_pattern wins when both are set). Predicate
+    # mirror with tier.compute.compute_auto_t3_candidates:
+    # ``days_since >= target_cadence_days`` (inclusive boundary).
+    if due_pattern is None and target_cadence_days is not None:
+        if (
+            not isinstance(target_cadence_days, int)
+            or target_cadence_days <= 0
+        ):
+            # Defensive: zero/negative target → undefined semantics →
+            # don't hand off. Item renders in routine section.
+            return None
+        log_dict = (
+            completion_log if isinstance(completion_log, dict) else {}
+        )
+        completion_dates = _parse_log_dates(log_dict.get(item_text, []))
+        if not completion_dates:
+            # Never completed → max overdue → SURFACE in T3.
+            return 3
+        days_since = (today - max(completion_dates)).days
+        if days_since < 0:
+            # Future-dated completion (operator hand-edit) → clamp.
+            days_since = 0
+        if days_since >= target_cadence_days:
+            return 3
+        # Within soft cadence window → render in routine section.
+        return None
+
+    # ---- T1/T2 branches (deadline-bearing) -----------------------
+    if due_pattern is None or escalate_at_days is None:
         return None
     due = resolve_due_date(due_pattern, today)
     if due is None:
@@ -350,10 +490,12 @@ def _collect_items_for_today(
             # rendering here, (b) swap to cycle-aware annotation when the
             # item has a due_pattern but stays in the routine section.
             #
-            # Aspirational items are NEVER handed off (operator-stated:
-            # T3 is for self-care intentions, not deadline-driven work).
-            # Defensive: only Critical/Tracked items with due_pattern
-            # qualify for tier handoff.
+            # Aspirational items are NEVER handed off via the deadline-
+            # bearing T1/T2 path (operator-stated: T3 is for self-care
+            # intentions, not deadline-driven work). Phase 2A-soft-cadence
+            # (2026-05-30) DOES allow aspirational items to hand off to
+            # T3 — that's exactly the new T3 surface (overdue self-care
+            # items rank into the brief's auto-suggest subsection).
             due_pattern = DuePattern.from_dict(raw_item.get("due_pattern"))
             surface_raw = raw_item.get("surface_at_days")
             try:
@@ -369,19 +511,49 @@ def _collect_items_for_today(
                 )
             except (TypeError, ValueError):
                 escalate_at_days = None
+            # Phase 2A-soft-cadence (2026-05-30): parse target_cadence_days
+            # for the T3 auto-suggest surface.
+            target_cadence_raw = raw_item.get("target_cadence_days")
+            try:
+                target_cadence_days = (
+                    int(target_cadence_raw)
+                    if target_cadence_raw is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                target_cadence_days = None
 
-            if (
-                due_pattern is not None
-                and priority != "aspirational"
-            ):
+            # T1/T2 handoff path: only Critical/Tracked items with
+            # due_pattern. T3 handoff path: any item with
+            # target_cadence_days (aspirational included — that's the
+            # whole point of the soft-cadence surface).
+            should_check_handoff = (
+                (due_pattern is not None and priority != "aspirational")
+                or target_cadence_days is not None
+            )
+            if should_check_handoff:
                 handoff_tier = _decide_tier_handoff(
-                    due_pattern, surface_at_days, escalate_at_days, today,
+                    due_pattern,
+                    surface_at_days,
+                    escalate_at_days,
+                    today,
+                    target_cadence_days=target_cadence_days,
+                    completion_log=completion_log,
+                    item_text=text,
+                    routine_record=name,
                 )
                 if handoff_tier is not None:
-                    due = resolve_due_date(due_pattern, today)
-                    days_to_due = (
-                        (due - today).days if due is not None else None
-                    )
+                    # Compute days_to_due for the log only when
+                    # due_pattern is present (T1/T2 path); T3 path
+                    # uses days_since semantics, but logging it
+                    # uniformly as days_to_due=None keeps the log
+                    # event shape stable.
+                    days_to_due = None
+                    if due_pattern is not None:
+                        due = resolve_due_date(due_pattern, today)
+                        days_to_due = (
+                            (due - today).days if due is not None else None
+                        )
                     log.info(
                         "routine.aggregator.handed_off_to_tier",
                         item_text=text,
@@ -389,9 +561,12 @@ def _collect_items_for_today(
                         days_to_due=days_to_due,
                         routine_record=name,
                         detail=(
-                            "routine item with due_pattern surfaces via "
-                            "tier section instead of routine section; "
-                            "dedup skip per Phase 2A Ship B."
+                            "routine item handed off to tier section "
+                            f"(T{handoff_tier}); routine-section "
+                            "render suppressed for dedup. T1/T2 path: "
+                            "due_pattern + tier window. T3 path: "
+                            "target_cadence_days + overdue against "
+                            "soft cadence target."
                         ),
                     )
                     continue
@@ -422,6 +597,21 @@ def _collect_items_for_today(
                     annotation = _format_tracked_annotation(
                         text, completion_log, gap, today,
                     )
+            # Phase 2A-soft-cadence (2026-05-30): items with
+            # ``target_cadence_days`` that AREN'T overdue (overdue
+            # path was intercepted by the T3 handoff above) get a
+            # soft-cadence annotation. Applies to ALL priorities —
+            # operator framing is "self-care", commonly on
+            # ``aspirational`` items but doesn't preclude ``tracked``
+            # / ``critical`` use. Overrides the tracked-gap annotation
+            # when both apply (target_cadence_days is the more
+            # specific signal; gap-based is the generic fallback).
+            if target_cadence_days is not None and due_pattern is None:
+                soft_annotation = _format_soft_cadence_annotation(
+                    text, completion_log, target_cadence_days, today,
+                )
+                if soft_annotation is not None:
+                    annotation = soft_annotation
 
             items_by_text[text] = {
                 "text": text,
@@ -683,6 +873,7 @@ __all__ = [
     "DEFAULT_TRACKED_GAP_DAYS",
     "_decide_tier_handoff",
     "_format_cycle_aware_annotation",
+    "_format_soft_cadence_annotation",
     "_load_existing_tier_curation",
     "render_daily_body",
     "run_aggregator_once",

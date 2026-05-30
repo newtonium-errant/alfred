@@ -177,8 +177,28 @@ class Item:
       * ``escalate_at_days`` — T1 escalation threshold (days before
         due when the item moves to T1)
 
+    Phase 2A-soft-cadence extension (T3 auto-suggestions, 2026-05-30):
+      * ``target_cadence_days`` — soft-cadence target (e.g.
+        ``target_cadence_days: 3`` means "should be done at least
+        every 3 days"). When ``days_since_last_completed >= target``,
+        the item surfaces as an auto-T3 candidate in the brief's
+        tier section. Items with soft cadence NEVER escalate to T1/T2
+        — they stay T3 (self-care intention, not deadline-driven).
+
+    ``target_cadence_days`` is mutually exclusive with ``due_pattern``
+    at the SEMANTIC level: a deadline-bearing item (``due_pattern``)
+    is "must do BY this date"; a soft-cadence item
+    (``target_cadence_days``) is "aim to do every N days." Both set
+    is operator confusion; per the validator-level rule in
+    :func:`alfred.routine.aggregator._decide_tier_handoff`, when both
+    are present we prefer ``due_pattern`` and emit a warn log
+    ``routine.item_both_cadence_modes``. Parse-side we accept both;
+    the precedence rule lives at the consumer.
+
     See module docstring for the T1/T2 window math + the three
-    operator-stated semantics combinations.
+    operator-stated semantics combinations. The T3 soft-cadence
+    surface is documented in
+    :func:`alfred.tier.compute.compute_auto_t3_candidates`.
     """
 
     text: str
@@ -188,6 +208,7 @@ class Item:
     due_pattern: DuePattern | None = None
     surface_at_days: int | None = None
     escalate_at_days: int | None = None
+    target_cadence_days: int | None = None
 
     @classmethod
     def from_dict(cls, data: Any) -> Item | None:
@@ -240,6 +261,20 @@ class Item:
             )
         except (TypeError, ValueError):
             escalate_at_days = None
+        # Phase 2A-soft-cadence (2026-05-30): T3 auto-suggest field.
+        # Default ``None`` per the dataclass-default-None-extension
+        # backward-compat contract (existing routine records without
+        # the field continue to parse unchanged; only items that opt
+        # in carry the value). Coerce defensively the same way the
+        # tier-window fields above do — operator hand-edit may pass
+        # a string ("3") instead of an int (3).
+        cadence_raw = data.get("target_cadence_days")
+        try:
+            target_cadence_days = (
+                int(cadence_raw) if cadence_raw is not None else None
+            )
+        except (TypeError, ValueError):
+            target_cadence_days = None
         return cls(
             text=text.strip(),
             priority=priority,
@@ -248,6 +283,7 @@ class Item:
             due_pattern=due_pattern,
             surface_at_days=surface_at_days,
             escalate_at_days=escalate_at_days,
+            target_cadence_days=target_cadence_days,
         )
 
 

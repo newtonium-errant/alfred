@@ -561,11 +561,255 @@ def _parse_item_completion_dates(raw: Any) -> list[date]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Phase 2A-soft-cadence — auto-T3 surface for routine items with
+# ``target_cadence_days`` (2026-05-30)
+# ---------------------------------------------------------------------------
+#
+# The T3 self-care surface is NOT deadline-driven (unlike T1/T2 which scan
+# ``due_pattern`` + tier windows). Instead, it ranks routine items by
+# **days-since-last-completed** vs a soft cadence target carried on the
+# item itself (``target_cadence_days``). Operator framing: "walk the dog
+# at least every 3 days" — surface in T3 when overdue.
+#
+# Auto-T3 criteria:
+#   * Item carries ``target_cadence_days: <int>``.
+#   * Item does NOT carry ``due_pattern`` (mutually exclusive; the
+#     deadline-bearing item's already handled by T1/T2 surfaces). If
+#     BOTH are set on the same item, the routine aggregator's
+#     ``_decide_tier_handoff`` emits a warn log + prefers ``due_pattern``;
+#     the auto-T3 compute path defensively skips items with both set
+#     so the precedence-rule outcome is identical regardless of which
+#     consumer reads first. The aggregator owns the operator-facing
+#     warn; this compute layer just enforces the same precedence
+#     silently (no log spam from the compute path which runs every
+#     /today + every brief fire).
+#   * Days-since-last-completed (from ``completion_log[item.text]``,
+#     parsed via :func:`_parse_item_completion_dates`) is GREATER than
+#     OR EQUAL to ``target_cadence_days`` — the threshold is INCLUSIVE
+#     at the boundary (a 3-day target with the last completion 3 days
+#     ago is overdue per the operator-stated "at least every Nd"
+#     framing; "at least every 3 days" includes the 3rd day as the
+#     when-you-should-have-done-it boundary).
+#   * Never-completed items (``completion_log[text]`` missing or empty)
+#     are treated as MAXIMUM overdue — they rank first in the
+#     sort-by-overdue-ratio output. Operator hasn't started yet; the
+#     item should surface most prominently.
+#
+# Mirror with :func:`alfred.routine.aggregator._decide_tier_handoff`:
+# the predicate ``days_since >= target_cadence_days`` is computed in
+# BOTH layers. The aggregator uses it to suppress the routine-section
+# render (the item handed off to T3); this compute uses it to surface
+# the item AS the T3 candidate. The two outcomes are two sides of one
+# decision; rename the predicate here = update the aggregator in
+# lockstep. Per ``feedback_two_layer_window_math_mirror`` — the
+# regression-pin lives in ``tests/tier/test_compute.py``
+# (``test_mirror_decide_tier_handoff_t3_matches_compute_auto_t3``).
+#
+# Companion talker grammar (``T3 confirm <item>`` + voice-completion
+# of soft-cadence items) is deferred to Phase 2B B1. Operator-axis
+# surface — see :data:`alfred.brief.tier_section.
+# T3_AUTO_TALKER_DEFERRED_NOTE` for the operator-facing ILB
+# acknowledgement that surfaces in the brief.
+
+
+@dataclass
+class AutoT3Candidate:
+    """One auto-suggested T3 (self-care) candidate this morning.
+
+    Discriminated-union sibling to :class:`AutoT1Candidate`. The two
+    aren't unified because the surface semantics differ:
+      * AutoT1Candidate: deadline-driven (``due_iso`` + ``surface_reason``
+        anchored to a due date).
+      * AutoT3Candidate: cadence-driven (``days_since_last_completed``
+        + ``overdue_ratio`` ranked against a soft target).
+
+    Fields:
+      * ``path`` — routine record vault-relative path (e.g.
+        ``"routine/Self Care.md"``).
+      * ``routine_record`` — routine record's name (e.g.
+        ``"Self Care"``); brief renders the wikilink
+        ``[[routine/<record>]]``.
+      * ``item_text`` — operator-facing line (e.g. ``"Walk Fergus"``).
+      * ``target_cadence_days`` — the soft cadence target carried on
+        the item (e.g. ``3`` for "every 3 days").
+      * ``days_since_last_completed`` — int days since most-recent
+        completion log entry; ``None`` when the completion log is
+        empty for this item (never completed).
+      * ``overdue_ratio`` — ``days_since / target_cadence_days`` when
+        completed at least once; ``float('inf')`` when never
+        completed. Used purely for sort-order (descending — most
+        overdue surfaces first).
+
+    Brief renders this via :func:`alfred.brief.tier_section.
+    _render_auto_t3_routine_entry`. Talker recognition pattern
+    (``T3 confirm <item>``) ships in Phase 2B B1.
+
+    Cross-Ship contract: field names are stable; rename = update
+    brief render + Phase 2B SKILL in lockstep.
+    """
+
+    path: str
+    routine_record: str
+    item_text: str
+    target_cadence_days: int
+    days_since_last_completed: int | None
+    overdue_ratio: float
+
+
+def compute_auto_t3_candidates(
+    vault_path: Path, now: datetime,
+) -> list[AutoT3Candidate]:
+    """Walk ``vault/routine/*.md`` and return routine items
+    auto-suggesting as T3 candidates (overdue against their soft
+    cadence target).
+
+    Filter logic (in this exact order — short-circuits on first
+    rejection per item):
+
+      1. Frontmatter parse failure → skip the whole record silently
+         (mirrors the T1/T2 routine scan).
+      2. ``type != "routine"`` → skip (defensive against stray files).
+      3. ``status`` archived → skip the whole record.
+      4. ``alfred_triage is True`` on the routine record → skip
+         (defense-in-depth — mirror of the T1/T2 scan).
+      5. For each item in ``items``:
+         a. Item missing ``target_cadence_days`` → skip (not a
+            soft-cadence item; T1/T2 handle deadline-bearing items).
+         b. Item ALSO carries ``due_pattern`` → skip (precedence
+            rule: the aggregator's warn-log path owns the operator-
+            facing signal; this compute path defensively enforces the
+            same outcome). Mutually-exclusive semantics per
+            :class:`alfred.routine.config.Item`.
+         c. ``target_cadence_days`` is not a positive int → skip
+            (zero / negative would produce undefined overdue
+            semantics; defensive against operator hand-edit).
+         d. Resolve days_since_last_completed:
+              - completion_log empty / missing key → ``None`` →
+                overdue_ratio = ``inf`` → SURFACE (treat as max
+                overdue; never-completed items rank first).
+              - completion_log populated → max(parsed dates) → today
+                delta in days → if ``days_since >= target`` →
+                SURFACE; otherwise SKIP (item is within its soft
+                cadence window).
+
+    Returns AutoT3Candidates sorted by ``overdue_ratio`` DESCENDING
+    (most overdue first), ties broken by ``item_text`` case-
+    insensitive ascending. ``float('inf')`` ranks above any finite
+    ratio so never-completed items always lead.
+
+    Per ``feedback_intentionally_left_blank``: pure-compute path, no
+    log emissions. Callers (brief render layer) emit the "ran, here's
+    the count" log.
+    """
+    import frontmatter  # type: ignore[import-untyped]
+
+    # Lazy imports to avoid the top-level circular hazard between
+    # ``alfred.tier.compute`` and ``alfred.routine.config``. Mirrors
+    # the pattern in ``_compute_auto_routine``.
+    from alfred.routine.config import Item
+
+    routine_dir = vault_path / "routine"
+    if not routine_dir.is_dir():
+        return []
+
+    today_local = now.date()
+
+    candidates: list[AutoT3Candidate] = []
+    for record_path in sorted(routine_dir.glob("*.md")):
+        try:
+            post = frontmatter.load(str(record_path))
+        except Exception:  # noqa: BLE001
+            continue
+        fm = dict(post.metadata or {})
+        if fm.get("type") != "routine":
+            continue
+        status = str(fm.get("status") or "active").lower()
+        if status == "archived":
+            continue
+        if fm.get("alfred_triage") is True:
+            continue
+        record_name = str(fm.get("name") or record_path.stem)
+        raw_items = fm.get("items") or []
+        if not isinstance(raw_items, list):
+            continue
+
+        completion_log = fm.get("completion_log") or {}
+        if not isinstance(completion_log, dict):
+            completion_log = {}
+
+        rel_path = f"routine/{record_path.name}"
+
+        for raw_item in raw_items:
+            item = Item.from_dict(raw_item)
+            if item is None:
+                continue
+            if item.target_cadence_days is None:
+                continue
+            # Mutually-exclusive precedence: due_pattern wins. The
+            # aggregator's _decide_tier_handoff emits the warn log
+            # naming the record + item text; here we defensively
+            # match the same outcome silently (compute paths run per
+            # /today + per brief fire — log emission lives at the
+            # write/aggregate layer to avoid spam).
+            if item.due_pattern is not None:
+                continue
+            target = item.target_cadence_days
+            if not isinstance(target, int) or target <= 0:
+                # Defensive: zero / negative target has undefined
+                # overdue semantics. Operator hand-edit corruption.
+                continue
+
+            completion_dates = _parse_item_completion_dates(
+                completion_log.get(item.text, [])
+            )
+            days_since_value: int | None
+            if completion_dates:
+                most_recent = max(completion_dates)
+                days_since = (today_local - most_recent).days
+                # Defensive: a future-dated completion (operator hand-
+                # edit producing tomorrow's date) yields negative
+                # days_since. Treat as "done today" — clamp to 0,
+                # which produces overdue_ratio = 0 → skip.
+                if days_since < 0:
+                    days_since = 0
+                days_since_value = days_since
+                # Predicate mirror with aggregator._decide_tier_handoff
+                # T3 branch: days_since >= target → surface.
+                if days_since < target:
+                    continue
+                ratio = days_since / target
+            else:
+                # Never completed — treat as max overdue.
+                days_since_value = None
+                ratio = float("inf")
+
+            candidates.append(AutoT3Candidate(
+                path=rel_path,
+                routine_record=record_name,
+                item_text=item.text,
+                target_cadence_days=target,
+                days_since_last_completed=days_since_value,
+                overdue_ratio=ratio,
+            ))
+
+    # Sort by overdue_ratio DESCENDING (most overdue first), ties
+    # broken by item_text case-insensitive. ``float('inf')`` ranks
+    # above any finite ratio naturally — Python's sort handles inf
+    # correctly without special-casing.
+    candidates.sort(
+        key=lambda c: (-c.overdue_ratio, c.item_text.lower()),
+    )
+    return candidates
+
+
 __all__ = [
     "AutoT1Candidate",
+    "AutoT3Candidate",
     "OPEN_STATUSES",
     "coerce_due_date",
     "compute_auto_routine_candidates",
     "compute_auto_routine_t2_candidates",
     "compute_auto_t1_candidates",
+    "compute_auto_t3_candidates",
 ]

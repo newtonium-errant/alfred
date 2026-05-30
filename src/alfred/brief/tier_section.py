@@ -87,6 +87,7 @@ from alfred.tier.compute import (
     compute_auto_routine_candidates,
     compute_auto_routine_t2_candidates,
     compute_auto_t1_candidates,
+    compute_auto_t3_candidates,
 )
 from alfred.tier.daily_curation import (
     DailyCuration,
@@ -135,6 +136,46 @@ T2_POOL_HEADER = "### T2 selection pool"
 T2_AUTO_ROUTINE_HEADER = "#### Auto-surfaced (from routines)"
 T2_ROUTINE_CONFIRM_PROMPT = (
     '*(reply "T2 confirm" to keep on today\'s list)*'
+)
+
+# Phase 2A-soft-cadence (2026-05-30): T3 auto-suggest subsection
+# constants — CROSS-AGENT CONTRACT (Phase 2B B1 SKILL quotes verbatim).
+#
+# T3 auto-suggestions surface routine items overdue against their soft
+# cadence target (``target_cadence_days``). Distinct subsection inside
+# the T3 bucket (after any curated T3 entries). Rendered ONLY when
+# auto-T3 candidates exist — empty auto-T3 with populated curated T3
+# is silently omitted (no spurious "auto-suggested: nothing" header).
+# Empty curated T3 + empty auto-T3 falls through to the existing
+# ``T3_EMPTY_PROMPT`` sentinel.
+#
+# ``T3_AUTO_CONFIRM_PROMPT`` is the talker reply pattern Phase 2B B1
+# will recognise (``T3 confirm <item text>``). Wire is operator-axis
+# only in this ship — talker SKILL extension lives in Phase 2B B1.
+# Per ``feedback_operator_vs_user_axis``: the ILB acknowledgement
+# (``T3_AUTO_TALKER_DEFERRED_NOTE``) surfaces in the brief so the
+# operator-readable surface doesn't silently drop the User-axis
+# deferral.
+#
+# ``T3_AUTO_DAYS_SINCE_NEVER_LABEL`` is the per-item display string
+# for items with empty completion_log (never completed). Keeps the
+# render layer free of magic strings.
+#
+# ``T3_AUTO_ANNOTATION_TEMPLATE`` is the per-item annotation format
+# string. ``{days_since}`` and ``{target}`` are the only fields;
+# call site formats it via ``.format(...)``.
+T3_AUTO_SECTION_HEADER = "#### Auto-suggested (from routine cadence)"
+T3_AUTO_CONFIRM_PROMPT = (
+    '*(reply "T3 confirm <item>" to add to today\'s T3)*'
+)
+T3_AUTO_DAYS_SINCE_NEVER_LABEL = "never done"
+T3_AUTO_ANNOTATION_TEMPLATE = (
+    "*({days_since} days since last; target every {target}d)*"
+)
+T3_AUTO_TALKER_DEFERRED_NOTE = (
+    "*(talker T3 confirm grammar ships in Phase 2B B1; meanwhile use "
+    '`alfred routine done "<item text>"` to mark complete, or '
+    "edit the daily file directly.)*"
 )
 
 
@@ -437,6 +478,48 @@ def _render_t3_entry(entry: T3Entry) -> str:
     return f"- [ ] {entry.item}"
 
 
+def _render_auto_t3_routine_entry(candidate: Any) -> str:
+    """Render one auto-suggested T3 routine candidate line.
+
+    ``candidate`` is an :class:`alfred.tier.compute.AutoT3Candidate`.
+    Renders as:
+
+      ``- [ ] [[routine/<record>]] — <item> *(Nd days since last;
+      target every Md)*``
+
+    For never-completed items (``days_since_last_completed is None``)
+    the annotation uses :data:`T3_AUTO_DAYS_SINCE_NEVER_LABEL` instead
+    of an integer day count. Keeps the operator's eye drawn to the
+    "this has never been done" signal — distinct from "0 days since
+    last" which would imply "done today."
+
+    Phase 2A-soft-cadence contract: this is the auto-T3 sibling to
+    :func:`_render_auto_t2_routine_entry` (T2 ramp surface). The two
+    render paths share the wikilink shape but the annotation format
+    differs because the semantics differ (deadline-driven vs
+    cadence-driven). Per-candidate confirm prompt is NOT inlined per
+    item — instead, a single :data:`T3_AUTO_CONFIRM_PROMPT` line
+    fires once below the candidate list. Mirrors the T2-auto
+    subsection's prompt placement.
+    """
+    record = candidate.routine_record or ""
+    text = candidate.item_text or ""
+    target = candidate.target_cadence_days
+    days_since = candidate.days_since_last_completed
+    if days_since is None:
+        annotation = (
+            f"*({T3_AUTO_DAYS_SINCE_NEVER_LABEL}; "
+            f"target every {target}d)*"
+        )
+    else:
+        annotation = T3_AUTO_ANNOTATION_TEMPLATE.format(
+            days_since=days_since, target=target,
+        )
+    return (
+        f"- [ ] [[routine/{record}]] — {text} {annotation}"
+    )
+
+
 def _merge_auto_t1_into_curated(
     curated_t1: list[T1T2Entry],
     auto_t1_task_candidates: list[Any],     # list[AutoT1Candidate] origin=task
@@ -546,6 +629,7 @@ def _render_curated_shortlists(
     auto_t1_task_candidates: list[Any],
     auto_t1_routine_candidates: list[Any],
     auto_t2_routine_candidates: list[Any],
+    auto_t3_routine_candidates: list[Any] | None = None,
 ) -> str:
     """Compose the three ``### T1 / T2 / T3`` subsections.
 
@@ -564,7 +648,24 @@ def _render_curated_shortlists(
     operator has already curated the (record, text) into either tier,
     suppress the auto-T2-routine render line (the curated entry
     already covers it).
+
+    Phase 2A-soft-cadence (2026-05-30): T3 grows an
+    :data:`T3_AUTO_SECTION_HEADER` subsection BELOW the curated T3
+    entries — auto-suggested routine items overdue against their
+    soft cadence target. Empty auto-T3 with populated curated T3 →
+    auto subsection silently omitted (NOT polluted with "auto-
+    suggested: nothing" header). Empty curated T3 + empty auto-T3 →
+    existing :data:`T3_EMPTY_PROMPT` sentinel fires. Empty curated T3
+    + populated auto-T3 → subsection renders normally with NO
+    ``T3_EMPTY_PROMPT`` (the auto candidates fill the bucket).
+
+    Operator-axis ILB acknowledgement
+    (:data:`T3_AUTO_TALKER_DEFERRED_NOTE`) appends to the auto-T3
+    subsection so the operator-readable surface doesn't silently
+    drop the User-axis deferral. Per
+    ``feedback_operator_vs_user_axis``.
     """
+    auto_t3_routine_candidates = auto_t3_routine_candidates or []
     curated_t1: list[T1T2Entry] = curation.t1 if curation else []
     curated_t2: list[T1T2Entry] = curation.t2 if curation else []
     curated_t3: list[T3Entry] = curation.t3 if curation else []
@@ -633,13 +734,48 @@ def _render_curated_shortlists(
         t2_lines.append("")
 
     # --- T3 -----------------------------------------------------------
+    # Phase 2A-soft-cadence (2026-05-30): T3 bucket now has two
+    # populating sources — curated entries (operator-added) and
+    # auto-T3 candidates (overdue against soft cadence). The empty-
+    # state contract distinguishes three cases:
+    #
+    #   Case A: curated T3 populated + auto-T3 empty
+    #     → curated entries + NO auto subsection (silent omission;
+    #     a "auto-suggested: nothing" header would be noise).
+    #
+    #   Case B: curated T3 empty + auto-T3 populated
+    #     → auto subsection ONLY (no T3_EMPTY_PROMPT — the auto
+    #     candidates fill the bucket).
+    #
+    #   Case C: curated T3 empty + auto-T3 empty
+    #     → T3_EMPTY_PROMPT sentinel (existing behavior preserved).
+    #
+    #   Case D: curated T3 populated + auto-T3 populated
+    #     → curated entries FIRST, then auto subsection BELOW.
     t3_lines = ["### T3 — Self-care for today", ""]
-    if not curated_t3:
-        t3_lines.append(T3_EMPTY_PROMPT)
-        t3_lines.append("")
-    else:
+    has_curated_t3 = bool(curated_t3)
+    has_auto_t3 = bool(auto_t3_routine_candidates)
+    if has_curated_t3:
         for entry in curated_t3:
             t3_lines.append(_render_t3_entry(entry))
+        t3_lines.append("")
+    if has_auto_t3:
+        t3_lines.append(T3_AUTO_SECTION_HEADER)
+        t3_lines.append("")
+        for cand in auto_t3_routine_candidates:
+            t3_lines.append(_render_auto_t3_routine_entry(cand))
+        t3_lines.append("")
+        t3_lines.append(T3_AUTO_CONFIRM_PROMPT)
+        t3_lines.append("")
+        # ILB acknowledgement for the deferred talker grammar — per
+        # ``feedback_operator_vs_user_axis``: the operator-readable
+        # surface must surface the User-axis deferral so the
+        # operator sees that the talker can't yet act on this
+        # subsection.
+        t3_lines.append(T3_AUTO_TALKER_DEFERRED_NOTE)
+        t3_lines.append("")
+    if not has_curated_t3 and not has_auto_t3:
+        t3_lines.append(T3_EMPTY_PROMPT)
         t3_lines.append("")
 
     return "\n".join(t1_lines + t2_lines + t3_lines)
@@ -854,7 +990,7 @@ def render_tier_section(
     # --- 1. Read today's curation ---------------------------------
     curation = load_daily_curation(vault_path, today)
 
-    # --- 2. Compute auto-T1 / auto-T2 candidates ------------------
+    # --- 2. Compute auto-T1 / auto-T2 / auto-T3 candidates --------
     # Task-origin (the original Ship 2 surface).
     auto_t1_task_candidates = compute_auto_t1_candidates(vault_path, now)
     # Routine-origin T1 + T2 ramp (Phase 2A Ship B, 2026-05-29).
@@ -862,6 +998,14 @@ def render_tier_section(
         vault_path, now,
     )
     auto_t2_routine_candidates = compute_auto_routine_t2_candidates(
+        vault_path, now,
+    )
+    # Routine-origin T3 soft-cadence auto-suggest (Phase 2A-soft-
+    # cadence, 2026-05-30). Predicate mirror with the routine
+    # aggregator's ``_decide_tier_handoff`` T3 branch — both layers
+    # must agree on which items hand off. See
+    # ``feedback_two_layer_window_math_mirror``.
+    auto_t3_routine_candidates = compute_auto_t3_candidates(
         vault_path, now,
     )
     auto_t1_record_names = {c.name for c in auto_t1_task_candidates}
@@ -897,6 +1041,7 @@ def render_tier_section(
         auto_t1_task_candidates,
         auto_t1_routine_candidates,
         auto_t2_routine_candidates,
+        auto_t3_routine_candidates,
     )
     pool = _render_t2_selection_pool(
         records,
@@ -925,6 +1070,11 @@ def render_tier_section(
         auto_t1_task_count=len(auto_t1_task_candidates),
         auto_t1_routine_count=len(auto_t1_routine_candidates),
         auto_t2_routine_count=len(auto_t2_routine_candidates),
+        # Phase 2A-soft-cadence (2026-05-30): T3 soft-cadence auto-
+        # suggest count. ``feedback_log_emission_test_pattern`` pin:
+        # test asserts this field is present in the log when
+        # candidates exist, AND when bucket is empty.
+        auto_t3_routine_count=len(auto_t3_routine_candidates),
         rollover_present=bool(rollover),
         yesterday_curation_loaded=yesterday_curation is not None,
     )
@@ -1023,6 +1173,11 @@ __all__ = [
     "T2_EMPTY_PROMPT",
     "T2_POOL_HEADER",
     "T2_ROUTINE_CONFIRM_PROMPT",
+    "T3_AUTO_ANNOTATION_TEMPLATE",
+    "T3_AUTO_CONFIRM_PROMPT",
+    "T3_AUTO_DAYS_SINCE_NEVER_LABEL",
+    "T3_AUTO_SECTION_HEADER",
+    "T3_AUTO_TALKER_DEFERRED_NOTE",
     "T3_EMPTY_PROMPT",
     "render_curated_tier_section_for_today",
     "render_tier_section",

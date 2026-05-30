@@ -19,7 +19,7 @@ Test surface (per dispatch):
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from textwrap import dedent
 
@@ -1107,4 +1107,388 @@ def test_handed_off_log_fires_for_t2_handoff(tmp_path: Path) -> None:
     ]
     assert len(events) == 1
     assert events[0]["tier"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A-soft-cadence (2026-05-30) — T3 auto-suggest from soft cadence
+#
+# Test surface:
+#   * Item schema: target_cadence_days optional + default None
+#     (backward-compat regression pin per
+#     feedback_dataclass_default_none_extension).
+#   * Item schema: both due_pattern AND target_cadence_days set →
+#     warn log + due_pattern wins (validator-level rule).
+#   * Aggregator: item with target_cadence_days that's overdue →
+#     handed off to T3 → routine-section render suppressed.
+#   * Aggregator: item with target_cadence_days that's within window
+#     → stays in routine section with soft-cadence annotation.
+#   * Soft-cadence annotation format: "Nd since last; target every Nd"
+#     for completed items; "no completions yet; target every Nd" for
+#     empty log; "done today; target every Nd" for same-day completion.
+#   * Never-completed soft-cadence item → handed off to T3 (treated
+#     as max overdue per the compute path's never-completed contract).
+#   * Boundary semantics: days_since == target → handoff (inclusive).
+# ---------------------------------------------------------------------------
+
+
+def test_target_cadence_days_field_optional_default_none() -> None:
+    """Backward-compat regression pin: existing routine YAML without
+    the field continues to parse — ``target_cadence_days`` defaults
+    to ``None`` and the Item construct succeeds.
+
+    Per ``feedback_dataclass_default_none_extension``: schema
+    extensions must default-None so old data continues to flow."""
+    from alfred.routine.config import Item
+
+    # An Item shape predating Phase 2A-soft-cadence — no
+    # target_cadence_days field. Construct succeeds; field reads None.
+    item = Item.from_dict({"text": "Walk Fergus", "priority": "tracked"})
+    assert item is not None
+    assert item.target_cadence_days is None
+
+    # Existing fields unaffected.
+    assert item.text == "Walk Fergus"
+    assert item.priority == "tracked"
+    assert item.due_pattern is None
+    assert item.escalate_at_days is None
+    assert item.surface_at_days is None
+
+
+def test_target_cadence_days_parsed_when_present() -> None:
+    """When the field IS present, it parses to int — including
+    coercion from string (operator hand-edit may pass '3' instead
+    of 3)."""
+    from alfred.routine.config import Item
+
+    # Native int.
+    item = Item.from_dict({
+        "text": "Walk dog",
+        "priority": "aspirational",
+        "target_cadence_days": 3,
+    })
+    assert item is not None
+    assert item.target_cadence_days == 3
+
+    # String coerced to int.
+    item2 = Item.from_dict({
+        "text": "Walk dog",
+        "priority": "aspirational",
+        "target_cadence_days": "5",
+    })
+    assert item2 is not None
+    assert item2.target_cadence_days == 5
+
+    # Malformed → None (defensive).
+    item3 = Item.from_dict({
+        "text": "Walk dog",
+        "priority": "aspirational",
+        "target_cadence_days": "not an int",
+    })
+    assert item3 is not None
+    assert item3.target_cadence_days is None
+
+
+def test_target_cadence_days_and_due_pattern_mutually_exclusive_warn(
+    tmp_path: Path,
+) -> None:
+    """Item with BOTH ``due_pattern`` AND ``target_cadence_days`` →
+    warn log fires + due_pattern wins (so the item handoff path is
+    T1/T2, not T3). Validator-level rule, not a load failure — the
+    record still renders.
+
+    Per ``feedback_log_emission_test_pattern``: pin both the warn-
+    log emission (event + fields) AND the behavior (due_pattern
+    wins → T1 handoff for a today-due item)."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Mixed Modes", {
+        "type": "routine",
+        "status": "active",
+        "name": "Mixed Modes",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Ambiguous Item",
+                "priority": "tracked",
+                # Due today (Thu): weekly day=thu, escalate_at_days=0.
+                "due_pattern": {"type": "weekly", "day": "thu"},
+                "escalate_at_days": 0,
+                # ALSO target_cadence_days — should warn + ignore.
+                "target_cadence_days": 7,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    # Warn log present + names the record + item.
+    warns = [
+        c for c in captured
+        if c.get("event") == "routine.item_both_cadence_modes"
+    ]
+    assert len(warns) == 1
+    assert warns[0]["routine_record"] == "Mixed Modes"
+    assert warns[0]["item_text"] == "Ambiguous Item"
+    assert warns[0]["target_cadence_days"] == 7
+    assert warns[0]["due_pattern_type"] == "weekly"
+    # Due_pattern wins → handoff path = T1 (due today, escalate_at=0).
+    handoffs = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+    ]
+    assert len(handoffs) == 1
+    assert handoffs[0]["tier"] == 1, (
+        "due_pattern wins on the precedence rule — T1 handoff "
+        "(NOT T3 which would have surfaced for the target_cadence_days "
+        "branch)"
+    )
+
+
+def test_soft_cadence_overdue_item_handed_off_to_t3(tmp_path: Path) -> None:
+    """Item with target_cadence_days=3 + last completion 4 days ago →
+    overdue (4 >= 3) → T3 handoff → routine-section render
+    suppressed."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28  # 2026-05-28
+    last_completed = today - timedelta(days=4)  # 2026-05-24
+    _write_routine(vault, "Self Care", {
+        "type": "routine",
+        "status": "active",
+        "name": "Self Care",
+        "cadence": {"type": "daily"},
+        "completion_log": {
+            "Walk dog": [last_completed.isoformat()],
+        },
+        "items": [
+            {
+                "text": "Walk dog",
+                "priority": "aspirational",
+                "target_cadence_days": 3,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    # Item handed off → NOT in routine-section render.
+    walk_dog_lines = [
+        ln for ln in body.splitlines() if "Walk dog" in ln
+    ]
+    assert walk_dog_lines == [], (
+        f"Walk dog should be handed off to T3 (overdue 4d against 3d "
+        f"target); routine-section render should be suppressed. "
+        f"Found in body: {walk_dog_lines}"
+    )
+    # Handoff log fires with tier=3.
+    handoffs = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+        and c.get("item_text") == "Walk dog"
+    ]
+    assert len(handoffs) == 1
+    assert handoffs[0]["tier"] == 3
+
+
+def test_soft_cadence_never_completed_handed_off_to_t3(
+    tmp_path: Path,
+) -> None:
+    """Item with target_cadence_days but no completion_log entry →
+    treated as max overdue → T3 handoff. Mirrors the compute path's
+    never-completed contract."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Self Care", {
+        "type": "routine",
+        "status": "active",
+        "name": "Self Care",
+        "cadence": {"type": "daily"},
+        # No completion_log at all.
+        "items": [
+            {
+                "text": "Practice guitar",
+                "priority": "aspirational",
+                "target_cadence_days": 7,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    assert "Practice guitar" not in body, (
+        "Never-completed soft-cadence item should hand off to T3 "
+        "(treated as max overdue)"
+    )
+    handoffs = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+        and c.get("item_text") == "Practice guitar"
+    ]
+    assert len(handoffs) == 1
+    assert handoffs[0]["tier"] == 3
+
+
+def test_soft_cadence_within_window_renders_in_routine_section(
+    tmp_path: Path,
+) -> None:
+    """Item with target_cadence_days=7 + last completion 3 days ago →
+    NOT overdue (3 < 7) → stays in routine section with soft-cadence
+    annotation."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    last_completed = today - timedelta(days=3)
+    _write_routine(vault, "Self Care", {
+        "type": "routine",
+        "status": "active",
+        "name": "Self Care",
+        "cadence": {"type": "daily"},
+        "completion_log": {
+            "Walk dog": [last_completed.isoformat()],
+        },
+        "items": [
+            {
+                "text": "Walk dog",
+                "priority": "aspirational",
+                "target_cadence_days": 7,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    # Item renders in routine section with soft-cadence annotation.
+    assert "Walk dog" in body
+    assert "3d since last; target every 7d" in body
+
+
+def test_soft_cadence_annotation_done_today(tmp_path: Path) -> None:
+    """Item with target_cadence_days completed TODAY → "done today;
+    target every Nd" annotation."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    _write_routine(vault, "Self Care", {
+        "type": "routine",
+        "status": "active",
+        "name": "Self Care",
+        "cadence": {"type": "daily"},
+        "completion_log": {
+            "Walk dog": [today.isoformat()],
+        },
+        "items": [
+            {
+                "text": "Walk dog",
+                "priority": "aspirational",
+                "target_cadence_days": 7,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    assert "Walk dog" in body
+    assert "done today; target every 7d" in body
+
+
+def test_soft_cadence_annotation_no_completions_yet_when_not_overdue() -> None:
+    """Defensive — never-completed items normally hand off to T3
+    (max overdue), but a future refactor could change that contract.
+    Pin the annotation works for the "stayed in routine section
+    without completions" path."""
+    from alfred.routine.aggregator import _format_soft_cadence_annotation
+
+    today = _NOW_THU_2026_05_28
+    annotation = _format_soft_cadence_annotation(
+        "Walk dog", {}, 7, today,
+    )
+    assert annotation == "*(no completions yet; target every 7d)*"
+
+
+def test_soft_cadence_annotation_negative_target_returns_none() -> None:
+    """Defensive: target_cadence_days=0 or negative → None (no
+    annotation; the calling code falls through to other render
+    paths)."""
+    from alfred.routine.aggregator import _format_soft_cadence_annotation
+
+    today = _NOW_THU_2026_05_28
+    assert _format_soft_cadence_annotation(
+        "Walk dog", {}, 0, today,
+    ) is None
+    assert _format_soft_cadence_annotation(
+        "Walk dog", {}, -3, today,
+    ) is None
+
+
+def test_soft_cadence_inclusive_threshold_at_boundary(
+    tmp_path: Path,
+) -> None:
+    """Boundary pin: days_since == target_cadence_days → overdue
+    (INCLUSIVE). Operator framing "at least every N days" includes
+    the Nth day as the when-you-should-have-done-it boundary.
+
+    Mirror predicate with tier.compute — same boundary semantics."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    last_completed = today - timedelta(days=3)  # exactly target
+    _write_routine(vault, "Self Care", {
+        "type": "routine",
+        "status": "active",
+        "name": "Self Care",
+        "cadence": {"type": "daily"},
+        "completion_log": {
+            "Walk dog": [last_completed.isoformat()],
+        },
+        "items": [
+            {
+                "text": "Walk dog",
+                "priority": "aspirational",
+                "target_cadence_days": 3,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    # 3 >= 3 → overdue → handoff → suppressed.
+    assert "Walk dog" not in body
+    handoffs = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+        and c.get("item_text") == "Walk dog"
+    ]
+    assert len(handoffs) == 1
+    assert handoffs[0]["tier"] == 3
+
+
+def test_soft_cadence_just_under_threshold_no_handoff(
+    tmp_path: Path,
+) -> None:
+    """Mirror of the boundary pin: days_since == target - 1 → NOT
+    overdue → no handoff → renders in routine section."""
+    vault = tmp_path / "vault"
+    today = _NOW_THU_2026_05_28
+    last_completed = today - timedelta(days=2)  # target - 1
+    _write_routine(vault, "Self Care", {
+        "type": "routine",
+        "status": "active",
+        "name": "Self Care",
+        "cadence": {"type": "daily"},
+        "completion_log": {
+            "Walk dog": [last_completed.isoformat()],
+        },
+        "items": [
+            {
+                "text": "Walk dog",
+                "priority": "aspirational",
+                "target_cadence_days": 3,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    run_aggregator_once(config, today)
+    body = _read_body(vault, today.isoformat())
+    # 2 < 3 → not overdue → renders.
+    assert "Walk dog" in body
+    assert "2d since last; target every 3d" in body
     assert events[0]["days_to_due"] == 4
