@@ -180,6 +180,25 @@ class EmailClassifierConfig:
     # How many corpus entries to inject as few-shot examples. 0 disables
     # injection even if the path is set.
     calibration_few_shot_count: int = 10
+    # c6 (2026-05-31) spam quarantine. Path to the daily_sync state file
+    # carrying the per-tier confidence flags. When ``confidence.spam ==
+    # true`` AND a record's classifier verdict is ``priority: spam``,
+    # the record is moved to ``<vault>/<quarantine_dir>/<YYYY-MM>/`` so
+    # it doesn't clutter the active inbox/processing pipeline. Recovery
+    # remains possible — the brief surfaces a quarantine count for
+    # periodic operator review. Default matches the daily_sync default
+    # so a co-located install needs no config plumbing; per-instance
+    # YAML can override (e.g. KAL-LE's path if it ever wires up spam
+    # quarantine, though today KAL-LE has no email pipeline).
+    quarantine_state_path: str = "./data/daily_sync_state.json"
+    # Vault-relative directory name for the spam quarantine root. The
+    # full path is ``<vault>/<quarantine_dir>/spam/<YYYY-MM>/<file>``.
+    # Operator-discoverable via the brief's operations section; recovery
+    # is a plain ``vault_move`` back to ``inbox/`` (or wherever the
+    # operator wants the misclassified record to live). Default
+    # ``quarantine`` mirrors the convention of using top-level dirs
+    # like ``inbox``, ``view``, ``digests`` — easily globbable.
+    quarantine_dir_name: str = "quarantine"
 
 
 # --- Recursive builder ------------------------------------------------------

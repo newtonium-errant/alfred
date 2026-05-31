@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,7 +26,7 @@ import frontmatter
 import structlog
 
 from alfred.vault.mutation_log import log_mutation
-from alfred.vault.ops import VaultError, vault_edit
+from alfred.vault.ops import VaultError, vault_edit, vault_move
 
 from .config import EmailClassifierConfig
 from .vault_helpers import (
@@ -105,6 +106,15 @@ class ClassificationResult:
     otherwise. Convenience for downstream consumers (canary log,
     calibration dashboard); ``llm_priority is not None`` is the same
     signal in the data layer.
+
+    ``quarantined_to`` (c6, 2026-05-31) is the vault-relative path the
+    record was MOVED to when the spam-quarantine layer fired (i.e.
+    ``priority == "spam"`` AND the daily_sync ``confidence.spam``
+    flag is true). Empty string when quarantine did NOT fire (most
+    common case — non-spam priority, or flag is false). When this
+    field is populated, ``written_to`` is the PRE-quarantine
+    location (the path where the classifier wrote the priority
+    frontmatter); the record currently lives at ``quarantined_to``.
     """
 
     priority: str
@@ -113,6 +123,7 @@ class ClassificationResult:
     written_to: str = ""
     llm_priority: str | None = None
     override_applied: bool = False
+    quarantined_to: str = ""
 
 
 # --- LLM call type -----------------------------------------------------------
@@ -591,6 +602,138 @@ def _coerce_result(
     )
 
 
+# --- c6 spam quarantine ---------------------------------------------------
+
+
+def _is_spam_quarantine_enabled(state_path: str) -> bool:
+    """Read the daily_sync confidence.spam flag from the state file.
+
+    c6 (2026-05-31). The quarantine layer only fires when the operator
+    has explicitly ratified the spam tier via ``/calibration_ok spam``
+    (which flips ``confidence.spam`` to ``true`` in the state file).
+    Pre-flip — and through every prior calibration cycle — the
+    classifier writes the spam priority into the frontmatter but
+    leaves the record at its normal vault location.
+
+    Failure-tolerant: missing state file, malformed JSON, missing
+    ``confidence`` key, or unexpected types all return False (treat
+    as flag-off). The justification matches the dispatch's edge-case
+    spec: ``state file missing → treat as flag=false``. We never
+    want a stat / parse error to silently quarantine records when
+    the operator hasn't approved the surfacing.
+    """
+    try:
+        text = Path(state_path).read_text(encoding="utf-8")
+        state = json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(state, dict):
+        return False
+    confidence = state.get("confidence")
+    if not isinstance(confidence, dict):
+        return False
+    return bool(confidence.get("spam"))
+
+
+def _quarantine_spam_record(
+    vault_path: Path,
+    note_rel_path: str,
+    config: EmailClassifierConfig,
+    *,
+    session_path: str | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """Move a spam-classified record to the quarantine directory.
+
+    Returns the new vault-relative path on success, ``None`` when the
+    move was skipped (e.g. the destination directory creation failed,
+    or vault_move raised). Failure to quarantine is logged but does
+    NOT crash the classifier — the record stays at its normal
+    location and the operator can re-process via the calibration loop.
+
+    Quarantine path convention (c6, 2026-05-31):
+    ``<vault>/<config.quarantine_dir_name>/spam/<YYYY-MM>/<filename>``
+
+    YYYY-MM bucketing matches the daily_sync calendar grouping +
+    keeps each month's quarantine directory finite (operators can
+    archive old months wholesale). The filename preserves the
+    classifier's pre-quarantine name so an operator who finds a
+    misclassification can grep the quarantine root by stem.
+
+    ``now`` (default ``datetime.now()``) is injectable so tests can
+    pin the YYYY-MM bucket without freezing the clock.
+    """
+    if now is None:
+        now = datetime.now()
+    month_bucket = now.strftime("%Y-%m")
+
+    # Preserve the filename (just the basename) — the directory
+    # changes from ``note/`` to ``<quarantine>/spam/<YYYY-MM>/``.
+    filename = Path(note_rel_path).name
+    dest_rel_path = (
+        f"{config.quarantine_dir_name}/spam/{month_bucket}/{filename}"
+    )
+
+    # Pre-create the destination directory so vault_move's
+    # filesystem-fallback path succeeds (it does mkdir(parents=True)
+    # itself, but a pre-existing tree means the Obsidian-CLI path
+    # also lands cleanly). Defensive — no harm if it already exists.
+    dest_full = vault_path / dest_rel_path
+    try:
+        dest_full.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning(
+            "email_classifier.quarantine_mkdir_failed",
+            path=note_rel_path,
+            dest=dest_rel_path,
+            error=str(exc),
+        )
+        return None
+
+    try:
+        vault_move(vault_path, note_rel_path, dest_rel_path)
+    except VaultError as exc:
+        log.warning(
+            "email_classifier.quarantine_move_failed",
+            path=note_rel_path,
+            dest=dest_rel_path,
+            error=str(exc),
+        )
+        return None
+
+    # Log to the mutation log so the audit trail captures the move
+    # alongside the priority frontmatter edit. ``scope`` mirrors the
+    # priority-edit mutation so an operator audit can correlate the
+    # two by scope.
+    if session_path is not None:
+        try:
+            log_mutation(
+                session_path,
+                "move",
+                note_rel_path,
+                scope="email_classifier",
+                # Stash the dest in the mutation entry's extra data
+                # so an operator reviewing the audit log can see the
+                # quarantine destination without separately querying.
+                dest=dest_rel_path,
+            )
+        except Exception as exc:  # noqa: BLE001 — audit log must not crash classifier
+            log.warning(
+                "email_classifier.quarantine_log_failed",
+                path=note_rel_path,
+                dest=dest_rel_path,
+                error=str(exc),
+            )
+
+    log.info(
+        "email_classifier.quarantined_spam",
+        path=note_rel_path,
+        dest=dest_rel_path,
+        month_bucket=month_bucket,
+    )
+    return dest_rel_path
+
+
 # --- Classification entry points -------------------------------------------
 
 
@@ -697,6 +840,42 @@ def classify_record(
             path=note_rel_path,
             error=str(exc),
         )
+        # Skip quarantine when the priority write failed — the record
+        # didn't get the spam frontmatter persisted, so quarantining
+        # it would lose the operator-recoverable signal. Operator
+        # log review of email_classifier.write_failed surfaces the
+        # broken case for retry.
+        return result
+
+    # c6 spam quarantine (2026-05-31). Runs AFTER the priority is
+    # successfully persisted via vault_edit. Two gates: classifier
+    # said "spam" AND the operator has ratified spam surfacing via
+    # /calibration_ok spam (which flipped daily_sync confidence.spam
+    # to true). Pre-ratification (operator still calibrating), spam
+    # records stay in the normal location so /tier_inspect and
+    # corpus review work normally.
+    #
+    # Quarantine failure (mkdir / move error) is logged but doesn't
+    # propagate — the record stays at its normal location with the
+    # spam priority frontmatter persisted. Operator-discoverable via
+    # the email_classifier.quarantine_* warning logs.
+    #
+    # Per feedback_intentionally_left_blank.md: the no-op cases (not
+    # spam OR flag not enabled) are silent-by-design — there's no
+    # operator-actionable signal in "didn't quarantine the 5,000th
+    # non-spam email today." Only the firing case logs, plus the
+    # failure cases.
+    if result.priority == "spam" and _is_spam_quarantine_enabled(
+        config.quarantine_state_path
+    ):
+        quarantined_to = _quarantine_spam_record(
+            vault_path,
+            note_rel_path,
+            config,
+            session_path=session_path,
+        )
+        if quarantined_to is not None:
+            result.quarantined_to = quarantined_to
 
     return result
 

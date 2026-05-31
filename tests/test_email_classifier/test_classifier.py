@@ -1308,3 +1308,264 @@ def test_alias_match_handles_regex_metachars(
     # has no boundary around the ``OBrien`` substring).
     assert result2.priority == "low"
     assert result2.override_applied is False
+
+
+# ---------------------------------------------------------------------------
+# c6 — spam quarantine layer (2026-05-31)
+# ---------------------------------------------------------------------------
+#
+# Two gates: (a) classifier verdict == "spam", (b) operator has ratified
+# spam surfacing via ``/calibration_ok spam`` (which flipped the
+# ``confidence.spam`` flag in the daily_sync state file to true). When
+# both fire, vault_move the record to ``<quarantine>/spam/<YYYY-MM>/``.
+# Pre-ratification (the most common state during c1-c5 calibration) the
+# spam frontmatter persists but the record stays at its normal vault
+# location. See ``classifier._quarantine_spam_record`` for the path
+# convention; see ``EmailClassifierConfig.quarantine_*`` for the config
+# surface.
+
+
+def _seed_confidence_state(state_path: Path, *, spam_flag: bool) -> None:
+    """Write a minimal daily_sync state file with the confidence map.
+
+    Mirrors the on-disk shape ``daily_sync.confidence.list_confidence``
+    produces — see ``alfred/daily_sync/confidence.py::load_state`` for
+    the canonical reader.
+    """
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({
+            "confidence": {
+                "high": True,
+                "medium": True,
+                "low": True,
+                "spam": spam_flag,
+            },
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_classifier_quarantines_spam_when_flag_true(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+) -> None:
+    """Classifier verdict ``spam`` + ``confidence.spam: true`` →
+    record gets moved to ``quarantine/spam/<YYYY-MM>/<filename>``."""
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    _seed_confidence_state(state_path, spam_flag=True)
+    enabled_config.quarantine_state_path = str(state_path)
+
+    rel = _seed_note(classifier_vault, "Obvious spam pitch")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "spam",
+        "action_hint": None,
+        "reasoning": "unsolicited commercial pitch",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # The result carries the quarantine destination.
+    assert result.priority == "spam"
+    assert result.quarantined_to != ""
+    # Path format: quarantine/spam/YYYY-MM/<filename>
+    assert result.quarantined_to.startswith("quarantine/spam/")
+    assert result.quarantined_to.endswith("Obvious spam pitch.md")
+
+    # On-disk: the record exists at the new location, not the old.
+    new_full = classifier_vault / result.quarantined_to
+    old_full = classifier_vault / rel
+    assert new_full.exists(), "record missing from quarantine destination"
+    assert not old_full.exists(), "record still present at original note/ path"
+
+    # Frontmatter survives the move — priority + reasoning intact so
+    # an operator reviewing the quarantine can see WHY the classifier
+    # flagged it.
+    post = frontmatter.load(str(new_full))
+    assert post.metadata["priority"] == "spam"
+    assert "unsolicited" in post.metadata.get("priority_reasoning", "")
+
+
+def test_classifier_does_not_quarantine_spam_when_flag_false(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+) -> None:
+    """Classifier verdict ``spam`` + ``confidence.spam: false`` →
+    record stays at normal path (current pre-c6 behavior preserved).
+
+    This is the dominant state during c1-c5 calibration before the
+    operator explicitly ratifies spam surfacing."""
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    _seed_confidence_state(state_path, spam_flag=False)
+    enabled_config.quarantine_state_path = str(state_path)
+
+    rel = _seed_note(classifier_vault, "Spam in calibration window")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "spam",
+        "action_hint": None,
+        "reasoning": "looks spammy",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # Quarantine did NOT fire — record stays at note/<file>.md
+    assert result.priority == "spam"
+    assert result.quarantined_to == ""
+    # On-disk: record at original location, no quarantine tree created.
+    assert (classifier_vault / rel).exists()
+    assert not (classifier_vault / "quarantine").exists()
+
+
+def test_classifier_does_not_quarantine_non_spam_when_flag_true(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+) -> None:
+    """Classifier verdict ``medium`` + ``confidence.spam: true`` →
+    record stays at normal path. The flag gates spam quarantine ONLY;
+    non-spam verdicts proceed unchanged regardless of the flag's
+    state."""
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    _seed_confidence_state(state_path, spam_flag=True)
+    enabled_config.quarantine_state_path = str(state_path)
+
+    rel = _seed_note(classifier_vault, "Routine appointment confirm")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "medium",
+        "action_hint": "calendar",
+        "reasoning": "appointment confirm from a vendor",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "medium"
+    assert result.quarantined_to == ""
+    assert (classifier_vault / rel).exists()
+    assert not (classifier_vault / "quarantine").exists()
+
+
+def test_classifier_does_not_quarantine_when_state_file_missing(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+) -> None:
+    """Edge case from the dispatch: state file missing → treat as
+    flag=false (don't crash; don't quarantine if flag-mechanism state
+    is unreadable).
+
+    Operator-actionable: a missing state file usually means the
+    daily_sync daemon hasn't been run yet, OR the operator deleted
+    the state to reset calibration. Either way, the safest default
+    is "stay at normal path" rather than silently quarantine on a
+    state we can't read."""
+    # Point at a non-existent path — load_state returns {} → flag is
+    # treated as False.
+    enabled_config.quarantine_state_path = str(
+        tmp_path / "nonexistent" / "daily_sync_state.json"
+    )
+
+    rel = _seed_note(classifier_vault, "Spam with no state file")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "spam",
+        "action_hint": None,
+        "reasoning": "spammy",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "spam"
+    assert result.quarantined_to == ""
+    assert (classifier_vault / rel).exists()
+
+
+def test_classifier_does_not_quarantine_when_state_file_malformed(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+) -> None:
+    """Defensive: a corrupt state file (truncated JSON, garbage)
+    falls back to flag=false rather than crashing the classifier.
+    Mirrors the same fail-safe stance as the missing-file case.
+
+    Pre-c6, the daily_sync ``load_state`` helper already had the
+    "tolerant of malformed JSON" behavior (confidence.py:60); this
+    test pins that the classifier's read path also tolerates."""
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{not valid json at all", encoding="utf-8")
+    enabled_config.quarantine_state_path = str(state_path)
+
+    rel = _seed_note(classifier_vault, "Spam with garbage state")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "spam",
+        "action_hint": None,
+        "reasoning": "spammy",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "spam"
+    assert result.quarantined_to == ""
+
+
+def test_classifier_does_not_quarantine_when_unclassified(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+) -> None:
+    """LLM parse failure → priority=unclassified (sentinel). Even when
+    the spam flag is true, an unclassified record is NOT quarantined
+    — quarantine is gated on the explicit ``"spam"`` verdict, not on
+    any non-high/medium/low value. This prevents the calibration
+    loop's "needs reclassification" records from being moved out of
+    the active processing pipeline."""
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    _seed_confidence_state(state_path, spam_flag=True)
+    enabled_config.quarantine_state_path = str(state_path)
+
+    rel = _seed_note(classifier_vault, "Confused classifier output")
+    fake = _FakeLLM(response="prose, not JSON")  # → sentinel
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "unclassified"
+    assert result.quarantined_to == ""
+    assert (classifier_vault / rel).exists()
