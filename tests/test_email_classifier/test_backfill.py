@@ -507,14 +507,76 @@ def test_backfill_progress_log_fires_at_interval(
 #   log event with old_priority + new_priority fields for grep
 # - reclassify+dry_run → counts re-evaluations without LLM call or
 #   write (dry-run beats reclassify when both passed)
+#
+# c6 quarantine isolation: the classifier shipped 2026-05-31 with a
+# spam-quarantine layer that reads ``data/daily_sync_state.json`` and
+# moves spam-classified records to ``quarantine/spam/<YYYY-MM>/`` when
+# ``confidence.spam: true``. ``EmailClassifierConfig.quarantine_state_path``
+# defaults to the relative ``./data/daily_sync_state.json``, which
+# resolves against the test's cwd at runtime — if any prior test or
+# live state has flipped the flag to true, reclassify tests whose
+# classifier returns spam will see their records moved out from under
+# them (review on 521e578 caught this with a FileNotFoundError on the
+# post-test ``frontmatter.load(vault / rel)`` assertion).
+#
+# ``_isolate_quarantine_state`` writes an explicit ``confidence.spam:
+# false`` to a tmp-path state file AND points the test's config at
+# it, so the quarantine gate evaluates to False regardless of the
+# live state. Every reclassify test that uses a spam classifier
+# verdict MUST call this — the regression-pin
+# ``test_backfill_reclassify_isolated_from_c6_quarantine_flag``
+# below also pins the contract explicitly.
+
+
+def _isolate_quarantine_state(
+    tmp_path: Path,
+    config: EmailClassifierConfig,
+    *,
+    spam_flag: bool = False,
+) -> Path:
+    """Write a daily_sync state file with the requested spam flag AND
+    point the config's quarantine_state_path at it.
+
+    Default ``spam_flag=False`` makes the quarantine layer a no-op —
+    the configured-flag-false branch returns the record stays at its
+    normal vault location even when the classifier returns spam.
+
+    Returns the state-file path for tests that want to assert on its
+    content (e.g., the isolation-pin test).
+    """
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({
+            "confidence": {
+                "high": True,
+                "medium": True,
+                "low": True,
+                "spam": spam_flag,
+            },
+        }),
+        encoding="utf-8",
+    )
+    config.quarantine_state_path = str(state_path)
+    return state_path
 
 
 def test_backfill_reclassify_processes_records_with_existing_priority(
     vault: Path,
     enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
 ) -> None:
     """Record with ``priority: low`` set; reclassify=True + classifier
-    returns ``spam`` → frontmatter priority overwritten to ``spam``."""
+    returns ``spam`` → frontmatter priority overwritten to ``spam``.
+
+    Isolated from c6 quarantine (see ``_isolate_quarantine_state``
+    docstring + the dedicated isolation-pin test below) — without
+    this, a live ``data/daily_sync_state.json`` with ``spam: true``
+    would trigger the c6 quarantine layer, MOVE the record to
+    ``quarantine/spam/<YYYY-MM>/``, and break the post-test
+    ``frontmatter.load(vault / rel)`` assertion with FileNotFoundError
+    (review caught this on the original 521e578)."""
+    _isolate_quarantine_state(tmp_path, enabled_config, spam_flag=False)
     rel = _seed_note(
         vault,
         "Mockingbird marketing — was misclassified low",
@@ -547,17 +609,28 @@ def test_backfill_reclassify_processes_records_with_existing_priority(
     post = frontmatter.load(str(vault / rel))
     assert post.metadata["priority"] == "spam"
     assert "retroactive" in post.metadata.get("priority_reasoning", "")
+    # Quarantine did NOT fire — confirms _isolate_quarantine_state
+    # actually held the c6 layer off. If quarantine had fired, the
+    # record would be at quarantine/spam/<YYYY-MM>/ and this
+    # directory would exist; its absence pins isolation.
+    assert not (vault / "quarantine").exists()
 
 
 def test_backfill_reclassify_false_default_preserves_existing_behavior(
     vault: Path,
     enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
 ) -> None:
     """Regression-pin for the pre-2026-05-31 contract: default
     reclassify=False keeps the has_priority skip-gate, no LLM call
     fires for already-classified records. A future change that flips
     the default to True silently re-classifies the entire vault on
-    every cron-driven backfill run — this test catches that drift."""
+    every cron-driven backfill run — this test catches that drift.
+
+    Isolated from c6 quarantine for defense-in-depth (cheap; cuts
+    contamination risk if a future edit changes the fake LLM
+    response to spam)."""
+    _isolate_quarantine_state(tmp_path, enabled_config, spam_flag=False)
     rel = _seed_note(
         vault,
         "Already classified — must not re-evaluate",
@@ -587,6 +660,7 @@ def test_backfill_reclassify_logs_verdict_change(
     vault: Path,
     enabled_config: EmailClassifierConfig,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     """When a reclassify re-evaluation produces a DIFFERENT priority
     than the on-disk value, info-level
@@ -597,7 +671,11 @@ def test_backfill_reclassify_logs_verdict_change(
     Mirrors the capsys-stdout pattern of
     ``test_backfill_progress_log_fires_at_interval`` (the project
     routes structlog through ConsoleRenderer; capsys captures
-    rendered events from stdout)."""
+    rendered events from stdout). Isolated from c6 quarantine —
+    classifier returns spam, which would otherwise trigger the move
+    + pollute capsys output with the quarantine_spam log line.
+    """
+    _isolate_quarantine_state(tmp_path, enabled_config, spam_flag=False)
     _seed_note(
         vault, "Verdict change candidate",
         body=_EMAIL_BODY, priority="medium",
@@ -632,12 +710,19 @@ def test_backfill_reclassify_logs_verdict_change(
 def test_backfill_reclassify_dry_run_does_not_write(
     vault: Path,
     enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
 ) -> None:
     """reclassify=True + dry_run=True → counts re-evaluations as
     candidates, but makes NO LLM call and writes NO frontmatter.
     dry-run beats reclassify when both passed (matches the
     existing dry-run-beats-real-call composition of --dry-run +
-    --limit in non-reclassify mode)."""
+    --limit in non-reclassify mode).
+
+    Isolated from c6 quarantine for defense-in-depth (cheap; dry-run
+    skips the LLM call so the quarantine path can't fire today, but
+    a future bug that flips the dry-run-beats-reclassify ordering
+    would otherwise contaminate this test)."""
+    _isolate_quarantine_state(tmp_path, enabled_config, spam_flag=False)
     rel = _seed_note(
         vault, "Dry-run reclassify candidate",
         body=_EMAIL_BODY, priority="low",
@@ -661,3 +746,73 @@ def test_backfill_reclassify_dry_run_does_not_write(
     # On-disk: priority untouched.
     post = frontmatter.load(str(vault / rel))
     assert post.metadata["priority"] == "low"
+
+
+def test_backfill_reclassify_isolated_from_c6_quarantine_flag(
+    vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+) -> None:
+    """Cross-isolation regression-pin (review-fix on 521e578).
+
+    The c6 spam-quarantine layer (cab582c) reads
+    ``data/daily_sync_state.json`` for the ``confidence.spam`` flag
+    and, when true, moves spam-classified records to
+    ``quarantine/spam/<YYYY-MM>/`` BEFORE this test's frontmatter
+    assertions run. ``EmailClassifierConfig.quarantine_state_path``
+    defaults to ``./data/daily_sync_state.json`` (relative path
+    resolving against cwd at runtime), so a live state file OR
+    earlier-test contamination could flip the gate.
+
+    This test pins the contract: when the quarantine_state_path is
+    explicitly seeded with ``spam: false``, a reclassify run whose
+    classifier returns spam does NOT trigger the quarantine — the
+    record stays at ``note/<file>.md``. Failure of this test means
+    either (a) ``_isolate_quarantine_state`` is broken, or (b) the
+    quarantine gate stopped honoring the spam=false branch.
+
+    Counterpart test in tests/test_email_classifier/test_classifier.py
+    (``test_classifier_does_not_quarantine_spam_when_flag_false``)
+    pins the same gate at the classifier-call layer; this pins it at
+    the backfill-via-classifier layer."""
+    state_path = _isolate_quarantine_state(
+        tmp_path, enabled_config, spam_flag=False,
+    )
+    rel = _seed_note(
+        vault, "Spam classified during isolated reclassify",
+        body=_EMAIL_BODY, priority="low",
+    )
+    fake = _FakeLLM(response=_classifier_response(
+        priority="spam",
+        reasoning="isolation-pin classifier verdict",
+    ))
+
+    summary = run_backfill(
+        vault_path=vault,
+        config=enabled_config,
+        llm_caller=fake,
+        reclassify=True,
+    )
+
+    # Classification ran (spam verdict reached the writer).
+    assert summary.classified == 1
+    assert summary.reclassified_verdict_changes == 1
+
+    # On-disk: record is STILL at the original note/ path. Quarantine
+    # did NOT fire because the state file we wrote has spam=false.
+    assert (vault / rel).exists(), (
+        "record was MOVED out of note/ — isolation broken; check that "
+        "_isolate_quarantine_state actually points config at the "
+        "tmp state file, and that the file contains spam=false"
+    )
+    # Frontmatter rewritten with new spam verdict.
+    post = frontmatter.load(str(vault / rel))
+    assert post.metadata["priority"] == "spam"
+
+    # Defense-in-depth: no quarantine directory tree was created.
+    assert not (vault / "quarantine").exists()
+
+    # Sanity: the state file we wrote is the one the config points at.
+    # Pin so a future change to _isolate_quarantine_state can't silently
+    # break the wiring (e.g., if the helper stops updating the config).
+    assert enabled_config.quarantine_state_path == str(state_path)
