@@ -485,3 +485,179 @@ def test_backfill_progress_log_fires_at_interval(
     assert progress_count >= 2, (
         f"expected ≥2 progress logs, got {progress_count}\n--- stdout ---\n{captured.out}"
     )
+
+
+# ---------------------------------------------------------------------------
+# run_backfill — --reclassify flag (2026-05-31)
+# ---------------------------------------------------------------------------
+#
+# Operator use case: after a corpus / few-shot fix lands, the historical
+# vault holds records classified under the broken prompt. Default
+# backfill skips records with priority already set (the c1 "fill in
+# missing field" use case). --reclassify bypasses that gate so the
+# improved classifier rewrites historical verdicts.
+#
+# Contract:
+# - reclassify=False (default) → existing skip-on-existing-priority
+#   behavior preserved (regression-pin)
+# - reclassify=True → re-evaluate records with priority set, overwrite
+#   on disk, count verdict CHANGES (not no-op re-confirms) on summary
+#   .reclassified_verdict_changes
+# - Verdict change → info-level email_classifier.backfill.reclassified
+#   log event with old_priority + new_priority fields for grep
+# - reclassify+dry_run → counts re-evaluations without LLM call or
+#   write (dry-run beats reclassify when both passed)
+
+
+def test_backfill_reclassify_processes_records_with_existing_priority(
+    vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Record with ``priority: low`` set; reclassify=True + classifier
+    returns ``spam`` → frontmatter priority overwritten to ``spam``."""
+    rel = _seed_note(
+        vault,
+        "Mockingbird marketing — was misclassified low",
+        body=_EMAIL_BODY,
+        priority="low",  # pre-reclassify verdict from broken few-shot
+    )
+    fake = _FakeLLM(response=_classifier_response(
+        priority="spam",
+        reasoning="unsolicited commercial, retroactive verdict",
+    ))
+
+    summary = run_backfill(
+        vault_path=vault,
+        config=enabled_config,
+        llm_caller=fake,
+        reclassify=True,
+    )
+
+    # Re-evaluated, not skipped.
+    assert summary.classified == 1
+    assert summary.skipped_already_done == 0, (
+        "reclassify mode must bypass the has_priority gate; "
+        "skipped_already_done should stay 0"
+    )
+    # Verdict actually changed (low → spam) so the change counter ticks.
+    assert summary.reclassified_verdict_changes == 1
+    assert len(fake.calls) == 1
+
+    # On-disk verification: priority overwritten.
+    post = frontmatter.load(str(vault / rel))
+    assert post.metadata["priority"] == "spam"
+    assert "retroactive" in post.metadata.get("priority_reasoning", "")
+
+
+def test_backfill_reclassify_false_default_preserves_existing_behavior(
+    vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Regression-pin for the pre-2026-05-31 contract: default
+    reclassify=False keeps the has_priority skip-gate, no LLM call
+    fires for already-classified records. A future change that flips
+    the default to True silently re-classifies the entire vault on
+    every cron-driven backfill run — this test catches that drift."""
+    rel = _seed_note(
+        vault,
+        "Already classified — must not re-evaluate",
+        body=_EMAIL_BODY,
+        priority="low",
+    )
+    fake = _FakeLLM(response="should not be called")
+
+    # reclassify NOT passed → defaults to False
+    summary = run_backfill(
+        vault_path=vault,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # Pre-2026-05-31 behavior preserved.
+    assert summary.skipped_already_done == 1
+    assert summary.classified == 0
+    assert summary.reclassified_verdict_changes == 0
+    assert len(fake.calls) == 0
+    # On-disk: priority unchanged.
+    post = frontmatter.load(str(vault / rel))
+    assert post.metadata["priority"] == "low"
+
+
+def test_backfill_reclassify_logs_verdict_change(
+    vault: Path,
+    enabled_config: EmailClassifierConfig,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When a reclassify re-evaluation produces a DIFFERENT priority
+    than the on-disk value, info-level
+    ``email_classifier.backfill.reclassified`` fires with both
+    priorities pinned so operator log review can grep verdict changes
+    apart from no-op re-confirms.
+
+    Mirrors the capsys-stdout pattern of
+    ``test_backfill_progress_log_fires_at_interval`` (the project
+    routes structlog through ConsoleRenderer; capsys captures
+    rendered events from stdout)."""
+    _seed_note(
+        vault, "Verdict change candidate",
+        body=_EMAIL_BODY, priority="medium",
+    )
+    fake = _FakeLLM(response=_classifier_response(
+        priority="spam",  # different from on-disk "medium"
+        reasoning="retroactive spam under corrected few-shot",
+    ))
+
+    run_backfill(
+        vault_path=vault,
+        config=enabled_config,
+        llm_caller=fake,
+        reclassify=True,
+        # Disable the progress log so its events don't pollute the
+        # capsys output we're grepping.
+        progress_every=0,
+    )
+
+    captured = capsys.readouterr()
+    # Event name present in rendered output.
+    assert "email_classifier.backfill.reclassified" in captured.out, (
+        f"reclassified log event missing from capsys output:\n--- stdout ---\n{captured.out}"
+    )
+    # Both old + new priorities surfaced as structured fields. Pin
+    # both values so a future refactor that drops either field fails
+    # this test (per feedback_log_emission_test_pattern.md).
+    assert "old_priority=medium" in captured.out or "old_priority='medium'" in captured.out
+    assert "new_priority=spam" in captured.out or "new_priority='spam'" in captured.out
+
+
+def test_backfill_reclassify_dry_run_does_not_write(
+    vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """reclassify=True + dry_run=True → counts re-evaluations as
+    candidates, but makes NO LLM call and writes NO frontmatter.
+    dry-run beats reclassify when both passed (matches the
+    existing dry-run-beats-real-call composition of --dry-run +
+    --limit in non-reclassify mode)."""
+    rel = _seed_note(
+        vault, "Dry-run reclassify candidate",
+        body=_EMAIL_BODY, priority="low",
+    )
+    fake = _FakeLLM(response="should not be called")
+
+    summary = run_backfill(
+        vault_path=vault,
+        config=enabled_config,
+        llm_caller=fake,
+        reclassify=True,
+        dry_run=True,
+    )
+
+    # Record was a candidate (would be re-evaluated in a live run).
+    assert summary.candidates == 1
+    # But no LLM call, no classification, no verdict-change accounting.
+    assert summary.classified == 0
+    assert summary.reclassified_verdict_changes == 0
+    assert len(fake.calls) == 0
+    # On-disk: priority untouched.
+    post = frontmatter.load(str(vault / rel))
+    assert post.metadata["priority"] == "low"

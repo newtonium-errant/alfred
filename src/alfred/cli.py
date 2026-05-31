@@ -552,7 +552,10 @@ def cmd_email_classifier(args: argparse.Namespace) -> None:
 
     subcmd = getattr(args, "email_classifier_cmd", None)
     if subcmd != "backfill":
-        print("Usage: alfred email-classifier backfill [--dry-run] [--limit N]")
+        print(
+            "Usage: alfred email-classifier backfill "
+            "[--dry-run] [--limit N] [--reclassify]"
+        )
         sys.exit(1)
 
     from alfred.email_classifier import EmailClassifierConfig, run_backfill
@@ -580,16 +583,23 @@ def cmd_email_classifier(args: argparse.Namespace) -> None:
         config=config,
         dry_run=args.dry_run,
         limit=args.limit,
+        reclassify=args.reclassify,
     )
 
     print()
     print("=== Email-classifier backfill summary ===")
+    if args.reclassify:
+        print(f"  mode:                         reclassify (overwrite existing priority)")
     if args.dry_run:
         print(f"  candidates (would classify): {summary.candidates}")
     else:
         print(f"  classified:                   {summary.classified}")
     print(f"  skipped (already classified): {summary.skipped_already_done}")
     print(f"  skipped (not email-derived):  {summary.skipped_not_email}")
+    if args.reclassify:
+        # Verdict-change count is only meaningful in reclassify mode;
+        # in default mode it's always zero (no record gets a second look).
+        print(f"  verdict changes:              {summary.reclassified_verdict_changes}")
     print(f"  errors:                       {summary.errors}")
     print(f"  elapsed seconds:              {summary.elapsed_seconds:.1f}")
     if summary.error_paths:
@@ -2986,6 +2996,15 @@ def build_parser() -> argparse.ArgumentParser:
     ec_backfill.add_argument(
         "--limit", type=int, default=None,
         help="Cap the number of records actually classified (skips don't count)",
+    )
+    ec_backfill.add_argument(
+        "--reclassify", action="store_true", default=False,
+        help=(
+            "Process records EVEN when priority is already set; overwrite "
+            "priority + action_hint + reasoning with new classification. "
+            "Use this after a corpus / few-shot prompt fix to retroactively "
+            "re-evaluate historical records. Composes with --dry-run + --limit."
+        ),
     )
 
     # janitor

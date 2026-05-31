@@ -85,6 +85,24 @@ class BackfillSummary:
     buckets are mutually exclusive. ``errors`` counts records where
     :func:`classify_record` raised an unexpected exception — the run
     continues, but we want the count visible in the summary.
+
+    ``skipped_already_done`` counts records that had ``priority`` set
+    AND were therefore skipped by the default-behavior gate. Always
+    zero when ``reclassify=True`` is passed to :func:`run_backfill`
+    (reclassify mode bypasses the gate, so no record is ever "skipped
+    as already done"). Operator log review of a reclassify-mode run
+    should see this field at 0 and the classified count include the
+    previously-classified records that got re-evaluated.
+
+    ``reclassified_verdict_changes`` (2026-05-31) counts records where
+    a reclassify-mode run produced a DIFFERENT priority than the one
+    already on disk. Zero on default runs (reclassify=False), and zero
+    on reclassify runs where the new few-shot confirms every old
+    verdict. Operator-actionable signal: "how many records actually
+    moved tier under the corrected classifier?" If this stays at 0
+    on a large reclassify run, the corrected few-shot didn't change
+    the model's mind on anything — investigate whether the corpus
+    fix landed in the prompt.
     """
 
     candidates: int = 0
@@ -94,6 +112,7 @@ class BackfillSummary:
     errors: int = 0
     elapsed_seconds: float = 0.0
     error_paths: list[str] = field(default_factory=list)
+    reclassified_verdict_changes: int = 0
 
 
 # --- Heuristics -------------------------------------------------------------
@@ -150,6 +169,7 @@ def run_backfill(
     llm_caller: LLMCaller | None = None,
     now: Callable[[], float] = time.monotonic,
     progress_every: int = _PROGRESS_EVERY,
+    reclassify: bool = False,
 ) -> BackfillSummary:
     """Walk ``vault/note/`` and classify email-derived notes without priority.
 
@@ -164,6 +184,18 @@ def run_backfill(
     - ``now``: injectable clock for deterministic test timing.
     - ``progress_every``: emit a progress log every N *processed*
       records (candidates + skipped). 0 disables progress logging.
+    - ``reclassify`` (2026-05-31): when True, process records EVEN
+      when ``priority`` is already set; overwrite priority +
+      action_hint + reasoning with the new classification. Default
+      False preserves the original "fill in the missing field" use
+      case. Composes with ``dry_run`` (counts re-evaluations without
+      writing) and ``limit`` (caps LLM calls, not skips). Operator
+      use case: a post-corpus-fix retroactive re-evaluation so the
+      improved few-shot rewrites earlier verdicts. Verdict CHANGES
+      (vs no-op re-confirmations) are counted on
+      ``summary.reclassified_verdict_changes`` and logged at info-
+      level via ``email_classifier.backfill.reclassified`` with
+      ``old_priority`` + ``new_priority`` fields for operator grep.
 
     Returns a :class:`BackfillSummary` with counts. The caller (CLI) is
     responsible for rendering the summary to the operator.
@@ -183,6 +215,7 @@ def run_backfill(
         total=total,
         dry_run=dry_run,
         limit=limit,
+        reclassify=reclassify,
     )
 
     for idx, note_file in enumerate(note_files, start=1):
@@ -202,10 +235,23 @@ def run_backfill(
         metadata = post.metadata or {}
         body = post.content or ""
 
+        # In default mode, skip records that already carry a priority.
+        # In reclassify mode, bypass this gate but capture the old
+        # priority so the verdict-change comparison + log can show the
+        # before/after pair.
+        old_priority: str | None = None
         if has_priority(metadata):
-            summary.skipped_already_done += 1
-            _maybe_log_progress(idx, total, start, now, summary, progress_every)
-            continue
+            if not reclassify:
+                summary.skipped_already_done += 1
+                _maybe_log_progress(idx, total, start, now, summary, progress_every)
+                continue
+            # reclassify mode: capture pre-reclassify verdict for the
+            # change-detection log below. Coerce to a str so non-str
+            # frontmatter (defensive — shouldn't happen on real vault
+            # records but has_priority's docstring tolerates non-str
+            # truthy values) renders cleanly in the log.
+            old_val = metadata.get("priority")
+            old_priority = str(old_val) if old_val is not None else None
 
         if not is_email_derived_note(metadata, body):
             summary.skipped_not_email += 1
@@ -218,6 +264,10 @@ def run_backfill(
             log.debug(
                 "email_classifier.backfill.dry_run_candidate",
                 path=rel_path,
+                # Surface old_priority on the dry-run log so a
+                # reclassify dry-run shows which records WOULD be
+                # re-evaluated, distinct from first-time candidates.
+                old_priority=old_priority,
             )
             _maybe_log_progress(idx, total, start, now, summary, progress_every)
             if limit is not None and summary.candidates >= limit:
@@ -228,8 +278,11 @@ def run_backfill(
         # Real run — call the classifier. ``inbox_content`` is the
         # note's own body (see module docstring for rationale). The
         # classifier writes priority + action_hint via vault_edit.
+        # In reclassify mode we use the returned ClassificationResult
+        # to compare against the captured old_priority and emit the
+        # verdict-change log when they differ.
         try:
-            classify_record(
+            result = classify_record(
                 vault_path=vault_path,
                 note_rel_path=rel_path,
                 inbox_content=body,
@@ -237,6 +290,18 @@ def run_backfill(
                 llm_caller=llm_caller,
             )
             summary.classified += 1
+            # Verdict-change accounting only meaningful in reclassify
+            # mode (default mode's old_priority is always None because
+            # records with priority were skipped before this point).
+            if reclassify and old_priority is not None:
+                if result.priority != old_priority:
+                    summary.reclassified_verdict_changes += 1
+                    log.info(
+                        "email_classifier.backfill.reclassified",
+                        path=rel_path,
+                        old_priority=old_priority,
+                        new_priority=result.priority,
+                    )
         except Exception as exc:  # noqa: BLE001 — one bad record must not abort the batch
             log.warning(
                 "email_classifier.backfill.classify_error",
@@ -261,6 +326,8 @@ def run_backfill(
         errors=summary.errors,
         elapsed_seconds=round(summary.elapsed_seconds, 2),
         dry_run=dry_run,
+        reclassify=reclassify,
+        reclassified_verdict_changes=summary.reclassified_verdict_changes,
     )
     return summary
 
