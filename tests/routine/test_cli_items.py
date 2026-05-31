@@ -253,6 +253,198 @@ def test_item_add_duplicate_text_returns_canary(
     assert len(_read_fm(vault, "Daily")["items"]) == 1
 
 
+def test_atomic_item_mutate_refusal_does_not_touch_file(
+    tmp_path: Path, capsys,
+) -> None:
+    """Regression pin (WARN-1, code-reviewer 2026-05-30) — refusal
+    paths through ``_atomic_item_mutate`` MUST NOT touch the file
+    on disk. Pre-fix, the primitive unconditionally called
+    ``_write_record_state``, which round-trips the YAML — even
+    identical content bumps mtime + can drift YAML formatting
+    (number normalisation, multiline-style flattening, list-of-
+    dicts reflow). The ``aborted=True`` signal on ``_MutationResult``
+    now gates the write; this test pins the no-write invariant for
+    all three refusal sites.
+
+    Covers all three refusal paths:
+      1. ``cmd_item_add`` duplicate-item: text matches existing →
+         ``aborted=True`` → file untouched.
+      2. ``cmd_item_edit`` cadence-conflict: existing item has
+         due_pattern, edit sets target_cadence_days without
+         --clear-due-pattern → ``aborted=True`` → file untouched.
+      3. ``cmd_item_edit`` TOCTOU-disappeared: hard to provoke from
+         a test (mutator sees the item disappear between load +
+         iteration), exercised by hand-deleting the items list
+         between load + mutate. Tested via the _atomic_item_mutate
+         primitive directly with a forced aborted return.
+
+    Pinning bytes (not just mtime) is the load-bearing invariant
+    — mtime alone could theoretically pass if write+read happen
+    within the same OS time granule. Byte-identity is the
+    semantic operator promise: "refused → file unchanged."
+    """
+    import os
+    import time
+
+    from alfred.routine.cli_items import (
+        _MutationResult,
+        _atomic_item_mutate,
+    )
+
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Daily", {
+        "type": "routine", "name": "Daily",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Walk dog", "priority": "tracked"}],
+    })
+    config = _config(vault, tmp_path)
+    record_path = vault / "routine" / "Daily.md"
+
+    # Capture baseline bytes + mtime BEFORE any refused call.
+    bytes_before = record_path.read_bytes()
+    mtime_before = record_path.stat().st_mtime_ns
+
+    # Small sleep so any erroneous write would produce a
+    # detectably-different mtime (avoids the same-OS-tick collision
+    # that could mask the bug on a fast filesystem).
+    time.sleep(0.01)
+
+    # --- Refusal path 1: duplicate-item on add --------------------
+    code = cmd_item_add(
+        config, record_name="Daily", item_text="Walk dog",
+        wants_json=True,
+    )
+    capsys.readouterr()  # drain canary output
+    assert code == 1, "duplicate-item path must exit 1"
+    assert record_path.read_bytes() == bytes_before, (
+        "duplicate-item refusal MUST NOT touch the file bytes "
+        "(YAML round-trip drift breaks the operator-promise "
+        '"refused → file unchanged")'
+    )
+    assert record_path.stat().st_mtime_ns == mtime_before, (
+        "duplicate-item refusal MUST NOT bump mtime"
+    )
+
+    # --- Refusal path 2: cadence-conflict on edit -----------------
+    # Re-seed the record with an item carrying due_pattern so the
+    # cadence-conflict path fires.
+    _write_routine(vault, "Bills", {
+        "type": "routine", "name": "Bills",
+        "cadence": {"type": "daily"},
+        "items": [{
+            "text": "Pay rent", "priority": "critical",
+            "due_pattern": {"type": "monthly", "day": 1},
+            "escalate_at_days": 0,
+        }],
+    })
+    bills_path = vault / "routine" / "Bills.md"
+    bills_bytes_before = bills_path.read_bytes()
+    bills_mtime_before = bills_path.stat().st_mtime_ns
+    time.sleep(0.01)
+
+    code = cmd_item_edit(
+        config, record_name="Bills", item_text="Pay rent",
+        target_cadence_days=30,
+        # --clear-due-pattern intentionally NOT supplied → conflict.
+        wants_json=True,
+    )
+    capsys.readouterr()  # drain canary
+    assert code == 1, "cadence-conflict path must exit 1"
+    assert bills_path.read_bytes() == bills_bytes_before, (
+        "cadence-conflict refusal MUST NOT touch the file bytes"
+    )
+    assert bills_path.stat().st_mtime_ns == bills_mtime_before, (
+        "cadence-conflict refusal MUST NOT bump mtime"
+    )
+
+    # --- Refusal path 3: forced aborted=True via the primitive ----
+    # Direct exercise of _atomic_item_mutate's gate. A mutator that
+    # returns aborted=True must NOT trigger a write. This covers
+    # the TOCTOU-disappeared refusal path in cmd_item_edit without
+    # needing to provoke the race condition itself.
+    _write_routine(vault, "Test", {
+        "type": "routine", "name": "Test",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "X", "priority": "tracked"}],
+    })
+    test_path = vault / "routine" / "Test.md"
+    test_bytes_before = test_path.read_bytes()
+    test_mtime_before = test_path.stat().st_mtime_ns
+    time.sleep(0.01)
+
+    def _refuse_mutator(items, completion_log):
+        # Return ANY state with aborted=True — primitive must skip
+        # the write regardless of what items/completion_log contain.
+        return _MutationResult(
+            items=[{"text": "totally different", "priority": "critical"}],
+            completion_log={"different": ["2026-05-30"]},
+            payload_extras={},
+            aborted=True,
+        )
+
+    result = _atomic_item_mutate(test_path, _refuse_mutator)
+    assert result.aborted is True
+    assert test_path.read_bytes() == test_bytes_before, (
+        "aborted=True MUST NOT touch the file bytes even when the "
+        "mutator returns wildly different items/completion_log"
+    )
+    assert test_path.stat().st_mtime_ns == test_mtime_before, (
+        "aborted=True MUST NOT bump mtime"
+    )
+
+
+def test_atomic_item_mutate_success_does_touch_file(
+    tmp_path: Path,
+) -> None:
+    """Companion regression pin to the refusal test above: success
+    path (aborted=False, the default) MUST write the file.
+
+    Sanity check that the gate isn't accidentally suppressing
+    legitimate writes — the bytes+mtime invariant only applies to
+    refusals."""
+    import time
+
+    from alfred.routine.cli_items import (
+        _MutationResult,
+        _atomic_item_mutate,
+    )
+
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Test", {
+        "type": "routine", "name": "Test",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "X", "priority": "tracked"}],
+    })
+    test_path = vault / "routine" / "Test.md"
+    bytes_before = test_path.read_bytes()
+    mtime_before = test_path.stat().st_mtime_ns
+    time.sleep(0.01)
+
+    def _success_mutator(items, completion_log):
+        # Mutate items (append a new one) + return without aborted
+        # flag. Primitive MUST write.
+        items.append({"text": "Y", "priority": "tracked"})
+        return _MutationResult(
+            items=items,
+            completion_log=completion_log,
+            payload_extras={},
+        )
+
+    result = _atomic_item_mutate(test_path, _success_mutator)
+    assert result.aborted is False  # default
+    # File DID change.
+    assert test_path.read_bytes() != bytes_before, (
+        "Success path (aborted=False) MUST write the file"
+    )
+    assert test_path.stat().st_mtime_ns > mtime_before, (
+        "Success path MUST bump mtime"
+    )
+    # New item landed on disk.
+    fm = _read_fm(vault, "Test")
+    assert len(fm["items"]) == 2
+    assert fm["items"][1]["text"] == "Y"
+
+
 def test_item_add_unknown_record_returns_canary(
     tmp_path: Path, capsys,
 ) -> None:

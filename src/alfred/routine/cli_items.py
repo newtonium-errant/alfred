@@ -248,16 +248,38 @@ def _validate_due_pattern(value: Any) -> tuple[dict | None, str | None]:
 
 @dataclass
 class _MutationResult:
-    """Result of a successful mutator_fn call.
+    """Result of a mutator_fn call (success OR refusal).
 
     ``items`` is the new items-list value. ``completion_log`` is the
     new completion_log dict value. ``payload_extras`` is a per-action
     dict that's merged into the canary JSON payload (so the
     operator-facing reply can name what changed).
+
+    ``aborted`` is the refusal-path flag — when ``True``, the
+    primitive ``_atomic_item_mutate`` will SKIP the on-disk write
+    even though the mutator ran to completion. The caller (CLI
+    handler) sets this when discovering a precondition violation
+    INSIDE the mutator closure (duplicate-item on add, cadence-
+    conflict on edit, TOCTOU-disappeared on edit) — the closure
+    can't return early via canary emission because the canary
+    emission happens AFTER ``_atomic_item_mutate`` returns. Setting
+    ``aborted=True`` is the in-band signal "I declined to mutate;
+    don't write."
+
+    **Why this matters**: pre-fix the primitive always called
+    ``_write_record_state``, which round-trips the YAML through
+    ``yaml.dump``. Even identical-content round-trips bump mtime +
+    can drift YAML formatting (number normalisation, multiline
+    flatten, list-of-dicts reflow). Operator semantics: "I refused,
+    your file is untouched." Actual semantics: "I rewrote it
+    identically-modulo-formatting." The ``aborted`` gate closes that
+    mismatch — reviewer-flagged 2026-05-30 WARN; regression-pinned
+    by ``test_atomic_item_mutate_refusal_does_not_touch_file``.
     """
     items: list[dict]
     completion_log: dict[str, list[str]]
     payload_extras: dict[str, Any]
+    aborted: bool = False
 
 
 def _load_record_state(
@@ -339,20 +361,32 @@ def _atomic_item_mutate(
         _MutationResult,
     ],
 ) -> _MutationResult:
-    """Load the record, run ``mutator_fn``, write atomically.
+    """Load the record, run ``mutator_fn``, write atomically (UNLESS
+    the mutator signalled ``aborted=True``).
 
     The mutator function receives the items list + completion_log
     (both already deep-copied by ``_load_record_state``) and returns
-    the new state. The primitive then writes the file once. There's
-    no rollback story — the mutator either succeeds (returns a
-    ``_MutationResult``) or raises (we don't catch; the CLI handler
-    above raises a canary).
+    the new state. The primitive then writes the file once IF the
+    mutator's return carries ``aborted=False`` (the default —
+    success path). When ``aborted=True``, the write is skipped
+    entirely: file bytes + mtime stay untouched. The caller (CLI
+    handler) then emits the refusal canary based on closure state
+    captured during the aborted mutator run.
+
+    There's no rollback story for the success path — the mutator
+    either succeeds (returns a ``_MutationResult`` with
+    ``aborted=False``) or raises (we don't catch; the CLI handler
+    above raises a canary). The ``aborted`` path is the in-band
+    refusal channel for preconditions only detectable AFTER load
+    (duplicate-item check, cadence-conflict check, TOCTOU-disappeared
+    check).
     """
     fm, items, completion_log, post = _load_record_state(record_path)
     result = mutator_fn(items, completion_log)
-    _write_record_state(
-        record_path, fm, result.items, result.completion_log, post,
-    )
+    if not result.aborted:
+        _write_record_state(
+            record_path, fm, result.items, result.completion_log, post,
+        )
     return result
 
 
@@ -791,11 +825,15 @@ def cmd_item_add(
             t = str(it.get("text") or "").strip()
             if t == item_text:
                 duplicate_seen["hit"] = True
-                # Return state unchanged — caller emits the canary.
+                # Refusal path: signal aborted so the primitive
+                # skips the write — file bytes + mtime stay
+                # untouched. Caller emits the duplicate_item canary
+                # AFTER the primitive returns.
                 return _MutationResult(
                     items=items,
                     completion_log=completion_log,
                     payload_extras={},
+                    aborted=True,
                 )
         # Build the new item dict — text + priority (defaulting to
         # tracked per the aggregator's convention) + any operator-
@@ -1037,7 +1075,8 @@ def cmd_item_edit(
                 break
         if target_idx < 0:
             # Shouldn't happen — resolve already verified — but
-            # defensive guard against TOCTOU.
+            # defensive guard against TOCTOU. Refusal path: aborted
+            # so the primitive skips the write (file untouched).
             cadence_conflict["err"] = (
                 f"Item {canonical_item!r} disappeared between resolve "
                 f"and mutate; operator hand-edit during the operation?"
@@ -1046,6 +1085,7 @@ def cmd_item_edit(
                 items=items,
                 completion_log=completion_log,
                 payload_extras={},
+                aborted=True,
             )
 
         existing = items[target_idx]
@@ -1059,11 +1099,15 @@ def cmd_item_edit(
             clear_target_cadence_days=clear_target_cadence_days,
         )
         if c_err is not None:
+            # Refusal path: aborted so the primitive skips the write
+            # (file untouched). Caller emits the cadence_conflict
+            # canary AFTER the primitive returns.
             cadence_conflict["err"] = c_err
             return _MutationResult(
                 items=items,
                 completion_log=completion_log,
                 payload_extras={},
+                aborted=True,
             )
 
         # Apply field changes to the existing item dict in place

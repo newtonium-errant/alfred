@@ -66,6 +66,20 @@ from .state import StateManager
 log = structlog.get_logger(__name__)
 
 
+# Module-load-order contract: keep the DONE_KIND_* + ITEM_KIND_*
+# constant blocks (below) ABOVE the bottom-of-file
+# ``from .cli_items import ...`` line. ``cli_items.py`` imports
+# these constants from us at deferred-import time; defining them
+# AFTER the bottom-of-file import would crash on partial-module-load
+# (the import statement runs first, cli_items.py tries to import
+# the constants, they don't exist yet → ImportError). Same applies
+# to ``_check_salem_only``, ``_emit_canary``, ``_fuzzy_match_vault_wide``,
+# ``_ItemCandidate``, ``_matches_item``, ``_routine_path`` — all of
+# which ``cli_items.py`` lazy-imports from this module. Moving any
+# of these definitions below the bottom-of-file import block would
+# silently break the deferred-circular-import design.
+
+
 # ---------------------------------------------------------------------------
 # Phase 2B B1 (2026-05-30) — Conversational completion canary kinds
 # ---------------------------------------------------------------------------
