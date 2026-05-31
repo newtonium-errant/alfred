@@ -89,6 +89,20 @@ class BriefConfig:
     # silently in that case.
     primary_telegram_user_id: int | None = None
 
+    # c6 spam-quarantine surface wiring (2026-05-31 followup to 164839a).
+    # The brief's operations section reads quarantined records from
+    # ``<vault>/<quarantine_dir_name>/spam/<YYYY-MM>/``. Mirrors the
+    # ``email_classifier.quarantine_dir_name`` field on the classifier
+    # side; brief.load_from_unified pulls the value from the
+    # email_classifier YAML block so a per-instance override on the
+    # classifier side surfaces in the operator brief without manual
+    # double-config. Default ``"quarantine"`` matches
+    # ``EmailClassifierConfig.quarantine_dir_name`` default; instances
+    # that don't run the email_classifier still get the same default
+    # (the brief's operations.py emits "Spam quarantine: empty" when
+    # the directory doesn't exist, which is the correct surface).
+    quarantine_dir_name: str = "quarantine"
+
 
 def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
     """Build BriefConfig from the unified config dict."""
@@ -171,6 +185,19 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         except (TypeError, ValueError):
             primary_user = None
 
+    # c6 spam-quarantine wiring (2026-05-31 followup to 164839a). Mirror
+    # the classifier's ``email_classifier.quarantine_dir_name`` onto the
+    # brief side so per-instance overrides flow through to the operator
+    # surface. Reads ONLY the brief-relevant field — the brief doesn't
+    # need anything else from the email_classifier block, so a full
+    # ``email_classifier.config.load_from_unified`` would be over-coupling.
+    # Default ``"quarantine"`` matches the classifier default so
+    # instances that omit the email_classifier block load unchanged.
+    ec_raw = raw.get("email_classifier", {}) or {}
+    quarantine_dir_name = str(
+        ec_raw.get("quarantine_dir_name", "quarantine")
+    )
+
     return BriefConfig(
         vault_path=vault_path,
         schedule=schedule,
@@ -181,4 +208,5 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         peer_digests=peer_digests,
         log_file=f"{log_dir}/brief.log",
         primary_telegram_user_id=primary_user,
+        quarantine_dir_name=quarantine_dir_name,
     )

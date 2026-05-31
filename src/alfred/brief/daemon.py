@@ -92,9 +92,18 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # Fetch weather section
     weather_md = await fetch_and_format(config.weather)
 
-    # Operations snapshot
+    # Operations snapshot. quarantine_dir_name threads through from the
+    # email_classifier YAML block via BriefConfig.load_from_unified so a
+    # per-instance override on the classifier surfaces in the brief
+    # without a separate brief config knob (2026-05-31 followup to
+    # 164839a — code-reviewer WARN: previously hardcoded to default).
     data_dir = str(Path(config.state.path).parent)
-    ops_md = format_operations_section(data_dir, config.vault_path, since=today)
+    ops_md = format_operations_section(
+        data_dir,
+        config.vault_path,
+        since=today,
+        quarantine_dir_name=config.quarantine_dir_name,
+    )
 
     # Health section — reads the latest BIT record from vault/process/,
     # falling back to the BIT state file if no record is available.

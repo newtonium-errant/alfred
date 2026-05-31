@@ -71,3 +71,64 @@ def test_daemon_next_fire_matches_helper_output(tmp_path: Path) -> None:
     assert target.day == 21
     assert target.hour == 6
     assert target.minute == 0
+
+
+# ---------------------------------------------------------------------------
+# c6 — quarantine_dir_name wiring (2026-05-31 followup to 164839a)
+# ---------------------------------------------------------------------------
+#
+# The brief reads quarantined-records from
+# ``<vault>/<quarantine_dir_name>/spam/<YYYY-MM>/`` in operations.py.
+# Pre-followup, the brief's daemon hardcoded the default — a per-
+# instance ``email_classifier.quarantine_dir_name`` override would
+# silently misroute the read (classifier wrote to override path; brief
+# read from ``quarantine/``, reported "empty" forever). This wiring
+# pulls the field from the email_classifier YAML block into BriefConfig
+# so the daemon can thread it to format_operations_section.
+
+
+def test_brief_config_quarantine_dir_default_when_email_classifier_absent(
+    tmp_path: Path,
+) -> None:
+    """No email_classifier block → BriefConfig.quarantine_dir_name
+    defaults to ``"quarantine"`` (matches EmailClassifierConfig
+    default; instances without an email pipeline stay unaffected)."""
+    raw: dict[str, Any] = {"vault": {"path": str(tmp_path)}}
+    cfg = load_from_unified(raw)
+    assert cfg.quarantine_dir_name == "quarantine"
+
+
+def test_brief_config_quarantine_dir_default_when_field_omitted(
+    tmp_path: Path,
+) -> None:
+    """email_classifier block present but ``quarantine_dir_name``
+    field omitted → BriefConfig still defaults to ``"quarantine"``.
+    Pins the YAML's-block-without-the-field path (the common case for
+    instances that enable the classifier but don't override the dir)."""
+    raw: dict[str, Any] = {
+        "vault": {"path": str(tmp_path)},
+        "email_classifier": {"enabled": True},
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.quarantine_dir_name == "quarantine"
+
+
+def test_brief_config_quarantine_dir_threaded_from_email_classifier_block(
+    tmp_path: Path,
+) -> None:
+    """Per-instance override on the classifier surfaces in BriefConfig.
+    This is THE wiring the WARN identified — without this, the brief
+    silently misroutes its quarantine read.
+
+    A future drift that removes the load_from_unified plumbing fails
+    this test instead of silently restoring the production
+    misroute."""
+    raw: dict[str, Any] = {
+        "vault": {"path": str(tmp_path)},
+        "email_classifier": {
+            "enabled": True,
+            "quarantine_dir_name": "spam_archive",
+        },
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.quarantine_dir_name == "spam_archive"

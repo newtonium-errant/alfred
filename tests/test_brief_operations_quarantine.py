@@ -176,3 +176,45 @@ def test_format_operations_section_includes_quarantine_line_populated(
 
     out = format_operations_section(str(data_dir), str(vault))
     assert "**Spam quarantine: 1 this week (1 this month)**" in out
+
+
+def test_format_operations_section_threads_non_default_quarantine_dir(
+    tmp_path: Path,
+) -> None:
+    """End-to-end regression pin for the WARN on 164839a code-review:
+    the brief's operations section must honor a non-default
+    ``quarantine_dir_name``, NOT silently default to ``quarantine``
+    when the classifier writes elsewhere.
+
+    Fixture seeds records ONLY at the non-default location
+    (``spam_archive/spam/<YYYY-MM>/``). If the brief defaults to
+    ``quarantine``, this test fails with "Spam quarantine: empty"
+    instead of the count — same failure shape as the production
+    silent-misroute the WARN identified."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    now = datetime.now()
+    month_bucket = now.strftime("%Y-%m")
+    # Seed under the NON-DEFAULT dir name only.
+    non_default_root = vault / "spam_archive" / "spam" / month_bucket
+    non_default_root.mkdir(parents=True)
+    rec = non_default_root / "non-default-spam.md"
+    rec.write_text(
+        "---\ntype: note\nname: non-default-spam\n---\n",
+        encoding="utf-8",
+    )
+
+    # Default invocation — would miss the record (silent-misroute
+    # shape from the original WARN).
+    default_out = format_operations_section(str(data_dir), str(vault))
+    assert "**Spam quarantine: empty**" in default_out
+
+    # Threaded invocation — finds the record. Wired path works.
+    threaded_out = format_operations_section(
+        str(data_dir),
+        str(vault),
+        quarantine_dir_name="spam_archive",
+    )
+    assert "**Spam quarantine: 1 this week (1 this month)**" in threaded_out
