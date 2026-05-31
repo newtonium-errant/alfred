@@ -131,35 +131,70 @@ def recent_corrections(
     limit: int = 10,
     diversify_by_tier: bool = True,
 ) -> list[CorpusEntry]:
-    """Return the most recent N entries, optionally diversified by tier.
+    """Return the most recent N actual CORRECTIONS, optionally
+    diversified by tier.
+
+    **Filters to actual corrections only** (entries where
+    ``andrew_priority != classifier_priority`` per
+    :meth:`CorpusEntry.is_correction`). Confirmations (operator
+    agreed with classifier) carry no learning signal for the
+    few-shot rotation and are skipped — letting them through would
+    fill the prompt slot with ``low→low / spam→spam`` rows that
+    teach the classifier nothing.
+
+    Pre-fix this function returned the most-recent N ENTRIES of any
+    kind. Verified 2026-05-31 against the live Salem corpus (106
+    entries, 46 corrections): under the buggy contract the few-shot
+    window often surfaced 0/10 actual corrections, with the result
+    that same-sender items kept getting misclassified the same way
+    across many days (ViewPoint Listing Alert: 7 corrections across
+    5 different days, never reached the few-shot window). The
+    classifier prompt's wording ("Recent calibration corrections
+    from the operator... Treat these as authoritative") matches the
+    function's NAME — the fix makes the implementation match both.
+
+    **Walks the entire corpus** (dispatch option (a)) rather than
+    a fixed tail window. Reasoning: at the current cadence
+    (~3-5 entries/day) the corpus reaches 10K entries in years,
+    not months; cheap to read end-to-end every classifier call;
+    avoids the starve case where a recent burst of confirmations
+    pushes corrections out of a fixed window. If corpus growth
+    becomes a real concern (>10K entries), revisit with a
+    sliding-window scan-from-tail approach.
 
     ``diversify_by_tier`` (default True) tries to keep each tier
-    represented in the result rather than letting one noisy tier
-    dominate. The algorithm is greedy: walk the tail of the corpus
-    newest-first, take every entry until we've seen at least one from
-    each tier (or until we hit ``limit``), then take any remaining
-    entries newest-first to fill up to ``limit``.
+    represented in the corrections result rather than letting one
+    noisy tier dominate (e.g. 30 recent ``low→spam`` ViewPoint
+    corrections). The algorithm is greedy: walk the corrections
+    newest-first, take every entry until we've seen at least one
+    from each tier (or until we hit ``limit``), then take any
+    remaining entries newest-first to fill up to ``limit``.
 
-    Deterministic for a given corpus — the rotation must produce the
-    same prompt across processes (Salem and a one-off ``alfred bit
-    classifier`` re-run should agree on the few-shot examples).
+    Deterministic for a given corpus — the rotation must produce
+    the same prompt across processes (Salem and a one-off
+    ``alfred bit classifier`` re-run should agree on the few-shot
+    examples).
     """
     if limit <= 0:
         return []
-    all_entries = list(iter_corrections(corpus_path))
-    if not all_entries:
+    # Walk the FULL corpus + filter to actual corrections. Per the
+    # docstring's "Walks the entire corpus" rationale.
+    all_corrections = [
+        e for e in iter_corrections(corpus_path) if e.is_correction()
+    ]
+    if not all_corrections:
         return []
 
-    # Newest-first traversal of the most recent ``limit * 4`` rows.
-    # Cap so we don't read a huge corpus end-to-end every classifier call.
-    window_size = max(limit * 4, limit)
-    window = all_entries[-window_size:]
-    newest_first = list(reversed(window))
+    # Newest-first traversal of the corrections-only list.
+    newest_first = list(reversed(all_corrections))
 
     if not diversify_by_tier:
+        # Take the most recent ``limit`` corrections in newest-first
+        # order, then reverse back to oldest-first for the chronological
+        # few-shot block.
         return list(reversed(newest_first[:limit]))
 
-    # Greedy diversification.
+    # Greedy diversification across the corrections-only list.
     seen_tiers: set[str] = set()
     chosen: list[CorpusEntry] = []
     chosen_indices: set[int] = set()
