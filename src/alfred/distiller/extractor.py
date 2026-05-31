@@ -35,6 +35,7 @@ from pydantic import ValidationError
 
 from .backends.anthropic_sdk import call_anthropic_no_tools
 from .backends.ollama import call_ollama_no_tools
+from .backends.together import call_together_no_tools
 from .candidates import CandidateSignal
 from .config import DistillerConfig
 from .contracts import ExtractionResult
@@ -410,18 +411,26 @@ async def _call_extraction_llm(
 
       * ``"anthropic"`` (default) → :func:`call_anthropic_no_tools`
       * ``"ollama"`` → :func:`call_ollama_no_tools`
+      * ``"together"`` → :func:`call_together_no_tools` (Phase 1.5)
 
-    Both backends honour the same ``(text, metadata)`` return contract
+    All backends honour the same ``(text, metadata)`` return contract
     so the extractor's downstream parsing + repair-retry path stays
     backend-agnostic.
 
     Path C Phase 1 spike (2026-05-06): added so the spike harness
     can flip ``backend: ollama`` in a per-run config and exercise
-    local extraction without forking the extract() body.
+    local extraction without forking the extract() body. Phase 1.5
+    (2026-05-31) extended for ``together`` to baseline qwen2.5-72b
+    on managed cloud GPU and separate
+    "model is wrong for the task" from "local hardware is wrong
+    for the model."
 
     Unknown backend → ``RuntimeError`` (NOT silent fallback). Per the
     spike spec: an operator who configures a typo'd backend should
     see the failure immediately, not silently get the wrong path.
+    Together with an empty ``together_api_key`` → ``RuntimeError``
+    at this gate (rather than letting Together return 401 with a
+    less actionable message).
     """
     backend = (config.extraction.backend or "anthropic").lower()
     if backend == "anthropic":
@@ -440,9 +449,28 @@ async def _call_extraction_llm(
             max_tokens=config.anthropic.max_tokens,
             endpoint=config.extraction.ollama_endpoint,
         )
+    if backend == "together":
+        # Fail-loud-at-dispatch on missing api_key per spike spec.
+        # The together backend also defends in depth, but this is
+        # the operator-actionable layer (config.yaml is where the
+        # operator would set ``${TOGETHER_API_KEY}``).
+        if not config.extraction.together_api_key:
+            raise RuntimeError(
+                "distiller.extraction.backend='together' requires "
+                "distiller.extraction.together_api_key to be set "
+                "(typically via ${TOGETHER_API_KEY} env-var "
+                "substitution). NO silent fallback per spike spec."
+            )
+        return await call_together_no_tools(
+            prompt=prompt,
+            system=system,
+            model=config.extraction.together_model,
+            max_tokens=config.anthropic.max_tokens,
+            api_key=config.extraction.together_api_key,
+        )
     raise RuntimeError(
         f"Unknown distiller.extraction.backend: {config.extraction.backend!r}. "
-        f"Valid values: 'anthropic', 'ollama'."
+        f"Valid values: 'anthropic', 'ollama', 'together'."
     )
 
 

@@ -107,11 +107,16 @@ class ExtractionConfig:
     # non-agentic v2 extractor. ``"anthropic"`` (default) uses the
     # Anthropic Messages API per ``backends/anthropic_sdk.py``;
     # ``"ollama"`` uses Ollama's OpenAI-compatible chat-completions
-    # endpoint per ``backends/ollama.py``. Adding new backends is a
-    # pure-extend: register a new value here + a new sibling module
-    # in ``backends/``; ``_call_extraction_llm`` in ``extractor.py``
-    # is the single dispatch point. Defaulted to ``"anthropic"`` so
-    # existing config.yaml files load unchanged.
+    # endpoint per ``backends/ollama.py``; ``"together"`` (Phase 1.5,
+    # 2026-05-31) uses Together.ai's managed-GPU
+    # OpenAI-compatible endpoint per ``backends/together.py`` —
+    # cloud-GPU capability baseline to separate
+    # "model is wrong for the task" from "local hardware is wrong
+    # for the model." Adding new backends is a pure-extend: register
+    # a new value here + a new sibling module in ``backends/``;
+    # ``_call_extraction_llm`` in ``extractor.py`` is the single
+    # dispatch point. Defaulted to ``"anthropic"`` so existing
+    # config.yaml files load unchanged.
     backend: str = "anthropic"
     # Ollama endpoint (used only when ``backend == "ollama"``). Default
     # matches Ollama's standard local install. The spike harness
@@ -123,6 +128,18 @@ class ExtractionConfig:
     # with overhead). The spike harness overrides per-run to compare
     # 7b / 14b / 32b / 72b candidates.
     ollama_model: str = "qwen2.5:72b-instruct-q4_K_M"
+    # Together.ai API key (used only when ``backend == "together"``).
+    # Phase 1.5 spike — defaulted empty so existing configs load
+    # unchanged. Required to be non-empty when the backend is
+    # selected; dispatcher fails-loud on empty per spike spec.
+    # Sourced via ``${TOGETHER_API_KEY}`` env-var substitution in
+    # config.yaml — never check the literal key into the repo.
+    together_api_key: str = ""
+    # Default Together model — Turbo variant for the spike's
+    # "is qwen2.5-72b fast enough at cloud-GPU scale" question. The
+    # non-Turbo variant exists for higher quality at higher latency;
+    # spike harness can override per-run.
+    together_model: str = "Qwen/Qwen2.5-72B-Instruct-Turbo"
     interval_seconds: int = 86400
     # Deprecated fallback — preserved so old config.yaml files still
     # load, but ``deep_extraction_schedule`` is the canonical gate for
