@@ -469,6 +469,32 @@ def _compute_auto_routine(
             item = Item.from_dict(raw_item)
             if item is None:
                 continue
+            # MIRRORS ``_collect_items_for_today`` in
+            # ``routine/aggregator.py`` (around line 530, the
+            # ``should_check_handoff`` precondition):
+            # aspirational-priority items skip the hard-deadline
+            # T1/T2 handoff even when they accidentally carry
+            # ``due_pattern`` + ``escalate_at_days``. The
+            # operator-stated semantic (Phase 2A ratification): T3
+            # is for self-care intentions, not deadline-driven work;
+            # the soft-cadence T3 surface (``target_cadence_days``,
+            # ``compute_auto_t3_candidates``) is the legitimate
+            # aspirational path.
+            #
+            # Drift between the two layers either double-renders
+            # items (compute permissive, aggregator strict — pre-fix
+            # state) or silently loses them (reverse). Pinned by
+            # ``test_mirror_aspirational_t1_predicate_matches_aggregator``
+            # in ``tests/tier/test_compute.py`` per
+            # ``feedback_two_layer_window_math_mirror``.
+            #
+            # Latent in production until this fix (2026-05-31): no
+            # real records combined ``priority: aspirational`` with
+            # deadline-bearing fields, so the double-render never
+            # surfaced. The gate ships before a future record shape
+            # exercises the bug.
+            if item.priority == "aspirational":
+                continue
             if item.due_pattern is None:
                 continue
             if item.escalate_at_days is None:

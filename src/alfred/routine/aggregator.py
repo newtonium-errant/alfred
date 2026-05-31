@@ -527,6 +527,21 @@ def _collect_items_for_today(
             # due_pattern. T3 handoff path: any item with
             # target_cadence_days (aspirational included — that's the
             # whole point of the soft-cadence surface).
+            #
+            # MIRRORS the ``if item.priority == "aspirational": continue``
+            # guard in ``_compute_auto_routine`` in ``tier/compute.py``.
+            # Same gate, same reason, same operator-stated semantic:
+            # aspirational items don't deadline-escalate to T1/T2 even
+            # when they carry due_pattern + escalate_at_days. The
+            # soft-cadence T3 path IS the legitimate aspirational
+            # surface (target_cadence_days → auto-T3 candidates).
+            #
+            # Don't introduce variance here without matching the
+            # compute site. Drift either double-renders items
+            # (compute permissive, aggregator strict) or silently
+            # loses them (reverse). Side-by-side regression-pin in
+            # ``tests/tier/test_compute.py::test_mirror_aspirational_t1_predicate_matches_aggregator``
+            # per ``feedback_two_layer_window_math_mirror``.
             should_check_handoff = (
                 (due_pattern is not None and priority != "aspirational")
                 or target_cadence_days is not None

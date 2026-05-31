@@ -1338,3 +1338,276 @@ def test_mirror_decide_tier_handoff_t3_matches_compute_auto_t3(
     candidates4 = compute_auto_t3_candidates(vault4, NOW)
     assert len(candidates4) == 1
     assert candidates4[0].days_since_last_completed is None
+
+
+# ===========================================================================
+# Compute-side aspirational gate (2026-05-31) — mirror-discipline pin
+# ===========================================================================
+#
+# Phase 2A-soft-cadence reviewer NOTE-1 (2026-05-30 review) flagged a
+# latent asymmetry: routine/aggregator.py's _collect_items_for_today
+# had an aspirational-priority gate on the hard-deadline T1/T2 handoff,
+# but tier/compute.py's _compute_auto_routine did NOT. An aspirational
+# item carrying due_pattern + escalate_at_days would:
+#   - aggregator: skip handoff, item renders in routine section
+#   - compute: STILL surface as AutoT1Candidate → brief renders it
+#     in T1 candidates
+# Result: double-render. Latent because no real records combine
+# aspirational + hard cadence; fix shipped before a future record
+# shape exercises the bug.
+#
+# Tests below pin the compute-side gate + the side-by-side mirror
+# contract per feedback_two_layer_window_math_mirror.
+
+
+def test_aspirational_routine_item_with_due_pattern_does_not_surface_in_t1(
+    tmp_path: Path,
+) -> None:
+    """Compute-side regression pin: aspirational item with full
+    hard-cadence fields (due_pattern + escalate_at_days) MUST NOT
+    surface as AutoT1Candidate. Mirrors the aggregator's existing
+    gate at _collect_items_for_today's should_check_handoff
+    precondition.
+
+    Pre-fix this test would have FAILED — the compute path lacked
+    the aspirational gate and would emit the candidate despite the
+    aggregator suppressing the routine-section render.
+
+    Fixture: item with priority=aspirational + due_pattern that
+    resolves into the T1 window (every_n_days n=1 anchor=today
+    → due today → escalate_at_days=0 → in T1 window). Compute
+    asserts zero candidates emitted from this item.
+    """
+    # NOW = 2026-05-28. anchor=today means due=today, which would
+    # put days_to_due=0 — in the T1 window for escalate_at_days=0.
+    # A non-aspirational item with this shape would surface; the
+    # aspirational gate skips it.
+    vault = _write_routine(
+        tmp_path,
+        "Aspirational With Deadline.md",
+        "type: routine\nstatus: active\nname: Aspirational With Deadline\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Read for an hour\n"
+        "  priority: aspirational\n"
+        "  due_pattern:\n"
+        "    type: every_n_days\n"
+        "    n: 1\n"
+        "    anchor: '2026-05-28'\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_candidates(vault, NOW)
+    assert result == [], (
+        "Aspirational item with hard-cadence fields MUST NOT surface "
+        "as AutoT1Candidate — operator-stated semantic (T3 is for "
+        "self-care, not deadline work). Mirror gate to "
+        "_collect_items_for_today in routine/aggregator.py."
+    )
+    # Also verify the T2 ramp scan applies the same gate. Same
+    # fixture, different window — `surface_at_days` would be
+    # needed for a real T2 surface, but the gate fires BEFORE the
+    # window check so this still pins the no-surface invariant.
+    result_t2 = compute_auto_routine_t2_candidates(vault, NOW)
+    assert result_t2 == [], (
+        "Aspirational gate must apply to BOTH T1 and T2 routine "
+        "scans — they share the _compute_auto_routine helper."
+    )
+
+
+def test_aspirational_routine_item_still_surfaces_in_t3_when_target_cadence_overdue(
+    tmp_path: Path,
+) -> None:
+    """Counterpart to the above: the aspirational gate ONLY affects
+    the hard-cadence T1/T2 surface. The soft-cadence T3 path
+    (target_cadence_days → compute_auto_t3_candidates) IS the
+    legitimate aspirational surface — the dog-walk / read-for-an-hour
+    use case from Phase 2A-soft-cadence.
+
+    Pin so a future regression that extends the aspirational gate to
+    T3 too would silently break the operator-facing T3 auto-suggest
+    contract. NOW = 2026-05-28; last completion 5 days ago; target
+    3 days → overdue → must surface.
+    """
+    vault = _write_routine(
+        tmp_path,
+        "Aspirational Soft Cadence.md",
+        "type: routine\nstatus: active\nname: Aspirational Soft Cadence\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  Walk dog:\n"
+        "  - '2026-05-23'\n"
+        "items:\n"
+        "- text: Walk dog\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    result = compute_auto_t3_candidates(vault, NOW)
+    assert len(result) == 1, (
+        "Aspirational gate must NOT apply to the T3 soft-cadence "
+        "surface — T3 is the legitimate aspirational surface (per "
+        "Phase 2A-soft-cadence operator-stated semantic)."
+    )
+    assert result[0].item_text == "Walk dog"
+
+
+def test_mirror_aspirational_t1_predicate_matches_aggregator(
+    tmp_path: Path,
+) -> None:
+    """Side-by-side trace pin per feedback_two_layer_window_math_mirror:
+    identical inputs → identical decisions across the two layers.
+
+    Three cases exercise the mirror contract:
+      Case A: aspirational + hard cadence → BOTH skip handoff (gate
+              fires).
+      Case B: tracked + hard cadence → BOTH proceed to handoff (gate
+              doesn't fire; tracked is in-scope for T1/T2).
+      Case C: aspirational + soft cadence → BOTH proceed via T3 path
+              (gate is T1/T2-only; soft-cadence is the legitimate
+              aspirational surface).
+
+    For each case, the test asserts BOTH layers agree:
+      * aggregator: _collect_items_for_today's should_check_handoff
+        precondition. We exercise via the run_aggregator_once path
+        (writes a daily file; we read it back to verify the item
+        rendered/suppressed).
+      * compute: _compute_auto_routine (T1) emits / skips the
+        candidate.
+
+    Drift between the layers would fire one half of the assertion
+    while the other passes — the failure message names the gap.
+    """
+    from datetime import date as _date
+
+    from alfred.routine.aggregator import run_aggregator_once
+    from alfred.routine.config import RoutineConfig
+
+    today = _date(2026, 5, 28)
+
+    def _aggregator_renders_item_in_routine_section(
+        case_dir: Path, item_text: str,
+    ) -> bool:
+        """Helper: run aggregator on case_dir's vault, return whether
+        item_text appears in the body (rendered in routine section)."""
+        vault_path = case_dir / "vault"
+        config = RoutineConfig(
+            vault_path=str(vault_path),
+            instance_name="salem",
+        )
+        config.state.path = str(case_dir / "routine_state.json")
+        run_aggregator_once(config, today)
+        body = (vault_path / "daily" / "2026-05-28.md").read_text(
+            encoding="utf-8",
+        )
+        return item_text in body
+
+    # --- Case A: aspirational + hard cadence -------------------------
+    # Both layers must SKIP the T1/T2 handoff. Aggregator: item
+    # renders in routine section (Aspirational bucket). Compute:
+    # zero AutoT1Candidates.
+    case_a_dir = tmp_path / "case_a"
+    case_a_dir.mkdir()
+    vault_a = _write_routine(
+        case_a_dir,
+        "Mirror Pin.md",
+        "type: routine\nstatus: active\nname: Mirror Pin\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: A_item\n"
+        "  priority: aspirational\n"
+        "  due_pattern:\n"
+        "    type: every_n_days\n"
+        "    n: 1\n"
+        "    anchor: '2026-05-28'\n"
+        "  escalate_at_days: 0\n",
+    )
+    compute_a = compute_auto_routine_candidates(vault_a, NOW)
+    aggregator_a_rendered = (
+        _aggregator_renders_item_in_routine_section(case_a_dir, "A_item")
+    )
+    assert compute_a == [], (
+        "Case A (aspirational + hard cadence): compute MUST skip T1 "
+        "candidate emission. Mirror gap with aggregator."
+    )
+    assert aggregator_a_rendered, (
+        "Case A (aspirational + hard cadence): aggregator MUST render "
+        "the item in routine section (no handoff). Mirror gap with "
+        "compute."
+    )
+
+    # --- Case B: tracked + hard cadence ------------------------------
+    # Both layers must PROCEED to handoff. Aggregator: item is
+    # handed off (suppressed from routine section). Compute: emits
+    # one AutoT1Candidate.
+    case_b_dir = tmp_path / "case_b"
+    case_b_dir.mkdir()
+    vault_b = _write_routine(
+        case_b_dir,
+        "Mirror Pin.md",
+        "type: routine\nstatus: active\nname: Mirror Pin\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: B_item\n"
+        "  priority: tracked\n"
+        "  due_pattern:\n"
+        "    type: every_n_days\n"
+        "    n: 1\n"
+        "    anchor: '2026-05-28'\n"
+        "  escalate_at_days: 0\n",
+    )
+    compute_b = compute_auto_routine_candidates(vault_b, NOW)
+    aggregator_b_rendered = (
+        _aggregator_renders_item_in_routine_section(case_b_dir, "B_item")
+    )
+    assert len(compute_b) == 1, (
+        "Case B (tracked + hard cadence): compute MUST emit exactly "
+        "one AutoT1Candidate. Mirror gap with aggregator."
+    )
+    assert not aggregator_b_rendered, (
+        "Case B (tracked + hard cadence): aggregator MUST suppress "
+        "the item from routine section (handoff to tier). Mirror gap "
+        "with compute."
+    )
+
+    # --- Case C: aspirational + soft cadence -------------------------
+    # T1/T2 gate is the FIRST check in compute (lives at the top of
+    # the per-item loop, before the due_pattern check); aspirational
+    # items WITHOUT due_pattern would never reach that gate, but
+    # WITH due_pattern they're filtered. For the T3 path
+    # (compute_auto_t3_candidates), aspirational items ARE allowed
+    # — the soft-cadence surface is the legitimate aspirational
+    # path. Aggregator: hands off to T3 (suppresses from routine
+    # section). Compute: emits AutoT3Candidate.
+    case_c_dir = tmp_path / "case_c"
+    case_c_dir.mkdir()
+    vault_c = _write_routine(
+        case_c_dir,
+        "Mirror Pin.md",
+        "type: routine\nstatus: active\nname: Mirror Pin\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  C_item:\n"
+        "  - '2026-05-23'\n"  # 5 days ago → overdue vs target 3
+        "items:\n"
+        "- text: C_item\n"
+        "  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    compute_c_t1 = compute_auto_routine_candidates(vault_c, NOW)
+    compute_c_t3 = compute_auto_t3_candidates(vault_c, NOW)
+    aggregator_c_rendered = (
+        _aggregator_renders_item_in_routine_section(case_c_dir, "C_item")
+    )
+    assert compute_c_t1 == [], (
+        "Case C (aspirational + soft cadence): T1 scan MUST skip "
+        "(no due_pattern at all → no hard-cadence handoff)."
+    )
+    assert len(compute_c_t3) == 1, (
+        "Case C (aspirational + soft cadence): T3 compute MUST emit "
+        "AutoT3Candidate. The soft-cadence path IS the legitimate "
+        "aspirational surface."
+    )
+    assert not aggregator_c_rendered, (
+        "Case C (aspirational + soft cadence): aggregator MUST "
+        "suppress from routine section (handed off to T3 per the "
+        "Phase 2A-soft-cadence contract)."
+    )
