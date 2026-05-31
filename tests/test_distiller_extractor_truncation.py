@@ -172,6 +172,49 @@ class TestTruncationWarningOnEmpty:
             f"discrimination path is broken; got: {info_empties}"
         )
 
+    async def test_extractor_emits_truncation_warning_on_attempt_1_path(
+        self, monkeypatch,
+    ) -> None:
+        """Regression pin for the attempt=1 discrimination (added
+        2026-05-31 after the original ship covered only attempt=2 +
+        validation-failed paths — review caught the gap when these
+        tests failed with empty captured logs).
+
+        The attempt=1 path fires when the model returns valid
+        ``{"learnings": []}`` JSON on the FIRST call with a truncated
+        stop_reason — the most common production shape per the
+        spike's Voice Chat record. Pin the ``attempt=1`` field
+        explicitly so a future refactor that moves the discrimination
+        back to attempt=2-only re-fails this test."""
+
+        async def _fake_dispatch(*, prompt, system, config):
+            return (json.dumps({"learnings": []}), {"stop_reason": "max_tokens"})
+
+        monkeypatch.setattr(
+            extractor_mod, "_call_extraction_llm", _fake_dispatch,
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            await extractor_mod.extract(
+                source_body="x",
+                source_frontmatter=_frontmatter(),
+                existing_learn_titles=[],
+                signals=_signals(),
+                config=_config(),
+            )
+
+        truncated = [
+            c for c in captured
+            if c.get("event") == "extractor.truncated_drop"
+        ]
+        assert len(truncated) == 1
+        # Pin attempt=1 explicitly — the bug that caused the original
+        # ship's tests to fail was the discrimination being absent
+        # from this attempt. If a future refactor accidentally
+        # restores the gap, this assertion catches it.
+        assert truncated[0]["attempt"] == 1
+        assert truncated[0]["stop_reason"] == "max_tokens"
+
     async def test_extractor_emits_truncation_warning_on_length_stop_reason(
         self, monkeypatch,
     ) -> None:

@@ -474,6 +474,77 @@ async def _call_extraction_llm(
     )
 
 
+# Stop-reason values that indicate the LLM hit its output cap mid-
+# generation. ``"max_tokens"`` is Anthropic's truncation token;
+# ``"length"`` is OpenAI's (Ollama + Together both emit it via the
+# OpenAI-compatible endpoint). Used by the truncation-discrimination
+# layer to distinguish "model output cut off" from "model said
+# nothing extractable" / "model produced bad JSON for non-truncation
+# reasons" — operator action is different for each (raise max_tokens
+# vs tune prompt). Added 2026-05-31 after the Path C Phase 1.5 spike.
+_TRUNCATED_STOP_REASONS = frozenset({"max_tokens", "length"})
+
+
+def _log_empty_or_truncated_drop(
+    *,
+    attempt: int,
+    stop_reason: str | None,
+    raw_text: str,
+    source_frontmatter: dict[str, Any],
+    failure_mode: str = "empty_learnings",
+) -> None:
+    """Emit the right log when the extractor returns an empty result.
+
+    Two failure modes need different operator surfaces:
+
+    - ``stop_reason`` was truncation-shaped (``"max_tokens"`` /
+      ``"length"``) — likely DROPPED output. Emit
+      ``extractor.truncated_drop`` WARNING with operator-actionable
+      ``note`` field naming the config knob.
+    - Otherwise (``"end_turn"`` / ``"stop"`` / unknown) — genuine
+      "model said nothing" or other non-truncation empty. Emit the
+      info-level ``extractor.extract_empty`` (preserves the c9
+      diagnostic behavior).
+
+    Factored 2026-05-31 from inline call-site duplication after a
+    review caught the attempt=1 path missing the discrimination — 3
+    call sites (attempt=1 empty, attempt=2 empty, validation-failed
+    final) all need the same OR-shape and now share one helper.
+
+    ``failure_mode`` differentiates the note text — "Empty learnings"
+    for the post-parse-success empty path, "Validation failed" for
+    the validation-failed path. Other call-sites get the post-parse
+    default.
+    """
+    if stop_reason in _TRUNCATED_STOP_REASONS:
+        if failure_mode == "validation_failed":
+            note = (
+                "Validation failed after truncated response — "
+                "raise distiller.anthropic.max_tokens or shorten source"
+            )
+        else:
+            note = (
+                "Empty learnings after truncated response — "
+                "raise distiller.anthropic.max_tokens or shorten source"
+            )
+        log.warning(
+            "extractor.truncated_drop",
+            attempt=attempt,
+            stop_reason=stop_reason,
+            raw_len=len(raw_text),
+            source_title=source_frontmatter.get("title", "(no title)"),
+            source_type=source_frontmatter.get("type", "(no type)"),
+            note=note,
+        )
+    else:
+        log.info(
+            "extractor.extract_empty",
+            attempt=attempt,
+            stop_reason=stop_reason,
+            raw_preview=raw_text[:200],
+        )
+
+
 async def extract(
     source_body: str,
     source_frontmatter: dict[str, Any],
@@ -516,12 +587,17 @@ async def extract(
         # from a silent "nothing to extract" vs. a truncated / refused LLM.
         # We now log the raw preview + stop_reason when the first attempt
         # returns empty so the next iteration can tell the three apart.
+        # 2026-05-31: truncation discrimination — the helper picks
+        # WARNING-level extractor.truncated_drop when stop_reason is
+        # truncation-shaped, info-level extract_empty otherwise.
+        # Attempt=1 path included after review caught the original
+        # ship only covering attempt=2 + validation-failed paths.
         if len(result.learnings) == 0:
-            log.info(
-                "extractor.extract_empty",
+            _log_empty_or_truncated_drop(
                 attempt=1,
                 stop_reason=stop_reason,
-                raw_preview=raw[:200],
+                raw_text=raw,
+                source_frontmatter=source_frontmatter,
             )
         log.info(
             "extractor.extract_complete",
@@ -553,35 +629,14 @@ async def extract(
     try:
         result = ExtractionResult.model_validate_json(cleaned_repair)
         if len(result.learnings) == 0:
-            # Truncation-discrimination layer (2026-05-31). Empty learnings
-            # AFTER a truncated stop_reason is a likely dropped-output, NOT
-            # a genuine "model said nothing extractable" result. Surface
-            # the distinction with a WARNING (vs the info-level
-            # extract_empty below for genuine empties) so operator log
-            # review can grep ``extractor.truncated_drop`` and triage.
-            # ``max_tokens`` is Anthropic's truncation token; ``length``
-            # is OpenAI's (Ollama + Together both emit it via the
-            # OpenAI-compatible endpoint).
-            if stop_reason_repair in {"max_tokens", "length"}:
-                log.warning(
-                    "extractor.truncated_drop",
-                    attempt=2,
-                    stop_reason=stop_reason_repair,
-                    raw_len=len(raw_repair),
-                    source_title=source_frontmatter.get("title", "(no title)"),
-                    source_type=source_frontmatter.get("type", "(no type)"),
-                    note=(
-                        "Empty learnings after truncated response — "
-                        "raise distiller.anthropic.max_tokens or shorten source"
-                    ),
-                )
-            else:
-                log.info(
-                    "extractor.extract_empty",
-                    attempt=2,
-                    stop_reason=stop_reason_repair,
-                    raw_preview=raw_repair[:200],
-                )
+            # Same discrimination as attempt=1 — see
+            # ``_log_empty_or_truncated_drop`` for the OR-shape rationale.
+            _log_empty_or_truncated_drop(
+                attempt=2,
+                stop_reason=stop_reason_repair,
+                raw_text=raw_repair,
+                source_frontmatter=source_frontmatter,
+            )
         log.info(
             "extractor.extract_complete",
             attempt=2,
@@ -602,21 +657,22 @@ async def extract(
         # (2026-05-31). When JSON parsing fails twice AND the stop_reason
         # was truncation-shaped, the failure mode is "JSON cut off mid-
         # string" (operator-actionable: bump max_tokens), not "model
-        # produced bad JSON" (operator-actionable: tune prompt). Emit a
-        # distinct WARNING so log review can route the two failure
-        # classes differently. Pre-2026-05-31 every Voice Chat-shape
-        # truncation looked like a generic validation_failed in logs.
-        if stop_reason_repair in {"max_tokens", "length"}:
-            log.warning(
-                "extractor.truncated_drop",
+        # produced bad JSON" (operator-actionable: tune prompt). The
+        # helper emits a distinct WARNING (extractor.truncated_drop)
+        # alongside the validation_failed log above so review can
+        # route the two failure classes differently. Pre-2026-05-31
+        # every Voice Chat-shape truncation looked like a generic
+        # validation_failed in logs. Non-truncation validation
+        # failures intentionally do NOT emit extract_empty here (the
+        # validation_failed log already carries the diagnostic — the
+        # discrimination layer's job is only to add the truncation
+        # surface, not duplicate the bad-JSON surface).
+        if stop_reason_repair in _TRUNCATED_STOP_REASONS:
+            _log_empty_or_truncated_drop(
                 attempt=2,
                 stop_reason=stop_reason_repair,
-                raw_len=len(raw_repair),
-                source_title=source_frontmatter.get("title", "(no title)"),
-                source_type=source_frontmatter.get("type", "(no type)"),
-                note=(
-                    "Validation failed after truncated response — "
-                    "raise distiller.anthropic.max_tokens or shorten source"
-                ),
+                raw_text=raw_repair,
+                source_frontmatter=source_frontmatter,
+                failure_mode="validation_failed",
             )
         return ExtractionResult(learnings=[])
