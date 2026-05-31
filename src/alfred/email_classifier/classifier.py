@@ -297,11 +297,29 @@ def _apply_high_priority_sender_override(
                     break
         if matched is not None:
             break
-        # Alias match (case-insensitive substring against display name).
+        # Alias match (case-insensitive word-boundary against display name).
+        #
+        # NOTE-1 from code-reviewer on 6d85bc2 (2026-05-31): the prior
+        # substring ``in`` check was too loose for short aliases. A
+        # contact with alias ``"Pat"`` would match incoming display
+        # names like ``"Patricia Smith"`` / ``"Pat O'Brien at SpamCo"``
+        # / ``"Pattern Recognition Weekly"`` — false positives. Paul
+        # Chudnovsky's multi-word alias was safe; foot-gun for the
+        # next operator-flagged contact with a short alias.
+        #
+        # Fix: word-boundary regex (``\b<alias>\b``) so ``"Pat"`` matches
+        # ``"Pat O'Brien"`` (boundary between space and ``P``) but NOT
+        # ``"Patricia"`` (no boundary between ``Pat`` and ``r``). The
+        # ``re.escape`` defends against aliases containing regex
+        # metacharacters (apostrophes, parens, dots) — operator-set
+        # aliases are freeform strings, never trust them as regex.
         if sender_display_lower:
             for alias in contact.aliases:
                 alias_lower = alias.strip().lower()
-                if alias_lower and alias_lower in sender_display_lower:
+                if not alias_lower:
+                    continue
+                pattern = r"\b" + re.escape(alias_lower) + r"\b"
+                if re.search(pattern, sender_display_lower):
                     matched = contact
                     break
         if matched is not None:

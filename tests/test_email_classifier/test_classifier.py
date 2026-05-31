@@ -1100,3 +1100,211 @@ def test_extract_sender_lowercases_email() -> None:
 
     email, _ = _extract_sender("**From:** Jamie@EXAMPLE.COM\n")
     assert email == "jamie@example.com"
+
+
+# ---------------------------------------------------------------------------
+# Word-boundary alias match (NOTE-1 fix on 6d85bc2, 2026-05-31)
+#
+# Pre-fix the alias check used substring ``in`` — a contact with alias
+# ``"Pat"`` would falsely match "Patricia Smith" / "Pattern Recognition
+# Weekly" / any display name with "pat" as a substring. The
+# word-boundary regex (``\b<alias>\b``) closes the foot-gun for short
+# aliases while preserving the legitimate matches.
+
+
+def test_alias_match_uses_word_boundary_pat_does_not_match_patricia(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Flagged contact with alias ``"Pat"``; incoming email from
+    "Patricia Smith". Override MUST NOT fire — ``Patricia`` is not
+    a word-boundary match for ``Pat`` (``Pat`` is a prefix of a
+    longer word, no boundary between ``Pat`` and ``ricia``).
+
+    Pre-fix this test would have FAILED — substring ``"pat" in
+    "patricia smith"`` was True → override fired → priority forced
+    to high on a stranger's email."""
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "Pat O'Brien",
+        email="po@example.com",  # email does NOT match
+        aliases=["Pat"],  # short alias — foot-gun under substring match
+    )
+    inbox = "From: Patricia Smith <patricia@news.com>\nSubject\nbody\n"
+    rel = _seed_note(classifier_vault, "Patricia note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "low",
+        "action_hint": None,
+        "reasoning": "newsletter",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # Override DID NOT fire — LLM's "low" stands.
+    assert result.priority == "low"
+    assert result.override_applied is False
+    assert result.llm_priority is None
+
+
+def test_alias_match_uses_word_boundary_pat_does_match_pat_obrien(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Flagged contact with alias ``"Pat"``; incoming email from
+    "Pat O'Brien <po@example.com>". Override MUST fire — ``Pat`` is
+    a word-boundary match in ``"Pat O'Brien"`` (boundary between
+    start-of-string and ``P``, boundary between ``t`` and space).
+
+    Sister test to the Patricia case above — same alias, same
+    flagged contact, different display name. The legitimate match
+    must still work after the word-boundary tightening."""
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "Pat O'Brien",
+        email="different@domain.com",  # email does NOT match
+        aliases=["Pat"],
+    )
+    inbox = "From: Pat O'Brien <po@example.com>\nSubject\nbody\n"
+    rel = _seed_note(classifier_vault, "Pat note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "medium",
+        "action_hint": None,
+        "reasoning": "casual contact",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # Override DID fire — LLM's "medium" overridden to "high".
+    assert result.priority == "high"
+    assert result.override_applied is True
+    assert result.llm_priority == "medium"
+
+
+def test_alias_match_full_phrase_still_works(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Regression pin for the canonical Paul Chudnovsky worked
+    example — multi-word aliases still match under the word-boundary
+    rule.
+
+    Alias ``"Chudnovsky"`` matches display name ``"Chudnovsky, Paul
+    (Halifax)"`` because the ``,`` after ``Chudnovsky`` is not a
+    ``\\w`` character → word boundary. The shipped 6d85bc2 test
+    ``test_classifier_alias_match_triggers_override`` already covers
+    this; this is an explicit pin against the word-boundary tightening
+    regressing it."""
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "P Chudnovsky",
+        email="different@some-other-domain.com",
+        aliases=["Chudnovsky"],
+    )
+    inbox = (
+        "From: Chudnovsky, Paul (Halifax) "
+        "<p.chudnovsky@coxandpalmer.com>\nSubject\nbody\n"
+    )
+    rel = _seed_note(classifier_vault, "Law office note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "low",
+        "action_hint": None,
+        "reasoning": "no familiar sender",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "high"
+    assert result.override_applied is True
+    assert result.llm_priority == "low"
+
+
+def test_alias_match_handles_regex_metachars(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Alias containing regex metacharacters (apostrophe, parens,
+    dots) MUST NOT be interpreted as regex syntax.
+
+    Without ``re.escape``, an alias like ``"O'Brien"`` would pass
+    through unescaped — apostrophe doesn't break Python regex (it
+    has no special meaning), but other metachars like ``.`` (any
+    char) or ``(`` (group-start, error) would. This test pins the
+    safe behaviour: the alias is treated as a literal string,
+    matched via word boundaries.
+
+    Two assertions to cover both directions:
+      * alias ``"O'Brien"`` matches display ``"O'Brien"`` → override
+        fires (literal apostrophe handled correctly via escape).
+      * alias ``"O'Brien"`` does NOT match display ``"XOBrienY"``
+        (no apostrophe, different word stem) → no false positive
+        from misinterpreting the apostrophe."""
+    # --- Case 1: apostrophe in alias matches apostrophe in display ---
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "Sean OBrien",
+        email="different@somewhere.com",
+        aliases=["O'Brien"],
+    )
+    inbox = "From: Sean O'Brien <so@example.com>\nSubject\nbody\n"
+    rel = _seed_note(classifier_vault, "OBrien note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "medium",
+        "action_hint": None,
+        "reasoning": "neutral",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+    assert result.priority == "high", (
+        "Apostrophe-bearing alias must match literal apostrophe in "
+        "display name (re.escape preserves the apostrophe as a "
+        "literal, not as a regex metachar)"
+    )
+    assert result.override_applied is True
+
+    # --- Case 2: same alias does NOT match an apostrophe-less display ---
+    # Different note + different inbox; same vault carries the same
+    # flagged contact from Case 1.
+    inbox_no_apos = (
+        "From: XOBrienY Smith <xy@spam.com>\nSubject\nbody\n"
+    )
+    rel2 = _seed_note(classifier_vault, "XOBrienY note")
+    fake2 = _FakeLLM(response=json.dumps({
+        "priority": "low",
+        "action_hint": None,
+        "reasoning": "stranger",
+    }))
+
+    result2 = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel2,
+        inbox_content=inbox_no_apos,
+        config=enabled_config,
+        llm_caller=fake2,
+    )
+    # NO override — the apostrophe in the alias is a LITERAL that
+    # must match. ``XOBrienY`` contains ``OBrien`` but NOT ``O'Brien``;
+    # the literal apostrophe requirement prevents a false positive.
+    # AND the word-boundary check would block it anyway (``XOBrienY``
+    # has no boundary around the ``OBrien`` substring).
+    assert result2.priority == "low"
+    assert result2.override_applied is False
