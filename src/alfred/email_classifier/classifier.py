@@ -442,11 +442,50 @@ def _build_user_prompt(
     """Compose the per-record user prompt.
 
     The contact list is interpolated verbatim so the model can match
-    senders against Andrew's address book (the ``high`` tier "named
-    person" cue).
+    senders against Andrew's address book. The "Named-contact handling"
+    rules block above the list tightens the tiering — named contacts
+    floor at ``medium`` (no ``low`` / ``spam`` for an actual contact
+    match), and a contact + time-pressure / financial / legal / family
+    marker is the principal ``high``-tier signal.
     """
     contact_block = render_contacts_for_prompt(contacts)
+    rules = (
+        "## Named-contact handling — minimums + ceilings\n"
+        "The contacts list below is Andrew's address book (every "
+        "``person/`` record in the vault). When the email's actual "
+        "sender address matches a row in this list, apply these "
+        "rules:\n"
+        "  - **HIGH** when the email also carries time-pressure / "
+        "reply-required / financial / legal / family-emergency "
+        "markers (deadline language, direct question, payment / "
+        "invoice content, medical or legal-process content, family "
+        "urgency).\n"
+        "  - **MEDIUM** is the minimum when the email is routine "
+        "(\"thanks\", \"I'll get back to you next week\", general "
+        "FYI, casual update). Named-contact + routine subject is "
+        "still medium, not low — Andrew chose to keep this person "
+        "on file.\n"
+        "  - **LOW** only for obvious automated system notifications "
+        "that happen to carry a contact's name in the display field "
+        "(e.g. ``noreply@docusign.com`` sending \"Paul Chudnovsky "
+        "wants you to sign\"). The actual sender address is the "
+        "system, not the contact — match on the address.\n"
+        "  - **SPAM** never applies to an email whose actual sender "
+        "address matches a contact. Display-name spoofing where the "
+        "address does NOT match a contact IS spam (phishing-shape) "
+        "— weigh the address, not the display name.\n"
+        "\n"
+        "Note: an operator-set flag on the person record may post-"
+        "process the final priority upward (e.g. always-high for a "
+        "specific contact). That override happens in the code layer "
+        "after your classification — classify normally per the rules "
+        "above, and don't try to anticipate the override. Your "
+        "``medium`` may surface to the operator as ``high`` if the "
+        "flag is set; that's expected and not a sign your "
+        "classification was wrong.\n\n"
+    )
     return (
+        f"{rules}"
         f"## Named contacts on file\n{contact_block}\n\n"
         f"## Note record subject\n{note_subject}\n\n"
         f"## Note record body\n{note_body}\n\n"

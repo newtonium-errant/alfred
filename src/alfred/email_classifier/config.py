@@ -60,8 +60,9 @@ def _substitute_env(value: Any) -> Any:
 # defaults; instance configs can override the whole ``prompt`` block.
 
 _DEFAULT_HIGH = (
-    "From a named person Andrew has interacted with recently "
-    "(vault-lookup for person records)",
+    "From a named contact (a person on the contacts list shown in the "
+    "user prompt) AND the email carries time-pressure / reply-required / "
+    "financial / legal / family-emergency markers",
     "Explicit time-pressure language (\"today\", \"by EOD\", \"urgent\", "
     "deadline within 48h)",
     "Reply-required signals (direct question to Andrew, RSVP request)",
@@ -70,6 +71,11 @@ _DEFAULT_HIGH = (
 )
 
 _DEFAULT_MEDIUM = (
+    "From a named contact on a routine subject with no time-pressure "
+    "markers — this is the MINIMUM tier for named contacts (see the "
+    "\"Named-contact handling\" rules in the user prompt; named "
+    "contacts NEVER drop below medium except for obvious automated "
+    "notifications carrying the contact's name)",
     "Appointments / confirmations / notices with future dates",
     "Subscription renewals",
     "Financial notifications (transactions, statements)",
@@ -80,12 +86,20 @@ _DEFAULT_LOW = (
     "Newsletters Andrew chose to receive",
     "Marketing from established relationships (vendors he uses)",
     "Automated notifications (system status, build emails, etc.)",
+    "Automated system notification that happens to carry a named "
+    "contact's name (e.g. an e-signature reminder \"from\" Paul "
+    "Chudnovsky actually sent by noreply@docusign.com) — match on the "
+    "actual sender address, not the display name",
 )
 
 _DEFAULT_SPAM = (
     "Unsolicited commercial",
     "Phishing-shape messages",
     "Unknown senders pitching products / services",
+    "NEVER classify as spam an email whose actual sender address "
+    "matches a named contact on the contacts list — if the display "
+    "name spoofs a contact but the address doesn't match, that IS "
+    "spam (phishing-shape); weigh the address, not the display name",
 )
 
 
