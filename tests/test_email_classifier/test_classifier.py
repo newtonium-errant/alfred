@@ -676,3 +676,427 @@ def test_system_prompt_contains_all_cue_groups(
     # Salem-specific seed lines
     assert "Jamie Newton" in sys_prompt
     assert "RRTS customer" in sys_prompt
+
+
+# ---------------------------------------------------------------------------
+# high_priority_sender override (2026-05-31)
+#
+# Operator-declarative override: a person record carrying
+# ``high_priority_sender: true`` forces ``priority=high`` when the
+# inbox sender matches the contact (by email OR alias substring on
+# display name). Backward-compat: existing records without the field
+# default to False; their behavior is unchanged.
+
+
+def _seed_person_with_high_priority_flag(
+    vault: Path,
+    name: str,
+    *,
+    email: str | list[str] | None = None,
+    aliases: list[str] | None = None,
+    high_priority_sender: bool = True,
+) -> None:
+    """Variant of ``_seed_person`` that sets the override flag."""
+    fm: dict[str, Any] = {
+        "type": "person",
+        "name": name,
+        "created": "2026-04-21",
+        "tags": [],
+        "related": [],
+        "high_priority_sender": high_priority_sender,
+    }
+    if email is not None:
+        fm["email"] = email
+    if aliases is not None:
+        fm["aliases"] = aliases
+    post = frontmatter.Post(f"# {name}\n", **fm)
+    (vault / "person" / f"{name}.md").write_text(
+        frontmatter.dumps(post) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_high_priority_sender_flag_loaded_from_person_frontmatter(
+    classifier_vault: Path,
+) -> None:
+    """``get_named_contacts`` populates ``high_priority_sender`` from
+    the person record's frontmatter when the field is set."""
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "Paul Chudnovsky",
+        email="pchudnovsky@coxandpalmer.com",
+        aliases=["Paul Chudnovsky", "P Chudnovsky"],
+        high_priority_sender=True,
+    )
+
+    contacts = get_named_contacts(classifier_vault, config=None)
+    assert len(contacts) == 1
+    assert contacts[0].name == "Paul Chudnovsky"
+    assert contacts[0].high_priority_sender is True
+
+
+def test_high_priority_sender_default_false_when_absent(
+    classifier_vault: Path,
+) -> None:
+    """Backward-compat: existing person records without the field still
+    parse cleanly; ``high_priority_sender`` defaults to False. Pin so
+    the ~30+ existing person records on Salem's vault stay unaffected
+    by this ship until the operator explicitly flips the flag."""
+    _seed_person(
+        classifier_vault, "Jamie Newton",
+        email="jamie@example.com",
+    )  # no high_priority_sender field set
+
+    contacts = get_named_contacts(classifier_vault, config=None)
+    assert len(contacts) == 1
+    assert contacts[0].high_priority_sender is False
+
+
+def test_classifier_override_to_high_when_sender_matches_flagged_contact(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """End-to-end override pin: flagged contact + matching sender +
+    LLM verdict ``medium`` → final ``priority=high`` + reason names
+    override + audit fields populated.
+
+    This is the canonical worked example from the dispatch — Paul
+    Chudnovsky's email always lands high regardless of what the LLM
+    picks."""
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "Paul Chudnovsky",
+        email="pchudnovsky@coxandpalmer.com",
+        aliases=["Paul Chudnovsky"],
+    )
+    # Inbox content with the canonical Outlook → n8n display-name +
+    # bracketed-address shape.
+    inbox = dedent(
+        """\
+        From: Chudnovsky, Paul (Halifax) <pchudnovsky@coxandpalmer.com>
+        **Subject:** Re: contract review
+
+        Andrew — see attached redlines.
+        """
+    )
+    rel = _seed_note(classifier_vault, "Chudnovsky contract review")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "medium",  # LLM thinks medium; override forces high
+        "action_hint": None,
+        "reasoning": "business correspondence",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # Priority forced to high.
+    assert result.priority == "high"
+    # Audit fields populated — both signals that override fired.
+    assert result.override_applied is True
+    assert result.llm_priority == "medium"
+    # Reason carries the override marker AND preserves the LLM's
+    # original rationale.
+    from alfred.email_classifier.classifier import (
+        HIGH_PRIORITY_SENDER_OVERRIDE_PREFIX,
+    )
+    assert HIGH_PRIORITY_SENDER_OVERRIDE_PREFIX in result.reasoning
+    assert "Paul Chudnovsky" in result.reasoning
+    assert "business correspondence" in result.reasoning  # LLM preserved
+    # Frontmatter on disk reflects the override + the audit field.
+    post = frontmatter.load(str(classifier_vault / rel))
+    assert post.metadata["priority"] == "high"
+    assert post.metadata["priority_llm_pre_override"] == "medium"
+    assert HIGH_PRIORITY_SENDER_OVERRIDE_PREFIX in post.metadata[
+        "priority_reasoning"
+    ]
+
+
+def test_classifier_no_override_when_sender_matches_unflagged_contact(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Person record exists with matching email but flag is False →
+    LLM verdict respected, no override fires. Pin the backward-compat
+    invariant: existing person records without the flag don't
+    suddenly start overriding."""
+    _seed_person(
+        classifier_vault, "Random Person",
+        email="random@example.com",
+    )  # NO high_priority_sender flag
+    inbox = "**From:** random@example.com\n**Subject:** hi\nbody\n"
+    rel = _seed_note(classifier_vault, "Random note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "medium",
+        "action_hint": None,
+        "reasoning": "neutral",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # Priority unchanged from LLM verdict.
+    assert result.priority == "medium"
+    # Audit fields confirm no override.
+    assert result.override_applied is False
+    assert result.llm_priority is None
+    # Frontmatter doesn't carry the audit field (only present when
+    # override fires).
+    post = frontmatter.load(str(classifier_vault / rel))
+    assert "priority_llm_pre_override" not in post.metadata
+
+
+def test_classifier_no_override_when_sender_does_not_match_any_flagged_contact(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Flagged contact exists in the vault but the inbox sender is
+    different. LLM verdict respected."""
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "Paul Chudnovsky",
+        email="pchudnovsky@coxandpalmer.com",
+    )
+    inbox = "**From:** newsletter@randomsite.com\n**Subject:** offer\nbody\n"
+    rel = _seed_note(classifier_vault, "Newsletter note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "low",
+        "action_hint": "archive",
+        "reasoning": "newsletter",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "low"
+    assert result.override_applied is False
+    assert result.llm_priority is None
+
+
+def test_classifier_alias_match_triggers_override(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Alias substring match on the From-line display name fires the
+    override. Fixture: contact with alias 'Paul Chudnovsky'; sender
+    display name 'Chudnovsky, Paul (Halifax)' contains 'Chudnovsky'
+    AND the contact's alias substring fires via the symmetric
+    case-insensitive substring rule.
+
+    Per dispatch's match semantics: alias match against display name
+    is OUT OF SCOPE for the canonical 'Paul Chudnovsky' alias →
+    'Chudnovsky, Paul' display name case (the substring check is in
+    one direction — alias-IN-display). Pick an alias that IS a
+    substring of the display name to exercise the path."""
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "P Chudnovsky",
+        email="different@some-other-domain.com",  # email does NOT match
+        aliases=["Chudnovsky"],  # alias IS substring of display name
+    )
+    # Different domain than the contact's email, but display name
+    # contains the alias.
+    inbox = dedent(
+        """\
+        From: Chudnovsky, Paul (Halifax) <p.chudnovsky@coxandpalmer.com>
+        **Subject:** Note from law office
+
+        Andrew — see attached.
+        """
+    )
+    rel = _seed_note(classifier_vault, "Law office note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "low",  # LLM mis-classifies; alias override fixes
+        "action_hint": None,
+        "reasoning": "no familiar sender",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "high"
+    assert result.override_applied is True
+    assert result.llm_priority == "low"
+
+
+def test_classifier_case_insensitive_email_match(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Email match is case-insensitive on BOTH sides. Fixture: contact
+    email is lowercase ``pchudnovsky@coxandpalmer.com``; incoming
+    From-line uses uppercase ``PCHUDNOVSKY@COXANDPALMER.COM`` →
+    override still fires."""
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "Paul Chudnovsky",
+        email="pchudnovsky@coxandpalmer.com",  # lowercase
+    )
+    inbox = (
+        "**From:** PCHUDNOVSKY@COXANDPALMER.COM\n"  # uppercase
+        "**Subject:** redlines\nbody\n"
+    )
+    rel = _seed_note(classifier_vault, "Case test note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "medium",
+        "action_hint": None,
+        "reasoning": "ok",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "high"
+    assert result.override_applied is True
+
+
+def test_classifier_override_preserves_llm_priority_in_audit_field(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """The override audit must capture BOTH the final ``priority=high``
+    AND the LLM's original verdict so calibration review can second-
+    guess the override.
+
+    The dispatch named this pin specifically — operator needs to be
+    able to see ``classifier said: medium / operator-flagged →
+    high`` post-override, otherwise the calibration loop loses the
+    ability to ask 'should this contact still be flagged?'"""
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "Paul Chudnovsky",
+        email="pchudnovsky@coxandpalmer.com",
+    )
+    inbox = "**From:** pchudnovsky@coxandpalmer.com\nSubject\nbody\n"
+    rel = _seed_note(classifier_vault, "Audit pin note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "spam",  # extreme: LLM thought SPAM, override → high
+        "action_hint": "archive",
+        "reasoning": "looked like marketing",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # Final priority is the override value.
+    assert result.priority == "high"
+    # LLM's pre-override verdict captured exactly.
+    assert result.llm_priority == "spam"
+    assert result.override_applied is True
+    # Frontmatter on disk carries the audit field.
+    post = frontmatter.load(str(classifier_vault / rel))
+    assert post.metadata["priority"] == "high"
+    assert post.metadata["priority_llm_pre_override"] == "spam"
+    # action_hint preserved from LLM per dispatch (operator can fix
+    # via calibration if needed — out of scope for the override).
+    assert post.metadata["action_hint"] == "archive"
+
+
+def test_classifier_no_override_when_llm_already_high(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """No-op override path: LLM already picked ``high`` for a flagged-
+    contact email → don't muddy the audit fields with a redundant
+    override marker.
+
+    The ``override_applied`` field is meant to signal 'override
+    CHANGED the verdict'; firing it on already-high would make the
+    field useless as a calibration filter."""
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "Paul Chudnovsky",
+        email="pchudnovsky@coxandpalmer.com",
+    )
+    inbox = "**From:** pchudnovsky@coxandpalmer.com\nSubject\nbody\n"
+    rel = _seed_note(classifier_vault, "Already-high note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "high",  # LLM AGREES with the override
+        "action_hint": None,
+        "reasoning": "named contact, looks important",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # Priority stayed high (was already, didn't change).
+    assert result.priority == "high"
+    # Audit fields signal NO override fired (because nothing changed).
+    assert result.override_applied is False
+    assert result.llm_priority is None
+    # LLM's reasoning preserved verbatim, NO override marker.
+    from alfred.email_classifier.classifier import (
+        HIGH_PRIORITY_SENDER_OVERRIDE_PREFIX,
+    )
+    assert HIGH_PRIORITY_SENDER_OVERRIDE_PREFIX not in result.reasoning
+    # Frontmatter doesn't carry the audit field.
+    post = frontmatter.load(str(classifier_vault / rel))
+    assert "priority_llm_pre_override" not in post.metadata
+
+
+def test_extract_sender_handles_bare_address() -> None:
+    """``_extract_sender`` correctly parses the ``**From:** addr``
+    shape (no display name, no brackets)."""
+    from alfred.email_classifier.classifier import _extract_sender
+
+    email, display = _extract_sender("**From:** jamie@example.com\nbody\n")
+    assert email == "jamie@example.com"
+    assert display == ""
+
+
+def test_extract_sender_handles_display_name_with_brackets() -> None:
+    """``_extract_sender`` correctly parses the corporate-mail-client
+    shape: ``From: Display Name <addr@host>``."""
+    from alfred.email_classifier.classifier import _extract_sender
+
+    email, display = _extract_sender(
+        "From: Chudnovsky, Paul (Halifax) <pchudnovsky@coxandpalmer.com>\n"
+    )
+    assert email == "pchudnovsky@coxandpalmer.com"
+    assert display == "Chudnovsky, Paul (Halifax)"
+
+
+def test_extract_sender_empty_when_no_from_line() -> None:
+    """No From-line at all → empty tuple. Override step's caller
+    treats this as 'no override possible' + falls through to LLM."""
+    from alfred.email_classifier.classifier import _extract_sender
+
+    email, display = _extract_sender("Just a voice memo transcript.\n")
+    assert email == ""
+    assert display == ""
+
+
+def test_extract_sender_lowercases_email() -> None:
+    """Email is normalised to lowercase for case-insensitive match
+    in the override step."""
+    from alfred.email_classifier.classifier import _extract_sender
+
+    email, _ = _extract_sender("**From:** Jamie@EXAMPLE.COM\n")
+    assert email == "jamie@example.com"

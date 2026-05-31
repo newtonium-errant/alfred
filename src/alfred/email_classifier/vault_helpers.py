@@ -31,11 +31,19 @@ class NamedContact:
     de-duplicated list of email addresses lifted from the frontmatter.
     ``aliases`` carries any explicit ``aliases:`` list — useful when a
     person has nicknames or formal-vs-casual variants.
+
+    ``high_priority_sender`` (2026-05-31) is the operator-set declarative
+    flag for guaranteed-high override. When True AND an incoming email
+    matches this contact by email or alias, the classifier forces
+    ``priority=high`` regardless of LLM verdict. Absent / unset / falsy
+    in the source record → False (backward-compat for the ~30+ existing
+    person records that don't carry the field).
     """
 
     name: str
     emails: list[str] = field(default_factory=list)
     aliases: list[str] = field(default_factory=list)
+    high_priority_sender: bool = False
 
 
 @dataclass
@@ -125,6 +133,13 @@ def get_named_contacts(
                 name=md_file.stem,
                 emails=_extract_email_field(fm.get("email")),
                 aliases=_extract_aliases(fm.get("aliases")),
+                # Operator-set override flag (2026-05-31). Use bool()
+                # to coerce YAML truthy variants (``true`` / ``True`` /
+                # 1) uniformly; default False for records that don't
+                # carry the field.
+                high_priority_sender=bool(
+                    fm.get("high_priority_sender", False),
+                ),
             )
             contacts.append(contact)
 

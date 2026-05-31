@@ -51,6 +51,26 @@ _EMAIL_FROM_RE = re.compile(r"^\s*\*?\*?From:\*?\*?\s*\S+@\S+", re.MULTILINE)
 _EMAIL_SUBJECT_RE = re.compile(r"^\s*\*?\*?Subject:\*?\*?\s*\S+", re.MULTILINE)
 _EMAIL_ACCOUNT_RE = re.compile(r"^\s*\*?\*?Account:\*?\*?\s*\S+", re.MULTILINE)
 
+# Capture the FULL From-line for sender extraction (high-priority-sender
+# override path, 2026-05-31). Two shapes seen in real Outlook → n8n
+# captures:
+#   * ``**From:** jamie@example.com`` (bare address)
+#   * ``From: Chudnovsky, Paul (Halifax) <pchudnovsky@coxandpalmer.com>``
+#     (display name + bracketed address — common from corporate mail
+#     clients)
+# The capture group is the everything-after-``From:`` payload; the
+# parser :func:`_extract_sender` splits it into (email, display_name).
+_EMAIL_FROM_CAPTURE_RE = re.compile(
+    r"^\s*\*?\*?From:\*?\*?\s*(.+?)\s*$",
+    re.MULTILINE,
+)
+
+# Operator-readable override-marker prefix in ``classifier_reason``.
+# Grep-friendly so the calibration UI can filter for override-fired
+# rows. Pinned in tests; rename here = update SKILL + calibration
+# filter in lockstep.
+HIGH_PRIORITY_SENDER_OVERRIDE_PREFIX = "OVERRIDE→high"
+
 
 # --- Types ------------------------------------------------------------------
 
@@ -69,12 +89,30 @@ class ClassificationResult:
     ``written_to`` is the vault-relative path of the note record the
     classifier mutated, or empty when the classifier short-circuited
     (disabled / non-email / no records).
+
+    ``llm_priority`` (2026-05-31) is the LLM's PRE-OVERRIDE verdict —
+    populated only when the high-priority-sender override fired (i.e.
+    ``priority == "high"`` was forced AFTER the LLM said something
+    else). ``None`` on the normal path so the field's presence is
+    the audit signal that an override applied. Pinned in the
+    structured log + in the frontmatter (``priority_llm_pre_override``)
+    so calibration can review whether the override fired sensibly
+    AND so an operator changing their mind about a contact's flag
+    can see what the LLM would have picked on its own.
+
+    ``override_applied`` (2026-05-31) is the boolean companion to
+    ``llm_priority`` — explicit True when override fired, False
+    otherwise. Convenience for downstream consumers (canary log,
+    calibration dashboard); ``llm_priority is not None`` is the same
+    signal in the data layer.
     """
 
     priority: str
     action_hint: str | None = None
     reasoning: str = ""
     written_to: str = ""
+    llm_priority: str | None = None
+    override_applied: bool = False
 
 
 # --- LLM call type -----------------------------------------------------------
@@ -152,6 +190,146 @@ def is_email_inbox(content: str) -> bool:
     if _EMAIL_ACCOUNT_RE.search(content) and _EMAIL_SUBJECT_RE.search(content):
         return True
     return False
+
+
+# --- Sender extraction (for high-priority-sender override) -----------------
+
+
+def _extract_sender(inbox_content: str) -> tuple[str, str]:
+    """Parse the From-line and return ``(email, display_name)``.
+
+    Handles the two shapes seen in real Outlook → n8n captures:
+      * ``**From:** jamie@example.com`` → ``("jamie@example.com", "")``
+      * ``From: Chudnovsky, Paul (Halifax) <pchudnovsky@coxandpalmer.com>``
+        → ``("pchudnovsky@coxandpalmer.com", "Chudnovsky, Paul (Halifax)")``
+
+    Returns ``("", "")`` when no From-line is found or the line carries
+    no parseable email address. Defensive against malformed input —
+    the override step's caller treats empty email as "no override
+    possible" + falls through to the LLM verdict.
+
+    Email is normalised by stripping ``mailto:`` prefix + angle
+    brackets + surrounding whitespace + lowercased for case-insensitive
+    match in the override step. Display name is preserved verbatim
+    (operator-set aliases may use any case).
+    """
+    if not inbox_content:
+        return "", ""
+    match = _EMAIL_FROM_CAPTURE_RE.search(inbox_content)
+    if match is None:
+        return "", ""
+    payload = match.group(1).strip()
+    if not payload:
+        return "", ""
+
+    # Bracketed shape: ``Display Name <addr@host>``.
+    bracket_match = re.match(r"^(.+?)\s*<([^<>]+@[^<>]+)>\s*$", payload)
+    if bracket_match:
+        display = bracket_match.group(1).strip().strip('"')
+        email = bracket_match.group(2).strip()
+    else:
+        # Bare address (no display name). Strip mailto:/angle brackets
+        # defensively in case the address still carries them.
+        email = (
+            payload.strip().strip("<>").removeprefix("mailto:").strip()
+        )
+        display = ""
+
+    # Final cleanup + lowercased email for case-insensitive matching.
+    email = email.removeprefix("mailto:").strip().lower()
+    if "@" not in email:
+        return "", display
+    return email, display
+
+
+def _apply_high_priority_sender_override(
+    result: ClassificationResult,
+    inbox_content: str,
+    contacts: list[NamedContact],
+) -> ClassificationResult:
+    """Force ``priority=high`` when the inbox sender matches a contact
+    flagged ``high_priority_sender: true``.
+
+    Match semantics (per dispatch 2026-05-31):
+      * Email match: case-insensitive equality between the sender's
+        normalised email address and any address on the contact's
+        ``emails`` list (also case-folded).
+      * Alias match: case-insensitive substring match of any alias
+        against the sender's display name (when present). Aliases
+        commonly carry name strings (e.g. ``"Paul Chudnovsky"``);
+        substring lets ``"Chudnovsky, Paul (Halifax)"`` match.
+      * Domain match: OUT OF SCOPE (per dispatch: too permissive —
+        ``accountant@gmail.com`` shouldn't match every gmail sender).
+
+    On match, mutates ``result`` in place:
+      * ``priority`` → ``"high"``
+      * ``llm_priority`` → the pre-override value (for audit)
+      * ``override_applied`` → True
+      * ``reasoning`` gets the override marker prefixed (preserving
+        the LLM's original reasoning afterward — the calibration
+        review still gets the model's rationale).
+
+    No-op when:
+      * Sender can't be parsed (empty email AND empty display name).
+      * No contact has ``high_priority_sender=True``.
+      * No flagged contact matches the sender.
+      * ``result.priority`` is already ``"high"`` (no-op override —
+        avoid mutating ``llm_priority`` / ``override_applied`` when
+        the LLM already agreed, so the audit field stays a true signal).
+    """
+    sender_email, sender_display = _extract_sender(inbox_content)
+    if not sender_email and not sender_display:
+        return result
+
+    sender_email_lower = sender_email.lower()
+    sender_display_lower = sender_display.lower()
+
+    # Find a flagged contact that matches.
+    matched: NamedContact | None = None
+    for contact in contacts:
+        if not contact.high_priority_sender:
+            continue
+        # Email match (case-insensitive on both sides).
+        if sender_email_lower:
+            for email in contact.emails:
+                if email.strip().lower() == sender_email_lower:
+                    matched = contact
+                    break
+        if matched is not None:
+            break
+        # Alias match (case-insensitive substring against display name).
+        if sender_display_lower:
+            for alias in contact.aliases:
+                alias_lower = alias.strip().lower()
+                if alias_lower and alias_lower in sender_display_lower:
+                    matched = contact
+                    break
+        if matched is not None:
+            break
+
+    if matched is None:
+        return result
+
+    # Already-high path: don't muddy the audit fields with a no-op
+    # override (the LLM agreed; ``llm_priority`` should stay None so
+    # downstream consumers can use it as a "did override fire?" signal).
+    if result.priority == "high":
+        return result
+
+    # Override fires — capture pre-override state + mutate.
+    result.llm_priority = result.priority
+    result.override_applied = True
+    result.priority = "high"
+
+    override_marker = (
+        f"{HIGH_PRIORITY_SENDER_OVERRIDE_PREFIX} — sender matches "
+        f"[[person/{matched.name}]] flagged as high_priority_sender."
+    )
+    if result.reasoning:
+        result.reasoning = f"{override_marker} (LLM said: {result.reasoning})"
+    else:
+        result.reasoning = override_marker
+    return result
 
 
 # --- Prompt construction ----------------------------------------------------
@@ -404,6 +582,19 @@ def classify_record(
     parsed = _parse_classification(raw)
     result = _coerce_result(parsed, config.unclassified_sentinel)
 
+    # High-priority-sender override (2026-05-31). Operator-declarative
+    # override: when the inbox sender matches a ``person/*.md`` record
+    # carrying ``high_priority_sender: true``, force priority=high
+    # regardless of the LLM's verdict. The LLM-side heuristic ("lean
+    # toward high for named contacts") is too soft for explicit
+    # operator-marked senders. Implementation lives at
+    # ``_apply_high_priority_sender_override``; see its docstring for
+    # match semantics (email exact match + alias substring on display
+    # name; domain match deliberately out of scope).
+    result = _apply_high_priority_sender_override(
+        result, inbox_content, contacts,
+    )
+
     # Write priority + action_hint + (optional) reasoning into the
     # note's frontmatter via vault_edit so the mutation is logged
     # consistently with curator's other writes.
@@ -413,6 +604,13 @@ def classify_record(
     set_fields["action_hint"] = result.action_hint
     if result.reasoning:
         set_fields["priority_reasoning"] = result.reasoning
+    # Audit trail for the high-priority-sender override (2026-05-31).
+    # Only persist when the override actually fired so normal-path
+    # records don't grow a noisy nullable column. Calibration UI can
+    # filter on ``priority_llm_pre_override`` presence to show only
+    # override-affected rows for review.
+    if result.override_applied and result.llm_priority is not None:
+        set_fields["priority_llm_pre_override"] = result.llm_priority
 
     try:
         vault_edit(vault_path, note_rel_path, set_fields=set_fields)
@@ -428,6 +626,13 @@ def classify_record(
             path=note_rel_path,
             priority=result.priority,
             has_action_hint=result.action_hint is not None,
+            # Audit signal for the high-priority-sender override
+            # (2026-05-31). False on normal path; True when override
+            # fired. ``llm_priority`` carries the pre-override verdict
+            # so calibration grep can find override-affected rows
+            # without re-reading the frontmatter.
+            override_applied=result.override_applied,
+            llm_priority=result.llm_priority,
         )
     except VaultError as exc:
         log.warning(
