@@ -553,12 +553,35 @@ async def extract(
     try:
         result = ExtractionResult.model_validate_json(cleaned_repair)
         if len(result.learnings) == 0:
-            log.info(
-                "extractor.extract_empty",
-                attempt=2,
-                stop_reason=stop_reason_repair,
-                raw_preview=raw_repair[:200],
-            )
+            # Truncation-discrimination layer (2026-05-31). Empty learnings
+            # AFTER a truncated stop_reason is a likely dropped-output, NOT
+            # a genuine "model said nothing extractable" result. Surface
+            # the distinction with a WARNING (vs the info-level
+            # extract_empty below for genuine empties) so operator log
+            # review can grep ``extractor.truncated_drop`` and triage.
+            # ``max_tokens`` is Anthropic's truncation token; ``length``
+            # is OpenAI's (Ollama + Together both emit it via the
+            # OpenAI-compatible endpoint).
+            if stop_reason_repair in {"max_tokens", "length"}:
+                log.warning(
+                    "extractor.truncated_drop",
+                    attempt=2,
+                    stop_reason=stop_reason_repair,
+                    raw_len=len(raw_repair),
+                    source_title=source_frontmatter.get("title", "(no title)"),
+                    source_type=source_frontmatter.get("type", "(no type)"),
+                    note=(
+                        "Empty learnings after truncated response — "
+                        "raise distiller.anthropic.max_tokens or shorten source"
+                    ),
+                )
+            else:
+                log.info(
+                    "extractor.extract_empty",
+                    attempt=2,
+                    stop_reason=stop_reason_repair,
+                    raw_preview=raw_repair[:200],
+                )
         log.info(
             "extractor.extract_complete",
             attempt=2,
@@ -575,4 +598,25 @@ async def extract(
             raw_preview=raw_repair[:500],
             stop_reason=stop_reason_repair,
         )
+        # Truncation-discrimination at the validation-failure path
+        # (2026-05-31). When JSON parsing fails twice AND the stop_reason
+        # was truncation-shaped, the failure mode is "JSON cut off mid-
+        # string" (operator-actionable: bump max_tokens), not "model
+        # produced bad JSON" (operator-actionable: tune prompt). Emit a
+        # distinct WARNING so log review can route the two failure
+        # classes differently. Pre-2026-05-31 every Voice Chat-shape
+        # truncation looked like a generic validation_failed in logs.
+        if stop_reason_repair in {"max_tokens", "length"}:
+            log.warning(
+                "extractor.truncated_drop",
+                attempt=2,
+                stop_reason=stop_reason_repair,
+                raw_len=len(raw_repair),
+                source_title=source_frontmatter.get("title", "(no title)"),
+                source_type=source_frontmatter.get("type", "(no type)"),
+                note=(
+                    "Validation failed after truncated response — "
+                    "raise distiller.anthropic.max_tokens or shorten source"
+                ),
+            )
         return ExtractionResult(learnings=[])

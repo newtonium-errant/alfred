@@ -37,7 +37,13 @@ async def call_anthropic_no_tools(
     prompt: str,
     system: str | None = None,
     model: str = "claude-opus-4-7",
-    max_tokens: int = 4096,
+    # Bumped 2026-05-31 from 4096 → 16384 alongside
+    # ``AnthropicConfig.max_tokens`` — see config.py for the full
+    # truncation-bug rationale. Direct callers that bypass the config
+    # (rare) get the same safer default; production calls go through
+    # the dispatcher which threads ``config.anthropic.max_tokens``
+    # through, so both paths land on the same cap unless overridden.
+    max_tokens: int = 16384,
     api_key: str | None = None,
 ) -> tuple[str, dict]:
     """Call the Anthropic Messages API without any tools.

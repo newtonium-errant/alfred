@@ -64,7 +64,13 @@ async def call_together_no_tools(
     prompt: str,
     system: str | None = None,
     model: str = "Qwen/Qwen2.5-72B-Instruct-Turbo",
-    max_tokens: int = 4096,
+    # Bumped 2026-05-31 from 4096 → 16384 to mirror Anthropic + Ollama
+    # backends after the Path C Phase 1.5 truncation bug surfaced. See
+    # ``AnthropicConfig.max_tokens`` in config.py for the full
+    # rationale. Together bills per-token; the higher cap raises the
+    # spend ceiling on long-output records but the actual spend only
+    # rises when the model actually uses the headroom.
+    max_tokens: int = 16384,
     api_key: str = "",
 ) -> tuple[str, dict]:
     """Call Together.ai's OpenAI-compatible chat-completions endpoint.

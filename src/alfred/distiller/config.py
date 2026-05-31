@@ -239,7 +239,23 @@ class AnthropicConfig:
 
     api_key: str = ""
     model: str = "claude-opus-4-7"
-    max_tokens: int = 4096
+    # Bumped 2026-05-31 from 4096 → 16384 after Path C Phase 1.5
+    # spike confirmed in-production truncation. The 4096 default
+    # silently truncated extractor JSON on long records (e.g.,
+    # ``session/Voice Chat and Calibration Design 2026-04-15.md``
+    # at 650 lines: 0 learnings extracted at 4096; 26 learnings at
+    # 16384). Production daily-distiller runs since the 4096 default
+    # landed have been losing learnings on every long record — empty
+    # ``learnings=[]`` looks identical to "nothing extractable" in
+    # operator logs without inspecting ``extractor.validation_failed``
+    # with ``stop_reason=max_tokens``. See the truncation-warning
+    # log added alongside this bump in ``extractor.py``.
+    #
+    # Cost impact: per-call cap rises 4× on output tokens; real spend
+    # depends on how often the model actually uses the higher cap
+    # (only on long-output records). Operator can override via
+    # ``distiller.anthropic.max_tokens`` in config.yaml.
+    max_tokens: int = 16384
 
 
 @dataclass

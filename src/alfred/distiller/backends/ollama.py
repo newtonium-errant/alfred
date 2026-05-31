@@ -53,7 +53,13 @@ async def call_ollama_no_tools(
     prompt: str,
     system: str | None = None,
     model: str = "qwen2.5:72b-instruct-q4_K_M",
-    max_tokens: int = 4096,
+    # Bumped 2026-05-31 from 4096 → 16384 to mirror the Anthropic +
+    # Together backends after the Path C Phase 1.5 truncation bug
+    # surfaced. See ``AnthropicConfig.max_tokens`` in config.py for
+    # the full rationale. Local Ollama doesn't have per-call billing,
+    # so the higher cap has no spend impact (only memory / latency
+    # under heavy load).
+    max_tokens: int = 16384,
     endpoint: str = "http://localhost:11434",
 ) -> tuple[str, dict]:
     """Call Ollama's OpenAI-compatible chat-completions endpoint.
