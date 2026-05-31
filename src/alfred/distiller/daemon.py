@@ -212,6 +212,12 @@ async def _run_v2_shadow(
                 existing_learn_titles=existing_titles,
                 signals=sc.signals,
                 config=config,
+                # Threaded through to extractor.truncated_drop log
+                # so operator review can identify which record dropped
+                # output (2026-05-31 followup). Matches the source=
+                # field on the existing distiller.v2.extract_error log
+                # at line 220, so the two logs correlate by path.
+                source_path=sc.record.rel_path,
             )
         except Exception as exc:  # noqa: BLE001 — isolate per-source LLM/network errors
             log.warning(

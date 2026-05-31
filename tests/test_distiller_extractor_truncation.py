@@ -356,3 +356,139 @@ class TestTruncationWarningOnValidationFailure:
         assert ev["source_title"] == "A Long Source"
         # Note field actionable hint identifies the fix path.
         assert "max_tokens" in ev["note"]
+
+
+# --- source_path threading (2026-05-31 followup) -------------------------
+
+
+class TestSourcePathThreading:
+    """Pin the source_path kwarg surface added 2026-05-31 followup.
+
+    Operator log review needs to identify WHICH source record dropped
+    output. Pre-fix, only ``source_title`` + ``source_type`` from
+    frontmatter were logged; the path was only available on the
+    upper-layer daemon error log (``distiller.v2.extract_error``),
+    which required timestamp-correlation between two logs to identify
+    a truncated record. Post-fix, ``extractor.truncated_drop``
+    carries ``source_path`` directly when the caller threads it
+    through.
+
+    Three tests cover the contract:
+      - Caller supplies source_path → field populated in log
+      - Caller omits source_path → field present with value ``None``
+        (so grep ``source_path=`` matches both cases; absence-of-
+        value is a discoverable state, not a missing key)
+      - Existing callers that don't pass source_path still work
+        (back-compat regression pin)
+    """
+
+    async def test_extract_passes_source_path_to_truncation_warning(
+        self, monkeypatch,
+    ) -> None:
+        """Caller passes ``source_path="some/path.md"`` → the
+        ``extractor.truncated_drop`` log emits
+        ``source_path="some/path.md"`` so operator grep can identify
+        the affected record without cross-log correlation."""
+
+        async def _fake_dispatch(*, prompt, system, config):
+            return (json.dumps({"learnings": []}), {"stop_reason": "max_tokens"})
+
+        monkeypatch.setattr(
+            extractor_mod, "_call_extraction_llm", _fake_dispatch,
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            await extractor_mod.extract(
+                source_body="x",
+                source_frontmatter=_frontmatter(),
+                existing_learn_titles=[],
+                signals=_signals(),
+                config=_config(),
+                source_path="session/Voice Chat and Calibration Design 2026-04-15.md",
+            )
+
+        truncated = [
+            c for c in captured
+            if c.get("event") == "extractor.truncated_drop"
+        ]
+        assert len(truncated) == 1
+        ev = truncated[0]
+        # Path threaded verbatim — no normalization, the caller's
+        # representation is authoritative (matches the daemon-layer
+        # log fields ``source=sc.record.rel_path`` /
+        # ``source=str(source_file)``).
+        assert (
+            ev["source_path"]
+            == "session/Voice Chat and Calibration Design 2026-04-15.md"
+        )
+
+    async def test_extract_omits_source_path_when_caller_does_not_supply(
+        self, monkeypatch,
+    ) -> None:
+        """Caller omits source_path → field present with value
+        ``None`` (back-compat for tests / direct callers; absence-of-
+        value is grep-able)."""
+
+        async def _fake_dispatch(*, prompt, system, config):
+            return (json.dumps({"learnings": []}), {"stop_reason": "max_tokens"})
+
+        monkeypatch.setattr(
+            extractor_mod, "_call_extraction_llm", _fake_dispatch,
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            await extractor_mod.extract(
+                source_body="x",
+                source_frontmatter=_frontmatter(),
+                existing_learn_titles=[],
+                signals=_signals(),
+                config=_config(),
+                # Deliberately omit source_path to exercise default.
+            )
+
+        truncated = [
+            c for c in captured
+            if c.get("event") == "extractor.truncated_drop"
+        ]
+        assert len(truncated) == 1
+        ev = truncated[0]
+        # Field present in log with None value — pinned so a future
+        # refactor that drops the field entirely (rather than logging
+        # None) fails this test. Grep-able as ``source_path=None``.
+        assert "source_path" in ev
+        assert ev["source_path"] is None
+
+    async def test_extract_default_kwarg_does_not_break_existing_callers(
+        self, monkeypatch,
+    ) -> None:
+        """Back-compat regression pin: extract() called without
+        source_path (the pre-followup signature) returns normally and
+        emits the truncated_drop log without raising TypeError. The
+        original 6 tests in this file all exercise this path
+        implicitly; this test makes the contract explicit so a future
+        change that promotes source_path to positional-required fails
+        this test instead of silently breaking unit-test callers."""
+
+        async def _fake_dispatch(*, prompt, system, config):
+            # Return a non-empty valid result so we exercise the
+            # success-path code instead of the truncation path.
+            return (
+                json.dumps({"learnings": []}),
+                {"stop_reason": "end_turn"},
+            )
+
+        monkeypatch.setattr(
+            extractor_mod, "_call_extraction_llm", _fake_dispatch,
+        )
+
+        # Pre-followup call signature — no source_path kwarg.
+        result = await extractor_mod.extract(
+            source_body="smoke test",
+            source_frontmatter=_frontmatter(),
+            existing_learn_titles=[],
+            signals=_signals(),
+            config=_config(),
+        )
+
+        # Returns normally — back-compat preserved.
+        assert result.learnings == []

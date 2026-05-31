@@ -365,6 +365,11 @@ async def run_backfill(
                 existing_learn_titles=[],
                 signals=signals,
                 config=config,
+                # Threaded through to extractor.truncated_drop log
+                # so operator review can identify which record dropped
+                # output (2026-05-31 followup). Matches the source=
+                # field on the existing backfill.extract_error log.
+                source_path=str(source_file),
             )
         except Exception as exc:  # noqa: BLE001 — isolate per-source LLM/SDK errors
             log.warning(

@@ -491,6 +491,7 @@ def _log_empty_or_truncated_drop(
     stop_reason: str | None,
     raw_text: str,
     source_frontmatter: dict[str, Any],
+    source_path: str | None = None,
     failure_mode: str = "empty_learnings",
 ) -> None:
     """Emit the right log when the extractor returns an empty result.
@@ -515,6 +516,15 @@ def _log_empty_or_truncated_drop(
     for the post-parse-success empty path, "Validation failed" for
     the validation-failed path. Other call-sites get the post-parse
     default.
+
+    ``source_path`` (added 2026-05-31 followup) is the vault-relative
+    or absolute path of the source record being extracted. Threaded
+    in from the daemon caller so operator log review can identify
+    WHICH record dropped output without needing to correlate against
+    upper-layer daemon logs by timestamp. ``None`` when the caller
+    doesn't supply (back-compat for tests / direct callers); the log
+    field is still emitted with the None value so a grep on
+    ``source_path=`` matches both populated and absent cases.
     """
     if stop_reason in _TRUNCATED_STOP_REASONS:
         if failure_mode == "validation_failed":
@@ -534,6 +544,7 @@ def _log_empty_or_truncated_drop(
             raw_len=len(raw_text),
             source_title=source_frontmatter.get("title", "(no title)"),
             source_type=source_frontmatter.get("type", "(no type)"),
+            source_path=source_path,
             note=note,
         )
     else:
@@ -551,6 +562,7 @@ async def extract(
     existing_learn_titles: list[tuple[str, str]],
     signals: CandidateSignal,
     config: DistillerConfig,
+    source_path: str | None = None,
 ) -> ExtractionResult:
     """Non-agentic LLM extraction with Pydantic validation + one repair retry.
 
@@ -563,6 +575,14 @@ async def extract(
         return empty result. Surfaces in logs; doesn't crash the daemon.
       - SDK error (timeout, rate-limit, etc.) → propagates to the caller.
         The daemon's top-level ``try`` catches it per-batch.
+
+    ``source_path`` (added 2026-05-31 followup) is the vault-relative
+    or absolute path of the source record. Threaded through to the
+    truncation-warning log (``extractor.truncated_drop``) so operator
+    log review can identify WHICH record dropped output. Default
+    ``None`` for back-compat with any caller that hasn't been updated
+    yet (and for unit tests that don't need to pin the path); both
+    production callers (``daemon.py``, ``backfill.py``) pass it.
     """
     user_prompt = _render_user_prompt(
         source_body=source_body,
@@ -598,6 +618,7 @@ async def extract(
                 stop_reason=stop_reason,
                 raw_text=raw,
                 source_frontmatter=source_frontmatter,
+                source_path=source_path,
             )
         log.info(
             "extractor.extract_complete",
@@ -636,6 +657,7 @@ async def extract(
                 stop_reason=stop_reason_repair,
                 raw_text=raw_repair,
                 source_frontmatter=source_frontmatter,
+                source_path=source_path,
             )
         log.info(
             "extractor.extract_complete",
@@ -673,6 +695,7 @@ async def extract(
                 stop_reason=stop_reason_repair,
                 raw_text=raw_repair,
                 source_frontmatter=source_frontmatter,
+                source_path=source_path,
                 failure_mode="validation_failed",
             )
         return ExtractionResult(learnings=[])
