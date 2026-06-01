@@ -60,8 +60,7 @@ and the operator sees the malformed-pattern signal in the log.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
-from typing import Any
+from datetime import date, datetime, timedelta
 
 import structlog
 from dateutil.relativedelta import relativedelta
@@ -422,7 +421,7 @@ def _has_completion_in_iso_week(
 #   * :func:`completion_satisfies_current_cycle` — nearest-cycle
 #     ±half-cycle heuristic. A completion within half a cycle-length
 #     of the upcoming due date "covers" that cycle.
-#   * :func:`effective_due_for_predicate` — returns prev_due when
+#   * :func:`overdue_effective_due` — returns prev_due when
 #     prev cycle is unsatisfied AND has passed, else current_due.
 #     Lets the window math accept negative days_to_due as
 #     "overdue, retain in T1."
@@ -612,55 +611,6 @@ def completion_satisfies_current_cycle(
     )
 
 
-def effective_due_for_predicate(
-    due_pattern: DuePattern | None,
-    completion_log: dict | None,
-    item_text: str,
-    today: date,
-) -> date | None:
-    """Return the due date the window-math predicate should compare against.
-
-    Default path: returns the resolver's next-upcoming due date
-    (``current_due``). This is the pre-Phase-2C-C1 behavior.
-
-    Overdue-retention path (new 2026-06-01): when ``prev_due`` has
-    passed (``prev_due < today``) AND no completion satisfies the
-    prev cycle (per :func:`completion_satisfies_current_cycle`
-    applied against the prev cycle window), returns ``prev_due``
-    instead. This makes ``days_to_due = (prev_due - today).days``
-    NEGATIVE, which the post-C1 T1 window math accepts as
-    "overdue, retain in T1."
-
-    Example: monthly day=15, today=June 17, completion_log empty.
-      * resolve_due_date → July 15 (rolls forward)
-      * prev_due → June 15
-      * prev_due (June 15) < today (June 17) → True
-      * no completion satisfies prev cycle → True
-      * returns June 15 → days_to_due = -2 → T1 with overdue
-        annotation
-
-    Without this override, days_to_due = (July 15 - June 17) = 28,
-    fails the T1 window check (even with escalate_at_days = 7), item
-    silently drops.
-
-    Returns ``None`` when the resolver returns None (malformed
-    pattern) — caller treats as "no tier handoff."
-    """
-    if due_pattern is None:
-        return None
-    current_due = resolve_due_date(due_pattern, today)
-    if current_due is None:
-        return None
-    if current_due >= today:
-        # Current cycle hasn't passed yet — use current_due. The
-        # completion-suppression check (separately) handles "did
-        # the operator already cover this cycle?"
-        return current_due
-    # current_due < today is the pathological case (resolver should
-    # always return >= today). If it does happen, treat as overdue.
-    return current_due
-
-
 def _completion_satisfies_prev_cycle(
     item_text: str,
     completion_log: dict | None,
@@ -672,7 +622,7 @@ def _completion_satisfies_prev_cycle(
 
     Same nearest-cycle ±half-cycle logic as
     :func:`completion_satisfies_current_cycle`, but with prev_due as
-    the reference. Used by :func:`effective_due_for_predicate` to
+    the reference. Used by :func:`overdue_effective_due` to
     decide whether to fall back to prev_due as the effective due
     date (overdue retention) vs. the default current_due.
     """
@@ -706,11 +656,10 @@ def overdue_effective_due(
 ) -> date | None:
     """Return effective_due that admits overdue retention.
 
-    The full overdue-retention helper — distinct from
-    :func:`effective_due_for_predicate` above which only returns
-    current_due (the resolver's roll-forward result). This helper
-    detects "prev cycle passed without completion → retain at prev_due
-    as effective_due" and returns prev_due in that case.
+    Detects "prev cycle passed without completion → retain at
+    prev_due as effective_due" and returns prev_due in that case.
+    Otherwise returns the resolver's next-upcoming due date
+    (``current_due``).
 
     Used by the T1/T2 predicate to make the "missed deadline" case
     show up in the operator's tier section instead of silently
@@ -733,9 +682,6 @@ def overdue_effective_due(
     this for retain). Layers call both in the same order, identical
     args.
     """
-    import datetime as _dt
-    _ = _dt  # silence unused-import warning; imported for clarity
-
     if due_pattern is None:
         return None
     current_due = resolve_due_date(due_pattern, today)
@@ -743,8 +689,8 @@ def overdue_effective_due(
         return None
 
     # The resolver returns >= today by design. The overdue case is
-    # when the PREVIOUS cycle's due date has passed AND no completion
-    # satisfies it.
+    # when the PREVIOUS cycle's due date has RECENTLY passed AND no
+    # completion satisfies it — operator just missed the deadline.
     prev_due = _previous_cycle_due_date(due_pattern, current_due)
     if prev_due is None:
         return current_due
@@ -757,19 +703,38 @@ def overdue_effective_due(
     if cycle_length <= 0:
         return current_due
 
+    # Recency gate: only retain at prev_due when we're STILL inside
+    # the half-cycle window just past it. If we're closer to
+    # current_due than to prev_due, the natural "due today / due in
+    # Nd" surfacing handles the item — no need to retain at prev_due.
+    #
+    # Without this gate, today=June 1 with monthly day=1 (current_due
+    # IS today, prev_due=May 1 a full cycle back) would incorrectly
+    # retain at May 1 → days_to_due=-31 → operator sees "overdue by
+    # 31d" when the right surface is "due today." Pinned via the
+    # mirror test's Case B (no completion, today on the due date).
+    days_since_prev_due = (today - prev_due).days
+    half_cycle = max(1, cycle_length // 2)
+    if days_since_prev_due > half_cycle:
+        # Today is further from prev_due than half a cycle → we're
+        # in the upcoming cycle's window. Use current_due so the
+        # standard "due today / due in Nd" path applies.
+        return current_due
+
     if _completion_satisfies_prev_cycle(
         item_text, completion_log, due_pattern, prev_due, cycle_length,
     ):
         # Prev cycle was completed → use current_due (default).
         return current_due
 
-    # Prev cycle passed without completion → retain at prev_due.
+    # Prev cycle passed RECENTLY without completion → retain at
+    # prev_due. Caller's days_to_due = (prev_due - today).days is
+    # negative; T1 window math admits as overdue retention.
     return prev_due
 
 
 __all__ = [
     "completion_satisfies_current_cycle",
-    "effective_due_for_predicate",
     "is_done_in_current_cycle",
     "overdue_effective_due",
     "resolve_due_date",

@@ -1747,59 +1747,159 @@ def test_auto_routine_overdue_retention_suppressed_when_completed(
     )
 
 
+_MIRROR_CASES = [
+    # (case_id, item_text, due_pattern_kwargs, completion_log,
+    #  today, expected_handoff_tier, expected_compute_count)
+    # Case A — operator bug repro: Pay Clinic monthly day=1,
+    # completion May 29, today June 1 → SUPPRESS at both layers.
+    (
+        "A_suppress_via_recent_completion",
+        "Pay Clinic Rental",
+        {"type": "monthly", "day": 1},
+        {"Pay Clinic Rental": [date(2026, 5, 29)]},
+        date(2026, 6, 1),
+        None,   # aggregator returns None (no handoff)
+        0,      # compute returns empty list (no candidate)
+    ),
+    # Case B — no completion: monthly day=1, today June 1, empty log
+    # → SURFACE T1 at both layers ('due today').
+    (
+        "B_no_completion_surfaces_t1",
+        "Pay Clinic Rental",
+        {"type": "monthly", "day": 1},
+        {},
+        date(2026, 6, 1),
+        1,      # T1
+        1,      # one candidate
+    ),
+    # Case C — overdue retention: monthly day=15, today June 17, no
+    # completion → effective_due=June 15, days_to_due=-2 → T1 at
+    # both layers.
+    (
+        "C_overdue_retention",
+        "Pay credit card",
+        {"type": "monthly", "day": 15},
+        {},
+        date(2026, 6, 17),
+        1,      # T1 (overdue retention)
+        1,      # one candidate
+    ),
+    # Case D — completion too old: monthly day=1, completion Apr 17
+    # (covers prev cycle May 1, NOT current June 1), today June 1 →
+    # SURFACE T1 at both layers (completion did NOT cover current
+    # cycle; overdue retention skipped because prev cycle WAS
+    # covered).
+    (
+        "D_completion_too_old_for_current_cycle",
+        "Pay Clinic Rental",
+        {"type": "monthly", "day": 1},
+        {"Pay Clinic Rental": [date(2026, 4, 17)]},
+        date(2026, 6, 1),
+        1,      # T1 'due today'
+        1,      # one candidate
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "case_id,item_text,due_pattern_kwargs,completion_log,today,"
+    "expected_handoff_tier,expected_compute_count",
+    _MIRROR_CASES,
+    ids=[c[0] for c in _MIRROR_CASES],
+)
 def test_mirror_completion_predicate_aggregator_matches_compute(
     tmp_path: Path,
+    case_id: str,
+    item_text: str,
+    due_pattern_kwargs: dict,
+    completion_log: dict,
+    today: date,
+    expected_handoff_tier: int | None,
+    expected_compute_count: int,
 ) -> None:
     """Side-by-side mirror: identical fixture → both layers return
     the same decision. Pins the
     ``feedback_two_layer_window_math_mirror`` contract for the new
     completion-aware gates.
 
-    Test case: Pay Clinic Rental monthly day=1, completion May 29,
-    today June 1. Both layers MUST suppress.
+    Four cases (matches the dispatch's trace table):
+
+      * A — suppress via recent completion (operator bug repro)
+      * B — no completion, surfaces T1
+      * C — overdue retention (missed deadline → prev_due as
+        effective_due → T1 with negative days_to_due)
+      * D — completion too old to cover current cycle → surfaces T1
+
+    Each case asserts BOTH layers reach the same decision. Drift
+    here would silently break the mirror contract (one layer
+    suppresses, the other surfaces).
     """
-    # Compute side.
-    later_now = datetime(2026, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
-    vault_compute = _write_routine(
-        tmp_path / "compute",
-        "Recurring Bills.md",
+    from alfred.routine.aggregator import _decide_tier_handoff
+    from alfred.routine.config import DuePattern
+
+    # Build the routine record YAML for the compute side.
+    if completion_log:
+        completion_log_yaml = (
+            "completion_log:\n"
+            + "\n".join(
+                f"  {k}:\n"
+                + "\n".join(f"  - '{d.isoformat()}'" for d in v)
+                for k, v in completion_log.items()
+            )
+            + "\n"
+        )
+    else:
+        completion_log_yaml = ""
+
+    # Render due_pattern as YAML.
+    dp_yaml = "  due_pattern:\n"
+    for k, v in due_pattern_kwargs.items():
+        dp_yaml += f"    {k}: {v}\n"
+
+    fm_yaml = (
         "type: routine\nstatus: active\nname: Recurring Bills\n"
         "cadence:\n  type: daily\n"
-        "completion_log:\n"
-        "  Pay Clinic Rental:\n"
-        "  - '2026-05-29'\n"
-        "items:\n"
-        "- text: Pay Clinic Rental\n"
-        "  priority: critical\n"
-        "  due_pattern:\n"
-        "    type: monthly\n"
-        "    day: 1\n"
-        "  escalate_at_days: 0\n",
+        + completion_log_yaml
+        + "items:\n"
+        + f"- text: {item_text}\n"
+        + "  priority: critical\n"
+        + dp_yaml
+        + "  escalate_at_days: 0\n"
+    )
+
+    # Compute side — use a per-case tmp subdirectory so parametrized
+    # cases don't collide on the shared tmp_path.
+    case_root = tmp_path / case_id
+    case_root.mkdir()
+    later_now = datetime(
+        today.year, today.month, today.day, 13, 0, 0,
+        tzinfo=timezone.utc,
+    )
+    vault_compute = _write_routine(
+        case_root, "Recurring Bills.md", fm_yaml,
     )
     compute_result = compute_auto_routine_candidates(vault_compute, later_now)
 
-    # Aggregator side — invoke _decide_tier_handoff directly with the
-    # same args. (run_aggregator_once does more setup; the predicate
-    # is the unit under test for the mirror.)
-    from alfred.routine.aggregator import _decide_tier_handoff
-    from alfred.routine.config import DuePattern
-    today = date(2026, 6, 1)
+    # Aggregator side — direct predicate invocation with the same args.
     agg_result = _decide_tier_handoff(
-        due_pattern=DuePattern(type="monthly", day=1),
+        due_pattern=DuePattern(**due_pattern_kwargs),
         surface_at_days=None,
         escalate_at_days=0,
         today=today,
-        completion_log={"Pay Clinic Rental": [date(2026, 5, 29)]},
-        item_text="Pay Clinic Rental",
+        completion_log=completion_log,
+        item_text=item_text,
         routine_record="Recurring Bills",
     )
 
-    # Both must agree: SKIP (no handoff, no surface).
-    assert compute_result == [], (
-        f"compute_auto_routine surfaced when aggregator suppressed — "
-        f"mirror broken on compute side. Got: {[c.name for c in compute_result]}"
+    # Mirror assertion: both layers' decisions must agree.
+    assert agg_result == expected_handoff_tier, (
+        f"[{case_id}] aggregator returned tier {agg_result}, "
+        f"expected {expected_handoff_tier}. Mirror broken on "
+        f"aggregator side."
     )
-    assert agg_result is None, (
-        f"_decide_tier_handoff returned tier {agg_result} when "
-        f"compute suppressed — mirror broken on aggregator side."
+    assert len(compute_result) == expected_compute_count, (
+        f"[{case_id}] compute returned {len(compute_result)} "
+        f"candidates, expected {expected_compute_count}. Mirror "
+        f"broken on compute side. Got: "
+        f"{[c.name for c in compute_result]}"
     )
