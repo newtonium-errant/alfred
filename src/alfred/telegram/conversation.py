@@ -3197,6 +3197,24 @@ async def _execute_tool(
             # template-default-body path); the model only triggers wrapping
             # when it composed body content itself.
             sf = dict(set_fields) if isinstance(set_fields, dict) else {}
+
+            # c6 (2026-05-31) — auto-populate aggregator-owned ``date``
+            # field for daily/ creates. The ``daily`` TypeDefinition
+            # requires ``date`` per schema.py, but the operator-facing
+            # field-allowlist denies operator from supplying it (only
+            # ``tier_curation`` is allowlisted at the dispatch gate).
+            # The tool layer already parses ``name`` as ISO YYYY-MM-DD
+            # for the future-date check — reuse that as the ``date``
+            # value. The aggregator's next fire will overwrite this
+            # field with its own ISO render (per render_daily_body /
+            # aggregator.py:838), so this is just bridging the gap
+            # for the record-validator + janitor first-pass on a
+            # talker-pre-set daily file. Defensive guard: only set
+            # when not already present so a future refactor that
+            # allows operator-supplied ``date`` doesn't get stomped.
+            if record_type == "daily" and "date" not in sf:
+                sf["date"] = name
+
             if body:
                 wrapped_body, audit_entry = attribution.with_inferred_marker(
                     body,

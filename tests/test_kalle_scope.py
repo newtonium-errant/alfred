@@ -8,6 +8,7 @@ import pytest
 
 from alfred.telegram.conversation import (
     KALLE_VAULT_TOOLS,
+    SALEM_VAULT_TOOLS,
     TALKER_VAULT_TOOLS,
     VAULT_TOOLS,
     VAULT_TOOLS_BY_SET,
@@ -196,7 +197,28 @@ def test_vault_tools_is_alias_for_talker():
 
 
 def test_tools_for_set_talker_default():
-    assert tools_for_set("talker") is TALKER_VAULT_TOOLS
+    """``tools_for_set("talker")`` returns the canonical Salem tool set.
+
+    Updated 2026-05-31 (c6 follow-up): the assertion was pre-existing
+    drift from B1 ship 2026-05-30 (commit 65e4233) — that ship moved
+    Salem's tool list from ``TALKER_VAULT_TOOLS`` to a new
+    ``SALEM_VAULT_TOOLS`` = ``[*TALKER_VAULT_TOOLS,
+    _ROUTINE_DONE_TOOL_SCHEMA, _ROUTINE_ITEM_TOOL_SCHEMA]``
+    superset, and ``VAULT_TOOLS_BY_SET["talker"]`` started pointing
+    at the new list, but this test wasn't updated in lockstep.
+    Surfaced by the c6 ship's full pytest run.
+
+    Contract preserved: ``tools_for_set("talker")`` returns the
+    canonical module-level list object (not a copy), so callers
+    that depend on identity-stable instances still get one. The
+    identity is now ``SALEM_VAULT_TOOLS``; that list still IS the
+    Salem-instance tool surface (talker tools + Salem-specific
+    routine tools). Fallback-to-talker for unknown set_name still
+    asserts ``is TALKER_VAULT_TOOLS`` below (different code path:
+    ``VAULT_TOOLS_BY_SET.get(unknown) or TALKER_VAULT_TOOLS`` →
+    the ``or``-fallback returns the literal TALKER_VAULT_TOOLS,
+    not SALEM_VAULT_TOOLS)."""
+    assert tools_for_set("talker") is SALEM_VAULT_TOOLS
 
 
 def test_tools_for_set_kalle():
