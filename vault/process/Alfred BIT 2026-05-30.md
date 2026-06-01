@@ -3,6 +3,11 @@ alfred_tags:
 - alfred/bit
 created: '2026-05-30'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — broken wikilink [[process/Alfred BIT]] in process: field;
+  parent process record does not exist in vault. Same pattern as other Alfred BIT
+  run records (2026-04-22, 2026-05-21, 2026-05-24). Out of janitor scope to create;
+  operator action required to either create process/Alfred BIT.md or retarget the
+  link.'
 mode: quick
 name: Alfred BIT 2026-05-30
 overall_status: ok
