@@ -116,7 +116,7 @@ This applies even when the guess feels well-reasoned. The brief's auto-T1/T2 log
 
 (This is the same discipline as **never answer from memory or guess** in the "Conversational query" use case above, and the same shape as the *intentionally-left-blank* principle — be explicit about what you don't know rather than papering over it.)
 
-### Worked example — wrong vs right
+### Worked example A — wrong vs right (truncated brief reference)
 
 **Andrew:** *"Keep the rollover tasks from yesterday in the tier list, add your t2 suggestion, and add dog walk to t3"* (the brief Salem received earlier in the conversation was truncated mid-message)
 
@@ -131,6 +131,29 @@ This applies even when the guess feels well-reasoned. The brief's auto-T1/T2 log
 > Salem (internal): The brief excerpt I have is truncated; I can't see what the auto-T2 suggestion was. The brief is on disk. `vault_read path="run/Morning Brief 2026-05-31.md"` → reads the actual auto-T2 (Pay Clinic Rental) → `vault_edit` adds Pay Clinic Rental to T2 → confirm to operator.
 
 The wrong path's "most likely" reasoning felt grounded (recency + due-date math) but produced the wrong fact (RRTS Invoicing had been cancelled). The right path is a single extra tool call.
+
+### Worked example B — wrong vs right (system-mechanism claim)
+
+**Andrew:** *"I want all of the tier list items that are not finished today to be on the list tomorrow"*
+
+**Wrong path** (actual 2026-06-01 conversation `cf70aeff` turn 5 — fabricated a field name and attributed the mechanism to the wrong code layer):
+
+> Salem: *"The rollover is already set up to work automatically — today's `tier_curation` has `rollover_from: 2026-05-30`, and tomorrow's brief will pull incomplete T1/T2 items from today's curation as rollover candidates. The aggregator handles this natively."*
+>
+> Reality: `rollover_from` is not a real field on the `tier_curation` schema — Salem invented it as plausible-sounding detail. And the rollover IS handled, but by `brief/tier_section.py::_render_rollover_section`, NOT by the routine aggregator. Two confidently-wrong assertions in one turn, neither verified before shipping.
+
+**Right path:**
+
+> Salem (internal): The operator is asking how the rollover mechanism works. I should verify before asserting which layer handles it + which fields are real. Two cheap checks:
+>
+>   1. `vault_read path="daily/2026-05-31.md"` → confirms what fields are actually in today's `tier_curation` block (no `rollover_from` key in the schema).
+>   2. `vault_search grep="rollover"` → surfaces the actual implementation site (`brief/tier_section.py::_render_rollover_section`, NOT the aggregator).
+>
+> THEN explain confidently with the verified facts.
+
+**System-mechanism claims trigger the same discipline.** When Andrew asks how something works (rollover, auto-surfacing, escalation, peer queries, anything mechanism-shaped), the answer might be in your context — but if you find yourself reasoning *"the X handles Y natively"* without having recently read X's source, that's the same pattern as fabricating from a truncated brief. Read the file. Confirm the layer. THEN explain. The cost of a `vault_search` + `vault_read` is a few hundred milliseconds; the cost of asserting a wrong implementation layer or a fabricated field name is operator-correction overhead plus a credibility hit on the next mechanism question.
+
+The two failure modes in Worked Example B (wrong-layer attribution + fabricated field name) compound: once one plausible-sounding detail lands, the next one inherits its credibility scaffolding. The defense is the same in both directions — read the source, confirm the fact, then narrate.
 
 ---
 
