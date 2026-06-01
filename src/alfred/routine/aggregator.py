@@ -606,11 +606,27 @@ def _collect_items_for_today(
                     # uses days_since semantics, but logging it
                     # uniformly as days_to_due=None keeps the log
                     # event shape stable.
+                    #
+                    # Phase 2C C1 (2026-06-01): use overdue_effective_due
+                    # instead of resolve_due_date so the log reflects
+                    # the SAME effective due the predicate used. The
+                    # predicate now admits overdue retention
+                    # (effective_due=prev_due → days_to_due negative);
+                    # the log field MUST mirror that so operator log
+                    # review can grep for negative days_to_due as the
+                    # overdue signal. Pre-C1 the log used the resolver
+                    # directly which always returned >= today, so
+                    # the field stayed non-negative even when the
+                    # predicate was treating an item as overdue.
                     days_to_due = None
                     if due_pattern is not None:
-                        due = resolve_due_date(due_pattern, today)
+                        effective = overdue_effective_due(
+                            due_pattern, completion_log, text, today,
+                        )
                         days_to_due = (
-                            (due - today).days if due is not None else None
+                            (effective - today).days
+                            if effective is not None
+                            else None
                         )
                     log.info(
                         "routine.aggregator.handed_off_to_tier",
