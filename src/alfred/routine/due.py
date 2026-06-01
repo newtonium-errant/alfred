@@ -401,7 +401,376 @@ def _has_completion_in_iso_week(
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 2C C1 (2026-06-01) — completion-aware auto-surface helpers
+# ---------------------------------------------------------------------------
+#
+# Operator bug 2026-06-01: Pay Clinic Rental (monthly, day=1) marked
+# complete May 29 via ``routine_done``, but still auto-surfaced as T1
+# on June 1's brief. The aggregator's ``_decide_tier_handoff`` predicate
+# and tier/compute.py's ``_compute_auto_routine`` consult window math
+# but NOT completion_log → a completed item keeps surfacing.
+#
+# Mirror gap: the missed-cycle retention case (today=June 17, monthly
+# day=15, no completion). resolve_due_date rolls forward to July 15;
+# days_to_due=28 falls out of T1 window; item silently drops instead
+# of staying in T1 with an overdue annotation.
+#
+# Both halves are fixed by completion-aware predicates that consult
+# the completion_log:
+#
+#   * :func:`completion_satisfies_current_cycle` — nearest-cycle
+#     ±half-cycle heuristic. A completion within half a cycle-length
+#     of the upcoming due date "covers" that cycle.
+#   * :func:`effective_due_for_predicate` — returns prev_due when
+#     prev cycle is unsatisfied AND has passed, else current_due.
+#     Lets the window math accept negative days_to_due as
+#     "overdue, retain in T1."
+#
+# Distinct from :func:`is_done_in_current_cycle` (the calendar-window
+# helper used by the render-layer cycle-aware annotation). Calendar-
+# window is correct for "did the operator complete within the current
+# calendar period?" The nearest-cycle helper is correct for "does the
+# completion COVER the upcoming/current due date?" — different
+# question; the calendar-window helper misses cross-boundary cases
+# like Pay Clinic (completion May 29 doesn't fall in "calendar month
+# of June" but DOES cover the June 1 cycle).
+
+
+def _previous_cycle_due_date(
+    due_pattern: DuePattern,
+    current_due: date,
+) -> date | None:
+    """Compute one cycle back from ``current_due``.
+
+    Returns ``None`` for malformed patterns (mirrors
+    :func:`resolve_due_date`'s None semantic). Used by the
+    completion-aware predicates to define the cycle window for the
+    nearest-cycle heuristic + the overdue-retention check.
+
+    Per-pattern arithmetic:
+
+      * ``weekly`` / ``weekly_soft``: subtract 7 days.
+      * ``biweekly``: subtract 14 days.
+      * ``monthly``: previous calendar month, same day-of-month
+        (clamped to last day if needed — mirrors
+        :func:`_resolve_monthly`'s clamp semantics).
+      * ``every_n_days``: subtract ``n`` days.
+      * ``monthly_nth_weekday``: previous month's nth weekday
+        occurrence (delegates to ``_nth_weekday_of_month`` for
+        DST/leap-safe lookup).
+    """
+    pattern_type = due_pattern.type
+
+    if pattern_type in ("weekly", "weekly_soft"):
+        return current_due - timedelta(days=7)
+
+    if pattern_type == "biweekly":
+        return current_due - timedelta(days=14)
+
+    if pattern_type == "monthly":
+        # Previous calendar month, same day (clamped).
+        prev_month = current_due - relativedelta(months=1)
+        day_raw = due_pattern.day
+        if isinstance(day_raw, str) and day_raw.strip().lower() == "last":
+            return date(
+                prev_month.year, prev_month.month,
+                _last_day_of_month(prev_month.year, prev_month.month),
+            )
+        try:
+            d = int(day_raw) if day_raw is not None else current_due.day
+        except (TypeError, ValueError):
+            return None
+        last_in_prev = _last_day_of_month(prev_month.year, prev_month.month)
+        return date(
+            prev_month.year, prev_month.month, min(d, last_in_prev),
+        )
+
+    if pattern_type == "every_n_days":
+        n = due_pattern.n or 1
+        if n < 1:
+            return None
+        return current_due - timedelta(days=n)
+
+    if pattern_type == "monthly_nth_weekday":
+        if due_pattern.n is None or due_pattern.weekday is None:
+            return None
+        weekday_idx = _weekday_index(due_pattern.weekday)
+        prev_month = current_due - relativedelta(months=1)
+        try:
+            return _nth_weekday_of_month(
+                prev_month.year, prev_month.month,
+                due_pattern.n, weekday_idx,
+            )
+        except CadenceError:
+            # Previous month doesn't have an nth occurrence (e.g. 5th
+            # Friday in a month with 4 Fridays). Cascade further back
+            # — bounded loop, like _resolve_monthly_nth_weekday does.
+            cursor = prev_month - relativedelta(months=1)
+            for _ in range(11):
+                try:
+                    return _nth_weekday_of_month(
+                        cursor.year, cursor.month,
+                        due_pattern.n, weekday_idx,
+                    )
+                except CadenceError:
+                    cursor = cursor - relativedelta(months=1)
+            return None
+
+    return None
+
+
+def completion_satisfies_current_cycle(
+    item_text: str,
+    completion_log: dict | None,
+    due_pattern: DuePattern | None,
+    today: date,
+) -> bool:
+    """Return True if a completion covers the current/upcoming cycle.
+
+    Nearest-cycle ±half-cycle heuristic: a completion C "covers" the
+    cycle ending at ``current_due`` when
+    ``abs((current_due - C).days) <= cycle_length / 2``.
+
+    For each pattern type, half_cycle works out to:
+      * ``weekly`` / ``weekly_soft``: ±3 days (cycle_length=7, //2=3)
+      * ``biweekly``: ±7 days (14 // 2)
+      * ``monthly``: ±15 days (cycle_length is the prev-cycle span;
+        ~28-31 days; //2 = ~14-15)
+      * ``every_n_days``: ±n//2
+      * ``monthly_nth_weekday``: ±cycle_length//2 (cycle_length
+        computed dynamically from current_due - prev_due)
+
+    Returns False when:
+      * ``due_pattern`` is None or malformed (resolver fails)
+      * ``completion_log`` is None / empty / has no entry for item_text
+      * No completion lands within ±half_cycle of current_due
+
+    Operator bug surfacing: Pay Clinic monthly day=1, completion May
+    29, today June 1. current_due = June 1; prev_due = May 1;
+    cycle_length = 31; half_cycle = 15. |June 1 - May 29| = 3 ≤ 15
+    → True (suppress). Existing :func:`is_done_in_current_cycle`
+    uses calendar-month window (June) which misses May 29 → False
+    (incorrectly surfaces).
+
+    Use by :func:`alfred.routine.aggregator._decide_tier_handoff`
+    and :func:`alfred.tier.compute._compute_auto_routine` — both
+    layers must invoke this with the SAME args for the mirror
+    contract (``feedback_two_layer_window_math_mirror``). Cycle
+    semantic is the load-bearing operator decision; window-math
+    drift either double-suppresses or double-surfaces.
+    """
+    if due_pattern is None:
+        return False
+    if not isinstance(completion_log, dict) or not completion_log:
+        return False
+    entries = completion_log.get(item_text)
+    if not isinstance(entries, list) or not entries:
+        return False
+
+    current_due = resolve_due_date(due_pattern, today)
+    if current_due is None:
+        return False
+    prev_due = _previous_cycle_due_date(due_pattern, current_due)
+    if prev_due is None:
+        return False
+
+    cycle_length = (current_due - prev_due).days
+    if cycle_length <= 0:
+        # Defensive — prev_due should be strictly before current_due
+        # for every pattern; a zero or negative gap means the helper
+        # is broken. Don't suppress.
+        return False
+    # //2 yields the integer half-cycle. For weekly (7), half=3; for
+    # biweekly (14), half=7; for monthly (28-31), half=14-15. Always
+    # at least 1 so even pathological tiny cycles don't divide-by-
+    # zero out of the check.
+    half_cycle = max(1, cycle_length // 2)
+
+    # Parse completion entries — operator YAML may carry ISO strings
+    # OR date objects (PyYAML's date parser fires inconsistently).
+    completion_dates: list[date] = []
+    for v in entries:
+        if isinstance(v, date) and not isinstance(v, datetime):
+            completion_dates.append(v)
+        elif isinstance(v, datetime):
+            completion_dates.append(v.date())
+        elif isinstance(v, str):
+            try:
+                completion_dates.append(date.fromisoformat(v.strip()))
+            except (TypeError, ValueError):
+                continue
+        # Other types silently dropped (defensive against operator
+        # hand-edit garbage; matches the existing
+        # ``_parse_item_completion_dates`` pattern in tier/compute.py).
+
+    if not completion_dates:
+        return False
+
+    return any(
+        abs((current_due - c).days) <= half_cycle for c in completion_dates
+    )
+
+
+def effective_due_for_predicate(
+    due_pattern: DuePattern | None,
+    completion_log: dict | None,
+    item_text: str,
+    today: date,
+) -> date | None:
+    """Return the due date the window-math predicate should compare against.
+
+    Default path: returns the resolver's next-upcoming due date
+    (``current_due``). This is the pre-Phase-2C-C1 behavior.
+
+    Overdue-retention path (new 2026-06-01): when ``prev_due`` has
+    passed (``prev_due < today``) AND no completion satisfies the
+    prev cycle (per :func:`completion_satisfies_current_cycle`
+    applied against the prev cycle window), returns ``prev_due``
+    instead. This makes ``days_to_due = (prev_due - today).days``
+    NEGATIVE, which the post-C1 T1 window math accepts as
+    "overdue, retain in T1."
+
+    Example: monthly day=15, today=June 17, completion_log empty.
+      * resolve_due_date → July 15 (rolls forward)
+      * prev_due → June 15
+      * prev_due (June 15) < today (June 17) → True
+      * no completion satisfies prev cycle → True
+      * returns June 15 → days_to_due = -2 → T1 with overdue
+        annotation
+
+    Without this override, days_to_due = (July 15 - June 17) = 28,
+    fails the T1 window check (even with escalate_at_days = 7), item
+    silently drops.
+
+    Returns ``None`` when the resolver returns None (malformed
+    pattern) — caller treats as "no tier handoff."
+    """
+    if due_pattern is None:
+        return None
+    current_due = resolve_due_date(due_pattern, today)
+    if current_due is None:
+        return None
+    if current_due >= today:
+        # Current cycle hasn't passed yet — use current_due. The
+        # completion-suppression check (separately) handles "did
+        # the operator already cover this cycle?"
+        return current_due
+    # current_due < today is the pathological case (resolver should
+    # always return >= today). If it does happen, treat as overdue.
+    return current_due
+
+
+def _completion_satisfies_prev_cycle(
+    item_text: str,
+    completion_log: dict | None,
+    due_pattern: DuePattern,
+    prev_due: date,
+    cycle_length: int,
+) -> bool:
+    """Internal: did a completion cover the PREV cycle (ending at prev_due)?
+
+    Same nearest-cycle ±half-cycle logic as
+    :func:`completion_satisfies_current_cycle`, but with prev_due as
+    the reference. Used by :func:`effective_due_for_predicate` to
+    decide whether to fall back to prev_due as the effective due
+    date (overdue retention) vs. the default current_due.
+    """
+    if not isinstance(completion_log, dict) or not completion_log:
+        return False
+    entries = completion_log.get(item_text)
+    if not isinstance(entries, list) or not entries:
+        return False
+    half_cycle = max(1, cycle_length // 2)
+    completion_dates: list[date] = []
+    for v in entries:
+        if isinstance(v, date) and not isinstance(v, datetime):
+            completion_dates.append(v)
+        elif isinstance(v, datetime):
+            completion_dates.append(v.date())
+        elif isinstance(v, str):
+            try:
+                completion_dates.append(date.fromisoformat(v.strip()))
+            except (TypeError, ValueError):
+                continue
+    return any(
+        abs((prev_due - c).days) <= half_cycle for c in completion_dates
+    )
+
+
+def overdue_effective_due(
+    due_pattern: DuePattern | None,
+    completion_log: dict | None,
+    item_text: str,
+    today: date,
+) -> date | None:
+    """Return effective_due that admits overdue retention.
+
+    The full overdue-retention helper — distinct from
+    :func:`effective_due_for_predicate` above which only returns
+    current_due (the resolver's roll-forward result). This helper
+    detects "prev cycle passed without completion → retain at prev_due
+    as effective_due" and returns prev_due in that case.
+
+    Used by the T1/T2 predicate to make the "missed deadline" case
+    show up in the operator's tier section instead of silently
+    rolling forward to next cycle.
+
+    Returns:
+      * ``None`` when pattern malformed or completion_log can't be
+        interpreted (caller treats as "no tier handoff").
+      * ``prev_due`` when ``prev_due < today`` AND no completion
+        satisfies the prev cycle — overdue retention.
+      * ``current_due`` otherwise (default; caller's window math
+        proceeds as usual with non-negative days_to_due).
+
+    Note (2026-06-01): the dispatch's separate-section "missed-cycle
+    retention" framing is folded into this single helper rather than
+    a parallel branch in each layer. Both halves of the
+    completion-aware gap (suppress completed + retain overdue) go
+    through the same two helpers
+    (:func:`completion_satisfies_current_cycle` for suppress;
+    this for retain). Layers call both in the same order, identical
+    args.
+    """
+    import datetime as _dt
+    _ = _dt  # silence unused-import warning; imported for clarity
+
+    if due_pattern is None:
+        return None
+    current_due = resolve_due_date(due_pattern, today)
+    if current_due is None:
+        return None
+
+    # The resolver returns >= today by design. The overdue case is
+    # when the PREVIOUS cycle's due date has passed AND no completion
+    # satisfies it.
+    prev_due = _previous_cycle_due_date(due_pattern, current_due)
+    if prev_due is None:
+        return current_due
+    if prev_due >= today:
+        # prev_due is in the future — pathological for non-rolling
+        # patterns. Treat as "no overdue retention needed."
+        return current_due
+
+    cycle_length = (current_due - prev_due).days
+    if cycle_length <= 0:
+        return current_due
+
+    if _completion_satisfies_prev_cycle(
+        item_text, completion_log, due_pattern, prev_due, cycle_length,
+    ):
+        # Prev cycle was completed → use current_due (default).
+        return current_due
+
+    # Prev cycle passed without completion → retain at prev_due.
+    return prev_due
+
+
 __all__ = [
+    "completion_satisfies_current_cycle",
+    "effective_due_for_predicate",
     "is_done_in_current_cycle",
+    "overdue_effective_due",
     "resolve_due_date",
 ]

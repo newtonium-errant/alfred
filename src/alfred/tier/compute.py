@@ -424,9 +424,19 @@ def _compute_auto_routine(
     # keeps the tier-compute load order clean.
     from alfred.routine.config import Item
     from alfred.routine.due import (
-        is_done_in_current_cycle,
-        resolve_due_date,
+        completion_satisfies_current_cycle,
+        overdue_effective_due,
     )
+    # Phase 2C C1 (2026-06-01) — ``is_done_in_current_cycle`` +
+    # ``resolve_due_date`` no longer imported here. The new helpers
+    # encapsulate both: ``completion_satisfies_current_cycle``
+    # supersedes ``is_done_in_current_cycle`` (more permissive,
+    # catches cross-month-boundary completions); ``overdue_effective_
+    # due`` calls ``resolve_due_date`` internally + handles overdue
+    # retention. Render-layer annotation in aggregator.py still uses
+    # ``is_done_in_current_cycle`` for the "*(done this cycle)*"
+    # text — different semantic (calendar-window question), kept
+    # for that use.
 
     routine_dir = vault_path / "routine"
     if not routine_dir.is_dir():
@@ -499,19 +509,61 @@ def _compute_auto_routine(
                 continue
             if item.escalate_at_days is None:
                 continue
-            due = resolve_due_date(item.due_pattern, today_local)
-            if due is None:
+
+            # Phase 2C C1 (2026-06-01) completion-aware suppression.
+            # MIRROR of the same gate in
+            # ``alfred.routine.aggregator._decide_tier_handoff``.
+            # Operator bug surfacing: Pay Clinic Rental (monthly
+            # day=1) completed May 29, still auto-surfaced T1 on
+            # June 1's brief because the old ``is_done_in_current_
+            # cycle`` predicate uses calendar-month windows and
+            # May 29 doesn't fall in "calendar month of June 1 due."
+            # The new nearest-cycle ±half-cycle helper correctly
+            # treats May 29 as covering the June 1 cycle.
+            #
+            # Drift between this gate and the aggregator's identical
+            # call would either double-surface completed items
+            # (both layers permissive) or double-suppress real T1
+            # work (both layers strict). Pinned by
+            # ``test_mirror_completion_predicate_aggregator_matches_
+            # compute`` in tests/tier/test_compute.py per
+            # ``feedback_two_layer_window_math_mirror``.
+            if completion_satisfies_current_cycle(
+                item.text, completion_log, item.due_pattern,
+                today_local,
+            ):
                 continue
+
+            # Phase 2C C1 overdue retention. ``overdue_effective_due``
+            # returns prev_due when prev cycle is unsatisfied AND has
+            # passed → makes days_to_due negative → T1 window admits.
+            # Without this, monthly day=15, today=June 17, no
+            # completion → current_due=July 15, days_to_due=28, item
+            # silently drops out of T1 instead of staying with the
+            # overdue annotation operator expects.
+            #
+            # MIRROR with aggregator's _decide_tier_handoff use of
+            # the same helper.
+            effective_due = overdue_effective_due(
+                item.due_pattern, completion_log, item.text, today_local,
+            )
+            if effective_due is None:
+                continue
+            due = effective_due
             days_to_due = (due - today_local).days
-            # Past-due is out-of-scope for the auto-surface — the
-            # operator's already missed the deadline and the next
-            # cycle's window is what should surface. resolve_due_date
-            # always returns >= today so days_to_due >= 0 always.
 
             reason: str | None = None
             if window == "t1":
-                if 0 <= days_to_due <= item.escalate_at_days:
-                    if days_to_due == 0:
+                # Phase 2C C1: T1 admits non-positive days_to_due
+                # (overdue retention). The upper bound stays
+                # ``escalate_at_days``.
+                if days_to_due <= item.escalate_at_days:
+                    if days_to_due < 0:
+                        reason = (
+                            f"overdue by {abs(days_to_due)}d "
+                            f"(no completion this cycle)"
+                        )
+                    elif days_to_due == 0:
                         reason = "due today"
                     elif days_to_due == 1:
                         reason = "due tomorrow"
@@ -530,18 +582,6 @@ def _compute_auto_routine(
                     reason = f"surface window ({days_to_due}d before due)"
 
             if reason is None:
-                continue
-
-            # Skip items already completed in the current cycle.
-            # Resolving completion dates from the routine's
-            # completion_log map; only checked when we have a
-            # candidate to filter (otherwise wasted work).
-            completion_dates = _parse_item_completion_dates(
-                completion_log.get(item.text, [])
-            )
-            if is_done_in_current_cycle(
-                item.due_pattern, completion_dates, today_local,
-            ):
                 continue
 
             candidates.append(AutoT1Candidate(

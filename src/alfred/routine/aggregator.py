@@ -48,7 +48,12 @@ from alfred.brief.renderer import serialize_record
 
 from .cadence import CadenceError, is_due
 from .config import DuePattern, RoutineConfig
-from .due import is_done_in_current_cycle, resolve_due_date
+from .due import (
+    completion_satisfies_current_cycle,
+    is_done_in_current_cycle,
+    overdue_effective_due,
+    resolve_due_date,
+)
 from .state import RoutineRun, StateManager
 
 log = structlog.get_logger(__name__)
@@ -284,8 +289,10 @@ def _decide_tier_handoff(
     """Decide if the item should be handed off to the tier section.
 
     Returns:
-      * ``1`` — item is in the T1 window (``[0, escalate_at_days]``);
-        tier section will surface it. Aggregator SKIPs the render.
+      * ``1`` — item is in the T1 window
+        (``days_to_due <= escalate_at_days``, including NEGATIVE days
+        for overdue retention per Phase 2C C1 2026-06-01); tier
+        section will surface it. Aggregator SKIPs the render.
       * ``2`` — item is in the T2 window
         (``(escalate_at_days, surface_at_days]``); tier section will
         surface it. Aggregator SKIPs the render.
@@ -387,17 +394,53 @@ def _decide_tier_handoff(
     # ---- T1/T2 branches (deadline-bearing) -----------------------
     if due_pattern is None or escalate_at_days is None:
         return None
-    due = resolve_due_date(due_pattern, today)
-    if due is None:
+
+    # Phase 2C C1 (2026-06-01) completion-aware suppression: if a
+    # completion entry covers the current/upcoming cycle (per the
+    # nearest-cycle ±half-cycle heuristic in
+    # ``completion_satisfies_current_cycle``), don't hand off — the
+    # operator has already completed this cycle's work, so the
+    # routine section's "*(done this cycle)*" annotation is the
+    # right surface, not T1/T2.
+    #
+    # Operator bug 2026-06-01 surfacing: Pay Clinic Rental (monthly
+    # day=1) completed May 29 via routine_done, but still auto-
+    # surfaced T1 on June 1's brief because this predicate didn't
+    # consult completion_log. The new helper consults it.
+    #
+    # MIRROR with ``alfred.tier.compute._compute_auto_routine`` —
+    # same call, same args, same result. Drift here either
+    # double-surfaces (operator sees completed items in T1) or
+    # double-suppresses (operator misses real T1 work). Pinned in
+    # ``test_mirror_completion_predicate_aggregator_matches_compute``.
+    if completion_satisfies_current_cycle(
+        item_text, completion_log, due_pattern, today,
+    ):
         return None
-    days_to_due = (due - today).days
-    if days_to_due < 0:
-        # resolve_due_date always returns >= today; this branch is
-        # defensive only. No tier handoff for overdue items (they
-        # never auto-surfaced and the routine section will flag them
-        # via the cycle-aware annotation).
+
+    # Phase 2C C1 — overdue retention. The default
+    # ``resolve_due_date`` returns the next-upcoming due, which rolls
+    # forward past today on a missed deadline. The
+    # ``overdue_effective_due`` helper returns prev_due instead when
+    # prev cycle has passed without completion → days_to_due becomes
+    # negative → T1 window accepts as "overdue, retain."
+    #
+    # Without this: monthly day=15, today=June 17, no completion →
+    # current_due=July 15, days_to_due=28, falls out of T1 window,
+    # item silently drops. With this: effective_due=June 15,
+    # days_to_due=-2, T1 window admits.
+    effective_due = overdue_effective_due(
+        due_pattern, completion_log, item_text, today,
+    )
+    if effective_due is None:
         return None
-    if 0 <= days_to_due <= escalate_at_days:
+    days_to_due = (effective_due - today).days
+    # Phase 2C C1: T1 admits non-positive days_to_due ("overdue,
+    # retain"). The upper bound stays ``escalate_at_days``; the
+    # lower bound moves from 0 to -∞ to capture the overdue case.
+    # T2 stays bounded — operator wants overdue items in T1 (the
+    # urgent surface), not T2 (the upcoming-soon surface).
+    if days_to_due <= escalate_at_days:
         return 1
     if (
         surface_at_days is not None

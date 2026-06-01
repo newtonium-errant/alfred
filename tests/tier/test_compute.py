@@ -1611,3 +1611,195 @@ def test_mirror_aspirational_t1_predicate_matches_aggregator(
         "suppress from routine section (handed off to T3 per the "
         "Phase 2A-soft-cadence contract)."
     )
+
+
+# ===========================================================================
+# Phase 2C C1 (2026-06-01) — completion-aware predicate mirror
+# ===========================================================================
+#
+# Operator bug 2026-06-01: Pay Clinic Rental (monthly day=1) marked
+# complete May 29, still auto-surfaced T1 on June 1's brief.
+# ``_compute_auto_routine`` historically used ``is_done_in_current_
+# cycle`` (calendar-month window), which misses cross-month-boundary
+# completions like May 29 → June 1. Replaced with the new
+# ``completion_satisfies_current_cycle`` nearest-cycle ±half-cycle
+# helper which catches the bug case.
+#
+# Symmetric concern: missed-deadline retention via
+# ``overdue_effective_due`` — same shape, same gate-order as the
+# aggregator's ``_decide_tier_handoff``.
+#
+# The mirror test below pins side-by-side behavior: both layers
+# return the same decision (handoff vs skip) on identical fixtures.
+
+
+def test_auto_routine_suppressed_when_completion_within_half_cycle_before_due(
+    tmp_path: Path,
+) -> None:
+    """Operator bug repro at the compute layer: monthly day=1,
+    completion May 29, today June 1 → suppress."""
+    # NOW = 2026-05-28; for this test we need today=2026-06-01.
+    later_now = datetime(2026, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
+    vault = _write_routine(
+        tmp_path,
+        "Recurring Bills.md",
+        "type: routine\nstatus: active\nname: Recurring Bills\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  Pay Clinic Rental:\n"
+        "  - '2026-05-29'\n"
+        "items:\n"
+        "- text: Pay Clinic Rental\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 1\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_candidates(vault, later_now)
+    assert result == [], (
+        f"Pay Clinic Rental auto-surfaced despite May 29 completion. "
+        f"Got: {[c.name for c in result]}. Pre-2C-C1 bug regressing?"
+    )
+
+
+def test_auto_routine_surfaces_without_completion(tmp_path: Path) -> None:
+    """No completion log → existing window math applies → surfaces.
+    Regression pin: the new helper must not over-suppress when no
+    completion exists."""
+    later_now = datetime(2026, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
+    vault = _write_routine(
+        tmp_path,
+        "Recurring Bills.md",
+        "type: routine\nstatus: active\nname: Recurring Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Pay Clinic Rental\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 1\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_candidates(vault, later_now)
+    assert len(result) == 1
+    assert result[0].name == "Pay Clinic Rental"
+    assert result[0].surface_reason == "due today"
+
+
+def test_auto_routine_overdue_retention(tmp_path: Path) -> None:
+    """Missed-deadline retention: monthly day=15, today June 17, no
+    completion → effective_due=June 15, days_to_due=-2 → T1 with
+    overdue reason. Pre-2C-C1: silently dropped (resolver rolled to
+    July 15, days_to_due=28, out of window)."""
+    overdue_now = datetime(2026, 6, 17, 13, 0, 0, tzinfo=timezone.utc)
+    vault = _write_routine(
+        tmp_path,
+        "Mid Month Bills.md",
+        "type: routine\nstatus: active\nname: Mid Month Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Pay credit card\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 15\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_candidates(vault, overdue_now)
+    assert len(result) == 1
+    c = result[0]
+    assert c.name == "Pay credit card"
+    assert c.due_iso == "2026-06-15", (
+        f"effective_due should be prev_due=June 15, got {c.due_iso}"
+    )
+    # surface_reason names the overdue case for operator log review.
+    assert "overdue by 2d" in c.surface_reason
+
+
+def test_auto_routine_overdue_retention_suppressed_when_completed(
+    tmp_path: Path,
+) -> None:
+    """When operator HAS completed within ±half_cycle of prev_due,
+    overdue retention does NOT fire — returns current_due (next
+    cycle's date) which is far out → not in T1 window."""
+    overdue_now = datetime(2026, 6, 17, 13, 0, 0, tzinfo=timezone.utc)
+    vault = _write_routine(
+        tmp_path,
+        "Mid Month Bills.md",
+        "type: routine\nstatus: active\nname: Mid Month Bills\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  Pay credit card:\n"
+        "  - '2026-06-12'\n"
+        "items:\n"
+        "- text: Pay credit card\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 15\n"
+        "  escalate_at_days: 0\n",
+    )
+    result = compute_auto_routine_candidates(vault, overdue_now)
+    assert result == [], (
+        f"Pay credit card should NOT surface — June 12 completion "
+        f"covers prev cycle (June 15). Got: {[c.name for c in result]}"
+    )
+
+
+def test_mirror_completion_predicate_aggregator_matches_compute(
+    tmp_path: Path,
+) -> None:
+    """Side-by-side mirror: identical fixture → both layers return
+    the same decision. Pins the
+    ``feedback_two_layer_window_math_mirror`` contract for the new
+    completion-aware gates.
+
+    Test case: Pay Clinic Rental monthly day=1, completion May 29,
+    today June 1. Both layers MUST suppress.
+    """
+    # Compute side.
+    later_now = datetime(2026, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
+    vault_compute = _write_routine(
+        tmp_path / "compute",
+        "Recurring Bills.md",
+        "type: routine\nstatus: active\nname: Recurring Bills\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n"
+        "  Pay Clinic Rental:\n"
+        "  - '2026-05-29'\n"
+        "items:\n"
+        "- text: Pay Clinic Rental\n"
+        "  priority: critical\n"
+        "  due_pattern:\n"
+        "    type: monthly\n"
+        "    day: 1\n"
+        "  escalate_at_days: 0\n",
+    )
+    compute_result = compute_auto_routine_candidates(vault_compute, later_now)
+
+    # Aggregator side — invoke _decide_tier_handoff directly with the
+    # same args. (run_aggregator_once does more setup; the predicate
+    # is the unit under test for the mirror.)
+    from alfred.routine.aggregator import _decide_tier_handoff
+    from alfred.routine.config import DuePattern
+    today = date(2026, 6, 1)
+    agg_result = _decide_tier_handoff(
+        due_pattern=DuePattern(type="monthly", day=1),
+        surface_at_days=None,
+        escalate_at_days=0,
+        today=today,
+        completion_log={"Pay Clinic Rental": [date(2026, 5, 29)]},
+        item_text="Pay Clinic Rental",
+        routine_record="Recurring Bills",
+    )
+
+    # Both must agree: SKIP (no handoff, no surface).
+    assert compute_result == [], (
+        f"compute_auto_routine surfaced when aggregator suppressed — "
+        f"mirror broken on compute side. Got: {[c.name for c in compute_result]}"
+    )
+    assert agg_result is None, (
+        f"_decide_tier_handoff returned tier {agg_result} when "
+        f"compute suppressed — mirror broken on aggregator side."
+    )

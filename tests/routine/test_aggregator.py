@@ -1491,3 +1491,217 @@ def test_soft_cadence_just_under_threshold_no_handoff(
     # 2 < 3 → not overdue → renders.
     assert "Walk dog" in body
     assert "2d since last; target every 3d" in body
+
+
+# ===========================================================================
+# Phase 2C C1 (2026-06-01) — completion-aware handoff predicate
+# ===========================================================================
+#
+# Operator bug 2026-06-01: Pay Clinic Rental (monthly day=1) marked
+# complete May 29 via routine_done, but auto-surfaced T1 on June 1's
+# brief. The old ``_decide_tier_handoff`` predicate consulted window
+# math + completion_log only for the T3 soft-cadence path, NOT for
+# the T1/T2 deadline-bearing path. The fix wires the new
+# ``completion_satisfies_current_cycle`` nearest-cycle helper into
+# the T1/T2 branch.
+#
+# Symmetric concern: missed-deadline retention. The resolver rolls
+# forward to next cycle on a missed deadline; without completion-
+# aware retention, the item silently drops out of T1. New helper
+# ``overdue_effective_due`` returns prev_due when prev cycle is
+# unsatisfied AND past today → days_to_due becomes negative → T1
+# window admits.
+#
+# Both halves tested below + the mirror contract with tier.compute is
+# pinned in ``tests/tier/test_compute.py``.
+
+
+def test_decide_handoff_suppresses_when_completion_within_half_cycle_before_due(
+    tmp_path: Path,
+) -> None:
+    """Operator bug reproduction: Pay Clinic Rental (monthly day=1),
+    completion May 29, today June 1. Predicate must NOT hand off to
+    T1 — operator already paid, no auto-surface.
+
+    Pre-2C-C1: the predicate auto-surfaced because completion_log
+    was ignored in the T1 branch."""
+    vault = tmp_path / "vault"
+    today = date(2026, 6, 1)
+    _write_routine(vault, "Recurring Bills", {
+        "type": "routine",
+        "status": "active",
+        "name": "Recurring Bills",
+        "cadence": {"type": "daily"},
+        "completion_log": {
+            "Pay Clinic Rental": ["2026-05-29"],
+        },
+        "items": [
+            {
+                "text": "Pay Clinic Rental",
+                "priority": "critical",
+                "due_pattern": {"type": "monthly", "day": 1},
+                "escalate_at_days": 0,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    # The item should NOT have been handed off — no handed_off_to_tier
+    # event for "Pay Clinic Rental".
+    handoffs = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+        and c.get("item_text") == "Pay Clinic Rental"
+    ]
+    assert handoffs == [], (
+        f"Pay Clinic Rental was handed off to T{handoffs[0]['tier']} "
+        f"despite May 29 completion within ±15d half-cycle of June 1 due. "
+        f"Pre-2C-C1 bug regressing?"
+    )
+
+
+def test_decide_handoff_suppresses_when_completion_on_due_date(
+    tmp_path: Path,
+) -> None:
+    """Completion exactly on due date (|0| ≤ any half-cycle) → suppress.
+    Edge-case pin: even with cycle_length=1 (pathological), zero-day
+    distance still satisfies."""
+    vault = tmp_path / "vault"
+    today = date(2026, 5, 28)
+    _write_routine(vault, "Daily Habits", {
+        "type": "routine",
+        "status": "active",
+        "name": "Daily Habits",
+        "cadence": {"type": "daily"},
+        "completion_log": {
+            "Garbage Out": ["2026-05-29"],
+        },
+        "items": [
+            {
+                "text": "Garbage Out",
+                "priority": "critical",
+                # weekly fri → due May 29 (today is May 28 Thursday).
+                "due_pattern": {"type": "weekly", "day": "fri"},
+                "escalate_at_days": 1,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    handoffs = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+        and c.get("item_text") == "Garbage Out"
+    ]
+    assert handoffs == []
+
+
+def test_decide_handoff_surfaces_when_no_completion_in_current_cycle(
+    tmp_path: Path,
+) -> None:
+    """Empty completion log → existing window math applies → handoff.
+    Pins the pre-2C-C1 default behavior preserved when no completion
+    exists (regression pin)."""
+    vault = tmp_path / "vault"
+    today = date(2026, 6, 1)
+    _write_routine(vault, "Recurring Bills", {
+        "type": "routine",
+        "status": "active",
+        "name": "Recurring Bills",
+        "cadence": {"type": "daily"},
+        # NO completion_log
+        "items": [
+            {
+                "text": "Pay Clinic Rental",
+                "priority": "critical",
+                "due_pattern": {"type": "monthly", "day": 1},
+                "escalate_at_days": 0,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    handoffs = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+        and c.get("item_text") == "Pay Clinic Rental"
+    ]
+    assert len(handoffs) == 1
+    assert handoffs[0]["tier"] == 1
+
+
+def test_decide_handoff_overdue_retention(tmp_path: Path) -> None:
+    """Missed-deadline retention: monthly day=15, today June 17, no
+    completion → prev_due=June 15, days_to_due=-2 → STILL T1
+    (overdue annotation). Pre-2C-C1: predicate dropped overdue items
+    silently."""
+    vault = tmp_path / "vault"
+    today = date(2026, 6, 17)
+    _write_routine(vault, "Mid Month Bills", {
+        "type": "routine",
+        "status": "active",
+        "name": "Mid Month Bills",
+        "cadence": {"type": "daily"},
+        "items": [
+            {
+                "text": "Pay credit card",
+                "priority": "critical",
+                "due_pattern": {"type": "monthly", "day": 15},
+                "escalate_at_days": 0,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    handoffs = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+        and c.get("item_text") == "Pay credit card"
+    ]
+    assert len(handoffs) == 1
+    assert handoffs[0]["tier"] == 1
+    # days_to_due is negative (overdue) — pin the field for
+    # downstream consumers grepping the log.
+    assert handoffs[0]["days_to_due"] == -2
+
+
+def test_decide_handoff_completion_for_prev_cycle_doesnt_satisfy_current(
+    tmp_path: Path,
+) -> None:
+    """Completion well outside half-cycle for monthly → must NOT
+    suppress current cycle. Pay Clinic monthly day=1, completion
+    April 17 (covers prev cycle May 1, NOT current cycle June 1),
+    today June 1 → handoff fires."""
+    vault = tmp_path / "vault"
+    today = date(2026, 6, 1)
+    _write_routine(vault, "Recurring Bills", {
+        "type": "routine",
+        "status": "active",
+        "name": "Recurring Bills",
+        "cadence": {"type": "daily"},
+        "completion_log": {
+            "Pay Clinic Rental": ["2026-04-17"],
+        },
+        "items": [
+            {
+                "text": "Pay Clinic Rental",
+                "priority": "critical",
+                "due_pattern": {"type": "monthly", "day": 1},
+                "escalate_at_days": 0,
+            },
+        ],
+    })
+    config = _config(vault, tmp_path)
+    with structlog.testing.capture_logs() as captured:
+        run_aggregator_once(config, today)
+    handoffs = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+        and c.get("item_text") == "Pay Clinic Rental"
+    ]
+    assert len(handoffs) == 1
+    assert handoffs[0]["tier"] == 1
