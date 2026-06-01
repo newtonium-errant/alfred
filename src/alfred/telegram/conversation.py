@@ -150,6 +150,15 @@ TALKER_VAULT_TOOLS: list[dict[str, Any]] = [
                         # here so the enum mirrors TALKER_CREATE_TYPES.
                         "preference",
                         "routine",
+                        # c6 (2026-05-31) — ``daily`` for pre-setting
+                        # tomorrow's tier_curation. ``name`` must be
+                        # an ISO date >= today; ``set_fields`` must
+                        # contain ONLY ``tier_curation`` (other
+                        # daily/ fields are aggregator-owned). The
+                        # aggregator's 05:59 ADT fire preserves the
+                        # pre-set block. See SKILL "Pre-setting
+                        # tomorrow's tier list" section.
+                        "daily",
                     ],
                     "description": (
                         "Record type. Use ``person`` for individuals, "
@@ -3087,6 +3096,98 @@ async def _execute_tool(
             name = tool_input.get("name", "")
             body = tool_input.get("body")
 
+            # c6 (2026-05-31) — per-type field-allowlist + date-future
+            # check for ``daily`` records. The talker scope's standard
+            # ``create: talker_types_only`` permits ``daily`` type
+            # (added to TALKER_CREATE_TYPES this ship), but the operator
+            # contract narrows the write surface to ONLY the
+            # ``tier_curation`` field, and ONLY for today-or-future
+            # dates. Two checks here, both fail-loud as scope_denied:
+            #
+            #   1. set_fields keys must be a subset of {tier_curation}
+            #      — enforced by check_talker_tier_curation_fields.
+            #      Body content + aggregator-owned fields stay rejected.
+            #   2. name (which becomes the filename stem + iso date)
+            #      must be an ISO YYYY-MM-DD string >= today. Past
+            #      dates would be operationally weird (the aggregator
+            #      already wrote that day; talker pre-write would
+            #      stomp historical context). Today is allowed because
+            #      the aggregator may not have fired yet (pre-05:59 ADT).
+            if record_type == "daily":
+                supplied_fields: list[str] | None = (
+                    list(set_fields.keys())
+                    if isinstance(set_fields, dict) else None
+                )
+                try:
+                    scope.check_talker_tier_curation_fields(
+                        record_type, supplied_fields,
+                    )
+                except scope.ScopeError as exc:
+                    log.info(
+                        "talker.tool.scope_denied",
+                        tool=tool_name,
+                        scope=active_scope,
+                        reason="tier_curation_field_allowlist",
+                        error=str(exc),
+                    )
+                    return _dumps({"error": f"scope denied: {exc}"})
+                # Body content denied — the aggregator owns the body.
+                # Defense-in-depth even though the SKILL will tell the
+                # LLM to leave body empty for daily/.
+                if body:
+                    log.info(
+                        "talker.tool.scope_denied",
+                        tool=tool_name,
+                        scope=active_scope,
+                        reason="daily_body_aggregator_owned",
+                    )
+                    return _dumps({
+                        "error": (
+                            "scope denied: ``daily`` records have "
+                            "aggregator-owned body content. Pre-set "
+                            "``tier_curation`` via set_fields only; "
+                            "leave body empty (the aggregator's next "
+                            "fire will fill it via render_daily_body)."
+                        ),
+                    })
+                # Date-future gate. ``name`` becomes the filename stem
+                # AND is treated as the date by the aggregator. Reject
+                # past dates fail-loud.
+                try:
+                    target_date = _dt.date.fromisoformat(name)
+                except (TypeError, ValueError):
+                    log.info(
+                        "talker.tool.scope_denied",
+                        tool=tool_name,
+                        scope=active_scope,
+                        reason="daily_name_not_iso_date",
+                        name=name,
+                    )
+                    return _dumps({
+                        "error": (
+                            f"scope denied: ``daily`` record name must "
+                            f"be ISO YYYY-MM-DD (e.g. ``2026-06-01``). "
+                            f"Got: {name!r}."
+                        ),
+                    })
+                today_local = _dt.date.today()
+                if target_date < today_local:
+                    log.info(
+                        "talker.tool.scope_denied",
+                        tool=tool_name,
+                        scope=active_scope,
+                        reason="daily_date_in_past",
+                        name=name,
+                    )
+                    return _dumps({
+                        "error": (
+                            f"scope denied: ``daily`` pre-set requires "
+                            f"today or future date. Got: {name} (today "
+                            f"is {today_local.isoformat()}). Use a "
+                            f"future ISO date (e.g. tomorrow)."
+                        ),
+                    })
+
             # Attribution-marker wiring (calibration audit gap, c2). The
             # talker invokes vault_create as a side-effect of an LLM
             # turn — every body that lands this way is, by definition,
@@ -3128,6 +3229,66 @@ async def _execute_tool(
             body_append = tool_input.get("body_append")
             body_insert_at = tool_input.get("body_insert_at")
             body_replace = tool_input.get("body_replace")
+
+            # c6 (2026-05-31) — per-type field-allowlist for talker
+            # edits on existing ``daily/<date>.md`` records. Mirror of
+            # the vault_create branch's daily-specific check; path-
+            # based detection (rel_path starts with "daily/") since
+            # the edit tool doesn't carry ``type=`` in tool_input.
+            # Fail-loud as scope_denied on any field outside
+            # TALKER_TIER_CURATION_FIELDS, on any body-mutation tool
+            # use (body_append / body_insert_at / body_replace —
+            # aggregator owns the body), or on any append_fields use
+            # (the daily fields supporting append are aggregator-owned).
+            if rel_path.startswith("daily/"):
+                set_field_keys = (
+                    list(set_fields.keys())
+                    if isinstance(set_fields, dict) else []
+                )
+                append_field_keys = (
+                    list(append_fields.keys())
+                    if isinstance(append_fields, dict) else []
+                )
+                supplied_fields_edit = set_field_keys + append_field_keys
+                # Empty-fields case: fail-loud (no-op edits aren't
+                # interesting + would otherwise hit the field-check
+                # helper's "did not supply" branch — pass None to
+                # surface the actionable error message).
+                fields_for_check: list[str] | None = (
+                    supplied_fields_edit or None
+                )
+                try:
+                    scope.check_talker_tier_curation_fields(
+                        "daily", fields_for_check,
+                    )
+                except scope.ScopeError as exc:
+                    log.info(
+                        "talker.tool.scope_denied",
+                        tool=tool_name,
+                        scope=active_scope,
+                        reason="tier_curation_field_allowlist",
+                        path=rel_path,
+                        error=str(exc),
+                    )
+                    return _dumps({"error": f"scope denied: {exc}"})
+                # Body-mutation tools denied — aggregator owns body.
+                if body_append or body_insert_at or body_replace:
+                    log.info(
+                        "talker.tool.scope_denied",
+                        tool=tool_name,
+                        scope=active_scope,
+                        reason="daily_body_aggregator_owned",
+                        path=rel_path,
+                    )
+                    return _dumps({
+                        "error": (
+                            "scope denied: ``daily`` records have "
+                            "aggregator-owned body content. Edit "
+                            "``tier_curation`` via set_fields only; "
+                            "body_append / body_insert_at / body_replace "
+                            "are denied on daily/ records."
+                        ),
+                    })
 
             # Attribution-marker wiring (calibration audit gap, c2). For
             # body_append, wrap ONLY the appended fragment — the existing

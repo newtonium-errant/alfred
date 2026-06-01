@@ -747,7 +747,110 @@ TALKER_CREATE_TYPES: set[str] = {
     # Don't expect belt-and-suspenders defense from the validator —
     # the scope gate is the only enforcement surface.
     "routine",
+    # c6 (2026-05-31) — talker tier_curation pre-set on future daily
+    # files. Operator conversation 2026-06-01 00:01 surfaced the
+    # capability gap: "set tomorrow's tier list" couldn't go through
+    # vault_create because ``daily`` wasn't in this set. The
+    # aggregator at 05:59 ADT each day preserves any pre-existing
+    # ``tier_curation`` block per ``_load_existing_tier_curation``
+    # (aggregator.py:828), so mechanically the talker pre-write is
+    # safe — this set was the missing piece.
+    #
+    # The CREATE permission here is wide-open to ``daily`` type, but
+    # the FIELD allowlist (``TALKER_TIER_CURATION_FIELDS`` below) is
+    # enforced separately at the conversation.py dispatch layer when
+    # ``record_type == "daily"`` — operator pre-set is restricted to
+    # the ``tier_curation`` field; ``type``, ``date``,
+    # ``routines_contributing``, ``critical_pending`` remain
+    # aggregator-owned. Body content stays empty on talker pre-write
+    # (the aggregator's next fire will fill it via
+    # ``render_daily_body``).
+    "daily",
 }
+
+
+# c6 (2026-05-31) — talker tier_curation field-allowlist scope set.
+#
+# Mirrors B1's ``TALKER_COMPLETION_LOG_*`` and B3's
+# ``TALKER_ROUTINE_ITEM_*`` shape. Two constants:
+#
+#   * ``TALKER_TIER_CURATION_TYPES`` — record types this gate applies
+#     to (just ``daily``; tier_curation isn't a meaningful field on
+#     any other vault type).
+#   * ``TALKER_TIER_CURATION_FIELDS`` — frontmatter fields this gate
+#     allows when ``record_type`` is in TYPES (just ``tier_curation``).
+#
+# Unlike B1/B3, this gate is NOT a standalone SCOPE_RULES entry — the
+# talker scope's ``create: talker_types_only`` + ``edit: True``
+# permissions stay intact for other types (note/task/event/etc.). The
+# per-type carve-out is enforced at the conversation.py dispatch
+# layer via :func:`check_talker_tier_curation_fields` below, which is
+# called only when the dispatch detects ``record_type == "daily"``.
+#
+# This shape avoids broadening the narrow-scope-rule design B1/B3
+# established (each narrow scope = one subprocess tool path) — the
+# tier_curation case is invoked from the same LLM vault_create /
+# vault_edit dispatch as every other talker write, just with a
+# per-type field check spliced in.
+TALKER_TIER_CURATION_TYPES: set[str] = {"daily"}
+TALKER_TIER_CURATION_FIELDS: set[str] = {"tier_curation"}
+
+
+def check_talker_tier_curation_fields(
+    record_type: str,
+    fields: list[str] | None,
+) -> None:
+    """Per-type field-allowlist check for talker writes on ``daily``.
+
+    Called from the conversation.py vault_create + vault_edit dispatch
+    when ``record_type == "daily"``. Three checks, all must pass:
+
+      1. ``record_type`` must be in ``TALKER_TIER_CURATION_TYPES`` —
+         this is the dispatcher's responsibility to gate on, but we
+         re-check here for defense-in-depth.
+      2. ``fields`` must be supplied (fail-closed — same shape as the
+         B1/B3 narrow scopes' field-allowlist enforcement). An LLM
+         that hits vault_create with type=daily but supplies no
+         set_fields would otherwise create a daily record with no
+         tier_curation — that's a no-op + a stub file the aggregator
+         will overwrite, but explicit fail-loud is better.
+      3. ``fields`` must be a subset of ``TALKER_TIER_CURATION_FIELDS``.
+         Defends against the LLM trying to pre-set
+         ``routines_contributing`` or any other aggregator-owned
+         field via the same write.
+
+    Raises:
+        ScopeError: when any of the three checks fails.
+    """
+    if record_type not in TALKER_TIER_CURATION_TYPES:
+        # Defensive — the dispatcher should only call this when
+        # record_type is in the type set. Fail loud if a future
+        # refactor wires the helper at the wrong call site.
+        raise ScopeError(
+            f"Tier-curation field allowlist only applies to record types "
+            f"({', '.join(sorted(TALKER_TIER_CURATION_TYPES))}). "
+            f"Got: '{record_type}'."
+        )
+    if fields is None:
+        raise ScopeError(
+            f"Talker writes on '{record_type}' record types must restrict "
+            f"to the tier_curation field allowlist "
+            f"({', '.join(sorted(TALKER_TIER_CURATION_FIELDS))}); "
+            f"caller did not supply the field list."
+        )
+    rejected = [f for f in fields if f not in TALKER_TIER_CURATION_FIELDS]
+    if rejected:
+        raise ScopeError(
+            f"Talker writes on '{record_type}' record types may only "
+            f"touch fields in the tier_curation allowlist "
+            f"({', '.join(sorted(TALKER_TIER_CURATION_FIELDS))}). "
+            f"Rejected: {', '.join(rejected)}. The fields "
+            f"``type``, ``date``, ``routines_contributing``, "
+            f"``critical_pending`` and body content are aggregator-"
+            f"owned; the aggregator at 05:59 ADT each day will "
+            f"fill them and preserve any pre-set ``tier_curation`` "
+            f"via ``_load_existing_tier_curation``."
+        )
 
 
 # Phase 2B B1 (2026-05-30) — Conversational completion narrow scope.

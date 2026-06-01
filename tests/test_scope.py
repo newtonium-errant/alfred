@@ -622,3 +622,88 @@ def test_talker_routine_item_constants_pinned():
     )
     assert TALKER_ROUTINE_ITEM_TYPES == {"routine"}
     assert TALKER_ROUTINE_ITEM_FIELDS == {"items", "completion_log"}
+
+
+# ===========================================================================
+# c6 (2026-05-31) — talker tier_curation field-allowlist
+# ===========================================================================
+#
+# Operator (Andrew) ratified 2026-06-01: pre-set tomorrow's tier list via
+# the standard talker LLM vault_create / vault_edit dispatch, with the
+# ``daily`` record type carved out so ONLY the ``tier_curation`` field
+# may be pre-set. The aggregator's 05:59 ADT fire preserves the pre-set
+# block via ``_load_existing_tier_curation`` (aggregator.py:828).
+#
+# Three layers tested:
+#   * Scope layer — check_talker_tier_curation_fields helper enforces
+#     the type + fields allowlist.
+#   * TALKER_CREATE_TYPES — ``daily`` is in the set so the standard
+#     talker_types_only create gate admits the type.
+#   * Constants — TALKER_TIER_CURATION_TYPES + _FIELDS pinned.
+
+
+def test_talker_scope_allows_tier_curation_on_daily():
+    """Happy path — type=daily + fields=[tier_curation] passes the
+    field-allowlist helper. The actual write goes through
+    talker_types_only on the broader talker scope; this helper is the
+    per-type narrow-gate spliced in at the conversation.py dispatch."""
+    from alfred.vault.scope import check_talker_tier_curation_fields
+    check_talker_tier_curation_fields("daily", ["tier_curation"])
+
+
+def test_talker_scope_rejects_non_tier_curation_field_on_daily():
+    """type=daily but field outside the allowlist → rejected. Defends
+    against the LLM trying to pre-set ``routines_contributing`` or
+    other aggregator-owned fields via the same write."""
+    from alfred.vault.scope import check_talker_tier_curation_fields
+    with pytest.raises(ScopeError, match="allowlist"):
+        check_talker_tier_curation_fields(
+            "daily", ["routines_contributing"],
+        )
+    with pytest.raises(ScopeError, match="allowlist"):
+        check_talker_tier_curation_fields("daily", ["date"])
+    # Mixed allowed + non-allowed → rejected (subset check).
+    with pytest.raises(ScopeError, match="allowlist"):
+        check_talker_tier_curation_fields(
+            "daily", ["tier_curation", "critical_pending"],
+        )
+
+
+def test_talker_scope_rejects_tier_curation_on_non_daily_type():
+    """field=tier_curation but type != daily → rejected. Defends
+    against the talker pointing at a task / note / etc. record via
+    the tier_curation helper. (The helper is intentionally only
+    called when conversation.py detects type=daily; this is the
+    defense-in-depth check.)"""
+    from alfred.vault.scope import check_talker_tier_curation_fields
+    with pytest.raises(ScopeError, match="record types"):
+        check_talker_tier_curation_fields("task", ["tier_curation"])
+    with pytest.raises(ScopeError, match="record types"):
+        check_talker_tier_curation_fields("note", ["tier_curation"])
+
+
+def test_talker_scope_fails_closed_on_missing_fields():
+    """When fields=None (caller didn't supply set_fields keys), the
+    helper fails closed. Mirrors B1/B3 narrow-scope semantics."""
+    from alfred.vault.scope import check_talker_tier_curation_fields
+    with pytest.raises(ScopeError, match="did not supply"):
+        check_talker_tier_curation_fields("daily", None)
+
+
+def test_talker_create_daily_is_in_TALKER_CREATE_TYPES_constant():
+    """``daily`` is in TALKER_CREATE_TYPES so the broad talker scope's
+    create: talker_types_only gate admits the type. Field-allowlist
+    enforcement is then layered at the conversation.py dispatch."""
+    from alfred.vault.scope import TALKER_CREATE_TYPES
+    assert "daily" in TALKER_CREATE_TYPES
+
+
+def test_talker_tier_curation_constants_pinned():
+    """Cross-agent contract pin — TALKER_TIER_CURATION_TYPES +
+    TALKER_TIER_CURATION_FIELDS exported and carry expected values."""
+    from alfred.vault.scope import (
+        TALKER_TIER_CURATION_FIELDS,
+        TALKER_TIER_CURATION_TYPES,
+    )
+    assert TALKER_TIER_CURATION_TYPES == {"daily"}
+    assert TALKER_TIER_CURATION_FIELDS == {"tier_curation"}

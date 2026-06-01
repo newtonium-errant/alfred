@@ -60,11 +60,13 @@ def _make_vault(tmp_path: Path) -> Path:
     vault_dir = tmp_path / "vault"
     vault_dir.mkdir(exist_ok=True)
     # Mirror enough of the scaffold tree that vault_create can land
-    # records of every type we exercise.
+    # records of every type we exercise. ``daily`` added 2026-05-31
+    # (c6) for the talker tier_curation pre-set tests below.
     for sub in (
         "session", "task", "note", "project",
         "pattern", "principle",
         "document", "concept", "source",
+        "daily",
     ):
         (vault_dir / sub).mkdir(exist_ok=True)
     return vault_dir
@@ -523,4 +525,320 @@ async def test_routine_in_vault_create_tool_schema_enum(tmp_path):
         f"the dispatcher ever sees it — silent failure with no "
         f"model-visible explanation. Update the enum in "
         f"src/alfred/telegram/conversation.py to match."
+    )
+
+
+# --- c6 (2026-05-31): talker tier_curation pre-set on daily/ records -----
+
+
+@pytest.mark.asyncio
+async def test_talker_can_create_future_daily_with_just_tier_curation(
+    tmp_path,
+):
+    """End-to-end happy path: vault_create on ``daily/<future-date>.md``
+    with ONLY ``tier_curation`` set_fields lands successfully.
+
+    Per c6 spec: operator says "set tomorrow's tier list: T1 = X" →
+    talker dispatches vault_create with type=daily, name=<tomorrow-iso>,
+    set_fields={tier_curation: {...}}, body=None. The conversation.py
+    per-type gate admits the write; the file lands at
+    ``daily/<future-date>.md`` with the curation block in frontmatter.
+    The aggregator's next fire on that date will preserve the block."""
+    from datetime import date, timedelta
+    config = _make_config(
+        tmp_path, instance_name="Salem", tool_set="talker",
+    )
+    sess = _make_session()
+    state = StateManager(config.session.state_path)
+
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    tier_block = {
+        "t1": ["Drive Pierre to soccer", "Submit RRTS invoice"],
+        "t2": ["Call mom"],
+        "t3": [],
+    }
+    result = await conversation._execute_tool(
+        tool_name="vault_create",
+        tool_input={
+            "type": "daily",
+            "name": tomorrow,
+            "set_fields": {"tier_curation": tier_block},
+        },
+        vault_path=config.vault.path,
+        state=state,
+        session=sess,
+        config=config,
+    )
+    parsed = json.loads(result)
+    assert "path" in parsed, parsed
+    assert parsed["path"] == f"daily/{tomorrow}.md"
+
+    # On-disk verification: the file exists with the curation block.
+    import frontmatter
+    post = frontmatter.load(
+        str(Path(config.vault.path) / f"daily/{tomorrow}.md"),
+    )
+    assert post.metadata.get("tier_curation") == tier_block
+    assert post.metadata.get("type") == "daily"
+
+
+@pytest.mark.asyncio
+async def test_talker_dispatcher_rejects_daily_with_aggregator_owned_field(
+    tmp_path,
+):
+    """Field-allowlist enforcement at the dispatch layer: an LLM
+    attempting to pre-set ``routines_contributing`` (aggregator-owned)
+    alongside ``tier_curation`` is rejected scope_denied.
+
+    Pins the per-type field gate. Without it, the talker could pre-
+    write any frontmatter field on a daily record and the aggregator
+    would either preserve garbage or stomp it inconsistently."""
+    from datetime import date, timedelta
+    config = _make_config(
+        tmp_path, instance_name="Salem", tool_set="talker",
+    )
+    sess = _make_session()
+    state = StateManager(config.session.state_path)
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+
+    result = await conversation._execute_tool(
+        tool_name="vault_create",
+        tool_input={
+            "type": "daily",
+            "name": tomorrow,
+            "set_fields": {
+                "tier_curation": {"t1": ["X"]},
+                "routines_contributing": ["faked"],  # aggregator-owned
+            },
+        },
+        vault_path=config.vault.path,
+        state=state,
+        session=sess,
+        config=config,
+    )
+    parsed = json.loads(result)
+    assert "error" in parsed, parsed
+    assert "scope denied" in parsed["error"].lower()
+    # The error names the rejected field so the operator (or model
+    # reading the error response) can correct the next attempt.
+    assert "routines_contributing" in parsed["error"]
+
+
+@pytest.mark.asyncio
+async def test_talker_dispatcher_rejects_daily_with_past_date(tmp_path):
+    """Date-future gate at the dispatch layer: rejecting past dates
+    prevents the talker from stomping a historical daily/ record the
+    aggregator already wrote. Today is allowed (the aggregator may
+    not have fired yet pre-05:59 ADT); only strictly-past dates fail."""
+    from datetime import date, timedelta
+    config = _make_config(
+        tmp_path, instance_name="Salem", tool_set="talker",
+    )
+    sess = _make_session()
+    state = StateManager(config.session.state_path)
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    result = await conversation._execute_tool(
+        tool_name="vault_create",
+        tool_input={
+            "type": "daily",
+            "name": yesterday,
+            "set_fields": {"tier_curation": {"t1": ["X"]}},
+        },
+        vault_path=config.vault.path,
+        state=state,
+        session=sess,
+        config=config,
+    )
+    parsed = json.loads(result)
+    assert "error" in parsed, parsed
+    assert "scope denied" in parsed["error"].lower()
+    # Error message names the date so the model can fix the input.
+    assert yesterday in parsed["error"]
+
+
+@pytest.mark.asyncio
+async def test_talker_dispatcher_rejects_daily_with_body_content(tmp_path):
+    """Defense-in-depth: body content rejected on daily/ creates.
+    The aggregator owns the body (``render_daily_body``); pre-writing
+    body would either be stomped by the next aggregator fire or
+    survive only until the next stomping write. Either way the
+    operator-facing semantics are confused; reject fail-loud."""
+    from datetime import date, timedelta
+    config = _make_config(
+        tmp_path, instance_name="Salem", tool_set="talker",
+    )
+    sess = _make_session()
+    state = StateManager(config.session.state_path)
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+
+    result = await conversation._execute_tool(
+        tool_name="vault_create",
+        tool_input={
+            "type": "daily",
+            "name": tomorrow,
+            "set_fields": {"tier_curation": {"t1": ["X"]}},
+            "body": "# This body will be stomped\n\nDon't write here.\n",
+        },
+        vault_path=config.vault.path,
+        state=state,
+        session=sess,
+        config=config,
+    )
+    parsed = json.loads(result)
+    assert "error" in parsed
+    assert "aggregator-owned" in parsed["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_talker_can_edit_existing_daily_tier_curation(tmp_path):
+    """End-to-end: vault_edit on an existing daily/<date>.md record
+    succeeds for the tier_curation field. Mirrors the create test but
+    exercises the edit branch."""
+    from datetime import date, timedelta
+    import frontmatter
+    config = _make_config(
+        tmp_path, instance_name="Salem", tool_set="talker",
+    )
+    sess = _make_session()
+    state = StateManager(config.session.state_path)
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+
+    # Pre-seed the daily record (simulate a prior talker pre-write
+    # OR an aggregator-written file).
+    daily_path = Path(config.vault.path) / f"daily/{tomorrow}.md"
+    post = frontmatter.Post(
+        "",
+        type="daily",
+        date=tomorrow,
+        tier_curation={"t1": ["Initial"], "t2": [], "t3": []},
+    )
+    daily_path.write_text(
+        frontmatter.dumps(post) + "\n", encoding="utf-8",
+    )
+
+    # Edit only the tier_curation field — should succeed.
+    new_block = {"t1": ["Updated"], "t2": ["Added"], "t3": []}
+    result = await conversation._execute_tool(
+        tool_name="vault_edit",
+        tool_input={
+            "path": f"daily/{tomorrow}.md",
+            "set_fields": {"tier_curation": new_block},
+        },
+        vault_path=config.vault.path,
+        state=state,
+        session=sess,
+        config=config,
+    )
+    parsed = json.loads(result)
+    assert "path" in parsed, parsed
+    # Verify on-disk frontmatter overwritten.
+    post_after = frontmatter.load(str(daily_path))
+    assert post_after.metadata["tier_curation"] == new_block
+
+
+@pytest.mark.asyncio
+async def test_talker_dispatcher_rejects_edit_of_non_tier_curation_on_daily(
+    tmp_path,
+):
+    """vault_edit on a daily/ record can ONLY touch tier_curation;
+    attempting to set ``routines_contributing`` via edit is rejected
+    at the dispatch layer."""
+    from datetime import date, timedelta
+    import frontmatter
+    config = _make_config(
+        tmp_path, instance_name="Salem", tool_set="talker",
+    )
+    sess = _make_session()
+    state = StateManager(config.session.state_path)
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+
+    daily_path = Path(config.vault.path) / f"daily/{tomorrow}.md"
+    post = frontmatter.Post(
+        "",
+        type="daily",
+        date=tomorrow,
+        tier_curation={"t1": [], "t2": [], "t3": []},
+    )
+    daily_path.write_text(
+        frontmatter.dumps(post) + "\n", encoding="utf-8",
+    )
+
+    result = await conversation._execute_tool(
+        tool_name="vault_edit",
+        tool_input={
+            "path": f"daily/{tomorrow}.md",
+            "set_fields": {
+                "tier_curation": {"t1": ["X"]},
+                "routines_contributing": ["faked"],
+            },
+        },
+        vault_path=config.vault.path,
+        state=state,
+        session=sess,
+        config=config,
+    )
+    parsed = json.loads(result)
+    assert "error" in parsed
+    assert "scope denied" in parsed["error"].lower()
+    assert "routines_contributing" in parsed["error"]
+
+
+def test_aggregator_preserves_talker_pre_set_tier_curation(tmp_path):
+    """Integration: pre-write a daily/<date>.md with a tier_curation
+    block (simulating talker pre-set), then run the aggregator on the
+    same date; assert the curation block survives the aggregator's
+    overwrite of the file.
+
+    This is the LOAD-BEARING contract for c6: the whole point of
+    the talker pre-set is that the aggregator's 05:59 ADT fire
+    preserves it. ``_load_existing_tier_curation`` (aggregator.py:828)
+    is the read-side; this test pins it round-trips through the full
+    aggregator fire."""
+    import frontmatter
+    from alfred.routine import aggregator as agg_mod
+    from alfred.routine.config import OutputConfig, RoutineConfig
+
+    vault = _make_vault(tmp_path)
+
+    # Pre-write a tier_curation block as the talker would have.
+    target_date = "2026-06-15"
+    daily_path = vault / f"daily/{target_date}.md"
+    pre_set_curation = {
+        "t1": ["Drive Pierre to soccer", "Submit RRTS invoice"],
+        "t2": ["Call mom"],
+        "t3": [],
+    }
+    post = frontmatter.Post(
+        "",
+        type="daily",
+        date=target_date,
+        tier_curation=pre_set_curation,
+    )
+    daily_path.write_text(
+        frontmatter.dumps(post) + "\n", encoding="utf-8",
+    )
+
+    # Run the aggregator on the same date. Minimal config — empty
+    # routine directory means no items, but the aggregator still
+    # writes the daily file. The key contract: tier_curation MUST
+    # appear on the post-aggregator frontmatter.
+    routine_dir = vault / "routine"
+    routine_dir.mkdir(exist_ok=True)  # empty — no routine records
+    config = RoutineConfig(
+        vault_path=str(vault),
+        output=OutputConfig(directory="daily", name_template="{date}"),
+    )
+
+    from datetime import date as date_cls
+    agg_mod.run_aggregator_once(
+        config=config,
+        today=date_cls.fromisoformat(target_date),
+    )
+
+    # Re-load the file — tier_curation must survive.
+    post_after = frontmatter.load(str(daily_path))
+    assert post_after.metadata.get("tier_curation") == pre_set_curation, (
+        f"aggregator stomped pre-set tier_curation; got: "
+        f"{post_after.metadata.get('tier_curation')!r}"
     )

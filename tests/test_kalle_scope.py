@@ -111,6 +111,23 @@ def test_talker_create_types_shape():
         # application records); KAL-LE does NOT — not a heavy talker
         # surface in V1.
         "preference",
+        # Routine Phase 2B B2 (2026-05-30) — conversational routine
+        # record creation. The narrow talker_routine_completion /
+        # talker_routine_item scopes handle in-place mutations; the
+        # broad talker scope's create path handles new-routine
+        # creation. Pin updated 2026-05-31 per builder.md memo #6
+        # (contract-pin sweep — drift on master surfaced when this
+        # ship's pre-flight inspected the membership).
+        "routine",
+        # c6 (2026-05-31) — talker tier_curation pre-set on future
+        # daily files. ``daily`` was added to TALKER_CREATE_TYPES so
+        # the conversation.py vault_create path admits the type;
+        # field-allowlist enforcement (only ``tier_curation`` may
+        # be pre-set, body stays empty, future dates only) happens
+        # at the conversation.py dispatch layer via
+        # ``check_talker_tier_curation_fields``. Aggregator at 05:59
+        # ADT each day preserves any pre-set ``tier_curation`` block.
+        "daily",
     }
 
 

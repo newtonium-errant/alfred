@@ -807,6 +807,36 @@ _DEFINITIONS: list[TypeDefinition] = [
         required_fields=("name", "cadence", "items"),
         available_in_scopes=frozenset({SCOPE_CANONICAL}),
     ),
+    # Daily aggregator record (2026-05-31, c6 of routine arc — registered
+    # alongside talker tier_curation scope expansion). ``vault/daily/
+    # <YYYY-MM-DD>.md`` records are written by the routine aggregator at
+    # 05:59 ADT each morning AND may now be pre-written by the talker for
+    # future-date tier_curation pre-set ("set tomorrow's tier list").
+    #
+    # Body content + most frontmatter fields (``date``, ``routines_
+    # contributing``, ``critical_pending``) are aggregator-owned and
+    # rewritten on every aggregator fire. The ONE field the talker is
+    # permitted to pre-set / edit is ``tier_curation``, gated through
+    # the new ``talker_tier_curation_only`` scope path (see scope.py:
+    # ``TALKER_TIER_CURATION_TYPES`` + ``TALKER_TIER_CURATION_FIELDS``).
+    # ``_load_existing_tier_curation`` in aggregator.py preserves any
+    # pre-set block when the aggregator next fires.
+    #
+    # No status — daily records are timestamp-keyed and don't carry
+    # operational status (the aggregator fires once per day; stale runs
+    # overwrite). ``required_fields=("date",)`` because every daily
+    # record carries the ISO date as a top-level frontmatter field;
+    # the aggregator and talker both populate it. ``is_leaf`` because
+    # other records aren't expected to wikilink TO a daily/ record
+    # (the daily is a derivative aggregation, not a canonical record).
+    TypeDefinition(
+        name="daily",
+        directory="daily",
+        statuses=None,
+        required_fields=("date",),
+        available_in_scopes=frozenset({SCOPE_CANONICAL}),
+        is_leaf=True,
+    ),
 ]
 
 
