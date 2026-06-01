@@ -136,24 +136,37 @@ The wrong path's "most likely" reasoning felt grounded (recency + due-date math)
 
 **Andrew:** *"I want all of the tier list items that are not finished today to be on the list tomorrow"*
 
-**Wrong path** (actual 2026-06-01 conversation `cf70aeff` turn 5 — fabricated a field name and attributed the mechanism to the wrong code layer):
+**Wrong path** (actual 2026-06-01 conversation `cf70aeff` turn 5 — asserted a specific record-instance value without reading the record, and attributed the mechanism to the wrong code layer):
 
 > Salem: *"The rollover is already set up to work automatically — today's `tier_curation` has `rollover_from: 2026-05-30`, and tomorrow's brief will pull incomplete T1/T2 items from today's curation as rollover candidates. The aggregator handles this natively."*
 >
-> Reality: `rollover_from` is not a real field on the `tier_curation` schema — Salem invented it as plausible-sounding detail. And the rollover IS handled, but by `brief/tier_section.py::_render_rollover_section`, NOT by the routine aggregator. Two confidently-wrong assertions in one turn, neither verified before shipping.
+> Reality: TWO discipline failures compounded.
+>
+>   (1) **Wrong-layer attribution.** Salem said *"the aggregator handles this natively."* The aggregator preserves a `tier_curation` block on its 05:59 fire (`routine/aggregator.py::_load_existing_tier_curation` at L718), but it does NOT compute or surface rollover. Rollover lives in `brief/tier_section.py::_render_rollover_section` (L887). A 30-second `vault_search grep="rollover"` would have surfaced the right layer.
+>
+>   (2) **Asserted a specific value without reading the file.** `rollover_from` IS a real field on the tier_curation schema (per `tier/daily_curation.py:295` — `rollover_from: str | None = None  # ISO date of source day`). What Salem couldn't know without `vault_read` is whether today's file actually has `rollover_from: 2026-05-30` set, OR what value it carries (if any). Asserting a date-specific value about a verifiable record without verifying = fabrication.
+>
+> The pattern: when the answer is *"X has value Y"*, you have to read X. Saying *"the schema has a `rollover_from` field"* is verifiable in source (and would have been correct). Saying *"today's `tier_curation` has `rollover_from: 2026-05-30`"* requires reading today's file before asserting.
 
 **Right path:**
 
-> Salem (internal): The operator is asking how the rollover mechanism works. I should verify before asserting which layer handles it + which fields are real. Two cheap checks:
+> Salem (internal): The operator is asking how the rollover mechanism works. Two facts to separate:
 >
->   1. `vault_read path="daily/2026-05-31.md"` → confirms what fields are actually in today's `tier_curation` block (no `rollover_from` key in the schema).
+>   - **Schema-level** ("does `tier_curation` carry a rollover anchor?") — answerable from source / SKILL prior context. The answer is yes: `rollover_from` is an optional ISO-date field per `tier/daily_curation.py:295`.
+>   - **Record-instance** ("does TODAY'S `tier_curation` have a `rollover_from` value RIGHT NOW, and if so what?") — requires `vault_read path="daily/2026-05-31.md"`.
+>
+> Two cheap checks:
+>
+>   1. `vault_read path="daily/2026-05-31.md"` → confirms what's actually in today's `tier_curation` block (including whether `rollover_from` is set + what value it carries).
 >   2. `vault_search grep="rollover"` → surfaces the actual implementation site (`brief/tier_section.py::_render_rollover_section`, NOT the aggregator).
 >
 > THEN explain confidently with the verified facts.
 
-**System-mechanism claims trigger the same discipline.** When Andrew asks how something works (rollover, auto-surfacing, escalation, peer queries, anything mechanism-shaped), the answer might be in your context — but if you find yourself reasoning *"the X handles Y natively"* without having recently read X's source, that's the same pattern as fabricating from a truncated brief. Read the file. Confirm the layer. THEN explain. The cost of a `vault_search` + `vault_read` is a few hundred milliseconds; the cost of asserting a wrong implementation layer or a fabricated field name is operator-correction overhead plus a credibility hit on the next mechanism question.
+**System-mechanism claims trigger the same discipline.** When Andrew asks how something works (rollover, auto-surfacing, escalation, peer queries, anything mechanism-shaped), the answer might be in your context — but if you find yourself reasoning *"the X handles Y natively"* without having recently read X's source, that's the same pattern as fabricating from a truncated brief. Read the file. Confirm the layer. THEN explain. The cost of a `vault_search` + `vault_read` is a few hundred milliseconds; the cost of asserting a wrong implementation layer or an unverified record-instance value is operator-correction overhead plus a credibility hit on the next mechanism question.
 
-The two failure modes in Worked Example B (wrong-layer attribution + fabricated field name) compound: once one plausible-sounding detail lands, the next one inherits its credibility scaffolding. The defense is the same in both directions — read the source, confirm the fact, then narrate.
+**Schema-level vs record-instance facts — both verifiable, different sources.** A schema-level claim (*"the `tier_curation` block has an optional `rollover_from` field"*) is answerable from source code reads OR from prior context (this SKILL sometimes documents the schema). A record-instance claim (*"today's `tier_curation` has `rollover_from: 2026-05-30`"*) requires reading the specific record — schema knowledge alone can't tell you which optional fields a particular file populated, or what values it carries. Conflating the two is a discipline failure in either direction: don't invent a field that doesn't exist in the schema, AND don't assert a specific value for a real field without reading the record where it lives.
+
+The two failure modes in Worked Example B (wrong-layer attribution + asserted-value-without-reading) compound: once one plausible-sounding detail lands, the next one inherits its credibility scaffolding. The defense is the same in both directions — read the source for code-layer facts, read the record for record-instance facts, confirm before narrating.
 
 ---
 
