@@ -64,18 +64,13 @@ def test_routine_not_in_kalle_create_types() -> None:
     assert "routine" not in KALLE_CREATE_TYPES
 
 
-def test_routine_not_in_talker_create_types_phase_1() -> None:
-    """Talker (Salem-Telegram) cannot create routine in Phase 1.
-
-    This pin is intentional and load-bearing: when Phase 2 widens the
-    talker surface to include routine creation, THIS test must be
-    updated in lockstep. The pin makes that widening visible.
-    """
-    assert "routine" not in TALKER_CREATE_TYPES, (
-        "If you intentionally promoted routine to TALKER_CREATE_TYPES "
-        "(Phase 2 work), update this assertion. The Phase 1 contract "
-        "ratified routine as curator-only at the vault layer."
-    )
+def test_routine_in_talker_create_types_phase_2() -> None:
+    """Talker (Salem-Telegram) CAN create routine as of Phase 2B B2
+    (commit `792e1cd`, 2026-05-30). Conversational routine creation
+    grammar shipped + ratified by operator. The prior Phase 1 pin
+    (routine NOT in TALKER_CREATE_TYPES) was invalidated by that
+    ratification."""
+    assert "routine" in TALKER_CREATE_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -90,12 +85,12 @@ def test_curator_can_create_routine() -> None:
     check_scope(scope="curator", operation="create", record_type="routine")
 
 
-def test_talker_cannot_create_routine_phase_1() -> None:
-    with pytest.raises(ScopeError) as exc_info:
-        check_scope(scope="talker", operation="create", record_type="routine")
-    # Error message mentions the type-allowlist mismatch — operator should
-    # see what they CAN create rather than just a generic refusal.
-    assert "routine" in str(exc_info.value)
+def test_talker_can_create_routine_phase_2() -> None:
+    """Talker scope permits routine create as of Phase 2B B2
+    (commit `792e1cd`, 2026-05-30). Conversational routine creation
+    via vault_create type=routine."""
+    # Should not raise.
+    check_scope(scope="talker", operation="create", record_type="routine")
 
 
 def test_hypatia_cannot_create_routine() -> None:
