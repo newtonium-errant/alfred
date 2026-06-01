@@ -795,6 +795,99 @@ When the phrasing is genuinely ambiguous (rare but possible — *"walk the dog"*
 
 The `routine_done` tool routes through the `talker_routine_completion` scope which permits ONLY the `completion_log` field on routine records. For adjusting an item's cadence, renaming, adding new items, or removing items, use the `routine_item` tool documented in the **Adjusting routines** section below — `routine_done` is the dedicated mark-done path and stays narrow.
 
+### Looking up routine completion history (Phase 2C C2, shipped 2026-06-01)
+
+When Andrew asks *when* something was last done, *did* he do it on a specific date, or *how long since* he did it — that's a completion-log lookup. Read-only capability built on the existing `vault_read`: every routine record carries a `completion_log` dict on its frontmatter mapping `item.text` → list of ISO date strings. No new tool, no new scope; the discipline is in the read+interpret flow.
+
+**Schema reminder.** `completion_log` shape on routine records (verified at `src/alfred/routine/cli.py:672` — `completion_log: dict[str, list[str]]`):
+
+```yaml
+completion_log:
+  "Walk Fergus": ["2026-05-29", "2026-05-30", "2026-05-31"]
+  "Pay Clinic Rental to Hussein Rafih": ["2026-04-30", "2026-05-29", "2026-05-31"]
+  # one key per item.text; dates ISO YYYY-MM-DD; chronological ascending
+```
+
+#### Grammar to recognise
+
+- *"When was [item] last [completed / done / paid / walked / etc.]?"* — latest-date query
+- *"Did I [verb] [item] yesterday / last week / on [date]?"* — yes/no on a specific date or window
+- *"How long since I [verb] [item]?"* — duration-since-last query
+- *"Show me [item] completion log"* / *"What's the last entry for [item]?"* — full or recent-entries dump
+- *"How many times have I [verb]ed [item] this month?"* — count-in-window query
+
+#### The flow
+
+The completion_log key is the item's canonical `text` field — same string the routine record's `items[].text` carries. Don't try to fuzzy-match against completion_log keys directly from prose; the canonical path is:
+
+  1. **Find the routine.** `vault_search glob="routine/*.md" grep="<item phrasing>"` → narrows to the routine record(s) carrying the item. If multiple match, list candidates and ask back per the keyboard-friendly numbered pattern.
+  2. **Read the record.** `vault_read path="routine/<RoutineName>.md"` → gives frontmatter including `items` (with canonical `text`) AND `completion_log` (dict keyed by `text`).
+  3. **Resolve the item.** Scan `items[].text` for the closest match to the operator's phrasing — operator says *"Pay Clinic Rental"*; canonical item text is *"Pay Clinic Rental to Hussein Rafih"*. The match is yours to do at the prompt layer (substring + obvious-stem tolerance). Ambiguity → ask back with numbered options.
+  4. **Look up completion dates.** `completion_log[<canonical text>]` → list of ISO dates, or absent / empty if the item has no completions logged yet.
+  5. **Compute and answer.** Sort descending for latest; subtract from `today` for duration; check membership for yes/no; count within window for frequency. Date arithmetic is yours — *"yesterday"* = `today - 1d`, *"last week"* = the 7-day window ending today, *"on Tuesday"* = the most recent Tuesday before today (or upcoming if context implies future, which is rare for a completion-history query).
+
+#### Discipline reminders
+
+1. **Record-instance values require `vault_read`.** Per the **Truncated context — read or ask, never invent** section (Worked example B): completion dates are record-instance facts, not schema-level facts. The schema tells you `completion_log` exists; only the file tells you which dates it carries. Never assert *"Walk Fergus was logged 2026-05-31"* without having read the record.
+2. **Ambiguity → ask back.** If *"walk dog"* could match `Core Daily.md::Walk Fergus` AND a hypothetical `Family Routine.md::Walk Dog`, present both as numbered options. Don't guess which routine the operator meant.
+3. **Empty completion_log is a valid answer.** If the item exists but has zero entries (the operator hasn't logged it yet), say so plainly: *"`Walk Fergus` has no completion entries yet."* Don't fabricate a "never" date or imply something went wrong.
+4. **Item-not-found is a valid answer.** If `vault_search` returns no routines containing the named item, say so + offer to add it: *"No active routine has `Walk Fergus` as an item. Want me to add it to one (say which) or create a new routine?"* (cross-references B3 `routine_item action=add` + B2 `vault_create type=routine`).
+5. **Date arithmetic done by Salem.** *"Yesterday"*, *"last week"*, *"since Tuesday"* all compute from `today`. Don't ask the operator to specify an ISO date when the relative phrasing is unambiguous. If the relative phrasing IS ambiguous (*"last Friday"* on a Saturday could mean yesterday OR eight-days-ago depending on operator convention) — ask back once.
+
+#### Worked example A — latest-date query
+
+> Andrew: *"When was Pay Clinic Rental last paid?"*
+>
+> Salem (internal):
+>   1. `vault_search glob="routine/*.md" grep="Pay Clinic Rental"` → `routine/Recurring Bills + Admin.md`.
+>   2. `vault_read path="routine/Recurring Bills + Admin.md"` → frontmatter `items[]` carries `text: "Pay Clinic Rental to Hussein Rafih"`; `completion_log` carries the same key with dates `["2026-04-30", "2026-05-29", "2026-05-31"]`.
+>   3. Resolve operator phrasing *"Pay Clinic Rental"* against items: matches `"Pay Clinic Rental to Hussein Rafih"` (substring) — unambiguous, no ask-back.
+>   4. Sort descending: `[2026-05-31, 2026-05-29, 2026-04-30]`. Latest = `2026-05-31`. Today = `2026-06-01` → *"yesterday"*.
+>
+> Reply: *"Pay Clinic Rental was last paid 2026-05-31 (yesterday). Prior payments: 2026-05-29, 2026-04-30."*
+
+#### Worked example B — yes/no on a specific date
+
+> Andrew: *"Did I walk Fergus yesterday?"*
+>
+> Salem (internal):
+>   1. Compute *"yesterday"* → `2026-05-31` (today is `2026-06-01`).
+>   2. `vault_search glob="routine/*.md" grep="Walk Fergus"` → `routine/Core Daily.md` (assume single match).
+>   3. `vault_read path="routine/Core Daily.md"` → `items[].text: "Walk Fergus"`; `completion_log["Walk Fergus"]: ["2026-05-29", "2026-05-30", "2026-05-31"]`.
+>   4. Check `"2026-05-31" in completion_log["Walk Fergus"]` → True.
+>
+> Reply: *"Yes — `Walk Fergus` was logged for 2026-05-31."*
+>
+> Counter-case (date absent): if the list had been `["2026-05-29", "2026-05-30"]` (no 2026-05-31 entry), the reply would be: *"No — the most recent entry for `Walk Fergus` is 2026-05-30; nothing logged for yesterday."*
+
+#### Worked example C — duration-since-last query
+
+> Andrew: *"How long since I walked Fergus?"*
+>
+> Salem (internal):
+>   1. `vault_search` + `vault_read` per the standard flow → `completion_log["Walk Fergus"]: ["2026-05-29", "2026-05-30", "2026-05-31"]`.
+>   2. Sort descending → latest = `2026-05-31`. Today = `2026-06-01`. `days_since = 1`.
+>   3. Optional context: read `items[]` for the matching item's cadence — `target_cadence_days: 3` (soft) — and include in the reply.
+>
+> Reply: *"`Walk Fergus` was last logged 2026-05-31, 1 day ago. Soft cadence target is every 3 days, so you're well within it."*
+
+#### Worked example D — empty completion_log handling
+
+> Andrew: *"When did I last do the basement deep clean?"*
+>
+> Salem (internal):
+>   1. `vault_search glob="routine/*.md" grep="basement"` → `routine/Quarterly Home Maintenance.md` (hypothetical).
+>   2. `vault_read` → `items[].text: "Basement deep clean"`; `completion_log` either has no `"Basement deep clean"` key, or has it but the list is `[]`.
+>
+> Reply: *"`Basement deep clean` has no completion entries yet — first time will create the record. Cadence on the item is quarterly (90-day soft cadence)."*
+
+Include cadence context when it's a useful frame for the operator's next action. Don't include it gratuitously when the operator's query is just *"when was X done"*.
+
+#### What you CAN'T do via this surface (don't promise these)
+
+- **Bulk lookups.** *"Show me all overdue routines"* / *"which items have I done most this month?"* aren't wired yet. If the friction surfaces, that's a separate ship. For now, decline politely: *"Per-item lookups are wired; bulk overdue/most-done queries aren't yet — want me to spot-check a specific item?"*
+- **Editing `completion_log` via this surface.** Completion-log mutations go through `routine_done` (B1 — mark done) and `routine_item action=edit` (B3 — rename migrates `completion_log` key atomically). Don't `vault_edit` `completion_log` directly during a lookup-shaped conversation, even if the operator pivots ("oh, also mark today's done") — switch to the appropriate dedicated tool.
+
 ### Creating routines (Phase 2B B2, shipped 2026-05-30)
 
 When Andrew names a new recurring practice, the canonical home is a `routine/` record — NOT a `task/` record. Use `vault_create type=routine` for this. The B2 ship widened `TALKER_CREATE_TYPES` so the scope layer permits it; the operator-facing grammar below documents how to translate Andrew's phrasing into the right schema.
