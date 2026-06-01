@@ -192,10 +192,30 @@ _SMART_ROUTE_ALL_OK_RE = re.compile(
 # is enough to flag a calibration reply, otherwise the two-numbered-
 # reference gate below would reject ``"1-5 confirm"`` (only one
 # leading-digit token, even though it semantically spans five items).
+#
+# **Anchored** at start-of-string with ``^\s*`` (paired with
+# :meth:`re.Pattern.match` below, not :meth:`re.Pattern.search`). An
+# unanchored match would false-positive on prose like
+# ``"chapters 1-5 keep reading on the bus"`` / ``"sections 3-7 delete
+# the old draft"`` / ``"pages 4-9 down at the bookstore"`` — the
+# leading word doesn't prevent the range substring from matching,
+# and the smart-route guard (zero corrections + zero all_ok) doesn't
+# save these because the per-fragment parser DOES produce
+# corrections (for the wrong items). The siblings
+# ``_SMART_ROUTE_NUMBERED_LIST_RE`` and ``_SMART_ROUTE_ALL_OK_RE``
+# follow the same anchored-match discipline.
+#
+# Verb alternation is intentionally narrower than the per-fragment
+# parser's combined set: ``critical`` / ``tracked`` /
+# ``aspirational`` / ``approve`` are NOT recognised here because the
+# per-fragment parser doesn't accept them either (the smart-route
+# guard would revert the routing on zero output, but bouncing the
+# message through the parser only to revert is wasteful and
+# misleading in logs).
 _SMART_ROUTE_RANGE_RE = re.compile(
-    r"\b(?:items?\s+)?\d+\s*(?:[-–—]|\s+through\s+)\s*\d+\s+"
-    r"(?:high|medium|low|spam|critical|tracked|aspirational|"
-    r"confirm|reject|keep|approve|delete|remove|"
+    r"^\s*(?:items?\s+)?\d+\s*(?:[-–—]|\s+through\s+)\s*\d+\s+"
+    r"(?:high|medium|low|spam|"
+    r"confirm|reject|keep|delete|remove|"
     r"yes|no|ok|up|down)\b",
     re.IGNORECASE,
 )
@@ -256,7 +276,10 @@ def looks_like_calibration_reply(text: str) -> bool:
     # Task #55 (2026-06-01) — single range token ("1-5 confirm") is
     # enough on its own; the two-numbered-reference gate below would
     # otherwise reject it for having only one leading-digit token.
-    if _SMART_ROUTE_RANGE_RE.search(cleaned):
+    # Anchored match (NOT search) so prose like ``"chapters 1-5 keep
+    # reading"`` doesn't false-positive on the embedded range
+    # substring.
+    if _SMART_ROUTE_RANGE_RE.match(cleaned):
         return True
     matches = _SMART_ROUTE_NUM_REF_RE.findall(cleaned)
     if len(matches) >= 2:

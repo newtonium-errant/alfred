@@ -358,6 +358,14 @@ _RANGE_FRAGMENT_RE = re.compile(
 )
 
 
+# Upper bound on range-fragment expansion (Task #55 NIT 1, 2026-06-01).
+# Daily Sync batches are 5-30 items in practice; 50 is a comfortable
+# ceiling that catches plausible operator use while rejecting typos
+# like ``"5-2026 confirm"`` that would otherwise expand to thousands
+# of synthetic fragments.
+_MAX_RANGE_EXPANSION = 50
+
+
 @dataclass
 class ReplyCorrection:
     """One per-item correction extracted from Andrew's reply.
@@ -572,6 +580,12 @@ def _expand_range_fragments(fragments: list[str]) -> list[str]:
     passed through unchanged — they hit ``_parse_fragment`` which
     rejects them (the ``-1`` is not a valid token) and lands them in
     the unparsed bucket so the operator sees the typo echoed back.
+
+    Cap: expansion is bounded at :data:`_MAX_RANGE_EXPANSION` items
+    (50, well above any plausible Daily Sync batch size). Over-cap
+    ranges (e.g. typo ``"5-2026 confirm"``) fall through as the
+    original fragment so the operator sees the unparsed echo rather
+    than a runaway expansion.
     """
     if not fragments:
         return fragments
@@ -587,6 +601,12 @@ def _expand_range_fragments(fragments: list[str]) -> list[str]:
         if start > end:
             # Inverted range — leave fragment untouched so the parser
             # rejects it and the operator's typo surfaces.
+            expanded.append(frag)
+            continue
+        if end - start + 1 > _MAX_RANGE_EXPANSION:
+            # Over-cap range (typo like ``"5-2026 confirm"``) — leave
+            # untouched so it lands in the unparsed bucket rather
+            # than running away with thousands of synthetic fragments.
             expanded.append(frag)
             continue
         for n in range(start, end + 1):

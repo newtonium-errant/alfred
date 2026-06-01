@@ -289,3 +289,37 @@ def test_heuristic_matches_range_token():
     assert looks_like_calibration_reply("1-5 confirm")
     assert looks_like_calibration_reply("items 3-7 reject")
     assert looks_like_calibration_reply("4 through 9 high")
+
+
+def test_heuristic_rejects_prose_with_range_token():
+    """Prose that happens to contain a range substring (``"chapters 1-5
+    keep reading"``) must NOT smart-route — the range gate is anchored,
+    not searched. Code-reviewer concern #1 (Task #55, 2026-06-01)
+    confirmed this class of false positive on the unanchored regex.
+    """
+    # Reviewer's three concrete examples — all must reject.
+    assert not looks_like_calibration_reply("chapters 1-5 keep reading on the bus")
+    assert not looks_like_calibration_reply("sections 3-7 delete the old draft")
+    assert not looks_like_calibration_reply("pages 4-9 down at the bookstore")
+    # Adjacent shape — prose preamble with embedded range — also rejects.
+    assert not looks_like_calibration_reply("looked at items 1-5 yesterday confirm")
+
+
+def test_heuristic_rejects_pruned_range_verbs():
+    """Range-gate verb alternation excludes ``critical|tracked|aspirational|
+    approve`` because the per-fragment parser doesn't accept them. Code-
+    reviewer concern #2 (Task #55, 2026-06-01) — keep heuristic + parser
+    verb sets aligned for the range gate.
+
+    The all-ok regex still recognises ``approve`` / ``approve all``
+    (it short-circuits before the per-fragment parser), so those
+    phrasings as a whole-message ack still flag — only the RANGE
+    form ``"1-5 approve"`` rejects here.
+    """
+    assert not looks_like_calibration_reply("1-5 critical")
+    assert not looks_like_calibration_reply("1-5 tracked")
+    assert not looks_like_calibration_reply("1-5 aspirational")
+    assert not looks_like_calibration_reply("1-5 approve")
+    # Sanity: ``"approve all"`` as a whole-message ack still hits the
+    # all-ok regex, which is independent of the range gate.
+    assert looks_like_calibration_reply("approve all")

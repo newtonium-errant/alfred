@@ -487,3 +487,29 @@ def test_parse_reply_range_idempotent_vs_expanded():
         assert rc.reject == ec.reject
         assert rc.new_tier == ec.new_tier
         assert rc.modifier == ec.modifier
+
+
+def test_parse_reply_range_over_cap_falls_through():
+    """``5-2026 confirm`` exceeds the 50-item expansion cap and falls
+    through to the unparsed bucket rather than producing 2022 synthetic
+    corrections.
+    """
+    result = parse_reply("5-2026 confirm")
+    assert result.all_ok is False
+    assert result.corrections == []
+    assert len(result.unparsed) == 1
+    assert "5-2026" in result.unparsed[0]
+
+
+def test_parse_reply_range_at_cap_expands():
+    """``1-50 confirm`` sits exactly at the cap and expands to 50
+    corrections (one per item).
+    """
+    result = parse_reply("1-50 confirm")
+    assert result.all_ok is False
+    assert len(result.corrections) == 50
+    assert result.corrections[0].item_number == 1
+    assert result.corrections[49].item_number == 50
+    for c in result.corrections:
+        assert c.ok is True
+    assert result.unparsed == []
