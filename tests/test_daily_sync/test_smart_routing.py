@@ -265,3 +265,27 @@ def test_mark_batch_replied_noop_when_no_batch(tmp_path: Path):
     # No batch persisted.
     mark_batch_replied(cfg)
     assert is_latest_batch_replied(cfg) is False
+
+
+# --- Task #55 (2026-06-01) — widened heuristic surfaces -------------------
+#
+# Mirror the assembler-side widening: the heuristic must recognise the
+# new all-ok phrasings AND a single range token (which the historical
+# two-numbered-reference gate would otherwise reject).
+
+
+def test_heuristic_matches_confirm_all():
+    """Widened all-ok phrasings flag as calibration reply shape."""
+    assert looks_like_calibration_reply("Confirm all")
+    assert looks_like_calibration_reply("all confirm")
+    assert looks_like_calibration_reply("lgtm")
+    assert looks_like_calibration_reply("good to go")
+
+
+def test_heuristic_matches_range_token():
+    """A single ``1-5 confirm`` token short-circuits to True even though
+    only one leading-digit reference is present.
+    """
+    assert looks_like_calibration_reply("1-5 confirm")
+    assert looks_like_calibration_reply("items 3-7 reject")
+    assert looks_like_calibration_reply("4 through 9 high")

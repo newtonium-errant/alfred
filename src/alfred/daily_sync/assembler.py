@@ -314,8 +314,46 @@ _DUPLICATE_RE = re.compile(
 # Whole-message ack tokens. Any of these alone (after stripping
 # whitespace and the leading bullet) means "all items confirmed as
 # classified, no changes". Emoji + word forms.
+#
+# Task #55 (2026-06-01) widened the alternation to cover the natural
+# operator phrasings Andrew uses in voice replies: ``confirm all`` /
+# ``all confirm`` / ``confirmed`` / ``approve`` / ``approve all`` /
+# ``lgtm`` / ``all clear`` / ``good to go`` / bare ``yes`` / ``y``.
+# Order is irrelevant inside the alternation; the regex requires the
+# token to be the WHOLE message (after bullet/whitespace stripping)
+# so a stray ``yes`` mid-prose does NOT short-circuit to all-ok.
 _ALL_OK_PATTERNS = re.compile(
-    r"^(?:✅|✔|👍|ok|okay|all good|all ok|looks good|approved)\s*[.!]?\s*$",
+    r"^(?:"
+    r"✅|✔|👍|"
+    r"ok|okay|"
+    r"all good|all ok|all clear|"
+    r"looks good|good to go|"
+    r"approved|approve all|approve|"
+    r"confirm all|all confirm|confirmed|"
+    r"lgtm|"
+    r"yes|y"
+    r")\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+# Range fragment: ``1-5 confirm`` / ``items 3-7 reject`` / ``4 through 9 high``.
+# Task #55 (2026-06-01) — operator shorthand to apply a single verb to a
+# contiguous range of items. The fragment is expanded into per-item
+# fragments before the per-fragment parser runs, so downstream rules
+# (verb recognition, chaining, dispatcher routing) need no changes.
+#
+# Captures: start number, end number, trailing verb/tier/modifier
+# string. Range separators accepted: ``-``, ``–`` (en-dash),
+# ``—`` (em-dash), and the literal word ``through`` (voice
+# transcripts).
+#
+# Inverted ranges (``5-1``) are left unmodified so they fall through
+# to the per-fragment parser and land in the unparsed bucket — the
+# operator sees the typo echoed back rather than silently expanding
+# into a guess.
+_RANGE_FRAGMENT_RE = re.compile(
+    r"^\s*(?:items?\s+)?(\d+)\s*(?:[-–—]|\s+through\s+)\s*(\d+)\s+(.+)$",
     re.IGNORECASE,
 )
 
@@ -509,7 +547,8 @@ def _split_fragments(text: str) -> list[str]:
         # as a preamble and dropped — Andrew's replies don't include
         # one, but we don't want to crash on ``"ok: 1. down, 2. up"``.
         parts = _LIST_ITEM_BOUNDARY_RE.split(text)
-        return [p.strip() for p in parts if p.strip()]
+        fragments = [p.strip() for p in parts if p.strip()]
+        return _expand_range_fragments(fragments)
     # Convert " and " to a comma so the split below is uniform. Avoid
     # touching " and " inside notes (e.g. "Jamie and the customer") by
     # only splitting on " and " between item-prefixed tokens — but a
@@ -518,7 +557,41 @@ def _split_fragments(text: str) -> list[str]:
     # the ``unparsed`` bucket.
     text = re.sub(r"\s+and\s+", ",", text)
     parts = re.split(r"[,;\n]+", text)
-    return [p.strip() for p in parts if p.strip()]
+    fragments = [p.strip() for p in parts if p.strip()]
+    return _expand_range_fragments(fragments)
+
+
+def _expand_range_fragments(fragments: list[str]) -> list[str]:
+    """Expand ``"1-5 confirm"`` / ``"items 3-7 reject"`` / ``"4 through 9 high"``
+    into per-item fragments.
+
+    Task #55 (2026-06-01) — runs after the primary split pass so the
+    downstream per-fragment parser sees the same shape it always did
+    (``"<n> <verb>"`` per fragment). Single-item ranges (``"3-3 confirm"``)
+    expand to one fragment. Inverted ranges (``"5-1 confirm"``) are
+    passed through unchanged — they hit ``_parse_fragment`` which
+    rejects them (the ``-1`` is not a valid token) and lands them in
+    the unparsed bucket so the operator sees the typo echoed back.
+    """
+    if not fragments:
+        return fragments
+    expanded: list[str] = []
+    for frag in fragments:
+        m = _RANGE_FRAGMENT_RE.match(frag)
+        if m is None:
+            expanded.append(frag)
+            continue
+        start = int(m.group(1))
+        end = int(m.group(2))
+        verb = m.group(3).strip()
+        if start > end:
+            # Inverted range — leave fragment untouched so the parser
+            # rejects it and the operator's typo surfaces.
+            expanded.append(frag)
+            continue
+        for n in range(start, end + 1):
+            expanded.append(f"{n} {verb}")
+    return expanded
 
 
 def parse_reply(reply_text: str) -> ReplyParseResult:

@@ -169,8 +169,34 @@ def reply_targets_daily_sync(
 # Whole-message ack tokens — the existing parser also recognises these
 # (via ``_ALL_OK_PATTERNS``). Duplicated here so the smart-routing
 # decision doesn't depend on importing parser internals.
+#
+# Task #55 (2026-06-01) — kept in lockstep with ``_ALL_OK_PATTERNS``
+# in ``assembler.py``. If you widen one, widen the other.
 _SMART_ROUTE_ALL_OK_RE = re.compile(
-    r"^(?:✅|✔|👍|ok|okay|all good|all ok|looks good|approved)\s*[.!]?\s*$",
+    r"^(?:"
+    r"✅|✔|👍|"
+    r"ok|okay|"
+    r"all good|all ok|all clear|"
+    r"looks good|good to go|"
+    r"approved|approve all|approve|"
+    r"confirm all|all confirm|confirmed|"
+    r"lgtm|"
+    r"yes|y"
+    r")\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+# Range token — ``1-5 confirm`` / ``items 3-7 reject`` /
+# ``4 through 9 high``. Task #55 (2026-06-01) — a single range token
+# is enough to flag a calibration reply, otherwise the two-numbered-
+# reference gate below would reject ``"1-5 confirm"`` (only one
+# leading-digit token, even though it semantically spans five items).
+_SMART_ROUTE_RANGE_RE = re.compile(
+    r"\b(?:items?\s+)?\d+\s*(?:[-–—]|\s+through\s+)\s*\d+\s+"
+    r"(?:high|medium|low|spam|critical|tracked|aspirational|"
+    r"confirm|reject|keep|approve|delete|remove|"
+    r"yes|no|ok|up|down)\b",
     re.IGNORECASE,
 )
 
@@ -226,6 +252,11 @@ def looks_like_calibration_reply(text: str) -> bool:
     if _SMART_ROUTE_ALL_OK_RE.match(cleaned):
         return True
     if _SMART_ROUTE_NUMBERED_LIST_RE.match(cleaned):
+        return True
+    # Task #55 (2026-06-01) — single range token ("1-5 confirm") is
+    # enough on its own; the two-numbered-reference gate below would
+    # otherwise reject it for having only one leading-digit token.
+    if _SMART_ROUTE_RANGE_RE.search(cleaned):
         return True
     matches = _SMART_ROUTE_NUM_REF_RE.findall(cleaned)
     if len(matches) >= 2:

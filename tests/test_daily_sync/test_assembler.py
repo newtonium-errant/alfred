@@ -390,3 +390,100 @@ def test_apply_modifier_spam_saturates():
 def test_apply_modifier_unknown_tier_conservative():
     assert apply_modifier("unclassified", "down") == "low"
     assert apply_modifier("", "up") == "high"
+
+
+# --- Task #55 (2026-06-01) — confirm-all variants + range fragments --------
+#
+# Widen ``_ALL_OK_PATTERNS`` to recognise the natural operator phrasings
+# Andrew uses in voice replies, and expand ``"1-5 confirm"`` /
+# ``"items 3-7 reject"`` / ``"4 through 9 high"`` range fragments into
+# per-item corrections before the per-fragment parser runs.
+
+
+def test_parse_reply_confirm_all_variants():
+    """All-ok widening: each phrase short-circuits to ``all_ok=True``."""
+    for token in (
+        "confirm all",
+        "all confirm",
+        "approve all",
+        "lgtm",
+        "all clear",
+        "good to go",
+        "yes",
+    ):
+        result = parse_reply(token)
+        assert result.all_ok is True, f"failed for {token!r}"
+        assert result.corrections == [], f"unexpected corrections for {token!r}"
+        assert result.unparsed == [], f"unexpected unparsed for {token!r}"
+
+
+def test_parse_reply_range_confirm():
+    """``1-5 confirm`` expands to five ``ok=True`` corrections."""
+    result = parse_reply("1-5 confirm")
+    assert result.all_ok is False
+    assert len(result.corrections) == 5
+    for i, c in enumerate(result.corrections, start=1):
+        assert c.item_number == i
+        assert c.ok is True
+        assert c.reject is False
+    assert result.unparsed == []
+
+
+def test_parse_reply_range_reject():
+    """``items 3-7 reject`` expands to five ``reject=True`` corrections."""
+    result = parse_reply("items 3-7 reject")
+    assert result.all_ok is False
+    assert len(result.corrections) == 5
+    expected_items = [3, 4, 5, 6, 7]
+    for c, expected in zip(result.corrections, expected_items):
+        assert c.item_number == expected
+        assert c.reject is True
+        assert c.ok is False
+    assert result.unparsed == []
+
+
+def test_parse_reply_range_through_form():
+    """``4 through 9 high`` expands to six tier=high corrections."""
+    result = parse_reply("4 through 9 high")
+    assert result.all_ok is False
+    assert len(result.corrections) == 6
+    expected_items = [4, 5, 6, 7, 8, 9]
+    for c, expected in zip(result.corrections, expected_items):
+        assert c.item_number == expected
+        assert c.new_tier == "high"
+    assert result.unparsed == []
+
+
+def test_parse_reply_range_single_item():
+    """``3-3 confirm`` expands to a single correction for item 3."""
+    result = parse_reply("3-3 confirm")
+    assert result.all_ok is False
+    assert len(result.corrections) == 1
+    c = result.corrections[0]
+    assert c.item_number == 3
+    assert c.ok is True
+    assert result.unparsed == []
+
+
+def test_parse_reply_range_inverted():
+    """``5-1 confirm`` is left intact and falls through to the unparsed bucket."""
+    result = parse_reply("5-1 confirm")
+    assert result.all_ok is False
+    assert result.corrections == []
+    assert len(result.unparsed) == 1
+    assert "5-1" in result.unparsed[0]
+
+
+def test_parse_reply_range_idempotent_vs_expanded():
+    """``1-3 confirm`` and ``1 confirm, 2 confirm, 3 confirm`` produce
+    equivalent correction lists (same item_numbers, same verbs).
+    """
+    range_result = parse_reply("1-3 confirm")
+    expanded_result = parse_reply("1 confirm, 2 confirm, 3 confirm")
+    assert len(range_result.corrections) == len(expanded_result.corrections) == 3
+    for rc, ec in zip(range_result.corrections, expanded_result.corrections):
+        assert rc.item_number == ec.item_number
+        assert rc.ok == ec.ok
+        assert rc.reject == ec.reject
+        assert rc.new_tier == ec.new_tier
+        assert rc.modifier == ec.modifier
