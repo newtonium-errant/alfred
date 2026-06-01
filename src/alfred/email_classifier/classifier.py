@@ -15,6 +15,7 @@ post-processor.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -115,6 +116,15 @@ class ClassificationResult:
     field is populated, ``written_to`` is the PRE-quarantine
     location (the path where the classifier wrote the priority
     frontmatter); the record currently lives at ``quarantined_to``.
+
+    ``pushed_to_telegram`` (c5, 2026-06-01) is True when the high-tier
+    Telegram push fired (i.e. ``priority == "high"`` AND the daily_sync
+    ``confidence.high`` flag is true AND the transport call returned
+    successfully). False on every other path: non-high priority, flag
+    off, no primary_telegram_user_id configured, transport error.
+    Mirrors ``quarantined_to``'s role as a non-empty audit signal —
+    the calibration UI can grep on ``pushed_to_telegram=True`` to find
+    records that triggered an active operator notification.
     """
 
     priority: str
@@ -124,6 +134,7 @@ class ClassificationResult:
     llm_priority: str | None = None
     override_applied: bool = False
     quarantined_to: str = ""
+    pushed_to_telegram: bool = False
 
 
 # --- LLM call type -----------------------------------------------------------
@@ -734,6 +745,236 @@ def _quarantine_spam_record(
     return dest_rel_path
 
 
+# --- c5 high-priority Telegram push ---------------------------------------
+#
+# Architectural sibling of c6 quarantine — same gate-on-confidence-flag
+# pattern, different fire action. Two gates:
+#   (a) result.priority == "high"
+#   (b) daily_sync confidence.high flag is true
+# When both fire, dispatch a one-shot Telegram message via
+# transport.client.send_outbound with a per-record dedupe_key.
+#
+# Failure tolerance: transport errors are logged via
+# ``email_classifier.high_push_failed`` warning but do NOT propagate —
+# the record's frontmatter is already persisted via vault_edit, and the
+# operator can recover the push via re-classify if needed. Mirrors the
+# c6 quarantine failure tolerance.
+
+
+# Maximum length of the body excerpt included in the Telegram message
+# body. Keeps the full message comfortably under Telegram's 4096-char
+# cap (header + sender + subject + action hint + vault:// line + body
+# excerpt all together stay under 800 chars on realistic inputs).
+_C5_BODY_EXCERPT_LIMIT = 400
+
+# Total message length cap — defensive ceiling so a pathological
+# subject/sender doesn't push the message anywhere near Telegram's
+# 4096-char hard limit. The renderer truncates the body excerpt
+# further if the assembled message exceeds this.
+_C5_TOTAL_LENGTH_LIMIT = 800
+
+# Quoted-line strip pattern. Cheap heuristic — drop lines starting with
+# ``>`` (RFC-style email quote) before the body excerpt is sliced.
+# Doesn't try to be exhaustive (no Outlook-style ``-----Original
+# Message-----`` block detection, no signature stripping) — just gets
+# the high-signal first 400 chars of the operator-facing body.
+_C5_QUOTE_LINE_RE = re.compile(r"^\s*>.*$", re.MULTILINE)
+
+
+def _is_high_priority_push_enabled(state_path: str) -> bool:
+    """Read the daily_sync confidence.high flag from the state file.
+
+    c5 (2026-06-01). The push layer only fires when the operator has
+    explicitly ratified the high tier via ``/calibration_ok high``
+    (which flips ``confidence.high`` to ``true`` in the state file).
+    Pre-flip — through every prior calibration cycle — the classifier
+    writes ``priority: high`` into the frontmatter but does NOT push.
+
+    Failure-tolerant: missing state file, malformed JSON, missing
+    ``confidence`` key, or unexpected types all return False (treat
+    as flag-off). Mirrors :func:`_is_spam_quarantine_enabled` exactly
+    — same shape, different flag name. Per the dispatch's edge-case
+    spec: ``state file missing → treat as flag=false``.
+    """
+    try:
+        text = Path(state_path).read_text(encoding="utf-8")
+        state = json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(state, dict):
+        return False
+    confidence = state.get("confidence")
+    if not isinstance(confidence, dict):
+        return False
+    return bool(confidence.get("high"))
+
+
+def _render_c5_message(
+    note_rel_path: str,
+    result: "ClassificationResult",
+    fm: dict[str, Any],
+    body: str,
+    inbox_content: str,
+) -> str:
+    """Render the operator-facing Telegram message for a c5 push.
+
+    Format (mirrors the dispatch spec):
+
+      📬 High-priority email
+      From: <sender display name + email>
+      Subject: <subject>
+      Action hint: <action_hint or "—">
+
+      <first 400 chars of body, stripped of obvious quoting>
+
+      🔗 vault://<note_rel_path>
+
+    Total length capped at :data:`_C5_TOTAL_LENGTH_LIMIT` (800). The
+    body excerpt is the FIRST 400 chars by default; if the assembled
+    message exceeds the total cap, the excerpt is trimmed further to
+    fit. The ``vault://`` URL is symbolic — Telegram won't follow it,
+    but operator-recognisable as the vault-relative path.
+    """
+    sender_email, sender_display = _extract_sender(inbox_content)
+    if sender_display and sender_email:
+        sender_line = f"{sender_display} <{sender_email}>"
+    elif sender_email:
+        sender_line = sender_email
+    elif sender_display:
+        sender_line = sender_display
+    else:
+        sender_line = "(unknown sender)"
+
+    subject = str(
+        fm.get("subject")
+        or fm.get("name")
+        or fm.get("description")
+        or Path(note_rel_path).stem
+    )
+
+    action_hint = result.action_hint or "—"
+
+    # Strip quoted lines (``> ...``) then take the first N chars. The
+    # body may be empty (operator-skipped capture); fall through to an
+    # empty excerpt rather than crashing.
+    cleaned_body = _C5_QUOTE_LINE_RE.sub("", body or "").strip()
+    excerpt = cleaned_body[:_C5_BODY_EXCERPT_LIMIT].rstrip()
+
+    parts = [
+        "📬 High-priority email",
+        f"From: {sender_line}",
+        f"Subject: {subject}",
+        f"Action hint: {action_hint}",
+        "",
+        excerpt if excerpt else "(no body content)",
+        "",
+        f"🔗 vault://{note_rel_path}",
+    ]
+    message = "\n".join(parts)
+
+    # Defensive total-length trim. If a pathological sender or subject
+    # pushes the assembled message past the cap, trim the excerpt
+    # further. Recompute once — operator sees a slightly shorter
+    # excerpt rather than a runaway-length message.
+    if len(message) > _C5_TOTAL_LENGTH_LIMIT and excerpt:
+        overflow = len(message) - _C5_TOTAL_LENGTH_LIMIT
+        # Keep at least 50 chars of excerpt if possible — better some
+        # context than none. If even 50 chars overflows, drop the
+        # excerpt to "(body trimmed)" to keep the header intact.
+        new_excerpt_len = max(len(excerpt) - overflow - 3, 0)
+        if new_excerpt_len < 50:
+            trimmed_excerpt = "(body trimmed)"
+        else:
+            trimmed_excerpt = excerpt[:new_excerpt_len].rstrip() + "..."
+        parts[5] = trimmed_excerpt
+        message = "\n".join(parts)
+
+    return message
+
+
+async def _push_high_priority_email(
+    note_rel_path: str,
+    result: "ClassificationResult",
+    fm: dict[str, Any],
+    body: str,
+    inbox_content: str,
+    config: EmailClassifierConfig,
+) -> bool:
+    """Dispatch the c5 Telegram push for a high-priority record.
+
+    Returns True when ``send_outbound`` returned successfully (operator
+    will see the Telegram message in their queue). False on every
+    failure path: no ``primary_telegram_user_id`` configured, transport
+    error, or unexpected exception.
+
+    Failure tolerance: every ``TransportError`` subclass is caught and
+    logged via ``email_classifier.high_push_failed``; the function
+    returns False so the caller can record ``pushed_to_telegram=False``
+    on the result. The exception is NOT re-raised — c5 is a
+    fire-and-forget post-processor like c6 quarantine.
+
+    Dedupe key: ``f"email-c5-{note_rel_path}"``. A re-classify of the
+    same record (e.g. backfill rerun) within the 24h transport dedupe
+    window returns the recorded entry instead of double-pushing.
+    """
+    user_id = config.primary_telegram_user_id
+    if user_id is None:
+        log.info(
+            "email_classifier.high_push_skipped_no_user",
+            path=note_rel_path,
+        )
+        return False
+
+    # Lazy import — keeps the email_classifier importable without the
+    # transport dependency at module-load time (relevant for unit tests
+    # that don't exercise this code path).
+    from alfred.transport.client import send_outbound
+    from alfred.transport.exceptions import TransportError
+
+    message = _render_c5_message(
+        note_rel_path=note_rel_path,
+        result=result,
+        fm=fm,
+        body=body,
+        inbox_content=inbox_content,
+    )
+    dedupe_key = f"email-c5-{note_rel_path}"
+
+    try:
+        await send_outbound(
+            user_id=user_id,
+            text=message,
+            dedupe_key=dedupe_key,
+        )
+    except TransportError as exc:
+        log.warning(
+            "email_classifier.high_push_failed",
+            path=note_rel_path,
+            user_id=user_id,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 — must not crash classifier
+        log.warning(
+            "email_classifier.high_push_unexpected_error",
+            path=note_rel_path,
+            user_id=user_id,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return False
+
+    log.info(
+        "email_classifier.high_push_sent",
+        path=note_rel_path,
+        user_id=user_id,
+        dedupe_key=dedupe_key,
+        message_len=len(message),
+    )
+    return True
+
+
 # --- Classification entry points -------------------------------------------
 
 
@@ -876,6 +1117,63 @@ def classify_record(
         )
         if quarantined_to is not None:
             result.quarantined_to = quarantined_to
+
+    # c5 high-priority Telegram push (2026-06-01). Architectural sibling
+    # of c6 quarantine — same gate-on-confidence-flag pattern, different
+    # fire action. Two gates: classifier said "high" AND the operator
+    # has ratified high-tier surfacing via /calibration_ok high (which
+    # flipped daily_sync confidence.high to true). Pre-ratification
+    # (operator still calibrating), high frontmatter persists but no
+    # push fires — keeps Andrew's Telegram quiet until calibration is
+    # ready.
+    #
+    # Push failure (transport error) is logged but doesn't propagate —
+    # the record's priority frontmatter is already persisted. Operator-
+    # discoverable via the ``email_classifier.high_push_failed``
+    # warning log. The push helper is async (transport.client uses
+    # httpx); the surrounding ``classify_record`` is sync. We invoke
+    # via ``asyncio.run`` because both call sites
+    # (``classify_records_for_inbox`` wrapped in ``asyncio.to_thread``;
+    # ``backfill.py`` plain CLI) are off the curator's event loop —
+    # spinning up a per-call loop in the worker thread is correct here
+    # and keeps the sync signature stable. See builder report for the
+    # full async-vs-sync rationale (2026-06-01 Task #54 c5 ship).
+    #
+    # Per feedback_intentionally_left_blank.md: the no-op cases (not
+    # high OR flag not enabled) are silent-by-design — there's no
+    # operator-actionable signal in "didn't push the 5,000th medium-
+    # tier email today." Only the firing case logs (high_push_sent),
+    # plus the no-user-configured case (high_push_skipped_no_user)
+    # and the failure cases.
+    if result.priority == "high" and _is_high_priority_push_enabled(
+        config.c5_state_path
+    ):
+        try:
+            pushed = asyncio.run(
+                _push_high_priority_email(
+                    note_rel_path=note_rel_path,
+                    result=result,
+                    fm=fm,
+                    body=body,
+                    inbox_content=inbox_content,
+                    config=config,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — must not crash classifier
+            # Defensive — _push_high_priority_email catches its own
+            # transport exceptions, but asyncio.run itself can raise
+            # (e.g. RuntimeError "asyncio.run() cannot be called from
+            # a running event loop" if the caller's context changes).
+            # The classifier must NEVER raise into the curator.
+            log.warning(
+                "email_classifier.high_push_runtime_error",
+                path=note_rel_path,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            pushed = False
+        if pushed:
+            result.pushed_to_telegram = True
 
     return result
 

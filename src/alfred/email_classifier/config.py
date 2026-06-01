@@ -200,6 +200,29 @@ class EmailClassifierConfig:
     # like ``inbox``, ``view``, ``digests`` — easily globbable.
     quarantine_dir_name: str = "quarantine"
 
+    # c5 (2026-06-01) high-priority Telegram push. Architectural sibling
+    # of c6 quarantine: same gate-on-confidence-flag pattern, different
+    # fire action. Two gates: (a) classifier verdict == "high",
+    # (b) ``confidence.high == true`` in the daily_sync state file.
+    # When both fire, the classifier dispatches a one-shot Telegram
+    # message to ``primary_telegram_user_id`` (the unified config's
+    # ``telegram.allowed_users[0]``). Pre-ratification, the high
+    # frontmatter persists but no push fires — operator is still
+    # calibrating.
+    #
+    # ``c5_state_path`` mirrors ``quarantine_state_path`` — same default,
+    # same file (one daily_sync state file carries every per-tier
+    # confidence flag). Separate field rather than reusing
+    # ``quarantine_state_path`` so a future arc could route the two
+    # gates to different state files without a breaking config change.
+    c5_state_path: str = "./data/daily_sync_state.json"
+    # Telegram user_id the c5 high-tier push dispatches to. Derived
+    # from the unified config's ``telegram.allowed_users[0]`` at load
+    # time (mirror of brief's ``primary_telegram_user_id``). ``None``
+    # when no telegram section is configured — push is skipped
+    # silently in that case (graceful no-op, like brief's behaviour).
+    primary_telegram_user_id: int | None = None
+
 
 # --- Recursive builder ------------------------------------------------------
 
@@ -236,12 +259,41 @@ def load_from_unified(raw: dict[str, Any]) -> EmailClassifierConfig:
     Returns a default-constructed (``enabled=False``) config when the
     ``email_classifier`` block is absent. Callers can rely on the
     ``.enabled`` flag to decide whether to run the post-processor.
+
+    c5 (2026-06-01) — ``primary_telegram_user_id`` is hydrated from the
+    unified config's ``telegram.allowed_users[0]`` (mirror of brief's
+    behaviour). When no telegram section is present, the field stays
+    ``None`` and the c5 push is silently skipped at runtime. Reading
+    the unified ``telegram`` block here keeps the field's source of
+    truth in one place (the operator's top-level telegram config),
+    rather than requiring a duplicated entry under email_classifier.
     """
     raw = _substitute_env(raw)
+
+    # Resolve primary_telegram_user_id from the unified telegram block.
+    # Mirrors brief/config.py's load_from_unified — identical extraction
+    # so a per-instance install gets the same user_id across the c5
+    # push and the brief push.
+    telegram_raw = raw.get("telegram", {}) or {}
+    allowed = telegram_raw.get("allowed_users") or []
+    primary_user: int | None = None
+    if allowed:
+        try:
+            primary_user = int(allowed[0])
+        except (TypeError, ValueError):
+            primary_user = None
+
     section = raw.get("email_classifier", {}) or {}
     if not section:
-        return EmailClassifierConfig(enabled=False)
-    return _build(EmailClassifierConfig, section)
+        cfg = EmailClassifierConfig(enabled=False)
+        cfg.primary_telegram_user_id = primary_user
+        return cfg
+    cfg = _build(EmailClassifierConfig, section)
+    # Always overlay the telegram-derived value — operator's top-level
+    # telegram config wins over a hypothetical (and unsupported) inline
+    # override in the email_classifier YAML block.
+    cfg.primary_telegram_user_id = primary_user
+    return cfg
 
 
 def load_config(path: str | Path = "config.yaml") -> EmailClassifierConfig:

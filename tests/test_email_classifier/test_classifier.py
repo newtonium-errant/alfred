@@ -225,6 +225,61 @@ def test_load_from_unified_env_substitution(monkeypatch: pytest.MonkeyPatch) -> 
     assert cfg.anthropic.api_key == "DUMMY_ANTHROPIC_TEST_KEY_FROM_ENV"
 
 
+def test_load_from_unified_resolves_primary_telegram_user_id() -> None:
+    """c5 (2026-06-01) — ``primary_telegram_user_id`` is hydrated from
+    the unified ``telegram.allowed_users[0]`` (mirror of brief's
+    behaviour). Operator's top-level telegram config is the single
+    source of truth — no per-tool duplication needed."""
+    raw = {
+        "telegram": {
+            "allowed_users": [123456789, 987654321],
+        },
+        "email_classifier": {
+            "enabled": True,
+        },
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.primary_telegram_user_id == 123456789
+
+
+def test_load_from_unified_telegram_user_id_none_when_absent() -> None:
+    """No telegram block in the unified config → push user_id stays
+    None → c5 push silently no-ops at runtime."""
+    raw = {"email_classifier": {"enabled": True}}
+    cfg = load_from_unified(raw)
+    assert cfg.primary_telegram_user_id is None
+
+
+def test_load_from_unified_telegram_user_id_with_classifier_disabled() -> None:
+    """Even when the email_classifier block is absent (disabled path),
+    the telegram user_id is still resolved — keeps the field's value
+    consistent regardless of which load_from_unified branch fires.
+
+    Mostly defensive: a future capability that pushes from a disabled
+    classifier (e.g. a manual ``alfred email-classifier push <path>``
+    CLI) should still see the operator's configured user_id."""
+    raw = {
+        "telegram": {"allowed_users": [555]},
+        # No email_classifier block at all.
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.enabled is False
+    assert cfg.primary_telegram_user_id == 555
+
+
+def test_load_from_unified_telegram_user_id_malformed_falls_back_to_none() -> None:
+    """``telegram.allowed_users[0]`` not an int-coercible value → field
+    stays None rather than crashing the loader. Mirrors brief's
+    defensive handling (an operator typo in YAML shouldn't break the
+    daemon)."""
+    raw = {
+        "telegram": {"allowed_users": ["not-a-number"]},
+        "email_classifier": {"enabled": True},
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.primary_telegram_user_id is None
+
+
 # ---------------------------------------------------------------------------
 # Email detection
 # ---------------------------------------------------------------------------
@@ -1569,3 +1624,425 @@ def test_classifier_does_not_quarantine_when_unclassified(
     assert result.priority == "unclassified"
     assert result.quarantined_to == ""
     assert (classifier_vault / rel).exists()
+
+
+# ---------------------------------------------------------------------------
+# c5 — high-priority Telegram push (2026-06-01)
+# ---------------------------------------------------------------------------
+#
+# Architectural sibling of c6 quarantine — same gate-on-confidence-flag
+# pattern, different fire action. Two gates: (a) classifier verdict ==
+# "high", (b) operator has ratified high-tier surfacing via
+# ``/calibration_ok high`` (which flipped daily_sync ``confidence.high``
+# to true). When both fire, dispatch a one-shot Telegram message via
+# transport.client.send_outbound. Pre-ratification, the high frontmatter
+# persists but no push fires.
+#
+# Tests monkeypatch ``alfred.transport.client.send_outbound`` to capture
+# the call args without making real HTTP requests. The push helper
+# imports the symbol LAZILY inside the function body, so patching the
+# module attribute is sufficient — no need to patch the binding at the
+# classifier module level.
+
+
+def _seed_high_confidence_state(
+    state_path: Path,
+    *,
+    high_flag: bool,
+) -> None:
+    """Write a minimal daily_sync state file with the high-confidence flag.
+
+    Mirrors the on-disk shape ``daily_sync.confidence.list_confidence``
+    produces (see ``_seed_confidence_state`` above — same writer, just
+    a different flag-of-interest for c5 tests).
+    """
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({
+            "confidence": {
+                "high": high_flag,
+                "medium": True,
+                "low": True,
+                "spam": True,
+            },
+        }),
+        encoding="utf-8",
+    )
+
+
+@dataclass
+class _CapturedSend:
+    """Records the args passed to ``send_outbound`` for assertion."""
+
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    raise_exc: BaseException | None = None
+
+    async def __call__(
+        self,
+        user_id: int,
+        text: str,
+        *,
+        scheduled_at: str | None = None,
+        dedupe_key: str | None = None,
+        client_name: str | None = None,
+    ) -> dict[str, Any]:
+        self.calls.append({
+            "user_id": user_id,
+            "text": text,
+            "scheduled_at": scheduled_at,
+            "dedupe_key": dedupe_key,
+            "client_name": client_name,
+        })
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return {"id": "fake-msg-id", "status": "sent"}
+
+
+def _enabled_config_with_push_user(
+    enabled_config: EmailClassifierConfig,
+    user_id: int = 42,
+) -> EmailClassifierConfig:
+    """Stamp a primary_telegram_user_id on the shared enabled_config."""
+    enabled_config.primary_telegram_user_id = user_id
+    return enabled_config
+
+
+def test_high_push_fires_when_gate_enabled(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Classifier verdict ``high`` + ``confidence.high: true`` →
+    send_outbound called once with expected text + dedupe_key."""
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    _seed_high_confidence_state(state_path, high_flag=True)
+    cfg = _enabled_config_with_push_user(enabled_config, user_id=42)
+    cfg.c5_state_path = str(state_path)
+
+    captured = _CapturedSend()
+    monkeypatch.setattr(
+        "alfred.transport.client.send_outbound", captured
+    )
+
+    rel = _seed_note(classifier_vault, "Urgent contract review")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "high",
+        "action_hint": "respond",
+        "reasoning": "named contact + urgent deadline",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=cfg,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "high"
+    assert result.pushed_to_telegram is True
+    assert len(captured.calls) == 1
+    call = captured.calls[0]
+    assert call["user_id"] == 42
+    assert call["dedupe_key"] == f"email-c5-{rel}"
+    # Message contains the expected operator-readable lines. Subject
+    # comes from the note's frontmatter (the seeded ``name`` field),
+    # NOT from the inbox _EMAIL_SAMPLE — the classifier persists the
+    # subject into frontmatter at curator-creation time, so c5 reads
+    # the same source of truth as everything else downstream.
+    assert "📬 High-priority email" in call["text"]
+    assert "jamie@example.com" in call["text"]  # from _EMAIL_SAMPLE sender
+    assert "Urgent contract review" in call["text"]  # subject (frontmatter name)
+    assert "Action hint: respond" in call["text"]
+    assert f"vault://{rel}" in call["text"]
+
+
+def test_high_push_silent_when_gate_disabled(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Classifier verdict ``high`` + ``confidence.high: false`` →
+    send_outbound NOT called. Frontmatter still persisted."""
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    _seed_high_confidence_state(state_path, high_flag=False)
+    cfg = _enabled_config_with_push_user(enabled_config, user_id=42)
+    cfg.c5_state_path = str(state_path)
+
+    captured = _CapturedSend()
+    monkeypatch.setattr(
+        "alfred.transport.client.send_outbound", captured
+    )
+
+    rel = _seed_note(classifier_vault, "Important email pre-cal")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "high",
+        "action_hint": "respond",
+        "reasoning": "urgent",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=cfg,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "high"
+    assert result.pushed_to_telegram is False
+    assert captured.calls == []
+    # Frontmatter still got the high priority — push gate is independent
+    # of the priority write.
+    post = frontmatter.load(str(classifier_vault / rel))
+    assert post.metadata["priority"] == "high"
+
+
+def test_high_push_skipped_for_non_high_priority(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Classifier verdict ``medium`` + ``confidence.high: true`` →
+    send_outbound NOT called. The gate fires ONLY on priority=high."""
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    _seed_high_confidence_state(state_path, high_flag=True)
+    cfg = _enabled_config_with_push_user(enabled_config, user_id=42)
+    cfg.c5_state_path = str(state_path)
+
+    captured = _CapturedSend()
+    monkeypatch.setattr(
+        "alfred.transport.client.send_outbound", captured
+    )
+
+    rel = _seed_note(classifier_vault, "Routine medium-tier email")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "medium",
+        "action_hint": None,
+        "reasoning": "routine traffic",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=cfg,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "medium"
+    assert result.pushed_to_telegram is False
+    assert captured.calls == []
+
+
+def test_high_push_transport_failure_does_not_crash(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """send_outbound raises TransportUnavailable → classifier still
+    returns the result with ``pushed_to_telegram=False``, no exception
+    propagates, and the ``email_classifier.high_push_failed`` warning
+    is logged.
+
+    Uses ``structlog.testing.capture_logs`` rather than caplog because
+    the push helper runs inside ``asyncio.run`` from the sync
+    classifier — structlog's capture_logs is the canonical pattern
+    for async/threaded code paths (see
+    ``feedback_structlog_assertion_patterns.md``).
+    """
+    import structlog
+    from alfred.transport.exceptions import TransportUnavailable
+
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    _seed_high_confidence_state(state_path, high_flag=True)
+    cfg = _enabled_config_with_push_user(enabled_config, user_id=42)
+    cfg.c5_state_path = str(state_path)
+
+    captured = _CapturedSend(
+        raise_exc=TransportUnavailable("upstream 503"),
+    )
+    monkeypatch.setattr(
+        "alfred.transport.client.send_outbound", captured
+    )
+
+    rel = _seed_note(classifier_vault, "High when transport down")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "high",
+        "action_hint": "respond",
+        "reasoning": "urgent",
+    }))
+
+    with structlog.testing.capture_logs() as log_records:
+        # The classifier must NEVER raise into the curator — even on
+        # transport failure.
+        result = classify_record(
+            vault_path=classifier_vault,
+            note_rel_path=rel,
+            inbox_content=_EMAIL_SAMPLE,
+            config=cfg,
+            llm_caller=fake,
+        )
+
+    assert result.priority == "high"
+    assert result.pushed_to_telegram is False
+    # send_outbound was called once (the gate fired), it just failed.
+    assert len(captured.calls) == 1
+
+    failed = [
+        r for r in log_records
+        if r.get("event") == "email_classifier.high_push_failed"
+    ]
+    assert len(failed) == 1, (
+        f"expected exactly one high_push_failed warning, "
+        f"got {len(failed)}: {log_records}"
+    )
+    # Assert load-bearing fields per
+    # feedback_log_emission_test_pattern.md — catches field renames or
+    # drops, not just full-event drops.
+    entry = failed[0]
+    assert entry["path"] == rel
+    assert entry["user_id"] == 42
+    assert entry["error_type"] == "TransportUnavailable"
+    assert "upstream 503" in entry.get("error", "")
+
+
+def test_high_push_state_file_missing_treated_as_disabled(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edge case mirroring the c6 fail-safe: state file missing → treat
+    as flag=false (don't crash; don't push if state-mechanism is
+    unreadable).
+
+    A missing state file usually means daily_sync hasn't run yet, OR
+    the operator reset calibration. Either way, the safest default is
+    "don't push" rather than firing a push on a state we can't read.
+    """
+    cfg = _enabled_config_with_push_user(enabled_config, user_id=42)
+    cfg.c5_state_path = str(
+        tmp_path / "nonexistent" / "daily_sync_state.json"
+    )
+
+    captured = _CapturedSend()
+    monkeypatch.setattr(
+        "alfred.transport.client.send_outbound", captured
+    )
+
+    rel = _seed_note(classifier_vault, "High when state missing")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "high",
+        "action_hint": "respond",
+        "reasoning": "urgent",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=cfg,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "high"
+    assert result.pushed_to_telegram is False
+    assert captured.calls == []
+
+
+def test_high_push_message_format(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rendered Telegram text contains sender + subject + vault:// line
+    and total length is under the 800-char operator-deliverable cap.
+
+    Pins the message format so a future refactor that drops the
+    sender line or the vault:// URL surfaces here rather than in
+    operator-facing Telegram noise.
+    """
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    _seed_high_confidence_state(state_path, high_flag=True)
+    cfg = _enabled_config_with_push_user(enabled_config, user_id=42)
+    cfg.c5_state_path = str(state_path)
+
+    captured = _CapturedSend()
+    monkeypatch.setattr(
+        "alfred.transport.client.send_outbound", captured
+    )
+
+    rel = _seed_note(classifier_vault, "Format check")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "high",
+        "action_hint": "respond",
+        "reasoning": "urgent",
+    }))
+
+    classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=cfg,
+        llm_caller=fake,
+    )
+
+    assert len(captured.calls) == 1
+    text = captured.calls[0]["text"]
+    # Required structural lines per the dispatch spec.
+    assert "📬 High-priority email" in text
+    assert "From:" in text
+    assert "Subject:" in text
+    assert "Action hint:" in text
+    assert f"🔗 vault://{rel}" in text
+    # Total length cap — operator-deliverable, well under Telegram's
+    # 4096-char hard limit.
+    assert len(text) < 800, (
+        f"rendered message exceeds 800 chars: len={len(text)}"
+    )
+
+
+def test_high_push_skipped_when_no_user_id_configured(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``primary_telegram_user_id`` on the config (i.e. operator has
+    no telegram section configured) → push is silently skipped even
+    when the gate is on. Mirrors brief's graceful-no-op behaviour."""
+    state_path = tmp_path / "data" / "daily_sync_state.json"
+    _seed_high_confidence_state(state_path, high_flag=True)
+    # NOTE: deliberately NOT stamping primary_telegram_user_id — it
+    # stays as the dataclass default of None.
+    enabled_config.c5_state_path = str(state_path)
+
+    captured = _CapturedSend()
+    monkeypatch.setattr(
+        "alfred.transport.client.send_outbound", captured
+    )
+
+    rel = _seed_note(classifier_vault, "High with no telegram configured")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "high",
+        "action_hint": "respond",
+        "reasoning": "urgent",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "high"
+    assert result.pushed_to_telegram is False
+    assert captured.calls == []
