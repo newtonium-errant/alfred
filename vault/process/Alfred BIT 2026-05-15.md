@@ -11,6 +11,8 @@ mode: quick
 name: Alfred BIT 2026-05-15
 overall_status: ok
 process: '[[process/Alfred BIT]]'
+related_projects:
+- project/Alfred.md
 relationships:
 - confidence: 1
   context: Same Alfred BIT run series
