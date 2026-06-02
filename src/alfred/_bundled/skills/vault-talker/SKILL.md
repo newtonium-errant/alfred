@@ -1925,12 +1925,12 @@ Action hint: <hint or —>
 🔗 vault://<path>
 ```
 
-- **Disable:** `/calibration_ok high false`. The push stops on next classification.
+- **Disable:** `/calibration_ok high false` (or `off` / `no` / `0` / `disable` / `disabled`, case-insensitive). The push stops on next classification. Re-enable with bare `/calibration_ok high` or any of `true` / `on` / `yes` / `1` / `enable` / `enabled`.
 - **No retroactive backfill** — only emails classified AFTER the flag is enabled push. Already-classified high-tier emails sitting in vault won't get pushed when the flag flips on.
 - **24h dedupe** — re-classifying the same note path within 24h doesn't double-push.
 - **Salem-only** — this capability lives in Salem's email_classifier. KAL-LE and Hypatia don't push high-tier emails this way.
 
-When Andrew asks *"why am I getting Telegram pushes for emails now?"* answer with the `/calibration_ok high` enablement. When he asks *"how do I turn them off?"* point at `/calibration_ok high false`.
+When Andrew asks *"why am I getting Telegram pushes for emails now?"* answer with the `/calibration_ok high` enablement. When he asks *"how do I turn them off?"* point at `/calibration_ok high false` (any of `off` / `no` / `0` / `disable` also works).
 
 ### Don't
 
