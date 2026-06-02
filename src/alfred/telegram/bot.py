@@ -3490,17 +3490,27 @@ async def on_calibrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_calibration_ok(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/calibration_ok [tier]`` — manage per-tier surfacing confidence flags.
+    """``/calibration_ok [tier [value]]`` — manage per-tier surfacing confidence flags.
 
     Usage:
-      * ``/calibration_ok``         → list current flags.
-      * ``/calibration_ok high``    → flip the ``high`` flag to True.
+      * ``/calibration_ok``               → list current flags.
+      * ``/calibration_ok <tier>``        → flip the tier's flag to True.
+      * ``/calibration_ok <tier> <value>`` → explicit on/off (value is
+        one of: ``on``/``off``, ``true``/``false``, ``yes``/``no``,
+        ``1``/``0``, ``enable``/``disable``).
 
-    The flags are read by future surfacing consumers (c3 brief section,
-    c4 Obsidian view, c5 Telegram push) to gate per-tier surfacing on
-    Andrew's explicit approval. Flipping is idempotent — calling
-    ``/calibration_ok high`` when the flag is already True is a no-op
+    The flags are read by surfacing consumers (c3 brief section, c4
+    Obsidian view, c5 Telegram push) to gate per-tier surfacing on the
+    operator's explicit approval. Flipping is idempotent — calling
+    ``/calibration_ok high`` when the flag is already True (or
+    ``/calibration_ok high off`` when already False) is a no-op
     response that confirms the current state.
+
+    Task #57 (2026-06-02) added the explicit-value form. c5's high-tier
+    Telegram push shipped 2026-06-01 (commit ``8f01640``); operators
+    routinely need to disable an active push tier mid-calibration if
+    notification volume turns out wrong, so the disable path is now
+    discoverable from the same surface as the enable path.
     """
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
     if not _is_allowed(update, config):
@@ -3539,18 +3549,58 @@ async def on_calibration_ok(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(format_confidence_report(flags))
         return
 
+    # Task #57 (2026-06-02) — parse the optional third token as an
+    # explicit on/off. Reject unknown tokens with a friendly reply
+    # rather than silently flipping True; an operator who typed
+    # ``/calibration_ok high frobnicate`` almost certainly didn't
+    # intend "enable" and would otherwise be confused when the disable
+    # didn't take effect.
+    value_arg = parts[2].lower().strip() if len(parts) > 2 else ""
+    if value_arg in _CALIBRATION_OK_DISABLE_TOKENS:
+        value = False
+    elif value_arg in _CALIBRATION_OK_ENABLE_TOKENS or value_arg == "":
+        value = True
+    else:
+        await update.message.reply_text(
+            f"Unknown value `{value_arg}`; use one of: "
+            "on/off, true/false, yes/no, 1/0, enable/disable."
+        )
+        return
+
     try:
         flags = set_confidence(
-            ds_config.state.path, arg, True, seed=ds_config.confidence,
+            ds_config.state.path, arg, value, seed=ds_config.confidence,
         )
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return
 
+    # Reply-text differentiates enable vs disable so the operator can
+    # see at a glance which direction the flip went. Per
+    # feedback_intentionally_left_blank.md, the "no-op already in this
+    # state" case is NOT silent — the report below shows the current
+    # full per-tier map so an operator who re-runs the same command
+    # sees the unchanged state explicitly.
+    if value:
+        verb = "enabled"
+    else:
+        verb = "disabled"
     await update.message.reply_text(
-        f"Flipped `{arg}` confidence to True.\n\n"
+        f"`{arg}` confidence {verb}.\n\n"
         + format_confidence_report(flags)
     )
+
+
+# Task #57 (2026-06-02) — value-token vocab for ``/calibration_ok <tier> <value>``.
+# Module-level so tests can import + assert on coverage without
+# re-deriving the list. Lower-case tokens; the handler ``lower()``s
+# the operator's input before lookup.
+_CALIBRATION_OK_DISABLE_TOKENS = frozenset({
+    "false", "off", "0", "no", "disable", "disabled",
+})
+_CALIBRATION_OK_ENABLE_TOKENS = frozenset({
+    "true", "on", "1", "yes", "enable", "enabled",
+})
 
 
 # Inline ``/extract abc123`` detection. PTB's CommandHandler fires when
