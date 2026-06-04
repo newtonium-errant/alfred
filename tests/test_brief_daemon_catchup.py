@@ -40,6 +40,47 @@ from alfred.common.schedule import ScheduleConfig
 HALIFAX = ZoneInfo("America/Halifax")
 
 
+# Task #58 Class A (2026-06-04) — _CLOCK_PATCH_RATIONALE
+#
+# Every catchup test that drives ``run_daemon`` MUST patch BOTH:
+#   monkeypatch.setattr("alfred.brief.daemon.datetime", _FrozenDT)
+#   monkeypatch.setattr("alfred.common.schedule.datetime", _FrozenDT)
+#
+# Why: ``sleep_until`` lives in ``alfred.common.schedule`` (line 337-339)
+# and resolves ``datetime.now`` from its OWN module's binding via
+# ``def clock(): return datetime.now(target.tzinfo)``. The daemon's
+# ``alfred.brief.daemon.datetime`` patch does NOT touch this binding,
+# so a single-module patch leaves real wall-clock time leaking into
+# the chunked-sleep path.
+#
+# Symptom of the gap: with frozen "now" set days/weeks in the past
+# (typical test fixture), ``remaining = target - real_now`` is
+# strongly negative, ``sleep_until`` returns IMMEDIATELY, the daemon
+# loop re-iterates, ``generate_brief`` (mocked) fires AGAIN, and
+# ``len(generate_calls) == 1`` assertions fail. The swallowed
+# SnapshotError warning in pytest log capture (from the daemon's
+# best-effort snapshot block at brief/daemon.py:354-372) is a
+# RED HERRING — the real failure is the multi-fire assertion mismatch,
+# not the snapshot.
+#
+# Patching both bindings keeps the test rig's clock consistent across
+# the daemon + schedule modules; sleep_until blocks until wait_for's
+# timeout cancels the task naturally.
+#
+# Latent-bug-class also present in tests/test_daily_sync_daemon_catchup.py
+# (5 sites with the same single-module patch). Those tests currently
+# pass because the file's authors narrowed their assertions to the
+# catchup_fired log event count rather than total-fire-count (see
+# the comment at line 197-205 of that file). Don't introduce
+# fire-count assertions there without applying the same dual-patch
+# fix.
+#
+# Architecturally cleaner production-side fix (deferred — see
+# Task #58 handoff): thread the ``clock`` kwarg of ``sleep_until``
+# through ``run_daemon`` so tests can inject a frozen clock at one
+# point instead of monkey-patching two module bindings.
+
+
 def _make_brief_config(tmp_path: Path) -> BriefConfig:
     """Build a minimal BriefConfig pointing at tmp_path for state.
 
@@ -96,6 +137,10 @@ async def test_catchup_fires_when_window_passed_and_no_fire_today(
             return frozen_now if tz is None else frozen_now.astimezone(tz)
 
     monkeypatch.setattr("alfred.brief.daemon.datetime", _FrozenDT)
+    # See module-level note _CLOCK_PATCH_RATIONALE — patch both
+    # daemon.datetime AND common.schedule.datetime so sleep_until's
+    # clock stays consistent with the daemon's frozen clock.
+    monkeypatch.setattr("alfred.common.schedule.datetime", _FrozenDT)
 
     # Stub generate_brief so the catch-up call resolves without
     # touching weather / vault / etc.
@@ -162,6 +207,10 @@ async def test_no_catchup_when_today_already_fired(
             return frozen_now if tz is None else frozen_now.astimezone(tz)
 
     monkeypatch.setattr("alfred.brief.daemon.datetime", _FrozenDT)
+    # See module-level note _CLOCK_PATCH_RATIONALE — patch both
+    # daemon.datetime AND common.schedule.datetime so sleep_until's
+    # clock stays consistent with the daemon's frozen clock.
+    monkeypatch.setattr("alfred.common.schedule.datetime", _FrozenDT)
 
     generate_calls = []
 
@@ -212,6 +261,10 @@ async def test_no_catchup_when_window_not_yet_passed(
             return frozen_now if tz is None else frozen_now.astimezone(tz)
 
     monkeypatch.setattr("alfred.brief.daemon.datetime", _FrozenDT)
+    # See module-level note _CLOCK_PATCH_RATIONALE — patch both
+    # daemon.datetime AND common.schedule.datetime so sleep_until's
+    # clock stays consistent with the daemon's frozen clock.
+    monkeypatch.setattr("alfred.common.schedule.datetime", _FrozenDT)
 
     async def _fake_generate_brief(cfg, state_mgr, refresh=False):
         return None
@@ -258,6 +311,10 @@ async def test_catchup_fired_log_event_emits_with_required_fields(
             return frozen_now if tz is None else frozen_now.astimezone(tz)
 
     monkeypatch.setattr("alfred.brief.daemon.datetime", _FrozenDT)
+    # See module-level note _CLOCK_PATCH_RATIONALE — patch both
+    # daemon.datetime AND common.schedule.datetime so sleep_until's
+    # clock stays consistent with the daemon's frozen clock.
+    monkeypatch.setattr("alfred.common.schedule.datetime", _FrozenDT)
 
     async def _fake_generate_brief(cfg, state_mgr, refresh=False):
         state_mgr.state.add_run(BriefRun(
@@ -316,6 +373,10 @@ async def test_catchup_fire_updates_state_identically_to_scheduled(
             return frozen_now if tz is None else frozen_now.astimezone(tz)
 
     monkeypatch.setattr("alfred.brief.daemon.datetime", _FrozenDT)
+    # See module-level note _CLOCK_PATCH_RATIONALE — patch both
+    # daemon.datetime AND common.schedule.datetime so sleep_until's
+    # clock stays consistent with the daemon's frozen clock.
+    monkeypatch.setattr("alfred.common.schedule.datetime", _FrozenDT)
 
     async def _fake_generate_brief(cfg, state_mgr, refresh=False):
         # Exact same code as the real generate_brief's state-write
