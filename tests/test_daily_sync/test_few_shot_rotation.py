@@ -74,11 +74,30 @@ def test_few_shot_block_appears_with_corpus(tmp_path: Path):
 
 
 def test_few_shot_block_orders_newest_first(tmp_path: Path):
+    """Newest-first ordering pin for the few-shot block.
+
+    Task #58 (2026-06-04) — the seeded entries are now ACTUAL
+    corrections (classifier_priority != andrew_priority). Per
+    ``recent_corrections``' 2026-05-31 contract (commit message in
+    ``alfred/daily_sync/corpus.py``), the function filters to
+    entries where ``is_correction()`` is True. Pre-fix the seeds
+    set ``classifier_priority="low"`` AND ``andrew_priority="low"``
+    which short-circuited the filter to an empty list and the
+    rendered prompt didn't contain any sender lines, surfacing as
+    ``ValueError: substring not found`` on ``prompt.index(...)``.
+
+    The corrections-only filter has its own coverage in test_corpus.py
+    via ``recent_corrections``-direct tests; this test pins the
+    ordering at the few-shot-block layer, not the filtering.
+    """
     corpus = tmp_path / "corpus.jsonl"
     for i in range(3):
         append_correction(corpus, CorpusEntry(
             record_path=f"note/{i}.md",
-            classifier_priority="low",
+            # classifier said "medium" → operator corrected to "low"
+            # (per i parity, vary across entries so the
+            # diversify_by_tier path doesn't preferentially drop one).
+            classifier_priority="medium",
             classifier_action_hint=None,
             classifier_reason="x",
             andrew_priority="low",
