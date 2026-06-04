@@ -72,10 +72,29 @@ def _make_vault(tmp_path: Path) -> Path:
 
 
 def test_build_batch_picks_uncalibrated_first(tmp_path: Path):
+    """Per-record calibration ordering — pin that uncalibrated items
+    surface in the batch.
+
+    Each seeded note uses a distinct (sender, subject) so the c5
+    cluster-collapsing layer (added 2026-05-31) treats each as its own
+    singleton cluster rather than merging the 3 into one. The
+    clustering layer is INDEPENDENT of the calibration-ordering
+    behaviour this test pins; using varied content keeps the test's
+    intent surgical (Task #58, 2026-06-04).
+    """
     vault = _make_vault(tmp_path)
-    _seed_note(vault, "A", priority="medium")
-    _seed_note(vault, "B", priority="high")
-    _seed_note(vault, "C", priority="low")
+    _seed_note(
+        vault, "A", priority="medium",
+        sender="alice@example.com", subject="Project Aurora kickoff",
+    )
+    _seed_note(
+        vault, "B", priority="high",
+        sender="bob@example.com", subject="Quarterly review draft",
+    )
+    _seed_note(
+        vault, "C", priority="low",
+        sender="carol@example.com", subject="Newsletter sign-up confirm",
+    )
 
     config = DailySyncConfig(enabled=True, batch_size=3)
     config.corpus.path = str(tmp_path / "corpus.jsonl")
@@ -87,10 +106,28 @@ def test_build_batch_picks_uncalibrated_first(tmp_path: Path):
 
 
 def test_build_batch_excludes_already_calibrated(tmp_path: Path):
+    """Calibration-skip behaviour — already-corpus-logged records are
+    excluded from the batch.
+
+    Varied (sender, subject) per the same rationale as
+    ``test_build_batch_picks_uncalibrated_first`` (Task #58) — the
+    clustering layer would otherwise collapse A+B+C into one item and
+    the ``"note/A.md" not in rel_paths`` assertion would fail because
+    the cluster's primary record_path could be A's.
+    """
     vault = _make_vault(tmp_path)
-    _seed_note(vault, "A", priority="medium")
-    _seed_note(vault, "B", priority="high")
-    _seed_note(vault, "C", priority="low")
+    _seed_note(
+        vault, "A", priority="medium",
+        sender="alice@example.com", subject="Project Aurora kickoff",
+    )
+    _seed_note(
+        vault, "B", priority="high",
+        sender="bob@example.com", subject="Quarterly review draft",
+    )
+    _seed_note(
+        vault, "C", priority="low",
+        sender="carol@example.com", subject="Newsletter sign-up confirm",
+    )
 
     corpus = tmp_path / "corpus.jsonl"
     append_correction(corpus, CorpusEntry(
@@ -111,10 +148,23 @@ def test_build_batch_excludes_already_calibrated(tmp_path: Path):
 
 
 def test_build_batch_falls_back_to_stratified_when_short(tmp_path: Path):
+    """Stratified fallback when all candidates are already calibrated.
+
+    Varied (sender, subject) per the clustering-independence rationale
+    above (Task #58). Without varied content, the clustering layer
+    would collapse A+B into one item and the ``len(batch) == 2``
+    assertion would fail with 1.
+    """
     vault = _make_vault(tmp_path)
     # Two notes, both already calibrated
-    _seed_note(vault, "A", priority="medium")
-    _seed_note(vault, "B", priority="high")
+    _seed_note(
+        vault, "A", priority="medium",
+        sender="alice@example.com", subject="Project Aurora kickoff",
+    )
+    _seed_note(
+        vault, "B", priority="high",
+        sender="bob@example.com", subject="Quarterly review draft",
+    )
 
     corpus = tmp_path / "corpus.jsonl"
     for path, pri in [("note/A.md", "medium"), ("note/B.md", "high")]:
