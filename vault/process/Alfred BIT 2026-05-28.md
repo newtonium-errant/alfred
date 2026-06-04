@@ -3,6 +3,11 @@ alfred_tags:
 - alfred/bit
 created: '2026-05-28'
 description: Alfred built-in test (health sweep)
+janitor_note: LINK001 — [[process/Alfred BIT]] parent process record does not exist
+  in vault. Same pattern as Alfred BIT 2026-05-07 and Morning Brief 2026-05-11/2026-05-18/2026-05-25.
+  Cannot unambiguously fix (outside janitor scope to create missing canonical process
+  record). DIR001 — record has type=run but lives in process/; expected autofix.py
+  to handle deterministically.
 mode: quick
 name: Alfred BIT 2026-05-28
 overall_status: fail

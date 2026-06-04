@@ -3,10 +3,22 @@ alfred_tags:
 - alfred/bit
 created: '2026-06-02'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — broken wikilink [[process/Alfred BIT]] in process: field;
+  parent process record does not exist in vault (process/ contains only dated Alfred
+  BIT run records). Consistent with all other dated Alfred BIT run records. DIR001
+  deterministic — type=run filed under process/; awaiting autofix.py.'
 mode: quick
 name: Alfred BIT 2026-06-02
 overall_status: ok
 process: '[[process/Alfred BIT]]'
+relationships:
+- confidence: 1
+  context: Same Alfred BIT run series
+  source: process/Alfred BIT 2026-06-02.md
+  source_anchor: run Alfred BIT 2026-06-02
+  target: process/Alfred BIT 2026-06-03.md
+  target_anchor: run Alfred BIT 2026-06-03
+  type: related-to
 started: '2026-06-02T05:55:03.453438-03:00'
 status: completed
 tags:
