@@ -147,3 +147,41 @@ class TestAggregator:
         report = await agg.run_all_checks({}, mode="quick", _auto_load=False)
         assert report.elapsed_ms is not None
         assert report.elapsed_ms < 300  # < 0.3s
+
+
+# --- P16 budget-constant contract pins (2026-06-07) -----------------------
+#
+# Pin the literal values of the per-tool budget constants so a future
+# tweaker has to deliberately update BOTH the constant in
+# ``aggregator.py`` AND these pins together. The motivation for the
+# 5.0 → 10.0 widen is documented in the aggregator.py block comment
+# above ``QUICK_TIMEOUT_SECONDS``; a future tweaker reading the
+# constant sees the rationale without commit-message archaeology.
+#
+# These are NOT timing-based tests (those would be flaky on slow CI);
+# they're contract pins on the module-level constants.
+
+
+def test_quick_timeout_constant_widened_to_10s() -> None:
+    """P16 (2026-06-07): QUICK budget widened from 5s to 10s.
+
+    The widen was driven by ``claude-haiku-4-5`` API latency variance
+    — curator / janitor / distiller probes routinely run 3–4s on the
+    haiku auth path, leaving 1–2s headroom on the old 5s budget that
+    broke under a regional Anthropic slowdown 2026-06-07 morning
+    (curator probe at 6.2s on the 5s budget). See the block comment
+    above ``QUICK_TIMEOUT_SECONDS`` in
+    ``src/alfred/health/aggregator.py`` for the latency table and
+    incident detail.
+    """
+    assert agg.QUICK_TIMEOUT_SECONDS == 10.0
+
+
+def test_full_timeout_constant_unchanged_at_15s() -> None:
+    """P16: ``FULL_TIMEOUT_SECONDS`` stays at 15s.
+
+    The haiku-using tools have 10s+ headroom over their baselines on
+    the ``full`` budget — no widen needed. Pinning the value here
+    surfaces any accidental ``full`` change in the same code review.
+    """
+    assert agg.FULL_TIMEOUT_SECONDS == 15.0

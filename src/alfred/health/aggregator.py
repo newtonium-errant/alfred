@@ -59,7 +59,34 @@ KNOWN_TOOL_MODULES: dict[str, str] = {
 # 15s budget per tool (plan Part 11 Q2). These are per-tool, not per-check —
 # the tool's ``health_check`` is responsible for subdividing its own time
 # budget across the probes it runs.
-QUICK_TIMEOUT_SECONDS = 5.0
+#
+# 2026-06-07 widen 5.0 → 10.0 (P16): the original 5s value was tuned
+# against sonnet-fast probes (talker probe baseline ~1.3s). Three tools
+# — curator, janitor, distiller — use ``claude-haiku-4-5`` for their
+# shared anthropic-auth probe (see ``alfred.health.anthropic_auth``)
+# and routinely run 3–4s on a healthy day:
+#
+#     Tool       | Baseline   | Old 5s headroom
+#     -----------|-----------|------------------
+#     curator    | ~3.3s     | 1.7s good, 0 on a bad day
+#     janitor    | ~2.9s     | 2.1s good, 0.5s on a bad day
+#     distiller  | ~3.0s     | 2.0s good, 0.4s on a bad day
+#     talker     | ~1.3s     | 3.7s comfortable
+#
+# 2026-06-07 morning: a regional Anthropic ``claude-haiku-4-5``
+# latency spike drove the curator probe to 6.2s on the 5s budget,
+# producing a false-positive timeout FAIL on a BIT cycle. Six minutes
+# later a fresh probe ran in 125ms — root cause was Anthropic-side
+# latency variance, not a bug in any curator code path. The 10s
+# budget gives ~2.5x current haiku-baseline headroom even on a bad
+# API day, while keeping a reasonable cap on a genuinely-stuck health
+# check. ``FULL_TIMEOUT_SECONDS`` stays at 15s — ample headroom there
+# for the haiku-using tools (10s+ over haiku baselines).
+#
+# Future widen / narrow: change the literal AND
+# ``tests/health/test_aggregator.py::test_quick_timeout_constant_widened_to_10s``
+# together so a deliberate code-review touch ratifies the new value.
+QUICK_TIMEOUT_SECONDS = 10.0
 FULL_TIMEOUT_SECONDS = 15.0
 
 
