@@ -116,3 +116,73 @@ def mark_processed(
     shutil.move(str(inbox_file), str(dest))
     log.info("writer.marked_processed", src=str(inbox_file), dest=str(dest))
     return dest
+
+
+def mark_filtered(
+    inbox_file: Path,
+    processed_dir: Path,
+    *,
+    preference_slug: str,
+    reason: str,
+) -> Path:
+    """Mark an inbox file as filtered-by-preference and move to processed_dir.
+
+    Parallel to :func:`mark_processed` for the P10 / Ship 3 inbox-stage
+    preference filter. Differences:
+
+    - ``status`` set to ``filtered_by_preference`` (not ``processed``)
+      so the operator-grep workflow distinguishes "LLM said this is
+      done" from "filter dropped this before any LLM call."
+    - Sidecar frontmatter fields ``filtered_at`` (ISO UTC timestamp),
+      ``filtered_by_preference`` (slug of the matching pref), and
+      ``filtered_reason`` (the matcher's grep-able motivation string)
+      land alongside ``status`` so a single ``grep -l "status:
+      filtered_by_preference"`` over ``processed/`` lists every filtered
+      file, and a grep on ``filtered_by_preference: <slug>`` enumerates
+      drops per pref.
+
+    Reuses ``processed_dir`` (no separate ``filtered/`` directory) per
+    operator decision 2026-06-07: the access pattern is grep on the
+    sidecar field, not a separate-directory enumeration.
+
+    Returns the new path of the moved file. Best-effort frontmatter
+    augmentation matches the ``mark_processed`` contract: frontmatter
+    parse failure logs a warning and still completes the file move —
+    the audit trail (processed_dir move) is more important than the
+    sidecar field landing.
+
+    Binary files (the same heuristic as ``mark_processed``) skip the
+    frontmatter step and just move. Filtered binary inbox files are
+    rare-to-impossible (the sender extraction would have returned None
+    upstream), but defensible to handle uniformly.
+    """
+    if not _is_binary(inbox_file):
+        try:
+            post = frontmatter.load(str(inbox_file))
+            post.metadata["status"] = "filtered_by_preference"
+            post.metadata["filtered_at"] = datetime.now(timezone.utc).isoformat()
+            post.metadata["filtered_by_preference"] = preference_slug
+            post.metadata["filtered_reason"] = reason
+            _atomic_write(inbox_file, frontmatter.dumps(post))
+        except Exception:
+            log.warning("writer.filter_frontmatter_failed", file=str(inbox_file))
+
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    dest = processed_dir / inbox_file.name
+
+    if dest.exists():
+        stem = dest.stem
+        suffix = dest.suffix
+        counter = 1
+        while dest.exists():
+            dest = processed_dir / f"{stem}_{counter}{suffix}"
+            counter += 1
+
+    shutil.move(str(inbox_file), str(dest))
+    log.info(
+        "writer.marked_filtered",
+        src=str(inbox_file),
+        dest=str(dest),
+        preference_slug=preference_slug,
+    )
+    return dest

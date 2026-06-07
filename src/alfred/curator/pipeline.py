@@ -64,6 +64,15 @@ _CURATOR_RULE_BY_TYPE: dict[str, str] = {
 }
 
 
+# P10 / Ship 3 (2026-06-07) — inbox-stage filter rule. Distinct from
+# the manifest-stage ``_CURATOR_RULE_BY_TYPE`` dispatch because the
+# inbox filter runs BEFORE entity extraction (no manifest yet — the
+# gate is per-file, keyed off sender metadata only). Lifted as a
+# module-level constant so the test surface can pin the rule name
+# without spelunking the filter function body.
+_INBOX_FILTER_RULE: str = "skip_inbox_if_sender_matches"
+
+
 def _apply_preference_filter(
     manifest: list[dict],
     prefs: list[Preference],
@@ -142,6 +151,131 @@ def _apply_preference_filter(
         candidates_out=len(kept),
     )
     return kept
+
+
+# ---------------------------------------------------------------------------
+# Inbox-stage preference filter (P10 / Ship 3 — 2026-06-07)
+# ---------------------------------------------------------------------------
+#
+# Distinct from ``_apply_preference_filter`` above which gates per-entity
+# AFTER the agent's stage 1 extraction. This one gates per-FILE BEFORE
+# any LLM call — sender-based blocklist for empty-body promotional traffic
+# (Salem's recent inbox is ~99% empty-body, ~29% Substack-platform-routed).
+#
+# The two filters are separate functions (rather than a polymorphic
+# dispatch on "phase") because:
+#   1. Inputs differ — manifest filter takes ``list[dict]`` candidates,
+#      inbox filter takes ``str | None`` sender.
+#   2. Output differs — manifest returns filtered ``list[dict]``, inbox
+#      returns ``(should_skip, reason, matching_pref)`` so the daemon
+#      can short-circuit + log + move + bump stats.
+#   3. The two filters fire at different points in ``_process_file`` and
+#      composing them via a single ``apply_filters`` would mask the
+#      cost-saving "no LLM at all" property of the inbox stage.
+
+
+def _apply_inbox_preference_filter(
+    sender_email: str | None,
+    prefs: list[Preference],
+) -> tuple[bool, str | None, Preference | None]:
+    """Apply inbox-stage operator-preference filter to one inbox file.
+
+    Operates on inbox-file metadata (sender) BEFORE any LLM call. The
+    caller (``curator.daemon._process_file``) short-circuits the file
+    when ``should_skip`` is True: marks the file ``filtered_by_preference``
+    via :func:`writer.mark_filtered`, records a state row with
+    ``backend_used="preference_filter_inbox"``, bumps the daily-summary
+    stats bucket, and returns without invoking the backend.
+
+    Args:
+        sender_email: The sender extracted from the inbox file's
+            ``**From:**`` line by
+            :func:`alfred.curator.context.extract_sender_email`. ``None``
+            (or empty) means the file is not email-derived; the filter
+            is a no-op for those.
+        prefs: Active preferences loaded from ``<vault>/preference/``.
+            Only entries with ``shape=action``, ``matcher.domain=curator``,
+            and ``matcher.rule=skip_inbox_if_sender_matches`` are
+            considered; everything else is silently passed over (the
+            other-rule prefs may be valid for other consumers).
+
+    Returns:
+        ``(should_skip, reason, matching_pref)``:
+            * ``should_skip`` — True if the caller should drop this file.
+            * ``reason`` — operator-grep-able motivation string when
+              ``should_skip`` is True; None otherwise.
+            * ``matching_pref`` — the :class:`Preference` whose matcher
+              fired (so the caller can name the slug in the drop log
+              and update the daily-summary stats bucket); None otherwise.
+
+    Per ``feedback_intentionally_left_blank.md``: every code path emits
+    a ``curator.preference_filter_inbox_run`` log so an operator can
+    distinguish "filter ran, nothing to drop" from "filter never ran"
+    via grep. The DROP log (``curator.preference_filter_inbox_dropped``)
+    fires at the caller site where the inbox filename + state-mgr
+    context lives — keeping it there avoids threading the filename
+    through this helper.
+    """
+    if not sender_email:
+        log.info(
+            "curator.preference_filter_inbox_run",
+            preferences_loaded=len(prefs),
+            result="no_sender",
+            detail=(
+                "inbox file has no extractable sender — non-email "
+                "or unparseable From line; rule does not fire"
+            ),
+        )
+        return (False, None, None)
+
+    if not prefs:
+        log.info(
+            "curator.preference_filter_inbox_run",
+            preferences_loaded=0,
+            sender=sender_email,
+            result="no_preferences",
+        )
+        return (False, None, None)
+
+    # Filter to inbox-relevant preferences only. ``prefs`` may carry
+    # mixed-rule entries (skip_event_if for the manifest filter,
+    # skip_brief_event_if for brief, etc.); we iterate the full list
+    # and dispatch only those matching this filter's rule + domain.
+    candidate = {"sender": sender_email}
+    inbox_prefs_considered = 0
+    for pref in prefs:
+        matcher = pref.matcher or {}
+        if matcher.get("rule") != _INBOX_FILTER_RULE:
+            continue
+        # ``matcher.domain`` is optional in v1 of the preference schema
+        # (Andrew's authored prefs may omit it). Treat missing as
+        # "matches every consumer"; only explicit other-domain values
+        # filter the pref out.
+        if matcher.get("domain") not in (None, "curator"):
+            continue
+        inbox_prefs_considered += 1
+        result = evaluate(_INBOX_FILTER_RULE, matcher.get("args", {}), candidate)
+        if result.skip:
+            log.info(
+                "curator.preference_filter_inbox_run",
+                preferences_loaded=len(prefs),
+                preferences_considered=inbox_prefs_considered,
+                sender=sender_email,
+                result="match",
+                preference_slug=pref.slug,
+            )
+            return (True, result.reason, pref)
+
+    # No match across any inbox-relevant preference. Emit the run
+    # signal so the empty-match case stays observable.
+    log.info(
+        "curator.preference_filter_inbox_run",
+        preferences_loaded=len(prefs),
+        preferences_considered=inbox_prefs_considered,
+        sender=sender_email,
+        result="no_match",
+    )
+    return (False, None, None)
 
 
 # ---------------------------------------------------------------------------

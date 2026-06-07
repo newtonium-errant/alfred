@@ -15,23 +15,27 @@ import asyncio
 import json
 import os
 import time as _time
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
     from alfred.email_classifier.config import EmailClassifierConfig
 
 from alfred.common.heartbeat import Heartbeat
+from alfred.preferences.loader import load_active_preferences
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
 
 from .backends import BaseBackend
 from .backends.cli import ClaudeBackend
 from .config import CuratorConfig
 from .context import build_vault_context, extract_sender_email, gather_sender_context
+from .pipeline import _apply_inbox_preference_filter
 from .state import StateManager
 from .utils import get_logger
 from .watcher import InboxWatcher
-from .writer import mark_processed
+from .writer import mark_filtered, mark_processed
 
 # Email classifier (per-instance, opt-in) — post-processor that adds
 # ``priority`` + ``action_hint`` frontmatter fields to email-derived
@@ -47,6 +51,153 @@ log = get_logger(__name__)
 # :func:`_process_file`. The heartbeat task is spawned in :func:`run`
 # only when ``config.idle_tick.enabled`` is True.
 heartbeat: Heartbeat = Heartbeat(daemon_name="curator", log=log)
+
+
+# --- P10 / Ship 3 (2026-06-07) inbox-stage preference filter ---
+# Bucket of per-preference drop counts since the last daily summary.
+# Reset to {} when ``_emit_daily_filter_summary`` fires. Keyed by
+# preference slug; integer count.
+#
+# Module-level state on the same asyncio loop as ``_process_file`` and
+# the main run loop — plain int/dict mutation is correct here, no lock
+# needed. The bucket survives across ``_process_file`` calls so the
+# daily summary aggregates per Halifax-local calendar day.
+_inbox_filter_stats: dict[str, int] = {}
+
+# Halifax-local calendar date of the LAST daily-summary emit. None on
+# fresh daemon startup → seeded to today's date on the first tick
+# (without firing a summary — see ``_maybe_emit_daily_filter_summary``).
+_last_summary_emit: date | None = None
+
+# Halifax timezone constant. Pinned at module load so the tz lookup
+# doesn't fire on every poll iteration; zoneinfo objects are
+# immutable and cheap to share.
+_HALIFAX_TZ = ZoneInfo("America/Halifax")
+
+# Active inbox-filter rule name — kept here as a module constant so
+# tests + the daily-summary helper share the same source of truth.
+# Mirrors ``alfred.curator.pipeline._INBOX_FILTER_RULE``; importing
+# the underscored name from a sibling module is fine within the
+# package but the constant is duplicated here for readability of the
+# summary helper (single grep target for "which rule does the
+# summary count").
+_INBOX_FILTER_RULE_NAME: str = "skip_inbox_if_sender_matches"
+
+
+def _filter_stats_bump(preference_slug: str) -> None:
+    """Increment the per-pref drop counter by one.
+
+    Called from ``_process_file`` when the inbox filter fires. Cheap
+    by design — must add no measurable latency to the inbox path.
+    Same loop as the main run loop = no lock.
+    """
+    _inbox_filter_stats[preference_slug] = (
+        _inbox_filter_stats.get(preference_slug, 0) + 1
+    )
+
+
+def _halifax_today() -> date:
+    """Return today's date in America/Halifax local time.
+
+    Used by ``_maybe_emit_daily_filter_summary`` to decide if a new
+    Halifax-local calendar day has begun since the last summary
+    emit. Factored out for test injectability and so the timezone
+    pin lives in one place.
+    """
+    return datetime.now(_HALIFAX_TZ).date()
+
+
+def _count_active_inbox_filter_prefs(vault_path: Path | str) -> int:
+    """Count active curator-domain prefs with the inbox-filter rule.
+
+    Used in the daily summary as the ``prefs_active`` field. Per
+    operator decision 2026-06-07 (decision flag #4): the count
+    reports ONLY the inbox-filter rule, not all curator-domain
+    preferences — the summary is about THIS filter's activity.
+
+    Defensive: any loader exception (e.g. malformed preference YAML)
+    returns 0 with an info log. The daily summary should never crash
+    the daemon — observability about other prefs is what the
+    main loader log lines are for.
+    """
+    try:
+        prefs = load_active_preferences(vault_path, shape="action")
+    except Exception as exc:
+        log.info(
+            "curator.preference_filter_inbox_summary_load_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return 0
+    count = 0
+    for pref in prefs:
+        matcher = pref.matcher or {}
+        if matcher.get("rule") != _INBOX_FILTER_RULE_NAME:
+            continue
+        if matcher.get("domain") not in (None, "curator"):
+            continue
+        count += 1
+    return count
+
+
+def _emit_daily_filter_summary(
+    summary_date: date,
+    vault_path: Path | str,
+) -> None:
+    """Emit one ``curator.preference_filter_inbox_summary`` log line and reset.
+
+    Drains ``_inbox_filter_stats`` into a single info-level log event
+    (date, prefs_active, drops_today, drops_by_pref) and resets the
+    stats bucket to empty. Per ``feedback_intentionally_left_blank.md``,
+    a zero-drop day still emits — operator can distinguish "filter
+    alive, nothing to drop" from "filter silently broken."
+
+    Factored out from ``_maybe_emit_daily_filter_summary`` so test
+    fixtures can drive the emit path directly without simulating a
+    Halifax-midnight boundary.
+    """
+    global _inbox_filter_stats
+    drops_by_pref = dict(_inbox_filter_stats)
+    drops_today = sum(drops_by_pref.values())
+    prefs_active = _count_active_inbox_filter_prefs(vault_path)
+    log.info(
+        "curator.preference_filter_inbox_summary",
+        date=summary_date.isoformat(),
+        prefs_active=prefs_active,
+        drops_today=drops_today,
+        drops_by_pref=drops_by_pref,
+    )
+    _inbox_filter_stats = {}
+
+
+def _maybe_emit_daily_filter_summary(vault_path: Path | str) -> None:
+    """Fire the daily inbox-filter summary if a Halifax day has rolled.
+
+    Called from the main poll loop. Behaviour:
+
+    1. First call after daemon start (``_last_summary_emit is None``):
+       seed ``_last_summary_emit`` to today, do NOT emit. The startup
+       case shouldn't replay an empty summary for whatever calendar
+       day the daemon happens to boot on.
+    2. Subsequent calls: if today's Halifax-local date is greater than
+       ``_last_summary_emit``, emit the summary for the PREVIOUS day
+       (the day the stats accumulated against) and update the marker
+       to today. Today's drops start fresh.
+    3. Same-day calls: no-op.
+
+    The "summary covers the previous day" semantic matters: a drop at
+    23:59 Halifax-local lands in the same summary as drops earlier in
+    the day, NOT in the next day's summary. The boundary is the
+    Halifax-midnight roll, not the emit-tick.
+    """
+    global _last_summary_emit
+    today = _halifax_today()
+    if _last_summary_emit is None:
+        _last_summary_emit = today
+        return
+    if today > _last_summary_emit:
+        _emit_daily_filter_summary(_last_summary_emit, vault_path)
+        _last_summary_emit = today
 
 
 def _load_skill(skills_dir: Path) -> str:
@@ -200,7 +351,84 @@ async def _process_file(
     except (UnicodeDecodeError, ValueError):
         inbox_content = f"[File: {filename} — read it directly from: {inbox_file}]"
 
-    # Build vault context
+    # Extract sender FIRST so the inbox-stage preference filter (below)
+    # can gate the whole file BEFORE the expensive vault-context scan.
+    # Per Salem operator friction 2026-06-07: ~99% of recent inbox
+    # volume is empty-body promotional; dropping at the inbox stage
+    # saves both the LLM cost AND the vault-walk that builds context.
+    sender_email = extract_sender_email(inbox_content)
+
+    # P10 / Ship 3 (2026-06-07) — inbox-stage operator-preference
+    # filter. Loads ``shape: action`` preferences from
+    # ``<vault>/preference/`` and applies the
+    # ``skip_inbox_if_sender_matches`` rule. Filtered files move to
+    # ``processed/`` with ``status: filtered_by_preference`` sidecar
+    # frontmatter (slug + reason + timestamp) so the operator-grep
+    # workflow distinguishes filtered from LLM-processed files. State
+    # row carries ``backend_used="preference_filter_inbox"`` for the
+    # same reason.
+    #
+    # The filter is no-op (returns (False, None, None)) when:
+    #   * the inbox file has no extractable sender (non-email path)
+    #   * the vault has no active inbox-filter preferences
+    #   * no preference's sender_patterns match this sender
+    # Per ``feedback_intentionally_left_blank.md`` the filter always
+    # emits ``curator.preference_filter_inbox_run`` so the empty-match
+    # / no-prefs / no-sender cases stay distinguishable from a
+    # silently-broken filter.
+    prefs = load_active_preferences(config.vault.vault_path, shape="action")
+    should_skip, filter_reason, matching_pref = _apply_inbox_preference_filter(
+        sender_email, prefs,
+    )
+    if should_skip and matching_pref is not None:
+        log.info(
+            "curator.preference_filter_inbox_dropped",
+            preference_slug=matching_pref.slug,
+            preference_name=matching_pref.name,
+            sender=sender_email,
+            inbox_filename=filename,
+            rule=_INBOX_FILTER_RULE_NAME,
+            reason=filter_reason,
+        )
+        try:
+            mark_filtered(
+                inbox_file,
+                config.vault.processed_path,
+                preference_slug=matching_pref.slug,
+                reason=filter_reason or "",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Move failure: log and continue. State still records the
+            # processed marker so the daemon doesn't retry this file
+            # on next sweep. Per ``feedback_intentionally_left_blank.md``,
+            # the failure must surface in logs — silent move failure
+            # would leave the inbox file in place AND mark it
+            # processed in state, creating a stuck-loop signature.
+            log.warning(
+                "curator.preference_filter_inbox_move_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                file=filename,
+                preference_slug=matching_pref.slug,
+            )
+        # Update state: filtered files count as processed for
+        # deduplication purposes. Sentinel ``backend_used`` value lets
+        # operator grep distinguish filtered vs. LLM-processed.
+        state_mgr.state.mark_processed(
+            filename=filename,
+            inbox_path=str(inbox_file),
+            files_created=[],
+            files_modified=[],
+            backend_used="preference_filter_inbox",
+        )
+        state_mgr.save()
+        # Bump daily-summary stats. The summary fires from the main
+        # run loop's first-tick-after-Halifax-midnight.
+        _filter_stats_bump(matching_pref.slug)
+        return
+
+    # Build vault context (post-filter — only paid for files that
+    # actually reach the LLM).
     vault_context = build_vault_context(
         config.vault.vault_path,
         ignore_dirs=config.vault.ignore_dirs,
@@ -208,7 +436,6 @@ async def _process_file(
     context_text = vault_context.to_prompt_text()
 
     # Inject sender-specific context for emails
-    sender_email = extract_sender_email(inbox_content)
     if sender_email:
         sender_ctx = gather_sender_context(
             config.vault.vault_path,
@@ -420,6 +647,17 @@ async def run(
     try:
         while True:
             await asyncio.sleep(config.watcher.poll_interval)
+
+            # P10 / Ship 3 (2026-06-07) — daily inbox-filter summary
+            # tick. Cheap (date math + an in-memory dict snapshot
+            # when fired), so calling on every poll iteration is
+            # fine. Internal Halifax-midnight roll detection means
+            # the actual log emit fires at most once per calendar
+            # day. Per ``feedback_intentionally_left_blank.md``,
+            # zero-drop days still emit so silence is distinguishable
+            # from broken.
+            _maybe_emit_daily_filter_summary(config.vault.vault_path)
+
             ready = watcher.collect_ready()
 
             # Periodic full_scan fallback (inotify may not work on all kernels/mounts)

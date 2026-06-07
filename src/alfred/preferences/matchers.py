@@ -1,4 +1,4 @@
-"""Action-shape preference matcher dispatch — V1 enum (3 rules).
+"""Action-shape preference matcher dispatch — V1 enum (4 rules).
 
 Each Shape A preference carries a ``matcher`` dict with shape:
 
@@ -7,12 +7,13 @@ Each Shape A preference carries a ``matcher`` dict with shape:
       rule: <rule name from KNOWN_RULES>
       args: <rule-specific args dict>
 
-Consumer modules (curator stage 1, brief upcoming_events) build a
-``candidate`` dict from the record being considered (e.g. event
-frontmatter or task frontmatter), then call ``evaluate(rule, args,
-candidate)``. The function returns a ``MatcherResult`` carrying
-``skip`` + ``reason`` so the consumer can log the decision with a
-grep-able motivation rather than a silent drop.
+Consumer modules (curator stage 1, curator daemon inbox-stage, brief
+upcoming_events) build a ``candidate`` dict from the record being
+considered (e.g. event frontmatter or inbox sender metadata), then
+call ``evaluate(rule, args, candidate)``. The function returns a
+``MatcherResult`` carrying ``skip`` + ``reason`` so the consumer can
+log the decision with a grep-able motivation rather than a silent
+drop.
 
 V1 rules:
 - ``skip_event_if`` — curator stage 1 dispatch. Args: ``title_regex``
@@ -29,6 +30,17 @@ V1 rules:
   one because the operator's "filter this from my brief" intent is
   type-specific (operator-flagged friction is per-type, not
   per-content).
+- ``skip_inbox_if_sender_matches`` — curator inbox-stage dispatch
+  (P10 / Ship 3 — 2026-06-07). Args: ``sender_patterns`` (required;
+  list of glob-style patterns matched via :func:`fnmatch.fnmatchcase`
+  on the lowercased sender email vs. lowercased pattern). Candidate
+  key read: ``sender``. Caller pattern: curator daemon's
+  ``_process_file`` BEFORE any backend prompt is built — gates the
+  whole inbox file, not individual extracted entities. First-match
+  wins on the pattern list; first-skip wins on the preference list at
+  the caller layer. Operator motivation: Salem inbox is ~99%
+  empty-body promotional with ~29% Substack-platform-routed; dropping
+  those at the inbox stage avoids LLM cost + manifest churn entirely.
 
 Prose-LLM fallback is a STUB in ``prose_eval.py``. It raises
 ``NotImplementedError`` so any path that reaches it surfaces loudly
@@ -36,6 +48,7 @@ rather than silently dropping the gate decision.
 """
 from __future__ import annotations
 
+import fnmatch
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -65,6 +78,9 @@ KNOWN_RULES: frozenset[str] = frozenset({
     "skip_event_if",
     "skip_brief_event_if",
     "skip_brief_task_if",
+    # P10 / Ship 3 — inbox-stage curator dispatch. See module docstring
+    # + ``_evaluate_sender_glob`` for rationale.
+    "skip_inbox_if_sender_matches",
 })
 
 
@@ -138,6 +154,98 @@ def _evaluate_title_regex(
     )
 
 
+def _candidate_sender(candidate: dict[str, Any]) -> str:
+    """Read the candidate's sender email.
+
+    Returns ``""`` for missing / None / empty-after-coerce sender so
+    the caller (the sender-glob evaluator) can take the "no sender"
+    branch and decline to gate. The caller-side curator daemon has
+    already done sender extraction via :func:`extract_sender_email`;
+    a missing sender at THIS layer means the inbox file had no
+    ``**From:**`` line (e.g. a non-email file dropped into ``inbox/``).
+    """
+    value = candidate.get("sender")
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _evaluate_sender_glob(
+    *,
+    rule: str,
+    args: dict[str, Any],
+    candidate: dict[str, Any],
+) -> MatcherResult:
+    """Sender-glob implementation for ``skip_inbox_if_sender_matches``.
+
+    Matches the candidate's ``sender`` field against each entry in
+    ``args.sender_patterns`` via :func:`fnmatch.fnmatchcase`,
+    lowercased on both sides. First match wins. Returns a
+    ``MatcherResult`` with the matching pattern in the reason so the
+    operator can grep "which pattern dropped this sender."
+
+    Defensive failures (all fail-open with a reason — never crash the
+    consumer):
+        * Missing or non-list ``sender_patterns`` arg
+        * Empty ``sender_patterns`` list
+        * Empty / missing sender on the candidate
+
+    Glob over regex: per project_empty_body_email_arc.md and
+    operator decision 2026-06-07, sender filtering is intent-aligned
+    with a domain-shaped pattern language (``*@substack.com`` /
+    ``*@*.substack.com``); regex would be overkill and harder for the
+    operator to author via the talker. The ``fnmatchcase`` (vs.
+    ``fnmatch``) variant defeats platform-dependent case-folding on
+    Windows; we lowercase both sides ourselves so the matching stays
+    case-insensitive across all platforms.
+    """
+    patterns = args.get("sender_patterns")
+    if not isinstance(patterns, list):
+        return MatcherResult(
+            skip=False,
+            reason=(
+                f"{rule}: missing or non-list 'sender_patterns' arg "
+                f"(got {type(patterns).__name__!r}) — rule does not fire"
+            ),
+        )
+    if not patterns:
+        return MatcherResult(
+            skip=False,
+            reason=f"{rule}: empty sender_patterns list — rule does not fire",
+        )
+    sender = _candidate_sender(candidate)
+    if not sender:
+        return MatcherResult(
+            skip=False,
+            reason=f"{rule}: candidate has no sender — rule does not fire",
+        )
+
+    sender_lower = sender.lower()
+    for pattern in patterns:
+        # Defensive: non-string patterns silently skipped. An operator
+        # who authored a yaml list with a stray int / dict entry
+        # shouldn't break gate dispatch for the rest of the list.
+        if not isinstance(pattern, str) or not pattern:
+            continue
+        if fnmatch.fnmatchcase(sender_lower, pattern.lower()):
+            return MatcherResult(
+                skip=True,
+                reason=(
+                    f"{rule}: sender {sender!r} matches pattern {pattern!r}"
+                ),
+            )
+
+    return MatcherResult(
+        skip=False,
+        reason=(
+            f"{rule}: sender {sender!r} does not match any of "
+            f"{len(patterns)} pattern(s)"
+        ),
+    )
+
+
 def evaluate(
     rule: str,
     args: dict[str, Any] | None,
@@ -175,6 +283,11 @@ def evaluate(
 
     if rule in ("skip_event_if", "skip_brief_event_if", "skip_brief_task_if"):
         return _evaluate_title_regex(
+            rule=rule, args=safe_args, candidate=candidate,
+        )
+
+    if rule == "skip_inbox_if_sender_matches":
+        return _evaluate_sender_glob(
             rule=rule, args=safe_args, candidate=candidate,
         )
 
