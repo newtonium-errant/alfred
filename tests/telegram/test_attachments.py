@@ -41,8 +41,8 @@ from alfred.telegram.attachments import (
 
 
 def _make_two_page_pdf(
-    page_one: str = "Page one body — quarterly metrics summary.",
-    page_two: str = "Page two body — recommendations and next steps.",
+    page_one: str = "Page one body - quarterly metrics summary.",
+    page_two: str = "Page two body - recommendations and next steps.",
 ) -> bytes:
     """Build a tiny 2-page PDF in memory.
 

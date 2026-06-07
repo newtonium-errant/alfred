@@ -600,23 +600,65 @@ async def test_pre_pass_alone_produces_unhandled_signal(
     arrives that no entry handler routes (the 2026-06-06 PDF incident
     pre-fix), only the pre-pass fires, only the total counter bumps,
     and the tick emits ``inbound_unhandled > 0``.
+
+    Choice of update type: sticker. Bot.py registers handlers for
+    ``TEXT & ~COMMAND``, ``VOICE``, ``PHOTO``, ``Document.ALL`` (post
+    2026-06-06 c1). A sticker matches none of these filters, has no
+    CommandHandler equivalent, and Algernon has no roadmap-level plan
+    for sticker support. That makes it the most stable choice for a
+    silent-drop signature test — a future commit that adds sticker
+    support would need to update this test deliberately, signalling
+    that the silent-drop signature has changed.
+
+    Why NOT ``/calibration`` (the original 2026-04-22 incident shape):
+    that test choice was invalidated as builder verified empirically
+    via team-lead 2026-06-06 — PTB's ``filters.TEXT & ~filters.COMMAND``
+    behaviour against unregistered commands now actually routes the
+    text body to ``on_text`` rather than dropping the Update. So
+    ``/calibration``-style updates DO bump the handled counter today,
+    which is the wrong shape for the silent-drop signature test. The
+    bug class (unrecognised commands silently dropping) is still
+    closed by the application-level pre-pass at group=-1; this test
+    just needs a different non-routed update type to assert the
+    counter-split signature against.
     """
-    from telegram import Update
+    from telegram import Sticker, Update
 
     app = _build_app_for_test(talker_config, state_mgr, fake_client)
 
-    # ``/calibration`` is an unrecognised command (the 2026-04-22
-    # incident shape). The pre-pass bumps total; no CommandHandler or
-    # MessageHandler is registered for it, so no entry handler runs
-    # ``record_handled``.
-    msg = _make_message("/calibration", message_id=42)
+    # Build a Sticker-bearing message. PTB's ``Sticker`` requires
+    # ``file_id``, ``file_unique_id``, ``type``, ``width``, ``height``,
+    # ``is_animated``, and ``is_video``. The minimal valid construction
+    # is enough; the pre-pass doesn't introspect the sticker, it just
+    # sees that an Update arrived.
+    from telegram import Chat, Message, User
+    chat = Chat(id=1, type="private")
+    user = User(id=1, first_name="Andrew", is_bot=False)
+    sticker = Sticker(
+        file_id="sticker-fid",
+        file_unique_id="sticker-uid",
+        type=Sticker.REGULAR,
+        width=512,
+        height=512,
+        is_animated=False,
+        is_video=False,
+    )
+    msg = Message(
+        message_id=42,
+        date=datetime.now(timezone.utc),
+        chat=chat,
+        from_user=user,
+        sticker=sticker,
+    )
     await app.process_update(Update(update_id=42, message=msg))
 
     assert heartbeat.get_count() == 1
     assert heartbeat.get_handled_count() == 0, (
-        "Unrecognised command must NOT bump the handled counter — "
-        "this is the silent-drop signature the split was designed to "
-        "surface."
+        "Sticker update must NOT bump the handled counter — bot.py "
+        "registers no handler for stickers, so the only counter "
+        "increment is the application-level pre-pass at group=-1. "
+        "This is the silent-drop signature the counter split was "
+        "designed to surface."
     )
 
     # Tick to confirm the field math is right.
