@@ -913,7 +913,17 @@ async def test_extract_audio_transcript_transcribe_error_wraps(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_extract_audio_transcript_not_implemented_wraps(monkeypatch) -> None:
-    """``NotImplementedError`` (unsupported STT provider) wraps cleanly."""
+    """``NotImplementedError`` (unsupported STT provider) wraps cleanly.
+
+    The production error string is "Audio transcription isn't configured
+    on this instance (<provider message>)" — the assertion checks for
+    "configured" rather than the literal "not configured" so the test
+    stays robust to natural-prose phrasings ("isn't configured" / "is
+    not configured" / "not yet configured"). Per team-lead's P8
+    follow-up review (2026-06-06 Option A): the assertion is the
+    contract, and twisting prose to match a brittle substring is the
+    wrong direction.
+    """
     from alfred.telegram import transcribe as transcribe_mod
 
     async def _boom(*args, **kwargs):
@@ -925,7 +935,7 @@ async def test_extract_audio_transcript_not_implemented_wraps(monkeypatch) -> No
         await attachments.extract_audio_transcript(
             b"bytes", "audio/wav", stt_config=None,
         )
-    assert "not configured" in str(exc_info.value).lower()
+    assert "configured" in str(exc_info.value).lower()
 
 
 @pytest.mark.asyncio
