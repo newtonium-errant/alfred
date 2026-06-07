@@ -161,13 +161,34 @@ def _build_markdown(msg: email.message.EmailMessage, account: str) -> str:
     ``tests/mail/test_extract_parity.py``. Per-path log-event coverage
     is pinned by ``tests/mail/test_fetcher_synth.py``.
     """
-    subject = msg.get("Subject", "No Subject")
-    from_addr = msg.get("From", "")
-    to_addr = msg.get("To", "")
-    date_str = msg.get("Date", "")
-    message_id = msg.get("Message-ID", "")
-    in_reply_to = msg.get("In-Reply-To", "")
-    references = msg.get("References", "")
+    # Header reads — separate the SYNTH-GATE value from the
+    # DISPLAY value. Webhook receives data via JSON from n8n where
+    # every key is always present (empty string when absent), so
+    # ``data.get("subject", "No Subject")`` returns ``""`` for
+    # source-side absent subjects. Fetcher receives raw EmailMessage
+    # objects where missing headers truly are missing, so
+    # ``msg.get("Subject", "No Subject")`` returns the literal "No
+    # Subject" fallback — which then leaks into the synth gate's
+    # all-falsy check at ``extract.synthesize_minimal_from_subject``
+    # and prevents the no-signal branch from firing. The fix
+    # threads the falsy-when-absent value into the synth gate; the
+    # human-friendly "No Subject" fallback applies only to the
+    # markdown heading line.
+    #
+    # Caught at QA time on Ship 2 ship-review (commits ``ea85b6f``
+    # + ``5b68ac0``) — the parity test
+    # ``test_empty_message_no_subject_no_from_emits_no_signal_log``
+    # was authored against the operationally-correct contract
+    # (synth must NOT fire when everything is absent) but the
+    # production code's display-fallback was bleeding into the
+    # gate. Fix lives here.
+    subject = msg.get("Subject") or ""
+    from_addr = msg.get("From") or ""
+    to_addr = msg.get("To") or ""
+    date_str = msg.get("Date") or ""
+    message_id = msg.get("Message-ID") or ""
+    in_reply_to = msg.get("In-Reply-To") or ""
+    references = msg.get("References") or ""
 
     body, raw_html = _extract_text(msg)
 
@@ -264,8 +285,15 @@ def _build_markdown(msg: email.message.EmailMessage, account: str) -> str:
                 visible_len=extract.visible_text_len(body),
             )
 
+    # Display-only fallback for the markdown heading. The synth-gate
+    # value (``subject`` above) is empty when the source-side subject
+    # was absent; the heading line still gets the human-friendly
+    # "No Subject" fallback so the rendered record reads cleanly.
+    # See the header-read block above for the gate-vs-display split
+    # rationale.
+    display_subject = subject or "No Subject"
     lines = [
-        f"# {subject}",
+        f"# {display_subject}",
         "",
         f"**From:** {from_addr}",
         f"**To:** {to_addr}",
