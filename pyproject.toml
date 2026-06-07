@@ -59,6 +59,20 @@ voice = [
     # because the talker is the only consumer — curator / janitor /
     # distiller standalone installs pay no import cost.
     "pypdf>=4.0",
+    # 2026-06-06 P8 (universal filetype bundle): adds .docx, .txt, .md,
+    # .csv, .ics, and audio (.mp3/.m4a/.wav/.ogg) to the on_document
+    # extraction cascade. Per ``feedback_universal_filetype_support.md``
+    # (operator-ratified 2026-06-06) all filetype support lives in the
+    # shared code path; no per-instance config gate.
+    #
+    # - ``python-docx`` for .docx walking (paragraph + table extraction)
+    # - ``icalendar`` for .ics VEVENT parsing
+    # - text/csv use stdlib (utf-8 + BOM sniffing + errors=replace);
+    #   audio reuses the existing Groq Whisper STT path so no new dep
+    #
+    # Both new deps are pure-Python, MIT-licensed, actively maintained.
+    "python-docx>=1.0",
+    "icalendar>=5.0",
 ]
 dev = [
     "pytest>=8.0",

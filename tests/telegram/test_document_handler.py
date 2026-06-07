@@ -210,14 +210,19 @@ async def test_on_document_pdf_calls_handle_message_with_extracted_text(
 
 
 @pytest.mark.asyncio
-async def test_on_document_non_pdf_replies_and_skips_handle_message(
+async def test_on_document_unsupported_mime_replies_and_skips_handle_message(
     talker_config, monkeypatch,
 ) -> None:
-    """``.docx`` MIME → user-facing reply, no handle_message call.
+    """Unsupported MIME (e.g. ``application/zip``) → reply, no handle_message.
 
     Per ``feedback_intentionally_left_blank.md``: silent filter-drop on
-    a non-PDF document is the same bug class this commit closes for
-    PDFs (the original 2026-06-06 incident).
+    a non-supported document is the same bug class this commit closes
+    for supported types (the original 2026-06-06 incident).
+
+    Pre-P8 (c1 ship), this test used ``.docx`` as the "rejected MIME"
+    fixture — that's now in the P8 allowlist, so the test was updated
+    to use ``application/zip`` (still explicitly unsupported per
+    SUPPORTED_DOCUMENT_MIME).
     """
     from alfred.telegram import bot
 
@@ -229,10 +234,9 @@ async def test_on_document_non_pdf_replies_and_skips_handle_message(
     monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
 
     document = _FakeDocument(
-        content=b"PK\x03\x04 fake docx bytes",
-        mime_type="application/vnd.openxmlformats-officedocument."
-        "wordprocessingml.document",
-        file_name="proposal.docx",
+        content=b"PK\x03\x04 fake zip bytes",
+        mime_type="application/zip",
+        file_name="archive.zip",
     )
     update, ctx, reply = _build_update_and_ctx(talker_config, document)
 
@@ -241,6 +245,8 @@ async def test_on_document_non_pdf_replies_and_skips_handle_message(
     # User-facing rejection reply.
     reply.assert_awaited_once()
     reply_text = reply.call_args.args[0]
+    # The reply lists supported types — derived from
+    # SUPPORTED_DOCUMENT_MIME so every active kind label appears.
     assert "PDF" in reply_text
     # handle_message NOT called.
     assert "called" not in captured
@@ -454,3 +460,366 @@ async def test_on_document_save_failure_continues_to_llm(
     assert kwargs["document_metadata"] == []
     # No user-facing reply — handle_message owns it.
     reply.assert_not_awaited()
+
+
+# === P8 — universal filetype bundle ======================================
+#
+# Tests below cover per-kind dispatch: each non-PDF kind (.docx, text,
+# csv, ics, audio) routes correctly through on_document to the right
+# extractor + the right save helper + handle_message with the right
+# document_metadata.kind field. The reject tests cover explicitly
+# still-unsupported types (.xlsx, .html, .zip).
+
+
+def _make_valid_docx_bytes() -> bytes:
+    """Build a tiny valid .docx for handler-level tests."""
+    docx_mod = pytest.importorskip("docx")
+    doc = docx_mod.Document()
+    doc.add_paragraph("DOCX report body content.")
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _make_valid_ics_bytes() -> bytes:
+    """Build a tiny valid .ics with one VEVENT for handler-level tests."""
+    from datetime import datetime as _dt, timezone as _tz
+    icalendar = pytest.importorskip("icalendar")
+    cal = icalendar.Calendar()
+    cal.add("prodid", "-//Algernon Test//EN")
+    cal.add("version", "2.0")
+    ev = icalendar.Event()
+    ev.add("summary", "Test meeting")
+    ev.add("dtstart", _dt(2026, 6, 10, 10, 0, 0, tzinfo=_tz.utc))
+    ev.add("dtend", _dt(2026, 6, 10, 11, 0, 0, tzinfo=_tz.utc))
+    cal.add_component(ev)
+    return cal.to_ical()
+
+
+@pytest.mark.asyncio
+async def test_on_document_docx_dispatches_to_docx_extractor(
+    talker_config, monkeypatch,
+) -> None:
+    """A .docx MIME routes to ``extract_docx_text`` and lands in handle_message."""
+    from alfred.telegram import bot
+
+    docx_bytes = _make_valid_docx_bytes()
+    document = _FakeDocument(
+        content=docx_bytes,
+        mime_type="application/vnd.openxmlformats-officedocument."
+        "wordprocessingml.document",
+        file_name="proposal.docx",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    update, ctx, reply = _build_update_and_ctx(talker_config, document)
+    await bot.on_document(update, ctx)
+
+    assert "kwargs" in captured
+    kwargs = captured["kwargs"]
+    assert "DOCX report body content" in kwargs["text"]
+    assert "[DOCX attached:" in kwargs["text"]
+    # document_metadata carries the kind tag.
+    meta = kwargs["document_metadata"]
+    assert len(meta) == 1
+    assert meta[0]["kind"] == "docx"
+    assert meta[0]["filename"] == "proposal.docx"
+    reply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_document_text_plain_dispatches_to_text_extractor(
+    talker_config, monkeypatch,
+) -> None:
+    """text/plain MIME routes to ``extract_text_decoded``."""
+    from alfred.telegram import bot
+
+    document = _FakeDocument(
+        content="Simple plain text body here.".encode("utf-8"),
+        mime_type="text/plain",
+        file_name="notes.txt",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    update, ctx, reply = _build_update_and_ctx(talker_config, document)
+    await bot.on_document(update, ctx)
+
+    assert "kwargs" in captured
+    kwargs = captured["kwargs"]
+    assert "Simple plain text body here." in kwargs["text"]
+    assert "[Text file attached:" in kwargs["text"]
+    assert kwargs["document_metadata"][0]["kind"] == "text"
+
+
+@pytest.mark.asyncio
+async def test_on_document_text_markdown_dispatches_with_md_extension(
+    talker_config, monkeypatch,
+) -> None:
+    """text/markdown MIME routes to text extractor; save uses .md extension."""
+    from alfred.telegram import bot
+
+    document = _FakeDocument(
+        content="# Heading\n\nMarkdown body content.".encode("utf-8"),
+        mime_type="text/markdown",
+        file_name="notes.md",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    update, ctx, reply = _build_update_and_ctx(talker_config, document)
+    await bot.on_document(update, ctx)
+
+    assert "kwargs" in captured
+    kwargs = captured["kwargs"]
+    assert "Markdown body content" in kwargs["text"]
+    meta = kwargs["document_metadata"][0]
+    assert meta["kind"] == "text"
+    # The saved path uses .md as extension (derived from MIME).
+    assert meta["path"].endswith(".md")
+
+
+@pytest.mark.asyncio
+async def test_on_document_csv_dispatches_to_csv_extractor(
+    talker_config, monkeypatch,
+) -> None:
+    """text/csv MIME routes to ``extract_csv_text``; output is a Markdown table."""
+    from alfred.telegram import bot
+
+    document = _FakeDocument(
+        content=b"col1,col2\nfoo,bar\nbaz,qux\n",
+        mime_type="text/csv",
+        file_name="data.csv",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    update, ctx, reply = _build_update_and_ctx(talker_config, document)
+    await bot.on_document(update, ctx)
+
+    assert "kwargs" in captured
+    kwargs = captured["kwargs"]
+    text = kwargs["text"]
+    assert "[CSV attached:" in text
+    assert "| col1 | col2 |" in text
+    assert "| foo | bar |" in text
+    assert kwargs["document_metadata"][0]["kind"] == "csv"
+
+
+@pytest.mark.asyncio
+async def test_on_document_ics_dispatches_to_ics_extractor(
+    talker_config, monkeypatch,
+) -> None:
+    """text/calendar MIME routes to ``extract_ics_text``; fence is Events."""
+    from alfred.telegram import bot
+
+    document = _FakeDocument(
+        content=_make_valid_ics_bytes(),
+        mime_type="text/calendar",
+        file_name="invite.ics",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    update, ctx, reply = _build_update_and_ctx(talker_config, document)
+    await bot.on_document(update, ctx)
+
+    assert "kwargs" in captured
+    text = captured["kwargs"]["text"]
+    assert "[Calendar invite attached:" in text
+    assert "--- Events ---" in text
+    assert "Event: Test meeting" in text
+    assert captured["kwargs"]["document_metadata"][0]["kind"] == "ics"
+
+
+@pytest.mark.asyncio
+async def test_on_document_audio_dispatches_to_transcribe(
+    talker_config, monkeypatch,
+) -> None:
+    """audio/* MIME routes to ``extract_audio_transcript`` via Whisper.
+
+    The transcribe call is monkeypatched so the test doesn't hit the
+    network. Verifies (a) the transcript text reaches handle_message,
+    (b) the saved file uses the ``audio-`` storage prefix, (c) the
+    document_metadata.kind is "audio", and (d) the fence label is
+    Transcript (not Document text).
+    """
+    from alfred.telegram import bot, transcribe as transcribe_mod
+
+    async def _fake_transcribe(audio_bytes, mime, config):
+        return "Transcribed: this is what the audio said."
+
+    monkeypatch.setattr(transcribe_mod, "transcribe", _fake_transcribe)
+
+    document = _FakeDocument(
+        content=b"\xff\xfb fake mp3",
+        mime_type="audio/mpeg",
+        file_name="recording.mp3",
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    update, ctx, reply = _build_update_and_ctx(talker_config, document)
+    await bot.on_document(update, ctx)
+
+    assert "kwargs" in captured
+    kwargs = captured["kwargs"]
+    text = kwargs["text"]
+    assert "Transcribed: this is what the audio said." in text
+    assert "[Audio transcript:" in text
+    assert "--- Transcript ---" in text
+    meta = kwargs["document_metadata"][0]
+    assert meta["kind"] == "audio"
+    # Audio uses the audio- storage prefix.
+    assert "/audio-" in meta["path"]
+    assert meta["path"].endswith(".mp3")
+
+
+@pytest.mark.asyncio
+async def test_on_document_oversized_audio_uses_audio_cap(
+    talker_config, monkeypatch,
+) -> None:
+    """Audio sized above MAX_AUDIO_BYTES rejects with the audio cap, not the PDF cap."""
+    from alfred.telegram import bot
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("handle_message should not have been called")
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    huge_audio = _FakeDocument(
+        content=b"\xff\xfb stub",
+        mime_type="audio/mpeg",
+        file_name="long-recording.mp3",
+        file_size=attachments.MAX_AUDIO_BYTES + 1,
+    )
+    update, ctx, reply = _build_update_and_ctx(talker_config, huge_audio)
+    await bot.on_document(update, ctx)
+
+    reply.assert_awaited_once()
+    text = reply.call_args.args[0]
+    assert "MB" in text
+    # 25 MB cap (Groq Whisper sync endpoint).
+    assert "25" in text
+
+
+@pytest.mark.asyncio
+async def test_on_document_oversized_docx_uses_docx_cap(
+    talker_config, monkeypatch,
+) -> None:
+    """DOCX over MAX_DOCX_BYTES rejects with the docx cap."""
+    from alfred.telegram import bot
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("handle_message should not have been called")
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    huge_docx = _FakeDocument(
+        content=b"PK stub",
+        mime_type="application/vnd.openxmlformats-officedocument."
+        "wordprocessingml.document",
+        file_name="big.docx",
+        file_size=attachments.MAX_DOCX_BYTES + 1,
+    )
+    update, ctx, reply = _build_update_and_ctx(talker_config, huge_docx)
+    await bot.on_document(update, ctx)
+    reply.assert_awaited_once()
+    assert "MB" in reply.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_on_document_unsupported_lists_all_supported_types(
+    talker_config, monkeypatch,
+) -> None:
+    """Rejection reply names every active supported-type label.
+
+    Pin the contract: the reply is derived from
+    SUPPORTED_DOCUMENT_MIME, so each kind's human label appears.
+    """
+    from alfred.telegram import bot
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("handle_message should not have been called")
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    document = _FakeDocument(
+        content=b"x",
+        mime_type="application/x-tar",
+        file_name="bundle.tar",
+    )
+    update, ctx, reply = _build_update_and_ctx(talker_config, document)
+    await bot.on_document(update, ctx)
+
+    reply.assert_awaited_once()
+    text = reply.call_args.args[0]
+    # Each P8-supported human label appears.
+    for kind in set(attachments.SUPPORTED_DOCUMENT_MIME.values()):
+        label = attachments._HUMAN_LABELS_BY_KIND[kind]
+        assert label in text
+
+
+@pytest.mark.parametrize("mime_type,filename", [
+    ("application/vnd.ms-excel", "data.xls"),
+    ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "data.xlsx"),
+    ("text/html", "page.html"),
+    ("application/zip", "archive.zip"),
+    ("application/x-zip-compressed", "archive.zip"),
+    ("application/epub+zip", "book.epub"),
+])
+@pytest.mark.asyncio
+async def test_on_document_explicitly_unsupported_types_reject(
+    mime_type, filename, talker_config, monkeypatch,
+) -> None:
+    """Explicit reject tests for MIMEs that aren't in the P8 allowlist.
+
+    Pinning these surfaces silent allowlist drift — if a future commit
+    adds ``application/zip`` to SUPPORTED_DOCUMENT_MIME without
+    deliberately updating the test, the parametrize set must be
+    revised, forcing a deliberate code-review touch.
+    """
+    from alfred.telegram import bot
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        pytest.fail(f"handle_message should not have been called for {mime_type}")
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    document = _FakeDocument(
+        content=b"opaque", mime_type=mime_type, file_name=filename,
+    )
+    update, ctx, reply = _build_update_and_ctx(talker_config, document)
+    await bot.on_document(update, ctx)
+    reply.assert_awaited_once()

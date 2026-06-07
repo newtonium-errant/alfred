@@ -168,6 +168,17 @@ class Session:
         # Document attachments: missing on pre-2026-06-06 rehydrated
         # sessions — back-compat default is empty list.
         documents = list(filtered.get("documents") or [])
+        # P8 (universal filetype bundle): backfill ``kind="pdf"`` on
+        # pre-P8 document rows. Before P8, the on_document handler
+        # only handled PDFs so every existing row's ``mime_type`` is
+        # ``"application/pdf"``; the kind is unambiguous. Doing the
+        # backfill on read means consumers downstream
+        # (frontmatter rendering, retroactive analysis) can rely on
+        # the kind field being present without per-row defensive
+        # ``.get("kind", "pdf")`` calls.
+        for row in documents:
+            if isinstance(row, dict) and "kind" not in row:
+                row["kind"] = "pdf"
 
         # ``opening_model`` wk2 fallback: missing on pre-wk3 records;
         # the session was opened on its ``model`` so that's the correct
@@ -1110,21 +1121,34 @@ def append_document(
     bytes_size: int,
     filename: str,
     mime_type: str,
+    kind: str = "pdf",
 ) -> None:
     """Record a saved-document attachment on the session and persist.
 
     Parallel to :func:`append_image` — called by the bot's document
-    handler after a PDF has been downloaded, text-extracted, and saved
-    to ``<vault>/inbox/``. The ``turn_index`` semantics match
-    :func:`append_image`: it points at the user turn the document
-    arrived on (``len(session.transcript)`` at call time, which is the
-    would-be position of the next user turn).
+    handler after a file has been downloaded, text-extracted (or
+    transcribed for audio), and saved to ``<vault>/inbox/``. The
+    ``turn_index`` semantics match :func:`append_image`: it points at
+    the user turn the document arrived on
+    (``len(session.transcript)`` at call time, which is the would-be
+    position of the next user turn).
 
     ``filename`` carries the Telegram-side original name so retroactive
     lookups can correlate the inbox file (which has a
     timestamp-derived name) back to the user's "report.pdf".
+
     ``mime_type`` is recorded so a future allowlist widening doesn't
     need a backfill pass to identify which records had which type.
+
+    ``kind`` (2026-06-06 P8 — universal filetype bundle) is the
+    short tag from :data:`alfred.telegram.attachments.SUPPORTED_DOCUMENT_MIME`
+    (``pdf``, ``docx``, ``text``, ``csv``, ``ics``, ``audio``).
+    Recorded alongside ``mime_type`` because the kind is the
+    operational grouping consumers care about ("what audio has Andrew
+    shared this week?") whereas the MIME is the wire-level identifier.
+    Defaults to ``"pdf"`` for back-compat — pre-P8 callers (c1 /
+    8ac333b) only handled PDFs, so omitting ``kind`` correctly
+    recovers their behaviour.
 
     Surfaced in the session-record frontmatter as ``documents: [...]``
     at close time. Field omitted entirely when empty so pre-document
@@ -1136,6 +1160,7 @@ def append_document(
         "bytes": int(bytes_size),
         "filename": str(filename),
         "mime_type": str(mime_type),
+        "kind": str(kind),
         "turn_index": len(session.transcript),
         "timestamp": _now_utc().isoformat(),
     })

@@ -205,6 +205,10 @@ def test_append_document_writes_row_and_persists(tmp_path: Path) -> None:
     assert row["bytes"] == 2048
     assert row["filename"] == "report.pdf"
     assert row["mime_type"] == "application/pdf"
+    # P8: the default kind is "pdf" for back-compat with the c1
+    # call sites — this test predates the P8 universal-filetype-bundle
+    # so it doesn't pass ``kind=`` and still expects the default.
+    assert row["kind"] == "pdf"
     # Turn-index is the would-be position of the next user turn (one
     # turn currently in the transcript, so the next is index 1).
     assert row["turn_index"] == 1
@@ -216,6 +220,7 @@ def test_append_document_writes_row_and_persists(tmp_path: Path) -> None:
     active = fresh.get_active(1)
     assert len(active["documents"]) == 1
     assert active["documents"][0]["filename"] == "report.pdf"
+    assert active["documents"][0]["kind"] == "pdf"
 
 
 # --- _render_content forward-compat document branch ----------------------
@@ -288,3 +293,161 @@ def test_frontmatter_omits_documents_when_empty() -> None:
         tool_set="",
     )
     assert "documents" not in fm
+
+
+# === P8 — universal filetype bundle ======================================
+#
+# Tests below pin the ``kind`` field semantics on document rows: the
+# field is recorded by :func:`append_document`, round-trips through
+# state, backfills for pre-P8 rows on read, and survives the frontmatter
+# emit shape.
+
+
+def test_append_document_with_audio_kind(tmp_path: Path) -> None:
+    """``kind="audio"`` is recorded on the row when supplied."""
+    state_path = tmp_path / "state.json"
+    state_mgr = StateManager(state_path)
+    state_mgr.load()
+    state_mgr.set_active(1, {
+        "session_id": "sess-audio",
+        "chat_id": 1,
+        "started_at": "2026-06-06T12:00:00+00:00",
+        "last_message_at": "2026-06-06T12:05:00+00:00",
+        "model": "claude-opus-4-7",
+        "transcript": [],
+        "vault_ops": [],
+        "outbound_failures": [],
+        "images": [],
+        "documents": [],
+    })
+    state_mgr.save()
+
+    sess = Session.from_dict(state_mgr.get_active(1))
+    from alfred.telegram.session import append_document as _append
+    _append(
+        state_mgr, sess,
+        path="/vault/inbox/audio-20260606T120014Z-aud1.mp3",
+        file_unique_id="aud1",
+        bytes_size=4096,
+        filename="recording.mp3",
+        mime_type="audio/mpeg",
+        kind="audio",
+    )
+
+    assert sess.documents[0]["kind"] == "audio"
+    assert sess.documents[0]["mime_type"] == "audio/mpeg"
+
+    # Round-trip through state.
+    fresh = StateManager(state_path)
+    fresh.load()
+    active = fresh.get_active(1)
+    assert active["documents"][0]["kind"] == "audio"
+
+
+def test_session_from_dict_backfills_kind_on_pre_p8_documents() -> None:
+    """Pre-P8 document rows (no ``kind`` field) backfill to ``"pdf"`` on read.
+
+    This is the load-time backfill — pre-P8 (c1) sessions only handled
+    PDFs, so every row's ``mime_type`` is ``application/pdf``, making
+    the kind unambiguous. Doing the backfill on read means consumers
+    downstream can rely on the kind field being present without
+    per-row defensive ``.get("kind", "pdf")`` calls.
+    """
+    pre_p8_dict = {
+        "session_id": "sess-pre-p8",
+        "chat_id": 1,
+        "started_at": "2026-06-06T12:00:00+00:00",
+        "last_message_at": "2026-06-06T12:05:00+00:00",
+        "model": "claude-opus-4-7",
+        "transcript": [],
+        "vault_ops": [],
+        "outbound_failures": [],
+        "images": [],
+        # Pre-P8 document rows: no ``kind`` field.
+        "documents": [
+            {
+                "path": "/vault/inbox/document-x.pdf",
+                "file_unique_id": "x",
+                "bytes": 1024,
+                "filename": "report.pdf",
+                "mime_type": "application/pdf",
+                "turn_index": 0,
+                "timestamp": "2026-05-15T10:00:00+00:00",
+                # NO "kind" key — pre-P8 row.
+            },
+        ],
+    }
+    sess = Session.from_dict(pre_p8_dict)
+    assert len(sess.documents) == 1
+    # Backfilled to "pdf" on load.
+    assert sess.documents[0]["kind"] == "pdf"
+
+
+def test_session_from_dict_does_not_overwrite_kind_when_present() -> None:
+    """Backfill only fires when ``kind`` is absent — existing values stay."""
+    p8_dict = {
+        "session_id": "sess-p8",
+        "chat_id": 1,
+        "started_at": "2026-06-06T12:00:00+00:00",
+        "last_message_at": "2026-06-06T12:05:00+00:00",
+        "model": "claude-opus-4-7",
+        "transcript": [],
+        "vault_ops": [],
+        "outbound_failures": [],
+        "images": [],
+        "documents": [
+            {
+                "path": "/vault/inbox/audio-y.m4a",
+                "file_unique_id": "y",
+                "bytes": 2048,
+                "filename": "voice.m4a",
+                "mime_type": "audio/mp4",
+                "kind": "audio",  # explicit; must not be overwritten.
+                "turn_index": 0,
+                "timestamp": "2026-06-06T12:00:00+00:00",
+            },
+        ],
+    }
+    sess = Session.from_dict(p8_dict)
+    assert sess.documents[0]["kind"] == "audio"
+
+
+def test_session_round_trip_with_mixed_kinds() -> None:
+    """Multi-kind document list round-trips cleanly (kind preserved per row)."""
+    sess = _make_session()
+    sess.documents = [
+        {
+            "path": "/vault/inbox/document-a.pdf",
+            "file_unique_id": "a",
+            "bytes": 1024,
+            "filename": "report.pdf",
+            "mime_type": "application/pdf",
+            "kind": "pdf",
+            "turn_index": 0,
+            "timestamp": "2026-06-06T12:00:00+00:00",
+        },
+        {
+            "path": "/vault/inbox/audio-b.mp3",
+            "file_unique_id": "b",
+            "bytes": 4096,
+            "filename": "voice.mp3",
+            "mime_type": "audio/mpeg",
+            "kind": "audio",
+            "turn_index": 1,
+            "timestamp": "2026-06-06T12:01:00+00:00",
+        },
+        {
+            "path": "/vault/inbox/document-c.docx",
+            "file_unique_id": "c",
+            "bytes": 2048,
+            "filename": "spec.docx",
+            "mime_type": "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document",
+            "kind": "docx",
+            "turn_index": 2,
+            "timestamp": "2026-06-06T12:02:00+00:00",
+        },
+    ]
+    rehydrated = Session.from_dict(sess.to_dict())
+    assert len(rehydrated.documents) == 3
+    assert [r["kind"] for r in rehydrated.documents] == ["pdf", "audio", "docx"]

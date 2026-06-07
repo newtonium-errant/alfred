@@ -3986,36 +3986,53 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Document message entry point — MIME-gate, download, extract, dispatch.
 
-    Parallel to :func:`on_photo` for Telegram ``document`` updates (PDFs
-    and any other file attached as a file rather than a photo). The
-    handler:
+    Parallel to :func:`on_photo` for Telegram ``document`` updates
+    (PDFs, .docx, .txt/.md, .csv, .ics, and audio files attached as
+    files rather than as photos / voice notes). The handler:
 
     1. Allowlist-gates the user (same shape as photo / voice / text).
-    2. MIME-allowlists the document (PDF-only in c1). Non-PDF mimes get
-       an explicit user-facing reply — see
-       ``feedback_intentionally_left_blank.md``: silent filter-drop on
-       a ``.docx`` is the same class of bug we're fixing.
-    3. Size-gates against :data:`attachments.MAX_PDF_BYTES`.
+    2. Looks up the MIME in :data:`attachments.SUPPORTED_DOCUMENT_MIME`
+       to derive the kind tag (``pdf``, ``docx``, ``text``, ``csv``,
+       ``ics``, ``audio``). Unknown MIMEs get an explicit user-facing
+       reply listing every supported type — per
+       ``feedback_intentionally_left_blank.md``, silent filter-drop on
+       a non-supported document is the same bug class this commit
+       closes for previously-unhandled types.
+    3. Size-gates against the kind's entry in
+       :data:`attachments.MAX_BYTES_BY_KIND`.
     4. Downloads bytes via :func:`attachments.download_document_bytes`.
-    5. Text-extracts via :func:`attachments.extract_pdf_text` (lazy
-       imports :mod:`pypdf` — on installs missing the ``voice`` extra
-       the extractor raises with a clean message rather than crashing
-       the daemon at module-import time).
-    6. Persists to ``<vault>/inbox/`` for audit. Persistence failure is
-       treated as non-fatal: the model still sees the extracted text;
-       only the audit trail is incomplete.
+    5. Dispatches to the kind's extractor:
+       :func:`attachments.extract_pdf_text` / ``extract_docx_text`` /
+       ``extract_text_decoded`` / ``extract_csv_text`` /
+       ``extract_ics_text`` / ``extract_audio_transcript`` (async).
+       Each extractor handles its own missing-dep case via lazy
+       imports + :class:`AttachmentExtractError`, so a non-``[voice]``
+       install gets clean user-facing replies rather than daemon
+       crashes.
+    6. Persists to ``<vault>/inbox/`` for audit. Audio uses the
+       ``audio-`` prefix (via :func:`attachments.save_audio_to_inbox`);
+       everything else uses ``document-`` (via
+       :func:`attachments.save_document_to_inbox`). Persistence
+       failure is treated as non-fatal: the model still sees the
+       extracted text; only the audit trail is incomplete.
     7. Composes the user-message text via
-       :func:`attachments.build_document_user_text` and dispatches
-       through :func:`handle_message`.
+       :func:`attachments.build_document_user_text` (with the kind
+       tag for the right banner + fence label) and dispatches through
+       :func:`handle_message`.
 
     Documents are NOT gated on ``vision.enabled`` — vision is an
-    image-specific feature flag; documents go through a separate
-    text-extraction path that's always-on if :mod:`pypdf` imports
-    cleanly (the extractor's lazy import handles the missing-dep case
-    gracefully).
+    image-specific feature flag; documents / audio go through
+    separate extraction paths that are always-on if the relevant
+    backing libs are installed.
 
     Every failure mode produces an explicit user-facing reply — never
     silent drop, per ``feedback_intentionally_left_blank.md``.
+
+    2026-06-06 P8: extended from PDF-only (c1 / 8ac333b) to cover
+    five additional kinds per ``feedback_universal_filetype_support.md``
+    (operator-ratified). Single dispatch table
+    (:data:`attachments.SUPPORTED_DOCUMENT_MIME`) — no per-instance
+    config gate.
     """
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
     if not _is_allowed(update, config):
@@ -4047,20 +4064,22 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         has_caption=bool(update.message.caption),
     )
     # 2026-06-06 c1: handled-counter split. Placed BEFORE the MIME /
-    # size gates because rejecting a .docx or oversized PDF still
-    # counts as handled — the message routed, the user got a reply.
-    # "Handled" means "reached a registered handler and produced a
-    # user-visible outcome," not "produced a successful LLM turn."
+    # size gates because rejecting an unsupported type or oversized
+    # file still counts as handled — the message routed, the user got
+    # a reply. "Handled" means "reached a registered handler and
+    # produced a user-visible outcome," not "produced a successful
+    # LLM turn."
     heartbeat.record_handled()
 
-    # MIME allowlist gate. PDF-only in c1; non-PDF mimes get a single
-    # user-facing reply naming the rejected type. Per
-    # ``feedback_intentionally_left_blank.md`` — silent filter-drop on a
-    # ``.docx`` would be the same bug class this commit closes for
-    # PDFs. The allowlist lives in :data:`attachments.SUPPORTED_DOCUMENT_MIME`
-    # so widening it later is one constant update + one extractor
-    # branch.
-    if mime_type not in attachments.SUPPORTED_DOCUMENT_MIME:
+    # MIME allowlist gate via the kind-tag dispatch table. Unknown
+    # MIME → user-facing reply listing every supported type. The
+    # supported-types string is DERIVED from
+    # :data:`attachments.SUPPORTED_DOCUMENT_MIME` at module-load time
+    # (via ``attachments._supported_types_human()``), so a future c2
+    # widening updates the user-facing text by extending the constant
+    # — no scattered string-literal sweep.
+    kind = attachments.SUPPORTED_DOCUMENT_MIME.get(mime_type)
+    if kind is None:
         log.info(
             "talker.bot.document_unsupported_mime",
             chat_id=chat_id,
@@ -4068,98 +4087,147 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             file_name=file_name,
         )
         await update.message.reply_text(
-            f"I can only read PDFs right now — got "
-            f"{mime_type or 'unknown type'}. "
+            f"I can read {attachments._supported_types_human()}. "
+            f"Got {mime_type or 'unknown type'}. "
             "Forward as a photo or paste the text and I can help."
         )
         return
 
-    # Size gate. Catches pathological forwards before we burn
-    # bandwidth + memory on the download. ``file_size`` may be ``None``
-    # for some Telegram clients (rare); only enforce when present.
-    if file_size and file_size > attachments.MAX_PDF_BYTES:
+    # Per-kind size gate. Each kind has its own cap (PDF / DOCX 10 MiB,
+    # text / CSV 5 MiB, ICS 1 MiB, audio 25 MiB — the Groq Whisper
+    # sync-endpoint cap). Cap value comes from
+    # :data:`attachments.MAX_BYTES_BY_KIND` so the on_document handler
+    # doesn't carry six per-kind constants. ``file_size`` may be 0 /
+    # missing for some Telegram clients (rare); only enforce when
+    # present.
+    cap_bytes = attachments.MAX_BYTES_BY_KIND[kind]
+    if file_size and file_size > cap_bytes:
         size_mb = file_size / (1024 * 1024)
-        limit_mb = attachments.MAX_PDF_BYTES / (1024 * 1024)
+        limit_mb = cap_bytes / (1024 * 1024)
         log.info(
             "talker.bot.document_oversized",
             chat_id=chat_id,
+            kind=kind,
             file_size=file_size,
-            limit=attachments.MAX_PDF_BYTES,
+            limit=cap_bytes,
             file_name=file_name,
         )
         await update.message.reply_text(
-            f"That PDF is {size_mb:.1f} MB — bigger than my "
-            f"{limit_mb:.0f} MB limit. Can you trim it or share the "
-            "relevant pages as a screenshot?"
+            f"That file is {size_mb:.1f} MB — bigger than my "
+            f"{limit_mb:.0f} MB limit for {kind} files. "
+            "Can you trim it or share a shorter excerpt?"
         )
         return
 
     # Download bytes. Distinct error class from the extract failure
     # below so the user-facing reply can be more specific.
     try:
-        pdf_bytes = await attachments.download_document_bytes(document)
+        raw_bytes = await attachments.download_document_bytes(document)
     except attachments.AttachmentDownloadError as exc:
         log.warning("talker.bot.document_download_failed", error=str(exc))
         await update.message.reply_text(
-            "sorry, couldn't fetch the PDF — try sending it again?"
+            f"sorry, couldn't fetch your {kind} file — try sending it again?"
         )
         return
 
-    # Text-extract. Distinct catch from the download path. The lazy
-    # :mod:`pypdf` import inside the extractor handles the
-    # missing-dependency case with its own ``AttachmentExtractError``
-    # so a non-``[voice]`` install still gets a clean user-facing
-    # reply rather than a daemon crash.
+    # Per-kind extraction dispatch. Each branch returns the extracted
+    # text (or raises :class:`AttachmentExtractError`). Audio is the
+    # only async branch (it awaits the Groq Whisper HTTP call); the
+    # rest are sync. Wrapping in a single try / except keeps the
+    # error-handling tidy — the user-facing reply pulls the kind
+    # name + the exception message so the user sees actionable
+    # detail ("couldn't read your DOCX — Failed to open ...").
     try:
-        extracted_text = attachments.extract_pdf_text(pdf_bytes)
+        if kind == "pdf":
+            extracted_text = attachments.extract_pdf_text(raw_bytes)
+        elif kind == "docx":
+            extracted_text = attachments.extract_docx_text(raw_bytes)
+        elif kind == "text":
+            extracted_text = attachments.extract_text_decoded(raw_bytes)
+        elif kind == "csv":
+            extracted_text = attachments.extract_csv_text(raw_bytes)
+        elif kind == "ics":
+            extracted_text = attachments.extract_ics_text(raw_bytes)
+        elif kind == "audio":
+            extracted_text = await attachments.extract_audio_transcript(
+                raw_bytes, mime_type, config.stt,
+            )
+        else:
+            # Defensive — the MIME-allowlist check above should have
+            # rejected anything not in this dispatch tree. If a
+            # future commit adds a MIME to ``SUPPORTED_DOCUMENT_MIME``
+            # without adding the matching extractor branch, fail loud
+            # rather than silently.
+            log.error(
+                "talker.bot.document_kind_no_extractor",
+                kind=kind,
+                mime_type=mime_type,
+            )
+            raise attachments.AttachmentExtractError(
+                f"No extractor registered for kind {kind!r}"
+            )
     except attachments.AttachmentExtractError as exc:
         log.warning(
             "talker.bot.document_extract_failed",
             error=str(exc),
+            kind=kind,
             file_name=file_name,
         )
         await update.message.reply_text(
-            f"sorry, couldn't read that PDF — {exc!s}. "
-            "If it's a scanned image, paste the text directly instead?"
+            f"sorry, couldn't read your {kind} file — {exc!s}."
         )
         return
 
-    # Persist to ``<vault>/inbox/`` for audit. Persistence failure is
-    # treated as recoverable (mirror of the on_photo save path): the
-    # extracted text is still in memory and will reach the model. We
-    # log the failure with ``action=continuing_to_llm_in_memory_only``
-    # so an operator tailing the log can grep that field and see the
-    # policy decision without re-reading source. Per the universal
-    # "intentionally left blank" rule — the decision NOT to abort the
-    # conversation must live in the log, not just the code.
+    # Persist to ``<vault>/inbox/`` for audit. Audio uses the audio-
+    # storage path (distinct ``audio-`` filename prefix); everything
+    # else uses the document-storage path (``document-`` prefix). The
+    # extension is derived from the kind + MIME so .m4a stays .m4a,
+    # .ogg stays .ogg, etc. Persistence failure is treated as
+    # recoverable (mirror of the on_photo save path): extracted text
+    # is still in memory and will reach the model. We log the failure
+    # with ``action=continuing_to_llm_in_memory_only`` so an operator
+    # tailing the log can grep that field and see the policy decision
+    # without re-reading source.
     file_unique_id = getattr(document, "file_unique_id", "") or ""
+    extension = attachments.extension_for_kind(kind, mime_type)
     saved_path: str | None = None
     try:
-        saved = attachments.save_document_to_inbox(
-            pdf_bytes,
-            config.vault.path,
-            file_unique_id,
-            extension="pdf",
-        )
+        if kind == "audio":
+            saved = attachments.save_audio_to_inbox(
+                raw_bytes,
+                config.vault.path,
+                file_unique_id,
+                extension=extension,
+            )
+        else:
+            saved = attachments.save_document_to_inbox(
+                raw_bytes,
+                config.vault.path,
+                file_unique_id,
+                extension=extension,
+            )
         saved_path = str(saved)
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "talker.bot.document_save_failed",
             error=str(exc),
+            kind=kind,
             vault_path=config.vault.path,
             action="continuing_to_llm_in_memory_only",
         )
         # Continue — extracted text still reaches the model.
 
-    # Compose the user-message text: header naming the attachment +
-    # optional caption + fenced extracted text. Caption-less PDFs are
-    # fine; the header is enough to signal the model that there's an
-    # attachment to consider.
+    # Compose the user-message text: kind-specific header banner +
+    # optional caption + fenced extracted text. The kind tag picks
+    # the right banner ("PDF attached" / "Audio transcript" / etc.)
+    # and fence label ("Document text" / "Events" / "Transcript") so
+    # the LLM sees the attachment shape for what it is.
     caption = (update.message.caption or "").strip()
     user_text = attachments.build_document_user_text(
         caption=caption,
         extracted_text=extracted_text,
-        filename=file_name or "document.pdf",
+        filename=file_name or f"document.{extension}",
+        kind=kind,
     )
 
     await handle_message(
@@ -4169,9 +4237,10 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         document_metadata=[{
             "path": saved_path,
             "file_unique_id": file_unique_id,
-            "bytes": len(pdf_bytes),
-            "filename": file_name or "document.pdf",
+            "bytes": len(raw_bytes),
+            "filename": file_name or f"document.{extension}",
             "mime_type": mime_type,
+            "kind": kind,
         }] if saved_path else [],
     )
 
@@ -5427,6 +5496,13 @@ async def handle_message(
                     bytes_size=int(meta.get("bytes", 0) or 0),
                     filename=meta.get("filename", ""),
                     mime_type=meta.get("mime_type", ""),
+                    # P8: kind tag from
+                    # :data:`attachments.SUPPORTED_DOCUMENT_MIME.values()`.
+                    # Defaults to "pdf" via append_document's signature
+                    # so pre-P8 call sites (none currently in tree, but
+                    # belt-and-braces against a future caller) still
+                    # work.
+                    kind=meta.get("kind", "pdf"),
                 )
 
         try:
