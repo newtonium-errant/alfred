@@ -26,6 +26,56 @@ def _sanitize_filename(s: str, max_len: int = 80) -> str:
     return s[:max_len].rstrip("-") or "no-subject"
 
 
+def _safe_get_content(part: email.message.EmailMessage) -> str | None:
+    """Return the part's string content, or None if extraction fails.
+
+    :meth:`EmailMessage.get_content` crashes on several structural edge
+    cases that arise in real IMAP traffic:
+
+    * **Headers-only messages.** When no body has been set, the
+      ``EmailMessage`` defaults to ``text/plain`` at the structural
+      level. ``get_body(preferencelist=("plain",))`` returns the
+      message itself; ``get_content()`` calls ``get_payload(decode=True)``
+      which returns ``None``; the stdlib then tries
+      ``None.decode(charset)`` and raises ``AttributeError``. Salem's
+      IMAP path sees these whenever n8n upstream drops the body or an
+      upstream filter strips content.
+    * **Binary sub-types.** Certain content-types (PGP attachments,
+      proprietary container formats) raise ``LookupError`` /
+      ``KeyError`` from the content manager.
+    * **Malformed multipart structures.** Edge cases in the
+      content-transfer-encoding step raise other ``AttributeError``
+      variants.
+
+    All three are operationally indistinguishable from "no usable
+    content" — the caller should fall through to the next path. We
+    emit one ``fetcher.get_content_failed`` log per catch (per
+    ``feedback_intentionally_left_blank.md``) carrying the exception
+    type + the part's content-type so a future edge case is debuggable
+    without re-instrumenting the code.
+
+    The defensive shape mirrors the implicit guarantees ``webhook.py``
+    enjoys (its ``body`` field is a guaranteed string via JSON parse);
+    fetcher receives raw ``EmailMessage`` objects and needs the explicit
+    guards.
+
+    Returns:
+        The decoded string content on success, ``None`` on any
+        extraction failure or when the decoded content is not a
+        string (e.g. binary-decoded ``bytes``).
+    """
+    try:
+        content = part.get_content()
+    except (AttributeError, KeyError, LookupError) as exc:
+        log.info(
+            "fetcher.get_content_failed",
+            error_type=exc.__class__.__name__,
+            content_type=part.get_content_type(),
+        )
+        return None
+    return content if isinstance(content, str) else None
+
+
 def _extract_text(msg: email.message.EmailMessage) -> tuple[str, str]:
     """Extract ``(body_text, raw_html)`` from an email message.
 
@@ -58,19 +108,27 @@ def _extract_text(msg: email.message.EmailMessage) -> tuple[str, str]:
     flow applies the same visibility threshold to both paths, fixing
     the Salem IMAP empty-body parity gap. See
     ``project_empty_body_email_arc.md`` for the design.
+
+    The ``get_content()`` calls on both paths go through
+    :func:`_safe_get_content` so a headers-only ``EmailMessage`` (the
+    operational shape Salem sees when n8n upstream drops the body)
+    falls through cleanly to the empty path rather than crashing with
+    ``AttributeError: 'NoneType' object has no attribute 'decode'``.
+    Caught at QA time on Ship 2 ship-review (commit ``ea85b6f``) by
+    the parity-test surface — fixed in follow-up.
     """
     plain_part = msg.get_body(preferencelist=("plain",))
     if plain_part is not None:
-        content = plain_part.get_content()
-        if isinstance(content, str):
+        content = _safe_get_content(plain_part)
+        if content is not None:
             stripped = content.strip()
             if extract.visible_text_len(stripped) >= extract.MIN_BODY_CHARS:
                 return (stripped, "")
 
     html_part = msg.get_body(preferencelist=("html",))
     if html_part is not None:
-        content = html_part.get_content()
-        if isinstance(content, str):
+        content = _safe_get_content(html_part)
+        if content is not None:
             return (extract.strip_html(content), content)
 
     return ("", "")

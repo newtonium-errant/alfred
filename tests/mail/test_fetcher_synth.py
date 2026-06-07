@@ -390,3 +390,67 @@ def test_log_event_fields_for_upstream_truncated() -> None:
     assert "body_len" in event
     assert "visible_len" in event
     assert "synth_len" in event
+
+
+# --- _safe_get_content defensive guard (Ship 2 follow-up bug fix) --------
+
+
+def test_safe_get_content_handles_headers_only_message() -> None:
+    """A headers-only EmailMessage doesn't crash ``_extract_text``.
+
+    Regression pin for the Ship 2 ship-review bug (caught externally
+    by team-lead's pytest run; 6 parity tests revealed
+    ``AttributeError: 'NoneType' object has no attribute 'decode'`` on
+    headers-only messages). The defensive ``_safe_get_content`` helper
+    catches AttributeError / KeyError / LookupError from
+    ``EmailMessage.get_content()`` and returns None so the routing
+    falls through to the empty path.
+
+    Salem's IMAP traffic hits this shape whenever n8n upstream drops
+    the body or an upstream filter strips content — a production
+    scenario, not a synthetic edge case.
+    """
+    msg = EmailMessage(policy=email.policy.default)
+    msg["Subject"] = "Headers only"
+    msg["From"] = "sender@example.com"
+    msg["To"] = "andrew@example.com"
+    msg["Date"] = "Mon, 7 Jun 2026 10:00:00 +0000"
+    # No set_content / add_alternative — headers only. Pre-fix, this
+    # raised AttributeError inside get_content().
+    body, raw_html = _extract_text(msg)
+    assert body == ""
+    assert raw_html == ""
+
+
+def test_safe_get_content_emits_grep_able_log_on_failure() -> None:
+    """``fetcher.get_content_failed`` fires on extraction failure.
+
+    Per ``feedback_intentionally_left_blank.md`` — the defensive catch
+    must emit a log so a future edge case is debuggable without
+    re-instrumenting the code. Field shape pinned:
+    ``error_type`` + ``content_type`` are the minimum debuggable set.
+    """
+    msg = EmailMessage(policy=email.policy.default)
+    msg["Subject"] = "Headers only"
+    msg["From"] = "sender@example.com"
+    msg["To"] = "andrew@example.com"
+    msg["Date"] = "Mon, 7 Jun 2026 10:00:00 +0000"
+    with structlog.testing.capture_logs() as captured:
+        _extract_text(msg)
+    matches = [
+        c for c in captured
+        if c.get("event") == "fetcher.get_content_failed"
+    ]
+    assert len(matches) >= 1, (
+        f"expected at least one fetcher.get_content_failed event, "
+        f"got {len(matches)} (captured={[c.get('event') for c in captured]!r})"
+    )
+    event = matches[0]
+    # Field shape pin: error_type + content_type are the debuggable
+    # minimum. AttributeError is what get_content() raises on
+    # headers-only messages.
+    assert event["error_type"] == "AttributeError"
+    assert "content_type" in event
+    # The default content type for a headers-only EmailMessage with
+    # policy.default is text/plain.
+    assert event["content_type"] == "text/plain"
