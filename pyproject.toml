@@ -48,6 +48,17 @@ voice = [
     # the talker's event loop cleanly. Pulled in under ``voice`` because
     # the server only runs when the talker is active.
     "aiohttp>=3.10",
+    # 2026-06-06 c1 (PDF document handler): pure-Python PDF text
+    # extraction for ``bot.on_document``. The handler routes Telegram
+    # ``document`` updates with mime ``application/pdf`` through
+    # ``pypdf.PdfReader`` and threads the extracted text into the
+    # conversation. Anthropic's native PDF document block is
+    # model-family-specific (a quirk-centralisation surface we don't
+    # need yet); text extraction is backend-agnostic and works across
+    # every model the talker can route to. Lives under ``voice``
+    # because the talker is the only consumer — curator / janitor /
+    # distiller standalone installs pay no import cost.
+    "pypdf>=4.0",
 ]
 dev = [
     "pytest>=8.0",

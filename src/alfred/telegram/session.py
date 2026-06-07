@@ -89,6 +89,20 @@ class Session:
     # paths. Empty by default — field omitted from frontmatter when no
     # images attached.
     images: list[dict[str, Any]] = field(default_factory=list)
+    # Document attachments (2026-06-06 c1: PDF document handler).
+    # Parallel shape to ``images`` — each entry is a dict with ``path``,
+    # ``turn_index``, ``timestamp``, ``bytes``, ``file_unique_id`` PLUS
+    # ``filename`` (Telegram's original-name field — useful for
+    # retroactive lookups since the inbox filename is timestamp-derived)
+    # and ``mime_type`` (allowlist-validated upstream, but kept in the
+    # record so a future widening of the allowlist doesn't need a
+    # backfill pass to identify which records had which type).
+    # Populated by the bot's document handler when a PDF is downloaded,
+    # text-extracted, and saved to inbox/. Surfaced in the
+    # session-record frontmatter as ``documents: [...]`` at close time;
+    # field omitted when empty so pre-document session records /
+    # consumers see no shape drift.
+    documents: list[dict[str, Any]] = field(default_factory=list)
 
     # --- serialization ---
 
@@ -104,26 +118,76 @@ class Session:
             "opening_model": self.opening_model or self.model,
             "outbound_failures": self.outbound_failures,
             "images": self.images,
+            "documents": self.documents,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Session:
+        """Build a :class:`Session` from a JSON-loaded dict.
+
+        Implements the load-time **schema-tolerance contract** from
+        CLAUDE.md "State persistence" — filter incoming keys against
+        ``cls.__dataclass_fields__`` before construction so:
+
+        - A state file written by an OLDER version of the talker that
+          lacks a field this version added (e.g. ``documents`` on a
+          pre-2026-06-06 session) loads cleanly via the dataclass's
+          field default (empty list).
+        - A state file written by a NEWER version that has extra fields
+          (e.g. some future ``audio_attachments`` field rolled back
+          from) silently ignores them rather than crashing the loader.
+
+        The per-field coercions (datetime parsing, int casting, the
+        ``opening_model`` wk2 fallback) still apply — we filter the
+        allowed-keys set first, then apply coercions to the survivors.
+        Without this filter, schema drift between talker versions
+        becomes a deployment-blocking failure on rollback.
+        """
+        known_fields = cls.__dataclass_fields__
+        # Filter unknown keys out of the input dict. The known-keys set
+        # is the source of truth: any field added to the dataclass
+        # picks up the back-compat semantics for free, and any field
+        # removed is silently dropped from old state.
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+
+        # Required fields fail loud if absent — the dataclass would
+        # raise ``TypeError`` on construction anyway, but pulling them
+        # out explicitly here keeps the per-field coercions readable.
+        session_id = filtered["session_id"]
+        chat_id = int(filtered["chat_id"])
+        started_at = _parse_iso(filtered["started_at"])
+        last_message_at = _parse_iso(filtered["last_message_at"])
+        model = filtered["model"]
+
+        # Optional list fields default to empty list on absence.
+        transcript = list(filtered.get("transcript") or [])
+        vault_ops = list(filtered.get("vault_ops") or [])
+        outbound_failures = list(filtered.get("outbound_failures") or [])
+        # Vision: missing on pre-vision rehydrated sessions.
+        images = list(filtered.get("images") or [])
+        # Document attachments: missing on pre-2026-06-06 rehydrated
+        # sessions — back-compat default is empty list.
+        documents = list(filtered.get("documents") or [])
+
+        # ``opening_model`` wk2 fallback: missing on pre-wk3 records;
+        # the session was opened on its ``model`` so that's the correct
+        # opening snapshot.
+        opening_model = (
+            filtered.get("opening_model") or filtered.get("model", "")
+        )
+
         return cls(
-            session_id=data["session_id"],
-            chat_id=int(data["chat_id"]),
-            started_at=_parse_iso(data["started_at"]),
-            last_message_at=_parse_iso(data["last_message_at"]),
-            model=data["model"],
-            transcript=list(data.get("transcript") or []),
-            vault_ops=list(data.get("vault_ops") or []),
-            # Missing opening_model (wk2 records) → use current model as
-            # the opening snapshot. Conservative: a rehydrated wk2
-            # session was opened on its ``model`` so this is correct.
-            opening_model=data.get("opening_model") or data.get("model", ""),
-            outbound_failures=list(data.get("outbound_failures") or []),
-            # Vision: missing on pre-vision rehydrated sessions. Defaults
-            # to empty list so old state files load cleanly.
-            images=list(data.get("images") or []),
+            session_id=session_id,
+            chat_id=chat_id,
+            started_at=started_at,
+            last_message_at=last_message_at,
+            model=model,
+            transcript=transcript,
+            vault_ops=vault_ops,
+            opening_model=opening_model,
+            outbound_failures=outbound_failures,
+            images=images,
+            documents=documents,
         )
 
 
@@ -1037,6 +1101,47 @@ def append_image(
     _persist(state, session)
 
 
+def append_document(
+    state: StateManager,
+    session: Session,
+    *,
+    path: str,
+    file_unique_id: str,
+    bytes_size: int,
+    filename: str,
+    mime_type: str,
+) -> None:
+    """Record a saved-document attachment on the session and persist.
+
+    Parallel to :func:`append_image` — called by the bot's document
+    handler after a PDF has been downloaded, text-extracted, and saved
+    to ``<vault>/inbox/``. The ``turn_index`` semantics match
+    :func:`append_image`: it points at the user turn the document
+    arrived on (``len(session.transcript)`` at call time, which is the
+    would-be position of the next user turn).
+
+    ``filename`` carries the Telegram-side original name so retroactive
+    lookups can correlate the inbox file (which has a
+    timestamp-derived name) back to the user's "report.pdf".
+    ``mime_type`` is recorded so a future allowlist widening doesn't
+    need a backfill pass to identify which records had which type.
+
+    Surfaced in the session-record frontmatter as ``documents: [...]``
+    at close time. Field omitted entirely when empty so pre-document
+    record consumers see no shape change.
+    """
+    session.documents.append({
+        "path": str(path),
+        "file_unique_id": str(file_unique_id),
+        "bytes": int(bytes_size),
+        "filename": str(filename),
+        "mime_type": str(mime_type),
+        "turn_index": len(session.transcript),
+        "timestamp": _now_utc().isoformat(),
+    })
+    _persist(state, session)
+
+
 def resolve_on_startup(
     state: StateManager,
     now: datetime,
@@ -1402,6 +1507,17 @@ def _build_session_frontmatter(
     if session.images:
         fm["images"] = list(session.images)
 
+    # Document attachments (2026-06-06 c1: PDF document handler).
+    # Mirror of the ``images`` block above — field omitted when empty
+    # so pre-document records / consumers see no shape drift. Each
+    # entry carries the saved vault path so the distiller / future
+    # retroactive tools can locate the file. The extracted document
+    # text itself never lands in frontmatter (the canonical extracted
+    # text is in the transcript's user turn at ``turn_index``); only
+    # the metadata + saved path live here.
+    if session.documents:
+        fm["documents"] = list(session.documents)
+
     if tool_set == "hypatia":
         # Per Hypatia SKILL spec + library-alexandria/CLAUDE.md: mode +
         # processed gate the "Unprocessed captures" Bases view; capture
@@ -1524,6 +1640,20 @@ def _render_content(content: str | list[dict[str, Any]]) -> str:
             # ``images`` field (frontmatter), populated at handle_message
             # time by the bot layer when it persists the file to inbox/.
             parts.append("[image]")
+        elif btype == "document":
+            # 2026-06-06 c1: forward-compat branch for an Anthropic-side
+            # document content block. The on_document handler currently
+            # text-inlines the extracted PDF into the user-message
+            # ``text`` (not as a block), so this branch is not exercised
+            # by the production path today. It's here so that if a
+            # future model family round-trips a document block back to
+            # us — or if we lift to Anthropic's native document blocks
+            # later — the transcript stays readable rather than dropping
+            # into the catchall ``[{btype}]`` shape. Mirrors the
+            # ``[image]`` rationale: the canonical record of *which*
+            # document is on the session's ``documents`` frontmatter
+            # field, not in the transcript body.
+            parts.append("[document]")
         else:
             parts.append(f"[{btype}]")
     return " ".join(parts)

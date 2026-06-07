@@ -39,6 +39,7 @@ from telegram.ext import (
 )
 
 from . import (
+    attachments,
     calibration,
     capture_batch,
     capture_extract,
@@ -55,7 +56,12 @@ from . import (
     voice_train,
 )
 from .config import TalkerConfig
-from .session import Session, append_image, append_outbound_failure
+from .session import (
+    Session,
+    append_document,
+    append_image,
+    append_outbound_failure,
+)
 from .state import StateManager
 from .utils import get_logger
 
@@ -115,25 +121,51 @@ from ._compat import _normalize_instance_name  # noqa: E402, F401
 
 # --- Application-level inbound pre-pass ----------------------------------
 #
-# The idle-tick heartbeat counter (``heartbeat.record_inbound``) lives at
-# application scope so EVERY inbound update increments it — recognised
-# commands, unrecognised commands, plain text, voice notes, edited
-# messages, callback queries, anything PTB delivers. Anything narrower
-# leaves coverage gaps.
+# The idle-tick heartbeat counter has TWO surfaces post 2026-06-06 c1:
 #
-# History: the original commit (5a26d13) called ``record_inbound`` from
-# inside ``on_text`` and ``on_voice`` only. Unrecognised commands
-# (e.g. ``/calibration`` when only ``/calibrate`` is registered) bypass
-# both — PTB's ``CommandHandler`` matches the recognised ones first and
-# the text MessageHandler is gated by ``~filters.COMMAND``, so the
+# * ``heartbeat.record_inbound()`` — the **total** counter, called from
+#   the application-level pre-pass below so EVERY inbound update
+#   increments it (recognised commands, unrecognised commands, plain
+#   text, voice notes, photos, documents, edited messages, callback
+#   queries — anything PTB delivers).
+#
+# * ``heartbeat.record_handled()`` — the **handled** counter, called as
+#   the first line of each entry handler (``on_text`` / ``on_voice`` /
+#   ``on_photo`` / ``on_document``) AFTER the allowlist gate.
+#   Increments when an inbound reaches a registered handler.
+#
+# Tick log emits ``inbound_in_window=T`` (total, legacy alias) plus
+# ``inbound_handled=H`` and ``inbound_unhandled=U`` where ``U = T - H``.
+# Silent-drops show as ``inbound_unhandled > 0``.
+#
+# Why the split (2026-06-06 incident)
+# -----------------------------------
+# Andrew sent a PDF to Hypatia at 13:57 ADT. PTB had no handler
+# registered for ``filters.Document``, so the document update fell
+# through all routing — but the pre-pass at group=-1 still incremented
+# the (then-single) counter. The heartbeat reported
+# ``inbound_in_window=1`` which was indistinguishable from a healthy
+# short-of-quiet tick; the actual silent-drop was invisible. The
+# handled/unhandled split surfaces this case explicitly: when an
+# operator sees ``inbound_unhandled > 0``, they know messages came in
+# but nothing routed them — register a handler for that update type
+# (or check the allowlist).
+#
+# Earlier incident (2026-04-22)
+# -----------------------------
+# The original commit (5a26d13) called ``record_inbound`` from inside
+# ``on_text`` and ``on_voice`` only. Unrecognised commands (e.g.
+# ``/calibration`` when only ``/calibrate`` is registered) bypass both
+# — PTB's ``CommandHandler`` matches the recognised ones first and the
+# text MessageHandler is gated by ``~filters.COMMAND``, so the
 # unknown-command update fell through every handler without ever
 # bumping the counter. Result: a ``inbound_in_window=0`` heartbeat
 # emitted while Telegram had clearly delivered the message — caught
-# 2026-04-22 from a real ``/calibration`` typo. The fix moves the
-# increment to a TypeHandler at group=-1 so it observes every Update
-# before the per-handler routing fires. Same asyncio loop = no thread
-# safety required; the pre-pass returns normally so subsequent groups
-# still match exactly as before (no ``ApplicationHandlerStop``).
+# from a real ``/calibration`` typo. The fix moved the increment to a
+# ``TypeHandler`` at group=-1 so it observes every Update before
+# per-handler routing fires. Same asyncio loop = no thread safety
+# required; the pre-pass returns normally so subsequent groups still
+# match exactly as before (no ``ApplicationHandlerStop``).
 #
 # PTB mechanism: ``TypeHandler(Update, …)`` matches every update and
 # group=-1 puts it ahead of the default group (0) where the real
@@ -145,13 +177,18 @@ from ._compat import _normalize_instance_name  # noqa: E402, F401
 async def _pre_record_inbound(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Pre-pass: bump the heartbeat counter for every inbound update.
+    """Pre-pass: bump the TOTAL heartbeat counter for every inbound update.
 
     Registered at group=-1 via :class:`TypeHandler` so it fires before
     any per-handler routing. Returns normally (does NOT raise
     :class:`ApplicationHandlerStop`) so the rest of the handler chain
     runs unchanged. Wraps the increment in a try/except so a counter
     bug can never break message delivery.
+
+    The **handled** counter is bumped separately by each entry handler
+    via :func:`heartbeat.record_handled` after the allowlist gate. See
+    the block comment above and the on_text / on_voice / on_photo /
+    on_document handlers for the split rationale.
     """
     try:
         heartbeat.record_inbound()
@@ -450,6 +487,21 @@ def build_app(
     # screenshot-share workflow goes through the photo path. Per-instance
     # ``vision.enabled=false`` short-circuits with a user-facing reply.
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    # 2026-06-06 c1: document handler — PDFs and any other ``document``
+    # update Telegram delivers. ``filters.Document.ALL`` matches every
+    # document; the MIME allowlist check lives inside ``on_document``
+    # so non-PDFs get an EXPLICIT user-facing reply ("I can only read
+    # PDFs right now — got <mime>") rather than a silent filter-drop.
+    # Per ``feedback_intentionally_left_blank.md``: silent absence and
+    # explicit-replied absence are operationally different — the
+    # silent-PDF-drop incident this commit closes was the
+    # ``filters.PHOTO``-only registration treating every document as
+    # "not for me," which collapsed to "Telegram delivered it but the
+    # bot never replied." Registering ``filters.Document.ALL`` here
+    # plus the in-handler allowlist guarantees every document update
+    # produces SOME visible outcome — extracted-text-and-replied for
+    # PDFs, "I can only read PDFs" for everything else.
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
 
     return app
 
@@ -3683,6 +3735,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             user_id=update.effective_user.id if update.effective_user else None,
             kind="text",
         )
+        # Allowlist-rejected: do NOT call ``record_handled``. The
+        # message was received (TOTAL counter bumped by the pre-pass)
+        # but never handled — landing it in ``inbound_unhandled``
+        # surfaces a misconfigured allowlist in the heartbeat. See the
+        # block comment above ``_pre_record_inbound`` for the split
+        # rationale.
         return
     if update.message is None or update.message.text is None:
         return
@@ -3694,10 +3752,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         kind="text",
         length=len(text),
     )
-    # Idle-tick heartbeat counter is bumped by the application-level
-    # ``_pre_record_inbound`` pre-pass (group=-1), not here — that
-    # ensures unrecognised commands and other non-text-handler updates
-    # still count. See the pre-pass comment block above ``build_app``.
+    # 2026-06-06 c1: handled-counter split. Total inbound is bumped by
+    # the application-level ``_pre_record_inbound`` pre-pass (group=-1)
+    # so even unrecognised commands count. THIS counter bumps the
+    # "handled" half — the difference at tick time
+    # (``inbound_unhandled = total - handled``) surfaces silent-drops.
+    heartbeat.record_handled()
 
     chat_id = update.effective_chat.id if update.effective_chat else None
 
@@ -3743,6 +3803,9 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             user_id=update.effective_user.id if update.effective_user else None,
             kind="voice",
         )
+        # Allowlist-rejected: do NOT call ``record_handled`` — see
+        # the on_text counter-site comment for the unhandled-bucket
+        # rationale.
         return
     if update.message is None or update.message.voice is None:
         return
@@ -3755,8 +3818,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         kind="voice",
         duration=update.message.voice.duration,
     )
-    # Idle-tick heartbeat counter is bumped by the application-level
-    # ``_pre_record_inbound`` pre-pass (group=-1) — see ``on_text``.
+    # 2026-06-06 c1: handled-counter split — see on_text counter site.
+    heartbeat.record_handled()
 
     try:
         tg_file = await update.message.voice.get_file()
@@ -3810,6 +3873,9 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             user_id=update.effective_user.id if update.effective_user else None,
             kind="photo",
         )
+        # Allowlist-rejected: do NOT call ``record_handled`` — see
+        # the on_text counter-site comment for the unhandled-bucket
+        # rationale.
         return
     if update.message is None or not update.message.photo:
         return
@@ -3824,8 +3890,15 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         photo_sizes=photo_count,
         has_caption=bool(update.message.caption),
     )
-    # Idle-tick heartbeat counter is bumped by the application-level
-    # ``_pre_record_inbound`` pre-pass (group=-1) — see ``on_text``.
+    # 2026-06-06 c1: handled-counter split. Placed BEFORE the
+    # vision-disabled check because a vision-disabled reply still
+    # counts as handled — the message routed correctly, the handler
+    # replied, the only difference vs. success is the feature is off.
+    # Per Andrew (decision 2026-06-06): vision-disabled = handled. The
+    # operationally-meaningful definition of "handled" is "routed to a
+    # registered handler and replied to the user," not "produced a
+    # successful LLM turn."
+    heartbeat.record_handled()
 
     # Vision-disabled gate. ``vision.enabled=false`` (or ``vision``
     # missing in config — defaulted-on dataclass keeps it true) replies
@@ -3906,6 +3979,199 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "path": saved_path,
             "file_unique_id": file_unique_id,
             "bytes": len(image_bytes),
+        }] if saved_path else [],
+    )
+
+
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Document message entry point — MIME-gate, download, extract, dispatch.
+
+    Parallel to :func:`on_photo` for Telegram ``document`` updates (PDFs
+    and any other file attached as a file rather than a photo). The
+    handler:
+
+    1. Allowlist-gates the user (same shape as photo / voice / text).
+    2. MIME-allowlists the document (PDF-only in c1). Non-PDF mimes get
+       an explicit user-facing reply — see
+       ``feedback_intentionally_left_blank.md``: silent filter-drop on
+       a ``.docx`` is the same class of bug we're fixing.
+    3. Size-gates against :data:`attachments.MAX_PDF_BYTES`.
+    4. Downloads bytes via :func:`attachments.download_document_bytes`.
+    5. Text-extracts via :func:`attachments.extract_pdf_text` (lazy
+       imports :mod:`pypdf` — on installs missing the ``voice`` extra
+       the extractor raises with a clean message rather than crashing
+       the daemon at module-import time).
+    6. Persists to ``<vault>/inbox/`` for audit. Persistence failure is
+       treated as non-fatal: the model still sees the extracted text;
+       only the audit trail is incomplete.
+    7. Composes the user-message text via
+       :func:`attachments.build_document_user_text` and dispatches
+       through :func:`handle_message`.
+
+    Documents are NOT gated on ``vision.enabled`` — vision is an
+    image-specific feature flag; documents go through a separate
+    text-extraction path that's always-on if :mod:`pypdf` imports
+    cleanly (the extractor's lazy import handles the missing-dep case
+    gracefully).
+
+    Every failure mode produces an explicit user-facing reply — never
+    silent drop, per ``feedback_intentionally_left_blank.md``.
+    """
+    config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+    if not _is_allowed(update, config):
+        log.info(
+            "talker.bot.unauthorized",
+            user_id=update.effective_user.id if update.effective_user else None,
+            kind="document",
+        )
+        # Allowlist-rejected: do NOT call ``record_handled`` — see
+        # the on_text counter-site comment for the unhandled-bucket
+        # rationale.
+        return
+    if update.message is None or update.message.document is None:
+        return
+
+    document = update.message.document
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    mime_type = document.mime_type or ""
+    file_name = document.file_name or ""
+    file_size = document.file_size or 0
+    log.info(
+        "talker.bot.inbound",
+        chat_id=chat_id,
+        user_id=update.effective_user.id if update.effective_user else None,
+        kind="document",
+        mime_type=mime_type,
+        file_name=file_name,
+        file_size=file_size,
+        has_caption=bool(update.message.caption),
+    )
+    # 2026-06-06 c1: handled-counter split. Placed BEFORE the MIME /
+    # size gates because rejecting a .docx or oversized PDF still
+    # counts as handled — the message routed, the user got a reply.
+    # "Handled" means "reached a registered handler and produced a
+    # user-visible outcome," not "produced a successful LLM turn."
+    heartbeat.record_handled()
+
+    # MIME allowlist gate. PDF-only in c1; non-PDF mimes get a single
+    # user-facing reply naming the rejected type. Per
+    # ``feedback_intentionally_left_blank.md`` — silent filter-drop on a
+    # ``.docx`` would be the same bug class this commit closes for
+    # PDFs. The allowlist lives in :data:`attachments.SUPPORTED_DOCUMENT_MIME`
+    # so widening it later is one constant update + one extractor
+    # branch.
+    if mime_type not in attachments.SUPPORTED_DOCUMENT_MIME:
+        log.info(
+            "talker.bot.document_unsupported_mime",
+            chat_id=chat_id,
+            mime_type=mime_type,
+            file_name=file_name,
+        )
+        await update.message.reply_text(
+            f"I can only read PDFs right now — got "
+            f"{mime_type or 'unknown type'}. "
+            "Forward as a photo or paste the text and I can help."
+        )
+        return
+
+    # Size gate. Catches pathological forwards before we burn
+    # bandwidth + memory on the download. ``file_size`` may be ``None``
+    # for some Telegram clients (rare); only enforce when present.
+    if file_size and file_size > attachments.MAX_PDF_BYTES:
+        size_mb = file_size / (1024 * 1024)
+        limit_mb = attachments.MAX_PDF_BYTES / (1024 * 1024)
+        log.info(
+            "talker.bot.document_oversized",
+            chat_id=chat_id,
+            file_size=file_size,
+            limit=attachments.MAX_PDF_BYTES,
+            file_name=file_name,
+        )
+        await update.message.reply_text(
+            f"That PDF is {size_mb:.1f} MB — bigger than my "
+            f"{limit_mb:.0f} MB limit. Can you trim it or share the "
+            "relevant pages as a screenshot?"
+        )
+        return
+
+    # Download bytes. Distinct error class from the extract failure
+    # below so the user-facing reply can be more specific.
+    try:
+        pdf_bytes = await attachments.download_document_bytes(document)
+    except attachments.AttachmentDownloadError as exc:
+        log.warning("talker.bot.document_download_failed", error=str(exc))
+        await update.message.reply_text(
+            "sorry, couldn't fetch the PDF — try sending it again?"
+        )
+        return
+
+    # Text-extract. Distinct catch from the download path. The lazy
+    # :mod:`pypdf` import inside the extractor handles the
+    # missing-dependency case with its own ``AttachmentExtractError``
+    # so a non-``[voice]`` install still gets a clean user-facing
+    # reply rather than a daemon crash.
+    try:
+        extracted_text = attachments.extract_pdf_text(pdf_bytes)
+    except attachments.AttachmentExtractError as exc:
+        log.warning(
+            "talker.bot.document_extract_failed",
+            error=str(exc),
+            file_name=file_name,
+        )
+        await update.message.reply_text(
+            f"sorry, couldn't read that PDF — {exc!s}. "
+            "If it's a scanned image, paste the text directly instead?"
+        )
+        return
+
+    # Persist to ``<vault>/inbox/`` for audit. Persistence failure is
+    # treated as recoverable (mirror of the on_photo save path): the
+    # extracted text is still in memory and will reach the model. We
+    # log the failure with ``action=continuing_to_llm_in_memory_only``
+    # so an operator tailing the log can grep that field and see the
+    # policy decision without re-reading source. Per the universal
+    # "intentionally left blank" rule — the decision NOT to abort the
+    # conversation must live in the log, not just the code.
+    file_unique_id = getattr(document, "file_unique_id", "") or ""
+    saved_path: str | None = None
+    try:
+        saved = attachments.save_document_to_inbox(
+            pdf_bytes,
+            config.vault.path,
+            file_unique_id,
+            extension="pdf",
+        )
+        saved_path = str(saved)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.bot.document_save_failed",
+            error=str(exc),
+            vault_path=config.vault.path,
+            action="continuing_to_llm_in_memory_only",
+        )
+        # Continue — extracted text still reaches the model.
+
+    # Compose the user-message text: header naming the attachment +
+    # optional caption + fenced extracted text. Caption-less PDFs are
+    # fine; the header is enough to signal the model that there's an
+    # attachment to consider.
+    caption = (update.message.caption or "").strip()
+    user_text = attachments.build_document_user_text(
+        caption=caption,
+        extracted_text=extracted_text,
+        filename=file_name or "document.pdf",
+    )
+
+    await handle_message(
+        update, ctx,
+        text=user_text,
+        voice=False,
+        document_metadata=[{
+            "path": saved_path,
+            "file_unique_id": file_unique_id,
+            "bytes": len(pdf_bytes),
+            "filename": file_name or "document.pdf",
+            "mime_type": mime_type,
         }] if saved_path else [],
     )
 
@@ -4885,6 +5151,7 @@ async def handle_message(
     voice: bool = False,
     image_blocks: list[dict[str, Any]] | None = None,
     image_metadata: list[dict[str, Any]] | None = None,
+    document_metadata: list[dict[str, Any]] | None = None,
 ) -> None:
     """Shared pipeline — open/reuse session, run Anthropic turn, reply.
 
@@ -4901,6 +5168,17 @@ async def handle_message(
     so the saved-file paths land on the session-record frontmatter at
     close time. ``None`` / empty preserves the wk1 single-modal flow
     byte-for-byte.
+
+    ``document_metadata`` (2026-06-06 c1: PDF document handler) is the
+    parallel list for document attachments —
+    ``{path, file_unique_id, bytes, filename, mime_type}`` dicts. Unlike
+    images, documents do NOT produce a separate content block: the
+    extracted text is inlined into the ``text`` argument upstream by
+    :func:`on_document` so the model sees it as part of the user
+    message. ``document_metadata`` is the audit trail (saved path +
+    Telegram metadata) that lands on the session-record frontmatter via
+    one :func:`append_document` row per entry. ``None`` / empty
+    preserves the existing flow byte-for-byte.
     """
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
     state_mgr: StateManager = ctx.application.bot_data[_KEY_STATE]
@@ -5129,6 +5407,26 @@ async def handle_message(
                     path=meta["path"],
                     file_unique_id=meta.get("file_unique_id", ""),
                     bytes_size=int(meta.get("bytes", 0) or 0),
+                )
+
+        # 2026-06-06 c1: same shape as ``image_metadata`` above, for
+        # document attachments. Records each saved-document row against
+        # the session via :func:`append_document` BEFORE ``run_turn`` so
+        # the audit trail is preserved even when the LLM call fails.
+        # ``turn_index`` semantics match :func:`append_image` — the
+        # would-be position of the next user turn.
+        if document_metadata:
+            for meta in document_metadata:
+                if not meta.get("path"):
+                    continue
+                append_document(
+                    state_mgr,
+                    sess,
+                    path=meta["path"],
+                    file_unique_id=meta.get("file_unique_id", ""),
+                    bytes_size=int(meta.get("bytes", 0) or 0),
+                    filename=meta.get("filename", ""),
+                    mime_type=meta.get("mime_type", ""),
                 )
 
         try:

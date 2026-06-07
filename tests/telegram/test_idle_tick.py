@@ -421,3 +421,233 @@ async def test_pre_pass_does_not_double_count_text(
         "calls were removed but the pre-pass isn't observing) or a "
         "re-introduced per-handler call (double counting)."
     )
+
+
+# --- 7. Handled-counter split (2026-06-06 c1) ----------------------------
+#
+# The split addresses the silent-drop ambiguity surfaced 2026-06-06: a
+# pre-split heartbeat with ``inbound_in_window=1`` was indistinguishable
+# between (a) one Update routed and handled normally and (b) one Update
+# delivered but with no handler registered (silent drop). The split
+# surfaces case (b) as ``inbound_unhandled > 0``.
+#
+# Tests below pin the new contract:
+#
+#   * ``record_handled`` increments a SEPARATE counter from
+#     ``record_inbound``.
+#   * ``tick`` emits all three fields: ``inbound_in_window`` (total,
+#     legacy alias), ``inbound_handled`` (split half), ``inbound_unhandled``
+#     (derived: total - handled).
+#   * Derivation is correct: total=3, handled=2 → unhandled=1.
+#   * ``reset`` clears BOTH counters together (preserves the
+#     ``handled <= total`` invariant).
+#   * Pre-pass alone bumps total but NOT handled — the silent-drop
+#     signature.
+
+
+def test_record_handled_increments_separate_counter() -> None:
+    """``record_handled`` bumps the handled counter, leaving total alone."""
+    assert heartbeat.get_count() == 0
+    assert heartbeat.get_handled_count() == 0
+
+    heartbeat.record_handled()
+    heartbeat.record_handled()
+    assert heartbeat.get_handled_count() == 2
+    # Total counter NOT touched by record_handled.
+    assert heartbeat.get_count() == 0
+
+
+def test_tick_emits_split_fields() -> None:
+    """``tick`` emits ``inbound_in_window`` AND the split fields together.
+
+    The three-field emit is the load-bearing observability contract —
+    log dashboards / grep queries that consume any of the three should
+    find them all in the same event.
+    """
+    heartbeat.record_inbound()
+    heartbeat.record_inbound()
+    heartbeat.record_inbound()
+    heartbeat.record_handled()
+    heartbeat.record_handled()
+
+    with patch.object(heartbeat.log, "info") as mock_info:
+        returned = heartbeat.tick(60)
+
+    # Return value still carries the total (back-compat for callers
+    # that consumed the pre-split return).
+    assert returned == 3
+    assert mock_info.call_count == 1
+    args, kwargs = mock_info.call_args
+    assert args[0] == "talker.idle_tick"
+    # All three split fields present.
+    assert kwargs["inbound_in_window"] == 3
+    assert kwargs["inbound_handled"] == 2
+    assert kwargs["inbound_unhandled"] == 1
+    assert kwargs["interval_seconds"] == 60
+
+
+def test_tick_unhandled_derives_correctly() -> None:
+    """``inbound_unhandled = total - handled`` — derivation contract.
+
+    Pins the silent-drop signal: an Update that bumped total via the
+    pre-pass but never reached an entry handler shows up as
+    unhandled > 0.
+    """
+    # Simulate: 2 messages routed normally (total + handled), 1 message
+    # silently dropped (only total bumped — no handler called
+    # record_handled).
+    for _ in range(3):
+        heartbeat.record_inbound()
+    for _ in range(2):
+        heartbeat.record_handled()
+
+    with patch.object(heartbeat.log, "info") as mock_info:
+        heartbeat.tick(60)
+    _, kwargs = mock_info.call_args
+    assert kwargs["inbound_in_window"] == 3
+    assert kwargs["inbound_handled"] == 2
+    assert kwargs["inbound_unhandled"] == 1, (
+        "Silent-drop case: 3 messages received via pre-pass, 2 reached "
+        "a handler. The 1 that didn't must surface as inbound_unhandled."
+    )
+
+
+def test_tick_zero_traffic_emits_zero_split() -> None:
+    """Idle tick (no traffic) emits all three fields as zero.
+
+    The "intentionally left blank" contract applies to ALL three
+    fields: a quiet daemon must still emit the heartbeat with
+    ``handled=0`` and ``unhandled=0`` so an operator can see that the
+    daemon is alive AND that no silent-drops happened this window.
+    """
+    assert heartbeat.get_count() == 0
+    assert heartbeat.get_handled_count() == 0
+
+    with patch.object(heartbeat.log, "info") as mock_info:
+        heartbeat.tick(60)
+
+    _, kwargs = mock_info.call_args
+    assert kwargs["inbound_in_window"] == 0
+    assert kwargs["inbound_handled"] == 0
+    assert kwargs["inbound_unhandled"] == 0
+
+
+def test_tick_resets_both_counters() -> None:
+    """After ``tick``, BOTH counters reset to zero together.
+
+    Preserves the ``handled <= total`` invariant on the next interval.
+    """
+    heartbeat.record_inbound()
+    heartbeat.record_inbound()
+    heartbeat.record_handled()
+
+    with patch.object(heartbeat.log, "info"):
+        heartbeat.tick(60)
+
+    assert heartbeat.get_count() == 0
+    assert heartbeat.get_handled_count() == 0
+
+
+def test_reset_clears_both_counters() -> None:
+    """The test-helper :func:`reset` zeroes BOTH counters together.
+
+    Without this, a test that pre-loads handled but resets only total
+    would leak handled state into the next test. Module-level state
+    cleanup is load-bearing.
+    """
+    heartbeat.record_inbound()
+    heartbeat.record_handled()
+    heartbeat.record_handled()
+    assert heartbeat.get_count() == 1
+    assert heartbeat.get_handled_count() == 2
+
+    heartbeat.reset()
+    assert heartbeat.get_count() == 0
+    assert heartbeat.get_handled_count() == 0
+
+
+def test_tick_handled_capped_at_total_when_drift() -> None:
+    """If handled somehow exceeds total, unhandled clamps to 0 (no negatives).
+
+    Belt-and-braces guard. The ``record_handled`` call sites are paired
+    with ``record_inbound`` via the application pre-pass, so handled
+    should never exceed total in production. The clamp protects against
+    a hypothetical future refactor that decouples the counters and
+    introduces drift — negative ``inbound_unhandled`` would be a
+    nonsense signal in dashboards.
+    """
+    # Drive a drift case: handled > total. (Production doesn't do this,
+    # but the test pins the defensive ``max(0, ...)`` behaviour.)
+    heartbeat.record_handled()
+    heartbeat.record_handled()
+
+    with patch.object(heartbeat.log, "info") as mock_info:
+        heartbeat.tick(60)
+    _, kwargs = mock_info.call_args
+    assert kwargs["inbound_in_window"] == 0
+    assert kwargs["inbound_handled"] == 2
+    # Derived value clamps to 0 rather than going negative.
+    assert kwargs["inbound_unhandled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_pass_alone_produces_unhandled_signal(
+    talker_config, state_mgr, fake_client,
+) -> None:
+    """Application-level pre-pass increments total without bumping handled.
+
+    This is the load-bearing **silent-drop signature** — when an Update
+    arrives that no entry handler routes (the 2026-06-06 PDF incident
+    pre-fix), only the pre-pass fires, only the total counter bumps,
+    and the tick emits ``inbound_unhandled > 0``.
+    """
+    from telegram import Update
+
+    app = _build_app_for_test(talker_config, state_mgr, fake_client)
+
+    # ``/calibration`` is an unrecognised command (the 2026-04-22
+    # incident shape). The pre-pass bumps total; no CommandHandler or
+    # MessageHandler is registered for it, so no entry handler runs
+    # ``record_handled``.
+    msg = _make_message("/calibration", message_id=42)
+    await app.process_update(Update(update_id=42, message=msg))
+
+    assert heartbeat.get_count() == 1
+    assert heartbeat.get_handled_count() == 0, (
+        "Unrecognised command must NOT bump the handled counter — "
+        "this is the silent-drop signature the split was designed to "
+        "surface."
+    )
+
+    # Tick to confirm the field math is right.
+    with patch.object(heartbeat.log, "info") as mock_info:
+        heartbeat.tick(60)
+    _, kwargs = mock_info.call_args
+    assert kwargs["inbound_unhandled"] == 1
+
+
+@pytest.mark.asyncio
+async def test_on_text_handler_bumps_handled_counter(
+    talker_config, state_mgr, fake_client,
+) -> None:
+    """The on_text handler bumps the handled counter when the user is allowed.
+
+    Pin the production code path: an allowed user's text message
+    routes through ``on_text``, which calls ``record_handled``. Total
+    bumps via the pre-pass; handled bumps via the handler. The
+    resulting tick emits ``inbound_unhandled=0`` — the healthy case.
+    """
+    from telegram import Update
+
+    app = _build_app_for_test(talker_config, state_mgr, fake_client)
+
+    msg = _make_message("hello there", message_id=50)
+    await app.process_update(Update(update_id=50, message=msg))
+
+    assert heartbeat.get_count() == 1
+    assert heartbeat.get_handled_count() == 1, (
+        "An allowed text message must bump BOTH counters — total via "
+        "pre-pass, handled via the on_text handler. Missing the "
+        "handled bump means every healthy message inflates the "
+        "unhandled count, breaking the silent-drop signal."
+    )
