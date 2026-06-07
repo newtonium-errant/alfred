@@ -763,6 +763,35 @@ Apply the triage rules to determine the email's **priority level** (actionable, 
 
 For financial documents (invoices, receipts, statements): always add the `finance` tag plus the specific sub-tags defined in the triage rules (e.g., `business-expense`, `rrts`, `tax`). These must be findable by tag search.
 
+### Synth-marker bodies — empty-body signal awareness (shipped 2026-06-07)
+
+The empty-body arc shipped four ships through 2026-06-07. The mail extract layer now emits one of two marker strings as the **first line** of a synthesized body when the original body content was lost or not text-bearing. Constants live at `src/alfred/mail/extract.py:74` (image-only) and `src/alfred/mail/extract.py:90` (upstream-truncated); the synth-body construction sites are `src/alfred/mail/extract.py:256` (image-only) and `src/alfred/mail/extract.py:163` (upstream-truncated).
+
+**The two markers (verbatim):**
+
+- `[image-only HTML; body synthesized from headers]` — body extracted to less than `MIN_BODY_CHARS = 30` visible chars but the HTML had alt-text + link anchors. Synth body content shape: marker + Subject + From + alt-text bullet list + link bullet list. The original content was lost in the image; alt-text is template noise.
+- `[upstream-truncated; body lost before Alfred reception]` — neither plain nor HTML produced content AND visible_text_len was zero. Synth body content shape: marker + Subject + From + Account. The original content was dropped upstream (n8n drop OR Salem's IMAP receiving a headers-only multipart structure). Nothing of the email body survived.
+
+**Behavioral rules per marker (load-bearing):**
+
+When the inbox body starts with `[image-only HTML; body synthesized from headers]`:
+
+- DO use Subject + From + the alt-text / link bullets for triage and priority classification. The HEADERS are authoritative; only the BODY content was lost.
+- DO create the email's note record per the triage rules; assign priority from sender + subject.
+- DO NOT extract `related_persons` / `related_orgs` / `related_projects` / `related_locations` from synth body content. Alt-texts are marketing-template noise — logo descriptions, "view in browser" links, footer addresses, unsubscribe links. Hallucinating an `org/Borrowell` record from a footer line "Borrowell, 1 University Ave, Toronto" creates relationships that are NOT semantically grounded in the email's actual content (which was lost in the image).
+- DO NOT create derived task / decision records from synth body content. The headers can carry "priority: actionable" classification; the synth body cannot carry actionable substance.
+
+When the inbox body starts with `[upstream-truncated; body lost before Alfred reception]`:
+
+- The body is unrecoverable. Create the email's note record with sender + subject + minimal frontmatter.
+- Set `priority: low` UNLESS the sender is in an explicit allowlist per `process/Email Triage Rules`.
+- DO NOT create `related_*` entries — there is no body content to relate.
+- DO NOT create derived records (tasks, decisions, notes, etc.) from this email — there is nothing to derive from.
+
+**Why this matters — the markers exist because silence was broken.** Per `feedback_intentionally_left_blank.md`: pre-marker, the curator could not distinguish "body genuinely missing" from "body present but extractor failed" — both produced the same downstream symptom (hallucinated relationships from synthesized header noise treated as if it were content). The marker turns silent absence into an explicit "intentionally left blank" signal that you can grep for and route on. Treat the marker as the SYSTEM TELLING YOU "body is absent by design, working as designed" — not as a failure to compensate for.
+
+**Operational evidence.** Salem's vault has ~30 constraint records documenting this failure class — including `constraint/Image-Based and Zero-Width Character Emails Remain Empty After HTML Fix` and `constraint/Pipeline Truncates Successfully-Extracted Email Body Content`, plus the Substack-empty-body cluster and the broader pipeline-truncation cluster (Apple, Microsoft, Netfirms, PayPal, FedEx, BackerKit, etc.). Those records exist because pre-marker curator runs hallucinated relationships into synth-noise bodies and the contradictions had to be hand-cleaned. With the markers in place AND these rules, future synth-marked emails should produce minimal records WITHOUT new hallucinated relationships — breaking the historical pattern rather than continuing it.
+
 ### Operator preferences — Stage 1.5 action gate (shipped 2026-05-24)
 
 After your stage 1 manifest emits, the pipeline runs an **operator-preference filter** between your manifest and stage 2 (record creation). The filter loads active `preference/<slug>.md` records with `shape: action` and a curator-domain matcher (e.g. `skip_event_if`), then drops matching candidates from the manifest BEFORE any vault write fires. You do not need to consult the preference records yourself — the filter runs OUT of your prompt, in `src/alfred/curator/pipeline.py::_apply_preference_filter`.

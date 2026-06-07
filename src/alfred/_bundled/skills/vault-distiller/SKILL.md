@@ -387,6 +387,23 @@ The gate is defeated if you reframe a suppressed-recurrence as a "meta-synthesis
 
 ## 3. Extraction Rules by Source Type
 
+### Skip synth-marked email records (shipped 2026-06-07)
+
+When you encounter a source record whose body STARTS WITH either of these two marker strings, **DO NOT extract learning records from it**:
+
+- `[image-only HTML; body synthesized from headers]` (constant `SYNTH_MARKER_IMAGE_ONLY` at `src/alfred/mail/extract.py:74`)
+- `[upstream-truncated; body lost before Alfred reception]` (constant `SYNTH_MARKER_UPSTREAM_TRUNCATED` at `src/alfred/mail/extract.py:90`)
+
+Both markers are emitted by the mail extract layer (Ship 4 of the empty-body arc, shipped 2026-06-07) as the first line of a synthesized body when the original email's body content was lost or non-text-bearing. The synth body that follows is HEADERS + alt-text + link anchors — NOT the original email content.
+
+**Why skip:** the actual content the operator received was lost. Extracting decisions / constraints / assumptions / contradictions / syntheses from synth body content produces NOISE LEARNINGS that don't reflect operator reality. Salem's vault already has ~30 constraint records documenting this failure class — including `constraint/Image-Based and Zero-Width Character Emails Remain Empty After HTML Fix` and `constraint/Pipeline Truncates Successfully-Extracted Email Body Content`, plus the Substack-empty-body cluster (e.g., `constraint/Substack Newsletter Platform Canonical Empty-Body Pattern Combines Figure-Space and Combining Grapheme Joiner`, `constraint/Substack Empty-Body Padding Repertoire Extends to No-Break-Space U+00A0`) and the broader pipeline-truncation cluster (Apple, Microsoft, Netfirms, PayPal, FedEx, BackerKit, 80000Hours, etc.). Distilling MORE constraints from synth-marked records compounds the noise — new derived learnings would be near-duplicates of existing ones at canonical resolution.
+
+**Positive framing — the marker is the system telling you "body intentionally absent, working as designed."** Per `feedback_intentionally_left_blank.md`: the empty-body extraction failure was the operator's pain point; the markers are the fix. Pre-marker, the distiller had no signal that an email's body was synthesized noise rather than original content — silence and broken were indistinguishable. With the markers, "no learnings extracted from this record" is the CORRECT outcome, not a missed extraction. Treat synth-marked records the same way you'd treat `status: cancelled` or `alfred_triage: true` records — they're flagged for skip, not for further processing.
+
+**Edge case — operator commentary in a wrapping record.** If a synth-marked email is QUOTED inside a larger source record (e.g., a `session/` transcript where the operator pastes or discusses a synth-marked email), extract from the operator's surrounding commentary, NOT from the quoted synth body. The skip rule applies to the synth body content itself; the operator's commentary about the synth-marked email IS legitimate source material.
+
+**Detection.** Check the source record's body for either marker string as its first non-empty line. Both markers are stable verbatim constants pinned at the code layer; any change there would need a coordinated SKILL update.
+
 ### From Conversations
 - **Decisions:** Look for "we agreed", "let's go with", "decided to", explicit choices
 - **Assumptions:** "we're assuming", "should be fine", implicit beliefs about timelines or outcomes
