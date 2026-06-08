@@ -44,6 +44,54 @@ def test_vault_search_finds_known_glob(tmp_vault: Path):
     assert sample["name"] == "Sample Person"
 
 
+def test_vault_search_glob_is_case_insensitive(tmp_vault: Path):
+    """P4 / Surface (a) — 2026-06-07: glob case-folds by default.
+
+    The 2026-06-06 Tilray conversation friction: Salem called
+    ``vault_search glob="task/FMM Review video*.md"`` against the
+    live file ``task/FMM Review Video.md`` and got no match
+    (lowercase ``video`` vs capital ``V``). Operator-spoken phrasing
+    rarely matches filesystem capitalization, and the
+    ``vault_create`` near-match guard already prevents case-only-
+    distinguishable filenames from coexisting in a well-formed vault.
+
+    The fix is :meth:`pathlib.Path.glob`'s ``case_sensitive=False``
+    kwarg (Python 3.12+). This test pins the contract: a lowercased
+    glob pattern matches a capitalized filename.
+    """
+    # Seed a task with capital-V "Video" in the name to reproduce the
+    # 2026-06-06 shape.
+    (tmp_vault / "task").mkdir(exist_ok=True)
+    (tmp_vault / "task" / "FMM Review Video.md").write_text(
+        "---\ntype: task\nname: FMM Review Video\nstatus: todo\n---\n",
+    )
+
+    # Lowercase "video" in the glob — pre-P4 this would have missed.
+    hits = vault_search(tmp_vault, glob_pattern="task/FMM Review video*.md")
+    paths = {h["path"] for h in hits}
+    assert "task/FMM Review Video.md" in paths, (
+        f"Case-fold glob should find capitalized file; got paths={paths!r}"
+    )
+
+
+def test_vault_search_glob_case_fold_works_in_both_directions(tmp_vault: Path):
+    """Capitalized glob pattern also matches lowercased file (symmetry pin).
+
+    The case-fold is symmetric — if operators sometimes uppercase
+    things in habits and the filename happens to be lowercase, the
+    match still fires.
+    """
+    (tmp_vault / "task").mkdir(exist_ok=True)
+    (tmp_vault / "task" / "lowercase-task.md").write_text(
+        "---\ntype: task\nname: lowercase-task\nstatus: todo\n---\n",
+    )
+
+    # Capital-cased glob against lowercase file.
+    hits = vault_search(tmp_vault, glob_pattern="task/LOWERCASE-TASK.md")
+    paths = {h["path"] for h in hits}
+    assert "task/lowercase-task.md" in paths
+
+
 def test_vault_create_note_with_living_status(tmp_vault: Path):
     # Hypatia QA 2026-04-28: status='living' on a note record (e.g. a
     # permanent task list) was rejected by validation, forcing

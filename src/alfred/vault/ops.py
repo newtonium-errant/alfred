@@ -794,7 +794,28 @@ def vault_search(
     results: list[dict] = []
 
     if glob_pattern:
-        matches = list(vault_path.glob(glob_pattern))
+        # P4 / Surface (a) — 2026-06-07: case-insensitive glob default.
+        # ``pathlib.Path.glob`` is case-sensitive on POSIX (and WSL2,
+        # where Salem runs). Operator-spoken phrasing rarely matches
+        # filesystem capitalization — the 2026-06-06 Tilray
+        # conversation friction was Salem calling
+        # ``vault_search glob="task/FMM Review video*.md"`` against
+        # the live file ``task/FMM Review Video.md`` and getting no
+        # match (lowercase ``video`` vs capital ``V``). The brief's
+        # T2 pool literally listed the task; the operator-grep
+        # workflow + the talker's spoken-vs-filesystem-case mismatch
+        # were the real ergonomics gap.
+        #
+        # ``case_sensitive=False`` requires Python 3.12+ (Salem's
+        # venv is 3.12). The default-fold contract is safe because
+        # :func:`vault_create` already enforces near-match uniqueness
+        # via ``casefold`` at the write-time guard (see line ~649),
+        # so case-only-distinguishable filenames cannot exist in a
+        # well-formed vault and the disambiguation case can't occur
+        # in practice. Per ``feedback_universal_filetype_support.md``:
+        # shared code, no per-instance gate; all instances pick up
+        # the case-fold default identically.
+        matches = list(vault_path.glob(glob_pattern, case_sensitive=False))
     else:
         matches = list(vault_path.rglob("*.md"))
 

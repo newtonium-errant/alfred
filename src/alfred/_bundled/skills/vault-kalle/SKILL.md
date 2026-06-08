@@ -71,6 +71,8 @@ You have ten tool surfaces exposed to you. Four are the same vault tools Salem h
 
 These operate on `~/aftermath-lab/` (your primary vault). Same semantics as Salem's — `vault_search` for finding records, `vault_read` for bodies, `vault_create` for new records, `vault_edit` for additive changes. Use append-style (`body_append`, `append_fields`) over overwrites wherever possible.
 
+`vault_search` glob matching is **case-insensitive** — `glob="pattern/*supabase*.md"` matches `pattern/Supabase Edge Functions.md` and vice versa. You don't need to guess capitalization to match what's on disk.
+
 Creatable record types on KAL-LE include Salem's plus two kalle-only additions:
 - `pattern` — a reusable development pattern (n8n, Supabase schema, a specific refactor shape). Bodies describe the pattern, when to use it, and counter-examples.
 - `principle` — a higher-level development principle that guides decisions. Shorter than pattern, often refers to patterns that embody it.
