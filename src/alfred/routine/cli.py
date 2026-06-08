@@ -397,6 +397,18 @@ def _matches_item(query: str, item_text: str) -> bool:
     istem = _fuzzy_stem(item_text)
     if not qstem or not istem:
         return False
+    # TODO P4-followup: structural fix — add min_stem_length floor
+    # here. Short stems (e.g. "med" from "Meds") match too
+    # aggressively into unrelated tokens ("medical", "medium",
+    # "comedian"). The 2026-06-06 Tilray→Meds incident is the
+    # canonical failure: ``_fuzzy_stem("Meds") == "med"`` (3 chars
+    # after the conservative -s strip), then ``"med" in "tilray
+    # medical registration renewal"`` fires via substring containment
+    # at this check, returning True with effectively zero shared
+    # content tokens. Confidence instrumentation (this ship, P4
+    # Surface b) is upstream of the tightening; tune after measuring
+    # N=10+ low-confidence matches in production logs by grepping
+    # ``routine_done.matched confidence=0.0`` in talker logs.
     if qstem in istem or istem in qstem:
         return True
     # Token-set overlap with stop-word filter.
@@ -413,6 +425,75 @@ def _matches_item(query: str, item_text: str) -> bool:
     # but produces too many false positives ("walk the cat" matching
     # "Walk dog" via shared "walk").
     return q_tokens <= i_tokens or i_tokens <= q_tokens
+
+
+def _match_confidence(query: str, item_text: str) -> float:
+    """Return a 0.0–1.0 confidence score for a query→item match.
+
+    P4 / Surface (b) — 2026-06-07 instrumentation helper. The
+    operative ``_matches_item`` returns ``bool`` for back-compat with
+    30+ test sites; this is a separate helper called from the success
+    branch of :func:`cmd_done` so we can log a per-match confidence
+    score without changing the matcher's return signature.
+
+    Scoring shape — Jaccard-like ratio over stemmed + stopword-
+    filtered token sets:
+
+      * Token-set intersection / max(|q|, |i|)
+      * 0.0 when no shared non-stopword content tokens
+      * 1.0 when token sets are identical (after stem + stopword
+        filter)
+      * In between when the sets overlap partially
+
+    Worked example (2026-06-06 Tilray→Meds canonical false positive):
+      * query = "Tilray Medical Registration Renewal"
+      * item_text = "Meds"
+      * qstem tokens = {tilray, medical, registration, renewal}
+      * istem tokens = {med}
+      * Intersection = {} (med ≠ medical post-stem)
+      * Confidence = 0.0
+
+    Worked example (genuine match):
+      * query = "I walked the dog yesterday"
+      * item_text = "Walk dog"
+      * qstem tokens = {walk, dog, yesterday} (stopword "I", "the"
+        filtered)
+      * istem tokens = {walk, dog}
+      * Intersection = {walk, dog}
+      * Confidence = 2 / max(3, 2) = 0.667
+
+    Worked example (exact match):
+      * query = "Walk dog"
+      * item_text = "Walk dog"
+      * Confidence = 1.0
+
+    The scoring is intentionally simple — Jaccard over stemmed token
+    sets is a single-pass O(n) computation, no dependencies beyond
+    the existing stem helper. A future tightening pass can use the
+    confidence threshold to gate the check-2 substring fallback (see
+    the TODO P4-followup comment in ``_matches_item`` at line ~400);
+    that's deferred per the 2026-06-07 brief — instrument first,
+    measure across actual Salem traffic, then tune.
+
+    Returns:
+        Float in [0.0, 1.0]. NaN-free; empty-input cases return 0.0.
+    """
+    qstem = _fuzzy_stem(query)
+    istem = _fuzzy_stem(item_text)
+    if not qstem or not istem:
+        return 0.0
+    q_tokens = {
+        t for t in qstem.split() if t and t not in _FUZZY_STOPWORDS
+    }
+    i_tokens = {
+        t for t in istem.split() if t and t not in _FUZZY_STOPWORDS
+    }
+    if not q_tokens or not i_tokens:
+        return 0.0
+    intersection = q_tokens & i_tokens
+    if not intersection:
+        return 0.0
+    return len(intersection) / max(len(q_tokens), len(i_tokens))
 
 
 def _iter_active_routine_items(vault_path: Path) -> list[_ItemCandidate]:
@@ -649,6 +730,27 @@ def cmd_done(
         # ``name:`` different from the file stem. WARN-1 fix
         # 2026-05-30 — see ``_ItemCandidate.path`` docstring.
         chosen = matches[0]
+        # P4 / Surface (b) — 2026-06-07: emit a per-match confidence
+        # log so future false-positive analysis has data without
+        # re-instrumenting the matcher. Operator-grep on
+        # ``confidence=0.0`` surfaces every check-2 substring-only
+        # match (the 2026-06-06 Tilray→Meds failure mode); higher
+        # values surface progressively better matches. The log fires
+        # ONLY on the single-match success path (here) — ambiguous
+        # and no-match canaries already carry their own
+        # operator-visible diagnostics.
+        #
+        # Per ``feedback_log_emission_test_pattern.md``: the log
+        # shape is pinned by ``test_match_confidence_log_emission``
+        # in ``tests/test_routine_done_confidence.py``.
+        confidence = _match_confidence(item_text, chosen.item_text)
+        log.info(
+            "routine_done.matched",
+            query=item_text,
+            matched_to=chosen.item_text,
+            record=chosen.record_name,
+            confidence=confidence,
+        )
         resolved_record = chosen.record_name
         item_text = chosen.item_text  # canonicalise to verbatim text
         resolved_path = chosen.path
