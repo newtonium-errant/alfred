@@ -26,6 +26,10 @@ from typing import Any, Callable
 import frontmatter
 import structlog
 
+from alfred.mail.extract import (
+    SYNTH_MARKER_IMAGE_ONLY,
+    SYNTH_MARKER_UPSTREAM_TRUNCATED,
+)
 from alfred.vault.mutation_log import log_mutation
 from alfred.vault.ops import VaultError, vault_edit, vault_move
 
@@ -72,6 +76,39 @@ _EMAIL_FROM_CAPTURE_RE = re.compile(
 # rows. Pinned in tests; rename here = update SKILL + calibration
 # filter in lockstep.
 HIGH_PRIORITY_SENDER_OVERRIDE_PREFIX = "OVERRIDE→high"
+
+# Synth-marker gate (Ship 5, empty-body arc 2026-06-09). The mail extract
+# layer (``alfred.mail.extract``) emits one of these markers as the FIRST
+# line of a synthesized body when the original email body was lost
+# (image-only HTML, invisible-Unicode padding, or upstream truncation).
+# Ship 4 added curator + distiller SKILL gating, but the classifier runs
+# as CODE, not an agent prompt — so the SKILL gating doesn't cover it.
+# Without this gate the classifier assigns a confident tier to an absent
+# body (the operator symptom "Salem confidently classifies empty-body
+# records"). The byte-strings are single-sourced from
+# ``extract.SYNTH_MARKER_*`` — never duplicate the literals here. A
+# marker rename now breaks this import in lockstep, which is the desired
+# coupling (the import fails loud rather than the gate silently missing
+# a renamed marker).
+_SYNTH_MARKERS = (SYNTH_MARKER_IMAGE_ONLY, SYNTH_MARKER_UPSTREAM_TRUNCATED)
+
+
+def _detect_synth_marker(note_body: str, inbox_content: str) -> str | None:
+    """Return the synth marker present in the record, or ``None``.
+
+    Checks the note body first (the curator's product), then the raw
+    inbox content (the source email). The marker is documented as the
+    FIRST line of the synth body, but the curator may reshape the note —
+    so we scan for the marker substring anywhere in either text rather
+    than anchoring to line 0. Image-only takes precedence when both
+    somehow appear (they never co-occur in practice — the two synth
+    paths are mutually exclusive bifurcation branches).
+    """
+    for text in (note_body or "", inbox_content or ""):
+        for marker in _SYNTH_MARKERS:
+            if marker in text:
+                return marker
+    return None
 
 
 # --- Types ------------------------------------------------------------------
@@ -1008,6 +1045,60 @@ def classify_record(
             or fm.get("description")
             or file_path.stem)
     )
+
+    # Synth-marker gate (Ship 5, empty-body arc 2026-06-09). When the
+    # record carries an empty-body synth marker, the body is absent-by-
+    # design — classifying it would assign a confident tier to content
+    # that was never there. Short-circuit to ``priority: low`` with a
+    # grep-able reasoning string and skip: the LLM call, the high-
+    # priority-sender override, the c5 high-tier push, and the c6 spam
+    # quarantine. We never push or quarantine on absent content, even
+    # from a flagged priority sender — there is no body to act on.
+    #
+    # Per ``feedback_intentionally_left_blank.md``: emit an explicit
+    # ``email_classifier.skip_synth_marked`` log so the no-classify
+    # decision is distinguishable from a broken classifier. The no-op
+    # is intentional and grep-able, not silent.
+    synth_marker = _detect_synth_marker(body, inbox_content)
+    if synth_marker is not None:
+        result = ClassificationResult(
+            priority="low",
+            action_hint=None,
+            reasoning=(
+                f"Synth-marked empty body ({synth_marker}) — not "
+                f"classified on absent content. The original email body "
+                f"was lost upstream (image-only / invisible-padded / "
+                f"upstream-truncated); there is no content to tier."
+            ),
+        )
+        synth_fields: dict[str, Any] = {
+            "priority": result.priority,
+            "action_hint": result.action_hint,
+            "priority_reasoning": result.reasoning,
+        }
+        try:
+            vault_edit(vault_path, note_rel_path, set_fields=synth_fields)
+            result.written_to = note_rel_path
+            log_mutation(
+                session_path,
+                "edit",
+                note_rel_path,
+                scope="email_classifier",
+            )
+        except VaultError as exc:
+            log.warning(
+                "email_classifier.write_failed",
+                path=note_rel_path,
+                error=str(exc),
+            )
+            return result
+        log.info(
+            "email_classifier.skip_synth_marked",
+            path=note_rel_path,
+            marker=synth_marker,
+            priority=result.priority,
+        )
+        return result
 
     contacts = get_named_contacts(vault_path, config)
     system = _build_system_prompt(config)

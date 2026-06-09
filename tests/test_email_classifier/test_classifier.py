@@ -2046,3 +2046,281 @@ def test_high_push_skipped_when_no_user_id_configured(
     assert result.priority == "high"
     assert result.pushed_to_telegram is False
     assert captured.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Synth-marker gate (Ship 5, empty-body arc 2026-06-09)
+# ---------------------------------------------------------------------------
+#
+# The mail extract layer marks bodies it could not recover (image-only
+# HTML, invisible-Unicode padding, upstream truncation) with one of two
+# byte-strings as the first line of a synthesized body. The classifier
+# runs as code, not an agent prompt, so Ship 4's curator + distiller
+# SKILL gating doesn't reach it. These tests pin that the classifier
+# short-circuits to ``priority: low`` WITHOUT calling the LLM (or the
+# high-priority-sender override / c5 push / c6 quarantine) when a synth
+# marker is present, and emits the grep-able
+# ``email_classifier.skip_synth_marked`` log.
+
+
+def _synth_email_inbox(marker: str) -> str:
+    """Build an email-shaped inbox body carrying a synth ``marker``.
+
+    Carries a ``**From:**`` line so ``is_email_inbox`` routes it, and the
+    marker on the body line so ``_detect_synth_marker`` fires. Mirrors
+    the shape the mail extract layer produces below the ``---`` header
+    separator.
+    """
+    return dedent(
+        f"""\
+        **From:** newsletter@example.com
+        **Subject:** Something happened
+
+        {marker}
+
+        Subject: Something happened
+        From: newsletter@example.com
+        Account: live
+        """
+    )
+
+
+def test_synth_marked_image_only_skips_classification(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Image-only synth marker → priority=low, LLM never called."""
+    from alfred.mail import extract
+
+    rel = _seed_note(
+        classifier_vault,
+        "Pizza Hut order update",
+        body=f"# Pizza Hut order update\n\n{extract.SYNTH_MARKER_IMAGE_ONLY}\n",
+    )
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "high",
+        "action_hint": "calendar",
+        "reasoning": "should never be used",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_synth_email_inbox(extract.SYNTH_MARKER_IMAGE_ONLY),
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "low"
+    assert result.action_hint is None
+    assert result.written_to == rel
+    # LLM was NOT called — the gate short-circuits before the caller.
+    assert len(fake.calls) == 0
+    # On-disk frontmatter reflects the gate decision.
+    post = frontmatter.load(str(classifier_vault / rel))
+    assert post.metadata["priority"] == "low"
+    assert post.metadata["action_hint"] is None
+    assert "Synth-marked empty body" in post.metadata["priority_reasoning"]
+
+
+def test_synth_marked_upstream_truncated_skips_classification(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Upstream-truncated synth marker → priority=low, LLM never called."""
+    from alfred.mail import extract
+
+    rel = _seed_note(
+        classifier_vault,
+        "Newsletter blast",
+        body=f"# Newsletter blast\n\n{extract.SYNTH_MARKER_UPSTREAM_TRUNCATED}\n",
+    )
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "medium",
+        "action_hint": None,
+        "reasoning": "should never be used",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_synth_email_inbox(extract.SYNTH_MARKER_UPSTREAM_TRUNCATED),
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "low"
+    assert len(fake.calls) == 0
+    post = frontmatter.load(str(classifier_vault / rel))
+    assert post.metadata["priority"] == "low"
+
+
+def test_synth_marker_in_inbox_content_only_still_skips(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Marker absent from note body but present in inbox content → skip.
+
+    The curator may reshape the note body; the raw inbox content is the
+    authoritative second signal. The gate checks both.
+    """
+    from alfred.mail import extract
+
+    # Note body is clean (no marker) — simulate a curator that dropped
+    # the marker line when reshaping the note.
+    rel = _seed_note(
+        classifier_vault,
+        "Reshaped note",
+        body="# Reshaped note\n\nSome curator-written summary text.\n",
+    )
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "high",
+        "action_hint": None,
+        "reasoning": "should never be used",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_synth_email_inbox(extract.SYNTH_MARKER_IMAGE_ONLY),
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    assert result.priority == "low"
+    assert len(fake.calls) == 0
+
+
+def test_synth_marked_skips_high_priority_sender_override(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Synth-marked body from a flagged priority sender → still low.
+
+    We never escalate (or push / quarantine) on absent content, even
+    from a ``high_priority_sender: true`` contact. The override must
+    NOT fire because the gate short-circuits before the override step.
+    """
+    from alfred.mail import extract
+
+    _seed_person_with_high_priority_flag(
+        classifier_vault, "VIP Sender",
+        email="vip@example.com",
+        high_priority_sender=True,
+    )
+    rel = _seed_note(
+        classifier_vault,
+        "VIP image-only blast",
+        body=f"# VIP image-only blast\n\n{extract.SYNTH_MARKER_IMAGE_ONLY}\n",
+    )
+    # Inbox content From-line matches the flagged contact's address.
+    inbox = dedent(
+        f"""\
+        **From:** vip@example.com
+        **Subject:** Exclusive
+
+        {extract.SYNTH_MARKER_IMAGE_ONLY}
+
+        Subject: Exclusive
+        From: vip@example.com
+        Account: live
+        """
+    )
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "medium",
+        "action_hint": None,
+        "reasoning": "should never be used",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=inbox,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # Override did NOT fire — priority stays low, audit fields untouched.
+    assert result.priority == "low"
+    assert result.override_applied is False
+    assert result.llm_priority is None
+    assert result.pushed_to_telegram is False
+    assert result.quarantined_to == ""
+    assert len(fake.calls) == 0
+
+
+def test_skip_synth_marked_log_emission(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Pin the ``email_classifier.skip_synth_marked`` log + its fields.
+
+    Per ``feedback_log_emission_test_pattern.md`` — the gate's
+    intentionally-left-blank log must be driven by the production code
+    path and its key fields pinned so a refactor that drops the event
+    or renames a field is caught at test time.
+    """
+    import structlog
+
+    from alfred.mail import extract
+
+    rel = _seed_note(
+        classifier_vault,
+        "Logged synth note",
+        body=f"# Logged synth note\n\n{extract.SYNTH_MARKER_UPSTREAM_TRUNCATED}\n",
+    )
+    fake = _FakeLLM(response="should never be used")
+
+    with structlog.testing.capture_logs() as captured:
+        classify_record(
+            vault_path=classifier_vault,
+            note_rel_path=rel,
+            inbox_content=_synth_email_inbox(
+                extract.SYNTH_MARKER_UPSTREAM_TRUNCATED
+            ),
+            config=enabled_config,
+            llm_caller=fake,
+        )
+
+    matches = [
+        c for c in captured
+        if c.get("event") == "email_classifier.skip_synth_marked"
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one skip_synth_marked event, got "
+        f"{[c.get('event') for c in captured]!r}"
+    )
+    event = matches[0]
+    assert event["path"] == rel
+    assert event["marker"] == extract.SYNTH_MARKER_UPSTREAM_TRUNCATED
+    assert event["priority"] == "low"
+
+
+def test_non_synth_body_classifies_normally(
+    classifier_vault: Path,
+    enabled_config: EmailClassifierConfig,
+) -> None:
+    """Negative guard: a normal body still calls the LLM and tiers.
+
+    Pins that the substring detection does NOT over-fire on ordinary
+    email content — the gate only triggers on the actual marker strings.
+    """
+    rel = _seed_note(classifier_vault, "Ordinary email note")
+    fake = _FakeLLM(response=json.dumps({
+        "priority": "medium",
+        "action_hint": "archive",
+        "reasoning": "routine update from a known vendor",
+    }))
+
+    result = classify_record(
+        vault_path=classifier_vault,
+        note_rel_path=rel,
+        inbox_content=_EMAIL_SAMPLE,
+        config=enabled_config,
+        llm_caller=fake,
+    )
+
+    # Normal path: LLM was called and its verdict stuck.
+    assert result.priority == "medium"
+    assert result.action_hint == "archive"
+    assert len(fake.calls) == 1
