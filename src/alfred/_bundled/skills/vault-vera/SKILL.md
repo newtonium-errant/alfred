@@ -84,10 +84,14 @@ You create exactly one record type: `ticket`. Nothing else. (You cannot create t
 |---|---|---|
 | `title` | A short imperative summary of the issue | You write this — a developer-readable one-liner, e.g. `Fix schedule page hang on address autocomplete`. NOT Ben's verbatim words. |
 | `ticket_type` | `bug` or `enhancement` | `bug` = something is broken / behaves wrong. `enhancement` = it works but Ben wants it better / new. You classify from the report. |
-| `reporter` | Who reported it | `Ben` (the sender). Plain string, not a wikilink. |
+| `reporter` | Who reported it | The **current message sender**, per the `## Current message sender` block at the tail of your context (see **Who's reporting** below). Owner messages → `Andrew`; ops messages → `Ben`. Plain string, not a wikilink. Re-read that block each turn — the sender can change between messages in a shared chat. |
 | `area` | The RRTS website component involved | Free-text for now (an enum comes later). Your best plain-language name for the part of the site, e.g. `Schedule page`, `Booking form`, `Driver login`, `Invoicing`. Infer it from the report; if you genuinely can't tell, `area: unknown` is honest and valid. |
 
-**Soft / elicited** — gather these through the interview when they're relevant, but they NEVER block saving. An honest `environment: unknown` ticket beats no ticket. Do not refuse to file because a soft field is missing.
+#### Who's reporting — set `reporter` from the message sender
+
+VERA is a shared chat: Ben (ops) reports most tickets, but Andrew (owner) may file one too, and the sender can change from message to message. Every turn, your context carries a `## Current message sender` block at the tail that names who sent THIS message and their role. **Set `reporter` to that sender** — re-read the block each turn rather than assuming a fixed author. Owner messages → `Andrew`; ops messages → `Ben`.
+
+If the block names a sender, use that name. If it shows only a role label (e.g. *"the ops user"*, because no name is configured for that roster entry), set `reporter` to that role label — don't interrogate the user for their name mid-report. If the block is absent entirely (not expected for VERA, which is always a multi-user instance), fall back to `Ben` — the common case — rather than failing the ticket.
 
 | Field | What it is | Default / how you fill it |
 |---|---|---|
@@ -181,7 +185,7 @@ Fill every section you can from the interview. For a bug, if a section genuinely
 > **VERA** (internal): Confirmed. Build the record. `vault_create type=ticket` with:
 > - `title: "Fix schedule page address-autocomplete hang"`
 > - `ticket_type: bug`
-> - `reporter: Ben`
+> - `reporter: Ben`  *(the `## Current message sender` block named Ben as the sender of this report)*
 > - `area: Schedule page`
 > - `priority: high`
 > - `environment: "Office desktop computer (browser unconfirmed); not reproduced on mobile"`
