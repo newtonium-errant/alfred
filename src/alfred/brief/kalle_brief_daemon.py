@@ -38,6 +38,7 @@ from alfred.transport.exceptions import TransportError
 
 from .kalle_digest import assemble_digest
 from .utils import get_logger
+from .vera_ticket_digest import assemble_ticket_digest
 
 log = get_logger(__name__)
 
@@ -69,15 +70,29 @@ class BriefDigestPushConfig:
             time="05:30", timezone="America/Halifax",
         ),
     )
+    # Digest assembler selector (VERA P2, 2026-06-09). Picks which
+    # assembler ``fire_once`` invokes:
+    #   * ``"git_activity"`` (DEFAULT) — KAL-LE's git-commit + BIT posture
+    #     digest via ``kalle_digest.assemble_digest`` (uses repo_paths /
+    #     data_dir / bit_state_path below). Default preserves KAL-LE's
+    #     behaviour byte-identically — KAL-LE's config omits ``source``.
+    #   * ``"tickets"`` — VERA's open-ticket snapshot via
+    #     ``vera_ticket_digest.assemble_ticket_digest`` (uses vault_path
+    #     below). Re-surfaces all open/in_progress tickets each morning.
+    source: str = "git_activity"
+    # VERA ticket source: the vault root holding the ``ticket/`` dir.
+    # Only consulted when ``source == "tickets"``. Empty for KAL-LE.
+    vault_path: str = ""
     # Optional: where to scan for git activity. Defaults populated by
-    # load_from_unified to KAL-LE's two repos.
+    # load_from_unified to KAL-LE's two repos. (git_activity source only.)
     repo_paths: list[str] = field(default_factory=list)
     # Override the data dir scanned for bash_exec + instructor state.
     # Empty string → use ``logging.dir`` from the unified config.
+    # (git_activity source only.)
     data_dir: str = ""
     # Optional BIT state path — when empty AND no bit_state.json found
     # in data_dir, posture defaults to green / no-data per the
-    # assembler's docstring.
+    # assembler's docstring. (git_activity source only.)
     bit_state_path: str = ""
 
 
@@ -104,14 +119,82 @@ def load_brief_digest_push_config(raw: dict[str, Any]) -> BriefDigestPushConfig:
     if not data_dir:
         data_dir = str(raw.get("logging", {}).get("dir", "./data"))
 
+    # Digest source selector (VERA P2). Default "git_activity" keeps
+    # KAL-LE's behaviour when the key is absent. "tickets" selects the
+    # VERA open-ticket assembler. Any other value falls through to the
+    # default at fire time (fire_once logs + uses git_activity).
+    source = str(section.get("source", "git_activity") or "git_activity")
+
+    # VERA ticket source vault root. Falls back to the unified config's
+    # ``vault.path`` when omitted from the brief_digest_push block, so a
+    # VERA config that sets ``source: tickets`` doesn't have to repeat
+    # its vault path. Empty for KAL-LE (git_activity ignores it).
+    vault_path = str(section.get("vault_path", "") or "")
+    if not vault_path:
+        vault_path = str((raw.get("vault", {}) or {}).get("path", "") or "")
+
     return BriefDigestPushConfig(
         enabled=bool(section.get("enabled", False)),
         self_name=str(section.get("self_name", "") or ""),
         target_peer=str(section.get("target_peer", "salem") or "salem"),
         schedule=schedule,
+        source=source,
+        vault_path=vault_path,
         repo_paths=repo_paths,
         data_dir=data_dir,
         bit_state_path=str(section.get("bit_state_path", "") or ""),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Assembler selection (VERA P2)
+# ---------------------------------------------------------------------------
+
+
+def _assemble_for_source(config: BriefDigestPushConfig, today: date) -> str:
+    """Dispatch to the right digest assembler per ``config.source``.
+
+    * ``"tickets"`` → VERA open-ticket snapshot
+      (``vera_ticket_digest.assemble_ticket_digest``), scanning
+      ``config.vault_path / ticket/``.
+    * anything else (default ``"git_activity"``) → KAL-LE's
+      git-commit + BIT posture digest (``kalle_digest.assemble_digest``).
+      Byte-identical to the pre-VERA-P2 code path — an unknown source
+      value falls through here too (logged) rather than raising, so a
+      config typo degrades to the KAL-LE digest instead of crashing the
+      daemon loop.
+
+    Kept as a pure function (no I/O beyond the assemblers' own reads, no
+    push) so tests can exercise the branch selection directly.
+    """
+    if config.source == "tickets":
+        return assemble_ticket_digest(
+            today=today,
+            vault_path=Path(config.vault_path),
+        )
+
+    if config.source != "git_activity":
+        # Unknown source — fall through to the KAL-LE default but log so
+        # a config typo is grep-able rather than silently mis-routing.
+        log.warning(
+            "kalle.brief_digest.unknown_source",
+            source=config.source,
+            detail="falling back to git_activity assembler",
+        )
+
+    bit_path: Path | None = None
+    if config.bit_state_path:
+        bit_path = Path(config.bit_state_path)
+    else:
+        candidate = Path(config.data_dir) / "bit_state.json"
+        if candidate.exists():
+            bit_path = candidate
+
+    return assemble_digest(
+        today=today,
+        data_dir=Path(config.data_dir),
+        repo_paths=[Path(p) for p in config.repo_paths],
+        bit_state_path=bit_path,
     )
 
 
@@ -138,20 +221,7 @@ async def fire_once(
     today = today or _local_today(config.schedule.timezone)
     today_iso = today.isoformat()
 
-    bit_path: Path | None = None
-    if config.bit_state_path:
-        bit_path = Path(config.bit_state_path)
-    else:
-        candidate = Path(config.data_dir) / "bit_state.json"
-        if candidate.exists():
-            bit_path = candidate
-
-    digest_md = assemble_digest(
-        today=today,
-        data_dir=Path(config.data_dir),
-        repo_paths=[Path(p) for p in config.repo_paths],
-        bit_state_path=bit_path,
-    )
+    digest_md = _assemble_for_source(config, today)
 
     log.info(
         "kalle.brief_digest.assembled",
@@ -159,6 +229,7 @@ async def fire_once(
         digest_length=len(digest_md),
         target_peer=config.target_peer,
         self_name=config.self_name,
+        source=config.source,
     )
 
     try:
