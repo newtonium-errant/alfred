@@ -465,3 +465,204 @@ async def test_owner_only_on_status_blocks_ops_via_decorator(tmp_path):
     )
     assert denied[0]["role"] == "ops"
     assert denied[0]["command"] == "on_status"
+
+
+# ---------------------------------------------------------------------------
+# AllowedUser.name — loader parse (VERA reporter follow-up)
+# ---------------------------------------------------------------------------
+
+
+def test_loader_parses_name_when_present():
+    """Dict entries carry their ``name`` through the loader."""
+    cfg = load_from_unified(_base_unified([
+        {"id": 111, "role": "owner", "name": "Andrew"},
+        {"id": 222, "role": "ops", "name": "Ben"},
+    ]))
+    assert [(u.id, u.role, u.name) for u in cfg.allowed_users] == [
+        (111, "owner", "Andrew"),
+        (222, "ops", "Ben"),
+    ]
+
+
+def test_loader_name_absent_defaults_none():
+    """A role dict without ``name`` → name=None (back-compat)."""
+    cfg = load_from_unified(_base_unified([{"id": 333, "role": "ops"}]))
+    assert cfg.allowed_users == [AllowedUser(id=333, role="ops", name=None)]
+
+
+def test_loader_bare_int_has_no_name():
+    """Bare-int entries (flat-list instances) → name=None."""
+    cfg = load_from_unified(_base_unified([111, 222]))
+    assert all(u.name is None for u in cfg.allowed_users)
+
+
+def test_loader_empty_name_normalizes_to_none():
+    """An empty-string or non-str name → None (not the empty string)."""
+    cfg = load_from_unified(_base_unified([
+        {"id": 111, "name": ""},
+        {"id": 222, "name": 12345},  # non-str
+    ]))
+    assert [(u.id, u.name) for u in cfg.allowed_users] == [
+        (111, None), (222, None),
+    ]
+
+
+def test_allowed_user_name_defaults_none_on_direct_construct():
+    """``AllowedUser(id, role)`` without name → name=None (dataclass default)."""
+    assert AllowedUser(id=1, role="owner").name is None
+    assert AllowedUser(id=1).name is None
+
+
+# ---------------------------------------------------------------------------
+# _name_for — sender display-name resolution
+# ---------------------------------------------------------------------------
+
+
+def _vera_named_config() -> TalkerConfig:
+    return load_from_unified(_base_unified([
+        {"id": 111, "role": "owner", "name": "Andrew"},
+        {"id": 222, "role": "ops", "name": "Ben"},
+        {"id": 333, "role": "ops"},  # nameless ops entry
+    ]))
+
+
+def test_name_for_owner():
+    cfg = _vera_named_config()
+    assert bot._name_for(_update_from_user(111), cfg) == "Andrew"
+
+
+def test_name_for_ops():
+    cfg = _vera_named_config()
+    assert bot._name_for(_update_from_user(222), cfg) == "Ben"
+
+
+def test_name_for_nameless_entry_returns_none():
+    """A matched entry WITHOUT a name → None (role-fallback territory)."""
+    cfg = _vera_named_config()
+    assert bot._name_for(_update_from_user(333), cfg) is None
+
+
+def test_name_for_unmatched_user_returns_none():
+    cfg = _vera_named_config()
+    assert bot._name_for(_update_from_user(999), cfg) is None
+
+
+def test_name_for_bare_int_entry_returns_none():
+    """Direct-construct fixture with a bare int → None (no name)."""
+    cfg = TalkerConfig(
+        allowed_users=[111],
+        instance=InstanceConfig(name="V.E.R.A."),
+    )
+    assert bot._name_for(_update_from_user(111), cfg) is None
+
+
+def test_name_for_single_user_flat_instance_returns_none():
+    """Flat-list (Salem-shape) config → name is None for every user.
+
+    This is the inert/back-compat guarantee at the resolution layer:
+    a single-user instance never produces a sender name, so the
+    downstream sender-identity block is never injected.
+    """
+    cfg = load_from_unified(_base_unified([8661018406]))
+    assert bot._name_for(_update_from_user(8661018406), cfg) is None
+
+
+# ---------------------------------------------------------------------------
+# _build_sender_identity_text — block rendering
+# ---------------------------------------------------------------------------
+
+
+def test_sender_identity_text_uses_name_when_present():
+    text = conversation._build_sender_identity_text("Ben", "ops")
+    assert "Ben" in text
+    assert "ops" in text
+    assert "## Current message sender" in text
+
+
+def test_sender_identity_text_falls_back_to_role_when_nameless():
+    """name=None → the block names 'the <role> user' (role fallback)."""
+    text = conversation._build_sender_identity_text(None, "ops")
+    assert "the ops user" in text
+    assert "ops" in text
+
+
+# ---------------------------------------------------------------------------
+# _build_system_blocks — sender-identity injection + inert default
+# ---------------------------------------------------------------------------
+
+
+def _last_block_text(blocks: list) -> str:
+    return blocks[-1]["text"]
+
+
+def test_system_blocks_omit_sender_block_by_default():
+    """No sender_identity_block kwarg → byte-identical to pre-feature.
+
+    The back-compat guarantee for Salem / KAL-LE / Hypatia: the system
+    blocks end with the today-block (no sender block appended).
+    """
+    blocks = conversation._build_system_blocks(
+        "SYSTEM", "VAULT CTX",
+    )
+    # Today-block stays last — no sender block.
+    assert all(
+        "## Current message sender" not in b.get("text", "")
+        for b in blocks
+    )
+
+
+def test_system_blocks_append_sender_block_when_present():
+    """A sender_identity_block lands as the LAST (tail, uncached) block."""
+    sender = conversation._build_sender_identity_text("Ben", "ops")
+    blocks = conversation._build_system_blocks(
+        "SYSTEM", "VAULT CTX",
+        sender_identity_block=sender,
+    )
+    last = blocks[-1]
+    assert "## Current message sender" in last["text"]
+    assert "Ben" in last["text"]
+    # Tail position is uncached — most-volatile block.
+    assert "cache_control" not in last
+
+
+def test_system_blocks_sender_block_after_today_block():
+    """Sender block sits AFTER the today-block (cache-neutral tail)."""
+    sender = conversation._build_sender_identity_text("Andrew", "owner")
+    blocks = conversation._build_system_blocks(
+        "SYSTEM", "VAULT CTX",
+        sender_identity_block=sender,
+    )
+    texts = [b.get("text", "") for b in blocks]
+    today_idx = next(
+        i for i, t in enumerate(texts) if "Today" in t or "today" in t
+    )
+    sender_idx = next(
+        i for i, t in enumerate(texts) if "## Current message sender" in t
+    )
+    assert sender_idx > today_idx, (
+        "sender-identity block must come AFTER the today-block so it "
+        "doesn't invalidate any cache prefix"
+    )
+
+
+def test_system_blocks_dynamic_per_message():
+    """Different senders → different sender blocks (dynamic per-message).
+
+    Pins that the block is rebuilt per call rather than a static var:
+    two distinct senders produce two distinct tail blocks.
+    """
+    blocks_ben = conversation._build_system_blocks(
+        "SYSTEM", "VAULT CTX",
+        sender_identity_block=conversation._build_sender_identity_text(
+            "Ben", "ops",
+        ),
+    )
+    blocks_andrew = conversation._build_system_blocks(
+        "SYSTEM", "VAULT CTX",
+        sender_identity_block=conversation._build_sender_identity_text(
+            "Andrew", "owner",
+        ),
+    )
+    assert "Ben" in _last_block_text(blocks_ben)
+    assert "Andrew" in _last_block_text(blocks_andrew)
+    assert _last_block_text(blocks_ben) != _last_block_text(blocks_andrew)

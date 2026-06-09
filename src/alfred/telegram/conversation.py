@@ -1545,6 +1545,39 @@ def _build_today_block_text(
     )
 
 
+def _build_sender_identity_text(
+    user_name: str | None, user_role: str,
+) -> str:
+    """Render the per-message sender-identity block text.
+
+    VERA reporter follow-up (2026-06-09). Multi-user instances (VERA)
+    surface WHO sent the current message so the agent can attribute
+    per-message authorship — e.g. set a ticket's ``reporter`` field from
+    the actual sender rather than a hardcoded value.
+
+    The block names the sender (``user_name`` when configured, else the
+    role label as a fallback) AND the role, and instructs the agent to
+    attribute authorship to this sender for the current message only.
+    Sender CAN change per message in a shared chat, so this block is
+    rebuilt every turn (uncached tail position) — it is genuinely
+    dynamic-per-message, NOT a static SKILL template var.
+
+    Callers gate on ``user_name`` being non-None (see ``run_turn``): the
+    block is omitted entirely on single-user instances so their behaviour
+    is byte-identical. The role-fallback wording here is for the case
+    where a multi-user instance has a roster entry WITHOUT a name set.
+    """
+    who = user_name if user_name else f"the {user_role} user"
+    return (
+        "## Current message sender\n\n"
+        f"This message was sent by **{who}** (role: {user_role}). "
+        "When attributing authorship for THIS message — e.g. setting a "
+        "record's reporter/author field — use this sender. The sender "
+        "can change between messages in a shared chat, so re-read this "
+        "block each turn rather than assuming a fixed author."
+    )
+
+
 def _build_system_blocks(
     system_prompt: str,
     vault_context_str: str,
@@ -1552,6 +1585,7 @@ def _build_system_blocks(
     pushback_level: int | None = None,
     voice_preferences_block: str | None = None,
     *,
+    sender_identity_block: str | None = None,
     now: _dt.datetime | None = None,
     instance_timezone: str = _DEFAULT_INSTANCE_TIMEZONE,
 ) -> list[dict[str, Any]]:
@@ -1645,6 +1679,24 @@ def _build_system_blocks(
         "text": _build_today_block_text(now, instance_timezone),
         # Deliberately NO cache_control — see docstring.
     })
+
+    # Sender-identity block (VERA reporter follow-up 2026-06-09) — tail
+    # position, never cached. The sender CAN change per message in a
+    # shared multi-user chat, so this block is the MOST volatile of all
+    # (more volatile than today, which only rolls at midnight). Placing
+    # it AFTER the today-block (already uncached) is cache-neutral — no
+    # ephemeral breakpoint sits below it to invalidate. Omitted entirely
+    # when ``sender_identity_block`` is None (single-user instances pass
+    # None), so Salem / KAL-LE / Hypatia system blocks are byte-identical
+    # to before. Per ``feedback_intentionally_left_blank.md`` the absence
+    # is meaningful — a single-user instance has no per-message sender
+    # ambiguity to resolve.
+    if sender_identity_block:
+        blocks.append({
+            "type": "text",
+            "text": sender_identity_block,
+            # No cache_control — most-volatile block, see above.
+        })
     return blocks
 
 
@@ -3664,6 +3716,7 @@ async def run_turn(
     session_type: str | None = None,
     image_blocks: list[dict[str, Any]] | None = None,
     user_role: str = _OWNER_ROLE,
+    user_name: str | None = None,
 ) -> str:
     """Run one user turn through the model, handling tool_use internally.
 
@@ -3686,6 +3739,20 @@ async def run_turn(
     byte-identical. When present, the user turn is stored as a content-
     block list (image blocks first, then text) — the SDK accepts either
     shape on subsequent turns so the round-trip stays clean.
+
+    ``user_role`` (VERA MVP) is the sending user's role
+    (``"owner"`` / ``"ops"``) — threaded to ``_execute_tool`` →
+    ``resolve_scope`` for per-role vault scoping. Defaults to ``"owner"``
+    so single-user instances route exactly as before.
+
+    ``user_name`` (VERA reporter follow-up) is the sending user's
+    configured display name, used to build a per-message sender-identity
+    system block so the agent can attribute authorship (e.g. a ticket
+    ``reporter``). ``None`` — the default and the value on every
+    single-user / flat-list instance — omits the block entirely, leaving
+    the system blocks byte-identical to pre-feature behaviour. Dynamic
+    per-message: the block is rebuilt each turn because the sender can
+    change between turns in a shared chat.
 
     Returns the final assistant text. Tool-use blocks and their results are
     appended to the session transcript (so the next turn sees the full
@@ -3743,12 +3810,27 @@ async def run_turn(
         )
         voice_pref_block = None
 
+    # Sender-identity block (VERA reporter follow-up 2026-06-09). Built
+    # ONLY when the sending user has a configured display name —
+    # i.e. multi-user instances (VERA). Single-user instances pass
+    # ``user_name=None`` so this stays None and the block is omitted from
+    # the system blocks: byte-identical behaviour for Salem / KAL-LE /
+    # Hypatia. The block is dynamic per-message (sender can change between
+    # turns in a shared chat); ``_build_system_blocks`` places it in the
+    # uncached tail so per-message rebuilds don't churn the cache prefix.
+    sender_identity_block = (
+        _build_sender_identity_text(user_name, user_role)
+        if user_name
+        else None
+    )
+
     system_blocks = _build_system_blocks(
         system_prompt,
         vault_context_str,
         calibration_str=calibration_str,
         pushback_level=pushback_level,
         voice_preferences_block=voice_pref_block,
+        sender_identity_block=sender_identity_block,
     )
     vault_path = config.vault.path
     # Stage 3.5: pick the tool list per instance tool_set. Salem

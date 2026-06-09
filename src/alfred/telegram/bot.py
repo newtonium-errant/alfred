@@ -725,6 +725,17 @@ def _entry_role(entry: Any) -> str:
     return role if isinstance(role, str) and role else "owner"
 
 
+def _entry_name(entry: Any) -> str | None:
+    """Return the display name of an allowlist entry, or None.
+
+    VERA reporter follow-up (2026-06-09). ``AllowedUser`` → its ``.name``
+    (``None`` when unset); bare int (legacy / direct-construct fixtures)
+    → ``None``. See :func:`_entry_id`.
+    """
+    name = getattr(entry, "name", None)
+    return name if isinstance(name, str) and name else None
+
+
 def _is_allowed(update: Update, config: TalkerConfig) -> bool:
     """Return True iff the message's user_id is in config.allowed_users.
 
@@ -764,6 +775,30 @@ def _role_for(update: Update, config: TalkerConfig) -> str:
         if _entry_id(entry) == user.id:
             return _entry_role(entry)
     return "owner"
+
+
+def _name_for(update: Update, config: TalkerConfig) -> str | None:
+    """Return the sending user's configured display name, or None.
+
+    VERA reporter follow-up (2026-06-09). Looks up the message's user_id
+    in the allowlist and returns the entry's ``name`` (``AllowedUser.name``).
+    Returns ``None`` when the user is absent, unmatched, or matched but
+    nameless — every single-user / flat-list instance returns ``None`` for
+    every user (no name configured), so the downstream sender-identity
+    injection is inert there. The talker turn falls back to the role label
+    when this is ``None`` (see the sender-identity block in
+    ``conversation.run_turn``).
+
+    Tolerates both ``AllowedUser`` and bare-int entries via
+    :func:`_entry_id` / :func:`_entry_name`.
+    """
+    user = update.effective_user
+    if user is None:
+        return None
+    for entry in config.allowed_users or []:
+        if _entry_id(entry) == user.id:
+            return _entry_name(entry)
+    return None
 
 
 def _require_owner(update: Update, config: TalkerConfig, command: str) -> bool:
@@ -5649,6 +5684,13 @@ async def handle_message(
         # single-role instance this is always ``"owner"`` (flat allowlist
         # normalizes to owner), so the threaded value is inert there.
         user_role = _role_for(update, config)
+        # VERA reporter follow-up (2026-06-09): resolve the sending user's
+        # display name so the agent can attribute per-message authorship
+        # (e.g. set a ticket ``reporter`` from the actual sender). ``None``
+        # on every single-user / flat-list instance (no name configured),
+        # so the sender-identity block in run_turn is omitted there —
+        # byte-identical behaviour for Salem / KAL-LE / Hypatia.
+        user_name = _name_for(update, config)
         try:
             response_text = await conversation.run_turn(
                 client=client,
@@ -5668,6 +5710,7 @@ async def handle_message(
                 session_type=active_session_type,
                 image_blocks=image_blocks,
                 user_role=user_role,
+                user_name=user_name,
             )
         except anthropic.APIError as exc:
             log.warning(

@@ -42,10 +42,20 @@ class AllowedUser:
     ``role`` defaults to ``"owner"`` — the back-compat default. A bare-int
     entry (or any entry without an explicit role) is an owner, preserving
     full powers for every existing flat-allowlist instance.
+
+    ``name`` (VERA reporter follow-up, 2026-06-09) is the sender's display
+    name (e.g. ``"Andrew"``, ``"Ben"``), surfaced to the talker turn so
+    the agent can attribute per-message authorship — e.g. set a ticket's
+    ``reporter`` field from the actual sender rather than a hardcoded
+    value. Defaults to ``None``: bare-int and role-only entries carry no
+    name, and single-user instances never need one (the sender is always
+    the owner). When ``None`` the talker falls back to the role label (see
+    ``bot._name_for`` / the sender-identity block in ``conversation.py``).
     """
 
     id: int
     role: str = "owner"
+    name: str | None = None
 
 
 def _normalize_allowed_users(raw: Any) -> list[AllowedUser]:
@@ -82,7 +92,12 @@ def _normalize_allowed_users(raw: Any) -> list[AllowedUser]:
                 continue
             role = entry.get("role")
             role_str = role if isinstance(role, str) and role else "owner"
-            out.append(AllowedUser(id=uid, role=role_str))
+            # ``name`` (VERA reporter follow-up) — optional sender display
+            # name. Absent / empty / non-str → None (the back-compat
+            # default for bare-int + role-only entries).
+            name = entry.get("name")
+            name_str = name if isinstance(name, str) and name else None
+            out.append(AllowedUser(id=uid, role=role_str, name=name_str))
             continue
         # Unknown entry shape (str, list, None) — drop defensively.
     return out
