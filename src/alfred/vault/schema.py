@@ -426,6 +426,61 @@ _DEFINITIONS: list[TypeDefinition] = [
         available_in_scopes=frozenset({SCOPE_CANONICAL}),
     ),
 
+    # --- VERA scope extension (Ben's RRTS ops co-pilot) ----------------
+    #
+    # VERA MVP (2026-06-09, project_vera_ops_assistant.md) — trouble-ticket
+    # intake ONLY. Ben reports RRTS website bugs / improvement ideas via
+    # Telegram; VERA scopes them into a dev-ready ``ticket`` record whose
+    # body is a clean Claude-Code handoff brief (body format owned by the
+    # prompt-tuner's vault-vera SKILL; the frontmatter contract is here).
+    #
+    # ``available_in_scopes={"vera", "vera_ops"}`` — NOT canonical. This is
+    # the schema-side gate of the two-gate contract: ``_validate_type``
+    # accepts ``ticket`` only under the two VERA scopes and REJECTS it
+    # everywhere else (Salem / KAL-LE / Hypatia can't create tickets —
+    # correct per-instance isolation). The scope-side gate lives in
+    # ``vault/scope.py`` (``VERA_OPS_CREATE_TYPES`` / ``VERA_CREATE_TYPES``);
+    # keep the two in sync — drift surfaces as "type accepted by validator,
+    # rejected by scope" or vice versa (same failure class the kalle /
+    # hypatia comments warn about).
+    #
+    # Status set (operator-ratified 2026-06-09): ``open`` (new, default on
+    # create), ``in_progress`` (dev picked it up), ``resolved`` (fixed,
+    # pending verification), ``closed`` (done + verified), ``wont_fix``
+    # (triaged out). resolve/close are status edits, not moves/deletes —
+    # see the ``vera_ops`` scope's move/delete=False rules.
+    #
+    # Required fields (gate creation; all determinable by VERA itself from
+    # the interview + sender identity + the RRTS component list, so none
+    # demand technical knowledge from a non-technical reporter): ``title``
+    # (the name_field — short imperative summary), ``ticket_type``
+    # (bug | enhancement), ``reporter`` (who filed it), ``area`` (RRTS
+    # website component — free-text for P0 per Decision D; enum-later in
+    # P1 once the component list lands). priority / environment /
+    # screenshots and the body diagnostic fields (repro steps, expected /
+    # actual) are OPTIONAL-BUT-ELICITED — the SKILL interviews for them
+    # but the schema never gates on them. A ticket with
+    # ``environment: unknown`` and no repro steps is a valid, creatable
+    # ticket.
+    #
+    # ``name_field="title"`` — tickets are titled, not "name"d. Mirrors
+    # ``conversation`` / ``input`` using ``subject`` as their name field.
+    #
+    # ``is_leaf=True`` — tickets are terminal: nothing in the VERA vault
+    # links INTO a ticket, so zero inbound wikilinks is the norm, not an
+    # ORPHAN001 defect (same reasoning as note / run / the learning types).
+    TypeDefinition(
+        name="ticket",
+        directory="ticket",
+        statuses=frozenset({
+            "open", "in_progress", "resolved", "closed", "wont_fix",
+        }),
+        required_fields=("title", "ticket_type", "reporter", "area"),
+        name_field="title",
+        available_in_scopes=frozenset({"vera", "vera_ops"}),
+        is_leaf=True,
+    ),
+
     # --- KAL-LE scope extensions (``~/aftermath-lab/``) ----------------
     #
     # Stage 3.5: record types KAL-LE uses inside the aftermath-lab
@@ -885,9 +940,31 @@ KNOWN_TYPES_KALLE: set[str] = set(TYPE_REGISTRY.types_in_scope("kalle"))
 # adds its own scope extensions, add definitions to ``_DEFINITIONS``
 # with the new scope name in ``available_in_scopes`` — this dict
 # auto-populates from the registry.
+#
+# 2026-06-09 (VERA MVP): this dict is now ACTUALLY auto-populated from
+# every non-canonical scope any ``TypeDefinition`` tags, rather than a
+# hardcoded ``{"kalle", "hypatia"}`` literal. The prior literal silently
+# omitted ``vera`` / ``vera_ops`` even though the ``ticket`` TypeDefinition
+# tagged them — so ``_validate_type`` fell back to canonical KNOWN_TYPES
+# and rejected ``ticket`` creation under the VERA scopes (the type-gate
+# never consulted ``available_in_scopes``). Deriving the scope key set
+# from the registry closes that gap permanently: the comment above
+# ("auto-populates from the registry") is now true, and the NEXT
+# instance's scope-tagged types validate without touching this line.
+#
+# ``SCOPE_CANONICAL`` is excluded — it's the every-scope base set, not a
+# per-instance extension key. ``known_types(scope)`` already unions
+# canonical with the scope's tagged types, so each value is the full
+# valid set for that scope (matching the prior literal's shape).
+_EXTENSION_SCOPES: set[str] = {
+    s
+    for d in TYPE_REGISTRY
+    for s in d.available_in_scopes
+    if s != SCOPE_CANONICAL
+}
 KNOWN_TYPES_BY_SCOPE: dict[str, set[str]] = {
-    "kalle": set(TYPE_REGISTRY.known_types("kalle")),
-    "hypatia": set(TYPE_REGISTRY.known_types("hypatia")),
+    scope_name: set(TYPE_REGISTRY.known_types(scope_name))
+    for scope_name in _EXTENSION_SCOPES
 }
 
 
@@ -1114,6 +1191,13 @@ LIST_FIELDS: set[str] = {
     # Per-item value-list mutation is owned by ``alfred routine done``
     # in ``routine/cli.py`` — that code path stays unchanged.
     "items",
+    # Ticket (2026-06-09, VERA MVP). ``screenshots`` is a list of
+    # vault-relative image paths attached to a ticket. VERA writes it as
+    # a list, but an operator hand-edit (or a single-screenshot create)
+    # may drop the outer list shape (``screenshots: "ticket/img/foo.png"``);
+    # the scalar→list coerce collapses it to a one-element list at
+    # create/edit time.
+    "screenshots",
 }
 
 # Required fields for all records

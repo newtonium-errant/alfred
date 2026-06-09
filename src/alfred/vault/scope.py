@@ -608,6 +608,70 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
             "article": True,
         },
     },
+    # --- VERA (Ben's RRTS ops co-pilot — first multi-user instance) ----
+    #
+    # VERA MVP (2026-06-09, project_vera_ops_assistant.md) is the first
+    # instance where vault scope depends on the SENDING USER's role, not
+    # just the instance. Both Andrew (owner) and Ben (ops) hit the same
+    # VERA daemon / same ``tool_set: vera``, but route to DIFFERENT scopes
+    # via ``conversation.resolve_scope(tool_set, role)``:
+    #   * owner (Andrew) → ``vera`` scope (broader — ticket + note)
+    #   * ops   (Ben)    → ``vera_ops`` scope (ticket-type ONLY, full ops)
+    #
+    # ``vera_ops`` — Ben's scope. Full ops on the ticket queue
+    # (create / read / search / list / context / edit), where resolve +
+    # close are status edits riding on ``edit: True`` (set ``status:
+    # resolved | closed``). Locked OUT of non-ticket vault writes by the
+    # ``vera_ops_types_only`` create gate, and out of move / delete
+    # (Decision B, ratified): a resolved/closed ticket is a status flip,
+    # never a relocation or a destruction of queue history. This is the
+    # load-bearing half of the memo's "can't recode the instance"
+    # guarantee (the command-layer ops gate in bot.py is the first,
+    # UX-facing fence; THIS scope is the security fence).
+    "vera_ops": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": "vera_ops_types_only",   # → VERA_OPS_CREATE_TYPES = {ticket}
+        # resolve/close = status edit (``status: resolved|closed``); full
+        # ops field edits on ticket records. No field allowlist — ops owns
+        # the whole ticket record's frontmatter.
+        "edit": True,
+        # Decision B (ratified): both False. Resolution is a status flip,
+        # not a move/delete. Ben can never relocate a ticket out of
+        # ``ticket/`` or destroy queue history.
+        "move": False,
+        "delete": False,
+        # VERA writes the Claude-Code brief body at ticket-create time.
+        "allow_body_writes": True,
+        # Ops doesn't patch briefs mid-doc or rewrite them wholesale in
+        # MVP — only owner (vera scope) does. Empty allowlists deny both.
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
+    # ``vera`` — Andrew's (owner) scope on the VERA vault. Broader than
+    # ``vera_ops``: owner may create ``ticket`` AND ``note`` (Decision C,
+    # ratified — note for Andrew's own scratch/review jottings in the
+    # VERA vault), and may patch / rewrite ticket + note bodies. Move +
+    # delete stay denied for P1 (parity with hypatia's "owner deletes via
+    # filesystem" posture; widen later if a real workflow needs it).
+    "vera": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": "vera_owner_types_only",  # → VERA_CREATE_TYPES = {ticket, note}
+        "edit": True,
+        "move": False,
+        "delete": False,
+        "allow_body_writes": True,
+        # Owner may anchored-insert + full-rewrite ticket + note bodies
+        # (e.g. refine a Claude-Code brief, restructure a scratch note).
+        # ``ticket`` is NOT in _BODY_MUTATE_DENIED_TYPES, so these fire.
+        "allow_body_insert_at": {"ticket": True, "note": True},
+        "allow_body_replace": {"ticket": True, "note": True},
+    },
     # Migration scope — one-shot operational scripts under
     # ``scripts/migrate_*.py`` that perform schema rewrites against the
     # LIVE vault. NOT a daemon scope: this scope is never assigned to a
@@ -1057,6 +1121,27 @@ MIGRATION_CREATE_TYPES: set[str] = {
 }
 
 
+# VERA create allowlists (2026-06-09, VERA MVP). Two sets — one per role.
+# Keep ``ticket`` in sync with the ``available_in_scopes={"vera",
+# "vera_ops"}`` tag on the ``ticket`` TypeDefinition in schema.py — drift
+# between the two surfaces as "type accepted by validator, rejected by
+# scope" or vice versa (same failure class the kalle / hypatia create
+# sets warn about).
+#
+# ``VERA_OPS_CREATE_TYPES`` — Ben's (ops) create surface: ``ticket`` ONLY.
+# This is the schema-narrowing half of the "can't recode the instance"
+# guarantee. ``ticket`` is NOT in CANONICAL_RECORD_TYPES, so no
+# propose-flow guard fires (VERA owns its own tickets; there's no peer
+# Salem to propose to in MVP).
+VERA_OPS_CREATE_TYPES: set[str] = {"ticket"}
+
+# ``VERA_CREATE_TYPES`` — Andrew's (owner) create surface: ``ticket`` plus
+# ``note`` (Decision C, ratified — owner scratch/review jottings in the
+# VERA vault). Deliberately NOT the canonical person/org/event set: VERA's
+# zero-PHI vault doesn't model RRTS entities in MVP.
+VERA_CREATE_TYPES: set[str] = {"ticket", "note"}
+
+
 # Canonical record types — the ones Salem owns as authoritative source-
 # of-truth for entity identity + time. Phase A inter-instance comms
 # (2026-05-01) explicitly carves these out from peer-instance
@@ -1367,6 +1452,34 @@ def check_scope(
             raise ScopeError(
                 f"Scope '{scope}' can only create hypatia types "
                 f"({', '.join(sorted(HYPATIA_CREATE_TYPES))}). Got: '{record_type}'"
+            )
+        return
+
+    if permission == "vera_ops_types_only":
+        # VERA MVP (2026-06-09) — Ben's (ops) create gate. Ticket-type
+        # ONLY. No canonical-type propose hint (VERA owns its own
+        # tickets; there's no peer Salem to propose to in MVP), so this
+        # branch is simpler than the kalle / hypatia ones above. The
+        # narrow allowlist is the schema-side enforcement of "Ben can't
+        # write non-ticket records."
+        if record_type not in VERA_OPS_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create vera-ops types "
+                f"({', '.join(sorted(VERA_OPS_CREATE_TYPES))}). "
+                f"Got: '{record_type}'. The ops role is locked to the "
+                f"ticket queue; non-ticket vault writes are owner-only."
+            )
+        return
+
+    if permission == "vera_owner_types_only":
+        # VERA MVP (2026-06-09) — Andrew's (owner) create gate. Ticket +
+        # note (Decision C). Same shape as the ops gate above, broader
+        # allowlist. No canonical-type propose hint for the same reason.
+        if record_type not in VERA_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create vera types "
+                f"({', '.join(sorted(VERA_CREATE_TYPES))}). "
+                f"Got: '{record_type}'"
             )
         return
 

@@ -402,9 +402,13 @@ async def run(
                 # + telegram user. Receives Salem→peer resolution
                 # dispatches and runs the action plan locally.
                 from alfred.pending_items.executor import resolve_local_item
-                resolver_user_id = (
+                # VERA MVP: allowed_users entries are AllowedUser(id, role);
+                # ``getattr(..., "id", entry)`` tolerates a bare-int entry
+                # from a direct-construct fixture (falls back to the int).
+                _first_user = (
                     config.allowed_users[0] if config.allowed_users else 0
                 )
+                resolver_user_id = getattr(_first_user, "id", _first_user)
                 _pending_queue_path = pending_items_config.queue_path
                 _pending_vault_path = Path(config.vault.path)
 
@@ -992,8 +996,13 @@ async def run(
             ),
             name="transport-server",
         )
-        scheduler_user_id = (
+        # VERA MVP: tolerate AllowedUser or bare-int entry (see the
+        # pending-items resolver site above for the getattr rationale).
+        _sched_first_user = (
             config.allowed_users[0] if config.allowed_users else 0
+        )
+        scheduler_user_id = getattr(
+            _sched_first_user, "id", _sched_first_user,
         )
         if scheduler_user_id:
             scheduler_task = asyncio.create_task(

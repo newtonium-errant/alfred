@@ -21,6 +21,7 @@ session record. We stash these immediately after ``open_session``.
 from __future__ import annotations
 
 import asyncio
+import functools
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -696,13 +697,134 @@ async def _send_outbound_chunked(
 # --- Allowlist helper -----------------------------------------------------
 
 
+def _entry_id(entry: Any) -> int | None:
+    """Return the user id of an allowlist entry, tolerating both shapes.
+
+    VERA MVP (2026-06-09) — ``config.allowed_users`` is normally
+    ``list[AllowedUser]`` (the loader coerces all YAML into that), but
+    test fixtures and other direct ``TalkerConfig(...)`` constructors
+    sometimes pass bare ints (the pre-VERA shape). Accept either: an
+    ``AllowedUser`` (read ``.id``), or a bare int. Returns ``None`` for
+    anything else (bool / malformed), which the caller skips.
+    """
+    if isinstance(entry, bool):
+        return None
+    if isinstance(entry, int):
+        return entry
+    eid = getattr(entry, "id", None)
+    return eid if isinstance(eid, int) and not isinstance(eid, bool) else None
+
+
+def _entry_role(entry: Any) -> str:
+    """Return the role of an allowlist entry, tolerating both shapes.
+
+    ``AllowedUser`` → its ``.role``; bare int (legacy / direct-construct
+    fixtures) → ``"owner"`` (back-compat default). See :func:`_entry_id`.
+    """
+    role = getattr(entry, "role", None)
+    return role if isinstance(role, str) and role else "owner"
+
+
 def _is_allowed(update: Update, config: TalkerConfig) -> bool:
-    """Return True iff the message's user_id is in config.allowed_users."""
+    """Return True iff the message's user_id is in config.allowed_users.
+
+    ``config.allowed_users`` is ``list[AllowedUser]`` (VERA MVP, 2026-06-09).
+    Flat-list instances (Salem / KAL-LE / Hypatia) normalize their bare-int
+    YAML to ``AllowedUser(id, "owner")`` at load time, so the id-set match
+    here is byte-equivalent to the pre-VERA ``user.id in allowed`` check.
+    ``_entry_id`` tolerates direct-construct fixtures that still pass bare
+    ints in the field.
+    """
     user = update.effective_user
     if user is None:
         return False
     allowed = config.allowed_users or []
-    return user.id in allowed
+    ids = {eid for eid in (_entry_id(e) for e in allowed) if eid is not None}
+    return user.id in ids
+
+
+def _role_for(update: Update, config: TalkerConfig) -> str:
+    """Return the sending user's role (``"owner"`` / ``"ops"`` / ...).
+
+    VERA MVP (2026-06-09). Looks up the message's user_id in the
+    role-bearing allowlist and returns its role. Defaults to ``"owner"``
+    when the user is absent OR allowed-but-unmatched — back-compat: a
+    flat-list instance whose entries all normalize to ``"owner"`` returns
+    ``"owner"`` for every allowed user, exactly the pre-VERA behaviour
+    (full owner powers). Callers should still gate on :func:`_is_allowed`
+    first; this only resolves the role of an already-allowed user.
+
+    Tolerates both ``AllowedUser`` and bare-int entries via
+    :func:`_entry_id` / :func:`_entry_role`.
+    """
+    user = update.effective_user
+    if user is None:
+        return "owner"
+    for entry in config.allowed_users or []:
+        if _entry_id(entry) == user.id:
+            return _entry_role(entry)
+    return "owner"
+
+
+def _require_owner(update: Update, config: TalkerConfig, command: str) -> bool:
+    """Return True iff the sending user has the ``owner`` role.
+
+    VERA MVP (2026-06-09) — the command-layer half of the two-layer
+    "Ben can't recode the instance" guarantee. This is an ADDITIVE gate:
+    owner-only command handlers call it AFTER the existing
+    :func:`_is_allowed` check. On deny it logs ``talker.bot.role_denied``
+    (mirroring the silent-drop shape of the ``talker.bot.unauthorized``
+    path) and returns False so the handler returns without acting.
+
+    Non-owner-gated commands are unaffected. On every single-role instance
+    (Salem / KAL-LE / Hypatia) every allowed user is ``owner``, so this
+    always returns True there — no behaviour change.
+    """
+    role = _role_for(update, config)
+    if role == "owner":
+        return True
+    log.info(
+        "talker.bot.role_denied",
+        user_id=update.effective_user.id if update.effective_user else None,
+        command=command,
+        role=role,
+    )
+    return False
+
+
+def owner_only(handler: Callable[..., Any]) -> Callable[..., Any]:
+    """Decorator — gate a command handler to the ``owner`` role.
+
+    VERA MVP (2026-06-09) — applied to owner-only command handlers
+    (calibration, model/session control, brief/today/status). Wraps the
+    ``(update, ctx)`` handler: reads config off ``ctx.application.bot_data``,
+    runs :func:`_require_owner`, and on deny returns WITHOUT invoking the
+    wrapped handler (silent-drop shape — the ops user simply gets no
+    response, matching the unauthorized-path UX).
+
+    Applied at the def site so it covers BOTH dispatch paths in one place:
+    the PTB ``CommandHandler`` registration AND the inline ``_dispatch_
+    inline_command`` map (both reference the same ``on_*`` symbol).
+
+    Inert on single-role instances — every allowed user there is
+    ``owner``, so the wrapper always falls through to the real handler.
+
+    ``_is_allowed`` is NOT re-checked here: every gated handler retains
+    its own ``_is_allowed`` check as the first fence, and this decorator
+    adds the role fence on top. An unauthorized non-allowlisted user is
+    dropped by the handler's own ``_is_allowed`` exactly as before; an
+    allowed-but-ops user is dropped by ``_require_owner`` here.
+    """
+
+    @functools.wraps(handler)
+    async def _wrapped(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
+        command = getattr(handler, "__name__", "owner_only_command")
+        if not _require_owner(update, config, command):
+            return
+        await handler(update, ctx)
+
+    return _wrapped
 
 
 # --- Commands -------------------------------------------------------------
@@ -727,6 +849,7 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@owner_only
 async def on_recap(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/recap — mid-session structured summary on an OPEN capture session.
 
@@ -975,6 +1098,7 @@ async def on_research_pointers(
 # leave the block absent and Telegram's unknown-command behaviour fires.
 
 
+@owner_only
 async def on_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """``/today`` — glance-view mini-brief (tier + routines + upcoming).
 
@@ -1507,6 +1631,7 @@ async def _stamp_extract_target_override_on_active(
     return True
 
 
+@owner_only
 async def on_end_zettel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/end-zettel — close session with operator override forcing
     ``zettel/`` extraction target regardless of source-anchor state.
@@ -1545,6 +1670,7 @@ async def on_end_zettel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await on_end(update, ctx)
 
 
+@owner_only
 async def on_end_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/end-note — close session with operator override forcing
     ``note/`` extraction target regardless of source-anchor state.
@@ -1562,6 +1688,7 @@ async def on_end_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await on_end(update, ctx)
 
 
+@owner_only
 async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/end — explicitly close the current session, return vault record path.
 
@@ -1855,6 +1982,7 @@ def _switch_model(
     return f"switched to {label}."
 
 
+@owner_only
 async def on_opus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """``/opus`` — switch the active session to the Opus model.
 
@@ -1914,6 +2042,7 @@ async def on_opus(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(reply)
 
 
+@owner_only
 async def on_no_auto_escalate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """``/no-auto-escalate`` — suppress the implicit-escalation offer for this session.
 
@@ -1947,6 +2076,7 @@ async def on_no_auto_escalate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("auto-escalate off for this session.")
 
 
+@owner_only
 async def on_sonnet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """``/sonnet`` — switch the active session to the Sonnet model."""
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
@@ -1981,6 +2111,7 @@ async def on_sonnet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(reply)
 
 
+@owner_only
 async def on_extract(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/extract <short-id> — extract standalone notes from a capture session.
 
@@ -2079,6 +2210,7 @@ async def on_extract(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@owner_only
 async def on_brief(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/brief <short-id> — audio summary via ElevenLabs.
 
@@ -2261,6 +2393,7 @@ async def on_brief(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+@owner_only
 async def on_speed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """``/speed [value | default]`` — manage per-instance TTS speed preference.
 
@@ -3467,6 +3600,7 @@ def _resolve_queue_path(config: TalkerConfig) -> Path:
 # --- Daily Sync slash commands (email-surfacing c2) -----------------------
 
 
+@owner_only
 async def on_calibrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """``/calibrate`` — fire a fresh Daily Sync sample out of cycle.
 
@@ -3500,7 +3634,9 @@ async def on_calibrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    user_id = config.allowed_users[0] if config.allowed_users else 0
+    user_id = (
+        _entry_id(config.allowed_users[0]) if config.allowed_users else 0
+    ) or 0
     if not user_id:
         await update.message.reply_text(
             "No primary Telegram user configured — can't dispatch."
@@ -3541,6 +3677,7 @@ async def on_calibrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # they'll see it as a separate message and can reply to it.
 
 
+@owner_only
 async def on_calibration_ok(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """``/calibration_ok [tier [value]]`` — manage per-tier surfacing confidence flags.
 
@@ -3692,6 +3829,7 @@ def _parse_short_id_arg(text: str, args: Any) -> str:
     return ""
 
 
+@owner_only
 async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/status — debug helper: active session count, turn count, last-message age."""
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
@@ -5505,6 +5643,12 @@ async def handle_message(
                     kind=meta.get("kind", "pdf"),
                 )
 
+        # VERA MVP (2026-06-09): resolve the sending user's role so the
+        # vault-tool dispatcher (``_execute_tool`` → ``resolve_scope``)
+        # routes ops users to ``vera_ops`` and owners to ``vera``. On every
+        # single-role instance this is always ``"owner"`` (flat allowlist
+        # normalizes to owner), so the threaded value is inert there.
+        user_role = _role_for(update, config)
         try:
             response_text = await conversation.run_turn(
                 client=client,
@@ -5523,6 +5667,7 @@ async def handle_message(
                 pushback_level=pushback_level,
                 session_type=active_session_type,
                 image_blocks=image_blocks,
+                user_role=user_role,
             )
         except anthropic.APIError as exc:
             log.warning(

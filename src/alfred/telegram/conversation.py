@@ -2940,6 +2940,41 @@ def _detect_truncated_tool_input(
     }
 
 
+# --- Role-aware scope resolution (VERA MVP, 2026-06-09) --------------------
+#
+# VERA is the first multi-user instance: Andrew (owner) and Ben (ops) hit
+# the same daemon / same ``tool_set: vera`` but must route to DIFFERENT
+# vault scopes. Every other instance is single-role — scope is a pure
+# function of ``tool_set`` and ``role`` is ignored.
+#
+# This helper is the ONE cross-cutting keystone change ratified in the P0
+# matrix (Decision A). It branches ONLY for ``tool_set == "vera"``; for
+# every existing instance it returns ``tool_set`` unchanged, so Salem /
+# KAL-LE / Hypatia behaviour is byte-identical to before (the previous
+# inline ``active_scope = config.instance.tool_set or "talker"``).
+_OWNER_ROLE = "owner"
+_OPS_ROLE = "ops"
+
+
+def resolve_scope(tool_set: str, role: str) -> str:
+    """Map ``(tool_set, role)`` → vault scope name.
+
+    VERA-only role split: ``vera`` tool_set routes owner → ``vera`` scope,
+    any non-owner role → ``vera_ops`` scope. Every other tool_set is
+    role-independent and returns unchanged (single-role instances).
+
+    ``tool_set`` empty / falsy → ``"talker"`` (Salem's legacy default,
+    preserved from the pre-VERA inline resolution). ``role`` empty / falsy
+    is treated as owner (back-compat: a flat-allowlist instance whose
+    users carry no explicit role default to owner — see
+    ``config.AllowedUser`` and ``bot._role_for``).
+    """
+    ts = tool_set or "talker"
+    if ts == "vera":
+        return "vera" if (role or _OWNER_ROLE) == _OWNER_ROLE else "vera_ops"
+    return ts
+
+
 async def _execute_tool(
     tool_name: str,
     tool_input: dict[str, Any],
@@ -2947,6 +2982,7 @@ async def _execute_tool(
     state: StateManager,
     session: Session,
     config: TalkerConfig | None = None,
+    user_role: str = _OWNER_ROLE,
 ) -> str:
     """Execute one tool_use block and return JSON-stringified result.
 
@@ -2959,6 +2995,13 @@ async def _execute_tool(
     :class:`TalkerConfig`. Kept optional for backwards compatibility with
     callers that predate bash_exec; when ``None`` the bash_exec branch
     refuses with a clear error rather than crashing.
+
+    ``user_role`` (VERA MVP, 2026-06-09) is the sending Telegram user's
+    role (``"owner"`` / ``"ops"``), plumbed from the bot dispatch via
+    ``run_turn``. Combined with the instance ``tool_set`` by
+    :func:`resolve_scope` to pick the vault scope. Defaults to ``"owner"``
+    so single-role callers (every instance except VERA) and legacy test
+    callers route exactly as before.
     """
     from pathlib import Path
 
@@ -3044,21 +3087,28 @@ async def _execute_tool(
 
     vault_path_obj = Path(vault_path)
 
-    # Per-instance scope routing. Without this, every bot (Salem, KAL-LE,
-    # Hypatia) routed through ``check_scope("talker", ...)`` and Hypatia
-    # ``document`` / KAL-LE ``pattern`` creates were rejected at
-    # ``talker_types_only`` BEFORE the scope-aware ``_validate_type`` gate
-    # in ops.py ever engaged. The config's ``instance.tool_set`` is the
-    # source of truth — it's already used to pick the tool schema in
+    # Per-instance, per-role scope routing. Without this, every bot
+    # (Salem, KAL-LE, Hypatia) routed through ``check_scope("talker", ...)``
+    # and Hypatia ``document`` / KAL-LE ``pattern`` creates were rejected
+    # at ``talker_types_only`` BEFORE the scope-aware ``_validate_type``
+    # gate in ops.py ever engaged. The config's ``instance.tool_set`` is
+    # the source of truth — it's already used to pick the tool schema in
     # ``tools_for_set`` (KAL-LE → bash_exec, Salem/Hypatia → vault-only)
     # so reusing it for scope dispatch keeps the contract consistent.
-    # Default ``"talker"`` preserves Salem behavior when ``config`` is
-    # ``None`` (legacy callers, tests that skip the config plumb-through).
-    active_scope = (
+    #
+    # VERA MVP (2026-06-09): scope is now a function of (tool_set, role),
+    # not tool_set alone — VERA is the first instance where the sending
+    # user's role splits the scope (owner → ``vera``, ops → ``vera_ops``).
+    # ``resolve_scope`` branches ONLY for ``tool_set == "vera"``; every
+    # other instance is role-independent and resolves to ``tool_set``
+    # unchanged (``"talker"`` when ``config`` is None — legacy callers,
+    # tests that skip the config plumb-through).
+    tool_set = (
         config.instance.tool_set
         if config and config.instance and config.instance.tool_set
         else "talker"
     )
+    active_scope = resolve_scope(tool_set, user_role)
 
     # Scope enforcement — the scope check happens BEFORE the op so we never
     # attempt a denied mutation.
@@ -3613,6 +3663,7 @@ async def run_turn(
     pushback_level: int | None = None,
     session_type: str | None = None,
     image_blocks: list[dict[str, Any]] | None = None,
+    user_role: str = _OWNER_ROLE,
 ) -> str:
     """Run one user turn through the model, handling tool_use internally.
 
@@ -3931,6 +3982,7 @@ async def run_turn(
                         state,
                         session,
                         config=config,
+                        user_role=user_role,
                     )
                     is_error = False
                 except asyncio.CancelledError:

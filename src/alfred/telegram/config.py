@@ -28,6 +28,66 @@ def _substitute_env(value: Any) -> Any:
 
 # --- Dataclasses ---
 
+
+@dataclass
+class AllowedUser:
+    """One entry in the ``allowed_users`` allowlist, with an optional role.
+
+    VERA MVP (2026-06-09) — VERA is the first multi-user instance, so the
+    allowlist must carry a per-user role (``owner`` vs ``ops``). Existing
+    single-role instances (Salem, KAL-LE, Hypatia) ship a flat list of
+    bare ints; the loader normalizes those to ``AllowedUser(id, "owner")``
+    so their behaviour is unchanged.
+
+    ``role`` defaults to ``"owner"`` — the back-compat default. A bare-int
+    entry (or any entry without an explicit role) is an owner, preserving
+    full powers for every existing flat-allowlist instance.
+    """
+
+    id: int
+    role: str = "owner"
+
+
+def _normalize_allowed_users(raw: Any) -> list[AllowedUser]:
+    """Coerce a mixed ``allowed_users`` list into ``list[AllowedUser]``.
+
+    Accepts BOTH shapes in the same list (back-compat by construction):
+
+      * bare int ``123`` → ``AllowedUser(123, "owner")`` (flat-list
+        instances — Salem / KAL-LE / Hypatia — keep owner powers).
+      * dict ``{id: 222, role: ops}`` → ``AllowedUser(222, "ops")``
+        (VERA's role-bearing entries).
+
+    A dict missing ``role`` defaults to ``"owner"`` (same back-compat
+    default as a bare int). Entries with a non-int / missing ``id`` are
+    dropped (defensive against malformed YAML) rather than crashing the
+    whole config load — a single bad allowlist row shouldn't take the
+    daemon down. Bare ints that are actually booleans (YAML ``true`` →
+    Python ``True`` is an ``int`` subclass) are dropped too.
+    """
+    if not raw:
+        return []
+    out: list[AllowedUser] = []
+    for entry in raw:
+        if isinstance(entry, bool):
+            # YAML ``true`` parses as Python ``True`` (an int subclass) —
+            # never a valid user id; drop it.
+            continue
+        if isinstance(entry, int):
+            out.append(AllowedUser(id=entry, role="owner"))
+            continue
+        if isinstance(entry, dict):
+            uid = entry.get("id")
+            if isinstance(uid, bool) or not isinstance(uid, int):
+                continue
+            role = entry.get("role")
+            role_str = role if isinstance(role, str) and role else "owner"
+            out.append(AllowedUser(id=uid, role=role_str))
+            continue
+        # Unknown entry shape (str, list, None) — drop defensively.
+    return out
+
+
 @dataclass
 class VaultConfig:
     path: str = ""
@@ -409,7 +469,11 @@ class BashExecConfig:
 @dataclass
 class TalkerConfig:
     bot_token: str = ""
-    allowed_users: list[int] = field(default_factory=list)
+    # VERA MVP (2026-06-09): role-bearing allowlist. Each entry is an
+    # ``AllowedUser(id, role)``; the loader normalizes bare-int YAML
+    # entries (Salem / KAL-LE / Hypatia flat lists) to role ``"owner"``.
+    # See ``_normalize_allowed_users`` + ``AllowedUser``.
+    allowed_users: list[AllowedUser] = field(default_factory=list)
     primary_users: list[str] = field(default_factory=list)
     anthropic: AnthropicConfig = field(default_factory=AnthropicConfig)
     stt: STTConfig = field(default_factory=STTConfig)
@@ -549,7 +613,14 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
     tts_raw = tool.get("tts")
     built = _build(TalkerConfig, {
         "bot_token": tool.get("bot_token", ""),
-        "allowed_users": tool.get("allowed_users", []) or [],
+        # VERA MVP: normalize the mixed (bare-int OR role-dict) allowlist
+        # into list[AllowedUser] BEFORE _build. _build assigns it directly
+        # (allowed_users isn't a _DATACLASS_MAP key and the value is a
+        # list, not a dict, so no recursion fires). Bare-int entries
+        # become role "owner" — back-compat for flat-list instances.
+        "allowed_users": _normalize_allowed_users(
+            tool.get("allowed_users", []) or []
+        ),
         "primary_users": tool.get("primary_users", []) or [],
         "anthropic": tool.get("anthropic", {}) or {},
         "stt": tool.get("stt", {}) or {},
