@@ -374,3 +374,94 @@ async def test_vera_default_role_is_owner_when_unset(tmp_path):
     parsed = json.loads(result)
     assert "error" not in parsed, parsed
     assert parsed["path"].startswith("note/"), parsed
+
+
+# ---------------------------------------------------------------------------
+# owner_only decorator — end-to-end gate (code-review Nit 2)
+# ---------------------------------------------------------------------------
+#
+# The direct unit tests above cover _require_owner / _role_for / _is_allowed
+# in isolation. ``owner_only`` is the actual production gate wrapping the
+# owner-only command handlers — it reads config off
+# ``ctx.application.bot_data[_KEY_CONFIG]`` and drops the call for a
+# non-owner BEFORE the wrapped handler runs. These tests drive that
+# decorator path end-to-end (security-relevant: this is what keeps an
+# ``ops`` user out of /calibrate, /brief, /status, etc.).
+
+
+def _fake_ctx(config: TalkerConfig) -> SimpleNamespace:
+    """Minimal ContextTypes stand-in carrying config under _KEY_CONFIG.
+
+    Mirrors the shape ``owner_only._wrapped`` reads:
+    ``ctx.application.bot_data[_KEY_CONFIG]``.
+    """
+    return SimpleNamespace(
+        application=SimpleNamespace(bot_data={bot._KEY_CONFIG: config}),
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_only_decorator_blocks_ops_user(tmp_path):
+    """ops user → decorated handler's inner body is NOT invoked (silent drop)."""
+    config = _make_vera_config(tmp_path)  # 111=owner, 222=ops
+
+    calls: list[str] = []
+
+    @bot.owner_only
+    async def fake_handler(update, ctx) -> None:
+        calls.append("ran")
+
+    await fake_handler(_update_from_user(222), _fake_ctx(config))
+
+    # The inner handler must NOT have run — the decorator dropped it.
+    assert calls == [], (
+        "owner_only let an ops user through to the wrapped handler"
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_only_decorator_allows_owner_user(tmp_path):
+    """owner user → decorated handler's inner body IS invoked."""
+    config = _make_vera_config(tmp_path)  # 111=owner, 222=ops
+
+    calls: list[str] = []
+
+    @bot.owner_only
+    async def fake_handler(update, ctx) -> None:
+        calls.append("ran")
+
+    await fake_handler(_update_from_user(111), _fake_ctx(config))
+
+    # The inner handler ran exactly once for the owner.
+    assert calls == ["ran"], (
+        "owner_only failed to invoke the wrapped handler for an owner user"
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_only_on_status_blocks_ops_via_decorator(tmp_path):
+    """End-to-end through the SHIPPED decorated handler ``on_status``.
+
+    Pins that ``on_status`` is actually wrapped by ``owner_only`` (not
+    just that the decorator works on a synthetic handler): an ops user
+    hitting /status gets dropped before the handler's body runs. We
+    assert via the role-deny log emission rather than a reply, since
+    the handler short-circuits before any ``update.message`` access —
+    so a bare SimpleNamespace update (no .message) is safe here.
+    """
+    import structlog
+
+    config = _make_vera_config(tmp_path)  # 222 = ops
+    with structlog.testing.capture_logs() as captured:
+        await bot.on_status(_update_from_user(222), _fake_ctx(config))
+
+    denied = [
+        c for c in captured
+        if c.get("event") == "talker.bot.role_denied"
+    ]
+    assert len(denied) == 1, (
+        f"expected on_status to drop an ops user via owner_only "
+        f"(role_denied log); captured={[c.get('event') for c in captured]!r}"
+    )
+    assert denied[0]["role"] == "ops"
+    assert denied[0]["command"] == "on_status"
