@@ -272,6 +272,51 @@ async def test_fire_once_assembles_and_pushes(
 
 
 @pytest.mark.asyncio
+async def test_fire_once_default_source_is_git_activity_digest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """VERA-P2 regression guard: a config WITHOUT ``source`` produces the
+    KAL-LE git-activity digest, byte-identically to pre-P2.
+
+    The assembler-source parameterization (VERA P2) defaults to
+    ``git_activity`` — KAL-LE's config omits the key, so its digest path
+    must be unchanged. Pins that the default still carries KAL-LE's
+    ``**Yesterday:**`` / ``**Posture:**`` markers and that ``source``
+    defaults correctly on a bare ``BriefDigestPushConfig``.
+    """
+    captured_pushes: list[dict[str, Any]] = []
+
+    async def _fake_send(
+        peer_name: str, *, digest_markdown: str, digest_date: str,
+        self_name: str, config: TransportConfig | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        captured_pushes.append({"digest_markdown": digest_markdown})
+        return {"status": "accepted", "path": "x", "correlation_id": "c"}
+
+    import alfred.brief.kalle_brief_daemon as daemon_mod
+    monkeypatch.setattr(daemon_mod, "peer_send_brief_digest", _fake_send)
+
+    data_dir = _make_data_dir(tmp_path)
+    # Note: NO source= passed → defaults to "git_activity".
+    config = BriefDigestPushConfig(
+        enabled=True, self_name="kal-le", target_peer="salem",
+        repo_paths=[], data_dir=str(data_dir),
+    )
+    assert config.source == "git_activity"  # default pin
+
+    result = await fire_once(
+        config, TransportConfig(peers={"salem": PeerEntry(base_url="http://x", token="t")}),
+        today=date(2026, 4, 23),
+    )
+    assert result["ok"] is True
+    md = captured_pushes[0]["digest_markdown"]
+    # KAL-LE digest markers — unchanged by the source parameterization.
+    assert "**Yesterday:**" in md
+    assert "**Posture:**" in md
+
+
+@pytest.mark.asyncio
 async def test_fire_once_transport_failure_swallowed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
