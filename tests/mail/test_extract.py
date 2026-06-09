@@ -265,3 +265,53 @@ def test_invisible_chars_re_pattern_covers_all_documented_codepoints() -> None:
 def test_invisible_chars_re_includes_standard_whitespace() -> None:
     body = " \t\n\r"
     assert extract.INVISIBLE_CHARS_RE.sub("", body) == ""
+
+
+# ---------------------------------------------------------------------------
+# KNOWN/DEFERRED: cause-class 4 (HTML-drops-URLs)
+# ---------------------------------------------------------------------------
+# strip_html keeps anchor TEXT but discards the href URL for any email
+# whose visible text exceeds MIN_BODY_CHARS (the synth path never fires,
+# so extract_links — which DOES preserve URLs — is never consulted).
+# This is the 4th documented cause-class in the empty-body arc memo
+# (project_email_empty_body_pipeline.md) — content-bearing-but-lossy, a
+# distinct surface from empty-body. Fixing it changes every email's body
+# output and needs a parity re-pin, so it is DEFERRED to its own arc.
+# These fixtures pin the CURRENT (lossy) behavior so the deferral is
+# visible and a future fix-arc has a regression baseline to flip. When
+# that arc lands and URL-preservation ships, these two assertions flip
+# from "not in" to "in" — that's the signal the deferral closed.
+
+
+def test_strip_html_drops_href_url_keeps_anchor_text_KNOWN_DEFERRED() -> None:
+    """KNOWN/DEFERRED cause-class 4: strip_html drops the href, keeps text."""
+    html = (
+        "<p>Read our full report on the quarterly numbers and the outlook "
+        "for next year over at "
+        '<a href="https://example.com/q3-report">our blog</a> today.</p>'
+    )
+    result = extract.strip_html(html)
+    # Anchor text survives the strip.
+    assert "our blog" in result
+    # URL is dropped — DEFERRED behavior, not a bug to fix in this arc.
+    assert "https://example.com/q3-report" not in result
+
+
+def test_strip_html_url_drop_not_recovered_when_body_above_threshold_KNOWN_DEFERRED() -> None:
+    """Synth path (which preserves URLs) never fires above MIN_BODY_CHARS.
+
+    Pins WHY cause-class 4 is uncovered by the Ship 1-5 work: the synth
+    fallback (extract_links preserves URLs) only runs when the stripped
+    body is below MIN_BODY_CHARS. A substantive body keeps its prose but
+    silently loses its URLs, and no synth marker fires to flag it.
+    """
+    html = (
+        "<p>This is a substantive newsletter body with well over thirty "
+        "visible characters of real prose content, plus a "
+        '<a href="https://example.com/cta">call to action</a> link.</p>'
+    )
+    stripped = extract.strip_html(html)
+    # Body is above the synth threshold, so the synth path never fires.
+    assert extract.visible_text_len(stripped) >= extract.MIN_BODY_CHARS
+    # URL dropped and NOT recovered — the deferred cause-class 4 surface.
+    assert "https://example.com/cta" not in stripped
