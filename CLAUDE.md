@@ -98,6 +98,8 @@ Vault writes go through two gates in order:
 
 When adding a new instance type, scope rule, or per-instance type registry: the scope check needs the calling instance's identity to look up the right rule. Hardcoded `agent="salem"` or `scope="talker"` literals at the call site silently route every instance through Salem's gate. Per-instance scope work should plumb the instance name through the call, not default it. See `project_hardcoding_followups.md` for the open sweep items.
 
+**`_validate_type`'s per-scope valid-type set now auto-derives from `available_in_scopes`.** When adding a per-instance scope that can create a new record type, you do NOT edit `KNOWN_TYPES_BY_SCOPE` — just tag the `TypeDefinition`'s `available_in_scopes` frozenset with the scope name(s). The dict in `schema.py` genuinely auto-populates from the registry (every non-`SCOPE_CANONICAL` scope any TypeDefinition tags). Trap closed during VERA P1 (2026-06-09): `KNOWN_TYPES_BY_SCOPE` had a comment claiming "auto-populates from the registry" but was a hardcoded `{kalle, hypatia}` literal — so `ticket` tagged `{vera, vera_ops}` was rejected by gate 1 (`_validate_type`) with "Unknown type under scope 'vera'" even though gate 2 (`check_scope`) allowed it. A comment-lies-about-behavior trap STAY-C would have hit identically. If you tag `available_in_scopes` and gate 1 still rejects, confirm the auto-population is still live (not reverted to a literal).
+
 ### Surveyor Pipeline
 
 Surveyor doesn't use the agent backend. It has its own 4-stage pipeline:
