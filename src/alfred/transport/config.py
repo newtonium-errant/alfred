@@ -98,6 +98,67 @@ class AuthConfig:
     tokens: dict[str, AuthTokenEntry] = field(default_factory=dict)
 
 
+# Allowed filter operators for a filtered peer query (P1, 2026-06-09).
+# Fixed enum — the deterministic broker (``/peer/search``) implements
+# exactly these; a predicate naming any other operator is rejected
+# fail-closed. ``eq`` scalar equality; ``contains`` substring OR
+# list-membership (with wikilink-unwrap for ``[[type/Name]]`` list
+# elements); ``gte`` / ``lte`` / ``between`` ISO-date or numeric
+# comparison.
+FILTER_OPERATORS: frozenset[str] = frozenset(
+    {"eq", "contains", "gte", "lte", "between"}
+)
+
+# Hard ceiling on a filtered query's result cap, regardless of what a
+# per-type ``max_limit`` is set to. Defense against a misconfigured
+# policy disclosing an unbounded record set.
+FILTER_LIMIT_CEILING: int = 50
+
+
+@dataclass
+class FilterDimRule:
+    """Allowed operators for one filterable dimension (P1, 2026-06-09).
+
+    ``op`` is the allowlist of operators (from :data:`FILTER_OPERATORS`)
+    a peer may use when filtering on this dimension. A predicate naming
+    an operator NOT in this list is denied fail-closed. Unknown operators
+    in the config are dropped at load time (validated against
+    ``FILTER_OPERATORS``).
+    """
+
+    op: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PeerQueryRules:
+    """Filtered-query permissions for one peer × record-type (P1).
+
+    The OPTIONAL ``query`` sub-block on :class:`PeerFieldRules`. When
+    ABSENT (the default for every existing config entry — ``None`` on
+    ``PeerFieldRules.query``), filtered queries are denied entirely and
+    only the by-exact-name ``/peer/query`` path works (byte-identical to
+    pre-P1). When present, it governs the new ``/peer/search`` endpoint.
+
+    Three fail-closed gates flow from this:
+      1. Type-queryable — ``query`` absent → all ``/peer/search`` denied.
+      2. Filter-dimension — a predicate dim not in ``filter_dims`` (or an
+         operator not in that dim's :class:`FilterDimRule.op`) → denied.
+      3. Return-field — the existing ``fields`` allowlist still decides
+         what comes back per matched record (via ``apply_field_permissions``).
+
+    ``filter_dims`` maps a frontmatter field name (the dimension the peer
+    may filter on) → its :class:`FilterDimRule`. ``sort`` is the allowlist
+    of fields usable as a sort key. ``max_limit`` caps the result count
+    (clamped further by :data:`FILTER_LIMIT_CEILING`); ``default_limit``
+    applies when the request omits a limit.
+    """
+
+    filter_dims: dict[str, FilterDimRule] = field(default_factory=dict)
+    sort: list[str] = field(default_factory=list)
+    max_limit: int = 10
+    default_limit: int = 5
+
+
 @dataclass
 class PeerFieldRules:
     """Per-record-type permissions for one peer.
@@ -107,10 +168,17 @@ class PeerFieldRules:
     ``bodies`` is a belt-and-braces flag — never True in v1, never
     honoured by the handler. Parked here so future code that wants to
     grow body-level access doesn't require a schema change.
+
+    ``query`` (P1, 2026-06-09) is the OPTIONAL filtered-query policy. When
+    ``None`` (the default + every existing config), filtered queries via
+    ``/peer/search`` are denied — only by-exact-name ``/peer/query`` works,
+    exactly as before. When present, it opts this peer × type into the
+    deterministic filtered-query broker. See :class:`PeerQueryRules`.
     """
 
     fields: list[str] = field(default_factory=list)
     bodies: bool = False
+    query: "PeerQueryRules | None" = None
 
 
 @dataclass
@@ -218,6 +286,58 @@ def _build_auth(data: dict[str, Any]) -> AuthConfig:
     return AuthConfig(tokens=tokens)
 
 
+def _build_peer_query_rules(raw: Any) -> "PeerQueryRules | None":
+    """Build the optional ``query`` sub-block, or ``None`` when absent (P1).
+
+    Returns ``None`` when ``raw`` is missing / not a dict — the
+    back-compat default that keeps filtered queries denied (only by-name
+    works). When present, parses ``filter_dims`` (each dim's ``op`` list
+    intersected against :data:`FILTER_OPERATORS` so an unknown operator
+    in config is dropped rather than silently granting it), ``sort``,
+    ``max_limit`` (clamped to :data:`FILTER_LIMIT_CEILING`), and
+    ``default_limit``.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    filter_dims: dict[str, FilterDimRule] = {}
+    dims_raw = raw.get("filter_dims", {}) or {}
+    if isinstance(dims_raw, dict):
+        for dim_name, dim_rule_raw in dims_raw.items():
+            if not isinstance(dim_rule_raw, dict):
+                continue
+            ops_raw = dim_rule_raw.get("op", []) or []
+            # Intersect against the fixed operator enum — an unknown
+            # operator in config is dropped (never silently granted).
+            ops = [
+                str(o) for o in ops_raw
+                if isinstance(o, str) and o in FILTER_OPERATORS
+            ]
+            filter_dims[str(dim_name)] = FilterDimRule(op=ops)
+
+    sort_raw = raw.get("sort", []) or []
+    sort = [str(s) for s in sort_raw if isinstance(s, str)]
+
+    try:
+        max_limit = int(raw.get("max_limit", 10))
+    except (TypeError, ValueError):
+        max_limit = 10
+    max_limit = max(1, min(max_limit, FILTER_LIMIT_CEILING))
+
+    try:
+        default_limit = int(raw.get("default_limit", 5))
+    except (TypeError, ValueError):
+        default_limit = 5
+    default_limit = max(1, min(default_limit, max_limit))
+
+    return PeerQueryRules(
+        filter_dims=filter_dims,
+        sort=sort,
+        max_limit=max_limit,
+        default_limit=default_limit,
+    )
+
+
 def _build_canonical(data: dict[str, Any]) -> CanonicalConfig:
     """Build ``CanonicalConfig`` + nested per-peer-type rules."""
     peer_perms_raw = data.get("peer_permissions", {}) or {}
@@ -233,6 +353,7 @@ def _build_canonical(data: dict[str, Any]) -> CanonicalConfig:
                 type_map[str(type_name)] = PeerFieldRules(
                     fields=list(rules_raw.get("fields", []) or []),
                     bodies=bool(rules_raw.get("bodies", False)),
+                    query=_build_peer_query_rules(rules_raw.get("query")),
                 )
             peer_perms[str(peer_name)] = type_map
     return CanonicalConfig(

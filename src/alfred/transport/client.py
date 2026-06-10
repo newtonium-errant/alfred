@@ -502,6 +502,71 @@ async def peer_query(
     )
 
 
+async def peer_search(
+    peer_name: str,
+    record_type: str,
+    *,
+    filter: list[dict[str, Any]] | None = None,  # noqa: A002
+    sort: dict[str, Any] | None = None,
+    limit: int | None = None,
+    fields: list[str] | None = None,
+    config: "TransportConfig | None" = None,
+    self_name: str,
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /peer/search on the named peer — deterministic filtered query (P1).
+
+    The requester-side client for the inter-instance filtered-query
+    broker. Sends a structured query (type + filter predicates + sort +
+    limit); the holder (Salem) executes it deterministically against its
+    disclosure policy and returns a LIST of field-filtered records.
+
+    Args:
+        peer_name: Outbound peer key (``"salem"`` from a requester's POV).
+        record_type: Canonical record type to search (e.g. ``"event"``).
+        filter: List of ``{"dim", "op", "value"}`` predicate clauses, all
+            AND-combined. Each dim+op must be permitted by the holder's
+            policy or the whole query is denied 403.
+        sort: ``{"by": <field>, "dir": "asc"|"desc"}`` — field must be in
+            the policy's sort allowlist.
+        limit: Max records (clamped to the policy's max_limit).
+        fields: Optional return-field subset (intersected with the policy
+            field allowlist).
+        self_name / config / correlation_id: as for :func:`peer_query`.
+
+    Returns the server's response dict — ``{status, record_type, count,
+    records[], granted, denied_dims, correlation_id}`` on success, or a
+    transport error dict on failure.
+    """
+    from .config import TransportConfig, load_config
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = correlation_id or _new_correlation_id()
+
+    body: dict[str, Any] = {"record_type": record_type}
+    if filter:
+        body["filter"] = list(filter)
+    if sort:
+        body["sort"] = dict(sort)
+    if limit is not None:
+        body["limit"] = int(limit)
+    if fields:
+        body["fields"] = list(fields)
+
+    return await _peer_request(
+        base_url=base_url,
+        token=token,
+        method="POST",
+        path="/peer/search",
+        self_name=self_name,
+        correlation_id=cid,
+        json_body=body,
+    )
+
+
 async def peer_handshake(
     peer_name: str,
     *,

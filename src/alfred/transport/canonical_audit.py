@@ -42,6 +42,7 @@ def append_audit(
     denied: list[str],
     correlation_id: str = "",
     ts: datetime | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> None:
     """Append one audit entry to the JSONL log.
 
@@ -52,6 +53,16 @@ def append_audit(
         the last successful call.
       - Never raises; disk errors log-and-continue. Audit failures must
         not propagate to the caller and interrupt the canonical read.
+
+    ``extra`` (P1, 2026-06-09) — an OPTIONAL dict of additional fields
+    merged into the entry, for the filtered-query (``/peer/search``)
+    audit. By-name callers omit it, so their entries are byte-identical
+    to pre-P1. Filtered callers pass ``{"kind": "search", "filter": [...],
+    "sort": {...}, "limit": N, "match_count": M, "denied_dims": [...]}``.
+    Core keys (ts/peer/type/name/requested/granted/denied/correlation_id)
+    are written first and CANNOT be overwritten by ``extra`` (the core
+    fields are re-applied after the merge), so an ``extra`` carrying a
+    conflicting ``peer`` can't corrupt the audit identity.
     """
     if not audit_log_path:
         # Audit explicitly disabled — skip. Used by tests that don't
@@ -64,7 +75,13 @@ def append_audit(
         # Log layer will pick this up; can't raise from audit.
         return
 
-    entry: dict[str, Any] = {
+    entry: dict[str, Any] = {}
+    # Merge the optional extra fields FIRST so the core identity fields
+    # below overwrite any conflicting key — ``extra`` can add (kind,
+    # filter, match_count, ...) but can never corrupt peer/type/name.
+    if isinstance(extra, dict):
+        entry.update(extra)
+    entry.update({
         "ts": (ts or datetime.now(timezone.utc)).isoformat(),
         "peer": peer,
         "type": record_type,
@@ -73,7 +90,7 @@ def append_audit(
         "granted": list(granted),
         "denied": list(denied),
         "correlation_id": correlation_id,
-    }
+    })
     line = json.dumps(entry, default=str) + "\n"
     try:
         with open(path, "a", encoding="utf-8") as f:

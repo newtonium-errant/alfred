@@ -71,6 +71,14 @@ from aiohttp import web
 
 from .canonical import apply_field_permissions
 from .canonical_audit import append_audit
+from .peer_search import (
+    FilterPolicyError,
+    filter_sort_limit,
+    json_sanitize,
+    resolve_limit,
+    validate_clauses,
+    validate_sort,
+)
 from .canonical_proposals import (
     Proposal,
     append_proposal,
@@ -364,6 +372,214 @@ async def _handle_peer_query(request: web.Request) -> web.StreamResponse:
         requested=requested_fields,
         correlation_id=correlation_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# /peer/search — deterministic filtered canonical query (P1, 2026-06-09)
+# ---------------------------------------------------------------------------
+#
+# SIBLING of /peer/query, NOT a mode of it. Kept a separate handler so the
+# by-exact-name /peer/query + /canonical/* paths stay byte-identical (they
+# do NOT route through here, and this does NOT route through
+# _serve_canonical). The currently-ignored ``filter`` field on /peer/query
+# stays ignored there — filtered queries ONLY land here.
+#
+# Three fail-closed gates (per the P1 disclosure-policy matrix):
+#   1. Type-queryable — the peer×type ``query`` block must be present
+#      (PeerFieldRules.query is not None). Absent → 403, all filtered
+#      queries denied for that type.
+#   2. Filter-dimension — each predicate's dim+op validated against the
+#      policy's filter_dims (peer_search.validate_clauses). Denied →403.
+#   3. Return-field — apply_field_permissions (reused VERBATIM) decides
+#      the per-record field subset from the existing ``fields`` allowlist.
+#
+# Deterministic: glob <vault>/<type>/*.md → parse frontmatter → predicate
+# (AND) → sort → limit → field-gate. No LLM, no NL. Bodies never exposed.
+_MAX_SEARCH_SCAN = 5000  # safety cap on files globbed per search
+
+
+async def _handle_peer_search(request: web.Request) -> web.StreamResponse:
+    """POST /peer/search — deterministic filtered canonical query.
+
+    Body:
+        {
+          "record_type": "event",
+          "filter": [{"dim": "participants", "op": "contains",
+                      "value": "Andrew Newton"},
+                     {"dim": "date", "op": "gte", "value": "2026-01-01"}],
+          "sort":   {"by": "date", "dir": "desc"},   # optional
+          "limit":  3,                                # optional
+          "fields": ["title", "date", "start"],       # optional return subset
+          "correlation_id": "<optional>"
+        }
+
+    Returns 200 ``{status, record_type, count, records[], granted,
+    denied_dims, correlation_id}``. Every outcome (granted / denied /
+    not-permitted) is audited with ``kind: "search"`` + the predicate.
+    """
+    config = _get_config(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        correlation_id = _ensure_correlation_id(request, None)
+        return _json_error(400, "invalid_json", correlation_id=correlation_id)
+
+    correlation_id = _ensure_correlation_id(request, body)
+    peer = request.get("transport_peer", "")
+    audit_path = config.canonical.audit_log_path
+
+    if not config.canonical.owner:
+        return _json_error(
+            404, "canonical_not_owned",
+            detail="this instance does not host canonical records",
+            correlation_id=correlation_id,
+        )
+
+    record_type = body.get("record_type")
+    if not isinstance(record_type, str) or not record_type:
+        return _json_error(
+            400, "schema_error",
+            detail="record_type must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+    requested_fields = body.get("fields") or []
+    if not isinstance(requested_fields, list):
+        return _json_error(
+            400, "schema_error",
+            detail="fields must be a list of strings",
+            correlation_id=correlation_id,
+        )
+
+    raw_filter = body.get("filter")
+
+    # --- Gate 1: type-queryable ------------------------------------------
+    perms = config.canonical.peer_permissions
+    peer_rules = perms.get(peer, {})
+    type_rules = peer_rules.get(record_type)
+    query_rules = getattr(type_rules, "query", None) if type_rules else None
+    if query_rules is None:
+        append_audit(
+            audit_path,
+            peer=peer, record_type=record_type, name="",
+            requested=requested_fields, granted=[], denied=[],
+            correlation_id=correlation_id,
+            extra={"kind": "search", "filter": raw_filter, "match_count": 0,
+                   "denied_dims": []},
+        )
+        return _json_error(
+            403, "filtered_query_not_permitted",
+            detail=(
+                f"peer '{peer}' has no filtered-query policy for type "
+                f"'{record_type}'"
+            ),
+            correlation_id=correlation_id,
+        )
+
+    # --- Gate 2: filter-dimension + sort + limit -------------------------
+    try:
+        clauses = validate_clauses(raw_filter, query_rules)
+        sort_spec = validate_sort(body.get("sort"), query_rules)
+        limit = resolve_limit(body.get("limit"), query_rules)
+    except FilterPolicyError as exc:
+        append_audit(
+            audit_path,
+            peer=peer, record_type=record_type, name="",
+            requested=requested_fields, granted=[], denied=[],
+            correlation_id=correlation_id,
+            extra={"kind": "search", "filter": raw_filter, "match_count": 0,
+                   "denied_dims": [exc.dim] if exc.dim else []},
+        )
+        status = 403 if exc.code == "filter_dim_denied" else 400
+        return _json_error(
+            status, exc.code, detail=exc.detail,
+            correlation_id=correlation_id,
+        )
+
+    # --- Load + scan the type's directory --------------------------------
+    vault_path = _get_vault_path(request)
+    if vault_path is None:
+        return _json_error(
+            404, "record_not_found",
+            detail="vault not configured",
+            correlation_id=correlation_id,
+        )
+    type_dir = vault_path / record_type
+    parsed: list[dict[str, Any]] = []
+    if type_dir.exists():
+        for md_file in sorted(type_dir.glob("*.md"))[:_MAX_SEARCH_SCAN]:
+            try:
+                post = frontmatter.load(str(md_file))
+            except Exception as exc:  # noqa: BLE001 — one bad record never fails the search
+                log.warning(
+                    "transport.peer.search_parse_failed",
+                    path=str(md_file), error=str(exc),
+                )
+                continue
+            fm = dict(post.metadata or {})
+            # Stash the stem so the field gate / sort can fall back to it.
+            fm.setdefault("name", md_file.stem)
+            parsed.append(fm)
+
+    # --- Execute predicate + sort + limit (deterministic) ----------------
+    matched = filter_sort_limit(parsed, clauses, sort_spec, limit)
+
+    # --- Gate 3: per-record field gate (reused apply_field_permissions) --
+    requested_set = {f for f in requested_fields if isinstance(f, str)}
+    out_records: list[dict[str, Any]] = []
+    all_granted: set[str] = set()
+    all_denied: set[str] = set()
+    for fm in matched:
+        filtered, granted, denied = apply_field_permissions(
+            peer=peer,
+            record_type=record_type,
+            frontmatter=fm,
+            perms=perms,
+        )
+        if requested_set:
+            filtered = {
+                k: v for k, v in filtered.items()
+                if k in requested_set
+                or any(k == rf.split(".", 1)[0] for rf in requested_set)
+            }
+            granted = [
+                g for g in granted
+                if g in requested_set
+                or any(g.split(".", 1)[0] == rf.split(".", 1)[0]
+                       for rf in requested_set)
+            ]
+        # JSON-sanitize: frontmatter dates/datetimes come back as native
+        # Python objects that json_response can't serialize. Coerce to
+        # isoformat strings (+ any exotic YAML scalar to str) so the
+        # response never 500s on a permitted date field.
+        out_records.append(json_sanitize(filtered))
+        all_granted.update(granted)
+        all_denied.update(denied)
+
+    append_audit(
+        audit_path,
+        peer=peer, record_type=record_type, name="",
+        requested=requested_fields or sorted(all_granted),
+        granted=sorted(all_granted), denied=sorted(all_denied),
+        correlation_id=correlation_id,
+        extra={
+            "kind": "search",
+            "filter": raw_filter,
+            "sort": body.get("sort"),
+            "limit": limit,
+            "match_count": len(out_records),
+            "denied_dims": [],
+        },
+    )
+
+    return web.json_response({
+        "status": "ok",
+        "record_type": record_type,
+        "count": len(out_records),
+        "records": out_records,
+        "granted": sorted(all_granted),
+        "denied_dims": [],
+        "correlation_id": correlation_id,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -2117,6 +2333,7 @@ def register_peer_routes(app: web.Application) -> None:
     """Swap in real /peer/* handlers (replaces _register_peer_stub)."""
     app.router.add_post("/peer/send", _handle_peer_send)
     app.router.add_post("/peer/query", _handle_peer_query)
+    app.router.add_post("/peer/search", _handle_peer_search)
     app.router.add_post("/peer/handshake", _handle_peer_handshake)
     app.router.add_post("/peer/brief_digest", _handle_peer_brief_digest)
     app.router.add_post("/peer/pending_items_push", _handle_peer_pending_items_push)
