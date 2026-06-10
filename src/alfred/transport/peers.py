@@ -37,6 +37,122 @@ from .utils import get_logger
 log = get_logger(__name__)
 
 
+# --- Message Precedence (Z/O/P/R) ------------------------------------------
+#
+# USAF Message Precedence (operator framing, 2026-06-09). Four labels;
+# MVP implements two delivery LANES (Expedited Z+O / Deferred P+R) — the
+# 4-label enum is the schema from day one, split per-tier later as the
+# self-observation loop demands.
+#
+#   Z — Flash      interrupt / highest. MVP: immediate Telegram relay +
+#                  a 🚨 Flash marker (NO true turn-preemption yet).
+#   O — Immediate  push now (today's relay behavior, made explicit).
+#   P — Priority   reply-owed async; placeholder/back-fill via the mailbox.
+#   R — Routine    fire-and-forget; batched/scheduled (brief digest /
+#                  heartbeat). The DEFAULT when precedence is absent.
+#
+# Default R (operator Decision A, 2026-06-09): an un-tagged message is
+# most likely a report/heartbeat — defaulting to the least-disruptive
+# lane (no interrupt, no reply owed) is the fail-safe. Unknown values
+# coerce to R + log (forward-compat: "enum, free, never migrate").
+PRECEDENCE_FLASH = "Z"
+PRECEDENCE_IMMEDIATE = "O"
+PRECEDENCE_PRIORITY = "P"
+PRECEDENCE_ROUTINE = "R"
+PRECEDENCE_VALUES: frozenset[str] = frozenset(
+    {PRECEDENCE_FLASH, PRECEDENCE_IMMEDIATE, PRECEDENCE_PRIORITY, PRECEDENCE_ROUTINE}
+)
+PRECEDENCE_DEFAULT = PRECEDENCE_ROUTINE
+
+# Operator-facing word labels for the Telegram relay prefix (Decision D).
+PRECEDENCE_LABELS: dict[str, str] = {
+    PRECEDENCE_FLASH: "Flash",
+    PRECEDENCE_IMMEDIATE: "Immediate",
+    PRECEDENCE_PRIORITY: "Priority",
+    PRECEDENCE_ROUTINE: "Routine",
+}
+
+# Flash marker — prepended to Z-precedence relays in EVERY label style
+# (Decision C: Z = O + a visual Flash marker, no true turn-preemption).
+PRECEDENCE_FLASH_MARKER = "🚨"
+
+# Per-instance label style for the Telegram relay prefix (Decision D
+# refinement, 2026-06-09). Andrew (ex-USAF) reads Z/O/P/R instantly and
+# opts his instances into ``letters``; non-technical users (Ben on VERA)
+# need ``words``. Default ``words`` is the safe choice for any new user;
+# the operator sets per-instance values in config (Salem/KAL-LE/Hypatia →
+# letters, VERA → words). ``both`` shows letter + word.
+PRECEDENCE_LABEL_STYLE_LETTERS = "letters"
+PRECEDENCE_LABEL_STYLE_WORDS = "words"
+PRECEDENCE_LABEL_STYLE_BOTH = "both"
+PRECEDENCE_LABEL_STYLES: frozenset[str] = frozenset({
+    PRECEDENCE_LABEL_STYLE_LETTERS,
+    PRECEDENCE_LABEL_STYLE_WORDS,
+    PRECEDENCE_LABEL_STYLE_BOTH,
+})
+PRECEDENCE_LABEL_STYLE_DEFAULT = PRECEDENCE_LABEL_STYLE_WORDS
+
+
+def render_precedence_prefix(
+    from_peer: str, precedence: str, style: str | None = None,
+) -> str:
+    """Render the Telegram relay prefix for a precedence-tagged message.
+
+    Returns ``"[<peer> · <label>] "`` (trailing space included) per the
+    per-instance ``style``:
+        * ``letters`` → ``[KAL-LE · O] ``
+        * ``words``   → ``[KAL-LE · Immediate] `` (the default)
+        * ``both``    → ``[KAL-LE · O Immediate] ``
+
+    The Flash marker (🚨) is prepended for ``Z`` precedence in EVERY style
+    (e.g. ``[VERA · 🚨 Flash] `` / ``[VERA · 🚨 Z] ``). An unknown ``style``
+    falls back to ``words`` (the safe default). When ``from_peer`` is
+    empty the peer segment is omitted (``[Immediate] ``) so a relay never
+    renders an empty ``[ · ...]`` bracket.
+
+    Pure function — no I/O — so the render is unit-testable independent of
+    the daemon relay path.
+    """
+    style = style if style in PRECEDENCE_LABEL_STYLES else PRECEDENCE_LABEL_STYLE_DEFAULT
+    letter = precedence if precedence in PRECEDENCE_VALUES else PRECEDENCE_DEFAULT
+    word = PRECEDENCE_LABELS[letter]
+
+    if style == PRECEDENCE_LABEL_STYLE_LETTERS:
+        label = letter
+    elif style == PRECEDENCE_LABEL_STYLE_BOTH:
+        label = f"{letter} {word}"
+    else:  # words (default)
+        label = word
+
+    # Flash marker on Z, in every style.
+    if letter == PRECEDENCE_FLASH:
+        label = f"{PRECEDENCE_FLASH_MARKER} {label}"
+
+    if from_peer:
+        return f"[{from_peer} · {label}] "
+    return f"[{label}] "
+
+
+def normalize_precedence(value: Any) -> tuple[str, bool]:
+    """Coerce a precedence value to a valid enum member.
+
+    Returns ``(precedence, was_unknown)``: a valid uppercase Z/O/P/R, and
+    a flag set True when the input was missing / unrecognized (coerced to
+    the default ``R``). The caller logs ``transport.peer.precedence_unknown``
+    on the ``was_unknown`` path so a typo'd or future-tier precedence is
+    grep-able without a 400 (per Decision A — don't reject, coerce + log).
+    """
+    if isinstance(value, str):
+        upper = value.strip().upper()
+        if upper in PRECEDENCE_VALUES:
+            return upper, False
+    if value is None:
+        # Absent is the common case — default R, NOT "unknown".
+        return PRECEDENCE_DEFAULT, False
+    # Present but unrecognized — coerce + flag for the log.
+    return PRECEDENCE_DEFAULT, True
+
+
 # --- Response inbox --------------------------------------------------------
 
 

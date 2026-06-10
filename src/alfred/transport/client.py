@@ -567,6 +567,87 @@ async def peer_search(
     )
 
 
+async def peer_async_query(
+    peer_name: str,
+    record_type: str,
+    *,
+    filter: list[dict[str, Any]] | None = None,  # noqa: A002
+    sort: dict[str, Any] | None = None,
+    limit: int | None = None,
+    fields: list[str] | None = None,
+    precedence: str = "P",
+    config: "TransportConfig | None" = None,
+    self_name: str,
+    correlation_id: str | None = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """Async (P-lane) filtered query via the mailbox — placeholder pattern.
+
+    The Priority-precedence counterpart to the synchronous
+    :func:`peer_search`. Sends a ``kind=query`` to the holder's
+    ``/peer/send`` (the holder runs the SAME deterministic search +
+    disclosure gates as ``/peer/search``, then replies async via
+    ``kind=query_result`` on the same correlation_id), and waits for that
+    reply through the in-process mailbox (:func:`peers.await_response`).
+
+    The requester-side flow this enables (the placeholder pattern):
+        1. send the async query → get a correlation_id back
+        2. insert ``{{peer-lookup:<cid>}}`` into the draft, keep working
+        3. when the holder's query_result lands, the daemon inbox calls
+           ``deliver_response(cid, payload)`` which wakes this await
+        4. back-fill the placeholder with the answer
+
+    For the MVP tool surface this awaits inline (timeout-bounded) — the
+    cross-turn "keep drafting, back-fill next turn" orchestration is the
+    natural extension on top of this same mailbox substrate.
+
+    Returns the holder's query_result payload (``{status: "ok",
+    records, ...}`` or ``{status: "denied", code, detail}``), or
+    ``{status: "timeout", correlation_id}`` if no reply arrived in time.
+
+    SECURITY: the holder runs ``_execute_filtered_search`` — the IDENTICAL
+    disclosure path as ``/peer/search``. There is no weaker async path.
+    """
+    import asyncio
+
+    from .peers import await_response
+
+    cid = correlation_id or _new_correlation_id()
+
+    query_payload: dict[str, Any] = {
+        "record_type": record_type,
+        "precedence": precedence,
+    }
+    if filter:
+        query_payload["filter"] = list(filter)
+    if sort:
+        query_payload["sort"] = dict(sort)
+    if limit is not None:
+        query_payload["limit"] = int(limit)
+    if fields:
+        query_payload["fields"] = list(fields)
+
+    # Fire the async query. The holder acks fast ({"status": "accepted"})
+    # and replies via query_result out-of-band.
+    await peer_send(
+        peer_name,
+        "query",
+        query_payload,
+        config=config,
+        self_name=self_name,
+        correlation_id=cid,
+    )
+
+    # Await the correlated query_result via the mailbox (the daemon inbox
+    # calls deliver_response on receipt). Orphan-buffer collects a reply
+    # that beat this await.
+    try:
+        reply = await await_response(cid, timeout=timeout)
+    except asyncio.TimeoutError:
+        return {"status": "timeout", "correlation_id": cid}
+    return reply
+
+
 async def peer_handshake(
     peer_name: str,
     *,
