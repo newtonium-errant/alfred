@@ -611,6 +611,15 @@ def build_app(
     app[_KEY_STATE] = state
     if send_fn is not None:
         app[_KEY_SEND_FN] = send_fn
+    # Background-task retention set (peer-precedence async query broker).
+    # Initialized HERE at build time — while the app is still mutable —
+    # NOT lazily in the handler: ``app[<new-key>] = ...`` on a STARTED app
+    # raises ``DeprecationWarning: Changing state of started or joined
+    # application`` (hard-errors in a future aiohttp). The handler only
+    # MUTATES this set (``.add`` / ``.discard``), which is allowed
+    # post-start. Holds a strong ref to each detached query_result reply
+    # task so it isn't GC'd mid-flight; the done-callback discards it.
+    app["_bg_tasks"] = set()
 
     for register in ROUTE_NAMESPACES.values():
         register(app)

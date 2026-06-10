@@ -370,3 +370,91 @@ async def test_bad_kind_still_400(salem_app):  # type: ignore[no-untyped-def]
     assert resp.status == 400
     body = await resp.json()
     assert body["reason"] == "schema_error"
+
+
+# ---------------------------------------------------------------------------
+# GC-hazard regression — the detached reply task is strongly referenced
+# ---------------------------------------------------------------------------
+
+
+async def test_detached_reply_task_is_retained_until_complete(salem_app, monkeypatch):  # type: ignore[no-untyped-def]
+    """The reply task must survive until ``peer_send`` completes.
+
+    A bare ``asyncio.create_task`` is held only by a WEAK ref in the loop;
+    once the handler returns the 200 ack, nothing references the task and
+    it can be GC'd mid-flight — the requester's ``await_response`` then
+    never gets the reply and waits out the full timeout. The fix parks the
+    task in ``request.app["_bg_tasks"]`` and discards on completion.
+
+    This test widens the GC window: the fake ``peer_send`` does a real
+    multi-``await`` (two ``sleep(0)`` yields) so the reply is NOT delivered
+    in a single tick. We assert (a) the task is referenced on the app
+    WHILE in flight, (b) the reply still lands after the awaits resolve,
+    and (c) the set is emptied (discard callback fired) once complete. A
+    bare create_task would let the reply still land HERE (the test holds a
+    ref via the loop) — so the load-bearing assertion is (a): the app-set
+    is non-empty mid-flight, which only the strong-ref fix produces.
+    """
+    captured: list[dict[str, Any]] = []
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_peer_send(
+        peer_name: str, kind: str, payload: dict[str, Any], **kwargs: Any,
+    ) -> dict[str, Any]:
+        # Signal we've entered the outbound send, then yield across
+        # multiple awaits so the task is genuinely mid-flight while the
+        # handler has already returned its ack.
+        in_flight.set()
+        await release.wait()
+        await asyncio.sleep(0)
+        captured.append({"kind": kind, "payload": payload,
+                         "correlation_id": kwargs.get("correlation_id")})
+        return {"status": "accepted"}
+
+    import alfred.transport.client as client_mod
+    monkeypatch.setattr(client_mod, "peer_send", _slow_peer_send)
+
+    resp = await salem_app.post(
+        "/peer/send",
+        json={
+            "kind": "query",
+            "from": "hypatia",
+            "payload": {
+                "record_type": "event",
+                "filter": [
+                    {"dim": "participants", "op": "contains", "value": "Andrew Newton"},
+                ],
+                "precedence": "P",
+            },
+            "correlation_id": "cid-gc-1",
+        },
+        headers=_hypatia_headers(),
+    )
+    # Handler returned its ack already.
+    assert resp.status == 200
+
+    # Let the detached task reach the outbound send (it's now mid-flight,
+    # parked on ``release``). The reply has NOT been captured yet.
+    await in_flight.wait()
+    assert captured == []  # still in flight — reply not sent
+
+    # LOAD-BEARING: the task is strongly referenced on the app while in
+    # flight. A bare create_task (the bug) would leave nothing holding it.
+    bg_tasks = salem_app.app["_bg_tasks"]
+    assert len(bg_tasks) >= 1
+
+    # Release the send; let it finish across its remaining awaits.
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # The reply landed.
+    assert len(captured) == 1
+    assert captured[0]["correlation_id"] == "cid-gc-1"
+
+    # The done-callback that discards the finished task fires on a LATER
+    # loop tick than task completion — yield once more so it runs before
+    # we assert the set is emptied.
+    await asyncio.sleep(0)
+    assert len(salem_app.app["_bg_tasks"]) == 0

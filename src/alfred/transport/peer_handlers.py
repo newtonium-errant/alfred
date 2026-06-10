@@ -372,7 +372,21 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
                 )
 
         # Detached — don't block the inbound ack on the outbound round-trip.
-        asyncio.create_task(_reply_query_result())
+        # RETAIN A STRONG REFERENCE: ``asyncio`` keeps only a WEAK ref to a
+        # bare ``create_task`` result, so once this handler returns the 200
+        # ack nothing holds the task and it can be GC'd mid-flight (before
+        # ``peer_send`` finishes the outbound POST) — the requester's
+        # ``await_response`` then never receives the reply and waits out
+        # its full timeout. Park the task in the app-level ``_bg_tasks``
+        # set (created at BUILD time in ``server.build_app`` — adding a new
+        # app KEY post-start is the deprecated operation; MUTATING the set
+        # here is fine) and discard on completion. Not a disclosure risk —
+        # a dropped task can only fail-to-send — but it's the "reply lost,
+        # requester hangs" hazard.
+        reply_task = asyncio.create_task(_reply_query_result())
+        bg_tasks: set = request.app["_bg_tasks"]
+        bg_tasks.add(reply_task)
+        reply_task.add_done_callback(bg_tasks.discard)
         return web.json_response({
             "status": "accepted",
             "kind": "query",
