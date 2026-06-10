@@ -162,6 +162,47 @@ async def test_search_field_gate_excludes_unpermitted_field(salem_search_app):  
         assert "secret_notes" not in record
 
 
+async def test_search_never_exposes_record_body(salem_search_app):  # type: ignore[no-untyped-def]
+    """SECURITY INVARIANT: record bodies must NEVER appear in the response.
+
+    Leak-safety is impossible-by-construction today — ``_handle_peer_search``
+    reads only ``post.metadata`` (frontmatter), never ``post.content``. This
+    test pins that invariant against a future refactor: every fixture event
+    carries the literal body ``Body never exposed.`` and an unpermitted
+    ``secret_notes`` frontmatter field. We assert NEITHER appears anywhere
+    in the serialized response — even when the request explicitly asks for
+    body-ish / unpermitted field names. PHI-adjacent path: a refactor that
+    accidentally reads the body would leak record content with nothing else
+    to catch it.
+    """
+    import json
+
+    resp = await salem_search_app.post(
+        "/peer/search",
+        json={
+            "record_type": "event",
+            "filter": [
+                {"dim": "participants", "op": "contains", "value": "Andrew Newton"},
+            ],
+            # Explicitly request unpermitted / body-ish field names — the
+            # field gate must still withhold them (they aren't in the
+            # ``fields`` allowlist), and the body must never surface.
+            "fields": ["title", "date", "secret_notes", "content", "body"],
+        },
+        headers=_hypatia_headers(),
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["count"] >= 1  # the search matched, so there's something to leak
+    serialized = json.dumps(body)
+    # The record body literal must NOT appear anywhere in the response.
+    assert "Body never exposed" not in serialized
+    # The unpermitted frontmatter field must NOT appear either, even though
+    # the request asked for it by name.
+    assert "secret_notes" not in serialized
+    assert "do not leak" not in serialized  # the secret_notes VALUE
+
+
 async def test_search_date_range_filter(salem_search_app):  # type: ignore[no-untyped-def]
     resp = await salem_search_app.post(
         "/peer/search",
