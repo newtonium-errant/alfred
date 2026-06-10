@@ -3,6 +3,11 @@ alfred_tags:
 - alfred/bit
 created: '2026-06-04'
 description: Alfred built-in test (health sweep)
+janitor_note: 'LINK001 — broken wikilink [[process/Alfred BIT]] in process frontmatter;
+  the parent process record has not been created in vault. Field is run.process which
+  janitor cannot edit safely. Human action: create the process record OR adjust BIT
+  writer to omit/correct the wikilink. DIR001 — type is run but file resides in process/;
+  scanner-handled.'
 mode: quick
 name: Alfred BIT 2026-06-04
 overall_status: ok

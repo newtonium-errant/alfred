@@ -1,7 +1,6 @@
 ---
 alfred_tags:
 - tool/input-truncation
-- log/event-emission
 created: '2026-05-25'
 distiller_learnings:
 - '[[synthesis/Schema Evolution in One Consumer Silently Invalidates Assumptions in
