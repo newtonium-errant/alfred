@@ -80,6 +80,36 @@ def test_instance_tool_set_default_is_talker():
     assert config.instance.tool_set == "talker"
 
 
+def test_precedence_label_style_default_is_words():
+    """Absent key → ``words`` (the safe default for any new user)."""
+    raw = {"telegram": {"instance": {"name": "VERA"}}}
+    config = load_from_unified(raw)
+    assert config.precedence_label_style == "words"
+
+
+def test_precedence_label_style_letters_override():
+    """Andrew's instances opt into ``letters`` (ex-USAF reads Z/O/P/R)."""
+    raw = {
+        "telegram": {
+            "instance": {"name": "Salem"},
+            "precedence_label_style": "letters",
+        },
+    }
+    config = load_from_unified(raw)
+    assert config.precedence_label_style == "letters"
+
+
+def test_precedence_label_style_both_override():
+    raw = {
+        "telegram": {
+            "instance": {"name": "KAL-LE"},
+            "precedence_label_style": "both",
+        },
+    }
+    config = load_from_unified(raw)
+    assert config.precedence_label_style == "both"
+
+
 def test_load_from_unified_requires_instance_name() -> None:
     """A config without ``instance.name`` raises ``TypeError`` at load time.
 
