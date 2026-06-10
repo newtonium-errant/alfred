@@ -417,3 +417,129 @@ async def test_fallback_when_peer_unreachable(tmp_path):  # type: ignore[no-unty
             config=salem_config,
             self_name="salem",
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 5: real query_result through the daemon inbox callable wakes a waiter
+# ---------------------------------------------------------------------------
+#
+# Regression for the ``deliver_response`` ImportError BLOCKER (code-review
+# 2026-06-10). The talker daemon's peer-inbox callable
+# (``telegram/daemon.py`` ``_peer_inbox_handler``) does
+# ``from alfred.transport.peers import deliver_response`` and, on
+# ``kind=query_result``, calls ``deliver_response(correlation_id, payload)``
+# to wake the requester's ``await_response``. ``peers.py`` only defined
+# ``register_response`` — so that import raised ``ImportError`` and the
+# requester hung to its full timeout. The fix is the
+# ``deliver_response = register_response`` back-compat alias in peers.py.
+#
+# The pre-existing dual-instance tests never caught this: their Salem inbox
+# stub calls ``register_response`` DIRECTLY (see ``_salem_inbox`` above),
+# never exercising the daemon's ``deliver_response`` import path. This test
+# closes that gap by registering an inbox callable that reproduces the
+# daemon's EXACT query_result branch — same import statement, same call —
+# and driving a real ``kind=query_result`` through ``/peer/send``. If the
+# alias is removed, the import below raises ``ImportError`` inside the
+# handler and the ``await_response`` waiter times out → this test fails.
+
+
+def test_deliver_response_alias_is_register_response():
+    """Cheapest guard: the daemon's import symbol exists and IS the inbox fn.
+
+    A bare ``import`` assertion that fails loudly if the back-compat alias
+    is ever dropped, independent of the full round-trip below.
+    """
+    from alfred.transport.peers import deliver_response, register_response
+
+    assert deliver_response is register_response
+
+
+async def test_query_result_through_real_daemon_inbox_wakes_waiter(
+    aiohttp_client, tmp_path,
+):  # type: ignore[no-untyped-def]
+    """A real query_result POST drives the daemon inbox callable end-to-end.
+
+    Unlike the existing dual-instance round-trip (whose Salem inbox calls
+    ``register_response`` directly), this inbox callable reproduces the
+    daemon's actual ``kind=query_result`` branch — importing and calling
+    ``deliver_response`` exactly as ``_peer_inbox_handler`` does — so the
+    ImportError BLOCKER is exercised on the path that wires two instances
+    together. We register a real ``await_response`` waiter, POST a real
+    ``query_result``, and assert the waiter wakes with the reply.
+    """
+    from alfred.transport.peers import await_response, _INBOX, _ORPHANS
+
+    # Clean inbox between tests (module-global state).
+    _INBOX.clear()
+    _ORPHANS.clear()
+
+    correlation_id = "deliver-response-regression-cid-1"
+
+    inbox_returns: list[dict[str, Any]] = []
+
+    async def _daemon_like_inbox(*, kind, payload, from_peer, correlation_id):
+        """Faithful copy of the daemon's query_result branch.
+
+        Load-bearing: the import statement and the ``deliver_response``
+        call mirror ``telegram/daemon.py`` ``_peer_inbox_handler`` so a
+        dropped alias surfaces HERE (ImportError) rather than only in
+        production. Keep these two lines identical to the daemon's.
+        """
+        # ↓ mirrors daemon.py _peer_inbox_handler import + query_result call ↓
+        from alfred.transport.peers import deliver_response
+        if kind == "query_result":
+            delivered = deliver_response(correlation_id, payload)
+            result = {"delivered": delivered, "kind": kind}
+            inbox_returns.append(result)
+            return result
+        return {"relayed": False, "kind": kind}
+
+    # Build Salem with the daemon-like inbox wired in (NOT a no-op stub).
+    salem_state = TransportState.create(tmp_path / "salem_state.json")
+    salem_config = _salem_config(
+        kalle_url="http://127.0.0.1:1",
+        audit_path=str(tmp_path / "audit.jsonl"),
+    )
+    salem_app = build_app(salem_config, salem_state)
+    register_instance_identity(salem_app, name="S.A.L.E.M.")
+    register_peer_inbox(salem_app, _daemon_like_inbox)
+    salem_client: TestClient = await aiohttp_client(salem_app)
+    salem_url = f"http://127.0.0.1:{salem_client.port}"
+
+    # Register a waiter BEFORE the reply arrives, then POST the
+    # query_result inbound (KAL-LE → Salem direction; KAL-LE authenticates
+    # with DUMMY_SALEM_PEER_TOKEN as Salem's auth.tokens.kal-le validates).
+    async def _await() -> dict[str, Any]:
+        return await await_response(correlation_id, timeout=3.0)
+
+    waiter = asyncio.ensure_future(_await())
+    # Yield so the waiter registers its inbox slot before the reply lands.
+    await asyncio.sleep(0)
+
+    import httpx
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{salem_url}/peer/send",
+            json={
+                "kind": "query_result",
+                "from": "kal-le",
+                "payload": {"text": "answer", "value": 7},
+                "correlation_id": correlation_id,
+            },
+            headers={
+                "Authorization": f"Bearer {DUMMY_SALEM_PEER_TOKEN}",
+                "X-Alfred-Client": "kal-le",
+                "X-Correlation-Id": correlation_id,
+            },
+        )
+
+    # The handler ran the REAL deliver_response import + call and acked.
+    assert resp.status_code == 200
+    assert len(inbox_returns) == 1
+    assert inbox_returns[0]["delivered"] is True
+
+    # The waiter woke with the delivered reply — proving deliver_response
+    # resolved to register_response and unblocked await_response.
+    reply = await waiter
+    assert reply["text"] == "answer"
+    assert reply["value"] == 7

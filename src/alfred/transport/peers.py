@@ -221,6 +221,19 @@ def register_response(correlation_id: str, reply: dict[str, Any]) -> bool:
     return False
 
 
+# Back-compat alias. The talker daemon's peer-inbox callable imports
+# ``deliver_response`` (its domain verb — "deliver this reply to the
+# waiter"); the inbox/orphan-buffer verb here is ``register_response``.
+# They are the same function. This alias closes a latent ImportError on
+# the one path that wires two instances together: when a peer POSTs
+# ``kind=query_result`` back to the requester's daemon inbox, the inbox
+# handler imports ``deliver_response`` — without this alias that raises
+# ``ImportError``, ``register_response`` never runs, ``await_response``
+# never wakes, and the requester hangs to its full timeout. Dead on
+# master (P1 was sync-only); made live by the async query-broker path.
+deliver_response = register_response
+
+
 async def await_response(
     correlation_id: str,
     timeout: float = 60.0,
