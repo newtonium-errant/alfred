@@ -802,47 +802,95 @@ async def run(
             from_peer: str,
             correlation_id: str,
         ) -> dict[str, Any]:
-            """Route an inbound /peer/send relay.
+            """Route an inbound /peer/send relay, precedence-aware (Z/O/P/R).
 
             * ``query_result`` → deliver to a waiting ``await_response``
-              (else park in the orphan buffer). For the future async
-              query lane; no Telegram relay.
+              (else park in the orphan buffer). The P-lane back-fill
+              substrate; no Telegram relay.
             * ``message`` / ``notice`` → relay to the operator via Telegram
-              with a ``[<from_peer>]`` prefix (mirrors the existing
-              peer-route reply prefix). Best-effort — a relay failure is
-              logged but still acks the sender (the message WAS received).
-            """
-            if kind == "query_result":
-                from alfred.transport.peers import deliver_response
-                delivered = deliver_response(correlation_id, payload)
-                return {"delivered": delivered, "kind": kind}
+              with a precedence-tagged prefix (``[<peer> · Immediate]`` /
+              ``[<peer> · 🚨 Flash]`` etc., per the per-instance
+              ``precedence_label_style``). Best-effort — a relay failure
+              is logged but still acks the sender.
 
-            # message | notice → Telegram relay to the primary operator.
+            Precedence lane mapping (MVP two lanes):
+              * Z (Flash)  → immediate relay + 🚨 marker (NO turn-preempt)
+              * O (Immediate) → immediate relay (today's behavior)
+              * P (Priority)  → query_result → deliver_response (handled
+                above); a P *message* relays with a [Priority] tag
+              * R (Routine)   → DEFAULT; a Routine message still relays
+                (report/digest R lands on the brief-digest path, NOT here)
+            """
+            from alfred.transport.peers import (
+                deliver_response,
+                normalize_precedence,
+                render_precedence_prefix,
+            )
+
+            # Precedence — absent → R; unknown → R + log (Decision A). Emit
+            # on every message so the later self-observation phase can
+            # consume the dimension.
+            precedence, prec_unknown = normalize_precedence(
+                payload.get("precedence"),
+            )
+            if prec_unknown:
+                log.info(
+                    "talker.daemon.peer_inbox_precedence_unknown",
+                    raw=str(payload.get("precedence")),
+                    coerced_to=precedence,
+                    kind=kind, from_peer=from_peer,
+                    correlation_id=correlation_id,
+                )
+            log.info(
+                "talker.daemon.peer_inbox_received",
+                kind=kind, precedence=precedence, from_peer=from_peer,
+                correlation_id=correlation_id,
+            )
+
+            if kind == "query_result":
+                # P-lane back-fill substrate — wake the waiting requester
+                # (or orphan-buffer). No relay; precedence is logged above.
+                delivered = deliver_response(correlation_id, payload)
+                return {
+                    "delivered": delivered, "kind": kind,
+                    "precedence": precedence,
+                }
+
+            # message | notice → Telegram relay to the primary operator,
+            # with a precedence-tagged prefix in the configured label style.
             text = str(payload.get("text") or payload.get("body") or "")
-            prefix = f"[{from_peer}] " if from_peer else ""
+            prefix = render_precedence_prefix(
+                from_peer, precedence, config.precedence_label_style,
+            )
             first = config.allowed_users[0] if config.allowed_users else None
             # Tolerate AllowedUser or a bare-int fixture entry.
             primary_user_id = getattr(first, "id", first) if first else 0
             if not primary_user_id or not text:
                 log.info(
                     "talker.daemon.peer_inbox_relay_skipped",
-                    kind=kind, from_peer=from_peer,
+                    kind=kind, precedence=precedence, from_peer=from_peer,
                     reason="no_primary_user" if not primary_user_id else "empty_text",
                     correlation_id=correlation_id,
                 )
-                return {"relayed": False, "kind": kind}
+                return {"relayed": False, "kind": kind, "precedence": precedence}
             try:
                 msg_ids = await _send_via_telegram(
                     int(primary_user_id), f"{prefix}{text}",
                 )
-                return {"relayed": True, "kind": kind, "message_ids": msg_ids}
+                return {
+                    "relayed": True, "kind": kind, "precedence": precedence,
+                    "message_ids": msg_ids,
+                }
             except Exception as exc:  # noqa: BLE001 — relay failure still acks the sender
                 log.warning(
                     "talker.daemon.peer_inbox_relay_failed",
-                    kind=kind, from_peer=from_peer,
+                    kind=kind, precedence=precedence, from_peer=from_peer,
                     error=str(exc), correlation_id=correlation_id,
                 )
-                return {"relayed": False, "kind": kind, "error": str(exc)}
+                return {
+                    "relayed": False, "kind": kind, "precedence": precedence,
+                    "error": str(exc),
+                }
 
         # ---- Centralized wiring --------------------------------------
         # ``wire_transport_app`` calls every register_* helper

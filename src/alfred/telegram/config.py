@@ -490,6 +490,15 @@ class TalkerConfig:
     # See ``_normalize_allowed_users`` + ``AllowedUser``.
     allowed_users: list[AllowedUser] = field(default_factory=list)
     primary_users: list[str] = field(default_factory=list)
+    # Peer-message precedence label style (2026-06-09) — how the inbound
+    # peer-relay prefix renders the Z/O/P/R precedence in Telegram:
+    # ``letters`` (``[KAL-LE · O]``), ``words`` (``[KAL-LE · Immediate]``),
+    # or ``both`` (``[KAL-LE · O Immediate]``). Default ``words`` — the
+    # safe choice for any new / non-technical user (Ben on VERA). Andrew's
+    # instances (Salem/KAL-LE/Hypatia) set ``letters`` (ex-USAF reads
+    # Z/O/P/R instantly). An absent key keeps ``words``. Consumed by
+    # ``peers.render_precedence_prefix`` in the daemon relay path.
+    precedence_label_style: str = "words"
     anthropic: AnthropicConfig = field(default_factory=AnthropicConfig)
     stt: STTConfig = field(default_factory=STTConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
@@ -637,6 +646,10 @@ def load_from_unified(raw: dict[str, Any]) -> TalkerConfig:
             tool.get("allowed_users", []) or []
         ),
         "primary_users": tool.get("primary_users", []) or [],
+        # Peer-precedence label style — default "words" when absent.
+        "precedence_label_style": str(
+            tool.get("precedence_label_style", "words") or "words"
+        ),
         "anthropic": tool.get("anthropic", {}) or {},
         "stt": tool.get("stt", {}) or {},
         "session": tool.get("session", {}) or {},

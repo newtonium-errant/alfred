@@ -717,6 +717,24 @@ _PEER_SEARCH_CANONICAL_TOOL = {
 }
 
 
+_PEER_ASYNC_QUERY_CANONICAL_TOOL = {
+    "name": "peer_async_query_canonical",
+    "description": (
+        "Like peer_search_canonical, but ASYNC (Priority precedence) — "
+        "use when you can keep working while Salem answers, rather than "
+        "blocking. Salem runs the IDENTICAL deterministic, policy-gated "
+        "search as peer_search_canonical (same disclosure rules), but the "
+        "answer returns out-of-band via the peer mailbox. Returns the "
+        "same ``{status, count, records[], ...}`` shape on success, "
+        "``{status: 'denied', code, detail}`` when the policy denies the "
+        "query, or ``{status: 'timeout'}`` if Salem doesn't reply in "
+        "time. Prefer peer_search_canonical for a quick blocking lookup; "
+        "use this when the answer is latency-tolerant."
+    ),
+    "input_schema": _PEER_SEARCH_CANONICAL_TOOL["input_schema"],
+}
+
+
 _PROPOSE_PERSON_TOOL = {
     "name": "propose_person",
     "description": (
@@ -874,6 +892,7 @@ _PROPOSE_EVENT_TOOL = {
 _PEER_INTER_INSTANCE_TOOLS: list[dict[str, Any]] = [
     _QUERY_CANONICAL_TOOL,
     _PEER_SEARCH_CANONICAL_TOOL,
+    _PEER_ASYNC_QUERY_CANONICAL_TOOL,
     _PROPOSE_PERSON_TOOL,
     _PROPOSE_ORG_TOOL,
     _PROPOSE_LOCATION_TOOL,
@@ -2512,6 +2531,10 @@ async def _dispatch_peer_inter_instance_tool(
             return await _peer_tool_search_canonical(
                 tool_input, transport_config, self_name,
             )
+        if tool_name == "peer_async_query_canonical":
+            return await _peer_tool_async_query_canonical(
+                tool_input, transport_config, self_name,
+            )
         if tool_name == "propose_person":
             return await _peer_tool_propose_record(
                 "person", tool_input, transport_config, self_name,
@@ -2890,6 +2913,48 @@ async def _peer_tool_search_canonical(
     return _dumps(response)
 
 
+async def _peer_tool_async_query_canonical(
+    tool_input: dict[str, Any],
+    transport_config: Any,
+    self_name: str,
+) -> str:
+    """Requester-side handler for ``peer_async_query_canonical`` (P-lane).
+
+    Sends an async Priority-precedence query to Salem via the mailbox and
+    awaits the correlated ``query_result``. Salem runs the IDENTICAL
+    deterministic, policy-gated search as the synchronous path — the
+    placeholder-pattern substrate (await_response / orphan buffer) is what
+    differs, not the disclosure decision.
+    """
+    from alfred.transport.client import peer_async_query
+
+    record_type = tool_input.get("record_type") if isinstance(tool_input, dict) else None
+    if not isinstance(record_type, str) or not record_type:
+        return _dumps({"error": "peer_async_query_canonical requires a 'record_type'"})
+
+    filter_clauses = tool_input.get("filter")
+    if filter_clauses is not None and not isinstance(filter_clauses, list):
+        return _dumps({"error": "filter must be a list of {dim, op, value} clauses"})
+    sort = tool_input.get("sort")
+    if sort is not None and not isinstance(sort, dict):
+        return _dumps({"error": "sort must be an object {by, dir}"})
+    limit = tool_input.get("limit")
+    fields = tool_input.get("fields")
+
+    response = await peer_async_query(
+        _PEER_TARGET,
+        record_type,
+        filter=filter_clauses,
+        sort=sort,
+        limit=limit if isinstance(limit, int) else None,
+        fields=fields if isinstance(fields, list) else None,
+        precedence="P",
+        config=transport_config,
+        self_name=self_name,
+    )
+    return _dumps(response)
+
+
 async def _peer_tool_propose_record(
     record_type: str,
     tool_input: dict[str, Any],
@@ -3220,6 +3285,7 @@ async def _execute_tool(
     if tool_name in {
         "query_canonical",
         "peer_search_canonical",
+        "peer_async_query_canonical",
         "propose_person",
         "propose_org",
         "propose_location",
