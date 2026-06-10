@@ -446,6 +446,35 @@ async def test_peer_query_filters_fields(salem_app):  # type: ignore[no-untyped-
     assert "timezone" not in body["frontmatter"]
 
 
+async def test_peer_query_ignores_filter_field(salem_app):  # type: ignore[no-untyped-def]
+    """P1 WATCH-ITEM: /peer/query must NOT start honoring ``filter``.
+
+    The by-name endpoint accepted (and ignored) an optional ``filter``
+    field before P1. P1 adds filtered queries via the SEPARATE
+    /peer/search endpoint — /peer/query stays by-name only. This pins
+    that a ``filter`` on /peer/query is still ignored: the by-name lookup
+    returns the named record regardless of the (bogus) filter clause.
+    """
+    resp = await salem_app.post(
+        "/peer/query",
+        json={
+            "record_type": "person",
+            "name": "Andrew Newton",
+            "fields": ["name"],
+            # A filter that would EXCLUDE the record if honored — must be ignored.
+            "filter": [{"dim": "name", "op": "eq", "value": "Someone Else"}],
+        },
+        headers={
+            "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
+            "X-Alfred-Client": "kal-le",
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    # The named record came back — the filter was ignored, NOT applied.
+    assert body["frontmatter"]["name"] == "Andrew Newton"
+
+
 async def test_peer_query_schema_error(salem_app):  # type: ignore[no-untyped-def]
     resp = await salem_app.post(
         "/peer/query",
