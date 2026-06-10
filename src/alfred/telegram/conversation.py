@@ -650,6 +650,73 @@ _QUERY_CANONICAL_TOOL = {
 }
 
 
+_PEER_SEARCH_CANONICAL_TOOL = {
+    "name": "peer_search_canonical",
+    "description": (
+        "Ask Salem (the canonical authority) a FILTERED query over its "
+        "canonical records and get back a LIST of matching records — "
+        "deterministic, policy-gated. Use when you need 'find records "
+        "where <field> matches <value>, most recent N' rather than a "
+        "single record by exact name. Example: the events Andrew "
+        "attended (filter participants contains 'Andrew Newton', sort by "
+        "date descending, limit 1) to find when he last met someone. "
+        "Salem returns only the fields its disclosure policy permits; a "
+        "filter dimension the policy doesn't allow is denied. Returns "
+        "``{status, count, records[], granted, denied_dims}``."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "record_type": {
+                "type": "string",
+                "enum": ["person", "org", "location", "event", "project"],
+                "description": "Canonical record type to search.",
+            },
+            "filter": {
+                "type": "array",
+                "description": (
+                    "Predicate clauses, all AND-combined. Each clause is "
+                    "{dim, op, value}. op is one of eq | contains | gte | "
+                    "lte | between. For a wikilink-list field like "
+                    "participants, 'contains' matches a person name "
+                    "against the list (e.g. value 'Andrew Newton')."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "dim": {"type": "string"},
+                        "op": {
+                            "type": "string",
+                            "enum": ["eq", "contains", "gte", "lte", "between"],
+                        },
+                        "value": {},
+                    },
+                    "required": ["dim", "op"],
+                },
+            },
+            "sort": {
+                "type": "object",
+                "description": "Optional. {by: <field>, dir: asc|desc}.",
+                "properties": {
+                    "by": {"type": "string"},
+                    "dir": {"type": "string", "enum": ["asc", "desc"]},
+                },
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max records (capped by Salem's policy).",
+            },
+            "fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional return-field subset.",
+            },
+        },
+        "required": ["record_type"],
+    },
+}
+
+
 _PROPOSE_PERSON_TOOL = {
     "name": "propose_person",
     "description": (
@@ -806,6 +873,7 @@ _PROPOSE_EVENT_TOOL = {
 # vault_create rather than proposing them to itself.
 _PEER_INTER_INSTANCE_TOOLS: list[dict[str, Any]] = [
     _QUERY_CANONICAL_TOOL,
+    _PEER_SEARCH_CANONICAL_TOOL,
     _PROPOSE_PERSON_TOOL,
     _PROPOSE_ORG_TOOL,
     _PROPOSE_LOCATION_TOOL,
@@ -2440,6 +2508,10 @@ async def _dispatch_peer_inter_instance_tool(
             return await _peer_tool_query_canonical(
                 tool_input, transport_config, self_name,
             )
+        if tool_name == "peer_search_canonical":
+            return await _peer_tool_search_canonical(
+                tool_input, transport_config, self_name,
+            )
         if tool_name == "propose_person":
             return await _peer_tool_propose_record(
                 "person", tool_input, transport_config, self_name,
@@ -2777,6 +2849,47 @@ async def _peer_tool_query_canonical(
     return _dumps({"status": "found", **record})
 
 
+async def _peer_tool_search_canonical(
+    tool_input: dict[str, Any],
+    transport_config: Any,
+    self_name: str,
+) -> str:
+    """Requester-side handler for ``peer_search_canonical`` (P1).
+
+    Forwards a filtered query to Salem's ``/peer/search`` and returns the
+    list of policy-filtered records. Deterministic on Salem's side — the
+    requester's LLM formulates the structured query + integrates the
+    returned fields into its draft, but never touches Salem's disclosure
+    decision.
+    """
+    from alfred.transport.client import peer_search
+
+    record_type = tool_input.get("record_type") if isinstance(tool_input, dict) else None
+    if not isinstance(record_type, str) or not record_type:
+        return _dumps({"error": "peer_search_canonical requires a 'record_type'"})
+
+    filter_clauses = tool_input.get("filter")
+    if filter_clauses is not None and not isinstance(filter_clauses, list):
+        return _dumps({"error": "filter must be a list of {dim, op, value} clauses"})
+    sort = tool_input.get("sort")
+    if sort is not None and not isinstance(sort, dict):
+        return _dumps({"error": "sort must be an object {by, dir}"})
+    limit = tool_input.get("limit")
+    fields = tool_input.get("fields")
+
+    response = await peer_search(
+        _PEER_TARGET,
+        record_type,
+        filter=filter_clauses,
+        sort=sort,
+        limit=limit if isinstance(limit, int) else None,
+        fields=fields if isinstance(fields, list) else None,
+        config=transport_config,
+        self_name=self_name,
+    )
+    return _dumps(response)
+
+
 async def _peer_tool_propose_record(
     record_type: str,
     tool_input: dict[str, Any],
@@ -3106,6 +3219,7 @@ async def _execute_tool(
     # line of defence (same shape as bash_exec).
     if tool_name in {
         "query_canonical",
+        "peer_search_canonical",
         "propose_person",
         "propose_org",
         "propose_location",

@@ -781,6 +781,69 @@ async def run(
             # the sentinel exists for. Don't reset it.
             log.exception("talker.daemon.gcal_setup_failed")
 
+        # ---- Peer inbox callable (inter-instance messaging, P1 501 fix) --
+        # Inbound /peer/send (kinds message | query_result | notice) was
+        # defined-but-not-wired: wire_transport_app accepts a
+        # ``peer_inbox_callable`` and registers it via register_peer_inbox,
+        # but this daemon never passed one — so every inbound /peer/send
+        # 501'd ``peer_inbox_not_configured``. Wiring it here completes the
+        # foundation for the inter-instance query protocol (the deterministic
+        # /peer/search path is synchronous and does NOT use this inbox; the
+        # inbox carries query_result delivery for the future async lane +
+        # message/notice relays + the R-precedence comms-test heartbeat).
+        #
+        # All instances run this daemon, so all instances now accept inbound
+        # peer messages (intended — the comms-test BIT + query_result need
+        # it everywhere, not just on Salem).
+        async def _peer_inbox_handler(
+            *,
+            kind: str,
+            payload: dict[str, Any],
+            from_peer: str,
+            correlation_id: str,
+        ) -> dict[str, Any]:
+            """Route an inbound /peer/send relay.
+
+            * ``query_result`` → deliver to a waiting ``await_response``
+              (else park in the orphan buffer). For the future async
+              query lane; no Telegram relay.
+            * ``message`` / ``notice`` → relay to the operator via Telegram
+              with a ``[<from_peer>]`` prefix (mirrors the existing
+              peer-route reply prefix). Best-effort — a relay failure is
+              logged but still acks the sender (the message WAS received).
+            """
+            if kind == "query_result":
+                from alfred.transport.peers import deliver_response
+                delivered = deliver_response(correlation_id, payload)
+                return {"delivered": delivered, "kind": kind}
+
+            # message | notice → Telegram relay to the primary operator.
+            text = str(payload.get("text") or payload.get("body") or "")
+            prefix = f"[{from_peer}] " if from_peer else ""
+            first = config.allowed_users[0] if config.allowed_users else None
+            # Tolerate AllowedUser or a bare-int fixture entry.
+            primary_user_id = getattr(first, "id", first) if first else 0
+            if not primary_user_id or not text:
+                log.info(
+                    "talker.daemon.peer_inbox_relay_skipped",
+                    kind=kind, from_peer=from_peer,
+                    reason="no_primary_user" if not primary_user_id else "empty_text",
+                    correlation_id=correlation_id,
+                )
+                return {"relayed": False, "kind": kind}
+            try:
+                msg_ids = await _send_via_telegram(
+                    int(primary_user_id), f"{prefix}{text}",
+                )
+                return {"relayed": True, "kind": kind, "message_ids": msg_ids}
+            except Exception as exc:  # noqa: BLE001 — relay failure still acks the sender
+                log.warning(
+                    "talker.daemon.peer_inbox_relay_failed",
+                    kind=kind, from_peer=from_peer,
+                    error=str(exc), correlation_id=correlation_id,
+                )
+                return {"relayed": False, "kind": kind, "error": str(exc)}
+
         # ---- Centralized wiring --------------------------------------
         # ``wire_transport_app`` calls every register_* helper
         # conditionally based on what we pass in. This is the single
@@ -799,6 +862,7 @@ async def run(
             transport_app,
             transport_config,
             instance_name=config.instance.name,
+            peer_inbox_callable=_peer_inbox_handler,
             # instance_alias deliberately omitted — InstanceConfig.aliases is a
             # router accept-list (case-insensitive variant matching like
             # "Salem"→S.A.L.E.M., "Pat"→Hypatia), not a display alias.
