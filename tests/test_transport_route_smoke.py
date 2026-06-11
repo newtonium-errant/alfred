@@ -253,6 +253,15 @@ def _bodies_by_route() -> dict[tuple[str, str], dict[str, Any]]:
             "kind": "ping",
             "payload": {},
         },
+        ("POST", "/peer/search"): {
+            # P1 filtered-query broker (4db2070, 2026-06-09). The smoke
+            # peer has no filtered-query policy, so the deterministic
+            # gates reject this fail-closed (403/404) — acceptable; the
+            # contract pinned here is "never 500 with full wiring".
+            "record_type": "event",
+            "filter": [{"dim": "date", "op": "gte", "value": "2026-01-01"}],
+            "limit": 1,
+        },
         ("POST", "/peer/handshake"): {
             "from": "smoke-peer",
             "protocol_version": 1,
@@ -542,18 +551,26 @@ async def test_smoke_covers_expected_route_count(  # type: ignore[no-untyped-def
     should look at this test, confirm the new shape is intentional, and
     bump the expected count.
 
-    Current surface (2026-05-02):
+    Current surface (2026-06-11):
       * /outbound/send, /outbound/send_batch, /outbound/status/{id}
-      * /peer/send, /peer/query, /peer/handshake, /peer/brief_digest,
-        /peer/pending_items_push, /peer/pending_items_resolve
+      * /peer/send, /peer/query, /peer/search, /peer/handshake,
+        /peer/brief_digest, /peer/pending_items_push,
+        /peer/pending_items_resolve
       * /canonical/event/propose-create, /canonical/{type}/propose,
         /canonical/{type}/{name}
       * /health
-    Total: 13.
+    Total: 14.
+
+    History note: /peer/search (the P1 deterministic filtered-query
+    broker, 4db2070, 2026-06-09) shipped without updating this pin or
+    ``_bodies_by_route`` — the no-500 smoke still exercised the route
+    via discovery (default empty body → fail-closed 4xx), but the
+    count pin sat stale until the 2026-06-11 suite-debt sweep. When
+    bumping this number, update _bodies_by_route in the SAME commit.
     """
     app = fully_wired_client.app  # type: ignore[union-attr]
     routes = _discover_routes(app)
-    expected = 13
+    expected = 14
     assert len(routes) == expected, (
         f"Expected {expected} routes, found {len(routes)}: {routes}. "
         f"If you've added or removed a transport route, update this "
