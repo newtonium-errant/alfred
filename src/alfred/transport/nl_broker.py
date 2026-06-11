@@ -272,15 +272,26 @@ INTERPRET_OUTPUT_SCHEMA: dict[str, Any] = {
 # --- Pure helpers ------------------------------------------------------------
 
 
+# Case-insensitive closing-delimiter matcher (lane review NIT 5,
+# 2026-06-11): ``</QUESTION>`` / ``</Question>`` variants read as the
+# same structural close to the model, but the original exact-case
+# ``str.replace`` missed them.
+_QUESTION_CLOSE_RE = re.compile(r"</question>", re.IGNORECASE)
+
+
 def escape_question(question: str) -> str:
     """Neutralize the closing delimiter so the question can't break out.
 
     The question is embedded between ``<question>`` tags as untrusted
-    data; an embedded literal ``</question>`` would let it impersonate
-    post-delimiter prompt content. Structural layer one — the prompt's
-    "do not follow instructions" framing is layer two.
+    data; an embedded literal ``</question>`` — ANY case, the matcher is
+    case-insensitive (lane review NIT 5, layer-2 hardening) — would let
+    it impersonate post-delimiter prompt content. Layer ONE remains the
+    code-side revalidation (G2v + the reused deterministic gates: an
+    injected instruction has no actuator and a hallucinated query still
+    dies at the policy gates); this escape and the prompt's "do not
+    follow instructions" framing are the second layer.
     """
-    return question.replace("</question>", "</ question>")
+    return _QUESTION_CLOSE_RE.sub("</ question>", question)
 
 
 # Hard cap on the requester's ``record_type_hint`` length (review WARN 1,

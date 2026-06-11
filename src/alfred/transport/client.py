@@ -671,8 +671,13 @@ async def peer_nl_query(
     ``kind=query_result`` on the same correlation_id.
 
     Default ``timeout`` is 90s (vs 60s on the deterministic async path)
-    — the holder runs two LLM turns. A late reply lands in the requester
-    daemon's orphan buffer (300s TTL) and a re-ask collects it.
+    — the holder runs two LLM turns. A reply that lands after the
+    timeout parks in the requester daemon's orphan buffer (300s TTL) and
+    ages out there: orphan pickup is SAME-correlation-id only, and this
+    tool surface mints a fresh cid per call, so a re-ask is a fresh
+    holder round-trip, NOT a collection of the orphaned reply. (Only an
+    ``await_response`` re-issued on the original cid within the TTL —
+    which no current surface does — would collect it.)
 
     Returns the holder's reply payload:
       * ``{status: "ok", answer, basis, truncated, outcome, ...}`` —
