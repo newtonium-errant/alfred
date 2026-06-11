@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ import frontmatter
 import pytest
 
 from alfred.pending_items.executor import (
+    _extract_assistant_turn_text,
     execute_action_plan,
     resolve_local_item,
 )
@@ -209,6 +211,85 @@ async def test_resolve_local_item_deliver_text_calls_transport(
     assert "this is the failed assistant turn" in "".join(sent_calls[0]["chunks"])
     found = find_by_id(queue_path, item.id)
     assert found.status == STATUS_RESOLVED
+
+
+def test_extract_assistant_turn_counts_tool_transcript_lines(
+    tmp_path: Path,
+) -> None:
+    """Regression pin: tool_result transcript entries must not shift indices.
+
+    Renderer↔executor contract, pinned end-to-end: the session body is
+    built by the REAL ``_build_session_body`` (alfred.telegram.session),
+    not a hand-written string. Since 71998aa a user-role transcript
+    entry containing only ``tool_result`` blocks renders as a
+    ``**Tool** (HH:MM): …`` line instead of an ``**Andrew**`` line. The
+    executor's line-walk maps the global transcript index to a rendered
+    line by counting speaker headers — if it stops counting ``**Tool**``
+    lines (or the renderer's Tool-line shape changes so the walk no
+    longer recognizes it), every assistant turn after a tool invocation
+    reconstructs the wrong turn (or fails to reconstruct at all). This
+    test fails in either regression direction.
+    """
+    from alfred.telegram.session import Session, _build_session_body
+
+    now = datetime(2026, 6, 11, 10, 0, tzinfo=timezone.utc)
+    sess = Session(
+        session_id="d145d57c",
+        chat_id=12345,
+        started_at=now,
+        last_message_at=now,
+        model="claude-sonnet-4-6",
+    )
+    sess.transcript = [
+        {
+            "role": "user",
+            "content": "hi",
+            "_ts": "2026-06-11T10:00:00+00:00",
+            "_kind": "text",
+        },
+        {
+            "role": "assistant",
+            "content": "earlier assistant turn",
+            "_ts": "2026-06-11T10:01:00+00:00",
+        },
+        {
+            # Pure tool_result entry — user-role per the Anthropic API,
+            # rendered under the **Tool** speaker since 71998aa.
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_0123456789",
+                    "content": "3 records found",
+                },
+            ],
+            "_ts": "2026-06-11T10:02:00+00:00",
+        },
+        {
+            "role": "assistant",
+            "content": "this is the target turn",
+            "_ts": "2026-06-11T10:03:00+00:00",
+        },
+    ]
+
+    body = _build_session_body(sess)
+    # Fixture validity: the rendered body must actually exercise the
+    # Tool-line path — if the renderer stops emitting **Tool** headers
+    # for pure-tool_result entries, this contract test must not pass
+    # vacuously.
+    assert "**Tool** (" in body
+
+    record = tmp_path / "session1.md"
+    record.write_text(
+        frontmatter.dumps(frontmatter.Post(body, type="session")),
+        encoding="utf-8",
+    )
+
+    # turn_index 3 = the final assistant entry, 0-based global
+    # transcript index (recorded at failure time in bot.py as
+    # ``len(session.transcript) - 1``).
+    text = _extract_assistant_turn_text(record, 3)
+    assert text == "this is the target turn"
 
 
 @pytest.mark.asyncio

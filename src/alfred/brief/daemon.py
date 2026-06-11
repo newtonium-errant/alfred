@@ -121,8 +121,9 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         quarantine_dir_name=config.quarantine_dir_name,
     )
 
-    # Health section — reads the latest BIT record from vault/process/,
-    # falling back to the BIT state file if no record is available.
+    # Health section — reads the latest BIT record from vault/run/
+    # (vault/process/ for pre-2026-06-12 legacy records), falling back
+    # to the BIT state file if no record is available.
     bit_state_path = Path(data_dir) / "bit_state.json"
     health_md = render_health_section(
         config.vault_path,

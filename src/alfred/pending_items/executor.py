@@ -89,11 +89,11 @@ def _extract_assistant_turn_text(
     Phase 1 simplification: the session frontmatter doesn't carry the
     full transcript (the body does, in display form). For this Phase
     we read the frontmatter ``telegram.transcript_path`` if present;
-    otherwise fall back to scanning the markdown body for the Nth
-    ``**Alfred** (...):`` line. This is best-effort — if the session
-    record's render-format changes, the executor surfaces that as an
-    error string and the user sees "couldn't reconstruct" rather than
-    silently delivering garbage.
+    otherwise fall back to scanning the markdown body's speaker-header
+    lines for the turn at ``turn_index``. This is best-effort — if the
+    session record's render-format changes, the executor surfaces that
+    as an error string and the user sees "couldn't reconstruct" rather
+    than silently delivering garbage.
     """
     try:
         post = frontmatter.load(str(record_path))
@@ -106,19 +106,48 @@ def _extract_assistant_turn_text(
         return None
 
     body = post.content or ""
-    # Walk lines, count Alfred turns, return the body of the Nth one.
-    # The renderer in ``session._build_session_body`` emits
-    # ``**Alfred** (HH:MM): TEXT`` per line. Voice/text user lines have
-    # the pattern ``**Andrew** (HH:MM[ · voice]): TEXT``.
+    # Walk lines, count speaker-header lines, return the body of the
+    # turn at ``turn_index``. The renderer in
+    # ``session._build_session_body`` emits one header line per
+    # transcript entry:
+    #   assistant turn          → ``**Alfred** (HH:MM): TEXT``
+    #   user voice/text turn    → ``**Andrew** (HH:MM[ · voice]): TEXT``
+    #   pure tool_result turn   → ``**Tool** (HH:MM): [tool_result: …]``
     #
     # turn_index is the global transcript index (user + assistant
-    # combined). We map global → assistant-only by counting both
-    # speakers and stopping when ``turn_index`` matches.
+    # combined; tool results arrive as user-role transcript entries and
+    # occupy a slot too). We map global index → line by counting all
+    # three speaker headers and stopping when ``turn_index`` matches.
+    #
+    # Known limitation (reviewer-acknowledged): a MIXED user turn
+    # (text + tool_result blocks in one transcript entry) renders BOTH
+    # a Tool line and an Andrew line for a single transcript slot,
+    # which this line-walk cannot disambiguate — it would over-count
+    # that entry by one. The production tool loop only ever appends
+    # pure-tool user messages, so the mixed shape never occurs in real
+    # transcripts; we deliberately accept it.
     lines = body.splitlines()
     line_idx = 0
     user_count = 0
     assistant_count = 0
+    tool_count = 0
     for line in lines:
+        if line.startswith("**Tool**"):
+            # A pure-tool_result transcript entry renders as a single
+            # ``**Tool**`` line — count it so assistant turns later in
+            # the transcript keep their index alignment.
+            if line_idx == turn_index:
+                # The failed turn was a tool-result turn — that should
+                # not happen for an outbound_failure (only assistant
+                # turns are outbound), but defensive: return the
+                # rendered content so the operator sees something.
+                paren_idx = line.find("):")
+                if paren_idx != -1:
+                    return line[paren_idx + 2:].strip()
+                return line
+            line_idx += 1
+            tool_count += 1
+            continue
         if line.startswith("**Andrew**"):
             if line_idx == turn_index:
                 # The failed turn was a user turn — that should not
@@ -152,6 +181,7 @@ def _extract_assistant_turn_text(
         turn_index=turn_index,
         assistant_count=assistant_count,
         user_count=user_count,
+        tool_count=tool_count,
     )
     return None
 
