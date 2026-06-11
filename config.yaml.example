@@ -349,6 +349,26 @@ transport:
   #   owner: true
   #   audit_log_path: "./data/canonical_audit.jsonl"
   #   proposals_path: "./data/canonical_proposals.jsonl"
+  #
+  #   # NL-lane broker (LLM-mediated opt-in lane, kind=query_nl) —
+  #   # HOLDER-side master switch. Absent block = lane OFF (fail-closed).
+  #   # The lane additionally requires per-(peer, type) `nl_query` grants
+  #   # below — BOTH levels must opt in. The holder's LLM translates a
+  #   # peer's natural-language question into structured queries (which
+  #   # run through the SAME deterministic gates as /peer/search) and
+  #   # composes a prose answer from policy-cleared fields only.
+  #   # nl_broker:
+  #   #   enabled: true
+  #   #   model: ""                    # "" = inherit telegram.anthropic.model
+  #   #   max_subqueries: 1            # sub-queries one question may derive
+  #   #   question_max_chars: 2000     # inbound NL question size gate
+  #   #   max_answer_chars: 1200       # composed answer hard cap (truncates)
+  #   #   verbatim_run_limit: 80       # compose-tier verbatim-dump guard
+  #   #   compose_field_max_chars: 1500  # per-value cap into the composer
+  #   #   interpret_max_tokens: 1024
+  #   #   compose_max_tokens: 1024
+  #   #   llm_timeout_seconds: 30
+  #
   #   peer_permissions:
   #     kal-le:
   #       person:   { fields: [name, email, timezone, aliases, preferences.coding] }
@@ -361,7 +381,31 @@ transport:
   #       project:  { fields: [name, status, description] }
   #       org:      { fields: [name, type, status, alfred_tags] }
   #       location: { fields: [name, type, address, alfred_tags] }
-  #       event:    { fields: [name, type, title, start, end, status, alfred_tags] }
+  #       event:
+  #         fields: [name, type, title, start, end, status, alfred_tags]
+  #         # Deterministic filtered-query opt-in (P1) — governs
+  #         # /peer/search + the async kind=query broker. Absent = denied.
+  #         # query:
+  #         #   filter_dims:
+  #         #     participants: { op: [eq, contains] }
+  #         #     date: { op: [gte, lte, between] }
+  #         #   sort: [date]
+  #         #   max_limit: 10
+  #         #   default_limit: 5
+  #         # NL-lane opt-in for THIS peer × type (requires the `query`
+  #         # block above AND canonical.nl_broker.enabled). Absent = the
+  #         # NL lane is denied for this pair.
+  #         #
+  #         # compose_fields is the COMPOSITION-GRANT tier: fields the
+  #         # composer may READ to inform its prose answer but which are
+  #         # never raw-released through any lane. GOVERNANCE: a
+  #         # compose-grant is a disclosure decision with friction — the
+  #         # peer can learn what the field says in PARAPHRASE. Only
+  #         # compose-grant a field whose content is acceptable for that
+  #         # peer to learn in prose. Ships EMPTY by default.
+  #         # nl_query:
+  #         #   compose_fields: []     # e.g. [description]
+  #         #   max_records: 5         # records fed to the composer
 
 # ---------------------------------------------------------------------------
 # Google Calendar integration (Phase A+ inter-instance comms — Salem-only)
