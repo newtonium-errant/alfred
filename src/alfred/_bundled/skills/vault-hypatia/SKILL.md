@@ -2916,7 +2916,7 @@ If a session has nothing extraction-worthy, mark `processed: true` and emit one 
 
 ## Peer protocol — Salem
 
-Salem is the **canonical authority** for a small set of operationally-load-bearing record types: `person`, `org`, `location`, `event`, `project`. When those entities surface in your work — a person named in a draft, a vendor in a marketing piece, a venue, a meeting Andrew wants scheduled — you do not write them locally. You read from Salem (`query_canonical`) and you propose to Salem (`propose_*`). This is a hard architectural boundary: peer instances do not duplicate canonical state. The scope guard backs this up by rejecting `vault_create` on canonical types with a hint pointing at the propose tool.
+Salem is the **canonical authority** for a small set of operationally-load-bearing record types: `person`, `org`, `location`, `event`, `project`. When those entities surface in your work — a person named in a draft, a vendor in a marketing piece, a venue, a meeting Andrew wants scheduled — you do not write them locally. You read from Salem (`query_canonical`, `peer_search_canonical`, `peer_ask_canonical`) and you propose to Salem (`propose_*`). This is a hard architectural boundary: peer instances do not duplicate canonical state. The scope guard backs this up by rejecting `vault_create` on canonical types with a hint pointing at the propose tool.
 
 You have **eight peer tools** for talking to Salem from inside a turn. They round-trip via the transport client; treat them like any other tool call.
 
@@ -2959,7 +2959,7 @@ Worked example — "Pat, when did I last meet Ben?":
 
 Check `denied_dims` before narrating: if it's non-empty, Salem's policy refused that filter dimension and the result is narrower than you asked for — say so rather than presenting a partial answer as complete.
 
-There's also `peer_async_query_canonical` — identical query shape and identical disclosure rules, but it returns out-of-band via the peer mailbox so you can keep working while Salem answers. Prefer `peer_search_canonical` for a quick blocking lookup; reach for the async sibling only when the answer is latency-tolerant.
+There's also `peer_async_query_canonical` — identical query shape and identical disclosure rules, but routed through the peer mailbox at Priority precedence. The call itself still waits inline for the reply (up to ~60s); what the lane buys is latency tolerance, not an early return. Prefer `peer_search_canonical` for a quick lookup; use the mailbox sibling when a slow answer is acceptable — and if it returns `{status: "timeout"}`, drop a `[verify: awaiting Salem — <what you asked>]` placeholder, keep working, and re-ask later (the query is read-only; asking again is safe).
 
 ### `peer_ask_canonical(question, record_type_hint)` — fuzzy question, composed answer
 
@@ -2974,9 +2974,10 @@ The contrast pair:
 
 Formulation discipline:
 
+- **Third person, real names.** Write the question as Salem's broker will read it — it has no referent for "I"/"me"/"you". *"When did Andrew last meet Ben Carver?"*, not *"When did I last meet Ben?"*.
 - **Full canonical names in the question.** Underneath, Salem's participant matching is exact on the full name — a question that only says "Ben" matches nothing; "Ben Carver" matches. Expand short forms to the canonical full name even when Andrew used the nickname.
 - `record_type_hint` is advisory — Salem's broker decides; the hint just helps it aim. Pass it when you know the type.
-- It rides the async mailbox at Priority precedence and is slower than the structured tools (two LLM turns on Salem's side — tens of seconds, up to 90s). Same posture as `peer_async_query_canonical`: don't stall on it when structured would do. If you're mid-draft, drop a `[verify: awaiting Salem — <question>]` placeholder, keep working, and back-fill when the answer lands.
+- It rides the async mailbox at Priority precedence and is slower than the structured tools (two LLM turns on Salem's side) — the call itself waits inline for the answer, tens of seconds, up to ~90s. Don't reach for it when structured would do. If it comes back `{status: "timeout"}`, drop a `[verify: awaiting Salem — <question>]` placeholder, keep working, and re-ask later — it's read-only, so asking again is safe and gets the answer.
 
 What comes back, and what each outcome means:
 
