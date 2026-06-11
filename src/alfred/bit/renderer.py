@@ -27,6 +27,55 @@ def _tool_counts(report: HealthReport) -> dict[str, int]:
     return counts
 
 
+def process_hub_name(name_template: str) -> str:
+    """Derive the BIT process-hub record name from the run name template.
+
+    Strips the ``{date}`` placeholder and collapses the leftover
+    whitespace, so the default template ``"Alfred BIT {date}"`` yields
+    ``"Alfred BIT"`` — byte-identical to the historical hub link. An
+    operator overriding ``name_template`` (e.g. ``"KAL-LE BIT {date}"``)
+    gets a matching hub name instead of a hardcoded instance literal.
+
+    Falls back to ``"Alfred BIT"`` when the stripped result is empty
+    (e.g. a template of just ``"{date}"``) so the ``process`` wikilink
+    can never render as ``[[process/]]``.
+    """
+    name = " ".join(name_template.replace("{date}", " ").split())
+    return name or "Alfred BIT"
+
+
+def render_process_hub_record(hub_name: str, date_str: str) -> tuple[dict, str]:
+    """Render the BIT process hub note as ``(frontmatter, body)``.
+
+    Every BIT run record's ``process`` field links to this hub
+    (``[[process/<hub_name>]]``) — it's the run→process join key, same
+    convention as the Morning Brief's run records. The hub is written
+    by :func:`alfred.bit.daemon.ensure_process_hub`; the janitor has no
+    create scope, so the writer owning the hub's existence is the only
+    automated way to keep the link from dangling (janitor LINK001).
+    """
+    frontmatter = {
+        "type": "process",
+        "status": "active",
+        "name": hub_name,
+        "description": (
+            "Daily built-in test (BIT) health sweep across Alfred's tools."
+        ),
+        "created": date_str,
+        "tags": ["bit", "health"],
+    }
+    body = "\n".join([
+        f"# {hub_name}",
+        "",
+        "Recurring daily health sweep across Alfred's tools. Each run "
+        "writes a `run/` record that links back here via its `process` "
+        "frontmatter field.",
+        "",
+        "Created automatically by the BIT daemon.",
+    ])
+    return frontmatter, body
+
+
 def render_bit_record(
     report: HealthReport,
     date_str: str,
@@ -57,7 +106,10 @@ def render_bit_record(
         "status": "completed",
         "name": name,
         "description": "Alfred built-in test (health sweep)",
-        "process": "[[process/Alfred BIT]]",
+        # Hub link derives from the name template so a custom
+        # name_template gets a matching hub (no instance hardcode).
+        # The hub note itself is ensure-created by the daemon.
+        "process": f"[[process/{process_hub_name(config.output.name_template)}]]",
         "trigger": "scheduled",
         "started": now.isoformat(),
         "created": date_str,

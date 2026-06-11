@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
+import structlog
+
 from alfred import cli as top_cli
 from alfred.bit import cli as bit_cli
 from alfred.bit.config import (
@@ -18,8 +20,12 @@ from alfred.bit.config import (
     DEFAULT_LEAD_MINUTES,
     load_from_unified,
 )
-from alfred.bit.daemon import _next_run_time, run_bit_once
-from alfred.bit.renderer import _tool_counts, render_bit_record
+from alfred.bit.daemon import _next_run_time, ensure_process_hub, run_bit_once
+from alfred.bit.renderer import (
+    _tool_counts,
+    process_hub_name,
+    render_bit_record,
+)
 from alfred.bit.state import BITRun, StateManager
 from alfred.health import aggregator as agg
 from alfred.health.types import CheckResult, HealthReport, Status, ToolHealth
@@ -288,6 +294,132 @@ class TestRunBitOnce:
             _, status = await run_bit_once(cfg, {}, sm)
         assert status == Status.FAIL
         assert sm.state.runs[0].overall_status == "fail"
+
+
+class TestProcessHub:
+    """LINK001 closure — the BIT process hub note (2026-06-12).
+
+    Every BIT record carries ``process: [[process/<hub>]]`` but nothing
+    ever created the hub note, so the janitor flagged LINK001 daily and
+    (no create scope) could never self-heal it. The daemon now
+    ensure-creates the hub writer-side, idempotently.
+    """
+
+    # --- process_hub_name (pure helper) ---
+
+    def test_default_template_derives_alfred_bit(self) -> None:
+        assert process_hub_name("Alfred BIT {date}") == "Alfred BIT"
+
+    def test_custom_template_derives_matching_hub(self) -> None:
+        assert process_hub_name("KAL-LE BIT {date}") == "KAL-LE BIT"
+
+    def test_empty_template_falls_back(self) -> None:
+        # The wikilink must never render as ``[[process/]]``.
+        assert process_hub_name("") == "Alfred BIT"
+
+    def test_date_only_template_falls_back(self) -> None:
+        assert process_hub_name("{date}") == "Alfred BIT"
+
+    # --- render_bit_record process-field pins ---
+
+    def test_default_process_link_byte_identical(self, tmp_path: Path) -> None:
+        """Regression pin: default config emits the historical link."""
+        cfg = BITConfig(vault_path=str(tmp_path))
+        fm, _ = render_bit_record(_sample_report(), "2026-04-19", cfg)
+        assert fm["process"] == "[[process/Alfred BIT]]"
+
+    def test_custom_template_process_link_matches_hub(
+        self, tmp_path: Path
+    ) -> None:
+        cfg = BITConfig(vault_path=str(tmp_path))
+        cfg.output.name_template = "KAL-LE BIT {date}"
+        fm, _ = render_bit_record(_sample_report(), "2026-04-19", cfg)
+        assert fm["process"] == "[[process/KAL-LE BIT]]"
+
+    # --- ensure_process_hub ---
+
+    def test_first_call_creates_hub(self, tmp_path: Path) -> None:
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        cfg = BITConfig(vault_path=str(vault))
+        created = ensure_process_hub(vault, cfg, "2026-06-12")
+        assert created is True
+        hub = vault / "process" / "Alfred BIT.md"
+        assert hub.exists()
+        content = hub.read_text(encoding="utf-8")
+        assert "type: process" in content
+        assert "status: active" in content
+        assert "name: Alfred BIT" in content
+
+    def test_second_call_is_idempotent(self, tmp_path: Path) -> None:
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        cfg = BITConfig(vault_path=str(vault))
+        assert ensure_process_hub(vault, cfg, "2026-06-12") is True
+        hub = vault / "process" / "Alfred BIT.md"
+        first_content = hub.read_text(encoding="utf-8")
+        assert ensure_process_hub(vault, cfg, "2026-06-13") is False
+        assert hub.read_text(encoding="utf-8") == first_content
+
+    def test_create_logs_once_then_silent(self, tmp_path: Path) -> None:
+        """capture_logs pin: CREATE logs exactly once; existing hub none."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        cfg = BITConfig(vault_path=str(vault))
+        with structlog.testing.capture_logs() as captured:
+            ensure_process_hub(vault, cfg, "2026-06-12")
+        created_events = [
+            c for c in captured if c.get("event") == "bit.process_hub_created"
+        ]
+        assert len(created_events) == 1
+        assert created_events[0]["path"].endswith("process/Alfred BIT.md")
+
+        with structlog.testing.capture_logs() as captured_2nd:
+            ensure_process_hub(vault, cfg, "2026-06-13")
+        assert [
+            c for c in captured_2nd
+            if c.get("event") == "bit.process_hub_created"
+        ] == []
+
+    def test_create_failure_is_loud_not_fatal(self, tmp_path: Path) -> None:
+        """A FILE at vault/process makes mkdir raise — warn, don't raise."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "process").write_text("not a directory", encoding="utf-8")
+        cfg = BITConfig(vault_path=str(vault))
+        with structlog.testing.capture_logs() as captured:
+            created = ensure_process_hub(vault, cfg, "2026-06-12")
+        assert created is False
+        failed_events = [
+            c for c in captured
+            if c.get("event") == "bit.process_hub_create_failed"
+        ]
+        assert len(failed_events) == 1
+        assert failed_events[0]["error_type"]
+        assert failed_events[0]["path"].endswith("process/Alfred BIT.md")
+
+    async def test_run_bit_once_creates_hub_and_matching_link(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end LINK001 closure: run record + hub, link targets hub."""
+        _install_stub("x", Status.OK)
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        cfg = BITConfig(vault_path=str(vault))
+        cfg.state.path = str(tmp_path / "bit_state.json")
+        sm = StateManager(cfg.state.path)
+        sm.load()
+        with patch("alfred.health.aggregator._load_tool_checks", lambda: None):
+            rel_path, _ = await run_bit_once(cfg, {}, sm)
+
+        record = vault / rel_path
+        assert record.exists()
+        hub = vault / "process" / "Alfred BIT.md"
+        assert hub.exists()
+        # The record's ``process`` link target matches the hub filename —
+        # the janitor's LINK001 resolves against this exact pair.
+        record_content = record.read_text(encoding="utf-8")
+        assert f"[[process/{hub.stem}]]" in record_content
 
 
 class TestNextRunTime:

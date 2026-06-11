@@ -27,10 +27,57 @@ from alfred.health.aggregator import run_all_checks
 from alfred.health.types import Status
 
 from .config import BITConfig
-from .renderer import _tool_counts, render_bit_record
+from .renderer import (
+    _tool_counts,
+    process_hub_name,
+    render_bit_record,
+    render_process_hub_record,
+)
 from .state import BITRun, StateManager
 
 log = structlog.get_logger(__name__)
+
+
+def ensure_process_hub(
+    vault_path: Path,
+    config: BITConfig,
+    date_str: str,
+) -> bool:
+    """Create the BIT process hub note if it doesn't exist yet.
+
+    Every BIT run record carries ``process: [[process/<hub>]]`` — with
+    no hub note, the janitor flags LINK001 daily and (having no create
+    scope) can never self-heal it. The BIT daemon already writes the
+    vault directly/unscoped by design (see module docstring), so the
+    writer owns the hub's existence.
+
+    Returns True when the hub was created, False when it already
+    existed or the create failed. The existing-hub path doesn't log —
+    the hub's existence is vault-observable; only the CREATE and FAIL
+    events are signal. Failure is loud (warning) but never fatal: the
+    BIT record write must still proceed, and the janitor's LINK001
+    keeps flagging until the hub exists, so the failure is doubly
+    visible.
+    """
+    hub_name = process_hub_name(config.output.name_template)
+    hub_path = vault_path / "process" / f"{hub_name}.md"
+    if hub_path.exists():
+        return False
+    frontmatter, body = render_process_hub_record(hub_name, date_str)
+    content = serialize_record(frontmatter, body)
+    try:
+        hub_path.parent.mkdir(parents=True, exist_ok=True)
+        hub_path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        log.warning(
+            "bit.process_hub_create_failed",
+            path=str(hub_path),
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        return False
+    log.info("bit.process_hub_created", path=str(hub_path))
+    return True
 
 
 async def run_bit_once(
@@ -50,6 +97,10 @@ async def run_bit_once(
 
     # Write the vault record
     vault_path = Path(config.vault_path)
+    # Ensure the process hub the record's ``process`` field links to
+    # exists — the janitor has no create scope, so it can never
+    # self-heal the dangling link (LINK001) if we don't.
+    ensure_process_hub(vault_path, config, today)
     frontmatter, body = render_bit_record(report, today, config)
     content = serialize_record(frontmatter, body)
 
