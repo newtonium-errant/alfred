@@ -842,6 +842,99 @@ TOOL_RUNNERS = {
 }
 
 
+# Seconds between consecutive daemon spawns (O1, 2026-06-11 slow-start
+# remediation). The stagger exists to avoid a thundering herd — 13+
+# children forking and importing their tool stacks simultaneously on
+# shared infra (WSL2) — and that rationale stands. The VALUE was the
+# problem: the original 10s stagger was measured (2026-06-11, N=5
+# restarts, log archaeology) at ~115s of Salem's ~119s boot — 12 gaps
+# x ~10.2s, ~97% of total startup, dwarfing every per-daemon cost
+# (heaviest child self-init: talker at 2.5s; surveyor 1.2s; the ML
+# stack is lazy-loaded and never on the start path). 2s keeps adjacent
+# heavy children (talker, cloudflared, surveyor) from overlapping
+# their import/init windows while cutting the 13-tool boot to ~26s.
+# Bumping this back up should be a visible, deliberate diff — the
+# constant is pinned in tests/test_orchestrator_spawn.py.
+SPAWN_STAGGER_SECONDS = 2.0
+
+# Priority spawn order (O2, 2026-06-11 slow-start remediation). The
+# auto-selected roster is reordered so latency-sensitive daemons start
+# first; selection (configuration-by-presence) is unchanged — this is
+# ordering only, applied via ``order_tools`` after the roster is built.
+#
+# Rationale, from the same measurement: spawn order used to be
+# selection-block order, which put the talker (the user-facing
+# Telegram surface AND the host of the transport server every peer +
+# co-located tool depends on) in slot 9 of 13 — reachable at +82s,
+# behind four batch daemons whose next scheduled work was hours away.
+# Priority order + the 2s stagger puts talker polling at ~+3s and the
+# tunnel registered at ~+5s.
+#
+#   1. talker      — user-facing + hosts transport :8891
+#   2. cloudflared — inbound tunnel (webhooks). NOTE the accepted
+#      window: the tunnel now comes up ~16s before the mail webhook
+#      listener (batch slot); an inbound delivery in that window gets
+#      a tunnel-side 502 and relies on the sender's retry (n8n
+#      retries; email is minutes-tolerant). Pre-O2 the exposure was
+#      reversed (webhook up ~80s before tunnel) and equally harmless.
+#   3-5. bit / brief / routine — morning-cadence daemons; cheap, and
+#      bit is the brief's pre-check.
+#   6+. batch daemons — hourly/daily sweep cadence (curator, janitor,
+#      distiller, surveyor, mail webhook, instructor, daily_sync,
+#      pending_items_pusher) and per-instance extras (KAL-LE's
+#      digest/radar/friction, peer digest push). Nothing here is
+#      latency-sensitive at boot.
+#
+# Verified order-independence before reordering (2026-06-11): the
+# transport token is injected into os.environ BEFORE any spawn (all
+# children inherit it at fork regardless of position); the bit
+# auto-start rule at selection time only affects roster MEMBERSHIP;
+# transport-dependent daemons (brief push, pending pusher) already
+# retry/degrade on transport-down by design — starting talker first
+# only helps them. ``--only`` rosters are NOT reordered (explicit
+# operator sequencing is respected verbatim).
+#
+# Lockstep contract: this tuple must name every TOOL_RUNNERS key
+# exactly once (pinned) so a new tool gets a DELIBERATE slot decision
+# rather than an accidental one. Unknown tools (belt-and-braces) sort
+# after all listed ones, preserving selection order.
+SPAWN_PRIORITY: tuple[str, ...] = (
+    "talker",
+    "cloudflared",
+    "bit",
+    "brief",
+    "routine",
+    "curator",
+    "janitor",
+    "distiller",
+    "surveyor",
+    "mail",
+    "instructor",
+    "daily_sync",
+    "pending_items_pusher",
+    "brief_digest_push",
+    "digest",
+    "radar_day",
+    "friction_analyzer",
+)
+
+
+def order_tools(tools: list[str]) -> list[str]:
+    """Return the roster in spawn-priority order (stable).
+
+    Tools not in :data:`SPAWN_PRIORITY` sort after every listed tool,
+    preserving their relative selection order (Python's sort is
+    stable). Pure function — pinned in tests/test_orchestrator_spawn.py
+    against a Salem-shaped roster.
+    """
+    def _key(tool: str) -> int:
+        try:
+            return SPAWN_PRIORITY.index(tool)
+        except ValueError:
+            return len(SPAWN_PRIORITY)
+    return sorted(tools, key=_key)
+
+
 def run_all(
     raw: dict[str, Any],
     only: str | None = None,
@@ -993,6 +1086,12 @@ def run_all(
             for tool_name, reason in skipped:
                 _log.info("orchestrator.daemon_skipped", tool=tool_name, reason=reason)
 
+        # Priority-ordered spawn (O2) — reorder the auto-selected roster
+        # only; ``--only`` rosters above are explicit operator sequencing
+        # and stay verbatim. See SPAWN_PRIORITY for the full rationale +
+        # the 2026-06-11 slot-9-talker measurement that motivated it.
+        tools = order_tools(tools)
+
     # Validate tool names
     for tool in tools:
         if tool not in TOOL_RUNNERS:
@@ -1025,8 +1124,9 @@ def run_all(
 
     # ---- Graceful SIGTERM/SIGINT handling --------------------------------
     # Installed BEFORE spawning children so that SIGTERM arriving during the
-    # stagger sleep (10s between tool starts) sets the flag instead of killing
-    # the orchestrator instantly and orphaning already-started children.
+    # stagger sleep (SPAWN_STAGGER_SECONDS between tool starts) sets the flag
+    # instead of killing the orchestrator instantly and orphaning
+    # already-started children.
     shutdown_requested = False
 
     def _handle_shutdown(signum, frame):
@@ -1097,11 +1197,19 @@ def run_all(
             pass
 
     try:
-        # Start all — stagger by 10s to avoid thundering herd on shared infra.
-        # Stagger sleep uses small increments so SIGTERM is noticed quickly.
+        # Start all — stagger between spawns to avoid thundering herd on
+        # shared infra (see SPAWN_STAGGER_SECONDS for the rationale + the
+        # 2026-06-11 measurement that cut it from 10s to 2s).
+        #
+        # The increment-sleep SHAPE is deliberate and verified (O1): the
+        # SIGTERM handler only sets ``shutdown_requested`` — a monolithic
+        # ``time.sleep(SPAWN_STAGGER_SECONDS)`` would delay shutdown
+        # response by up to a full stagger during startup. 0.1s
+        # increments keep `alfred down` responsive mid-boot.
+        stagger_increments = max(1, int(SPAWN_STAGGER_SECONDS * 10))
         for i, tool in enumerate(tools):
             if i > 0:
-                for _ in range(100):  # 10s in 0.1s increments
+                for _ in range(stagger_increments):
                     time.sleep(0.1)
                     if shutdown_requested:
                         break
