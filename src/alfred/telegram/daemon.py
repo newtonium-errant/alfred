@@ -892,6 +892,107 @@ async def run(
                     "error": str(exc),
                 }
 
+        # ---- NL-broker LLM callable (LLM-mediated opt-in lane) ----------
+        # ``kind=query_nl`` needs a constrained one-shot completion for
+        # its interpret + compose stages. The transport module stays free
+        # of anthropic imports: the daemon (which owns the talker's
+        # Anthropic config) builds an ASYNC closure here and registers it
+        # via wire_transport_app — the peer_inbox_callable precedent.
+        #
+        # AsyncAnthropic is MANDATORY (not the sync client): the broker
+        # runs inside this event loop, and a sync HTTP call would freeze
+        # Telegram polling for the 5-25s LLM turns.
+        #
+        # Model resolution (ratified Decision D): nl_broker.model, with
+        # "" inheriting the talker's anthropic.model — no per-instance
+        # model literal in code. Failures here are non-fatal: the lane
+        # fail-closes to ``nl_broker_unavailable`` (distinguishable from
+        # "not opted in") and the talker keeps running.
+        nl_llm_callable = None
+        nl_llm_model_label = ""
+        try:
+            nl_broker_cfg = transport_config.canonical.nl_broker
+            if nl_broker_cfg.enabled:
+                from alfred.telegram._anthropic_compat import (
+                    messages_create_kwargs as _nl_create_kwargs,
+                )
+
+                _nl_model = nl_broker_cfg.model or config.anthropic.model
+                _nl_client = anthropic.AsyncAnthropic(
+                    api_key=config.anthropic.api_key,
+                    timeout=nl_broker_cfg.llm_timeout_seconds,
+                )
+
+                async def _nl_llm_complete(
+                    *,
+                    system: str,
+                    user: str,
+                    max_tokens: int,
+                    output_schema: dict[str, Any] | None = None,
+                ) -> tuple[str, dict[str, Any]]:
+                    """The broker's injection contract — one-shot, no tools.
+
+                    ``output_schema`` rides ``output_config.format`` when
+                    given; a model that rejects structured outputs gets one
+                    retry without it (the broker parses defensively either
+                    way). ``temperature`` is omitted entirely (one-shot
+                    translation/composition wants the default; also
+                    sidesteps the Opus-family rejection quirk).
+                    """
+                    kwargs = _nl_create_kwargs(
+                        model=_nl_model,
+                        max_tokens=max_tokens,
+                        system=system,
+                        messages=[{"role": "user", "content": user}],
+                    )
+                    if output_schema is not None:
+                        kwargs["output_config"] = {
+                            "format": {
+                                "type": "json_schema",
+                                "schema": output_schema,
+                            },
+                        }
+                    try:
+                        resp = await _nl_client.messages.create(**kwargs)
+                    except Exception as exc:
+                        # Structured-output rejection fallback — older /
+                        # other model families 400 on output_config; the
+                        # plain completion + defensive parse still works.
+                        rejected_output_config = (
+                            output_schema is not None
+                            and "output" in str(exc).lower()
+                        )
+                        if not rejected_output_config:
+                            raise
+                        log.info(
+                            "talker.daemon.nl_broker_output_config_fallback",
+                            model=_nl_model, error=str(exc)[:200],
+                        )
+                        kwargs.pop("output_config", None)
+                        resp = await _nl_client.messages.create(**kwargs)
+                    text = "".join(
+                        block.text for block in resp.content
+                        if getattr(block, "type", "") == "text"
+                    )
+                    usage = {
+                        "input_tokens": getattr(resp.usage, "input_tokens", 0),
+                        "output_tokens": getattr(resp.usage, "output_tokens", 0),
+                    }
+                    return text, usage
+
+                nl_llm_callable = _nl_llm_complete
+                nl_llm_model_label = _nl_model
+                log.info(
+                    "talker.daemon.nl_broker_enabled", model=_nl_model,
+                )
+            else:
+                # ILB: opted-out reads differently from setup-failed.
+                log.info("talker.daemon.nl_broker_disabled")
+        except Exception:  # noqa: BLE001 — lane fail-closes; talker survives
+            log.exception("talker.daemon.nl_broker_setup_failed")
+            nl_llm_callable = None
+            nl_llm_model_label = ""
+
         # ---- Centralized wiring --------------------------------------
         # ``wire_transport_app`` calls every register_* helper
         # conditionally based on what we pass in. This is the single
@@ -925,6 +1026,8 @@ async def run(
             gcal_client=gcal_client,
             gcal_config=gcal_config,
             gcal_intended_on=gcal_intended_on,
+            nl_llm_callable=nl_llm_callable,
+            nl_llm_model_label=nl_llm_model_label,
         )
         log.info(
             "talker.daemon.transport_configured",
