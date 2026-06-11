@@ -389,3 +389,352 @@ class TestFormatTafSectionSignificanceGate:
         ])
         out = format_taf_section([taf], [StationConfig(id="CYZX", name="Greenwood")])
         assert "Key changes" in out
+
+
+# ---------------------------------------------------------------------------
+# Cloud-base mixed-type sweep (2026-06-11) — the SAME failure class as the
+# visib P0, remaining sites: parse_metar's ceiling derivation compared
+# ``base < ceiling_ft`` (str vs int — the 2026-04-30/05-10 incident class
+# verbatim), and ``base // 100`` in _format_ceiling / _format_taf_period
+# (str // int TypeError; float base ALSO crashed the ``:03d`` format with
+# ValueError). ``_parse_cloud_base`` is the boundary validator.
+#
+# Unconditional per feedback_regression_pin_unconditional — no importorskip.
+# ---------------------------------------------------------------------------
+
+
+class TestParseCloudBase:
+    def test_int_passthrough(self) -> None:
+        from alfred.brief.weather import _parse_cloud_base
+        assert _parse_cloud_base(500) == 500
+        assert isinstance(_parse_cloud_base(500), int)
+
+    def test_float_truncated_to_int(self) -> None:
+        # A float base ALSO crashed downstream — not at the comparison,
+        # but at ``f"{base // 100:03d}"`` (ValueError: Unknown format
+        # code 'd' for float). int coercion closes both.
+        from alfred.brief.weather import _parse_cloud_base
+        assert _parse_cloud_base(1500.0) == 1500
+        assert isinstance(_parse_cloud_base(1500.0), int)
+
+    def test_numeric_string_coerced(self) -> None:
+        from alfred.brief.weather import _parse_cloud_base
+        assert _parse_cloud_base("500") == 500
+        assert _parse_cloud_base("1500.0") == 1500
+        assert _parse_cloud_base(" 200 ") == 200
+
+    def test_none_and_empty_return_none_silently(self) -> None:
+        import structlog
+        from alfred.brief.weather import _parse_cloud_base
+        with structlog.testing.capture_logs() as captured:
+            assert _parse_cloud_base(None) is None
+            assert _parse_cloud_base("") is None
+            assert _parse_cloud_base("   ") is None
+        warns = [c for c in captured
+                 if c.get("event") == "weather.cloud_base_unparseable"]
+        assert warns == []  # well-formed absence — no operator noise
+
+    def test_garbage_string_returns_none_with_warn(self) -> None:
+        import structlog
+        from alfred.brief.weather import _parse_cloud_base
+        with structlog.testing.capture_logs() as captured:
+            assert _parse_cloud_base("///", station_id="CYHZ") is None
+        warns = [c for c in captured
+                 if c.get("event") == "weather.cloud_base_unparseable"]
+        assert len(warns) == 1
+        assert warns[0]["station"] == "CYHZ"
+        assert warns[0]["reason"] == "non_numeric_string"
+
+    def test_bool_rejected_explicitly(self) -> None:
+        import structlog
+        from alfred.brief.weather import _parse_cloud_base
+        with structlog.testing.capture_logs() as captured:
+            assert _parse_cloud_base(True) is None
+        warns = [c for c in captured
+                 if c.get("event") == "weather.cloud_base_unparseable"]
+        assert len(warns) == 1
+        assert warns[0]["reason"] == "bool"
+
+    def test_unexpected_type_rejected_with_warn(self) -> None:
+        import structlog
+        from alfred.brief.weather import _parse_cloud_base
+        with structlog.testing.capture_logs() as captured:
+            assert _parse_cloud_base([500]) is None
+        warns = [c for c in captured
+                 if c.get("event") == "weather.cloud_base_unparseable"]
+        assert len(warns) == 1
+        assert warns[0]["reason"] == "type_list"
+
+
+class TestCloudBaseMetarPipeline:
+    """End-to-end pins through parse_metar + the formatters — the tests
+    that would have caught the ceiling-comparison crash at introduction.
+    """
+
+    def _configs(self):  # type: ignore[no-untyped-def]
+        from alfred.brief.config import StationConfig
+        return [StationConfig(id="CYHZ", name="Halifax", primary=True)]
+
+    def test_string_base_then_int_base_does_not_crash_ceiling(self) -> None:
+        # The bug-of-record path: first BKN/OVC layer's string base got
+        # assigned to ceiling_ft untransformed; the next layer's int
+        # base then hit ``200 < "500"`` → TypeError. Post-fix: both
+        # parse to int, ceiling = the lower (200).
+        from alfred.brief.weather import parse_metar
+        raw = {
+            "icaoId": "CYHZ",
+            "visib": "10+",
+            "fltCat": "IFR",
+            "clouds": [
+                {"cover": "OVC", "base": "500"},
+                {"cover": "BKN", "base": 200},
+            ],
+        }
+        sw = parse_metar(raw, self._configs())
+        assert sw.ceiling_ft == 200
+        assert isinstance(sw.ceiling_ft, int)
+        # Every stored layer base is int|None by contract.
+        assert [c["base"] for c in sw.clouds] == [500, 200]
+
+    def test_incident_shape_renders_full_section_without_crash(self) -> None:
+        # The 2026-04-30 incident METAR shape (string visib, OVC 500)
+        # PLUS a string base — the full row render must survive.
+        from alfred.brief.weather import format_weather_section, parse_metar
+        raw = {
+            "icaoId": "CYHZ",
+            "visib": "10+",
+            "temp": 3,
+            "dewp": 2,
+            "wdir": 140,
+            "wspd": 8,
+            "fltCat": "IFR",
+            "clouds": [{"cover": "OVC", "base": "500"}],
+            "reportTime": "2026-04-30T08:00:00.000Z",
+        }
+        sw = parse_metar(raw, self._configs())
+        out = format_weather_section([sw], self._configs())
+        assert ">10SM" in out
+        assert "OVC005" in out  # string base rendered via ``// 100``
+
+    def test_float_base_renders_without_format_crash(self) -> None:
+        # ``f"{1500.0 // 100:03d}"`` raises ValueError pre-coercion.
+        from alfred.brief.weather import _format_ceiling, parse_metar
+        raw = {
+            "icaoId": "CYHZ",
+            "fltCat": "VFR",
+            "clouds": [{"cover": "SCT", "base": 1500.0}],
+        }
+        sw = parse_metar(raw, self._configs())
+        assert _format_ceiling(sw) == "SCT015"
+
+    def test_unparseable_base_skips_element_not_run(self) -> None:
+        # Degradation contract: the malformed LAYER renders bare cover
+        # and is excluded from the ceiling; the run continues; warning
+        # logged.
+        import structlog
+        from alfred.brief.weather import _format_ceiling, parse_metar
+        raw = {
+            "icaoId": "CYHZ",
+            "fltCat": "IFR",
+            "clouds": [
+                {"cover": "FEW", "base": "///"},
+                {"cover": "OVC", "base": 400},
+            ],
+        }
+        with structlog.testing.capture_logs() as captured:
+            sw = parse_metar(raw, self._configs())
+        assert sw.ceiling_ft == 400  # junk layer excluded from ceiling
+        assert _format_ceiling(sw) == "FEW OVC004"  # bare cover survives
+        warns = [c for c in captured
+                 if c.get("event") == "weather.cloud_base_unparseable"]
+        assert len(warns) == 1
+
+    def test_non_dict_cloud_layer_skipped_with_warn(self) -> None:
+        import structlog
+        from alfred.brief.weather import parse_metar
+        raw = {
+            "icaoId": "CYHZ",
+            "fltCat": "VFR",
+            "clouds": ["CAVOK", {"cover": "FEW", "base": 12000}],
+        }
+        with structlog.testing.capture_logs() as captured:
+            sw = parse_metar(raw, self._configs())
+        assert len(sw.clouds) == 1  # the string entry skipped
+        warns = [c for c in captured
+                 if c.get("event") == "weather.cloud_layer_unparseable"]
+        assert len(warns) == 1
+
+    def test_flight_cat_warning_safe_with_string_derived_ceiling(self) -> None:
+        # Downstream consumer of the derivation: ``ceiling_ft < 1000``
+        # crashed when the derivation assigned a string base. Post-fix
+        # the alert renders.
+        from alfred.brief.weather import _flight_cat_warning, parse_metar
+        raw = {
+            "icaoId": "CYHZ",
+            "fltCat": "IFR",
+            "clouds": [{"cover": "OVC", "base": "500"}],
+        }
+        sw = parse_metar(raw, self._configs())
+        alert = _flight_cat_warning(sw)
+        assert alert is not None
+        assert "ceiling 500ft" in alert
+
+
+class TestTafCloudBase:
+    def test_string_base_renders(self) -> None:
+        from alfred.brief.weather import _format_taf_period
+        out = _format_taf_period(
+            {"fcstChange": "FM", "clouds": [{"cover": "BKN", "base": "800"}]},
+        )
+        assert "BKN008" in out
+
+    def test_float_base_renders(self) -> None:
+        from alfred.brief.weather import _format_taf_period
+        out = _format_taf_period(
+            {"fcstChange": "BASE", "clouds": [{"cover": "OVC", "base": 800.0}]},
+        )
+        assert "OVC008" in out
+
+    def test_garbage_base_omitted_with_warn(self) -> None:
+        import structlog
+        from alfred.brief.weather import _format_taf_period
+        with structlog.testing.capture_logs() as captured:
+            out = _format_taf_period(
+                {"fcstChange": "FM",
+                 "clouds": [{"cover": "BKN", "base": "junk"}]},
+                station_id="CYZX",
+            )
+        assert "junk" not in out
+        assert "BKN0" not in out  # no fabricated base rendering
+        warns = [c for c in captured
+                 if c.get("event") == "weather.cloud_base_unparseable"]
+        assert len(warns) == 1
+        assert warns[0]["station"] == "CYZX"
+
+
+# ---------------------------------------------------------------------------
+# Section-boundary containment (2026-06-11) — the structural half of the
+# incident: only httpx errors were caught in fetch_and_format, so ANY
+# parse/format exception propagated to brief.daemon.error and killed the
+# run (the 2026-04-30 brief was lost outright; 2026-05-10 delayed ~9h).
+# Contract: weather failure of any shape → explicit "unavailable" line,
+# run continues.
+# ---------------------------------------------------------------------------
+
+
+class TestFetchAndFormatContainment:
+    def _config(self):  # type: ignore[no-untyped-def]
+        from alfred.brief.config import StationConfig, WeatherConfig
+        return WeatherConfig(stations=[StationConfig(id="CYHZ", name="Halifax")])
+
+    async def test_non_httpx_metar_failure_contained(self, monkeypatch) -> None:
+        import structlog
+        from alfred.brief import weather as weather_mod
+
+        async def _boom(config):  # type: ignore[no-untyped-def]
+            raise ValueError("unexpected API shape")
+
+        async def _no_tafs(config):  # type: ignore[no-untyped-def]
+            return []
+
+        monkeypatch.setattr(weather_mod, "fetch_metars", _boom)
+        monkeypatch.setattr(weather_mod, "fetch_tafs", _no_tafs)
+        with structlog.testing.capture_logs() as captured:
+            out = await weather_mod.fetch_and_format(self._config())
+        assert "Current conditions unavailable" in out
+        assert "could not be processed" in out
+        events = [c for c in captured
+                  if c.get("event") == "weather.metar_section_failed"]
+        assert len(events) == 1
+        assert events[0]["error_type"] == "ValueError"
+
+    async def test_malformed_metar_payload_contained(self, monkeypatch) -> None:
+        # parse_metar crashing on a malformed entry (the post-fetch
+        # half of the incident class) is contained too.
+        from alfred.brief import weather as weather_mod
+
+        async def _bad_payload(config):  # type: ignore[no-untyped-def]
+            return [None]  # parse_metar(None, ...) raises
+
+        async def _no_tafs(config):  # type: ignore[no-untyped-def]
+            return []
+
+        monkeypatch.setattr(weather_mod, "fetch_metars", _bad_payload)
+        monkeypatch.setattr(weather_mod, "fetch_tafs", _no_tafs)
+        out = await weather_mod.fetch_and_format(self._config())
+        assert "Current conditions unavailable" in out
+
+    async def test_httpx_failure_keeps_request_failed_message(self, monkeypatch) -> None:
+        # REGRESSION: the narrower httpx catch (with its distinct
+        # operator message) still wins for transport-level failures.
+        import httpx
+        from alfred.brief import weather as weather_mod
+
+        async def _conn_refused(config):  # type: ignore[no-untyped-def]
+            raise httpx.ConnectError("connection refused")
+
+        async def _no_tafs(config):  # type: ignore[no-untyped-def]
+            return []
+
+        monkeypatch.setattr(weather_mod, "fetch_metars", _conn_refused)
+        monkeypatch.setattr(weather_mod, "fetch_tafs", _no_tafs)
+        out = await weather_mod.fetch_and_format(self._config())
+        assert "METAR request failed" in out
+        assert "could not be processed" not in out
+
+    async def test_taf_failure_degrades_partially(self, monkeypatch) -> None:
+        # METAR half healthy + TAF half exploding → brief gets current
+        # conditions AND an explicit forecast-unavailable line.
+        from alfred.brief import weather as weather_mod
+
+        async def _no_metars(config):  # type: ignore[no-untyped-def]
+            return []
+
+        async def _taf_boom(config):  # type: ignore[no-untyped-def]
+            raise RuntimeError("taf parser exploded")
+
+        monkeypatch.setattr(weather_mod, "fetch_metars", _no_metars)
+        monkeypatch.setattr(weather_mod, "fetch_tafs", _taf_boom)
+        out = await weather_mod.fetch_and_format(self._config())
+        assert "Weather data unavailable" in out  # ILB empty-METAR line
+        assert "Forecast unavailable — TAF data could not be processed." in out
+
+
+class TestGenerateBriefWeatherGuard:
+    """Daemon-side last-resort guard: even a structural fetch_and_format
+    bug yields a brief with an explicit '*Weather unavailable.*' line —
+    the run (and the push that follows it) must out-rank the section.
+    """
+
+    async def test_weather_crash_still_generates_brief(self, tmp_path, monkeypatch) -> None:
+        import structlog
+        from alfred.brief import daemon as daemon_mod
+        from alfred.brief.config import BriefConfig, StateConfig
+        from alfred.brief.state import StateManager
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+
+        async def _structural_bug(config):  # type: ignore[no-untyped-def]
+            raise TypeError("'>=' not supported between instances of 'str' and 'int'")
+
+        monkeypatch.setattr(daemon_mod, "fetch_and_format", _structural_bug)
+
+        config = BriefConfig(
+            vault_path=str(vault),
+            state=StateConfig(path=str(data_dir / "brief_state.json")),
+        )
+        state_mgr = StateManager(config.state.path)
+
+        with structlog.testing.capture_logs() as captured:
+            rel_path = await daemon_mod.generate_brief(config, state_mgr)
+
+        assert rel_path is not None  # the run SURVIVED
+        content = (vault / rel_path).read_text(encoding="utf-8")
+        assert "*Weather unavailable.*" in content
+        events = [c for c in captured
+                  if c.get("event") == "brief.weather_section_failed"]
+        assert len(events) == 1
+        assert events[0]["error_type"] == "TypeError"

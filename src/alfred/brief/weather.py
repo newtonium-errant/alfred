@@ -103,6 +103,103 @@ def _parse_visibility(raw_visib: object, *, station_id: str = "") -> float | Non
     return None
 
 
+def _parse_cloud_base(raw_base: object, *, station_id: str = "") -> int | None:
+    """Coerce a cloud layer's ``base`` into ``int | None`` (boundary validator).
+
+    Same failure class as ``_parse_visibility`` (the 2026-04-30 /
+    2026-05-10 brief-killing TypeError): aviationweather.gov METAR/TAF
+    JSON intermittently string-types numeric fields. ``base`` is usually
+    an int (feet AGL) but can arrive as a float or a numeric string —
+    and the raw passthrough fed three crash sites:
+
+    - ``parse_metar``'s ceiling derivation compared ``base < ceiling_ft``
+      (str vs int → TypeError, the incident class verbatim);
+    - ``_format_ceiling`` / ``_format_taf_period`` render ``base // 100``
+      (str // int → TypeError; a FLOAT base also crashes the sibling
+      ``f"{...:03d}"`` format with ValueError — int coercion here closes
+      both);
+    - ``_flight_cat_warning`` compares ``ceiling_ft < 1000`` downstream
+      of whatever the derivation assigned.
+
+    Returns int (truncated) for int/float/numeric-string; ``None`` for
+    ``None`` / empty string. Unparseable shapes return ``None`` with a
+    ``weather.cloud_base_unparseable`` warning — the malformed ELEMENT
+    is skipped, the run continues (degradation contract per
+    intentionally-left-blank: a bad field never kills the brief).
+    """
+    if raw_base is None:
+        return None
+    if isinstance(raw_base, bool):
+        # bool is an int subclass — reject explicitly (mirror of the
+        # _parse_visibility bool branch).
+        log.warning(
+            "weather.cloud_base_unparseable",
+            raw=raw_base,
+            station=station_id,
+            reason="bool",
+        )
+        return None
+    if isinstance(raw_base, (int, float)):
+        return int(raw_base)
+    if isinstance(raw_base, str):
+        s = raw_base.strip()
+        if not s:
+            return None
+        try:
+            return int(float(s))
+        except ValueError:
+            log.warning(
+                "weather.cloud_base_unparseable",
+                raw=raw_base,
+                station=station_id,
+                reason="non_numeric_string",
+            )
+            return None
+    log.warning(
+        "weather.cloud_base_unparseable",
+        raw=raw_base,
+        station=station_id,
+        reason=f"type_{type(raw_base).__name__}",
+    )
+    return None
+
+
+def _normalize_clouds(raw_clouds: object, *, station_id: str = "") -> list[dict]:
+    """Boundary-normalize a METAR/TAF ``clouds`` list.
+
+    Every layer's ``base`` is coerced via :func:`_parse_cloud_base` so
+    everything downstream (``ceiling_ft`` derivation, ``_format_ceiling``,
+    ``_build_summary``, ``_flight_cat_warning``) trusts ``int | None``.
+    Non-dict layer entries (an API surface change) are skipped with a
+    ``weather.cloud_layer_unparseable`` warning — skip the element,
+    never the run.
+    """
+    if not isinstance(raw_clouds, list):
+        if raw_clouds is not None:
+            log.warning(
+                "weather.cloud_layer_unparseable",
+                raw=str(raw_clouds)[:80],
+                station=station_id,
+                reason=f"clouds_type_{type(raw_clouds).__name__}",
+            )
+        return []
+    out: list[dict] = []
+    for layer in raw_clouds:
+        if not isinstance(layer, dict):
+            log.warning(
+                "weather.cloud_layer_unparseable",
+                raw=str(layer)[:80],
+                station=station_id,
+                reason=f"layer_type_{type(layer).__name__}",
+            )
+            continue
+        out.append({
+            **layer,
+            "base": _parse_cloud_base(layer.get("base"), station_id=station_id),
+        })
+    return out
+
+
 async def fetch_metars(config: WeatherConfig) -> list[dict]:
     """Fetch METAR data for configured stations."""
     ids = ",".join(s.id for s in config.stations)
@@ -119,9 +216,17 @@ def parse_metar(raw: dict, station_configs: list[StationConfig]) -> StationWeath
     station_id = raw.get("icaoId", "")
     name_map = {s.id: s.name for s in station_configs}
 
+    # Boundary-normalize clouds FIRST (every base → int | None) so the
+    # ceiling derivation below and every downstream consumer
+    # (_format_ceiling's ``base // 100``, _flight_cat_warning's
+    # ``ceiling_ft < 1000``, _build_summary) operate on trusted types.
+    # Pre-fix, a string-typed base from the API crashed ``base <
+    # ceiling_ft`` here — the same mixed-type class as the visib P0.
+    clouds = _normalize_clouds(raw.get("clouds", []), station_id=station_id)
+
     # Find lowest ceiling (BKN or OVC layer)
     ceiling_ft = None
-    for cloud in raw.get("clouds", []):
+    for cloud in clouds:
         cover = cloud.get("cover", "")
         if cover in ("BKN", "OVC", "VV"):
             base = cloud.get("base")
@@ -144,7 +249,10 @@ def parse_metar(raw: dict, station_configs: list[StationConfig]) -> StationWeath
         visibility_sm=_parse_visibility(raw.get("visib"), station_id=station_id),
         ceiling_ft=ceiling_ft,
         cloud_cover=raw.get("cover", ""),
-        clouds=raw.get("clouds", []),
+        # The NORMALIZED list — StationWeather.clouds carries int|None
+        # bases by contract, same trust-the-boundary doctrine as
+        # visibility_sm.
+        clouds=clouds,
         flight_category=raw.get("fltCat", ""),
         raw_text=raw.get("rawOb", ""),
         observed_at=raw.get("reportTime", ""),
@@ -347,7 +455,12 @@ def _format_taf_period(period: dict, *, station_id: str = "") -> str:
     if wx:
         parts.append(wx)
 
-    clouds = period.get("clouds", [])
+    # TAF periods have no parse_metar-style boundary step (raw API dicts
+    # flow straight to this formatter), so the cloud-base coercion
+    # happens at consumption — same mixed-type class as the visib P0: a
+    # string base crashed ``base // 100`` here, a float base crashed the
+    # ``:03d`` format.
+    clouds = _normalize_clouds(period.get("clouds", []), station_id=station_id)
     for c in clouds[:2]:
         cover = c.get("cover", "")
         base = c.get("base")
@@ -411,7 +524,17 @@ def format_taf_section(tafs: list[dict], station_configs: list[StationConfig]) -
 
 
 async def fetch_and_format(config: WeatherConfig) -> str:
-    """Top-level: fetch weather data and return formatted markdown section."""
+    """Top-level: fetch weather data and return formatted markdown section.
+
+    SECTION-BOUNDARY CONTAINMENT (2026-06-11, closing the 2026-04-30 /
+    2026-05-10 incident class): pre-fix, only httpx errors were caught
+    here, so any parse/format exception (e.g. the mixed-type TypeErrors)
+    propagated through ``generate_brief`` to ``brief.daemon.error`` and
+    KILLED the entire brief run — the 2026-04-30 brief was lost outright.
+    The contract now: a weather failure of ANY shape degrades to an
+    explicit "unavailable" line (intentionally-left-blank — visible
+    absence, never silence) and the rest of the brief continues.
+    """
     parts = []
 
     # METAR (current conditions)
@@ -422,6 +545,16 @@ async def fetch_and_format(config: WeatherConfig) -> str:
     except (httpx.HTTPError, httpx.TimeoutException) as e:
         log.error("weather.metar_fetch_failed", error=str(e))
         parts.append("*Current conditions unavailable — METAR request failed.*")
+    except Exception as e:  # noqa: BLE001 — containment: weather never kills the brief
+        log.error(
+            "weather.metar_section_failed",
+            error=str(e),
+            error_type=e.__class__.__name__,
+        )
+        parts.append(
+            "*Current conditions unavailable — weather data could not "
+            "be processed.*"
+        )
 
     # TAF (forecast)
     try:
@@ -432,5 +565,14 @@ async def fetch_and_format(config: WeatherConfig) -> str:
     except (httpx.HTTPError, httpx.TimeoutException) as e:
         log.error("weather.taf_fetch_failed", error=str(e))
         parts.append("*Forecast unavailable — TAF request failed.*")
+    except Exception as e:  # noqa: BLE001 — containment: weather never kills the brief
+        log.error(
+            "weather.taf_section_failed",
+            error=str(e),
+            error_type=e.__class__.__name__,
+        )
+        parts.append(
+            "*Forecast unavailable — TAF data could not be processed.*"
+        )
 
     return "\n\n".join(parts)

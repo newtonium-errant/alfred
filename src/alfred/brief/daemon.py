@@ -89,8 +89,23 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
 
     log.info("brief.generating", date=today, refresh=refresh)
 
-    # Fetch weather section
-    weather_md = await fetch_and_format(config.weather)
+    # Fetch weather section. fetch_and_format owns its own degradation
+    # (every fetch/parse/format failure → explicit "unavailable" line),
+    # but this last-resort guard means even a STRUCTURAL bug there can
+    # never kill the run again — two morning briefs died to exactly
+    # that propagation (2026-04-30 lost outright, 2026-05-10 delayed
+    # ~9h; TypeError from mixed-type API fields reached
+    # brief.daemon.error). Weather is one section of the brief; the
+    # brief must out-rank it.
+    try:
+        weather_md = await fetch_and_format(config.weather)
+    except Exception as exc:  # noqa: BLE001 — section never kills the run
+        log.warning(
+            "brief.weather_section_failed",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        weather_md = "*Weather unavailable.*"
 
     # Operations snapshot. quarantine_dir_name threads through from the
     # email_classifier YAML block via BriefConfig.load_from_unified so a
