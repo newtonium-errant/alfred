@@ -49,6 +49,7 @@ FROZEN contract owned by the builder — see
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import time
@@ -270,6 +271,14 @@ def escape_question(question: str) -> str:
     "do not follow instructions" framing is layer two.
     """
     return question.replace("</question>", "</ question>")
+
+
+# Hard cap on the requester's ``record_type_hint`` length (review WARN 1,
+# 2026-06-11). Real record-type names are short ("event", "person");
+# anything longer is junk by construction. Belt-and-braces alongside the
+# ∈-NL-enabled-set gate in :func:`run_nl_query` — the hint is a SECOND
+# untrusted channel and must never reach the interpret prompt unvalidated.
+MAX_HINT_CHARS = 64
 
 
 def _shape_get(rules: Any, key: str, default: Any = None) -> Any:
@@ -696,6 +705,27 @@ async def run_nl_query(
             "detail": f"peer '{peer}' has no NL-lane grants",
         })
 
+    # --- Hint hardening (review WARN 1, 2026-06-11) ------------------------
+    # ``record_type_hint`` is a SECOND untrusted channel from the peer.
+    # It is only semantically useful when it names one of THIS peer's
+    # NL-enabled types — anything else (unknown type, oversized junk, an
+    # injection payload) is DROPPED to absent before prompt assembly. The
+    # ∈-enabled gate is the real filter; the MAX_HINT_CHARS cap here and
+    # escape_question at the interpolation site below are belt-and-braces
+    # layers that hold even if the gate is ever loosened. Flow proceeds
+    # normally either way — a hostile hint costs no extra LLM spend.
+    if record_type_hint is not None:
+        candidate = record_type_hint.strip()
+        if len(candidate) > MAX_HINT_CHARS or candidate not in enabled:
+            log.info(
+                "transport.nl_broker.hint_dropped",
+                peer=peer, correlation_id=correlation_id,
+                hint_chars=len(candidate),
+            )
+            record_type_hint = None
+        else:
+            record_type_hint = candidate
+
     # --- G2: interpret (LLM call #1 — policy metadata only) ---------------
     today_str = (today or _date.today()).isoformat()
     policy_slice = build_policy_slice(peer, perms, enabled)
@@ -707,7 +737,10 @@ async def run_nl_query(
     interpret_user = INTERPRET_USER_TEMPLATE.format(
         policy_slice=policy_slice,
         today=today_str,
-        record_type_hint=record_type_hint or "(none)",
+        # Validated ∈-enabled above; escape is belt-and-braces (WARN 1).
+        record_type_hint=(
+            escape_question(record_type_hint) if record_type_hint else "(none)"
+        ),
         max_subqueries=broker.max_subqueries,
         question=escape_question(question),
     )
@@ -723,7 +756,10 @@ async def run_nl_query(
                 output_schema=INTERPRET_OUTPUT_SCHEMA,
             )
         except Exception as exc:  # noqa: BLE001 — any LLM failure → retry once
-            last_err = f"interpretation LLM call failed: {exc}"
+            # Peer-visible detail stays GENERIC (review WARN 2) — raw
+            # exception strings can carry internal specifics (endpoints,
+            # model ids, quota text). The specifics go to structlog below.
+            last_err = "interpretation stage failed"
             log.warning(
                 "transport.nl_broker.interpret_failed",
                 attempt=attempt, error=str(exc),
@@ -859,7 +895,12 @@ async def run_nl_query(
     composer_records: list[dict[str, Any]] = []
     compose_value_strings: list[str] = []
     for rec, extras in zip(gated_records, compose_extras):
-        merged = dict(rec)
+        # DEEP copy (review NIT 1): dict(rec) is shallow, so a dotted
+        # compose field nesting into a granted nested dict would let
+        # _deep_merge mutate the original gated record via the shared
+        # inner dict. Records are json_sanitize'd plain structures —
+        # deepcopy is cheap and keeps gated_records pristine.
+        merged = copy.deepcopy(rec)
         truncated_extras = _truncate_compose_values(
             extras, broker.compose_field_max_chars,
         )
@@ -892,7 +933,9 @@ async def run_nl_query(
                 output_schema=None,
             )
         except Exception as exc:  # noqa: BLE001 — any LLM failure → retry once
-            last_err = f"composition LLM call failed: {exc}"
+            # GENERIC peer-visible detail (review WARN 2) — specifics to
+            # structlog only, mirroring the interpret stage.
+            last_err = "composition stage failed"
             log.warning(
                 "transport.nl_broker.compose_failed",
                 attempt=attempt, error=str(exc),

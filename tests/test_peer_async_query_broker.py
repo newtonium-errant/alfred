@@ -221,6 +221,46 @@ async def test_async_query_discloses_identically_to_search(salem_app, monkeypatc
     assert reply["payload"]["count"] == sync_body["count"]
 
 
+async def test_query_ok_reply_keyset_is_exactly_the_designed_shape(salem_app, monkeypatch):  # type: ignore[no-untyped-def]
+    """● Wire pin (NL-lane review NIT 6 — symmetry with the query_nl
+    key-set pin in test_nl_query_handler.py): the deterministic async
+    broker's ok-reply payload carries EXACTLY the designed keys.
+
+    The engine's internal result dict carries audit-bound bookkeeping
+    (``denied`` — ungranted field NAMES — plus, on the NL binding,
+    compose-tier keys) that stays off this wire only by named-key
+    construction in the kind=query branch. If a future change serializes
+    the engine dict into the reply (``**result``), this pin fails before
+    field names leak to the peer.
+    """
+    captured = _patch_capture_reply(monkeypatch)
+
+    await salem_app.post(
+        "/peer/send",
+        json={
+            "kind": "query",
+            "from": "hypatia",
+            "payload": {
+                "record_type": "event",
+                "filter": [
+                    {"dim": "participants", "op": "contains", "value": "Andrew Newton"},
+                ],
+                "limit": 1,
+                "precedence": "P",
+            },
+            "correlation_id": "cid-keyset-1",
+        },
+        headers=_hypatia_headers(),
+    )
+    await asyncio.sleep(0)
+
+    payload = captured[0]["payload"]
+    assert payload["status"] == "ok"
+    assert set(payload.keys()) == {
+        "status", "record_type", "count", "records", "granted",
+    }
+
+
 async def test_async_query_never_exposes_body_or_unpermitted(salem_app, monkeypatch):  # type: ignore[no-untyped-def]
     """SECURITY: the async reply withholds bodies + unpermitted fields too."""
     import json

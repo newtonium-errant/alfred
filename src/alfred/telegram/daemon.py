@@ -921,6 +921,14 @@ async def run(
                 _nl_client = anthropic.AsyncAnthropic(
                     api_key=config.anthropic.api_key,
                     timeout=nl_broker_cfg.llm_timeout_seconds,
+                    # The BROKER owns retry (its 2-attempt interpret /
+                    # compose loops). The SDK default max_retries=2 would
+                    # STACK with those: 2 SDK retries × 2 broker attempts
+                    # × 2 stages × 30s timeout ≈ 6min worst case vs the
+                    # requester's 90s mailbox await and the 300s orphan
+                    # TTL (review NIT 3). Zero keeps worst-case holder
+                    # latency inside the orphan window.
+                    max_retries=0,
                 )
 
                 async def _nl_llm_complete(

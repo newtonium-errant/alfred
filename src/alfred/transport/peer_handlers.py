@@ -504,7 +504,12 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
                 reply_payload = {
                     "status": "failed",
                     "code": "nl_broker_error",
-                    "detail": f"NL broker error: {exc}",
+                    # GENERIC peer-visible detail (review WARN 2): raw
+                    # exception strings can carry internal specifics
+                    # (paths, model ids, quota text). The structlog event
+                    # above has error + error_type for the operator —
+                    # matching the deterministic lane's posture.
+                    "detail": "internal NL broker error",
                     "lane": "nl",
                     "correlation_id": correlation_id,
                 }
