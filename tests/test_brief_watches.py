@@ -271,14 +271,23 @@ async def test_one_failing_watch_contained_others_run(tmp_path, monkeypatch) -> 
     assert states["vendor-release"].last_seen_tag == "v1.0.2"
 
 
-async def test_invalid_regex_contained_as_unavailable(tmp_path, monkeypatch) -> None:
-    _patch_releases(monkeypatch, _RELEASES_NO_MATCH)
+async def test_invalid_regex_renders_config_error_label(tmp_path, monkeypatch) -> None:
+    """Review nit a4: an operator typo in the pattern is a CONFIG error
+    and must say so — ``re.error``'s class name is literally ``error``,
+    so the generic containment used to render the unhelpful
+    'api error: error: ...'. No network call happens either (compile
+    precedes fetch)."""
+    calls: list = []
+    _patch_releases(monkeypatch, _RELEASES_NO_MATCH, calls=calls)
     item = _release_item(pattern="(unclosed")
     with structlog.testing.capture_logs() as captured:
         out = await check_and_format_watches([item], tmp_path / "s.json")
-    assert "watch unavailable (api error:" in out
+    assert "watch unavailable (config error: invalid pattern regex:" in out
+    assert "api error" not in out
+    assert calls == []  # compile failure short-circuits before the fetch
     warns = [c for c in captured if c.get("event") == "brief.watch_check_failed"]
     assert len(warns) == 1
+    assert warns[0]["error_type"] == "config_error"
 
 
 async def test_unknown_type_renders_config_error_line(tmp_path) -> None:
@@ -419,6 +428,21 @@ def test_load_state_corrupt_json_yields_fresh_with_warning(tmp_path) -> None:
     assert len(warns) == 1
 
 
+def test_load_state_invalid_utf8_yields_fresh_with_warning(tmp_path) -> None:
+    """Review nit a3: UnicodeDecodeError (a ValueError, not OSError or
+    JSONDecodeError) from a binary-corrupted state file must degrade to
+    fresh-baseline + warning here — not escalate to the daemon guard."""
+    path = tmp_path / "s.json"
+    path.write_bytes(b"\xff\xfe\x00garbage\x80")
+    with structlog.testing.capture_logs() as captured:
+        states = load_watch_state(path)
+    assert states == {}
+    warns = [c for c in captured
+             if c.get("event") == "brief.watches_state_load_failed"]
+    assert len(warns) == 1
+    assert warns[0]["error_type"] == "UnicodeDecodeError"
+
+
 def test_state_round_trip(tmp_path) -> None:
     path = tmp_path / "nested" / "s.json"  # parent auto-created
     save_watch_state(path, {
@@ -466,3 +490,102 @@ def test_load_from_unified_defaults_to_no_watches() -> None:
 
     cfg = load_from_unified({"brief": {}})
     assert cfg.watches == []
+
+
+def test_loader_warns_on_non_dict_entry_and_missing_id() -> None:
+    """Review nits a1/a2: a YAML typo entry and an id-less watch both
+    surface as load-time warnings instead of silent tolerance."""
+    from alfred.brief.config import load_from_unified
+
+    with structlog.testing.capture_logs() as captured:
+        cfg = load_from_unified({
+            "brief": {
+                "watches": [
+                    "oops-a-string",
+                    {"label": "no id set", "type": "github_pr",
+                     "repo": "o/r", "number": 7},
+                ],
+            },
+        })
+    assert len(cfg.watches) == 1
+    invalid = [c for c in captured
+               if c.get("event") == "brief.watch_entry_invalid"]
+    assert len(invalid) == 1
+    assert invalid[0]["reason"] == "entry_type_str"
+    missing = [c for c in captured
+               if c.get("event") == "brief.watch_missing_id"]
+    assert len(missing) == 1
+    assert missing[0]["fallback_key"] == "github_pr:o/r:7"
+
+
+def test_loader_warns_on_duplicate_state_key() -> None:
+    from alfred.brief.config import load_from_unified
+
+    with structlog.testing.capture_logs() as captured:
+        cfg = load_from_unified({
+            "brief": {
+                "watches": [
+                    {"id": "same-id", "type": "github_pr",
+                     "repo": "o/r", "number": 1},
+                    {"id": "same-id", "type": "github_pr",
+                     "repo": "o/r", "number": 2},
+                ],
+            },
+        })
+    assert len(cfg.watches) == 2  # both kept — warning, not a drop
+    dupes = [c for c in captured
+             if c.get("event") == "brief.watch_duplicate_state_key"]
+    assert len(dupes) == 1
+    assert dupes[0]["key"] == "same-id"
+
+
+# ---------------------------------------------------------------------------
+# State-key fallback (review nit a1 — the collision bug-of-record)
+# ---------------------------------------------------------------------------
+
+
+def test_state_key_explicit_id_wins() -> None:
+    assert _release_item(id="my-id").state_key() == "my-id"
+
+
+def test_state_key_release_fallback_includes_pattern_hash() -> None:
+    """● The bug-of-record: two id-less release watches on ONE repo used
+    to share the key ``type:repo:0`` — the first match latched BOTH and
+    the second pattern could never fire. Distinct patterns must resolve
+    to distinct keys."""
+    a = _release_item(id="", pattern="newarch")
+    b = _release_item(id="", pattern="totally-different")
+    assert a.state_key() != b.state_key()
+    assert a.repo == b.repo  # same repo — the collision scenario
+    # Same pattern still resolves stably (idempotent key).
+    assert a.state_key() == _release_item(id="", pattern="newarch").state_key()
+
+
+def test_state_key_pr_fallback_unchanged() -> None:
+    # PR fallbacks keep the legacy shape — ``number`` already
+    # disambiguates them, and changing the shape would orphan any
+    # existing id-less PR watch state.
+    assert _pr_item(id="").state_key() == "github_pr:example-org/example-repo:123"
+
+
+async def test_two_idless_release_watches_track_independently(tmp_path, monkeypatch) -> None:
+    """● End-to-end pin for the collision: watch A matches and latches;
+    watch B (different pattern, same repo, also id-less) must NOT
+    inherit A's latch — it keeps checking and reports no-match."""
+    state_path = tmp_path / "s.json"
+    calls: list = []
+    _patch_releases(monkeypatch, _RELEASES_WITH_MATCH, calls=calls)
+    watch_a = _release_item(id="", pattern="newarch")          # matches v1.1.0
+    watch_b = _release_item(id="", pattern="never-mentioned")  # matches nothing
+
+    out1 = await check_and_format_watches([watch_a, watch_b], state_path)
+    lines1 = out1.splitlines()
+    assert FLIP_MARKER in lines1[0]          # A flipped
+    assert "no matching release" in lines1[1]  # B did not inherit the latch
+
+    out2 = await check_and_format_watches([watch_a, watch_b], state_path)
+    lines2 = out2.splitlines()
+    assert DONE_TAIL in lines2[0]            # A latched terminal (no fetch)
+    assert "no matching release" in lines2[1]  # B still live + still fetching
+    # Fetch count: run1 = A + B, run2 = B only (A latched) → 3 total.
+    assert len(calls) == 3

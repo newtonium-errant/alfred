@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
 from alfred.common.schedule import ScheduleConfig
+
+from .utils import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass
@@ -103,6 +108,27 @@ class WatchItemConfig:
     pattern: str = ""
     baseline_tag: str = ""
     on_flip_note: str = ""
+
+    def state_key(self) -> str:
+        """Stable key for the persisted watch state. Explicit ``id`` wins.
+
+        The id-less fallback is TYPE-SPECIFIC (watch-module review nit
+        a1, 2026-06-11): the original ``type:repo:number`` fallback
+        omitted ``pattern``, so two id-less release watches on the SAME
+        repo shared one state entry — the first match latched BOTH and
+        the second pattern could never fire. Release fallbacks now
+        include a short pattern hash; PR fallbacks keep the number
+        (which already disambiguates them). Set an explicit ``id``
+        anyway — the loader warns when one is missing.
+        """
+        if self.id:
+            return self.id
+        if self.type == "github_release_mention":
+            pattern_hash = hashlib.sha1(
+                self.pattern.encode("utf-8")
+            ).hexdigest()[:8]
+            return f"{self.type}:{self.repo}:{pattern_hash}"
+        return f"{self.type}:{self.repo}:{self.number}"
 
 
 @dataclass
@@ -218,6 +244,14 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
     watches: list[WatchItemConfig] = []
     for w in section.get("watches", []) or []:
         if not isinstance(w, dict):
+            # A YAML typo (stray string / list entry) must be VISIBLE —
+            # silently shrinking the watch list hides the mistake until
+            # the operator notices a watch never fired (review nit a2).
+            log.warning(
+                "brief.watch_entry_invalid",
+                raw=str(w)[:80],
+                reason=f"entry_type_{type(w).__name__}",
+            )
             continue
         try:
             number = int(w.get("number", 0) or 0)
@@ -233,6 +267,29 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
             baseline_tag=str(w.get("baseline_tag", "") or ""),
             on_flip_note=str(w.get("on_flip_note", "") or ""),
         ))
+
+    # Resolved-key hygiene (review nit a1): an empty ``id`` means the
+    # type-specific fallback key is in use (works, but brittle across
+    # config edits — warn so the operator adds one); a DUPLICATE
+    # resolved key means two watches would share one state entry (the
+    # first match latches both — almost certainly a config mistake).
+    seen_keys: set[str] = set()
+    for item in watches:
+        if not item.id:
+            log.warning(
+                "brief.watch_missing_id",
+                label=item.label or "(unlabeled)",
+                fallback_key=item.state_key(),
+            )
+        key = item.state_key()
+        if key in seen_keys:
+            log.warning(
+                "brief.watch_duplicate_state_key",
+                key=key,
+                label=item.label or "(unlabeled)",
+                detail="two watches share one state entry — give each a unique id",
+            )
+        seen_keys.add(key)
 
     # Primary Telegram user for post-write brief push. Reads the
     # unified config's ``telegram.allowed_users[0]`` — single-user v1;

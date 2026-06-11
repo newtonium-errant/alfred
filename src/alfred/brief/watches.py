@@ -114,7 +114,12 @@ def load_watch_state(path: Path) -> dict[str, WatchItemState]:
         return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+    except (ValueError, OSError) as exc:
+        # ValueError covers BOTH json.JSONDecodeError (its subclass) AND
+        # UnicodeDecodeError from read_text on an invalid-UTF-8 file
+        # (review nit a3 — the old JSONDecodeError-only catch let a
+        # binary-corrupted state file escalate to the daemon guard
+        # instead of degrading to a fresh baseline here).
         log.warning(
             "brief.watches_state_load_failed",
             path=str(path),
@@ -213,7 +218,24 @@ async def _check_release_mention(
         # Terminal latched — no API call.
         return f"- {label}: release {st.matched_tag} matched {DONE_TAIL}"
 
-    rx = re.compile(item.pattern, re.IGNORECASE)
+    # Compile BEFORE any network I/O and label the failure as what it
+    # is: a CONFIG error, not an API error (review nit a4 — ``re.error``
+    # has the unhelpful class name ``error``, so the generic containment
+    # rendered "api error: error: ..." for what is an operator typo in
+    # the pattern). Mirrors the unknown-type config-error path.
+    try:
+        rx = re.compile(item.pattern, re.IGNORECASE)
+    except re.error as exc:
+        log.warning(
+            "brief.watch_check_failed",
+            id=item.id or label,
+            error=f"invalid pattern regex: {exc}",
+            error_type="config_error",
+        )
+        return (
+            f"- {label}: watch unavailable "
+            f"(config error: invalid pattern regex: {exc})"
+        )
     releases = await _fetch_releases(client, item.repo)
 
     # Candidates = releases strictly newer than the boundary. GitHub
@@ -319,7 +341,12 @@ async def check_and_format_watches(
         follow_redirects=True,
     ) as client:
         for item in watches:
-            key = item.id or f"{item.type}:{item.repo}:{item.number}"
+            # Stable per-watch state key — explicit id, else the
+            # TYPE-SPECIFIC fallback (review nit a1: the old inline
+            # fallback omitted ``pattern``, colliding two id-less
+            # release watches on one repo). The loader warns on empty
+            # and duplicate resolved keys at config-load time.
+            key = item.state_key()
             st = states.get(key) or WatchItemState()
             try:
                 line = await _check_item(client, item, st)
