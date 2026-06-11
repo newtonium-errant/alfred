@@ -111,6 +111,64 @@ def check_already_running(pid_path: Path) -> int | None:
 # Spawn
 # ---------------------------------------------------------------------------
 
+
+def rotate_capture_log_if_oversized(
+    log_path: Path,
+    *,
+    max_bytes: int | None = None,
+    backup_count: int | None = None,
+) -> bool:
+    """Spawn-time rollover for the stdout-capture log. Returns True if rolled.
+
+    S5 (2026-06-11): the capture file (alfred.log) is opened fd-level
+    for child stdout/stderr — those writes BYPASS the parent's
+    ``RotatingFileHandler``, so the handler's size policy never bounds
+    them. Worse, when the handler's own first emit DID roll an
+    oversized file, the rename happened AFTER this capture fd was
+    opened — the fd followed the rename and the whole run's capture
+    fattened the ``.1`` sibling instead (observed 2026-06-11: 954MB /
+    911MB rotated files against a 100MB policy, ~2.4GB total).
+
+    Rolling HERE — before the capture fd is opened — keeps the policy
+    honest at run boundaries: the new run's capture starts on a fresh
+    file the handler shares coherently, and the previous run's history
+    survives in the numbered siblings (append-within-a-run,
+    rotate-across-runs). Residual, documented: growth WITHIN one run is
+    still unbounded by the policy (children hold the fd; you can't
+    size-rotate a file descriptor another process is writing) — bounded
+    in practice by per-run lifetime now that each restart rolls.
+
+    Mirrors ``RotatingFileHandler.doRollover``'s rename cascade and
+    reuses the bundled rotation policy for defaults.
+    """
+    from alfred.common.logging_handler import resolve_rotation_policy
+
+    resolved_max_bytes, resolved_backup_count = resolve_rotation_policy(
+        max_bytes, backup_count
+    )
+    # RotatingFileHandler semantics: maxBytes=0 or backupCount=0 means
+    # "never roll" — mirror that here so a rotation-disabled config
+    # disables the spawn-time roll too.
+    if resolved_max_bytes <= 0 or resolved_backup_count <= 0:
+        return False
+    try:
+        if not log_path.exists() or log_path.stat().st_size <= resolved_max_bytes:
+            return False
+        # RotatingFileHandler-style cascade: .{n-1} → .{n}, ... , live → .1
+        oldest = log_path.with_name(f"{log_path.name}.{resolved_backup_count}")
+        oldest.unlink(missing_ok=True)
+        for i in range(resolved_backup_count - 1, 0, -1):
+            src = log_path.with_name(f"{log_path.name}.{i}")
+            if src.exists():
+                src.rename(log_path.with_name(f"{log_path.name}.{i + 1}"))
+        log_path.rename(log_path.with_name(f"{log_path.name}.1"))
+        return True
+    except OSError:
+        # Rotation is best-effort — a locked/odd filesystem must never
+        # block daemon startup; the append-open below still works.
+        return False
+
+
 def spawn_daemon(
     config_path: str,
     only: str | None,
@@ -127,6 +185,12 @@ def spawn_daemon(
 
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Roll an oversized capture BEFORE opening the fd (see the helper's
+    # docstring — opening first is exactly what produced the 954MB
+    # rotated siblings). Append mode below is deliberate and was always
+    # the behavior: spawn history accumulates within the rotation policy.
+    rotate_capture_log_if_oversized(log_path)
 
     stdout_f = open(log_path, "a", encoding="utf-8")
 
