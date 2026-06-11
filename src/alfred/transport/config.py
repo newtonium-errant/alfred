@@ -32,6 +32,10 @@ from alfred._env import (
     substitute_env_in_value as _substitute_env,
 )
 
+from .utils import get_logger
+
+log = get_logger(__name__)
+
 
 # --- Dataclasses ------------------------------------------------------------
 
@@ -160,6 +164,38 @@ class PeerQueryRules:
 
 
 @dataclass
+class NLQueryRules:
+    """NL-lane (LLM-mediated) opt-in for one peer × record-type.
+
+    The OPTIONAL ``nl_query`` sub-block on :class:`PeerFieldRules`
+    (LLM lane, 2026-06-10). When ABSENT (``None`` — the default for
+    every existing config entry), the NL lane is DENIED for this
+    peer × type. Presence requires the deterministic ``query`` block
+    on the same entry — the NL lane retrieves THROUGH the deterministic
+    engine, so a deterministic policy must exist (``nl_query`` without
+    ``query`` is a config inconsistency: warned at load + treated as
+    absent, fail-closed).
+
+    ``compose_fields`` is the COMPOSITION-GRANT tier: frontmatter
+    fields (dotted notation supported) the holder's composer LLM may
+    read as INPUT when answering this peer's NL question, but which the
+    deterministic lane continues to deny raw. GOVERNANCE SEMANTIC: a
+    compose-grant is a disclosure decision with friction — the peer can
+    learn what the field says in PARAPHRASE (bounded by the answer
+    length cap + verbatim-run guard), but never receives the raw value.
+    Only compose-grant a field whose content is acceptable for that
+    peer to learn in prose. Ships EMPTY by default everywhere.
+
+    ``max_records`` caps how many matched records are fed to the
+    composer (clamped to the deterministic ``query.max_limit`` and
+    :data:`FILTER_LIMIT_CEILING` at execution time).
+    """
+
+    compose_fields: list[str] = field(default_factory=list)
+    max_records: int = 5
+
+
+@dataclass
 class PeerFieldRules:
     """Per-record-type permissions for one peer.
 
@@ -174,11 +210,17 @@ class PeerFieldRules:
     ``/peer/search`` are denied — only by-exact-name ``/peer/query`` works,
     exactly as before. When present, it opts this peer × type into the
     deterministic filtered-query broker. See :class:`PeerQueryRules`.
+
+    ``nl_query`` (LLM lane, 2026-06-10) is the OPTIONAL NL-lane opt-in.
+    When ``None`` (the default + every existing config), NL queries via
+    ``kind=query_nl`` are denied for this peer × type — both existing
+    lanes byte-identical. See :class:`NLQueryRules`.
     """
 
     fields: list[str] = field(default_factory=list)
     bodies: bool = False
     query: "PeerQueryRules | None" = None
+    nl_query: "NLQueryRules | None" = None
 
 
 @dataclass
@@ -195,6 +237,55 @@ class PeerEntry:
 
     base_url: str = ""
     token: str = ""
+
+
+@dataclass
+class NLBrokerConfig:
+    """Holder-side NL-lane mechanics + answer-shape limits (LLM lane).
+
+    The MASTER SWITCH for the LLM-mediated opt-in lane. ``enabled``
+    defaults False — an instance without this block never runs an NL
+    broker turn regardless of per-peer ``nl_query`` grants (fail-closed
+    at both levels).
+
+    ``model``: Anthropic model id for the interpret + compose calls.
+    Empty string (the default) = inherit the talker's
+    ``telegram.anthropic.model`` — avoids a per-instance model literal
+    in code; operators may override per-instance (e.g. a haiku-class
+    model once volume justifies it).
+
+    Answer-shape limits (enforced in CODE, post-compose — the composer
+    prompt's rules are the second layer, never the only one):
+      * ``max_answer_chars`` — composed answer hard cap; overflow is
+        truncated with a marker + audit flag (ratified Decision F).
+      * ``verbatim_run_limit`` — no contiguous run of this many
+        normalized chars from any compose-tier field value may appear
+        in the answer; violation = answer NOT delivered (Decision H).
+      * ``compose_field_max_chars`` — per-value input truncation before
+        a compose-tier value enters the composer prompt.
+
+    ``max_subqueries`` clamps how many structured sub-queries one NL
+    question may derive (Decision E: MVP 1; the interpreter output is a
+    list from day one so raising this is config-only).
+
+    ``question_max_chars`` bounds the inbound NL question (token-cost +
+    injection-surface gate, checked at handler entry).
+
+    ``interpret_max_tokens`` / ``compose_max_tokens`` cap each LLM
+    call's output; ``llm_timeout_seconds`` is the per-call client
+    timeout.
+    """
+
+    enabled: bool = False
+    model: str = ""
+    max_subqueries: int = 1
+    question_max_chars: int = 2000
+    max_answer_chars: int = 1200
+    verbatim_run_limit: int = 80
+    compose_field_max_chars: int = 1500
+    interpret_max_tokens: int = 1024
+    compose_max_tokens: int = 1024
+    llm_timeout_seconds: float = 30.0
 
 
 @dataclass
@@ -219,6 +310,11 @@ class CanonicalConfig:
     section provider reads from this file; the dispatcher writes state
     transitions back to it. Default sits alongside the audit log so
     operators can grep both in one ``ls data/``.
+
+    ``nl_broker`` (LLM lane, 2026-06-10) holds the holder-side NL-lane
+    mechanics. Default-constructed = disabled; the lane additionally
+    requires per-(peer, type) ``nl_query`` grants. See
+    :class:`NLBrokerConfig`.
     """
 
     owner: bool = False
@@ -227,6 +323,7 @@ class CanonicalConfig:
     peer_permissions: dict[str, dict[str, PeerFieldRules]] = field(
         default_factory=dict,
     )
+    nl_broker: NLBrokerConfig = field(default_factory=NLBrokerConfig)
 
 
 @dataclass
@@ -338,6 +435,93 @@ def _build_peer_query_rules(raw: Any) -> "PeerQueryRules | None":
     )
 
 
+def _build_nl_query_rules(
+    raw: Any,
+    *,
+    has_query: bool,
+    peer_name: str = "",
+    type_name: str = "",
+) -> "NLQueryRules | None":
+    """Build the optional ``nl_query`` sub-block, or ``None`` when absent.
+
+    Returns ``None`` when ``raw`` is missing / not a dict — the
+    back-compat default that keeps the NL lane denied for this
+    peer × type. A present ``nl_query`` WITHOUT a sibling ``query``
+    block is a config inconsistency (the NL lane retrieves through the
+    deterministic engine, which gate 1 would deny anyway): warn at load
+    time + treat as absent so the misconfiguration is visible, not
+    silent (fail-closed either way).
+    """
+    if not isinstance(raw, dict):
+        return None
+    if not has_query:
+        log.warning(
+            "transport.config.nl_query_without_query",
+            peer=peer_name,
+            type=type_name,
+            detail=(
+                "nl_query requires a sibling deterministic `query` block; "
+                "NL lane stays DENIED for this peer×type until one is added"
+            ),
+        )
+        return None
+
+    compose_raw = raw.get("compose_fields", []) or []
+    compose_fields = [f for f in compose_raw if isinstance(f, str) and f]
+
+    try:
+        max_records = int(raw.get("max_records", 5))
+    except (TypeError, ValueError):
+        max_records = 5
+    max_records = max(1, min(max_records, FILTER_LIMIT_CEILING))
+
+    return NLQueryRules(
+        compose_fields=compose_fields,
+        max_records=max_records,
+    )
+
+
+def _build_nl_broker(raw: Any) -> NLBrokerConfig:
+    """Build the holder-side ``nl_broker`` block (defaults = disabled).
+
+    Numeric knobs are int/float-coerced with the dataclass defaults as
+    fallback; every count is floored at 1 so a zero/negative config
+    value can't wedge the lane into an unusable-but-enabled state.
+    """
+    if not isinstance(raw, dict):
+        return NLBrokerConfig()
+
+    defaults = NLBrokerConfig()
+
+    def _int(key: str, fallback: int) -> int:
+        try:
+            return max(1, int(raw.get(key, fallback)))
+        except (TypeError, ValueError):
+            return fallback
+
+    try:
+        timeout = float(raw.get("llm_timeout_seconds", defaults.llm_timeout_seconds))
+    except (TypeError, ValueError):
+        timeout = defaults.llm_timeout_seconds
+
+    return NLBrokerConfig(
+        enabled=bool(raw.get("enabled", False)),
+        model=str(raw.get("model", "") or ""),
+        max_subqueries=_int("max_subqueries", defaults.max_subqueries),
+        question_max_chars=_int("question_max_chars", defaults.question_max_chars),
+        max_answer_chars=_int("max_answer_chars", defaults.max_answer_chars),
+        verbatim_run_limit=_int("verbatim_run_limit", defaults.verbatim_run_limit),
+        compose_field_max_chars=_int(
+            "compose_field_max_chars", defaults.compose_field_max_chars,
+        ),
+        interpret_max_tokens=_int(
+            "interpret_max_tokens", defaults.interpret_max_tokens,
+        ),
+        compose_max_tokens=_int("compose_max_tokens", defaults.compose_max_tokens),
+        llm_timeout_seconds=max(1.0, timeout),
+    )
+
+
 def _build_canonical(data: dict[str, Any]) -> CanonicalConfig:
     """Build ``CanonicalConfig`` + nested per-peer-type rules."""
     peer_perms_raw = data.get("peer_permissions", {}) or {}
@@ -350,10 +534,17 @@ def _build_canonical(data: dict[str, Any]) -> CanonicalConfig:
             for type_name, rules_raw in types_raw.items():
                 if not isinstance(rules_raw, dict):
                     continue
+                query = _build_peer_query_rules(rules_raw.get("query"))
                 type_map[str(type_name)] = PeerFieldRules(
                     fields=list(rules_raw.get("fields", []) or []),
                     bodies=bool(rules_raw.get("bodies", False)),
-                    query=_build_peer_query_rules(rules_raw.get("query")),
+                    query=query,
+                    nl_query=_build_nl_query_rules(
+                        rules_raw.get("nl_query"),
+                        has_query=query is not None,
+                        peer_name=str(peer_name),
+                        type_name=str(type_name),
+                    ),
                 )
             peer_perms[str(peer_name)] = type_map
     return CanonicalConfig(
@@ -365,6 +556,7 @@ def _build_canonical(data: dict[str, Any]) -> CanonicalConfig:
             data.get("proposals_path", "./data/canonical_proposals.jsonl")
         ),
         peer_permissions=peer_perms,
+        nl_broker=_build_nl_broker(data.get("nl_broker")),
     )
 
 
