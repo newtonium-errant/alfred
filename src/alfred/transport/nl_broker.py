@@ -124,12 +124,22 @@ surface for this peer; anything outside it is denied by the engine, \
 never fulfilled.
 - If the question wants a filter the slice does not offer, drop that \
 filter and query the allowed dimensions that come closest — a slightly \
-broader query is fine; the composition stage handles relevance.
+broader query is fine; the composition stage handles relevance. This \
+applies ONLY to filters the slice cannot express. It is never a license \
+to drop a person or entity the question names on a dimension the slice \
+DOES offer.
 - "between" takes a two-element [lo, hi] array value. "gte"/"lte" compare \
 ISO-format date strings correctly.
 - On a list-valued dimension (e.g. participants), "contains" matches a \
-complete entry: use the person's exact full name as the value, as plain \
-text (no [[...]] wikilink syntax). Partial names match nothing.
+complete entry, not a fragment. Values are plain text (no [[...]] \
+wikilink syntax).
+- When the question names specific people, emit one "contains" clause \
+per named person on the matching list dimension (e.g. participants), \
+each value exactly as the question names that person — do not shorten, \
+expand, or invent a fuller form, and NEVER drop one of the named people \
+to simplify the query. A zero-result answer reports the filters it \
+used, so the asker can recover; an answer drawn from the wrong records \
+cannot be detected.
 - Event records use the field `name` (not `title`) as their identifier.
 - For "most recent" / "when did ... last ..." questions: the engine has \
 no notion of "now" — add the upper bound yourself as \
