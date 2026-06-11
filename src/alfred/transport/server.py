@@ -687,6 +687,8 @@ def wire_transport_app(
     gcal_client: Any | None = None,
     gcal_config: Any | None = None,
     gcal_intended_on: bool = False,
+    nl_llm_callable: Any | None = None,
+    nl_llm_model_label: str = "",
 ) -> None:
     """Wire all transport-app dependencies in one place.
 
@@ -741,6 +743,15 @@ def wire_transport_app(
             log at ``warning`` instead of ``debug`` so the operator
             spots the silent feature-degradation. Default ``False``
             for instances that legitimately disabled GCal.
+        nl_llm_callable: The NL-broker LLM callable (LLM lane,
+            2026-06-10). Required only on instances that enable
+            ``transport.canonical.nl_broker`` — the talker daemon builds
+            an AsyncAnthropic-backed closure and passes it here. Wired
+            via :func:`peer_handlers.register_nl_llm`. Absent →
+            ``kind=query_nl`` replies ``nl_broker_unavailable``
+            (fail-closed).
+        nl_llm_model_label: Resolved model id carried alongside the
+            callable for the ``kind:"nl_query"`` audit row.
 
     Logging: emits one info event per registered resource so a
     misconfigured instance has a single grep target
@@ -753,6 +764,7 @@ def wire_transport_app(
         register_gcal_client,
         register_gcal_intended_on,
         register_instance_identity,
+        register_nl_llm,
         register_peer_inbox,
         register_pending_items_aggregate_path,
         register_pending_items_resolve_callable,
@@ -833,6 +845,21 @@ def wire_transport_app(
             "transport.wire_transport_app.peer_inbox_skipped",
             reason="no peer_inbox callable passed (/peer/send will "
                    "return 501 peer_inbox_not_configured)",
+        )
+
+    if nl_llm_callable is not None:
+        register_nl_llm(app, nl_llm_callable, model_label=nl_llm_model_label)
+        log.info(
+            "transport.wire_transport_app.nl_llm_registered",
+            model=nl_llm_model_label,
+        )
+    else:
+        log.debug(
+            "transport.wire_transport_app.nl_llm_skipped",
+            reason="no nl_llm callable passed (instance did not enable "
+                   "transport.canonical.nl_broker, OR enabled it and the "
+                   "daemon's Anthropic client construction failed — "
+                   "kind=query_nl replies nl_broker_unavailable)",
         )
 
     # GCal: client + config must be paired. Either-but-not-both is a

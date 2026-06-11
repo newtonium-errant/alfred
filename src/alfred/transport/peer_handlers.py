@@ -87,6 +87,7 @@ from .canonical_proposals import (
     _now_iso,
 )
 from .config import TransportConfig
+from .nl_broker import run_nl_query
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -100,6 +101,15 @@ _KEY_PEER_INBOX = "transport.peer_inbox"
 
 # Application-storage key for the vault path (needed for /canonical).
 _KEY_VAULT_PATH = "transport.vault_path"
+
+# Application-storage key for the NL-broker LLM callable (LLM lane,
+# 2026-06-10). Holds a ``(callable, model_label)`` tuple registered by
+# the talker daemon via :func:`register_nl_llm` — the constrained
+# one-shot completion the ``kind=query_nl`` broker uses for its
+# interpret + compose stages. Absent → the lane replies
+# ``nl_broker_unavailable`` (fail-closed, distinguishable from
+# "not opted in").
+_KEY_NL_LLM = "transport.nl_llm"
 
 # Application-storage keys for the GCal integration (Phase A+).
 # ``_KEY_GCAL_CLIENT`` holds a constructed
@@ -234,16 +244,21 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
 
     Body:
         {
-          "kind":    "message" | "query_result" | "notice",
+          "kind":    "message" | "query" | "query_nl" | "query_result"
+                     | "notice",
           "from":    "<peer-name>",          # must match auth peer
           "payload": {...},                   # kind-specific
           "correlation_id": "<optional>",
         }
 
-    The talker (on Salem) registers a peer-inbox callable that picks
-    this up and relays to the user via Telegram with the ``[KAL-LE]``
-    prefix. If the callable isn't registered, we return 501 — the
-    server came up but nobody's listening for peer messages.
+    ``query`` (deterministic async broker) and ``query_nl`` (the
+    LLM-mediated opt-in lane) are handled ENTIRELY in-transport — they
+    never reach the peer-inbox callable. The remaining kinds route to
+    the talker's registered inbox: ``query_result`` wakes a waiting
+    ``await_response``; ``message`` / ``notice`` relay to the user via
+    Telegram with the ``[KAL-LE]`` prefix. If the callable isn't
+    registered, those return 501 — the server came up but nobody's
+    listening for peer messages.
     """
     try:
         body = await request.json()
@@ -258,10 +273,10 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
     kind = body.get("kind")
     from_peer_claim = body.get("from")
     payload = body.get("payload")
-    if kind not in {"message", "query", "query_result", "notice"}:
+    if kind not in {"message", "query", "query_nl", "query_result", "notice"}:
         return _json_error(
             400, "schema_error",
-            detail="kind must be message | query | query_result | notice",
+            detail="kind must be message | query | query_nl | query_result | notice",
             correlation_id=correlation_id,
         )
     if not isinstance(payload, dict):
@@ -390,6 +405,141 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
         return web.json_response({
             "status": "accepted",
             "kind": "query",
+            "precedence": precedence,
+            "correlation_id": correlation_id,
+        })
+
+    # --- NL-lane broker (kind=query_nl) — the LLM-mediated opt-in lane ---
+    # 2026-06-10, ratified Decisions A-H. Like kind=query, handled
+    # ENTIRELY in-transport: the broker (``nl_broker.run_nl_query``)
+    # retrieves through the IDENTICAL ``_execute_filtered_search`` core
+    # (same gates, same field-gate, same kind:"search" audit per
+    # sub-query) — there is STILL no second, weaker disclosure path. The
+    # LLM only (a) translates the NL question into structured sub-queries
+    # that the deterministic gates re-validate, and (b) composes prose
+    # over already-field-gated records (+ the policy's compose tier).
+    #
+    # Sync here: only the question SHAPE gate (G0b) — payload-tier schema
+    # errors 400 like the other kinds. Everything downstream (lane
+    # enablement, grants, interpretation, search, composition, answer
+    # shape) flows back async via kind=query_result on the same
+    # correlation_id, consistent with the kind=query precedent — every
+    # denial/failure is a distinguishable payload, never a silent timeout.
+    if kind == "query_nl":
+        config = _get_config(request)
+        broker_cfg = config.canonical.nl_broker
+
+        # G0b: question shape gate (code, pre-everything). Bounds token
+        # cost + injection surface before any work happens.
+        question = payload.get("question")
+        if not isinstance(question, str) or not question.strip():
+            return _json_error(
+                400, "schema_error",
+                detail="payload.question must be a non-empty string",
+                correlation_id=correlation_id,
+            )
+        if len(question) > broker_cfg.question_max_chars:
+            return _json_error(
+                400, "schema_error",
+                detail=(
+                    f"question exceeds {broker_cfg.question_max_chars} chars"
+                ),
+                correlation_id=correlation_id,
+            )
+        hint_raw = payload.get("record_type_hint")
+        record_type_hint = hint_raw if isinstance(hint_raw, str) else None
+
+        llm_entry = request.app.get(_KEY_NL_LLM)
+        if isinstance(llm_entry, tuple) and len(llm_entry) == 2:
+            nl_llm_callable, nl_model_label = llm_entry
+        else:
+            nl_llm_callable, nl_model_label = None, ""
+
+        vault_path = _get_vault_path(request)
+        question_text = question.strip()
+
+        def _bound_search(
+            *, record_type: Any, raw_filter: Any, raw_sort: Any,
+            raw_limit: Any,
+        ) -> dict[str, Any]:
+            # The injected deterministic engine — include_compose_tier
+            # rides ONLY this binding, so no other surface can ever
+            # receive compose-tier values.
+            return _execute_filtered_search(
+                config=config,
+                vault_path=vault_path,
+                peer=auth_peer,
+                record_type=record_type,
+                raw_filter=raw_filter,
+                raw_sort=raw_sort,
+                raw_limit=raw_limit,
+                requested_fields=[],
+                correlation_id=correlation_id,
+                include_compose_tier=True,
+            )
+
+        nl_self_name = _get_instance_self_name(request)
+
+        async def _run_nl_and_reply() -> None:
+            from .client import peer_send as _peer_send
+            try:
+                result = await run_nl_query(
+                    question=question_text,
+                    record_type_hint=record_type_hint,
+                    peer=auth_peer,
+                    config=config,
+                    llm_complete=nl_llm_callable,
+                    model_label=nl_model_label,
+                    search_fn=_bound_search,
+                    correlation_id=correlation_id,
+                    precedence=precedence,
+                )
+                reply_payload = result["payload"]
+            except Exception as exc:  # noqa: BLE001 — never leave the requester to a silent timeout
+                log.warning(
+                    "transport.nl_broker.broker_error",
+                    peer=auth_peer, correlation_id=correlation_id,
+                    error=str(exc), error_type=exc.__class__.__name__,
+                )
+                reply_payload = {
+                    "status": "failed",
+                    "code": "nl_broker_error",
+                    "detail": f"NL broker error: {exc}",
+                    "lane": "nl",
+                    "correlation_id": correlation_id,
+                }
+            try:
+                await _peer_send(
+                    auth_peer,
+                    "query_result",
+                    reply_payload,
+                    config=config,
+                    self_name=nl_self_name,
+                    correlation_id=correlation_id,
+                )
+                log.info(
+                    "transport.nl_broker.replied",
+                    to_peer=auth_peer, correlation_id=correlation_id,
+                    status=reply_payload.get("status"),
+                    outcome=reply_payload.get("outcome", ""),
+                )
+            except Exception as exc:  # noqa: BLE001 — async reply is best-effort
+                log.warning(
+                    "transport.nl_broker.reply_failed",
+                    to_peer=auth_peer, correlation_id=correlation_id,
+                    error=str(exc), error_type=exc.__class__.__name__,
+                )
+
+        # Detached — same GC hazard as the kind=query reply task: park a
+        # STRONG reference in the app-level ``_bg_tasks`` set or the loop
+        # may collect the task mid-flight and the requester hangs.
+        nl_task = asyncio.create_task(_run_nl_and_reply())
+        nl_bg_tasks: set = request.app["_bg_tasks"]
+        nl_bg_tasks.add(nl_task)
+        nl_task.add_done_callback(nl_bg_tasks.discard)
+        return web.json_response({
+            "status": "accepted",
+            "kind": "query_nl",
             "precedence": precedence,
             "correlation_id": correlation_id,
         })
@@ -2590,6 +2740,31 @@ def register_peer_inbox(
 def register_vault_path(app: web.Application, vault_path: Path) -> None:
     """Tell the canonical handler where the vault lives."""
     app[_KEY_VAULT_PATH] = str(vault_path)
+
+
+def register_nl_llm(
+    app: web.Application,
+    callable_: Any,
+    *,
+    model_label: str = "",
+) -> None:
+    """Wire the NL-broker LLM callable onto an already-built app.
+
+    Mirrors :func:`register_peer_inbox` — the talker daemon registers
+    this at startup when ``transport.canonical.nl_broker.enabled`` is
+    true and the Anthropic client constructed successfully. The callable
+    shape is the broker's injection contract::
+
+        async (*, system: str, user: str, max_tokens: int,
+               output_schema: dict | None = None) -> (text, usage_dict)
+
+    ``model_label`` is the resolved model id, carried alongside purely
+    for the ``kind:"nl_query"`` audit row (the broker never needs the
+    model itself — the closure owns it). Stored as a tuple under
+    :data:`_KEY_NL_LLM`; absent → ``kind=query_nl`` replies
+    ``nl_broker_unavailable``.
+    """
+    app[_KEY_NL_LLM] = (callable_, str(model_label or ""))
 
 
 def register_instance_identity(

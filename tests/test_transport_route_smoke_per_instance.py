@@ -636,6 +636,7 @@ async def test_every_register_helper_has_wire_transport_app_kwarg():
       register_instance_identity → instance_name (+ instance_alias)
       register_gcal_client → gcal_client (+ gcal_config)
       register_gcal_intended_on → gcal_intended_on
+      register_nl_llm → nl_llm_callable (+ nl_llm_model_label)
     """
     from alfred.transport import peer_handlers
 
@@ -671,6 +672,10 @@ async def test_every_register_helper_has_wire_transport_app_kwarg():
         "register_instance_identity": "instance_name",
         "register_gcal_client": "gcal_client",
         "register_gcal_intended_on": "gcal_intended_on",
+        # NL-lane broker (LLM lane, 2026-06-10): the talker daemon's
+        # AsyncAnthropic closure rides nl_llm_callable (+ the audit-only
+        # nl_llm_model_label companion kwarg).
+        "register_nl_llm": "nl_llm_callable",
     }
 
     # Every discovered register helper must be in the mapping
@@ -741,6 +746,9 @@ async def test_wire_transport_app_logs_skip_for_omitted_kwargs(
         "transport.wire_transport_app.peer_inbox_skipped",
         "transport.wire_transport_app.gcal_skipped",
         "transport.wire_transport_app.gcal_intended_on_skipped",
+        # NL-lane broker (LLM lane, 2026-06-10) — instances without
+        # nl_broker enabled (every instance by default) skip-log here.
+        "transport.wire_transport_app.nl_llm_skipped",
     }
     actual_skips = set(skip_events)
     missing = expected_skips - actual_skips
