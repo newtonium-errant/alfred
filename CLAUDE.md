@@ -169,6 +169,7 @@ If you ever extend a dispatcher to inject a NEW env var, audit existing tests fo
 - Audit log: `data/vault_audit.log` — append-only JSONL of every vault mutation
 - PID file: `data/alfred.pid` — for daemon management
 - The vault itself is the source of truth; state files are just bookkeeping and can be deleted to force re-processing
+- **Runtime-location legend (inline subsystems — where the logs actually are):** three config sections run *inside a host daemon*, so their log lines land in the host's file: `email_classifier` → inside curator → `curator.log` (`email_classifier.log` is the CLI backfill only); `gcal` + `transport` → inside talker → `talker.log`. The `mail` daemon slot is the **webhook receiver** → `mail_webhook.log`; the IMAP fetcher is manual-CLI (`alfred mail fetch`, deliberate fallback) → `mail.log`; `alfred.log` is orchestrator + captured child stdout only. Two 2026-06-11 diagnosis incidents started as "subsystem looks dead" when it was healthy and logging into its host's file — check this legend before declaring a subsystem silent.
 
 ### Execution Model
 

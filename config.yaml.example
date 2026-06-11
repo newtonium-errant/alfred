@@ -23,6 +23,32 @@
 # daemon:
 #   pid_path: "./data/alfred.pid"  # override in config.<instance>.yaml
 
+# ---------------------------------------------------------------------------
+# Runtime-location legend — where each config section actually EXECUTES
+# ---------------------------------------------------------------------------
+# Most top-level sections map 1:1 to a daemon with its own log file
+# (data/<tool>.log). THREE DO NOT — they run inline inside a host
+# daemon's process, so their log lines land in the HOST's file. Two
+# real diagnosis incidents (2026-06-11) started as "subsystem X looks
+# dead" when X was healthy and logging into its host's file:
+#
+#   email_classifier: → runs INSIDE curator (post-processor per inbox
+#                       file) → logs to data/curator.log.
+#                       data/email_classifier.log belongs to the
+#                       standalone CLI backfill only.
+#   gcal:             → runs INSIDE talker → logs to data/talker.log.
+#   transport:        → the HTTP server is HOSTED by talker (no
+#                       transport daemon) → logs to data/talker.log.
+#
+# The ``mail`` section's split, for the same reason:
+#   mail (daemon slot) = the WEBHOOK receiver (live inbound path:
+#                       n8n → tunnel → webhook → inbox) →
+#                       data/mail_webhook.log.
+#   IMAP fetcher       = manual CLI only (``alfred mail fetch``,
+#                       deliberate fallback) → data/mail.log.
+#
+# alfred.log = orchestrator + captured child stdout only.
+
 vault:
   path: "./vault"
   # Two semantically distinct exclusion fields (split 2026-05-01):
