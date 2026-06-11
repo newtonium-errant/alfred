@@ -70,7 +70,7 @@ import frontmatter
 import yaml
 from aiohttp import web
 
-from .canonical import apply_field_permissions
+from .canonical import apply_compose_permissions, apply_field_permissions
 from .canonical_audit import append_audit
 from .peer_search import (
     FilterPolicyError,
@@ -532,18 +532,36 @@ def _execute_filtered_search(
     raw_limit: Any,
     requested_fields: Any,
     correlation_id: str,
+    include_compose_tier: bool = False,
 ) -> dict[str, Any]:
     """Run the deterministic filtered-canonical search + disclosure gates.
 
-    THE SINGLE SOURCE OF TRUTH for filtered-query disclosure. Both the
-    synchronous ``POST /peer/search`` handler AND the async ``kind=query``
-    broker (``/peer/send``) call this — there is NO second, weaker
-    disclosure path. Identical gates, identical ``apply_field_permissions``
-    field-gate, identical ``kind: "search"`` audit, by construction.
+    THE SINGLE SOURCE OF TRUTH for filtered-query disclosure. The
+    synchronous ``POST /peer/search`` handler, the async ``kind=query``
+    broker, AND the NL-lane broker (``kind=query_nl``) all call this —
+    there is NO second, weaker disclosure path. Identical gates,
+    identical ``apply_field_permissions`` field-gate, identical
+    ``kind: "search"`` audit, by construction.
+
+    ``include_compose_tier`` (LLM lane, 2026-06-10): when True, the
+    success dict additionally carries ``compose_extras`` (one dict per
+    matched record, aligned with ``records``) and ``compose_fields_used``
+    — the COMPOSE-TIER values extracted from raw frontmatter via
+    :func:`apply_compose_permissions`. The extracted set is 100%
+    POLICY-derived (``nl_query.compose_fields`` for this peer × type),
+    never caller-supplied, and bodies remain structurally unreachable
+    (this function only ever parses ``post.metadata``). Default False
+    keeps both pre-existing surfaces byte-identical — only the NL
+    broker sets it, so a plain ``/peer/search`` can never receive
+    compose-tier values. Kept INSIDE this function (rather than a
+    second vault read in the broker) precisely so the single-source-
+    of-truth property covers everything that leaves the vault.
 
     Returns a dict the caller maps to its own response shape:
         * Success → ``{"ok": True, "record_type", "count", "records",
-          "granted"}`` (records are field-gated + JSON-sanitized).
+          "granted"}`` (records are field-gated + JSON-sanitized),
+          plus ``compose_extras`` / ``compose_fields_used`` iff
+          ``include_compose_tier``.
         * Denied / error → ``{"ok": False, "status": <http-status>,
           "code": <error-code>, "detail": <str>}``.
 
@@ -633,6 +651,8 @@ def _execute_filtered_search(
     # --- Gate 3: per-record field gate (reused apply_field_permissions) --
     requested_set = {f for f in req_fields if isinstance(f, str)}
     out_records: list[dict[str, Any]] = []
+    compose_extras: list[dict[str, Any]] = []
+    compose_used: set[str] = set()
     all_granted: set[str] = set()
     all_denied: set[str] = set()
     for fm in matched:
@@ -657,6 +677,18 @@ def _execute_filtered_search(
         out_records.append(json_sanitize(filtered))
         all_granted.update(granted)
         all_denied.update(denied)
+        if include_compose_tier:
+            # Compose-tier extraction (NL lane). Policy-derived only —
+            # the allowlist comes from nl_query.compose_fields, never
+            # from the request. Aligned 1:1 with ``out_records``.
+            extras, used = apply_compose_permissions(
+                peer=peer,
+                record_type=record_type,
+                frontmatter=fm,
+                perms=perms,
+            )
+            compose_extras.append(json_sanitize(extras))
+            compose_used.update(used)
 
     append_audit(
         audit_path,
@@ -674,13 +706,21 @@ def _execute_filtered_search(
         },
     )
 
-    return {
+    result: dict[str, Any] = {
         "ok": True,
         "record_type": record_type,
         "count": len(out_records),
         "records": out_records,
         "granted": sorted(all_granted),
+        # ``denied`` is internal-dict-only (additive 2026-06-10 for the
+        # NL broker's audit row) — neither HTTP surface copies it into a
+        # wire response; both build their payloads from named keys.
+        "denied": sorted(all_denied),
     }
+    if include_compose_tier:
+        result["compose_extras"] = compose_extras
+        result["compose_fields_used"] = sorted(compose_used)
+    return result
 
 
 async def _handle_peer_search(request: web.Request) -> web.StreamResponse:
