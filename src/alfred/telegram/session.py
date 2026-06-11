@@ -1589,10 +1589,18 @@ def _build_session_body(session: Session) -> str:
 
     User turns: ``**Andrew** (HH:MM · voice): …``
     Assistant turns: ``**Alfred** (HH:MM): …``
+    Tool results: ``**Tool** (HH:MM): [tool_result: toolu_…]``
 
     Tool-use / tool-result blocks inside a content list render as compact
     one-liners (``[tool_use: vault_search glob=project/*.md]``). This keeps
     the session record skimmable — JSON blobs would be unreadable.
+
+    Tool results arrive in *user-role* messages (Anthropic API shape), so
+    the user branch splits them out and renders them under a ``**Tool**``
+    speaker — attributing machine output to the operator would mislead
+    downstream consumers (the distiller reads these records as operator
+    speech). ``tool_use`` blocks stay under ``**Alfred**`` — the assistant
+    did invoke them.
     """
     lines: list[str] = ["# Transcript", ""]
     base_time = session.started_at
@@ -1610,22 +1618,69 @@ def _build_session_body(session: Session) -> str:
         hhmm = ts.strftime("%H:%M")
 
         if role == "user":
-            speaker = "Andrew"
             meta = " · voice" if kind == "voice" else ""
-            header = f"**{speaker}** ({hhmm}{meta}):"
+            header = f"**Andrew** ({hhmm}{meta}):"
+            tool_blocks, rest = _split_tool_results(content)
+            turn_lines: list[str] = []
+            if tool_blocks:
+                # Tool line first — matches the API's block ordering
+                # within the message.
+                turn_lines.append(
+                    f"**Tool** ({hhmm}): {_render_content(tool_blocks)}"
+                )
+            rendered = _render_content(rest)
+            if rendered:
+                turn_lines.append(f"{header} {rendered}")
+            elif not tool_blocks:
+                # Fully-empty turn keeps the bare-header behaviour; a
+                # pure-tool_result turn emits ONLY the Tool line (no
+                # empty Andrew header).
+                turn_lines.append(header)
+            for j, turn_line in enumerate(turn_lines):
+                if j:
+                    # Blank line between the Tool line and the Andrew
+                    # line on a mixed turn.
+                    lines.append("")
+                lines.append(turn_line)
         else:
             header = f"**Alfred** ({hhmm}):"
-
-        rendered = _render_content(content)
-        if rendered:
-            lines.append(f"{header} {rendered}")
-        else:
-            lines.append(header)
+            rendered = _render_content(content)
+            if rendered:
+                lines.append(f"{header} {rendered}")
+            else:
+                lines.append(header)
         # Blank line between turns, except after the last one
         if idx < len(session.transcript) - 1:
             lines.append("")
 
     return "\n".join(lines) + "\n"
+
+
+def _split_tool_results(
+    content: str | list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str | list[Any]]:
+    """Partition ``tool_result`` blocks out of a user turn's content.
+
+    Tool results arrive in user-role messages per the Anthropic API —
+    the tool loop appends ``{"role": "user", "content": [{"type":
+    "tool_result", ...}]}`` after each invocation. The renderer must
+    not attribute them to the operator.
+
+    Returns ``(tool_blocks, rest)``: string content has no blocks →
+    ``([], content)``; list content partitions dict blocks with
+    ``type == "tool_result"`` into ``tool_blocks`` and everything else
+    (text blocks, non-dict members) into ``rest``, order preserved.
+    """
+    if not isinstance(content, list):
+        return [], content
+    tool_blocks: list[dict[str, Any]] = []
+    rest: list[Any] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            tool_blocks.append(block)
+        else:
+            rest.append(block)
+    return tool_blocks, rest
 
 
 def _render_content(content: str | list[dict[str, Any]]) -> str:

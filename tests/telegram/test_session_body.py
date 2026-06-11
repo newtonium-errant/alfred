@@ -88,3 +88,129 @@ def test_body_renders_distinct_per_turn_timestamps(state_mgr) -> None:
     assert body.count("(10:05") == 1
     assert body.count("(10:06") == 1
     assert body.count("(10:30") == 1
+
+
+# --- Tool-result speaker attribution (2026-06-12 fix) ----------------------
+#
+# Anthropic delivers tool results as USER-role messages carrying
+# ``tool_result`` content blocks. The renderer used to attribute every
+# user-role turn to **Andrew**, so machine output read as operator speech
+# and misled the distiller. Tool results now render under a **Tool**
+# speaker; ``tool_use`` stays under **Alfred** (the assistant invoked it).
+
+
+def test_pure_tool_result_turn_renders_under_tool_speaker() -> None:
+    """A user-role turn that is ONLY a tool_result gets no Andrew header."""
+    sess = _make_session()
+    sess.transcript = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_0123456789",
+                    "content": "3 records found",
+                },
+            ],
+            "_ts": "2026-04-18T10:07:00+00:00",
+        },
+    ]
+
+    body = talker_session._build_session_body(sess)
+
+    assert "**Tool** (10:07): [tool_result: toolu_01…]" in body
+    assert "**Andrew** (10:07" not in body
+
+
+def test_mixed_turn_splits_tool_and_andrew_lines() -> None:
+    """tool_result + text in one turn → Tool line AND Andrew line."""
+    sess = _make_session()
+    sess.transcript = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_0123456789",
+                    "content": "ok",
+                },
+                {"type": "text", "text": "also, remind me about the optometrist"},
+            ],
+            "_ts": "2026-04-18T10:08:00+00:00",
+        },
+    ]
+
+    body = talker_session._build_session_body(sess)
+
+    assert "**Tool** (10:08): [tool_result: toolu_01…]" in body
+    assert "**Andrew** (10:08): also, remind me about the optometrist" in body
+    # The marker must not bleed onto the Andrew line.
+    andrew_line = next(
+        ln for ln in body.splitlines() if ln.startswith("**Andrew**")
+    )
+    assert "tool_result" not in andrew_line
+
+
+def test_error_tool_result_keeps_error_marker_under_tool() -> None:
+    """``is_error`` keeps the `` error`` marker, attributed to Tool."""
+    sess = _make_session()
+    sess.transcript = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_0123456789",
+                    "content": "boom",
+                    "is_error": True,
+                },
+            ],
+            "_ts": "2026-04-18T10:09:00+00:00",
+        },
+    ]
+
+    body = talker_session._build_session_body(sess)
+
+    assert "**Tool** (10:09): [tool_result error: toolu_01…]" in body
+    assert "**Andrew**" not in body
+
+
+def test_plain_string_user_turn_still_renders_as_andrew() -> None:
+    """Regression pin: ordinary user text keeps the Andrew header."""
+    sess = _make_session()
+    sess.transcript = [
+        {
+            "role": "user",
+            "content": "plain message",
+            "_ts": "2026-04-18T10:10:00+00:00",
+            "_kind": "text",
+        },
+    ]
+
+    body = talker_session._build_session_body(sess)
+
+    assert "**Andrew** (10:10): plain message" in body
+    assert "**Tool**" not in body
+
+
+def test_assistant_tool_use_still_renders_under_alfred() -> None:
+    """Regression pin: tool_use stays under Alfred — he invoked it."""
+    sess = _make_session()
+    sess.transcript = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "vault_search",
+                    "input": {"glob": "project/*.md"},
+                },
+            ],
+            "_ts": "2026-04-18T10:11:00+00:00",
+        },
+    ]
+
+    body = talker_session._build_session_body(sess)
+
+    assert "**Alfred** (10:11): [tool_use: vault_search" in body
+    assert "**Tool**" not in body
