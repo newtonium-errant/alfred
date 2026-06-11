@@ -128,6 +128,90 @@ def apply_field_permissions(
     return out, granted, denied
 
 
+def apply_compose_permissions(
+    peer: str,
+    record_type: str,
+    frontmatter: dict[str, Any],
+    perms: dict[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Return ``(compose_extras, used_fields)`` for the NL-lane compose tier.
+
+    The COMPOSITION-GRANT mirror of :func:`apply_field_permissions`
+    (LLM lane, 2026-06-10). Reads the ``nl_query.compose_fields``
+    allowlist for this peer × type and extracts ONLY those fields from
+    the raw frontmatter — the values the holder's composer LLM may read
+    as input but which the deterministic lane continues to deny raw.
+
+    Args:
+        peer: Peer name (e.g. ``"hypatia"``).
+        record_type: Record type being composed over (e.g. ``"event"``).
+        frontmatter: The full raw frontmatter dict of one MATCHED record.
+        perms: The ``peer_permissions`` dict from :class:`CanonicalConfig`
+            — same shape :func:`apply_field_permissions` takes. ``None``
+            or empty → default-deny (empty extras).
+
+    Returns:
+        A tuple:
+          - ``compose_extras`` — nested dict of compose-tier values only
+            (dotted grants nest at the same path, mirroring
+            ``apply_field_permissions``). NEVER contains the body —
+            callers only ever pass frontmatter.
+          - ``used_fields`` — the dotted field names actually extracted
+            (present in both the allowlist AND the frontmatter). Feeds
+            the ``compose_fields_used`` audit field.
+
+    Semantics (all fail-closed, mirroring the field gate):
+      - Missing peer entry, missing type entry, absent ``nl_query``
+        block, or empty ``compose_fields`` → ``({}, [])``.
+      - Field named in ``compose_fields`` but absent from the
+        frontmatter → silently skipped (absence, not error).
+      - ``type_rules`` may be a dict (raw config shape used by handler
+        tests) or a ``PeerFieldRules`` dataclass (shape produced by
+        ``load_from_unified``) — both normalized, same as the field gate.
+    """
+    if not frontmatter or not perms:
+        return {}, []
+
+    peer_rules = perms.get(peer)
+    if not isinstance(peer_rules, dict):
+        return {}, []
+
+    type_rules = peer_rules.get(record_type)
+    if type_rules is None:
+        return {}, []
+
+    # Normalize the nl_query lookup across dict / dataclass shapes.
+    if isinstance(type_rules, dict):
+        nl_raw = type_rules.get("nl_query")
+        if isinstance(nl_raw, dict):
+            compose_allowed = nl_raw.get("compose_fields") or []
+        else:
+            compose_allowed = []
+    else:
+        nl_rules = getattr(type_rules, "nl_query", None)
+        compose_allowed = list(getattr(nl_rules, "compose_fields", None) or [])
+    if not isinstance(compose_allowed, list) or not compose_allowed:
+        return {}, []
+
+    extras: dict[str, Any] = {}
+    used: list[str] = []
+    for field_spec in compose_allowed:
+        if not isinstance(field_spec, str) or not field_spec:
+            continue
+        if "." in field_spec:
+            value = _read_dotted(frontmatter, field_spec)
+            if value is _SENTINEL:
+                continue
+            _write_dotted(extras, field_spec, value)
+            used.append(field_spec)
+        else:
+            if field_spec not in frontmatter:
+                continue
+            extras[field_spec] = frontmatter[field_spec]
+            used.append(field_spec)
+    return extras, used
+
+
 # Sentinel for "field absent" vs. "field present but None".
 _SENTINEL: Any = object()
 
