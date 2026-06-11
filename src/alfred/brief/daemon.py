@@ -24,6 +24,7 @@ from .tier_section import render_tier_section
 from .utils import get_logger
 from .operations import format_operations_section
 from .upcoming_events import render_upcoming_events_section
+from .watches import check_and_format_watches
 from .weather import fetch_and_format
 
 log = get_logger(__name__)
@@ -129,6 +130,29 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         today=today,
     )
 
+    # Watch Items — config-driven upstream checks (PRs, release
+    # mentions) run LIVE by the brief, weather-style. Empty string when
+    # no watches configured → section omitted entirely. Same section-
+    # boundary containment idiom as weather (874c751): the module owns
+    # per-item degradation, and this last-resort guard means even a
+    # structural watches bug can never kill the run. CancelledError
+    # derives from BaseException, so daemon-shutdown cancellation
+    # propagates through the ``except Exception`` untouched.
+    watches_md = ""
+    if config.watches:
+        try:
+            watches_md = await check_and_format_watches(
+                config.watches,
+                state_path=Path(data_dir) / "brief_watches_state.json",
+            )
+        except Exception as exc:  # noqa: BLE001 — section never kills the run
+            log.warning(
+                "brief.watches_section_failed",
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+            )
+            watches_md = "*Watch checks unavailable.*"
+
     # Upcoming Events — forward-looking calendar slice. Empty string
     # when the section is disabled in config; that signals "omit
     # entirely from the brief". A populated string (including the
@@ -201,6 +225,15 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
         ("Today's Routines", routines_md),
         ("Operations", ops_md),
     ]
+    # Watch Items sits after Operations, before Upcoming Events:
+    # upstream watches are forward-looking operational signals — more
+    # actionable than the calendar slice when one flips (🚨 lines carry
+    # the operator's own action note), less time-critical than today's
+    # tasks/routines when stable. Rendered ONLY when ≥1 watch is
+    # configured (the empty string from an unconfigured feature is the
+    # one permitted silence; every CONFIGURED watch yields a line).
+    if watches_md:
+        sections.append(("Watch Items", watches_md))
     if upcoming_md:
         sections.append(("Upcoming Events", upcoming_md))
     if peer_digests_md:

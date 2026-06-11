@@ -73,6 +73,39 @@ class PeerDigestsConfig:
 
 
 @dataclass
+class WatchItemConfig:
+    """One ``brief.watches`` entry — a config-driven upstream check.
+
+    The morning brief runs these live (the way the weather section
+    does) and renders one line per item under ``## Watch Items``.
+    GENERIC by design: what gets watched is operator config, never
+    code. Two types:
+
+    * ``github_pr`` — ``repo`` (``owner/name``) + ``number``. Reports
+      open / merged / closed; a state CHANGE since the last brief is a
+      flip (rendered loud with ``on_flip_note``).
+    * ``github_release_mention`` — ``repo`` + ``pattern`` (regex,
+      case-insensitive) + ``baseline_tag``. Fires when the first
+      release strictly newer than the baseline / last-seen tag matches
+      the pattern across tag + name + body.
+
+    ``id`` keys the persisted last-seen state
+    (``data/brief_watches_state.json``); keep it stable once set.
+    ``on_flip_note`` is the operator's action text, rendered when the
+    watch flips.
+    """
+
+    id: str = ""
+    label: str = ""
+    type: str = ""
+    repo: str = ""
+    number: int = 0
+    pattern: str = ""
+    baseline_tag: str = ""
+    on_flip_note: str = ""
+
+
+@dataclass
 class BriefConfig:
     vault_path: str = ""
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -81,6 +114,9 @@ class BriefConfig:
     state: StateConfig = field(default_factory=StateConfig)
     upcoming_events: UpcomingEventsConfig = field(default_factory=UpcomingEventsConfig)
     peer_digests: PeerDigestsConfig = field(default_factory=PeerDigestsConfig)
+    # Watch Items — optional; empty list = feature off, section never
+    # rendered. See WatchItemConfig.
+    watches: list[WatchItemConfig] = field(default_factory=list)
     log_file: str = "./data/brief.log"
 
     # Telegram user_id the post-write brief push dispatches to. v1
@@ -173,6 +209,31 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         peer_canonical_names=peer_canonical_names,
     )
 
+    # Watch Items — optional list; absent block = feature off. Lenient
+    # build (str/int coercion, non-dict entries skipped): a structurally
+    # malformed ITEM still constructs and is surfaced at check time as a
+    # "watch unavailable (config error / api error)" line in the brief —
+    # a config mistake the operator actually SEES, rather than a
+    # load-time skip that silently shrinks the watch list.
+    watches: list[WatchItemConfig] = []
+    for w in section.get("watches", []) or []:
+        if not isinstance(w, dict):
+            continue
+        try:
+            number = int(w.get("number", 0) or 0)
+        except (TypeError, ValueError):
+            number = 0
+        watches.append(WatchItemConfig(
+            id=str(w.get("id", "") or ""),
+            label=str(w.get("label", "") or ""),
+            type=str(w.get("type", "") or ""),
+            repo=str(w.get("repo", "") or ""),
+            number=number,
+            pattern=str(w.get("pattern", "") or ""),
+            baseline_tag=str(w.get("baseline_tag", "") or ""),
+            on_flip_note=str(w.get("on_flip_note", "") or ""),
+        ))
+
     # Primary Telegram user for post-write brief push. Reads the
     # unified config's ``telegram.allowed_users[0]`` — single-user v1;
     # peer protocol in Stage 3.5 will widen.
@@ -206,6 +267,7 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         state=state,
         upcoming_events=upcoming_events,
         peer_digests=peer_digests,
+        watches=watches,
         log_file=f"{log_dir}/brief.log",
         primary_telegram_user_id=primary_user,
         quarantine_dir_name=quarantine_dir_name,

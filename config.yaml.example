@@ -572,6 +572,41 @@ brief:
       - kal-le
     # peer_canonical_names: # optional override for the section header
     #   kalle: "K.A.L.L.E."  # default uppercases the peer key
+  #
+  # Watch Items — config-driven upstream checks the brief runs LIVE
+  # each morning (unauthenticated GitHub REST; 60 req/hr unauth is
+  # plenty at one brief/day). Absent list = feature off, section never
+  # rendered. Render contract: stable state = quiet one-liner;
+  # state-flip since the last brief = loud 🚨 line carrying your
+  # on_flip_note; a flipped-to-terminal item keeps a "✓ done — remove
+  # from config when acted on" line every brief until YOU remove it
+  # (operator-in-the-loop — nothing auto-removes). A failing check
+  # renders "watch unavailable (api error: ...)" and never kills the
+  # brief. Last-seen state: ./data/brief_watches_state.json (keyed by
+  # ``id`` — keep ids stable once set).
+  #
+  # Two types:
+  #   github_pr              — repo + number; open / merged / closed.
+  #   github_release_mention — repo + pattern (regex, case-insensitive,
+  #                            matched across tag+name+body) +
+  #                            baseline_tag (only releases STRICTLY
+  #                            newer than this are scanned).
+  #
+  # Example (the North Mini Code spike watches, 2026-06-11):
+  # watches:
+  #   - id: llamacpp-cohere2moe-pr
+  #     label: "llama.cpp cohere2moe arch"
+  #     type: github_pr
+  #     repo: "ggml-org/llama.cpp"
+  #     number: 24260
+  #     on_flip_note: "NMC GGUF unblocked — rebuild llama.cpp + retry the spike (project_nmc_spike.md)"
+  #   - id: ollama-vendors-cohere2moe
+  #     label: "ollama release vendoring cohere2moe"
+  #     type: github_release_mention
+  #     repo: "ollama/ollama"
+  #     pattern: "cohere2moe|north.?mini"
+  #     baseline_tag: "v0.16.1"
+  #     on_flip_note: "ollama can serve NMC natively — swap the spike to ollama pull (project_nmc_spike.md)"
 
 # Daily Sync — 09:00 ADT Telegram conversation channel (email-surfacing c2).
 # Salem fires a per-day OODA-loop message: today's calibration batch (5
