@@ -19,11 +19,21 @@ from alfred.brief.health_section import (
 )
 
 
-def _write_bit_record(vault: Path, date_str: str, overall: str = "ok") -> Path:
-    """Write a BIT record file in the vault, returning its path."""
-    process_dir = vault / "process"
-    process_dir.mkdir(parents=True, exist_ok=True)
-    path = process_dir / f"Alfred BIT {date_str}.md"
+def _write_bit_record(
+    vault: Path,
+    date_str: str,
+    overall: str = "ok",
+    bit_dir: str = "run",
+) -> Path:
+    """Write a BIT record file in the vault, returning its path.
+
+    ``bit_dir`` defaults to ``"run"`` (the canonical home since
+    2026-06-12); pass ``"process"`` to model a pre-migration legacy
+    record.
+    """
+    record_dir = vault / bit_dir
+    record_dir.mkdir(parents=True, exist_ok=True)
+    path = record_dir / f"Alfred BIT {date_str}.md"
     content = dedent(f"""\
         ---
         type: run
@@ -85,8 +95,47 @@ class TestFindLatestBitRecord:
         assert latest is not None
         assert latest.name == "Alfred BIT 2026-04-19.md"
 
-    def test_missing_process_dir(self, tmp_path: Path) -> None:
+    def test_missing_bit_dirs(self, tmp_path: Path) -> None:
+        # Neither run/ nor process/ exists yet — no record, no crash.
         assert _find_latest_bit_record(tmp_path) is None
+
+    def test_legacy_process_record_still_found(self, tmp_path: Path) -> None:
+        """Pre-2026-06-12 records living in process/ are still found."""
+        _write_bit_record(tmp_path, "2026-04-19", bit_dir="process")
+        latest = _find_latest_bit_record(tmp_path)
+        assert latest is not None
+        assert latest.name == "Alfred BIT 2026-04-19.md"
+        assert latest.parent.name == "process"
+
+    def test_newest_filename_wins_across_dirs(self, tmp_path: Path) -> None:
+        """Newest-dated filename wins regardless of which dir holds it."""
+        # Older legacy record in process/, newer in run/ → run record.
+        _write_bit_record(tmp_path, "2026-04-18", bit_dir="process")
+        _write_bit_record(tmp_path, "2026-04-19", bit_dir="run")
+        latest = _find_latest_bit_record(tmp_path)
+        assert latest is not None
+        assert latest.name == "Alfred BIT 2026-04-19.md"
+        assert latest.parent.name == "run"
+
+    def test_newest_filename_wins_when_legacy_is_newer(
+        self, tmp_path: Path
+    ) -> None:
+        """Not-yet-migrated case: newer record in process/ still wins."""
+        _write_bit_record(tmp_path, "2026-04-19", bit_dir="run")
+        _write_bit_record(tmp_path, "2026-04-20", bit_dir="process")
+        latest = _find_latest_bit_record(tmp_path)
+        assert latest is not None
+        assert latest.name == "Alfred BIT 2026-04-20.md"
+        assert latest.parent.name == "process"
+
+    def test_filename_tie_prefers_run_dir(self, tmp_path: Path) -> None:
+        """Migration-overlap: same filename in both dirs → run/ wins."""
+        _write_bit_record(tmp_path, "2026-04-19", bit_dir="process")
+        _write_bit_record(tmp_path, "2026-04-19", bit_dir="run")
+        latest = _find_latest_bit_record(tmp_path)
+        assert latest is not None
+        assert latest.name == "Alfred BIT 2026-04-19.md"
+        assert latest.parent.name == "run"
 
 
 class TestParseFrontmatter:
@@ -160,7 +209,7 @@ class TestRenderHealthSection:
             "runs": [{
                 "date": "2026-04-19",
                 "generated_at": "2026-04-19T05:55:00+00:00",
-                "vault_path": "process/Alfred BIT 2026-04-19.md",
+                "vault_path": "run/Alfred BIT 2026-04-19.md",
                 "overall_status": "warn",
                 "mode": "quick",
                 "tool_counts": {"ok": 5, "warn": 1, "fail": 0, "skip": 1},
@@ -199,5 +248,11 @@ class TestRenderHealthSection:
 
     def test_includes_record_link(self, tmp_path: Path) -> None:
         _write_bit_record(tmp_path, "2026-04-19")
+        md = render_health_section(tmp_path, today="2026-04-19")
+        assert "[[run/Alfred BIT 2026-04-19]]" in md
+
+    def test_legacy_record_link_points_at_process(self, tmp_path: Path) -> None:
+        """A pre-migration record renders its link at its real location."""
+        _write_bit_record(tmp_path, "2026-04-19", bit_dir="process")
         md = render_health_section(tmp_path, today="2026-04-19")
         assert "[[process/Alfred BIT 2026-04-19]]" in md

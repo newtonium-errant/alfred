@@ -1,9 +1,12 @@
 """Brief integration for the BIT daemon's most recent run.
 
 The Morning Brief includes a Health section that summarizes the latest
-``vault/process/Alfred BIT {date}.md`` record (or, as a fallback, the
-BIT state file).  The goal is a compact snapshot the reader can
-interpret at a glance:
+``vault/run/Alfred BIT {date}.md`` record (or, as a fallback, the
+BIT state file).  Records written before 2026-06-12 live in
+``vault/process/`` (the old mis-routed default — janitor DIR001), so
+the lookup checks both directories until the historical records are
+migrated.  The goal is a compact snapshot the reader can interpret at
+a glance:
 
     ## Health
 
@@ -59,19 +62,34 @@ def _parse_frontmatter(path: Path) -> dict[str, Any] | None:
     return data
 
 
-def _find_latest_bit_record(vault_path: Path, bit_dir: str = "process") -> Path | None:
+def _find_latest_bit_record(
+    vault_path: Path,
+    bit_dirs: tuple[str, ...] = ("run", "process"),
+) -> Path | None:
     """Find the most recent Alfred BIT record in the vault.
 
-    The BIT daemon writes ``vault/<bit_dir>/Alfred BIT {date}.md``, so
-    we glob for ``Alfred BIT *.md`` and return the lexicographically
-    last one — since the dates are ISO-8601, lexicographic order is
-    also chronological order.
+    The BIT daemon writes ``vault/run/Alfred BIT {date}.md`` (since
+    2026-06-12; ``vault/process/`` before that), so we glob for
+    ``Alfred BIT *.md`` in every directory in ``bit_dirs`` and return
+    the lexicographically-last FILENAME overall — since the dates are
+    ISO-8601, lexicographic order is also chronological order. On a
+    filename tie across directories (migration-overlap case), the
+    earlier-listed directory wins (``run/``, the canonical home).
     """
-    dir_path = vault_path / bit_dir
-    if not dir_path.exists():
+    candidates: list[tuple[str, int, Path]] = []
+    for dir_index, bit_dir in enumerate(bit_dirs):
+        dir_path = vault_path / bit_dir
+        if not dir_path.exists():
+            continue
+        for p in dir_path.glob("Alfred BIT *.md"):
+            # Sort key: filename first (chronological), then negated
+            # dir index so an earlier-listed dir sorts LAST on a
+            # filename tie (we take the final element below).
+            candidates.append((p.name, -dir_index, p))
+    if not candidates:
         return None
-    candidates = sorted(dir_path.glob("Alfred BIT *.md"))
-    return candidates[-1] if candidates else None
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    return candidates[-1][2]
 
 
 def _read_state_latest(state_path: Path) -> dict[str, Any] | None:
@@ -141,7 +159,8 @@ def render_health_section(
 
     Args:
         vault_path: Path to vault root.  We look under
-            ``vault/process/Alfred BIT *.md``.
+            ``vault/run/Alfred BIT *.md`` (and ``vault/process/`` for
+            pre-2026-06-12 legacy records).
         state_path: Optional path to the BIT state JSON. Used only as
             a fallback when no vault record is found.
         today: ISO date string. If the latest BIT record isn't from
@@ -160,7 +179,12 @@ def render_health_section(
         frontmatter = _parse_frontmatter(record_path)
         if frontmatter is not None:
             body = record_path.read_text(encoding="utf-8")
-            return _render_from_frontmatter(frontmatter, body, today_str)
+            return _render_from_frontmatter(
+                frontmatter,
+                body,
+                today_str,
+                record_dir=record_path.parent.name,
+            )
 
     # Fallback to state file
     if state_path is not None:
@@ -175,8 +199,15 @@ def _render_from_frontmatter(
     frontmatter: dict[str, Any],
     body: str,
     today_str: str,
+    record_dir: str = "process",
 ) -> str:
-    """Format the Health section from a parsed BIT record."""
+    """Format the Health section from a parsed BIT record.
+
+    ``record_dir`` is the directory the record was actually found in —
+    the "See full report" wikilink must point at the real location,
+    whether that's the canonical ``run/`` or a legacy ``process/``
+    record from before 2026-06-12.
+    """
     overall = str(frontmatter.get("overall_status", "unknown"))
     mode = str(frontmatter.get("mode", "?"))
     record_date = str(frontmatter.get("created", ""))
@@ -209,7 +240,7 @@ def _render_from_frontmatter(
 
     record_link = frontmatter.get("name") or "latest BIT"
     lines.append("")
-    lines.append(f"See full report: [[process/{record_link}]]")
+    lines.append(f"See full report: [[{record_dir}/{record_link}]]")
     return "\n".join(lines)
 
 

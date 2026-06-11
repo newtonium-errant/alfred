@@ -95,9 +95,11 @@ class TestLoadFromUnified:
         cfg = load_from_unified(raw)
         assert cfg.schedule.mode == "full"
 
-    def test_default_output_directory_is_process(self) -> None:
+    def test_default_output_directory_is_run(self) -> None:
+        # BIT records are ``type: run`` — TYPE_DIRECTORY["run"] == "run".
+        # The old "process" default tripped janitor DIR001 on every record.
         cfg = load_from_unified({"vault": {"path": "./vault"}})
-        assert cfg.output.directory == "process"
+        assert cfg.output.directory == "run"
 
     def test_state_path_under_logging_dir(self) -> None:
         raw = {"vault": {"path": "./vault"}, "logging": {"dir": "/tmp/d"}}
@@ -247,7 +249,9 @@ class TestRunBitOnce:
         with patch("alfred.health.aggregator._load_tool_checks", lambda: None):
             rel_path, status = await run_bit_once(cfg, {}, sm)
 
-        # Record written
+        # Record written — and routed to run/ (type: run → run/ per
+        # TYPE_DIRECTORY; the old process/ default was janitor DIR001).
+        assert rel_path.startswith("run/")
         full = vault / rel_path
         assert full.exists()
         content = full.read_text(encoding="utf-8")
@@ -360,7 +364,7 @@ class TestBitCli:
         json_start = out.rfind("{")
         parsed = json.loads(out[json_start:])
         assert parsed["overall_status"] == "ok"
-        assert parsed["record_path"].startswith("process/")
+        assert parsed["record_path"].startswith("run/")
 
     def test_cmd_status_with_runs(self, tmp_path: Path, capsys) -> None:
         cfg = BITConfig(vault_path=str(tmp_path))
@@ -369,7 +373,7 @@ class TestBitCli:
         sm.state.add_run(BITRun(
             date="2026-04-19",
             generated_at="2026-04-19T06:00:00Z",
-            vault_path="process/x.md",
+            vault_path="run/x.md",
             overall_status="ok",
             mode="quick",
             tool_counts={"ok": 5, "warn": 0, "fail": 0, "skip": 0},

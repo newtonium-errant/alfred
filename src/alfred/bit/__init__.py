@@ -1,7 +1,7 @@
 """Alfred BIT (built-in test) daemon and CLI.
 
 The BIT daemon runs a quick ``run_all_checks`` sweep on a schedule and
-writes a ``run``-type record to ``vault/process/`` so the outcome is
+writes a ``run``-type record to ``vault/run/`` so the outcome is
 queryable alongside the rest of Alfred's operational data. The Morning
 Brief pulls the latest BIT record via ``render_health_section`` (c6).
 

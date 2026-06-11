@@ -747,7 +747,7 @@ bit:
     # timezone: "America/Halifax"  # empty = use brief's timezone
     mode: "quick"
   output:
-    directory: "process"
+    directory: "run"
     name_template: "Alfred BIT {date}"
   state:
     path: "./data/bit_state.json"

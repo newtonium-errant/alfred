@@ -40,9 +40,16 @@ class ScheduleConfig:
 
 @dataclass
 class OutputConfig:
-    """Where the BIT daemon writes its run record."""
+    """Where the BIT daemon writes its run record.
 
-    directory: str = "process"
+    ``directory`` defaults to ``"run"`` — BIT records are ``type: run``
+    and ``TYPE_DIRECTORY["run"] == "run"``. The old ``"process"``
+    default mis-routed every record into ``process/``, tripping a
+    deterministic janitor DIR001 on each one (vault-reviewer
+    escalation 2026-06-12).
+    """
+
+    directory: str = "run"
     name_template: str = "Alfred BIT {date}"
 
 
@@ -124,7 +131,7 @@ def load_from_unified(raw: dict[str, Any]) -> BITConfig:
 
     output_raw = section.get("output", {}) or {}
     output = OutputConfig(
-        directory=output_raw.get("directory", "process"),
+        directory=output_raw.get("directory", "run"),
         name_template=output_raw.get("name_template", "Alfred BIT {date}"),
     )
 
