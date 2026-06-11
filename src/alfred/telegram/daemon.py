@@ -208,6 +208,90 @@ def _build_vault_context_str(config: TalkerConfig) -> str:
         return "Vault types: " + ", ".join(type_counts)
 
 
+async def _close_open_sessions_on_shutdown(
+    state_mgr: StateManager,
+    config: TalkerConfig,
+    client: Any,
+) -> list[str]:
+    """Close every still-open session so the records land before exit.
+
+    Extracted from ``run()``'s finally block so the call-site contract
+    is regression-pinnable. Behaviour matches the timeout sweeper's
+    close-call contract — including ``pushback_level=
+    raw_sess.get("_pushback_level")``, which the shutdown path omitted
+    pre-2026-06-12: shutdown-closed records got ``telegram.
+    pushback_level: null`` while the other three close paths (bot
+    ``/end``, timeout sweeper, startup sweep) all read the stash.
+
+    Returns the vault-relative paths of the records written.
+    """
+    closed_paths: list[str] = []
+    active_all = dict(state_mgr.state.get("active_sessions", {}) or {})
+    for chat_id_str in list(active_all.keys()):
+        raw_sess = active_all[chat_id_str]
+        vault_root = raw_sess.get("_vault_path_root") or config.vault.path
+        user_path = raw_sess.get("_user_vault_path") or (
+            config.primary_users[0] if config.primary_users else None
+        )
+        stt_model = raw_sess.get("_stt_model_used") or config.stt.model
+        # Snapshot for post-close substance-slug rename — same
+        # pattern as ``check_timeouts_with_meta`` since the
+        # active dict is popped during ``close_session``. The
+        # helper encodes the fields the hook needs in one place.
+        post_close_snap = session._snapshot_for_post_close(raw_sess)
+        transcript_snap = post_close_snap["transcript"]
+        session_id_snap = post_close_snap["session_id"]
+        try:
+            rel_path = session.close_session(
+                state_mgr,
+                vault_path_root=vault_root,
+                chat_id=int(chat_id_str),
+                reason="shutdown",
+                user_vault_path=user_path,
+                stt_model_used=stt_model,
+                session_type=raw_sess.get("_session_type", "note"),
+                continues_from=raw_sess.get("_continues_from"),
+                pushback_level=raw_sess.get("_pushback_level"),
+                # Per-instance session-save shape — prefer the
+                # stash, fall back to live config so a session
+                # opened before the field was stashed still
+                # closes with the correct shape on shutdown.
+                tool_set=(
+                    raw_sess.get("_tool_set")
+                    or config.instance.tool_set
+                    or ""
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "talker.daemon.shutdown_close_failed",
+                chat_id=chat_id_str,
+                error=str(exc),
+            )
+            continue
+        closed_paths.append(rel_path)
+        # Phase 2 deferred-enhancement #1 — same hook as the
+        # in-flight sweeper. Best-effort; the session record is
+        # already on disk by the time this runs.
+        try:
+            await session.maybe_apply_substance_slug(
+                state_mgr,
+                enabled=config.session.derive_slug_from_substance,
+                client=client,
+                model=config.anthropic.model,
+                vault_path_root=vault_root,
+                rel_path=rel_path,
+                transcript=transcript_snap,
+                session_id=session_id_snap,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.daemon.shutdown_substance_slug_failed",
+                chat_id=chat_id_str,
+            )
+    return closed_paths
+
+
 # --- Main entry -----------------------------------------------------------
 
 
@@ -1316,67 +1400,7 @@ async def run(
 
         # Close any still-open sessions so the record lands before exit.
         try:
-            active_all = dict(state_mgr.state.get("active_sessions", {}) or {})
-            for chat_id_str in list(active_all.keys()):
-                raw_sess = active_all[chat_id_str]
-                vault_root = raw_sess.get("_vault_path_root") or config.vault.path
-                user_path = raw_sess.get("_user_vault_path") or (
-                    config.primary_users[0] if config.primary_users else None
-                )
-                stt_model = raw_sess.get("_stt_model_used") or config.stt.model
-                # Snapshot for post-close substance-slug rename — same
-                # pattern as ``check_timeouts_with_meta`` since the
-                # active dict is popped during ``close_session``. The
-                # helper encodes the fields the hook needs in one place.
-                post_close_snap = session._snapshot_for_post_close(raw_sess)
-                transcript_snap = post_close_snap["transcript"]
-                session_id_snap = post_close_snap["session_id"]
-                try:
-                    rel_path = session.close_session(
-                        state_mgr,
-                        vault_path_root=vault_root,
-                        chat_id=int(chat_id_str),
-                        reason="shutdown",
-                        user_vault_path=user_path,
-                        stt_model_used=stt_model,
-                        session_type=raw_sess.get("_session_type", "note"),
-                        continues_from=raw_sess.get("_continues_from"),
-                        # Per-instance session-save shape — prefer the
-                        # stash, fall back to live config so a session
-                        # opened before the field was stashed still
-                        # closes with the correct shape on shutdown.
-                        tool_set=(
-                            raw_sess.get("_tool_set")
-                            or config.instance.tool_set
-                            or ""
-                        ),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.warning(
-                        "talker.daemon.shutdown_close_failed",
-                        chat_id=chat_id_str,
-                        error=str(exc),
-                    )
-                    continue
-                # Phase 2 deferred-enhancement #1 — same hook as the
-                # in-flight sweeper. Best-effort; the session record is
-                # already on disk by the time this runs.
-                try:
-                    await session.maybe_apply_substance_slug(
-                        state_mgr,
-                        enabled=config.session.derive_slug_from_substance,
-                        client=client,
-                        model=config.anthropic.model,
-                        vault_path_root=vault_root,
-                        rel_path=rel_path,
-                        transcript=transcript_snap,
-                        session_id=session_id_snap,
-                    )
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "talker.daemon.shutdown_substance_slug_failed",
-                        chat_id=chat_id_str,
-                    )
+            await _close_open_sessions_on_shutdown(state_mgr, config, client)
         except Exception:  # noqa: BLE001
             log.exception("talker.daemon.shutdown_sweep_error")
 
