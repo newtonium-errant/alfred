@@ -735,6 +735,50 @@ _PEER_ASYNC_QUERY_CANONICAL_TOOL = {
 }
 
 
+_PEER_ASK_CANONICAL_TOOL = {
+    "name": "peer_ask_canonical",
+    "description": (
+        "Ask Salem a NATURAL-LANGUAGE question about its canonical "
+        "records and get back a short composed prose answer (the "
+        "LLM-mediated lane). ONLY for genuinely fuzzy or compositional "
+        "questions that don't map cleanly to a structured filter — e.g. "
+        "'When did Andrew last meet Ben, and what was that meeting "
+        "about?'. STRUCTURED LOOKUP STAYS THE DEFAULT: if the question "
+        "maps to fields (a name lookup, a filter on participants or "
+        "dates), use query_canonical or peer_search_canonical instead — "
+        "they are faster, cheaper, and return raw fields. Salem's "
+        "disclosure policy gates everything; the answer is composed from "
+        "policy-cleared fields only and arrives async (Priority "
+        "precedence, may take ~10-30s). Returns ``{status: 'ok', answer, "
+        "basis, outcome}`` (outcome 'zero_results' when nothing "
+        "matched), ``{status: 'denied'|'failed', code, detail}`` on "
+        "policy denial or broker failure, or ``{status: 'timeout'}``."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": (
+                    "The natural-language question for Salem. Plain "
+                    "prose; Salem's broker translates it into a "
+                    "policy-gated structured query."
+                ),
+            },
+            "record_type_hint": {
+                "type": "string",
+                "enum": ["person", "org", "location", "event", "project"],
+                "description": (
+                    "Optional hint at the record type the question is "
+                    "about. Advisory only — Salem's broker decides."
+                ),
+            },
+        },
+        "required": ["question"],
+    },
+}
+
+
 _PROPOSE_PERSON_TOOL = {
     "name": "propose_person",
     "description": (
@@ -893,6 +937,7 @@ _PEER_INTER_INSTANCE_TOOLS: list[dict[str, Any]] = [
     _QUERY_CANONICAL_TOOL,
     _PEER_SEARCH_CANONICAL_TOOL,
     _PEER_ASYNC_QUERY_CANONICAL_TOOL,
+    _PEER_ASK_CANONICAL_TOOL,
     _PROPOSE_PERSON_TOOL,
     _PROPOSE_ORG_TOOL,
     _PROPOSE_LOCATION_TOOL,
@@ -2535,6 +2580,10 @@ async def _dispatch_peer_inter_instance_tool(
             return await _peer_tool_async_query_canonical(
                 tool_input, transport_config, self_name,
             )
+        if tool_name == "peer_ask_canonical":
+            return await _peer_tool_ask_canonical(
+                tool_input, transport_config, self_name,
+            )
         if tool_name == "propose_person":
             return await _peer_tool_propose_record(
                 "person", tool_input, transport_config, self_name,
@@ -2955,6 +3004,41 @@ async def _peer_tool_async_query_canonical(
     return _dumps(response)
 
 
+async def _peer_tool_ask_canonical(
+    tool_input: dict[str, Any],
+    transport_config: Any,
+    self_name: str,
+) -> str:
+    """Requester-side handler for ``peer_ask_canonical`` (NL lane).
+
+    Sends the natural-language question to Salem via ``kind=query_nl``
+    and awaits the composed-prose ``query_result``. Salem's broker
+    translates the question into structured sub-queries that run through
+    the IDENTICAL deterministic disclosure gates as
+    ``peer_search_canonical`` — the requester's LLM never touches
+    Salem's disclosure decision, and neither does Salem's (it composes
+    over already-field-gated records only).
+    """
+    from alfred.transport.client import peer_nl_query
+
+    question = tool_input.get("question") if isinstance(tool_input, dict) else None
+    if not isinstance(question, str) or not question.strip():
+        return _dumps({"error": "peer_ask_canonical requires a 'question'"})
+    hint = tool_input.get("record_type_hint")
+    if hint is not None and not isinstance(hint, str):
+        return _dumps({"error": "record_type_hint must be a string"})
+
+    response = await peer_nl_query(
+        _PEER_TARGET,
+        question.strip(),
+        record_type_hint=hint,
+        precedence="P",
+        config=transport_config,
+        self_name=self_name,
+    )
+    return _dumps(response)
+
+
 async def _peer_tool_propose_record(
     record_type: str,
     tool_input: dict[str, Any],
@@ -3286,6 +3370,7 @@ async def _execute_tool(
         "query_canonical",
         "peer_search_canonical",
         "peer_async_query_canonical",
+        "peer_ask_canonical",
         "propose_person",
         "propose_org",
         "propose_location",

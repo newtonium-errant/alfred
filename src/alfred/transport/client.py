@@ -648,6 +648,84 @@ async def peer_async_query(
     return reply
 
 
+async def peer_nl_query(
+    peer_name: str,
+    question: str,
+    *,
+    record_type_hint: str | None = None,
+    precedence: str = "P",
+    config: "TransportConfig | None" = None,
+    self_name: str,
+    correlation_id: str | None = None,
+    timeout: float = 90.0,
+) -> dict[str, Any]:
+    """NL (LLM-mediated) query via the mailbox — ``kind=query_nl``.
+
+    The fuzzy-question counterpart to :func:`peer_async_query` (LLM
+    lane, 2026-06-10, ratified Decision A: a NEW kind, not a mode flag —
+    a not-yet-upgraded holder 400s the unknown kind cleanly instead of
+    silently mis-executing it as a structured search). The holder's
+    broker interprets the question, retrieves through the IDENTICAL
+    deterministic disclosure gates as ``/peer/search``, composes prose
+    over policy-cleared fields only, and replies async via
+    ``kind=query_result`` on the same correlation_id.
+
+    Default ``timeout`` is 90s (vs 60s on the deterministic async path)
+    — the holder runs two LLM turns. A late reply lands in the requester
+    daemon's orphan buffer (300s TTL) and a re-ask collects it.
+
+    Returns the holder's reply payload:
+      * ``{status: "ok", answer, basis, truncated, outcome, ...}`` —
+        ``outcome`` distinguishes ``answered`` from ``zero_results``;
+      * ``{status: "denied"|"failed", code, detail, outcome, ...}`` —
+        every denial/failure is explicit and distinguishable;
+      * ``{status: "timeout", correlation_id}`` — no reply in time;
+      * ``{status: "failed", code: "send_rejected", ...}`` — the holder
+        rejected the send synchronously (schema error, or an older
+        holder without the query_nl kind).
+    """
+    import asyncio
+
+    from .exceptions import TransportRejected
+    from .peers import await_response
+
+    cid = correlation_id or _new_correlation_id()
+
+    nl_payload: dict[str, Any] = {
+        "question": question,
+        "precedence": precedence,
+    }
+    if record_type_hint:
+        nl_payload["record_type_hint"] = record_type_hint
+
+    try:
+        await peer_send(
+            peer_name,
+            "query_nl",
+            nl_payload,
+            config=config,
+            self_name=self_name,
+            correlation_id=cid,
+        )
+    except TransportRejected as exc:
+        # Sync 4xx from the holder — G0b schema gate, or an older holder
+        # whose kind enum predates query_nl. Surface immediately rather
+        # than waiting out the mailbox timeout.
+        return {
+            "status": "failed",
+            "code": "send_rejected",
+            "detail": str(exc),
+            "http_status": exc.status_code,
+            "correlation_id": cid,
+        }
+
+    try:
+        reply = await await_response(cid, timeout=timeout)
+    except asyncio.TimeoutError:
+        return {"status": "timeout", "correlation_id": cid}
+    return reply
+
+
 async def peer_handshake(
     peer_name: str,
     *,
