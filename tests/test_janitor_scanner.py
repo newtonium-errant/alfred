@@ -675,6 +675,24 @@ class TestScannerOrphanLeafTypes:
         # ``source_links``; back-references would require mutating
         # source records on every distiller fire, breaking the
         # deterministic-writer principle.
+        #
+        # 2026-05-31 expansion: ``daily`` (routine arc c6) — derivative
+        # aggregation keyed by date, rewritten every aggregator fire;
+        # nothing wikilinks INTO a daily record, and without the
+        # exemption every Salem morning would mint a fresh ORPHAN001
+        # false-positive.
+        #
+        # 2026-06-09 expansion: ``ticket`` (VERA P1) — terminal by
+        # design in the VERA vault; reporter/area live as frontmatter
+        # fields, not inbound links.
+        #
+        # (Diagnosis 2026-06-11: both expansions tagged is_leaf=True on
+        # their TypeDefinitions with documented reasoning, but neither
+        # ship bumped this pin — the set drift was schema-side-correct /
+        # pin-side-stale, NOT a scanner mishandling. LEAF_TYPES auto-
+        # derives from the registry; the scanner's single consumer is
+        # the ORPHAN001 exemption at scanner.py. Behavioral coverage
+        # for both new types pinned below.)
         from alfred.vault.schema import LEAF_TYPES
         assert LEAF_TYPES == {
             "note",
@@ -684,6 +702,8 @@ class TestScannerOrphanLeafTypes:
             "decision",
             "assumption",
             "constraint",
+            "daily",
+            "ticket",
         }
 
     @pytest.mark.parametrize(
@@ -735,6 +755,76 @@ class TestScannerOrphanLeafTypes:
 
         assert _orphan_issues(issues, rel) == [], (
             f"{rec_type} should skip ORPHAN001 (in LEAF_TYPES post-2026-05-06) "
+            f"but got: {_orphan_issues(issues, rel)}"
+        )
+
+    def test_daily_with_no_inbound_skips_orphan(
+        self, tmp_vault: Path, tmp_path: Path,
+    ) -> None:
+        # 2026-05-31 expansion regression (pinned 2026-06-11): daily
+        # aggregator records are derivative, date-keyed, rewritten every
+        # fire — nothing links into them. Without the exemption, every
+        # morning mints a fresh ORPHAN001 false-positive on Salem.
+        # NOTE: ``daily`` has ``statuses=None`` — no status field, by
+        # schema (the aggregator overwrites stale runs; no operational
+        # status to track).
+        rel = "daily/2026-06-11.md"
+        _write_record(
+            tmp_vault,
+            rel,
+            dedent(
+                """\
+                type: daily
+                date: '2026-06-11'
+                created: '2026-06-11'
+                tags: []
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        assert _orphan_issues(issues, rel) == [], (
+            f"daily should skip ORPHAN001 (in LEAF_TYPES post-2026-05-31) "
+            f"but got: {_orphan_issues(issues, rel)}"
+        )
+
+    def test_ticket_with_no_inbound_skips_orphan(
+        self, tmp_vault: Path, tmp_path: Path,
+    ) -> None:
+        # 2026-06-09 expansion regression (pinned 2026-06-11): VERA
+        # tickets are terminal — reporter/area are frontmatter fields,
+        # not inbound wikilinks, so zero inbound links is the norm.
+        rel = "ticket/Leaky Faucet Unit 4.md"
+        _write_record(
+            tmp_vault,
+            rel,
+            dedent(
+                """\
+                type: ticket
+                title: Leaky Faucet Unit 4
+                status: open
+                ticket_type: maintenance
+                reporter: Ben
+                area: Unit 4
+                created: '2026-06-11'
+                tags: []
+                """
+            ).rstrip(),
+        )
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        config = _build_scan_config(tmp_vault, state_dir)
+        state = JanitorState(config.state.path, config.state.max_sweep_history)
+        issues = run_structural_scan(config, state)
+
+        assert _orphan_issues(issues, rel) == [], (
+            f"ticket should skip ORPHAN001 (in LEAF_TYPES post-2026-06-09) "
             f"but got: {_orphan_issues(issues, rel)}"
         )
 
