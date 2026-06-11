@@ -581,33 +581,74 @@ class TestCloudBaseMetarPipeline:
 
 
 class TestTafCloudBase:
+    """Pins re-targeted through ``parse_taf`` (review nit b2 moved
+    cloud-base normalization from consumption inside _format_taf_period
+    to the ingest side, mirroring parse_metar → _format_ceiling). The
+    pipeline pinned here is the production path: parse_taf → formatter.
+    """
+
+    @staticmethod
+    def _period_via_parse(fcst: dict):  # type: ignore[no-untyped-def]
+        from alfred.brief.weather import parse_taf
+        taf = parse_taf({"icaoId": "CYZX", "fcsts": [fcst]})
+        return taf["fcsts"][0]
+
     def test_string_base_renders(self) -> None:
         from alfred.brief.weather import _format_taf_period
-        out = _format_taf_period(
+        period = self._period_via_parse(
             {"fcstChange": "FM", "clouds": [{"cover": "BKN", "base": "800"}]},
         )
+        out = _format_taf_period(period, station_id="CYZX")
         assert "BKN008" in out
 
     def test_float_base_renders(self) -> None:
         from alfred.brief.weather import _format_taf_period
-        out = _format_taf_period(
+        period = self._period_via_parse(
             {"fcstChange": "BASE", "clouds": [{"cover": "OVC", "base": 800.0}]},
         )
+        out = _format_taf_period(period, station_id="CYZX")
         assert "OVC008" in out
 
     def test_garbage_base_omitted_with_warn(self) -> None:
+        # The warning now fires at INGEST (parse_taf), not at format
+        # time — capture wraps the parse step.
         import structlog
         from alfred.brief.weather import _format_taf_period
         with structlog.testing.capture_logs() as captured:
-            out = _format_taf_period(
+            period = self._period_via_parse(
                 {"fcstChange": "FM",
                  "clouds": [{"cover": "BKN", "base": "junk"}]},
-                station_id="CYZX",
             )
+        out = _format_taf_period(period, station_id="CYZX")
         assert "junk" not in out
         assert "BKN0" not in out  # no fabricated base rendering
         warns = [c for c in captured
                  if c.get("event") == "weather.cloud_base_unparseable"]
+        assert len(warns) == 1
+        assert warns[0]["station"] == "CYZX"
+
+    def test_parse_taf_returns_normalized_copy(self) -> None:
+        """parse_taf never mutates the raw payload; bases land int|None."""
+        from alfred.brief.weather import parse_taf
+        raw = {
+            "icaoId": "CYZX",
+            "fcsts": [
+                {"fcstChange": "FM",
+                 "clouds": [{"cover": "BKN", "base": "800"}]},
+                "not-a-period-dict",
+            ],
+        }
+        import structlog
+        with structlog.testing.capture_logs() as captured:
+            out = parse_taf(raw)
+        # Normalized copy: int base in the output...
+        assert out["fcsts"][0]["clouds"][0]["base"] == 800
+        # ...raw input untouched (string survives)...
+        assert raw["fcsts"][0]["clouds"][0]["base"] == "800"
+        # ...non-dict period skipped with the element-level warning.
+        assert len(out["fcsts"]) == 1
+        warns = [c for c in captured
+                 if c.get("event") == "weather.taf_period_unparseable"]
         assert len(warns) == 1
         assert warns[0]["station"] == "CYZX"
 
@@ -738,3 +779,51 @@ class TestGenerateBriefWeatherGuard:
                   if c.get("event") == "brief.weather_section_failed"]
         assert len(events) == 1
         assert events[0]["error_type"] == "TypeError"
+
+
+async def test_generate_brief_empty_vault_smoke(tmp_path, monkeypatch) -> None:
+    """Companion smoke (warmup review b1): a REAL generate_brief run
+    over an empty vault, NO planted crash — so an empty-vault regression
+    in ANY section gets an honestly-named failure instead of only
+    surfacing through the weather-guard test above (previously among
+    the only full-brief invocations in the suite).
+
+    The two fetchers are stubbed to EMPTY responses — that's network
+    isolation (tests can't hit aviationweather.gov), not a planted
+    fault: parse, format, section assembly, render, and the vault write
+    all run for real.
+    """
+    from alfred.brief import weather as weather_mod
+    from alfred.brief import daemon as daemon_mod
+    from alfred.brief.config import BriefConfig, StateConfig
+    from alfred.brief.state import StateManager
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    async def _no_metars(config):  # type: ignore[no-untyped-def]
+        return []
+
+    async def _no_tafs(config):  # type: ignore[no-untyped-def]
+        return []
+
+    monkeypatch.setattr(weather_mod, "fetch_metars", _no_metars)
+    monkeypatch.setattr(weather_mod, "fetch_tafs", _no_tafs)
+
+    config = BriefConfig(
+        vault_path=str(vault),
+        state=StateConfig(path=str(data_dir / "brief_state.json")),
+    )
+    state_mgr = StateManager(config.state.path)
+
+    rel_path = await daemon_mod.generate_brief(config, state_mgr)
+
+    assert rel_path is not None
+    content = (vault / rel_path).read_text(encoding="utf-8")
+    # The real weather path ran and rendered its ILB empty line.
+    assert "Weather data unavailable" in content
+    # Core always-on sections rendered headers over the empty vault.
+    assert "Health" in content
+    assert "Operations" in content

@@ -408,8 +408,57 @@ async def fetch_tafs(config: WeatherConfig) -> list[dict]:
         return resp.json()
 
 
+def parse_taf(raw: dict) -> dict:
+    """Boundary-normalize one TAF API response — the TAF ingest step.
+
+    The TAF analog of :func:`parse_metar` (review nit b2, 2026-06-11).
+    Previously TAF dicts flowed RAW from fetch to the formatters and the
+    cloud-base coercion happened at consumption inside
+    ``_format_taf_period`` — a placement a future TAF consumer could
+    bypass. Normalization now happens once at ingest: every forecast
+    period's ``clouds`` bases are coerced to ``int | None`` via
+    :func:`_normalize_clouds` (the same validator the METAR path applies
+    in ``parse_metar``), non-dict periods are skipped with a
+    ``weather.taf_period_unparseable`` warning (skip the element, never
+    the run), and downstream formatters trust the boundary — exactly how
+    ``_format_ceiling`` trusts ``parse_metar``.
+
+    Returns a normalized COPY; the raw payload is never mutated.
+    ``visib`` deliberately stays raw here: ``_format_taf_period`` needs
+    the original string (the ``"6+"`` at-least suffix) for its rendering
+    semantic, and ``_parse_visibility`` already coerces it safely at
+    every use site.
+    """
+    station_id = str(raw.get("icaoId", "") or "")
+    out = dict(raw)
+    fcsts_raw = raw.get("fcsts", [])
+    fcsts: list[dict] = []
+    if isinstance(fcsts_raw, list):
+        for period in fcsts_raw:
+            if not isinstance(period, dict):
+                log.warning(
+                    "weather.taf_period_unparseable",
+                    raw=str(period)[:80],
+                    station=station_id,
+                    reason=f"period_type_{type(period).__name__}",
+                )
+                continue
+            normalized = dict(period)
+            normalized["clouds"] = _normalize_clouds(
+                period.get("clouds", []), station_id=station_id,
+            )
+            fcsts.append(normalized)
+    out["fcsts"] = fcsts
+    return out
+
+
 def _format_taf_period(period: dict, *, station_id: str = "") -> str:
     """Format a single TAF forecast period as a compact string.
+
+    EXPECTS a :func:`parse_taf`-normalized period (cloud bases already
+    ``int | None``) — consumers must route raw API data through
+    ``parse_taf`` first, the documented TAF ingest contract (review nit
+    b2 moved normalization there from this consumption site).
 
     The aviationweather.gov TAF JSON returns ``visib`` with the same
     mixed-type surface as the METAR endpoint (int / float /
@@ -455,12 +504,11 @@ def _format_taf_period(period: dict, *, station_id: str = "") -> str:
     if wx:
         parts.append(wx)
 
-    # TAF periods have no parse_metar-style boundary step (raw API dicts
-    # flow straight to this formatter), so the cloud-base coercion
-    # happens at consumption — same mixed-type class as the visib P0: a
-    # string base crashed ``base // 100`` here, a float base crashed the
-    # ``:03d`` format.
-    clouds = _normalize_clouds(period.get("clouds", []), station_id=station_id)
+    # Cloud bases are int|None by the parse_taf ingest contract — the
+    # mixed-type coercion (the visib-P0 class: string base crashed
+    # ``base // 100``, float base crashed the ``:03d`` format) happens
+    # ONCE at the boundary, not here (review nit b2).
+    clouds = period.get("clouds", []) or []
     for c in clouds[:2]:
         cover = c.get("cover", "")
         base = c.get("base")
@@ -471,7 +519,13 @@ def _format_taf_period(period: dict, *, station_id: str = "") -> str:
 
 
 def format_taf_section(tafs: list[dict], station_configs: list[StationConfig]) -> str:
-    """Render TAF forecast section as markdown."""
+    """Render TAF forecast section as markdown.
+
+    EXPECTS :func:`parse_taf`-normalized tafs (the documented TAF ingest
+    contract — ``fetch_and_format`` applies it; any future consumer must
+    too). ``visib`` significance-gating coerces via ``_parse_visibility``
+    at use, so it is shape-safe either way.
+    """
     if not tafs:
         return ""
 
@@ -559,7 +613,10 @@ async def fetch_and_format(config: WeatherConfig) -> str:
     # TAF (forecast)
     try:
         raw_tafs = await fetch_tafs(config)
-        taf_section = format_taf_section(raw_tafs, config.stations)
+        # Boundary-normalize at ingest (parse_taf — the TAF analog of
+        # parse_metar) so the formatters consume trusted types.
+        tafs = [parse_taf(t) for t in raw_tafs]
+        taf_section = format_taf_section(tafs, config.stations)
         if taf_section:
             parts.append(taf_section)
     except (httpx.HTTPError, httpx.TimeoutException) as e:
