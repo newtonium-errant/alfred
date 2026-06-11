@@ -343,10 +343,31 @@ def _run_surveyor(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
 
 
 def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
-    """Mail webhook receiver process entry point."""
+    """Mail webhook receiver process entry point.
+
+    Log routing (R2, 2026-06-11): this was the ONLY runner that never
+    called ``setup_logging``, so the webhook's structlog fell through to
+    stdout → the daemonized parent's capture (alfred.log) — which made
+    the live webhook look dead and orphaned two log files. The fate of
+    the mail module's three sinks, for the record:
+
+      * ``mail_webhook.log`` — THIS daemon (live inbound path:
+        n8n → tunnel → webhook → inbox). Wired below.
+      * ``mail.log``         — the IMAP fetcher's manual-CLI path
+        (``alfred mail fetch`` wires it via cmd_mail). Kept — the
+        fetcher is a deliberate, parity-maintained fallback.
+      * alfred.log           — orchestrator + captured child stdout
+        only; no tool's structlog should land there by default.
+    """
     log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/mail_webhook.log"
     if suppress_stdout:
-        _silence_stdio(f"{log_cfg.get('dir', './data')}/mail_webhook.log")
+        _silence_stdio(log_file)
+    # Reuse brief's setup_logging — same signature, no bespoke logger
+    # needs (the mail module has no utils.py of its own; bit borrows
+    # the same way).
+    from alfred.brief.utils import setup_logging
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.mail.config import load_from_unified
     config = load_from_unified(raw)
     vault_path = Path(raw.get("vault", {}).get("path", "./vault"))

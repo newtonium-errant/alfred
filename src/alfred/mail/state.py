@@ -46,7 +46,15 @@ class StateManager:
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
                 self.state = State.from_dict(data)
-                log.info("mail.state.loaded", accounts=len(self.state.seen_ids))
+                # R1 (2026-06-11): this field was named ``accounts`` for
+                # months while counting the account BUCKETS in the
+                # seen-ids dedup map (accounts that have fetched at
+                # least once) — NOT configured accounts. The misnomer
+                # sent an operator diagnosis down a "the IMAP account
+                # config isn't loading" rabbit hole (``accounts=0`` just
+                # meant nothing fetched yet). Configured-account truth
+                # is logged by ``fetcher.fetch_all`` at fetch start.
+                log.info("mail.state.loaded", seen_ids=len(self.state.seen_ids))
             except (json.JSONDecodeError, KeyError) as e:
                 log.warning("mail.state.load_failed", error=str(e))
                 self.state = State()

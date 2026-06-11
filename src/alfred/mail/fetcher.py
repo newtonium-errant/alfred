@@ -388,9 +388,26 @@ def fetch_account(
 
 
 def fetch_all(config: MailConfig, vault_path: Path) -> int:
-    """Fetch from all configured accounts. Returns total new emails."""
+    """Fetch from all configured accounts. Returns total new emails.
+
+    Manual-CLI fallback path (``alfred mail fetch``) — the live inbound
+    flow is the webhook (n8n → tunnel → ``mail.webhook``); this fetcher
+    is kept at feature parity deliberately (2026-06-07 empty-body-synth
+    parity commits) but is never scheduled. Its logs route to
+    ``mail.log`` via ``cmd_mail``'s setup_logging.
+    """
     inbox_path = vault_path / config.inbox_dir
     inbox_path.mkdir(parents=True, exist_ok=True)
+
+    # R1 (2026-06-11): log the CONFIGURED-account truth here, at the one
+    # place accounts are actually consumed. The (since renamed)
+    # ``mail.state.loaded accounts=N`` line counted seen message ids and
+    # misled a diagnosis into "the IMAP account config isn't loading."
+    log.info(
+        "mail.fetch.starting",
+        accounts=len(config.accounts),
+        account_names=[a.name for a in config.accounts],
+    )
 
     state_mgr = StateManager(config.state_path)
     state_mgr.load()
