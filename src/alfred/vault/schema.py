@@ -434,15 +434,32 @@ _DEFINITIONS: list[TypeDefinition] = [
     # body is a clean Claude-Code handoff brief (body format owned by the
     # prompt-tuner's vault-vera SKILL; the frontmatter contract is here).
     #
-    # ``available_in_scopes={"vera", "vera_ops"}`` — NOT canonical. This is
-    # the schema-side gate of the two-gate contract: ``_validate_type``
-    # accepts ``ticket`` only under the two VERA scopes and REJECTS it
-    # everywhere else (Salem / KAL-LE / Hypatia can't create tickets —
-    # correct per-instance isolation). The scope-side gate lives in
-    # ``vault/scope.py`` (``VERA_OPS_CREATE_TYPES`` / ``VERA_CREATE_TYPES``);
-    # keep the two in sync — drift surfaces as "type accepted by validator,
-    # rejected by scope" or vice versa (same failure class the kalle /
-    # hypatia comments warn about).
+    # ``available_in_scopes={"vera", "vera_ops", "kalle", "vera_forwarder"}``
+    # — NOT canonical. This is the schema-side gate of the two-gate
+    # contract: ``_validate_type`` accepts ``ticket`` only under the
+    # tagged scopes and REJECTS it everywhere else (Salem / Hypatia
+    # can't create tickets — correct per-instance isolation).
+    #
+    # Scope roster (ratified VERA→KAL-LE→GitHub ticket pipeline,
+    # 2026-06-11):
+    #   * ``vera`` / ``vera_ops`` — ticket ORIGIN (VERA MVP 2026-06-09):
+    #     Ben/Andrew file tickets via the VERA interview.
+    #   * ``kalle`` — ticket BACKLOG KEEPER (pipeline c2): VERA pushes
+    #     tickets over the peer protocol; KAL-LE's deterministic intake
+    #     handler RECORDS them in aftermath-lab's ``ticket/`` queue and
+    #     files the GitHub issue (KAL-LE is the single GitHub-credential
+    #     holder — see ``integrations/github_ops.py``).
+    #   * ``vera_forwarder`` — read+link-back only. Gate 1 fires on
+    #     CREATE and LIST (``vault_list`` calls ``_validate_type``);
+    #     the forwarder's ``list: True`` needs the tag even though its
+    #     create stays denied at gate 2.
+    #
+    # The scope-side gate lives in ``vault/scope.py``
+    # (``VERA_OPS_CREATE_TYPES`` / ``VERA_CREATE_TYPES`` /
+    # ``KALLE_CREATE_TYPES`` / ``VERA_FORWARDER_EDIT_TYPES``); keep the
+    # registries in sync — drift surfaces as "type accepted by
+    # validator, rejected by scope" or vice versa (same failure class
+    # the kalle / hypatia comments warn about).
     #
     # Status set (operator-ratified 2026-06-09): ``open`` (new, default on
     # create), ``in_progress`` (dev picked it up), ``resolved`` (fixed,
@@ -477,7 +494,9 @@ _DEFINITIONS: list[TypeDefinition] = [
         }),
         required_fields=("title", "ticket_type", "reporter", "area"),
         name_field="title",
-        available_in_scopes=frozenset({"vera", "vera_ops"}),
+        available_in_scopes=frozenset({
+            "vera", "vera_ops", "kalle", "vera_forwarder",
+        }),
         is_leaf=True,
     ),
 

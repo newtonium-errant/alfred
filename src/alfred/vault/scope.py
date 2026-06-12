@@ -672,6 +672,44 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "allow_body_insert_at": {"ticket": True, "note": True},
         "allow_body_replace": {"ticket": True, "note": True},
     },
+    # ``vera_forwarder`` — the VERA-side deterministic forwarder
+    # daemon's write authority for GitHub issue link-back ONLY
+    # (2026-06-11, pipeline c2 of the ratified VERA→KAL-LE→GitHub
+    # ticket design). After KAL-LE files the GitHub issue and answers
+    # over the peer protocol, the forwarder writes the link-back
+    # (ticket_uid / github_issue / github_url / forwarded_at) onto the
+    # originating ticket record — and can do NOTHING else:
+    #
+    #   * ``edit`` uses the combined type+field gate
+    #     ``vera_forwarder_link_back_only`` (same shape as
+    #     ``talker_routine_completion_only``): ticket records only,
+    #     fields restricted to ``VERA_FORWARDER_EDIT_FIELDS``,
+    #     fail-closed when the caller omits the field list.
+    #   * ``create`` DENIED — ticket creation belongs to the interview
+    #     paths (vera / vera_ops); a forwarder that could create
+    #     records could fabricate queue entries.
+    #   * ``move`` / ``delete`` DENIED — queue history preserved (same
+    #     Decision B posture as the other VERA scopes).
+    #   * Body writes + body-mutation tools DENIED — the Claude-Code
+    #     brief body is interview-owned; link-back is frontmatter-only.
+    #
+    # Read/search/list/context stay on so the daemon can resolve the
+    # ticket record by uid before writing. NOTE: ``list`` requires the
+    # ``vera_forwarder`` tag on the ticket TypeDefinition's
+    # ``available_in_scopes`` (gate 1 fires on create AND list).
+    "vera_forwarder": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": False,
+        "edit": "vera_forwarder_link_back_only",
+        "move": False,
+        "delete": False,
+        "allow_body_writes": False,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
     # Migration scope — one-shot operational scripts under
     # ``scripts/migrate_*.py`` that perform schema rewrites against the
     # LIVE vault. NOT a daemon scope: this scope is never assigned to a
@@ -998,6 +1036,16 @@ KALLE_CREATE_TYPES: set[str] = {
     "note", "session", "conversation",
     "decision", "assumption", "synthesis",
     "pattern", "principle", "architecture",
+    # ``ticket`` (added 2026-06-11, pipeline c2) — KAL-LE is the
+    # backlog keeper of the ratified VERA→KAL-LE→GitHub ticket
+    # pipeline: tickets are pushed from VERA over the peer protocol
+    # and RECORDED in aftermath-lab's ``ticket/`` queue by the
+    # deterministic intake handler (c3). The scope layer can't
+    # distinguish the intake handler from the KAL-LE talker agent —
+    # both run under scope "kalle" — so the create surface widens for
+    # the scope as a whole; the pipeline's privilege boundary lives in
+    # ``integrations/github_ops.py``, not here.
+    "ticket",
 }
 
 
@@ -1123,10 +1171,11 @@ MIGRATION_CREATE_TYPES: set[str] = {
 
 # VERA create allowlists (2026-06-09, VERA MVP). Two sets — one per role.
 # Keep ``ticket`` in sync with the ``available_in_scopes={"vera",
-# "vera_ops"}`` tag on the ``ticket`` TypeDefinition in schema.py — drift
-# between the two surfaces as "type accepted by validator, rejected by
-# scope" or vice versa (same failure class the kalle / hypatia create
-# sets warn about).
+# "vera_ops", "kalle", "vera_forwarder"}`` tag on the ``ticket``
+# TypeDefinition in schema.py (kalle + vera_forwarder added 2026-06-11,
+# pipeline c2) — drift between the two surfaces as "type accepted by
+# validator, rejected by scope" or vice versa (same failure class the
+# kalle / hypatia create sets warn about).
 #
 # ``VERA_OPS_CREATE_TYPES`` — Ben's (ops) create surface: ``ticket`` ONLY.
 # This is the schema-narrowing half of the "can't recode the instance"
@@ -1140,6 +1189,21 @@ VERA_OPS_CREATE_TYPES: set[str] = {"ticket"}
 # VERA vault). Deliberately NOT the canonical person/org/event set: VERA's
 # zero-PHI vault doesn't model RRTS entities in MVP.
 VERA_CREATE_TYPES: set[str] = {"ticket", "note"}
+
+
+# ``vera_forwarder`` link-back surface (2026-06-11, pipeline c2). The
+# VERA-side deterministic forwarder daemon may edit EXACTLY these four
+# frontmatter fields on ticket records — the GitHub issue link-back
+# written after KAL-LE files the issue and answers over the peer
+# protocol — and nothing else. Fail-loud beyond: any other field
+# (status, title, ...) or any other record type is a ScopeError at the
+# ``vera_forwarder_link_back_only`` gate in ``check_scope``.
+# Contract-pinned in tests/test_ticket_pipeline_scope.py — widening
+# either set must update the pin in the same commit.
+VERA_FORWARDER_EDIT_TYPES: set[str] = {"ticket"}
+VERA_FORWARDER_EDIT_FIELDS: set[str] = {
+    "ticket_uid", "github_issue", "github_url", "forwarded_at",
+}
 
 
 # Canonical record types — the ones Salem owns as authoritative source-
@@ -1480,6 +1544,39 @@ def check_scope(
                 f"Scope '{scope}' can only create vera types "
                 f"({', '.join(sorted(VERA_CREATE_TYPES))}). "
                 f"Got: '{record_type}'"
+            )
+        return
+
+    if permission == "vera_forwarder_link_back_only":
+        # Pipeline c2 (2026-06-11) — VERA-side forwarder link-back
+        # gate. Same three-check shape as
+        # ``talker_routine_completion_only``: type restriction +
+        # fail-closed-on-missing-fields + field-allowlist subset. The
+        # forwarder writes ONLY the GitHub issue link-back fields onto
+        # ticket records; anything else fails loud here.
+        if record_type and record_type not in VERA_FORWARDER_EDIT_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit record types "
+                f"({', '.join(sorted(VERA_FORWARDER_EDIT_TYPES))}). "
+                f"Got: '{record_type}'. The forwarder's write authority "
+                f"is the GitHub issue link-back on ticket records only."
+            )
+        if fields is None:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(VERA_FORWARDER_EDIT_FIELDS))}); "
+                f"caller did not supply the field list."
+            )
+        rejected = [
+            f for f in fields if f not in VERA_FORWARDER_EDIT_FIELDS
+        ]
+        if rejected:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(VERA_FORWARDER_EDIT_FIELDS))}). "
+                f"Rejected: {', '.join(rejected)}. The forwarder path "
+                f"narrows to the GitHub issue link-back; ticket status "
+                f"and content edits belong to the vera / vera_ops scopes."
             )
         return
 

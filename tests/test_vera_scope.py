@@ -10,8 +10,10 @@ Coverage:
     * ``vera`` scope — ticket + note create OK; canonical type denied;
       move + delete denied; body insert/replace allowed for ticket+note.
     * ``ticket`` TypeDefinition — registered with the right statuses,
-      required fields, directory, name_field, leaf-ness, and visible
-      ONLY under the two VERA scopes (rejected under talker/kalle/hypatia).
+      required fields, directory, name_field, leaf-ness, and NOT
+      canonical (rejected under talker/hypatia; the kalle + the
+      vera_forwarder tags were added 2026-06-11 for the ticket
+      pipeline — positive pins live in test_ticket_pipeline_scope.py).
     * Derived globals (STATUS_BY_TYPE / TYPE_DIRECTORY / REQUIRED_FIELDS_
       BY_TYPE / NAME_FIELD_BY_TYPE / LEAF_TYPES) auto-populate.
     * ``screenshots`` in LIST_FIELDS.
@@ -191,11 +193,14 @@ def test_ticket_visible_under_vera_scopes():
 
 
 def test_ticket_not_in_canonical_known_types():
-    # Salem / KAL-LE / Hypatia must not see the ticket type — it's not
+    # Salem / Hypatia must not see the ticket type — it's not
     # canonical, so it stays out of the default + their scope sets.
+    # KAL-LE moved OUT of this rejection list 2026-06-11 (pipeline c2):
+    # KAL-LE is the ticket backlog keeper of the ratified
+    # VERA→KAL-LE→GitHub pipeline — see
+    # tests/test_ticket_pipeline_scope.py for its positive pins.
     assert "ticket" not in schema.TYPE_REGISTRY.known_types()
     assert "ticket" not in schema.TYPE_REGISTRY.known_types("talker")
-    assert "ticket" not in schema.TYPE_REGISTRY.known_types("kalle")
     assert "ticket" not in schema.TYPE_REGISTRY.known_types("hypatia")
 
 
