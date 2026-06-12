@@ -910,3 +910,29 @@ scaffold:
   exclude:
     - ".obsidian"
     - ".gitkeep"
+
+# GitHub ops — KAL-LE-ONLY GitHub access for the VERA→KAL-LE→GitHub
+# ticket pipeline (ratified 2026-06-11). Exactly one instance holds a
+# GitHub credential: a fine-grained PAT scoped to ONE repo with
+# Issues RW + Pull requests READ + Metadata R. Other instances leave
+# this block out entirely — ``build_github_client`` additionally
+# fail-louds when the running instance's name doesn't match
+# ``instance`` below (the code-gate half of the privilege boundary).
+#
+# The env var name is operator-chosen and deliberately NOT
+# ALFRED_*-prefixed (it's an Algernon-platform credential, not a
+# legacy-namespace one).
+#
+# label_map: optional ticket_type / priority value → GitHub label.
+# Unmapped values get no extra label; ``labels`` below are applied to
+# every created issue.
+# github:
+#   repo: "newtonium-errant/transport-admin-portal"
+#   pat: "${ALGERNON_KALLE_GITHUB_PAT}"
+#   instance: "kal-le"
+#   labels: ["auto-fix"]
+#   label_map:
+#     bug: "bug"
+#     enhancement: "enhancement"
+#     p1: "priority-high"
+#   audit_log_path: "./data/github_ops_audit.jsonl"
