@@ -1,4 +1,6 @@
 ---
+alfred_tags:
+- alfred/bit
 created: '2026-06-11'
 description: Alfred built-in test (health sweep)
 mode: quick

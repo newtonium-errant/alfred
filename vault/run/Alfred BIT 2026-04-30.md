@@ -118,6 +118,13 @@ relationships:
   target: process/Alfred BIT 2026-05-11.md
   target_anchor: run Alfred BIT 2026-05-11
   type: related-to
+- confidence: 1
+  context: Same Alfred BIT series, consecutive dates
+  source: run/Alfred BIT 2026-04-30.md
+  source_anchor: Alfred BIT 2026-04-30
+  target: run/Alfred BIT 2026-05-02.md
+  target_anchor: Alfred BIT 2026-05-02
+  type: related-to
 started: '2026-04-30T05:55:02.527358-03:00'
 status: completed
 tags:

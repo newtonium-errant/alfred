@@ -41,6 +41,76 @@ relationships:
   target: process/Alfred BIT 2026-06-03.md
   target_anchor: run Alfred BIT 2026-06-03
   type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT event
+  source: run/Alfred BIT 2026-05-22.md
+  source_anchor: Alfred BIT 2026-05-22
+  target: run/Alfred BIT 2026-05-30.md
+  target_anchor: Alfred BIT 2026-05-30
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT event
+  source: run/Alfred BIT 2026-05-22.md
+  source_anchor: Alfred BIT 2026-05-22
+  target: run/Alfred BIT 2026-06-01.md
+  target_anchor: Alfred BIT 2026-06-01
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT event
+  source: run/Alfred BIT 2026-05-22.md
+  source_anchor: Alfred BIT 2026-05-22
+  target: run/Alfred BIT 2026-06-02.md
+  target_anchor: Alfred BIT 2026-06-02
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT event
+  source: run/Alfred BIT 2026-05-22.md
+  source_anchor: Alfred BIT 2026-05-22
+  target: run/Alfred BIT 2026-06-03.md
+  target_anchor: Alfred BIT 2026-06-03
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT event
+  source: run/Alfred BIT 2026-05-22.md
+  source_anchor: Alfred BIT 2026-05-22
+  target: run/Alfred BIT 2026-06-04.md
+  target_anchor: Alfred BIT 2026-06-04
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT event
+  source: run/Alfred BIT 2026-05-22.md
+  source_anchor: Alfred BIT 2026-05-22
+  target: run/Alfred BIT 2026-06-05.md
+  target_anchor: Alfred BIT 2026-06-05
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT event
+  source: run/Alfred BIT 2026-05-22.md
+  source_anchor: Alfred BIT 2026-05-22
+  target: run/Alfred BIT 2026-06-06.md
+  target_anchor: Alfred BIT 2026-06-06
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT event
+  source: run/Alfred BIT 2026-05-22.md
+  source_anchor: Alfred BIT 2026-05-22
+  target: run/Alfred BIT 2026-06-08.md
+  target_anchor: Alfred BIT 2026-06-08
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT event
+  source: run/Alfred BIT 2026-05-22.md
+  source_anchor: Alfred BIT 2026-05-22
+  target: run/Alfred BIT 2026-06-09.md
+  target_anchor: Alfred BIT 2026-06-09
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT event
+  source: run/Alfred BIT 2026-05-22.md
+  source_anchor: Alfred BIT 2026-05-22
+  target: run/Alfred BIT 2026-06-10.md
+  target_anchor: Alfred BIT 2026-06-10
+  type: related-to
 started: '2026-05-22T05:55:03.258334-03:00'
 status: completed
 tags:

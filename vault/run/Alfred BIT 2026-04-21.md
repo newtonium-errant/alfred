@@ -12,6 +12,9 @@ overall_status: ok
 process: '[[process/Alfred BIT]]'
 related_orgs:
 - org/ElevenLabs.md
+- org/Newton.md
+related_projects:
+- project/Alfred.md
 relationships:
 - confidence: 1
   context: Same Alfred BIT run series

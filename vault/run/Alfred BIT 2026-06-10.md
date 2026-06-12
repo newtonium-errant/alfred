@@ -1,4 +1,6 @@
 ---
+alfred_tags:
+- alfred/bit
 created: '2026-06-10'
 description: Alfred built-in test (health sweep)
 janitor_note: 'LINK001 — broken wikilink [[process/Alfred BIT]] in process frontmatter

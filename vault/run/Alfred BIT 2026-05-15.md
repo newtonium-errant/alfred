@@ -11,6 +11,8 @@ mode: quick
 name: Alfred BIT 2026-05-15
 overall_status: ok
 process: '[[process/Alfred BIT]]'
+related_orgs:
+- org/Newton.md
 related_projects:
 - project/Alfred.md
 relationships:

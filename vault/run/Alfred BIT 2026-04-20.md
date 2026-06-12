@@ -8,6 +8,10 @@ mode: quick
 name: Alfred BIT 2026-04-20
 overall_status: skip
 process: '[[process/Alfred BIT]]'
+related_orgs:
+- org/Newton.md
+related_projects:
+- project/Alfred.md
 started: '2026-04-20T05:54:54.289230-03:00'
 status: completed
 tags:

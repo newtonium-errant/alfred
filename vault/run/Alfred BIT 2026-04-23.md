@@ -1,6 +1,7 @@
 ---
 alfred_tags:
 - alfred/bit
+- logging/run
 created: '2026-04-23'
 description: Alfred built-in test (health sweep)
 janitor_note: LINK001 — [[process/Alfred BIT]] target does not exist. Only run records
@@ -26,6 +27,20 @@ relationships:
   source_anchor: run Alfred BIT 2026-04-23
   target: process/Alfred BIT 2026-04-26.md
   target_anchor: run Alfred BIT 2026-04-26
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT series
+  source: run/Alfred BIT 2026-04-23.md
+  source_anchor: BIT 2026-04-23
+  target: run/Alfred BIT 2026-04-24.md
+  target_anchor: BIT 2026-04-24
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT series
+  source: run/Alfred BIT 2026-04-23.md
+  source_anchor: BIT 2026-04-23
+  target: run/Alfred BIT 2026-04-25.md
+  target_anchor: BIT 2026-04-25
   type: related-to
 started: '2026-04-23T05:55:02.388731-03:00'
 status: completed

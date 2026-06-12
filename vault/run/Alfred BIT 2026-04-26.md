@@ -13,6 +13,21 @@ overall_status: ok
 process: '[[process/Alfred BIT]]'
 related_orgs:
 - org/ElevenLabs.md
+relationships:
+- confidence: 1
+  context: Same Alfred BIT series
+  source: run/Alfred BIT 2026-04-26.md
+  source_anchor: BIT 2026-04-26
+  target: run/Alfred BIT 2026-04-27.md
+  target_anchor: BIT 2026-04-27
+  type: related-to
+- confidence: 1
+  context: Same Alfred BIT series
+  source: run/Alfred BIT 2026-04-26.md
+  source_anchor: BIT 2026-04-26
+  target: run/Alfred BIT 2026-04-28.md
+  target_anchor: BIT 2026-04-28
+  type: related-to
 started: '2026-04-26T05:55:02.200569-03:00'
 status: completed
 tags:

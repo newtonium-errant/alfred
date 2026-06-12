@@ -1,6 +1,7 @@
 ---
 alfred_tags:
 - alfred/bit
+- logging/run
 created: '2026-04-24'
 description: Alfred built-in test (health sweep)
 janitor_note: LINK001 — frontmatter process target [[process/Alfred BIT]] does not
@@ -12,6 +13,14 @@ overall_status: warn
 process: '[[process/Alfred BIT]]'
 related_orgs:
 - org/ElevenLabs.md
+relationships:
+- confidence: 1
+  context: Same Alfred BIT series
+  source: run/Alfred BIT 2026-04-24.md
+  source_anchor: BIT 2026-04-24
+  target: run/Alfred BIT 2026-04-25.md
+  target_anchor: BIT 2026-04-25
+  type: related-to
 started: '2026-04-24T05:55:01.888789-03:00'
 status: completed
 tags:
