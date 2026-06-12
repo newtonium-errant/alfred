@@ -603,9 +603,16 @@ class GitHubOpsClient:
         search index strips the HTML comment delimiters that
         :func:`issue_marker` wraps around it). Returns the first hit
         as ``{number, html_url, state}`` or ``None`` on no match.
+
+        The ``is:issue`` qualifier is MANDATORY: since GitHub's 2025
+        search change, /search/issues 422s on any query without a type
+        qualifier — ``{"message": "Query must include 'is:issue' or
+        'is:pull-request'"}``. Observed live 2026-06-11 (60/60 audit
+        rows, KAL-LE first ticket-pipeline tick). Do not drop it in a
+        refactor.
         """
         query = (
-            f'repo:{self._config.repo} in:body '
+            f'repo:{self._config.repo} is:issue in:body '
             f'"algernon-ticket: {ticket_uid}"'
         )
         resp = await self._request_audited(

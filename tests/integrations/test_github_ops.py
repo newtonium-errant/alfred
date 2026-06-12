@@ -458,7 +458,7 @@ class TestIssueSearchMarker:
         call = fake.calls[0]
         assert call["url"] == "https://api.github.com/search/issues"
         assert call["params"]["q"] == (
-            f'repo:{TEST_REPO} in:body "algernon-ticket: t-7"'
+            f'repo:{TEST_REPO} is:issue in:body "algernon-ticket: t-7"'
         )
         rows = read_github_audit(cfg.audit_log_path)
         assert rows[0]["op"] == "issue_search"
@@ -480,6 +480,31 @@ class TestIssueSearchMarker:
         assert rows[0]["outcome"] == "ok"
         assert rows[0]["issue_number"] is None
         assert rows[0]["match_count"] == 0
+
+    async def test_query_contains_mandatory_qualifiers(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """REGRESSION PIN (2026-06-11 422 outage): /search/issues now
+        REQUIRES a type qualifier — every query missing ``is:issue``
+        422s with "Query must include 'is:issue' or 'is:pull-request'"
+        (60/60 audit-row failure on KAL-LE's first live tick).
+
+        String-level on purpose: a refactor that rebuilds the query
+        must not silently drop any of these four parts.
+        """
+        cfg = _config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(200, {"total_count": 0, "items": []}))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+
+        await client.issue_search_marker(
+            ticket_uid="t-pin", caller="ticket_intake",
+        )
+        q = fake.calls[0]["params"]["q"]
+        assert "is:issue" in q
+        assert f"repo:{TEST_REPO}" in q
+        assert "in:body" in q
+        assert "algernon-ticket: t-pin" in q
 
 
 class TestDigestReads:
