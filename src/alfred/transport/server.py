@@ -689,6 +689,8 @@ def wire_transport_app(
     gcal_intended_on: bool = False,
     nl_llm_callable: Any | None = None,
     nl_llm_model_label: str = "",
+    ticket_intake_config: Any | None = None,
+    ticket_intake_github_client: Any | None = None,
 ) -> None:
     """Wire all transport-app dependencies in one place.
 
@@ -752,6 +754,18 @@ def wire_transport_app(
             (fail-closed).
         nl_llm_model_label: Resolved model id carried alongside the
             callable for the ``kind:"nl_query"`` audit row.
+        ticket_intake_config: Typed
+            :class:`alfred.transport.ticket_intake.TicketIntakeConfig`.
+            Required only on the instance that receives VERA's
+            ``kind=ticket`` pushes (KAL-LE). Pass with
+            ``ticket_intake_github_client`` together or omit both —
+            ``kind=ticket`` answers 501 when either is missing.
+        ticket_intake_github_client: Built
+            :class:`alfred.integrations.github_ops.GitHubOpsClient`.
+            The daemon constructs it via the fail-loud
+            ``build_github_client`` factory; a failed build means the
+            daemon logs ``transport.ticket_intake.disabled`` and
+            passes ``None`` here (the daemon must still start).
 
     Logging: emits one info event per registered resource so a
     misconfigured instance has a single grep target
@@ -768,6 +782,7 @@ def wire_transport_app(
         register_peer_inbox,
         register_pending_items_aggregate_path,
         register_pending_items_resolve_callable,
+        register_ticket_intake,
         register_vault_path,
     )
 
@@ -892,6 +907,42 @@ def wire_transport_app(
             reason="no gcal_client + gcal_config passed (instance "
                    "did not opt into GCal integration; KAL-LE / "
                    "Hypatia / non-GCal Salem all leave None)",
+        )
+
+    # Ticket intake (pipeline c3): config + github client must be
+    # paired — same posture as GCal above. Either-but-not-both is a
+    # wiring error; log + skip rather than crash, with the explicit
+    # warning surfacing the half-wired state (kind=ticket 501s).
+    if ticket_intake_config is not None and ticket_intake_github_client is not None:
+        register_ticket_intake(
+            app,
+            intake_config=ticket_intake_config,
+            github_client=ticket_intake_github_client,
+        )
+        log.info(
+            "transport.wire_transport_app.ticket_intake_registered",
+            repo=getattr(
+                getattr(ticket_intake_github_client, "config", None),
+                "repo", "",
+            ),
+            state_path=getattr(ticket_intake_config, "state_path", ""),
+        )
+    elif ticket_intake_config is not None or ticket_intake_github_client is not None:
+        log.warning(
+            "transport.wire_transport_app.ticket_intake_partial_wiring",
+            config_set=ticket_intake_config is not None,
+            client_set=ticket_intake_github_client is not None,
+            detail=(
+                "ticket intake config and github client must be wired "
+                "together; skipping registration — kind=ticket will 501"
+            ),
+        )
+    else:
+        log.debug(
+            "transport.wire_transport_app.ticket_intake_skipped",
+            reason="no ticket_intake config + github client passed "
+                   "(instance is not the pipeline's intake — only "
+                   "KAL-LE registers this)",
         )
 
     # P2-4 sentinel: ``gcal_intended_on=True`` flags the

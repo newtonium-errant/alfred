@@ -67,6 +67,7 @@ from pathlib import Path
 from typing import Any
 
 import frontmatter
+import httpx
 import yaml
 from aiohttp import web
 
@@ -127,6 +128,17 @@ _KEY_NL_LLM = "transport.nl_llm"
 _KEY_GCAL_CLIENT = "transport.gcal_client"
 _KEY_GCAL_CONFIG = "transport.gcal_config"
 _KEY_GCAL_INTENDED_ON = "transport.gcal_intended_on"
+
+# Application-storage keys for the ticket intake (VERA→KAL-LE→GitHub
+# pipeline c3). Both are registered together via
+# :func:`register_ticket_intake` — config is the typed
+# :class:`alfred.transport.ticket_intake.TicketIntakeConfig`; the
+# client is a built :class:`alfred.integrations.github_ops.
+# GitHubOpsClient`. Either absent → ``kind=ticket`` answers 501
+# ``ticket_intake_unavailable`` (fail-closed, never a silent
+# half-registration).
+_KEY_TICKET_INTAKE_CONFIG = "transport.ticket_intake_config"
+_KEY_TICKET_INTAKE_GITHUB = "transport.ticket_intake_github"
 
 
 # ---------------------------------------------------------------------------
@@ -245,20 +257,26 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
     Body:
         {
           "kind":    "message" | "query" | "query_nl" | "query_result"
-                     | "notice",
+                     | "notice" | "ticket",
           "from":    "<peer-name>",          # must match auth peer
           "payload": {...},                   # kind-specific
           "correlation_id": "<optional>",
         }
 
-    ``query`` (deterministic async broker) and ``query_nl`` (the
-    LLM-mediated opt-in lane) are handled ENTIRELY in-transport — they
+    ``query`` (deterministic async broker), ``query_nl`` (the
+    LLM-mediated opt-in lane), and ``ticket`` (the VERA→KAL-LE ticket
+    pipeline intake, c3) are handled ENTIRELY in-transport — they
     never reach the peer-inbox callable. The remaining kinds route to
     the talker's registered inbox: ``query_result`` wakes a waiting
     ``await_response``; ``message`` / ``notice`` relay to the user via
     Telegram with the ``[KAL-LE]`` prefix. If the callable isn't
     registered, those return 501 — the server came up but nobody's
     listening for peer messages.
+
+    Version negotiation (R1, the query_nl Decision-A lesson): a
+    not-yet-upgraded receiver 400s an unknown kind via the enum gate
+    below — that IS the negotiation; senders treat the 400 as "peer
+    not upgraded" and keep their queue intact. No version field.
     """
     try:
         body = await request.json()
@@ -273,10 +291,10 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
     kind = body.get("kind")
     from_peer_claim = body.get("from")
     payload = body.get("payload")
-    if kind not in {"message", "query", "query_nl", "query_result", "notice"}:
+    if kind not in {"message", "query", "query_nl", "query_result", "notice", "ticket"}:
         return _json_error(
             400, "schema_error",
-            detail="kind must be message | query | query_nl | query_result | notice",
+            detail="kind must be message | query | query_nl | query_result | notice | ticket",
             correlation_id=correlation_id,
         )
     if not isinstance(payload, dict):
@@ -548,6 +566,20 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
             "precedence": precedence,
             "correlation_id": correlation_id,
         })
+
+    # --- Ticket intake (kind=ticket) — VERA→KAL-LE pipeline c3 ---------
+    # Handled ENTIRELY in-transport (like query / query_nl): the intake
+    # is deterministic record-then-post bookkeeping with no LLM and no
+    # user-facing relay, so it never reaches the talker inbox callable.
+    # Precedence handling came free from the preamble above (VERA sends
+    # payload precedence R).
+    if kind == "ticket":
+        return await _handle_ticket_intake(
+            request,
+            payload=payload,
+            auth_peer=auth_peer,
+            correlation_id=correlation_id,
+        )
 
     inbox: PeerInboxCallable | None = request.app.get(_KEY_PEER_INBOX)
     if inbox is None:
@@ -967,10 +999,25 @@ _DEFAULT_CAPABILITIES: tuple[str, ...] = (
 )
 
 
-def _compute_capabilities(config: TransportConfig) -> list[str]:
+def _compute_capabilities(
+    config: TransportConfig,
+    *,
+    ticket_intake: bool = False,
+) -> list[str]:
+    """Capability list for /peer/handshake.
+
+    ``canonical_owner`` is config-driven (TransportConfig);
+    ``ticket_intake`` is registration-driven — the handshake handler
+    passes whether :func:`register_ticket_intake` actually wired the
+    intake (config present+enabled AND github client built), so peers
+    never see the capability advertised by a half-configured instance.
+    The keyword default keeps pre-existing call sites byte-identical.
+    """
     caps = list(_DEFAULT_CAPABILITIES)
     if config.canonical.owner:
         caps.append("canonical_owner")
+    if ticket_intake:
+        caps.append("ticket_intake")
     return caps
 
 
@@ -1016,7 +1063,10 @@ async def _handle_peer_handshake(request: web.Request) -> web.StreamResponse:
         "instance": instance_name,
         "alias": alias,
         "protocol_version": _PEER_PROTOCOL_VERSION,
-        "capabilities": _compute_capabilities(config),
+        "capabilities": _compute_capabilities(
+            config,
+            ticket_intake=_ticket_intake_registered(request),
+        ),
         "peers": peers_advertised,
         "correlation_id": correlation_id,
     })
@@ -2691,6 +2741,603 @@ def _sync_event_to_gcal(
     )
 
 # ---------------------------------------------------------------------------
+# kind=ticket — KAL-LE ticket intake (VERA→KAL-LE→GitHub pipeline c3)
+# ---------------------------------------------------------------------------
+#
+# Ratified architecture (R1/R3, 2026-06-11): VERA pushes kind=ticket →
+# KAL-LE records the ticket in its vault (backlog keeper) + posts the
+# GitHub issue with the auto-fix label, ALL deterministic (no LLM
+# anywhere in this path). The sync ack carries the outcome.
+# GitHub-down = record-then-pending-ack; VERA's re-push (every
+# forwarder tick) is the SINGLE retry mechanism — no separate retry
+# daemon, no back-channel.
+#
+# Idempotency layers, outermost first:
+#   1. intake state by ticket_uid — issue already filed → ack "exists"
+#      with no GitHub call and no vault write.
+#   2. marker-search guard for NEW uids — state files are deletable
+#      bookkeeping (CLAUDE.md), so before minting an issue for a uid
+#      the state has never seen, search GitHub for the
+#      ``algernon-ticket: <uid>`` body marker and ADOPT a hit instead
+#      of duplicating it.
+#   3. vault-record reuse — a record that already exists with the same
+#      ticket_uid is reused, not duplicate-created.
+
+# Exception classes contained around the GitHub calls (marker search +
+# issue create). HTTP-layer failures (httpx.HTTPStatusError is a
+# subclass of httpx.HTTPError) PROPAGATE from the github_ops client by
+# contract — the intake owns containment. TransportError is included
+# defensively for fakes/wrappers that surface transport-taxonomy
+# errors.
+def _github_contained_errors() -> tuple[type[BaseException], ...]:
+    from .exceptions import TransportError
+    return (httpx.HTTPError, TransportError)
+
+
+# Filename-unsafe characters for the KAL-LE record name (the vault
+# filename stem). Same character class the event filenames use.
+_TICKET_NAME_BAD_CHARS = re.compile(r'[\\/:*?"<>|\t\n\r]+')
+
+
+def _safe_ticket_record_name(title: str) -> str:
+    """Sanitise a pushed ticket title into a vault record name.
+
+    The ORIGINAL title still lands verbatim in the record's ``title``
+    frontmatter (set_fields wins over the core name assignment in
+    ``vault_create``); only the filename stem is sanitised.
+    """
+    cleaned = _TICKET_NAME_BAD_CHARS.sub(" ", title).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned) or "Ticket"
+    if len(cleaned) > 120:
+        cleaned = cleaned[:117].rstrip() + "..."
+    return cleaned
+
+
+def _build_issue_body(
+    *,
+    fm: dict[str, Any],
+    relpath: str,
+    auth_peer: str,
+    body: str,
+    ticket_uid: str,
+) -> str:
+    """Compose the GitHub issue body — deterministic, no LLM.
+
+    Metadata header (absent optionals omitted entirely — no
+    empty-trailing-colon lines), blank line, ticket body verbatim,
+    blank line, the ``algernon-ticket`` marker (the dedupe join key
+    ``issue_search_marker`` recovers on).
+    """
+    from alfred.integrations.github_ops import issue_marker
+
+    header_lines: list[str] = []
+
+    def _add(label: str, value: Any) -> None:
+        text = str(value).strip() if value is not None else ""
+        if text:
+            header_lines.append(f"{label}: {text}")
+
+    _add("Reported by", fm.get("reporter"))
+    _add("Area", fm.get("area"))
+    _add("Priority", fm.get("priority"))
+    _add("Environment", fm.get("environment"))
+    _add("Source", relpath)
+    _add("Filed", fm.get("created"))
+    _add("Origin instance", auth_peer)
+
+    parts = ["\n".join(header_lines)]
+    body_text = body.strip()
+    if body_text:
+        parts.append(body_text)
+    parts.append(issue_marker(ticket_uid))
+    return "\n\n".join(parts) + "\n"
+
+
+def _assemble_labels(
+    github_config: Any,
+    fm: dict[str, Any],
+    *,
+    correlation_id: str,
+) -> list[str]:
+    """Base labels + label_map lookups on ticket_type / priority.
+
+    Unmapped values are NOT silently skipped — each gets one
+    ``transport.ticket.label_unmapped`` log (once per value per call)
+    and the create proceeds without the extra label.
+    """
+    labels: list[str] = list(getattr(github_config, "labels", []) or [])
+    label_map: dict[str, str] = dict(
+        getattr(github_config, "label_map", {}) or {},
+    )
+    seen_values: set[str] = set()
+    for key in ("ticket_type", "priority"):
+        value = fm.get(key)
+        text = str(value).strip() if value is not None else ""
+        if not text or text in seen_values:
+            continue
+        seen_values.add(text)
+        mapped = label_map.get(text)
+        if mapped:
+            if mapped not in labels:
+                labels.append(mapped)
+        else:
+            log.info(
+                "transport.ticket.label_unmapped",
+                field=key,
+                value=text,
+                correlation_id=correlation_id,
+            )
+    return labels
+
+
+def _record_kalle_ticket(
+    vault_path: Path,
+    *,
+    name: str,
+    set_fields: dict[str, Any],
+    body: str,
+    ticket_uid: str,
+) -> tuple[str, bool]:
+    """Create the KAL-LE vault ticket record under scope ``kalle``.
+
+    Returns ``(kalle_relpath, created_new)``. Idempotent on re-push /
+    state-deletion recovery: when a record with the SAME ticket_uid
+    already exists at the target name (or its case-insensitive
+    near-match), it is reused. A DIFFERENT ticket colliding on the
+    same title gets a uid-suffixed name so queue entries are never
+    silently merged.
+
+    Raises ``VaultError`` for non-collision failures (caller maps to a
+    500-class response).
+    """
+    from alfred.vault.ops import VaultError, vault_create, vault_read
+
+    try:
+        result = vault_create(
+            vault_path, "ticket", name,
+            set_fields=set_fields, body=body, scope="kalle",
+        )
+        return str(result["path"]), True
+    except VaultError as exc:
+        details = getattr(exc, "details", None) or {}
+        existing_rel = str(details.get("canonical_path") or "")
+        if not existing_rel:
+            candidate = f"ticket/{name}.md"
+            if (vault_path / candidate).exists():
+                existing_rel = candidate
+        if not existing_rel:
+            raise
+        try:
+            existing = vault_read(vault_path, existing_rel)
+            existing_uid = (existing.get("frontmatter") or {}).get(
+                "ticket_uid",
+            )
+        except VaultError:
+            existing_uid = None
+        if existing_uid == ticket_uid:
+            # Same logical ticket already recorded (state-deletion
+            # recovery or crash-between-record-and-post re-push).
+            return existing_rel, False
+        # Title collision with a DIFFERENT ticket — disambiguate.
+        suffixed = f"{name} {ticket_uid[-8:]}"
+        result = vault_create(
+            vault_path, "ticket", suffixed,
+            set_fields=set_fields, body=body, scope="kalle",
+        )
+        return str(result["path"]), True
+
+
+def _ticket_intake_registered(request: web.Request) -> bool:
+    """True iff register_ticket_intake wired BOTH config + client."""
+    return (
+        request.app.get(_KEY_TICKET_INTAKE_CONFIG) is not None
+        and request.app.get(_KEY_TICKET_INTAKE_GITHUB) is not None
+    )
+
+
+async def _handle_ticket_intake(
+    request: web.Request,
+    *,
+    payload: dict[str, Any],
+    auth_peer: str,
+    correlation_id: str,
+) -> web.StreamResponse:
+    """The in-transport ``kind=ticket`` branch — see the section comment.
+
+    Ack statuses (the forwarder's contract):
+      * ``created`` — vault record + GitHub issue both landed now.
+      * ``exists`` — state already links this uid to an issue; no
+        GitHub call, no vault write.
+      * ``adopted`` — marker-search guard found the issue on GitHub
+        (state had been deleted); linkage re-recorded.
+      * ``recorded_issue_pending`` — vault record landed but GitHub is
+        down; VERA's next re-push retries the post (path d).
+
+    Every ack carries ``kalle_relpath`` + ``correlation_id``;
+    issue-bearing acks add ``issue_number`` + ``issue_url``.
+    """
+    from alfred.integrations.github_ops import append_github_audit
+    from alfred.transport.ticket_intake import (
+        TicketIntakeEntry,
+        TicketIntakeState,
+    )
+    from alfred.vault.ops import VaultError
+
+    intake_config = request.app.get(_KEY_TICKET_INTAKE_CONFIG)
+    github_client = request.app.get(_KEY_TICKET_INTAKE_GITHUB)
+    if intake_config is None or github_client is None:
+        # Mirror of the inbox-callable 501: the server is up but this
+        # instance has no intake wired (not configured, or the github
+        # client build failed loudly at daemon startup).
+        return _json_error(
+            501, "ticket_intake_unavailable",
+            detail=(
+                "this instance has no ticket intake registered "
+                "(ticket_intake config absent/disabled, or github "
+                "client setup failed at startup)"
+            ),
+            correlation_id=correlation_id,
+        )
+
+    # --- Schema gate (400 schema_error w/ detail) -----------------------
+    ticket_uid = payload.get("ticket_uid")
+    relpath = payload.get("relpath")
+    fm_in = payload.get("frontmatter")
+    body_in = payload.get("body")
+    if not isinstance(ticket_uid, str) or not ticket_uid.strip():
+        return _json_error(
+            400, "schema_error",
+            detail="payload.ticket_uid must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+    ticket_uid = ticket_uid.strip()
+    if not isinstance(relpath, str):
+        return _json_error(
+            400, "schema_error",
+            detail="payload.relpath must be a string",
+            correlation_id=correlation_id,
+        )
+    if not isinstance(fm_in, dict):
+        return _json_error(
+            400, "schema_error",
+            detail="payload.frontmatter must be an object",
+            correlation_id=correlation_id,
+        )
+    for required_field in ("title", "ticket_type", "reporter", "area"):
+        value = fm_in.get(required_field)
+        if not isinstance(value, str) or not value.strip():
+            return _json_error(
+                400, "schema_error",
+                detail=(
+                    f"payload.frontmatter.{required_field} must be a "
+                    f"non-empty string"
+                ),
+                correlation_id=correlation_id,
+            )
+    if not isinstance(body_in, str):
+        return _json_error(
+            400, "schema_error",
+            detail="payload.body must be a string",
+            correlation_id=correlation_id,
+        )
+
+    vault_path = _get_vault_path(request)
+    if vault_path is None:
+        return _json_error(
+            500, "vault_not_configured",
+            detail="vault path not registered on transport server",
+            correlation_id=correlation_id,
+        )
+
+    audit_path = github_client.config.audit_log_path
+    state = TicketIntakeState.load(intake_config.state_path)
+    entry = state.entries.get(ticket_uid)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    contained = _github_contained_errors()
+
+    # --- (c) Dedupe: uid known AND issue already filed ------------------
+    if entry is not None and entry.issue_number is not None:
+        log.info(
+            "transport.ticket.dedupe_hit",
+            ticket_uid=ticket_uid,
+            issue_number=entry.issue_number,
+            from_peer=auth_peer,
+            correlation_id=correlation_id,
+        )
+        append_github_audit(
+            audit_path,
+            op="issue_create",
+            repo=github_client.config.repo,
+            caller="ticket_intake",
+            outcome="exists",
+            ticket_uid=ticket_uid,
+            issue_number=entry.issue_number,
+            from_peer=auth_peer,
+            correlation_id=correlation_id,
+        )
+        return web.json_response({
+            "status": "exists",
+            "issue_number": entry.issue_number,
+            "issue_url": entry.issue_url,
+            "kalle_relpath": entry.kalle_relpath,
+            "correlation_id": correlation_id,
+        })
+
+    fm_title = str(fm_in["title"]).strip()
+    fm_ticket_type = str(fm_in["ticket_type"]).strip()
+
+    # Vault-record fields: pushed frontmatter + origin provenance. The
+    # ``type`` key is forced server-side (never trust the wire value to
+    # steer the record into another registry); ``ticket_uid`` likewise
+    # comes from the validated payload field.
+    record_fields = {
+        k: v for k, v in fm_in.items() if k != "type"
+    }
+    record_fields["origin"] = auth_peer
+    record_fields["origin_relpath"] = relpath
+    record_fields["ticket_uid"] = ticket_uid
+
+    adopted_issue: dict[str, Any] | None = None
+    marker_search_failed: Exception | None = None
+
+    if entry is None:
+        # --- (e) New uid → marker-search guard FIRST --------------------
+        # Protects against intake-state deletion: state files are
+        # deletable bookkeeping (CLAUDE.md); deletion must NOT mint
+        # duplicate issues.
+        try:
+            adopted_issue = await github_client.issue_search_marker(
+                ticket_uid=ticket_uid,
+                caller="ticket_intake",
+                correlation_id=correlation_id,
+            )
+        except contained as exc:
+            marker_search_failed = exc
+
+        # Record the ticket in KAL-LE's vault (both the adopt-hit and
+        # the search-miss/failed paths record it — record-then-pending
+        # is the crash-safe ordering).
+        try:
+            kalle_relpath, created_new = _record_kalle_ticket(
+                vault_path,
+                name=_safe_ticket_record_name(fm_title),
+                set_fields=record_fields,
+                body=body_in,
+                ticket_uid=ticket_uid,
+            )
+        except VaultError as exc:
+            log.warning(
+                "transport.ticket.record_failed",
+                ticket_uid=ticket_uid,
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+                correlation_id=correlation_id,
+            )
+            return _json_error(
+                500, "ticket_record_failed",
+                detail=str(exc),
+                correlation_id=correlation_id,
+            )
+        if created_new:
+            log.info(
+                "transport.ticket.recorded",
+                ticket_uid=ticket_uid,
+                path=kalle_relpath,
+                from_peer=auth_peer,
+                correlation_id=correlation_id,
+            )
+        # State-write recorded_at/kalle_relpath IMMEDIATELY so a crash
+        # between record and post lands in the pending-retry path (d),
+        # not the duplicate-record path.
+        entry = TicketIntakeEntry(
+            recorded_at=now_iso,
+            kalle_relpath=kalle_relpath,
+        )
+        state.entries[ticket_uid] = entry
+        state.save()
+
+        if marker_search_failed is not None:
+            # GitHub down before we could even check for an existing
+            # issue — recorded, pending; VERA's re-push retries.
+            return _ticket_issue_pending_response(
+                state=state,
+                entry=entry,
+                ticket_uid=ticket_uid,
+                exc=marker_search_failed,
+                correlation_id=correlation_id,
+            )
+
+        if adopted_issue is not None:
+            # Marker hit → adopt the existing issue instead of minting
+            # a duplicate.
+            entry.issue_number = adopted_issue.get("number")
+            entry.issue_url = str(adopted_issue.get("html_url") or "")
+            state.save()
+            log.info(
+                "transport.ticket.adopted",
+                ticket_uid=ticket_uid,
+                issue_number=entry.issue_number,
+                from_peer=auth_peer,
+                correlation_id=correlation_id,
+            )
+            append_github_audit(
+                audit_path,
+                op="issue_create",
+                repo=github_client.config.repo,
+                caller="ticket_intake",
+                outcome="adopted",
+                ticket_uid=ticket_uid,
+                issue_number=entry.issue_number,
+                from_peer=auth_peer,
+                correlation_id=correlation_id,
+            )
+            _link_back_kalle_record(
+                vault_path,
+                kalle_relpath=entry.kalle_relpath,
+                issue_number=entry.issue_number,
+                issue_url=entry.issue_url,
+                ticket_uid=ticket_uid,
+                correlation_id=correlation_id,
+            )
+            return web.json_response({
+                "status": "adopted",
+                "issue_number": entry.issue_number,
+                "issue_url": entry.issue_url,
+                "kalle_relpath": entry.kalle_relpath,
+                "correlation_id": correlation_id,
+            })
+    # else: --- (d) uid recorded, issue pending → skip vault create, ----
+    # fall through to retry the post below.
+
+    # --- (f) Post the GitHub issue --------------------------------------
+    issue_title = f"[{fm_ticket_type}] {fm_title}"
+    issue_body = _build_issue_body(
+        fm=fm_in,
+        relpath=relpath,
+        auth_peer=auth_peer,
+        body=body_in,
+        ticket_uid=ticket_uid,
+    )
+    labels = _assemble_labels(
+        github_client.config, fm_in, correlation_id=correlation_id,
+    )
+    try:
+        created = await github_client.issue_create(
+            title=issue_title,
+            body=issue_body,
+            labels=labels,
+            ticket_uid=ticket_uid,
+            caller="ticket_intake",
+            correlation_id=correlation_id,
+        )
+    except contained as exc:
+        # --- (g) GitHub failure — contain, record stays, ack pending ----
+        return _ticket_issue_pending_response(
+            state=state,
+            entry=entry,
+            ticket_uid=ticket_uid,
+            exc=exc,
+            correlation_id=correlation_id,
+        )
+
+    entry.issue_number = created.get("number")
+    entry.issue_url = str(created.get("html_url") or "")
+    entry.issue_created_at = datetime.now(timezone.utc).isoformat()
+    state.save()
+    _link_back_kalle_record(
+        vault_path,
+        kalle_relpath=entry.kalle_relpath,
+        issue_number=entry.issue_number,
+        issue_url=entry.issue_url,
+        ticket_uid=ticket_uid,
+        correlation_id=correlation_id,
+    )
+    log.info(
+        "transport.ticket.issue_created",
+        ticket_uid=ticket_uid,
+        issue_number=entry.issue_number,
+        from_peer=auth_peer,
+        correlation_id=correlation_id,
+    )
+    # (The github client already audited outcome="created".)
+    return web.json_response({
+        "status": "created",
+        "issue_number": entry.issue_number,
+        "issue_url": entry.issue_url,
+        "kalle_relpath": entry.kalle_relpath,
+        "correlation_id": correlation_id,
+    })
+
+
+def _ticket_issue_pending_response(
+    *,
+    state: Any,
+    entry: Any,
+    ticket_uid: str,
+    exc: BaseException,
+    correlation_id: str,
+) -> web.Response:
+    """Shared (g) containment tail — log, bump retry_count, ack 200.
+
+    Per the subprocess-failure-logging discipline analog: the WARNING
+    carries error + error_type AND an HTTP detail head (status code +
+    response text) when the exception exposes a response, so a
+    rate-limit/abuse message from GitHub is grep-able from the log
+    rather than silently collapsed into a class name.
+    """
+    http_status: int | None = None
+    response_head = ""
+    response = getattr(exc, "response", None)
+    if response is not None:
+        http_status = getattr(response, "status_code", None)
+        try:
+            response_head = str(getattr(response, "text", ""))[:200]
+        except Exception:  # noqa: BLE001 — diagnostics must never raise
+            response_head = ""
+    detail = (
+        f"HTTP {http_status}: {response_head or '(no body)'}"
+        if http_status is not None
+        else f"{exc.__class__.__name__}: {str(exc)[:200] or '(no detail)'}"
+    )
+    entry.retry_count += 1
+    state.save()
+    log.warning(
+        "transport.ticket.issue_pending",
+        ticket_uid=ticket_uid,
+        error=str(exc),
+        error_type=exc.__class__.__name__,
+        http_status=http_status,
+        detail=detail,
+        retry_count=entry.retry_count,
+        correlation_id=correlation_id,
+    )
+    return web.json_response({
+        "status": "recorded_issue_pending",
+        "kalle_relpath": entry.kalle_relpath,
+        "correlation_id": correlation_id,
+    })
+
+
+def _link_back_kalle_record(
+    vault_path: Path,
+    *,
+    kalle_relpath: str,
+    issue_number: Any,
+    issue_url: str,
+    ticket_uid: str,
+    correlation_id: str,
+) -> None:
+    """Write github_issue/github_url onto the KAL-LE ticket record.
+
+    Failure-isolated: the issue exists and the state links it — a
+    frontmatter write failing must not turn a created issue into a
+    failed ack (the record link-back self-heals on the next pipeline
+    pass; the state is the source of truth for dedupe).
+    """
+    from alfred.vault.ops import vault_edit
+
+    try:
+        vault_edit(
+            vault_path,
+            kalle_relpath,
+            set_fields={
+                "github_issue": issue_number,
+                "github_url": issue_url,
+            },
+            scope="kalle",
+        )
+    except Exception as exc:  # noqa: BLE001 — link-back is best-effort
+        log.warning(
+            "transport.ticket.link_back_failed",
+            ticket_uid=ticket_uid,
+            path=kalle_relpath,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            correlation_id=correlation_id,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Registrars — consumed by ROUTE_NAMESPACES in server.py
 # ---------------------------------------------------------------------------
 
@@ -2806,6 +3453,32 @@ def register_gcal_client(
     """
     app[_KEY_GCAL_CLIENT] = client
     app[_KEY_GCAL_CONFIG] = config
+
+
+def register_ticket_intake(
+    app: web.Application,
+    *,
+    intake_config: Any,
+    github_client: Any,
+) -> None:
+    """Wire the ticket intake (pipeline c3) onto an already-built app.
+
+    Mirrors :func:`register_gcal_client` — both halves register
+    together or not at all. ``intake_config`` is a
+    :class:`alfred.transport.ticket_intake.TicketIntakeConfig`;
+    ``github_client`` is a BUILT
+    :class:`alfred.integrations.github_ops.GitHubOpsClient` (the
+    daemon constructs it via the fail-loud ``build_github_client``
+    factory and skips this call — with a loud
+    ``transport.ticket_intake.disabled`` warning — when that build
+    raises). Absent → ``kind=ticket`` answers 501
+    ``ticket_intake_unavailable``.
+
+    Loose typing on purpose: the transport module must load on
+    instances that never configure GitHub.
+    """
+    app[_KEY_TICKET_INTAKE_CONFIG] = intake_config
+    app[_KEY_TICKET_INTAKE_GITHUB] = github_client
 
 
 def register_gcal_intended_on(app: web.Application) -> None:

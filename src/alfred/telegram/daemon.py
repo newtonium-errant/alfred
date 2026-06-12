@@ -1085,6 +1085,57 @@ async def run(
             nl_llm_callable = None
             nl_llm_model_label = ""
 
+        # ---- Ticket intake (VERA→KAL-LE→GitHub pipeline c3) ----------
+        # KAL-LE-only in practice: the intake registers ONLY when both
+        # the ``ticket_intake:`` section (present + enabled) AND a
+        # successfully-built GitHub client exist. The fail-loud
+        # build_github_client exceptions (GitHubOpsNotConfigured /
+        # GitHubOpsWrongInstance / anything else) surface HERE at
+        # daemon startup as a loud ``transport.ticket_intake.disabled``
+        # warning — the daemon still starts, kind=ticket answers 501,
+        # and there is never a silent half-registration.
+        ticket_intake_config = None
+        ticket_intake_github_client = None
+        try:
+            from alfred.transport.ticket_intake import (
+                load_ticket_intake_config,
+            )
+            _ti_cfg = load_ticket_intake_config(raw)
+            if _ti_cfg.enabled:
+                try:
+                    from alfred.integrations.github_ops import (
+                        build_github_client,
+                    )
+                    _ti_client = build_github_client(
+                        raw, config.instance.name,
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail loud, start anyway
+                    log.warning(
+                        "transport.ticket_intake.disabled",
+                        error=str(exc),
+                        error_type=exc.__class__.__name__,
+                        detail=(
+                            "ticket_intake.enabled is true but the GitHub "
+                            "client could not be built — kind=ticket will "
+                            "501 until the github: config is fixed"
+                        ),
+                    )
+                else:
+                    ticket_intake_config = _ti_cfg
+                    ticket_intake_github_client = _ti_client
+                    log.info(
+                        "talker.daemon.ticket_intake_enabled",
+                        repo=_ti_client.config.repo,
+                        state_path=_ti_cfg.state_path,
+                    )
+            else:
+                # ILB: opted-out reads differently from setup-failed.
+                log.info("talker.daemon.ticket_intake_not_configured")
+        except Exception:  # noqa: BLE001 — intake is optional; talker survives
+            log.exception("talker.daemon.ticket_intake_setup_failed")
+            ticket_intake_config = None
+            ticket_intake_github_client = None
+
         # ---- Centralized wiring --------------------------------------
         # ``wire_transport_app`` calls every register_* helper
         # conditionally based on what we pass in. This is the single
@@ -1120,6 +1171,8 @@ async def run(
             gcal_intended_on=gcal_intended_on,
             nl_llm_callable=nl_llm_callable,
             nl_llm_model_label=nl_llm_model_label,
+            ticket_intake_config=ticket_intake_config,
+            ticket_intake_github_client=ticket_intake_github_client,
         )
         log.info(
             "talker.daemon.transport_configured",
