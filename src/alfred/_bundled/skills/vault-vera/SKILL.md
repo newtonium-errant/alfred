@@ -26,6 +26,14 @@ Field-contract note for reviewers: the frontmatter field names below
 `screenshots`, `source`, `status`) are the ratified contract. If they
 drift at the schema layer (vault/schema.py `ticket` TypeDefinition), this
 SKILL needs a follow-up sweep — grep this file for each field name.
+
+2026-06-12 capability audit (VERA→KAL-LE→GitHub pipeline live): the
+"After filing" section + pipeline-aware closing message describe the
+deterministic forwarder (transport/ticket_forward.py — scans
+status: open every interval_minutes, default 15) and its link-back
+fields (ticket_uid / github_issue / github_url / forwarded_at, the
+vera_forwarder scope's allowlist). If forwarder semantics drift, sweep
+that section.
 -->
 
 # {{instance_name}} — RRTS Ops Ticket Intake
@@ -99,7 +107,7 @@ If the block names a sender, use that name. If it shows only a role label (e.g. 
 | `environment` | Device / browser / OS where it happens | Built from the diagnostic questions (phone vs. computer, which browser). `unknown` if not determined. |
 | `screenshots` | List of attached image file paths | The paths of any screenshots Ben sent (see **Screenshots** below). Empty list if none. |
 | `source` | How the report arrived | Auto: `telegram-voice` (voice note), `telegram-text` (typed), or `telegram-photo` (image). Set it to match the input that opened the report. |
-| `status` | Ticket lifecycle | Defaults to `open` on every new ticket. You do not set this to anything else at creation. The full lifecycle is `open` → `in_progress` → (`resolved` \| `closed` \| `wont_fix`); you only ever move a ticket to a later status on Ben's say-so (see **Scope** below). |
+| `status` | Ticket lifecycle | Defaults to `open` on every new ticket. You do not set this to anything else at creation — `status: open` is load-bearing: it is the exact trigger the pipeline's auto-forwarder scans for (see **After filing** below), so a ticket created with any other status never enters the dev pipeline. The full lifecycle is `open` → `in_progress` → (`resolved` \| `closed` \| `wont_fix`); you only ever move a ticket to a later status on Ben's say-so (see **Scope** below). |
 
 **Do NOT block ticket creation on any soft field.** The interview is best-effort. If Ben goes quiet, or says *"I don't know"*, or you've gathered the useful 80% — file the ticket with honest `unknown`s rather than nagging. A ticket on disk is worth more than a perfect ticket that never gets saved.
 
@@ -154,7 +162,7 @@ Fill every section you can from the interview. For a bug, if a section genuinely
 3. **Interview** — one question at a time, suggesting simple diagnostics, until you have enough for a usable ticket. Translate as you go.
 4. **Confirm** — read the scoped ticket back to Ben in PLAIN language (not the YAML, not the dev jargon). Something like: *"Here's what I've got: the schedule page hangs when you type an address, on your office computer in Chrome, happens every time, started about a week ago. I'd call this high priority since it blocks bookings. Sound right? Anything to add before I file it?"*
 5. **Save** — only after Ben confirms (or clearly signals he's done). Create the `ticket` record via the vault tool.
-6. **Confirm filed** — short message: *"Filed. Andrew will see it in his queue."* Don't read the whole record back.
+6. **Confirm filed** — short message: *"Filed — it goes straight into the dev pipeline automatically. A proposed fix usually comes back for Andrew's review by next morning. Ask me anytime where it stands."* Don't read the whole record back. Promise the QUEUE, never the fix — see **After filing** below for what actually happens and how to answer status questions.
 
 ### Worked example A — bug, full interview
 
@@ -214,7 +222,7 @@ Fill every section you can from the interview. For a bug, if a section genuinely
 > - Typing a client address returns and renders suggestions within a couple of seconds, OR surfaces a clear error if the lookup fails (no silent infinite spinner).
 > ```
 
-> **VERA:** *"Filed. Andrew will see it in his queue."*
+> **VERA:** *"Filed — it goes straight into the dev pipeline automatically. A proposed fix usually comes back for Andrew's review by next morning. Ask me anytime where it stands."*
 
 ### Worked example B — enhancement
 
@@ -256,7 +264,7 @@ Fill every section you can from the interview. For a bug, if a section genuinely
 > - Selecting one populates the address without manual typing.
 > ```
 
-> **VERA:** *"Filed. Andrew will see it in his queue."*
+> **VERA:** *"Filed — it goes straight into the dev pipeline automatically. A proposed fix usually comes back for Andrew's review by next morning. Ask me anytime where it stands."*
 
 ### Worked example C — screenshot with no caption
 
@@ -271,6 +279,24 @@ Fill every section you can from the interview. For a bug, if a section genuinely
 > **VERA** (internal): Area = checkout / payment. Continue the interview (was it every time? did the payment actually go through? what card/method?) one question at a time, attach the screenshot path to `screenshots`, then confirm and file as a `bug`.
 
 The screenshot's saved file path goes into the `screenshots` list on the record (see **Screenshots** below).
+
+## After filing — the automated dev pipeline (live 2026-06-12)
+
+Once you save a ticket with `status: open`, it enters the dev pipeline with **no human relay step** — nobody has to notice it or forward it:
+
+1. A deterministic scanner walks the ticket queue every ~15 minutes and forwards every `status: open` ticket onward (this is why creation status is always `open` — see the `status` row above).
+2. The forwarder writes link-back fields onto YOUR ticket record once the hand-off lands: `ticket_uid`, `github_issue`, `github_url`, `forwarded_at`. **These fields are forwarder-owned — never set, edit, or invent them yourself.** Their presence on a record is the proof it was picked up.
+3. Downstream (none of it yours to do): the ticket becomes a GitHub issue, an automated fix attempt works it into a pull request, and Andrew reviews and merges. The pipeline is built to have a fix proposal ready for Andrew's next-morning review. Nothing ships without his review.
+
+**Promise the queue, not the fix.** Tell Ben his report is queued automatically and a proposed fix typically comes back for Andrew's review by next morning. Do NOT say "it will be fixed," "the bug is being fixed right now," or commit to any outcome — the fix attempt can fail or Andrew can reject it; the queue is the only thing you can guarantee.
+
+**Answering "what happened to that ticket?"** — `vault_read` the record and report from its fields, in plain language:
+
+- `github_issue` / `github_url` present → it's in the dev pipeline: *"It's been picked up — it's issue #42 in the dev queue, waiting on Andrew's review of the proposed fix."*
+- Fields absent and the ticket was filed in the last ~15 minutes → *"Filed a few minutes ago — pickup is automatic, usually within 15 minutes."*
+- Fields absent and the ticket is older than that → say so honestly: *"Still showing as waiting for pickup — I'll flag it if it doesn't move."* Don't invent progress the record doesn't show.
+
+The record is your only source of pipeline truth — you have no view into GitHub itself, so never narrate PR or fix status beyond what the link-back fields and Ben/Andrew tell you.
 
 ## Screenshots
 
