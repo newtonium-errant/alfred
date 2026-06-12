@@ -506,6 +506,50 @@ def _run_brief_digest_push(raw: dict[str, Any], suppress_stdout: bool = False) -
     asyncio.run(run_daemon(config, transport_config))
 
 
+def _run_ticket_forward(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """VERA ticket-forwarder daemon entry point (pipeline c4 sender).
+
+    Runs on VERA (the ticket-origin instance). Auto-starts when
+    ``ticket_forward:`` is in the unified config AND ``enabled: true``
+    — the kill-switch. KAL-LE hosts the RECEIVER (the ``kind=ticket``
+    intake inside its talker's transport server) and omits this block.
+
+    Mirrors ``_run_brief_digest_push`` exactly, including the
+    setup_logging wiring to its own log file (the mail_webhook runner
+    missing setup_logging caused orphaned logs — don't repeat it).
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/ticket_forward.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    from alfred.brief.utils import setup_logging
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
+    from alfred.transport.ticket_forward import (
+        load_ticket_forward_config,
+        run_daemon,
+    )
+    config = load_ticket_forward_config(raw)
+    if not config.enabled:
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("ticket_forward.daemon.disabled_in_config")
+        sys.exit(78)
+    if not config.self_name:
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("ticket_forward.daemon.missing_self_name")
+        sys.exit(78)
+    if not config.vault_path:
+        import sys
+        import structlog
+        log = structlog.get_logger(__name__)
+        log.warning("ticket_forward.daemon.missing_vault_path")
+        sys.exit(78)
+    asyncio.run(run_daemon(config, raw))
+
+
 def _run_digest(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Digest daemon entry — KAL-LE weekly cross-arc synthesis.
 
@@ -854,6 +898,7 @@ TOOL_RUNNERS = {
     "talker": _run_talker,
     "daily_sync": _run_daily_sync,
     "brief_digest_push": _run_brief_digest_push,
+    "ticket_forward": _run_ticket_forward,
     "digest": _run_digest,
     "pending_items_pusher": _run_pending_items_pusher,
     "radar_day": _run_radar_day,
@@ -934,6 +979,10 @@ SPAWN_PRIORITY: tuple[str, ...] = (
     "daily_sync",
     "pending_items_pusher",
     "brief_digest_push",
+    # VERA ticket forwarder (pipeline c4) — batch tier: 15-min scanner
+    # cadence, nothing latency-sensitive at boot. Slots after the
+    # other peer-push daemon (brief_digest_push) it most resembles.
+    "ticket_forward",
     "digest",
     "radar_day",
     "friction_analyzer",
@@ -1053,6 +1102,12 @@ def run_all(
         # principal — receiver, not sender).
         if "brief_digest_push" in raw and (raw.get("brief_digest_push") or {}).get("enabled"):
             tools.append("brief_digest_push")
+        # VERA ticket forwarder (pipeline c4 sender). Auto-starts when
+        # ``ticket_forward:`` is in config AND ``enabled: true`` — the
+        # pipeline kill-switch. VERA turns this on; every other
+        # instance leaves the block absent (KAL-LE is the receiver).
+        if "ticket_forward" in raw and (raw.get("ticket_forward") or {}).get("enabled"):
+            tools.append("ticket_forward")
         # KAL-LE weekly cross-arc digest. Auto-starts when ``digest:``
         # is in config AND ``enabled: true``. Default off so subordinates
         # that don't write digests don't fire one.
@@ -1180,7 +1235,7 @@ def run_all(
         # ``test_dispatcher_two_arg_branch_matches_two_arg_tools`` in
         # ``tests/orchestrator/test_tool_dispatch.py`` so a missing
         # entry trips a test rather than a TypeError on first spawn.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared", "routine"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "ticket_forward", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared", "routine"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

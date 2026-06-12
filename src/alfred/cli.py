@@ -1904,6 +1904,110 @@ def cmd_bit(args: argparse.Namespace) -> None:
     sys.exit(code)
 
 
+def cmd_ticket_forward(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred ticket-forward`` subcommands (pipeline c4).
+
+    ``run-once`` is the testable single tick AND the c6 probe surface
+    — stdout stays explicit (per-ticket outcome lines + the ILB tick
+    summary). ``status`` summarizes the forwarder state (linked /
+    pending) plus a live vault scan (open / eligible-now).
+    """
+    raw = _load_unified_config(args.config)
+    wants_json = bool(getattr(args, "json", False))
+    _setup_logging_from_config(
+        raw, tool="ticket_forward", suppress_stdout=wants_json,
+    )
+
+    import asyncio
+
+    from alfred.transport.ticket_forward import (
+        TicketForwardState,
+        load_ticket_forward_config,
+        run_forward_once,
+        scan_tickets,
+    )
+
+    config = load_ticket_forward_config(raw)
+    subcmd = getattr(args, "ticket_forward_cmd", None)
+
+    if subcmd == "run-once":
+        if not config.vault_path:
+            print(
+                "ticket-forward: no vault path configured "
+                "(set ticket_forward.vault_path or vault.path)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not config.self_name:
+            print(
+                "ticket-forward: self_name missing from the "
+                "ticket_forward config block",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        result = asyncio.run(run_forward_once(config, raw))
+        if wants_json:
+            print(json.dumps(result, indent=2))
+        else:
+            for r in result.get("results", []):
+                bits = [
+                    r.get("outcome", "?"),
+                    r.get("uid", ""),
+                    r.get("relpath", ""),
+                ]
+                if r.get("issue_number") is not None:
+                    bits.append(f"issue #{r['issue_number']}")
+                print("  " + " · ".join(str(b) for b in bits if b))
+            if not result.get("results"):
+                # Intentionally-left-blank: zero work is an explicit line.
+                print("  (no eligible tickets — nothing to forward)")
+            tail = (
+                " aborted=peer_not_upgraded" if result.get("aborted") else ""
+            )
+            print(
+                f"tick: scanned={result['scanned']} "
+                f"eligible={result['eligible']} "
+                f"forwarded={result['forwarded']} "
+                f"pending={result['pending']} "
+                f"failed={result['failed']}{tail}"
+            )
+        sys.exit(
+            0 if not result.get("failed") and not result.get("aborted") else 1
+        )
+    elif subcmd == "status":
+        state = TicketForwardState.load(config.state_path)
+        linked = sum(
+            1 for e in state.entries.values() if e.issue_number is not None
+        )
+        pending = len(state.entries) - linked
+        open_count = eligible_now = 0
+        if config.vault_path:
+            scanned, eligible = scan_tickets(Path(config.vault_path), state)
+            open_count = scanned
+            eligible_now = len(eligible)
+        out = {
+            "enabled": config.enabled,
+            "target_peer": config.target_peer,
+            "interval_minutes": config.interval_minutes,
+            "vault_path": config.vault_path,
+            "state_path": config.state_path,
+            "tracked": len(state.entries),
+            "linked": linked,
+            "pending": pending,
+            "tickets_scanned": open_count,
+            "eligible_now": eligible_now,
+        }
+        if wants_json:
+            print(json.dumps(out, indent=2))
+        else:
+            for key, value in out.items():
+                print(f"{key}: {value}")
+        sys.exit(0)
+    else:
+        print("Usage: alfred ticket-forward {run-once|status}")
+        sys.exit(1)
+
+
 def cmd_check(args: argparse.Namespace) -> None:
     """Run Alfred's built-in test (BIT) and report health.
 
@@ -3703,6 +3807,29 @@ def build_parser() -> argparse.ArgumentParser:
     bit_hist.add_argument("--limit", type=int, default=10)
     bit_hist.add_argument("--json", action="store_true", default=False, help="Emit JSON")
 
+    # ticket-forward — VERA→KAL-LE ticket pipeline forwarder (c4)
+    tf_p = sub.add_parser(
+        "ticket-forward",
+        help=(
+            "VERA ticket forwarder — scan open tickets, push to the "
+            "intake peer as kind=ticket"
+        ),
+    )
+    tf_sub = tf_p.add_subparsers(dest="ticket_forward_cmd")
+    tf_run = tf_sub.add_parser(
+        "run-once",
+        help="Run one forward tick now (the pipeline's probe surface)",
+    )
+    tf_run.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+    tf_status = tf_sub.add_parser(
+        "status", help="Show forwarder state summary (linked/pending)",
+    )
+    tf_status.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+
     # instance — Stage 3.5 multi-instance scaffolding + Algernon
     # platform wrapper (Phase 1, 2026-05-28)
     instance_p = sub.add_parser(
@@ -3979,6 +4106,7 @@ def main() -> None:
         "check-tool-schemas": cmd_check_tool_schemas,
         "bit": cmd_bit,
         "routine": cmd_routine,
+        "ticket-forward": cmd_ticket_forward,
         "audit": cmd_audit,
         "scaffold": cmd_scaffold,
         "reviews": cmd_reviews,

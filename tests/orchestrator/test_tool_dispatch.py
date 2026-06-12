@@ -55,6 +55,10 @@ EXPECTED_TOOLS = {
     # writes ``vault/daily/<date>.md`` for the brief to read. Daemon's
     # own start guard refuses non-Salem instances and exits 78.
     "routine",
+    # VERA ticket forwarder (pipeline c4) — 15-min deterministic
+    # scanner pushing open tickets to KAL-LE as kind=ticket.
+    # Auto-starts on instances with ``ticket_forward.enabled: true``.
+    "ticket_forward",
 }
 
 TWO_ARG_TOOLS = {
@@ -65,6 +69,7 @@ TWO_ARG_TOOLS = {
     "friction_analyzer",
     "cloudflared",
     "routine",
+    "ticket_forward",
 }
 THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "instructor", "talker"}
 

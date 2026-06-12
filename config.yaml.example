@@ -936,3 +936,37 @@ scaffold:
 #     enhancement: "enhancement"
 #     p1: "priority-high"
 #   audit_log_path: "./data/github_ops_audit.jsonl"
+
+# Ticket intake — KAL-LE-ONLY receiver half of the VERA→KAL-LE→GitHub
+# ticket pipeline (ratified 2026-06-11; see integrations/github_ops.py
+# for the architecture). VERA pushes kind=ticket over the peer
+# protocol; the intake records the ticket in this instance's vault
+# (scope kalle) and files the GitHub issue. Requires the github: block
+# above — the talker daemon registers the intake only when BOTH are
+# present and the GitHub client builds (a broken github: config logs
+# transport.ticket_intake.disabled and kind=ticket answers 501).
+# NOTE: github.instance must exactly match this instance's
+# telegram.instance.name. labels/label_map live on github: (one home).
+# Live wiring (the per-peer token blocks that let VERA reach this
+# instance) is per-instance config — see the transport.peers example.
+# ticket_intake:
+#   enabled: true
+#   state:
+#     path: "./data/ticket_intake_state.json"
+
+# Ticket forwarder — VERA-ONLY sender half of the same pipeline.
+# Deterministic 15-minute scanner over <vault>/ticket/: every ticket
+# with status: open and no linked GitHub issue is pushed to the intake
+# peer as kind=ticket (no LLM, no operator gate; enabled is the
+# kill-switch). The ack's issue link-back is written onto the record
+# via the narrow vera_forwarder scope. vault_path falls back to
+# vault.path when omitted. target_peer must name an entry in THIS
+# instance's transport.peers block (token + base_url — see the
+# transport.peers example for the live wiring).
+# ticket_forward:
+#   enabled: true
+#   self_name: "vera"
+#   target_peer: "kalle"
+#   interval_minutes: 15
+#   state:
+#     path: "./data/ticket_forward_state.json"
