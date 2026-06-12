@@ -236,6 +236,24 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _rejected_reason_detail(body: str) -> tuple[str, str]:
+    """Parse ``(reason, detail)`` off a peer's 4xx response body.
+
+    The receiver's ``_json_error`` emits ``{"reason": ..., "detail":
+    ..., ...}`` JSON; ``TransportRejected.body`` carries the raw text
+    (first 500 chars). Empty strings when the body isn't that shape
+    (old receivers, proxies, truncated/non-JSON bodies) — callers must
+    treat the unparsed case conservatively.
+    """
+    try:
+        data = json.loads(body or "")
+    except ValueError:
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    return str(data.get("reason") or ""), str(data.get("detail") or "")
+
+
 def scan_tickets(
     vault_path: Path,
     state: TicketForwardState,
@@ -310,9 +328,18 @@ async def run_forward_once(
         number; link-back written to the record + state.
       * ``issue_pending`` — KAL-LE recorded the ticket but GitHub was
         down; stays eligible, re-pushed next tick (this IS the retry).
-      * ``peer_not_upgraded`` — the peer 400'd ``kind=ticket`` (enum
-        gate on a not-yet-upgraded receiver); abort remaining pushes
-        this tick, leave ALL tickets queued.
+      * ``peer_not_upgraded`` — the peer 400'd ``kind=ticket`` with
+        ``unknown_kind`` (an upgraded receiver's enum gate) or a bare
+        ``schema_error`` without a ``payload.*`` detail (a PRE-upgrade
+        receiver's enum gate — it can't emit unknown_kind yet); both
+        mean version skew → abort remaining pushes this tick, leave
+        ALL tickets queued.
+      * ``push_rejected`` — the peer 400'd ``schema_error`` whose
+        detail names a ``payload.*`` field: THIS ticket is malformed.
+        Isolated per-ticket (the loop continues — aborting here would
+        starve every later ticket at the sorted-glob position); stays
+        issue-less so the c5 digest's ``forward FAILED ×N`` tail
+        surfaces it after the second attempt.
       * ``push_failed`` — transport down / timeout / non-400 error;
         isolated per-ticket, the loop continues.
 
@@ -400,15 +427,50 @@ async def run_forward_once(
                 self_name=config.self_name,
             )
         except TransportRejected as exc:
-            # 4xx — never retried by the client. A 400 specifically is
-            # the version-negotiation signal: the peer's kind enum
-            # predates "ticket" (or rejected our schema) — either way,
-            # re-pushing the REST of the queue this tick is pointless.
+            # 4xx — never retried by the client. The 400 family needs
+            # CLASSIFICATION (2026-06-12 review WARN-2): the receiver
+            # uses 400 both for "kind unknown" (version skew) and for
+            # a per-payload schema failure (one malformed ticket).
+            # Conflating them let one bad ticket abort every tick at
+            # its sorted-glob position and starve all later tickets
+            # under a misleading peer_not_upgraded log.
+            reason, reject_detail = _rejected_reason_detail(exc.body)
+            if (
+                exc.status_code == 400
+                and reason == "schema_error"
+                and "payload." in reject_detail
+            ):
+                # Per-payload gate on an upgraded receiver → THIS
+                # ticket is malformed; skip it, keep pushing the rest.
+                # attempts was already bumped above, the entry stays
+                # issue-less → the c5 digest's FAILED ×N tail surfaces
+                # it from the second attempt onward.
+                log.warning(
+                    "ticket_forward.push_rejected",
+                    uid=uid,
+                    relpath=relpath,
+                    detail=reject_detail[:200],
+                    http_status=exc.status_code,
+                )
+                failed += 1
+                results.append({
+                    "uid": uid,
+                    "relpath": relpath,
+                    "outcome": "push_rejected",
+                })
+                continue
             if exc.status_code == 400:
+                # ``unknown_kind`` is an upgraded receiver's enum gate;
+                # a bare ``schema_error`` with no ``payload.*`` detail
+                # is a PRE-upgrade receiver's enum gate (it can't emit
+                # unknown_kind yet). Anything else unparsed is treated
+                # the same, conservatively. All mean: re-pushing the
+                # REST of the queue this tick is pointless.
                 log.warning(
                     "ticket_forward.peer_not_upgraded",
                     target_peer=config.target_peer,
                     http_status=exc.status_code,
+                    reason=reason or "(unparsed)",
                     body=str(exc.body)[:200],
                     detail=(
                         "peer rejected kind=ticket with 400 — likely not "

@@ -45,7 +45,7 @@ Error taxonomy (aligned with the outbound contract):
     401 missing_bearer / invalid_token / client_not_allowed
     403 no_permitted_fields / peer_not_canonical_owner
     404 record_not_found / canonical_not_owned / unknown_peer
-    400 schema_error
+    400 invalid_json / unknown_kind / schema_error
     501 peer_inbox_not_configured
     502 peer_inbox_error
     503 peer_unavailable
@@ -277,6 +277,14 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
     not-yet-upgraded receiver 400s an unknown kind via the enum gate
     below — that IS the negotiation; senders treat the 400 as "peer
     not upgraded" and keep their queue intact. No version field.
+
+    The enum gate's error code is ``unknown_kind`` (split from the
+    generic ``schema_error`` 2026-06-12 so senders can distinguish
+    "this peer predates the kind" from "this one payload is
+    malformed" — conflating them let one malformed ticket starve the
+    forwarder's whole queue). PRE-split receivers still emit
+    ``schema_error`` with no ``payload.*`` detail for an unknown kind;
+    senders must treat that shape as version skew too.
     """
     try:
         body = await request.json()
@@ -292,8 +300,12 @@ async def _handle_peer_send(request: web.Request) -> web.StreamResponse:
     from_peer_claim = body.get("from")
     payload = body.get("payload")
     if kind not in {"message", "query", "query_nl", "query_result", "notice", "ticket"}:
+        # Distinct code (NOT schema_error): "kind unknown" means the
+        # receiver predates the kind — version skew, sender should
+        # back off with its queue intact. Per-payload failures keep
+        # emitting schema_error with a ``payload.*`` detail.
         return _json_error(
-            400, "schema_error",
+            400, "unknown_kind",
             detail="kind must be message | query | query_nl | query_result | notice | ticket",
             correlation_id=correlation_id,
         )

@@ -401,7 +401,9 @@ async def test_message_kind_still_routes_to_inbox(salem_app):  # type: ignore[no
 
 
 async def test_bad_kind_still_400(salem_app):  # type: ignore[no-untyped-def]
-    """REGRESSION: an unknown kind still 400s schema_error."""
+    """REGRESSION: an unknown kind still 400s — with the DISTINCT
+    ``unknown_kind`` code (split from schema_error 2026-06-12 so
+    senders can tell version skew from a malformed payload)."""
     resp = await salem_app.post(
         "/peer/send",
         json={"kind": "bogus", "from": "hypatia", "payload": {}},
@@ -409,7 +411,7 @@ async def test_bad_kind_still_400(salem_app):  # type: ignore[no-untyped-def]
     )
     assert resp.status == 400
     body = await resp.json()
-    assert body["reason"] == "schema_error"
+    assert body["reason"] == "unknown_kind"
 
 
 # ---------------------------------------------------------------------------

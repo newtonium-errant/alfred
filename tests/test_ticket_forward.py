@@ -349,11 +349,15 @@ async def test_pending_ack_stays_eligible_then_links(tmp_path, monkeypatch):  # 
 
 
 # ---------------------------------------------------------------------------
-# Peer not upgraded — 400 aborts the tick, queue intact
+# 400 classification — version skew aborts the tick; a malformed
+# payload skips ONLY that ticket (2026-06-12 review WARN-2)
 # ---------------------------------------------------------------------------
 
 
 async def test_peer_not_upgraded_aborts_tick_keeps_queue(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """A bare ``schema_error`` 400 with NO ``payload.*`` detail is a
+    PRE-upgrade receiver's kind-enum gate (it can't emit unknown_kind
+    yet) → conservative abort, queue intact."""
     vault = tmp_path / "vault"
     _write_ticket(vault, "A ticket")
     _write_ticket(vault, "B ticket")
@@ -384,6 +388,85 @@ async def test_peer_not_upgraded_aborts_tick_keeps_queue(tmp_path, monkeypatch):
     result2 = await run_forward_once(config, _raw(tmp_path))
     assert result2["forwarded"] == 2
     assert result2["aborted"] is False
+
+
+async def test_unknown_kind_aborts_tick_keeps_queue(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """``unknown_kind`` (an upgraded receiver's enum gate) is true
+    version skew → abort the tick, queue intact."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "A ticket")
+    _write_ticket(vault, "B ticket")
+    fake = FakePeerSend(script=[
+        TransportRejected(
+            "HTTP 400 from /peer/send: unknown_kind",
+            status_code=400,
+            body='{"reason": "unknown_kind", "detail": "kind must be message | query"}',
+        ),
+    ])
+    _patch_peer_send(monkeypatch, fake)
+    config = _config(tmp_path)
+
+    with structlog.testing.capture_logs() as captured:
+        result = await run_forward_once(config, _raw(tmp_path))
+
+    assert len(fake.calls) == 1
+    assert result["aborted"] is True
+    assert result["forwarded"] == 0
+    assert result["results"][0]["outcome"] == "peer_not_upgraded"
+    warned = _log_events(captured, "ticket_forward.peer_not_upgraded")
+    assert len(warned) == 1
+    assert warned[0]["reason"] == "unknown_kind"
+    # No per-ticket rejection logged — this is the skew branch.
+    assert _log_events(captured, "ticket_forward.push_rejected") == []
+
+
+async def test_payload_schema_error_skips_only_that_ticket(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """A ``schema_error`` whose detail names a ``payload.*`` field is a
+    PER-TICKET failure: the malformed ticket is skipped, every later
+    ticket still pushes (no starvation at the sorted-glob position)."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "A bad ticket")  # sorts first — the rejected one
+    _write_ticket(vault, "B good ticket")
+    fake = FakePeerSend(script=[
+        TransportRejected(
+            "HTTP 400 from /peer/send: schema_error",
+            status_code=400,
+            body=(
+                '{"reason": "schema_error", "detail": '
+                '"payload.ticket_uid must match ^[A-Za-z0-9_-]{1,64}$"}'
+            ),
+        ),
+    ])
+    _patch_peer_send(monkeypatch, fake)
+    config = _config(tmp_path)
+
+    with structlog.testing.capture_logs() as captured:
+        result = await run_forward_once(config, _raw(tmp_path))
+
+    # BOTH pushes attempted — the rejection did not abort the tick.
+    assert len(fake.calls) == 2
+    assert result["aborted"] is False
+    assert result["failed"] == 1
+    assert result["forwarded"] == 1
+    outcomes = {r["relpath"]: r["outcome"] for r in result["results"]}
+    assert outcomes["ticket/A bad ticket.md"] == "push_rejected"
+    assert outcomes["ticket/B good ticket.md"] == "linked"
+
+    rejected = _log_events(captured, "ticket_forward.push_rejected")
+    assert len(rejected) == 1
+    assert rejected[0]["relpath"] == "ticket/A bad ticket.md"
+    assert "payload.ticket_uid" in rejected[0]["detail"]
+    # No misleading version-skew warning.
+    assert _log_events(captured, "ticket_forward.peer_not_upgraded") == []
+
+    # The rejected ticket stays issue-less (attempts counted) → the c5
+    # digest FAILED tail picks it up from attempt 2; the good one linked.
+    state = TicketForwardState.load(config.state_path)
+    bad_uid = mint_ticket_uid("ticket/A bad ticket.md", "2026-06-10")
+    good_uid = mint_ticket_uid("ticket/B good ticket.md", "2026-06-10")
+    assert state.entries[bad_uid].issue_number is None
+    assert state.entries[bad_uid].attempts == 1
+    assert state.entries[good_uid].issue_number == 7
 
 
 # ---------------------------------------------------------------------------

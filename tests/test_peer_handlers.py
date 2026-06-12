@@ -289,10 +289,13 @@ async def test_peer_send_rejects_spoofed_from(aiohttp_client, tmp_path):  # type
     assert body["reason"] == "from_mismatch"
 
 
-async def test_peer_send_schema_error_on_bad_kind(salem_app):  # type: ignore[no-untyped-def]
+async def test_peer_send_unknown_kind_on_bad_kind(salem_app):  # type: ignore[no-untyped-def]
+    """The kind-enum gate emits the DISTINCT ``unknown_kind`` code
+    (split from schema_error 2026-06-12) — the sender-side version-skew
+    signal. Per-payload failures keep emitting schema_error."""
     resp = await salem_app.post(
         "/peer/send",
-        json={"kind": "unknown_kind", "from": "kal-le", "payload": {}},
+        json={"kind": "bogus-kind", "from": "kal-le", "payload": {}},
         headers={
             "Authorization": f"Bearer {DUMMY_KALLE_PEER_TOKEN}",
             "X-Alfred-Client": "kal-le",
@@ -300,7 +303,7 @@ async def test_peer_send_schema_error_on_bad_kind(salem_app):  # type: ignore[no
     )
     assert resp.status == 400
     body = await resp.json()
-    assert body["reason"] == "schema_error"
+    assert body["reason"] == "unknown_kind"
 
 
 async def test_peer_send_inbox_exception_becomes_502(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
