@@ -214,7 +214,7 @@ Salem writes to today's daily file via `vault_edit set_fields={"tier_curation": 
 **The pattern** (read existing → mutate the in-memory dict → write the full block back):
 
 1. `vault_read path="daily/<today>.md"` → frontmatter dict including any existing `tier_curation` block (or `None` if un-curated today).
-2. Build the updated block in memory: copy existing `t1` / `t2` / `t3` arrays, append/remove operator picks, refresh `curated_at`.
+2. Build the updated block in memory: copy existing `t1` / `t2` / `t3` arrays, append/remove operator picks, refresh `curated_at` to the actual current wall-clock time (see the `curated_at` rule in the field-shape list below).
 3. `vault_edit set_fields={"tier_curation": <full_block>}` — `set_fields` overwrites the `tier_curation` key with the new dict; all OTHER frontmatter keys (`type` / `date` / `routines_contributing` / `critical_pending` / `alfred_tags`) are preserved because `set_fields` is a key-level overwrite, not a record-level replace.
 
 **Why read-modify-write, not `append_fields`:** `append_fields` would append a new entry to a list-shaped field, but `tier_curation` is a dict (not a list), so list-append doesn't apply. The whole-block overwrite is the correct shape — Ship 1 (`tier/daily_curation.py:save_tier_curation`) uses the same read-modify-write discipline.
@@ -263,6 +263,7 @@ Field-shape rules (verify against the dataclass before drafting examples):
 - **Routine-origin entries do NOT roll over.** Per Ship B, when yesterday's routine-origin T1/T2 entry is incomplete, the rollover section silently skips it — the routine's compute surface (`compute_auto_routine_candidates` / `compute_auto_routine_t2_candidates`) re-fires the next morning if the item is still due. Task-origin entries DO roll over as before.
 - **T3 entries carry `item:` (a free-text string), NOT `task:` or `routine_item:`.** Source enum values: `aspirational`, `operator`, `operator-adhoc` (the canonical T3 set in `T3_SOURCES`). **T3 has no `rollover` source** — T3 is fresh-each-day per the spec.
 - **`confirmed: true` is T1-only and optional.** T2/T3 entries have no confirmed field — the operator-add IS the confirmation.
+- **`curated_at` records the ACTUAL wall-clock time of the edit you are making right now** (timezone-aware ISO 8601, Andrew's local offset). It is an audit field — backdating it makes the vault lie about when curation actually happened. NEVER set it to the daily block's nominal time (e.g. a morning-ish `09:00` because curation "belongs to the morning"), NEVER copy a timestamp from the existing block or from an earlier edit in the same session — every write stamps its own now. DO NOT repeat the 2026-06-10 mistakes: a session running at 13:19 ADT wrote `curated_at: '2026-06-10T09:00:00-03:00'`, and an edit made at 12:36 wrote `11:15` (carried over from the prior edit). Both backdated the audit trail. (Schema anchor: `curated_at: str | None` — "ISO-8601 wall-clock timestamp" — in `alfred/tier/daily_curation.py`; the code never auto-stamps it, so the honesty of this field is entirely on you.)
 - Source enum values + field names are stable contract surface pinned by tests. If they drift in `daily_curation.py`, this SKILL needs a follow-up sweep.
 
 #### `escalate_at_days` SURVIVES — surface-earlier knob
@@ -617,7 +618,7 @@ When tomorrow's file already exists (because you pre-set earlier in the day, or 
 >   1. Resolve "tomorrow" → `2026-06-02`.
 >   2. `vault_read path="daily/2026-06-02.md"` → EXISTS (from earlier pre-set), has `tier_curation` block with T1 already populated.
 >   3. `vault_search grep="Call Mom"` → resolve to task record (create if missing per Worked Example B's pattern).
->   4. Merge: copy the existing block in memory, append the new T2 entry, refresh `curated_at`:
+>   4. Merge: copy the existing block in memory, append the new T2 entry, refresh `curated_at` to the actual current time (NOT the earlier pre-set's `20:05`):
 >
 > ```yaml
 > tier_curation:
