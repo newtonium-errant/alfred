@@ -170,6 +170,10 @@ def test_mint_ticket_uid_stable_format_and_inputs():  # type: ignore[no-untyped-
     # Pinned shape: vera-YYYYMMDD-<8 hex>.
     assert re.fullmatch(r"vera-\d{8}-[0-9a-f]{8}", uid1)
     assert uid1.startswith("vera-20260610-")
+    # Wire-format contract: minted uids pass the intake's schema-gate
+    # format pin (peer_handlers rejects payload.ticket_uid outside it).
+    from alfred.transport.ticket_intake import TICKET_UID_RE
+    assert TICKET_UID_RE.fullmatch(uid1)
     # Pinned derivation: sha256("relpath|created")[:8].
     expected_hash = hashlib.sha256(
         b"ticket/Login broken.md|2026-06-10",

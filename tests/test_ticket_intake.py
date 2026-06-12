@@ -237,6 +237,12 @@ async def test_ticket_501_when_unregistered(aiohttp_client, tmp_path):  # type: 
     [
         ({"ticket_uid": ""}, "ticket_uid"),
         ({"ticket_uid": None}, "ticket_uid"),
+        # Format pin — the uid flows into the GitHub search phrase,
+        # the HTML dedupe marker, and the record filename; anything
+        # outside ^[A-Za-z0-9_-]{1,64}$ is rejected at the gate.
+        ({"ticket_uid": "has spaces"}, "ticket_uid"),
+        ({"ticket_uid": "<i>html</i>"}, "ticket_uid"),
+        ({"ticket_uid": "x" * 65}, "ticket_uid"),
         ({"relpath": 123}, "relpath"),
         ({"frontmatter": "not-a-dict"}, "frontmatter must be an object"),
         ({"body": None}, "body"),
@@ -254,6 +260,11 @@ async def test_ticket_schema_gate_payload_fields(
     body = await resp.json()
     assert body["reason"] == "schema_error"
     assert detail_fragment in body["detail"]
+    # Forwarder-classification contract: every per-payload gate's
+    # detail names a ``payload.*`` field — that prefix is what the
+    # forwarder keys on to treat the 400 as a PER-TICKET failure
+    # instead of a tick-aborting version-skew signal.
+    assert "payload." in body["detail"]
     # Schema failures never reach GitHub or the vault.
     assert fake.search_calls == []
     assert fake.create_calls == []
@@ -276,6 +287,7 @@ async def test_ticket_schema_gate_frontmatter_required_fields(
     body = await resp.json()
     assert body["reason"] == "schema_error"
     assert f"frontmatter.{missing_field}" in body["detail"]
+    assert "payload." in body["detail"]  # forwarder per-ticket classification key
 
 
 # ---------------------------------------------------------------------------
@@ -490,9 +502,10 @@ async def test_ticket_pending_then_repush_creates_without_duplicate(
     assert body2["status"] == "created"
     assert body2["issue_number"] == 7
 
-    # Path (d): recorded entry skips the marker search AND the vault
-    # create — no duplicate record.
-    assert len(fake.search_calls) == 1  # only the failed first attempt
+    # Path (d): the recorded entry skips the vault create (no duplicate
+    # record) but RE-RUNS the marker search — every create-bound path
+    # searches first (the double-post guard, 2026-06-12 review WARN-1).
+    assert len(fake.search_calls) == 2  # failed first attempt + retry miss
     assert len(fake.create_calls) == 1  # only the successful retry
     ticket_files = list((vault_root / "ticket").glob("*.md"))
     assert len(ticket_files) == 1
@@ -568,6 +581,156 @@ async def test_ticket_adopt_from_marker_search(aiohttp_client, tmp_path):  # typ
     adopted_rows = [r for r in rows if r.get("outcome") == "adopted"]
     assert len(adopted_rows) == 1
     assert adopted_rows[0]["from_peer"] == "vera"
+
+
+# ---------------------------------------------------------------------------
+# Double-post guard — marker search on EVERY create-bound path (WARN-1)
+# ---------------------------------------------------------------------------
+
+
+def _seed_kalle_ticket_record(vault_root: Path) -> Path:
+    """Write the KAL-LE ticket record the harness payload maps to."""
+    record_dir = vault_root / "ticket"
+    record_dir.mkdir(parents=True, exist_ok=True)
+    record_path = record_dir / "Login button broken.md"
+    record_path.write_text(
+        "---\n"
+        "type: ticket\n"
+        "title: Login button broken\n"
+        "ticket_type: bug\n"
+        "reporter: Ben\n"
+        "area: checkout\n"
+        "status: open\n"
+        "origin: vera\n"
+        f"ticket_uid: {TICKET_UID}\n"
+        "---\n\n## Repro\n1. Click login\n",
+        encoding="utf-8",
+    )
+    return record_path
+
+
+async def test_ticket_repush_adopts_after_create_timeout_no_double_post(
+    aiohttp_client, tmp_path,
+):  # type: ignore[no-untyped-def]
+    """REGRESSION (WARN-1 sequence a): create POST times out client-side
+    but GitHub actually committed the issue. The re-push must run the
+    marker search, find the committed issue, and ADOPT it — a second
+    ``issue_create`` would double-post."""
+    fake = FakeGitHubClient(
+        tmp_path / "audit.jsonl",
+        search_result=None,
+        create_exc=httpx.ConnectTimeout("timed out mid-create"),
+    )
+    client, vault_root, intake_config = await _build_kalle_app(
+        aiohttp_client, tmp_path, fake_client=fake,
+    )
+
+    # First push: search miss, create "fails" (but committed on GitHub).
+    resp = await _push(client, _ticket_payload())
+    assert (await resp.json())["status"] == "recorded_issue_pending"
+    assert len(fake.create_calls) == 1
+
+    # Second push (VERA re-push): the marker search now finds the
+    # committed issue. create_exc stays armed — if the handler
+    # erroneously re-created, the ack would be pending, not adopted.
+    fake.search_result = {
+        "number": 55,
+        "html_url": "https://github.com/acme/site/issues/55",
+        "state": "open",
+    }
+    with structlog.testing.capture_logs() as captured:
+        resp2 = await _push(client, _ticket_payload())
+    body2 = await resp2.json()
+    assert body2["status"] == "adopted"
+    assert body2["issue_number"] == 55
+    assert len(fake.create_calls) == 1  # ZERO further create calls
+    assert len(fake.search_calls) == 2
+
+    state = TicketIntakeState.load(intake_config.state_path)
+    assert state.entries[TICKET_UID].issue_number == 55
+    # Link-back landed on the record minted by the first push.
+    post = fm_lib.load(str(vault_root / "ticket" / "Login button broken.md"))
+    assert post.metadata["github_issue"] == 55
+    assert len(_log_events(captured, "transport.ticket.adopted")) == 1
+    # No duplicate vault record either.
+    assert len(list((vault_root / "ticket").glob("*.md"))) == 1
+
+
+async def test_ticket_recorded_entry_without_issue_adopts_on_marker_hit(
+    aiohttp_client, tmp_path,
+):  # type: ignore[no-untyped-def]
+    """REGRESSION (WARN-1 sequence b): crash between create success and
+    state save — entry carries kalle_relpath but no issue_number, the
+    issue exists on GitHub. Re-push → marker hit → adopt, zero creates."""
+    fake = FakeGitHubClient(
+        tmp_path / "audit.jsonl",
+        search_result={
+            "number": 61,
+            "html_url": "https://github.com/acme/site/issues/61",
+            "state": "open",
+        },
+    )
+    client, vault_root, intake_config = await _build_kalle_app(
+        aiohttp_client, tmp_path, fake_client=fake,
+    )
+    _seed_kalle_ticket_record(vault_root)
+    state = TicketIntakeState.load(intake_config.state_path)
+    state.entries[TICKET_UID] = TicketIntakeEntry(
+        recorded_at="2026-06-11T00:00:00+00:00",
+        kalle_relpath="ticket/Login button broken.md",
+        ticket_type="bug",
+    )
+    state.save()
+
+    resp = await _push(client, _ticket_payload())
+    body = await resp.json()
+    assert body["status"] == "adopted"
+    assert body["issue_number"] == 61
+    assert fake.create_calls == []
+    assert len(fake.search_calls) == 1
+
+    state2 = TicketIntakeState.load(intake_config.state_path)
+    assert state2.entries[TICKET_UID].issue_number == 61
+    # No duplicate vault record minted on the re-push.
+    assert len(list((vault_root / "ticket").glob("*.md"))) == 1
+
+
+# ---------------------------------------------------------------------------
+# Exists path — link-back heal (a prior link_back_failed gets repaired)
+# ---------------------------------------------------------------------------
+
+
+async def test_ticket_exists_path_heals_missing_link_back(
+    aiohttp_client, tmp_path,
+):  # type: ignore[no-untyped-def]
+    """State links the issue but the record lacks ``github_issue`` (a
+    prior link-back write failed). A redundant push acks ``exists`` AND
+    re-runs the link-back so the record heals."""
+    fake = FakeGitHubClient(tmp_path / "audit.jsonl")
+    client, vault_root, intake_config = await _build_kalle_app(
+        aiohttp_client, tmp_path, fake_client=fake,
+    )
+    record_path = _seed_kalle_ticket_record(vault_root)
+    state = TicketIntakeState.load(intake_config.state_path)
+    state.entries[TICKET_UID] = TicketIntakeEntry(
+        recorded_at="2026-06-11T00:00:00+00:00",
+        kalle_relpath="ticket/Login button broken.md",
+        issue_number=7,
+        issue_url="https://github.com/acme/site/issues/7",
+    )
+    state.save()
+
+    resp = await _push(client, _ticket_payload())
+    body = await resp.json()
+    assert body["status"] == "exists"
+    assert body["issue_number"] == 7
+    # Dedupe path still makes no GitHub calls.
+    assert fake.search_calls == []
+    assert fake.create_calls == []
+    # The heal: link-back fields restored onto the record.
+    post = fm_lib.load(str(record_path))
+    assert post.metadata["github_issue"] == 7
+    assert post.metadata["github_url"] == "https://github.com/acme/site/issues/7"
 
 
 # ---------------------------------------------------------------------------

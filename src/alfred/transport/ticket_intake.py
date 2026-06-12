@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,17 @@ log = structlog.get_logger(__name__)
 # generic ``state.json`` default across tools lets one tool silently
 # load another's state file.
 DEFAULT_TICKET_INTAKE_STATE_PATH = "./data/ticket_intake_state.json"
+
+# Wire-format pin for ``payload.ticket_uid``. The uid flows verbatim
+# into three injection-sensitive sinks: the GitHub search phrase
+# (``issue_search_marker`` quotes it into ``q=``), the HTML dedupe
+# marker comment (``issue_marker``), and the uid-suffixed vault record
+# filename (the title-collision path in ``_record_kalle_ticket``).
+# Constraining to a filename- and search-safe charset at the schema
+# gate keeps all three sinks clean. The forwarder's minted shape
+# (``vera-YYYYMMDD-<8 hex>``) conforms — pinned in
+# ``tests/test_ticket_forward.py``'s mint-stability test.
+TICKET_UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +223,7 @@ class TicketIntakeState:
 
 __all__ = [
     "DEFAULT_TICKET_INTAKE_STATE_PATH",
+    "TICKET_UID_RE",
     "TicketIntakeConfig",
     "TicketIntakeEntry",
     "TicketIntakeState",

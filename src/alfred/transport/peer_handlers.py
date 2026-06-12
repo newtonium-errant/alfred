@@ -2947,9 +2947,12 @@ async def _handle_ticket_intake(
     Ack statuses (the forwarder's contract):
       * ``created`` — vault record + GitHub issue both landed now.
       * ``exists`` — state already links this uid to an issue; no
-        GitHub call, no vault write.
+        GitHub call. No vault write either, EXCEPT the link-back heal:
+        when the record at ``kalle_relpath`` lacks ``github_issue``
+        (a prior ``link_back_failed``), the link-back is re-run.
       * ``adopted`` — marker-search guard found the issue on GitHub
-        (state had been deleted); linkage re-recorded.
+        (state deleted, or a prior create committed but the ack/state
+        save never landed); linkage re-recorded.
       * ``recorded_issue_pending`` — vault record landed but GitHub is
         down; VERA's next re-push retries the post (path d).
 
@@ -2958,10 +2961,11 @@ async def _handle_ticket_intake(
     """
     from alfred.integrations.github_ops import append_github_audit
     from alfred.transport.ticket_intake import (
+        TICKET_UID_RE,
         TicketIntakeEntry,
         TicketIntakeState,
     )
-    from alfred.vault.ops import VaultError
+    from alfred.vault.ops import VaultError, vault_read
 
     intake_config = request.app.get(_KEY_TICKET_INTAKE_CONFIG)
     github_client = request.app.get(_KEY_TICKET_INTAKE_GITHUB)
@@ -2991,6 +2995,22 @@ async def _handle_ticket_intake(
             correlation_id=correlation_id,
         )
     ticket_uid = ticket_uid.strip()
+    # Format pin (see TICKET_UID_RE): the uid flows into the GitHub
+    # search phrase, the HTML dedupe marker, and the uid-suffixed
+    # record filename — reject anything outside the safe charset.
+    # The ``payload.`` detail prefix makes this a PER-TICKET failure
+    # under the forwarder's 400-classification (a bad uid never
+    # starves the rest of the queue).
+    if not TICKET_UID_RE.fullmatch(ticket_uid):
+        return _json_error(
+            400, "schema_error",
+            detail=(
+                "payload.ticket_uid must match ^[A-Za-z0-9_-]{1,64}$ "
+                "(it flows into the GitHub search phrase, the HTML "
+                "dedupe marker, and the record filename)"
+            ),
+            correlation_id=correlation_id,
+        )
     if not isinstance(relpath, str):
         return _json_error(
             400, "schema_error",
@@ -3055,6 +3075,28 @@ async def _handle_ticket_intake(
             from_peer=auth_peer,
             correlation_id=correlation_id,
         )
+        # Link-back heal: a prior ``transport.ticket.link_back_failed``
+        # leaves the vault record without ``github_issue`` while the
+        # state still links the issue. A redundant push landing here is
+        # the only KAL-LE-side chance to repair it — re-run the
+        # link-back when the field is missing. (Missing/unreadable
+        # record → nothing to heal; the state stays the dedupe truth.)
+        needs_relink = False
+        try:
+            existing = vault_read(vault_path, entry.kalle_relpath)
+            existing_fm = existing.get("frontmatter") or {}
+            needs_relink = "github_issue" not in existing_fm
+        except VaultError:
+            needs_relink = False
+        if needs_relink:
+            _link_back_kalle_record(
+                vault_path,
+                kalle_relpath=entry.kalle_relpath,
+                issue_number=entry.issue_number,
+                issue_url=entry.issue_url,
+                ticket_uid=ticket_uid,
+                correlation_id=correlation_id,
+            )
         return web.json_response({
             "status": "exists",
             "issue_number": entry.issue_number,
@@ -3080,20 +3122,26 @@ async def _handle_ticket_intake(
     adopted_issue: dict[str, Any] | None = None
     marker_search_failed: Exception | None = None
 
-    if entry is None:
-        # --- (e) New uid → marker-search guard FIRST --------------------
-        # Protects against intake-state deletion: state files are
-        # deletable bookkeeping (CLAUDE.md); deletion must NOT mint
-        # duplicate issues.
-        try:
-            adopted_issue = await github_client.issue_search_marker(
-                ticket_uid=ticket_uid,
-                caller="ticket_intake",
-                correlation_id=correlation_id,
-            )
-        except contained as exc:
-            marker_search_failed = exc
+    # --- (e) Marker-search guard — EVERY create-bound path --------------
+    # Runs whenever the uid isn't already linked (new uid AND the
+    # recorded-pending re-push path (d)) BEFORE ``issue_create`` can
+    # fire. Two double-post windows it closes:
+    #   * intake-state deletion — state files are deletable bookkeeping
+    #     (CLAUDE.md); deletion must NOT mint duplicate issues;
+    #   * timeout-after-commit — a prior create POST that timed out
+    #     client-side (or crashed between create success and the state
+    #     save) may still have committed on GitHub; the re-push must
+    #     ADOPT that issue, never re-create it.
+    try:
+        adopted_issue = await github_client.issue_search_marker(
+            ticket_uid=ticket_uid,
+            caller="ticket_intake",
+            correlation_id=correlation_id,
+        )
+    except contained as exc:
+        marker_search_failed = exc
 
+    if entry is None:
         # Record the ticket in KAL-LE's vault (both the adopt-hit and
         # the search-miss/failed paths record it — record-then-pending
         # is the crash-safe ordering).
@@ -3137,59 +3185,62 @@ async def _handle_ticket_intake(
         )
         state.entries[ticket_uid] = entry
         state.save()
+    # else: --- (d) uid recorded, issue pending → skip the vault create
+    # (already recorded); the marker-search guard above still protects
+    # the retried post below against the double-post windows.
 
-        if marker_search_failed is not None:
-            # GitHub down before we could even check for an existing
-            # issue — recorded, pending; VERA's re-push retries.
-            return _ticket_issue_pending_response(
-                state=state,
-                entry=entry,
-                ticket_uid=ticket_uid,
-                exc=marker_search_failed,
-                correlation_id=correlation_id,
-            )
+    if marker_search_failed is not None:
+        # GitHub down before we could even check for an existing
+        # issue — recorded, pending; VERA's re-push retries. Posting
+        # blind here could double-post (the search IS the guard), so
+        # the create is skipped too.
+        return _ticket_issue_pending_response(
+            state=state,
+            entry=entry,
+            ticket_uid=ticket_uid,
+            exc=marker_search_failed,
+            correlation_id=correlation_id,
+        )
 
-        if adopted_issue is not None:
-            # Marker hit → adopt the existing issue instead of minting
-            # a duplicate.
-            entry.issue_number = adopted_issue.get("number")
-            entry.issue_url = str(adopted_issue.get("html_url") or "")
-            state.save()
-            log.info(
-                "transport.ticket.adopted",
-                ticket_uid=ticket_uid,
-                issue_number=entry.issue_number,
-                from_peer=auth_peer,
-                correlation_id=correlation_id,
-            )
-            append_github_audit(
-                audit_path,
-                op="issue_create",
-                repo=github_client.config.repo,
-                caller="ticket_intake",
-                outcome="adopted",
-                ticket_uid=ticket_uid,
-                issue_number=entry.issue_number,
-                from_peer=auth_peer,
-                correlation_id=correlation_id,
-            )
-            _link_back_kalle_record(
-                vault_path,
-                kalle_relpath=entry.kalle_relpath,
-                issue_number=entry.issue_number,
-                issue_url=entry.issue_url,
-                ticket_uid=ticket_uid,
-                correlation_id=correlation_id,
-            )
-            return web.json_response({
-                "status": "adopted",
-                "issue_number": entry.issue_number,
-                "issue_url": entry.issue_url,
-                "kalle_relpath": entry.kalle_relpath,
-                "correlation_id": correlation_id,
-            })
-    # else: --- (d) uid recorded, issue pending → skip vault create, ----
-    # fall through to retry the post below.
+    if adopted_issue is not None:
+        # Marker hit → adopt the existing issue instead of minting
+        # a duplicate.
+        entry.issue_number = adopted_issue.get("number")
+        entry.issue_url = str(adopted_issue.get("html_url") or "")
+        state.save()
+        log.info(
+            "transport.ticket.adopted",
+            ticket_uid=ticket_uid,
+            issue_number=entry.issue_number,
+            from_peer=auth_peer,
+            correlation_id=correlation_id,
+        )
+        append_github_audit(
+            audit_path,
+            op="issue_create",
+            repo=github_client.config.repo,
+            caller="ticket_intake",
+            outcome="adopted",
+            ticket_uid=ticket_uid,
+            issue_number=entry.issue_number,
+            from_peer=auth_peer,
+            correlation_id=correlation_id,
+        )
+        _link_back_kalle_record(
+            vault_path,
+            kalle_relpath=entry.kalle_relpath,
+            issue_number=entry.issue_number,
+            issue_url=entry.issue_url,
+            ticket_uid=ticket_uid,
+            correlation_id=correlation_id,
+        )
+        return web.json_response({
+            "status": "adopted",
+            "issue_number": entry.issue_number,
+            "issue_url": entry.issue_url,
+            "kalle_relpath": entry.kalle_relpath,
+            "correlation_id": correlation_id,
+        })
 
     # --- (f) Post the GitHub issue --------------------------------------
     issue_title = f"[{fm_ticket_type}] {fm_title}"
@@ -3313,8 +3364,13 @@ def _link_back_kalle_record(
 
     Failure-isolated: the issue exists and the state links it — a
     frontmatter write failing must not turn a created issue into a
-    failed ack (the record link-back self-heals on the next pipeline
-    pass; the state is the source of truth for dedupe).
+    failed ack. The state is the source of truth for dedupe. NOTE the
+    record does NOT reliably self-heal: after a ``created``/``adopted``
+    ack VERA's state links the issue and never re-pushes, so a failed
+    link-back here leaves the record permanently unlinked UNLESS a
+    redundant push arrives (VERA state loss), in which case the
+    dedupe path's link-back heal repairs it. The grep-able signature
+    is ``transport.ticket.link_back_failed``.
     """
     from alfred.vault.ops import vault_edit
 

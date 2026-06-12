@@ -473,6 +473,13 @@ async def run_forward_once(
                     scope="vera_forwarder",
                 )
             except Exception as exc:  # noqa: BLE001 — state still records the link
+                # The record does NOT self-heal: the state entry below
+                # gets issue_number, the ticket becomes ineligible, and
+                # this path never re-runs. The operator-visible
+                # mitigation is the c5 digest's state-fallback tail
+                # (``vera_ticket_digest._forward_status_tail`` precedence
+                # 2 renders ``→ GH#<n>`` from state when the record
+                # lacks ``github_issue``), keyed off this WARNING.
                 log.warning(
                     "ticket_forward.link_back_write_failed",
                     uid=uid,
