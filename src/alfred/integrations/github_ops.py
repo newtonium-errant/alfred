@@ -285,7 +285,9 @@ class GitHubOpsConfig:
     """Typed view of the ``github:`` config section (KAL-LE-only)."""
 
     repo: str = ""
-    pat: str = ""
+    # repr=False: the PAT is a credential — keep it out of repr()-driven
+    # surfaces (log lines, tracebacks, debugger dumps of the config).
+    pat: str = field(default="", repr=False)
     instance: str = ""
     labels: list[str] = field(default_factory=lambda: ["auto-fix"])
     # ticket_type / priority value -> GitHub label name. c3 consults

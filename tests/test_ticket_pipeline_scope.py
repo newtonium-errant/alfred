@@ -164,6 +164,18 @@ def test_forwarder_edit_fails_closed_without_field_list():
         check_scope("vera_forwarder", "edit", record_type="ticket")
 
 
+def test_forwarder_edit_fails_closed_without_record_type():
+    """REGRESSION (2026-06-12 review WARN-3): an empty record_type used
+    to SKIP the type restriction (fail-open) — the forwarder scope
+    could write its 4 fields onto ANY record type when the caller
+    omitted the type. Now fails closed."""
+    with pytest.raises(ScopeError, match="record type is unavailable"):
+        check_scope(
+            "vera_forwarder", "edit", record_type="",
+            fields=["github_issue"],
+        )
+
+
 def test_forwarder_edit_non_ticket_type_denied():
     with pytest.raises(ScopeError, match="ticket"):
         check_scope(
@@ -224,6 +236,30 @@ def test_forwarder_end_to_end_link_back_edit(tmp_path) -> None:
             set_fields={"status": "closed"},
             scope="vera_forwarder",
         )
+
+
+def test_forwarder_end_to_end_non_ticket_record_denied(tmp_path) -> None:
+    """REGRESSION (2026-06-12 review WARN-3): vault_edit under
+    vera_forwarder against a NON-ticket record must be refused at the
+    type restriction — before the fix, vault_edit never passed the
+    parsed record_type to the edit gate, so this write SUCCEEDED.
+    (Positive control: test_forwarder_end_to_end_link_back_edit pins
+    the same fields landing on a ticket record.)"""
+    note_dir = tmp_path / "note"
+    note_dir.mkdir(parents=True, exist_ok=True)
+    (note_dir / "Some note.md").write_text(
+        "---\ntype: note\ntitle: Some note\n---\n\nA note body.\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ScopeError, match="ticket"):
+        vault_edit(
+            tmp_path, "note/Some note.md",
+            set_fields={"github_issue": 99},
+            scope="vera_forwarder",
+        )
+    # The write never landed.
+    content = (note_dir / "Some note.md").read_text(encoding="utf-8")
+    assert "github_issue" not in content
 
 
 def test_forwarder_vault_list_tickets_passes_gate_1(tmp_path) -> None:

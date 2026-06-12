@@ -252,6 +252,15 @@ class TestLoadGithubConfig:
         assert cfg is not None
         assert cfg.pat == "${ALGERNON_TEST_GITHUB_PAT}"
 
+    def test_pat_excluded_from_repr(self, tmp_path: Path) -> None:
+        """The PAT is a credential — ``repr(config)`` must not leak it
+        (``field(repr=False)`` on the dataclass). The attribute itself
+        stays readable for the HTTP client."""
+        cfg = _config(tmp_path)
+        assert cfg.pat == DUMMY_PAT
+        assert DUMMY_PAT not in repr(cfg)
+        assert TEST_REPO in repr(cfg)  # non-secret fields still render
+
 
 # ---------------------------------------------------------------------------
 # Fail-loud factory

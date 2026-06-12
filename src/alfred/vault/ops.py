@@ -1396,10 +1396,17 @@ def vault_edit(
             body_append is not None or body_rewriter is not None
             or body_insert_at is not None or body_replace is not None
         )
+        # record_type is threaded through so the type-restricted edit
+        # gates (talker_routine_completion_only / talker_routine_item_
+        # only / vera_forwarder_link_back_only) can enforce their type
+        # restriction — they fail CLOSED on an empty type (2026-06-12
+        # review WARN-3: omitting it silently skipped the type check,
+        # letting narrow scopes write their fields onto ANY type).
         check_scope(
             scope,
             "edit",
             rel_path=rel_path,
+            record_type=record_type,
             fields=fields_list,
             body_write=body_write_requested,
         )

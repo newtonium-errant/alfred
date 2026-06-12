@@ -1254,7 +1254,13 @@ def check_scope(
         operation: The vault operation (read, search, list, context, create, edit, move, delete,
             body_insert_at, body_replace).
         rel_path: Relative path of the target file (for path-based checks).
-        record_type: Record type (for type-based checks on create).
+        record_type: Record type — used by the type-based create gates
+            AND the type-restricted edit gates
+            (``talker_routine_completion_only`` /
+            ``talker_routine_item_only`` /
+            ``vera_forwarder_link_back_only``), which fail CLOSED when
+            it is empty. ``vault_edit`` parses it from the target
+            record's frontmatter and passes it through.
         frontmatter: Optional frontmatter dict of the record being written
             (used by ``triage_tasks_only`` to enforce ``alfred_triage: true``).
             Defaults to None — rules that require it fail closed when absent.
@@ -1398,7 +1404,19 @@ def check_scope(
         # Frontmatter check is the narrow-gate path; the broader
         # ``edit`` permission ``True`` on the regular ``talker`` scope
         # is unaffected.
-        if record_type and record_type not in TALKER_COMPLETION_LOG_TYPES:
+        #
+        # Fail-CLOSED on a missing type (2026-06-12 review WARN-3):
+        # an empty record_type used to SKIP the type restriction,
+        # silently letting the scope edit its fields on any type.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'talker_routine_completion_only' "
+                f"is type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass "
+                f"record_type (vault_edit parses it from the target "
+                f"record's frontmatter)."
+            )
+        if record_type not in TALKER_COMPLETION_LOG_TYPES:
             raise ScopeError(
                 f"Scope '{scope}' may only edit record types "
                 f"({', '.join(sorted(TALKER_COMPLETION_LOG_TYPES))}). "
@@ -1432,7 +1450,18 @@ def check_scope(
         # field-allowlist subset). The allowlist is broader: items
         # AND completion_log, since text-rename + remove both mutate
         # both fields atomically.
-        if record_type and record_type not in TALKER_ROUTINE_ITEM_TYPES:
+        #
+        # Fail-CLOSED on a missing type (2026-06-12 review WARN-3) —
+        # see talker_routine_completion_only above.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'talker_routine_item_only' is "
+                f"type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass "
+                f"record_type (vault_edit parses it from the target "
+                f"record's frontmatter)."
+            )
+        if record_type not in TALKER_ROUTINE_ITEM_TYPES:
             raise ScopeError(
                 f"Scope '{scope}' may only edit record types "
                 f"({', '.join(sorted(TALKER_ROUTINE_ITEM_TYPES))}). "
@@ -1554,7 +1583,18 @@ def check_scope(
         # fail-closed-on-missing-fields + field-allowlist subset. The
         # forwarder writes ONLY the GitHub issue link-back fields onto
         # ticket records; anything else fails loud here.
-        if record_type and record_type not in VERA_FORWARDER_EDIT_TYPES:
+        #
+        # Fail-CLOSED on a missing type (2026-06-12 review WARN-3) —
+        # see talker_routine_completion_only above.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'vera_forwarder_link_back_only' "
+                f"is type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass "
+                f"record_type (vault_edit parses it from the target "
+                f"record's frontmatter)."
+            )
+        if record_type not in VERA_FORWARDER_EDIT_TYPES:
             raise ScopeError(
                 f"Scope '{scope}' may only edit record types "
                 f"({', '.join(sorted(VERA_FORWARDER_EDIT_TYPES))}). "

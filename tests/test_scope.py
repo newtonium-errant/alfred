@@ -445,6 +445,19 @@ def test_talker_routine_completion_fails_closed_on_missing_fields():
         )
 
 
+def test_talker_routine_completion_fails_closed_on_missing_record_type():
+    """REGRESSION (2026-06-12 review WARN-3): an empty record_type used
+    to SKIP the type restriction (fail-open), letting the scope edit
+    completion_log on ANY type. Now fails closed."""
+    with pytest.raises(ScopeError, match="record type is unavailable"):
+        check_scope(
+            "talker_routine_completion",
+            "edit",
+            record_type="",
+            fields=["completion_log"],
+        )
+
+
 def test_talker_routine_completion_denies_create_move_delete():
     """The narrow scope ONLY permits edit (of completion_log on
     routine). Create / move / delete all denied."""
@@ -586,6 +599,18 @@ def test_talker_routine_item_fails_closed_on_missing_fields():
             "edit",
             record_type="routine",
             fields=None,
+        )
+
+
+def test_talker_routine_item_fails_closed_on_missing_record_type():
+    """REGRESSION (2026-06-12 review WARN-3): empty record_type used to
+    fail open past the type restriction. Mirror of B1's new pin."""
+    with pytest.raises(ScopeError, match="record type is unavailable"):
+        check_scope(
+            "talker_routine_item",
+            "edit",
+            record_type="",
+            fields=["items"],
         )
 
 
