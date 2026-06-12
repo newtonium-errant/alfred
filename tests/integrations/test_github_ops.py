@@ -279,7 +279,15 @@ class TestBuildGithubClient:
         assert rows[0]["outcome"] == "denied"
         assert rows[0]["caller"] == "kal-le"
 
-    def test_unsubstituted_pat_fails_loud(self, tmp_path: Path) -> None:
+    def test_unsubstituted_pat_fails_loud(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # delenv guard (CLAUDE.md dispatcher env-var test-hygiene
+        # contract): the operator's REAL .env sets this var, and other
+        # tests in the full suite load .env into os.environ — without
+        # the delenv, the placeholder substitutes and the fail-loud
+        # path never fires (caught in the c1+c2 full-suite run).
+        monkeypatch.delenv("ALGERNON_KALLE_GITHUB_PAT", raising=False)
         raw = _raw(tmp_path, pat="${ALGERNON_KALLE_GITHUB_PAT}")
         with pytest.raises(GitHubOpsNotConfigured) as exc_info:
             build_github_client(raw, "kal-le")
