@@ -8,6 +8,60 @@ from zoneinfo import ZoneInfo
 from .config import BriefConfig
 
 
+def process_hub_name(name_template: str) -> str:
+    """Derive the brief's process-hub record name from the name template.
+
+    Strips the ``{date}`` placeholder and collapses the leftover
+    whitespace, so the default template ``"Morning Brief {date}"``
+    yields ``"Morning Brief"`` — byte-identical to the historical hub
+    link. An operator overriding ``name_template`` (e.g.
+    ``"KAL-LE Brief {date}"``) gets a matching hub name instead of a
+    hardcoded literal.
+
+    Falls back to ``"Morning Brief"`` when the stripped result is empty
+    (e.g. a template of just ``"{date}"``) so the ``process`` wikilink
+    can never render as ``[[process/]]``.
+
+    Same shape as :func:`alfred.bit.renderer.process_hub_name` —
+    deliberate duplication, not shared: the two tools' hub content
+    (description, body, tags, fallback name) is tool-specific and the
+    shared mechanical skeleton is ~10 lines. Extract a common helper if
+    a THIRD tool grows a process hub.
+    """
+    name = " ".join(name_template.replace("{date}", " ").split())
+    return name or "Morning Brief"
+
+
+def render_process_hub_record(hub_name: str, date_str: str) -> tuple[dict, str]:
+    """Render the brief's process hub note as ``(frontmatter, body)``.
+
+    Every brief run record's ``process`` field links to this hub
+    (``[[process/<hub_name>]]``) — it's the run→process join key, same
+    convention as the BIT's run records. The hub is written by
+    :func:`alfred.brief.daemon.ensure_process_hub`; the janitor has no
+    create scope, so the writer owning the hub's existence is the only
+    automated way to keep the link from dangling (janitor LINK001).
+    """
+    frontmatter = {
+        "type": "process",
+        "status": "active",
+        "name": hub_name,
+        "description": "Daily operational briefing generated each morning.",
+        "created": date_str,
+        "tags": ["brief", "daily"],
+    }
+    body = "\n".join([
+        f"# {hub_name}",
+        "",
+        "Recurring daily operational briefing. Each run writes a "
+        "`run/` record that links back here via its `process` "
+        "frontmatter field.",
+        "",
+        "Created automatically by the brief daemon.",
+    ])
+    return frontmatter, body
+
+
 def render_brief(
     date_str: str,
     sections: list[tuple[str, str]],
@@ -34,7 +88,10 @@ def render_brief(
         "status": "completed",
         "name": name,
         "description": "Daily operational briefing",
-        "process": "[[process/Morning Brief]]",
+        # Hub link derives from the name template so a custom
+        # name_template gets a matching hub (no hardcoded literal).
+        # The hub note itself is ensure-created by the daemon.
+        "process": f"[[process/{process_hub_name(config.output.name_template)}]]",
         "trigger": "scheduled",
         "started": now.isoformat(),
         "created": date_str,

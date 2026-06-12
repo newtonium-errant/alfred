@@ -16,7 +16,12 @@ from alfred.common.schedule import (
 from .config import BriefConfig
 from .health_section import render_health_section
 from .peer_digests import render_peer_digests_section
-from .renderer import render_brief, serialize_record
+from .renderer import (
+    process_hub_name,
+    render_brief,
+    render_process_hub_record,
+    serialize_record,
+)
 from .routine_section import render_routine_section
 from .state import BriefRun, StateManager
 from .tier_section import SECTION_HEADER as TIER_SECTION_HEADER
@@ -28,6 +33,49 @@ from .watches import check_and_format_watches
 from .weather import fetch_and_format
 
 log = get_logger(__name__)
+
+
+def ensure_process_hub(
+    vault_path: Path,
+    config: BriefConfig,
+    date_str: str,
+) -> bool:
+    """Create the brief's process hub note if it doesn't exist yet.
+
+    Every brief run record carries ``process: [[process/<hub>]]`` —
+    with no hub note, the janitor flags LINK001 daily and (having no
+    create scope) can never self-heal it. The brief daemon already
+    writes the vault directly by design, so the writer owns the hub's
+    existence. Same defect-class and same fix-shape as the BIT hub
+    (``alfred.bit.daemon.ensure_process_hub``, commit 02ff294).
+
+    Returns True when the hub was created, False when it already
+    existed or the create failed. The existing-hub path doesn't log —
+    the hub's existence is vault-observable; only the CREATE and FAIL
+    events are signal. Failure is loud (warning) but never fatal: the
+    brief record write must still proceed, and the janitor's LINK001
+    keeps flagging until the hub exists, so the failure is doubly
+    visible.
+    """
+    hub_name = process_hub_name(config.output.name_template)
+    hub_path = vault_path / "process" / f"{hub_name}.md"
+    if hub_path.exists():
+        return False
+    frontmatter, body = render_process_hub_record(hub_name, date_str)
+    content = serialize_record(frontmatter, body)
+    try:
+        hub_path.parent.mkdir(parents=True, exist_ok=True)
+        hub_path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        log.warning(
+            "brief.process_hub_create_failed",
+            path=str(hub_path),
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        return False
+    log.info("brief.process_hub_created", path=str(hub_path))
+    return True
 
 
 async def _push_brief_to_telegram(
@@ -246,6 +294,10 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
 
     # Write to vault
     vault_path = Path(config.vault_path)
+    # Ensure the process hub the record's ``process`` field links to
+    # exists — the janitor has no create scope, so it can never
+    # self-heal the dangling link (LINK001) if we don't.
+    ensure_process_hub(vault_path, config, today)
     name = config.output.name_template.replace("{date}", today)
     rel_path = f"{config.output.directory}/{name}.md"
     file_path = vault_path / rel_path
@@ -291,7 +343,10 @@ async def update_weather(config: BriefConfig) -> str:
     weather_md = await fetch_and_format(config.weather)
 
     if not file_path.exists():
-        # No brief yet — generate a full one
+        # No brief yet — generate a full one. This branch writes a run
+        # record carrying the ``process`` hub link too, so it ensures
+        # the hub the same way generate_brief does.
+        ensure_process_hub(vault_path, config, today)
         sections = [("Weather", weather_md)]
         frontmatter, body = render_brief(today, sections, config)
         content = serialize_record(frontmatter, body)
