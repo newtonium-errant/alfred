@@ -350,6 +350,8 @@ async def test_ticket_happy_path_end_to_end(aiohttp_client, tmp_path):  # type: 
     assert entry.recorded_at
     assert entry.issue_created_at
     assert entry.retry_count == 0
+    # c5 scoreboard split key captured at record time.
+    assert entry.ticket_type == "bug"
 
     # Log pins — received / recorded / issue_created, with key fields.
     received = _log_events(captured, "transport.peer.received")
@@ -469,6 +471,8 @@ async def test_ticket_pending_then_repush_creates_without_duplicate(
     assert entry.issue_number is None
     assert entry.retry_count == 1
     assert entry.kalle_relpath == "ticket/Login button broken.md"
+    # ticket_type rides the record-then-pending path too (c5 split key).
+    assert entry.ticket_type == "bug"
 
     pending = _log_events(captured, "transport.ticket.issue_pending")
     assert len(pending) == 1

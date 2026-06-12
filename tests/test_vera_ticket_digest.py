@@ -49,8 +49,13 @@ def _seed_ticket(
     priority: str = "medium",
     status: str = "open",
     created: str = "2026-06-09",
+    **extra: Any,
 ) -> None:
-    """Write a ticket record to ``<vault>/ticket/<filename>.md``."""
+    """Write a ticket record to ``<vault>/ticket/<filename>.md``.
+
+    ``extra`` lands as additional frontmatter — used by the c5
+    forward-status-tail tests for ``ticket_uid`` / ``github_issue``.
+    """
     post = frontmatter.Post(
         f"# {title}\n\nClaude Code brief body here.\n",
         type="ticket",
@@ -61,6 +66,7 @@ def _seed_ticket(
         priority=priority,
         status=status,
         created=created,
+        **extra,
     )
     (vault / "ticket" / f"{filename}.md").write_text(
         frontmatter.dumps(post) + "\n", encoding="utf-8",
@@ -223,6 +229,137 @@ def test_missing_priority_renders_unset(tmp_path: Path):
     )
     digest = assemble_ticket_digest(today=date(2026, 6, 9), vault_path=vault)
     assert "priority: unset" in digest
+
+
+# ---------------------------------------------------------------------------
+# Forward-status tails (pipeline c5)
+# ---------------------------------------------------------------------------
+
+
+def _write_forward_state(
+    tmp_path: Path,
+    entries: dict[str, dict[str, Any]],
+) -> Path:
+    """Write a c4 forwarder state file via the real state module."""
+    from alfred.transport.ticket_forward import (
+        TicketForwardEntry,
+        TicketForwardState,
+    )
+
+    state = TicketForwardState(path=tmp_path / "ticket_forward_state.json")
+    for uid, fields in entries.items():
+        state.entries[uid] = TicketForwardEntry(**fields)
+    state.save()
+    return state.path
+
+
+def test_tail_gh_link_from_record(tmp_path: Path):
+    """A record carrying the c4 link-back renders the → GH#<n> tail."""
+    vault = _make_vera_vault(tmp_path)
+    _seed_ticket(
+        vault, "t1", title="Linked one", status="open",
+        ticket_uid="vera-20260610-aaaa1111", github_issue=7,
+    )
+    digest = assemble_ticket_digest(today=date(2026, 6, 11), vault_path=vault)
+    assert "- bug · Linked one · priority: medium · open → GH#7" in digest
+
+
+def test_tail_forward_pending_base_format_pin(tmp_path: Path):
+    """A record WITHOUT pipeline fields keeps the existing line shape
+    (type · title · priority · status) and gains the pending tail —
+    plus header/footer unchanged."""
+    vault = _make_vera_vault(tmp_path)
+    _seed_ticket(
+        vault, "t1",
+        title="Login button broken on checkout",
+        ticket_type="bug", priority="high", status="open",
+    )
+    digest = assemble_ticket_digest(today=date(2026, 6, 9), vault_path=vault)
+    assert (
+        "- bug · Login button broken on checkout · priority: high · open"
+        " · forward pending"
+    ) in digest
+    # Snapshot shape pins — unchanged by the tails.
+    assert digest.startswith("1 open ticket (as of 2026-06-09):")
+    assert digest.endswith("Review in Obsidian: ticket/ in the VERA vault.")
+
+
+def test_tail_forward_failed_loud(tmp_path: Path):
+    """attempts >= 2 without an issue in forwarder state → loud tail."""
+    vault = _make_vera_vault(tmp_path)
+    uid = "vera-20260610-bbbb2222"
+    _seed_ticket(
+        vault, "t1", title="Failing one", status="open", ticket_uid=uid,
+    )
+    state_path = _write_forward_state(tmp_path, {
+        uid: {"relpath": "ticket/t1.md", "attempts": 2},
+    })
+    digest = assemble_ticket_digest(
+        today=date(2026, 6, 11), vault_path=vault,
+        forward_state_path=state_path,
+    )
+    assert "· forward FAILED ×2 (retrying)" in digest
+
+
+def test_tail_single_attempt_still_pending(tmp_path: Path):
+    """attempts == 1 without an issue is normal in-flight → pending."""
+    vault = _make_vera_vault(tmp_path)
+    uid = "vera-20260610-cccc3333"
+    _seed_ticket(
+        vault, "t1", title="In flight", status="open", ticket_uid=uid,
+    )
+    state_path = _write_forward_state(tmp_path, {
+        uid: {"relpath": "ticket/t1.md", "attempts": 1},
+    })
+    digest = assemble_ticket_digest(
+        today=date(2026, 6, 11), vault_path=vault,
+        forward_state_path=state_path,
+    )
+    assert "· forward pending" in digest
+    assert "FAILED" not in digest
+
+
+def test_tail_state_linked_fallback(tmp_path: Path):
+    """Forwarder state knows the issue but the record's link-back write
+    failed → tail still renders → GH#<n> (never a permanent
+    misleading 'pending')."""
+    vault = _make_vera_vault(tmp_path)
+    uid = "vera-20260610-dddd4444"
+    _seed_ticket(
+        vault, "t1", title="Linkback lost", status="open", ticket_uid=uid,
+    )
+    state_path = _write_forward_state(tmp_path, {
+        uid: {"relpath": "ticket/t1.md", "attempts": 1, "issue_number": 9},
+    })
+    digest = assemble_ticket_digest(
+        today=date(2026, 6, 11), vault_path=vault,
+        forward_state_path=state_path,
+    )
+    assert "→ GH#9" in digest
+
+
+def test_tail_state_file_absent_all_pending(tmp_path: Path):
+    """An absent forwarder-state file degrades to pending — no crash."""
+    vault = _make_vera_vault(tmp_path)
+    _seed_ticket(
+        vault, "t1", title="No state yet", status="open",
+        ticket_uid="vera-20260610-eeee5555",
+    )
+    digest = assemble_ticket_digest(
+        today=date(2026, 6, 11), vault_path=vault,
+        forward_state_path=tmp_path / "missing_forward_state.json",
+    )
+    assert "· forward pending" in digest
+
+
+def test_no_open_tickets_line_unchanged_with_state_path(tmp_path: Path):
+    """The empty-snapshot ILB line is byte-identical with tails wired."""
+    vault = _make_vera_vault(tmp_path)
+    digest = assemble_ticket_digest(
+        today=date(2026, 6, 9), vault_path=vault,
+        forward_state_path=tmp_path / "missing_forward_state.json",
+    )
+    assert digest == "No open tickets (as of 2026-06-09)."
 
 
 # ---------------------------------------------------------------------------

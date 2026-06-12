@@ -267,6 +267,112 @@ async def test_fire_once_assembles_and_pushes(
 
 
 # ---------------------------------------------------------------------------
+# fire_once — ticket-pipeline section composition (pipeline c5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fire_once_appends_ticket_pipeline_section(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The git_activity digest gains the c5 Ticket pipeline section,
+    rendered EVERY digest (ILB) — here the idle quiet line, appended
+    after the posture line."""
+    captured_pushes: list[dict[str, Any]] = []
+
+    async def _fake_send(
+        peer_name: str, *, digest_markdown: str, digest_date: str,
+        self_name: str, config: TransportConfig | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        captured_pushes.append({"digest_markdown": digest_markdown})
+        return {"status": "accepted", "path": "x", "correlation_id": "c"}
+
+    import alfred.brief.kalle_brief_daemon as daemon_mod
+    monkeypatch.setattr(daemon_mod, "peer_send_brief_digest", _fake_send)
+
+    data_dir = _make_data_dir(tmp_path)
+    config = BriefDigestPushConfig(
+        enabled=True, self_name="kal-le", target_peer="salem",
+        repo_paths=[], data_dir=str(data_dir),
+    )
+    # No ticket_intake state file at this path → the idle quiet line.
+    raw: dict[str, Any] = {
+        "ticket_intake": {
+            "state": {"path": str(tmp_path / "no_intake_state.json")},
+        },
+    }
+    result = await fire_once(
+        config,
+        TransportConfig(peers={"salem": PeerEntry(base_url="http://x", token="t")}),
+        today=date(2026, 4, 23),
+        raw=raw,
+    )
+    assert result["ok"] is True
+    md = captured_pushes[0]["digest_markdown"]
+    idle_line = "Ticket pipeline: no tickets received yet; GitHub ops idle."
+    assert idle_line in md
+    # Section is appended AFTER the existing digest body.
+    assert md.index("**Posture:**") < md.index(idle_line)
+    # digest_length reported on the post-append markdown.
+    assert result["digest_length"] == len(md)
+
+
+@pytest.mark.asyncio
+async def test_fire_once_tickets_source_gets_tails_not_pipeline_section(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """source=tickets (VERA) gets per-line forward-status tails (raw
+    threaded to the assembler) and NO Ticket pipeline section."""
+    import frontmatter
+
+    captured_pushes: list[dict[str, Any]] = []
+
+    async def _fake_send(
+        peer_name: str, *, digest_markdown: str, digest_date: str,
+        self_name: str, config: TransportConfig | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        captured_pushes.append({"digest_markdown": digest_markdown})
+        return {"status": "accepted", "path": "x", "correlation_id": "c"}
+
+    import alfred.brief.kalle_brief_daemon as daemon_mod
+    monkeypatch.setattr(daemon_mod, "peer_send_brief_digest", _fake_send)
+
+    vault = tmp_path / "vera-vault"
+    (vault / "ticket").mkdir(parents=True)
+    post = frontmatter.Post(
+        "# T\n", type="ticket", title="Tail test", ticket_type="bug",
+        reporter="Ben", area="x", status="open", created="2026-06-10",
+    )
+    (vault / "ticket" / "t.md").write_text(
+        frontmatter.dumps(post) + "\n", encoding="utf-8",
+    )
+
+    config = BriefDigestPushConfig(
+        enabled=True, self_name="vera", target_peer="salem",
+        source="tickets", vault_path=str(vault),
+    )
+    raw: dict[str, Any] = {
+        "ticket_forward": {
+            "state": {"path": str(tmp_path / "no_forward_state.json")},
+        },
+    }
+    result = await fire_once(
+        config,
+        TransportConfig(peers={"salem": PeerEntry(base_url="http://x", token="t")}),
+        today=date(2026, 6, 11),
+        raw=raw,
+    )
+    assert result["ok"] is True
+    md = captured_pushes[0]["digest_markdown"]
+    assert "Ticket pipeline" not in md  # KAL-LE-family section only
+    # raw threading proof: the forwarder-state-aware tail rendered
+    # (absent state file → pending).
+    assert "· forward pending" in md
+
+
+# ---------------------------------------------------------------------------
 # fire_once — failure path
 # ---------------------------------------------------------------------------
 

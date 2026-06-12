@@ -503,7 +503,10 @@ def _run_brief_digest_push(raw: dict[str, Any], suppress_stdout: bool = False) -
         log.warning("kalle.brief_digest.daemon.missing_self_name")
         sys.exit(78)
     transport_config = load_transport(raw)
-    asyncio.run(run_daemon(config, transport_config))
+    # raw threaded through for the c5 ticket-pipeline section (KAL-LE)
+    # and the VERA forward-status tails — both read state paths +
+    # github config from the unified dict.
+    asyncio.run(run_daemon(config, transport_config, raw=raw))
 
 
 def _run_ticket_forward(raw: dict[str, Any], suppress_stdout: bool = False) -> None:

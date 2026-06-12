@@ -25,8 +25,9 @@ marker-search guard (``issue_search_marker``) recovers issue linkage
 after a state deletion so duplicates are never minted. The
 effectiveness-loop fields (``pr_number`` / ``pr_state`` /
 ``disposition`` / ``ticket_to_pr_latency_days`` /
-``outcome_checked_at``) are RESERVED for the c5 digest loop — c3
-writes them as defaults and never touches them.
+``outcome_checked_at``) are FILLED by the c5 digest loop
+(``kalle_digest.assemble_ticket_pipeline_section``) — c3 writes them
+as defaults and never touches them.
 """
 
 from __future__ import annotations
@@ -107,13 +108,22 @@ class TicketIntakeEntry:
         search). ``issue_number is None`` == issue still pending.
       * ``retry_count`` — incremented on every GitHub failure that
         acked ``recorded_issue_pending``.
+      * ``ticket_type`` — the wire frontmatter's ``ticket_type``
+        (schema-gated non-empty by the handler), captured at record
+        time as the c5 scoreboard's split key. Additive +
+        backward-safe via the schema-tolerance loader: entries
+        recorded before this field existed carry ``""`` and bucket
+        under "unspecified" in the digest scoreboard.
 
-    Reserved for c5 (effectiveness loop — the digest fills these):
+    Filled by c5 (the digest effectiveness loop,
+    ``kalle_digest.assemble_ticket_pipeline_section``):
       * ``pr_number`` / ``pr_state`` — the linked PR, once one exists.
       * ``disposition`` — ``""`` until set; vocabulary
         ``merged_clean | merged_after_rework | closed_unmerged |
-        stalled``.
-      * ``ticket_to_pr_latency_days`` — float days from intake to PR.
+        stalled`` (terminal = the merged_*/closed_unmerged three;
+        ``stalled`` keeps re-checking).
+      * ``ticket_to_pr_latency_days`` — float days from issue creation
+        to PR merge (merged dispositions only).
       * ``outcome_checked_at`` — last time c5 evaluated this entry.
     """
 
@@ -123,6 +133,7 @@ class TicketIntakeEntry:
     issue_url: str = ""
     issue_created_at: str = ""
     retry_count: int = 0
+    ticket_type: str = ""
     # --- c5 effectiveness-loop capture fields (reserved; c3 never writes) ---
     pr_number: int | None = None
     pr_state: str = ""

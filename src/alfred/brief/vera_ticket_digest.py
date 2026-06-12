@@ -22,6 +22,14 @@ ambiguous absence (per ``feedback_intentionally_left_blank.md``).
 Distinct from ``kalle_digest`` (git-activity/BIT posture). The pusher
 daemon selects between them via ``brief_digest_push.source`` — KAL-LE's
 ``git_activity`` default stays byte-identical; VERA sets ``tickets``.
+
+Forward-status tails (pipeline c5): each rendered open-ticket line ends
+with its VERA→KAL-LE→GitHub pipeline status — ``→ GH#<n>`` once linked,
+``· forward pending`` before the forwarder reaches it, or the loud
+``· forward FAILED ×<attempts> (retrying)`` when the forwarder state
+shows repeated attempts without a linked issue. Everything else about
+the snapshot (selection, ordering, header/footer, the "No open
+tickets" ILB line) is unchanged.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import frontmatter
 
@@ -60,6 +69,11 @@ class TicketDigestItem:
     status: str
     created: str
     filename: str
+    # Pipeline fields (c5 forward-status tails). ``ticket_uid`` is the
+    # forwarder-state join key; ``github_issue`` is the c4 link-back.
+    # Defaults keep pre-pipeline records valid.
+    ticket_uid: str = ""
+    github_issue: int | None = None
 
 
 def _scan_open_tickets(vault_path: Path) -> list[TicketDigestItem]:
@@ -105,6 +119,18 @@ def _scan_open_tickets(vault_path: Path) -> list[TicketDigestItem]:
         # ``title`` is the ticket name_field; fall back to the file stem
         # so a record missing the field still renders something usable.
         title = str(fm.get("title") or md_file.stem)
+        # Pipeline fields — defensively typed (frontmatter is operator/
+        # agent-written; a stray string github_issue must not crash the
+        # digest).
+        uid_raw = fm.get("ticket_uid")
+        ticket_uid = uid_raw if isinstance(uid_raw, str) else ""
+        gh_raw = fm.get("github_issue")
+        github_issue: int | None = None
+        if gh_raw is not None and not isinstance(gh_raw, bool):
+            try:
+                github_issue = int(gh_raw)
+            except (TypeError, ValueError):
+                github_issue = None
         out.append(
             TicketDigestItem(
                 title=title,
@@ -113,6 +139,8 @@ def _scan_open_tickets(vault_path: Path) -> list[TicketDigestItem]:
                 status=status,
                 created=created_iso,
                 filename=md_file.name,
+                ticket_uid=ticket_uid,
+                github_issue=github_issue,
             )
         )
 
@@ -121,18 +149,53 @@ def _scan_open_tickets(vault_path: Path) -> list[TicketDigestItem]:
     return out
 
 
+def _forward_status_tail(
+    item: TicketDigestItem,
+    forward_entries: dict[str, Any],
+) -> str:
+    """One ticket's pipeline forward-status tail (c5).
+
+    Precedence:
+      1. The record carries ``github_issue`` (the c4 link-back) →
+         ``→ GH#<n>``.
+      2. The forwarder state knows an issue for this uid but the
+         record doesn't (link-back write failed —
+         ``ticket_forward.link_back_write_failed``) → ``→ GH#<n>``
+         from state, so a one-off write failure never renders as a
+         permanent misleading "pending".
+      3. State shows attempts >= 2 without an issue → the loud
+         ``· forward FAILED ×<attempts> (retrying)``.
+      4. Everything else (no state file, no entry yet, first attempt
+         in flight) → ``· forward pending``.
+    """
+    if item.github_issue is not None:
+        return f" → GH#{item.github_issue}"
+    entry = forward_entries.get(item.ticket_uid) if item.ticket_uid else None
+    if entry is not None:
+        issue_number = getattr(entry, "issue_number", None)
+        if issue_number is not None:
+            return f" → GH#{issue_number}"
+        attempts = getattr(entry, "attempts", 0) or 0
+        if attempts >= 2:
+            return f" · forward FAILED ×{attempts} (retrying)"
+    return " · forward pending"
+
+
 def _render_ticket_digest_markdown(
-    items: list[TicketDigestItem], today: date,
+    items: list[TicketDigestItem],
+    today: date,
+    forward_entries: dict[str, Any] | None = None,
 ) -> str:
     """Render the open-ticket snapshot as plain-text markdown.
 
-    Format (plain text, no emoji per operator decision F):
+    Format (plain text, no emoji per operator decision F), each line
+    ending with its pipeline forward-status tail (c5):
 
         3 open tickets (as of 2026-06-09):
 
-        - bug · Login button broken on checkout · priority: high · open
-        - enhancement · Add CSV export to driver report · priority: medium · open
-        - bug · Map pin misaligned on mobile · priority: low · in_progress
+        - bug · Login button broken on checkout · priority: high · open → GH#7
+        - enhancement · Add CSV export to driver report · priority: medium · open · forward pending
+        - bug · Map pin misaligned on mobile · priority: low · in_progress · forward FAILED ×2 (retrying)
 
         Review in Obsidian: ticket/ in the VERA vault.
 
@@ -150,6 +213,7 @@ def _render_ticket_digest_markdown(
         lines.append(
             f"- {item.ticket_type} · {item.title} · "
             f"priority: {item.priority} · {item.status}"
+            f"{_forward_status_tail(item, forward_entries or {})}"
         )
     lines.append("")
     lines.append("Review in Obsidian: ticket/ in the VERA vault.")
@@ -160,6 +224,7 @@ def assemble_ticket_digest(
     *,
     today: date | None = None,
     vault_path: Path,
+    forward_state_path: str | Path | None = None,
 ) -> str:
     """Build today's open-ticket snapshot digest markdown.
 
@@ -172,6 +237,11 @@ def assemble_ticket_digest(
         today: Date to anchor the digest header. ``None`` resolves to
             ``date.today()`` — the daemon passes its tz-aware local date.
         vault_path: VERA's vault root (holds the ``ticket/`` directory).
+        forward_state_path: The c4 forwarder's state file (from the
+            ``ticket_forward`` config section) for the forward-status
+            tails. ``None`` or an absent file degrades to "forward
+            pending" tails — never a crash (the loader treats a missing
+            file as an empty state).
 
     Returns:
         The one-slide markdown body. Never empty — the empty-snapshot
@@ -179,9 +249,13 @@ def assemble_ticket_digest(
     """
     today = today or date.today()
     items = _scan_open_tickets(vault_path)
+    forward_entries: dict[str, Any] = {}
+    if forward_state_path:
+        from alfred.transport.ticket_forward import TicketForwardState
+        forward_entries = TicketForwardState.load(forward_state_path).entries
     log.info(
         "vera.ticket_digest.assembled",
         date=today.isoformat(),
         open_count=len(items),
     )
-    return _render_ticket_digest_markdown(items, today)
+    return _render_ticket_digest_markdown(items, today, forward_entries)

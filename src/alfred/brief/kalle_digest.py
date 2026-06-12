@@ -36,6 +36,14 @@ Sections
     - red: any BIT FAIL
     KAL-LE doesn't run BIT in v1 (per the rollout ledger), so the
     typical posture line is "green — no BIT data on this instance".
+
+**Ticket pipeline** (deterministic, pipeline c5):
+    The VERA→KAL-LE→GitHub ticket pipeline's morning surface +
+    effectiveness-loop capture. Assembled by
+    :func:`assemble_ticket_pipeline_section` (async — the github_ops
+    client is async) and appended to the digest by the pusher daemon's
+    ``fire_once``. Rendered EVERY digest — an idle pipeline renders an
+    explicit quiet line per ``feedback_intentionally_left_blank.md``.
 """
 
 from __future__ import annotations
@@ -455,3 +463,468 @@ def assemble_digest(
         bit_state=bit_state_path,
     )
     return render_digest_markdown(data)
+
+
+# ---------------------------------------------------------------------------
+# Ticket pipeline section (pipeline c5) — effectiveness-loop capture + render
+# ---------------------------------------------------------------------------
+#
+# The VERA→KAL-LE→GitHub ticket pipeline's morning surface (ratified
+# 2026-06-11 incl. the effectiveness-loop amendment — the PAT carries
+# Pull requests: Read precisely for this). Two halves:
+#
+#   1. CAPTURE — for every intake entry with a GitHub issue whose
+#      disposition isn't terminal, read the linked-PR state via
+#      github_ops (caller="digest", the read-only allowlist rows) and
+#      fill pr_number / pr_state / disposition /
+#      ticket_to_pr_latency_days / outcome_checked_at on the intake
+#      state. CAPTURE ONLY: the distiller-mining / meta-issue-proposal
+#      half is a LATER phase by design — nothing here proposes anything.
+#   2. RENDER — counts, per-ticket status lines, and the auto-fix
+#      scoreboard, all purely from the (just-updated) state.
+#
+# PR-DISCOVERY STRATEGY (one deterministic strategy, documented): scan
+# the issue timeline (GitHub returns it oldest-first) for the FIRST
+# ``cross-referenced`` event whose source is a pull request
+# (``source.issue.pull_request`` present) and take that PR's number.
+# ``issue_get``'s ``pull_request`` field was REJECTED as the primary
+# strategy: that field only exists when the issue itself IS a PR, never
+# when a PR merely references the issue — useless for "which PR fixes
+# this ticket". Once a PR number is captured in state, later checks
+# skip timeline discovery and go straight to pr_get (cheaper, and
+# stable against later unrelated cross-references).
+#
+# Concurrency note: the intake handler (talker process) and this
+# assembler (brief_digest_push process) share the state file via
+# load-modify-save; a push landing inside the seconds-long check pass
+# could be clobbered. Tolerated by design — intake state is deletable
+# bookkeeping (CLAUDE.md) and the intake's marker-search guard recovers
+# issue linkage on VERA's next re-push, so the worst case is a
+# redundant GitHub search, never a duplicate issue.
+
+# Terminal dispositions LATCH (watches.py terminal-latch idiom): once
+# set, the entry is never queried again and renders only on digests
+# within 24h of the flip (outcome_checked_at freezes at flip time).
+TICKET_TERMINAL_DISPOSITIONS = frozenset({
+    "merged_clean",
+    "merged_after_rework",
+    "closed_unmerged",
+})
+
+# "stalled" threshold: issue open with no merged/closed PR for at least
+# this many nights. NON-terminal — a stalled ticket keeps being
+# re-checked every digest and can still upgrade to merged_*.
+TICKET_STALLED_NIGHTS = 3
+
+
+def _parse_iso_ts(value: Any) -> datetime | None:
+    """Defensive ISO-8601 parse → aware-UTC datetime, or None.
+
+    Handles both this codebase's ``+00:00`` suffixes and GitHub's
+    ``Z`` suffixes (``datetime.fromisoformat`` only learned ``Z`` in
+    3.11 — normalise rather than assume the interpreter).
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _nights_since(ts: Any, now: datetime) -> int | None:
+    """Whole midnights-crossed since ``ts`` (UTC dates), or None."""
+    parsed = _parse_iso_ts(ts)
+    if parsed is None:
+        return None
+    return max(0, (now.astimezone(timezone.utc).date() - parsed.date()).days)
+
+
+def _first_cross_referenced_pr(timeline: Any) -> int | None:
+    """The PR-discovery strategy (see the section comment above)."""
+    if not isinstance(timeline, list):
+        return None
+    for event in timeline:
+        if not isinstance(event, dict):
+            continue
+        if event.get("event") != "cross-referenced":
+            continue
+        source = event.get("source")
+        if not isinstance(source, dict):
+            continue
+        issue = source.get("issue")
+        if not isinstance(issue, dict):
+            continue
+        if not issue.get("pull_request"):
+            continue  # cross-reference from a plain issue — not a PR
+        number = issue.get("number")
+        if isinstance(number, int) and not isinstance(number, bool):
+            return number
+    return None
+
+
+async def _check_one_ticket_outcome(
+    client: Any,
+    entry: Any,
+    *,
+    now: datetime,
+) -> bool:
+    """Evaluate one non-terminal issue-bearing entry against GitHub.
+
+    Mutates the entry in place (the caller saves state) and returns
+    True when the disposition CHANGED. Disposition rules (ratified):
+      * PR merged + zero CHANGES_REQUESTED reviews → ``merged_clean``
+      * PR merged + any CHANGES_REQUESTED review → ``merged_after_rework``
+      * PR closed without merge → ``closed_unmerged``
+      * no PR (or PR still open) AND the issue is
+        ``TICKET_STALLED_NIGHTS``+ nights old → ``stalled`` (non-terminal)
+      * else → leave as-is (``""`` stays ``""``)
+    """
+    pr_number = entry.pr_number
+    if pr_number is None:
+        timeline = await client.issue_timeline(
+            number=entry.issue_number, caller="digest",
+        )
+        pr_number = _first_cross_referenced_pr(timeline)
+
+    old_disposition = entry.disposition
+    new_disposition = old_disposition
+    pr_state = entry.pr_state
+    latency = entry.ticket_to_pr_latency_days
+
+    if pr_number is None:
+        nights = _nights_since(entry.issue_created_at, now)
+        if nights is not None and nights >= TICKET_STALLED_NIGHTS:
+            new_disposition = "stalled"
+    else:
+        pr = await client.pr_get(number=pr_number, caller="digest")
+        pr = pr if isinstance(pr, dict) else {}
+        merged_at = pr.get("merged_at")
+        if merged_at:
+            pr_state = "merged"
+            reviews = await client.pr_reviews(
+                number=pr_number, caller="digest",
+            )
+            reviews = reviews if isinstance(reviews, list) else []
+            rework = any(
+                isinstance(review, dict)
+                and review.get("state") == "CHANGES_REQUESTED"
+                for review in reviews
+            )
+            new_disposition = (
+                "merged_after_rework" if rework else "merged_clean"
+            )
+            created_dt = _parse_iso_ts(entry.issue_created_at)
+            merged_dt = _parse_iso_ts(merged_at)
+            if created_dt is not None and merged_dt is not None:
+                latency = round(
+                    (merged_dt - created_dt).total_seconds() / 86400.0, 2,
+                )
+        elif str(pr.get("state") or "") == "closed":
+            pr_state = "closed"
+            new_disposition = "closed_unmerged"
+        else:
+            pr_state = "open"
+            nights = _nights_since(entry.issue_created_at, now)
+            if nights is not None and nights >= TICKET_STALLED_NIGHTS:
+                new_disposition = "stalled"
+
+    entry.pr_number = pr_number
+    entry.pr_state = pr_state
+    entry.disposition = new_disposition
+    entry.ticket_to_pr_latency_days = latency
+    # Set on every COMPLETED evaluation (changed or not); a failed check
+    # leaves the old value so staleness stays visible.
+    entry.outcome_checked_at = now.isoformat()
+    return new_disposition != old_disposition
+
+
+async def check_ticket_outcomes(
+    state: Any,
+    client: Any,
+    *,
+    now: datetime,
+    audit_log_path: str,
+) -> int:
+    """The effectiveness-loop capture pass. Returns the changed count.
+
+    Per-ticket containment: one bad issue's API failure logs + skips
+    that entry, never the rest. Each entry whose disposition CHANGED
+    gets ONE summarising audit row (the client already audits every
+    underlying HTTP call; this row carries the derived effectiveness
+    fields via ``extra``).
+    """
+    from alfred.integrations.github_ops import append_github_audit
+
+    changed_count = 0
+    for uid in sorted(state.entries):
+        entry = state.entries[uid]
+        if entry.issue_number is None:
+            continue  # no issue yet — nothing to check against
+        if entry.disposition in TICKET_TERMINAL_DISPOSITIONS:
+            continue  # terminal latch — never queried again
+        try:
+            changed = await _check_one_ticket_outcome(
+                client, entry, now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 — per-ticket containment
+            log.warning(
+                "kalle.digest.ticket_pipeline_outcome_check_failed",
+                uid=uid,
+                issue_number=entry.issue_number,
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+            )
+            continue
+        log.info(
+            "kalle.digest.ticket_pipeline_outcome_checked",
+            uid=uid,
+            disposition=entry.disposition,
+            pr_number=entry.pr_number,
+            pr_state=entry.pr_state,
+            changed=changed,
+        )
+        if changed:
+            changed_count += 1
+            append_github_audit(
+                audit_log_path,
+                op="issue_get",
+                repo=str(getattr(client.config, "repo", "")),
+                caller="digest",
+                outcome="ok",
+                ticket_uid=uid,
+                issue_number=entry.issue_number,
+                extra={
+                    "pr_number": entry.pr_number,
+                    "pr_state": entry.pr_state,
+                    "disposition": entry.disposition,
+                    "ticket_to_pr_latency_days": (
+                        entry.ticket_to_pr_latency_days
+                    ),
+                },
+            )
+    return changed_count
+
+
+def render_ticket_pipeline_section(
+    state: Any,
+    *,
+    now: datetime,
+    outcome_note: str = "",
+) -> str:
+    """Render the Ticket pipeline section purely from intake state.
+
+    Counts are state-derived only: dedupe hits live solely in the
+    github_ops audit JSONL (``outcome="exists"`` rows) and parsing that
+    log here isn't worth it — deliberately skipped (c5 decision).
+    """
+    if not state.entries:
+        return "Ticket pipeline: no tickets received yet; GitHub ops idle."
+
+    cutoff = now - timedelta(hours=24)
+    received_24h = 0
+    created_24h = 0
+    pending_retry = 0
+    last_activity: datetime | None = None
+    for entry in state.entries.values():
+        recorded = _parse_iso_ts(entry.recorded_at)
+        created = _parse_iso_ts(entry.issue_created_at)
+        if recorded is not None and recorded >= cutoff:
+            received_24h += 1
+        if created is not None and created >= cutoff:
+            created_24h += 1
+        if entry.retry_count > 0 and entry.issue_number is None:
+            pending_retry += 1
+        for ts in (recorded, created):
+            if ts is not None and (last_activity is None or ts > last_activity):
+                last_activity = ts
+
+    lines = ["**Ticket pipeline:**"]
+    counts_line = (
+        f"- Last 24h: {received_24h} received, {created_24h} "
+        f"issue{'s' if created_24h != 1 else ''} created"
+    )
+    if received_24h == 0 and created_24h == 0 and last_activity is not None:
+        counts_line += f" (idle since {last_activity.date().isoformat()})"
+    lines.append(counts_line)
+    if pending_retry:
+        lines.append(
+            f"- {pending_retry} issue post(s) pending retry — "
+            "see github_ops_audit"
+        )
+    if outcome_note:
+        lines.append(f"- ({outcome_note})")
+
+    # Per-ticket status lines, deterministic issue-number order.
+    issue_entries = sorted(
+        (e for e in state.entries.values() if e.issue_number is not None),
+        key=lambda e: e.issue_number,
+    )
+    for entry in issue_entries:
+        if entry.disposition in TICKET_TERMINAL_DISPOSITIONS:
+            # Loud-once: terminal entries render only while
+            # outcome_checked_at (frozen at flip time) is <24h old.
+            checked = _parse_iso_ts(entry.outcome_checked_at)
+            if checked is None or checked < cutoff:
+                continue
+            if entry.disposition == "closed_unmerged":
+                lines.append(
+                    f"- GH#{entry.issue_number} → PR#{entry.pr_number} "
+                    "CLOSED unmerged"
+                )
+            else:
+                latency = (
+                    f" ({entry.ticket_to_pr_latency_days:.1f}d)"
+                    if entry.ticket_to_pr_latency_days is not None
+                    else ""
+                )
+                lines.append(
+                    f"- GH#{entry.issue_number} → PR#{entry.pr_number} "
+                    f"MERGED ✓{latency}"
+                )
+        elif entry.pr_number is not None:
+            lines.append(
+                f"- GH#{entry.issue_number} → PR#{entry.pr_number} OPEN — "
+                "review this morning"
+            )
+        else:
+            nights = _nights_since(entry.issue_created_at, now)
+            age = (
+                f"{nights} night{'s' if nights != 1 else ''}"
+                if nights is not None
+                else "age unknown"
+            )
+            stalled = " — stalled" if entry.disposition == "stalled" else ""
+            lines.append(
+                f"- GH#{entry.issue_number} → no PR yet "
+                f"(issue open {age}){stalled}"
+            )
+
+    # Scoreboard over ALL terminal entries, split by ticket_type (the
+    # c3-captured state field; pre-c5 entries carry "" → "unspecified").
+    terminal = [
+        e for e in state.entries.values()
+        if e.disposition in TICKET_TERMINAL_DISPOSITIONS
+    ]
+    if not terminal:
+        lines.append("- Auto-fix scoreboard: no outcomes yet.")
+    else:
+        by_type: dict[str, list[int]] = {}
+        for entry in terminal:
+            bucket = by_type.setdefault(
+                getattr(entry, "ticket_type", "") or "unspecified", [0, 0],
+            )
+            bucket[1] += 1
+            if entry.disposition in ("merged_clean", "merged_after_rework"):
+                bucket[0] += 1
+        parts = [
+            f"{ticket_type} {merged}/{total} merged"
+            for ticket_type, (merged, total) in sorted(by_type.items())
+        ]
+        lines.append("- Auto-fix scoreboard: " + " · ".join(parts))
+    return "\n".join(lines)
+
+
+def _instance_name_from_raw(raw: dict[str, Any]) -> str:
+    """Tolerant read of ``telegram.instance.name`` (the identity the
+    github_ops instance gate compares against)."""
+    telegram = raw.get("telegram")
+    telegram = telegram if isinstance(telegram, dict) else {}
+    instance = telegram.get("instance")
+    instance = instance if isinstance(instance, dict) else {}
+    return str(instance.get("name") or "")
+
+
+async def assemble_ticket_pipeline_section(
+    raw: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Build the Ticket pipeline digest section (check + render).
+
+    §-boundary containment (the weather/watches idiom): ANY failure in
+    here renders an explicit "section unavailable" line and never kills
+    the digest. The no-credential path (``github:`` absent, or the
+    instance gate rejecting — e.g. a non-KAL-LE instance running this
+    assembler) still renders the state-derived counts/lines, plus one
+    quiet note that the PR outcome check was skipped.
+    """
+    try:
+        from alfred.integrations.github_ops import (
+            GitHubOpsNotConfigured,
+            GitHubOpsWrongInstance,
+            build_github_client,
+        )
+        from alfred.transport.ticket_intake import (
+            TicketIntakeState,
+            load_ticket_intake_config,
+        )
+
+        now = now or datetime.now(timezone.utc)
+        raw = raw if isinstance(raw, dict) else {}
+        intake_config = load_ticket_intake_config(raw)
+        state = TicketIntakeState.load(intake_config.state_path)
+        if not state.entries:
+            # ILB: the quiet line + a grep-able log — idle, not broken.
+            log.info(
+                "kalle.digest.ticket_pipeline_idle",
+                state_path=intake_config.state_path,
+            )
+            return render_ticket_pipeline_section(state, now=now)
+
+        outcome_note = ""
+        client = None
+        if not isinstance(raw.get("github"), dict):
+            # No github: section at all (every non-KAL-LE instance) —
+            # skip the client build entirely rather than spraying
+            # outcome="denied" audit rows into the default audit path
+            # on every digest.
+            log.info(
+                "kalle.digest.ticket_pipeline_outcome_check_unavailable",
+                reason="github_section_absent",
+            )
+            outcome_note = "outcome check unavailable: github not configured"
+        else:
+            try:
+                client = build_github_client(
+                    raw, _instance_name_from_raw(raw),
+                )
+            except (GitHubOpsNotConfigured, GitHubOpsWrongInstance) as exc:
+                log.info(
+                    "kalle.digest.ticket_pipeline_outcome_check_unavailable",
+                    reason=exc.__class__.__name__,
+                )
+                outcome_note = (
+                    "outcome check unavailable: github not configured"
+                )
+
+        if client is not None:
+            await check_ticket_outcomes(
+                state,
+                client,
+                now=now,
+                audit_log_path=client.config.audit_log_path,
+            )
+            # Atomic save — outcome_checked_at moved even when no
+            # disposition flipped.
+            state.save()
+
+        return render_ticket_pipeline_section(
+            state, now=now, outcome_note=outcome_note,
+        )
+    except Exception as exc:  # noqa: BLE001 — §-boundary: never kill the digest
+        log.warning(
+            "kalle.digest.ticket_pipeline_section_failed",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        return (
+            f"Ticket pipeline: section unavailable "
+            f"({exc.__class__.__name__})"
+        )

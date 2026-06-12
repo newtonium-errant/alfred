@@ -36,7 +36,7 @@ from alfred.transport.client import peer_send_brief_digest
 from alfred.transport.config import TransportConfig
 from alfred.transport.exceptions import TransportError
 
-from .kalle_digest import assemble_digest
+from .kalle_digest import assemble_digest, assemble_ticket_pipeline_section
 from .utils import get_logger
 from .vera_ticket_digest import assemble_ticket_digest
 
@@ -151,26 +151,41 @@ def load_brief_digest_push_config(raw: dict[str, Any]) -> BriefDigestPushConfig:
 # ---------------------------------------------------------------------------
 
 
-def _assemble_for_source(config: BriefDigestPushConfig, today: date) -> str:
+def _assemble_for_source(
+    config: BriefDigestPushConfig,
+    today: date,
+    raw: dict[str, Any] | None = None,
+) -> str:
     """Dispatch to the right digest assembler per ``config.source``.
 
     * ``"tickets"`` → VERA open-ticket snapshot
       (``vera_ticket_digest.assemble_ticket_digest``), scanning
-      ``config.vault_path / ticket/``.
+      ``config.vault_path / ticket/``. When the unified config dict is
+      available (the daemon path), the forwarder state path from its
+      ``ticket_forward`` section is threaded through so each line can
+      carry its pipeline forward-status tail (c5).
     * anything else (default ``"git_activity"``) → KAL-LE's
       git-commit + BIT posture digest (``kalle_digest.assemble_digest``).
       Byte-identical to the pre-VERA-P2 code path — an unknown source
       value falls through here too (logged) rather than raising, so a
       config typo degrades to the KAL-LE digest instead of crashing the
-      daemon loop.
+      daemon loop. (The c5 ticket-pipeline section is appended by
+      ``fire_once``, not here — this function stays sync + mockable.)
 
     Kept as a pure function (no I/O beyond the assemblers' own reads, no
     push) so tests can exercise the branch selection directly.
     """
     if config.source == "tickets":
+        forward_state_path: str | None = None
+        if isinstance(raw, dict):
+            from alfred.transport.ticket_forward import (
+                load_ticket_forward_config,
+            )
+            forward_state_path = load_ticket_forward_config(raw).state_path
         return assemble_ticket_digest(
             today=today,
             vault_path=Path(config.vault_path),
+            forward_state_path=forward_state_path,
         )
 
     if config.source != "git_activity":
@@ -208,6 +223,7 @@ async def fire_once(
     transport_config: TransportConfig,
     *,
     today: date | None = None,
+    raw: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build today's digest and push it to the target peer.
 
@@ -215,13 +231,30 @@ async def fire_once(
     and ``response`` (the server's reply when push succeeded). On
     failure: ``ok: False`` + ``error`` + ``error_type``.
 
+    ``raw`` is the unified config dict (threaded from the orchestrator
+    runner) — the c5 ticket-pipeline section and the VERA forward-status
+    tails read their state paths + github config from it. ``None`` (old
+    callers/tests) degrades gracefully: the pipeline section still
+    renders from defaults per ILB, just without GitHub credentials.
+
     Failure is non-fatal at the daemon level — the loop logs and
     continues so the next day's fire still runs.
     """
     today = today or _local_today(config.schedule.timezone)
     today_iso = today.isoformat()
 
-    digest_md = _assemble_for_source(config, today)
+    digest_md = _assemble_for_source(config, today, raw)
+
+    if config.source != "tickets":
+        # Ticket-pipeline section (pipeline c5) — KAL-LE-digest-family
+        # only (the "tickets" source is VERA's snapshot, which carries
+        # per-line forward-status tails instead). Awaited HERE because
+        # the github_ops client is async and fire_once is the assembler
+        # call's nearest async context. Internally §-contained: a
+        # section failure degrades to its "section unavailable" line,
+        # never a missing digest. Rendered EVERY digest (ILB).
+        section = await assemble_ticket_pipeline_section(raw)
+        digest_md = f"{digest_md}\n\n{section}"
 
     log.info(
         "kalle.brief_digest.assembled",
@@ -301,6 +334,7 @@ def _local_today(tz_name: str) -> date:
 async def run_daemon(
     config: BriefDigestPushConfig,
     transport_config: TransportConfig,
+    raw: dict[str, Any] | None = None,
 ) -> None:
     """Daily loop: sleep until ``schedule.time`` ADT, fire, repeat."""
     log.info(
@@ -333,7 +367,7 @@ async def run_daemon(
             )
 
         try:
-            await fire_once(config, transport_config)
+            await fire_once(config, transport_config, raw=raw)
         except Exception:  # noqa: BLE001 — daemon-level safety net
             log.exception("kalle.brief_digest.daemon.fire_error")
 

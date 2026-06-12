@@ -929,7 +929,10 @@ scaffold:
 # github:
 #   repo: "newtonium-errant/transport-admin-portal"
 #   pat: "${ALGERNON_KALLE_GITHUB_PAT}"
-#   instance: "kal-le"
+#   # CASE-SENSITIVE: must equal telegram.instance.name EXACTLY
+#   # ("KAL-LE", not "kal-le") — build_github_client's instance gate
+#   # does a strict string compare and fail-louds on mismatch.
+#   instance: "KAL-LE"
 #   labels: ["auto-fix"]
 #   label_map:
 #     bug: "bug"

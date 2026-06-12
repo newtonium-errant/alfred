@@ -3128,10 +3128,12 @@ async def _handle_ticket_intake(
             )
         # State-write recorded_at/kalle_relpath IMMEDIATELY so a crash
         # between record and post lands in the pending-retry path (d),
-        # not the duplicate-record path.
+        # not the duplicate-record path. ticket_type rides along as the
+        # c5 scoreboard's split key (schema-gated non-empty above).
         entry = TicketIntakeEntry(
             recorded_at=now_iso,
             kalle_relpath=kalle_relpath,
+            ticket_type=fm_ticket_type,
         )
         state.entries[ticket_uid] = entry
         state.save()
