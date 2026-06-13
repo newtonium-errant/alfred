@@ -923,9 +923,18 @@ scaffold:
 # ALFRED_*-prefixed (it's an Algernon-platform credential, not a
 # legacy-namespace one).
 #
-# label_map: optional ticket_type / priority value → GitHub label.
-# Unmapped values get no extra label; ``labels`` below are applied to
-# every created issue.
+# label_map: optional ticket_type / priority value → GitHub label(s).
+# A value may be a single label ("bug") OR a list (["bug", "auto-fix"]);
+# bare strings normalize to 1-element lists, so the single-string form
+# still works. The resolved per-issue set is ``labels`` below + every
+# matched label_map value, flattened, de-duplicated, order-stable.
+# Unmapped values get no extra label (each logs label_unmapped once).
+#
+# Gating the auto-fix label to BUG tickets (the recommended pattern):
+# put ``auto-fix`` only on the bug mapping, leave base ``labels`` empty.
+# A bug then files an issue WITH ``auto-fix`` (the claude-auto-fix.yml
+# workflow fires at creation); an enhancement files a tracked issue
+# WITHOUT it (the operator promotes it later by adding the label).
 # github:
 #   repo: "newtonium-errant/transport-admin-portal"
 #   pat: "${ALGERNON_KALLE_GITHUB_PAT}"
@@ -933,11 +942,11 @@ scaffold:
 #   # ("KAL-LE", not "kal-le") — build_github_client's instance gate
 #   # does a strict string compare and fail-louds on mismatch.
 #   instance: "KAL-LE"
-#   labels: ["auto-fix"]
+#   labels: []
 #   label_map:
-#     bug: "bug"
-#     enhancement: "enhancement"
-#     p1: "priority-high"
+#     bug: ["bug", "auto-fix"]
+#     enhancement: ["enhancement"]
+#     p1: "priority-high"   # single-string form still accepted
 #   audit_log_path: "./data/github_ops_audit.jsonl"
 
 # Ticket intake — KAL-LE-ONLY receiver half of the VERA→KAL-LE→GitHub

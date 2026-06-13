@@ -31,6 +31,7 @@ from alfred.transport.config import (
     TransportConfig,
 )
 from alfred.transport.peer_handlers import (
+    _assemble_labels,
     register_instance_identity,
     register_ticket_intake,
     register_vault_path,
@@ -80,7 +81,7 @@ class FakeGitHubClient:
         search_result: dict[str, Any] | None = None,
         search_exc: BaseException | None = None,
         create_exc: BaseException | None = None,
-        label_map: dict[str, str] | None = None,
+        label_map: dict[str, str | list[str]] | None = None,
     ) -> None:
         self.config = GitHubOpsConfig(
             repo="acme/site",
@@ -400,6 +401,137 @@ async def test_ticket_label_unmapped_logged_and_proceeds(
     assert len(unmapped) == 1
     assert unmapped[0]["value"] == "high"
     assert unmapped[0]["field"] == "priority"
+
+
+# ---------------------------------------------------------------------------
+# Label assembly — auto-fix gated to BUG tickets only (2026-06-13)
+#
+# The contract (operator-ratified routing option "issue-without-auto-fix"):
+#   bug         -> labels INCLUDE `auto-fix`  (workflow fires at creation)
+#   enhancement -> labels EXCLUDE `auto-fix`  (tracked issue, not auto-fixed)
+#
+# The label-resolution chokepoint is `_assemble_labels` (peer_handlers);
+# these are direct, unconditional regression pins on it — no GitHub, no
+# importorskip. The KAL-LE production shape is base `labels: []` +
+# `label_map: {bug: [bug, auto-fix], enhancement: [enhancement]}`.
+# ---------------------------------------------------------------------------
+
+
+class _LabelConfig:
+    """Minimal stand-in for GitHubOpsConfig — `_assemble_labels` reads
+    only `.labels` and `.label_map` via getattr."""
+
+    def __init__(self, labels, label_map):  # type: ignore[no-untyped-def]
+        self.labels = labels
+        self.label_map = label_map
+
+
+# The KAL-LE production label config (config.kalle.yaml github.label_map).
+_KALLE_BASE_LABELS: list[str] = []
+_KALLE_LABEL_MAP = {
+    "bug": ["bug", "auto-fix"],
+    "enhancement": ["enhancement"],
+}
+
+
+def test_assemble_labels_bug_includes_auto_fix() -> None:
+    cfg = _LabelConfig(list(_KALLE_BASE_LABELS), dict(_KALLE_LABEL_MAP))
+    labels = _assemble_labels(cfg, {"ticket_type": "bug"}, correlation_id="c")
+    assert "auto-fix" in labels
+    assert labels == ["bug", "auto-fix"]
+
+
+def test_assemble_labels_enhancement_excludes_auto_fix() -> None:
+    cfg = _LabelConfig(list(_KALLE_BASE_LABELS), dict(_KALLE_LABEL_MAP))
+    labels = _assemble_labels(
+        cfg, {"ticket_type": "enhancement"}, correlation_id="c",
+    )
+    assert "auto-fix" not in labels
+    assert "enhancement" in labels
+    assert labels == ["enhancement"]
+
+
+def test_assemble_labels_backcompat_bare_string_values() -> None:
+    """A pre-list config (bare-string map values) still resolves —
+    `_assemble_labels` coerces str -> [str] defensively even when the
+    config bypassed `load_github_config`'s normalization."""
+    cfg = _LabelConfig(
+        ["auto-fix"], {"bug": "bug", "high": "priority-high"},
+    )
+    labels = _assemble_labels(
+        cfg, {"ticket_type": "bug", "priority": "high"}, correlation_id="c",
+    )
+    # Matches the historical default-config contract exactly.
+    assert labels == ["auto-fix", "bug", "priority-high"]
+
+
+def test_assemble_labels_dedups_label_in_base_and_map() -> None:
+    """A label present in BOTH base and a map value appears once,
+    order-stable (base order wins)."""
+    cfg = _LabelConfig(
+        ["auto-fix"], {"bug": ["bug", "auto-fix"]},
+    )
+    labels = _assemble_labels(cfg, {"ticket_type": "bug"}, correlation_id="c")
+    assert labels == ["auto-fix", "bug"]
+    assert labels.count("auto-fix") == 1
+
+
+def test_assemble_labels_dedups_across_ticket_type_and_priority() -> None:
+    """The same label reached via two fields is emitted once."""
+    cfg = _LabelConfig(
+        [], {"bug": ["bug", "tracked"], "high": ["tracked", "p1"]},
+    )
+    labels = _assemble_labels(
+        cfg, {"ticket_type": "bug", "priority": "high"}, correlation_id="c",
+    )
+    assert labels == ["bug", "tracked", "p1"]
+    assert labels.count("tracked") == 1
+
+
+async def test_ticket_enhancement_excludes_auto_fix_end_to_end(
+    aiohttp_client, tmp_path,
+):  # type: ignore[no-untyped-def]
+    """End-to-end through the real intake handler: an enhancement ticket
+    files an issue WITHOUT the auto-fix label (the bug this fixes)."""
+    fake = FakeGitHubClient(
+        tmp_path / "audit.jsonl",
+        label_map={"bug": ["bug", "auto-fix"], "enhancement": ["enhancement"]},
+    )
+    # Match the production base-labels shape (empty — auto-fix lives in map).
+    fake.config.labels = []
+    client, _, _ = await _build_kalle_app(
+        aiohttp_client, tmp_path, fake_client=fake,
+    )
+    payload = _ticket_payload()
+    payload["frontmatter"]["ticket_type"] = "enhancement"
+    payload["frontmatter"].pop("priority", None)  # avoid unmapped noise
+    resp = await _push(client, payload)
+    assert resp.status == 200
+    assert (await resp.json())["status"] == "created"
+    labels = fake.create_calls[0]["labels"]
+    assert "auto-fix" not in labels
+    assert labels == ["enhancement"]
+
+
+async def test_ticket_bug_includes_auto_fix_end_to_end(
+    aiohttp_client, tmp_path,
+):  # type: ignore[no-untyped-def]
+    """End-to-end: a bug ticket files an issue WITH the auto-fix label."""
+    fake = FakeGitHubClient(
+        tmp_path / "audit.jsonl",
+        label_map={"bug": ["bug", "auto-fix"], "enhancement": ["enhancement"]},
+    )
+    fake.config.labels = []
+    client, _, _ = await _build_kalle_app(
+        aiohttp_client, tmp_path, fake_client=fake,
+    )
+    payload = _ticket_payload()  # ticket_type defaults to "bug"
+    payload["frontmatter"].pop("priority", None)
+    resp = await _push(client, payload)
+    assert resp.status == 200
+    labels = fake.create_calls[0]["labels"]
+    assert "auto-fix" in labels
+    assert labels == ["bug", "auto-fix"]
 
 
 # ---------------------------------------------------------------------------

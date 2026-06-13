@@ -290,9 +290,15 @@ class GitHubOpsConfig:
     pat: str = field(default="", repr=False)
     instance: str = ""
     labels: list[str] = field(default_factory=lambda: ["auto-fix"])
-    # ticket_type / priority value -> GitHub label name. c3 consults
-    # this at issue-create time; unmapped values get no extra label.
-    label_map: dict[str, str] = field(default_factory=dict)
+    # ticket_type / priority value -> GitHub label(s). c3 consults this
+    # at issue-create time; unmapped values get no extra label. Each
+    # value may be a single label (``"bug"``) OR a list of labels
+    # (``["bug", "auto-fix"]``) — the loader normalizes bare strings to
+    # 1-element lists so old single-string configs still parse. The
+    # list form is what gates the auto-fix label to BUG tickets only
+    # (2026-06-13): ``bug: ["bug", "auto-fix"]`` fires the auto-fix
+    # workflow at creation, ``enhancement: ["enhancement"]`` does not.
+    label_map: dict[str, list[str]] = field(default_factory=dict)
     audit_log_path: str = DEFAULT_AUDIT_LOG_PATH
 
 
@@ -322,10 +328,26 @@ def load_github_config(raw: dict[str, Any]) -> GitHubOpsConfig | None:
     else:
         labels = ["auto-fix"]
 
+    # label_map values accept str | list[str] — normalize each to a
+    # list[str] so callers get one uniform shape. A bare string becomes
+    # a 1-element list (back-compat: old ``{bug: "bug"}`` configs still
+    # work); a list is element-stringified, dropping empty/blank items.
     label_map_raw = section.get("label_map") or {}
-    label_map: dict[str, str] = {}
+    label_map: dict[str, list[str]] = {}
     if isinstance(label_map_raw, dict):
-        label_map = {str(k): str(v) for k, v in label_map_raw.items()}
+        for k, v in label_map_raw.items():
+            if isinstance(v, (list, tuple)):
+                values = [
+                    str(item).strip()
+                    for item in v
+                    if str(item).strip()
+                ]
+            elif v is None:
+                values = []
+            else:
+                text = str(v).strip()
+                values = [text] if text else []
+            label_map[str(k)] = values
 
     return GitHubOpsConfig(
         repo=str(section.get("repo", "") or ""),

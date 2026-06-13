@@ -2853,12 +2853,36 @@ def _assemble_labels(
 ) -> list[str]:
     """Base labels + label_map lookups on ticket_type / priority.
 
+    The resolved set is base ``labels`` followed by each matched
+    ``label_map`` value, flattened (a map value may be a single label
+    OR a list of labels), de-duplicated, order-stable. A map value of
+    ``["bug", "auto-fix"]`` for ``ticket_type: bug`` is how the
+    auto-fix label is gated to BUG tickets only (2026-06-13) —
+    enhancements map to ``["enhancement"]`` (no auto-fix) and so file a
+    tracked issue the auto-fix workflow does not pick up.
+
+    Tolerant on the map value shape: each value is coerced to a list of
+    label strings here, so a config that predates the list form
+    (``{bug: "bug"}``, a bare string) still resolves correctly even if
+    it bypassed :func:`load_github_config`'s normalization.
+
     Unmapped values are NOT silently skipped — each gets one
     ``transport.ticket.label_unmapped`` log (once per value per call)
     and the create proceeds without the extra label.
     """
-    labels: list[str] = list(getattr(github_config, "labels", []) or [])
-    label_map: dict[str, str] = dict(
+    labels: list[str] = []
+    seen: set[str] = set()
+
+    def _add(label: str) -> None:
+        text = str(label).strip()
+        if text and text not in seen:
+            seen.add(text)
+            labels.append(text)
+
+    for base in getattr(github_config, "labels", []) or []:
+        _add(base)
+
+    label_map: dict[str, Any] = dict(
         getattr(github_config, "label_map", {}) or {},
     )
     seen_values: set[str] = set()
@@ -2869,9 +2893,17 @@ def _assemble_labels(
             continue
         seen_values.add(text)
         mapped = label_map.get(text)
-        if mapped:
-            if mapped not in labels:
-                labels.append(mapped)
+        # Coerce str | list[str] -> list[str] (tolerant of pre-list
+        # configs that bypassed the loader's normalization).
+        if isinstance(mapped, (list, tuple)):
+            mapped_labels = [str(item) for item in mapped if str(item).strip()]
+        elif mapped is None or str(mapped).strip() == "":
+            mapped_labels = []
+        else:
+            mapped_labels = [str(mapped).strip()]
+        if mapped_labels:
+            for label in mapped_labels:
+                _add(label)
         else:
             log.info(
                 "transport.ticket.label_unmapped",

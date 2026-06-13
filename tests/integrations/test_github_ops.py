@@ -225,7 +225,49 @@ class TestLoadGithubConfig:
         assert cfg.pat == DUMMY_PAT
         assert cfg.instance == "kal-le"
         assert cfg.labels == ["auto-fix", "from-vera"]
-        assert cfg.label_map == {"bug": "bug", "p1": "priority-high"}
+        # Bare-string map values normalize to 1-element lists (back-compat:
+        # the value type is now str | list[str], stored uniformly as list).
+        assert cfg.label_map == {"bug": ["bug"], "p1": ["priority-high"]}
+
+    def test_loads_list_label_map_values(self, tmp_path: Path) -> None:
+        """List-valued label_map (the auto-fix-gating shape, 2026-06-13):
+        a single ticket_type can map to MULTIPLE labels."""
+        raw = _raw(
+            tmp_path,
+            labels=[],
+            label_map={"bug": ["bug", "auto-fix"], "enhancement": ["enhancement"]},
+        )
+        cfg = load_github_config(raw)
+        assert cfg is not None
+        assert cfg.labels == []
+        assert cfg.label_map == {
+            "bug": ["bug", "auto-fix"],
+            "enhancement": ["enhancement"],
+        }
+
+    def test_label_map_mixed_and_blank_values_tolerated(
+        self, tmp_path: Path,
+    ) -> None:
+        """Mixed str / list values coexist; blank/None entries become []."""
+        raw = _raw(
+            tmp_path,
+            label_map={
+                "bug": ["bug", "auto-fix"],
+                "p1": "priority-high",   # bare string -> 1-element list
+                "blank": "",             # empty string -> []
+                "none": None,            # None -> []
+                "spacey": ["  keep  ", "  ", ""],  # blanks dropped, trimmed
+            },
+        )
+        cfg = load_github_config(raw)
+        assert cfg is not None
+        assert cfg.label_map == {
+            "bug": ["bug", "auto-fix"],
+            "p1": ["priority-high"],
+            "blank": [],
+            "none": [],
+            "spacey": ["keep"],
+        }
 
     def test_defaults(self) -> None:
         cfg = load_github_config({"github": {"repo": TEST_REPO}})
