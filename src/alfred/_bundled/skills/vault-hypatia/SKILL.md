@@ -2944,14 +2944,14 @@ Formulate the query yourself — the broker does NOT infer intent. Two things it
 - **Ask for the field that actually exists.** Event records carry `name` (e.g. `"Chiropractic"`, `"Call with Ben"`), NOT `title`. Put `name` in `fields`. Asking for `title` returns nothing useful.
 - **Add your own recency bound.** For "when did I last meet/see X" you must add a `date lte <today>` clause AND sort `date` descending yourself — the broker won't add the upper bound for you. Without it you'll match future events too.
 
-The `participants` dimension is a wikilink list (`[[person/Andrew Newton]]`); use `contains` with the person's full name.
+The `participants` dimension is a wikilink list (`[[person/Ben]]`); use `contains` with the person's name **exactly as Andrew named them** — see the name-fidelity rule below. Salem's matching is exact on the stored participant name after wikilink-unwrap, so a guessed surname Andrew didn't supply silently matches nothing.
 
 Worked example — "Pat, when did I last meet Ben?":
 
 > You call:
-> `peer_search_canonical(record_type="event", filter=[{"dim": "participants", "op": "contains", "value": "Ben Carver"}, {"dim": "date", "op": "lte", "value": "2026-06-10"}], sort={"by": "date", "dir": "desc"}, limit=3, fields=["name", "date"])`
+> `peer_search_canonical(record_type="event", filter=[{"dim": "participants", "op": "contains", "value": "Ben"}, {"dim": "date", "op": "lte", "value": "2026-06-10"}], sort={"by": "date", "dir": "desc"}, limit=3, fields=["name", "date"])`
 >
-> Walk it through: `record_type="event"` (events live in Salem's canonical set). The `participants contains "Ben Carver"` clause matches Ben's wikilink inside each event's participant list. The `date lte "2026-06-10"` clause (today) excludes anything scheduled in the future — without it a future event with Ben would sort to the top and answer the wrong question. `sort {by: date, dir: desc}` puts the most recent qualifying event first; `limit 3` keeps it tight. `fields=["name", "date"]` returns the event's `name` (the human label) and its `date` — note `name`, not `title`.
+> Walk it through: `record_type="event"` (events live in Salem's canonical set). The `participants contains "Ben"` clause matches the participant entry inside each event's list — Salem unwraps the stored `[[person/Ben]]` wikilink to `Ben` and tests it for exact equality against the value you sent. Andrew said "Ben", so you send "Ben"; if you had guessed "Ben Carver" the exact-match would fail and you'd get zero results that look identical to "never happened." The `date lte "2026-06-10"` clause (today) excludes anything scheduled in the future — without it a future event with Ben would sort to the top and answer the wrong question. `sort {by: date, dir: desc}` puts the most recent qualifying event first; `limit 3` keeps it tight. `fields=["name", "date"]` returns the event's `name` (the human label) and its `date` — note `name`, not `title`.
 >
 > Tool returns `{"status": "found", "count": 2, "records": [{"name": "Coffee with Ben — RRTS intro", "date": "2026-05-22"}, ...], "granted": [...], "denied_dims": []}`.
 >
@@ -2969,13 +2969,13 @@ The LLM-mediated lane. You send Salem a plain-language question; her broker tran
 
 The contrast pair:
 
-- *"When did I last meet Ben?"* → **structured.** Maps cleanly to `participants contains "Ben Carver"` + `date lte <today>` + sort `date` desc — exactly the `peer_search_canonical` worked example above.
-- *"When did I last meet Ben, and what was that meeting about?"* → **fuzzy.** The second half has no filter shape — "what it was about" needs Salem to read context her policy lets her consult for composing (but never release as raw fields) and put it into prose. That's `peer_ask_canonical(question="When did Andrew last meet Ben Carver, and what was that meeting about?", record_type_hint="event")`.
+- *"When did I last meet Ben?"* → **structured.** Maps cleanly to `participants contains "Ben"` + `date lte <today>` + sort `date` desc — exactly the `peer_search_canonical` worked example above.
+- *"When did I last meet Ben, and what was that meeting about?"* → **fuzzy.** The second half has no filter shape — "what it was about" needs Salem to read context her policy lets her consult for composing (but never release as raw fields) and put it into prose. That's `peer_ask_canonical(question="When did Andrew last meet Ben, and what was that meeting about?", record_type_hint="event")`.
 
 Formulation discipline:
 
-- **Third person, real names.** Write the question as Salem's broker will read it — it has no referent for "I"/"me"/"you". *"When did Andrew last meet Ben Carver?"*, not *"When did I last meet Ben?"*.
-- **Full canonical names in the question.** Underneath, Salem's participant matching is exact on the full name — a question that only says "Ben" matches nothing; "Ben Carver" matches. Expand short forms to the canonical full name even when Andrew used the nickname.
+- **Third person, real names.** Write the question as Salem's broker will read it — it has no referent for "I"/"me"/"you". *"When did Andrew last meet Ben?"*, not *"When did I last meet Ben?"* — rewrite the pronoun, but keep the person's name exactly as Andrew gave it (see the next bullet).
+- **Name people exactly as Andrew named them — never invent a surname or fuller form.** Salem's participant matching is exact on the stored name after wikilink-unwrap, but the stored name is whatever Salem holds — you do not know it is a full "First Last" form, and guessing one Andrew didn't supply is how you get a confidently-wrong answer. If Andrew says "Ben," the relayed question says "Ben" — a wrong guess ("Ben Carver") matches nothing, and a zero-result is indistinguishable from "never happened," so a fabricated surname turns a real meeting into a false "never." The ONLY time you may use a fuller form is when you have independently grounded the canonical name from your OWN vault or a prior `query_canonical` hit — that is grounding, not guessing. When in doubt, relay the bare name Andrew used and let Salem's exact-match do its job.
 - `record_type_hint` is advisory — Salem's broker decides; the hint just helps it aim. Pass it when you know the type.
 - It rides the async mailbox at Priority precedence and is slower than the structured tools (two LLM turns on Salem's side) — the call itself waits inline for the answer, tens of seconds, up to ~90s. Don't reach for it when structured would do. If it comes back `{status: "timeout"}`, drop a `[verify: awaiting Salem — <question>]` placeholder, keep working, and re-ask later — it's read-only, so asking again is safe and gets the answer.
 
