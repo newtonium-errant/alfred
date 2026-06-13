@@ -170,6 +170,105 @@ def test_contains_no_match_absent_person():
     assert _clause_matches(clause, fm) is False
 
 
+# ---------------------------------------------------------------------------
+# _clause_matches — LIST `contains` whole-token-subset (2026-06-13 fix)
+# ---------------------------------------------------------------------------
+#
+# Root cause (session ae87ec92): the LIST `contains` branch did EXACT
+# post-unwrap equality, so Salem's NL broker deriving `participants contains
+# "Andrew"` (vault owner stored as [[person/Andrew Newton]] → "Andrew Newton")
+# matched nothing → every NL query naming Andrew by single name zeroed out.
+# Fix: whole-token-subset — the query value's words must all be WHOLE WORDS
+# in the entry's display name (order-independent), still fail-closed on
+# fragments / empty / absent-token (anti-fishing & anti-fabrication guard).
+
+
+def test_contains_single_first_name_token_matches():
+    """'Andrew' matches [[person/Andrew Newton]] (the bug this fix closes)."""
+    fm = {"participants": ["[[person/Andrew Newton]]"]}
+    clause = FilterClause(dim="participants", op="contains", value="Andrew")
+    assert _clause_matches(clause, fm) is True
+
+
+def test_contains_single_surname_token_matches():
+    """'Newton' matches [[person/Andrew Newton]] — surname token."""
+    fm = {"participants": ["[[person/Andrew Newton]]"]}
+    clause = FilterClause(dim="participants", op="contains", value="Newton")
+    assert _clause_matches(clause, fm) is True
+
+
+def test_contains_other_full_name_first_token_matches():
+    """'Stephanie' matches [[person/Stephanie Pearce]]."""
+    fm = {"participants": ["[[person/Stephanie Pearce]]"]}
+    clause = FilterClause(dim="participants", op="contains", value="Stephanie")
+    assert _clause_matches(clause, fm) is True
+
+
+def test_contains_ambiguous_token_matches_both_forms():
+    """'Ben' matches both the bare [[person/Ben]] and [[person/Ben McMillan]]."""
+    clause = FilterClause(dim="participants", op="contains", value="Ben")
+    assert _clause_matches(clause, {"participants": ["[[person/Ben]]"]}) is True
+    assert _clause_matches(
+        clause, {"participants": ["[[person/Ben McMillan]]"]},
+    ) is True
+
+
+def test_contains_full_name_still_matches_exact():
+    """'Andrew Newton' still matches [[person/Andrew Newton]] (natural subset)."""
+    fm = {"participants": ["[[person/Andrew Newton]]"]}
+    clause = FilterClause(dim="participants", op="contains", value="Andrew Newton")
+    assert _clause_matches(clause, fm) is True
+
+
+# --- Anti-fishing: sub-word fragments MUST NOT match (whole-word boundary) ---
+
+
+@pytest.mark.parametrize("fragment", ["a", "And", "ndrew"])
+def test_contains_subword_fragment_never_matches(fragment):
+    """Fragments of a name are not whole words → fail-closed (anti-fishing)."""
+    fm = {"participants": ["[[person/Andrew Newton]]"]}
+    clause = FilterClause(dim="participants", op="contains", value=fragment)
+    assert _clause_matches(clause, fm) is False
+
+
+def test_contains_empty_value_never_matches():
+    """Empty value has no tokens → fail-closed (would otherwise over-match)."""
+    fm = {"participants": ["[[person/Andrew Newton]]"]}
+    clause = FilterClause(dim="participants", op="contains", value="")
+    assert _clause_matches(clause, fm) is False
+
+
+# --- Anti-fabrication: a value with a token the entry lacks MUST NOT match ---
+# Regression guard for the original hallucinated-surname bug: "Ben Carver"
+# names a person who is not "Ben McMillan" — the "carver" token is absent.
+
+
+def test_contains_absent_token_never_matches_anti_fabrication():
+    """'Ben Carver' does NOT match [[person/Ben McMillan]] — 'carver' absent."""
+    fm = {"participants": ["[[person/Ben McMillan]]"]}
+    clause = FilterClause(dim="participants", op="contains", value="Ben Carver")
+    assert _clause_matches(clause, fm) is False
+
+
+def test_contains_case_insensitive_token_match():
+    """Token comparison casefolds both sides ('andrew' matches 'Andrew')."""
+    fm = {"participants": ["[[person/Andrew Newton]]"]}
+    clause = FilterClause(dim="participants", op="contains", value="andrew")
+    assert _clause_matches(clause, fm) is True
+
+
+def test_contains_scalar_branch_unchanged_substring():
+    """SCALAR contains is unchanged — substring (powers `name` title search)."""
+    fm = {"name": "rTMS appointment 2026-06-20"}
+    assert _clause_matches(
+        FilterClause("name", "contains", "rTMS"), fm,
+    ) is True
+    # Substring (not whole-word) still applies on the scalar branch.
+    assert _clause_matches(
+        FilterClause("name", "contains", "appoint"), fm,
+    ) is True
+
+
 def test_contains_matches_wikilink_value_form():
     """The query value may itself be a wikilink — unwrapped on both sides."""
     fm = {"participants": ["[[person/Andrew Newton]]"]}

@@ -14,6 +14,25 @@ handler in :mod:`peer_handlers` wires it to the vault + audit + field gate.
 
 Kept separate from ``peer_handlers`` so the predicate semantics are unit-
 testable without spinning up an aiohttp app.
+
+``contains`` matching contract (revised 2026-06-13)
+---------------------------------------------------
+For LIST dimensions (e.g. ``participants``, a wikilink list), ``contains``
+matches when the query value's words are all WHOLE WORDS in a list entry's
+display name — a whole-token-subset test, order-independent. So ``"Andrew"``
+or ``"Newton"`` each match ``[[person/Andrew Newton]]``, and the full
+``"Andrew Newton"`` still matches (the natural subset case). The previous
+contract was "matches a complete entry, not a fragment" — exact post-unwrap
+equality — which silently zeroed every NL query that named the vault owner
+by a single name (Salem's NL broker derives ``participants contains
+"Andrew"`` but the stored element unwraps to ``"Andrew Newton"``).
+
+Fail-closed is preserved by the WHOLE-WORD boundary: a sub-word fragment
+(``"And"``, ``"ndrew"``) does NOT match, an empty value does NOT match, and
+a value carrying any token absent from the entry (``"Ben Carver"`` vs
+``[[person/Ben McMillan]]``) does NOT match — the anti-fishing /
+anti-fabrication guard. The SCALAR branch of ``contains`` is unchanged
+(plain substring), and ``eq`` remains exact equality.
 """
 
 from __future__ import annotations
@@ -223,22 +242,53 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _whole_token_subset(value: str, display_name: str) -> bool:
+    """Whole-token-subset membership test for the LIST ``contains`` branch.
+
+    Tokenize both sides on whitespace and casefold. Returns ``True`` iff
+    ``value`` has at least one token AND every token of ``value`` appears in
+    the token-SET of ``display_name`` (order-independent subset). So:
+
+      * ``"Andrew"`` ⊆ ``{"andrew", "newton"}`` → True
+      * ``"Newton"`` ⊆ ``{"andrew", "newton"}`` → True
+      * ``"Andrew Newton"`` ⊆ ``{"andrew", "newton"}`` → True (exact)
+      * ``"Ben Carver"`` ⊄ ``{"ben", "mcmillan"}`` → False ("carver" absent)
+      * ``"And"`` ⊄ ``{"andrew", "newton"}`` → False (sub-word, not a token)
+      * ``""`` → False (no tokens — fail-closed)
+
+    The WHOLE-WORD boundary is the anti-fishing / anti-fabrication guard: a
+    fragment of a name, or a value carrying a token the entry lacks, never
+    matches.
+    """
+    value_tokens = value.casefold().split()
+    if not value_tokens:
+        return False
+    name_tokens = set(display_name.casefold().split())
+    return all(tok in name_tokens for tok in value_tokens)
+
+
 def _clause_matches(clause: FilterClause, fm: dict[str, Any]) -> bool:
     """Evaluate one predicate against a record's frontmatter. Deterministic.
 
     Operator semantics (P1 fixed enum):
       * ``eq``       — scalar equality (string compare, case-sensitive).
-      * ``contains`` — substring OR list-membership. For list-shaped
+      * ``contains`` — substring OR list whole-token-subset. For list-shaped
         dimensions (e.g. ``participants``) each element is wikilink-
-        unwrapped (``[[person/Andrew Newton]]`` → ``Andrew Newton``) and
-        compared to the (also-unwrapped) query value. For a scalar
-        dimension it's a plain substring test.
+        unwrapped (``[[person/Andrew Newton]]`` → ``Andrew Newton``) and the
+        clause matches when the (also-unwrapped) query value's words are all
+        WHOLE WORDS in that element — so ``"Andrew"`` or ``"Newton"`` match
+        ``[[person/Andrew Newton]]`` and the full name still matches, but a
+        sub-word fragment or a value with an absent token does NOT (see
+        ``_whole_token_subset``). For a scalar dimension it's an unchanged
+        plain substring test.
       * ``gte`` / ``lte`` — string comparison (ISO dates sort
         lexicographically, so ``"2026-01-01" <= "2026-05-30"`` works).
       * ``between`` — value must be ``[lo, hi]``; ``lo <= field <= hi``.
 
     A field absent from the frontmatter never matches (fail-closed at the
-    record level — an absent dimension can't satisfy a predicate).
+    record level — an absent dimension can't satisfy a predicate). An empty
+    ``contains`` value never matches either (no tokens / empty substring of a
+    real name would over-match — fail-closed).
     """
     field_value = fm.get(clause.dim)
     if field_value is None and clause.dim not in fm:
@@ -251,12 +301,17 @@ def _clause_matches(clause: FilterClause, fm: dict[str, Any]) -> bool:
         target = _unwrap_wikilink(str(clause.value))
         items = _as_list(field_value)
         if items and isinstance(field_value, list):
-            # List dimension — membership after wikilink-unwrap.
+            # List dimension — whole-token-subset after wikilink-unwrap.
+            # The query value's words must all be WHOLE WORDS in a list
+            # entry's display name (order-independent). "Andrew" / "Newton"
+            # each match [[person/Andrew Newton]]; a fragment or an absent
+            # token does not (anti-fishing / anti-fabrication guard).
             for item in items:
-                if _unwrap_wikilink(str(item)) == target:
+                if _whole_token_subset(target, _unwrap_wikilink(str(item))):
                     return True
             return False
-        # Scalar dimension — substring test.
+        # Scalar dimension — substring test (unchanged; powers `name`
+        # title search now that `name` is a granted filter dim).
         return target in str(field_value)
 
     if clause.op == "gte":
