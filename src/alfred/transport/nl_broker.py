@@ -130,16 +130,23 @@ to drop a person or entity the question names on a dimension the slice \
 DOES offer.
 - "between" takes a two-element [lo, hi] array value. "gte"/"lte" compare \
 ISO-format date strings correctly.
-- On a list-valued dimension (e.g. participants), "contains" matches a \
-complete entry, not a fragment. Values are plain text (no [[...]] \
-wikilink syntax).
+- On a list-valued dimension (e.g. participants), "contains" matches an \
+entry by WHOLE WORDS: every whitespace-separated word of your value must \
+appear as a complete word in the stored entry (order-independent, \
+case-insensitive). So "Andrew" matches the entry "Andrew Newton" and \
+"Ben" matches "Ben McMillan" — a first or partial name is enough. It is \
+NOT a substring match: "And" does NOT match "Andrew". Values are plain \
+text (no [[...]] wikilink syntax).
 - When the question names specific people, emit one "contains" clause \
 per named person on the matching list dimension (e.g. participants), \
-each value exactly as the question names that person — do not shorten, \
-expand, or invent a fuller form, and NEVER drop one of the named people \
-to simplify the query. A zero-result answer reports the filters it \
-used, so the asker can recover; an answer drawn from the wrong records \
-cannot be detected.
+each value exactly as the question names that person. Relay the name as \
+the question gives it: a first or partial name already matches the fuller \
+stored name (whole-word rule above), so do not expand it — and NEVER \
+invent a surname or fuller form the question did not supply (a fabricated \
+word the stored name lacks matches nothing). And NEVER drop one of the \
+named people to simplify the query. A zero-result answer reports the \
+filters it used, so the asker can recover; an answer drawn from the wrong \
+records cannot be detected.
 - Event records use the field `name` (not `title`) as their identifier.
 - For "most recent" / "when did ... last ..." questions: the engine has \
 no notion of "now" — add the upper bound yourself as \
