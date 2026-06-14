@@ -488,6 +488,29 @@ def test_assemble_labels_dedups_across_ticket_type_and_priority() -> None:
     assert labels.count("tracked") == 1
 
 
+def test_assemble_labels_priority_cannot_smuggle_auto_fix() -> None:
+    """NEGATIVE pin (2026-06-13): a PRIORITY key must NOT be able to
+    inject `auto-fix` onto a non-bug ticket. The invariant is "auto-fix
+    only on BUG tickets" — `_assemble_labels` resolves labels purely from
+    base + label_map lookups, so a config where `auto-fix` is absent from
+    every reachable map value can never produce it. This locks the
+    invariant against a future refactor that might (e.g.) blanket-append a
+    default label or route priority through a different path.
+
+    Here the resolved labels for an *enhancement* ticket at *p1* priority
+    must be exactly `["enhancement", "priority-high"]` — no `auto-fix`."""
+    cfg = _LabelConfig(
+        [], {"enhancement": ["enhancement"], "p1": ["priority-high"]},
+    )
+    labels = _assemble_labels(
+        cfg,
+        {"ticket_type": "enhancement", "priority": "p1"},
+        correlation_id="c",
+    )
+    assert "auto-fix" not in labels
+    assert labels == ["enhancement", "priority-high"]
+
+
 async def test_ticket_enhancement_excludes_auto_fix_end_to_end(
     aiohttp_client, tmp_path,
 ):  # type: ignore[no-untyped-def]

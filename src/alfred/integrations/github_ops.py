@@ -349,6 +349,46 @@ def load_github_config(raw: dict[str, Any]) -> GitHubOpsConfig | None:
                 values = [text] if text else []
             label_map[str(k)] = values
 
+    # ----- auto-fix invariant (operator-ratified 2026-06-13) -------------
+    # `auto-fix` may appear ONLY under label_map["bug"] — nowhere else.
+    # A bug ticket maps to ["bug", "auto-fix"] so the claude-auto-fix.yml
+    # workflow fires at issue creation; every other ticket_type/priority
+    # files a tracked issue WITHOUT auto-fix. This guard CODE-enforces that
+    # invariant (was convention-only) at the single load/normalization
+    # chokepoint: if `auto-fix` leaks into base `labels` or into any
+    # non-`bug` label_map value (config typo, copy-paste, a future edit
+    # that forgets the gating), it is STRIPPED and a LOUD warning names the
+    # offending location so the misconfig is observable, not silent.
+    #
+    # If `auto-fix` ever legitimately needs to apply to another
+    # ticket_type, THIS is the single place to revisit — do NOT generalize
+    # to a configurable auto_fix_types set here (out of scope 2026-06-13);
+    # keep the invariant keyed to "bug".
+    _AUTO_FIX_LABEL = "auto-fix"
+    if _AUTO_FIX_LABEL in labels:
+        log.warning(
+            "github.config.auto_fix_label_stripped",
+            location="base-labels",
+            detail=(
+                "auto-fix found in base `labels` — invariant allows it only "
+                "under label_map['bug']; stripping it from base labels"
+            ),
+        )
+        labels = [lbl for lbl in labels if lbl != _AUTO_FIX_LABEL]
+    for key, values in list(label_map.items()):
+        if key == "bug":
+            continue
+        if _AUTO_FIX_LABEL in values:
+            log.warning(
+                "github.config.auto_fix_label_stripped",
+                location=f"label_map[{key!r}]",
+                detail=(
+                    f"auto-fix found under label_map[{key!r}] — invariant "
+                    "allows it only under label_map['bug']; stripping it"
+                ),
+            )
+            label_map[key] = [v for v in values if v != _AUTO_FIX_LABEL]
+
     return GitHubOpsConfig(
         repo=str(section.get("repo", "") or ""),
         pat=str(section.get("pat", "") or ""),

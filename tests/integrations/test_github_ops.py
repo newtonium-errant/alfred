@@ -214,9 +214,13 @@ class TestLoadGithubConfig:
         assert load_github_config({"vault": {"path": "./vault"}}) is None
 
     def test_loads_fields(self, tmp_path: Path) -> None:
+        # Base labels deliberately exclude `auto-fix`: the invariant guard
+        # (2026-06-13) strips auto-fix from base labels, so a non-auto-fix
+        # base label keeps this test focused on field-loading. The
+        # auto-fix-in-base strip path has its own dedicated pin below.
         raw = _raw(
             tmp_path,
-            labels=["auto-fix", "from-vera"],
+            labels=["tracked", "from-vera"],
             label_map={"bug": "bug", "p1": "priority-high"},
         )
         cfg = load_github_config(raw)
@@ -224,7 +228,7 @@ class TestLoadGithubConfig:
         assert cfg.repo == TEST_REPO
         assert cfg.pat == DUMMY_PAT
         assert cfg.instance == "kal-le"
-        assert cfg.labels == ["auto-fix", "from-vera"]
+        assert cfg.labels == ["tracked", "from-vera"]
         # Bare-string map values normalize to 1-element lists (back-compat:
         # the value type is now str | list[str], stored uniformly as list).
         assert cfg.label_map == {"bug": ["bug"], "p1": ["priority-high"]}
@@ -270,11 +274,22 @@ class TestLoadGithubConfig:
         }
 
     def test_defaults(self) -> None:
-        cfg = load_github_config({"github": {"repo": TEST_REPO}})
+        # The legacy base-labels default is ["auto-fix"], but the auto-fix
+        # invariant guard (2026-06-13) strips auto-fix from base labels —
+        # auto-fix may live ONLY under label_map["bug"]. So an omitted
+        # `labels` key resolves to [] after the guard, with a warning.
+        with structlog.testing.capture_logs() as captured:
+            cfg = load_github_config({"github": {"repo": TEST_REPO}})
         assert cfg is not None
-        assert cfg.labels == ["auto-fix"]
+        assert cfg.labels == []
         assert cfg.label_map == {}
         assert cfg.audit_log_path == DEFAULT_AUDIT_LOG_PATH
+        stripped = [
+            c for c in captured
+            if c.get("event") == "github.config.auto_fix_label_stripped"
+        ]
+        assert len(stripped) == 1
+        assert stripped[0]["location"] == "base-labels"
 
     def test_env_substitution_is_local(self, monkeypatch) -> None:
         """The unified loader does NOT substitute ${VAR}; this loader
@@ -302,6 +317,90 @@ class TestLoadGithubConfig:
         assert cfg.pat == DUMMY_PAT
         assert DUMMY_PAT not in repr(cfg)
         assert TEST_REPO in repr(cfg)  # non-secret fields still render
+
+    # ----- auto-fix invariant guard (code-enforced, 2026-06-13) ---------
+    # `load_github_config` enforces "auto-fix may appear ONLY under
+    # label_map['bug']": it WARNS (intentionally-left-blank: misconfig is
+    # observable) and STRIPS auto-fix from any other location. These pins
+    # drive the production code path AND assert the warning fires
+    # (builder checklist #9, capture_logs).
+
+    def test_auto_fix_under_non_bug_key_warned_and_stripped(
+        self, tmp_path: Path,
+    ) -> None:
+        """auto-fix leaked under an `enhancement` key → warned + stripped;
+        the resolved enhancement labels exclude auto-fix. bug's auto-fix
+        is left untouched."""
+        raw = _raw(
+            tmp_path,
+            labels=[],
+            label_map={
+                "bug": ["bug", "auto-fix"],
+                "enhancement": ["enhancement", "auto-fix"],  # leak
+            },
+        )
+        with structlog.testing.capture_logs() as captured:
+            cfg = load_github_config(raw)
+        assert cfg is not None
+        # enhancement no longer carries auto-fix; bug still does.
+        assert cfg.label_map["enhancement"] == ["enhancement"]
+        assert cfg.label_map["bug"] == ["bug", "auto-fix"]
+        assert cfg.labels == []
+        stripped = [
+            c for c in captured
+            if c.get("event") == "github.config.auto_fix_label_stripped"
+        ]
+        assert len(stripped) == 1
+        assert stripped[0]["location"] == "label_map['enhancement']"
+
+    def test_auto_fix_in_base_labels_warned_and_stripped(
+        self, tmp_path: Path,
+    ) -> None:
+        """auto-fix in base `labels` → warned + stripped; it survives
+        only under label_map['bug']."""
+        raw = _raw(
+            tmp_path,
+            labels=["auto-fix", "from-vera"],
+            label_map={"bug": ["bug", "auto-fix"]},
+        )
+        with structlog.testing.capture_logs() as captured:
+            cfg = load_github_config(raw)
+        assert cfg is not None
+        assert cfg.labels == ["from-vera"]  # auto-fix stripped, rest kept
+        assert cfg.label_map["bug"] == ["bug", "auto-fix"]
+        stripped = [
+            c for c in captured
+            if c.get("event") == "github.config.auto_fix_label_stripped"
+        ]
+        assert len(stripped) == 1
+        assert stripped[0]["location"] == "base-labels"
+
+    def test_correct_config_passes_through_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        """The live KAL-LE shape (labels: [], bug: [bug, auto-fix]) is the
+        intended config — no warning, bug still resolves [bug, auto-fix]."""
+        raw = _raw(
+            tmp_path,
+            labels=[],
+            label_map={
+                "bug": ["bug", "auto-fix"],
+                "enhancement": ["enhancement"],
+            },
+        )
+        with structlog.testing.capture_logs() as captured:
+            cfg = load_github_config(raw)
+        assert cfg is not None
+        assert cfg.labels == []
+        assert cfg.label_map == {
+            "bug": ["bug", "auto-fix"],
+            "enhancement": ["enhancement"],
+        }
+        stripped = [
+            c for c in captured
+            if c.get("event") == "github.config.auto_fix_label_stripped"
+        ]
+        assert stripped == []  # correct config: untouched, no warning
 
 
 # ---------------------------------------------------------------------------
