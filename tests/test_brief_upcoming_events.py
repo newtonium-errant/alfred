@@ -45,12 +45,15 @@ def _write_event(
     location: str | None = None,
     description: str | None = None,
     status: str | None = None,
+    time: str | None = None,
 ) -> None:
     """Drop an event record into ``vault/event/{name}.md``.
 
     ``status`` is optional — when None, the field is omitted entirely
     (pre-Phase-A+ shape). Pass a string (``"cancelled"``, ``""``, etc.)
-    to exercise the closed-state filter on event records.
+    to exercise the closed-state filter on event records. ``time`` is
+    the display-ready clock string (e.g. ``"11:40 AM"``) the compact
+    event render inlines; omit it for an all-day event.
     """
     lines = [
         "---",
@@ -62,6 +65,8 @@ def _write_event(
         # Quote to allow empty string and avoid YAML interpreting unquoted
         # values. Single-quote is safe for the values exercised here.
         lines.append(f"status: '{status}'")
+    if time is not None:
+        lines.append(f"time: {time}")
     if location is not None:
         lines.append(f"location: {location}")
     if description is not None:
@@ -520,7 +525,11 @@ def test_disabled_returns_empty_string(vault: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_location_appended_when_present(vault: Path) -> None:
+def test_location_dropped_from_event_line(vault: Path) -> None:
+    """Compact event render (2026-06-15, ALL list views): the location
+    is DROPPED — it lives in the record + the conversational
+    'tell me about this event' path, not the list view. Inverts the
+    pre-2026-06-15 ``Workshop (Halifax HQ)`` assertion."""
     _write_event(
         vault,
         "Workshop",
@@ -528,10 +537,15 @@ def test_location_appended_when_present(vault: Path) -> None:
         location="Halifax HQ",
     )
     out = render_upcoming_events_section(_default_config(), vault, TODAY)
-    assert "Workshop (Halifax HQ)" in out
+    assert "Workshop" in out          # the event still appears
+    assert "Halifax HQ" not in out    # but the location is gone
+    assert "(Halifax HQ)" not in out
 
 
-def test_description_indented_when_present(vault: Path) -> None:
+def test_description_dropped_from_event_line(vault: Path) -> None:
+    """Compact event render (2026-06-15): the description is DROPPED in
+    every list view (no more indented ``*...*`` second line). Inverts
+    the pre-2026-06-15 description-indented assertion."""
     _write_event(
         vault,
         "Quarterly review",
@@ -539,7 +553,11 @@ def test_description_indented_when_present(vault: Path) -> None:
         description="Walk through Q2 numbers",
     )
     out = render_upcoming_events_section(_default_config(), vault, TODAY)
-    assert "*Walk through Q2 numbers*" in out
+    assert "Quarterly review" in out
+    assert "Walk through Q2 numbers" not in out
+    assert "*Walk through Q2 numbers*" not in out
+    # No indented second line anywhere.
+    assert "\n  *" not in out
 
 
 def test_items_sorted_by_date_then_name(vault: Path) -> None:
@@ -1017,3 +1035,124 @@ def test_compose_today_reply_uses_today_tomorrow_scope(
     # Today + Tomorrow events present.
     assert "Today Lunch" in out
     assert "Tomorrow Standup" in out
+
+
+# ---------------------------------------------------------------------------
+# Compact event render (2026-06-15) — applies to ALL list views
+#
+# Operator directive: "the recommended shortness works; scope is all
+# events when listed, unless I ask for details." Events render as a
+# SINGLE compact line in BOTH scope="brief" AND scope="today_tomorrow":
+#   - {date} {time} — {name-with-trailing-date-stripped}
+# Location + description DROPPED everywhere. Tasks keep their clean
+# one-liner. The full detail lives in the record + the conversational
+# "tell me about this event" path.
+# ---------------------------------------------------------------------------
+
+
+def test_compact_event_strips_trailing_date_from_name(vault: Path) -> None:
+    """The redundant ` YYYY-MM-DD` baked into an event name is stripped
+    so the date doesn't appear twice (prefix + name)."""
+    _write_event(
+        vault, f"Chiropractic Appointment {TODAY.isoformat()}",
+        TODAY.isoformat(),
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    # All-day event (no time) → exact compact line, name sans trailing date.
+    assert f"- {TODAY.isoformat()} — Chiropractic Appointment" in out
+    # The trailing date is NOT baked into the name a second time.
+    assert f"Chiropractic Appointment {TODAY.isoformat()}" not in out
+    # The date appears exactly once (the line prefix).
+    assert out.count(TODAY.isoformat()) == 1
+
+
+def test_compact_event_includes_time_when_present(vault: Path) -> None:
+    """The ``time`` field is inlined verbatim between date and name."""
+    _write_event(
+        vault, "Dentist", TODAY.isoformat(), time="11:40 AM",
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert f"- {TODAY.isoformat()} 11:40 AM — Dentist" in out
+
+
+def test_compact_event_omits_time_when_absent(vault: Path) -> None:
+    """All-day event (no time, no start) → no time segment — just
+    ``- {date} — {name}``."""
+    _write_event(vault, "All Day Offsite", TODAY.isoformat())
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert f"- {TODAY.isoformat()} — All Day Offsite" in out
+
+
+def test_compact_event_drops_location_and_description_in_brief_scope(
+    vault: Path,
+) -> None:
+    """The scope CHANGE (2026-06-15): the MORNING BRIEF (scope='brief')
+    now ALSO renders compact — location + description DROPPED, trailing
+    date stripped, time included. This REPLACES the prior
+    'brief byte-unchanged' pin."""
+    _write_event(
+        vault, f"Berwick Chiropractic {TODAY.isoformat()}", TODAY.isoformat(),
+        time="11:40 AM",
+        location="[[location/Coldbrook NS]]",
+        description="Adjustment follow-up",
+    )
+    out = render_upcoming_events_section(
+        _default_config(), vault, TODAY, scope="brief",
+    )
+    # Compact single line, time inlined, trailing date stripped.
+    assert f"- {TODAY.isoformat()} 11:40 AM — Berwick Chiropractic" in out
+    # Location + description GONE from the brief too.
+    assert "Coldbrook NS" not in out
+    assert "Adjustment follow-up" not in out
+    assert "\n  *" not in out  # no indented description line
+
+
+def test_compact_event_drops_location_and_description_in_today_tomorrow(
+    vault: Path,
+) -> None:
+    """Same compact render in the /today (today_tomorrow) scope."""
+    _write_event(
+        vault, f"Berwick Chiropractic {TODAY.isoformat()}", TODAY.isoformat(),
+        time="11:40 AM",
+        location="[[location/Coldbrook NS]]",
+        description="Adjustment follow-up",
+    )
+    out = render_upcoming_events_section(
+        _default_config(), vault, TODAY, scope="today_tomorrow",
+    )
+    assert f"- {TODAY.isoformat()} 11:40 AM — Berwick Chiropractic" in out
+    assert "Coldbrook NS" not in out
+    assert "Adjustment follow-up" not in out
+
+
+def test_compact_event_derives_time_from_start_fallback(vault: Path) -> None:
+    """When ``time`` is absent but ``start`` is a full ISO datetime, the
+    render derives HH:MM from start."""
+    _write_event_with_start(
+        vault, "TMS Session",
+        start=f"{TODAY.isoformat()}T15:30:00-03:00",
+        date_field=TODAY.isoformat(),
+    )
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert f"- {TODAY.isoformat()} 15:30 — TMS Session" in out
+
+
+def test_compact_task_keeps_clean_one_liner(vault: Path) -> None:
+    """Tasks render UNCHANGED — clean one-liner, no time, no
+    trailing-date-strip (tasks never had the clutter)."""
+    _write_task(vault, "Pay the invoice", due=TODAY.isoformat())
+    out = render_upcoming_events_section(_default_config(), vault, TODAY)
+    assert f"- {TODAY.isoformat()} — Pay the invoice" in out
+
+
+def test_strip_trailing_date_helper_idempotent_and_safe() -> None:
+    """Unit pin on the strip helper: removes a trailing date, leaves a
+    name without one untouched, and doesn't touch a mid-name date."""
+    from alfred.brief.upcoming_events import _strip_trailing_date
+
+    assert _strip_trailing_date("Dentist 2026-06-16") == "Dentist"
+    assert _strip_trailing_date("Dentist") == "Dentist"
+    # Mid-name date is NOT stripped (only end-anchored).
+    assert _strip_trailing_date("2026 Planning Kickoff") == "2026 Planning Kickoff"
+    # Already-stripped is idempotent.
+    assert _strip_trailing_date(_strip_trailing_date("X 2026-06-16")) == "X"

@@ -1528,6 +1528,10 @@ def test_curated_for_today_emits_rendered_log_event_with_counts(
     assert e["curated_t1"] == 2
     assert e["curated_t2"] == 0
     assert e["curated_t3"] == 1
+    # No vault_path threaded → status filter OFF (byte-identical to the
+    # pre-2026-06-15 render). Pin both new log fields per builder rule #9.
+    assert e["status_filter_applied"] is False
+    assert e["status_filtered"] == 0
 
 
 def test_curated_for_today_none_curation_log_event_curation_loaded_false(
@@ -1548,6 +1552,184 @@ def test_curated_for_today_none_curation_log_event_curation_loaded_false(
     assert e["curated_t1"] == 0
     assert e["curated_t2"] == 0
     assert e["curated_t3"] == 0
+
+
+# ===========================================================================
+# Live completed-task filter (2026-06-15) — /today hides closed tasks
+# ===========================================================================
+#
+# render_curated_tier_section_for_today(curation, vault_path=...) drops
+# curated T1/T2 task-origin entries whose task record is closed (status
+# not in OPEN_STATUSES). Routine-origin + T3 entries are never filtered.
+# Fail-open on a missing/unreadable record. Without vault_path the
+# render skips filtering entirely (back-compat pin).
+
+
+def test_curated_today_filter_hides_closed_task(tmp_path: Path) -> None:
+    """An OPEN curated task renders; a CLOSED one (status: done) is
+    OMITTED when vault_path is threaded."""
+    _write_task(
+        tmp_path, "Open Task",
+        {"type": "task", "name": "Open Task", "status": "todo"},
+    )
+    _write_task(
+        tmp_path, "Call Hedley Newton",
+        {"type": "task", "name": "Call Hedley Newton", "status": "done"},
+    )
+    curation = DailyCuration(
+        t1=[
+            T1T2Entry(task="[[task/Open Task]]", source="operator",
+                      confirmed=True),
+            T1T2Entry(task="[[task/Call Hedley Newton]]", source="operator",
+                      confirmed=True),
+        ],
+        t2=[], t3=[],
+    )
+    body = render_curated_tier_section_for_today(curation, vault_path=tmp_path)
+    assert "- [ ] [[task/Open Task]]" in body
+    # The closed task is HIDDEN (operator wants it gone, not struck).
+    assert "Call Hedley Newton" not in body
+
+
+def test_curated_today_filter_off_without_vault_path(tmp_path: Path) -> None:
+    """Back-compat pin: NO vault_path → no filtering, the closed task
+    still renders (byte-identical to the pre-2026-06-15 behaviour)."""
+    _write_task(
+        tmp_path, "Call Hedley Newton",
+        {"type": "task", "name": "Call Hedley Newton", "status": "done"},
+    )
+    curation = DailyCuration(
+        t1=[T1T2Entry(task="[[task/Call Hedley Newton]]", source="operator",
+                      confirmed=True)],
+        t2=[], t3=[],
+    )
+    # No vault_path → filtering off → the closed task still shows.
+    body = render_curated_tier_section_for_today(curation)
+    assert "[[task/Call Hedley Newton]]" in body
+
+
+def test_curated_today_filter_t2_also_filtered(tmp_path: Path) -> None:
+    """The filter applies to T2 as well as T1."""
+    _write_task(
+        tmp_path, "Closed T2",
+        {"type": "task", "name": "Closed T2", "status": "cancelled"},
+    )
+    _write_task(
+        tmp_path, "Open T2",
+        {"type": "task", "name": "Open T2", "status": "active"},
+    )
+    curation = DailyCuration(
+        t1=[],
+        t2=[
+            T1T2Entry(task="[[task/Closed T2]]", source="operator"),
+            T1T2Entry(task="[[task/Open T2]]", source="operator"),
+        ],
+        t3=[],
+    )
+    body = render_curated_tier_section_for_today(curation, vault_path=tmp_path)
+    assert "[[task/Open T2]]" in body
+    assert "Closed T2" not in body
+
+
+def test_curated_today_filter_keeps_routine_origin_entries(
+    tmp_path: Path,
+) -> None:
+    """Routine-origin T1/T2 entries have no task record → never filtered,
+    even with vault_path threaded."""
+    curation = DailyCuration(
+        t1=[
+            T1T2Entry(
+                routine_item={"record": "Weekly Chores", "text": "Bins out"},
+                source="operator",
+            ),
+        ],
+        t2=[], t3=[],
+    )
+    body = render_curated_tier_section_for_today(curation, vault_path=tmp_path)
+    assert "Bins out (from [[routine/Weekly Chores]])" in body
+
+
+def test_curated_today_filter_keeps_t3_free_text(tmp_path: Path) -> None:
+    """T3 entries carry free-text (no task ref) → never filtered."""
+    curation = DailyCuration(
+        t1=[], t2=[],
+        t3=[T3Entry(item="dog walk", source="aspirational")],
+    )
+    body = render_curated_tier_section_for_today(curation, vault_path=tmp_path)
+    assert "- [ ] dog walk" in body
+
+
+def test_curated_today_filter_fails_open_on_missing_record(
+    tmp_path: Path,
+) -> None:
+    """A curated task whose record is ABSENT from the vault is KEPT
+    (fail-open) — only an explicitly-closed status hides an item, so a
+    transient miss never silently drops a real commitment."""
+    # No task file written for this wikilink.
+    curation = DailyCuration(
+        t1=[T1T2Entry(task="[[task/Ghost Task]]", source="operator",
+                      confirmed=True)],
+        t2=[], t3=[],
+    )
+    body = render_curated_tier_section_for_today(curation, vault_path=tmp_path)
+    assert "[[task/Ghost Task]]" in body
+
+
+def test_curated_today_filter_empties_bucket_keeps_sentinel(
+    tmp_path: Path,
+) -> None:
+    """ILB: when filtering empties a bucket entirely, the header-suffix
+    sentinel still emits — the tier reads 'nothing committed', never
+    vanishes."""
+    _write_task(
+        tmp_path, "Only Closed",
+        {"type": "task", "name": "Only Closed", "status": "done"},
+    )
+    curation = DailyCuration(
+        t1=[T1T2Entry(task="[[task/Only Closed]]", source="operator",
+                      confirmed=True)],
+        t2=[], t3=[],
+    )
+    body = render_curated_tier_section_for_today(curation, vault_path=tmp_path)
+    assert "### T1 — (no items yet)" in body
+    assert "Only Closed" not in body
+
+
+def test_curated_today_filter_log_reports_filtered_count(
+    tmp_path: Path,
+) -> None:
+    """Log-emission pin (builder rule #9): the render log surfaces the
+    completed-task filter so an operator can grep why a T1 item went
+    away — status_filter_applied True + the filtered count."""
+    _write_task(
+        tmp_path, "Closed One",
+        {"type": "task", "name": "Closed One", "status": "done"},
+    )
+    _write_task(
+        tmp_path, "Open One",
+        {"type": "task", "name": "Open One", "status": "todo"},
+    )
+    curation = DailyCuration(
+        t1=[
+            T1T2Entry(task="[[task/Closed One]]", source="operator",
+                      confirmed=True),
+            T1T2Entry(task="[[task/Open One]]", source="operator",
+                      confirmed=True),
+        ],
+        t2=[], t3=[],
+    )
+    with structlog.testing.capture_logs() as captured:
+        render_curated_tier_section_for_today(curation, vault_path=tmp_path)
+    events = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.rendered_curated_for_today"
+    ]
+    assert len(events) == 1
+    e = events[0]
+    assert e["status_filter_applied"] is True
+    assert e["status_filtered"] == 1
+    # The surviving (open) entry is counted post-filter.
+    assert e["curated_t1"] == 1
 
 
 # ===========================================================================

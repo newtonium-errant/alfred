@@ -40,6 +40,7 @@ know the section ran rather than crashing silently.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -88,12 +89,26 @@ _IGNORE_DIRS: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class _UpcomingItem:
-    """One row in the rendered section. Sortable by (date_iso, name)."""
+    """One row in the rendered section. Sortable by (date_iso, name).
+
+    ``rec_type`` (event | task) + ``time_display`` added 2026-06-15 for
+    the compact event-line render. Events render as a single compact
+    line in EVERY list view (operator directive 2026-06-15: "scope is
+    all events when listed, unless I ask for details") — the redundant
+    trailing date is stripped from the name, the time is inlined when
+    known, and location/description are dropped (they live in the
+    record + the conversational "tell me about this event" path).
+    Tasks keep their clean one-liner unchanged. ``location`` /
+    ``description`` are still collected (cheap, and a future detail
+    surface may want them) but no list renderer emits them now.
+    """
 
     date_iso: str
     name: str
     location: str | None
     description: str | None
+    rec_type: str = "event"
+    time_display: str | None = None
 
 
 # Closed-state denyset — records in any of these statuses are excluded
@@ -172,6 +187,55 @@ def _event_date(fm: dict) -> date | None:
     through to ``.date()`` defensively rather than guessing at a tz.
     """
     return _coerce_date(fm.get("start")) or _coerce_date(fm.get("date"))
+
+
+# Matches a trailing ISO date baked into an event ``name`` — e.g.
+# "Chiropractic Appointment 2026-06-16" or "… Berwick Chiropractic
+# 2026-06-16". Event names historically appended the date (the
+# event-creation/GCal-sync naming convention); the date already lives
+# in ``date``/``start``, so the compact list render strips it to avoid
+# showing the date twice. Anchored to end-of-string with a leading
+# space so it only fires on a genuine trailing date, never a date
+# mid-name.
+_TRAILING_DATE_RE = re.compile(r"\s+\d{4}-\d{2}-\d{2}$")
+
+
+def _strip_trailing_date(name: str) -> str:
+    """Strip a trailing ` YYYY-MM-DD` from an event display name.
+
+    Idempotent + safe on names without a trailing date (returns the
+    name unchanged). Only the LAST trailing date is removed (the regex
+    is end-anchored), so a name that legitimately contains a date
+    mid-string keeps it.
+    """
+    return _TRAILING_DATE_RE.sub("", name).rstrip()
+
+
+def _event_time_display(fm: dict) -> str | None:
+    """Resolve an event's display time for the compact list line.
+
+    Prefers the explicit ``time`` frontmatter field VERBATIM (operator-
+    confirmed 2026-06-15) — live records carry it display-ready, e.g.
+    ``time: 11:40 AM``. Falls back to deriving ``HH:MM`` from the
+    ``start`` ISO datetime when ``time`` is absent. Returns ``None``
+    when neither yields a usable value (all-day events → no time shown).
+    """
+    raw_time = fm.get("time")
+    if isinstance(raw_time, str) and raw_time.strip():
+        return raw_time.strip()
+    # Fallback: derive HH:MM from a full ISO ``start`` datetime.
+    start = fm.get("start")
+    start_dt: datetime | None = None
+    if isinstance(start, datetime):
+        start_dt = start
+    elif isinstance(start, str) and start.strip():
+        try:
+            start_dt = datetime.fromisoformat(start.strip())
+        except ValueError:
+            start_dt = None
+    if start_dt is not None:
+        return start_dt.strftime("%H:%M")
+    return None
 
 
 def _iter_records(vault_path: Path) -> list[tuple[Path, dict]]:
@@ -327,12 +391,17 @@ def _collect_items(
         )
         location = fm.get("location")
         description = fm.get("description")
+        # Time only applies to events; tasks have no clock time in the
+        # list view (they render off ``due`` date only).
+        time_display = _event_time_display(fm) if rec_type == "event" else None
         items.append(
             _UpcomingItem(
                 date_iso=d.isoformat(),
                 name=str(name),
                 location=str(location) if location else None,
                 description=str(description) if description else None,
+                rec_type=str(rec_type),
+                time_display=time_display,
             )
         )
     return items, preference_filtered
@@ -401,13 +470,29 @@ def _bucket(
 
 
 def _render_item(item: _UpcomingItem) -> str:
-    """Render one item as one or two markdown lines."""
-    head = f"- {item.date_iso} — {item.name}"
-    if item.location:
-        head += f" ({item.location})"
-    if item.description:
-        head += f"\n  *{item.description}*"
-    return head
+    """Render one item as a single compact markdown line.
+
+    EVENTS (every list view, operator directive 2026-06-15 "scope is
+    all events when listed, unless I ask for details"):
+        ``- {date} {time} — {name-sans-trailing-date}``
+    The redundant trailing date baked into the event name is stripped,
+    the time is inlined when known (omitted gracefully for all-day
+    events → ``- {date} — {name}``), and location + description are
+    DROPPED. The full detail lives in the event record + the
+    conversational "tell me about this event" path (talker reads the
+    record) — it is intentionally no longer in ANY list view.
+
+    TASKS: clean one-liner unchanged — ``- {date} — {name}`` (tasks
+    never carried the location/description clutter and have no
+    trailing-date-in-name problem).
+    """
+    if item.rec_type == "event":
+        display_name = _strip_trailing_date(item.name)
+        if item.time_display:
+            return f"- {item.date_iso} {item.time_display} — {display_name}"
+        return f"- {item.date_iso} — {display_name}"
+    # Task (or any non-event) — clean one-liner, no location/description.
+    return f"- {item.date_iso} — {item.name}"
 
 
 def render_upcoming_events_section(

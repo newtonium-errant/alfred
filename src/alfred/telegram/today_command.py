@@ -151,7 +151,13 @@ def compose_today_reply(
     # tier_curation frontmatter block.
     try:
         curation = load_daily_curation(vault_path, today_local)
-        tier_body = render_curated_tier_section_for_today(curation)
+        # Pass vault_path so the render filters out curated tasks the
+        # operator has since CLOSED (2026-06-15) — /today shows only
+        # live commitments. Without the path the render skips filtering;
+        # the composer always has the path, so /today always filters.
+        tier_body = render_curated_tier_section_for_today(
+            curation, vault_path=vault_path,
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "today_command.tier_render_failed",

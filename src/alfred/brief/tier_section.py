@@ -1092,8 +1092,54 @@ def render_tier_section(
     return body
 
 
+def _build_task_status_map(vault_path: Path) -> dict[str, dict[str, Any]]:
+    """Map each task record's NAME → its frontmatter, for status lookup.
+
+    Built once per ``/today`` render from the existing
+    :func:`_iter_task_records` walk (which already skips broken /
+    non-task files). Keyed on the record name (matching what
+    :func:`_wikilink_to_record_name` extracts from a ``[[task/Name]]``
+    curated entry). On a duplicate name the first walked record wins
+    (sorted glob order); name collisions in ``task/`` are a separate
+    janitor concern.
+    """
+    status_map: dict[str, dict[str, Any]] = {}
+    for _path, fm, name in _iter_task_records(vault_path):
+        status_map.setdefault(name, fm)
+    return status_map
+
+
+def _curated_entry_is_closed(
+    entry: T1T2Entry,
+    status_map: dict[str, dict[str, Any]],
+) -> bool:
+    """Return True iff a curated T1/T2 entry references a CLOSED task.
+
+    Only task-origin entries (``entry.task`` is a ``[[task/Name]]``
+    wikilink) are status-checked. Routine-origin entries
+    (``entry.routine_item``) have no task record and are NEVER closed
+    by this gate (return False → kept).
+
+    Fail-OPEN on a lookup miss: an entry whose task record is missing,
+    unreadable, or absent from ``status_map`` returns False (kept), so a
+    transient parse failure never silently hides a real commitment —
+    only an EXPLICITLY closed status (``not _is_open``) hides the entry.
+    Reuses :func:`_is_open` / ``OPEN_STATUSES`` — no new status set.
+    """
+    if entry.routine_item is not None:
+        return False  # routine-origin — no task record to check
+    record_name = _wikilink_to_record_name(entry.task or "")
+    if record_name is None:
+        return False  # malformed/absent task ref → fail-open (keep)
+    fm = status_map.get(record_name)
+    if fm is None:
+        return False  # task record not found → fail-open (keep)
+    return not _is_open(fm)
+
+
 def render_curated_tier_section_for_today(
     daily_curation: DailyCuration | None,
+    vault_path: Path | None = None,
 ) -> str:
     """Render the ``/today`` curated-only tier section body.
 
@@ -1103,6 +1149,19 @@ def render_curated_tier_section_for_today(
     no T2 selection pool, no auto-T2-routine subsection, no rollover,
     no confirm prompts. Operator already committed; the view's purpose
     is "what's on my plate right now" not "what should I commit to."
+
+    **Live completed-task filter** (2026-06-15). When ``vault_path`` is
+    provided, each curated T1/T2 task-origin entry is checked against
+    its task record's CURRENT status and OMITTED when closed (status not
+    in ``OPEN_STATUSES``) — operator closes ``task/Foo`` via the talker
+    and ``/today`` stops showing it. Routine-origin T1/T2 entries and
+    all T3 free-text entries have no task record and always pass. The
+    filter fails OPEN on a missing/unreadable record (only an
+    explicitly-closed status hides an item). When ``vault_path`` is
+    ``None`` (the default — e.g. the morning brief's full-materials
+    render, or any caller that doesn't thread the path) NO filtering
+    happens and the render is byte-identical to the pre-2026-06-15
+    behaviour, so existing callers are unaffected.
 
     Contrast with :func:`render_tier_section` (the full materials view
     the morning brief uses): that function consumes the same
@@ -1136,6 +1195,25 @@ def render_curated_tier_section_for_today(
     curated_t1 = daily_curation.t1 if daily_curation else []
     curated_t2 = daily_curation.t2 if daily_curation else []
     curated_t3 = daily_curation.t3 if daily_curation else []
+
+    # Live completed-task filter (2026-06-15). Only when a vault_path is
+    # threaded (the /today composer). T1/T2 task-origin entries whose
+    # referenced task record is closed are dropped; routine-origin + T3
+    # entries are untouched (no task record). An emptied bucket still
+    # hits the header-suffix sentinel below (ILB preserved).
+    filtered_closed = 0
+    if vault_path is not None:
+        status_map = _build_task_status_map(vault_path)
+        before = len(curated_t1) + len(curated_t2)
+        curated_t1 = [
+            e for e in curated_t1
+            if not _curated_entry_is_closed(e, status_map)
+        ]
+        curated_t2 = [
+            e for e in curated_t2
+            if not _curated_entry_is_closed(e, status_map)
+        ]
+        filtered_closed = before - (len(curated_t1) + len(curated_t2))
 
     def _bucket(header_label: str, entries: list, render_entry) -> list[str]:
         """Compose one bucket's lines.
@@ -1172,6 +1250,13 @@ def render_curated_tier_section_for_today(
         curated_t1=len(curated_t1),
         curated_t2=len(curated_t2),
         curated_t3=len(curated_t3),
+        # ILB: surface the completed-task filter so an operator can grep
+        # "why did my T1 item disappear" — distinguishes "I closed it"
+        # (status_filtered>0) from "render dropped it" (a bug).
+        # status_filter_applied is False when no vault_path was threaded
+        # (filtering off — e.g. the brief's full-materials render).
+        status_filter_applied=vault_path is not None,
+        status_filtered=filtered_closed,
     )
     return body
 
