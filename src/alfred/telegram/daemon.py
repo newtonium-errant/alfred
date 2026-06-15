@@ -1136,6 +1136,61 @@ async def run(
             ticket_intake_config = None
             ticket_intake_github_client = None
 
+        # Ticket-outcome resolver (pipeline c7) — the VERA-side receiver
+        # for the KAL-LE→VERA outcome write-back. Wired only when this
+        # instance opts in as a receiver (``ticket_outcome.receiver_
+        # enabled: true``); the resolver closure flips the originating
+        # ticket out of the open worklist under the narrow
+        # ``vera_ticket_outcome`` scope. ILB: opted-out reads differently
+        # from not-configured.
+        ticket_outcome_resolver_fn = None
+        try:
+            from alfred.transport.ticket_intake import (
+                load_ticket_outcome_config,
+                resolve_ticket_outcome,
+            )
+            _to_cfg = load_ticket_outcome_config(raw)
+            if _to_cfg.receiver_enabled:
+                _to_vault_path = Path(config.vault.path)
+
+                async def _ticket_outcome_resolver(
+                    *,
+                    ticket_uid: str,
+                    status: str,
+                    disposition: str,
+                    pr_number: int | None = None,
+                    resolved_at: str | None = None,
+                    correlation_id: str = "",
+                ) -> dict[str, Any]:
+                    """Adapter: peer ticket_outcome → local write-back.
+
+                    The transport handler hands us the parsed body; we
+                    apply the resolution flip against this instance's
+                    own ticket vault and return the resolver-contract
+                    dict. Synchronous vault I/O is fine here — the write
+                    is a single small frontmatter edit (matches the
+                    pending-items resolver's posture).
+                    """
+                    return resolve_ticket_outcome(
+                        _to_vault_path,
+                        ticket_uid=ticket_uid,
+                        status=status,
+                        disposition=disposition,
+                        pr_number=pr_number,
+                        resolved_at=resolved_at,
+                    )
+
+                ticket_outcome_resolver_fn = _ticket_outcome_resolver
+                log.info(
+                    "talker.daemon.ticket_outcome_receiver_enabled",
+                    vault_path=str(_to_vault_path),
+                )
+            else:
+                log.info("talker.daemon.ticket_outcome_receiver_not_configured")
+        except Exception:  # noqa: BLE001 — receiver is optional; talker survives
+            log.exception("talker.daemon.ticket_outcome_setup_failed")
+            ticket_outcome_resolver_fn = None
+
         # ---- Centralized wiring --------------------------------------
         # ``wire_transport_app`` calls every register_* helper
         # conditionally based on what we pass in. This is the single
@@ -1173,6 +1228,7 @@ async def run(
             nl_llm_model_label=nl_llm_model_label,
             ticket_intake_config=ticket_intake_config,
             ticket_intake_github_client=ticket_intake_github_client,
+            ticket_outcome_resolve_callable=ticket_outcome_resolver_fn,
         )
         log.info(
             "talker.daemon.transport_configured",

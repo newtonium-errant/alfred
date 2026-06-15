@@ -982,3 +982,28 @@ scaffold:
 #   interval_minutes: 15
 #   state:
 #     path: "./data/ticket_forward_state.json"
+
+# Ticket outcome write-back (pipeline c7) — closes the loop the other
+# direction (KAL-LE→VERA). When KAL-LE's nightly effectiveness loop sees
+# a tracked GitHub issue reach a terminal disposition (merged / closed),
+# it pushes the outcome to the origin instance so the ORIGINATING ticket
+# flips out of the open worklist (status → resolved | closed). ONE
+# section, TWO independent roles — each instance sets only its side:
+#   * KAL-LE (pusher):   enabled: true + self_name + target_peer.
+#   * VERA (receiver):   receiver_enabled: true (wires the
+#                        /peer/ticket_outcome resolver + advertises the
+#                        ticket_outcome handshake capability).
+# Idempotent (pushed once per terminal transition); fail-closed (a push
+# failure leaves KAL-LE's own state authoritative and retries next
+# night). Uses a DEDICATED per-direction peer token (KAL-LE→VERA),
+# distinct from the VERA→KAL-LE intake token — see .env.example. Live
+# wiring (transport.peers.vera on KAL-LE + transport.auth.tokens.kalle
+# on VERA) is per-instance config.
+# --- on KAL-LE: ---
+# ticket_outcome:
+#   enabled: true
+#   self_name: "kal-le"
+#   target_peer: "vera"
+# --- on VERA: ---
+# ticket_outcome:
+#   receiver_enabled: true

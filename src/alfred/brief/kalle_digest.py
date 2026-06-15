@@ -516,6 +516,18 @@ TICKET_TERMINAL_DISPOSITIONS = frozenset({
 # re-checked every digest and can still upgrade to merged_*.
 TICKET_STALLED_NIGHTS = 3
 
+# Pipeline c7 — KAL-LE disposition → VERA write-back (status,
+# ticket_disposition) mapping. The status flips the ticket out of
+# VERA's open worklist (both values are outside OPEN_TICKET_STATUSES);
+# ticket_disposition records the outcome on VERA's copy. Pinned in
+# tests/test_kalle_digest.py (status-mapping pin) and reused by the
+# /peer/ticket_outcome wire schema gate.
+TICKET_OUTCOME_WRITEBACK_MAP: dict[str, tuple[str, str]] = {
+    "merged_clean": ("resolved", "merged"),
+    "merged_after_rework": ("resolved", "merged_after_rework"),
+    "closed_unmerged": ("closed", "closed_no_merge"),
+}
+
 
 def _parse_iso_ts(value: Any) -> datetime | None:
     """Defensive ISO-8601 parse → aware-UTC datetime, or None.
@@ -645,12 +657,143 @@ async def _check_one_ticket_outcome(
     return new_disposition != old_disposition
 
 
+async def _maybe_push_ticket_outcome(
+    uid: str,
+    entry: Any,
+    *,
+    outcome_config: Any,
+    transport_config: Any,
+    now: datetime,
+) -> bool:
+    """Push one terminal ticket's outcome to its origin instance (c7).
+
+    Fires the KAL-LE→VERA write-back ONCE per ticket, on the
+    open→terminal transition. Idempotency guard: ``entry.outcome_pushed_
+    at`` is set on the FIRST successful push; a failed push leaves it
+    empty so the next nightly pass retries (the latch refinement in
+    :func:`check_ticket_outcomes` keeps a terminal-but-unpushed entry
+    eligible for THIS path without re-querying GitHub).
+
+    Returns True iff a push succeeded this call (the caller sets
+    ``outcome_pushed_at`` + saves state). Fail-closed: any transport
+    error is logged + contained — KAL-LE's own state stays authoritative
+    and the digest pass never crashes on a push failure.
+
+    Skips (each with a distinct log) when: the pusher is disabled, the
+    entry isn't terminal, it was already pushed, the origin instance is
+    unknown, or the disposition isn't in the write-back map.
+    """
+    from alfred.transport.client import peer_send_ticket_outcome
+    from alfred.transport.exceptions import TransportError, TransportRejected
+
+    if not getattr(outcome_config, "enabled", False):
+        return False
+    if entry.disposition not in TICKET_TERMINAL_DISPOSITIONS:
+        return False
+    if entry.outcome_pushed_at:
+        return False  # already propagated — idempotent
+
+    mapped = TICKET_OUTCOME_WRITEBACK_MAP.get(entry.disposition)
+    if mapped is None:
+        # Defensive: a terminal disposition with no write-back mapping
+        # is a code bug, not a runtime condition — surface it loudly
+        # rather than silently skipping.
+        log.warning(
+            "kalle.digest.ticket_outcome_unmapped_disposition",
+            uid=uid,
+            disposition=entry.disposition,
+        )
+        return False
+    status, ticket_disposition = mapped
+
+    self_name = str(getattr(outcome_config, "self_name", "") or "")
+    if not self_name:
+        # Fail-loud per feedback_hardcoding_and_alfred_naming.md — never
+        # default the sender identity; an unset self_name is a config
+        # bug the operator must fix (VERA's allowed_clients can't match
+        # an empty client).
+        log.warning(
+            "kalle.digest.ticket_outcome_push_no_self_name",
+            uid=uid,
+            detail=(
+                "ticket_outcome.enabled is true but self_name is empty — "
+                "set ticket_outcome.self_name so the receiver's "
+                "allowed_clients can match"
+            ),
+        )
+        return False
+    target_peer = str(getattr(outcome_config, "target_peer", "") or "")
+
+    try:
+        ack = await peer_send_ticket_outcome(
+            target_peer,
+            ticket_uid=uid,
+            status=status,
+            disposition=ticket_disposition,
+            self_name=self_name,
+            pr_number=entry.pr_number,
+            resolved_at=entry.outcome_checked_at or now.isoformat(),
+            config=transport_config,
+        )
+    except (TransportError, TransportRejected) as exc:
+        # Transport down / 4xx / unknown peer (_resolve_peer raises
+        # TransportError). Contained: leave outcome_pushed_at empty so
+        # the next pass retries; KAL-LE's state stays authoritative.
+        http_status = getattr(exc, "status_code", None)
+        body_head = str(getattr(exc, "body", "") or "")[:200]
+        detail = (
+            f"HTTP {http_status}: {body_head or '(no body)'}"
+            if http_status is not None
+            else f"{exc.__class__.__name__}: {str(exc)[:200] or '(no detail)'}"
+        )
+        log.warning(
+            "kalle.digest.ticket_outcome_push_failed",
+            uid=uid,
+            target_peer=target_peer,
+            status=status,
+            disposition=ticket_disposition,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            http_status=http_status,
+            detail=detail,
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 — never crash the digest on a push
+        log.warning(
+            "kalle.digest.ticket_outcome_push_failed",
+            uid=uid,
+            target_peer=target_peer,
+            status=status,
+            disposition=ticket_disposition,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            http_status=None,
+            detail=f"{exc.__class__.__name__}: {str(exc)[:200] or '(no detail)'}",
+        )
+        return False
+
+    applied = bool(ack.get("applied")) if isinstance(ack, dict) else False
+    log.info(
+        "kalle.digest.ticket_outcome_pushed",
+        uid=uid,
+        target_peer=target_peer,
+        status=status,
+        disposition=ticket_disposition,
+        pr_number=entry.pr_number,
+        applied=applied,
+        relpath=str(ack.get("relpath", "")) if isinstance(ack, dict) else "",
+    )
+    return True
+
+
 async def check_ticket_outcomes(
     state: Any,
     client: Any,
     *,
     now: datetime,
     audit_log_path: str,
+    outcome_config: Any = None,
+    transport_config: Any = None,
 ) -> int:
     """The effectiveness-loop capture pass. Returns the changed count.
 
@@ -659,16 +802,50 @@ async def check_ticket_outcomes(
     gets ONE summarising audit row (the client already audits every
     underlying HTTP call; this row carries the derived effectiveness
     fields via ``extra``).
+
+    Pipeline c7 — the KAL-LE→VERA outcome write-back fires from this
+    same loop. Two terminal-entry cases now reach the push (both gated
+    by ``outcome_config.enabled``):
+      * a NON-terminal entry that newly flips terminal this pass, AND
+      * a terminal entry whose prior push FAILED (``outcome_pushed_at``
+        still empty) — re-attempted WITHOUT re-querying GitHub (the
+        disposition is already final, so no API cost).
+    A terminal entry already pushed (``outcome_pushed_at`` set) is fully
+    latched — neither re-queried nor re-pushed.
+
+    ``outcome_config`` / ``transport_config`` default None — when either
+    is absent (or the pusher is disabled) the loop runs exactly as
+    before (capture only, no push). ILB: a completed pass that found no
+    terminal outcome to propagate emits an explicit
+    ``kalle.digest.no_ticket_outcomes_to_propagate`` so an idle night is
+    distinguishable from a broken push path.
     """
     from alfred.integrations.github_ops import append_github_audit
 
+    push_enabled = bool(getattr(outcome_config, "enabled", False))
     changed_count = 0
+    pushed_count = 0
     for uid in sorted(state.entries):
         entry = state.entries[uid]
         if entry.issue_number is None:
             continue  # no issue yet — nothing to check against
+
         if entry.disposition in TICKET_TERMINAL_DISPOSITIONS:
-            continue  # terminal latch — never queried again
+            # Terminal latch — never re-query GitHub. But a terminal
+            # entry whose push never succeeded still needs the write-back
+            # retried (no GitHub call — the disposition is already
+            # final). A fully-pushed terminal entry skips both.
+            if push_enabled and not entry.outcome_pushed_at:
+                if await _maybe_push_ticket_outcome(
+                    uid, entry,
+                    outcome_config=outcome_config,
+                    transport_config=transport_config,
+                    now=now,
+                ):
+                    entry.outcome_pushed_at = now.isoformat()
+                    state.save()
+                    pushed_count += 1
+            continue
         try:
             changed = await _check_one_ticket_outcome(
                 client, entry, now=now,
@@ -709,6 +886,27 @@ async def check_ticket_outcomes(
                     ),
                 },
             )
+        # A non-terminal entry that flipped terminal THIS pass gets its
+        # write-back here (gated + idempotent inside the helper).
+        if push_enabled and not entry.outcome_pushed_at:
+            if await _maybe_push_ticket_outcome(
+                uid, entry,
+                outcome_config=outcome_config,
+                transport_config=transport_config,
+                now=now,
+            ):
+                entry.outcome_pushed_at = now.isoformat()
+                state.save()
+                pushed_count += 1
+
+    # ILB: idle is distinguishable from broken. Emit the no-op line when
+    # the pusher is enabled but no outcome was propagated this pass
+    # (every terminal entry already pushed, or no terminal entries yet).
+    if push_enabled and pushed_count == 0:
+        log.info(
+            "kalle.digest.no_ticket_outcomes_to_propagate",
+            checked=len(state.entries),
+        )
     return changed_count
 
 
@@ -864,11 +1062,13 @@ async def assemble_ticket_pipeline_section(
         from alfred.transport.ticket_intake import (
             TicketIntakeState,
             load_ticket_intake_config,
+            load_ticket_outcome_config,
         )
 
         now = now or datetime.now(timezone.utc)
         raw = raw if isinstance(raw, dict) else {}
         intake_config = load_ticket_intake_config(raw)
+        outcome_config = load_ticket_outcome_config(raw)
         state = TicketIntakeState.load(intake_config.state_path)
         if not state.entries:
             # ILB: the quiet line + a grep-able log — idle, not broken.
@@ -905,14 +1105,38 @@ async def assemble_ticket_pipeline_section(
                 )
 
         if client is not None:
+            # Build the transport config only when the c7 pusher is
+            # enabled — a KAL-LE instance NOT opted into the write-back
+            # runs capture-only exactly as before (no transport load).
+            transport_config = None
+            if outcome_config.enabled:
+                try:
+                    from alfred.transport.config import (
+                        load_from_unified as load_transport_config,
+                    )
+                    transport_config = load_transport_config(raw)
+                except Exception as exc:  # noqa: BLE001 — push is best-effort
+                    log.warning(
+                        "kalle.digest.ticket_outcome_transport_config_failed",
+                        error=str(exc),
+                        error_type=exc.__class__.__name__,
+                        detail=(
+                            "ticket_outcome.enabled is true but the "
+                            "transport config could not be loaded — "
+                            "write-back skipped this pass"
+                        ),
+                    )
             await check_ticket_outcomes(
                 state,
                 client,
                 now=now,
                 audit_log_path=client.config.audit_log_path,
+                outcome_config=outcome_config,
+                transport_config=transport_config,
             )
             # Atomic save — outcome_checked_at moved even when no
-            # disposition flipped.
+            # disposition flipped (check_ticket_outcomes also saves on
+            # each successful c7 push to persist outcome_pushed_at).
             state.save()
 
         return render_ticket_pipeline_section(

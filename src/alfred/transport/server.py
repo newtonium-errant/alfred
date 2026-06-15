@@ -671,6 +671,7 @@ def register_send_callable(
 # eagerly (avoids a circular import at module load).
 _PendingItemsResolveCallable = Callable[..., Awaitable[dict[str, Any]]]
 _PeerInboxCallable = Callable[..., Awaitable[dict[str, Any]]]
+_TicketOutcomeResolveCallable = Callable[..., Awaitable[dict[str, Any]]]
 
 
 def wire_transport_app(
@@ -691,6 +692,7 @@ def wire_transport_app(
     nl_llm_model_label: str = "",
     ticket_intake_config: Any | None = None,
     ticket_intake_github_client: Any | None = None,
+    ticket_outcome_resolve_callable: _TicketOutcomeResolveCallable | None = None,
 ) -> None:
     """Wire all transport-app dependencies in one place.
 
@@ -783,6 +785,7 @@ def wire_transport_app(
         register_pending_items_aggregate_path,
         register_pending_items_resolve_callable,
         register_ticket_intake,
+        register_ticket_outcome_resolver_callable,
         register_vault_path,
     )
 
@@ -943,6 +946,26 @@ def wire_transport_app(
             reason="no ticket_intake config + github client passed "
                    "(instance is not the pipeline's intake — only "
                    "KAL-LE registers this)",
+        )
+
+    # Ticket-outcome resolver (pipeline c7): the VERA-side receiver for
+    # the KAL-LE→VERA outcome write-back. Single callable, registered
+    # only on the ticket origin instance (VERA in MVP). Absent →
+    # POST /peer/ticket_outcome 501s (the capability isn't advertised
+    # in the handshake either) — explicit-by-omission, not silent.
+    if ticket_outcome_resolve_callable is not None:
+        register_ticket_outcome_resolver_callable(
+            app, ticket_outcome_resolve_callable,
+        )
+        log.info(
+            "transport.wire_transport_app.ticket_outcome_resolver_registered",
+        )
+    else:
+        log.debug(
+            "transport.wire_transport_app.ticket_outcome_resolver_skipped",
+            reason="no ticket_outcome resolver callable passed (instance "
+                   "is not a ticket-pipeline origin — only VERA registers "
+                   "this; KAL-LE/Salem/Hypatia leave None)",
         )
 
     # P2-4 sentinel: ``gcal_intended_on=True`` flags the

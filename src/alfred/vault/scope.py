@@ -710,6 +710,43 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "allow_body_insert_at": {},
         "allow_body_replace": {},
     },
+    # ``vera_ticket_outcome`` — the VERA-side resolver's write authority
+    # for the KAL-LE→VERA outcome write-back ONLY (2026-06-15, pipeline
+    # c7). After KAL-LE's effectiveness loop sees a tracked issue reach a
+    # terminal disposition, it pushes ``kind=ticket_outcome`` over the
+    # peer protocol; VERA's registered resolver flips the originating
+    # ticket out of the open worklist by editing the four outcome fields
+    # — and can do NOTHING else:
+    #
+    #   * ``edit`` uses the combined type+field gate
+    #     ``vera_ticket_outcome_only`` (same shape as
+    #     ``vera_forwarder_link_back_only``): ticket records only, fields
+    #     restricted to ``VERA_TICKET_OUTCOME_EDIT_FIELDS``, fail-closed
+    #     when the caller omits the field list or the record type.
+    #   * ``create`` DENIED — outcome write-back never mints records; a
+    #     resolver that could create could fabricate resolved tickets.
+    #   * ``move`` / ``delete`` DENIED — queue history preserved (same
+    #     Decision B posture as the other VERA scopes).
+    #   * Body writes + body-mutation tools DENIED — outcome write-back
+    #     is frontmatter-only (status flip + disposition record).
+    #
+    # Read/search/list/context stay on so the resolver can locate the
+    # ticket record by ``ticket_uid`` before writing. NOTE: ``list``
+    # requires the ``vera_ticket_outcome`` tag on the ticket
+    # TypeDefinition's ``available_in_scopes`` (gate 1 fires on list too).
+    "vera_ticket_outcome": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": False,
+        "edit": "vera_ticket_outcome_only",
+        "move": False,
+        "delete": False,
+        "allow_body_writes": False,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
     # Migration scope — one-shot operational scripts under
     # ``scripts/migrate_*.py`` that perform schema rewrites against the
     # LIVE vault. NOT a daemon scope: this scope is never assigned to a
@@ -1206,6 +1243,36 @@ VERA_FORWARDER_EDIT_FIELDS: set[str] = {
 }
 
 
+# ``vera_ticket_outcome`` write-back surface (2026-06-15, pipeline c7).
+# The KAL-LE→VERA outcome write-back: after KAL-LE's nightly
+# effectiveness loop (``brief.kalle_digest.check_ticket_outcomes``)
+# observes a tracked GitHub issue reach a TERMINAL disposition
+# (merged_clean / merged_after_rework / closed_unmerged), KAL-LE pushes
+# the outcome to VERA over the peer protocol (``kind=ticket_outcome``)
+# and VERA's resolver edits EXACTLY these four frontmatter fields on the
+# originating ticket record — flipping it out of VERA's open worklist —
+# and nothing else.
+#
+# A DEDICATED scope (NOT a widen of ``vera_forwarder``): the forwarder is
+# the VERA-INITIATED outbound daemon's identity, pinned to the link-back
+# fields by design (status + content edits explicitly belong elsewhere,
+# see the ``vera_forwarder_link_back_only`` gate). The outcome write-back
+# is the OPPOSITE direction (inbound, KAL-LE-initiated) and DOES flip
+# ``status`` — conflating the two trust surfaces would muddy both. Same
+# three-check gate shape (``vera_ticket_outcome_only``): ticket records
+# only, field-allowlist subset, fail-closed on missing type / fields.
+#
+# Fields: ``status`` (open→resolved|closed), ``ticket_disposition`` (the
+# merged/closed-no-merge record), ``resolved_at`` (resolution
+# timestamp), ``github_pr`` (the linked PR number, informational).
+# Contract-pinned in tests/test_ticket_pipeline_scope.py — widening
+# either set must update the pin in the same commit.
+VERA_TICKET_OUTCOME_EDIT_TYPES: set[str] = {"ticket"}
+VERA_TICKET_OUTCOME_EDIT_FIELDS: set[str] = {
+    "status", "ticket_disposition", "resolved_at", "github_pr",
+}
+
+
 # Canonical record types — the ones Salem owns as authoritative source-
 # of-truth for entity identity + time. Phase A inter-instance comms
 # (2026-05-01) explicitly carves these out from peer-instance
@@ -1617,6 +1684,52 @@ def check_scope(
                 f"Rejected: {', '.join(rejected)}. The forwarder path "
                 f"narrows to the GitHub issue link-back; ticket status "
                 f"and content edits belong to the vera / vera_ops scopes."
+            )
+        return
+
+    if permission == "vera_ticket_outcome_only":
+        # Pipeline c7 (2026-06-15) — VERA-side outcome write-back gate.
+        # Same three-check shape as ``vera_forwarder_link_back_only``:
+        # type restriction + fail-closed-on-missing-fields + field-
+        # allowlist subset. The resolver flips the originating ticket out
+        # of the open worklist (status + disposition + resolved_at +
+        # github_pr); anything else fails loud here.
+        #
+        # Fail-CLOSED on a missing type — same posture as the forwarder
+        # gate above; vault_edit parses record_type from the target's
+        # frontmatter, so an empty value here is a caller bug, not a
+        # licence to edit any type.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'vera_ticket_outcome_only' "
+                f"is type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass "
+                f"record_type (vault_edit parses it from the target "
+                f"record's frontmatter)."
+            )
+        if record_type not in VERA_TICKET_OUTCOME_EDIT_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit record types "
+                f"({', '.join(sorted(VERA_TICKET_OUTCOME_EDIT_TYPES))}). "
+                f"Got: '{record_type}'. The outcome write-back's write "
+                f"authority is the resolution flip on ticket records only."
+            )
+        if fields is None:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(VERA_TICKET_OUTCOME_EDIT_FIELDS))}); "
+                f"caller did not supply the field list."
+            )
+        rejected = [
+            f for f in fields if f not in VERA_TICKET_OUTCOME_EDIT_FIELDS
+        ]
+        if rejected:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the allowlist "
+                f"({', '.join(sorted(VERA_TICKET_OUTCOME_EDIT_FIELDS))}). "
+                f"Rejected: {', '.join(rejected)}. The outcome write-back "
+                f"narrows to the resolution flip; ticket creation and "
+                f"content edits belong to the vera / vera_ops scopes."
             )
         return
 

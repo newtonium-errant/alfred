@@ -278,6 +278,11 @@ def _bodies_by_route() -> dict[tuple[str, str], dict[str, Any]]:
             "item_id": "smoke-item-1",
             "resolution": "smoke-option-a",
         },
+        ("POST", "/peer/ticket_outcome"): {
+            "ticket_uid": "smoke-uid",
+            "status": "resolved",
+            "disposition": "merged",
+        },
         ("POST", "/canonical/event/propose-create"): {
             "title": "Smoke event",
             "start": "2026-05-04T14:00:00-03:00",
@@ -551,15 +556,15 @@ async def test_smoke_covers_expected_route_count(  # type: ignore[no-untyped-def
     should look at this test, confirm the new shape is intentional, and
     bump the expected count.
 
-    Current surface (2026-06-11):
+    Current surface (2026-06-15):
       * /outbound/send, /outbound/send_batch, /outbound/status/{id}
       * /peer/send, /peer/query, /peer/search, /peer/handshake,
         /peer/brief_digest, /peer/pending_items_push,
-        /peer/pending_items_resolve
+        /peer/pending_items_resolve, /peer/ticket_outcome
       * /canonical/event/propose-create, /canonical/{type}/propose,
         /canonical/{type}/{name}
       * /health
-    Total: 14.
+    Total: 15.
 
     History note: /peer/search (the P1 deterministic filtered-query
     broker, 4db2070, 2026-06-09) shipped without updating this pin or
@@ -567,10 +572,11 @@ async def test_smoke_covers_expected_route_count(  # type: ignore[no-untyped-def
     via discovery (default empty body → fail-closed 4xx), but the
     count pin sat stale until the 2026-06-11 suite-debt sweep. When
     bumping this number, update _bodies_by_route in the SAME commit.
+    /peer/ticket_outcome (pipeline c7, 2026-06-15) bumped 14→15.
     """
     app = fully_wired_client.app  # type: ignore[union-attr]
     routes = _discover_routes(app)
-    expected = 14
+    expected = 15
     assert len(routes) == expected, (
         f"Expected {expected} routes, found {len(routes)}: {routes}. "
         f"If you've added or removed a transport route, update this "

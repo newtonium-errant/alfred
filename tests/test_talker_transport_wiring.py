@@ -193,3 +193,39 @@ def test_talker_daemon_wires_gcal_client_when_enabled():
         "wire_transport_app must receive gcal_config=gcal_config; "
         "the handler reads calendar IDs from the typed config dataclass"
     )
+
+
+def test_talker_daemon_wires_ticket_outcome_resolver_when_receiver_enabled():
+    """Daemon must construct + wire the ticket-outcome resolver when
+    ``ticket_outcome.receiver_enabled`` is true (pipeline c7).
+
+    Defined-but-not-wired is the Flavor-3 bug class
+    (feedback_multi_instance_wiring_pattern.md): the resolver callable +
+    /peer/ticket_outcome route exist, but without the daemon threading
+    the closure through ``wire_transport_app`` the route 501s forever on
+    the origin instance. This pins the wiring line so a future refactor
+    can't silently drop it.
+
+    The pinned shape:
+      * Daemon imports ``load_ticket_outcome_config`` + ``resolve_ticket_
+        outcome`` from ticket_intake
+      * Gates on ``receiver_enabled``
+      * Passes ``ticket_outcome_resolve_callable=`` to wire_transport_app
+    """
+    source = _daemon_source()
+    assert "load_ticket_outcome_config" in source, (
+        "talker daemon must load the ticket_outcome config to decide "
+        "whether to wire the receiver"
+    )
+    assert "resolve_ticket_outcome" in source, (
+        "talker daemon must import the resolver core for the closure"
+    )
+    assert "receiver_enabled" in source, (
+        "talker daemon must gate the resolver wiring on "
+        "ticket_outcome.receiver_enabled (origin-instance opt-in)"
+    )
+    assert "ticket_outcome_resolve_callable=" in source, (
+        "wire_transport_app must receive ticket_outcome_resolve_callable; "
+        "without it /peer/ticket_outcome 501s forever (Flavor-3 "
+        "defined-but-not-wired bug)"
+    )

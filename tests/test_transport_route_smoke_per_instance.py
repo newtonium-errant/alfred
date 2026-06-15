@@ -344,6 +344,10 @@ def _bodies_by_route() -> dict[tuple[str, str], dict[str, Any]]:
         ("POST", "/peer/pending_items_resolve"): {
             "item_id": "smoke-1", "resolution": "ok",
         },
+        ("POST", "/peer/ticket_outcome"): {
+            "ticket_uid": "smoke-uid", "status": "resolved",
+            "disposition": "merged",
+        },
         ("POST", "/canonical/event/propose-create"): {
             "title": "Smoke event",
             "start": "2026-05-04T14:00:00-03:00",

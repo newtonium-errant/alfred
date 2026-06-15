@@ -102,6 +102,70 @@ def load_ticket_intake_config(raw: dict[str, Any]) -> TicketIntakeConfig:
 
 
 # ---------------------------------------------------------------------------
+# Outcome write-back config (c7) — KAL-LE→VERA push settings
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TicketOutcomeConfig:
+    """Typed view of the ``ticket_outcome:`` config section (pipeline c7).
+
+    The KAL-LE→VERA outcome write-back. ONE section, TWO roles — each
+    instance sets only the flag for its side:
+
+      * KAL-LE (the PUSHER): ``enabled: true`` + ``self_name`` +
+        ``target_peer`` → KAL-LE's nightly effectiveness loop pushes a
+        terminal-disposition outcome to ``target_peer`` over the peer
+        protocol.
+      * VERA (the RECEIVER): ``receiver_enabled: true`` → the talker
+        daemon wires the ``ticket_outcome`` resolver so
+        ``POST /peer/ticket_outcome`` applies the write-back (and the
+        handshake advertises the ``ticket_outcome`` capability).
+
+    The two flags are independent: an instance that only pushes leaves
+    ``receiver_enabled`` False; an instance that only receives leaves
+    ``enabled`` False. Both default False — an instance with no
+    ``ticket_outcome:`` block neither pushes nor receives (the
+    effectiveness loop runs exactly as before; the resolver 501s).
+
+    Deliberately tiny — the GitHub side (audit log) lives on ``github:``
+    and the issue state lives on the shared ``ticket_intake`` state
+    file. ``target_peer`` looks up base_url + token in THIS instance's
+    ``transport.peers[<target_peer>]``; ``self_name`` is the identity
+    KAL-LE presents as ``body.from`` + ``X-Alfred-Client`` (VERA's
+    ``auth.tokens`` entry must list it in ``allowed_clients``). No
+    hardcoded-default antipattern: ``self_name`` empty by default,
+    fail-loud at the push call site if a push is attempted without one
+    (per feedback_hardcoding_and_alfred_naming.md).
+    """
+
+    enabled: bool = False
+    receiver_enabled: bool = False
+    self_name: str = ""
+    target_peer: str = "vera"
+
+
+def load_ticket_outcome_config(raw: dict[str, Any]) -> TicketOutcomeConfig:
+    """Build :class:`TicketOutcomeConfig` from the unified config dict.
+
+    Tolerant defaults: an absent / malformed section returns the
+    all-disabled default config (the pusher's effectiveness loop then
+    skips the push and logs ``kalle.digest.ticket_outcome_push_disabled``;
+    the receiver leaves the resolver unwired so the route 501s).
+    """
+    section = raw.get("ticket_outcome") or {}
+    if not isinstance(section, dict):
+        return TicketOutcomeConfig()
+
+    return TicketOutcomeConfig(
+        enabled=bool(section.get("enabled", False)),
+        receiver_enabled=bool(section.get("receiver_enabled", False)),
+        self_name=str(section.get("self_name", "") or ""),
+        target_peer=str(section.get("target_peer", "vera") or "vera"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
@@ -137,6 +201,12 @@ class TicketIntakeEntry:
       * ``ticket_to_pr_latency_days`` — float days from issue creation
         to PR merge (merged dispositions only).
       * ``outcome_checked_at`` — last time c5 evaluated this entry.
+
+    Filled by c7 (the KAL-LE→VERA outcome write-back, fired from the
+    same c5 effectiveness loop):
+      * ``outcome_pushed_at`` — ISO timestamp of the first successful
+        write-back to VERA's ticket copy; ``""`` until then. The
+        idempotency guard (write once on the open→terminal transition).
     """
 
     recorded_at: str = ""
@@ -152,6 +222,16 @@ class TicketIntakeEntry:
     disposition: str = ""
     ticket_to_pr_latency_days: float | None = None
     outcome_checked_at: str = ""
+    # --- c7 outcome write-back idempotency flag ---
+    # Set to the ISO timestamp of the FIRST successful KAL-LE→VERA
+    # outcome write-back (``brief.kalle_digest.check_ticket_outcomes``).
+    # Empty == not yet propagated. The write-back fires once on the
+    # open→terminal transition; the terminal-latch's skip is gated on
+    # this being non-empty (a terminal entry whose push FAILED stays
+    # re-checkable so the next nightly pass retries). Additive +
+    # backward-safe via the schema-tolerance loader: entries written
+    # before this field existed carry "" and propagate on the next pass.
+    outcome_pushed_at: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> "TicketIntakeEntry":
@@ -221,11 +301,125 @@ class TicketIntakeState:
         os.replace(tmp_path, self.path)
 
 
+# ---------------------------------------------------------------------------
+# Outcome write-back resolver (c7) — VERA-side receiver logic
+# ---------------------------------------------------------------------------
+
+
+def find_ticket_by_uid(vault_path: Path, ticket_uid: str) -> str | None:
+    """Locate a ticket record by ``ticket_uid``; return its relpath or None.
+
+    Globs ``<vault>/ticket/*.md`` and returns the first record whose
+    ``ticket_uid`` frontmatter matches. Defensive parse (a malformed
+    record logs + is skipped, never raises). Deterministic order via
+    ``sorted`` so a (pathological) duplicate-uid vault resolves stably.
+    The VERA-side resolver uses this to find the originating ticket the
+    KAL-LE outcome write-back targets.
+    """
+    import frontmatter
+
+    ticket_dir = vault_path / "ticket"
+    if not ticket_dir.exists():
+        return None
+    for md_file in sorted(ticket_dir.glob("*.md")):
+        try:
+            post = frontmatter.load(str(md_file))
+        except Exception as exc:  # noqa: BLE001 — one bad record never fails the lookup
+            log.warning(
+                "ticket_outcome.lookup_parse_failed",
+                path=str(md_file),
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+            )
+            continue
+        fm = dict(post.metadata or {})
+        if fm.get("type") != "ticket":
+            continue
+        if str(fm.get("ticket_uid") or "") == ticket_uid:
+            return f"ticket/{md_file.name}"
+    return None
+
+
+def resolve_ticket_outcome(
+    vault_path: Path,
+    *,
+    ticket_uid: str,
+    status: str,
+    disposition: str,
+    pr_number: int | None = None,
+    resolved_at: str | None = None,
+) -> dict[str, Any]:
+    """Apply a KAL-LE outcome write-back to the VERA ticket copy.
+
+    The VERA-side resolver core (pipeline c7), called by the talker
+    daemon's registered ``ticket_outcome`` resolver closure. Locates the
+    ticket by ``ticket_uid`` and flips it out of the open worklist via
+    a single ``vera_ticket_outcome``-scoped edit of exactly the four
+    allowlisted fields (status / ticket_disposition / resolved_at /
+    github_pr).
+
+    Idempotent: re-applying an already-resolved status is a harmless
+    re-write (``applied=True``); the scope gate + vault_edit handle the
+    no-change case without error.
+
+    Returns the resolver-contract dict consumed by
+    ``peer_handlers._handle_peer_ticket_outcome``:
+      * ticket not found → ``{"found": False}`` (handler → 404).
+      * applied → ``{"found": True, "applied": True, "relpath": ...}``.
+      * write denied/failed → raised (handler → 502); the resolver does
+        NOT swallow scope/vault errors — a denied write is a real wiring
+        bug the operator must see, not a silent no-op.
+    """
+    from alfred.vault.ops import vault_edit
+
+    relpath = find_ticket_by_uid(vault_path, ticket_uid)
+    if relpath is None:
+        log.info(
+            "ticket_outcome.ticket_not_found",
+            ticket_uid=ticket_uid,
+            vault_path=str(vault_path),
+        )
+        return {"found": False}
+
+    set_fields: dict[str, Any] = {
+        "status": status,
+        "ticket_disposition": disposition,
+    }
+    if resolved_at:
+        set_fields["resolved_at"] = resolved_at
+    if pr_number is not None:
+        set_fields["github_pr"] = pr_number
+
+    result = vault_edit(
+        vault_path,
+        relpath,
+        set_fields=set_fields,
+        scope="vera_ticket_outcome",
+    )
+    log.info(
+        "ticket_outcome.applied",
+        ticket_uid=ticket_uid,
+        relpath=relpath,
+        status=status,
+        disposition=disposition,
+        fields_changed=result.get("fields_changed", []),
+    )
+    return {
+        "found": True,
+        "applied": True,
+        "relpath": relpath,
+    }
+
+
 __all__ = [
     "DEFAULT_TICKET_INTAKE_STATE_PATH",
     "TICKET_UID_RE",
     "TicketIntakeConfig",
     "TicketIntakeEntry",
     "TicketIntakeState",
+    "TicketOutcomeConfig",
+    "find_ticket_by_uid",
     "load_ticket_intake_config",
+    "load_ticket_outcome_config",
+    "resolve_ticket_outcome",
 ]

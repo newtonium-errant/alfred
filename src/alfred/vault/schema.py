@@ -496,6 +496,14 @@ _DEFINITIONS: list[TypeDefinition] = [
         name_field="title",
         available_in_scopes=frozenset({
             "vera", "vera_ops", "kalle", "vera_forwarder",
+            # ``vera_ticket_outcome`` (2026-06-15, pipeline c7) — the
+            # VERA-side resolver for the KAL-LE→VERA outcome write-back.
+            # Gate 1 (_validate_type) fires on list/edit, so the resolver
+            # scope must tag here too or its vault_edit is rejected as
+            # "Unknown type under scope 'vera_ticket_outcome'" before it
+            # reaches the scope gate. See
+            # scope.py::VERA_TICKET_OUTCOME_EDIT_FIELDS.
+            "vera_ticket_outcome",
         }),
         is_leaf=True,
     ),

@@ -1402,3 +1402,90 @@ async def peer_resolve_pending_item(
         correlation_id=cid,
         json_body=body,
     )
+
+
+async def peer_send_ticket_outcome(
+    peer_name: str,
+    *,
+    ticket_uid: str,
+    status: str,
+    disposition: str,
+    self_name: str,
+    pr_number: int | None = None,
+    resolved_at: str | None = None,
+    config: "TransportConfig | None" = None,
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """POST /peer/ticket_outcome on the named peer (KAL-LE → VERA).
+
+    The KAL-LE→VERA outcome write-back (pipeline c7), the SECOND
+    KAL-LE-initiated direction on the transport substrate (the first is
+    Salem→peer pending_items_resolve; KAL-LE's other transport traffic —
+    brief_digest_push, the ticket-intake ack — is all reactive). After
+    KAL-LE's nightly effectiveness loop observes a tracked issue reach a
+    terminal disposition, it pushes the outcome here so VERA's resolver
+    flips the originating ticket out of its open worklist.
+
+    Args:
+        peer_name: Outbound peer key (the ticket's origin instance —
+            ``vera`` in MVP). Looked up in THIS instance's
+            ``transport.peers``; an unconfigured peer raises
+            ``TransportError`` (fail-loud, caught + contained by the
+            effectiveness loop so a missing peer never crashes the
+            digest).
+        ticket_uid: The pipeline-stable join key; VERA resolves its
+            local ticket copy by this.
+        status: The resolution status to set on VERA's ticket —
+            ``"resolved"`` (merged dispositions) or ``"closed"``
+            (closed_unmerged). Both drop the ticket from VERA's
+            open worklist.
+        disposition: The KAL-LE disposition translated to VERA's
+            ``ticket_disposition`` vocabulary (``merged`` /
+            ``merged_after_rework`` / ``closed_no_merge``).
+        self_name: This instance's identity — required, no default.
+            KAL-LE is the only sender today but threading the value
+            through avoids the hardcoded-default antipattern flagged in
+            ``feedback_hardcoding_and_alfred_naming.md``.
+        pr_number: The linked PR number (informational; written to
+            VERA's ``github_pr``). Optional.
+        resolved_at: Optional caller-supplied iso8601 timestamp;
+            defaults to "now" on the receiving side.
+        config: Pre-loaded TransportConfig.
+        correlation_id: Optional tracing id.
+
+    Returns:
+        Server's response dict — ``{"applied": <bool>, "relpath": "...",
+        "error": <str|null>, "correlation_id": "<echo>"}``.
+    """
+    import secrets
+
+    from .config import TransportConfig, load_config
+    from .peers import _resolve_peer
+
+    if config is None:
+        config = load_config()
+    base_url, token = _resolve_peer(config, peer_name)
+    cid = (
+        correlation_id
+        or f"{self_name}-ticket-outcome-{ticket_uid[:16]}-{secrets.token_hex(2)}"
+    )
+
+    body: dict[str, Any] = {
+        "ticket_uid": ticket_uid,
+        "status": status,
+        "disposition": disposition,
+        "correlation_id": cid,
+    }
+    if pr_number is not None:
+        body["pr_number"] = pr_number
+    if resolved_at:
+        body["resolved_at"] = resolved_at
+    return await _peer_request(
+        base_url=base_url,
+        token=token,
+        method="POST",
+        path="/peer/ticket_outcome",
+        self_name=self_name,
+        correlation_id=cid,
+        json_body=body,
+    )

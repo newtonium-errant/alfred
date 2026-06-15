@@ -31,6 +31,8 @@ from alfred.vault.scope import (
     KALLE_CREATE_TYPES,
     VERA_FORWARDER_EDIT_FIELDS,
     VERA_FORWARDER_EDIT_TYPES,
+    VERA_TICKET_OUTCOME_EDIT_FIELDS,
+    VERA_TICKET_OUTCOME_EDIT_TYPES,
     ScopeError,
     check_scope,
 )
@@ -293,8 +295,11 @@ def test_known_types_by_scope_keys_derive_from_registry():
         if s != schema.SCOPE_CANONICAL
     }
     assert set(schema.KNOWN_TYPES_BY_SCOPE.keys()) == expected_scopes
-    # The pipeline scopes specifically must be present.
-    assert {"kalle", "vera", "vera_ops", "vera_forwarder"} <= expected_scopes
+    # The pipeline scopes specifically must be present (c7 added
+    # vera_ticket_outcome — the KAL-LE→VERA write-back resolver scope).
+    assert {
+        "kalle", "vera", "vera_ops", "vera_forwarder", "vera_ticket_outcome",
+    } <= expected_scopes
 
 
 def test_ticket_in_scope_unions_via_registry():
@@ -304,6 +309,7 @@ def test_ticket_in_scope_unions_via_registry():
     assert "ticket" in schema.KNOWN_TYPES_BY_SCOPE["vera"]
     assert "ticket" in schema.KNOWN_TYPES_BY_SCOPE["vera_ops"]
     assert "ticket" in schema.KNOWN_TYPES_BY_SCOPE["vera_forwarder"]
+    assert "ticket" in schema.KNOWN_TYPES_BY_SCOPE["vera_ticket_outcome"]
     assert "ticket" not in schema.KNOWN_TYPES_BY_SCOPE["hypatia"]
     assert "ticket" not in schema.KNOWN_TYPES
 
@@ -313,3 +319,150 @@ def test_forwarder_union_is_canonical_plus_ticket_only():
     — the read-surface widening is exactly one type wide."""
     forwarder_extension = schema.TYPE_REGISTRY.types_in_scope("vera_forwarder")
     assert forwarder_extension == frozenset({"ticket"})
+
+
+# ---------------------------------------------------------------------------
+# vera_ticket_outcome — KAL-LE→VERA write-back resolver scope (c7)
+# ---------------------------------------------------------------------------
+#
+# Mirror of the vera_forwarder block above, the OPPOSITE direction: the
+# forwarder writes the GitHub link-back (frontmatter join keys); the
+# outcome resolver flips the resolution (status + disposition). A
+# DEDICATED scope by design (not a vera_forwarder widen) — these tests
+# pin that separation: the outcome scope can touch status (the forwarder
+# CANNOT) and CANNOT touch the link-back fields (the forwarder's only
+# job).
+
+
+def test_ticket_outcome_field_allowlist_contract_pin():
+    """CONTRACT PIN: exactly the four write-back fields, ticket only.
+
+    Widening either set is a deliberate scope change — update this pin
+    in the same commit (pre-commit checklist #6).
+    """
+    assert VERA_TICKET_OUTCOME_EDIT_TYPES == {"ticket"}
+    assert VERA_TICKET_OUTCOME_EDIT_FIELDS == {
+        "status", "ticket_disposition", "resolved_at", "github_pr",
+    }
+
+
+def test_ticket_outcome_allows_read_search_list_context():
+    for op in ("read", "search", "list", "context"):
+        check_scope("vera_ticket_outcome", op)
+
+
+def test_ticket_outcome_edit_all_four_fields_allowed():
+    check_scope(
+        "vera_ticket_outcome", "edit", record_type="ticket",
+        fields=["status", "ticket_disposition", "resolved_at", "github_pr"],
+    )
+
+
+def test_ticket_outcome_edit_status_only_allowed():
+    # The minimal write-back is a bare status flip.
+    check_scope(
+        "vera_ticket_outcome", "edit", record_type="ticket",
+        fields=["status"],
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_field",
+    # github_issue / github_url / forwarded_at are the FORWARDER's
+    # fields — the outcome scope must NOT be able to touch them (the
+    # two-scope separation). title/reporter are general ticket content.
+    ["github_issue", "github_url", "forwarded_at", "title", "reporter"],
+)
+def test_ticket_outcome_edit_other_fields_denied(bad_field: str):
+    with pytest.raises(ScopeError, match=bad_field):
+        check_scope(
+            "vera_ticket_outcome", "edit", record_type="ticket",
+            fields=["status", bad_field],
+        )
+
+
+def test_ticket_outcome_edit_fails_closed_without_field_list():
+    with pytest.raises(ScopeError, match="did not supply"):
+        check_scope("vera_ticket_outcome", "edit", record_type="ticket")
+
+
+def test_ticket_outcome_edit_fails_closed_without_record_type():
+    """Same fail-closed posture as the forwarder gate (2026-06-12
+    WARN-3): an empty record_type must NOT skip the type restriction."""
+    with pytest.raises(ScopeError, match="record type is unavailable"):
+        check_scope(
+            "vera_ticket_outcome", "edit", record_type="",
+            fields=["status"],
+        )
+
+
+def test_ticket_outcome_edit_non_ticket_type_denied():
+    with pytest.raises(ScopeError, match="ticket"):
+        check_scope(
+            "vera_ticket_outcome", "edit", record_type="note",
+            fields=["status"],
+        )
+
+
+def test_ticket_outcome_create_move_delete_denied():
+    for op in ("create", "move", "delete"):
+        with pytest.raises(ScopeError):
+            check_scope("vera_ticket_outcome", op, record_type="ticket")
+
+
+def test_ticket_outcome_body_writes_denied():
+    with pytest.raises(ScopeError, match="body"):
+        check_scope(
+            "vera_ticket_outcome", "edit", record_type="ticket",
+            fields=["status"], body_write=True,
+        )
+
+
+def test_ticket_outcome_body_mutation_tools_denied():
+    with pytest.raises(ScopeError):
+        check_scope("vera_ticket_outcome", "body_insert_at", record_type="ticket")
+    with pytest.raises(ScopeError):
+        check_scope("vera_ticket_outcome", "body_replace", record_type="ticket")
+
+
+def test_ticket_outcome_end_to_end_resolution_flip(tmp_path) -> None:
+    """vault_edit under vera_ticket_outcome: the resolution fields land;
+    a link-back field write (the forwarder's surface) is refused."""
+    result = vault_create(
+        tmp_path, "ticket", "Portal 500 on login",
+        set_fields={**dict(_TICKET_FIELDS), "status": "open"}, scope="kalle",
+    )
+    rel_path = result["path"]
+
+    edited = vault_edit(
+        tmp_path, rel_path,
+        set_fields={
+            "status": "resolved",
+            "ticket_disposition": "merged",
+            "resolved_at": "2026-06-15T12:00:00+00:00",
+            "github_pr": 8,
+        },
+        scope="vera_ticket_outcome",
+    )
+    assert set(edited["fields_changed"]) >= {"status", "ticket_disposition"}
+    content = (tmp_path / rel_path).read_text(encoding="utf-8")
+    assert "status: resolved" in content
+    assert "ticket_disposition: merged" in content
+
+    # The forwarder's fields are OUT of this scope's allowlist — the
+    # two-scope separation, enforced.
+    with pytest.raises(ScopeError):
+        vault_edit(
+            tmp_path, rel_path,
+            set_fields={"github_issue": 8},
+            scope="vera_ticket_outcome",
+        )
+
+
+def test_ticket_outcome_union_is_canonical_plus_ticket_only():
+    """vera_ticket_outcome unlocks ticket and nothing else beyond
+    canonical — exactly one type wide, same as the forwarder."""
+    outcome_extension = schema.TYPE_REGISTRY.types_in_scope(
+        "vera_ticket_outcome",
+    )
+    assert outcome_extension == frozenset({"ticket"})

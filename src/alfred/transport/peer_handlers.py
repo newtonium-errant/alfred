@@ -1015,6 +1015,7 @@ def _compute_capabilities(
     config: TransportConfig,
     *,
     ticket_intake: bool = False,
+    ticket_outcome: bool = False,
 ) -> list[str]:
     """Capability list for /peer/handshake.
 
@@ -1023,13 +1024,19 @@ def _compute_capabilities(
     passes whether :func:`register_ticket_intake` actually wired the
     intake (config present+enabled AND github client built), so peers
     never see the capability advertised by a half-configured instance.
-    The keyword default keeps pre-existing call sites byte-identical.
+    ``ticket_outcome`` (pipeline c7) is likewise registration-driven —
+    advertised only when the VERA-side resolver callable is wired (so a
+    sender can check the capability before pushing an outcome write-back
+    and skip the round-trip on a peer that can't apply it). The keyword
+    defaults keep pre-existing call sites byte-identical.
     """
     caps = list(_DEFAULT_CAPABILITIES)
     if config.canonical.owner:
         caps.append("canonical_owner")
     if ticket_intake:
         caps.append("ticket_intake")
+    if ticket_outcome:
+        caps.append("ticket_outcome")
     return caps
 
 
@@ -1078,6 +1085,7 @@ async def _handle_peer_handshake(request: web.Request) -> web.StreamResponse:
         "capabilities": _compute_capabilities(
             config,
             ticket_intake=_ticket_intake_registered(request),
+            ticket_outcome=_ticket_outcome_registered(request),
         ),
         "peers": peers_advertised,
         "correlation_id": correlation_id,
@@ -1982,6 +1990,216 @@ async def _handle_peer_pending_items_resolve(
         item_id=item_id,
         resolution=resolution,
         executed=response["executed"],
+        correlation_id=correlation_id,
+    )
+    return web.json_response(response)
+
+
+# ---------------------------------------------------------------------------
+# /peer/ticket_outcome — KAL-LE → VERA (pipeline c7 outcome write-back)
+# ---------------------------------------------------------------------------
+#
+# Second KAL-LE-initiated direction on the transport substrate (the
+# Salem→peer pending_items_resolve above is the first). After KAL-LE's
+# nightly effectiveness loop (``brief.kalle_digest.check_ticket_outcomes``)
+# observes a tracked GitHub issue reach a TERMINAL disposition, it pushes
+# the outcome here so VERA's resolver flips the originating ticket out of
+# its open worklist (status: resolved | closed).
+#
+# Modeled on /peer/pending_items_resolve: the per-instance handler needs
+# the local vault path + the resolver scope, so the talker daemon
+# registers a resolver-callable at startup the same way the
+# pending-items resolver is wired. When the callable isn't registered,
+# return 501 so the operator sees the gap rather than a silent no-op
+# (a VERA without the resolver registered = the feature isn't wired).
+#
+# Idempotency lives on BOTH sides: KAL-LE pushes once per terminal
+# transition (the ``outcome_pushed_at`` intake-state flag), and VERA's
+# resolver is a no-op-safe status flip (re-applying resolved→resolved is
+# ``applied=True`` with no change), so a duplicate push is harmless.
+
+_KEY_TICKET_OUTCOME_RESOLVER = "transport.ticket_outcome.resolve_callable"
+
+TicketOutcomeResolveCallable = Callable[..., Awaitable[dict[str, Any]]]
+
+# Accepted resolution statuses on the wire — the receiver's schema gate.
+# Mirrors the KAL-LE-side status mapping (merged_* → resolved;
+# closed_unmerged → closed). Both are terminal ticket statuses outside
+# VERA's OPEN_TICKET_STATUSES, so either flips the ticket off the open
+# worklist. Pinned in tests/test_ticket_outcome.py.
+_TICKET_OUTCOME_STATUSES = frozenset({"resolved", "closed"})
+
+
+def register_ticket_outcome_resolver_callable(
+    app: web.Application,
+    callable_: TicketOutcomeResolveCallable,
+) -> None:
+    """Wire a ticket-outcome resolver callable onto an already-built app.
+
+    Mirrors :func:`register_pending_items_resolve_callable`. The callable
+    shape is ``(ticket_uid, status, disposition, pr_number, resolved_at,
+    correlation_id) -> awaitable[dict]``. The VERA talker daemon
+    registers it at startup as a closure over the running vault path +
+    the ``vera_ticket_outcome`` scope. Absent →
+    ``POST /peer/ticket_outcome`` answers 501
+    ``ticket_outcome_resolver_not_configured``.
+    """
+    app[_KEY_TICKET_OUTCOME_RESOLVER] = callable_
+
+
+async def _handle_peer_ticket_outcome(
+    request: web.Request,
+) -> web.StreamResponse:
+    """POST /peer/ticket_outcome — accept a KAL-LE outcome write-back.
+
+    Body::
+
+        {
+          "ticket_uid":  "vera-20260613-6ca5b92f",
+          "status":      "resolved" | "closed",
+          "disposition": "merged" | "merged_after_rework" | "closed_no_merge",
+          "pr_number":   8,                          # optional
+          "resolved_at": "2026-06-13T...Z",          # optional
+          "correlation_id": "<optional>"
+        }
+
+    Response::
+
+        {
+          "applied": <bool>,
+          "relpath": "<vera ticket relpath or empty>",
+          "error":   "<str or null>",
+          "correlation_id": "<echo>"
+        }
+
+    Error taxonomy (aligned with the other peer routes):
+        400 invalid_json / schema_error
+        404 ticket_not_found      (no VERA ticket with that uid)
+        501 ticket_outcome_resolver_not_configured
+        502 ticket_outcome_resolver_error
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        correlation_id = _ensure_correlation_id(request, None)
+        return _json_error(400, "invalid_json", correlation_id=correlation_id)
+
+    correlation_id = _ensure_correlation_id(request, body)
+
+    ticket_uid = body.get("ticket_uid")
+    status = body.get("status")
+    disposition = body.get("disposition")
+    pr_number = body.get("pr_number")
+    resolved_at = body.get("resolved_at")
+
+    if not isinstance(ticket_uid, str) or not ticket_uid.strip():
+        return _json_error(
+            400, "schema_error",
+            detail="ticket_uid must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+    ticket_uid = ticket_uid.strip()
+    if status not in _TICKET_OUTCOME_STATUSES:
+        return _json_error(
+            400, "schema_error",
+            detail=(
+                "status must be one of "
+                f"{sorted(_TICKET_OUTCOME_STATUSES)}"
+            ),
+            correlation_id=correlation_id,
+        )
+    if not isinstance(disposition, str) or not disposition.strip():
+        return _json_error(
+            400, "schema_error",
+            detail="disposition must be a non-empty string",
+            correlation_id=correlation_id,
+        )
+    disposition = disposition.strip()
+    if pr_number is not None and (
+        not isinstance(pr_number, int) or isinstance(pr_number, bool)
+    ):
+        return _json_error(
+            400, "schema_error",
+            detail="pr_number must be an integer when present",
+            correlation_id=correlation_id,
+        )
+    if resolved_at is not None and not isinstance(resolved_at, str):
+        return _json_error(
+            400, "schema_error",
+            detail="resolved_at must be an ISO 8601 string when present",
+            correlation_id=correlation_id,
+        )
+
+    resolver: TicketOutcomeResolveCallable | None = request.app.get(
+        _KEY_TICKET_OUTCOME_RESOLVER,
+    )
+    if resolver is None:
+        return _json_error(
+            501, "ticket_outcome_resolver_not_configured",
+            detail=(
+                "this instance has no ticket-outcome resolver registered "
+                "(likely not a ticket-pipeline origin instance, or the "
+                "talker daemon did not wire the resolver)"
+            ),
+            correlation_id=correlation_id,
+        )
+
+    try:
+        result = await resolver(
+            ticket_uid=ticket_uid,
+            status=status,
+            disposition=disposition,
+            pr_number=pr_number,
+            resolved_at=resolved_at,
+            correlation_id=correlation_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "transport.peer.ticket_outcome_resolver_error",
+            ticket_uid=ticket_uid,
+            status=status,
+            disposition=disposition,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            correlation_id=correlation_id,
+        )
+        return _json_error(
+            502, "ticket_outcome_resolver_error",
+            detail=str(exc),
+            correlation_id=correlation_id,
+        )
+
+    result = result if isinstance(result, dict) else {}
+    # The resolver signals "no VERA ticket with this uid" via
+    # found=False; surface it as a 404 so KAL-LE can log the miss
+    # distinctly (fail-closed: KAL-LE's own state stays authoritative).
+    if not result.get("found", True):
+        log.info(
+            "transport.peer.ticket_outcome_not_found",
+            ticket_uid=ticket_uid,
+            correlation_id=correlation_id,
+        )
+        return _json_error(
+            404, "ticket_not_found",
+            detail=f"no ticket with ticket_uid '{ticket_uid}'",
+            correlation_id=correlation_id,
+        )
+
+    response: dict[str, Any] = {
+        "applied": bool(result.get("applied", False)),
+        "relpath": str(result.get("relpath", "")),
+        "error": (
+            result.get("error") if result.get("error") is not None else None
+        ),
+        "correlation_id": correlation_id,
+    }
+    log.info(
+        "transport.peer.ticket_outcome_applied",
+        ticket_uid=ticket_uid,
+        status=status,
+        disposition=disposition,
+        applied=response["applied"],
+        relpath=response["relpath"],
         correlation_id=correlation_id,
     )
     return web.json_response(response)
@@ -2979,6 +3197,16 @@ def _ticket_intake_registered(request: web.Request) -> bool:
     )
 
 
+def _ticket_outcome_registered(request: web.Request) -> bool:
+    """True iff register_ticket_outcome_resolver_callable wired the resolver.
+
+    Drives the ``ticket_outcome`` handshake capability (pipeline c7) —
+    advertised only when VERA's resolver is actually wired, so a sender
+    can skip the write-back round-trip on a peer that can't apply it.
+    """
+    return request.app.get(_KEY_TICKET_OUTCOME_RESOLVER) is not None
+
+
 async def _handle_ticket_intake(
     request: web.Request,
     *,
@@ -3453,6 +3681,7 @@ def register_peer_routes(app: web.Application) -> None:
     app.router.add_post("/peer/brief_digest", _handle_peer_brief_digest)
     app.router.add_post("/peer/pending_items_push", _handle_peer_pending_items_push)
     app.router.add_post("/peer/pending_items_resolve", _handle_peer_pending_items_resolve)
+    app.router.add_post("/peer/ticket_outcome", _handle_peer_ticket_outcome)
 
 
 def register_canonical_routes(app: web.Application) -> None:
