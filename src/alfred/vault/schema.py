@@ -249,13 +249,24 @@ _DEFINITIONS: list[TypeDefinition] = [
         name="project",
         directory="project",
         statuses=frozenset({"active", "paused", "completed", "abandoned", "proposed"}),
-        available_in_scopes=frozenset({SCOPE_CANONICAL}),
+        # ``{vera, vera_ops}`` (2026-06-15, vera-assistant arc) — VERA is
+        # a general PHI-free business assistant; both roles create+edit
+        # ``project`` (initiatives). ``project`` is also SCOPE_CANONICAL,
+        # so gate 1 already admitted it for every scope; the explicit VERA
+        # tags make the capability greppable for the SKILL-capability
+        # audit (no-op for KNOWN_TYPES_BY_SCOPE). Gate 2 (the
+        # VERA_*_CREATE_TYPES allowlist in scope.py) is the policy fence —
+        # both gates must agree (the VERA-P1 trap class).
+        available_in_scopes=frozenset({SCOPE_CANONICAL, "vera", "vera_ops"}),
     ),
     TypeDefinition(
         name="task",
         directory="task",
         statuses=frozenset({"todo", "active", "blocked", "done", "cancelled"}),
-        available_in_scopes=frozenset({SCOPE_CANONICAL}),
+        # ``{vera, vera_ops}`` (2026-06-15, vera-assistant arc) — both
+        # VERA roles create+edit ``task`` (action items). See the
+        # ``project`` note above for the gate-1/gate-2 contract.
+        available_in_scopes=frozenset({SCOPE_CANONICAL, "vera", "vera_ops"}),
     ),
     TypeDefinition(
         name="session",
@@ -295,7 +306,10 @@ _DEFINITIONS: list[TypeDefinition] = [
         name="note",
         directory="note",
         statuses=frozenset({"draft", "active", "living", "review", "final"}),
-        available_in_scopes=frozenset({SCOPE_CANONICAL}),
+        # ``{vera, vera_ops}`` (2026-06-15, vera-assistant arc) — both
+        # VERA roles create+edit ``note`` (jottings / meeting notes).
+        # See the ``project`` note above for the gate-1/gate-2 contract.
+        available_in_scopes=frozenset({SCOPE_CANONICAL, "vera", "vera_ops"}),
         # Leaf-by-design: 258 of 360 ORPHAN001s lived under note/ in the
         # 2026-04-30 residual categorization. Notes are mostly captured
         # emails / one-off jottings; the few that DO get linked already
@@ -306,7 +320,17 @@ _DEFINITIONS: list[TypeDefinition] = [
         name="decision",
         directory="decision",
         statuses=frozenset({"draft", "final", "superseded", "reversed"}),
-        available_in_scopes=frozenset({SCOPE_CANONICAL}),
+        # ``{vera, vera_ops}`` (2026-06-15, vera-assistant arc) — both
+        # VERA roles create+edit ``decision``, the ONE dual-nature type
+        # VERA is granted: it captures OPERATIONAL business decisions
+        # ("we decided to use vendor X"), distinct from the distiller's
+        # epistemic decisions. Granting it does NOT grant the other four
+        # learn types (the create gate checks set membership, not
+        # is_learn_type). Body mutation stays denied via
+        # _BODY_MUTATE_DENIED_TYPES (supersede-with-new-record is the
+        # change path). See the ``project`` note above for the
+        # gate-1/gate-2 contract.
+        available_in_scopes=frozenset({SCOPE_CANONICAL, "vera", "vera_ops"}),
         # ``decision`` is in BOTH ``KNOWN_TYPES`` (the canonical
         # operational set) AND ``LEARN_TYPES`` — it's an entity type
         # that the distiller also produces. Preserved verbatim from

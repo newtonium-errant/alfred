@@ -1,4 +1,4 @@
-"""VERA MVP — role-aware allowlist + scope routing (2026-06-09).
+"""VERA — role-aware allowlist + scope routing.
 
 VERA is the first multi-user instance. This file pins the Layer 1 (role
 gate) + keystone (role-aware ``resolve_scope``) contract:
@@ -10,8 +10,15 @@ gate) + keystone (role-aware ``resolve_scope``) contract:
       tool_set is role-independent and unchanged.
     * ``_role_for`` / ``_require_owner`` — role resolution + owner gate.
     * The ``_execute_tool`` dispatcher end-to-end: a ``vera`` tool_set
-      with role=owner routes to the ``vera`` scope (ticket + note OK);
-      role=ops routes to ``vera_ops`` (ticket OK, note denied).
+      with role=owner routes to the ``vera`` scope, role=ops routes to
+      ``vera_ops``.
+
+**Capability expansion 2026-06-15 (vera-assistant arc).** BOTH roles
+now create+edit the same five business record types (ticket + note +
+task + decision + project). The routing layer (resolve_scope / role
+gate) is UNCHANGED — only the per-scope create allowlists widened (see
+test_vera_scope.py). The dispatcher e2e tests below confirm both roles
+create the business types.
 """
 
 from __future__ import annotations
@@ -298,15 +305,57 @@ async def test_vera_ops_dispatcher_creates_ticket(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_vera_ops_dispatcher_rejects_note(tmp_path):
-    """ops role → vera_ops scope → note create denied (ticket-only)."""
+@pytest.mark.parametrize(
+    "rec_type,set_fields",
+    [
+        ("note", {}),
+        ("task", {"status": "todo"}),
+        ("decision", {"status": "draft"}),
+        ("project", {"status": "active"}),
+    ],
+)
+async def test_vera_ops_dispatcher_creates_business_types(
+    tmp_path, rec_type, set_fields,
+):
+    """Capability expansion 2026-06-15: ops role → vera_ops scope now
+    creates note/task/decision/project (was ticket-only). INVERTS the
+    prior test_vera_ops_dispatcher_rejects_note."""
     config = _make_vera_config(tmp_path)
     sess = _make_session()
     state = StateManager(config.session.state_path)
 
     result = await conversation._execute_tool(
         tool_name="vault_create",
-        tool_input={"type": "note", "name": "Ops scratch", "set_fields": {}},
+        tool_input={
+            "type": rec_type, "name": f"Ops {rec_type}",
+            "set_fields": set_fields,
+        },
+        vault_path=config.vault.path,
+        state=state,
+        session=sess,
+        config=config,
+        user_role="ops",
+    )
+    parsed = json.loads(result)
+    assert "error" not in parsed, parsed
+    assert parsed["path"].startswith(f"{rec_type}/"), parsed
+
+
+@pytest.mark.asyncio
+async def test_vera_ops_dispatcher_rejects_learn_type(tmp_path):
+    """ops role → vera_ops scope → a learn type (assumption) still denied
+    — proves the decision grant didn't open the learn set via the
+    dispatcher path."""
+    config = _make_vera_config(tmp_path)
+    sess = _make_session()
+    state = StateManager(config.session.state_path)
+
+    result = await conversation._execute_tool(
+        tool_name="vault_create",
+        tool_input={
+            "type": "assumption", "name": "Ops assumption",
+            "set_fields": {"status": "active"},
+        },
         vault_path=config.vault.path,
         state=state,
         session=sess,
@@ -315,8 +364,6 @@ async def test_vera_ops_dispatcher_rejects_note(tmp_path):
     )
     parsed = json.loads(result)
     assert "error" in parsed, parsed
-    assert "scope denied" in parsed["error"].lower()
-    assert "vera-ops" in parsed["error"].lower()
 
 
 @pytest.mark.asyncio
