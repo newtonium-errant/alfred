@@ -642,6 +642,7 @@ async def test_every_register_helper_has_wire_transport_app_kwarg():
       register_gcal_intended_on → gcal_intended_on
       register_nl_llm → nl_llm_callable (+ nl_llm_model_label)
       register_ticket_intake → ticket_intake_config (+ ticket_intake_github_client)
+      register_ticket_outcome_resolver_callable → ticket_outcome_resolve_callable
     """
     from alfred.transport import peer_handlers
 
@@ -685,6 +686,9 @@ async def test_every_register_helper_has_wire_transport_app_kwarg():
         # talker daemon's intake config rides ticket_intake_config (+ the
         # paired ticket_intake_github_client companion kwarg).
         "register_ticket_intake": "ticket_intake_config",
+        # Ticket outcome write-back (KAL-LE→VERA, 2026-06-15): the VERA
+        # talker daemon's resolver closure rides ticket_outcome_resolve_callable.
+        "register_ticket_outcome_resolver_callable": "ticket_outcome_resolve_callable",
     }
 
     # Every discovered register helper must be in the mapping
@@ -762,6 +766,10 @@ async def test_wire_transport_app_logs_skip_for_omitted_kwargs(
         # instances without the github/ticket_intake config (every
         # instance except KAL-LE) skip-log here.
         "transport.wire_transport_app.ticket_intake_skipped",
+        # Ticket outcome write-back (KAL-LE→VERA, 2026-06-15) — instances
+        # that aren't a ticket-pipeline origin (every instance except
+        # VERA) skip-log here.
+        "transport.wire_transport_app.ticket_outcome_resolver_skipped",
     }
     actual_skips = set(skip_events)
     missing = expected_skips - actual_skips
