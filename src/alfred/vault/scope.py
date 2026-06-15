@@ -1662,30 +1662,38 @@ def check_scope(
         return
 
     if permission == "vera_ops_types_only":
-        # VERA MVP (2026-06-09) — Ben's (ops) create gate. Ticket-type
-        # ONLY. No canonical-type propose hint (VERA owns its own
-        # tickets; there's no peer Salem to propose to in MVP), so this
-        # branch is simpler than the kalle / hypatia ones above. The
-        # narrow allowlist is the schema-side enforcement of "Ben can't
-        # write non-ticket records."
+        # VERA ops (Ben) create gate. Capability expansion 2026-06-15
+        # (vera-assistant arc): both VERA roles create the same FIVE
+        # business types (ticket + note/task/decision/project) — see
+        # VERA_OPS_CREATE_TYPES. No canonical-type propose hint (VERA
+        # owns its own records; there's no peer Salem to propose to), so
+        # this branch is simpler than the kalle / hypatia ones above.
+        # The allowlist is the schema-side enforcement of the matrix:
+        # learn types (except dual-nature decision), canonical/PHI types,
+        # and everything else are denied for BOTH VERA roles.
         if record_type not in VERA_OPS_CREATE_TYPES:
             raise ScopeError(
                 f"Scope '{scope}' can only create vera-ops types "
                 f"({', '.join(sorted(VERA_OPS_CREATE_TYPES))}). "
-                f"Got: '{record_type}'. The ops role is locked to the "
-                f"ticket queue; non-ticket vault writes are owner-only."
+                f"Got: '{record_type}'. Types outside this allowlist "
+                f"(learn types except decision, canonical/PHI types) are "
+                f"denied for both VERA roles."
             )
         return
 
     if permission == "vera_owner_types_only":
-        # VERA MVP (2026-06-09) — Andrew's (owner) create gate. Ticket +
-        # note (Decision C). Same shape as the ops gate above, broader
-        # allowlist. No canonical-type propose hint for the same reason.
+        # VERA owner (Andrew) create gate. Same FIVE-type business
+        # surface as the ops gate above (capability expansion 2026-06-15;
+        # the two roles are operationally identical today) — see
+        # VERA_CREATE_TYPES. No canonical-type propose hint for the same
+        # reason.
         if record_type not in VERA_CREATE_TYPES:
             raise ScopeError(
                 f"Scope '{scope}' can only create vera types "
                 f"({', '.join(sorted(VERA_CREATE_TYPES))}). "
-                f"Got: '{record_type}'"
+                f"Got: '{record_type}'. Types outside this allowlist "
+                f"(learn types except decision, canonical/PHI types) are "
+                f"denied for both VERA roles."
             )
         return
 
