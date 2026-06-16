@@ -35,6 +35,20 @@ relationships:
   target: run/Alfred BIT 2026-04-30.md
   target_anchor: Alfred BIT 2026-04-30
   type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT
+  source: run/Alfred BIT 2026-04-29.md
+  source_anchor: Alfred BIT 2026-04-29
+  target: run/Alfred BIT 2026-05-02.md
+  target_anchor: Alfred BIT 2026-05-02
+  type: related-to
+- confidence: 1
+  context: Shared date range and Alfred BIT
+  source: run/Alfred BIT 2026-04-29.md
+  source_anchor: Alfred BIT 2026-04-29
+  target: run/Alfred BIT 2026-05-03.md
+  target_anchor: Alfred BIT 2026-05-03
+  type: related-to
 started: '2026-04-29T05:55:02.617871-03:00'
 status: completed
 tags:
