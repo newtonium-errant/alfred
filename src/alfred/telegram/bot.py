@@ -4510,6 +4510,46 @@ _PEER_MID_WAIT_PING_SECONDS: float = 20.0
 # replying with the timeout message.
 _PEER_MAX_WAIT_SECONDS: float = 45.0
 
+# Bleed-stop §2: how long a stashed ``_peer_route_target`` keeps
+# auto-forwarding follow-up turns to the same peer WITHOUT re-classifying.
+# After this window the next turn re-enters the router instead of blindly
+# force-forwarding (the 2026-06-16 swallowing bug). A rapid back-and-forth
+# with KAL-LE stays inside the window and stays sticky; a topic switch a
+# couple of minutes later re-classifies. Reply-anchored continuation (a
+# Telegram reply to a ``[KAL-LE] …`` relay) bypasses the TTL — an explicit
+# reply is an unambiguous "still talking to the peer" signal regardless of
+# elapsed time. 90s is the ratified value (design §2 / operator Q2).
+_PEER_ROUTE_STICKINESS_TTL_SECONDS: float = 90.0
+
+# Bleed-stop §2: the prefix every relayed peer reply carries
+# (``[{target.upper()}] …`` — see ``_dispatch_peer_route``). Used to detect
+# "this turn is a reply to a peer relay" for reply-anchored stickiness. The
+# leading ``[`` + uppercase token + ``] `` shape is matched generically so
+# any peer target (KAL-LE, STAY-C, …) qualifies without enumerating them.
+_PEER_RELAY_REPLY_RE = re.compile(r"^\[[A-Z][A-Z0-9.\-]*\]\s")
+
+
+def _is_reply_to_peer_relay(reply_to_message: Any) -> bool:
+    """Return True iff the replied-to message is a ``[PEER] …`` peer relay.
+
+    Bleed-stop §2 reply-anchored stickiness: when Andrew long-presses a
+    relayed ``[KAL-LE] <reply>`` message and hits Reply, that turn is an
+    unambiguous continuation of the peer conversation — keep auto-forwarding
+    regardless of the TTL window. Generic over the peer name via
+    :data:`_PEER_RELAY_REPLY_RE` (``[KAL-LE] ``, ``[STAY-C] ``, etc.).
+
+    Tolerant of the MagicMock / missing-attribute shapes the test harness
+    and photo-only replies produce — returns ``False`` rather than raising
+    when the parent has no usable text (mirrors
+    ``_build_reply_context_prefix``'s defensive ``getattr`` reads).
+    """
+    if reply_to_message is None:
+        return False
+    raw_text = getattr(reply_to_message, "text", None)
+    if not isinstance(raw_text, str) or not raw_text:
+        return False
+    return bool(_PEER_RELAY_REPLY_RE.match(raw_text))
+
 
 async def _dispatch_peer_route(
     update: Update,
@@ -4759,6 +4799,7 @@ async def _open_routed_session(
     first_message: str,
     has_reply_context: bool = False,
     valid_peer_targets: set[str] | None = None,
+    force_local_note: bool = False,
 ) -> Session:
     """Classify the opening cue, open a new session with the right defaults.
 
@@ -4789,7 +4830,41 @@ async def _open_routed_session(
     :func:`_instance_peer_targets`. ``None`` falls back to the router's
     hardcoded global set — the safe default for tests and any caller
     that doesn't have ``raw_config`` in scope.
+
+    ``force_local_note`` (peer-route bleed-stop §1a): when ``True``, skip
+    the LLM classifier entirely and open a plain ``note`` session. The
+    caller sets this when the deterministic confirm-guard
+    (:func:`router.is_brief_or_status_confirm`) matched — a morning-brief
+    / status confirmation must NEVER peer-route, so we don't even give the
+    probabilistic router the chance to mis-classify it. Continuation
+    pre-seeding is skipped too (a bare confirm isn't a continuation cue).
+    Defaults to ``False`` — normal routing for every non-confirm message.
     """
+    if force_local_note:
+        # Deterministic confirm-guard short-circuit: no router call, no
+        # peer-route possible. Open a note session on the note default
+        # model. The caller has already emitted the ILB guard log with the
+        # matched pattern; this path just opens the local session.
+        type_defaults = session_types.defaults_for("note")
+        sess = _open_session_with_stash(
+            state_mgr,
+            chat_id,
+            config,
+            model=type_defaults.model,
+            session_type="note",
+            continues_from=None,
+            pushback_level=type_defaults.pushback_level,
+        )
+        log.info(
+            "talker.bot.routed_open",
+            chat_id=chat_id,
+            session_type="note",
+            model=type_defaults.model,
+            continues=False,
+            forced_local_note=True,
+        )
+        return sess
+
     recent = _recent_sessions_for_router(state_mgr)
     # Stage 3.5 hotfix c3: thread the local instance identity into the
     # router so the classifier knows who it is and can't route to self.
@@ -4854,11 +4929,21 @@ async def _open_routed_session(
     active = state_mgr.get_active(chat_id) or {}
     active["_calibration_snapshot"] = calibration_snapshot
     # Stage 3.5: stash peer-route target on the active session so
-    # every subsequent turn forwards to the same peer without
-    # re-classifying. ``_dispatch_peer_route`` reads this in
-    # ``handle_message`` before it falls into the Anthropic turn.
+    # subsequent turns can forward to the same peer.
+    # ``_dispatch_peer_route`` reads this in ``handle_message`` before it
+    # falls into the Anthropic turn.
+    #
+    # Bleed-stop §2: also stash the open timestamp. The auto-forward is no
+    # longer unconditional-for-the-session-lifetime (the bug that swallowed
+    # the 2026-06-16 follow-up messages). It now persists only within a
+    # short TTL window (``_PEER_ROUTE_STICKINESS_TTL_SECONDS``) OR while the
+    # turn is an explicit reply to a ``[KAL-LE] …`` relay — outside that,
+    # the next turn re-enters the router. The timestamp is the TTL anchor.
     if decision.session_type == "peer_route" and decision.target:
         active["_peer_route_target"] = decision.target
+        active["_peer_route_target_ts"] = (
+            datetime.now(timezone.utc).timestamp()
+        )
     state_mgr.set_active(chat_id, active)
     state_mgr.save()
 
@@ -5549,6 +5634,28 @@ async def handle_message(
             ctx.application.bot_data.get("raw_config"),
             _self_name_for_peers,
         )
+
+        # Peer-route bleed-stop §1a: deterministic confirm-guard. A
+        # morning-brief / status confirmation ("T1 confirm", "T2 add ...",
+        # bare "done"/"confirmed", etc.) must NEVER peer-route — the
+        # 2026-06-16 incident mis-routed exactly such a message to KAL-LE.
+        # Computed ONCE here, against the ORIGINAL ``text`` (NOT
+        # ``effective_text``): a reply-context prefix would push the confirm
+        # verb past the start-anchor and break the match, same reason the
+        # inline-command detector above runs against original ``text``.
+        # ``confirm_guard_match`` is the matched-pattern label or ``None``;
+        # it (a) forces local handling on a fresh open and (b) diverts the
+        # active-session force-forward below. Emit the ILB log with the
+        # matched pattern (self-correcting correction-signal substrate —
+        # CLAUDE.md design standard).
+        confirm_guard_match = router.is_brief_or_status_confirm(text)
+        if confirm_guard_match is not None:
+            log.info(
+                "talker.router.confirm_guard_forced_local",
+                chat_id=chat_id,
+                matched_pattern=confirm_guard_match,
+            )
+
         active = state_mgr.get_active(chat_id)
         if active:
             try:
@@ -5565,10 +5672,13 @@ async def handle_message(
                 # text so the router sees the reply-to-bot context as the
                 # cue, and flag ``has_reply_context`` so the classifier
                 # prefers continues/note over a fresh cue-driven session.
+                # ``force_local_note`` from the confirm-guard wins over the
+                # router even on this path.
                 sess = await _open_routed_session(
                     state_mgr, config, client, chat_id, effective_text,
                     has_reply_context=has_reply_context,
                     valid_peer_targets=_instance_peers,
+                    force_local_note=confirm_guard_match is not None,
                 )
         else:
             # No active session — the router runs. When this message is a
@@ -5576,41 +5686,116 @@ async def handle_message(
             # so the classifier tips toward continuation / note rather
             # than opening a fresh capture / journal / article session on
             # what is almost certainly a follow-up to existing context.
+            # The confirm-guard (§1a) bypasses the router entirely when it
+            # matched — a confirm can never open a peer_route session.
             sess = await _open_routed_session(
                 state_mgr, config, client, chat_id, effective_text,
                 has_reply_context=has_reply_context,
                 valid_peer_targets=_instance_peers,
+                force_local_note=confirm_guard_match is not None,
             )
 
-        # Stage 3.5 peer-route flow. On the first message of a
-        # peer_route session AND on every subsequent turn while
-        # ``_peer_route_target`` stays stashed on the active dict, we
-        # forward to the named peer and relay its reply. Auto-forward
-        # stops when the user says ``/end`` (session close clears the
-        # target) or starts a new opening cue after the gap timeout
-        # fires.
+        # Stage 3.5 peer-route flow + bleed-stop §2. When
+        # ``_peer_route_target`` is stashed on the active dict we MAY
+        # forward this turn to the named peer — but no longer
+        # unconditionally-for-the-session-lifetime (the 2026-06-16 bug that
+        # swallowed two follow-up confirms). The decision now has three
+        # gates, in order:
+        #   1. Confirm-guard short-circuit (§2 step 1+3): if THIS turn is a
+        #      brief/status confirm, divert to local AND clear the stash
+        #      (close-on-topic-change) — the operator changed topic, the
+        #      peer session shouldn't keep swallowing.
+        #   2. TTL / reply-anchored window (§2 step 2): force-forward only
+        #      within ``_PEER_ROUTE_STICKINESS_TTL_SECONDS`` of the stash,
+        #      OR when this turn is an explicit reply to a ``[PEER] …``
+        #      relay. Outside that window → stop forwarding, handle locally
+        #      (the next opening cue re-routes normally).
+        #   3. Unreachable-peer fall-through (existing): a failed dispatch
+        #      clears the stash so we don't keep hitting a dead peer.
+        # Auto-forward also stops on ``/end`` (session close clears the
+        # target).
         active_now = state_mgr.get_active(chat_id) or {}
         peer_target = active_now.get("_peer_route_target")
-        if peer_target:
-            handled = await _dispatch_peer_route(
-                update, ctx,
-                target=peer_target,
-                # Forward with the reply-prefix so the peer has the same
-                # context the user is holding in their head ("explain the
-                # second failure" is meaningless without the prior
-                # [KAL-LE] pytest output it's referencing).
-                text=effective_text,
+        if peer_target and confirm_guard_match is not None:
+            # §2 step 1+3: a confirm must never be swallowed by an open
+            # peer session. Divert locally + clear the stash so the topic
+            # switch sticks. Emit BOTH ILB signals (divert + clear) with
+            # the matched pattern — correction-signal substrate.
+            log.info(
+                "talker.bot.peer_route_followup_diverted_to_local",
                 chat_id=chat_id,
-                originating_session_id=active_now.get("session_id", ""),
+                matched_pattern=confirm_guard_match,
+                target=peer_target,
             )
-            if handled:
-                return  # Peer path completed (with reply or timeout).
-            # Fall-through: peer was unreachable. Clear the target so
-            # subsequent turns don't keep hitting a dead peer, and let
-            # Salem handle the turn normally.
             active_now.pop("_peer_route_target", None)
+            active_now.pop("_peer_route_target_ts", None)
             state_mgr.set_active(chat_id, active_now)
             state_mgr.save()
+            log.info(
+                "talker.bot.peer_route_target_cleared_on_topic_change",
+                chat_id=chat_id,
+                matched_pattern=confirm_guard_match,
+                target=peer_target,
+            )
+            # Fall through to local handling (the Anthropic turn below).
+        elif peer_target:
+            # §2 step 2: TTL / reply-anchored stickiness gate.
+            stashed_ts = active_now.get("_peer_route_target_ts")
+            now_ts = datetime.now(timezone.utc).timestamp()
+            within_ttl = (
+                isinstance(stashed_ts, (int, float))
+                and (now_ts - stashed_ts) <= _PEER_ROUTE_STICKINESS_TTL_SECONDS
+            )
+            reply_anchored = _is_reply_to_peer_relay(
+                update.message.reply_to_message
+            )
+            if not (within_ttl or reply_anchored):
+                # Window expired and not an explicit peer-reply — stop
+                # force-forwarding. Clear the stash and handle THIS turn
+                # locally; a genuine new peer request will re-route via the
+                # normal opening-cue path. ILB so the expiry is observable.
+                log.info(
+                    "talker.bot.peer_route_stickiness_expired",
+                    chat_id=chat_id,
+                    target=peer_target,
+                    age_seconds=(
+                        round(now_ts - stashed_ts, 1)
+                        if isinstance(stashed_ts, (int, float))
+                        else None
+                    ),
+                )
+                active_now.pop("_peer_route_target", None)
+                active_now.pop("_peer_route_target_ts", None)
+                state_mgr.set_active(chat_id, active_now)
+                state_mgr.save()
+                # Fall through to local handling.
+            else:
+                handled = await _dispatch_peer_route(
+                    update, ctx,
+                    target=peer_target,
+                    # Forward with the reply-prefix so the peer has the same
+                    # context the user is holding in their head ("explain the
+                    # second failure" is meaningless without the prior
+                    # [KAL-LE] pytest output it's referencing).
+                    text=effective_text,
+                    chat_id=chat_id,
+                    originating_session_id=active_now.get("session_id", ""),
+                )
+                if handled:
+                    # Refresh the TTL anchor on a successful forward so an
+                    # active back-and-forth stays sticky turn-over-turn
+                    # (each forwarded turn re-opens the window).
+                    active_now["_peer_route_target_ts"] = now_ts
+                    state_mgr.set_active(chat_id, active_now)
+                    state_mgr.save()
+                    return  # Peer path completed (with reply or timeout).
+                # Fall-through: peer was unreachable. Clear the target so
+                # subsequent turns don't keep hitting a dead peer, and let
+                # Salem handle the turn normally.
+                active_now.pop("_peer_route_target", None)
+                active_now.pop("_peer_route_target_ts", None)
+                state_mgr.set_active(chat_id, active_now)
+                state_mgr.save()
 
         # Voice / text counts are tracked per-turn on the transcript
         # (``_kind`` metadata) — the state-dict counters were wk1

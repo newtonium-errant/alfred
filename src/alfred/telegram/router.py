@@ -31,6 +31,7 @@ opening message fall into?".
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -150,6 +151,35 @@ the failure", "why is X test failing".
   * Aftermath-lab curation: "promote this pattern to canonical", \
 "ask kal-le about X", "why is the transport scheduler firing twice".
 
+NEVER classify peer_route for morning-brief / digest status confirmations \
+and acknowledgements — these are Salem-local bookkeeping, NOT a request for \
+a peer to do work. This OVERRIDES every cue above, including direct \
+addressing, git issues, and peer names. Specifically, classify as `note` \
+(local), never peer_route, when the message is:
+  * A tier-confirm command: "T1 confirm", "T2 confirm", "T3 confirm X", \
+"T2 add ...", "T3 drop ...", or a bare leading status verb ("confirmed", \
+"done", "closed", "keep", "drop").
+  * An operator confirming or acknowledging an item from a brief, digest, \
+or peer digest — phrasings of the shape "X confirmed closed", "X confirmed \
+done", "X is done", "X confirmed in the digest/brief", "got it, X is \
+closed", "ack X".
+  * The SAME confirmation even when it names a git issue (gh#N), a ticket, \
+OR another instance/peer by name. A message can mention "gh#7", "Vera", or \
+"peer digest" and STILL be pure bookkeeping — mentioning a peer is not the \
+same as asking that peer to do something.
+The test: does the message ask a peer to DO new coding, debugging, testing, \
+or curation work (→ peer_route), or does it merely RECORD / CONFIRM / \
+ACKNOWLEDGE the status of something already done (→ note)? Status reports \
+about closed/done items are always note, regardless of which issues or \
+peers they name. peer_route is ONLY for dispatching new work to a peer.
+
+Worked examples:
+  * "Check Vera gh#7 confirmed closed in peer digest" → session_type=note, \
+target=null. Confirming a closed digest item; names gh#7 + a peer but asks \
+no one to DO anything.
+  * "KAL-LE, run pytest on the new branch" → session_type=peer_route, \
+target=kal-le. Dispatching new test work.
+
 When you classify peer_route, set "target" to the peer name (``kal-le`` \
 today; ``stay-c`` once that instance is live). Without a target, \
 peer_route is malformed — fall back to note.
@@ -195,6 +225,86 @@ def _detect_capture_prefix(message: str) -> bool:
     if not message:
         return False
     return message.lstrip().lower().startswith(_CAPTURE_PREFIX)
+
+
+# --- Brief / status-confirm guard (peer-route bleed-stop §1a) --------------
+#
+# 2026-06-16 incident: "Check Vera gh#7 confirmed closed in peer digest" was
+# mis-classified ``peer_route target=kal-le`` (the "gh#7" code-cue + literal
+# "peer" tripped the LLM router), force-forwarded to KAL-LE, and never worked
+# — the operator was confirming a morning-brief item, not asking KAL-LE to do
+# work. This guard is the DETERMINISTIC, 100%-reliable half of the fix
+# (operator directive: the T#-confirm / brief-confirm class must never depend
+# on a probabilistic classifier). Mirrors the ``_detect_capture_prefix``
+# discipline above: anchored at message start, case-insensitive,
+# leading-whitespace-tolerant, deliberately NARROW.
+#
+# TIGHT by ratified decision: it matches ONLY the canonical anchored grammar
+# (source-of-truth ``brief/tier_section.py``: "T1/T2/T3 confirm|add|...",
+# plus bare leading status verbs). It deliberately does NOT try to match the
+# fuzzy "X confirmed closed in [the] digest" shape — that is the prompt
+# layer's job (the ``_ROUTER_PROMPT`` exclusion block, §1b). A greedier
+# regex here would eat legit peer phrasings like "confirm the test passed,
+# KAL-LE", which is exactly the false-positive we must avoid.
+#
+# Returns the matched-pattern LABEL (a short, log-safe string) on a hit, or
+# ``None`` on no match. The label is the correction-signal substrate for the
+# self-correcting-by-design standard (CLAUDE.md): callers emit it on the ILB
+# log so accumulated mis-fires are greppable + tunable at morning cadence.
+
+# Tier grammar: ``T1 confirm`` / ``T2 add`` / ``T3 drop`` etc. ``[123]`` and
+# the verb set track the canonical brief reply patterns. ``\b`` after the
+# verb means "T1 confirmation" (a longer word) does NOT match — only the
+# bare verb or verb-plus-args ("T3 confirm walk Fergus").
+_CONFIRM_GUARD_TIER_RE = re.compile(
+    r"^\s*[Tt][123]\s+(confirm|add|drop|done|keep)\b",
+    re.IGNORECASE,
+)
+
+# Bare leading status verbs: "confirmed", "done", "closed", etc. opening the
+# message. Anchored so "I want KAL-LE to confirm X" (verb mid-sentence) does
+# NOT match — only a message that LEADS with the confirmation verb.
+_CONFIRM_GUARD_STATUS_RE = re.compile(
+    r"^\s*(confirm|confirmed|done|closed|keep|drop)\b",
+    re.IGNORECASE,
+)
+
+
+def is_brief_or_status_confirm(message: str) -> str | None:
+    """Return a matched-pattern label iff ``message`` is a brief/status confirm.
+
+    Deterministic peer-route exclusion guard (§1a). When this returns a
+    non-``None`` label the message is a morning-brief / status confirmation
+    (e.g. ``"T1 confirm"``, ``"T2 add eggs"``, ``"done"``, ``"confirmed"``)
+    and MUST NOT peer-route — the caller forces local handling.
+
+    The return value is the matched-pattern label, NOT a bare bool, so
+    callers can log WHICH pattern fired (the correction-signal substrate for
+    the self-correcting-design standard). Labels:
+
+      * ``"tier_grammar"``  — anchored ``T[123] (confirm|add|drop|done|keep)``
+      * ``"status_verb"``   — anchored bare leading status verb
+
+    Returns ``None`` when the message is not a confirm (the common case —
+    peer-route inference proceeds normally).
+
+    Deliberately TIGHT (ratified): does not match fuzzy "X confirmed closed
+    in digest" phrasings — those are the ``_ROUTER_PROMPT`` exclusion block's
+    job (§1b). Tightness is the false-positive defense: "confirm the test
+    passed, KAL-LE" leads with "confirm" so it WOULD match the status-verb
+    rule — see the §1b prompt block + the test pin
+    ``test_confirm_guard_does_not_eat_legit_peer_work`` for the boundary
+    we accept here (such a phrasing is rare; the cost of a missed peer-route
+    is the operator re-sending, vs. the cost of a swallowed confirm which is
+    silent data-loss — so we err toward catching confirms).
+    """
+    if not message:
+        return None
+    if _CONFIRM_GUARD_TIER_RE.match(message):
+        return "tier_grammar"
+    if _CONFIRM_GUARD_STATUS_RE.match(message):
+        return "status_verb"
+    return None
 
 
 # --- Helpers --------------------------------------------------------------
