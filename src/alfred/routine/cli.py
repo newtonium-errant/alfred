@@ -741,8 +741,9 @@ def cmd_done(
         # operator-visible diagnostics.
         #
         # Per ``feedback_log_emission_test_pattern.md``: the log
-        # shape is pinned by ``test_match_confidence_log_emission``
-        # in ``tests/test_routine_done_confidence.py``.
+        # shape is pinned by
+        # ``test_routine_done_matched_log_emission_fires_on_success``
+        # in ``tests/routine/test_routine_done_confidence.py``.
         confidence = _match_confidence(item_text, chosen.item_text)
         log.info(
             "routine_done.matched",
