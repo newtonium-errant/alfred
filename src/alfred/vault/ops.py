@@ -1459,16 +1459,27 @@ def vault_edit(
             fm[k] = v
             fields_changed.append(k)
 
-    # Append fields (add to lists)
+    # Append fields (add to lists).
+    #
+    # The value for each field may be a single scalar (the historic
+    # contract — e.g. ``{"tags": "added"}``) OR a list of values (the
+    # widened contract from the CLI ``--append`` same-field-collapse fix:
+    # two ``--append related=[[A]] --append related=[[B]]`` flags arrive
+    # here as ``{"related": ["[[A]]", "[[B]]"]}``). Normalize each value
+    # to a list and apply the per-element append logic so the widened
+    # contract works WITHOUT the nesting bug, while scalar callers keep
+    # producing exactly the same frontmatter they did before.
     if append_fields:
         for k, v in append_fields.items():
-            existing = fm.get(k)
-            if existing is None:
-                fm[k] = [v] if k in LIST_FIELDS else v
-            elif isinstance(existing, list):
-                existing.append(v)
-            else:
-                fm[k] = [existing, v]
+            vals = v if isinstance(v, list) else [v]
+            for element in vals:
+                existing = fm.get(k)
+                if existing is None:
+                    fm[k] = [element] if k in LIST_FIELDS else element
+                elif isinstance(existing, list):
+                    existing.append(element)
+                else:
+                    fm[k] = [existing, element]
             fields_changed.append(k)
 
     # Unset fields (remove frontmatter keys entirely). Runs AFTER

@@ -165,8 +165,23 @@ def _error(msg: str, code: int = 1, details: dict | None = None) -> None:
     sys.exit(code)
 
 
-def _parse_set_args(set_args: list[str] | None) -> dict:
-    """Parse --set field=value arguments into a dict."""
+def _parse_set_args(set_args: list[str] | None, *, append_mode: bool = False) -> dict:
+    """Parse ``field=value`` arguments into a dict.
+
+    ``append_mode`` controls how duplicate keys collapse:
+
+    - ``False`` (the ``--set`` contract, UNCHANGED): last-wins. Two
+      ``x=1 x=2`` flags resolve to ``{"x": 2}`` — the final value
+      overwrites earlier ones, matching frontmatter set-semantics.
+    - ``True`` (the ``--append`` contract): every key accumulates into
+      a list in flag order. Two ``related=[[A]] related=[[B]]`` flags
+      resolve to ``{"related": ["[[A]]", "[[B]]"]}`` rather than
+      collapsing to the last value. This fixes the same-field-collapse
+      bug where appending two values to one list field silently dropped
+      the first. The ops-layer append loop (``vault_edit``) normalizes
+      each value to a list and iterates per-element, so a list here
+      appends every element without nesting.
+    """
     if not set_args:
         return {}
     result: dict = {}
@@ -176,9 +191,15 @@ def _parse_set_args(set_args: list[str] | None) -> dict:
         key, _, value = item.partition("=")
         # Try to parse as JSON for lists/numbers, fall back to string
         try:
-            result[key] = json.loads(value)
+            parsed = json.loads(value)
         except (json.JSONDecodeError, ValueError):
-            result[key] = value
+            parsed = value
+        if append_mode:
+            # Accumulate duplicate keys into a list (flag order preserved).
+            result.setdefault(key, []).append(parsed)
+        else:
+            # Last-wins (``--set`` semantics, unchanged).
+            result[key] = parsed
     return result
 
 
@@ -294,7 +315,10 @@ def cmd_edit(args: argparse.Namespace) -> None:
     scope = _scope()
     vault = _vault_path()
     set_fields = _parse_set_args(args.set)
-    append_fields = _parse_set_args(args.append)
+    # ``append_mode=True`` so repeated ``--append field=value`` flags on
+    # the SAME field accumulate into an ordered list instead of last-
+    # winning (the same-field-collapse bug). ``--set`` stays last-wins.
+    append_fields = _parse_set_args(args.append, append_mode=True)
     # argparse's ``action="append"`` returns ``None`` when the flag is
     # absent (default=None above). Normalise to an empty list so the
     # downstream code can treat it as a list uniformly.

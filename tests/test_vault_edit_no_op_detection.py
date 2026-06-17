@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import frontmatter
 import pytest
 import structlog
 
@@ -275,3 +276,138 @@ class TestCmdEditNoFlagsCLIGate:
         assert "--unset" in msg
         assert "--body-append" in msg
         assert "--body-stdin" in msg
+
+
+class TestAppendSameFieldCollapse:
+    """Regression pins for the ``--append`` same-field-collapse fix
+    (ITEM 2, Option A).
+
+    Before the fix, ``--append related=[[A]] --append related=[[B]]``
+    parsed to ``{"related": "[[B]]"}`` (last-wins, ``[[A]]`` silently
+    dropped) because ``_parse_set_args`` always did ``result[key] =
+    parsed``. ``--append`` now parses with ``append_mode=True`` so each
+    key accumulates into an ordered list; the ops-layer append loop
+    normalizes each value to a list and iterates per-element so no
+    nesting bug is introduced and scalar callers keep working.
+
+    See ``_parse_set_args`` + ``cmd_edit`` in ``src/alfred/vault/cli.py``
+    and the append loop in ``vault_edit`` (``src/alfred/vault/ops.py``).
+    """
+
+    def test_parse_set_args_append_mode_accumulates_duplicate_keys(self):
+        """Pin (1) — parse-level. Two ``--append`` flags on the same
+        field accumulate into an ordered list under ``append_mode``."""
+        from alfred.vault.cli import _parse_set_args
+
+        result = _parse_set_args(
+            ["related=[[A]]", "related=[[B]]"], append_mode=True,
+        )
+        assert result == {"related": ["[[A]]", "[[B]]"]}
+
+    def test_set_mode_last_wins_unchanged(self):
+        """Pin (3) — ``--set`` non-regression. Duplicate keys without
+        ``append_mode`` still collapse last-wins (set-semantics)."""
+        from alfred.vault.cli import _parse_set_args
+
+        result = _parse_set_args(["x=1", "x=2"])
+        assert result == {"x": 2}
+
+    def test_append_two_values_to_one_list_field_keeps_both_ordered(
+        self, tmp_vault: Path,
+    ):
+        """Pin (2) — behavioral. ``vault_edit`` with the widened
+        list-valued append contract lands both values in frontmatter,
+        ordered, with no drop and no nesting."""
+        vault_create(
+            tmp_vault, "note", "Append Both",
+            body="# Title\n\nBody.\n",
+            set_fields={"related": []},
+        )
+        # Mirrors what the CLI produces after ``_parse_set_args`` with
+        # ``append_mode=True`` collapses two ``--append related=...``
+        # flags into a single list-valued entry.
+        result = vault_edit(
+            tmp_vault, "note/Append Both.md",
+            append_fields={"related": ["[[A]]", "[[B]]"]},
+        )
+        assert "related" in result["fields_changed"]
+
+        post = frontmatter.load(str(tmp_vault / "note/Append Both.md"))
+        assert post.metadata["related"] == ["[[A]]", "[[B]]"]
+
+    def test_scalar_append_caller_still_works(self, tmp_vault: Path):
+        """Pin (2b) — the historic scalar-valued append contract
+        (e.g. ``{"tags": "added"}``) must remain unchanged by the
+        list-normalization. Guards the existing caller in
+        ``test_append_fields_only_succeeds`` above."""
+        vault_create(
+            tmp_vault, "note", "Scalar Append",
+            body="# Title\n\nBody.\n",
+            set_fields={"tags": ["existing"]},
+        )
+        result = vault_edit(
+            tmp_vault, "note/Scalar Append.md",
+            append_fields={"tags": "added"},
+        )
+        assert "tags" in result["fields_changed"]
+        post = frontmatter.load(str(tmp_vault / "note/Scalar Append.md"))
+        assert post.metadata["tags"] == ["existing", "added"]
+
+    def test_cmd_edit_append_audit_log_and_record_state(
+        self, tmp_vault: Path, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Pin (4) — audit-log end-to-end. Driving ``cmd_edit`` with two
+        ``--append related=...`` flags must (a) NOT crash the keys-only
+        audit emission and (b) land both values in the record, ordered.
+
+        Drives the real ``cmd_edit`` production path (per
+        ``feedback_structlog_assertion_patterns.md`` companion rule —
+        test the actual call site, not an inline mimic) so the
+        ``_parse_set_args(append_mode=True)`` → ``vault_edit`` →
+        ``_log_or_audit`` chain is exercised in full.
+        """
+        import argparse
+        import json
+
+        from alfred.vault.cli import cmd_edit
+
+        vault_create(
+            tmp_vault, "note", "CLI Append Audit",
+            body="# Title\n\nBody.\n",
+            set_fields={"related": []},
+        )
+        audit_file = tmp_path / "vault_audit.log"
+        monkeypatch.setenv("ALFRED_VAULT_PATH", str(tmp_vault))
+        monkeypatch.delenv("ALFRED_VAULT_SESSION", raising=False)
+        monkeypatch.setenv("ALFRED_VAULT_AUDIT_LOG", str(audit_file))
+        monkeypatch.delenv("ALFRED_VAULT_SCOPE", raising=False)
+
+        args = argparse.Namespace(
+            path="note/CLI Append Audit.md",
+            set=None,
+            append=["related=[[A]]", "related=[[B]]"],
+            unset=None,
+            body_append=None,
+            body_stdin=False,
+        )
+        # ``cmd_edit`` emits structured logs (``vault_context.env_fallback``)
+        # to stdout under default structlog config; capture above the
+        # renderer so it doesn't interleave with the JSON payload print.
+        with structlog.testing.capture_logs():
+            cmd_edit(args)
+
+        # (a) Audit row written, keys-only ``fields`` extra (list-valued)
+        # filtered out by ``_log_or_audit`` — no crash, "modify" bucket.
+        entries = [
+            json.loads(line)
+            for line in audit_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(entries) == 1
+        assert entries[0]["op"] == "modify"
+        assert entries[0]["path"] == "note/CLI Append Audit.md"
+
+        # (b) Record state: both values landed, ordered, no nest.
+        post = frontmatter.load(str(tmp_vault / "note/CLI Append Audit.md"))
+        assert post.metadata["related"] == ["[[A]]", "[[B]]"]
