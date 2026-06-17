@@ -30,6 +30,7 @@ from typing import Any
 
 import frontmatter
 import pytest
+import structlog
 
 from alfred.telegram import session as talker_session
 
@@ -486,7 +487,7 @@ def test_apply_substance_slug_missing_source_passthrough(
 
 
 def test_apply_substance_slug_frontmatter_rewrite_failure_passthrough(
-    state_mgr, talker_config, monkeypatch, capsys,
+    state_mgr, talker_config, monkeypatch,
 ) -> None:
     """Frontmatter rewrite failure → original file preserved, warning logged.
 
@@ -496,6 +497,16 @@ def test_apply_substance_slug_frontmatter_rewrite_failure_passthrough(
     stay on disk at the original path, the function must return the
     original ``rel_path``, and the warning must surface stage info so
     operators can grep for it in the talker log.
+
+    Log-capture mechanism: asserts via ``structlog.testing.capture_logs``
+    rather than ``capsys`` on stdout. The capsys approach passed in
+    isolation but failed in full-suite runs — once an earlier test calls
+    ``setup_logging`` (telegram/utils.py), structlog is reconfigured
+    through the stdlib factory with ``basicConfig(force=True)`` and the
+    warning no longer lands on stdout. capture_logs intercepts at the
+    structlog level regardless of the configured factory. Per
+    ``feedback_structlog_assertion_patterns.md`` +
+    ``feedback_log_emission_test_pattern.md``.
     """
     vault = Path(talker_config.vault.path)
     old_rel = "session/conversation-2026-04-27-are-you-awake-73fe87fa.md"
@@ -506,13 +517,14 @@ def test_apply_substance_slug_frontmatter_rewrite_failure_passthrough(
 
     monkeypatch.setattr("frontmatter.dumps", _boom)
 
-    new_rel = talker_session.apply_substance_slug(
-        state_mgr,
-        vault_path_root=str(vault),
-        rel_path=old_rel,
-        new_slug="komal-gupta-termination-response",
-        session_id="73fe87fa-0000",
-    )
+    with structlog.testing.capture_logs() as captured_logs:
+        new_rel = talker_session.apply_substance_slug(
+            state_mgr,
+            vault_path_root=str(vault),
+            rel_path=old_rel,
+            new_slug="komal-gupta-termination-response",
+            session_id="73fe87fa-0000",
+        )
 
     # No rename occurred — original path returned, original file still on disk.
     assert new_rel == old_rel
@@ -520,12 +532,21 @@ def test_apply_substance_slug_frontmatter_rewrite_failure_passthrough(
     assert not (
         vault / "session/conversation-2026-04-27-komal-gupta-termination-response-73fe87fa.md"
     ).exists()
-    # Warning fired with the right stage tag — structlog routes warnings
-    # to stdout in test config; we grep the captured output.
-    captured = capsys.readouterr()
-    log_text = captured.out + captured.err
-    assert "talker.session.substance_slug_failed" in log_text
-    assert "stage=frontmatter_rewrite" in log_text
+    # Warning fired with the right stage tag. Pin the stage VALUE (not
+    # just event presence) so a future refactor that mislabels or drops
+    # the stage field fails here.
+    matches = [
+        c for c in captured_logs
+        if c.get("event") == "talker.session.substance_slug_failed"
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one talker.session.substance_slug_failed log; "
+        f"got {len(matches)}: {matches!r}"
+    )
+    entry = matches[0]
+    assert entry.get("stage") == "frontmatter_rewrite", (
+        f"stage tag missing/changed: {entry!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

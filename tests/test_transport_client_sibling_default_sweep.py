@@ -214,10 +214,18 @@ def test_resolve_pending_item_via_peer_forwards_self_instance() -> None:
     # ``_run_coro_sync`` actually awaits the coroutine; we patch it to
     # do exactly that so ``_fake_resolve`` populates ``captured_kwargs``
     # before returning the fake response dict.
+    #
+    # Use ``asyncio.run`` (creates + tears down its own loop) rather than
+    # ``asyncio.get_event_loop().run_until_complete``. In a full-suite run,
+    # prior pytest-asyncio tests close the global event loop, so
+    # ``get_event_loop()`` returns a CLOSED loop and ``run_until_complete``
+    # raises ``RuntimeError: Event loop is closed`` — an isolated-pass /
+    # full-suite-fail ordering pollution. ``asyncio.run`` is immune because
+    # it never touches the contaminated global loop.
     import asyncio
 
     def _await_inline(coro: Any) -> dict[str, Any]:
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     with patch(
         "alfred.transport.client.peer_resolve_pending_item",

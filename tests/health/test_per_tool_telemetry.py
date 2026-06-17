@@ -450,6 +450,16 @@ class TestTalkerHealth:
         assert bot.status == Status.FAIL
 
     async def test_unresolved_bot_token_fails(self, monkeypatch) -> None:
+        # health_check runs _substitute_env on the raw config before the
+        # bot-token check (telegram/health.py). _substitute_env resolves
+        # ${TELEGRAM_BOT_TOKEN} to its value when the env var is set,
+        # leaving the literal placeholder only when it is UNSET. If the
+        # ambient operator env (or another test) has TELEGRAM_BOT_TOKEN
+        # exported, the placeholder resolves and this test sees OK instead
+        # of the expected FAIL — an isolated-pass / full-suite-fail
+        # ordering pollution. Delenv pins the unresolved state. Per the
+        # "Dispatcher env-var injection — test-hygiene contract" in CLAUDE.md.
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
         monkeypatch.setattr(talker_health, "check_anthropic_auth", _ok_auth_stub)
         raw = {
             "telegram": {

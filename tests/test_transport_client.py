@@ -11,6 +11,7 @@ import json
 
 import httpx
 import pytest
+import structlog
 
 from alfred.transport import client as client_mod
 from alfred.transport.exceptions import (
@@ -262,14 +263,27 @@ async def test_connect_error_raises_server_down(
 
 
 async def test_failure_log_has_subprocess_contract_fields(
-    patch_httpx, capsys,  # type: ignore[no-untyped-def]
+    patch_httpx,  # type: ignore[no-untyped-def]
 ) -> None:
     """4xx failures emit ``code``, ``body``, and ``response_summary``.
 
     This is the adapted subprocess-failure contract from builder.md —
     ``response_summary`` is the grep-able one-line summary that lets
-    operators find the failure class at a glance. Structlog writes to
-    stdout via its ConsoleRenderer; we capture that directly.
+    operators find the failure class at a glance.
+
+    The emit fires from inside ``await client_mod.send_outbound`` (an
+    async coroutine), so we capture at structlog's processor chain via
+    ``structlog.testing.capture_logs`` rather than scraping stdout with
+    ``capsys``. The stdout-scrape variant passed in isolation but failed
+    in a full-suite run: a sibling test that installs a global structlog
+    config (renderer routed somewhere other than the capsys-captured
+    stdout, e.g. a file sink or the JSON renderer) leaves that config
+    live, so the rendered line never reaches capsys. ``capture_logs``
+    intercepts above the final renderer and is config-independent —
+    passes in both isolated and full-suite runs. Per
+    ``feedback_structlog_assertion_patterns.md`` (the 5th of the
+    ordering-pollution set; same trap as test_vision /
+    test_session_substance_slug).
     """
     handlers, _ = patch_httpx
     handlers.append(
@@ -278,15 +292,24 @@ async def test_failure_log_has_subprocess_contract_fields(
             json={"error": "user_id_and_text_required"},
         ),
     )
-    with pytest.raises(TransportRejected):
-        await client_mod.send_outbound(user_id=1, text="hi")
+    with structlog.testing.capture_logs() as captured:
+        with pytest.raises(TransportRejected):
+            await client_mod.send_outbound(user_id=1, text="hi")
 
-    captured = capsys.readouterr()
-    output = captured.out + captured.err
-    assert "transport.client.nonzero_response" in output
-    assert "code=400" in output
-    assert "Status 400" in output
-    assert "response_summary" in output
+    matches = [
+        c for c in captured
+        if c.get("event") == "transport.client.nonzero_response"
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one nonzero_response log, got {len(matches)}: "
+        f"{[c.get('event') for c in captured]}"
+    )
+    entry = matches[0]
+    # Subprocess-contract fields the assertion pins (structured kwargs,
+    # not a rendered string): ``code``, ``body``, ``response_summary``.
+    assert entry["code"] == 400
+    assert "user_id_and_text_required" in entry["body"]
+    assert entry["response_summary"].startswith("Status 400")
 
 
 # ---------------------------------------------------------------------------

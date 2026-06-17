@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import structlog
 
 from alfred.telegram import vision
 from alfred.telegram.config import VisionConfig
@@ -457,7 +458,7 @@ async def test_on_photo_unauthorized_user_silent(talker_config) -> None:
 
 @pytest.mark.asyncio
 async def test_on_photo_save_failure_continues_to_llm(
-    talker_config, monkeypatch, capsys,
+    talker_config, monkeypatch,
 ) -> None:
     """Save-to-inbox failure is non-fatal: image still reaches the LLM.
 
@@ -479,6 +480,20 @@ async def test_on_photo_save_failure_continues_to_llm(
             new ``action=continuing_to_llm_in_memory_only`` field so an
             operator tailing logs can grep the policy decision without
             re-reading source.
+
+    Log-capture mechanism: this test uses ``structlog.testing.capture_logs``
+    rather than ``capsys`` on stdout. ``capsys`` reads structlog's output
+    only when the global structlog config happens to route to stdout — but
+    ``setup_logging`` (telegram/utils.py) reconfigures structlog through the
+    stdlib ``logging`` factory with ``logging.basicConfig(force=True)``, so
+    any earlier test in a full-suite run that calls it leaves the log line
+    landing on a FileHandler (or nowhere) instead of stdout. The line is
+    still emitted — capsys just can't see it, producing an isolated-pass /
+    full-suite-fail ordering-pollution failure. ``capture_logs`` intercepts
+    at the structlog level regardless of the configured factory, so it is
+    immune to that global-config bleed. Per
+    ``feedback_structlog_assertion_patterns.md`` +
+    ``feedback_log_emission_test_pattern.md``.
     """
     from alfred.telegram import bot, vision as vision_mod
 
@@ -526,7 +541,8 @@ async def test_on_photo_save_failure_continues_to_llm(
     }})()
     ctx.bot = type("B", (), {})()
 
-    await bot.on_photo(update, ctx)
+    with structlog.testing.capture_logs() as captured_logs:
+        await bot.on_photo(update, ctx)
 
     # (a) handle_message reached — save failure did NOT abort.
     assert captured_kwargs, "handle_message was never invoked — save failure aborted the conversation"
@@ -552,10 +568,25 @@ async def test_on_photo_save_failure_continues_to_llm(
     # Caption forwarded as text.
     assert captured_kwargs["kwargs"].get("text") == "what's in this screenshot?"
 
-    # (d) The "continuing" log line was emitted. structlog is configured
-    # to write to stdout in tests so capsys catches it.
-    captured = capsys.readouterr()
-    log_text = captured.out + captured.err
-    assert "talker.bot.photo_save_failed" in log_text
-    assert "action=continuing_to_llm_in_memory_only" in log_text
-    assert "synthetic disk full" in log_text
+    # (d) The "continuing" log line was emitted with the policy-decision
+    # fields intact. Asserted via capture_logs (structured dicts) rather
+    # than a stdout grep — see the docstring's log-capture note for why
+    # the capsys approach was an ordering-pollution failure in full-suite
+    # runs. Pin the field VALUES, not just event presence, so a future
+    # refactor that drops ``action`` or stops threading the error text
+    # fails here (per feedback_log_emission_test_pattern.md).
+    matches = [
+        c for c in captured_logs
+        if c.get("event") == "talker.bot.photo_save_failed"
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one talker.bot.photo_save_failed log; got "
+        f"{len(matches)}: {matches!r}"
+    )
+    entry = matches[0]
+    assert entry.get("action") == "continuing_to_llm_in_memory_only", (
+        f"policy-decision field missing/changed: {entry!r}"
+    )
+    assert "synthetic disk full" in entry.get("error", ""), (
+        f"original error text not threaded into log: {entry!r}"
+    )
