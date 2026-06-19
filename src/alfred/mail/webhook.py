@@ -78,6 +78,24 @@ is fully explained by:
       ``webhook.body_synthesis_no_signal`` so the operator can
       grep for and triage the bifurcation tail.
 
+**CORRECTION (2026-06-19)**: the "**no truncation point**" conclusion
+above (layer 1) is **REFUTED**. The 05-18 audit checked the field
+*name* (``body.content``) and assumed that meant full delivery — it
+never measured the delivered *length*. That is the gap. Measurement
+shows email bodies arriving truncated at the Microsoft Graph
+``bodyPreview`` **255-char limit**, mid-sentence: **257 chars** on
+Cineplex lockout notes for BOTH 2026-06-12 and 2026-06-19 — the
+``bodyPreview`` signature, dead on. The curator has flagged **338
+``note/`` records** as truncated across **70 distinct senders**,
+ongoing daily. Root cause is **upstream in n8n/Graph**: the Outlook
+Trigger delivers a ``bodyPreview``-length ``body.content`` rather than
+fetching the full message body. The fix lives in n8n, tracked in the
+vault task ``Fix Email Pipeline bodyPreview Truncation — n8n Outlook
+Trigger Must Fetch Full Message Body``. NOTE: the empty-body
+conclusion (a)/(b)/(c) above still holds **for the empty-body mode
+only** — the empty-body arc (06-10) fixed that mode. Truncation is a
+SEPARATE, still-open mode the audit wrongly dismissed.
+
 **Open follow-up**: the IMAP fetcher path (``mail/fetcher.py``) uses
 a different ``_build_markdown`` with a rougher HTML strip
 (``re.sub(r"<[^>]+>", " ", content)``). It has no synthesis
