@@ -1,0 +1,27 @@
+Algernon
+========
+
+This product includes software developed by David Szabo-Stuban (GitHub:
+ssdavidai) as the "alfred" vault-operations suite — the foundation this
+project is built upon.
+
+    alfred
+    Copyright (c) 2025 ssdavidai
+    Licensed under the MIT License.
+
+The MIT permission notice for the alfred foundation is reproduced in the
+LICENSE file at the root of this repository and applies to the foundation
+code in full.
+
+The alfred foundation was published to PyPI as `alfred-vault` and is
+available at https://github.com/ssdavidai/alfred. Algernon is a friendly,
+disclosed fork of that project. Both trees have since diverged and are
+developed independently; Algernon does not track a live upstream.
+
+The Algernon platform — the multi-instance architecture, the peer/transport
+protocol, per-instance scope enforcement, and the additional subsystems
+documented in ATTRIBUTION.md — is original work by Andrew Newton, built on
+top of the alfred foundation and distributed under the same MIT terms.
+
+See ATTRIBUTION.md for a module-level map of which subsystems originate in
+the alfred foundation and which are Algernon-original.
