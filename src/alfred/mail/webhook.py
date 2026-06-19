@@ -345,13 +345,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 def run_webhook(
     inbox_path: Path,
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 5005,
     token: str = "",
     idle_tick_enabled: bool = True,
     idle_tick_interval_seconds: int = 60,
 ) -> None:
     """Start the webhook HTTPServer and (optionally) the idle-tick heartbeat.
+
+    ``host`` defaults to loopback (``127.0.0.1``), NOT all-interfaces. The
+    public ingress is the Cloudflare tunnel (cloudflared), the single proxy
+    in front of this receiver — its ``config.yml`` forwards
+    ``service: http://localhost:5005`` — so the only traffic that reaches this
+    server is the tunnel hitting localhost. Binding loopback keeps the
+    receiver off every other interface; the bearer-token check
+    (``MAIL_WEBHOOK_TOKEN``) remains the auth layer and is unaffected by this.
+    Override ``host`` only if you deliberately front the webhook with a
+    different reverse proxy bound to another interface.
 
     The heartbeat runs in a daemon thread because ``HTTPServer.serve_forever``
     is sync — there's no asyncio loop to host an async tick task. Same

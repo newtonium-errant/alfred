@@ -3911,7 +3911,15 @@ def build_parser() -> argparse.ArgumentParser:
     mail_sub.add_parser("status", help="Show mail fetcher state")
     mail_webhook = mail_sub.add_parser("webhook", help="Start webhook receiver for incoming email")
     mail_webhook.add_argument("--port", type=int, default=5005, help="Port to listen on (default: 5005)")
-    mail_webhook.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
+    mail_webhook.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Host to bind (default: 127.0.0.1, loopback). The Cloudflare "
+            "tunnel proxies to localhost:5005, so loopback is the correct "
+            "bind; pass 0.0.0.0 only if fronting with another reverse proxy."
+        ),
+    )
 
     # gcal (Phase A+ inter-instance comms — Google Calendar integration)
     gcal_p = sub.add_parser(
