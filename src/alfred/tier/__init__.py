@@ -18,9 +18,12 @@ The render layer lives at :mod:`alfred.brief.tier_section` (composes
 auto-T1 + curated shortlists + T2 selection pool + rollover).
 
 V1 (per-task ``base_tier`` / ``escalate_to`` / priority-fallback
-projection) was retired in Ship 3 (2026-05-29). The migration script
-``scripts/migrate_tier_phase1.py`` is preserved for the deferred
-backfill of the 24 existing ``base_tier`` records (Ship 5).
+projection) was retired in Ship 3 (2026-05-29). The ``base_tier`` /
+``escalate_to`` fields were removed from the schema surface 2026-06-25
+(routine-systems consolidation Step 1) and the ~24 stale records are
+being stripped, not backfilled — so the once-deferred "Ship 5
+backfill" is moot. ``scripts/migrate_tier_phase1.py`` (which populated
+those fields) is ARCHIVED as a completed one-time migration.
 """
 
 from .compute import (

@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Backwards-compat shim for the tier Phase 1 migration script.
 
+ARCHIVED 2026-06-25 — COMPLETED ONE-TIME MIGRATION, DO NOT RUN. The V1
+tier fields this script populated (``base_tier`` / ``escalate_to``) were
+removed from the schema surface 2026-06-25 (routine-systems
+consolidation Step 1). See the package module
+``alfred.scripts.migrate_tier_phase1`` docstring for the full archival
+note. The shim is kept only so the documented invocation path doesn't
+404; it is not part of any live migration.
+
 The real implementation lives at ``alfred.scripts.migrate_tier_phase1``.
 This shim preserves the top-level invocation path:
 

@@ -1,5 +1,19 @@
 """One-time migration: tier system Phase 1 (2026-05-28).
 
+.. note:: ARCHIVED 2026-06-25 — COMPLETED ONE-TIME MIGRATION, DO NOT RUN.
+
+   This script populated the V1 tier fields (``tier:`` → ``base_tier:``
+   rename + RRTS ``base_tier`` / ``escalate_to`` / ``escalate_at_days``
+   population). The V1 tier model (``base_tier`` / ``escalate_to``) was
+   retired 2026-05-29 (Ship 3) and those two fields were removed from
+   the schema surface 2026-06-25 (Step 1 of the routine-systems
+   consolidation). The "deferred backfill (Ship 5)" the V1 docstrings
+   used to reference is moot — V1 fields are being DELETED, not
+   backfilled. This module is retained only for historical reference
+   and test-importability (per ``alfred.scripts.__init__`` — modules
+   ship in-package so dataclass ``__module__`` resolves cleanly); it
+   is no longer part of any live or planned migration path.
+
 Three sub-tasks bundled in one script, all gated by ``--dry-run``:
 
   1. **Rename ``tier:`` → ``base_tier:``** on every ``task/*.md`` record

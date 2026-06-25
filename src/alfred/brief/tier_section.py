@@ -10,9 +10,12 @@ from yesterday's incomplete) below.
 The V1 surface (per-task ``base_tier``/``escalate_to`` projection
 through ``compute_effective_tier``) is gone from this module and from
 :mod:`alfred.tier.compute` itself (Ship 3 atomic drop, 2026-05-29 —
-last-consumer-rewrite ratified pattern #22). The migration script
-``scripts/migrate_tier_phase1.py`` is preserved for the deferred
-backfill of the 24 existing ``base_tier`` records (Ship 5).
+last-consumer-rewrite ratified pattern #22). The ``base_tier`` /
+``escalate_to`` fields were removed from the schema surface 2026-06-25
+(routine-systems consolidation Step 1); the ~24 stale records are
+being stripped, not backfilled, so the once-deferred "Ship 5 backfill"
+is moot. The migration script ``scripts/migrate_tier_phase1.py`` (which
+populated those fields) is ARCHIVED as a completed one-time migration.
 
 Render shape (the section body — the brief renderer wraps it under
 ``## Open Tasks by Tier``):

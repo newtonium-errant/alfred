@@ -57,3 +57,36 @@ def test_note_status_includes_living():
     # Other statuses must still be accepted — the addition is additive.
     for legacy in ("draft", "active", "review", "final"):
         assert legacy in STATUS_BY_TYPE["note"]
+
+
+def test_tier_fields_v1_base_tier_escalate_to_removed():
+    # Routine-systems consolidation Step 1 (2026-06-25): the dead
+    # Tier-V1 surface (``base_tier`` / ``escalate_to``) was removed from
+    # ``TIER_FIELDS`` so the schema stops describing a retired model.
+    # V1 was retired 2026-05-29 (Ship 3) and neither field has a live
+    # consumer. Reintroducing either into the tuple would re-assert the
+    # dead model — pin the absence.
+    from alfred.vault.schema import TIER_FIELDS
+
+    assert "base_tier" not in TIER_FIELDS, (
+        "base_tier is a dead Tier-V1 field (retired 2026-05-29); it must "
+        "not be in TIER_FIELDS. See routine-systems consolidation Step 1."
+    )
+    assert "escalate_to" not in TIER_FIELDS, (
+        "escalate_to is a dead Tier-V1 field (retired 2026-05-29); it must "
+        "not be in TIER_FIELDS. See routine-systems consolidation Step 1."
+    )
+
+
+def test_tier_fields_keeps_live_escalate_at_days():
+    # The other half of the Step-1 cut: ``escalate_at_days`` is the LIVE
+    # V2 due-window knob (consumed by
+    # ``alfred.tier.compute.compute_auto_t1_candidates`` — see the
+    # liveness pin in tests/tier/test_compute.py). It MUST survive the
+    # V1 removal. This is the both-ways pin: V1 gone, V2 kept.
+    from alfred.vault.schema import TIER_FIELDS
+
+    assert "escalate_at_days" in TIER_FIELDS, (
+        "escalate_at_days is the live V2 due-window field; it must stay "
+        "in TIER_FIELDS. Removing it would break task auto-T1 surfacing."
+    )

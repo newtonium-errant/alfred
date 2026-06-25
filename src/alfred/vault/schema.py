@@ -1163,35 +1163,34 @@ EVENT_GCAL_FIELDS: tuple[str, ...] = (
     "gcal_title",
 )
 
-# Optional frontmatter fields on ``task`` records that participate in
-# the 3-tier task system (Phase 1 ship 2026-05-28). Salem-only by
+# Optional frontmatter field on ``task`` records that participates in
+# the tier "today" view (the V2 due-window model). Salem-only by
 # virtue of brief integration — non-Salem instances simply don't
-# populate these fields and the brief never reaches the render path.
+# populate this field and the brief never reaches the render path.
 #
-#   - ``base_tier``         (int 1/2/3) — intrinsic tier the operator
-#     sets. T1 = now / time-critical; T2 = soon / on the radar;
-#     T3 = someday / aspirational.
-#   - ``escalate_to``       (int)       — tier the task escalates to as
-#     the deadline approaches. Default when omitted:
-#     ``max(1, base_tier - 1)`` (one tier up, capped at T1).
 #   - ``escalate_at_days``  (int)       — days BEFORE ``due`` when the
-#     escalation fires. **Opt-in per task**: omitting means the task
-#     never escalates, even when ``due`` is set. Past-due tasks always
-#     render at ``escalate_to`` regardless of this field.
+#     task auto-surfaces into the tier "today" view (the auto-T1
+#     candidate window). **Opt-in per task**: omitting means the task
+#     never auto-surfaces by deadline proximity, even when ``due`` is
+#     set. The window is ``2 <= days_to_due <= escalate_at_days``
+#     (the 0-day "due today" and 1-day "due tomorrow" cases are
+#     surfaced unconditionally, ahead of this knob). Consumed by
+#     ``alfred.tier.compute.compute_auto_t1_candidates`` — see that
+#     function for the full surfacing contract.
 #
 # The ``due`` field (already standard on task records) is the deadline
-# the escalation is relative to. ``priority`` (urgent/high/medium/low)
-# is orthogonal — it's intrinsic-importance, not urgency, and is used
-# only as a fallback to derive ``base_tier`` for pre-migration tasks
-# that lack the field. See ``alfred.tier.compute`` for the full
-# computation contract.
+# the window is relative to. Tier PLACEMENT (T1/T2/T3) is computed by
+# the voice/surfacing layer (``alfred.tier``), not stored on the
+# record — there is no ``base_tier`` / ``escalate_to`` / ``tier`` field.
 #
-# ``effective_tier`` is computed at brief-render time and is **never
-# written to the record**. The brief shows the projection; the record
-# stays canonical.
+# HISTORY: the V1 tier model (per-task ``base_tier`` + ``escalate_to``
+# stored fields + a ``compute_effective_tier`` projection) was retired
+# 2026-05-29 (Ship 3 atomic drop). ``base_tier`` and ``escalate_to``
+# have no live consumer; they were removed from this surface 2026-06-25
+# (Step 1 of the routine-systems consolidation) so the schema stops
+# describing a dead model. Only ``escalate_at_days`` — the live V2
+# due-window knob — remains.
 TIER_FIELDS: tuple[str, ...] = (
-    "base_tier",
-    "escalate_to",
     "escalate_at_days",
 )
 

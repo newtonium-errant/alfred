@@ -222,6 +222,48 @@ def test_auto_t1_due_in_3d_with_escalate_at_3_surfaces(
     assert result[0].surface_reason == "escalate window (3d before due)"
 
 
+def test_escalate_at_days_still_consumed_after_v1_cut(
+    tmp_path: Path,
+) -> None:
+    """Step-1 liveness pin (routine-systems consolidation 2026-06-25).
+
+    The Tier-V1 cut removed ``base_tier`` / ``escalate_to`` from the
+    schema surface but ``escalate_at_days`` is the LIVE V2 due-window
+    knob and MUST keep driving auto-T1 surfacing. This drives the real
+    ``compute_auto_t1_candidates`` code path (not just the field name)
+    so the cut can't silently sever the consumer: a task INSIDE its
+    ``escalate_at_days`` window surfaces; the otherwise-identical task
+    WITHOUT the field does not. Pinned per
+    ``feedback_regression_pin_unconditional`` — no importorskip.
+    """
+    # Same due date (3 days out), differ only by escalate_at_days.
+    with_field = _make_vault_with_task(
+        tmp_path / "with",
+        "Pay Rent.md",
+        "type: task\nstatus: todo\nname: Pay Rent\n"
+        "due: 2026-05-31\nescalate_at_days: 3\n",
+    )
+    without_field = _make_vault_with_task(
+        tmp_path / "without",
+        "Pay Rent.md",
+        "type: task\nstatus: todo\nname: Pay Rent\ndue: 2026-05-31\n",
+    )
+
+    surfaced = compute_auto_t1_candidates(with_field, NOW)
+    not_surfaced = compute_auto_t1_candidates(without_field, NOW)
+
+    assert len(surfaced) == 1, (
+        "escalate_at_days must still be consumed: a task inside its "
+        "window should auto-surface. If this fails, the V1 cut severed "
+        "the live V2 consumer."
+    )
+    assert surfaced[0].surface_reason == "escalate window (3d before due)"
+    assert not_surfaced == [], (
+        "control: the same task without escalate_at_days must NOT "
+        "surface — proves the field drives the decision."
+    )
+
+
 def test_auto_t1_due_in_4d_with_escalate_at_3_does_not_surface(
     tmp_path: Path,
 ) -> None:

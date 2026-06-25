@@ -63,9 +63,12 @@ V1 retired (2026-05-29 Ship 3). The per-task ``base_tier`` /
 ``compute_effective_tier`` function is gone, along with the
 ``PRIORITY_TO_BASE_TIER`` constant, ``derive_base_tier_from_priority``
 helper, ``TierResult`` namedtuple, and ``DEFAULT_ESCALATION_GAP``
-constant. The 24 existing ``base_tier`` records remain on disk
-(deferred backfill per Ship 5 — those records stay until either the
-operator curates them daily or runs the backfill).
+constant. The ``base_tier`` / ``escalate_to`` fields were also removed
+from the schema surface 2026-06-25 (routine-systems consolidation
+Step 1); the once-deferred "Ship 5 backfill" is moot — those fields
+are being stripped from the ~24 stale records, not backfilled.
+``escalate_at_days`` is the sole surviving tier field (the live V2
+due-window knob; see :func:`compute_auto_t1_candidates`).
 
 Reason strings (``"due today"`` / ``"due tomorrow"`` / ``"escalate
 window (Nd before due)"`` / ``"surface window (Nd before due)"``) are
@@ -673,10 +676,12 @@ def _parse_item_completion_dates(raw: Any) -> list[date]:
 # (``test_mirror_decide_tier_handoff_t3_matches_compute_auto_t3``).
 #
 # Companion talker grammar (``T3 confirm <item>`` + voice-completion
-# of soft-cadence items) is deferred to Phase 2B B1. Operator-axis
-# surface — see :data:`alfred.brief.tier_section.
-# T3_AUTO_TALKER_DEFERRED_NOTE` for the operator-facing ILB
-# acknowledgement that surfaces in the brief.
+# of soft-cadence items) shipped 2026-05-30 (Phase 2B B1) — the
+# ``routine_done`` tool path in :mod:`alfred.telegram.conversation`.
+# The operator-facing ILB acknowledgement that used to surface in the
+# brief (:data:`alfred.brief.tier_section.T3_AUTO_TALKER_DEFERRED_NOTE`)
+# was retired in that same ship; the constant is preserved for
+# backwards-compat but the brief render loop no longer emits it.
 
 
 @dataclass
@@ -709,7 +714,7 @@ class AutoT3Candidate:
 
     Brief renders this via :func:`alfred.brief.tier_section.
     _render_auto_t3_routine_entry`. Talker recognition pattern
-    (``T3 confirm <item>``) ships in Phase 2B B1.
+    (``T3 confirm <item>``) shipped 2026-05-30 (Phase 2B B1).
 
     Cross-Ship contract: field names are stable; rename = update
     brief render + Phase 2B SKILL in lockstep.
