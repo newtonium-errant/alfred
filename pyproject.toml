@@ -27,7 +27,13 @@ dependencies = [
 [project.optional-dependencies]
 temporal = ["temporalio>=1.9.0"]
 surveyor = [
-    "pymilvus[milvus_lite]>=2.4",
+    # PINNED 2026-06-25: >=2.4 let the box's fresh install grab pymilvus 3.0 /
+    # milvus-lite 3.0 (directory-based), which cannot open the existing 2.5.1
+    # file-based (single SQLite) vector DBs — surveyor crash-looped on cutover.
+    # Keep this stack matched to the on-disk DB format until a deliberate re-embed.
+    "pymilvus[milvus_lite]==2.5.7",
+    "milvus-lite==2.5.1",
+    "setuptools<81",  # milvus-lite 2.5.1 imports pkg_resources, removed in setuptools 81+
     "scikit-learn>=1.4",
     "leidenalg>=0.10",
     "igraph>=0.11",
