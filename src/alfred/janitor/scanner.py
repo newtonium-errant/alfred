@@ -13,6 +13,7 @@ from alfred.vault.schema import (
     LIST_FIELDS,
     NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS,
+    REQUIRED_FIELDS_BY_TYPE,
     STATUS_BY_TYPE,
     TYPE_DIRECTORY,
 )
@@ -88,11 +89,13 @@ def _decode_yaml_apostrophe(target: str) -> str:
 
 
 def _normalize_wikilink_target_for_lookup(target: str) -> str:
-    """Normalize a wikilink target string for stem_index resolution.
+    """Normalize a wikilink target's FULL name for stem_index resolution.
 
-    Applied at every lookup site (LINK001 check, inbound_index build,
-    LINK002 frontmatter/body diff) so the same normalization rules
-    flow through every code path. Composes:
+    This is the *full-name* normalization: it does NOT strip a trailing
+    ``#anchor``. Anchor handling is a fallback step owned by
+    :func:`_resolve_wikilink_target` so that a literal ``#`` in a
+    filename resolves to the real file BEFORE the anchor interpretation
+    is tried. Composes:
 
     1. **YAML apostrophe decode** — ``''`` → ``'`` (see
        :func:`_decode_yaml_apostrophe`). Required because YAML's
@@ -112,36 +115,111 @@ def _normalize_wikilink_target_for_lookup(target: str) -> str:
        this as a high-volume false-positive class. Real false-pos
        count on Salem's 920 false-positive-annotated records pre-fix.
 
-    3. **Anchor strip** — ``[[record#Section]]`` → ``record``. The
-       ``#anchor`` portion is an in-document jump destination, not
-       part of the file path. Obsidian resolves the file regardless
-       of the anchor; the scanner did the same when no anchor was
-       present and false-positived when one was. Low-volume on
-       Salem's vault (4 distinct patterns) but free to fix while
-       we're here, AND it matches the behavior the comment at the
-       LINK001 dispatch site implicitly assumes.
+    Anchor stripping (``[[record#Section]]`` → ``record``) is NOT done
+    here — see :func:`_resolve_wikilink_target`. The 2026-06-23 fix
+    (BUG C) moved the anchor strip to a fallback because a record whose
+    FILENAME contains a literal ``#`` (e.g.
+    ``decision/Morning Brief Re-Renders Latest BIT Record as a ##
+    Health Section.md``) was being truncated at the first ``#`` and
+    false-reported as a broken link. Resolving the full name first,
+    anchor-stripping only on a miss, fixes that without breaking real
+    ``[[file#anchor]]`` resolution.
 
     The order matters: apostrophe decode FIRST (so ``''`` doesn't
     interfere with subsequent normalizations), then strip trailing
-    ``.md``, then drop the anchor. Empty strings pass through
-    untouched.
+    ``.md``. Empty strings pass through untouched.
     """
     if not target:
         return target
     # 1. YAML apostrophe decode.
     out = _decode_yaml_apostrophe(target)
-    # 2. Strip ``#anchor`` — split once, take the head. We strip the
-    # anchor BEFORE checking ``.md`` because anchors can sit between
-    # the path and the suffix in unusual cases (``[[X#Y.md]]``? not
-    # a real shape, but the order keeps us safe).
-    if "#" in out:
-        out = out.split("#", 1)[0]
-    # 3. Strip trailing ``.md``. Obsidian-tolerated suffix; without
+    # 2. Strip trailing ``.md``. Obsidian-tolerated suffix; without
     # this strip, ``[[session/X.md]]`` lookup fails because stem_index
     # only carries ``session/X`` (the rel-path-without-extension key).
     if out.endswith(".md"):
         out = out[:-3]
     return out.strip()
+
+
+def _strip_anchor(normalized: str) -> str:
+    """Drop a trailing ``#anchor`` from an already-normalized target.
+
+    The ``#anchor`` portion of ``[[record#Section]]`` is an in-document
+    jump destination, not part of the file path; Obsidian resolves the
+    file regardless of the anchor. This is the FALLBACK step in
+    :func:`_resolve_wikilink_target` — applied only after the full
+    (anchor-bearing) name fails to resolve, so a literal ``#`` in a real
+    filename is never silently truncated. Returns ``normalized``
+    unchanged when there is no ``#``.
+    """
+    if "#" not in normalized:
+        return normalized
+    return normalized.split("#", 1)[0].strip()
+
+
+def _resolve_wikilink_target(
+    target: str,
+    stem_index: dict[str, set[str]],
+) -> set[str]:
+    """Resolve a raw wikilink target to the set of on-disk files.
+
+    Full-name-first, anchor-strip-fallback (BUG C, 2026-06-23):
+
+    1. Normalize the FULL target (apostrophe decode + ``.md`` strip,
+       anchor KEPT) and look it up. This resolves filenames that
+       legitimately contain a literal ``#`` — the truncating
+       ``split("#")`` that ran unconditionally pre-fix turned every such
+       filename into a phantom broken link.
+    2. Only if the full-name lookup MISSES, strip a trailing ``#anchor``
+       and retry. This preserves correct resolution of genuine
+       ``[[file#section]]`` links (where ``file.md`` exists but
+       ``file#section.md`` does not).
+
+    Returns an empty set when neither form resolves — the caller fires
+    LINK001 (or skips the inbound edge) exactly as before.
+    """
+    full = _normalize_wikilink_target_for_lookup(target)
+    resolved = stem_index.get(full)
+    if resolved:
+        return resolved
+    stripped = _strip_anchor(full)
+    if stripped != full:
+        return stem_index.get(stripped, set())
+    return set()
+
+
+def _canonical_link_key(
+    target: str,
+    stem_index: dict[str, set[str]],
+) -> str:
+    """Canonical lookup-key for a wikilink target, for LINK002 comparison.
+
+    LINK002 diffs the set of body wikilinks against the set of
+    frontmatter wikilinks. The two sides may write the SAME link in
+    different surface forms (``[[X]]`` vs ``[[X.md]]`` vs
+    ``[[X#Section]]``); without a canonical key the set difference would
+    falsely flag identical references as "missing from frontmatter."
+
+    Returns the normalized form that ACTUALLY resolves in ``stem_index``:
+    the full (anchor-bearing) normalized name when that resolves — so a
+    filename containing a literal ``#`` keeps its real name — otherwise
+    the anchor-stripped form. The returned key is always a
+    ``stem_index``-compatible string (``dir/Name`` or bare stem, no
+    ``.md``), so LINK002's downstream ``split("/")`` dir check,
+    self-reference compare, and ``stem_index.get(link)`` existence test
+    all keep working unchanged. This mirrors the full-name-first /
+    anchor-fallback order of :func:`_resolve_wikilink_target` so LINK001,
+    the inbound index, and LINK002 stay consistent (BUG C, 2026-06-23).
+    """
+    full = _normalize_wikilink_target_for_lookup(target)
+    if full in stem_index:
+        return full
+    stripped = _strip_anchor(full)
+    if stripped in stem_index:
+        return stripped
+    # Neither resolves: fall back to the anchor-stripped form so two
+    # unresolved-but-identical references still collapse to one key.
+    return stripped
 
 
 def _build_stem_index(vault_path: Path, ignore_dirs: set[str]) -> dict[str, set[str]]:
@@ -197,17 +275,16 @@ def _build_inbound_index(
 
         links = extract_wikilinks(raw)
         for target in links:
-            # Resolve target to actual files via the shared
-            # normalization helper (YAML apostrophe decode + trailing
-            # ``.md`` strip + anchor strip). Without this normalization
+            # Resolve target to actual files via the shared resolver
+            # (YAML apostrophe decode + trailing ``.md`` strip +
+            # full-name-first / anchor-strip-fallback). Without this
             # records that link via apostrophe-bearing names, paths
-            # carrying the ``.md`` suffix, or anchored wikilinks
-            # ``[[X#Section]]`` never register inbound — inflating
-            # ORPHAN001 false positives in parallel to the LINK001
-            # false positives the same normalization fixes downstream.
-            resolved = stem_index.get(
-                _normalize_wikilink_target_for_lookup(target), set(),
-            )
+            # carrying the ``.md`` suffix, anchored wikilinks
+            # ``[[X#Section]]``, or filenames that legitimately contain a
+            # literal ``#`` never register inbound — inflating ORPHAN001
+            # false positives in parallel to the LINK001 false positives
+            # the same resolver fixes downstream.
+            resolved = _resolve_wikilink_target(target, stem_index)
             for resolved_path in resolved:
                 inbound.setdefault(resolved_path, set()).add(rel_path)
 
@@ -342,9 +419,36 @@ def _check_record(
     """Run all structural checks on a single record."""
     issues: list[Issue] = []
     fm = record.frontmatter
+    rec_type = fm.get("type", "")
 
-    # FM001: Missing required fields
+    # FM001: Missing required fields.
+    #
+    # The universal ``REQUIRED_FIELDS`` (``type``, ``created``) apply to
+    # every record, PLUS the per-type extras in
+    # ``REQUIRED_FIELDS_BY_TYPE`` (additive — mirrors
+    # ``vault/ops.py::_validate_required_fields``). One per-type override
+    # (BUG D, 2026-06-23): a type whose per-type tuple declares its OWN
+    # timestamp field ``date`` (only ``daily`` today — the date-keyed
+    # aggregator record) is exempt from the universal ``created``
+    # requirement, since ``date`` plays that role. Every other type —
+    # ``routine``/``ticket``/``preference`` and the ~22 types with no
+    # per-type entry — still requires ``created`` (they all carry it),
+    # so this does NOT weaken validation for normal records.
+    type_extras = REQUIRED_FIELDS_BY_TYPE.get(rec_type, [])
+    title_field = NAME_FIELD_BY_TYPE.get(rec_type, "name")
+    declares_own_timestamp = "date" in type_extras
+
+    effective_required: list[str] = []
     for req in REQUIRED_FIELDS:
+        if req == "created" and declares_own_timestamp:
+            continue  # date-keyed type: its own timestamp substitutes
+        effective_required.append(req)
+    # Additive per-type extras (deduped against the universal list).
+    for extra in type_extras:
+        if extra not in effective_required:
+            effective_required.append(extra)
+
+    for req in effective_required:
         if not fm.get(req):
             issues.append(Issue(
                 code=IssueCode.MISSING_REQUIRED_FIELD,
@@ -354,10 +458,23 @@ def _check_record(
                 suggested_fix=f"Add '{req}' to frontmatter",
             ))
 
-    # Check name/subject field
-    rec_type = fm.get("type", "")
-    title_field = NAME_FIELD_BY_TYPE.get(rec_type, "name")
-    if rec_type and not fm.get(title_field) and not fm.get("name"):
+    # Check name/subject field — skip for nameless-by-design types.
+    #
+    # A type whose per-type required tuple is DECLARED but omits both
+    # ``name`` and its own ``name_field`` is intentionally nameless
+    # (only ``daily`` today — date-keyed, no title). Flagging it for a
+    # missing name produced a false FM001 (BUG D, 2026-06-23). Normal
+    # types (no per-type entry) and types that DO declare a name field
+    # (``routine``/``ticket``/``preference``) keep the existing check.
+    nameless_by_design = bool(type_extras) and (
+        "name" not in type_extras and title_field not in type_extras
+    )
+    if (
+        rec_type
+        and not nameless_by_design
+        and not fm.get(title_field)
+        and not fm.get("name")
+    ):
         issues.append(Issue(
             code=IssueCode.MISSING_REQUIRED_FIELD,
             severity=Severity.CRITICAL,
@@ -410,8 +527,22 @@ def _check_record(
         expected_dir = TYPE_DIRECTORY[rec_type]
         parts = rel_path.replace("\\", "/").split("/")
         if len(parts) > 1 and parts[0] != expected_dir:
-            # Allow date-organized paths (YYYY/MM/DD)
-            if not (len(parts[0]) == 4 and parts[0].isdigit()):
+            # Allow date-organized paths (YYYY/MM/DD).
+            date_organized = len(parts[0]) == 4 and parts[0].isdigit()
+            # Allow ``quarantine/`` — records legitimately live there
+            # regardless of their type-directory (BUG B, 2026-06-23). The
+            # quarantine convention buckets spam/garbage as
+            # ``quarantine/spam/<YYYY-MM>/*.md`` (all ``type: note``);
+            # see the vault record "Quarantine Spam Directory Buckets by
+            # Processing Month Not Source Email Date". DIR001 here would
+            # tell the agent to "move to note/", un-quarantining spam
+            # back into the main note/ tree — a latently dangerous
+            # suggestion. The whole ``quarantine/`` subtree is exempt
+            # (not just ``quarantine/spam/``) so future buckets
+            # (``quarantine/duplicate/`` etc.) are covered without
+            # another carve-out.
+            quarantined = parts[0] == "quarantine"
+            if not date_organized and not quarantined:
                 issues.append(Issue(
                     code=IssueCode.WRONG_DIRECTORY,
                     severity=Severity.WARNING,
@@ -425,15 +556,15 @@ def _check_record(
         # Skip Dataview base view references (e.g. "person.base#Decisions")
         if ".base" in target:
             continue
-        # Look up via the shared normalization helper (YAML apostrophe
-        # decode + trailing ``.md`` strip + ``#anchor`` strip) so
-        # wikilinks that vary along any of those axes still resolve to
-        # the same on-disk file Obsidian would. The raw ``target`` is
-        # kept for the user-visible LINK001 message so reviewers see
-        # exactly what the source file contained.
-        resolved = stem_index.get(
-            _normalize_wikilink_target_for_lookup(target), set(),
-        )
+        # Resolve via the shared resolver (YAML apostrophe decode +
+        # trailing ``.md`` strip + full-name-first / anchor-strip-
+        # fallback) so wikilinks that vary along any of those axes still
+        # resolve to the same on-disk file Obsidian would — INCLUDING
+        # filenames that legitimately contain a literal ``#`` (resolved
+        # by their full name before any anchor interpretation). The raw
+        # ``target`` is kept for the user-visible LINK001 message so
+        # reviewers see exactly what the source file contained.
+        resolved = _resolve_wikilink_target(target, stem_index)
         if not resolved:
             issues.append(Issue(
                 code=IssueCode.BROKEN_WIKILINK,
@@ -448,20 +579,22 @@ def _check_record(
     # so body-only entity links won't appear in base view tables.
     #
     # Both sides of the body/frontmatter set difference go through the
-    # shared normalization helper (YAML apostrophe decode + trailing
-    # ``.md`` strip + ``#anchor`` strip) so the same target written in
-    # different forms across body and frontmatter (``[[X]]`` vs
-    # ``[[X.md]]`` vs ``[[X#Section]]``) collapses to one canonical
-    # key — otherwise the set difference falsely flags identical
-    # references as missing.
+    # shared canonical-key helper (YAML apostrophe decode + trailing
+    # ``.md`` strip + full-name-first / anchor-strip-fallback) so the
+    # same target written in different forms across body and frontmatter
+    # (``[[X]]`` vs ``[[X.md]]`` vs ``[[X#Section]]``) collapses to one
+    # canonical key — otherwise the set difference falsely flags
+    # identical references as missing. The key is always a
+    # ``stem_index``-compatible string, so the dir/self-ref/existence
+    # checks below keep working unchanged.
     _entity_dirs = set(TYPE_DIRECTORY.values())
     fm_text = _frontmatter_text(record.frontmatter)
     fm_link_targets = {
-        _normalize_wikilink_target_for_lookup(t)
+        _canonical_link_key(t, stem_index)
         for t in extract_wikilinks(fm_text)
     }
     body_links = {
-        _normalize_wikilink_target_for_lookup(t)
+        _canonical_link_key(t, stem_index)
         for t in extract_wikilinks(record.body)
     }
     missing_from_fm = []

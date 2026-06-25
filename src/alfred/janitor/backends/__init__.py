@@ -5,10 +5,33 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from ..issues import Issue
+from ..issues import Issue, IssueCode
 from ..utils import get_logger
 
 log = get_logger(__name__)
+
+
+# Issue codes the AGENT is expected to act on. Everything else is
+# handled deterministically by the structural scanner / autofix
+# (FM001-FM004, DIR001, LINK002, ORPHAN001, STUB001, SEM001-SEM004)
+# and MUST NOT reach the agent prompt — the agent-facing contract in
+# ``skills/vault-janitor/SKILL.md`` §3 states the agent should only
+# receive LINK001 (fix unambiguous only), DUP001, and SEM005-SEM006;
+# every other code is annotated "you should not see this code in your
+# issue report." Routing the scanner-handled codes to the agent floods
+# it with false-positive busywork (the 2026-06-23 live-sweep report
+# violated this wholesale). The daemon filters the issue list against
+# this set BEFORE building the report — ``build_issue_report`` stays a
+# dumb formatter that renders whatever it is handed.
+#
+# Derived against the ``IssueCode`` enum (not hardcoded strings) so a
+# rename of an enum member can't silently desync the allowlist.
+AGENT_ACTIONABLE_CODES: frozenset[IssueCode] = frozenset({
+    IssueCode.BROKEN_WIKILINK,      # LINK001 — fix only when unambiguous
+    IssueCode.DUPLICATE_NAME,       # DUP001  — emit triage task
+    IssueCode.VAGUE_NOTE,           # SEM005  — agent judgment
+    IssueCode.DUPLICATE_SEMANTIC,   # SEM006  — agent judgment
+})
 
 
 @dataclass

@@ -23,7 +23,12 @@ from alfred.common.heartbeat import Heartbeat
 from alfred.common.schedule import compute_next_fire
 from alfred.vault.mutation_log import append_to_audit_log, cleanup_session_file, create_session_file, read_mutations
 
-from .backends import BaseBackend, BackendResult, build_issue_report
+from .backends import (
+    AGENT_ACTIONABLE_CODES,
+    BaseBackend,
+    BackendResult,
+    build_issue_report,
+)
 from .triage import collect_open_triage_tasks, format_open_triage_block
 from .backends.cli import ClaudeBackend
 from .config import JanitorConfig
@@ -207,108 +212,138 @@ async def run_sweep(
             backend = _create_backend(config)
             vault_path = config.vault.vault_path
 
-            # Batch issues if too many
-            max_per_call = config.sweep.max_files_per_agent_call
-            affected_files = list({i.file for i in issues})
+            # Scanner-handled-code filter (2026-06-23): only the codes in
+            # ``AGENT_ACTIONABLE_CODES`` (LINK001, DUP001, SEM005, SEM006)
+            # are routed to the agent. FM*/DIR001/LINK002/ORPHAN001/
+            # STUB001/SEM001-004 are handled deterministically by the
+            # scanner + autofix; surfacing them to the agent floods the
+            # prompt with false-positive busywork the SKILL explicitly
+            # tells the agent it should never see (§3). The full ``issues``
+            # list still drives SweepResult counts, severity tally, and
+            # state — this filter only narrows what the AGENT sees.
+            agent_issues = [i for i in issues if i.code in AGENT_ACTIONABLE_CODES]
 
-            # Layer 3: surface existing open triage tasks so the agent
-            # can skip already-queued candidates. Computed once per sweep.
-            open_triage_tasks = collect_open_triage_tasks(vault_path)
-            open_triage_block = format_open_triage_block(
-                open_triage_tasks,
-                seen_ids=state.triage_ids_seen,
-            )
-
-            for batch_start in range(0, len(affected_files), max_per_call):
-                batch_files = set(affected_files[batch_start:batch_start + max_per_call])
-                batch_issues = [i for i in issues if i.file in batch_files]
-
-                issue_report = build_issue_report(batch_issues)
-                affected_records = _build_affected_records(batch_issues, vault_path)
-
-                # Claude (the only surviving backend post 2026-05-25) always
-                # uses the mutation log — env_overrides feed scope + session
-                # path into the agent subprocess.
-                session_path = create_session_file()
-                backend.env_overrides = {
-                    "ALFRED_VAULT_PATH": str(vault_path),
-                    "ALFRED_VAULT_SCOPE": "janitor",
-                    "ALFRED_VAULT_SESSION": session_path,
-                }
-
-                # Invoke agent
+            if not agent_issues:
+                # "Intentionally left blank" signal: the sweep DID find
+                # issues, but every one is deterministically handled —
+                # nothing is routed to the agent. Emit an explicit
+                # "ran, nothing to route" line (greppable as
+                # ``sweep.no_agent_actionable``) so an all-deterministic
+                # batch is distinguishable from a broken/silent sweep,
+                # and skip the agent loop entirely rather than send an
+                # empty report.
                 log.info(
-                    "sweep.agent_invoke",
+                    "sweep.no_agent_actionable",
                     sweep_id=sweep_id,
-                    batch_files=len(batch_files),
-                    batch_issues=len(batch_issues),
+                    issues_found=len(issues),
+                    deterministic_handled=len(issues),
+                    routed_to_agent=0,
                 )
-                agent_result = await backend.process(
-                    skill_text=skill_text,
-                    issue_report=issue_report,
-                    affected_records=affected_records,
-                    vault_path=str(vault_path),
-                    open_triage_block=open_triage_block,
+            else:
+                # Batch issues if too many. Batch over the AGENT-actionable
+                # file set so a batch is never wholly scanner-handled noise
+                # (which would cost an agent call for an empty report).
+                max_per_call = config.sweep.max_files_per_agent_call
+                affected_files = list({i.file for i in agent_issues})
+
+                # Layer 3: surface existing open triage tasks so the agent
+                # can skip already-queued candidates. Computed once per sweep.
+                open_triage_tasks = collect_open_triage_tasks(vault_path)
+                open_triage_block = format_open_triage_block(
+                    open_triage_tasks,
+                    seen_ids=state.triage_ids_seen,
                 )
 
-                # Determine what changed via the mutation log.
-                mutations = read_mutations(session_path)
-                created = mutations["files_created"]
-                modified = mutations["files_modified"]
-                deleted = mutations["files_deleted"]
+                for batch_start in range(0, len(affected_files), max_per_call):
+                    batch_files = set(affected_files[batch_start:batch_start + max_per_call])
+                    batch_issues = [i for i in agent_issues if i.file in batch_files]
 
-                # Layer 3: record any newly-created triage task IDs in
-                # state so they cannot be re-surfaced on the next sweep
-                # even if the human closes or deletes them. Handles the
-                # empty-created case naturally (loop is a no-op).
-                # Heartbeat log below makes every fix-mode sweep visible
-                # in janitor.log even when `created` is empty.
-                log.info("daemon.triage_scan", created_count=len(created), sweep_id=sweep_id)
-                _record_triage_ids_from_created(created, vault_path, state)
+                    issue_report = build_issue_report(batch_issues)
+                    affected_records = _build_affected_records(batch_issues, vault_path)
 
-                # Audit log
-                audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
-                audit_path = str(Path(config.state.path).parent / "vault_audit.log")
-                append_to_audit_log(audit_path, "janitor", audit_mutations, detail=sweep_id)
+                    # Claude (the only surviving backend post 2026-05-25) always
+                    # uses the mutation log — env_overrides feed scope + session
+                    # path into the agent subprocess.
+                    session_path = create_session_file()
+                    backend.env_overrides = {
+                        "ALFRED_VAULT_PATH": str(vault_path),
+                        "ALFRED_VAULT_SCOPE": "janitor",
+                        "ALFRED_VAULT_SESSION": session_path,
+                    }
 
-                # Cleanup is the LAST session-related operation — read
-                # mutations, act on them, then cleanup. Avoids brittleness
-                # if future changes read session-derived data in helpers.
-                cleanup_session_file(session_path)
-
-                result.files_fixed += len(modified) + len(created)
-                result.files_deleted += len(deleted)
-                result.agent_invoked = True
-
-                # Log actions
-                for f in modified:
-                    state.add_fix_log(FixLogEntry(
+                    # Invoke agent
+                    log.info(
+                        "sweep.agent_invoke",
                         sweep_id=sweep_id,
-                        action="fixed",
-                        file=f,
-                        detail="Modified by agent",
-                    ))
-                for f in deleted:
-                    state.add_fix_log(FixLogEntry(
-                        sweep_id=sweep_id,
-                        action="deleted",
-                        file=f,
-                        detail="Deleted by agent",
-                    ))
-                for f in created:
-                    state.add_fix_log(FixLogEntry(
-                        sweep_id=sweep_id,
-                        action="fixed",
-                        file=f,
-                        detail="Created by agent",
-                    ))
-
-                if not agent_result.success:
-                    log.error(
-                        "sweep.agent_failed",
-                        sweep_id=sweep_id,
-                        summary=agent_result.summary[:500],
+                        batch_files=len(batch_files),
+                        batch_issues=len(batch_issues),
                     )
+                    agent_result = await backend.process(
+                        skill_text=skill_text,
+                        issue_report=issue_report,
+                        affected_records=affected_records,
+                        vault_path=str(vault_path),
+                        open_triage_block=open_triage_block,
+                    )
+
+                    # Determine what changed via the mutation log.
+                    mutations = read_mutations(session_path)
+                    created = mutations["files_created"]
+                    modified = mutations["files_modified"]
+                    deleted = mutations["files_deleted"]
+
+                    # Layer 3: record any newly-created triage task IDs in
+                    # state so they cannot be re-surfaced on the next sweep
+                    # even if the human closes or deletes them. Handles the
+                    # empty-created case naturally (loop is a no-op).
+                    # Heartbeat log below makes every fix-mode sweep visible
+                    # in janitor.log even when `created` is empty.
+                    log.info("daemon.triage_scan", created_count=len(created), sweep_id=sweep_id)
+                    _record_triage_ids_from_created(created, vault_path, state)
+
+                    # Audit log
+                    audit_mutations = {"files_created": created, "files_modified": modified, "files_deleted": deleted}
+                    audit_path = str(Path(config.state.path).parent / "vault_audit.log")
+                    append_to_audit_log(audit_path, "janitor", audit_mutations, detail=sweep_id)
+
+                    # Cleanup is the LAST session-related operation — read
+                    # mutations, act on them, then cleanup. Avoids brittleness
+                    # if future changes read session-derived data in helpers.
+                    cleanup_session_file(session_path)
+
+                    result.files_fixed += len(modified) + len(created)
+                    result.files_deleted += len(deleted)
+                    result.agent_invoked = True
+
+                    # Log actions
+                    for f in modified:
+                        state.add_fix_log(FixLogEntry(
+                            sweep_id=sweep_id,
+                            action="fixed",
+                            file=f,
+                            detail="Modified by agent",
+                        ))
+                    for f in deleted:
+                        state.add_fix_log(FixLogEntry(
+                            sweep_id=sweep_id,
+                            action="deleted",
+                            file=f,
+                            detail="Deleted by agent",
+                        ))
+                    for f in created:
+                        state.add_fix_log(FixLogEntry(
+                            sweep_id=sweep_id,
+                            action="fixed",
+                            file=f,
+                            detail="Created by agent",
+                        ))
+
+                    if not agent_result.success:
+                        log.error(
+                            "sweep.agent_failed",
+                            sweep_id=sweep_id,
+                            summary=agent_result.summary[:500],
+                        )
 
     log.info(
         "sweep.complete",

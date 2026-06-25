@@ -1,22 +1,30 @@
-"""Tests for the LINK001 wikilink normalization helper +
-its routing through scanner.py.
+"""Tests for the LINK001 wikilink normalization/resolution helpers +
+their routing through scanner.py.
 
-Pins the three normalization rules a scanner lookup must apply
-before testing a wikilink target against ``stem_index``:
+The scanner resolves a wikilink target against ``stem_index`` in two
+stages:
 
-    1. YAML apostrophe decode (``''`` → ``'``)
-    2. Trailing ``.md`` strip (Obsidian-tolerated suffix)
-    3. ``#anchor`` strip (in-document jump destination)
+  - ``_normalize_wikilink_target_for_lookup`` — base normalization of
+    the FULL name: YAML apostrophe decode (``''`` → ``'``) + trailing
+    ``.md`` strip (Obsidian-tolerated suffix). The ``#anchor`` is KEPT.
+  - ``_resolve_wikilink_target`` — full-name-first / anchor-strip-
+    fallback: looks up the full normalized name, and only on a miss
+    drops a trailing ``#anchor`` (via ``_strip_anchor``) and retries.
 
-Each rule has its own constraint record under
-``vault/constraint/Janitor LINK001 ...`` documenting the bug class
-and the false-positive volume it created. Trailing ``.md`` strip is
-the load-bearing fix from this commit; the other two are pre-existing
-behaviors that the helper now consolidates.
+The anchor strip moved OUT of the base helper into the fallback in the
+2026-06-23 BUG C fix: a filename that legitimately contains a literal
+``#`` (e.g. ``decision/... as a ## Health Section.md``) was being
+truncated at the first ``#`` and false-reported as broken. Resolving
+the full name first fixes that without breaking real ``[[file#anchor]]``
+resolution (still handled by the fallback).
+
+Each pre-existing rule has its own constraint record under
+``vault/constraint/Janitor LINK001 ...`` documenting the bug class and
+the false-positive volume it created.
 
 Regression coverage: a vault with a GENUINELY broken wikilink still
-fires LINK001 — the normalization can't be so aggressive that real
-broken links go silent.
+fires LINK001 — the resolution can't be so aggressive that real broken
+links go silent.
 """
 
 from __future__ import annotations
@@ -33,6 +41,7 @@ from alfred.janitor.config import (
 from alfred.janitor.issues import IssueCode
 from alfred.janitor.scanner import (
     _normalize_wikilink_target_for_lookup,
+    _strip_anchor,
     run_structural_scan,
 )
 from alfred.janitor.state import JanitorState
@@ -99,21 +108,33 @@ class TestNormalizeWikilinkTarget:
             "person/X.md.something",
         ) == "person/X.md.something"
 
-    def test_strips_anchor(self):
-        """``[[record#Section]]`` resolves to the file ``record``;
-        the anchor is an in-document jump, not part of the file path."""
+    def test_keeps_anchor_in_full_name(self):
+        """BUG C (2026-06-23): the base normalization helper NO LONGER
+        strips ``#anchor`` — anchor handling moved to the resolver
+        fallback (:func:`_strip_anchor` / ``_resolve_wikilink_target``)
+        so a filename containing a literal ``#`` resolves by its full
+        name before any anchor interpretation. The helper here keeps the
+        full (anchor-bearing) form; only apostrophe decode + ``.md``
+        strip are applied."""
         assert _normalize_wikilink_target_for_lookup(
             "person/Andrew Newton#Calibration",
-        ) == "person/Andrew Newton"
+        ) == "person/Andrew Newton#Calibration"
 
-    def test_strips_anchor_before_md_strip(self):
-        """Anchor strip happens FIRST so weird shapes like
-        ``[[X#Y.md]]`` (no real source carries this, but it's a
-        plausible YAML continuation artifact) drop the anchor cleanly
-        and leave the path bare."""
-        assert _normalize_wikilink_target_for_lookup(
-            "X#Y.md",
-        ) == "X"
+    def test_strip_anchor_helper_drops_anchor(self):
+        """The dedicated ``_strip_anchor`` fallback drops a trailing
+        ``#anchor`` from an already-normalized target. This is the step
+        the resolver applies ONLY after the full name fails to resolve,
+        so a genuine ``[[file#section]]`` still resolves to ``file``."""
+        assert _strip_anchor("person/Andrew Newton#Calibration") == (
+            "person/Andrew Newton"
+        )
+
+    def test_strip_anchor_helper_noop_without_hash(self):
+        """No ``#`` → returned unchanged (the literal-filename common
+        case the resolver tries FIRST)."""
+        assert _strip_anchor("decision/X as a Health Section") == (
+            "decision/X as a Health Section"
+        )
 
     def test_decodes_yaml_apostrophe(self):
         """YAML's single-quoted scalar form doubles literal apostrophes
@@ -122,12 +143,13 @@ class TestNormalizeWikilinkTarget:
             "constraint/Andrew''s Note",
         ) == "constraint/Andrew's Note"
 
-    def test_composes_all_three_rules(self):
-        """Apostrophe decode + anchor strip + ``.md`` strip in one
-        target — all rules apply in the right order."""
+    def test_composes_apostrophe_and_md_strip(self):
+        """Apostrophe decode + ``.md`` strip in one target; the anchor
+        is KEPT by the base helper (BUG C) and only dropped by the
+        resolver fallback, so the composed full name still carries it."""
         assert _normalize_wikilink_target_for_lookup(
             "constraint/Andrew''s Note#Section.md",
-        ) == "constraint/Andrew's Note"
+        ) == "constraint/Andrew's Note#Section"
 
     def test_empty_target_passes_through(self):
         assert _normalize_wikilink_target_for_lookup("") == ""
