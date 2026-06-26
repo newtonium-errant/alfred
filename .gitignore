@@ -51,16 +51,12 @@ alfred-documentation/
 # Finished n8n workflows (local only, repo is for coding knowledge)
 workflows/
 
-# Vault: only session/ and process/ live in the outer repo.
-# Everything else under vault/ is tracked by the nested vault git repo
-# used by the snapshot system. Do not add it here or it will double-track.
-/vault/*
-!/vault/session/
-!/vault/process/
-
-# Pending Items view auto-regenerates with timestamp churn (~288/day per
-# instance). Source of truth is data/pending_items.jsonl (also gitignored).
-/vault/process/Pending Items.md
+# Vault is a self-contained nested git repo (vault/.git) with its own daily
+# snapshot system — the outer repo tracks NONE of it. Untracked 2026-06-25:
+# session/ + process/ were formerly tracked here, which made a git-on-box
+# `reset --hard` able to clobber the live vault. Now fully box-local and
+# owned by the nested repo (also keeps talker conversation records off GitHub).
+/vault/
 
 # Pytest / coverage artifacts
 htmlcov/
