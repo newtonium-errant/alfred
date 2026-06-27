@@ -80,10 +80,21 @@ lockstep.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import structlog
+
+# Module logger. NOTE: the pure-compute predicates in this module
+# (``classify_routine_item``, ``compute_auto_*``) deliberately emit NO
+# logs (callers own logging — see their docstrings + the
+# ``capture_logs`` no-log pins). The ONE logging call-site is
+# ``compute_today_view``, the aggregation entry point, which emits a
+# single "ran, here's the view" signal per ``feedback_intentionally_
+# left_blank`` so an empty day is distinguishable from a broken render.
+log = structlog.get_logger(__name__)
 
 
 # Task statuses considered "open" — surfaced in the tier section /
@@ -1022,13 +1033,566 @@ def compute_auto_t3_candidates(
     return candidates
 
 
+# ---------------------------------------------------------------------------
+# compute_today_view — the unified "today" view (Step 2b, 2026-06-26)
+# ---------------------------------------------------------------------------
+#
+# The spec's keystone: ONE computed read over the substrate (tasks +
+# behind-routines + imminent-events) that the voice/surfacing layer
+# renders into channels. The brief's "Open Tasks by Tier" + "Today's
+# Routines" become two RENDERINGS of this one object — collapsing the
+# hand-mirrored two-pipeline math.
+#
+# Structural-dedup invariant: a routine item appears in EXACTLY ONE of
+# {t1, t2, t3, routine_today}. Items that classify into a tier (via the
+# single ``classify_routine_item`` predicate) land in t1/t2/t3; items
+# that fired today but did NOT classify land in ``routine_today``. The
+# two are complements by construction — no convention-enforced dedup.
+#
+# This commit (2b) builds the VIEW + the daily-goal. The render
+# re-pointing (making ``render_tier_section`` / ``render_routine_section``
+# consume this object) is Step 2c.
+
+
+@dataclass
+class TierEntry:
+    """One entry in a tier lane (T1/T2/T3) of the unified today view.
+
+    Discriminated union by ``origin``:
+      * ``"task"`` — a ``task/*.md`` record. ``name`` = the task name;
+        ``path`` = ``"task/<file>.md"``; ``routine_record`` / ``item_text``
+        are ``None``.
+      * ``"routine_item"`` — a recurring item inside a ``routine/*.md``
+        record. ``name`` = the item text; ``routine_record`` = the
+        record name; ``item_text`` = the item text; ``path`` =
+        ``"routine/<file>.md"``.
+
+    Fields:
+      * ``tier`` — 1 / 2 / 3 (which lane this entry is in).
+      * ``origin`` — ``"task"`` or ``"routine_item"``.
+      * ``name`` — operator-facing display string.
+      * ``path`` — vault-relative path to the owning record.
+      * ``due_iso`` — ISO due date when deadline-bearing; ``None`` for
+        T3 self-care (cadence-ranked, not deadline-anchored).
+      * ``surface_reason`` — the canonical reason string (``"due today"``
+        etc.) for deadline-bearing entries; ``None`` for T3.
+      * ``source`` — provenance enum (``"auto-due"`` / ``"auto-escalate"``
+        / ``"auto-due-routine"`` / ``"auto-surface-routine"`` /
+        ``"auto-cadence-routine"`` / ``"operator"`` / ``"rollover"``).
+        Mirrors the ``daily_curation`` source enum + adds the
+        cadence-routine T3 source.
+      * ``confirmed`` — T1-only; ``True`` once the operator confirms an
+        auto-surfaced candidate (curated entries are confirmed; fresh
+        auto candidates are not). ``None`` for T2/T3.
+      * ``escalation_state`` — optional human string describing the
+        climb dynamic (e.g. ``"T2→T1 in 2d"`` for an item ramping toward
+        T1). ``None`` when not escalating / not applicable.
+      * ``routine_record`` / ``item_text`` — populated only for
+        ``origin == "routine_item"``.
+    """
+
+    tier: int
+    origin: str
+    name: str
+    path: str
+    due_iso: str | None = None
+    surface_reason: str | None = None
+    source: str = "operator"
+    confirmed: bool | None = None
+    escalation_state: str | None = None
+    routine_record: str | None = None
+    item_text: str | None = None
+
+
+@dataclass
+class RoutineLine:
+    """One routine item that fired today but did NOT classify into any
+    tier — the complement of {t1, t2, t3} for routine items.
+
+    These render in the brief's "Today's Routines" section. The fields
+    mirror what the aggregator's ``_collect_items_for_today`` already
+    produces per item (text + priority + annotation + time), so Step 2c's
+    render re-point is a straight read.
+    """
+
+    text: str
+    priority: str
+    annotation: str = ""
+    time: str = ""
+
+
+@dataclass
+class DailyGoalState:
+    """The one-of-each-tier daily goal — the PURPOSE of tiering.
+
+    The spec's success criterion: finish AT LEAST one item from each of
+    T1, T2, T3 every day (ideal = all T1 done + one each of T2/T3). This
+    is a balanced day (urgent + medium + self-care), not "clear the
+    urgent." The voice layer renders/encourages off this state.
+
+    Fields (per-tier available + done counts, plus the rollups):
+      * ``t1_available`` / ``t2_available`` / ``t3_available`` — how many
+        items are in each lane today.
+      * ``t1_done`` / ``t2_done`` / ``t3_done`` — how many of each lane's
+        items are completed today (task status closed, or routine item
+        completed in the current cycle / today).
+      * ``balanced_day`` — ``True`` iff at least one item is done in EACH
+        of the three lanes (the daily goal met).
+      * ``all_t1_done`` — ``True`` iff every available T1 item is done
+        (the "ideal" T1 component; ``True`` vacuously when no T1 items).
+    """
+
+    t1_available: int = 0
+    t2_available: int = 0
+    t3_available: int = 0
+    t1_done: int = 0
+    t2_done: int = 0
+    t3_done: int = 0
+    balanced_day: bool = False
+    all_t1_done: bool = False
+
+
+@dataclass
+class TodayView:
+    """The unified today view — ONE computed read the voice layer renders.
+
+    Two renderings consume this:
+      * brief "Open Tasks by Tier" ← ``t1`` / ``t2`` / ``t3`` + ``daily_goal``
+      * brief "Today's Routines"   ← ``routine_today``
+
+    The ``t1`` / ``t2`` / ``t3`` lanes hold :class:`TierEntry` (tasks +
+    routine-items + curated). ``routine_today`` holds :class:`RoutineLine`
+    (routine items that fired but didn't escalate — the structural
+    complement). An item is in exactly one of the four by construction.
+    """
+
+    t1: list[TierEntry] = field(default_factory=list)
+    t2: list[TierEntry] = field(default_factory=list)
+    t3: list[TierEntry] = field(default_factory=list)
+    routine_today: list[RoutineLine] = field(default_factory=list)
+    daily_goal: DailyGoalState = field(default_factory=DailyGoalState)
+
+
+def _task_is_done_today(fm: dict, today: date) -> bool:
+    """Return True iff a task record counts as completed for the daily
+    goal: status is closed (done/cancelled) AND it was closed today
+    (when a ``completed`` / ``done`` date is present), else just closed.
+
+    Defensive: a closed task without a completion date still counts
+    (operator marked it done; we can't prove it wasn't today, and
+    counting it keeps the goal encouraging rather than pedantic).
+    """
+    status = str(fm.get("status") or "todo").lower()
+    if status in OPEN_STATUSES:
+        return False
+    # Closed. If a completion date is present, only count today's.
+    for key in ("completed", "done", "completed_at", "closed"):
+        raw = fm.get(key)
+        d = coerce_due_date(raw)
+        if d is not None:
+            return d == today
+    return True
+
+
+def compute_today_view(
+    vault_path: Path, now: datetime,
+) -> TodayView:
+    """Build the unified today view over the substrate.
+
+    Gathers, in one pass:
+      * task-origin auto-T1 (``compute_auto_t1_candidates``),
+      * routine-origin T1 / T2 / T3 (the ``classify_routine_item``-backed
+        ``compute_auto_routine_candidates`` / ``_t2`` / ``compute_auto_t3``),
+      * operator-curated T1/T2/T3 shortlists (``load_daily_curation``),
+      * the routine items that fired today but did NOT classify into a
+        tier (the aggregator's ``_collect_items_for_today`` complement),
+
+    partitions them into the T1/T2/T3 lanes + ``routine_today``, and
+    computes the one-of-each ``daily_goal``.
+
+    Curated + auto entries are merged per lane with dedup:
+      * task-origin key = record name (from the wikilink),
+      * routine-origin key = ``(routine_record, item_text)``.
+    A curated entry wins over an auto candidate for the same key (the
+    operator's confirmation is authoritative); auto candidates not in
+    the curated set are appended as ``confirmed=False`` (T1) entries.
+
+    Per ``feedback_intentionally_left_blank``: emits ONE structured
+    ``brief.today_view.computed`` log with the per-lane counts + the
+    daily-goal rollup so a stable "ran, here's the view" signal is
+    grep-able even on an empty day. Tests pin the emission +
+    field shape via ``capture_logs``.
+    """
+    import frontmatter  # type: ignore[import-untyped]
+
+    from alfred.tier.daily_curation import load_daily_curation
+
+    today = now.date()
+
+    # --- substrate: auto candidates (all routed through the single
+    # classify_routine_item predicate on the routine side) ----------
+    auto_t1_task = compute_auto_t1_candidates(vault_path, now)
+    auto_t1_routine = compute_auto_routine_candidates(vault_path, now)
+    auto_t2_routine = compute_auto_routine_t2_candidates(vault_path, now)
+    auto_t3_routine = compute_auto_t3_candidates(vault_path, now)
+
+    # --- operator curation ----------------------------------------
+    curation = load_daily_curation(vault_path, today)
+
+    # --- build the lanes ------------------------------------------
+    t1: list[TierEntry] = []
+    t2: list[TierEntry] = []
+    t3: list[TierEntry] = []
+
+    # Track keys present in each lane so auto candidates don't double
+    # an operator-curated entry (curated wins).
+    t1_keys: set[str] = set()
+    t2_keys: set[str] = set()
+    t3_keys: set[str] = set()
+
+    def _task_key(name: str) -> str:
+        return f"task::{name.lower()}"
+
+    def _routine_key(record: str | None, text: str | None) -> str:
+        return f"routine::{(record or '').lower()}::{(text or '').lower()}"
+
+    # 1. Curated entries first (authoritative).
+    if curation is not None:
+        for e in curation.t1:
+            entry = _curated_to_tier_entry(e, tier=1)
+            if entry is not None:
+                t1.append(entry)
+                t1_keys.add(_entry_key(entry, _task_key, _routine_key))
+        for e in curation.t2:
+            entry = _curated_to_tier_entry(e, tier=2)
+            if entry is not None:
+                t2.append(entry)
+                t2_keys.add(_entry_key(entry, _task_key, _routine_key))
+        for e in curation.t3:
+            entry = _curated_t3_to_tier_entry(e)
+            if entry is not None:
+                t3.append(entry)
+                t3_keys.add(_routine_key(None, entry.item_text or entry.name))
+
+    # 2. Auto-T1 task candidates (append if not already curated).
+    for c in auto_t1_task:
+        key = _task_key(c.name)
+        if key in t1_keys:
+            continue
+        source = (
+            "auto-due"
+            if c.surface_reason in ("due today", "due tomorrow")
+            else "auto-escalate"
+        )
+        t1.append(TierEntry(
+            tier=1, origin="task", name=c.name, path=c.path,
+            due_iso=c.due_iso, surface_reason=c.surface_reason,
+            source=source, confirmed=False,
+        ))
+        t1_keys.add(key)
+
+    # 3. Auto-T1 routine candidates.
+    for c in auto_t1_routine:
+        key = _routine_key(c.routine_record, c.item_text)
+        if key in t1_keys:
+            continue
+        t1.append(TierEntry(
+            tier=1, origin="routine_item", name=c.name, path=c.path,
+            due_iso=c.due_iso, surface_reason=c.surface_reason,
+            source="auto-due-routine", confirmed=False,
+            routine_record=c.routine_record, item_text=c.item_text,
+        ))
+        t1_keys.add(key)
+
+    # 4. Auto-T2 routine candidates (suppress if already in curated
+    # T1 OR T2 — an item confirmed up to T1 shouldn't also show as a
+    # T2 ramp suggestion).
+    for c in auto_t2_routine:
+        key = _routine_key(c.routine_record, c.item_text)
+        if key in t1_keys or key in t2_keys:
+            continue
+        t2.append(TierEntry(
+            tier=2, origin="routine_item", name=c.name, path=c.path,
+            due_iso=c.due_iso, surface_reason=c.surface_reason,
+            source="auto-surface-routine",
+            escalation_state=_escalation_state_from_reason(c.surface_reason),
+            routine_record=c.routine_record, item_text=c.item_text,
+        ))
+        t2_keys.add(key)
+
+    # 5. Auto-T3 routine (soft-cadence) candidates.
+    for c in auto_t3_routine:
+        key = _routine_key(c.routine_record, c.item_text)
+        if key in t3_keys:
+            continue
+        t3.append(TierEntry(
+            tier=3, origin="routine_item", name=c.item_text, path=c.path,
+            source="auto-cadence-routine",
+            routine_record=c.routine_record, item_text=c.item_text,
+        ))
+        t3_keys.add(key)
+
+    # --- routine_today: the complement (fired today, no handoff) ---
+    routine_today = _collect_routine_today(vault_path, today)
+
+    # --- daily goal -----------------------------------------------
+    daily_goal = _compute_daily_goal(vault_path, today, t1, t2, t3)
+
+    log.info(
+        "brief.today_view.computed",
+        t1_count=len(t1),
+        t2_count=len(t2),
+        t3_count=len(t3),
+        routine_today_count=len(routine_today),
+        balanced_day=daily_goal.balanced_day,
+        all_t1_done=daily_goal.all_t1_done,
+        t1_done=daily_goal.t1_done,
+        t2_done=daily_goal.t2_done,
+        t3_done=daily_goal.t3_done,
+        curation_loaded=curation is not None,
+    )
+
+    return TodayView(
+        t1=t1, t2=t2, t3=t3,
+        routine_today=routine_today,
+        daily_goal=daily_goal,
+    )
+
+
+def _entry_key(entry: TierEntry, task_key, routine_key) -> str:
+    if entry.origin == "task":
+        return task_key(entry.name)
+    return routine_key(entry.routine_record, entry.item_text)
+
+
+def _escalation_state_from_reason(reason: str | None) -> str | None:
+    """Translate a T2 ``"surface window (Nd before due)"`` reason into a
+    climb hint ``"T2→T1 in ~Nd"``. Best-effort; returns None when the
+    reason doesn't carry a parseable day count."""
+    if not reason or "surface window" not in reason:
+        return None
+    import re
+
+    m = re.search(r"\((\d+)d before due\)", reason)
+    if not m:
+        return None
+    return f"T2 (escalates to T1 as due nears, ~{m.group(1)}d out)"
+
+
+def _curated_to_tier_entry(entry: Any, *, tier: int) -> TierEntry | None:
+    """Convert a ``daily_curation`` T1/T2 entry to a TierEntry. Returns
+    None for an entry with neither task nor routine_item populated."""
+    if getattr(entry, "task", None):
+        name = _curated_task_display_name(entry.task)
+        return TierEntry(
+            tier=tier, origin="task", name=name,
+            path=_curated_task_path(entry.task),
+            source=getattr(entry, "source", "operator") or "operator",
+            confirmed=(
+                getattr(entry, "confirmed", None) if tier == 1 else None
+            ),
+        )
+    ri = getattr(entry, "routine_item", None)
+    if ri is not None:
+        record = getattr(ri, "record", None) or (
+            ri.get("record") if isinstance(ri, dict) else None
+        )
+        text = getattr(ri, "text", None) or (
+            ri.get("text") if isinstance(ri, dict) else None
+        )
+        return TierEntry(
+            tier=tier, origin="routine_item", name=str(text or ""),
+            path=f"routine/{record}.md" if record else "routine/",
+            source=getattr(entry, "source", "operator") or "operator",
+            confirmed=(
+                getattr(entry, "confirmed", None) if tier == 1 else None
+            ),
+            routine_record=str(record) if record else None,
+            item_text=str(text) if text else None,
+        )
+    return None
+
+
+def _curated_t3_to_tier_entry(entry: Any) -> TierEntry | None:
+    """Convert a ``daily_curation`` T3 entry (free-text ``item:``) to a
+    TierEntry."""
+    text = getattr(entry, "item", None)
+    if not text:
+        return None
+    return TierEntry(
+        tier=3, origin="routine_item", name=str(text),
+        path="routine/",
+        source=getattr(entry, "source", "operator") or "operator",
+        item_text=str(text),
+    )
+
+
+def _curated_task_display_name(wikilink: str) -> str:
+    """Extract the display name from a ``[[task/Name]]`` wikilink (or a
+    bare name). Mirrors the brief's ``_wikilink_to_record_name`` without
+    importing the render layer."""
+    s = (wikilink or "").strip().strip("[]").strip()
+    if "/" in s:
+        s = s.split("/", 1)[1]
+    if "|" in s:
+        s = s.split("|", 1)[1]
+    return s.strip()
+
+
+def _curated_task_path(wikilink: str) -> str:
+    name = _curated_task_display_name(wikilink)
+    return f"task/{name}.md"
+
+
+def _collect_routine_today(
+    vault_path: Path, today: date,
+) -> list[RoutineLine]:
+    """Return routine items that fired today but did NOT hand off to any
+    tier — the structural complement of {t1, t2, t3} for routine items.
+
+    Delegates to the aggregator's ``_collect_items_for_today`` (the
+    existing single source for "what fired today and stays in the
+    routine section") so this view never re-derives the cadence + handoff
+    logic. Returns the per-item shape the render layer needs.
+    """
+    from alfred.routine.aggregator import (
+        _collect_items_for_today,
+        _iter_routine_records,
+    )
+
+    records = _iter_routine_records(vault_path)
+    items, _contributing, _critical = _collect_items_for_today(
+        records, today,
+    )
+    out: list[RoutineLine] = []
+    for it in items:
+        out.append(RoutineLine(
+            text=str(it.get("text") or ""),
+            priority=str(it.get("priority") or "tracked"),
+            annotation=str(it.get("annotation") or ""),
+            time=str(it.get("time") or ""),
+        ))
+    return out
+
+
+def _compute_daily_goal(
+    vault_path: Path,
+    today: date,
+    t1: list[TierEntry],
+    t2: list[TierEntry],
+    t3: list[TierEntry],
+) -> DailyGoalState:
+    """Compute the one-of-each-tier daily goal over the assembled lanes.
+
+    Counts available + done per lane. "Done" =
+      * task-origin entry → the task record's status is closed
+        (``_task_is_done_today``),
+      * routine-origin entry → the item is completed in its current
+        cycle (or today, for soft-cadence) per its routine record's
+        ``completion_log``.
+
+    Note: items that classified into a tier are by definition NOT
+    completed-this-cycle (the classifier suppresses completed items via
+    ``completion_satisfies_current_cycle``). So tier-lane ``*_done``
+    counts come from CURATED entries the operator placed AND later
+    completed (a curated T1 task the operator finished), plus any
+    auto-task entry whose status flipped to done after surfacing. This
+    is the honest "did you finish something in this lane today" signal.
+    """
+    import frontmatter  # type: ignore[import-untyped]
+
+    # Cache task frontmatter by name + routine completion logs by record.
+    task_fm_by_name: dict[str, dict] = {}
+    task_dir = vault_path / "task"
+    if task_dir.is_dir():
+        for p in sorted(task_dir.glob("*.md")):
+            try:
+                post = frontmatter.load(str(p))
+            except Exception:  # noqa: BLE001
+                continue
+            fm = dict(post.metadata or {})
+            if fm.get("type") != "task":
+                continue
+            name = str(fm.get("name") or p.stem)
+            task_fm_by_name.setdefault(name, fm)
+
+    completion_by_record: dict[str, dict] = {}
+    routine_dir = vault_path / "routine"
+    if routine_dir.is_dir():
+        for p in sorted(routine_dir.glob("*.md")):
+            try:
+                post = frontmatter.load(str(p))
+            except Exception:  # noqa: BLE001
+                continue
+            fm = dict(post.metadata or {})
+            if fm.get("type") != "routine":
+                continue
+            rec = str(fm.get("name") or p.stem)
+            cl = fm.get("completion_log") or {}
+            completion_by_record[rec] = cl if isinstance(cl, dict) else {}
+
+    def _entry_done(entry: TierEntry) -> bool:
+        if entry.origin == "task":
+            fm = task_fm_by_name.get(entry.name)
+            if fm is None:
+                return False
+            return _task_is_done_today(fm, today)
+        # routine_item: completed today (a date in completion_log[text]
+        # equal to today). The classifier already excludes
+        # completed-this-cycle items from the lanes, so this catches the
+        # operator completing a curated routine item during the day.
+        text_key = entry.item_text or entry.name
+        if entry.routine_record:
+            # Record-anchored entry (auto-surfaced or curated routine_item
+            # with a record): look up that record's completion log.
+            cl = completion_by_record.get(entry.routine_record, {})
+            dates = _parse_item_completion_dates(cl.get(text_key, []))
+            return today in dates
+        # Free-text T3 entry (curated ``item:`` with no record anchor —
+        # "Meditate", "Read for an hour"). Scan ALL routine completion
+        # logs for a same-text completion today. This is the honest
+        # "did the operator complete this intention today" signal when
+        # the free-text maps to a routine item somewhere.
+        for cl in completion_by_record.values():
+            dates = _parse_item_completion_dates(cl.get(text_key, []))
+            if today in dates:
+                return True
+        return False
+
+    t1_done = sum(1 for e in t1 if _entry_done(e))
+    t2_done = sum(1 for e in t2 if _entry_done(e))
+    t3_done = sum(1 for e in t3 if _entry_done(e))
+
+    balanced_day = t1_done >= 1 and t2_done >= 1 and t3_done >= 1
+    # all_t1_done is vacuously True when there are no T1 items.
+    all_t1_done = (len(t1) == 0) or (t1_done == len(t1))
+
+    return DailyGoalState(
+        t1_available=len(t1),
+        t2_available=len(t2),
+        t3_available=len(t3),
+        t1_done=t1_done,
+        t2_done=t2_done,
+        t3_done=t3_done,
+        balanced_day=balanced_day,
+        all_t1_done=all_t1_done,
+    )
+
+
 __all__ = [
     "AutoT1Candidate",
     "AutoT3Candidate",
+    "DailyGoalState",
     "OPEN_STATUSES",
+    "RoutineItemClassification",
+    "RoutineLine",
+    "TierEntry",
+    "TodayView",
+    "classify_routine_item",
     "coerce_due_date",
     "compute_auto_routine_candidates",
     "compute_auto_routine_t2_candidates",
     "compute_auto_t1_candidates",
     "compute_auto_t3_candidates",
+    "compute_today_view",
 ]
