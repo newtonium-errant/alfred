@@ -87,10 +87,12 @@ import yaml
 
 from alfred.tier.compute import (
     OPEN_STATUSES,
+    DailyGoalState,
     compute_auto_routine_candidates,
     compute_auto_routine_t2_candidates,
     compute_auto_t1_candidates,
     compute_auto_t3_candidates,
+    compute_today_view,
 )
 from alfred.tier.daily_curation import (
     DailyCuration,
@@ -973,6 +975,49 @@ def _render_rollover_section(
     return "\n".join(out)
 
 
+def render_daily_goal_line(goal: DailyGoalState) -> str:
+    """Render the one-of-each-tier daily-goal status line (Q4, 2026-06-26).
+
+    The PURPOSE of tiering per the spec: finish at least one item from
+    each of T1/T2/T3 each day (a balanced day — urgent + medium +
+    self-care), ideally all T1 done. This line surfaces that goal's
+    progress at the top of the tier section so the view is rendered
+    AROUND the goal, not just as three buckets.
+
+    Minimal register per Q4 (voice polish — gentle/plain phrasing — is
+    deferred to prompt-tuner). Per ``feedback_intentionally_left_blank``:
+    ALWAYS emits a line, even on an empty day ("no tier items yet
+    today"), so the goal signal is never a silent absence.
+
+    Shape (per-lane ``done/available`` ticks + a balanced-day marker):
+
+        **Daily goal — balanced day:** ✓ achieved · T1 1/2 · T2 1/1 · T3 0/1
+        **Daily goal — balanced day:** not yet · T1 0/2 · T2 0/1 · T3 0/1
+        **Daily goal:** no tier items yet today.
+    """
+    total = (
+        goal.t1_available + goal.t2_available + goal.t3_available
+    )
+    if total == 0:
+        return "**Daily goal:** no tier items yet today."
+
+    def _lane(label: str, done: int, avail: int) -> str:
+        return f"{label} {done}/{avail}"
+
+    status = "✓ achieved" if goal.balanced_day else "not yet"
+    # Note the ideal (all T1 done) when it holds AND there are T1 items.
+    ideal = ""
+    if goal.t1_available > 0 and goal.all_t1_done:
+        ideal = " · all T1 done"
+    return (
+        f"**Daily goal — balanced day:** {status}"
+        f" · {_lane('T1', goal.t1_done, goal.t1_available)}"
+        f" · {_lane('T2', goal.t2_done, goal.t2_available)}"
+        f" · {_lane('T3', goal.t3_done, goal.t3_available)}"
+        f"{ideal}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1065,10 +1110,20 @@ def render_tier_section(
     )
     rollover = _render_rollover_section(yesterday_curation, status_by_name)
 
-    # Compose with separator between shortlists and materials. Rollover
-    # is appended only when non-empty (suppressed when yesterday's
-    # file is absent).
-    parts = [shortlists, "---", "", pool]
+    # Daily-goal status line (Q4, 2026-06-26). The unified
+    # ``compute_today_view`` produces the one-of-each-tier goal state;
+    # this section renders it as the FIRST line so the tier view is
+    # framed around the balanced-day goal, not just three buckets. This
+    # is the Step 2c (Option B) wiring: the daemon's tier render reads
+    # the single computed view for the goal, while the existing
+    # shortlist/pool/rollover formatting below is unchanged.
+    today_view = compute_today_view(vault_path, now)
+    goal_line = render_daily_goal_line(today_view.daily_goal)
+
+    # Compose: goal line first, then shortlists, separator, pool, and
+    # (optional) rollover. Rollover is appended only when non-empty
+    # (suppressed when yesterday's file is absent).
+    parts = [goal_line, "", shortlists, "---", "", pool]
     if rollover:
         parts.append(rollover)
 
@@ -1091,6 +1146,11 @@ def render_tier_section(
         auto_t3_routine_count=len(auto_t3_routine_candidates),
         rollover_present=bool(rollover),
         yesterday_curation_loaded=yesterday_curation is not None,
+        # Step 2c (2026-06-26): the daily-goal rollup, surfaced from the
+        # unified compute_today_view, pinned per
+        # ``feedback_log_emission_test_pattern``.
+        balanced_day=today_view.daily_goal.balanced_day,
+        all_t1_done=today_view.daily_goal.all_t1_done,
     )
     return body
 

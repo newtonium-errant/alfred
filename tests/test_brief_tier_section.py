@@ -48,8 +48,10 @@ from alfred.brief.tier_section import (
     T3_AUTO_TALKER_DEFERRED_NOTE,
     T3_EMPTY_PROMPT,
     render_curated_tier_section_for_today,
+    render_daily_goal_line,
     render_tier_section,
 )
+from alfred.tier.compute import DailyGoalState
 from alfred.tier.daily_curation import (
     DailyCuration,
     T1T2Entry,
@@ -2077,3 +2079,81 @@ def test_t3_log_emission_carries_auto_t3_routine_count_when_empty(
     assert len(events) == 1
     assert "auto_t3_routine_count" in events[0]
     assert events[0]["auto_t3_routine_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Daily-goal render line (Step 2c / Q4, 2026-06-26)
+# ---------------------------------------------------------------------------
+
+
+def test_daily_goal_line_empty_day_emits_sentinel() -> None:
+    """Per intentionally-left-blank: an empty day (no tier items) still
+    emits an explicit line, never a silent gap."""
+    line = render_daily_goal_line(DailyGoalState())
+    assert line == "**Daily goal:** no tier items yet today."
+
+
+def test_daily_goal_line_balanced_achieved() -> None:
+    line = render_daily_goal_line(DailyGoalState(
+        t1_available=2, t2_available=1, t3_available=1,
+        t1_done=2, t2_done=1, t3_done=1,
+        balanced_day=True, all_t1_done=True,
+    ))
+    assert "balanced day:** ✓ achieved" in line
+    assert "T1 2/2" in line
+    assert "T2 1/1" in line
+    assert "T3 1/1" in line
+    assert "all T1 done" in line
+
+
+def test_daily_goal_line_not_yet() -> None:
+    line = render_daily_goal_line(DailyGoalState(
+        t1_available=2, t2_available=1, t3_available=1,
+        t1_done=0, t2_done=0, t3_done=0,
+        balanced_day=False, all_t1_done=False,
+    ))
+    assert "balanced day:** not yet" in line
+    assert "T1 0/2" in line
+    # all_t1_done is False → no "all T1 done" marker.
+    assert "all T1 done" not in line
+
+
+def test_daily_goal_line_all_t1_done_marker_only_when_t1_items() -> None:
+    """all_t1_done is vacuously True with no T1 items, but the marker
+    must NOT appear when there are zero T1 items (it would be
+    misleading)."""
+    line = render_daily_goal_line(DailyGoalState(
+        t1_available=0, t2_available=1, t3_available=1,
+        t1_done=0, t2_done=1, t3_done=1,
+        balanced_day=False, all_t1_done=True,
+    ))
+    assert "all T1 done" not in line
+
+
+def test_tier_section_renders_goal_line_first(tmp_path: Path) -> None:
+    """The daily-goal line is the FIRST line of the tier section body —
+    the view is framed around the goal (Step 2c)."""
+    vault = tmp_path / "vault"
+    (vault / "task").mkdir(parents=True)
+    (vault / "task" / "Pay.md").write_text(
+        "---\ntype: task\nstatus: todo\nname: Pay\ndue: 2026-05-28\n---\n",
+        encoding="utf-8",
+    )
+    body = render_tier_section(vault, NOW)
+    assert body.splitlines()[0].startswith("**Daily goal")
+
+
+def test_tier_section_log_carries_goal_rollup(tmp_path: Path) -> None:
+    """Step 2c log-emission pin (discipline #9): the rendered log carries
+    the daily-goal rollup fields surfaced from the unified view."""
+    vault = tmp_path / "vault"
+    (vault / "task").mkdir(parents=True)
+    with structlog.testing.capture_logs() as captured:
+        render_tier_section(vault, NOW)
+    events = [
+        c for c in captured
+        if c.get("event") == "brief.tier_section.rendered"
+    ]
+    assert len(events) == 1
+    assert "balanced_day" in events[0]
+    assert "all_t1_done" in events[0]
