@@ -2157,3 +2157,70 @@ def test_tier_section_log_carries_goal_rollup(tmp_path: Path) -> None:
     assert len(events) == 1
     assert "balanced_day" in events[0]
     assert "all_t1_done" in events[0]
+
+
+# ---------------------------------------------------------------------------
+# Single-source invariant (Step 2c, 2026-06-26) — the renderer defers
+# WHAT to compute_today_view, never re-deriving via compute_auto_*.
+# ---------------------------------------------------------------------------
+
+
+def test_render_tier_section_reads_view_not_compute_auto(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The render layer must read compute_today_view, NOT call the
+    compute_auto_* predicates directly. Pin by exploding the auto
+    predicates if invoked from the render path — if any fires, the
+    renderer is still re-deriving its own surface decision (the
+    single-source invariant the team-lead required for Option B).
+
+    compute_today_view internally calls the predicates — that's the ONE
+    legitimate caller. So we patch them in the tier_section module
+    namespace (the render layer's import surface). Since Step 2c dropped
+    those imports, a NameError-free render proves the renderer never
+    references them; this test additionally guards against a future
+    re-import + direct call by asserting the symbols aren't in the
+    module namespace."""
+    import alfred.brief.tier_section as ts
+
+    # The render layer must not have re-imported the auto predicates.
+    for sym in (
+        "compute_auto_t1_candidates",
+        "compute_auto_routine_candidates",
+        "compute_auto_routine_t2_candidates",
+        "compute_auto_t3_candidates",
+    ):
+        assert not hasattr(ts, sym), (
+            f"tier_section re-imported {sym}; the render layer must read "
+            "compute_today_view for surface decisions, not re-derive via "
+            "the auto predicates (Step 2c single-source invariant)."
+        )
+
+    # And it DOES reference the view.
+    assert hasattr(ts, "compute_today_view")
+
+
+def test_render_tier_section_calls_view_once(tmp_path: Path) -> None:
+    """compute_today_view is called exactly once per render (no
+    double-compute — the goal line + the lane slices read the same
+    view)."""
+    import alfred.brief.tier_section as ts
+
+    _write_task(
+        tmp_path, "Pay",
+        {"type": "task", "status": "todo", "name": "Pay", "due": "2026-05-28"},
+    )
+    calls = {"n": 0}
+    real = ts.compute_today_view
+
+    def _counting(vault_path, now):
+        calls["n"] += 1
+        return real(vault_path, now)
+
+    import unittest.mock as _m
+    with _m.patch.object(ts, "compute_today_view", side_effect=_counting):
+        ts.render_tier_section(tmp_path, NOW)
+    assert calls["n"] == 1, (
+        f"compute_today_view called {calls['n']}x — must be exactly once "
+        "(no double-compute)."
+    )

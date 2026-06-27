@@ -1319,6 +1319,14 @@ class TierEntry:
     escalation_state: str | None = None
     routine_record: str | None = None
     item_text: str | None = None
+    # Cadence metadata — populated only for T3 cadence-driven entries
+    # (source ``auto-cadence-routine``). Carried so the brief's T3
+    # render is a pure read of the view (Step 2c): the annotation
+    # "Nd days since last; target every Md" needs both. ``None`` for
+    # every non-cadence entry.
+    target_cadence_days: int | None = None
+    days_since_last_completed: int | None = None
+    overdue_ratio: float | None = None
 
 
 @dataclass
@@ -1478,13 +1486,35 @@ def compute_today_view(
     def _routine_key(record: str | None, text: str | None) -> str:
         return f"routine::{(record or '').lower()}::{(text or '').lower()}"
 
-    # 1. Curated entries first (authoritative).
+    # Auto reason/due lookups by key — so a CURATED entry that also
+    # auto-surfaces carries the auto reason + due (the brief annotates a
+    # confirmed curated entry with "due today" etc.; that metadata comes
+    # from the auto candidate, which dedup would otherwise discard).
+    # Keyed the same way the lanes dedup.
+    auto_reason_by_t1_key: dict[str, str] = {}
+    auto_due_by_t1_key: dict[str, str] = {}
+    for c in auto_t1_task:
+        k = _task_key(c.name)
+        auto_reason_by_t1_key[k] = c.surface_reason
+        auto_due_by_t1_key[k] = c.due_iso
+    for c in auto_t1_routine:
+        k = _routine_key(c.routine_record, c.item_text)
+        auto_reason_by_t1_key[k] = c.surface_reason
+        auto_due_by_t1_key[k] = c.due_iso
+
+    # 1. Curated entries first (authoritative). Annotate with the auto
+    # reason/due when the same item also auto-surfaces (so the render is
+    # a pure read of the lane, curated entries included).
     if curation is not None:
         for e in curation.t1:
             entry = _curated_to_tier_entry(e, tier=1)
             if entry is not None:
+                k = _entry_key(entry, _task_key, _routine_key)
+                if entry.surface_reason is None and k in auto_reason_by_t1_key:
+                    entry.surface_reason = auto_reason_by_t1_key[k]
+                    entry.due_iso = auto_due_by_t1_key.get(k)
                 t1.append(entry)
-                t1_keys.add(_entry_key(entry, _task_key, _routine_key))
+                t1_keys.add(k)
         for e in curation.t2:
             entry = _curated_to_tier_entry(e, tier=2)
             if entry is not None:
@@ -1542,7 +1572,8 @@ def compute_today_view(
         ))
         t2_keys.add(key)
 
-    # 5. Auto-T3 routine (soft-cadence) candidates.
+    # 5. Auto-T3 routine (soft-cadence) candidates. Carry the cadence
+    # metadata so the brief's T3 render reads the view (Step 2c).
     for c in auto_t3_routine:
         key = _routine_key(c.routine_record, c.item_text)
         if key in t3_keys:
@@ -1551,6 +1582,9 @@ def compute_today_view(
             tier=3, origin="routine_item", name=c.item_text, path=c.path,
             source="auto-cadence-routine",
             routine_record=c.routine_record, item_text=c.item_text,
+            target_cadence_days=c.target_cadence_days,
+            days_since_last_completed=c.days_since_last_completed,
+            overdue_ratio=c.overdue_ratio,
         ))
         t3_keys.add(key)
 

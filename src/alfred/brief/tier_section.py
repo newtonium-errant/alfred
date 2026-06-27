@@ -40,23 +40,28 @@ Render shape (the section body — the brief renderer wraps it under
     ### Rollover from yesterday (incomplete)
     - T2: [[task/Connect QBO API — RRTS]] *(uncompleted yesterday)*
 
-Read path (per dispatch — three vault reads + one auto-T1 compute):
+Read path (Step 2c, 2026-06-26 — the SINGLE computed view + materials):
 
   1. ``load_daily_curation(vault_path, today)`` — today's
      ``tier_curation`` block. ``None`` when un-curated yet
      (operator's "selection pool" mode); populated when talker has
      already curated.
-  2. ``compute_auto_t1_candidates(vault_path, now)`` — the auto-T1
-     surface (due today / due tomorrow / inside ``escalate_at_days``
-     window). Used to merge auto-candidates with operator-curated T1
-     entries + surface the confirm affordance.
+  2. ``compute_today_view(vault_path, now)`` — THE single source of what
+     surfaces / which lane (T1/T2/T3 lanes + the daily goal). This
+     render layer no longer calls the ``compute_auto_*`` predicates
+     directly; it slices the view's lanes (by origin + auto-source) into
+     the candidate shapes the formatters consume, so no surface decision
+     is re-derived here. The view merged curated + auto per lane via the
+     single ``classify_routine_item`` predicate.
   3. ``load_daily_curation(vault_path, today - 1 day)`` — yesterday's
      curation, for rollover detection. Each yesterday-T1/T2 entry is
      checked against the current task record's status; incomplete
-     entries surface in the Rollover section.
+     entries surface in the Rollover section. (Render-only material —
+     not a substrate lane assignment.)
   4. Open-task pool scan over ``vault/task/*.md`` for the T2 selection
      pool (status in OPEN_STATUSES, NOT ``alfred_triage``, NOT in
-     today's auto-T1 set, NOT already-curated T1/T2).
+     today's auto-T1 set, NOT already-curated T1/T2). (Render-only
+     material — not a substrate lane assignment.)
 
 Cross-agent contract — operator-facing prompt phrases:
 
@@ -87,11 +92,10 @@ import yaml
 
 from alfred.tier.compute import (
     OPEN_STATUSES,
+    AutoT1Candidate,
+    AutoT3Candidate,
     DailyGoalState,
-    compute_auto_routine_candidates,
-    compute_auto_routine_t2_candidates,
-    compute_auto_t1_candidates,
-    compute_auto_t3_candidates,
+    TodayView,
     compute_today_view,
 )
 from alfred.tier.daily_curation import (
@@ -1019,6 +1023,109 @@ def render_daily_goal_line(goal: DailyGoalState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# View → formatter-input adapters (Step 2c, 2026-06-26)
+# ---------------------------------------------------------------------------
+#
+# The render layer no longer calls the ``compute_auto_*`` predicates. It
+# reads ``compute_today_view``'s lane assignments — the SINGLE source of
+# what surfaces / which lane — and these adapters slice the view's lanes
+# back into the candidate shapes the existing formatters consume. The
+# "auto" subset of each lane is selected by ``source`` (the view marks
+# auto candidates with ``auto-*`` sources; curated entries the formatters
+# read separately from the curation block). This keeps the markdown
+# byte-identical (the view's membership is equivalent to the prior direct
+# compute — proven by the unchanged output pins) while making the view
+# the only place a surface decision is made.
+
+def _auto_t1_task_from_view(view: TodayView) -> list[AutoT1Candidate]:
+    """Task-origin T1 entries carrying an auto reason, sliced from the
+    view's T1 lane.
+
+    Returns EVERY task-origin T1 entry that has a ``surface_reason`` —
+    including a CURATED entry the operator confirmed that also
+    auto-surfaces (the view annotates such entries with the auto
+    reason/due). The downstream merge keys reason lookups off this list
+    AND dedups appends against the curation block, so returning the
+    curated-coinciding entry populates the reason map without
+    double-rendering. Curated entries with NO auto reason (operator
+    added a task that isn't deadline-near) carry no reason and are
+    skipped — they render bare from the curation block."""
+    out: list[AutoT1Candidate] = []
+    for e in view.t1:
+        if e.origin != "task" or not e.surface_reason:
+            continue
+        out.append(AutoT1Candidate(
+            path=e.path,
+            name=e.name,
+            due_iso=e.due_iso or "",
+            surface_reason=e.surface_reason,
+            origin="task",
+        ))
+    return out
+
+
+def _auto_t1_routine_from_view(view: TodayView) -> list[AutoT1Candidate]:
+    """Routine-origin T1 entries carrying an auto reason, sliced from the
+    view's T1 lane. Same curated-coinciding inclusion as the task
+    variant (the view annotates curated routine_item entries that also
+    auto-surface)."""
+    out: list[AutoT1Candidate] = []
+    for e in view.t1:
+        if e.origin != "routine_item" or not e.surface_reason:
+            continue
+        out.append(AutoT1Candidate(
+            path=e.path,
+            name=e.name,
+            due_iso=e.due_iso or "",
+            surface_reason=e.surface_reason,
+            origin="routine",
+            routine_record=e.routine_record,
+            item_text=e.item_text,
+        ))
+    return out
+
+
+def _auto_t2_routine_from_view(view: TodayView) -> list[AutoT1Candidate]:
+    """Routine-origin auto-T2 ramp candidates, sliced from the T2 lane."""
+    out: list[AutoT1Candidate] = []
+    for e in view.t2:
+        if e.origin != "routine_item" or e.source != "auto-surface-routine":
+            continue
+        out.append(AutoT1Candidate(
+            path=e.path,
+            name=e.name,
+            due_iso=e.due_iso or "",
+            surface_reason=e.surface_reason or "",
+            origin="routine",
+            routine_record=e.routine_record,
+            item_text=e.item_text,
+        ))
+    return out
+
+
+def _auto_t3_routine_from_view(view: TodayView) -> list[AutoT3Candidate]:
+    """Cadence-driven auto-T3 candidates, sliced from the T3 lane. The
+    cadence metadata (target / days-since / ratio) is carried on the
+    view's TierEntry so the annotation render is a pure read."""
+    out: list[AutoT3Candidate] = []
+    for e in view.t3:
+        if e.origin != "routine_item" or e.source != "auto-cadence-routine":
+            continue
+        out.append(AutoT3Candidate(
+            path=e.path,
+            routine_record=e.routine_record or "",
+            item_text=e.item_text or e.name,
+            target_cadence_days=e.target_cadence_days or 0,
+            days_since_last_completed=e.days_since_last_completed,
+            overdue_ratio=(
+                e.overdue_ratio if e.overdue_ratio is not None
+                else float("inf")
+            ),
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -1049,24 +1156,26 @@ def render_tier_section(
     # --- 1. Read today's curation ---------------------------------
     curation = load_daily_curation(vault_path, today)
 
-    # --- 2. Compute auto-T1 / auto-T2 / auto-T3 candidates --------
-    # Task-origin (the original Ship 2 surface).
-    auto_t1_task_candidates = compute_auto_t1_candidates(vault_path, now)
-    # Routine-origin T1 + T2 ramp (Phase 2A Ship B, 2026-05-29).
-    auto_t1_routine_candidates = compute_auto_routine_candidates(
-        vault_path, now,
-    )
-    auto_t2_routine_candidates = compute_auto_routine_t2_candidates(
-        vault_path, now,
-    )
-    # Routine-origin T3 soft-cadence auto-suggest (Phase 2A-soft-
-    # cadence, 2026-05-30). Predicate mirror with the routine
-    # aggregator's ``_decide_tier_handoff`` T3 branch — both layers
-    # must agree on which items hand off. See
-    # ``feedback_two_layer_window_math_mirror``.
-    auto_t3_routine_candidates = compute_auto_t3_candidates(
-        vault_path, now,
-    )
+    # --- 2. Compute the unified today view ------------------------
+    # Step 2c (Option B, 2026-06-26): the SINGLE source of what
+    # surfaces / which lane. This render layer no longer calls the
+    # ``compute_auto_*`` predicates directly — it reads the view's lane
+    # assignments and re-presents them. The view already merged curated +
+    # auto candidates per lane (via ``classify_routine_item``, the single
+    # predicate); the auto-candidate lists below are SLICED from the
+    # view's lanes (by origin + auto-source), not independently computed.
+    # So the renderer makes NO surface decision of its own — it's a pure
+    # formatter of the view's WHAT. (Membership is byte-equivalent to the
+    # prior direct-compute path — proven by the unchanged
+    # ``test_brief_tier_section`` output pins.) The selection pool +
+    # rollover are render-only MATERIALS (not substrate lane assignment)
+    # and stay computed here.
+    today_view = compute_today_view(vault_path, now)
+
+    auto_t1_task_candidates = _auto_t1_task_from_view(today_view)
+    auto_t1_routine_candidates = _auto_t1_routine_from_view(today_view)
+    auto_t2_routine_candidates = _auto_t2_routine_from_view(today_view)
+    auto_t3_routine_candidates = _auto_t3_routine_from_view(today_view)
     auto_t1_record_names = {c.name for c in auto_t1_task_candidates}
 
     # --- 3. Read yesterday's curation for rollover ----------------
@@ -1110,14 +1219,10 @@ def render_tier_section(
     )
     rollover = _render_rollover_section(yesterday_curation, status_by_name)
 
-    # Daily-goal status line (Q4, 2026-06-26). The unified
-    # ``compute_today_view`` produces the one-of-each-tier goal state;
-    # this section renders it as the FIRST line so the tier view is
-    # framed around the balanced-day goal, not just three buckets. This
-    # is the Step 2c (Option B) wiring: the daemon's tier render reads
-    # the single computed view for the goal, while the existing
-    # shortlist/pool/rollover formatting below is unchanged.
-    today_view = compute_today_view(vault_path, now)
+    # Daily-goal status line (Q4, 2026-06-26). Read from the SAME
+    # ``today_view`` computed once at the top — no second compute. The
+    # line renders first so the tier view is framed around the
+    # balanced-day goal, not just three buckets.
     goal_line = render_daily_goal_line(today_view.daily_goal)
 
     # Compose: goal line first, then shortlists, separator, pool, and
