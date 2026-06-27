@@ -115,10 +115,25 @@ def _check_milvus(milvus_uri: str) -> CheckResult:
 
 
 def _check_openrouter(openrouter: dict) -> CheckResult:
-    """Static config check — key present + model id set."""
-    key = openrouter.get("api_key") or ""
+    """Static config check — key present + model id set.
+
+    The ``api_key`` is env-substituted the SAME way the surveyor config
+    resolves it for the labeler (``${VAR}`` → ``os.environ[VAR]``), so
+    the check sees what the labeler actually uses. Previously this
+    checked the RAW config value and treated any ``${VAR}`` placeholder
+    as "not set" — a false WARN for the canonical
+    ``api_key: "${GROQ_API_KEY}"`` config (the labeler resolves + labels
+    fine, but the check warned → posture yellow). Now: substitute first,
+    then test the RESOLVED value for emptiness. A configured-but-unset
+    ``${MISSING}`` still resolves to "" → WARN (correct); a set
+    ``${GROQ_API_KEY}`` resolves to the real key → OK.
+    """
+    from alfred.surveyor.config import _substitute_env
+
+    raw_key = openrouter.get("api_key") or ""
+    key = _substitute_env(raw_key)  # resolve ${VAR} as the labeler does
     model = openrouter.get("model") or ""
-    if not key or key.startswith("${"):
+    if not key:
         return CheckResult(
             name="openrouter-key",
             status=Status.WARN,

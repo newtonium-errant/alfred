@@ -22,6 +22,7 @@ from alfred.surveyor.health import (
     _SURVEYOR_STALE_FAIL_HOURS,
     _SURVEYOR_STALE_OK_HOURS,
     _check_last_successful_cycle,
+    _check_openrouter,
     _read_surveyor_last_run,
     _resolve_surveyor_state_path,
 )
@@ -192,3 +193,64 @@ class TestHealthCheckIntegration:
         assert "last-successful-cycle" in names
         last = next(r for r in rollup.results if r.name == "last-successful-cycle")
         assert last.status == Status.OK
+
+
+# ---------------------------------------------------------------------------
+# _check_openrouter — env-substituted key resolution (KAL-LE flag FIX 1)
+# ---------------------------------------------------------------------------
+#
+# The health-check must resolve the api_key the SAME way the labeler does
+# (${VAR} → os.environ[VAR]). The canonical config is
+# ``surveyor.openrouter.api_key: "${GROQ_API_KEY}"`` + Groq base_url; when
+# GROQ_API_KEY is set the labeler labels fine, so the check must PASS — it
+# previously WARNed on the raw ${...} placeholder (false cry-wolf →
+# posture yellow on Salem + KAL-LE).
+
+
+class TestCheckOpenrouterKeyResolution:
+    def test_groq_configured_key_set_passes(self, monkeypatch) -> None:
+        """REGRESSION PIN (KAL-LE flag): a Groq-configured surveyor
+        (api_key=${GROQ_API_KEY}) with the env var SET passes the
+        openrouter-key check — it must NOT false-WARN on the placeholder.
+        This is the live Salem + KAL-LE config; the labeler resolves +
+        labels fine, so the check must agree."""
+        monkeypatch.setenv("GROQ_API_KEY", "DUMMY_GROQ_TEST_KEY")
+        result = _check_openrouter(
+            {"api_key": "${GROQ_API_KEY}", "model": "llama-3.3-70b-versatile"}
+        )
+        assert result.status == Status.OK, (
+            f"Groq-configured key (env set) should PASS, got "
+            f"{result.status}: {result.detail}"
+        )
+        assert result.data["has_key"] is True
+
+    def test_unset_placeholder_warns(self, monkeypatch) -> None:
+        """A ${VAR} that resolves to empty (env var unset) → WARN — the
+        labeler WOULD skip, so the warn is correct here (not a
+        false-positive)."""
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = _check_openrouter(
+            {"api_key": "${OPENROUTER_API_KEY}", "model": "x"}
+        )
+        assert result.status == Status.WARN
+        assert result.data["has_key"] is False
+
+    def test_empty_key_warns(self) -> None:
+        result = _check_openrouter({"api_key": "", "model": "x"})
+        assert result.status == Status.WARN
+        assert result.data["has_key"] is False
+
+    def test_literal_key_passes(self) -> None:
+        result = _check_openrouter(
+            {"api_key": "DUMMY_LITERAL_TEST_KEY", "model": "x"}
+        )
+        assert result.status == Status.OK
+        assert result.data["has_key"] is True
+
+    def test_key_set_but_model_missing_warns(self, monkeypatch) -> None:
+        """The model-missing WARN must still fire AFTER the key resolves
+        (i.e. key-resolution doesn't mask the separate model check)."""
+        monkeypatch.setenv("GROQ_API_KEY", "DUMMY_GROQ_TEST_KEY")
+        result = _check_openrouter({"api_key": "${GROQ_API_KEY}", "model": ""})
+        assert result.status == Status.WARN
+        assert "model" in result.detail.lower()
