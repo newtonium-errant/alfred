@@ -627,6 +627,51 @@ def test_ticket_pipeline_pending_retry_renders_loud(tmp_path: Path) -> None:
     assert "- 1 issue post(s) pending retry — see github_ops_audit" in out
 
 
+def test_ticket_pipeline_abandoned_entry_not_counted_pending(
+    tmp_path: Path,
+) -> None:
+    """KAL-LE flag FIX 2 (digest side): an ``intake_abandoned`` entry —
+    a stale retry counter for a terminal (wont_fix) ticket — is NOT
+    counted as pending retry. This is the false-yellow-posture driver:
+    vera-20260609 (retry_count=61, no issue) whose ticket is wont_fix
+    must stop showing as pending."""
+    state = _mem_state(tmp_path, {
+        "uid-wontfix": TicketIntakeEntry(
+            recorded_at=_ago(hours=2),
+            kalle_relpath="ticket/Abandoned.md",
+            retry_count=61,
+            intake_abandoned=True,  # reconciled — terminal ticket
+        ),
+    })
+    out = render_ticket_pipeline_section(state, now=NOW)
+    assert "pending retry" not in out, (
+        "an intake_abandoned (reconciled-terminal) entry must NOT count "
+        "as pending retry — it's a stale counter, not an active retry."
+    )
+
+
+def test_ticket_pipeline_abandoned_does_not_mask_real_pending(
+    tmp_path: Path,
+) -> None:
+    """Mixed: an abandoned entry + a genuinely-pending one → the count
+    reflects ONLY the real pending (abandoned excluded, real preserved)."""
+    state = _mem_state(tmp_path, {
+        "uid-wontfix": TicketIntakeEntry(
+            recorded_at=_ago(hours=2),
+            kalle_relpath="ticket/Abandoned.md",
+            retry_count=61,
+            intake_abandoned=True,
+        ),
+        "uid-real": TicketIntakeEntry(
+            recorded_at=_ago(hours=2),
+            kalle_relpath="ticket/Real.md",
+            retry_count=2,
+        ),
+    })
+    out = render_ticket_pipeline_section(state, now=NOW)
+    assert "- 1 issue post(s) pending retry — see github_ops_audit" in out
+
+
 def test_ticket_pipeline_idle_since_when_no_24h_activity(
     tmp_path: Path,
 ) -> None:

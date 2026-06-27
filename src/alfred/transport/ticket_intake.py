@@ -44,6 +44,22 @@ import structlog
 log = structlog.get_logger(__name__)
 
 
+# Terminal ticket statuses for which a still-pending intake entry
+# (no GitHub issue created yet) should be reconciled to "abandoned" —
+# the ticket reached an end state without ever needing an issue, so its
+# stale retry counter must stop counting as "pending retry" in the
+# digest (KAL-LE flag FIX 2). Mirrors the ticket lifecycle's terminal
+# states (vera SKILL: open → in_progress → resolved|closed|wont_fix).
+# ``wont_fix`` is the case-of-record; ``resolved`` / ``closed`` are
+# included because a ticket that reached either WITHOUT a GitHub issue
+# (issue_number is None) is equally "no issue needed, stop retrying."
+TICKET_TERMINAL_NO_ISSUE_STATUSES: frozenset[str] = frozenset({
+    "wont_fix",
+    "closed",
+    "resolved",
+})
+
+
 # Tool-scoped default per the CLAUDE.md state-path rule — sharing a
 # generic ``state.json`` default across tools lets one tool silently
 # load another's state file.
@@ -232,6 +248,19 @@ class TicketIntakeEntry:
     # backward-safe via the schema-tolerance loader: entries written
     # before this field existed carry "" and propagate on the next pass.
     outcome_pushed_at: str = ""
+    # --- intake reconciliation flag (KAL-LE flag FIX 2) ---
+    # Set True when a still-pending entry (``issue_number is None``,
+    # ``retry_count > 0``) is reconciled against its ticket record and
+    # the ticket is in a terminal "no issue needed" status
+    # (``wont_fix`` / ``closed`` / ``resolved``). Such an entry should no
+    # longer be counted as "pending retry" in the digest — the ticket was
+    # abandoned/resolved without ever needing a GitHub issue, so the
+    # retry counter is stale, not an active failure. (It's NOT actively
+    # retrying GitHub — it's just a counter that never got cleared when
+    # the ticket flipped terminal.) See
+    # :func:`reconcile_intake_against_tickets`. Additive + backward-safe
+    # via the schema-tolerance loader (existing entries default False).
+    intake_abandoned: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> "TicketIntakeEntry":
@@ -340,6 +369,118 @@ def find_ticket_by_uid(vault_path: Path, ticket_uid: str) -> str | None:
     return None
 
 
+def _read_ticket_status(vault_path: Path, relpath: str) -> str | None:
+    """Read a ticket record's ``status`` from a vault-relative path.
+
+    Returns the lowercased status string, or ``None`` if the record is
+    missing / unreadable / not a ticket. Defensive: never raises (a
+    reconcile pass over many entries must not fail on one bad record).
+    """
+    import frontmatter
+
+    if not relpath:
+        return None
+    full = vault_path / relpath
+    if not full.exists():
+        return None
+    try:
+        post = frontmatter.load(str(full))
+    except Exception as exc:  # noqa: BLE001 — one bad record never fails the sweep
+        log.warning(
+            "ticket_intake.reconcile_parse_failed",
+            relpath=relpath,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        return None
+    fm = dict(post.metadata or {})
+    if fm.get("type") != "ticket":
+        return None
+    return str(fm.get("status") or "").strip().lower()
+
+
+def reconcile_intake_against_tickets(
+    state: "TicketIntakeState", vault_path: Path,
+) -> int:
+    """Sweep still-pending intake entries against their ticket records'
+    status, marking abandoned the ones whose ticket reached a terminal
+    "no issue needed" state (KAL-LE flag FIX 2). Returns the count newly
+    marked.
+
+    The bug it fixes: a ticket flipped to ``wont_fix`` (or otherwise
+    resolved) AFTER its intake entry was already in the pending-retry
+    shape (``issue_number is None`` + ``retry_count > 0``) — the
+    terminal flip never propagated to the intake state, so the entry was
+    counted as "pending retry" in the KAL-LE digest forever (a stale
+    counter, NOT an active GitHub retry). This reconciles each such
+    entry against its ticket record and latches ``intake_abandoned`` so
+    the digest stops counting it.
+
+    Scope (only touches the genuinely-stale shape):
+      * ``issue_number is not None`` → an issue exists; outcome tracking
+        is the c5/c7 loop's job, not this sweep. Skip.
+      * ``retry_count == 0`` → never failed a post; not "pending retry."
+        Skip (a fresh entry mid-first-attempt isn't stale).
+      * already ``intake_abandoned`` → idempotent skip.
+      * ticket status NOT terminal-no-issue → leave pending (a genuinely
+        open ticket whose issue post keeps failing is a REAL pending
+        retry the operator should still see).
+
+    Reads the ticket status from ``entry.kalle_relpath`` first (KAL-LE's
+    own recorded copy — the common case), falling back to a uid-glob via
+    :func:`find_ticket_by_uid` if the relpath record is gone. Pure local
+    vault reads; no GitHub call — so it runs on every digest pass
+    regardless of credential state.
+
+    Caller persists (``state.save()``) when the return is > 0.
+    """
+    marked = 0
+    for uid in sorted(state.entries):
+        entry = state.entries[uid]
+        if entry.issue_number is not None:
+            continue
+        if entry.retry_count <= 0:
+            continue
+        if entry.intake_abandoned:
+            continue
+        status = _read_ticket_status(vault_path, entry.kalle_relpath)
+        if status is None:
+            # kalle_relpath record gone / unreadable — fall back to a
+            # uid lookup before giving up (state-deletion recovery shape).
+            fallback = find_ticket_by_uid(vault_path, uid)
+            if fallback is not None:
+                status = _read_ticket_status(vault_path, fallback)
+        if status in TICKET_TERMINAL_NO_ISSUE_STATUSES:
+            entry.intake_abandoned = True
+            marked += 1
+            log.info(
+                "ticket_intake.reconciled_abandoned",
+                ticket_uid=uid,
+                ticket_status=status,
+                retry_count=entry.retry_count,
+                kalle_relpath=entry.kalle_relpath,
+                detail=(
+                    "intake entry was pending-retry (no issue, "
+                    f"retry_count={entry.retry_count}) but its ticket is "
+                    f"terminal ({status}) — marked intake_abandoned so the "
+                    "digest stops counting it as pending retry. The "
+                    "terminal flip never propagated to intake state; this "
+                    "sweep reconciles it. Not an active GitHub retry."
+                ),
+            )
+    if marked == 0:
+        # ILB: a swept-nothing pass is distinguishable from a broken one.
+        log.info(
+            "ticket_intake.reconcile_no_abandoned",
+            scanned=len(state.entries),
+            detail=(
+                "reconcile sweep ran; no pending-retry entry had a "
+                "terminal-no-issue ticket status (nothing to mark)."
+            ),
+        )
+    return marked
+
+
 def resolve_ticket_outcome(
     vault_path: Path,
     *,
@@ -413,6 +554,7 @@ def resolve_ticket_outcome(
 
 __all__ = [
     "DEFAULT_TICKET_INTAKE_STATE_PATH",
+    "TICKET_TERMINAL_NO_ISSUE_STATUSES",
     "TICKET_UID_RE",
     "TicketIntakeConfig",
     "TicketIntakeEntry",
@@ -421,5 +563,6 @@ __all__ = [
     "find_ticket_by_uid",
     "load_ticket_intake_config",
     "load_ticket_outcome_config",
+    "reconcile_intake_against_tickets",
     "resolve_ticket_outcome",
 ]

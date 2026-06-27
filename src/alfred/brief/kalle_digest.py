@@ -937,7 +937,16 @@ def render_ticket_pipeline_section(
             received_24h += 1
         if created is not None and created >= cutoff:
             created_24h += 1
-        if entry.retry_count > 0 and entry.issue_number is None:
+        if (
+            entry.retry_count > 0
+            and entry.issue_number is None
+            and not entry.intake_abandoned
+        ):
+            # KAL-LE flag FIX 2: an ``intake_abandoned`` entry is a stale
+            # counter for a terminal ticket (wont_fix/closed/resolved
+            # with no issue) — reconciled, NOT an active retry, so it no
+            # longer counts toward "pending retry" (which drove yellow
+            # posture). See reconcile_intake_against_tickets.
             pending_retry += 1
         for ts in (recorded, created):
             if ts is not None and (last_activity is None or ts > last_activity):
@@ -1063,6 +1072,7 @@ async def assemble_ticket_pipeline_section(
             TicketIntakeState,
             load_ticket_intake_config,
             load_ticket_outcome_config,
+            reconcile_intake_against_tickets,
         )
 
         now = now or datetime.now(timezone.utc)
@@ -1077,6 +1087,20 @@ async def assemble_ticket_pipeline_section(
                 state_path=intake_config.state_path,
             )
             return render_ticket_pipeline_section(state, now=now)
+
+        # Reconcile pending-retry entries against their ticket records
+        # (KAL-LE flag FIX 2): a still-pending entry whose ticket flipped
+        # terminal (wont_fix / closed / resolved) without ever needing a
+        # GitHub issue is a STALE counter, not an active retry — mark it
+        # abandoned so the digest stops counting it as "pending retry."
+        # Runs UNCONDITIONALLY (local vault reads, no GitHub call) BEFORE
+        # the github-client branch, so it works even on the no-credential
+        # path. The sweep auto-clears existing stale entries on the next
+        # pass — no manual state edit needed.
+        vault_path = Path((raw.get("vault") or {}).get("path") or ".")
+        reconciled = reconcile_intake_against_tickets(state, vault_path)
+        if reconciled:
+            state.save()
 
         outcome_note = ""
         client = None

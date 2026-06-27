@@ -39,9 +39,11 @@ from alfred.transport.peer_handlers import (
 from alfred.transport.server import build_app
 from alfred.transport.state import TransportState
 from alfred.transport.ticket_intake import (
+    TICKET_TERMINAL_NO_ISSUE_STATUSES,
     TicketIntakeConfig,
     TicketIntakeEntry,
     TicketIntakeState,
+    reconcile_intake_against_tickets,
 )
 
 
@@ -991,3 +993,175 @@ def test_intake_config_loader_defaults_and_overrides():  # type: ignore[no-untyp
     })
     assert cfg.enabled is True
     assert cfg.state_path == "/tmp/x.json"
+
+
+# ---------------------------------------------------------------------------
+# reconcile_intake_against_tickets — KAL-LE flag FIX 2
+# ---------------------------------------------------------------------------
+#
+# A still-pending intake entry (issue_number is None, retry_count > 0)
+# whose ticket flipped terminal (wont_fix / closed / resolved) without
+# ever needing a GitHub issue is a STALE counter, not an active retry.
+# The sweep marks it intake_abandoned so the digest stops counting it.
+
+
+def _write_ticket(vault: Path, name: str, *, uid: str, status: str) -> str:
+    (vault / "ticket").mkdir(parents=True, exist_ok=True)
+    (vault / "ticket" / f"{name}.md").write_text(
+        f"---\ntype: ticket\nstatus: {status}\nticket_uid: {uid}\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    return f"ticket/{name}.md"
+
+
+def test_reconcile_marks_wont_fix_pending_entry_abandoned(tmp_path: Path) -> None:
+    """THE case-of-record: vera-20260609 shape — retry_count high, no
+    issue, ticket wont_fix → marked intake_abandoned."""
+    vault = tmp_path / "vault"
+    rel = _write_ticket(vault, "Fix booking", uid="vera-x-1", status="wont_fix")
+    state = TicketIntakeState(path=tmp_path / "intake.json")
+    state.entries["vera-x-1"] = TicketIntakeEntry(
+        kalle_relpath=rel, issue_number=None, retry_count=61,
+    )
+    marked = reconcile_intake_against_tickets(state, vault)
+    assert marked == 1
+    assert state.entries["vera-x-1"].intake_abandoned is True
+
+
+def test_reconcile_resolved_and_closed_also_abandoned(tmp_path: Path) -> None:
+    """resolved / closed (terminal-no-issue) are reconciled too, not
+    just wont_fix."""
+    vault = tmp_path / "vault"
+    r1 = _write_ticket(vault, "R", uid="uid-resolved", status="resolved")
+    r2 = _write_ticket(vault, "C", uid="uid-closed", status="closed")
+    state = TicketIntakeState(path=tmp_path / "intake.json")
+    state.entries["uid-resolved"] = TicketIntakeEntry(
+        kalle_relpath=r1, issue_number=None, retry_count=4)
+    state.entries["uid-closed"] = TicketIntakeEntry(
+        kalle_relpath=r2, issue_number=None, retry_count=4)
+    assert reconcile_intake_against_tickets(state, vault) == 2
+    assert state.entries["uid-resolved"].intake_abandoned is True
+    assert state.entries["uid-closed"].intake_abandoned is True
+
+
+def test_reconcile_leaves_open_ticket_pending(tmp_path: Path) -> None:
+    """A genuinely-OPEN ticket whose issue post keeps failing is a REAL
+    pending retry — must NOT be marked abandoned (the operator should
+    still see it)."""
+    vault = tmp_path / "vault"
+    rel = _write_ticket(vault, "Open", uid="uid-open", status="open")
+    state = TicketIntakeState(path=tmp_path / "intake.json")
+    state.entries["uid-open"] = TicketIntakeEntry(
+        kalle_relpath=rel, issue_number=None, retry_count=3,
+    )
+    assert reconcile_intake_against_tickets(state, vault) == 0
+    assert state.entries["uid-open"].intake_abandoned is False
+
+
+def test_reconcile_skips_issue_bearing_entry(tmp_path: Path) -> None:
+    """An entry that already has an issue is the c5/c7 loop's job, not
+    this sweep — even if its ticket is wont_fix, the sweep skips it
+    (issue_number is not None)."""
+    vault = tmp_path / "vault"
+    rel = _write_ticket(vault, "Has Issue", uid="uid-iss", status="wont_fix")
+    state = TicketIntakeState(path=tmp_path / "intake.json")
+    state.entries["uid-iss"] = TicketIntakeEntry(
+        kalle_relpath=rel, issue_number=42, retry_count=1,
+    )
+    assert reconcile_intake_against_tickets(state, vault) == 0
+    assert state.entries["uid-iss"].intake_abandoned is False
+
+
+def test_reconcile_skips_zero_retry_entry(tmp_path: Path) -> None:
+    """retry_count == 0 isn't 'pending retry' — a fresh entry
+    mid-first-attempt (no failure yet) is left alone even if its ticket
+    is terminal (no stale counter to clear)."""
+    vault = tmp_path / "vault"
+    rel = _write_ticket(vault, "Fresh", uid="uid-fresh", status="wont_fix")
+    state = TicketIntakeState(path=tmp_path / "intake.json")
+    state.entries["uid-fresh"] = TicketIntakeEntry(
+        kalle_relpath=rel, issue_number=None, retry_count=0,
+    )
+    assert reconcile_intake_against_tickets(state, vault) == 0
+
+
+def test_reconcile_is_idempotent(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    rel = _write_ticket(vault, "WF", uid="uid-wf", status="wont_fix")
+    state = TicketIntakeState(path=tmp_path / "intake.json")
+    state.entries["uid-wf"] = TicketIntakeEntry(
+        kalle_relpath=rel, issue_number=None, retry_count=5)
+    assert reconcile_intake_against_tickets(state, vault) == 1
+    assert reconcile_intake_against_tickets(state, vault) == 0  # already marked
+
+
+def test_reconcile_falls_back_to_uid_when_relpath_gone(tmp_path: Path) -> None:
+    """If the kalle_relpath record is gone (state-deletion-recovery shape)
+    but a record with the same ticket_uid exists elsewhere, the sweep
+    finds it via find_ticket_by_uid and still reconciles."""
+    vault = tmp_path / "vault"
+    # record exists under a DIFFERENT filename than the stale relpath
+    _write_ticket(vault, "Renamed", uid="uid-moved", status="wont_fix")
+    state = TicketIntakeState(path=tmp_path / "intake.json")
+    state.entries["uid-moved"] = TicketIntakeEntry(
+        kalle_relpath="ticket/Gone.md",  # no longer exists
+        issue_number=None, retry_count=7,
+    )
+    assert reconcile_intake_against_tickets(state, vault) == 1
+    assert state.entries["uid-moved"].intake_abandoned is True
+
+
+def test_reconcile_missing_ticket_leaves_pending(tmp_path: Path) -> None:
+    """If the ticket record can't be found at all (relpath gone, no uid
+    match), leave the entry pending — don't guess. A missing record is
+    not proof of terminal status."""
+    vault = tmp_path / "vault"
+    (vault / "ticket").mkdir(parents=True)
+    state = TicketIntakeState(path=tmp_path / "intake.json")
+    state.entries["uid-ghost"] = TicketIntakeEntry(
+        kalle_relpath="ticket/Ghost.md", issue_number=None, retry_count=9,
+    )
+    assert reconcile_intake_against_tickets(state, vault) == 0
+    assert state.entries["uid-ghost"].intake_abandoned is False
+
+
+def test_reconcile_emits_log_on_mark(tmp_path: Path) -> None:
+    """Log-emission pin (discipline #9): a reconciled-abandoned mark
+    emits ticket_intake.reconciled_abandoned with the key fields, so the
+    operator can grep 'which stale counter cleared + why'."""
+    vault = tmp_path / "vault"
+    rel = _write_ticket(vault, "WF", uid="uid-log", status="wont_fix")
+    state = TicketIntakeState(path=tmp_path / "intake.json")
+    state.entries["uid-log"] = TicketIntakeEntry(
+        kalle_relpath=rel, issue_number=None, retry_count=12)
+    with structlog.testing.capture_logs() as captured:
+        reconcile_intake_against_tickets(state, vault)
+    marks = [c for c in captured
+             if c.get("event") == "ticket_intake.reconciled_abandoned"]
+    assert len(marks) == 1
+    assert marks[0]["ticket_uid"] == "uid-log"
+    assert marks[0]["ticket_status"] == "wont_fix"
+    assert marks[0]["retry_count"] == 12
+
+
+def test_reconcile_emits_ilb_log_when_nothing_marked(tmp_path: Path) -> None:
+    """ILB: a swept-nothing pass emits ticket_intake.reconcile_no_abandoned
+    so idle is distinguishable from broken."""
+    vault = tmp_path / "vault"
+    rel = _write_ticket(vault, "Open", uid="uid-open", status="open")
+    state = TicketIntakeState(path=tmp_path / "intake.json")
+    state.entries["uid-open"] = TicketIntakeEntry(
+        kalle_relpath=rel, issue_number=None, retry_count=2)
+    with structlog.testing.capture_logs() as captured:
+        reconcile_intake_against_tickets(state, vault)
+    assert any(c.get("event") == "ticket_intake.reconcile_no_abandoned"
+               for c in captured)
+
+
+def test_terminal_no_issue_statuses_pinned() -> None:
+    """Contract pin: the terminal-no-issue set is exactly
+    {wont_fix, closed, resolved}. A widening here should be a conscious
+    decision (mirrors the vera ticket lifecycle terminal states)."""
+    assert TICKET_TERMINAL_NO_ISSUE_STATUSES == frozenset(
+        {"wont_fix", "closed", "resolved"}
+    )
