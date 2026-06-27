@@ -236,7 +236,9 @@ async def generate_brief(config: BriefConfig, state_mgr: StateManager, refresh: 
     # always returns a non-empty string per intentionally-left-blank, so
     # this stays in the section list unconditionally.
     now_local = datetime.now(ZoneInfo(config.schedule.timezone))
-    tier_md = render_tier_section(Path(config.vault_path), now_local)
+    tier_md = render_tier_section(
+        Path(config.vault_path), now_local, config.tier_defaults,
+    )
 
     # Today's Routines — Salem-only Phase 1. Renders the body of
     # ``vault/daily/<today>.md`` (written by the routine daemon at

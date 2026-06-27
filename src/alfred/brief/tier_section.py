@@ -1133,12 +1133,18 @@ def _auto_t3_routine_from_view(view: TodayView) -> list[AutoT3Candidate]:
 def render_tier_section(
     vault_path: Path,
     now: datetime,
+    tier_defaults: Any = None,
 ) -> str:
     """Render the brief's ``Open Tasks by Tier`` section body (V2).
 
     ``now`` is the reference instant — passed by the brief daemon at
     fire time + by ``/today`` at request time. ``now.date()`` is "today"
     for the curation lookup.
+
+    ``tier_defaults`` (Q3 Option A, 2026-06-26): optional global tier-
+    window defaults, passed straight through to ``compute_today_view`` so
+    the 06:00 brief applies the SAME defaults the aggregator's 05:59 pass
+    does. ``None`` → no defaults (opt-out semantics unchanged).
 
     Always returns a non-empty string per
     ``feedback_intentionally_left_blank``: even the cold-start case
@@ -1170,7 +1176,7 @@ def render_tier_section(
     # ``test_brief_tier_section`` output pins.) The selection pool +
     # rollover are render-only MATERIALS (not substrate lane assignment)
     # and stay computed here.
-    today_view = compute_today_view(vault_path, now)
+    today_view = compute_today_view(vault_path, now, tier_defaults)
 
     auto_t1_task_candidates = _auto_t1_task_from_view(today_view)
     auto_t1_routine_candidates = _auto_t1_routine_from_view(today_view)

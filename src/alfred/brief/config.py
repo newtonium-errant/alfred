@@ -165,11 +165,31 @@ class BriefConfig:
     # the directory doesn't exist, which is the correct surface).
     quarantine_dir_name: str = "quarantine"
 
+    # Q3 Option A (2026-06-26): global tier-window defaults. Sourced from
+    # the ``routine.tier_defaults`` YAML block (NOT a brief-section key)
+    # so the brief's 06:00 tier view applies the SAME defaults the
+    # routine aggregator's 05:59 pass does — the two must agree or the
+    # render disagrees with the persisted handoff. Stored as the routine
+    # package's ``TierDefaultsConfig``; default all-None (no defaults →
+    # opt-out semantics unchanged). Mirrors the cross-section read
+    # precedent of ``quarantine_dir_name`` (from email_classifier).
+    tier_defaults: Any = None
+
 
 def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
     """Build BriefConfig from the unified config dict."""
     section = raw.get("brief", {})
     vault_path = raw.get("vault", {}).get("path", "./vault")
+    # Cross-section read: the tier-window defaults live under
+    # ``routine.tier_defaults`` (routine-domain config) but the brief
+    # render needs them too. Shared parse via the routine package's
+    # ``TierDefaultsConfig.from_raw`` so both layers build them
+    # identically. Lazy import keeps the brief→routine dependency at
+    # call time (not module load).
+    from alfred.routine.config import TierDefaultsConfig
+    tier_defaults = TierDefaultsConfig.from_raw(
+        (raw.get("routine") or {}).get("tier_defaults"),
+    )
     log_dir = raw.get("logging", {}).get("dir", "./data")
 
     # Parse stations
@@ -328,4 +348,5 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         log_file=f"{log_dir}/brief.log",
         primary_telegram_user_id=primary_user,
         quarantine_dir_name=quarantine_dir_name,
+        tier_defaults=tier_defaults,
     )

@@ -188,6 +188,21 @@ class RoutineItemClassification:
     both_modes_conflict: bool = False
 
 
+def _tier_default_values(tier_defaults: Any) -> tuple[int | None, int | None]:
+    """Extract ``(default_escalate_at_days, default_surface_at_days)`` from
+    a ``TierDefaultsConfig``-like object (or ``None``).
+
+    Duck-typed (``getattr``) so the compute layer doesn't import the
+    routine config dataclass — ``None`` → ``(None, None)`` (no defaults).
+    """
+    if tier_defaults is None:
+        return None, None
+    return (
+        getattr(tier_defaults, "escalate_at_days", None),
+        getattr(tier_defaults, "surface_at_days", None),
+    )
+
+
 def classify_routine_item(
     *,
     priority: str | None,
@@ -199,6 +214,8 @@ def classify_routine_item(
     item_text: str,
     today: date,
     self_care: bool = False,
+    default_escalate_at_days: int | None = None,
+    default_surface_at_days: int | None = None,
 ) -> RoutineItemClassification:
     """Classify one routine item into a tier placement (T1/T2/T3/none).
 
@@ -333,6 +350,27 @@ def classify_routine_item(
         return RoutineItemClassification(
             tier=None, both_modes_conflict=both_modes_conflict,
         )
+
+    # ---- Global default resolution (Q3 Option A, 2026-06-26) ------
+    # The spec's "global default + per-item override" for the tier
+    # windows, WITHOUT breaking the load-bearing opt-out: an item that
+    # has a ``due_pattern`` but NEITHER tier field is opted-OUT
+    # (the Walk-Fergus "absent = never auto-tier" shape) — defaults do
+    # NOT apply, it stays opted-out. Defaults apply ONLY to an item that
+    # has ALREADY opted in (has ≥1 of escalate_at_days / surface_at_days)
+    # but omits the SPECIFIC field. A per-item value always wins (it's
+    # only substituted when the per-item value is None). This yields ZERO
+    # behaviour change for existing records (which carry an explicit
+    # escalate_at_days when they tier, or neither field when they don't).
+    has_tier_signal = (
+        due_pattern is not None
+        and (escalate_at_days is not None or surface_at_days is not None)
+    )
+    if has_tier_signal:
+        if escalate_at_days is None and default_escalate_at_days is not None:
+            escalate_at_days = default_escalate_at_days
+        if surface_at_days is None and default_surface_at_days is not None:
+            surface_at_days = default_surface_at_days
 
     # ---- T1/T2 deadline branch -----------------------------------
     if due_pattern is None or escalate_at_days is None:
@@ -617,6 +655,7 @@ def compute_auto_t1_candidates(
 
 def compute_auto_routine_candidates(
     vault_path: Path, now: datetime,
+    tier_defaults: Any = None,
 ) -> list[AutoT1Candidate]:
     """Walk ``vault/routine/*.md`` and return routine items
     auto-surfacing in the T1 window.
@@ -651,15 +690,23 @@ def compute_auto_routine_candidates(
     case-insensitive — deterministic order for Ship B's brief
     render.
 
+    ``tier_defaults`` (Q3 Option A): optional global window defaults
+    (a ``TierDefaultsConfig`` or ``None``) applied to an item that has
+    a ``due_pattern`` + ≥1 tier field but omits the specific field. See
+    :func:`classify_routine_item`.
+
     Per ``feedback_intentionally_left_blank``: pure-compute path,
     no log emissions. Callers (Ship B brief render) emit the
     "ran, here's the count" log.
     """
-    return _compute_auto_routine(vault_path, now, window="t1")
+    return _compute_auto_routine(
+        vault_path, now, window="t1", tier_defaults=tier_defaults,
+    )
 
 
 def compute_auto_routine_t2_candidates(
     vault_path: Path, now: datetime,
+    tier_defaults: Any = None,
 ) -> list[AutoT1Candidate]:
     """Walk ``vault/routine/*.md`` and return routine items
     auto-surfacing in the T2 ramp window.
@@ -681,12 +728,18 @@ def compute_auto_routine_t2_candidates(
     :func:`compute_auto_routine_candidates`. The discriminator is
     ``surface_reason`` (``"surface window ..."`` vs
     ``"escalate window ..."`` / ``"due today"`` / ``"due tomorrow"``).
+
+    ``tier_defaults`` (Q3 Option A): see
+    :func:`compute_auto_routine_candidates`.
     """
-    return _compute_auto_routine(vault_path, now, window="t2")
+    return _compute_auto_routine(
+        vault_path, now, window="t2", tier_defaults=tier_defaults,
+    )
 
 
 def _compute_auto_routine(
     vault_path: Path, now: datetime, *, window: str,
+    tier_defaults: Any = None,
 ) -> list[AutoT1Candidate]:
     """Shared scan + filter for T1 / T2 routine surfaces.
 
@@ -758,6 +811,7 @@ def _compute_auto_routine(
             # all live in ``classify_routine_item`` — the SAME predicate
             # the aggregator's ``_decide_tier_handoff`` now delegates to.
             # No hand-mirrored copy here; the two layers cannot drift.
+            _def_esc, _def_surf = _tier_default_values(tier_defaults)
             classification = classify_routine_item(
                 priority=item.priority,
                 due_pattern=item.due_pattern,
@@ -768,6 +822,8 @@ def _compute_auto_routine(
                 item_text=item.text,
                 today=today_local,
                 self_care=item.self_care,
+                default_escalate_at_days=_def_esc,
+                default_surface_at_days=_def_surf,
             )
 
             want_tier = 1 if window == "t1" else 2
@@ -1421,8 +1477,15 @@ def _task_is_done_today(fm: dict, today: date) -> bool:
 
 def compute_today_view(
     vault_path: Path, now: datetime,
+    tier_defaults: Any = None,
 ) -> TodayView:
     """Build the unified today view over the substrate.
+
+    ``tier_defaults`` (Q3 Option A, 2026-06-26): optional global
+    window defaults (a ``TierDefaultsConfig`` or ``None``) threaded into
+    the routine T1/T2 surfaces so the brief's 06:00 view applies the SAME
+    defaults the aggregator's 05:59 pass does. Passed by the brief daemon
+    from its loaded config; ``None`` → no defaults (opt-out unchanged).
 
     Gathers, in one pass:
       * task-origin auto-T1 (``compute_auto_t1_candidates``),
@@ -1457,8 +1520,12 @@ def compute_today_view(
     # --- substrate: auto candidates (all routed through the single
     # classify_routine_item predicate on the routine side) ----------
     auto_t1_task = compute_auto_t1_candidates(vault_path, now)
-    auto_t1_routine = compute_auto_routine_candidates(vault_path, now)
-    auto_t2_routine = compute_auto_routine_t2_candidates(vault_path, now)
+    auto_t1_routine = compute_auto_routine_candidates(
+        vault_path, now, tier_defaults,
+    )
+    auto_t2_routine = compute_auto_routine_t2_candidates(
+        vault_path, now, tier_defaults,
+    )
     auto_t3_routine = compute_auto_t3_candidates(vault_path, now)
     # Q2 (2026-06-26): self_care-flagged items (no cadence target) →
     # the dedicated T3 self-care lane (daily floor). Both routine-item
@@ -1643,7 +1710,7 @@ def compute_today_view(
         t3_keys.add(key)
 
     # --- routine_today: the complement (fired today, no handoff) ---
-    routine_today = _collect_routine_today(vault_path, today)
+    routine_today = _collect_routine_today(vault_path, today, tier_defaults)
 
     # --- daily goal -----------------------------------------------
     daily_goal = _compute_daily_goal(vault_path, today, t1, t2, t3)
@@ -1756,6 +1823,7 @@ def _curated_task_path(wikilink: str) -> str:
 
 def _collect_routine_today(
     vault_path: Path, today: date,
+    tier_defaults: Any = None,
 ) -> list[RoutineLine]:
     """Return routine items that fired today but did NOT hand off to any
     tier — the structural complement of {t1, t2, t3} for routine items.
@@ -1771,15 +1839,24 @@ def _collect_routine_today(
     the same records; without ``quiet`` it would re-emit the same
     operator-facing handoff logs, duplicating them for every item. The
     aggregate pass owns that log; the view reads silently.
+
+    ``tier_defaults`` (Q3 Option A): MUST be passed so the complement's
+    handoff decision applies the SAME global defaults the tier lanes do —
+    otherwise an item that the defaults push into a tier would still
+    appear here (double-render, breaking the structural-complement
+    invariant).
     """
     from alfred.routine.aggregator import (
         _collect_items_for_today,
         _iter_routine_records,
     )
 
+    _def_esc, _def_surf = _tier_default_values(tier_defaults)
     records = _iter_routine_records(vault_path)
     items, _contributing, _critical = _collect_items_for_today(
         records, today, quiet=True,
+        default_escalate_at_days=_def_esc,
+        default_surface_at_days=_def_surf,
     )
     out: list[RoutineLine] = []
     for it in items:

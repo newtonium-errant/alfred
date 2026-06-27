@@ -2213,9 +2213,9 @@ def test_render_tier_section_calls_view_once(tmp_path: Path) -> None:
     calls = {"n": 0}
     real = ts.compute_today_view
 
-    def _counting(vault_path, now):
+    def _counting(*args, **kwargs):
         calls["n"] += 1
-        return real(vault_path, now)
+        return real(*args, **kwargs)
 
     import unittest.mock as _m
     with _m.patch.object(ts, "compute_today_view", side_effect=_counting):

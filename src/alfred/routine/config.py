@@ -331,6 +331,57 @@ class StateConfig:
 
 
 @dataclass
+class TierDefaultsConfig:
+    """Global default tier-window thresholds (Q3 Option A, 2026-06-26).
+
+    The spec's "global default + per-item override" for the escalation
+    thresholds, realized WITHOUT breaking the load-bearing opt-out
+    contract (``escalate_at_days`` absent = "this item never
+    auto-tiers" — the Walk-Fergus daily-routine shape).
+
+    These defaults apply in ``classify_routine_item`` ONLY to an item
+    that has ALREADY opted into tiering — i.e. it carries a
+    ``due_pattern`` AND at least one tier field (``escalate_at_days`` OR
+    ``surface_at_days``) — but omits the SPECIFIC field. A per-item value
+    always overrides. An item with a ``due_pattern`` but NEITHER tier
+    field stays fully opted-out (no default applied) — so existing
+    records get ZERO behaviour change.
+
+    Both default ``None`` (no global default configured) — the opt-out
+    semantics are then exactly as before this knob existed.
+    """
+
+    escalate_at_days: int | None = None
+    surface_at_days: int | None = None
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "TierDefaultsConfig":
+        """Build from a ``routine.tier_defaults`` YAML block (or absent).
+
+        Shared parse so the routine daemon AND the brief render layer
+        (which both consume the defaults — the aggregator's 05:59 pass +
+        the brief's 06:00 view must apply the SAME defaults or the two
+        disagree) build the config identically. Absent / malformed →
+        all-None (opt-out semantics unchanged). Coerces defensively;
+        a non-int value drops to None rather than raising.
+        """
+        block = raw if isinstance(raw, dict) else {}
+
+        def _opt_int(value: Any) -> int | None:
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        return cls(
+            escalate_at_days=_opt_int(block.get("escalate_at_days")),
+            surface_at_days=_opt_int(block.get("surface_at_days")),
+        )
+
+
+@dataclass
 class RoutineConfig:
     """Top-level routine daemon config.
 
@@ -349,6 +400,9 @@ class RoutineConfig:
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     state: StateConfig = field(default_factory=StateConfig)
+    tier_defaults: TierDefaultsConfig = field(
+        default_factory=TierDefaultsConfig,
+    )
     log_file: str = "./data/routine.log"
     instance_name: str = ""
 
@@ -377,6 +431,14 @@ def load_from_unified(raw: dict[str, Any]) -> RoutineConfig:
         max_history=int(state_raw.get("max_history", 30)),
     )
 
+    # Q3 Option A (2026-06-26): global default tier-window thresholds.
+    # Hand-rolled (not via the generic _build helper) per the routine
+    # config convention; shared parse with the brief render layer via
+    # ``TierDefaultsConfig.from_raw`` so both apply identical defaults.
+    tier_defaults = TierDefaultsConfig.from_raw(
+        section.get("tier_defaults"),
+    )
+
     # Resolve instance name via the canonical normaliser. Empty when
     # the operator omitted ``telegram.instance.name`` from config —
     # the daemon-start guard refuses to start in that case (rather
@@ -397,6 +459,7 @@ def load_from_unified(raw: dict[str, Any]) -> RoutineConfig:
         schedule=schedule,
         output=output,
         state=state,
+        tier_defaults=tier_defaults,
         log_file=f"{log_dir}/routine.log",
         instance_name=instance_name,
     )
@@ -412,5 +475,6 @@ __all__ = [
     "REQUIRED_INSTANCE",
     "RoutineConfig",
     "StateConfig",
+    "TierDefaultsConfig",
     "load_from_unified",
 ]

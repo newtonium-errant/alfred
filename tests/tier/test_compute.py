@@ -2215,3 +2215,79 @@ def test_classify_self_care_emits_no_logs() -> None:
     with structlog.testing.capture_logs() as captured:
         _classify(self_care=True, completion_log={})
     assert captured == []
+
+
+# ---------------------------------------------------------------------------
+# Q3 Option A — global tier-window defaults + per-item override (2026-06-26)
+# ---------------------------------------------------------------------------
+#
+# The load-bearing invariant: escalate_at_days ABSENT (with no other tier
+# field) = "never auto-tier" (Walk-Fergus opt-out). Defaults apply ONLY to
+# an item already opted into tiering (due_pattern + >=1 tier field) that
+# omits the SPECIFIC field. Per-item always overrides. Zero behavior
+# change for existing records.
+
+_DP_THU = DuePattern.from_dict({"type": "weekly", "day": "thu"})   # due today
+_DP_MON1 = DuePattern.from_dict({"type": "monthly", "day": 1})     # 4d out
+
+
+def test_q3_optout_preserved_due_pattern_no_tier_field() -> None:
+    """THE invariant: due_pattern but NEITHER tier field → opted out →
+    defaults do NOT apply, item never auto-tiers (Walk-Fergus). If this
+    flips, it's a tier-view-flood regression."""
+    r = _classify(
+        due_pattern=_DP_THU,
+        default_escalate_at_days=3,
+        default_surface_at_days=5,
+    )
+    assert r.tier is None
+
+
+def test_q3_default_fills_missing_escalate_when_opted_in() -> None:
+    """Item opted in via surface_at_days, omits escalate → default fills
+    escalate; due today → T1."""
+    r = _classify(
+        due_pattern=_DP_THU, surface_at_days=5,
+        default_escalate_at_days=1,
+    )
+    assert r.tier == 1
+    assert r.reason == "due today"
+
+
+def test_q3_default_fills_missing_surface_when_opted_in() -> None:
+    """Item opted in via escalate_at_days=0, omits surface → default
+    fills surface → T2 ramp at 4d out."""
+    r = _classify(
+        due_pattern=_DP_MON1, escalate_at_days=0,
+        default_surface_at_days=5,
+    )
+    assert r.tier == 2
+    assert r.reason == "surface window (4d before due)"
+
+
+def test_q3_per_item_overrides_default() -> None:
+    """A per-item escalate_at_days always wins over the default."""
+    r = _classify(
+        due_pattern=_DP_MON1, escalate_at_days=5,
+        default_escalate_at_days=0,
+    )
+    assert r.tier == 1
+    assert r.reason == "escalate window (5d before due)"
+
+
+def test_q3_no_default_configured_unchanged() -> None:
+    """No defaults configured → behavior exactly as before the knob
+    (opt-out item stays opted out)."""
+    assert _classify(due_pattern=_DP_THU).tier is None
+
+
+def test_q3_default_does_not_resurrect_optout_via_surface_only_default() -> None:
+    """Edge: an opted-OUT item (no tier field) must NOT be pulled in even
+    if ONLY a surface default is set — has_tier_signal is False, so no
+    default applies. Guards the opt-out against either default alone."""
+    assert _classify(
+        due_pattern=_DP_THU, default_surface_at_days=5,
+    ).tier is None
+    assert _classify(
+        due_pattern=_DP_THU, default_escalate_at_days=3,
+    ).tier is None

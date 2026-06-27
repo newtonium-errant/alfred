@@ -132,3 +132,62 @@ def test_brief_config_quarantine_dir_threaded_from_email_classifier_block(
     }
     cfg = load_from_unified(raw)
     assert cfg.quarantine_dir_name == "spam_archive"
+
+
+# ---------------------------------------------------------------------------
+# Q3 Option A — BriefConfig cross-section read of routine.tier_defaults
+# ---------------------------------------------------------------------------
+#
+# The brief's 06:00 tier view MUST apply the SAME tier-window defaults the
+# routine aggregator's 05:59 pass does, or the render disagrees with the
+# persisted handoff. The defaults live under routine.tier_defaults; the
+# brief reads them cross-section (same pattern as quarantine_dir_name from
+# email_classifier).
+
+
+def test_brief_reads_routine_tier_defaults(tmp_path: Path) -> None:
+    raw: dict[str, Any] = {
+        "vault": {"path": str(tmp_path)},
+        "routine": {"tier_defaults": {"escalate_at_days": 3,
+                                      "surface_at_days": 5}},
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.tier_defaults is not None
+    assert cfg.tier_defaults.escalate_at_days == 3
+    assert cfg.tier_defaults.surface_at_days == 5
+
+
+def test_brief_tier_defaults_absent_all_none(tmp_path: Path) -> None:
+    """No routine.tier_defaults block → all-None (opt-out unchanged)."""
+    raw: dict[str, Any] = {"vault": {"path": str(tmp_path)}}
+    cfg = load_from_unified(raw)
+    assert cfg.tier_defaults.escalate_at_days is None
+    assert cfg.tier_defaults.surface_at_days is None
+
+
+def test_brief_and_routine_tier_defaults_agree(tmp_path: Path) -> None:
+    """The whole point of the cross-section read: brief + routine build
+    IDENTICAL tier_defaults from the same YAML block (so the 05:59 and
+    06:00 passes can't disagree)."""
+    from alfred.routine.config import (
+        load_from_unified as routine_load,
+    )
+
+    raw: dict[str, Any] = {
+        "vault": {"path": str(tmp_path)},
+        "telegram": {"instance": {"name": "Salem"}},
+        "routine": {"tier_defaults": {"escalate_at_days": 2,
+                                      "surface_at_days": 7}},
+    }
+    brief_cfg = load_from_unified(raw)
+    routine_cfg = routine_load(raw)
+    assert (
+        brief_cfg.tier_defaults.escalate_at_days
+        == routine_cfg.tier_defaults.escalate_at_days
+        == 2
+    )
+    assert (
+        brief_cfg.tier_defaults.surface_at_days
+        == routine_cfg.tier_defaults.surface_at_days
+        == 7
+    )

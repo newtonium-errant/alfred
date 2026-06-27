@@ -596,3 +596,63 @@ def test_curated_freetext_t3_dedups_auto_cadence_same_item(
     )
     # The curated entry wins (operator-authoritative).
     assert walk[0].source == "operator"
+
+
+# --- Q3 Option A: tier_defaults flow through compute_today_view ------------
+
+
+def test_view_applies_tier_defaults_to_opted_in_item(tmp_path: Path) -> None:
+    """An opted-in routine item (due_pattern + surface_at_days, no
+    escalate_at_days) surfaces to T1 when the global default fills the
+    missing escalate field — proves the default flows end-to-end through
+    the view."""
+    from alfred.routine.config import TierDefaultsConfig
+
+    vault = _vault(tmp_path)
+    # weekly thu = due today; surface set (opted in), escalate omitted.
+    _write_routine(
+        vault, "Bills",
+        "type: routine\nstatus: active\nname: Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Pay Rent\n  priority: tracked\n"
+        "  due_pattern:\n    type: weekly\n    day: thu\n"
+        "  surface_at_days: 5\n",
+    )
+    td = TierDefaultsConfig(escalate_at_days=1)
+    view = compute_today_view(vault, NOW, td)
+    assert any(e.item_text == "Pay Rent" for e in view.t1), (
+        "opted-in item should surface to T1 via the default escalate"
+    )
+    # And it's NOT double-rendered in routine_today (complement holds
+    # because _collect_routine_today gets the same defaults).
+    assert all(r.text != "Pay Rent" for r in view.routine_today)
+
+
+def test_view_preserves_optout_against_tier_defaults(tmp_path: Path) -> None:
+    """THE invariant end-to-end: an opted-OUT item (due_pattern but NO
+    tier field) stays in routine_today, NOT pulled into a tier, even with
+    defaults configured. Guards the Walk-Fergus opt-out at the view
+    level."""
+    from alfred.routine.config import TierDefaultsConfig
+
+    vault = _vault(tmp_path)
+    _write_routine(
+        vault, "Daily",
+        "type: routine\nstatus: active\nname: Daily\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Walk Fergus\n  priority: tracked\n"
+        "  due_pattern:\n    type: weekly\n    day: thu\n",  # NO tier field
+    )
+    td = TierDefaultsConfig(escalate_at_days=3, surface_at_days=5)
+    view = compute_today_view(vault, NOW, td)
+    tier_texts = {
+        e.item_text for e in (view.t1 + view.t2 + view.t3)
+        if e.origin == "routine_item"
+    }
+    assert "Walk Fergus" not in tier_texts, (
+        "opted-out item must NOT be pulled into a tier by defaults "
+        "(Walk-Fergus opt-out preserved end-to-end)"
+    )
+    assert any(r.text == "Walk Fergus" for r in view.routine_today)

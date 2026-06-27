@@ -286,6 +286,8 @@ def _decide_tier_handoff(
     item_text: str = "",
     routine_record: str = "",
     self_care: bool = False,
+    default_escalate_at_days: int | None = None,
+    default_surface_at_days: int | None = None,
 ) -> int | None:
     """Decide if the item should be handed off to the tier section.
 
@@ -368,6 +370,8 @@ def _decide_tier_handoff(
         item_text=item_text,
         today=today,
         self_care=self_care,
+        default_escalate_at_days=default_escalate_at_days,
+        default_surface_at_days=default_surface_at_days,
     )
 
     # Mutually-exclusive validator: both cadence modes set → warn +
@@ -401,6 +405,8 @@ def _collect_items_for_today(
     today: date,
     *,
     quiet: bool = False,
+    default_escalate_at_days: int | None = None,
+    default_surface_at_days: int | None = None,
 ) -> tuple[list[dict], list[str], list[str]]:
     """Group items by priority for today.
 
@@ -571,6 +577,8 @@ def _collect_items_for_today(
                     item_text=text,
                     routine_record=name,
                     self_care=self_care,
+                    default_escalate_at_days=default_escalate_at_days,
+                    default_surface_at_days=default_surface_at_days,
                 )
                 if handoff_tier is not None:
                     # Compute days_to_due for the log only when
@@ -839,8 +847,14 @@ def run_aggregator_once(
             scanned_dir=str(vault_path / "routine"),
         )
 
+    # Q3 Option A (2026-06-26): pass the instance's global tier-window
+    # defaults so the authoritative 05:59 handoff applies them (the brief
+    # at 06:00 applies the SAME defaults via config.tier_defaults).
+    _td = getattr(config, "tier_defaults", None)
     items, contributing, critical_pending = _collect_items_for_today(
         records, today,
+        default_escalate_at_days=getattr(_td, "escalate_at_days", None),
+        default_surface_at_days=getattr(_td, "surface_at_days", None),
     )
     no_routines_overall = not items
     if no_routines_overall and records:

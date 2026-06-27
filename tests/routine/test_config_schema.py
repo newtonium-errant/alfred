@@ -13,6 +13,8 @@ from alfred.routine.config import (
     DUE_PATTERN_TYPES,
     DuePattern,
     Item,
+    TierDefaultsConfig,
+    load_from_unified,
 )
 
 
@@ -260,3 +262,62 @@ def test_item_unknown_keys_dropped() -> None:
     })
     assert item is not None
     assert item.text == "X"
+
+
+# ---------------------------------------------------------------------------
+# Q3 Option A — TierDefaultsConfig (global tier-window defaults, 2026-06-26)
+# ---------------------------------------------------------------------------
+
+
+def test_tier_defaults_absent_all_none() -> None:
+    """No routine.tier_defaults block → all-None (opt-out unchanged)."""
+    td = TierDefaultsConfig.from_raw(None)
+    assert td.escalate_at_days is None
+    assert td.surface_at_days is None
+
+
+def test_tier_defaults_from_raw_parses_ints() -> None:
+    td = TierDefaultsConfig.from_raw(
+        {"escalate_at_days": 3, "surface_at_days": 5},
+    )
+    assert td.escalate_at_days == 3
+    assert td.surface_at_days == 5
+
+
+def test_tier_defaults_from_raw_coerces_string_ints() -> None:
+    """Operator hand-edit may pass strings; coerce defensively."""
+    td = TierDefaultsConfig.from_raw(
+        {"escalate_at_days": "3", "surface_at_days": "5"},
+    )
+    assert td.escalate_at_days == 3
+    assert td.surface_at_days == 5
+
+
+def test_tier_defaults_from_raw_malformed_drops_to_none() -> None:
+    td = TierDefaultsConfig.from_raw(
+        {"escalate_at_days": "abc", "surface_at_days": None},
+    )
+    assert td.escalate_at_days is None
+    assert td.surface_at_days is None
+
+
+def test_routine_config_carries_tier_defaults() -> None:
+    """load_from_unified wires routine.tier_defaults onto RoutineConfig."""
+    cfg = load_from_unified({
+        "vault": {"path": "./vault"},
+        "telegram": {"instance": {"name": "Salem"}},
+        "routine": {"tier_defaults": {"escalate_at_days": 2}},
+    })
+    assert cfg.tier_defaults.escalate_at_days == 2
+    assert cfg.tier_defaults.surface_at_days is None
+
+
+def test_routine_config_tier_defaults_default_empty() -> None:
+    """Omitted routine block → tier_defaults all-None (no behavior
+    change for existing instance configs)."""
+    cfg = load_from_unified({
+        "vault": {"path": "./vault"},
+        "telegram": {"instance": {"name": "Salem"}},
+    })
+    assert cfg.tier_defaults.escalate_at_days is None
+    assert cfg.tier_defaults.surface_at_days is None
