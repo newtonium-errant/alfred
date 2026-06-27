@@ -55,9 +55,19 @@ You are analyzing documents from an Obsidian vault that were found to be semanti
 For each pair, decide whether a REAL relationship exists — grounded in concrete facts, not generic theme.
 
 GROUNDEDNESS RULE (hard requirement):
-Only suggest a relationship if both records share an explicit factual anchor — a named person, organization, project, product, date/date-range, location, or event mentioned in BOTH records. Generic thematic similarity ("both are organizations", "both offer services", "both are tech companies", "both are marketing emails") is NOT an acceptable anchor. If you cannot point to a concrete shared entity present in both texts, emit nothing for that pair.
+Only suggest a relationship if both records share an explicit factual anchor — a SPECIFIC named instance of a person, organization, project, product, date/date-range, location, or event that refers to the SAME concrete referent in BOTH records. Example of a real anchor: both records mention the account "andrew.newton@live.ca", or both name the product "ViewPoint", or both cite the date "2026-04-15".
 
-You must cite a short verbatim phrase from each side as "source_anchor" and "target_anchor". If you cannot cite both, DO NOT emit the relationship — drop the pair.
+The following are NOT acceptable anchors, even when you can quote a matching phrase from each side:
+- Generic category similarity ("both are organizations", "both offer services", "both are tech companies", "both are marketing emails").
+- A shared TOPIC, THEME, or SUBJECT-MATTER the cluster is about (e.g. "both discuss structured summaries", "both are about credential stuffing", "both address property search strategy").
+- A shared DOCUMENT FORMAT or RECORD TYPE ("both are decisions", "both are synthesis records", "both are capture-session notes").
+- The fact that the two records are in the SAME CLUSTER, or share the cluster's tag/label.
+- A recurring WORD or PHRASE that appears in both because it names the cluster's theme rather than a specific entity (e.g. "Structured Summary", "Capture Session", "Curator", "auto-population" recurring across a cluster's titles). A theme word quoted verbatim from each title is STILL theme similarity, not a factual anchor.
+
+The test: if you swapped in any other document from the same cluster, would the "anchor" still match? If yes, it's a theme, not an anchor — drop the pair. A real anchor identifies a specific shared thing, not the topic the whole cluster shares.
+CARVE-OUT (specific named entities only): this swap test flags GENERIC topics/themes/subjects/formats — it does NOT flag a SPECIFIC named product, account, person, project, dated event, or location. When the whole cluster genuinely centers on one specific named entity (e.g. every record names the product "ViewPoint" or the account "andrew.newton@live.ca"), that entity IS a real anchor even though swapping members keeps it matching — keep those links. The exception applies ONLY to specific named entities, NEVER to a shared topic, theme, subject-matter, document-format, or recurring theme-word.
+
+You must cite a short verbatim phrase from each side as "source_anchor" and "target_anchor", and that phrase must name the specific shared entity (not merely the shared topic). If you cannot cite both, DO NOT emit the relationship — drop the pair.
 
 Allowed relationship types (use exactly one, with the definition shown):
 - "related-to": both records reference the same named entity (person/org/project/event/location) but neither depends on nor supports the other.
@@ -68,8 +78,14 @@ Allowed relationship types (use exactly one, with the definition shown):
 
 Do NOT use any other relationship type. In particular, do NOT emit "contradicts" — contradiction analysis is handled elsewhere, not here.
 
-NEGATIVE EXAMPLE (do not do this):
+NEGATIVE EXAMPLE 1 — generic category (do not do this):
 BAD: `org/DigitalOcean.md → org/Marriott.md` type "related-to" with rationale "both are large enterprises offering services" — REJECTED. No named person, project, event, date, or location appears in both records. Generic "both are companies" is not a factual anchor. Drop the pair.
+
+NEGATIVE EXAMPLE 2 — theme-meshing within a tight single-topic cluster (do not do this):
+A cluster of decision records all about structured summaries: "Brief Compresses Structured Summary...", "Capture Session Batch Structuring Pass...", "Capture Session Structured Summary Schema...". A model that links nearly every pair "related-to" with rationale "both involve structured summary processing" and anchors quoting "Structured Summary" / "Capture Session" from each title — REJECTED, every pair. "Structured Summary" and "Capture Session" are the cluster's THEME, not a specific shared entity; they recur in the titles precisely because the cluster is about that topic. Quoting the theme word from both titles does not make it an anchor. Unless two of these records name a SPECIFIC shared entity in their bodies (the same person, the same dated event, the same external product), the correct output for these pairs is nothing. A tight, single-theme cluster usually produces FEW or ZERO links, not a near-complete mesh.
+
+ANTI-MESH RULE:
+Most pairs in a cluster have NO real relationship. An empty result [] is the common and expected outcome — the documents were clustered by semantic similarity, which is exactly the theme overlap that does NOT qualify as an anchor. Do NOT link a pair merely because the two documents co-occur in this cluster or share its topic. Evaluate each pair independently against the groundedness rule. If a cluster of N documents would yield a large number of links (e.g. approaching a complete N-by-N mesh, all of one type with near-identical "both are about X" rationales), treat that as a signal you are theme-meshing — re-check each pair and keep only those with a specific shared named entity. It is far better to miss a weak link than to emit a spurious one: this writer is append-only and never retracts, so every spurious link is permanent vault noise.
 
 Documents:
 {pairs}
