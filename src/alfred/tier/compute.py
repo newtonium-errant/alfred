@@ -1479,6 +1479,11 @@ def compute_today_view(
     t1_keys: set[str] = set()
     t2_keys: set[str] = set()
     t3_keys: set[str] = set()
+    # Lowercased texts of curated free-text T3 entries — used to
+    # suppress a record-anchored auto-T3 duplicate of the same item
+    # (reviewer NOTE-2). Free-text + record-anchored keys differ, so
+    # text-match is the cross-shape dedup.
+    curated_t3_texts: set[str] = set()
 
     def _task_key(name: str) -> str:
         return f"task::{name.lower()}"
@@ -1525,6 +1530,18 @@ def compute_today_view(
             if entry is not None:
                 t3.append(entry)
                 t3_keys.add(_routine_key(None, entry.item_text or entry.name))
+                # Reviewer NOTE-2 (Step 2c): a curated free-text T3 entry
+                # ("Walk Fergus") keys as ``routine::::<text>`` while an
+                # auto-cadence/self-care entry for the same item keys as
+                # ``routine::<record>::<text>`` — different keys, so both
+                # would render. Track the lowercased text so the auto T3
+                # steps below can suppress the record-anchored duplicate.
+                # (Pre-existing brief behaviour; closing it here is the
+                # cheap win — the full close is the deferred talker
+                # "anchor free-text back to a routine record" path.)
+                curated_t3_texts.add(
+                    (entry.item_text or entry.name).strip().lower()
+                )
 
     # 2. Auto-T1 task candidates (append if not already curated).
     for c in auto_t1_task:
@@ -1578,6 +1595,10 @@ def compute_today_view(
         key = _routine_key(c.routine_record, c.item_text)
         if key in t3_keys:
             continue
+        # NOTE-2 cross-shape dedup: skip if the operator already curated
+        # this item as free-text T3 (different key, same item).
+        if (c.item_text or "").strip().lower() in curated_t3_texts:
+            continue
         t3.append(TierEntry(
             tier=3, origin="routine_item", name=c.item_text, path=c.path,
             source="auto-cadence-routine",
@@ -1595,6 +1616,8 @@ def compute_today_view(
         key = _routine_key(c.routine_record, c.item_text)
         if key in t3_keys:
             continue
+        if (c.item_text or "").strip().lower() in curated_t3_texts:
+            continue  # NOTE-2 cross-shape dedup
         t3.append(TierEntry(
             tier=3, origin="routine_item", name=c.item_text, path=c.path,
             surface_reason="self-care",
@@ -1610,6 +1633,8 @@ def compute_today_view(
         key = _task_key(c.name)
         if key in t3_keys:
             continue
+        if c.name.strip().lower() in curated_t3_texts:
+            continue  # NOTE-2 cross-shape dedup
         t3.append(TierEntry(
             tier=3, origin="task", name=c.name, path=c.path,
             surface_reason="self-care",
@@ -1739,6 +1764,13 @@ def _collect_routine_today(
     existing single source for "what fired today and stays in the
     routine section") so this view never re-derives the cadence + handoff
     logic. Returns the per-item shape the render layer needs.
+
+    ``quiet=True`` (Step 2c reviewer NOTE-1): the brief's tier view runs
+    ~06:00, after the aggregate pass already wrote the daily file + logged
+    each ``handed_off_to_tier`` at 05:59. This call is a derived READ over
+    the same records; without ``quiet`` it would re-emit the same
+    operator-facing handoff logs, duplicating them for every item. The
+    aggregate pass owns that log; the view reads silently.
     """
     from alfred.routine.aggregator import (
         _collect_items_for_today,
@@ -1747,7 +1779,7 @@ def _collect_routine_today(
 
     records = _iter_routine_records(vault_path)
     items, _contributing, _critical = _collect_items_for_today(
-        records, today,
+        records, today, quiet=True,
     )
     out: list[RoutineLine] = []
     for it in items:

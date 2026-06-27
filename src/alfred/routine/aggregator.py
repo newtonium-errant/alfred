@@ -399,6 +399,8 @@ def _decide_tier_handoff(
 def _collect_items_for_today(
     records: list[tuple[Path, dict, str]],
     today: date,
+    *,
+    quiet: bool = False,
 ) -> tuple[list[dict], list[str], list[str]]:
     """Group items by priority for today.
 
@@ -413,6 +415,17 @@ def _collect_items_for_today(
       - ``critical_pending``: list of "Kiki Insulin @ 12:00" formatted
         strings for the frontmatter ``critical_pending`` field. Sorted
         by time, then text.
+
+    ``quiet`` (Step 2c, 2026-06-26): suppress the per-item
+    ``routine.aggregator.handed_off_to_tier`` info log. The AUTHORITATIVE
+    aggregate pass (``run_aggregator_once`` at 05:59) calls this with
+    ``quiet=False`` (default) — it owns the handoff-log emission. The
+    brief's tier view (``compute_today_view`` →
+    ``_collect_routine_today``, ~06:00) calls it with ``quiet=True``: it's
+    a derived READ over the same records, and re-emitting the same
+    operator-facing handoff logs would duplicate them for every item.
+    Same principle as the both-modes warn living only at the aggregate
+    layer (compute paths read silently). Per the 2b reviewer's NOTE-1.
     """
     items_by_text: dict[str, dict] = {}
     contributing: set[str] = set()
@@ -577,31 +590,32 @@ def _collect_items_for_today(
                     # directly which always returned >= today, so
                     # the field stayed non-negative even when the
                     # predicate was treating an item as overdue.
-                    days_to_due = None
-                    if due_pattern is not None:
-                        effective = overdue_effective_due(
-                            due_pattern, completion_log, text, today,
+                    if not quiet:
+                        days_to_due = None
+                        if due_pattern is not None:
+                            effective = overdue_effective_due(
+                                due_pattern, completion_log, text, today,
+                            )
+                            days_to_due = (
+                                (effective - today).days
+                                if effective is not None
+                                else None
+                            )
+                        log.info(
+                            "routine.aggregator.handed_off_to_tier",
+                            item_text=text,
+                            tier=handoff_tier,
+                            days_to_due=days_to_due,
+                            routine_record=name,
+                            detail=(
+                                "routine item handed off to tier section "
+                                f"(T{handoff_tier}); routine-section "
+                                "render suppressed for dedup. T1/T2 path: "
+                                "due_pattern + tier window. T3 path: "
+                                "target_cadence_days + overdue against "
+                                "soft cadence target."
+                            ),
                         )
-                        days_to_due = (
-                            (effective - today).days
-                            if effective is not None
-                            else None
-                        )
-                    log.info(
-                        "routine.aggregator.handed_off_to_tier",
-                        item_text=text,
-                        tier=handoff_tier,
-                        days_to_due=days_to_due,
-                        routine_record=name,
-                        detail=(
-                            "routine item handed off to tier section "
-                            f"(T{handoff_tier}); routine-section "
-                            "render suppressed for dedup. T1/T2 path: "
-                            "due_pattern + tier window. T3 path: "
-                            "target_cadence_days + overdue against "
-                            "soft cadence target."
-                        ),
-                    )
                     continue
 
             time_str = ""

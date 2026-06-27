@@ -531,3 +531,68 @@ def test_self_care_task_with_deadline_goes_t1_not_t3(tmp_path: Path) -> None:
     view = compute_today_view(vault, NOW)
     assert any(e.name == "Urgent Care" for e in view.t1)
     assert all(e.name != "Urgent Care" for e in view.t3)
+
+
+# --- Reviewer carry-forwards (Step 2c NOTE-1 + NOTE-2, 2026-06-26) ---------
+
+
+def test_view_emits_no_handed_off_to_tier_logs(tmp_path: Path) -> None:
+    """NOTE-1: compute_today_view's internal _collect_items_for_today call
+    must run quiet — the aggregate pass (05:59) owns the
+    routine.aggregator.handed_off_to_tier log; the view (~06:00) is a
+    derived read and must NOT re-emit them (duplicate-log fix)."""
+    vault = _vault(tmp_path)
+    _write_routine(
+        vault, "Bills",
+        "type: routine\nstatus: active\nname: Bills\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Pay Rent\n  priority: tracked\n"
+        "  due_pattern:\n    type: weekly\n    day: thu\n"  # due today → handoff
+        "  escalate_at_days: 1\n",
+    )
+    with structlog.testing.capture_logs() as captured:
+        compute_today_view(vault, NOW)
+    handoff = [
+        c for c in captured
+        if c.get("event") == "routine.aggregator.handed_off_to_tier"
+    ]
+    assert handoff == [], (
+        "compute_today_view must not emit handed_off_to_tier logs — the "
+        "aggregate pass owns them; the view reads quiet (NOTE-1)."
+    )
+
+
+def test_curated_freetext_t3_dedups_auto_cadence_same_item(
+    tmp_path: Path,
+) -> None:
+    """NOTE-2: a curated free-text T3 entry ("Walk Fergus") + an
+    auto-cadence T3 entry for the SAME item must render ONCE, not twice
+    (the free-text key and record-anchored key differ; text-match closes
+    it)."""
+    vault = _vault(tmp_path)
+    _write_routine(
+        vault, "Care",
+        "type: routine\nstatus: active\nname: Care\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n  Walk Fergus:\n  - '2026-05-20'\n"  # overdue → auto-T3
+        "items:\n"
+        "- text: Walk Fergus\n  priority: aspirational\n"
+        "  target_cadence_days: 3\n",
+    )
+    _write_daily_curation(
+        vault, "2026-05-28",
+        "type: daily\ndate: '2026-05-28'\n"
+        "tier_curation:\n"
+        "  t1: []\n  t2: []\n"
+        "  t3:\n  - item: Walk Fergus\n    source: operator\n"
+        "  curated_at: '2026-05-28T07:00:00-03:00'\n",
+    )
+    view = compute_today_view(vault, NOW)
+    walk = [e for e in view.t3 if (e.item_text or e.name) == "Walk Fergus"]
+    assert len(walk) == 1, (
+        f"Walk Fergus rendered {len(walk)}x in T3 — curated free-text + "
+        "auto-cadence must dedup to one (NOTE-2)."
+    )
+    # The curated entry wins (operator-authoritative).
+    assert walk[0].source == "operator"
