@@ -24,9 +24,15 @@ package so ``cls.__module__`` resolves cleanly against ``sys.modules``
 (dataclass machinery requires this when the loader is
 ``importlib.util.spec_from_file_location``).
 
-Recommended invocation (post-package-hoist):
+Recommended invocation (post-package-hoist; ARCHIVED — a live run
+requires the acknowledgement flag, dry-run inspects freely):
 
-    python -m alfred.scripts.migrate_2026_05_30_strip_v1_tier_fields [--dry-run]
+    # Inspect — NO writes.
+    python -m alfred.scripts.migrate_2026_05_30_strip_v1_tier_fields --dry-run
+
+    # Execute (deliberate operational run only).
+    python -m alfred.scripts.migrate_2026_05_30_strip_v1_tier_fields \
+        --i-understand-this-is-archived
 """
 
 from __future__ import annotations
