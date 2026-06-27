@@ -197,7 +197,15 @@ class Labeler:
         llm_tags: list[str] = []
         if response is not None:
             try:
-                parsed = json.loads(response)
+                # Strip markdown code fences before parsing — a model that
+                # wraps its tag array in ```json fences (e.g. Claude Haiku,
+                # confirmed in the labeler bake-off) would otherwise throw
+                # here → llm_tags=[] → ALL its descriptive tags silently
+                # dropped. Mirrors suggest_relationships, which already
+                # strips fences; this aligns the tag parser with the rel
+                # parser (live Groq emits bare JSON, so no behaviour change
+                # there — _strip_code_fences passes raw JSON through).
+                parsed = json.loads(_strip_code_fences(response))
                 if isinstance(parsed, list) and all(isinstance(t, str) for t in parsed):
                     llm_tags = parsed[:3]
             except (json.JSONDecodeError, TypeError):

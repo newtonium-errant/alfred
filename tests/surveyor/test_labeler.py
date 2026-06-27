@@ -4,6 +4,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+import structlog
 
 from alfred.surveyor.config import LabelerConfig, OpenRouterConfig
 from alfred.surveyor.labeler import (
@@ -165,6 +166,126 @@ async def test_label_cluster_below_min_size_returns_empty(monkeypatch):
     }
     tags = await labeler.label_cluster(
         cluster_id=6,
+        member_paths=list(records.keys()),
+        records=records,
+    )
+    assert tags == []
+
+
+# ---------------------------------------------------------------------------
+# Tag-parser code-fence handling (labeler bake-off fix)
+# ---------------------------------------------------------------------------
+#
+# label_cluster must strip ```json fences before json.loads the tag
+# response — exactly like suggest_relationships already does. A
+# fence-wrapping model (Claude Haiku, confirmed in the bake-off) would
+# otherwise throw → llm_tags=[] → all its descriptive tags silently
+# dropped. Live Groq emits bare JSON, so the bare case must still work.
+
+
+@pytest.mark.asyncio
+async def test_label_cluster_strips_json_code_fences(monkeypatch):
+    """(a) THE fix: a fenced tag response now parses (it previously threw
+    JSONDecodeError → tags dropped). No-entity cluster so the result is
+    LLM-tags-only, making the parse outcome unambiguous."""
+    labeler = _make_labeler(
+        monkeypatch,
+        llm_response='```json\n["construction/residential"]\n```',
+    )
+    records = {
+        "note/x.md": _record("note/x.md", "note"),
+        "event/y.md": _record("event/y.md", "event"),
+    }
+    tags = await labeler.label_cluster(
+        cluster_id=10,
+        member_paths=list(records.keys()),
+        records=records,
+    )
+    assert tags == ["construction/residential"]
+
+
+@pytest.mark.asyncio
+async def test_label_cluster_strips_bare_fences_no_lang_tag(monkeypatch):
+    """A fence without a language tag (```\\n[...]\\n```) also parses —
+    mirrors _strip_code_fences's no-tag branch."""
+    labeler = _make_labeler(
+        monkeypatch,
+        llm_response='```\n["devops", "infra"]\n```',
+    )
+    records = {
+        "note/x.md": _record("note/x.md", "note"),
+        "event/y.md": _record("event/y.md", "event"),
+    }
+    tags = await labeler.label_cluster(
+        cluster_id=11,
+        member_paths=list(records.keys()),
+        records=records,
+    )
+    assert tags == ["devops", "infra"]
+
+
+@pytest.mark.asyncio
+async def test_label_cluster_bare_json_still_parses_no_regression(monkeypatch):
+    """(b) Regression guard: the live Groq shape (bare JSON, no fences)
+    still parses unchanged — _strip_code_fences passes raw JSON through."""
+    labeler = _make_labeler(
+        monkeypatch,
+        llm_response='["infrastructure", "devops"]',
+    )
+    records = {
+        "note/x.md": _record("note/x.md", "note"),
+        "event/y.md": _record("event/y.md", "event"),
+    }
+    tags = await labeler.label_cluster(
+        cluster_id=12,
+        member_paths=list(records.keys()),
+        records=records,
+    )
+    assert tags == ["infrastructure", "devops"]
+
+
+@pytest.mark.asyncio
+async def test_label_cluster_malformed_response_yields_empty_with_log(
+    monkeypatch,
+):
+    """(c) A genuinely-malformed (non-JSON) response still yields [] AND
+    emits the labeler.parse_error log — the fence strip doesn't mask a
+    real parse failure."""
+    labeler = _make_labeler(
+        monkeypatch,
+        llm_response="not json at all, just prose",
+    )
+    records = {
+        "note/x.md": _record("note/x.md", "note"),
+        "event/y.md": _record("event/y.md", "event"),
+    }
+    with structlog.testing.capture_logs() as captured:
+        tags = await labeler.label_cluster(
+            cluster_id=13,
+            member_paths=list(records.keys()),
+            records=records,
+        )
+    assert tags == []
+    errs = [c for c in captured if c.get("event") == "labeler.parse_error"]
+    assert len(errs) == 1
+    assert errs[0]["cluster_id"] == 13
+
+
+@pytest.mark.asyncio
+async def test_label_cluster_non_list_json_yields_empty(monkeypatch):
+    """A valid-JSON-but-not-a-list response (e.g. an object) → [] (the
+    isinstance(list) guard), not a crash — fence strip is orthogonal to
+    the shape check."""
+    labeler = _make_labeler(
+        monkeypatch,
+        llm_response='```json\n{"tag": "nope"}\n```',
+    )
+    records = {
+        "note/x.md": _record("note/x.md", "note"),
+        "event/y.md": _record("event/y.md", "event"),
+    }
+    tags = await labeler.label_cluster(
+        cluster_id=14,
         member_paths=list(records.keys()),
         records=records,
     )
