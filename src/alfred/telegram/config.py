@@ -127,11 +127,81 @@ class AnthropicConfig:
     temperature: float = 0.7
 
 
+# Default domain-vocab biasing terms (STT fallback spec §9, must-fix 2).
+# Migrated from the previously-hardcoded ``transcribe._STT_VOCABULARY_PROMPT``
+# so EVERY backend in the chain biases the same terms (Whisper prompt=,
+# Deepgram keywords) — without this a fallback transcribes domain terms
+# worse than primary, breaking the "comparable = seamless" claim (§7).
+# Per-instance configs may override ``stt.vocab_terms``.
+_DEFAULT_STT_VOCAB_TERMS: list[str] = [
+    "Algernon", "Salem", "S.A.L.E.M.", "KAL-LE", "K.A.L.-L.E.", "Hypatia",
+    "V.E.R.A.", "STAY-C", "Zettelkasten", "aftermath-lab",
+    "library-alexandria", "distiller", "surveyor", "curator", "janitor",
+    "talker", "gcal", "Obsidian", "Andrew Newton", "RRTS", "Fergus",
+    "Marcus Aurelius", "Heraclitus", "Stoicism", "Epicureanism",
+    "Meditations", "Hayes", "Ryan Holiday",
+]
+
+
+@dataclass
+class SttBackendConfig:
+    """One backend in the STT fallback chain (spec §9).
+
+    A 2-backend chain (Groq → Deepgram) in M1; M4 adds the local-whisper
+    ``never_skip`` backstop. ``api_key`` is env-substituted upstream
+    (``${GROQ_API_KEY}`` / ``${DEEPGRAM_API_KEY}``) before the dataclass
+    is built. ``tier`` drives the §7 seamless-vs-flagged UX (M1 backends
+    are both ``comparable`` → seamless). ``never_skip`` is carried now for
+    the M2 circuit-breaker / M4 backstop (no M1 backend sets it).
+    """
+
+    backend: str = "groq-whisper"          # "groq-whisper" | "deepgram"
+    api_key: str = ""
+    model: str = ""                        # backend-specific default if ""
+    tier: str = "comparable"
+    timeout_s: float = 10.0
+    language: str = "en"
+    never_skip: bool = False
+    # Groq-only: verbose_json is required for no_speech_prob / avg_logprob.
+    response_format: str = "verbose_json"
+    # Deepgram-only output-shape parity (§7) — NOT optional in practice.
+    punctuate: bool = True
+    smart_format: bool = True
+
+
 @dataclass
 class STTConfig:
+    # --- legacy single-backend fields (back-compat) ---
+    # Existing per-instance configs (Salem/KAL-LE/Hypatia) carry only these
+    # three. When ``chain`` is empty they synthesize a 1-backend Groq chain
+    # (``effective_chain``), preserving today's exact behaviour.
     provider: str = "groq"
     api_key: str = ""
     model: str = "whisper-large-v3"
+    # --- STT fallback chain (spec §9) ---
+    vocab_terms: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_STT_VOCAB_TERMS)
+    )
+    total_budget_s: float = 30.0           # global per-message chain deadline
+    min_transcript_chars: int = 3          # "empty" threshold (post-trim)
+    chain: list[SttBackendConfig] = field(default_factory=list)
+
+    def effective_chain(self) -> list[SttBackendConfig]:
+        """The chain to run — the explicit ``chain`` if configured, else a
+        single Groq backend synthesized from the legacy fields.
+
+        Back-compat: an instance with only the old ``provider``/``api_key``/
+        ``model`` (no ``chain:``) runs exactly as before — one Groq backend,
+        no fallback. An instance that adds ``chain:`` gets the fallback.
+        """
+        if self.chain:
+            return self.chain
+        return [SttBackendConfig(
+            backend="groq-whisper",
+            api_key=self.api_key,
+            model=self.model or "whisper-large-v3",
+            tier="comparable",
+        )]
 
 
 @dataclass
@@ -589,12 +659,26 @@ _DATACLASS_MAP: dict[str, type] = {
 }
 
 
+# List-valued config keys whose items are dicts to build into a dataclass.
+# (The scalar ``_DATACLASS_MAP`` recurses into dict values; this handles
+# list-of-dict values like ``stt.chain`` → list[SttBackendConfig].)
+_LIST_DATACLASS_MAP: dict[str, type] = {
+    "chain": SttBackendConfig,
+}
+
+
 def _build(cls: type, data: dict[str, Any]) -> Any:
     """Recursively construct a dataclass from a dict."""
     kwargs: dict[str, Any] = {}
     for key, value in data.items():
         if key in _DATACLASS_MAP and isinstance(value, dict):
             kwargs[key] = _build(_DATACLASS_MAP[key], value)
+        elif key in _LIST_DATACLASS_MAP and isinstance(value, list):
+            item_cls = _LIST_DATACLASS_MAP[key]
+            kwargs[key] = [
+                _build(item_cls, item) if isinstance(item, dict) else item
+                for item in value
+            ]
         else:
             kwargs[key] = value
     return cls(**kwargs)

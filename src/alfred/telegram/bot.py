@@ -51,6 +51,7 @@ from . import (
     session,
     session_types,
     speed_pref,
+    stt_backends,
     transcribe,
     tts as tts_mod,
     vision,
@@ -4004,22 +4005,32 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    try:
-        text = await transcribe.transcribe(audio_bytes, "audio/ogg", config.stt)
-    except transcribe.TranscribeError as exc:
-        log.info("talker.bot.transcribe_failed", error=str(exc))
+    # STT fallback chain (M1, spec algernon-stt-fallback-2026-06-27): route
+    # the audio through the configured chain (Groq primary → Deepgram backup)
+    # instead of a single direct Groq call. The router applies the §4 matrix
+    # (network/429/auth/empty → next; genuine silence → serve; chain-end
+    # empty → degrade) and returns a served SttResult or NoTranscript. Both
+    # M1 backends are tier="comparable" → a served fallback is seamless (no
+    # user marker — M4 adds the degraded-tier marker for local-whisper).
+    chain = stt_backends.build_chain(config.stt)
+    result = await stt_backends.transcribe_with_fallback(
+        audio_bytes,
+        "audio/ogg",
+        chain,
+        config.stt.vocab_terms,
+        config.stt.total_budget_s,
+        min_transcript_chars=config.stt.min_transcript_chars,
+    )
+    if isinstance(result, stt_backends.NoTranscript):
+        # Every backend failed, or the chain degraded to empty at its end —
+        # ask the user to type (the ILB "ran, couldn't" graceful-degrade).
+        log.info("talker.bot.transcribe_no_transcript", reason=result.reason)
         await update.message.reply_text(
             "sorry, couldn't transcribe — try again or send a text message?"
         )
         return
-    except NotImplementedError as exc:
-        log.warning("talker.bot.transcribe_unsupported", error=str(exc))
-        await update.message.reply_text(
-            "voice isn't configured right now — please send a text message."
-        )
-        return
 
-    await handle_message(update, ctx, text=text, voice=True)
+    await handle_message(update, ctx, text=result.text, voice=True)
 
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

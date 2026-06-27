@@ -79,6 +79,13 @@ voice = [
     # Both new deps are pure-Python, MIT-licensed, actively maintained.
     "python-docx>=1.0",
     "icalendar>=5.0",
+    # STT fallback chain (M1, 2026-06-27): Deepgram as the backup STT behind
+    # Groq Whisper. The implementation uses httpx directly (no SDK
+    # import-time dep in src/ — mirrors the ElevenLabs convention above, and
+    # keeps the regression pins runnable without the SDK installed); pinning
+    # the official SDK here installs it for users who want to swap to
+    # SDK-based calls later without another pip install.
+    "deepgram-sdk>=3.0",
 ]
 dev = [
     "pytest>=8.0",
