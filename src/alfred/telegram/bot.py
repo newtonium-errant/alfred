@@ -4019,12 +4019,24 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         chain,
         config.stt.vocab_terms,
         config.stt.total_budget_s,
-        min_transcript_chars=config.stt.min_transcript_chars,
     )
-    if isinstance(result, stt_backends.NoTranscript):
-        # Every backend failed, or the chain degraded to empty at its end —
-        # ask the user to type (the ILB "ran, couldn't" graceful-degrade).
-        log.info("talker.bot.transcribe_no_transcript", reason=result.reason)
+    # Reprompt on no-transcript OR served-empty (spec decision #4, resolved →
+    # reprompt-on-empty). The router correctly SERVEs a genuine-silence
+    # primary's empty result (has_speech_signal=False) without re-spending on
+    # the backup — but a served empty/whitespace-only transcript must NOT be
+    # forwarded as a blank message into the conversation turn. Treat it the
+    # same as NoTranscript: ask the user to type, preserving today's
+    # reprompt-on-empty UX. (The no-re-spend stays at the router; the UX
+    # decision stays at the bot.)
+    if (
+        isinstance(result, stt_backends.NoTranscript)
+        or not result.text.strip()
+    ):
+        reason = (
+            result.reason if isinstance(result, stt_backends.NoTranscript)
+            else "served_empty"
+        )
+        log.info("talker.bot.transcribe_no_transcript", reason=reason)
         await update.message.reply_text(
             "sorry, couldn't transcribe — try again or send a text message?"
         )

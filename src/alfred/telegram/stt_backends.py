@@ -534,8 +534,6 @@ async def transcribe_with_fallback(
     chain: list[SttBackend],
     vocab: list[str],
     total_budget_s: float,
-    *,
-    min_transcript_chars: int = 3,
 ) -> SttResult | NoTranscript:
     """Route ``audio`` through ``chain`` (primary → backups), §3 + §4.
 
