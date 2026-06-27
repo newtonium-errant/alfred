@@ -196,9 +196,23 @@ This V2 model replaces the V1 per-task `base_tier` / `escalate_to` fields (shipp
 
 - **T1 — imminent deadline.** Hard deadline today or tomorrow, must act. Auto-surfaced from `due` (today/tomorrow) plus the `escalate_at_days` window. Operator confirms each unless already done.
 - **T2 — on the radar.** May have a deadline but further out than today/tomorrow; "work getting ahead" or "maintenance task being put off." Operator-curated from the T2 selection pool.
-- **T3 — self-care for today.** Personal/self-care intentions for mental health day-to-day (walk Fergus, exercise, music, reading). Operator-curated each morning from the routine's Aspirational items or as ad-hoc additions. **T3 is NEVER a "low priority" fallback bucket** — it's the operator's deliberate self-care list.
+- **T3 — self-care for today.** Personal/self-care intentions for mental health day-to-day (walk Fergus, exercise, music, reading). T3 is a **dedicated lane**, populated three ways: operator-curated each morning from the routine's Aspirational items, ad-hoc additions, soft-cadence auto-suggestions (overdue against `target_cadence_days`), AND the `self_care` floor (items/tasks flagged `self_care: true` surface here every day until done — see **The `self_care` flag — daily self-care floor** below). **T3 is NEVER a "low priority" fallback bucket** — it's a deliberate lane that exists so self-care is *included* in the day, not the bucket where unimportant things land. Frame it that way to Andrew: T3 is the day's self-care, surfaced on purpose.
 
 **Load-bearing design principle — don't lean on operator memory.** Anywhere the system would force Andrew to remember something is a feature opportunity for the system to handle. The auto-T1 surface, `escalate_at_days` knob, rollover indicators, and the daily file persistence all exist for this reason. When designing a response, ask: "am I making Andrew remember something Salem could surface?" If yes, surface it.
+
+#### The `self_care` flag — daily self-care floor
+
+A `task` or routine item can be flagged `self_care: true`. A self-care item is an **intrinsic** classification — it surfaces to the **T3 self-care lane every day until it's done that day**, regardless of any deadline cadence. This is the "self-care floor": the lane that makes sure self-care is *included* in the day rather than crowded out by deadline-driven work. Frame it in the gentle register — a self-care item showing up isn't a nag or a backlog; it's the day's self-care, surfaced on purpose. (Verified against `alfred.tier.compute.classify_routine_item` — the `self_care` T3 branch surfaces a non-deadline self_care item to tier 3 when it isn't completed today; and `compute_self_care_candidates` / `compute_self_care_task_candidates` build those surfaces.)
+
+**`self_care` vs a real deadline.** `self_care` is the floor, NOT a priority override. A self_care item that ALSO carries a real deadline (a task with a near `due`, or a routine item with a `due_pattern` + `escalate_at_days`) still classifies into **T1/T2 on the deadline** — deadline pressure is real and wins over the self-care floor. The self-care floor only applies to items with no external deadline pressure. (Verified against `classify_routine_item`: a `due_pattern`-bearing item takes the T1/T2 branch; `compute_self_care_task_candidates` excludes any task already surfacing as an auto-T1 candidate.)
+
+**Setting `self_care` — the working path is TASKS.** When Andrew says something like *"make booking a massage a self-care thing"* / *"flag exercise as self-care"* and the item is a one-off **task**, set `self_care: true` on the task record via the normal write path — `vault_create type=task ... set_fields={"self_care": true, ...}` for a new task, or `vault_edit path="task/<Name>.md" set_fields={"self_care": true}` for an existing one. It's an opt-in boolean (defaults to `false`); a self_care task with no near deadline surfaces in the T3 floor, a self_care task with a near deadline surfaces in T1.
+
+> Andrew: *"Add 'book a massage' as a self-care task."*
+>
+> Salem (internal): one-off task, self-care intention. `vault_create type=task name="Book a massage" set_fields={"self_care": true, "status": "todo"}` (no `due` → no deadline pressure → it'll sit in the T3 self-care floor each day until done). Reply: *"Created `Book a massage` as a self-care task — it'll show up in your T3 self-care lane each day until you've done it. No deadline on it, so it stays in the self-care floor, not the urgent lane."*
+
+**Recurring self-care lives on the routine record.** A *recurring* self-care practice (walk Fergus, daily meditation) belongs on a `routine/` record as an item, not as a standing `self_care` task. The conversational `routine_item` tool doesn't carry a `self_care` field yet, so don't reach for it to set self-care on a routine item — if Andrew wants a recurring practice marked as the daily self-care floor, say it's on the roadmap and, for now, surface the practice via the existing T3 routes (soft-cadence `target_cadence_days` for "do it every N days," or the Aspirational standing-practices pool). Don't instruct a tool path that would silently drop the flag.
 
 #### The four operator reply patterns
 
@@ -348,9 +362,11 @@ The verb grammar is the same as task-origin — `T1 confirm <item text>` and `T2
 
 #### The brief surface — render shapes operator will see
 
-The morning brief has a section titled exactly `Open Tasks by Tier` (single source of truth in `alfred.brief.tier_section.SECTION_HEADER`). It renders three subsections of curated shortlists followed by materials:
+The morning brief has a section titled exactly `Open Tasks by Tier` (single source of truth in `alfred.brief.tier_section.SECTION_HEADER`). It leads with the **daily-goal status line** (see **The daily goal — a balanced day** below), then three subsections of curated shortlists followed by materials:
 
 ```
+**Daily goal — balanced day:** not yet · T1 0/2 · T2 0/1 · T3 0/1
+
 ### T1 — Imminent deadlines (auto-surfaced — confirm or drop)
 - [ ] [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
 - [ ] [[task/Pay Clinic Rental]] — due tomorrow
@@ -373,6 +389,19 @@ The morning brief has a section titled exactly `Open Tasks by Tier` (single sour
 ```
 
 **The empty-bucket prompt strings, rollover header, pool header, and routine-T2 affordances are stable verbatim contracts** pinned in `alfred.brief.tier_section` as `T1_CONFIRM_PROMPT`, `T2_EMPTY_PROMPT`, `T3_EMPTY_PROMPT`, `ROLLOVER_HEADER`, `T2_POOL_HEADER`, plus the two Ship B additions `T2_AUTO_ROUTINE_HEADER` and `T2_ROUTINE_CONFIRM_PROMPT` (see **Routine-origin tier entries** above for the routine-specific shapes). Salem recognises these strings in the brief to know which reply pattern is expected. If any string changes at the code layer, this SKILL needs a follow-up sweep.
+
+#### The daily goal — a balanced day
+
+The **point** of the three tiers isn't to clear the urgent lane — it's a **balanced day**. The daily goal is to finish **at least one item from each of T1, T2, and T3** (urgent + medium + self-care), ideally with all T1 done. The brief renders this as a status line at the **top** of the `Open Tasks by Tier` section. The exact strings (verbatim from `alfred.brief.tier_section.render_daily_goal_line`):
+
+- Goal met: `**Daily goal — balanced day:** ✓ achieved · T1 1/2 · T2 1/1 · T3 0/1`
+- Goal not yet met: `**Daily goal — balanced day:** not yet · T1 0/2 · T2 0/1 · T3 0/1`
+- All T1 also done (the ideal): a ` · all T1 done` suffix is appended (e.g. `... · T3 1/1 · all T1 done`)
+- No tier items today at all: `**Daily goal:** no tier items yet today.`
+
+Each lane shows `done/available` (e.g. `T1 1/2` = one of two T1 items done). "Balanced day" is `True` only when **every** lane has at least one done. (Verified against `alfred.tier.compute.DailyGoalState` + `render_daily_goal_line`: `balanced_day` requires `t1_done >= 1 and t2_done >= 1 and t3_done >= 1`; `all_t1_done` is vacuously true when there are no T1 items.)
+
+**When Andrew asks "what should I do today" / "what's my balanced-day status" / "am I on track":** read today's daily file (`vault_read path="daily/<today>.md"`) for the tier lanes, or read the rendered brief, and answer in terms of the balanced-day goal — name what's still needed to balance the day (e.g. *"You've cleared a T1 and a T2; you just need one T3 to hit a balanced day — want to pick a self-care item?"*). Frame it as **encouragement, not a deficit tally**: the goal is one-of-each as a positive target, not a scorecard of what's undone. A day with self-care included is the win, not a day with everything cleared.
 
 #### Worked example A — operator-named T1 add (and auto-T1 confirm)
 
