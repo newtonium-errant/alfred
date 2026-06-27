@@ -48,7 +48,7 @@ import structlog
 from alfred.brief.renderer import serialize_record
 
 from .cadence import CadenceError, is_due
-from .config import DuePattern, RoutineConfig
+from .config import DuePattern, RoutineConfig, _coerce_self_care
 from .due import (
     is_done_in_current_cycle,
     overdue_effective_due,
@@ -530,14 +530,8 @@ def _collect_items_for_today(
             except (TypeError, ValueError):
                 target_cadence_days = None
             # Q2 (2026-06-26): parse self_care for the dedicated T3
-            # self-care lane (same coercion as Item.from_dict).
-            self_care_raw = raw_item.get("self_care", False)
-            if isinstance(self_care_raw, str):
-                self_care = self_care_raw.strip().lower() in (
-                    "true", "yes", "1", "on",
-                )
-            else:
-                self_care = bool(self_care_raw)
+            # self-care lane. Shared coercion (no drift across readers).
+            self_care = _coerce_self_care(raw_item.get("self_care", False))
 
             # T1/T2 handoff path: only Critical/Tracked items with
             # due_pattern. T3 handoff path: any item with
@@ -871,50 +865,71 @@ def run_aggregator_once(
     name = config.output.name_template.replace("{date}", iso)
     rel_path = f"{config.output.directory}/{name}.md"
     file_path = vault_path / rel_path
-
-    # Preserve any pre-existing tier_curation block. Talker may have
-    # pre-edited the daily file before the 05:59 aggregator fire; or
-    # the operator may have run ``alfred routine`` manually mid-day
-    # to refresh the aggregator side without touching the curation.
-    preserved_curation = _load_existing_tier_curation(file_path)
-
-    body = render_daily_body(items, no_routines_overall)
-    fm: dict[str, Any] = {
-        "type": "daily",
-        "date": iso,
-        "routines_contributing": contributing,
-        "critical_pending": critical_pending,
-    }
-    if preserved_curation is not None:
-        fm["tier_curation"] = preserved_curation
-        log.info(
-            "routine.aggregator.preserved_tier_curation",
-            path=rel_path,
-            date=iso,
-            detail=(
-                "pre-existing ``tier_curation`` block preserved in the "
-                "aggregator's write. Talker pre-edit OR mid-day "
-                "operator refresh likely cause; either way the curation "
-                "stays intact."
-            ),
-        )
-    content = serialize_record(fm, body)
-
-    # Atomic write (Step 2 writer-race fix, 2026-06-26). The daily file
-    # ``daily/<date>.md`` has TWO writers — this aggregator (owns
-    # ``type``/``date``/``routines_contributing``/``critical_pending`` +
-    # body) and ``daily_curation.save_tier_curation`` (owns the
-    # ``tier_curation`` block). Both do read-preserve-write of the
-    # whole file; a non-atomic ``write_text`` left a window where a
-    # concurrent reader (the brief) or the other writer could see a
-    # truncated file. ``.tmp`` → ``os.replace`` makes each write atomic.
-    # The tmp suffix is WRITER-DISTINGUISHED (``.routine.tmp``) so the
-    # two writers' tmp files never collide. Per the project-standard
-    # atomic-write contract (transport/instructor/curator state.py).
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = file_path.with_suffix(".routine.tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, file_path)
+
+    # Lost-update lock (Step 5, 2026-06-27): serialize this whole
+    # read-preserve-write against ``save_tier_curation``'s RMW on the
+    # same daily file. Without the lock, the talker could write a fresh
+    # tier_curation block AFTER we read (``_load_existing_tier_curation``)
+    # but BEFORE we write — and our write would preserve the STALE
+    # block, silently losing the operator's just-made curation. The
+    # ``fcntl.flock`` makes the two writers serialize. Atomic write
+    # (below) closed torn-reads; this closes lost-update. The lock is
+    # keyed on the resolved ``file_path`` so it matches the curation
+    # writer's lock on the same file.
+    from alfred.tier.daily_curation import daily_file_lock
+
+    with daily_file_lock(file_path):
+        # Preserve any pre-existing tier_curation block. Talker may have
+        # pre-edited the daily file before the 05:59 aggregator fire; or
+        # the operator may have run ``alfred routine`` manually mid-day
+        # to refresh the aggregator side without touching the curation.
+        # (Read INSIDE the lock so it can't go stale before the write.)
+        preserved_curation = _load_existing_tier_curation(file_path)
+
+        body = render_daily_body(items, no_routines_overall)
+        fm: dict[str, Any] = {
+            "type": "daily",
+            "date": iso,
+            "routines_contributing": contributing,
+            "critical_pending": critical_pending,
+        }
+        if preserved_curation is not None:
+            fm["tier_curation"] = preserved_curation
+            log.info(
+                "routine.aggregator.preserved_tier_curation",
+                path=rel_path,
+                date=iso,
+                detail=(
+                    "pre-existing ``tier_curation`` block preserved in "
+                    "the aggregator's write. Talker pre-edit OR mid-day "
+                    "operator refresh likely cause; either way the "
+                    "curation stays intact."
+                ),
+            )
+        content = serialize_record(fm, body)
+
+        # Atomic write (Step 2 writer-race fix, 2026-06-26). The daily
+        # file ``daily/<date>.md`` has TWO writers — this aggregator
+        # (owns ``type``/``date``/``routines_contributing``/
+        # ``critical_pending`` + body) and
+        # ``daily_curation.save_tier_curation`` (owns ``tier_curation``).
+        # Both do read-preserve-write of the whole file; a non-atomic
+        # ``write_text`` left a window where a concurrent reader (the
+        # brief) could see a truncated file. ``.tmp`` → ``os.replace``
+        # makes each write atomic. The tmp suffix is
+        # WRITER-DISTINGUISHED (``.routine.tmp``) so the two writers'
+        # tmp files never collide. Per the project-standard atomic-write
+        # contract (transport/instructor/curator state.py).
+        tmp_path = file_path.with_suffix(".routine.tmp")
+        # orphan-tmp cleanup (reviewer NOTE, 2026-06-27): try/finally
+        # removes a stale .routine.tmp on any failure path; on success
+        # os.replace already moved it (unlink is a no-op).
+        try:
+            tmp_path.write_text(content, encoding="utf-8")
+            os.replace(tmp_path, file_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     log.info(
         "routine.aggregator.written",

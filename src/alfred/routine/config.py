@@ -85,6 +85,25 @@ DUE_PATTERN_TYPES: frozenset[str] = frozenset({
 })
 
 
+def _coerce_self_care(raw: Any) -> bool:
+    """Coerce a frontmatter ``self_care`` value to a bool (Q2, 2026-06-26).
+
+    Shared by the three readers of the field (``Item.from_dict``, the
+    routine aggregator's per-item parse, and the tier compute task-scan)
+    so the truthy-string handling can't drift between them (reviewer NOTE,
+    2026-06-27).
+
+    PyYAML parses a bare ``self_care: true`` / ``yes`` to a real bool
+    already; the explicit string branch handles a QUOTED form
+    (``self_care: "true"``) — ``bool("false")`` is ``True`` in Python, so
+    a naive ``bool()`` on the string form would be wrong. Anything not
+    recognised as truthy-string and not already truthy → ``False``.
+    """
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("true", "yes", "1", "on")
+    return bool(raw)
+
+
 @dataclass
 class DuePattern:
     """Recurring-deadline pattern for a routine item.
@@ -282,19 +301,10 @@ class Item:
             )
         except (TypeError, ValueError):
             target_cadence_days = None
-        # Q2 (2026-06-26): self_care flag → T3 lane. Coerce truthy
-        # values defensively (operator may write ``self_care: true`` or
-        # ``self_care: yes``; PyYAML parses bare ``true``/``yes`` to a
-        # bool already, but a quoted ``"true"`` string would slip
-        # through — ``bool("false")`` is True, so handle the string form
-        # explicitly).
-        self_care_raw = data.get("self_care", False)
-        if isinstance(self_care_raw, str):
-            self_care = self_care_raw.strip().lower() in (
-                "true", "yes", "1", "on",
-            )
-        else:
-            self_care = bool(self_care_raw)
+        # Q2 (2026-06-26): self_care flag → T3 lane. Shared coercion
+        # (``_coerce_self_care``) so the truthy-string handling can't
+        # drift across the three readers of the field.
+        self_care = _coerce_self_care(data.get("self_care", False))
         return cls(
             text=text.strip(),
             priority=priority,
@@ -476,5 +486,6 @@ __all__ = [
     "RoutineConfig",
     "StateConfig",
     "TierDefaultsConfig",
+    "_coerce_self_care",
     "load_from_unified",
 ]

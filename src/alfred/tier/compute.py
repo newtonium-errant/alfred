@@ -1281,14 +1281,10 @@ def compute_self_care_task_candidates(
             continue
         if fm.get("alfred_triage") is True:
             continue
-        # Coerce self_care the same way Item.from_dict does (string-form
-        # defensive).
-        sc_raw = fm.get("self_care", False)
-        if isinstance(sc_raw, str):
-            self_care = sc_raw.strip().lower() in ("true", "yes", "1", "on")
-        else:
-            self_care = bool(sc_raw)
-        if not self_care:
+        # Coerce self_care via the shared helper (no drift across the
+        # three readers of the field — reviewer NOTE 2026-06-27).
+        from alfred.routine.config import _coerce_self_care
+        if not _coerce_self_care(fm.get("self_care", False)):
             continue
         name = str(fm.get("name") or path.stem)
         if name in auto_t1_names:

@@ -1766,3 +1766,40 @@ def test_decide_handoff_completion_for_prev_cycle_doesnt_satisfy_current(
     ]
     assert len(handoffs) == 1
     assert handoffs[0]["tier"] == 1
+
+
+def test_aggregator_cleans_orphan_tmp_on_replace_failure(
+    tmp_path: Path,
+) -> None:
+    """orphan-tmp cleanup (reviewer NOTE, 2026-06-27): a failed
+    os.replace in the aggregator write must NOT leave a stale
+    .routine.tmp orphan — the try/finally unlinks it."""
+    import alfred.routine.aggregator as agg
+
+    vault = tmp_path / "vault"
+    today = date(2026, 5, 26)
+    _write_routine(vault, "Daily R", {
+        "type": "routine",
+        "status": "active",
+        "name": "Daily R",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Brush AM", "priority": "tracked"}],
+    })
+    config = _config(vault, tmp_path)
+
+    def _boom(src, dst):
+        raise OSError("simulated replace failure")
+
+    orig = agg.os.replace
+    agg.os.replace = _boom
+    try:
+        try:
+            run_aggregator_once(config, today)
+        except OSError:
+            pass
+    finally:
+        agg.os.replace = orig
+
+    assert not (vault / "daily" / "2026-05-26.routine.tmp").exists(), (
+        "failed os.replace left an orphan .routine.tmp"
+    )

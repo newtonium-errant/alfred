@@ -32,6 +32,7 @@ from alfred.tier.daily_curation import (
     T1_T2_SOURCES,
     T3Entry,
     T3_SOURCES,
+    daily_file_lock,
     load_daily_curation,
     save_tier_curation,
 )
@@ -730,3 +731,187 @@ def test_aggregator_and_curation_tmp_suffixes_distinct() -> None:
     assert routine_tmp != curation_tmp
     assert str(routine_tmp).endswith(".routine.tmp")
     assert str(curation_tmp).endswith(".curation.tmp")
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — lost-update flock (2026-06-27)
+# ---------------------------------------------------------------------------
+#
+# The atomic .tmp→os.replace write closed torn-reads but NOT the
+# lost-update race (two RMW writers in separate processes: A reads, B
+# reads, A writes, B writes-preserving-A's-stale-view → A's keys lost).
+# daily_file_lock serializes each writer's whole RMW via fcntl.flock on a
+# sidecar .lock. These tests are deterministic (no sleeps/timing) — on
+# Linux flock on two separate open() fds of the same file blocks even
+# within one process, so mutual exclusion is testable in-process.
+
+import fcntl as _fcntl_test
+
+
+def test_daily_file_lock_is_mutually_exclusive(tmp_path: Path) -> None:
+    """While the lock is held, a second exclusive acquire on the same
+    sidecar fails (non-blocking) — proves the lock is actually held, so
+    a concurrent writer's RMW would block rather than interleave."""
+    vault = _make_vault(tmp_path)
+    daily_file = vault / "daily" / "2026-05-29.md"
+    lock_path = daily_file.with_suffix(".lock")
+
+    with daily_file_lock(daily_file):
+        # Lock sidecar created + held. A fresh fd's non-blocking
+        # exclusive acquire must fail (someone holds it).
+        with open(lock_path, "a", encoding="utf-8") as probe:
+            raised = False
+            try:
+                _fcntl_test.flock(
+                    probe.fileno(),
+                    _fcntl_test.LOCK_EX | _fcntl_test.LOCK_NB,
+                )
+            except BlockingIOError:
+                raised = True
+            finally:
+                # If we somehow acquired, release so cleanup is clean.
+                if not raised:
+                    _fcntl_test.flock(probe.fileno(), _fcntl_test.LOCK_UN)
+    assert raised, (
+        "daily_file_lock did not hold the lock exclusively — a "
+        "concurrent RMW could interleave (lost-update window open)."
+    )
+
+
+def test_daily_file_lock_releases_on_exit(tmp_path: Path) -> None:
+    """After the context exits, the lock is released — a fresh acquire
+    succeeds (no leaked lock that would deadlock the next writer)."""
+    vault = _make_vault(tmp_path)
+    daily_file = vault / "daily" / "2026-05-29.md"
+    lock_path = daily_file.with_suffix(".lock")
+
+    with daily_file_lock(daily_file):
+        pass
+    # Now acquirable again.
+    with open(lock_path, "a", encoding="utf-8") as probe:
+        _fcntl_test.flock(
+            probe.fileno(), _fcntl_test.LOCK_EX | _fcntl_test.LOCK_NB,
+        )  # must not raise
+        _fcntl_test.flock(probe.fileno(), _fcntl_test.LOCK_UN)
+
+
+def test_lost_update_curation_survives_interleaved_aggregator(
+    tmp_path: Path,
+) -> None:
+    """THE lost-update scenario, deterministic via a thread + the lock.
+
+    Reproduce the race ordering the lock must defeat: a writer (the
+    aggregator-style RMW) reads the daily file, then — BEFORE it writes —
+    the operator's curation lands. With the lock, the aggregator's RMW
+    holds the lock across read+write, so the curation write BLOCKS until
+    the aggregator finishes, then merges onto fresh state. Net: BOTH the
+    aggregator's keys AND the operator's curation survive (no clobber).
+
+    Driven without sleeps: a background thread attempts the curation save
+    while the main thread holds the lock mid-"aggregator RMW"; we release,
+    join, and assert both halves are present.
+    """
+    import threading
+
+    vault = _make_vault(tmp_path)
+    today = TODAY
+    daily_file = vault / "daily" / f"{today.isoformat()}.md"
+
+    # Seed an aggregator-written file (aggregator keys + body, no
+    # curation yet) so the curation save does a read-merge-write.
+    daily_file.write_text(
+        "---\ntype: daily\ndate: '2026-05-29'\n"
+        "routines_contributing:\n- Daily R\n"
+        "critical_pending: []\n---\n\n## Tracked\n- [ ] Brush AM\n",
+        encoding="utf-8",
+    )
+
+    curation = DailyCuration(
+        t1=[T1T2Entry(task="[[task/Confirm Me]]", source="operator",
+                      confirmed=True)],
+        t2=[], t3=[],
+    )
+
+    save_started = threading.Event()
+    save_done = threading.Event()
+
+    def _bg_save():
+        save_started.set()
+        # This BLOCKS on the lock the main thread holds, until released.
+        save_tier_curation(vault, today, curation)
+        save_done.set()
+
+    t = threading.Thread(target=_bg_save)
+
+    # Main thread holds the lock (simulating the aggregator's RMW
+    # in-flight), starts the bg curation save (which must block), then
+    # writes the aggregator's view + releases.
+    with daily_file_lock(daily_file):
+        t.start()
+        save_started.wait(timeout=5)
+        # The bg save is now blocked on the lock. Confirm it has NOT
+        # completed while we hold the lock (it can't have written).
+        assert not save_done.is_set(), (
+            "curation save completed while the lock was held — the lock "
+            "is not actually serializing the two RMWs."
+        )
+        # Aggregator writes its keys (re-read inside lock, preserve any
+        # curation — there's none yet, the bg save is still blocked).
+        post = frontmatter.load(str(daily_file))
+        meta = dict(post.metadata or {})
+        meta["routines_contributing"] = ["Daily R", "Evening R"]  # a change
+        new_post = frontmatter.Post(post.content or "", **meta)
+        tmp = daily_file.with_suffix(".routine.tmp")
+        tmp.write_text(frontmatter.dumps(new_post) + "\n", encoding="utf-8")
+        import os as _os
+        _os.replace(tmp, daily_file)
+    # Lock released — bg curation save now proceeds, reads FRESH (our
+    # just-written aggregator keys), merges its curation.
+    t.join(timeout=5)
+    assert save_done.is_set(), "bg curation save did not complete"
+
+    # BOTH survive: aggregator's updated key AND the operator's curation.
+    reloaded = frontmatter.load(str(daily_file))
+    rmeta = dict(reloaded.metadata or {})
+    assert rmeta.get("routines_contributing") == ["Daily R", "Evening R"], (
+        "aggregator's key was clobbered by the curation save"
+    )
+    loaded_cur = load_daily_curation(vault, today)
+    assert loaded_cur is not None
+    assert loaded_cur.t1[0].task == "[[task/Confirm Me]]", (
+        "operator's curation was lost — the lost-update race is NOT closed"
+    )
+
+
+def test_save_tier_curation_cleans_orphan_tmp_on_replace_failure(
+    tmp_path: Path,
+) -> None:
+    """orphan-tmp cleanup (reviewer NOTE, 2026-06-27): a failed
+    os.replace must NOT leave a stale .curation.tmp orphan — the
+    try/finally unlinks it. (Distinct from the existing
+    corrupt-file-integrity test: this pins the SCRATCH file is gone.)"""
+    import alfred.tier.daily_curation as dc
+
+    vault = _make_vault(tmp_path)
+    daily_file = vault / "daily" / f"{TODAY.isoformat()}.md"
+    daily_file.write_text(
+        "---\ntype: daily\ndate: '2026-05-29'\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+
+    def _boom(src, dst):
+        raise OSError("simulated replace failure")
+
+    orig = dc.os.replace
+    dc.os.replace = _boom
+    try:
+        try:
+            save_tier_curation(vault, TODAY, DailyCuration(t1=[], t2=[], t3=[]))
+        except OSError:
+            pass
+    finally:
+        dc.os.replace = orig
+
+    assert not (vault / "daily" / f"{TODAY.isoformat()}.curation.tmp").exists(), (
+        "failed os.replace left an orphan .curation.tmp"
+    )

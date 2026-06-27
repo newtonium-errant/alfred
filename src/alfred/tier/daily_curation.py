@@ -105,16 +105,85 @@ touch the file body.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from dataclasses import dataclass, field
 from datetime import date as _date
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import frontmatter  # type: ignore[import-untyped]
 import structlog
 
+# fcntl is POSIX-only. The fleet runs on Linux (prod box + WSL dev), so
+# it's always available there; the guarded import keeps the module
+# importable on a hypothetical non-POSIX box (the lock then degrades to a
+# no-op — see daily_file_lock).
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    _fcntl = None  # type: ignore[assignment]
+
 log = structlog.get_logger(__name__)
+
+
+@contextlib.contextmanager
+def daily_file_lock(daily_file_path: Path) -> Iterator[None]:
+    """Exclusive cross-process lock around a daily-file read-modify-write.
+
+    Step 5 lost-update fix (2026-06-27): ``daily/<date>.md`` has TWO
+    read-preserve-write writers in SEPARATE processes — the routine
+    aggregator daemon (05:59 fire) and ``save_tier_curation`` (talker /
+    operator, any time). The atomic ``.tmp`` → ``os.replace`` write
+    (2026-06-26) closed torn READS but NOT the lost-update race: writer A
+    reads → writer B reads the same state → A writes → B writes
+    (preserving A's now-STALE view) → A's keys are clobbered. The
+    operator-facing symptom is a just-made tier-curation confirmation
+    silently lost when the aggregate pass fires mid-edit.
+
+    This wraps each writer's WHOLE RMW (read existing → merge → atomic
+    write) in an ``fcntl.flock(LOCK_EX)`` on a sidecar lock file, so the
+    two RMWs serialize: the second writer blocks until the first's write
+    lands, then reads the fresh state.
+
+    ``daily_file_path`` is the RESOLVED daily-file path the caller is
+    about to write (``<...>/<date>.md``); the lock is that path with a
+    ``.lock`` suffix. Deriving the lock from the actual file path (not a
+    re-hardcoded ``daily/``) means both writers lock the SAME sidecar as
+    long as they write the SAME file — the lock is structurally
+    consistent with whatever path each writer resolved, even if the
+    aggregator's configurable output dir ever diverges from the curation
+    layer's path (that would be a pre-existing file-path bug, not a lock
+    bug). The lock file is created on demand, never deleted (a stable
+    0-byte sidecar; deleting it would reopen a create-race on the lock).
+
+    Degrades to a no-op (with a warn) if ``fcntl`` is unavailable —
+    preserves the prior atomic-only behaviour on non-POSIX rather than
+    crashing. The fleet is Linux, so this path is defensive-only.
+    """
+    if _fcntl is None:  # pragma: no cover - non-POSIX fallback
+        log.warning(
+            "tier.daily_curation.flock_unavailable",
+            detail=(
+                "fcntl not available (non-POSIX); daily-file writes fall "
+                "back to atomic-only (torn-reads closed, lost-update "
+                "window OPEN). The fleet is Linux; this path is defensive."
+            ),
+        )
+        yield
+        return
+
+    lock_path = daily_file_path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # Open (create if absent) the sidecar lock file. ``a`` so concurrent
+    # creators don't truncate each other; we never write to it — the
+    # flock on the fd is the whole mechanism.
+    with open(lock_path, "a", encoding="utf-8") as lock_fd:
+        _fcntl.flock(lock_fd.fileno(), _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(lock_fd.fileno(), _fcntl.LOCK_UN)
 
 
 # Canonical ``source`` enum values — Ships 2 + 4 reference these as
@@ -509,6 +578,12 @@ def save_tier_curation(
     files never collide. Per the project-standard atomic-write contract
     (transport/instructor/curator state.py).
 
+    Lost-update lock (Step 5, 2026-06-27): the WHOLE read-merge-write is
+    wrapped in :func:`daily_file_lock` (exclusive ``fcntl.flock`` on the
+    ``.lock`` sidecar) so a concurrent aggregator RMW can't read stale,
+    write, and clobber this curation — the two writers serialize. Atomic
+    write alone closed torn-reads; the lock closes lost-update.
+
     Per ``feedback_intentionally_left_blank``: every write emits a
     named log event with the curation counts so operators can grep
     for "did the save land?" without re-reading the file.
@@ -516,48 +591,61 @@ def save_tier_curation(
     daily_file = _daily_file_path(vault_path, today)
     daily_file.parent.mkdir(parents=True, exist_ok=True)
 
-    if daily_file.exists():
-        try:
-            post = frontmatter.load(str(daily_file))
-        except Exception as exc:  # noqa: BLE001
-            # Defensive: a corrupt file forces caller to delete + retry.
-            # Don't overwrite blindly — operator may have hand-edits we'd
-            # lose.
-            log.warning(
-                "tier.daily_curation.save_aborted_corrupt_file",
+    # Serialize the whole RMW against the aggregator's RMW on the same
+    # daily file (Step 5 lost-update fix). The read below must stay valid
+    # through the write; the lock guarantees no other writer interleaves.
+    with daily_file_lock(daily_file):
+        if daily_file.exists():
+            try:
+                post = frontmatter.load(str(daily_file))
+            except Exception as exc:  # noqa: BLE001
+                # Defensive: a corrupt file forces caller to delete +
+                # retry. Don't overwrite blindly — operator may have
+                # hand-edits we'd lose.
+                log.warning(
+                    "tier.daily_curation.save_aborted_corrupt_file",
+                    path=str(daily_file),
+                    date=today.isoformat(),
+                    error=str(exc),
+                )
+                raise
+            existing_meta = dict(post.metadata or {})
+            body = post.content or ""
+        else:
+            # Fresh file — seed minimum frontmatter so a downstream
+            # reader (brief, janitor) sees a well-formed ``type: daily``
+            # record.
+            existing_meta = {"type": "daily", "date": today.isoformat()}
+            body = ""
+            log.info(
+                "tier.daily_curation.created_fresh_daily_file",
                 path=str(daily_file),
                 date=today.isoformat(),
-                error=str(exc),
+                detail=(
+                    "daily file did not exist; seeded minimum frontmatter "
+                    "(``type: daily``, ``date: <iso>``) + empty body. The "
+                    "routine aggregator's next fire will "
+                    "read-preserve-write this curation."
+                ),
             )
-            raise
-        existing_meta = dict(post.metadata or {})
-        body = post.content or ""
-    else:
-        # Fresh file — seed minimum frontmatter so a downstream reader
-        # (brief, janitor) sees a well-formed ``type: daily`` record.
-        existing_meta = {"type": "daily", "date": today.isoformat()}
-        body = ""
-        log.info(
-            "tier.daily_curation.created_fresh_daily_file",
-            path=str(daily_file),
-            date=today.isoformat(),
-            detail=(
-                "daily file did not exist; seeded minimum frontmatter "
-                "(``type: daily``, ``date: <iso>``) + empty body. The "
-                "routine aggregator's next fire will read-preserve-write "
-                "this curation."
-            ),
-        )
 
-    # Replace / add the tier_curation block.
-    existing_meta["tier_curation"] = curation.to_dict()
+        # Replace / add the tier_curation block.
+        existing_meta["tier_curation"] = curation.to_dict()
 
-    new_post = frontmatter.Post(body, **existing_meta)
-    tmp_path = daily_file.with_suffix(".curation.tmp")
-    tmp_path.write_text(
-        frontmatter.dumps(new_post) + "\n", encoding="utf-8",
-    )
-    os.replace(tmp_path, daily_file)
+        new_post = frontmatter.Post(body, **existing_meta)
+        tmp_path = daily_file.with_suffix(".curation.tmp")
+        # orphan-tmp cleanup (reviewer NOTE, 2026-06-27): a failed
+        # os.replace would otherwise leave a stale .curation.tmp orphan
+        # (self-heals next run, but invisible to scanners). try/finally
+        # removes it on any failure path; on success os.replace has
+        # already moved it, so unlink(missing_ok=True) is a no-op.
+        try:
+            tmp_path.write_text(
+                frontmatter.dumps(new_post) + "\n", encoding="utf-8",
+            )
+            os.replace(tmp_path, daily_file)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     log.info(
         "tier.daily_curation.saved",
@@ -576,6 +664,7 @@ __all__ = [
     "T1_T2_SOURCES",
     "T3Entry",
     "T3_SOURCES",
+    "daily_file_lock",
     "load_daily_curation",
     "save_tier_curation",
 ]
