@@ -425,3 +425,109 @@ def test_routine_line_carries_render_fields(tmp_path: Path) -> None:
     assert isinstance(line, RoutineLine)
     assert line.text == "Do Dishes"
     assert line.priority == "tracked"
+
+
+# --- self_care flag → T3 lane (Q2, 2026-06-26) -----------------------------
+
+
+def test_self_care_item_lands_in_t3_lane(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    _write_routine(
+        vault, "Care",
+        "type: routine\nstatus: active\nname: Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Meditate\n  priority: aspirational\n  self_care: true\n",
+    )
+    view = compute_today_view(vault, NOW)
+    assert len(view.t3) == 1
+    e = view.t3[0]
+    assert e.item_text == "Meditate"
+    assert e.source == "self-care"
+    assert e.surface_reason == "self-care"
+
+
+def test_self_care_item_not_in_routine_today(tmp_path: Path) -> None:
+    """Structural-complement invariant: a self_care item surfaced to T3
+    must NOT also appear in routine_today (it's handed off)."""
+    vault = _vault(tmp_path)
+    _write_routine(
+        vault, "Care",
+        "type: routine\nstatus: active\nname: Care\n"
+        "cadence:\n  type: daily\n"
+        "items:\n"
+        "- text: Meditate\n  priority: aspirational\n  self_care: true\n"
+        "- text: Do Dishes\n  priority: tracked\n",
+    )
+    view = compute_today_view(vault, NOW)
+    t3_texts = {e.item_text for e in view.t3}
+    rt_texts = {r.text for r in view.routine_today}
+    assert "Meditate" in t3_texts
+    assert "Do Dishes" in rt_texts
+    assert t3_texts.isdisjoint(rt_texts)
+
+
+def test_self_care_done_today_not_surfaced(tmp_path: Path) -> None:
+    vault = _vault(tmp_path)
+    _write_routine(
+        vault, "Care",
+        "type: routine\nstatus: active\nname: Care\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n  Meditate:\n  - '2026-05-28'\n"
+        "items:\n"
+        "- text: Meditate\n  priority: aspirational\n  self_care: true\n",
+    )
+    view = compute_today_view(vault, NOW)
+    # Done today → not in T3; renders in routine_today instead (it still
+    # fired as a daily item).
+    assert all(e.item_text != "Meditate" for e in view.t3)
+
+
+def test_self_care_with_cadence_uses_cadence_surface(tmp_path: Path) -> None:
+    """A self_care item that ALSO has target_cadence_days goes through
+    the cadence surface (compute_auto_t3_candidates), not the self-care-
+    only surface — no double-render. Exactly one T3 entry."""
+    vault = _vault(tmp_path)
+    _write_routine(
+        vault, "Care",
+        "type: routine\nstatus: active\nname: Care\n"
+        "cadence:\n  type: daily\n"
+        "completion_log:\n  Walk Fergus:\n  - '2026-05-20'\n"
+        "items:\n"
+        "- text: Walk Fergus\n  priority: aspirational\n"
+        "  self_care: true\n  target_cadence_days: 3\n",
+    )
+    view = compute_today_view(vault, NOW)
+    walk = [e for e in view.t3 if e.item_text == "Walk Fergus"]
+    assert len(walk) == 1  # exactly one — no double-render
+    # Cadence surface owns it (source auto-cadence-routine, not self-care).
+    assert walk[0].source == "auto-cadence-routine"
+
+
+def test_self_care_task_no_deadline_lands_in_t3(tmp_path: Path) -> None:
+    """A self_care task with no due date → the T3 self-care lane (the
+    spec routes self_care on routines AND tasks to T3)."""
+    vault = _vault(tmp_path)
+    _write_task(
+        vault, "Book Massage",
+        "type: task\nstatus: todo\nname: Book Massage\nself_care: true\n",
+    )
+    view = compute_today_view(vault, NOW)
+    sc = [e for e in view.t3 if e.name == "Book Massage"]
+    assert len(sc) == 1
+    assert sc[0].origin == "task"
+    assert sc[0].source == "self-care"
+
+
+def test_self_care_task_with_deadline_goes_t1_not_t3(tmp_path: Path) -> None:
+    """A self_care task due today surfaces in T1 (deadline pressure wins)
+    and is NOT double-rendered in the T3 self-care floor."""
+    vault = _vault(tmp_path)
+    _write_task(
+        vault, "Urgent Care",
+        "type: task\nstatus: todo\nname: Urgent Care\n"
+        "self_care: true\ndue: 2026-05-28\n",
+    )
+    view = compute_today_view(vault, NOW)
+    assert any(e.name == "Urgent Care" for e in view.t1)
+    assert all(e.name != "Urgent Care" for e in view.t3)

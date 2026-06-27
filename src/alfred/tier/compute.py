@@ -198,6 +198,7 @@ def classify_routine_item(
     completion_log: dict | None,
     item_text: str,
     today: date,
+    self_care: bool = False,
 ) -> RoutineItemClassification:
     """Classify one routine item into a tier placement (T1/T2/T3/none).
 
@@ -216,17 +217,34 @@ def classify_routine_item(
       2. **Both-modes precedence.** ``due_pattern`` + ``target_cadence_days``
          both set → ``due_pattern`` wins; ``both_modes_conflict=True`` so
          the caller can emit the operator warn.
-      3. **T3 soft-cadence branch** (``due_pattern`` absent,
+      3. **T3 self-care branch** (``due_pattern`` absent, ``self_care``
+         true): the dedicated self-care lane (operator decision Q2,
+         2026-06-26). An intrinsic classification — NOT deadline-driven,
+         never escalates. Surfaces to T3 when NOT completed today (the
+         daily self-care floor), so the operator's self-care item is
+         deliberately included each day rather than skipped as "less
+         necessary." Composes with ``target_cadence_days``: a self_care
+         item ALSO carrying a cadence target surfaces if EITHER overdue
+         against cadence OR not-done-today.
+      4. **T3 soft-cadence branch** (``due_pattern`` absent,
          ``target_cadence_days`` present): surface (tier 3) when
          ``days_since_last_completed >= target_cadence_days`` (inclusive),
          OR when never completed (max overdue). Within window → no
          handoff (tier None).
-      4. **T1/T2 deadline branch** (``due_pattern`` + ``escalate_at_days``
+      5. **T1/T2 deadline branch** (``due_pattern`` + ``escalate_at_days``
          present): completion-aware suppression
          (``completion_satisfies_current_cycle``) → tier None; else
          overdue-retention-aware effective due → T1 when
          ``days_to_due <= escalate_at_days`` (admits negative/overdue),
          T2 when ``escalate_at_days < days_to_due <= surface_at_days``.
+
+    ``self_care`` is intrinsic to the item (an item-level classification,
+    not deadline-driven). A self_care item that ALSO carries a real
+    deadline (``due_pattern`` + ``escalate_at_days``) still classifies
+    T1/T2 on the deadline — deadline pressure is real and wins over the
+    self-care floor (the spec frames T3 as "no external deadline
+    pressure"; a deadline-bearing item isn't pure self-care). The
+    self-care floor only applies to non-deadline items.
 
     Reason strings are stable contract (the SKILL quotes them verbatim
     so the talker recognises operator replies). Change a string here =
@@ -254,6 +272,30 @@ def classify_routine_item(
     # deadline-driven work). It still falls through to the T3 branch
     # below if it carries target_cadence_days.
     aspirational = (priority or "").lower() == "aspirational"
+
+    # ---- T3 self-care branch (Q2, 2026-06-26) --------------------
+    # The dedicated self-care lane: a non-deadline item flagged
+    # ``self_care: true`` surfaces to T3 when not completed today, so
+    # it's deliberately included in the day rather than skipped. Fires
+    # before the soft-cadence branch so a self_care item without a
+    # cadence target still surfaces (the daily floor). A self_care item
+    # WITH a cadence target also surfaces here if not-done-today even
+    # when within its cadence window (self-care broadens, never narrows).
+    if due_pattern is None and self_care:
+        log_dict = (
+            completion_log if isinstance(completion_log, dict) else {}
+        )
+        completion_dates = _parse_item_completion_dates(
+            log_dict.get(item_text, [])
+        )
+        if today not in completion_dates:
+            # Not done today → surface in the self-care lane.
+            return RoutineItemClassification(
+                tier=3, both_modes_conflict=both_modes_conflict,
+            )
+        # Done today: fall through to the cadence branch (a cadence
+        # target may still surface it as overdue against a longer
+        # window); otherwise it renders in the routine section.
 
     # ---- T3 soft-cadence branch ----------------------------------
     # Fires when due_pattern is absent (both-modes precedence: due_pattern
@@ -725,6 +767,7 @@ def _compute_auto_routine(
                 completion_log=completion_log,
                 item_text=item.text,
                 today=today_local,
+                self_care=item.self_care,
             )
 
             want_tier = 1 if window == "t1" else 2
@@ -985,13 +1028,23 @@ def compute_auto_t3_candidates(
                 completion_log=completion_log,
                 item_text=item.text,
                 today=today_local,
+                self_care=item.self_care,
             )
             if classification.tier != 3:
                 continue
+            # This surface is CADENCE-driven (its AutoT3Candidate carries
+            # overdue_ratio / target_cadence_days). A pure ``self_care``
+            # item (Q2) with NO cadence target can also classify tier 3,
+            # but it has no ratio to rank — it's surfaced separately by
+            # ``compute_today_view``'s self-care pass. Skip it here so the
+            # cadence-shaped dataclass stays well-defined.
+            if item.target_cadence_days is None:
+                continue
 
-            # tier == 3 guarantees target_cadence_days is a positive int
-            # and due_pattern is absent (the classifier's T3 branch
-            # preconditions). Recompute the sort metadata.
+            # tier == 3 + a cadence target guarantees target_cadence_days
+            # is a positive int and due_pattern is absent (the
+            # classifier's T3 cadence branch preconditions). Recompute
+            # the sort metadata.
             target = item.target_cadence_days
             assert isinstance(target, int) and target > 0
 
@@ -1030,6 +1083,170 @@ def compute_auto_t3_candidates(
     candidates.sort(
         key=lambda c: (-c.overdue_ratio, c.item_text.lower()),
     )
+    return candidates
+
+
+def compute_self_care_candidates(
+    vault_path: Path, now: datetime,
+) -> list[AutoT1Candidate]:
+    """Walk ``vault/routine/*.md`` and return ``self_care``-flagged items
+    that surface to the T3 self-care lane (Q2, 2026-06-26).
+
+    The dedicated self-care lane: items flagged ``self_care: true`` (no
+    ``due_pattern``) surface to T3 when not completed today — the daily
+    self-care floor, deliberately included rather than skipped. This is
+    the surface for self_care items WITHOUT a ``target_cadence_days``
+    (cadence-driven self-care is already covered by
+    :func:`compute_auto_t3_candidates`; including it here too would
+    double-render, so this surface SKIPS items that carry a cadence
+    target — they belong to the cadence surface).
+
+    Returns :class:`AutoT1Candidate` (the shared routine-origin shape;
+    ``origin="routine"``, ``surface_reason="self-care"``, no ``due_iso``).
+    Surfacing decision is the single ``classify_routine_item`` predicate
+    (``tier == 3``); this just filters to the self_care-only subset +
+    builds the candidate. Sorted by item text case-insensitive.
+
+    Per ``feedback_intentionally_left_blank``: pure-compute, no logs.
+    """
+    import frontmatter  # type: ignore[import-untyped]
+
+    from alfred.routine.config import Item
+
+    routine_dir = vault_path / "routine"
+    if not routine_dir.is_dir():
+        return []
+
+    today_local = now.date()
+
+    candidates: list[AutoT1Candidate] = []
+    for record_path in sorted(routine_dir.glob("*.md")):
+        try:
+            post = frontmatter.load(str(record_path))
+        except Exception:  # noqa: BLE001
+            continue
+        fm = dict(post.metadata or {})
+        if fm.get("type") != "routine":
+            continue
+        status = str(fm.get("status") or "active").lower()
+        if status == "archived":
+            continue
+        if fm.get("alfred_triage") is True:
+            continue
+        record_name = str(fm.get("name") or record_path.stem)
+        raw_items = fm.get("items") or []
+        if not isinstance(raw_items, list):
+            continue
+        completion_log = fm.get("completion_log") or {}
+        if not isinstance(completion_log, dict):
+            completion_log = {}
+        rel_path = f"routine/{record_path.name}"
+
+        for raw_item in raw_items:
+            item = Item.from_dict(raw_item)
+            if item is None:
+                continue
+            if not item.self_care:
+                continue
+            # Cadence-driven self_care is the cadence surface's job;
+            # this surface is the self_care-ONLY (no-cadence) floor.
+            if item.target_cadence_days is not None:
+                continue
+            classification = classify_routine_item(
+                priority=item.priority,
+                due_pattern=item.due_pattern,
+                surface_at_days=item.surface_at_days,
+                escalate_at_days=item.escalate_at_days,
+                target_cadence_days=item.target_cadence_days,
+                completion_log=completion_log,
+                item_text=item.text,
+                today=today_local,
+                self_care=item.self_care,
+            )
+            if classification.tier != 3:
+                continue
+            candidates.append(AutoT1Candidate(
+                path=rel_path,
+                name=item.text,
+                due_iso="",
+                surface_reason="self-care",
+                origin="routine",
+                routine_record=record_name,
+                item_text=item.text,
+            ))
+
+    candidates.sort(key=lambda c: c.name.lower())
+    return candidates
+
+
+def compute_self_care_task_candidates(
+    vault_path: Path, now: datetime,
+) -> list[AutoT1Candidate]:
+    """Walk ``vault/task/*.md`` and return open tasks flagged
+    ``self_care: true`` that surface to the T3 self-care lane (Q2,
+    2026-06-26 — the spec routes ``self_care`` on routines AND tasks to
+    T3).
+
+    A self_care task surfaces to T3 when it is OPEN and NOT already an
+    auto-T1 candidate (a near-deadline self_care task surfaces in T1 —
+    deadline pressure wins over the self-care floor, per the spec). So
+    this surface is "self_care tasks with no near deadline" — the daily
+    self-care floor for one-off tasks (e.g. a ``task`` record "book a
+    massage" flagged self_care, no due date).
+
+    Returns :class:`AutoT1Candidate` with ``origin="task"``,
+    ``surface_reason="self-care"``, no ``due_iso``. Sorted by name.
+    Defensive filters mirror the auto-T1 task scan (parse failure,
+    non-task type, closed status, ``alfred_triage``).
+
+    Per ``feedback_intentionally_left_blank``: pure-compute, no logs.
+    """
+    import frontmatter  # type: ignore[import-untyped]
+
+    task_dir = vault_path / "task"
+    if not task_dir.is_dir():
+        return []
+
+    # Tasks already surfacing in auto-T1 (by name) are excluded — a
+    # near-deadline self_care task lives in T1, not the T3 floor.
+    auto_t1_names = {c.name for c in compute_auto_t1_candidates(vault_path, now)}
+
+    candidates: list[AutoT1Candidate] = []
+    for path in sorted(task_dir.glob("*.md")):
+        try:
+            post = frontmatter.load(str(path))
+        except Exception:  # noqa: BLE001
+            continue
+        fm = dict(post.metadata or {})
+        if fm.get("type") != "task":
+            continue
+        status = str(fm.get("status") or "todo").lower()
+        if status not in OPEN_STATUSES:
+            continue
+        if fm.get("alfred_triage") is True:
+            continue
+        # Coerce self_care the same way Item.from_dict does (string-form
+        # defensive).
+        sc_raw = fm.get("self_care", False)
+        if isinstance(sc_raw, str):
+            self_care = sc_raw.strip().lower() in ("true", "yes", "1", "on")
+        else:
+            self_care = bool(sc_raw)
+        if not self_care:
+            continue
+        name = str(fm.get("name") or path.stem)
+        if name in auto_t1_names:
+            # Already surfacing in T1 (deadline pressure wins).
+            continue
+        candidates.append(AutoT1Candidate(
+            path=f"task/{path.name}",
+            name=name,
+            due_iso="",
+            surface_reason="self-care",
+            origin="task",
+        ))
+
+    candidates.sort(key=lambda c: c.name.lower())
     return candidates
 
 
@@ -1235,6 +1452,11 @@ def compute_today_view(
     auto_t1_routine = compute_auto_routine_candidates(vault_path, now)
     auto_t2_routine = compute_auto_routine_t2_candidates(vault_path, now)
     auto_t3_routine = compute_auto_t3_candidates(vault_path, now)
+    # Q2 (2026-06-26): self_care-flagged items (no cadence target) →
+    # the dedicated T3 self-care lane (daily floor). Both routine-item
+    # and task origins.
+    self_care_routine = compute_self_care_candidates(vault_path, now)
+    self_care_task = compute_self_care_task_candidates(vault_path, now)
 
     # --- operator curation ----------------------------------------
     curation = load_daily_curation(vault_path, today)
@@ -1329,6 +1551,35 @@ def compute_today_view(
             tier=3, origin="routine_item", name=c.item_text, path=c.path,
             source="auto-cadence-routine",
             routine_record=c.routine_record, item_text=c.item_text,
+        ))
+        t3_keys.add(key)
+
+    # 6. Self-care T3 candidates (Q2 — the dedicated self-care lane).
+    # self_care-flagged items with no cadence target surface here as the
+    # daily floor. Dedup against curated + cadence T3 by the same key.
+    for c in self_care_routine:
+        key = _routine_key(c.routine_record, c.item_text)
+        if key in t3_keys:
+            continue
+        t3.append(TierEntry(
+            tier=3, origin="routine_item", name=c.item_text, path=c.path,
+            surface_reason="self-care",
+            source="self-care",
+            routine_record=c.routine_record, item_text=c.item_text,
+        ))
+        t3_keys.add(key)
+
+    # 7. Self-care TASK candidates (Q2 — self_care tasks with no near
+    # deadline; near-deadline self_care tasks live in T1). Dedup by task
+    # name key.
+    for c in self_care_task:
+        key = _task_key(c.name)
+        if key in t3_keys:
+            continue
+        t3.append(TierEntry(
+            tier=3, origin="task", name=c.name, path=c.path,
+            surface_reason="self-care",
+            source="self-care",
         ))
         t3_keys.add(key)
 
@@ -1594,5 +1845,7 @@ __all__ = [
     "compute_auto_routine_t2_candidates",
     "compute_auto_t1_candidates",
     "compute_auto_t3_candidates",
+    "compute_self_care_candidates",
+    "compute_self_care_task_candidates",
     "compute_today_view",
 ]

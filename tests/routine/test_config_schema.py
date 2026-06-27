@@ -182,6 +182,41 @@ def test_item_with_phase_2a_fields() -> None:
     assert item.escalate_at_days == 0
 
 
+def test_item_self_care_defaults_false() -> None:
+    """Q2 (2026-06-26): self_care defaults to False — existing records
+    without the field parse unchanged (backward-compat)."""
+    item = Item.from_dict({"text": "Pay Rent", "priority": "tracked"})
+    assert item is not None
+    assert item.self_care is False
+
+
+def test_item_self_care_bool_true() -> None:
+    """self_care: true (PyYAML bool) → True."""
+    item = Item.from_dict({
+        "text": "Meditate", "priority": "aspirational", "self_care": True,
+    })
+    assert item is not None
+    assert item.self_care is True
+
+
+def test_item_self_care_string_coercion() -> None:
+    """A quoted string form (operator hand-edit) coerces correctly —
+    bool('false') is True in Python, so the string path must be explicit.
+    """
+    assert Item.from_dict(
+        {"text": "X", "priority": "tracked", "self_care": "true"}
+    ).self_care is True
+    assert Item.from_dict(
+        {"text": "X", "priority": "tracked", "self_care": "yes"}
+    ).self_care is True
+    assert Item.from_dict(
+        {"text": "X", "priority": "tracked", "self_care": "false"}
+    ).self_care is False
+    assert Item.from_dict(
+        {"text": "X", "priority": "tracked", "self_care": "no"}
+    ).self_care is False
+
+
 def test_item_missing_text_returns_none() -> None:
     """Item without ``text`` → None (can't render or track)."""
     assert Item.from_dict({"priority": "tracked"}) is None

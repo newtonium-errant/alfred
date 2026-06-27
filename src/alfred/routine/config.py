@@ -209,6 +209,13 @@ class Item:
     surface_at_days: int | None = None
     escalate_at_days: int | None = None
     target_cadence_days: int | None = None
+    # Q2 (2026-06-26): the dedicated self-care lane. An item flagged
+    # ``self_care: true`` surfaces to the T3 lane as an intrinsic
+    # classification (not deadline-driven, never escalates) — the daily
+    # self-care floor. Composes with ``target_cadence_days`` (both can be
+    # set). Default ``False`` per the dataclass-default extension
+    # backward-compat contract.
+    self_care: bool = False
 
     @classmethod
     def from_dict(cls, data: Any) -> Item | None:
@@ -275,6 +282,19 @@ class Item:
             )
         except (TypeError, ValueError):
             target_cadence_days = None
+        # Q2 (2026-06-26): self_care flag → T3 lane. Coerce truthy
+        # values defensively (operator may write ``self_care: true`` or
+        # ``self_care: yes``; PyYAML parses bare ``true``/``yes`` to a
+        # bool already, but a quoted ``"true"`` string would slip
+        # through — ``bool("false")`` is True, so handle the string form
+        # explicitly).
+        self_care_raw = data.get("self_care", False)
+        if isinstance(self_care_raw, str):
+            self_care = self_care_raw.strip().lower() in (
+                "true", "yes", "1", "on",
+            )
+        else:
+            self_care = bool(self_care_raw)
         return cls(
             text=text.strip(),
             priority=priority,
@@ -284,6 +304,7 @@ class Item:
             surface_at_days=surface_at_days,
             escalate_at_days=escalate_at_days,
             target_cadence_days=target_cadence_days,
+            self_care=self_care,
         )
 
 

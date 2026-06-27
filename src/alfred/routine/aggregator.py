@@ -285,6 +285,7 @@ def _decide_tier_handoff(
     completion_log: dict | None = None,
     item_text: str = "",
     routine_record: str = "",
+    self_care: bool = False,
 ) -> int | None:
     """Decide if the item should be handed off to the tier section.
 
@@ -366,6 +367,7 @@ def _decide_tier_handoff(
         completion_log=completion_log,
         item_text=item_text,
         today=today,
+        self_care=self_care,
     )
 
     # Mutually-exclusive validator: both cadence modes set → warn +
@@ -508,11 +510,21 @@ def _collect_items_for_today(
                 )
             except (TypeError, ValueError):
                 target_cadence_days = None
+            # Q2 (2026-06-26): parse self_care for the dedicated T3
+            # self-care lane (same coercion as Item.from_dict).
+            self_care_raw = raw_item.get("self_care", False)
+            if isinstance(self_care_raw, str):
+                self_care = self_care_raw.strip().lower() in (
+                    "true", "yes", "1", "on",
+                )
+            else:
+                self_care = bool(self_care_raw)
 
             # T1/T2 handoff path: only Critical/Tracked items with
             # due_pattern. T3 handoff path: any item with
-            # target_cadence_days (aspirational included — that's the
-            # whole point of the soft-cadence surface).
+            # target_cadence_days OR self_care (the dedicated self-care
+            # lane — aspirational included; that's the whole point of the
+            # T3 surface).
             #
             # The ``priority != "aspirational"`` gate enforces the
             # operator-stated semantic: aspirational items don't
@@ -533,6 +545,7 @@ def _collect_items_for_today(
             should_check_handoff = (
                 (due_pattern is not None and priority != "aspirational")
                 or target_cadence_days is not None
+                or self_care
             )
             if should_check_handoff:
                 handoff_tier = _decide_tier_handoff(
@@ -544,6 +557,7 @@ def _collect_items_for_today(
                     completion_log=completion_log,
                     item_text=text,
                     routine_record=name,
+                    self_care=self_care,
                 )
                 if handoff_tier is not None:
                     # Compute days_to_due for the log only when

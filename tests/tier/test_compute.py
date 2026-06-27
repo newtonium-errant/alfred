@@ -2159,3 +2159,59 @@ def test_aggregator_delegates_to_classifier() -> None:
     spy.assert_called_once()
     # The adapter returns the classification's tier verbatim.
     assert out == 2
+
+
+# ---------------------------------------------------------------------------
+# self_care flag → T3 lane (Q2, 2026-06-26)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_self_care_not_done_today_surfaces_t3() -> None:
+    # A self_care item (no due_pattern, no cadence) not completed today
+    # → the daily self-care floor → T3.
+    result = _classify(self_care=True, completion_log={})
+    assert result.tier == 3
+
+
+def test_classify_self_care_done_today_does_not_surface() -> None:
+    # Completed today → not surfaced (renders in routine section / done).
+    result = _classify(
+        self_care=True, completion_log={"X": ["2026-05-28"]},
+    )
+    assert result.tier is None
+
+
+def test_classify_self_care_default_false_no_surface() -> None:
+    # Without the flag, a plain item doesn't hit the self-care floor.
+    result = _classify(completion_log={})
+    assert result.tier is None
+
+
+def test_classify_self_care_with_deadline_still_t1() -> None:
+    # A self_care item that ALSO carries a real deadline classifies on
+    # the deadline (T1) — deadline pressure wins over the self-care
+    # floor (spec: T3 is "no external deadline pressure").
+    dp = DuePattern.from_dict({"type": "weekly", "day": "thu"})  # due today
+    result = _classify(
+        self_care=True, due_pattern=dp, escalate_at_days=1,
+        completion_log={},
+    )
+    assert result.tier == 1
+
+
+def test_classify_self_care_composes_with_cadence() -> None:
+    # self_care + target_cadence_days: surfaces if not-done-today even
+    # when within the cadence window (self-care broadens, never narrows).
+    # Last done 1 day ago (within a 3-day cadence) but not today →
+    # self-care floor surfaces it.
+    result = _classify(
+        self_care=True, target_cadence_days=3,
+        completion_log={"X": ["2026-05-27"]},  # yesterday
+    )
+    assert result.tier == 3
+
+
+def test_classify_self_care_emits_no_logs() -> None:
+    with structlog.testing.capture_logs() as captured:
+        _classify(self_care=True, completion_log={})
+    assert captured == []
