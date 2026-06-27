@@ -105,6 +105,7 @@ touch the file body.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import date as _date
 from pathlib import Path
@@ -495,14 +496,18 @@ def save_tier_curation(
         fire will read-preserve-write this curation; operators see a
         usable file even before the aggregator runs.
       * If the file exists → load via python-frontmatter, replace the
-        ``tier_curation`` value (or add it), write atomically through
-        the standard frontmatter.dumps path.
+        ``tier_curation`` value (or add it), write atomically.
 
-    Atomic write via tempfile + rename is NOT implemented here yet —
-    matches the routine aggregator's existing pattern (which also
-    does a direct write). A future arc may add atomic writes to both
-    layers in lockstep; doing it unilaterally here would create
-    asymmetric contract surface.
+    Atomic write (Step 2 writer-race fix, 2026-06-26): ``.tmp`` →
+    ``os.replace``, in LOCKSTEP with the routine aggregator (which now
+    does the same). The daily file has two writers — this one (owns
+    ``tier_curation``) and the aggregator (owns the rest + body) — both
+    doing read-preserve-write of the whole file. A non-atomic write left
+    a window where a concurrent reader (the brief) or the other writer
+    could observe a truncated file. The tmp suffix is
+    WRITER-DISTINGUISHED (``.curation.tmp``) so the two writers' tmp
+    files never collide. Per the project-standard atomic-write contract
+    (transport/instructor/curator state.py).
 
     Per ``feedback_intentionally_left_blank``: every write emits a
     named log event with the curation counts so operators can grep
@@ -548,7 +553,11 @@ def save_tier_curation(
     existing_meta["tier_curation"] = curation.to_dict()
 
     new_post = frontmatter.Post(body, **existing_meta)
-    daily_file.write_text(frontmatter.dumps(new_post) + "\n", encoding="utf-8")
+    tmp_path = daily_file.with_suffix(".curation.tmp")
+    tmp_path.write_text(
+        frontmatter.dumps(new_post) + "\n", encoding="utf-8",
+    )
+    os.replace(tmp_path, daily_file)
 
     log.info(
         "tier.daily_curation.saved",

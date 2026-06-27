@@ -37,6 +37,7 @@ config so the janitor skips this derivative file.
 
 from __future__ import annotations
 
+import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -857,10 +858,21 @@ def run_aggregator_once(
         )
     content = serialize_record(fm, body)
 
-    # Write the file (overwrite on stale-tolerated re-runs; the daemon
-    # only fires once per day, but CLI re-runs may stomp).
+    # Atomic write (Step 2 writer-race fix, 2026-06-26). The daily file
+    # ``daily/<date>.md`` has TWO writers — this aggregator (owns
+    # ``type``/``date``/``routines_contributing``/``critical_pending`` +
+    # body) and ``daily_curation.save_tier_curation`` (owns the
+    # ``tier_curation`` block). Both do read-preserve-write of the
+    # whole file; a non-atomic ``write_text`` left a window where a
+    # concurrent reader (the brief) or the other writer could see a
+    # truncated file. ``.tmp`` → ``os.replace`` makes each write atomic.
+    # The tmp suffix is WRITER-DISTINGUISHED (``.routine.tmp``) so the
+    # two writers' tmp files never collide. Per the project-standard
+    # atomic-write contract (transport/instructor/curator state.py).
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(content, encoding="utf-8")
+    tmp_path = file_path.with_suffix(".routine.tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, file_path)
 
     log.info(
         "routine.aggregator.written",

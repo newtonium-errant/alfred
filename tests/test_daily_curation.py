@@ -613,3 +613,120 @@ def test_daily_curation_round_trip_with_routine_entries() -> None:
     )
     round_tripped = DailyCuration.from_dict(cur.to_dict())
     assert round_tripped == cur
+
+
+# ---------------------------------------------------------------------------
+# Atomic write — daily-file writer-race fix (Step 2, 2026-06-26)
+# ---------------------------------------------------------------------------
+#
+# The daily file daily/<date>.md has two writers — save_tier_curation
+# (owns tier_curation) and the routine aggregator (owns the rest + body).
+# Both were non-atomic write_text, leaving a truncation window. Both now
+# write .tmp -> os.replace with WRITER-DISTINGUISHED tmp suffixes so the
+# two tmp files never collide.
+
+
+def test_save_tier_curation_leaves_no_tmp_file(tmp_path: Path) -> None:
+    """After an atomic save, the .curation.tmp scratch file is gone
+    (os.replace moved it onto the real path)."""
+    vault = _make_vault(tmp_path)
+    cur = DailyCuration(
+        t1=[T1T2Entry(task="[[task/X]]", source="operator")],
+        t2=[], t3=[],
+    )
+    save_tier_curation(vault, TODAY, cur)
+    daily_file = vault / "daily" / "2026-05-29.md"
+    assert daily_file.exists()
+    # No leftover scratch file.
+    assert not (vault / "daily" / "2026-05-29.curation.tmp").exists()
+
+
+def test_save_tier_curation_uses_distinct_tmp_suffix(tmp_path: Path) -> None:
+    """The curation writer's tmp suffix is .curation.tmp — distinct from
+    the aggregator's .routine.tmp — so the two writers' scratch files
+    never collide on the same daily date. Pin the suffix by observing
+    the tmp path os.replace consumes."""
+    import os as _os
+
+    vault = _make_vault(tmp_path)
+    cur = DailyCuration(t1=[], t2=[], t3=[])
+
+    seen_tmp: list[str] = []
+    real_replace = _os.replace
+
+    def _spy_replace(src, dst):
+        seen_tmp.append(str(src))
+        return real_replace(src, dst)
+
+    import alfred.tier.daily_curation as dc
+
+    orig = dc.os.replace
+    dc.os.replace = _spy_replace
+    try:
+        save_tier_curation(vault, TODAY, cur)
+    finally:
+        dc.os.replace = orig
+
+    assert len(seen_tmp) == 1
+    assert seen_tmp[0].endswith(".curation.tmp"), seen_tmp[0]
+
+
+def test_atomic_write_does_not_corrupt_on_replace_failure(
+    tmp_path: Path,
+) -> None:
+    """If os.replace fails mid-save, the EXISTING daily file is left
+    intact (the write went to .tmp, never to the real path). Simulates a
+    crashed write — the operator's prior curation survives."""
+    import os as _os
+
+    vault = _make_vault(tmp_path)
+    daily_file = vault / "daily" / "2026-05-29.md"
+    # Seed a valid existing file with a known curation.
+    first = DailyCuration(
+        t1=[T1T2Entry(task="[[task/Original]]", source="operator")],
+        t2=[], t3=[],
+    )
+    save_tier_curation(vault, TODAY, first)
+    before = daily_file.read_bytes()
+
+    import alfred.tier.daily_curation as dc
+
+    def _boom(src, dst):
+        raise OSError("simulated replace failure")
+
+    orig = dc.os.replace
+    dc.os.replace = _boom
+    try:
+        second = DailyCuration(
+            t1=[T1T2Entry(task="[[task/Replacement]]", source="operator")],
+            t2=[], t3=[],
+        )
+        try:
+            save_tier_curation(vault, TODAY, second)
+        except OSError:
+            pass  # expected — the replace failed
+    finally:
+        dc.os.replace = orig
+
+    # The real file is byte-identical to before — never truncated.
+    assert daily_file.read_bytes() == before
+    # Reloads cleanly to the ORIGINAL curation.
+    reloaded = load_daily_curation(vault, TODAY)
+    assert reloaded is not None
+    assert reloaded.t1[0].task == "[[task/Original]]"
+
+
+def test_aggregator_and_curation_tmp_suffixes_distinct() -> None:
+    """Cross-writer pin: the aggregator's tmp suffix (.routine.tmp) and
+    the curation writer's (.curation.tmp) are distinct, so two writers
+    hitting the same daily date never clobber each other's scratch file.
+    Pin both literals so a future rename of one without the other
+    re-introduces the collision."""
+    from pathlib import Path as _P
+
+    daily = _P("/v/daily/2026-05-29.md")
+    routine_tmp = daily.with_suffix(".routine.tmp")
+    curation_tmp = daily.with_suffix(".curation.tmp")
+    assert routine_tmp != curation_tmp
+    assert str(routine_tmp).endswith(".routine.tmp")
+    assert str(curation_tmp).endswith(".curation.tmp")

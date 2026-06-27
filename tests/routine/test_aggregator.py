@@ -638,6 +638,67 @@ def test_aggregator_preserves_tier_curation(tmp_path: Path) -> None:
     assert events[0]["date"] == "2026-05-26"
 
 
+def test_aggregator_write_is_atomic_no_tmp_leftover(
+    tmp_path: Path,
+) -> None:
+    """Step 2 writer-race fix: the aggregator writes the daily file
+    atomically (.routine.tmp -> os.replace). After a fire, the real
+    daily file exists and NO .routine.tmp scratch file is left behind."""
+    vault = tmp_path / "vault"
+    today = date(2026, 5, 26)
+    _write_routine(vault, "Daily R", {
+        "type": "routine",
+        "status": "active",
+        "name": "Daily R",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Brush AM", "priority": "tracked"}],
+    })
+    config = _config(vault, tmp_path)
+    rel = run_aggregator_once(config, today)
+    daily_file = vault / rel
+    assert daily_file.exists()
+    # No leftover scratch file — distinct suffix from the curation
+    # writer's .curation.tmp so the two writers never collide.
+    assert not (vault / "daily" / "2026-05-26.routine.tmp").exists()
+
+
+def test_aggregator_atomic_write_uses_routine_tmp_suffix(
+    tmp_path: Path,
+) -> None:
+    """Pin the aggregator's tmp suffix is .routine.tmp (distinct from
+    the curation writer's .curation.tmp). Observe the path os.replace
+    consumes."""
+    import alfred.routine.aggregator as agg
+
+    vault = tmp_path / "vault"
+    today = date(2026, 5, 26)
+    _write_routine(vault, "Daily R", {
+        "type": "routine",
+        "status": "active",
+        "name": "Daily R",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Brush AM", "priority": "tracked"}],
+    })
+    config = _config(vault, tmp_path)
+
+    seen: list[str] = []
+    real = agg.os.replace
+
+    def _spy(src, dst):
+        seen.append(str(src))
+        return real(src, dst)
+
+    orig = agg.os.replace
+    agg.os.replace = _spy
+    try:
+        run_aggregator_once(config, today)
+    finally:
+        agg.os.replace = orig
+
+    assert len(seen) == 1
+    assert seen[0].endswith(".routine.tmp"), seen[0]
+
+
 def test_aggregator_writes_clean_file_without_existing_tier_curation(
     tmp_path: Path,
 ) -> None:
