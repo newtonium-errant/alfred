@@ -123,6 +123,235 @@ def coerce_due_date(value: Any) -> date | None:
 
 
 # ---------------------------------------------------------------------------
+# Routine-item tier classification — THE SINGLE SOURCE OF TRUTH
+# ---------------------------------------------------------------------------
+#
+# Routine-systems consolidation Step 2 (2026-06-26): the T1/T2/T3
+# window math used to be hand-mirrored in TWO places —
+# ``_decide_tier_handoff`` (aggregator, used at 05:59 to SUPPRESS
+# handed-off items from the routine section) and ``_compute_auto_routine``
+# / ``compute_auto_t3_candidates`` (this module, used at 06:00 to
+# SURFACE them in the tier section). The two ran identical predicates
+# over the same records one minute apart, kept in sync only by
+# convention + the three ``test_mirror_*`` regression pins.
+#
+# :func:`classify_routine_item` collapses that mirror into ONE predicate.
+# Both former call sites now delegate here. The ``test_mirror_*`` pins
+# stay green and now prove "both callers route through one function"
+# rather than "two hand-written copies happen to agree." Per
+# ``feedback_two_layer_window_math_mirror`` — the duplication dissolves
+# once the decision has a single home.
+
+
+@dataclass
+class RoutineItemClassification:
+    """The tier decision for one routine item — what both the aggregator
+    (suppress-from-routine-section) and the tier render (surface) read.
+
+    Fields:
+      * ``tier`` — ``1`` / ``2`` / ``3`` for a T1/T2/T3 placement, or
+        ``None`` when the item is OUTSIDE all tier windows (and so
+        renders normally in the routine section). This is exactly the
+        value the aggregator's ``_decide_tier_handoff`` returned.
+      * ``reason`` — the canonical operator-facing reason string Ship 2's
+        brief renders inline (``"due today"`` / ``"due tomorrow"`` /
+        ``"escalate window (Nd before due)"`` / ``"surface window (Nd
+        before due)"`` / ``"overdue by Nd (no completion this cycle)"``).
+        ``None`` for a T3 placement (T3 is cadence-ranked, not
+        reason-stringed) and for ``tier is None``.
+      * ``effective_due`` — the due date the decision was made against
+        (overdue-retention-aware: prev_due when the prior cycle lapsed
+        unsatisfied). ``None`` for T3 and for ``tier is None``.
+      * ``both_modes_conflict`` — ``True`` when the item carries BOTH
+        ``due_pattern`` and ``target_cadence_days`` (mutually-exclusive
+        semantics; ``due_pattern`` wins). The aggregator emits the
+        once-per-pass ``routine.item_both_cadence_modes`` warn on this
+        flag; the compute/render path reads it silently (it runs
+        per-brief-fire + per-/today and would spam the log). The
+        WARN-VOICING lives at the caller; the DECISION lives here.
+    """
+
+    tier: int | None
+    reason: str | None = None
+    effective_due: date | None = None
+    both_modes_conflict: bool = False
+
+
+def classify_routine_item(
+    *,
+    priority: str | None,
+    due_pattern: Any,
+    surface_at_days: int | None,
+    escalate_at_days: int | None,
+    target_cadence_days: int | None,
+    completion_log: dict | None,
+    item_text: str,
+    today: date,
+) -> RoutineItemClassification:
+    """Classify one routine item into a tier placement (T1/T2/T3/none).
+
+    THE single window-math predicate for routine items. Encapsulates,
+    in this order:
+
+      1. **Aspirational skip (T1/T2 only).** A ``priority ==
+         "aspirational"`` item never takes the hard-deadline T1/T2
+         handoff even if it carries ``due_pattern`` + ``escalate_at_days``
+         (T3 is the legitimate aspirational surface). It CAN still take
+         the T3 soft-cadence handoff via ``target_cadence_days``. This
+         used to live split across two layers: the aggregator gated it
+         at the ``should_check_handoff`` call site; the compute path
+         gated it inline in ``_compute_auto_routine``. Now it's one
+         rule, enforced once.
+      2. **Both-modes precedence.** ``due_pattern`` + ``target_cadence_days``
+         both set → ``due_pattern`` wins; ``both_modes_conflict=True`` so
+         the caller can emit the operator warn.
+      3. **T3 soft-cadence branch** (``due_pattern`` absent,
+         ``target_cadence_days`` present): surface (tier 3) when
+         ``days_since_last_completed >= target_cadence_days`` (inclusive),
+         OR when never completed (max overdue). Within window → no
+         handoff (tier None).
+      4. **T1/T2 deadline branch** (``due_pattern`` + ``escalate_at_days``
+         present): completion-aware suppression
+         (``completion_satisfies_current_cycle``) → tier None; else
+         overdue-retention-aware effective due → T1 when
+         ``days_to_due <= escalate_at_days`` (admits negative/overdue),
+         T2 when ``escalate_at_days < days_to_due <= surface_at_days``.
+
+    Reason strings are stable contract (the SKILL quotes them verbatim
+    so the talker recognises operator replies). Change a string here =
+    update Ship B render + Ship D SKILL in lockstep.
+
+    Per ``feedback_intentionally_left_blank``: this is a pure-compute
+    predicate; it emits NO log lines (callers own the "ran, here's the
+    decision" log + the both-modes warn). Tests assert the no-logs
+    invariant via ``capture_logs``.
+    """
+    # Lazy import — avoid the top-level circular hazard between
+    # ``alfred.tier.compute`` and ``alfred.routine.due``.
+    from alfred.routine.due import (
+        completion_satisfies_current_cycle,
+        overdue_effective_due,
+    )
+
+    both_modes_conflict = (
+        due_pattern is not None and target_cadence_days is not None
+    )
+
+    # ---- Aspirational skip (T1/T2 only) --------------------------
+    # An aspirational item with due_pattern does NOT take the T1/T2
+    # handoff (operator semantic: T3 is for self-care intentions, not
+    # deadline-driven work). It still falls through to the T3 branch
+    # below if it carries target_cadence_days.
+    aspirational = (priority or "").lower() == "aspirational"
+
+    # ---- T3 soft-cadence branch ----------------------------------
+    # Fires when due_pattern is absent (both-modes precedence: due_pattern
+    # wins when both set). Predicate: days_since >= target (inclusive).
+    if due_pattern is None and target_cadence_days is not None:
+        if (
+            not isinstance(target_cadence_days, int)
+            or target_cadence_days <= 0
+        ):
+            # Defensive: zero/negative target → undefined semantics →
+            # no handoff. Item renders in the routine section.
+            return RoutineItemClassification(
+                tier=None, both_modes_conflict=both_modes_conflict,
+            )
+        log_dict = (
+            completion_log if isinstance(completion_log, dict) else {}
+        )
+        completion_dates = _parse_item_completion_dates(
+            log_dict.get(item_text, [])
+        )
+        if not completion_dates:
+            # Never completed → max overdue → SURFACE in T3.
+            return RoutineItemClassification(
+                tier=3, both_modes_conflict=both_modes_conflict,
+            )
+        days_since = (today - max(completion_dates)).days
+        if days_since < 0:
+            # Future-dated completion (operator hand-edit) → clamp.
+            days_since = 0
+        if days_since >= target_cadence_days:
+            return RoutineItemClassification(
+                tier=3, both_modes_conflict=both_modes_conflict,
+            )
+        # Within soft cadence window → render in routine section.
+        return RoutineItemClassification(
+            tier=None, both_modes_conflict=both_modes_conflict,
+        )
+
+    # ---- T1/T2 deadline branch -----------------------------------
+    if due_pattern is None or escalate_at_days is None:
+        return RoutineItemClassification(
+            tier=None, both_modes_conflict=both_modes_conflict,
+        )
+    if aspirational:
+        # Aspirational + deadline-bearing: never T1/T2. (No T3 either —
+        # the T3 branch above only fires for target_cadence_days items;
+        # an aspirational due_pattern item just renders in the routine
+        # section.)
+        return RoutineItemClassification(
+            tier=None, both_modes_conflict=both_modes_conflict,
+        )
+
+    # Phase 2C C1 completion-aware suppression: a completion covering
+    # the current/upcoming cycle (nearest-cycle ±half-cycle heuristic)
+    # → no handoff; the routine section's "*(done this cycle)*"
+    # annotation is the right surface.
+    if completion_satisfies_current_cycle(
+        item_text, completion_log, due_pattern, today,
+    ):
+        return RoutineItemClassification(
+            tier=None, both_modes_conflict=both_modes_conflict,
+        )
+
+    # Phase 2C C1 overdue retention: effective_due = prev_due when the
+    # prior cycle lapsed unsatisfied → days_to_due negative → T1 admits.
+    effective_due = overdue_effective_due(
+        due_pattern, completion_log, item_text, today,
+    )
+    if effective_due is None:
+        return RoutineItemClassification(
+            tier=None, both_modes_conflict=both_modes_conflict,
+        )
+    days_to_due = (effective_due - today).days
+
+    if days_to_due <= escalate_at_days:
+        if days_to_due < 0:
+            reason = (
+                f"overdue by {abs(days_to_due)}d "
+                f"(no completion this cycle)"
+            )
+        elif days_to_due == 0:
+            reason = "due today"
+        elif days_to_due == 1:
+            reason = "due tomorrow"
+        else:
+            reason = f"escalate window ({escalate_at_days}d before due)"
+        return RoutineItemClassification(
+            tier=1,
+            reason=reason,
+            effective_due=effective_due,
+            both_modes_conflict=both_modes_conflict,
+        )
+    if (
+        surface_at_days is not None
+        and surface_at_days > escalate_at_days
+        and escalate_at_days < days_to_due <= surface_at_days
+    ):
+        return RoutineItemClassification(
+            tier=2,
+            reason=f"surface window ({days_to_due}d before due)",
+            effective_due=effective_due,
+            both_modes_conflict=both_modes_conflict,
+        )
+    return RoutineItemClassification(
+        tier=None, both_modes_conflict=both_modes_conflict,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tier-V2 surface — auto-T1 candidate discovery
 # ---------------------------------------------------------------------------
 
@@ -420,26 +649,13 @@ def _compute_auto_routine(
     """
     import frontmatter  # type: ignore[import-untyped]
 
-    # Lazy imports — avoid the top-level circular hazard between
-    # ``alfred.tier.compute`` and ``alfred.routine.due`` / config.
-    # Both modules import from alfred.tier.compute (via cadence
-    # symbol re-use) on the routine side; the lazy import here
-    # keeps the tier-compute load order clean.
+    # Lazy import — avoid the top-level circular hazard between
+    # ``alfred.tier.compute`` and ``alfred.routine.config``. The
+    # window-math helpers (``completion_satisfies_current_cycle`` /
+    # ``overdue_effective_due``) are no longer imported here — they live
+    # inside ``classify_routine_item`` now (Step 2 single-source
+    # collapse). This scan only needs ``Item`` to parse the raw items.
     from alfred.routine.config import Item
-    from alfred.routine.due import (
-        completion_satisfies_current_cycle,
-        overdue_effective_due,
-    )
-    # Phase 2C C1 (2026-06-01) — ``is_done_in_current_cycle`` +
-    # ``resolve_due_date`` no longer imported here. The new helpers
-    # encapsulate both: ``completion_satisfies_current_cycle``
-    # supersedes ``is_done_in_current_cycle`` (more permissive,
-    # catches cross-month-boundary completions); ``overdue_effective_
-    # due`` calls ``resolve_due_date`` internally + handles overdue
-    # retention. Render-layer annotation in aggregator.py still uses
-    # ``is_done_in_current_cycle`` for the "*(done this cycle)*"
-    # text — different semantic (calendar-window question), kept
-    # for that use.
 
     routine_dir = vault_path / "routine"
     if not routine_dir.is_dir():
@@ -482,116 +698,37 @@ def _compute_auto_routine(
             item = Item.from_dict(raw_item)
             if item is None:
                 continue
-            # MIRRORS ``_collect_items_for_today`` in
-            # ``routine/aggregator.py`` (around line 530, the
-            # ``should_check_handoff`` precondition):
-            # aspirational-priority items skip the hard-deadline
-            # T1/T2 handoff even when they accidentally carry
-            # ``due_pattern`` + ``escalate_at_days``. The
-            # operator-stated semantic (Phase 2A ratification): T3
-            # is for self-care intentions, not deadline-driven work;
-            # the soft-cadence T3 surface (``target_cadence_days``,
-            # ``compute_auto_t3_candidates``) is the legitimate
-            # aspirational path.
-            #
-            # Drift between the two layers either double-renders
-            # items (compute permissive, aggregator strict — pre-fix
-            # state) or silently loses them (reverse). Pinned by
-            # ``test_mirror_aspirational_t1_predicate_matches_aggregator``
-            # in ``tests/tier/test_compute.py`` per
-            # ``feedback_two_layer_window_math_mirror``.
-            #
-            # Latent in production until this fix (2026-05-31): no
-            # real records combined ``priority: aspirational`` with
-            # deadline-bearing fields, so the double-render never
-            # surfaced. The gate ships before a future record shape
-            # exercises the bug.
-            if item.priority == "aspirational":
-                continue
-            if item.due_pattern is None:
-                continue
-            if item.escalate_at_days is None:
-                continue
 
-            # Phase 2C C1 (2026-06-01) completion-aware suppression.
-            # MIRROR of the same gate in
-            # ``alfred.routine.aggregator._decide_tier_handoff``.
-            # Operator bug surfacing: Pay Clinic Rental (monthly
-            # day=1) completed May 29, still auto-surfaced T1 on
-            # June 1's brief because the old ``is_done_in_current_
-            # cycle`` predicate uses calendar-month windows and
-            # May 29 doesn't fall in "calendar month of June 1 due."
-            # The new nearest-cycle ±half-cycle helper correctly
-            # treats May 29 as covering the June 1 cycle.
-            #
-            # Drift between this gate and the aggregator's identical
-            # call would either double-surface completed items
-            # (both layers permissive) or double-suppress real T1
-            # work (both layers strict). Pinned by
-            # ``test_mirror_completion_predicate_aggregator_matches_
-            # compute`` in tests/tier/test_compute.py per
-            # ``feedback_two_layer_window_math_mirror``.
-            if completion_satisfies_current_cycle(
-                item.text, completion_log, item.due_pattern,
-                today_local,
-            ):
-                continue
-
-            # Phase 2C C1 overdue retention. ``overdue_effective_due``
-            # returns prev_due when prev cycle is unsatisfied AND has
-            # passed → makes days_to_due negative → T1 window admits.
-            # Without this, monthly day=15, today=June 17, no
-            # completion → current_due=July 15, days_to_due=28, item
-            # silently drops out of T1 instead of staying with the
-            # overdue annotation operator expects.
-            #
-            # MIRROR with aggregator's _decide_tier_handoff use of
-            # the same helper.
-            effective_due = overdue_effective_due(
-                item.due_pattern, completion_log, item.text, today_local,
+            # Single source of truth (Step 2, 2026-06-26). The
+            # aspirational skip, the completion-aware suppression, the
+            # overdue-retention effective-due, and the T1/T2 window math
+            # all live in ``classify_routine_item`` — the SAME predicate
+            # the aggregator's ``_decide_tier_handoff`` now delegates to.
+            # No hand-mirrored copy here; the two layers cannot drift.
+            classification = classify_routine_item(
+                priority=item.priority,
+                due_pattern=item.due_pattern,
+                surface_at_days=item.surface_at_days,
+                escalate_at_days=item.escalate_at_days,
+                target_cadence_days=item.target_cadence_days,
+                completion_log=completion_log,
+                item_text=item.text,
+                today=today_local,
             )
-            if effective_due is None:
-                continue
-            due = effective_due
-            days_to_due = (due - today_local).days
 
-            reason: str | None = None
-            if window == "t1":
-                # Phase 2C C1: T1 admits non-positive days_to_due
-                # (overdue retention). The upper bound stays
-                # ``escalate_at_days``.
-                if days_to_due <= item.escalate_at_days:
-                    if days_to_due < 0:
-                        reason = (
-                            f"overdue by {abs(days_to_due)}d "
-                            f"(no completion this cycle)"
-                        )
-                    elif days_to_due == 0:
-                        reason = "due today"
-                    elif days_to_due == 1:
-                        reason = "due tomorrow"
-                    else:
-                        reason = (
-                            f"escalate window "
-                            f"({item.escalate_at_days}d before due)"
-                        )
-            else:  # window == "t2"
-                surface = item.surface_at_days
-                if (
-                    surface is not None
-                    and surface > item.escalate_at_days
-                    and item.escalate_at_days < days_to_due <= surface
-                ):
-                    reason = f"surface window ({days_to_due}d before due)"
-
-            if reason is None:
+            want_tier = 1 if window == "t1" else 2
+            if classification.tier != want_tier:
                 continue
+            # T1/T2 classifications always carry a reason + effective_due
+            # (the classifier only omits them for T3 / no-handoff).
+            assert classification.reason is not None
+            assert classification.effective_due is not None
 
             candidates.append(AutoT1Candidate(
                 path=rel_path,
                 name=item.text,
-                due_iso=due.isoformat(),
-                surface_reason=reason,
+                due_iso=classification.effective_due.isoformat(),
+                surface_reason=classification.reason,
                 origin="routine",
                 routine_record=record_name,
                 item_text=item.text,
@@ -665,15 +802,19 @@ def _parse_item_completion_dates(raw: Any) -> list[date]:
 #     sort-by-overdue-ratio output. Operator hasn't started yet; the
 #     item should surface most prominently.
 #
-# Mirror with :func:`alfred.routine.aggregator._decide_tier_handoff`:
-# the predicate ``days_since >= target_cadence_days`` is computed in
-# BOTH layers. The aggregator uses it to suppress the routine-section
-# render (the item handed off to T3); this compute uses it to surface
-# the item AS the T3 candidate. The two outcomes are two sides of one
-# decision; rename the predicate here = update the aggregator in
-# lockstep. Per ``feedback_two_layer_window_math_mirror`` — the
-# regression-pin lives in ``tests/tier/test_compute.py``
-# (``test_mirror_decide_tier_handoff_t3_matches_compute_auto_t3``).
+# Single source of truth (Step 2, 2026-06-26): the T3 surface predicate
+# (``days_since >= target_cadence_days``, never-completed = max overdue)
+# lives in :func:`classify_routine_item`. Both this surface (which reads
+# ``tier == 3`` to emit the candidate) AND the aggregator's
+# ``_decide_tier_handoff`` (which reads the same value to SUPPRESS the
+# routine-section render) delegate to that one function — the two
+# outcomes are two reads of one decision, not a hand-mirror. The
+# ``overdue_ratio`` / ``days_since_last_completed`` SORT metadata below
+# is computed here (it isn't part of the handoff decision). Per
+# ``feedback_two_layer_window_math_mirror`` — the regression-pin lives
+# in ``tests/tier/test_compute.py``
+# (``test_mirror_decide_tier_handoff_t3_matches_compute_auto_t3``), now
+# proving "both callers route through one function."
 #
 # Companion talker grammar (``T3 confirm <item>`` + voice-completion
 # of soft-cadence items) shipped 2026-05-30 (Phase 2B B1) — the
@@ -815,21 +956,33 @@ def compute_auto_t3_candidates(
             item = Item.from_dict(raw_item)
             if item is None:
                 continue
-            if item.target_cadence_days is None:
+
+            # Single source of truth (Step 2, 2026-06-26). The T3 SURFACE
+            # decision (target present, due_pattern absent, target
+            # positive, days_since >= target OR never-completed) lives in
+            # ``classify_routine_item`` — the SAME predicate the
+            # aggregator delegates to. We read ``tier == 3`` for the
+            # surface gate, then compute the sort-only metadata
+            # (``days_since`` / ``overdue_ratio``) locally; those fields
+            # aren't part of the handoff decision so they stay here.
+            classification = classify_routine_item(
+                priority=item.priority,
+                due_pattern=item.due_pattern,
+                surface_at_days=item.surface_at_days,
+                escalate_at_days=item.escalate_at_days,
+                target_cadence_days=item.target_cadence_days,
+                completion_log=completion_log,
+                item_text=item.text,
+                today=today_local,
+            )
+            if classification.tier != 3:
                 continue
-            # Mutually-exclusive precedence: due_pattern wins. The
-            # aggregator's _decide_tier_handoff emits the warn log
-            # naming the record + item text; here we defensively
-            # match the same outcome silently (compute paths run per
-            # /today + per brief fire — log emission lives at the
-            # write/aggregate layer to avoid spam).
-            if item.due_pattern is not None:
-                continue
+
+            # tier == 3 guarantees target_cadence_days is a positive int
+            # and due_pattern is absent (the classifier's T3 branch
+            # preconditions). Recompute the sort metadata.
             target = item.target_cadence_days
-            if not isinstance(target, int) or target <= 0:
-                # Defensive: zero / negative target has undefined
-                # overdue semantics. Operator hand-edit corruption.
-                continue
+            assert isinstance(target, int) and target > 0
 
             completion_dates = _parse_item_completion_dates(
                 completion_log.get(item.text, [])
@@ -838,17 +991,12 @@ def compute_auto_t3_candidates(
             if completion_dates:
                 most_recent = max(completion_dates)
                 days_since = (today_local - most_recent).days
-                # Defensive: a future-dated completion (operator hand-
-                # edit producing tomorrow's date) yields negative
-                # days_since. Treat as "done today" — clamp to 0,
-                # which produces overdue_ratio = 0 → skip.
+                # Future-dated completion (operator hand-edit) → clamp.
+                # (The classifier already clamps for its predicate; we
+                # clamp here too so the ratio matches.)
                 if days_since < 0:
                     days_since = 0
                 days_since_value = days_since
-                # Predicate mirror with aggregator._decide_tier_handoff
-                # T3 branch: days_since >= target → surface.
-                if days_since < target:
-                    continue
                 ratio = days_since / target
             else:
                 # Never completed — treat as max overdue.

@@ -1945,3 +1945,217 @@ def test_mirror_completion_predicate_aggregator_matches_compute(
         f"broken on compute side. Got: "
         f"{[c.name for c in compute_result]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# classify_routine_item — THE single source of truth (Step 2, 2026-06-26)
+# ---------------------------------------------------------------------------
+#
+# These tests pin the extracted predicate directly. The three
+# ``test_mirror_*`` tests above continue to prove the two former call
+# sites (aggregator ``_decide_tier_handoff`` + compute
+# ``_compute_auto_routine`` / ``compute_auto_t3_candidates``) agree —
+# and now they agree BY CONSTRUCTION because both delegate here.
+
+
+from alfred.routine.config import DuePattern  # noqa: E402
+from alfred.tier.compute import (  # noqa: E402
+    RoutineItemClassification,
+    classify_routine_item,
+)
+
+# Reference date for the classifier tests — 2026-05-28 (Thursday), the
+# same "today" the NOW instant resolves to.
+_TODAY = date(2026, 5, 28)
+
+
+def _classify(**overrides):
+    """Build a classify_routine_item call with sensible defaults; pass
+    only the fields the case exercises."""
+    kwargs = dict(
+        priority="tracked",
+        due_pattern=None,
+        surface_at_days=None,
+        escalate_at_days=None,
+        target_cadence_days=None,
+        completion_log=None,
+        item_text="X",
+        today=_TODAY,
+    )
+    kwargs.update(overrides)
+    return classify_routine_item(**kwargs)
+
+
+def test_classify_returns_dataclass() -> None:
+    result = _classify()
+    assert isinstance(result, RoutineItemClassification)
+    assert result.tier is None
+    assert result.reason is None
+    assert result.effective_due is None
+    assert result.both_modes_conflict is False
+
+
+def test_classify_t1_due_today() -> None:
+    # weekly day=thu, today=Thursday → due today → T1.
+    dp = DuePattern.from_dict({"type": "weekly", "day": "thu"})
+    result = _classify(due_pattern=dp, escalate_at_days=1)
+    assert result.tier == 1
+    assert result.reason == "due today"
+    assert result.effective_due == _TODAY
+
+
+def test_classify_t1_due_tomorrow() -> None:
+    # weekly day=fri, today=Thursday → due tomorrow → T1.
+    dp = DuePattern.from_dict({"type": "weekly", "day": "fri"})
+    result = _classify(due_pattern=dp, escalate_at_days=1)
+    assert result.tier == 1
+    assert result.reason == "due tomorrow"
+
+
+def test_classify_t1_escalate_window() -> None:
+    # monthly day=1, today=May 28 → due June 1 = 4 days out. With
+    # escalate_at_days=5 the item is inside the T1 escalate window.
+    dp = DuePattern.from_dict({"type": "monthly", "day": 1})
+    result = _classify(due_pattern=dp, escalate_at_days=5)
+    assert result.tier == 1
+    assert result.reason == "escalate window (5d before due)"
+
+
+def test_classify_t2_surface_window() -> None:
+    # monthly day=1 → due June 1 = 4 days out. escalate_at_days=0,
+    # surface_at_days=5 → strictly above escalate, within surface → T2.
+    dp = DuePattern.from_dict({"type": "monthly", "day": 1})
+    result = _classify(
+        due_pattern=dp, escalate_at_days=0, surface_at_days=5,
+    )
+    assert result.tier == 2
+    assert result.reason == "surface window (4d before due)"
+
+
+def test_classify_none_outside_all_windows() -> None:
+    # monthly day=1 → due June 1 = 4 days out. escalate_at_days=1,
+    # no surface window → outside both → render in routine section.
+    dp = DuePattern.from_dict({"type": "monthly", "day": 1})
+    result = _classify(due_pattern=dp, escalate_at_days=1)
+    assert result.tier is None
+    assert result.reason is None
+
+
+def test_classify_t3_soft_cadence_overdue() -> None:
+    # target_cadence_days=3, last completed 4 days ago → overdue → T3.
+    result = _classify(
+        target_cadence_days=3,
+        completion_log={"X": ["2026-05-24"]},  # 4 days ago
+    )
+    assert result.tier == 3
+    # T3 carries no reason/effective_due (cadence-ranked, not
+    # reason-stringed).
+    assert result.reason is None
+    assert result.effective_due is None
+
+
+def test_classify_t3_soft_cadence_within_window() -> None:
+    # target_cadence_days=3, last completed 2 days ago → within → none.
+    result = _classify(
+        target_cadence_days=3,
+        completion_log={"X": ["2026-05-26"]},  # 2 days ago
+    )
+    assert result.tier is None
+
+
+def test_classify_t3_never_completed_surfaces() -> None:
+    # target_cadence_days=3, no completion log → max overdue → T3.
+    result = _classify(target_cadence_days=3, completion_log={})
+    assert result.tier == 3
+
+
+def test_classify_aspirational_skips_t1_t2() -> None:
+    # An aspirational item with a deadline-bearing shape that WOULD be
+    # T1 for a tracked item is suppressed from T1/T2 (operator
+    # semantic: T3 is for self-care intentions, not deadline work).
+    dp = DuePattern.from_dict({"type": "weekly", "day": "thu"})  # due today
+    result = _classify(
+        priority="aspirational", due_pattern=dp, escalate_at_days=1,
+    )
+    assert result.tier is None
+
+
+def test_classify_aspirational_none_priority_does_not_skip() -> None:
+    # priority=None (the value the aggregator adapter passes) must NOT
+    # trigger the aspirational skip — preserves the legacy
+    # _decide_tier_handoff contract where the call site already
+    # filtered aspirational items.
+    dp = DuePattern.from_dict({"type": "weekly", "day": "thu"})  # due today
+    result = _classify(
+        priority=None, due_pattern=dp, escalate_at_days=1,
+    )
+    assert result.tier == 1
+
+
+def test_classify_both_modes_conflict_flag_set() -> None:
+    # due_pattern + target_cadence_days both set → conflict flag True,
+    # due_pattern wins (T1 decision computed, not the T3 cadence path).
+    dp = DuePattern.from_dict({"type": "weekly", "day": "thu"})  # due today
+    result = _classify(
+        due_pattern=dp,
+        escalate_at_days=1,
+        target_cadence_days=3,
+        completion_log={"X": []},
+    )
+    assert result.both_modes_conflict is True
+    assert result.tier == 1  # due_pattern wins
+
+
+def test_classify_no_conflict_flag_when_single_mode() -> None:
+    dp = DuePattern.from_dict({"type": "weekly", "day": "thu"})
+    assert _classify(due_pattern=dp, escalate_at_days=1).both_modes_conflict is False
+    assert _classify(target_cadence_days=3).both_modes_conflict is False
+
+
+def test_classify_emits_no_logs() -> None:
+    # Per feedback_intentionally_left_blank: the classifier is a pure
+    # predicate; callers own the "ran, here's the decision" log + the
+    # both-modes warn. The classifier itself must emit nothing.
+    dp = DuePattern.from_dict({"type": "weekly", "day": "thu"})
+    with structlog.testing.capture_logs() as captured:
+        _classify(
+            due_pattern=dp,
+            escalate_at_days=1,
+            target_cadence_days=3,  # would-be both-modes conflict
+            completion_log={"X": []},
+        )
+    assert captured == [], (
+        "classify_routine_item must emit no logs — the both-modes warn "
+        "is the aggregator's responsibility (it reads both_modes_conflict)."
+    )
+
+
+def test_aggregator_delegates_to_classifier() -> None:
+    # Delegation proof: _decide_tier_handoff routes through
+    # classify_routine_item. Spy on the classifier (patched in the
+    # aggregator's lazy-import namespace) and assert it's called with
+    # the forwarded args + that the adapter returns classification.tier.
+    from unittest.mock import patch
+
+    import alfred.tier.compute as compute_mod
+
+    dp = DuePattern.from_dict({"type": "weekly", "day": "thu"})
+    sentinel = RoutineItemClassification(tier=2, both_modes_conflict=False)
+    with patch.object(
+        compute_mod, "classify_routine_item", return_value=sentinel,
+    ) as spy:
+        from alfred.routine.aggregator import _decide_tier_handoff
+
+        out = _decide_tier_handoff(
+            due_pattern=dp,
+            surface_at_days=5,
+            escalate_at_days=0,
+            today=_TODAY,
+            target_cadence_days=None,
+            completion_log={"X": []},
+            item_text="X",
+            routine_record="Rec",
+        )
+    spy.assert_called_once()
+    # The adapter returns the classification's tier verbatim.
+    assert out == 2

@@ -49,7 +49,6 @@ from alfred.brief.renderer import serialize_record
 from .cadence import CadenceError, is_due
 from .config import DuePattern, RoutineConfig
 from .due import (
-    completion_satisfies_current_cycle,
     is_done_in_current_cycle,
     overdue_effective_due,
     resolve_due_date,
@@ -325,25 +324,56 @@ def _decide_tier_handoff(
       * ``routine_record`` — routine record name (operator-facing
         identifier for the warn log).
 
-    Mirrors the window math in :mod:`alfred.tier.compute`'s
-    ``_compute_auto_routine`` (T1/T2) and ``compute_auto_t3_candidates``
-    (T3). Don't introduce variance here — the two layers must agree
-    exactly on which items hand off vs. render-in-routine-section.
-    Per ``feedback_two_layer_window_math_mirror``; regression-pin in
-    ``tests/tier/test_compute.py`` (T3 mirror) and
-    ``tests/routine/test_aggregator.py`` (T1/T2 mirror).
+    Routine-systems consolidation Step 2 (2026-06-26): this function is
+    now a THIN ADAPTER over
+    :func:`alfred.tier.compute.classify_routine_item` — the single
+    source of truth for routine-item tier classification. The window
+    math, the completion-aware suppression, the overdue-retention
+    effective-due, and the T3 soft-cadence predicate ALL live in the
+    classifier; the tier-render path (``_compute_auto_routine`` /
+    ``compute_auto_t3_candidates``) delegates to the same function. The
+    two layers can no longer drift because there is only one predicate.
+    This function's remaining job is (a) translate the classifier result
+    to the legacy ``int | None`` return shape its callers expect, and
+    (b) emit the once-per-pass ``routine.item_both_cadence_modes`` warn
+    (the warn VOICING is the aggregator's responsibility — the compute
+    path reads the same ``both_modes_conflict`` flag silently to avoid
+    per-fire spam). Per ``feedback_two_layer_window_math_mirror``; the
+    ``test_mirror_*`` pins now prove "both callers route through one
+    function."
+
+    NOTE: the aspirational-priority skip lives INSIDE the classifier.
+    The aggregator's call site (``should_check_handoff``) already
+    short-circuits aspirational items in the deadline case, so this
+    function historically only saw non-aspirational items on the T1/T2
+    path. We pass ``priority=None`` here so the classifier's aspirational
+    gate is a no-op (preserving the legacy contract exactly — the
+    call-site filter remains the operative gate for the aggregate pass).
     """
+    # Lazy import — the routine and tier packages reference each other's
+    # symbols; importing the classifier at call time keeps the module
+    # load order clean (mirrors the lazy imports the compute path
+    # already uses for routine.due / routine.config).
+    from alfred.tier.compute import classify_routine_item
+
+    classification = classify_routine_item(
+        priority=None,
+        due_pattern=due_pattern,
+        surface_at_days=surface_at_days,
+        escalate_at_days=escalate_at_days,
+        target_cadence_days=target_cadence_days,
+        completion_log=completion_log,
+        item_text=item_text,
+        today=today,
+    )
+
     # Mutually-exclusive validator: both cadence modes set → warn +
-    # prefer due_pattern. The warn fires HERE (not at the T3 compute
-    # path) because this is the once-per-aggregate-pass call site;
-    # the compute path runs per-brief-fire + per-/today and would
-    # spam the log. Per the dispatch's "validator-level rule, not a
-    # load-failure" framing — operator sees the signal but the record
-    # still works.
-    if (
-        due_pattern is not None
-        and target_cadence_days is not None
-    ):
+    # prefer due_pattern. The warn fires HERE (not at the compute path)
+    # because this is the once-per-aggregate-pass call site; the compute
+    # path runs per-brief-fire + per-/today and would spam the log. Per
+    # the "validator-level rule, not a load-failure" framing — operator
+    # sees the signal but the record still works.
+    if classification.both_modes_conflict:
         log.warning(
             "routine.item_both_cadence_modes",
             routine_record=routine_record,
@@ -359,96 +389,8 @@ def _decide_tier_handoff(
                 "ambiguity."
             ),
         )
-        # due_pattern wins — fall through to the T1/T2 branches below;
-        # target_cadence_days is ignored for this dispatch.
 
-    # ---- Phase 2A-soft-cadence T3 branch -------------------------
-    # Only fires when due_pattern is absent (the precedence rule
-    # above means due_pattern wins when both are set). Predicate
-    # mirror with tier.compute.compute_auto_t3_candidates:
-    # ``days_since >= target_cadence_days`` (inclusive boundary).
-    if due_pattern is None and target_cadence_days is not None:
-        if (
-            not isinstance(target_cadence_days, int)
-            or target_cadence_days <= 0
-        ):
-            # Defensive: zero/negative target → undefined semantics →
-            # don't hand off. Item renders in routine section.
-            return None
-        log_dict = (
-            completion_log if isinstance(completion_log, dict) else {}
-        )
-        completion_dates = _parse_log_dates(log_dict.get(item_text, []))
-        if not completion_dates:
-            # Never completed → max overdue → SURFACE in T3.
-            return 3
-        days_since = (today - max(completion_dates)).days
-        if days_since < 0:
-            # Future-dated completion (operator hand-edit) → clamp.
-            days_since = 0
-        if days_since >= target_cadence_days:
-            return 3
-        # Within soft cadence window → render in routine section.
-        return None
-
-    # ---- T1/T2 branches (deadline-bearing) -----------------------
-    if due_pattern is None or escalate_at_days is None:
-        return None
-
-    # Phase 2C C1 (2026-06-01) completion-aware suppression: if a
-    # completion entry covers the current/upcoming cycle (per the
-    # nearest-cycle ±half-cycle heuristic in
-    # ``completion_satisfies_current_cycle``), don't hand off — the
-    # operator has already completed this cycle's work, so the
-    # routine section's "*(done this cycle)*" annotation is the
-    # right surface, not T1/T2.
-    #
-    # Operator bug 2026-06-01 surfacing: Pay Clinic Rental (monthly
-    # day=1) completed May 29 via routine_done, but still auto-
-    # surfaced T1 on June 1's brief because this predicate didn't
-    # consult completion_log. The new helper consults it.
-    #
-    # MIRROR with ``alfred.tier.compute._compute_auto_routine`` —
-    # same call, same args, same result. Drift here either
-    # double-surfaces (operator sees completed items in T1) or
-    # double-suppresses (operator misses real T1 work). Pinned in
-    # ``test_mirror_completion_predicate_aggregator_matches_compute``.
-    if completion_satisfies_current_cycle(
-        item_text, completion_log, due_pattern, today,
-    ):
-        return None
-
-    # Phase 2C C1 — overdue retention. The default
-    # ``resolve_due_date`` returns the next-upcoming due, which rolls
-    # forward past today on a missed deadline. The
-    # ``overdue_effective_due`` helper returns prev_due instead when
-    # prev cycle has passed without completion → days_to_due becomes
-    # negative → T1 window accepts as "overdue, retain."
-    #
-    # Without this: monthly day=15, today=June 17, no completion →
-    # current_due=July 15, days_to_due=28, falls out of T1 window,
-    # item silently drops. With this: effective_due=June 15,
-    # days_to_due=-2, T1 window admits.
-    effective_due = overdue_effective_due(
-        due_pattern, completion_log, item_text, today,
-    )
-    if effective_due is None:
-        return None
-    days_to_due = (effective_due - today).days
-    # Phase 2C C1: T1 admits non-positive days_to_due ("overdue,
-    # retain"). The upper bound stays ``escalate_at_days``; the
-    # lower bound moves from 0 to -∞ to capture the overdue case.
-    # T2 stays bounded — operator wants overdue items in T1 (the
-    # urgent surface), not T2 (the upcoming-soon surface).
-    if days_to_due <= escalate_at_days:
-        return 1
-    if (
-        surface_at_days is not None
-        and surface_at_days > escalate_at_days
-        and escalate_at_days < days_to_due <= surface_at_days
-    ):
-        return 2
-    return None
+    return classification.tier
 
 
 def _collect_items_for_today(
@@ -571,18 +513,20 @@ def _collect_items_for_today(
             # target_cadence_days (aspirational included — that's the
             # whole point of the soft-cadence surface).
             #
-            # MIRRORS the ``if item.priority == "aspirational": continue``
-            # guard in ``_compute_auto_routine`` in ``tier/compute.py``.
-            # Same gate, same reason, same operator-stated semantic:
-            # aspirational items don't deadline-escalate to T1/T2 even
-            # when they carry due_pattern + escalate_at_days. The
-            # soft-cadence T3 path IS the legitimate aspirational
-            # surface (target_cadence_days → auto-T3 candidates).
-            #
-            # Don't introduce variance here without matching the
-            # compute site. Drift either double-renders items
-            # (compute permissive, aggregator strict) or silently
-            # loses them (reverse). Side-by-side regression-pin in
+            # The ``priority != "aspirational"`` gate enforces the
+            # operator-stated semantic: aspirational items don't
+            # deadline-escalate to T1/T2 even when they carry due_pattern
+            # + escalate_at_days; the soft-cadence T3 path IS the
+            # legitimate aspirational surface. Post-Step-2 (2026-06-26)
+            # the SAME rule also lives inside
+            # ``classify_routine_item`` (the single predicate the tier
+            # render path uses) — so the two surfaces agree by
+            # construction, not by hand-mirroring. We keep this call-site
+            # gate because the aggregator's ``_decide_tier_handoff``
+            # adapter passes ``priority=None`` (preserving its legacy
+            # contract where the call site was the operative aspirational
+            # filter); the classifier's own gate is the one that protects
+            # the tier render path. Regression-pinned by
             # ``tests/tier/test_compute.py::test_mirror_aspirational_t1_predicate_matches_aggregator``
             # per ``feedback_two_layer_window_math_mirror``.
             should_check_handoff = (
