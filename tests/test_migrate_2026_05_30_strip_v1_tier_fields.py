@@ -8,8 +8,11 @@ against synthesized fixture vaults.
 Test surface split:
 
   * **Plan-build** (no I/O): the discovery function against in-fixture
-    vaults. Pin three record-shape buckets (all-3-fields, base_tier-
-    only, none) into the right pending / already-clean lists.
+    vaults. Pin the record-shape buckets (both-dead-fields, base_tier-
+    only, none, live-field-only) into the right pending / already-clean
+    lists. Post-2026-06-26 the strip set is the two DEAD fields only
+    (base_tier / escalate_to); ``escalate_at_days`` is the LIVE V2 knob
+    and is NEVER stripped — a live-field-only record lands already-clean.
   * **Plan-rendering**: human-readable dry-run output. Pin section
     header fires unconditionally per ``feedback_intentionally_left_
     blank.md``; sentinel strings on empty bucket; per-record line
@@ -87,40 +90,48 @@ def _write_task(
 
 
 def _build_fixture_vault(tmp_path: Path) -> Path:
-    """Build a fixture vault with the three V1-tier-field record shapes
-    the live vault carries (per 2026-05-30 census):
+    """Build a fixture vault with the V1-tier-field record shapes the
+    live vault carries (per 2026-05-30 census), updated for the
+    2026-06-26 narrowing of the strip set to the two DEAD fields
+    (``base_tier`` / ``escalate_to``); ``escalate_at_days`` is now a
+    LIVE V2 field and is NEVER stripped.
 
-      * 1 all-3-fields record (mirrors RRTS Invoicing / RRTS Payroll /
-        Pay Clinic Rental — all status=cancelled in live data, but
-        status is not load-bearing for the strip)
+      * 1 record carrying both dead fields + the live field
+        (``base_tier`` + ``escalate_to`` + ``escalate_at_days``):
+        strip removes the two dead fields, PRESERVES ``escalate_at_days``.
+        Mirrors RRTS Invoicing / RRTS Payroll / Pay Clinic Rental.
       * 1 base_tier-only record (mirrors the 25 records carrying just
-        base_tier in live data)
-      * 1 out-of-scope record (no V1 fields — never participated in
-        V1 tier system, or already cleaned by a prior run)
-
-    Plus 1 record with two of the three fields (base_tier + escalate_to
-    but no escalate_at_days) to exercise the partial-field case — not
-    observed in live data but defensible against a partial prior strip.
+        base_tier in live data) — strip removes that one dead field.
+      * 1 out-of-scope record (no V1 fields) — already-clean bucket.
+      * 1 partial-two-dead-fields record (base_tier + escalate_to, no
+        escalate_at_days) — strip removes exactly those two.
+      * 1 LIVE-FIELD-ONLY record (escalate_at_days, NO dead fields) —
+        MUST land in the already-clean bucket: the strip never touches
+        the live V2 knob. This is the landmine-guard fixture.
     """
     vault = tmp_path / "vault"
     vault.mkdir()
     (vault / "task").mkdir()
 
-    # All three V1 fields present — strip removes all 3.
+    # Both dead fields + the live field — strip removes the 2 dead
+    # fields, PRESERVES escalate_at_days.
     _write_task(
-        vault, "All Three Fields",
+        vault, "Both Dead Plus Live",
         base_tier=2, escalate_to=1, escalate_at_days=3,
         status="cancelled",
     )
-    # base_tier only — strip removes just that one.
+    # base_tier only — strip removes just that one dead field.
     _write_task(vault, "Only Base Tier", base_tier=1)
-    # Two of three — strip removes exactly those two.
+    # Two dead fields — strip removes exactly those two.
     _write_task(
         vault, "Partial Two Fields",
         base_tier=3, escalate_to=2,
     )
     # No V1 fields — already-clean bucket.
     _write_task(vault, "Already Clean")
+    # LIVE field ONLY (no dead fields) — the strip must NOT touch it;
+    # lands in already-clean. Landmine-guard fixture.
+    _write_task(vault, "Live Field Only", escalate_at_days=5)
 
     return vault
 
@@ -135,31 +146,40 @@ class TestStripDiscovery:
         vault = _build_fixture_vault(tmp_path)
         pending, already_clean = mig.discover_strip_records(vault)
         names = {p.rel_path for p in pending}
-        assert "task/All Three Fields.md" in names
+        assert "task/Both Dead Plus Live.md" in names
         assert "task/Only Base Tier.md" in names
         assert "task/Partial Two Fields.md" in names
         # Already-clean record is in already_clean bucket, NOT pending.
         assert "task/Already Clean.md" not in names
         assert "task/Already Clean.md" in already_clean
+        # LANDMINE GUARD: a record carrying ONLY the live escalate_at_days
+        # field has no DEAD field to strip → already-clean, never pending.
+        # If this flips to pending, the strip set has re-acquired the
+        # live V2 knob and would sever task auto-T1 surfacing.
+        assert "task/Live Field Only.md" not in names
+        assert "task/Live Field Only.md" in already_clean
 
     def test_fields_present_lists_match_record_shape(
         self, tmp_path: Path,
     ) -> None:
         """Pin the per-record fields_present list — the dry-run report
         + apply path both consume this. Order matches V1_TIER_FIELDS
-        (base_tier, escalate_to, escalate_at_days) for deterministic
-        output."""
+        (base_tier, escalate_to) for deterministic output.
+        ``escalate_at_days`` is NO LONGER in the strip set (live V2
+        field, 2026-06-26) so it never appears in fields_present even
+        when present on the record."""
         vault = _build_fixture_vault(tmp_path)
         pending, _ = mig.discover_strip_records(vault)
         by_path = {p.rel_path: p.fields_present for p in pending}
-        # All-three record carries all three fields in canonical order.
-        assert by_path["task/All Three Fields.md"] == [
-            "base_tier", "escalate_to", "escalate_at_days",
+        # Record carrying both dead fields + the live field reports ONLY
+        # the two dead fields — escalate_at_days is preserved, so it's
+        # not in the strip list.
+        assert by_path["task/Both Dead Plus Live.md"] == [
+            "base_tier", "escalate_to",
         ]
         # base_tier-only carries just base_tier.
         assert by_path["task/Only Base Tier.md"] == ["base_tier"]
-        # Partial-two carries base_tier + escalate_to (in order),
-        # NOT escalate_at_days (absent on the record).
+        # Partial-two carries base_tier + escalate_to (in order).
         assert by_path["task/Partial Two Fields.md"] == [
             "base_tier", "escalate_to",
         ]
@@ -202,10 +222,16 @@ class TestBuildPlan:
     def test_full_plan_bucket_counts(self, tmp_path: Path) -> None:
         vault = _build_fixture_vault(tmp_path)
         plan = mig.build_plan(vault)
-        # 3 records carry at least one V1 field.
+        # 3 records carry at least one DEAD V1 field (base_tier /
+        # escalate_to). The live-field-only record is NOT pending.
         assert len(plan.records_pending) == 3
-        # 1 record has no V1 fields.
-        assert plan.records_already_clean == ["task/Already Clean.md"]
+        # 2 records have no DEAD V1 fields: "Already Clean" (none) +
+        # "Live Field Only" (only the live escalate_at_days). Both
+        # already-clean, sorted alphabetically.
+        assert plan.records_already_clean == [
+            "task/Already Clean.md",
+            "task/Live Field Only.md",
+        ]
 
 
 # --- Plan rendering --------------------------------------------------------
@@ -265,12 +291,18 @@ class TestPrintPlan:
         plan = mig.build_plan(vault)
         mig.print_plan(plan, vault, dry_run=True)
         out = capsys.readouterr().out
-        # All-three record's line names all three fields.
-        assert "task/All Three Fields.md" in out
-        assert "base_tier, escalate_to, escalate_at_days" in out
+        # The both-dead-plus-live record's line names ONLY the two dead
+        # fields — escalate_at_days is preserved, not listed.
+        assert "task/Both Dead Plus Live.md" in out
+        assert "base_tier, escalate_to" in out
+        # And escalate_at_days must NOT appear as a field-to-unset
+        # anywhere in the dry-run output (landmine guard at the render
+        # layer — the operator reading the plan must never see the live
+        # field slated for strip).
+        assert "escalate_at_days" not in out
         # base_tier-only record's line names just base_tier.
         # Use a line-scoped match so we don't false-positive on the
-        # all-three record's line above.
+        # both-dead-plus-live record's line above.
         lines = out.splitlines()
         only_base_lines = [
             ln for ln in lines if "task/Only Base Tier.md" in ln
@@ -288,7 +320,10 @@ class TestPrintPlan:
         mig.print_plan(plan, vault, dry_run=True)
         out = capsys.readouterr().out
         assert "idempotency-skip" in out
-        assert "1 record(s) already clean" in out
+        # 2 already-clean records: "Already Clean" (no V1 fields) +
+        # "Live Field Only" (only the live escalate_at_days, no dead
+        # field to strip).
+        assert "2 record(s) already clean" in out
 
     def test_total_count_emitted_in_pending_bucket(
         self, tmp_path: Path, capsys: pytest.CaptureFixture,
@@ -312,17 +347,22 @@ class TestSubprocessCommandShape:
     dry-run inspection.
     """
 
-    def test_strip_all_three_fields_emits_three_unset_flags(
+    def test_strip_both_dead_fields_emits_two_unset_flags(
         self, tmp_path: Path,
     ) -> None:
-        """All-three-fields record: ``vault edit <path> --unset base_tier
-        --unset escalate_to --unset escalate_at_days``. Three --unset
-        flags in a single call so the audit log emits THREE unset
-        rows per record (per the unset-capability dual-emission
-        contract — verified against migrate_tier_phase1.py)."""
+        """Both-dead-fields record: ``vault edit <path> --unset base_tier
+        --unset escalate_to``. Two --unset flags in a single call so the
+        audit log emits TWO unset rows per record (per the
+        unset-capability dual-emission contract — verified against
+        migrate_tier_phase1.py).
+
+        This is the max real shape post-2026-06-26: ``discover_strip_
+        records`` can produce at most these two dead fields in
+        ``fields_present`` (``escalate_at_days`` is excluded from
+        ``V1_TIER_FIELDS``)."""
         entry = mig.StripRecord(
             rel_path="task/RRTS Payroll.md",
-            fields_present=["base_tier", "escalate_to", "escalate_at_days"],
+            fields_present=["base_tier", "escalate_to"],
         )
         env: dict = {}
         with patch.object(mig, "_alfred_vault_cmd") as mocked:
@@ -332,11 +372,12 @@ class TestSubprocessCommandShape:
         assert call_args.args[0] == "edit"
         assert call_args.args[1] == "task/RRTS Payroll.md"
         flat = list(call_args.args[2:])
-        # Three --unset flags + the three field names.
-        assert flat.count("--unset") == 3
+        # Two --unset flags + the two dead field names.
+        assert flat.count("--unset") == 2
         assert "base_tier" in flat
         assert "escalate_to" in flat
-        assert "escalate_at_days" in flat
+        # The live V2 field is never emitted as an unset target.
+        assert "escalate_at_days" not in flat
 
     def test_strip_base_tier_only_emits_one_unset_flag(
         self, tmp_path: Path,
@@ -393,14 +434,16 @@ class TestApplyPlanCounters:
         """End-to-end ``apply_plan`` with subprocess mocked — pin the
         counter dict matches the pending plan exactly.
 
-        Fixture has 3 records pending: All Three (3 fields), Only Base
-        (1 field), Partial Two (2 fields). Total: 3 records / 6 fields."""
+        Fixture has 3 records pending (post-2026-06-26 strip set =
+        base_tier / escalate_to only): Both Dead Plus Live (2 dead
+        fields; escalate_at_days preserved), Only Base (1 field),
+        Partial Two (2 fields). Total: 3 records / 5 fields."""
         vault = _build_fixture_vault(tmp_path)
         plan = mig.build_plan(vault)
         with patch.object(mig, "_alfred_vault_cmd"):
             counters = mig.apply_plan(plan, vault)
         assert counters["records_stripped"] == 3
-        assert counters["fields_unset"] == 3 + 1 + 2  # = 6
+        assert counters["fields_unset"] == 2 + 1 + 2  # = 5
 
     def test_idempotent_rerun_zero_counters(self, tmp_path: Path) -> None:
         """When the plan is fully empty after a prior successful
@@ -460,29 +503,60 @@ class TestMainCLI:
     def test_live_run_invokes_subprocess_per_pending_record(
         self, tmp_path: Path, capsys: pytest.CaptureFixture,
     ) -> None:
-        """Live-run mode (default) calls ``_alfred_vault_cmd`` once per
-        pending record. Fixture has 3 pending → 3 subprocess
-        invocations."""
+        """Live-run mode (with the archived-acknowledgement flag) calls
+        ``_alfred_vault_cmd`` once per pending record. Fixture has 3
+        pending → 3 subprocess invocations."""
         vault = _build_fixture_vault(tmp_path)
         with patch.object(mig, "_alfred_vault_cmd") as mocked:
-            rc = mig.main(["--vault", str(vault)])
+            rc = mig.main([
+                "--vault", str(vault), "--i-understand-this-is-archived",
+            ])
         assert rc == 0
         assert mocked.call_count == 3
         out = capsys.readouterr().out
         assert "Migration complete" in out
 
+    def test_live_run_refused_without_archived_flag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        """ARCHIVED-script live-run guard (2026-06-26). Without
+        ``--i-understand-this-is-archived`` a live run is refused: the
+        plan is printed, exit code 3, NO subprocess writes happen.
+        Guards against a stale muscle-memory invocation mutating the
+        production vault."""
+        vault = _build_fixture_vault(tmp_path)
+        before = {
+            p.name: p.read_bytes() for p in (vault / "task").glob("*.md")
+        }
+        with patch.object(mig, "_alfred_vault_cmd") as mocked:
+            rc = mig.main(["--vault", str(vault)])
+        assert rc == 3
+        # No vault writes attempted.
+        assert mocked.call_count == 0
+        after = {
+            p.name: p.read_bytes() for p in (vault / "task").glob("*.md")
+        }
+        assert before == after
+        err = capsys.readouterr().err
+        assert "REFUSING LIVE RUN" in err
+        assert "--i-understand-this-is-archived" in err
+
     def test_live_run_summary_line_present(
         self, tmp_path: Path, capsys: pytest.CaptureFixture,
     ) -> None:
         """Per migrate_tier_phase1 pattern: final ``Summary:`` line
-        carries the counter shape. Pin so a refactor doesn't drop it."""
+        carries the counter shape. Pin so a refactor doesn't drop it.
+        Post-2026-06-26 strip set (base_tier / escalate_to only):
+        3 records / 5 fields."""
         vault = _build_fixture_vault(tmp_path)
         with patch.object(mig, "_alfred_vault_cmd"):
-            mig.main(["--vault", str(vault)])
+            mig.main([
+                "--vault", str(vault), "--i-understand-this-is-archived",
+            ])
         out = capsys.readouterr().out
         assert "Summary:" in out
         assert "records_stripped=3" in out
-        assert "fields_unset=6" in out
+        assert "fields_unset=5" in out
 
 
 # --- Subprocess env-var threading ------------------------------------------
@@ -514,13 +588,45 @@ class TestModuleConstants:
     needs to know."""
 
     def test_v1_tier_fields_pinned(self) -> None:
-        """Three V1 fields in canonical order: base_tier, escalate_to,
-        escalate_at_days. Pin so an accidental re-order doesn't break
-        the deterministic dry-run output ordering."""
+        """The ACTIVE strip set: the two DEAD V1 fields in canonical
+        order (base_tier, escalate_to). Pin so an accidental re-order
+        doesn't break the deterministic dry-run output ordering — and,
+        critically, so the live V2 ``escalate_at_days`` knob can't be
+        re-added to the strip set without this test firing."""
         assert mig.V1_TIER_FIELDS == (
             "base_tier",
             "escalate_to",
+        )
+
+    def test_escalate_at_days_not_in_strip_set(self) -> None:
+        """LANDMINE GUARD (routine-systems consolidation, 2026-06-26).
+
+        ``escalate_at_days`` is the LIVE V2 due-window knob consumed by
+        ``alfred.tier.compute.compute_auto_t1_candidates``. It was
+        REMOVED from the strip set so this archived migration can no
+        longer sever task auto-T1 surfacing. Re-adding it would
+        reintroduce the landmine — pin the absence explicitly (not just
+        implicitly via the tuple-equality pin above) so the intent is
+        unmissable to a future editor."""
+        assert "escalate_at_days" not in mig.V1_TIER_FIELDS, (
+            "escalate_at_days is a LIVE V2 field; it must never be in "
+            "the strip set. See the module banner + TIER_FIELDS history "
+            "in alfred.vault.schema."
+        )
+
+    def test_historical_strip_set_preserved_for_provenance(self) -> None:
+        """The original 3-field strip set is preserved (renamed,
+        DO-NOT-USE) so a reader can see exactly what the superseded
+        2026-05-30 migration would have stripped. Pin it stays a
+        3-field record AND stays distinct from the active set (i.e. it
+        is NOT what build_plan reads)."""
+        assert mig._HISTORICAL_V1_TIER_FIELDS_DO_NOT_USE == (
+            "base_tier",
+            "escalate_to",
             "escalate_at_days",
+        )
+        assert (
+            mig._HISTORICAL_V1_TIER_FIELDS_DO_NOT_USE != mig.V1_TIER_FIELDS
         )
 
 
@@ -578,7 +684,9 @@ class TestPartialMigrationHandling:
             raise RuntimeError("simulated subprocess failure")
 
         with patch.object(mig, "_alfred_vault_cmd", side_effect=_always_fail):
-            rc = mig.main(["--vault", str(vault)])
+            rc = mig.main([
+                "--vault", str(vault), "--i-understand-this-is-archived",
+            ])
         assert rc == 1
         captured = capsys.readouterr()
         assert "PARTIAL MIGRATION" in captured.out

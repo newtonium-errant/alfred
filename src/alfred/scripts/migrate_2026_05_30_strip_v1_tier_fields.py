@@ -1,5 +1,42 @@
 """One-shot migration: strip V1 tier fields (2026-05-30).
 
+.. danger:: ARCHIVED 2026-06-26 — DO NOT RUN AS-IS. LIVE-FIELD HAZARD.
+
+   The ORIGINAL strip set (``_HISTORICAL_V1_TIER_FIELDS_DO_NOT_USE``)
+   targeted THREE fields: ``base_tier``, ``escalate_to``, AND
+   ``escalate_at_days``. The first two are dead Tier-V1 fields (removed
+   from the schema surface 2026-06-25, routine-systems consolidation
+   Step 1) and ARE safe to strip. **``escalate_at_days`` is NOT — it is
+   the LIVE V2 due-window knob** consumed by
+   ``alfred.tier.compute.compute_auto_t1_candidates`` (+
+   ``RoutineItem``). Stripping it from task records would silently sever
+   task auto-T1 surfacing (a task inside its escalate window would stop
+   appearing in the tier "today" view). The original docstring below
+   (written 2026-05-30 under the now-superseded "all three V1 fields are
+   inert" framing) is FACTUALLY STALE on this point: ``escalate_at_days``
+   was NOT retired — it was retained as the sole surviving tier field.
+   See the ``TIER_FIELDS`` history note in ``alfred.vault.schema``.
+
+   Mitigation applied 2026-06-26: the ACTIVE :data:`V1_TIER_FIELDS` set
+   that ``build_plan`` reads has been narrowed to the two safe fields
+   (``base_tier`` / ``escalate_to``) — the script is now
+   safe-by-construction. A live-run guard in :func:`main` additionally
+   refuses to write unless ``--i-understand-this-is-archived`` is
+   passed (defense-in-depth; dry-run still works freely).
+
+   Consequence: stripping the two genuinely-dead fields from the ~24
+   stale records is a separate, careful OPERATIONAL step against the
+   live production vault — flagged to the operator, run from there.
+   Retained here only for historical reference + test-importability
+   (per ``alfred.scripts.__init__``); it is no longer part of any
+   automatic migration path.
+
+----
+
+Original 2026-05-30 docstring (preserved for provenance; the
+``escalate_at_days``-is-inert claim is superseded — see the banner
+above):
+
 The Tier-V2 redesign superseded the V1 ``base_tier`` + ``escalate_to`` +
 ``escalate_at_days`` field semantics. V2 stores curation in
 ``vault/daily/<date>.md``'s ``tier_curation`` frontmatter; legacy V1
@@ -44,13 +81,16 @@ means the audit log records one row per ``--unset`` flag.
     surfaces both buckets (``records_pending`` + ``records_already_
     clean``) so the operator sees the convergence state.
 
-Recommended invocation:
+Recommended invocation (ARCHIVED — see banner; the strip set no longer
+includes ``escalate_at_days``, and a live run requires the
+acknowledgement flag):
 
     # Inspect what would happen — NO writes.
     python -m alfred.scripts.migrate_2026_05_30_strip_v1_tier_fields --dry-run
 
-    # Execute against the live vault.
-    python -m alfred.scripts.migrate_2026_05_30_strip_v1_tier_fields
+    # Execute against the live vault (deliberate operational run only).
+    python -m alfred.scripts.migrate_2026_05_30_strip_v1_tier_fields \
+        --i-understand-this-is-archived
 
 If ``--vault`` is omitted, the script defaults to ``$ALFRED_VAULT_PATH``
 then ``/home/andrew/alfred/vault`` (Salem's vault).
@@ -78,13 +118,29 @@ import frontmatter
 # --- Constants ------------------------------------------------------------
 
 
-#: The three V1 tier fields the migration strips. Order is preserved in
-#: the dry-run output's per-record line so the operator sees the same
-#: ordering on every record.
-V1_TIER_FIELDS: tuple[str, ...] = (
+#: ARCHIVED 2026-06-26 — the ORIGINAL strip set, preserved for
+#: provenance only. DO NOT WIRE THIS BACK INTO ``build_plan``: it
+#: includes ``escalate_at_days``, the LIVE V2 due-window knob (see the
+#: module banner). Kept so a reader can see exactly what the
+#: now-superseded 2026-05-30 migration would have stripped.
+_HISTORICAL_V1_TIER_FIELDS_DO_NOT_USE: tuple[str, ...] = (
     "base_tier",
     "escalate_to",
     "escalate_at_days",
+)
+
+#: The V1 tier fields this migration is SAFE to strip. Order is
+#: preserved in the dry-run output's per-record line so the operator
+#: sees the same ordering on every record.
+#:
+#: ``escalate_at_days`` was REMOVED from this set 2026-06-26 (it is the
+#: live V2 due-window knob — stripping it severs task auto-T1
+#: surfacing). Only the two genuinely-dead Tier-V1 fields remain. The
+#: script is now safe-by-construction even if the live-run guard in
+#: ``main`` is bypassed, but the guard stays as defense-in-depth.
+V1_TIER_FIELDS: tuple[str, ...] = (
+    "base_tier",
+    "escalate_to",
 )
 
 
@@ -214,7 +270,7 @@ def print_plan(plan: StripPlan, vault: Path, *, dry_run: bool) -> None:
     print(f"  Mode:  {mode}")
     print()
 
-    print("--- Strip V1 tier fields (base_tier / escalate_to / escalate_at_days) ---")
+    print("--- Strip V1 tier fields (base_tier / escalate_to) ---")
     if not plan.records_pending:
         print("  (no records pending strip)")
     else:
@@ -442,11 +498,13 @@ def _default_vault_path() -> Path:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "V1 tier-field strip migration (2026-05-30). Removes "
-            "base_tier / escalate_to / escalate_at_days from every "
-            "task/*.md record that carries them. Default mode is LIVE "
-            "RUN; pass --dry-run to inspect the plan without writes. "
-            "Idempotent — safe to re-run."
+            "V1 tier-field strip migration (2026-05-30, ARCHIVED "
+            "2026-06-26). Removes the two dead Tier-V1 fields "
+            "(base_tier / escalate_to) from every task/*.md record "
+            "that carries them. escalate_at_days is a LIVE V2 field "
+            "and is NO LONGER stripped (see module banner). A live "
+            "run requires --i-understand-this-is-archived; --dry-run "
+            "inspects the plan freely. Idempotent — safe to re-run."
         ),
     )
     parser.add_argument(
@@ -463,8 +521,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Report the plan without touching the vault. Default is "
-            "LIVE RUN — the script DOES vault writes unless this "
-            "flag is passed."
+            "NO-OP — this script is ARCHIVED; a live run additionally "
+            "requires --i-understand-this-is-archived (see module "
+            "banner)."
+        ),
+    )
+    parser.add_argument(
+        "--i-understand-this-is-archived",
+        action="store_true",
+        help=(
+            "Acknowledge the ARCHIVED banner + live-field hazard "
+            "(escalate_at_days was removed from the strip set; the "
+            "record-strip is meant as a deliberate operational run). "
+            "Required for any live write. Without it the script "
+            "refuses to write and exits non-zero after printing the "
+            "plan."
         ),
     )
     args = parser.parse_args(argv)
@@ -482,10 +553,26 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         print(
-            "--- DRY-RUN — no changes written. "
-            "Re-run without --dry-run to execute. ---"
+            "--- DRY-RUN — no changes written. This script is ARCHIVED; "
+            "a live run requires --i-understand-this-is-archived. ---"
         )
         return 0
+
+    if not args.i_understand_this_is_archived:
+        # ARCHIVED-script live-run guard (2026-06-26). The plan has been
+        # printed above; refuse to write without the explicit
+        # acknowledgement flag so a stale muscle-memory invocation
+        # (``python -m ...migrate_2026_05_30_strip_v1_tier_fields``)
+        # can't silently mutate the vault. Per the module banner.
+        print(
+            "--- REFUSING LIVE RUN — this script is ARCHIVED. ---\n"
+            "Pass --i-understand-this-is-archived to acknowledge the "
+            "banner + live-field hazard and execute. The plan above "
+            "shows what WOULD change (note: escalate_at_days is NO "
+            "longer in the strip set — it is a live V2 field).",
+            file=sys.stderr,
+        )
+        return 3
 
     print("--- APPLYING ---")
     try:
