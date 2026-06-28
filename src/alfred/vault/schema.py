@@ -1177,8 +1177,19 @@ REMINDER_FIELDS: tuple[str, ...] = (
 #     like ``gcal_title``); the sync layer's ``sync_collapse_group``
 #     coordinator does the grouping. Resolved via
 #     ``alfred.integrations.gcal_sync.resolve_collapse_key``.
+#   - ``gcal_collapse_synced`` — internal sync-STATE cache (NOT operator-set,
+#     like ``gcal_event_id``). The last-synced
+#     ``"<start_iso>|<end_iso>|<title>"`` signature, written direct-frontmatter
+#     to the collapse PRIMARY by ``sync_collapse_group`` (via
+#     ``_write_primary_id``). Lets the next recompute SKIP a redundant GCal
+#     PATCH when the projected span+title are unchanged (the skip-unchanged
+#     short-circuit, arc-followup §2 / NOTE-A). Cleared off demoted secondaries
+#     by ``_clear_gcal_ids``. One opaque string — compared whole, never split.
 #
-# All six are opt-in per record. None are required.
+# Five are opt-in operator/Salem knobs (gcal_keep_on_cancel, gcal_title,
+# gcal_sync, gcal_collapse_key) plus the identity id; gcal_event_id, gcal_
+# calendar and gcal_collapse_synced are internal sync-state (never operator-set).
+# None are required.
 EVENT_GCAL_FIELDS: tuple[str, ...] = (
     "gcal_event_id",
     "gcal_calendar",
@@ -1186,6 +1197,7 @@ EVENT_GCAL_FIELDS: tuple[str, ...] = (
     "gcal_title",
     "gcal_sync",
     "gcal_collapse_key",
+    "gcal_collapse_synced",
 )
 
 # Optional frontmatter field on ``task`` records that participates in

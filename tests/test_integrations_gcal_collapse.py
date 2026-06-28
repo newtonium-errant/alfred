@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 
 import frontmatter
+import structlog
 
 from alfred.integrations.gcal_config import GCalConfig
 from alfred.integrations.gcal_sync import resolve_collapse_key, sync_collapse_group
@@ -265,7 +266,8 @@ def test_adopt_manual_umbrella_as_primary(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 8. Idempotent — a second pass creates no second entry
+# 8. Idempotent — a second pass creates no second entry, AND (NOTE-A) skips the
+#    redundant PATCH when nothing changed.
 # ---------------------------------------------------------------------------
 
 
@@ -278,7 +280,12 @@ def test_idempotent_recompute(tmp_path):
     out2 = _run(tmp_path, client)
 
     assert out1["action"] == "created"
-    assert out2["action"] == "patched"   # primary now has the id → patch
+    # NOTE-A skip-unchanged: the second identical recompute no longer fires a
+    # redundant PATCH — span+title match the stored gcal_collapse_synced
+    # signature, so the coordinator short-circuits to a noop.
+    assert out2["action"] == "noop"
+    assert out2["noop"] == "collapse_unchanged"
+    assert client.updated == []           # NO redundant update_event call
     assert len(client.created) == 1       # exactly one entry ever created
     assert out1["primary_event_id"] == out2["primary_event_id"]
     assert out2["member_count"] == 2
@@ -390,3 +397,69 @@ def test_cli_collapse_bad_date(tmp_path, capsys):
     )
     assert rc == 1
     assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 14. NOTE-A skip-unchanged — an unchanged recompute fires NO redundant PATCH
+# ---------------------------------------------------------------------------
+
+
+def test_unchanged_recompute_skips_redundant_patch(tmp_path):
+    """First sync creates + persists the gcal_collapse_synced signature. A
+    second recompute with no change short-circuits to a noop — NO update_event.
+    This is the redundant-PATCH (non-time-field member edit → hook → recompute)
+    that NOTE-A eliminates."""
+    _seed(tmp_path, "A", date_str=D, start_hm="08:30", end_hm="09:00")
+    _seed(tmp_path, "B", date_str=D, start_hm="09:30", end_hm="10:00")
+    client = _FakeGCal()
+
+    out1 = _run(tmp_path, client)
+    assert out1["action"] == "created"
+    # The signature is persisted on the elected primary for next-pass compare.
+    primary_meta = _meta(tmp_path / "event" / "A.md")
+    assert primary_meta.get("gcal_collapse_synced")
+    assert "|" in primary_meta["gcal_collapse_synced"]
+
+    # Per feedback_log_emission_test_pattern.md: pin the ILB observability
+    # event so a future refactor that drops/renames it is caught here.
+    with structlog.testing.capture_logs() as captured:
+        out2 = _run(tmp_path, client)
+    assert out2["action"] == "noop"
+    assert out2["noop"] == "collapse_unchanged"
+    assert client.updated == []          # the redundant PATCH was skipped
+    assert len(client.created) == 1
+    assert out2["primary_event_id"] == out1["primary_event_id"]
+    matches = [c for c in captured if c.get("event") == "gcal.collapse_unchanged"]
+    assert len(matches) == 1, (
+        f"expected one gcal.collapse_unchanged; got "
+        f"{[c.get('event') for c in captured]!r}"
+    )
+    assert matches[0]["primary_event_id"] == out1["primary_event_id"]
+    assert matches[0]["member_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 15. NOTE-A — a GENUINE span change still PATCHes (skip is change-gated)
+# ---------------------------------------------------------------------------
+
+
+def test_changed_span_still_patches(tmp_path):
+    """After a first sync, adding a member extends the span + bumps the
+    "N sessions" title → the signature differs → the coordinator still fires
+    the PATCH (the skip is strictly change-gated)."""
+    _seed(tmp_path, "A", date_str=D, start_hm="08:30", end_hm="09:00")
+    _seed(tmp_path, "B", date_str=D, start_hm="09:30", end_hm="10:00")
+    client = _FakeGCal()
+
+    out1 = _run(tmp_path, client)
+    assert out1["action"] == "created"
+
+    # New later member → span end moves to 14:45, "3 sessions" → new signature.
+    _seed(tmp_path, "C", date_str=D, start_hm="13:30", end_hm="14:45")
+    out2 = _run(tmp_path, client)
+
+    assert out2["action"] == "patched"
+    assert client.updated and client.updated[0][0] == out1["primary_event_id"]
+    assert out2["member_count"] == 3
+    assert out2["title"] == "rTMS — 3 sessions (08:30–14:45)"
+    assert len(client.created) == 1      # still no second create

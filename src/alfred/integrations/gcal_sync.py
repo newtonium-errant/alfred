@@ -900,13 +900,15 @@ def _collapse_title(key: str, n: int, span_start: datetime, span_end: datetime) 
 
 
 def _clear_gcal_ids(file_path: Path, correlation_id: str = "") -> None:
-    """Direct-frontmatter clear of ``gcal_event_id`` + ``gcal_calendar`` on a
-    secondary member (no vault_edit → no hook re-fire; mirrors the
-    cancellation-path writeback)."""
+    """Direct-frontmatter clear of ``gcal_event_id`` + ``gcal_calendar`` (+ the
+    ``gcal_collapse_synced`` skip-unchanged cache) on a secondary member (no
+    vault_edit → no hook re-fire; mirrors the cancellation-path writeback). A
+    demoted-from-primary member must shed its stale sync-state cache too, else a
+    future re-election could read a stale signature."""
     try:
         post = frontmatter.load(str(file_path))
         changed = False
-        for k in ("gcal_event_id", "gcal_calendar"):
+        for k in ("gcal_event_id", "gcal_calendar", "gcal_collapse_synced"):
             if k in post:
                 del post[k]
                 changed = True
@@ -923,14 +925,23 @@ def _clear_gcal_ids(file_path: Path, correlation_id: str = "") -> None:
 
 
 def _write_primary_id(
-    file_path: Path, event_id: str, calendar_label: str, correlation_id: str = "",
+    file_path: Path, event_id: str, calendar_label: str,
+    correlation_id: str = "", *, synced_signature: str = "",
 ) -> None:
     """Direct-frontmatter writeback of the primary's ``gcal_event_id`` +
-    ``gcal_calendar`` (no vault_edit → no hook re-fire)."""
+    ``gcal_calendar`` (no vault_edit → no hook re-fire).
+
+    ``synced_signature`` (when non-empty) persists the last-synced
+    ``"<start_iso>|<end_iso>|<title>"`` to ``gcal_collapse_synced`` so the next
+    recompute can skip a redundant PATCH when nothing changed (NOTE-A). It's an
+    internal sync-state cache (like ``gcal_event_id``), never operator-set; one
+    opaque string so YAML never re-types it on reload."""
     try:
         post = frontmatter.load(str(file_path))
         post["gcal_event_id"] = event_id
         post["gcal_calendar"] = calendar_label
+        if synced_signature:
+            post["gcal_collapse_synced"] = synced_signature
         text = frontmatter.dumps(post)
         if not text.endswith("\n"):
             text += "\n"
@@ -980,12 +991,22 @@ def sync_collapse_group(
         (last-member-delete → remove the entry, operator Q3).
 
     Writeback is direct-frontmatter (no ``vault_edit`` → no hook re-fire):
-    the primary gets ``gcal_event_id`` + ``gcal_calendar``; every other
-    member's stale ids are cleared.
+    the primary gets ``gcal_event_id`` + ``gcal_calendar`` + the internal
+    ``gcal_collapse_synced`` cache (the last-synced ``"<start>|<end>|<title>"``
+    signature, for the skip-unchanged short-circuit); every other member's
+    stale ids/cache are cleared.
+
+    SKIP-UNCHANGED (NOTE-A): re-confirming an existing primary whose stored
+    signature equals the freshly-computed one — with no duplicates cleaned this
+    pass — returns a ``collapse_unchanged`` noop instead of a redundant PATCH.
+    A genuine span/title change still PATCHes; first-sync still creates;
+    adopt/promote still PATCH (no stored signature → no match).
 
     Returns (per ``intentionally_left_blank`` — every outcome is explicit):
       * ``{}`` — gcal disabled (skip).
       * ``{"noop": "no_collapse_key"}`` / ``{"noop": "no_eligible_members"}``.
+      * ``{"collapsed": True, "action": "noop", "noop": "collapse_unchanged",
+        ...}`` — span+title unchanged, PATCH skipped (NOTE-A).
       * ``{"collapsed": True, "action": "created"|"patched"|"deleted",
         "collapse_key", "date", "primary_event_id", "member_count",
         "title", "span": [start_iso, end_iso], "reconciled_deleted": [...]}``.
@@ -1118,6 +1139,44 @@ def sync_collapse_group(
     span_start = min(m["start"] for m in eligible)
     span_end = max(m["end"] for m in eligible)
     title = _collapse_title(key, len(eligible), span_start, span_end)
+    # One opaque signature of everything that determines the projected GCal
+    # entry (span + title; the title already encodes member_count via "N
+    # sessions"). Compared whole-string, never split — so a "|" inside a key
+    # is harmless, and YAML never re-types it on reload.
+    signature = f"{span_start.isoformat()}|{span_end.isoformat()}|{title}"
+
+    # --- skip-unchanged PATCH short-circuit (NOTE-A) ---------------------
+    # When re-confirming an EXISTING primary (not an orphan-promote, not a
+    # fresh create) whose last-synced signature is byte-identical to the
+    # freshly-computed one AND this pass cleaned no duplicates, the PATCH would
+    # be a no-op round-trip — skip it (and the writeback churn). The common
+    # trigger: a member edit to a non-time field fires the hook → recompute →
+    # identical span+title. ``elig_with_id`` (not orphan/fresh) + empty
+    # ``reconciled_deleted`` (nothing changed structurally) gate it; a genuine
+    # span/title change yields a different signature → falls through to PATCH.
+    if elig_with_id and not reconciled_deleted:
+        try:
+            stored_sig = dict(
+                frontmatter.load(str(primary["path"])).metadata or {}
+            ).get("gcal_collapse_synced")
+        except Exception:  # noqa: BLE001
+            stored_sig = None
+        if stored_sig == signature:
+            log.info(
+                "gcal.collapse_unchanged",
+                collapse_key=key, date=gdate.isoformat(),
+                primary_event_id=primary_id, member_count=len(eligible),
+                title=title, correlation_id=correlation_id,
+            )
+            return {
+                "collapsed": True, "action": "noop",
+                "noop": "collapse_unchanged",
+                "collapse_key": key, "date": gdate.isoformat(),
+                "primary_event_id": primary_id, "member_count": len(eligible),
+                "title": title,
+                "span": [span_start.isoformat(), span_end.isoformat()],
+                "reconciled_deleted": reconciled_deleted,
+            }
 
     common: dict[str, Any] = {"start": span_start, "end": span_end, "title": title}
     if getattr(config, "default_time_zone", ""):
@@ -1151,7 +1210,10 @@ def sync_collapse_group(
         return {"error": {"code": code, "detail": str(exc)}}
 
     # --- writeback: primary owns the id; everyone else is cleared --------
-    _write_primary_id(primary["path"], primary_id, calendar_label, correlation_id)
+    _write_primary_id(
+        primary["path"], primary_id, calendar_label, correlation_id,
+        synced_signature=signature,
+    )
     for md in set(all_ids.values()):
         if md != primary["path"]:
             _clear_gcal_ids(md, correlation_id)

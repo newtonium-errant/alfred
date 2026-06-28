@@ -363,8 +363,10 @@ def test_non_per_type_registries_shape_preserved():
         "gcal_event_id", "gcal_calendar", "gcal_keep_on_cancel", "gcal_title",
         # Routine-consolidation Step 4: §2 added the per-event sync POLICY
         # (gcal_sync), §3 added the same-day collapse SERIES key
-        # (gcal_collapse_key). Lockstep with ``vault.schema.EVENT_GCAL_FIELDS``.
-        "gcal_sync", "gcal_collapse_key",
+        # (gcal_collapse_key). arc-followup §2 added the collapse skip-unchanged
+        # sync-state cache (gcal_collapse_synced — internal, not operator-set).
+        # Lockstep with ``vault.schema.EVENT_GCAL_FIELDS``.
+        "gcal_sync", "gcal_collapse_key", "gcal_collapse_synced",
     )
     assert REQUIRED_FIELDS == ["type", "created"]
     assert "tags" in LIST_FIELDS
