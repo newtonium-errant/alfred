@@ -7,6 +7,7 @@ instance config raises ScopeError before any vault mutation occurs.
 
 from __future__ import annotations
 
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -919,3 +920,83 @@ def test_matches_item_empty_inputs_return_false() -> None:
     from alfred.routine.cli import _matches_item
     assert not _matches_item("", "Walk dog")
     assert not _matches_item("walk", "")
+
+
+# ---------------------------------------------------------------------------
+# arc-followup 1 — JSON-stdout contract guard (logger → stderr)
+#
+# An ungated edge-path log (e.g. ``routine.cli.completion_log_not_dict`` on a
+# corrupt record) must NOT interleave with the ``--json`` canary on stdout.
+# The ``@_json_stdout_safe`` handler guard routes structlog to stderr for the
+# duration of a ``wants_json`` call, so stdout stays a pure JSON contract while
+# the diagnostic stays VISIBLE on stderr.
+# ---------------------------------------------------------------------------
+
+
+def test_corrupt_record_json_stdout_stays_clean(tmp_path: Path, capsys) -> None:
+    """A corrupt ``completion_log`` (list, not dict) fires the
+    ``completion_log_not_dict`` warning mid-``cmd_done``. On ``wants_json`` the
+    warning must land on stderr, NOT stdout — ``json.loads(stdout)`` parses."""
+    import json
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Morning", {
+        "type": "routine",
+        "name": "Morning",
+        "status": "active",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Meditation practice"}],
+        # corrupt: completion_log should be a dict
+        "completion_log": ["not", "a", "dict"],
+    })
+    config = _config(vault, tmp_path)
+
+    rc = cmd_done(
+        config, "Morning", "Meditation practice",
+        wants_json=True, today_override="2026-06-28",
+    )
+
+    captured = capsys.readouterr()
+    # stdout is a pure JSON contract — would raise if the warning leaked.
+    payload = json.loads(captured.out)
+    assert payload["ok"] is True
+    assert rc == 0
+    assert "completion_log_not_dict" not in captured.out
+    # diagnostic stayed VISIBLE on stderr (intentionally-left-blank).
+    assert "completion_log_not_dict" in captured.err
+
+
+def test_json_guard_overrides_prior_stdout_structlog_config(
+    tmp_path: Path, capsys,
+) -> None:
+    """Robustness pin: even when a PRIOR caller/test left structlog globally
+    configured to write to STDOUT, the ``wants_json`` guard overrides it for
+    the handler's duration so stdout stays clean. Without the guard this leaks
+    (the failure mode the guard exists to close)."""
+    import json
+    # Simulate contamination: structlog rendering to stdout.
+    structlog.configure(
+        processors=[structlog.dev.ConsoleRenderer()],
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+    )
+    try:
+        vault = tmp_path / "vault"
+        _write_routine(vault, "Morning", {
+            "type": "routine",
+            "name": "Morning",
+            "status": "active",
+            "cadence": {"type": "daily"},
+            "items": [{"text": "Meditation practice"}],
+            "completion_log": ["corrupt"],
+        })
+        config = _config(vault, tmp_path)
+
+        cmd_done(
+            config, "Morning", "Meditation practice",
+            wants_json=True, today_override="2026-06-28",
+        )
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)  # raises if the warning leaked
+        assert payload["ok"] is True
+        assert "completion_log_not_dict" not in captured.out
+    finally:
+        structlog.reset_defaults()

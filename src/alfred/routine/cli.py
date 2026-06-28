@@ -45,12 +45,14 @@ Phase 2B B1 additions (2026-05-30):
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import re
 import sys
 from dataclasses import dataclass
 from datetime import date as date_type, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import frontmatter  # type: ignore[import-untyped]
@@ -64,6 +66,77 @@ from .config import REQUIRED_INSTANCE, RoutineConfig
 from .state import StateManager
 
 log = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# JSON-stdout contract guard (arc-followup 1, 2026-06-28)
+# ---------------------------------------------------------------------------
+#
+# The routine CLI's ``--json`` output (the canary the talker subprocess +
+# tests ``json.loads``) shares ``sys.stdout`` with structlog. structlog's
+# *unconfigured* default sink is ``sys.stdout`` (``PrintLoggerFactory``), and
+# any config a prior caller/test left on the global ``structlog`` can also
+# point at stdout — so a diagnostic firing mid-handler interleaves a rendered
+# log line with the JSON and breaks the parse. This bit:
+#
+#   * ``routine.cli.completion_log_not_dict`` / ``skipping_bad_log_entry`` /
+#     ``bad_timezone`` — ungated edge-path logs in ``cmd_done``;
+#   * the nested ``routine.aggregator.*`` logs fired by ``run-now``;
+#   * the original ``routine_done.matched`` (Step 5 band-aided it with a
+#     per-log ``if not wants_json`` gate — now subsumed by this guard).
+#
+# In production the ``cmd_routine`` dispatcher already suppresses stdout
+# (``_setup_logging_from_config(suppress_stdout=wants_json)``); this guard
+# closes the DIRECT-call path (tests + any future importer of ``cmd_*``) so
+# stdout can never be polluted on ANY routine JSON CLI path — robust against
+# whatever global structlog state a prior test left behind, because it
+# OVERRIDES the config for the handler's duration then RESTORES it.
+#
+# Diagnostics stay VISIBLE on stderr (per ``feedback_intentionally_left_blank``)
+# rather than being dropped. A no-op when ``wants_json`` is False — the human
+# path renders wherever logging is configured, and ``structlog.testing.
+# capture_logs`` (the log-emission tests, all ``wants_json=False``) still works
+# because the guard never touches that path.
+
+
+@contextlib.contextmanager
+def _json_stdout_guard(wants_json: bool):
+    """Route EVERY structlog logger to ``sys.stderr`` for the duration when
+    ``wants_json`` — so the routine CLI's stdout stays a pure JSON contract —
+    then restore the prior global config. No-op when ``wants_json`` is False."""
+    if not wants_json:
+        yield
+        return
+    prev = structlog.get_config() if structlog.is_configured() else None
+    structlog.configure(
+        processors=[
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.dev.ConsoleRenderer(),
+        ],
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+    )
+    try:
+        yield
+    finally:
+        if prev is not None:
+            structlog.configure(**prev)
+        else:
+            structlog.reset_defaults()
+
+
+def _json_stdout_safe(fn: Callable) -> Callable:
+    """Decorator: wrap a routine CLI handler so its ``wants_json`` path can
+    never leak a log line onto stdout (see ``_json_stdout_guard``). All routine
+    handlers take ``wants_json`` keyword-only, so reading it from kwargs is
+    exact."""
+
+    @functools.wraps(fn)
+    def _wrapper(*args: Any, **kwargs: Any) -> Any:
+        with _json_stdout_guard(bool(kwargs.get("wants_json", False))):
+            return fn(*args, **kwargs)
+
+    return _wrapper
 
 
 # Module-load-order contract: keep the DONE_KIND_* + ITEM_KIND_*
@@ -621,6 +694,7 @@ def _validate_completed_at(
     return parsed.isoformat(), None
 
 
+@_json_stdout_safe
 def cmd_done(
     config: RoutineConfig,
     record_name: str,
@@ -764,22 +838,20 @@ def cmd_done(
         # ``test_routine_done_matched_log_emission_fires_on_success``
         # in ``tests/routine/test_routine_done_confidence.py``.
         confidence = _match_confidence(item_text, chosen.item_text)
-        # Suppress on ``wants_json`` for the SAME reason as the other
-        # routine.cli.done logs below (884-896, 944-951): structlog's
-        # default sink writes to stdout in CLI context, interleaving the
-        # rendered log line with the JSON canary and breaking the
-        # talker-subprocess / test parse contract (the long-standing
-        # ``test_vault_wide_fuzzy_*`` JSONDecodeError was THIS line, the
-        # only matched-log that escaped the gate). The confidence
-        # emission test pins it on the ``wants_json=False`` path.
-        if not wants_json:
-            log.info(
-                "routine_done.matched",
-                query=item_text,
-                matched_to=chosen.item_text,
-                record=chosen.record_name,
-                confidence=confidence,
-            )
+        # The Step-5 ``if not wants_json`` gate on this matched-log (the
+        # long-standing ``test_vault_wide_fuzzy_*`` JSONDecodeError) is now
+        # SUBSUMED by the ``@_json_stdout_safe`` handler guard: on the json
+        # path structlog is routed to stderr for the handler's duration, so
+        # this line stays VISIBLE (per ``feedback_intentionally_left_blank``)
+        # without polluting the stdout JSON contract. The confidence emission
+        # test pins the shape on the ``wants_json=False`` path.
+        log.info(
+            "routine_done.matched",
+            query=item_text,
+            matched_to=chosen.item_text,
+            record=chosen.record_name,
+            confidence=confidence,
+        )
         resolved_record = chosen.record_name
         item_text = chosen.item_text  # canonicalise to verbatim text
         resolved_path = chosen.path
@@ -1068,6 +1140,7 @@ def _emit_canary(
     return exit_code
 
 
+@_json_stdout_safe
 def cmd_run_now(
     config: RoutineConfig,
     *,
@@ -1095,6 +1168,7 @@ def cmd_run_now(
     return 0
 
 
+@_json_stdout_safe
 def cmd_status(config: RoutineConfig, *, wants_json: bool = False) -> int:
     """Print last run + schedule summary."""
     _check_salem_only(config)

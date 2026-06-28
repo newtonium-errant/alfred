@@ -98,6 +98,7 @@ from .cli import (
     _emit_canary,
     _fuzzy_match_vault_wide,
     _ItemCandidate,
+    _json_stdout_safe,
     _matches_item,
     _routine_path,
 )
@@ -745,6 +746,7 @@ def _check_cadence_conflict_on_edit(
 # ---------------------------------------------------------------------------
 
 
+@_json_stdout_safe
 def cmd_item_add(
     config: RoutineConfig,
     record_name: str,
@@ -908,6 +910,7 @@ def cmd_item_add(
 # ---------------------------------------------------------------------------
 
 
+@_json_stdout_safe
 def cmd_item_remove(
     config: RoutineConfig,
     record_name: str,
@@ -1004,6 +1007,7 @@ def cmd_item_remove(
 # ---------------------------------------------------------------------------
 
 
+@_json_stdout_safe
 def cmd_item_edit(
     config: RoutineConfig,
     record_name: str,
