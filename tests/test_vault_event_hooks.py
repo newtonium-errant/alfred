@@ -106,7 +106,7 @@ def test_register_update_hook_is_idempotent():
         _EVENT_UPDATE_HOOKS, register_event_update_hook,
     )
 
-    def hook(vault_path, rel_path, fm, fields_changed):
+    def hook(vault_path, rel_path, fm, fields_changed, pre_edit_fm=None):
         pass
 
     register_event_update_hook(hook)
@@ -245,7 +245,7 @@ def test_vault_edit_event_with_gcal_id_fires_update_hook(tmp_vault):
     )
     fired = []
 
-    def hook(vault_path, rel_path, fm, fields_changed):
+    def hook(vault_path, rel_path, fm, fields_changed, pre_edit_fm=None):
         fired.append({
             "rel_path": rel_path,
             "fm_gcal_id": fm.get("gcal_event_id"),
@@ -283,7 +283,7 @@ def test_vault_edit_event_without_gcal_id_still_fires_hook(tmp_vault):
     )
     fired = []
 
-    def hook(vault_path, rel_path_arg, fm, fields_changed):
+    def hook(vault_path, rel_path_arg, fm, fields_changed, pre_edit_fm=None):
         fired.append({
             "rel_path": rel_path_arg,
             "fm_gcal_id": fm.get("gcal_event_id"),
@@ -317,7 +317,7 @@ def test_vault_edit_event_with_promotion_eligible_state_fires_hook(tmp_vault):
     )
     fired = []
     register_event_update_hook(
-        lambda v, r, fm, fc: fired.append({
+        lambda v, r, fm, fc, pre=None: fired.append({
             "gcal_event_id": fm.get("gcal_event_id"),
             "start": fm.get("start"),
             "end": fm.get("end"),

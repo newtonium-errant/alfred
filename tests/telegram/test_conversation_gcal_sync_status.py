@@ -108,7 +108,7 @@ async def test_dispatcher_vault_edit_surfaces_gcal_auth_failed_in_tool_result(
     # Mock the gcal sync hook to return the exact shape ``sync_event_update_to_gcal``
     # returns on expired OAuth refresh tokens — same shape grep'd from
     # data/talker.log on May 12 18:45 ADT.
-    def _fake_update_hook(vault_path_, rel_path_, fm, fields_changed):
+    def _fake_update_hook(vault_path_, rel_path_, fm, fields_changed, pre_edit_fm=None):
         return {
             "error": {
                 "code": "auth_failed",
@@ -177,7 +177,7 @@ async def test_dispatcher_vault_edit_surfaces_gcal_ok_in_tool_result(
         },
     )
 
-    def _fake_update_hook(vault_path_, rel_path_, fm, fields_changed):
+    def _fake_update_hook(vault_path_, rel_path_, fm, fields_changed, pre_edit_fm=None):
         return {
             "event_id": "ev_marie_lunch",
             "calendar_label": "alfred",
@@ -222,7 +222,7 @@ async def test_dispatcher_vault_edit_omits_gcal_sync_when_no_gcal_action(
         fields={"date": "2026-05-19"},  # no start/end, no gcal_event_id
     )
 
-    def _fake_update_hook(vault_path_, rel_path_, fm, fields_changed):
+    def _fake_update_hook(vault_path_, rel_path_, fm, fields_changed, pre_edit_fm=None):
         # Mirror the daemon closure's "no_gcal_event_id_and_no_times"
         # branch — it returns ``None`` (which _fire_*_hooks filters out).
         return None

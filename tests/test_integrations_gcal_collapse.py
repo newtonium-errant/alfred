@@ -463,3 +463,127 @@ def test_changed_span_still_patches(tmp_path):
     assert out2["member_count"] == 3
     assert out2["title"] == "rTMS — 3 sessions (08:30–14:45)"
     assert len(client.created) == 1      # still no second create
+
+
+# ---------------------------------------------------------------------------
+# pre-edit-fm fix — _reconcile_left_collapse_group reconciles the group a
+# member LEFT (key removed/changed, or date moved it between (key,date)
+# groups), IMMEDIATELY, so survivors stay projected — NO transient gap.
+# (The leaver's own entry — re-scope / new-group adopt / promotion — is the
+# closure's job, pinned in test_telegram_gcal_update_hook.py.)
+# ---------------------------------------------------------------------------
+
+
+def _reconcile_left(tmp, client, *, pre_fm, post_fm, rel_path="event/A.md"):
+    from alfred.telegram.daemon import _reconcile_left_collapse_group
+
+    return _reconcile_left_collapse_group(
+        client=client, config=_cfg(), vault_path=tmp, rel_path=rel_path,
+        pre_fm=pre_fm, post_fm=post_fm, intended_on=True,
+    )
+
+
+def test_left_reconcile_unkey_primary_survivors_get_fresh_umbrella(tmp_path):
+    """The group's ex-PRIMARY A was un-keyed (its file no longer carries the
+    key, though it keeps its own gcal_event_id). Reconciling the LEFT group
+    (rTMS) sees the survivors B+C (no ids) and CREATES a fresh umbrella for
+    them — they stay projected (NO gap). A's evt-1 is untouched here (the
+    closure re-scopes it separately)."""
+    # Post-edit on-disk state: A has NO key (un-keyed) but still holds evt-1;
+    # B + C remain keyed survivors with no own id.
+    _seed(tmp_path, "A", date_str=D, start_hm="08:30", end_hm="09:00",
+          key=None, gcal_event_id="evt-1")
+    _seed(tmp_path, "B", date_str=D, start_hm="09:30", end_hm="10:00")
+    _seed(tmp_path, "C", date_str=D, start_hm="10:30", end_hm="11:00")
+    client = _FakeGCal()
+
+    changed = _reconcile_left(
+        tmp_path, client,
+        pre_fm={"gcal_collapse_key": "rTMS", "date": D},   # A's old state
+        post_fm={"date": D},                                # key removed
+    )
+    assert changed is True
+    # Survivors B+C reprojected via a fresh umbrella — no transient gap.
+    assert len(client.created) == 1
+    assert client.created[0][1]["title"] == "rTMS — 2 sessions (09:30–11:00)"
+    # A's own entry was NOT touched by the LEFT-group reconcile.
+    assert "evt-1" not in client.deleted
+
+
+def test_left_reconcile_unkey_secondary_recomputes_span(tmp_path):
+    """A secondary C un-keyed → the LEFT group (rTMS) still has its primary A
+    (evt-1) → recompute span via PATCH (2 sessions), no new create."""
+    _seed(tmp_path, "A", date_str=D, start_hm="08:30", end_hm="09:00",
+          gcal_event_id="evt-1")
+    _seed(tmp_path, "B", date_str=D, start_hm="09:30", end_hm="10:00")
+    # C is the un-keyed leaver (no key on disk now).
+    _seed(tmp_path, "C", date_str=D, start_hm="10:30", end_hm="11:00", key=None)
+    client = _FakeGCal()
+
+    changed = _reconcile_left(
+        tmp_path, client,
+        pre_fm={"gcal_collapse_key": "rTMS", "date": D},
+        post_fm={"date": D},
+    )
+    assert changed is True
+    assert len(client.created) == 0
+    assert client.updated and client.updated[0][0] == "evt-1"
+    assert client.updated[0][1]["title"] == "rTMS — 2 sessions (08:30–10:00)"
+
+
+def test_left_reconcile_rekey_primary_old_group_reforms(tmp_path):
+    """Primary A re-keyed rTMS→physio (its file now carries physio + evt-1).
+    The LEFT group (rTMS) = survivors B+C → fresh umbrella created; A's evt-1
+    follows A to the new group (the closure's new-group branch, not here)."""
+    _seed(tmp_path, "A", date_str=D, start_hm="08:30", end_hm="09:00",
+          key="physio", gcal_event_id="evt-1")
+    _seed(tmp_path, "B", date_str=D, start_hm="09:30", end_hm="10:00")
+    _seed(tmp_path, "C", date_str=D, start_hm="10:30", end_hm="11:00")
+    client = _FakeGCal()
+
+    changed = _reconcile_left(
+        tmp_path, client,
+        pre_fm={"gcal_collapse_key": "rTMS", "date": D},
+        post_fm={"gcal_collapse_key": "physio", "date": D},
+    )
+    assert changed is True
+    assert len(client.created) == 1   # rTMS survivors B+C get their own umbrella
+    assert client.created[0][1]["title"] == "rTMS — 2 sessions (09:30–11:00)"
+    assert "evt-1" not in client.deleted   # A's id follows A, not deleted
+
+
+def test_left_reconcile_date_change_reconciles_old_date_group(tmp_path):
+    """A keyed event A moved DAY (07-06 → 07-07) — same key, different
+    (key,date) group. The LEFT group (rTMS, 07-06) = survivor B → reconciled
+    immediately (date-change is the same gap class as key-change)."""
+    # A now lives on 07-07 (post-edit); B stays on 07-06.
+    _seed(tmp_path, "A", date_str="2026-07-07", start_hm="08:30", end_hm="09:00")
+    _seed(tmp_path, "B", date_str=D, start_hm="09:30", end_hm="10:00")
+    client = _FakeGCal()
+
+    changed = _reconcile_left(
+        tmp_path, client,
+        pre_fm={"gcal_collapse_key": "rTMS", "date": D},          # old day
+        post_fm={"gcal_collapse_key": "rTMS", "date": "2026-07-07"},  # new day
+    )
+    assert changed is True
+    # The 07-06 rTMS group (just B now) reconciled → fresh umbrella for B.
+    assert len(client.created) == 1
+    assert client.created[0][1]["title"] == "rTMS — 1 session (09:30–10:00)"
+
+
+def test_left_reconcile_unchanged_group_identity_is_noop(tmp_path):
+    """Same (key, day) — a time-only or non-key field edit — is NOT a group
+    change → no reconcile, no GCal call."""
+    _seed(tmp_path, "A", date_str=D, start_hm="08:30", end_hm="09:00",
+          gcal_event_id="evt-1")
+    _seed(tmp_path, "B", date_str=D, start_hm="09:30", end_hm="10:00")
+    client = _FakeGCal()
+
+    changed = _reconcile_left(
+        tmp_path, client,
+        pre_fm={"gcal_collapse_key": "rTMS", "start": f"{D}T08:30:00-03:00"},
+        post_fm={"gcal_collapse_key": "rTMS", "start": f"{D}T08:45:00-03:00"},
+    )
+    assert changed is False
+    assert client.created == [] and client.updated == [] and client.deleted == []

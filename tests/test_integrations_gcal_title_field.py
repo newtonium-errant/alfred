@@ -248,7 +248,7 @@ def _build_update_closure(create_fn, update_fn, log):
 
     from alfred.integrations.gcal_sync import resolve_gcal_title
 
-    def _on_event_updated(vault_path_, rel_path, fm, fields_changed):
+    def _on_event_updated(vault_path_, rel_path, fm, fields_changed, pre_fm=None):
         gcal_event_id = str(fm.get("gcal_event_id") or "")
         start_raw = fm.get("start")
         end_raw = fm.get("end")

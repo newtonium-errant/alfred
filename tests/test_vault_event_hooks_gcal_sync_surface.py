@@ -293,14 +293,43 @@ def test_fire_update_hooks_collects_dict_returns(tmp_vault):
         _fire_update_hooks, register_event_update_hook,
     )
 
-    def hook(vault_path, rel_path, fm, fields_changed):
+    def hook(vault_path, rel_path, fm, fields_changed, pre_edit_fm):
         return {"error": {"code": "auth_failed", "detail": "expired"}}
 
     register_event_update_hook(hook)
     results = _fire_update_hooks(
-        tmp_vault, "event/X.md", {}, ["start"],
+        tmp_vault, "event/X.md", {}, ["start"], {},
     )
     assert results == [{"error": {"code": "auth_failed", "detail": "expired"}}]
+
+
+def test_fire_update_hooks_threads_pre_edit_fm(tmp_vault):
+    """Pre-edit-fm fix: ``_fire_update_hooks`` must pass the PRE-edit fm as the
+    5th arg to each registered hook (a COPY, so hook mutation can't corrupt the
+    caller's snapshot). Without this the hook can't reconcile a collapse group
+    the event LEFT (the old key lives only in the pre-edit fm)."""
+    from alfred.vault.ops import (
+        _fire_update_hooks, register_event_update_hook,
+    )
+
+    seen: dict = {}
+
+    def hook(vault_path, rel_path, fm, fields_changed, pre_edit_fm):
+        seen["pre"] = pre_edit_fm
+        pre_edit_fm["mutated"] = True  # must not leak back to the caller
+        return None
+
+    register_event_update_hook(hook)
+    original_pre = {"gcal_collapse_key": "rTMS", "date": "2026-07-06"}
+    _fire_update_hooks(
+        tmp_vault, "event/X.md",
+        {"gcal_collapse_key": ""}, ["gcal_collapse_key"], original_pre,
+    )
+    assert seen["pre"] == {
+        "gcal_collapse_key": "rTMS", "date": "2026-07-06", "mutated": True,
+    }
+    # The hook's mutation stayed in its copy — the caller's dict is intact.
+    assert "mutated" not in original_pre
 
 
 def test_fire_delete_hooks_collects_dict_returns(tmp_vault):
@@ -326,16 +355,16 @@ def test_fire_hooks_skip_exceptions_but_collect_others(tmp_vault):
         _fire_update_hooks, register_event_update_hook,
     )
 
-    def boom(vault_path, rel_path, fm, fields_changed):
+    def boom(vault_path, rel_path, fm, fields_changed, pre_edit_fm):
         raise RuntimeError("boom")
 
-    def good(vault_path, rel_path, fm, fields_changed):
+    def good(vault_path, rel_path, fm, fields_changed, pre_edit_fm):
         return {"event_id": "ev1"}
 
     register_event_update_hook(boom)
     register_event_update_hook(good)
     results = _fire_update_hooks(
-        tmp_vault, "event/X.md", {}, ["start"],
+        tmp_vault, "event/X.md", {}, ["start"], {},
     )
     # Good hook's result still made it through; boom's exception was
     # logged and swallowed.
@@ -453,7 +482,7 @@ def test_vault_edit_event_surfaces_gcal_sync_failed(tmp_vault):
         },
     )
 
-    def hook(vault_path, rel_path_, fm, fields_changed):
+    def hook(vault_path, rel_path_, fm, fields_changed, pre_edit_fm=None):
         return {
             "error": {
                 "code": "auth_failed",
@@ -493,7 +522,7 @@ def test_vault_edit_event_omits_gcal_sync_for_noop_branch(tmp_vault):
         fields={"date": "2026-05-19"},  # no start/end, no gcal_event_id
     )
 
-    def hook(vault_path, rel_path_, fm, fields_changed):
+    def hook(vault_path, rel_path_, fm, fields_changed, pre_edit_fm=None):
         return {"noop": "no_gcal_event_id"}
 
     register_event_update_hook(hook)

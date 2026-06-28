@@ -10,22 +10,27 @@ mirror. The fix moves decision authority from the
 hook closure (now branches three ways: PATCH / PROMOTE / NO-OP).
 
 The closure itself lives inside the talker daemon's ``run`` function,
-captured in the GCal init block. Three things here:
+captured in the GCal init block. What's here:
 
   1. A small ``_promotion_branch_under_test`` reproduces the closure's
-     three-way branching so we can unit-test the routing decision
-     without spinning up the daemon. The reproduction is byte-for-
-     byte the same logic; the daemon source-pin below ensures the
-     production closure stays in sync.
+     per-event branching (PROMOTE / NO-OP / RE-SCOPE / PATCH) so we can
+     unit-test the routing decision without spinning up the daemon. The
+     reproduction mirrors the production logic; the daemon source-pins
+     below ensure the production closure stays in sync.
 
-  2. Three tests exercise each branch (PATCH / PROMOTE / NO-OP) and
-     verify the right ``sync_event_*_to_gcal`` function is invoked
-     with the right args.
+  2. Per-branch tests verify the right ``sync_event_*_to_gcal`` function
+     is invoked with the right args.
 
-  3. A daemon source-text pin confirms the production closure has
-     the three-branch structure (promotion check before patch check;
-     ``gcal.sync_promoted_to_create`` log event on the promotion
-     path; ``sync_event_create_to_gcal`` invoked on promotion).
+  3. Daemon source-text pins confirm the production closure keeps the
+     promotion branch, calls ``_reconcile_left_collapse_group`` (the
+     pre-edit-fm fix — reconcile the group a member LEFT), carries the
+     RE-SCOPE branch, and no longer references the superseded NOTE-F
+     ``_warn_if_collapse_key_removed`` warn.
+
+The ``_reconcile_left_collapse_group`` helper (the pre-edit-fm
+structural fix that replaced the NOTE-F deferred-reconcile warn) is
+covered here for its breadcrumb + no-op gate; its richer group-reconcile
+behavior is pinned in ``test_integrations_gcal_collapse.py``.
 """
 
 from __future__ import annotations
@@ -57,9 +62,15 @@ def _promotion_branch_under_test(
     ``_on_event_updated``. Returns the closure for direct invocation
     from tests.
     """
-    from alfred.integrations.gcal_sync import resolve_gcal_title
+    from alfred.integrations.gcal_sync import (
+        resolve_collapse_key, resolve_gcal_title,
+    )
 
-    def _on_event_updated(vault_path_, rel_path, fm, fields_changed):
+    def _on_event_updated(vault_path_, rel_path, fm, fields_changed, pre_fm):
+        was_unkeyed = (
+            bool(resolve_collapse_key(pre_fm))
+            and not resolve_collapse_key(fm)
+        )
         gcal_event_id = str(fm.get("gcal_event_id") or "")
         start_raw = fm.get("start")
         end_raw = fm.get("end")
@@ -94,6 +105,35 @@ def _promotion_branch_under_test(
 
         # NO-OP
         if not gcal_event_id:
+            return
+
+        # RE-SCOPE — ex-primary un-keyed to standalone (had key, none now,
+        # still holds the umbrella id): PATCH to its OWN name+times.
+        if was_unkeyed:
+            resolved_title, title_source = resolve_gcal_title(fm)
+            rescope_start = rescope_end = None
+            if start_raw:
+                try:
+                    rescope_start = _dt.fromisoformat(str(start_raw))
+                except Exception:
+                    pass
+            if end_raw:
+                try:
+                    rescope_end = _dt.fromisoformat(str(end_raw))
+                except Exception:
+                    pass
+            sync_event_update_to_gcal(
+                client=bound_client,
+                config=bound_config,
+                intended_on=bound_intended_on,
+                gcal_event_id=gcal_event_id,
+                title=resolved_title,
+                description=str(fm.get("summary") or ""),
+                start_dt=rescope_start,
+                end_dt=rescope_end,
+                correlation_id=str(fm.get("correlation_id") or ""),
+                title_source=title_source,
+            )
             return
 
         # PATCH
@@ -170,7 +210,7 @@ def test_promote_branch_no_id_with_times_calls_create(tmp_path):
         "end": "2026-06-27T22:00:00-03:00",
         # No gcal_event_id
     }
-    closure(tmp_path, "event/Predates Phase A+.md", fm, ["start", "end"])
+    closure(tmp_path, "event/Predates Phase A+.md", fm, ["start", "end"], {})
 
     create_fn.assert_called_once()
     update_fn.assert_not_called()
@@ -206,7 +246,7 @@ def test_promote_branch_falls_back_to_noop_on_unparseable_times(tmp_path):
         "start": "not a real datetime",
         "end": "also broken",
     }
-    closure(tmp_path, "event/Bad Times.md", fm, ["start", "end"])
+    closure(tmp_path, "event/Bad Times.md", fm, ["start", "end"], {})
     create_fn.assert_not_called()
     update_fn.assert_not_called()
 
@@ -238,7 +278,7 @@ def test_patch_branch_with_id_routes_to_update(tmp_path):
         "end": "2026-06-27T22:00:00-03:00",
         "gcal_event_id": "existing-mirror-id",
     }
-    closure(tmp_path, "event/Synced.md", fm, ["title"])
+    closure(tmp_path, "event/Synced.md", fm, ["title"], {})
 
     update_fn.assert_called_once()
     create_fn.assert_not_called()
@@ -274,7 +314,7 @@ def test_patch_branch_only_sends_changed_gcal_fields(tmp_path):
         "end": "2026-06-27T22:00:00-03:00",
         "gcal_event_id": "id-1",
     }
-    closure(tmp_path, "event/Tag Only.md", fm, ["tags"])
+    closure(tmp_path, "event/Tag Only.md", fm, ["tags"], {})
 
     update_fn.assert_called_once()
     kwargs = update_fn.call_args.kwargs
@@ -312,7 +352,7 @@ def test_noop_branch_no_id_no_times_does_nothing(tmp_path):
         "date": "2026-06-27",  # date-only, no times
         # No gcal_event_id
     }
-    closure(tmp_path, "event/Ineligible.md", fm, ["date"])
+    closure(tmp_path, "event/Ineligible.md", fm, ["date"], {})
     create_fn.assert_not_called()
     update_fn.assert_not_called()
 
@@ -338,7 +378,7 @@ def test_noop_branch_only_start_no_end_does_nothing(tmp_path):
         "start": "2026-06-27T19:00:00-03:00",
         # end missing
     }
-    closure(tmp_path, "event/Half-eligible.md", fm, ["start"])
+    closure(tmp_path, "event/Half-eligible.md", fm, ["start"], {})
     create_fn.assert_not_called()
     update_fn.assert_not_called()
 
@@ -411,75 +451,183 @@ def test_talker_daemon_update_hook_has_promotion_branch():
 
 
 # ---------------------------------------------------------------------------
-# NOTE-F (ILB): collapse_key-removed warning — §3 review fold-in.
+# pre-edit-fm fix: left-group reconcile breadcrumb (replaces the NOTE-F warn).
 #
-# The warn is a module-level helper (``_warn_if_collapse_key_removed``) the
-# update closure calls, so the emission is unit-testable on the production
-# code path (per ``feedback_log_emission_test_pattern.md``).
+# ``_reconcile_left_collapse_group`` is module-level so its
+# ``gcal.collapse_group_changed`` breadcrumb is unit-testable on the production
+# code path (per ``feedback_log_emission_test_pattern.md``). The richer
+# behavioral pins (old group reconciles / survivors stay projected / re-key /
+# date-change) live in ``test_integrations_gcal_collapse.py`` with the seed +
+# fake-GCal harness; here we pin the breadcrumb + the no-op gate cheaply.
 # ---------------------------------------------------------------------------
 
 
-def test_collapse_key_removed_emits_ilb_warning():
-    """Key removed this edit (in fields_changed, now absent from fm) → the
-    ILB warn fires so the deferred group-reconcile isn't a silent absence."""
+def _gcfg():
+    from alfred.integrations.gcal_config import GCalConfig
+
+    return GCalConfig(
+        enabled=True, alfred_calendar_id="cal@g.com",
+        alfred_calendar_label="alfred",
+    )
+
+
+def test_left_group_reconcile_emits_breadcrumb_on_unkey(tmp_path):
+    """Key removed this edit (pre had a key, post has none) → the left-group
+    reconcile fires + emits the ``gcal.collapse_group_changed`` breadcrumb. No
+    event dir → the reconcile itself is a clean noop, but the breadcrumb (the
+    ILB signal that the group identity changed) still fires."""
     import structlog
 
-    from alfred.telegram.daemon import _warn_if_collapse_key_removed
+    from alfred.telegram.daemon import _reconcile_left_collapse_group
 
-    fm = {"type": "event", "name": "rTMS Slot 1", "date": "2026-07-06"}
+    pre = {"type": "event", "gcal_collapse_key": "rTMS", "date": "2026-07-06"}
+    post = {"type": "event", "date": "2026-07-06"}  # key removed
     with structlog.testing.capture_logs() as cap:
-        fired = _warn_if_collapse_key_removed(
-            "event/rTMS Slot 1.md", fm, ["gcal_collapse_key"],
+        changed = _reconcile_left_collapse_group(
+            client=MagicMock(), config=_gcfg(), vault_path=tmp_path,
+            rel_path="event/rTMS Slot 1.md", pre_fm=pre, post_fm=post,
+            intended_on=True, correlation_id="cid-1",
         )
-    assert fired is True
-    warns = [c for c in cap if c.get("event") == "gcal.collapse_key_removed"]
-    assert len(warns) == 1
-    assert warns[0]["rel_path"] == "event/rTMS Slot 1.md"
-    assert warns[0]["date"] == "2026-07-06"
-    assert "force-reconcile" in warns[0]["detail"]
+    assert changed is True
+    crumbs = [c for c in cap if c.get("event") == "gcal.collapse_group_changed"]
+    assert len(crumbs) == 1
+    assert crumbs[0]["old_key"] == "rTMS"
+    assert crumbs[0]["new_key"] == ""
+    assert crumbs[0]["old_date"] == "2026-07-06"
 
 
-def test_collapse_key_removed_no_warn_when_not_in_fields_changed():
-    """Edit that didn't touch the key → no warn (returns False)."""
+def test_left_group_reconcile_breadcrumb_on_rekey(tmp_path):
+    """Key CHANGED (rTMS → physio) → breadcrumb fires with both keys."""
     import structlog
 
-    from alfred.telegram.daemon import _warn_if_collapse_key_removed
+    from alfred.telegram.daemon import _reconcile_left_collapse_group
 
-    fm = {"type": "event", "name": "x", "date": "2026-07-06"}
+    pre = {"type": "event", "gcal_collapse_key": "rTMS", "date": "2026-07-06"}
+    post = {"type": "event", "gcal_collapse_key": "physio", "date": "2026-07-06"}
     with structlog.testing.capture_logs() as cap:
-        fired = _warn_if_collapse_key_removed("event/x.md", fm, ["title"])
-    assert fired is False
-    assert not [c for c in cap if c.get("event") == "gcal.collapse_key_removed"]
-
-
-def test_collapse_key_removed_no_warn_when_key_still_present():
-    """Key in fields_changed but STILL present (a re-key, not a removal) →
-    no warn; the closure's collapse branch handles the present-key case."""
-    import structlog
-
-    from alfred.telegram.daemon import _warn_if_collapse_key_removed
-
-    fm = {"type": "event", "name": "x", "gcal_collapse_key": "rTMS"}
-    with structlog.testing.capture_logs() as cap:
-        fired = _warn_if_collapse_key_removed(
-            "event/x.md", fm, ["gcal_collapse_key"],
+        changed = _reconcile_left_collapse_group(
+            client=MagicMock(), config=_gcfg(), vault_path=tmp_path,
+            rel_path="event/x.md", pre_fm=pre, post_fm=post,
+            intended_on=True,
         )
-    assert fired is False
-    assert not [c for c in cap if c.get("event") == "gcal.collapse_key_removed"]
+    assert changed is True
+    crumbs = [c for c in cap if c.get("event") == "gcal.collapse_group_changed"]
+    assert len(crumbs) == 1
+    assert crumbs[0]["old_key"] == "rTMS" and crumbs[0]["new_key"] == "physio"
 
 
-def test_talker_daemon_update_hook_calls_collapse_key_removed_helper():
+def test_left_group_reconcile_breadcrumb_on_date_change(tmp_path):
+    """Same key, DATE moved → the event left its (key, old-date) group →
+    breadcrumb fires (date-change is the same gap class as key-change)."""
+    import structlog
+
+    from alfred.telegram.daemon import _reconcile_left_collapse_group
+
+    pre = {"type": "event", "gcal_collapse_key": "rTMS", "date": "2026-07-06"}
+    post = {"type": "event", "gcal_collapse_key": "rTMS", "date": "2026-07-07"}
+    with structlog.testing.capture_logs() as cap:
+        changed = _reconcile_left_collapse_group(
+            client=MagicMock(), config=_gcfg(), vault_path=tmp_path,
+            rel_path="event/x.md", pre_fm=pre, post_fm=post, intended_on=True,
+        )
+    assert changed is True
+    crumbs = [c for c in cap if c.get("event") == "gcal.collapse_group_changed"]
+    assert len(crumbs) == 1
+    assert crumbs[0]["old_date"] == "2026-07-06"
+    assert crumbs[0]["new_date"] == "2026-07-07"
+
+
+def test_left_group_reconcile_noop_when_group_identity_unchanged(tmp_path):
+    """Same (key, day) — e.g. a time-only edit within the day, or a non-key
+    field edit — is NOT a group change → no reconcile, no breadcrumb. Returns
+    False and never calls the GCal client."""
+    import structlog
+
+    from alfred.telegram.daemon import _reconcile_left_collapse_group
+
+    client = MagicMock()
+    # Same key, same DAY (only the time-of-day differs) → unchanged group id.
+    pre = {"type": "event", "gcal_collapse_key": "rTMS",
+           "start": "2026-07-06T08:30:00-03:00"}
+    post = {"type": "event", "gcal_collapse_key": "rTMS",
+            "start": "2026-07-06T09:00:00-03:00"}
+    with structlog.testing.capture_logs() as cap:
+        changed = _reconcile_left_collapse_group(
+            client=client, config=_gcfg(), vault_path=tmp_path,
+            rel_path="event/x.md", pre_fm=pre, post_fm=post, intended_on=True,
+        )
+    assert changed is False
+    assert not [c for c in cap if c.get("event") == "gcal.collapse_group_changed"]
+    client.delete_event.assert_not_called()
+    client.update_event.assert_not_called()
+    client.create_event.assert_not_called()
+
+
+def test_left_group_reconcile_noop_when_no_old_key(tmp_path):
+    """Pure key-ADD (no old key) → not a 'left a group' event → no reconcile,
+    no breadcrumb (the caller's new-group branch handles the add)."""
+    import structlog
+
+    from alfred.telegram.daemon import _reconcile_left_collapse_group
+
+    pre = {"type": "event", "date": "2026-07-06"}  # no key before
+    post = {"type": "event", "gcal_collapse_key": "rTMS", "date": "2026-07-06"}
+    with structlog.testing.capture_logs() as cap:
+        changed = _reconcile_left_collapse_group(
+            client=MagicMock(), config=_gcfg(), vault_path=tmp_path,
+            rel_path="event/x.md", pre_fm=pre, post_fm=post, intended_on=True,
+        )
+    assert changed is False
+    assert not [c for c in cap if c.get("event") == "gcal.collapse_group_changed"]
+
+
+def test_talker_daemon_update_hook_calls_left_group_reconcile():
     """Source-pin: the production ``_on_event_updated`` closure must call the
-    NOTE-F helper, and the helper must emit ``gcal.collapse_key_removed``."""
+    left-group reconcile helper (FIRST, before the new-state logic) + carry the
+    RE-SCOPE branch; the stale NOTE-F warn helper must be GONE."""
     here = Path(__file__).resolve().parent
     source = (
         here.parent / "src" / "alfred" / "telegram" / "daemon.py"
     ).read_text(encoding="utf-8")
+    # The closure must invoke the left-group reconcile helper.
+    assert "_reconcile_left_collapse_group(" in source, (
+        "the update closure must call _reconcile_left_collapse_group so the "
+        "group the member LEFT reconciles immediately (no transient gap)."
+    )
+    # ORDERING (load-bearing, reviewer WARN fold-in): inside _on_event_updated
+    # the reconcile CALL must run BEFORE the keyed-return resolve
+    # (``collapse_key = resolve_collapse_key(fm)``) — else a re-key / date-change
+    # returns from the NEW-group branch before the OLD group is reconciled and
+    # the transient gap silently regresses with no other test catching it.
+    # Anchor the comparison WITHIN the closure body: a bare ``source.index()``
+    # would resolve ``_reconcile_left_collapse_group(`` to the module-level DEF
+    # and ``collapse_key = resolve_collapse_key(fm)`` to the copy in
+    # _on_event_created — unrelated occurrences that never move (false-green).
+    hook_body = source[source.index("def _on_event_updated("):]
     assert (
-        "_warn_if_collapse_key_removed(rel_path, fm, fields_changed)" in source
-    ), "the update closure must call the NOTE-F collapse-key-removed helper"
-    assert '"gcal.collapse_key_removed"' in source, (
-        "the NOTE-F helper must emit gcal.collapse_key_removed (ILB signal)"
+        hook_body.index("_reconcile_left_collapse_group(")
+        < hook_body.index("collapse_key = resolve_collapse_key(fm)")
+    ), (
+        "the left-group reconcile CALL must precede the keyed-return "
+        "`collapse_key = resolve_collapse_key(fm)` inside _on_event_updated — "
+        "moving it below regresses the re-key/date-change transient gap."
+    )
+    # The breadcrumb is the ILB signal for the group-identity change.
+    assert '"gcal.collapse_group_changed"' in source, (
+        "the left-group reconcile must emit gcal.collapse_group_changed."
+    )
+    # The RE-SCOPE branch (ex-primary un-keyed to standalone) must exist.
+    assert "was_unkeyed" in source and '"gcal.collapse_unkey_rescope"' in source, (
+        "the closure must carry the RE-SCOPE branch (un-keyed ex-primary "
+        "sheds the umbrella identity)."
+    )
+    # The stale NOTE-F deferred-reconcile warn must be removed.
+    assert "_warn_if_collapse_key_removed" not in source, (
+        "the NOTE-F deferred-reconcile warn is superseded by the immediate "
+        "left-group reconcile — it must be removed, not left stale."
+    )
+    assert '"gcal.collapse_key_removed"' not in source, (
+        "the stale collapse_key_removed warn event must be gone."
     )
 
 

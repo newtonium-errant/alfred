@@ -45,7 +45,7 @@ def _cancel_aware_branch_under_test(
     synced event must NOT fall into PATCH which would patch the title /
     times of an event we've decided to delete).
     """
-    def _on_event_updated(vault_path_, rel_path, fm, fields_changed):
+    def _on_event_updated(vault_path_, rel_path, fm, fields_changed, pre_fm=None):
         gcal_event_id = str(fm.get("gcal_event_id") or "")
         start_raw = fm.get("start")
         end_raw = fm.get("end")

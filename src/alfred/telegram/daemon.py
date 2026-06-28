@@ -50,44 +50,88 @@ _MISSING_CONFIG_EXIT = 78
 _SWEEP_INTERVAL_SECONDS = 60
 
 
-def _warn_if_collapse_key_removed(
-    rel_path: str, fm: dict, fields_changed: list,
+def _reconcile_left_collapse_group(
+    *,
+    client,
+    config,
+    vault_path,
+    rel_path: str,
+    pre_fm: dict,
+    post_fm: dict,
+    intended_on: bool,
+    correlation_id: str = "",
 ) -> bool:
-    """NOTE-F (ILB): warn when ``gcal_collapse_key`` was removed this edit.
+    """Reconcile the collapse group an event just LEFT (the pre-edit-fm fix).
 
-    When the key is in ``fields_changed`` AND ``resolve_collapse_key(fm)`` is
-    now empty, the collapse group the member just LEFT only reconciles on the
-    NEXT edit of a remaining member (the update hook receives post-edit fm, so
-    the old key isn't available to recompute the old group immediately). If the
-    un-keyed event was the group's PRIMARY, the remaining sessions are
-    TRANSIENTLY UNPROJECTED from the calendar until then — a silent absence on
-    a live medical calendar, the intentionally-left-blank antipattern. Emit an
-    explicit operator-visible signal naming the force-reconcile command.
+    The update hook receives the POST-edit fm, so when an event's collapse-group
+    identity ``(gcal_collapse_key, date)`` changes — key removed, key changed,
+    or a date edit moving it to a different ``(key, date)`` bucket — the post-fm
+    alone can't recompute the group it left (the old key/date is gone). With the
+    pre-edit fm now plumbed through, recompute the OLD group IMMEDIATELY so the
+    survivors get their fresh umbrella in the same edit. Replaces the NOTE-F
+    deferred-reconcile WARN stopgap: the transient under-projection gap is GONE.
 
-    Returns True iff the warn fired (key was removed). Module-level (not inline
-    in the daemon closure) so the emission is unit-testable via capture_logs —
-    per ``feedback_log_emission_test_pattern.md`` the pin must drive the
-    production code path. The structural fix (plumb pre-edit fm into the update
-    hook to recompute BOTH groups) is a queued follow-up.
+    Fires FIRST (before the caller re-scopes / re-syncs the leaver's own entry):
+    survivors are reprojected before the leaver's entry sheds the umbrella, so
+    the sub-second transient is a benign DOUBLE (two umbrellas briefly), never a
+    GAP (vanished sessions on a live medical calendar).
+
+    Group identity is compared on the NORMALIZED day (``_coerce_event_date``),
+    not the raw ``date``/``start`` string, so a time-only edit within the same
+    day does NOT count as a group change (no spurious cross-group reconcile).
+
+    Own try/except: a GCal failure reconciling the OLD group must never abort
+    the caller's NEW-state reconcile or the bubbled-up result — it's a logged
+    side-effect. Returns True iff a group change was detected (the old group was
+    reconciled). Module-level (not inline in the daemon closure) so the
+    ``gcal.collapse_group_changed`` breadcrumb is unit-testable via capture_logs
+    driving production code — per ``feedback_log_emission_test_pattern.md``.
     """
-    from alfred.integrations.gcal_sync import resolve_collapse_key
+    from alfred.integrations.gcal_sync import (
+        _coerce_event_date,
+        resolve_collapse_key,
+        sync_collapse_group,
+    )
 
-    if "gcal_collapse_key" in fields_changed and not resolve_collapse_key(fm):
-        log.warning(
-            "gcal.collapse_key_removed",
-            rel_path=rel_path,
-            date=str(fm.get("date") or fm.get("start") or ""),
-            detail=(
-                "gcal_collapse_key removed from this event; the collapse "
-                "group it left reconciles only on the next edit of a "
-                "remaining member. If this was the group's primary, the "
-                "remaining sessions are transiently unprojected — run "
-                "`alfred gcal collapse --key <key> --date <date>` to "
-                "force-reconcile now."
-            ),
+    old_key = resolve_collapse_key(pre_fm)
+    new_key = resolve_collapse_key(post_fm)
+    old_day = _coerce_event_date(pre_fm)
+    new_day = _coerce_event_date(post_fm)
+    # Only the group the member LEFT needs reconciling here — so an old key must
+    # exist. A pure key-ADD (no old key) is handled by the caller's new-group
+    # branch. Same (key, day) → no group change → nothing to do.
+    if not old_key or (old_key, old_day) == (new_key, new_day):
+        return False
+
+    log.info(
+        "gcal.collapse_group_changed",
+        rel_path=rel_path,
+        old_key=old_key,
+        new_key=new_key,
+        old_date=str(pre_fm.get("date") or pre_fm.get("start") or ""),
+        new_date=str(post_fm.get("date") or post_fm.get("start") or ""),
+        correlation_id=correlation_id,
+    )
+    try:
+        sync_collapse_group(
+            client=client,
+            config=config,
+            vault_path=vault_path,
+            collapse_key=old_key,
+            group_date=pre_fm.get("date") or pre_fm.get("start"),
+            intended_on=intended_on,
+            correlation_id=correlation_id,
         )
-        return True
-    return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "gcal.collapse_old_group_reconcile_failed",
+            rel_path=rel_path,
+            old_key=old_key,
+            old_date=str(pre_fm.get("date") or pre_fm.get("start") or ""),
+            error=str(exc),
+            correlation_id=correlation_id,
+        )
+    return True
 
 
 # --- Validation -----------------------------------------------------------
@@ -715,17 +759,25 @@ async def run(
                         sync_policy=resolve_sync_policy(fm),
                     )
 
-                def _on_event_updated(vault_path_, rel_path, fm, fields_changed):
-                    """Vault-edit hook — four branches:
+                def _on_event_updated(
+                    vault_path_, rel_path, fm, fields_changed, pre_fm,
+                ):
+                    """Vault-edit hook — branches:
 
+                      * collapse-group identity ``(gcal_collapse_key,
+                        date)`` changed pre→post → reconcile the OLD
+                        group FIRST (pre-edit-fm fix): survivors of the
+                        group the member LEFT get their fresh umbrella
+                        immediately — no transient under-projection gap
+                      * post-edit ``gcal_collapse_key`` present → route
+                        to the group coordinator (NEW group: recompute /
+                        adopt / create the umbrella)
                       * status newly set to ``cancelled`` AND
                         gcal_event_id present → CANCEL: delete the GCal
                         mirror (or patch status=cancelled if the record
                         carries ``gcal_keep_on_cancel: true``); on
                         delete, clear ``gcal_event_id`` from the vault
                         record so a future re-confirm starts fresh
-                      * gcal_event_id present → PATCH (regular field
-                        edit on an existing mirror)
                       * gcal_event_id absent BUT start+end present →
                         PROMOTE: push as fresh create, writeback ID
                         (the "first-sync via edit" case — common when
@@ -733,6 +785,12 @@ async def run(
                         predates Phase A+, or when a vault_create
                         landed a record without times that subsequently
                         got them via vault_edit)
+                      * collapse-group ex-PRIMARY un-keyed to standalone
+                        (old key, no new key, still holds the umbrella
+                        id) → RE-SCOPE: PATCH the entry to this event's
+                        OWN name+times, shedding the umbrella identity
+                      * gcal_event_id present → PATCH (regular field
+                        edit on an existing mirror)
                       * otherwise (no datetimes, no cancel) → no-op;
                         the GCal sync functions short-circuit on missing
                         fields too, but bailing here saves the import +
@@ -767,9 +825,26 @@ async def run(
                     for the contract.
                     """
                     from datetime import datetime as _dt
+                    # Pre-edit-fm fix: reconcile the group the member LEFT
+                    # FIRST (before re-scoping/re-syncing its own entry), so a
+                    # collapse-group-identity change (key removed/changed, or a
+                    # date edit moving it between (key,date) groups) reprojects
+                    # the survivors immediately — no transient gap. Logged
+                    # side-effect (own try/except in the helper); the bubbled-up
+                    # result is the NEW-state action below.
+                    _reconcile_left_collapse_group(
+                        client=_bound_client,
+                        config=_bound_config,
+                        vault_path=vault_path_,
+                        rel_path=rel_path,
+                        pre_fm=pre_fm,
+                        post_fm=fm,
+                        intended_on=_bound_intended_on,
+                        correlation_id=str(fm.get("correlation_id") or ""),
+                    )
                     # §3 collapse: any edit of a keyed member (incl. a cancel,
                     # or the edit that ADDS the key) routes to the group
-                    # coordinator — idempotent recompute of the umbrella.
+                    # coordinator — idempotent recompute of the NEW umbrella.
                     # Absent key → the plain cancel/promote/patch paths below.
                     collapse_key = resolve_collapse_key(fm)
                     if collapse_key:
@@ -782,12 +857,13 @@ async def run(
                             intended_on=_bound_intended_on,
                             correlation_id=str(fm.get("correlation_id") or ""),
                         )
-                    # NOTE-F (ILB): the key was REMOVED this edit → surface
-                    # the deferred-group-reconcile gap (see the helper). Then
-                    # fall through to the plain per-event path: an un-keyed
-                    # ex-primary still carries its gcal_event_id and is treated
-                    # as a standalone synced event below.
-                    _warn_if_collapse_key_removed(rel_path, fm, fields_changed)
+                    # Un-key detection for the RE-SCOPE branch below: the event
+                    # had a collapse key pre-edit and has none now. An ex-PRIMARY
+                    # (still holds the umbrella ``gcal_event_id``) must shed the
+                    # "<key> — N sessions" umbrella identity and become its own
+                    # standalone entry. (Ex-SECONDARY un-key has no id → the
+                    # PROMOTION path creates a fresh standalone entry instead.)
+                    was_unkeyed = bool(resolve_collapse_key(pre_fm)) and not collapse_key
                     gcal_event_id = str(fm.get("gcal_event_id") or "")
                     start_raw = fm.get("start")
                     end_raw = fm.get("end")
@@ -866,6 +942,50 @@ async def run(
                             rel_path=rel_path,
                         )
                         return None
+
+                    # RE-SCOPE path — the group's ex-PRIMARY was un-keyed to
+                    # standalone (had a key, has none now, still holds the
+                    # umbrella id). The OLD-group reconcile above already gave
+                    # the survivors a fresh umbrella; now shed THIS entry's
+                    # "<key> — N sessions" umbrella identity by PATCHing it to
+                    # the event's OWN name + times, so it stops representing the
+                    # group. Force title/start/end even though only the key
+                    # changed — that's the whole point of the re-scope. (A
+                    # re-key keeps a new key → handled by the NEW-group branch
+                    # and never reaches here.)
+                    if was_unkeyed:
+                        resolved_title, title_source = resolve_gcal_title(fm)
+                        rescope_start = None
+                        rescope_end = None
+                        if start_raw:
+                            try:
+                                rescope_start = _dt.fromisoformat(str(start_raw))
+                            except Exception:  # noqa: BLE001
+                                pass
+                        if end_raw:
+                            try:
+                                rescope_end = _dt.fromisoformat(str(end_raw))
+                            except Exception:  # noqa: BLE001
+                                pass
+                        log.info(
+                            "gcal.collapse_unkey_rescope",
+                            rel_path=rel_path,
+                            gcal_event_id=gcal_event_id,
+                            correlation_id=str(fm.get("correlation_id") or ""),
+                        )
+                        return sync_event_update_to_gcal(
+                            client=_bound_client,
+                            config=_bound_config,
+                            intended_on=_bound_intended_on,
+                            gcal_event_id=gcal_event_id,
+                            title=resolved_title,
+                            description=str(fm.get("summary") or ""),
+                            start_dt=rescope_start,
+                            end_dt=rescope_end,
+                            correlation_id=str(fm.get("correlation_id") or ""),
+                            title_source=title_source,
+                            sync_policy=resolve_sync_policy(fm),
+                        )
 
                     # PATCH path — existing GCal mirror, normal update.
                     # Only patch fields that actually changed AND are

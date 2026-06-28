@@ -71,7 +71,12 @@ log = structlog.get_logger(__name__)
 # has access to ``gcal_event_id`` for the GCal-side delete.
 
 EventCreateHook = Callable[[Path, str, dict], None]
-EventUpdateHook = Callable[[Path, str, dict, list], None]
+# The update hook receives the PRE-edit frontmatter as its 5th arg (since the
+# 2026-06-28 pre-edit-fm fix) so it can detect collapse-group-identity changes
+# (gcal_collapse_key / date moving the event between (key, date) groups) and
+# reconcile the group the member just LEFT — the post-edit fm alone can't (the
+# old key is gone). See ``register_event_update_hook``.
+EventUpdateHook = Callable[[Path, str, dict, list, dict], None]
 EventDeleteHook = Callable[[Path, str, dict], None]
 
 _EVENT_CREATE_HOOKS: list[EventCreateHook] = []
@@ -96,10 +101,14 @@ def register_event_update_hook(func: EventUpdateHook) -> None:
     on an ``event/`` record.
 
     Decision authority lives in the hook — it sees the post-edit
-    frontmatter + the list of changed fields and decides:
+    frontmatter, the PRE-edit frontmatter, and the list of changed
+    fields and decides:
       * ``gcal_event_id`` present → patch the GCal mirror
       * ``gcal_event_id`` absent AND ``start``/``end`` now set →
         first-sync promotion (push as a fresh create + writeback ID)
+      * the collapse-group identity ``(gcal_collapse_key, date)``
+        changed (pre vs post) → reconcile the group the member LEFT
+        (the pre-edit fm carries the old key the post-edit fm lost)
       * anything else → no-op (no datetimes yet; nothing to sync)
     """
     if func not in _EVENT_UPDATE_HOOKS:
@@ -175,6 +184,7 @@ def _fire_create_hooks(
 
 def _fire_update_hooks(
     vault_path: Path, rel_path: str, fm: dict, fields_changed: list,
+    pre_edit_fm: dict,
 ) -> list[dict]:
     """Iterate registered update hooks; each exception is logged + swallowed.
 
@@ -199,7 +209,10 @@ def _fire_update_hooks(
     results: list[dict] = []
     for hook in list(_EVENT_UPDATE_HOOKS):
         try:
-            ret = hook(vault_path, rel_path, fm, list(fields_changed))
+            ret = hook(
+                vault_path, rel_path, fm, list(fields_changed),
+                dict(pre_edit_fm),
+            )
             if isinstance(ret, dict):
                 results.append(ret)
         except Exception as exc:  # noqa: BLE001
@@ -1631,6 +1644,7 @@ def vault_edit(
     if record_type == "event":
         hook_results = _fire_update_hooks(
             vault_path, rel_path, dict(fm), list(fields_changed),
+            pre_edit_fm,
         )
         gcal_sync = _extract_gcal_sync_status(hook_results)
         if gcal_sync is not None:
