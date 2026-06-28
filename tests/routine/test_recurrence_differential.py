@@ -480,3 +480,31 @@ def test_duepattern_cannot_hold_cadence_only_types():
     assert DuePattern.from_dict(
         {"type": "every_n_months", "n": 2, "day": 15, "anchor": "2026-01-15"}
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# THE ONE DOCUMENTED DIVERGENCE (reader-first widening) — pins NOTE-2.
+# A routine-level cadence written with due.py's SINGULAR `day` spelling
+# (``{type: weekly, day: "mon"}``) used to RAISE in cadence.is_due (cadence
+# weekly required a `days:[list]`). The unified from_dict FOLDS singular
+# `day` → `days`, so fires_on now FIRES on that weekday instead of raising.
+# This is the intended reader-first widening (operator-approved) — the single
+# old≠new case, kept honest by an explicit pin (NOT in the old==new sweep).
+# ---------------------------------------------------------------------------
+
+
+def test_singular_day_cadence_is_the_documented_reader_first_divergence():
+    shape = {"type": "weekly", "day": "mon"}
+    # OLD: cadence.is_due raised (no singular-day support at the routine level).
+    a_monday = date(2026, 6, 1)   # Monday
+    a_tuesday = date(2026, 6, 2)  # Tuesday
+    for d in (a_monday, a_tuesday):
+        old_raised = False
+        try:
+            oracle.cadence_is_due(shape, d)
+        except oracle.CadenceError:
+            old_raised = True
+        assert old_raised, ("old cadence.is_due must raise on singular day", d)
+    # NEW: fires_on folds day→days and fires on the named weekday.
+    assert live_cadence.is_due(shape, a_monday) is True
+    assert live_cadence.is_due(shape, a_tuesday) is False

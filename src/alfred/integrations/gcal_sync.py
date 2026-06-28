@@ -108,6 +108,61 @@ def resolve_gcal_title(fm: dict) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Per-event sync policy — event↔GCal decouple (consolidation Step 4)
+# ---------------------------------------------------------------------------
+
+# Canonical policy values (per ``vault.schema.EVENT_GCAL_FIELDS`` →
+# ``gcal_sync``). "sync" projects the event to Google Calendar (the
+# historical behaviour); "none" never projects it (remind-only — e.g.
+# birthdays/anniversaries; the brief's upcoming-events still surfaces them
+# because reminders read the vault record directly, not GCal).
+SYNC_POLICY_SYNC = "sync"
+SYNC_POLICY_NONE = "none"
+
+
+def resolve_sync_policy(fm: dict) -> str:
+    """Resolve a vault event's GCal sync policy from its frontmatter.
+
+    The event's IDENTITY is the record; Google Calendar is ONE optional
+    output channel. ``gcal_sync`` declares whether THIS event projects to
+    GCal:
+
+      * ``"none"`` → never project (remind-only).
+      * anything else, INCLUDING ABSENT → ``"sync"`` (project — the
+        historical behaviour).
+
+    The absent-→-``"sync"`` default is load-bearing: it preserves the
+    behaviour of every existing event (which carries no ``gcal_sync`` field)
+    — they keep syncing exactly as before this field existed. The resolver
+    is deliberately FAIL-SAFE toward sync: an unrecognised value resolves to
+    ``"sync"`` (we never silently DROP a calendar projection on a typo;
+    the worse failure is an accidental never-sync). An unrecognised non-empty
+    value emits a debug signal so a typo (e.g. ``gcal_sync: non``) is
+    grep-able rather than silently swallowed.
+
+    This is the canonical resolver (mirrors :func:`resolve_gcal_title`);
+    all sync entry points (the daemon hooks, the backfill CLI, the peer
+    propose-create handler) MUST use it rather than re-deriving the rule.
+    """
+    raw = fm.get("gcal_sync")
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized == SYNC_POLICY_NONE:
+            return SYNC_POLICY_NONE
+        if normalized == SYNC_POLICY_SYNC:
+            return SYNC_POLICY_SYNC
+        if normalized:
+            # Unrecognised non-empty value → fail-safe to sync, but surface
+            # the ambiguity so an operator typo is diagnosable.
+            log.debug(
+                "gcal.sync_policy_unrecognized",
+                value=raw[:40],
+                resolved=SYNC_POLICY_SYNC,
+            )
+    return SYNC_POLICY_SYNC
+
+
+# ---------------------------------------------------------------------------
 # Error classification (formerly in peer_handlers)
 # ---------------------------------------------------------------------------
 
@@ -204,6 +259,31 @@ def _gcal_skip_check(
     return None
 
 
+def _sync_policy_skip(
+    *, sync_policy: str, correlation_id: str, op: str,
+) -> dict[str, Any] | None:
+    """Return the early-return value if the per-event policy disables sync.
+
+    Consulted by all four sync funcs AFTER :func:`_gcal_skip_check` (the
+    global gcal-disabled gate takes precedence — its ``{}`` return is
+    unchanged). When the event's ``gcal_sync`` policy is ``"none"`` the func
+    returns ``{"noop": "sync_policy_none"}`` — a reason DISTINCT from
+    ``{}`` (gcal disabled) and ``{"noop": "no_gcal_event_id"}`` (never
+    synced) so callers + logs can tell "operator opted this event out of
+    GCal" apart from the other skips. Default ``"sync"`` → ``None`` (proceed),
+    so an un-updated caller preserves the historical always-sync behaviour.
+    """
+    if sync_policy == SYNC_POLICY_NONE:
+        log.debug(
+            "gcal.sync_skipped",
+            op=op,
+            reason="sync_policy_none",
+            correlation_id=correlation_id,
+        )
+        return {"noop": "sync_policy_none"}
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public: create
 # ---------------------------------------------------------------------------
@@ -221,6 +301,7 @@ def sync_event_create_to_gcal(
     end_dt: datetime,
     correlation_id: str = "",
     title_source: str = "name",
+    sync_policy: str = "sync",
 ) -> dict[str, Any]:
     """Push a freshly-created vault event to the configured calendar.
 
@@ -249,6 +330,11 @@ def sync_event_create_to_gcal(
     )
     if skip is not None:
         return skip
+    policy_skip = _sync_policy_skip(
+        sync_policy=sync_policy, correlation_id=correlation_id, op="create",
+    )
+    if policy_skip is not None:
+        return policy_skip
 
     from alfred.integrations.gcal import GCalError
 
@@ -329,6 +415,7 @@ def sync_event_update_to_gcal(
     end_dt: datetime | None = None,
     correlation_id: str = "",
     title_source: str | None = None,
+    sync_policy: str = "sync",
 ) -> dict[str, Any]:
     """Patch an existing GCal event to mirror a vault edit.
 
@@ -358,6 +445,11 @@ def sync_event_update_to_gcal(
     )
     if skip is not None:
         return skip
+    policy_skip = _sync_policy_skip(
+        sync_policy=sync_policy, correlation_id=correlation_id, op="update",
+    )
+    if policy_skip is not None:
+        return policy_skip
 
     if not gcal_event_id:
         log.debug(
@@ -445,6 +537,7 @@ def sync_event_delete_to_gcal(
     intended_on: bool = False,
     gcal_event_id: str,
     correlation_id: str = "",
+    sync_policy: str = "sync",
 ) -> dict[str, Any]:
     """Remove a GCal event when its vault record has been deleted.
 
@@ -468,6 +561,11 @@ def sync_event_delete_to_gcal(
     )
     if skip is not None:
         return skip
+    policy_skip = _sync_policy_skip(
+        sync_policy=sync_policy, correlation_id=correlation_id, op="delete",
+    )
+    if policy_skip is not None:
+        return policy_skip
 
     if not gcal_event_id:
         log.debug(
@@ -518,6 +616,7 @@ def sync_event_cancellation_to_gcal(
     gcal_event_id: str,
     keep_on_cancel: bool = False,
     correlation_id: str = "",
+    sync_policy: str = "sync",
 ) -> dict[str, Any]:
     """Mirror a ``vault_edit status: cancelled`` to GCal.
 
@@ -575,6 +674,11 @@ def sync_event_cancellation_to_gcal(
     )
     if skip is not None:
         return skip
+    policy_skip = _sync_policy_skip(
+        sync_policy=sync_policy, correlation_id=correlation_id, op="cancel",
+    )
+    if policy_skip is not None:
+        return policy_skip
 
     if not gcal_event_id:
         log.debug(

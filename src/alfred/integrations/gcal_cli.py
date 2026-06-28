@@ -572,7 +572,11 @@ def cmd_backfill(
 
     from .gcal import GCalClient
     from .gcal_config import load_from_unified
-    from .gcal_sync import resolve_gcal_title, sync_event_create_to_gcal
+    from .gcal_sync import (
+        resolve_gcal_title,
+        resolve_sync_policy,
+        sync_event_create_to_gcal,
+    )
 
     config = load_from_unified(raw)
     if not config.enabled:
@@ -631,6 +635,7 @@ def cmd_backfill(
     skipped_no_time_string: list[str] = []
     skipped_unparseable_time: list[dict[str, str]] = []
     skipped_before_cutoff: list[str] = []
+    skipped_sync_policy_none: list[str] = []
     failed: list[dict[str, str]] = []
 
     for md_file in sorted(event_dir.glob("*.md")):
@@ -647,6 +652,16 @@ def cmd_backfill(
 
         if fm.get("gcal_event_id"):
             skipped_already_synced.append(rel_path)
+            continue
+
+        # Per-event sync policy (Step 4 event↔GCal decouple): a
+        # ``gcal_sync: none`` event (birthday/anniversary) is remind-only —
+        # never projected to GCal. Skip before attempting (the sync func's
+        # gate is the un-bypassable backstop; this is the clean accounting
+        # path). Default-absent resolves to "sync" → every existing event
+        # backfills exactly as before.
+        if resolve_sync_policy(fm) == "none":
+            skipped_sync_policy_none.append(rel_path)
             continue
 
         window = _parse_event_window_from_fm(fm)
@@ -790,6 +805,7 @@ def cmd_backfill(
             end_dt=end_dt,
             correlation_id=correlation_id,
             title_source=title_source,
+            sync_policy=resolve_sync_policy(fm),  # backstop; none skipped above
         )
         if result.get("event_id"):
             synced.append({
@@ -828,6 +844,7 @@ def cmd_backfill(
         "skipped_no_time_string": len(skipped_no_time_string),
         "skipped_unparseable_time": len(skipped_unparseable_time),
         "skipped_before_cutoff": len(skipped_before_cutoff),
+        "skipped_sync_policy_none": len(skipped_sync_policy_none),
         "failed_count": len(failed),
         "synced": synced,
         "inferred": inferred,
@@ -839,12 +856,14 @@ def cmd_backfill(
         "skipped_no_time_string_paths": skipped_no_time_string,
         "skipped_unparseable_time_records": skipped_unparseable_time,
         "skipped_before_cutoff_paths": skipped_before_cutoff,
+        "skipped_sync_policy_none_paths": skipped_sync_policy_none,
     }
 
     total_records = (
         len(synced) + len(failed) + len(skipped_already_synced)
         + len(skipped_no_time) + len(skipped_no_time_string)
         + len(skipped_unparseable_time) + len(skipped_before_cutoff)
+        + len(skipped_sync_policy_none)
     )
 
     if wants_json:
@@ -872,6 +891,9 @@ def cmd_backfill(
                 f"{len(skipped_unparseable_time)} unparseable time"
             )
         skip_parts.append(f"{len(skipped_before_cutoff)} before cutoff")
+        skip_parts.append(
+            f"{len(skipped_sync_policy_none)} sync-policy:none"
+        )
         _print(f"  Skipped:    {', '.join(skip_parts)}")
         _print(f"  Failed:     {len(failed)}")
         if synced:

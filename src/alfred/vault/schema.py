@@ -1154,13 +1154,25 @@ REMINDER_FIELDS: tuple[str, ...] = (
 #     hooks pick it up automatically. See
 #     ``alfred.integrations.gcal_sync.resolve_gcal_title`` for the
 #     resolution helper.
+#   - ``gcal_sync``           — per-event sync POLICY (consolidation
+#     Step 4, event↔GCal decouple). ``"sync"`` (project to Google
+#     Calendar — the default) or ``"none"`` (never project; remind-only,
+#     e.g. birthdays/anniversaries — the brief's upcoming-events still
+#     surfaces them since reminders read the record directly, not GCal).
+#     The event's IDENTITY is the record; GCal is one OPTIONAL output
+#     channel. ABSENT field → treated as ``"sync"`` so every existing
+#     event keeps its current behaviour (behavior-preserving default).
+#     Resolved via ``alfred.integrations.gcal_sync.resolve_sync_policy``;
+#     the gate lives INSIDE the four sync funcs so all entry points
+#     (hooks, backfill CLI, peer propose-create) honour it un-bypassably.
 #
-# All four are opt-in per record. None are required.
+# All five are opt-in per record. None are required.
 EVENT_GCAL_FIELDS: tuple[str, ...] = (
     "gcal_event_id",
     "gcal_calendar",
     "gcal_keep_on_cancel",
     "gcal_title",
+    "gcal_sync",
 )
 
 # Optional frontmatter field on ``task`` records that participates in

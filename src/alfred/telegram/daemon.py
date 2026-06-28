@@ -588,6 +588,7 @@ async def run(
                 # ``_sync_event_to_gcal`` shim, no double-fire).
                 from alfred.integrations.gcal_sync import (
                     resolve_gcal_title,
+                    resolve_sync_policy,
                     sync_event_cancellation_to_gcal,
                     sync_event_create_to_gcal,
                     sync_event_delete_to_gcal,
@@ -655,6 +656,7 @@ async def run(
                         end_dt=end_dt,
                         correlation_id=str(fm.get("correlation_id") or ""),
                         title_source=title_source,
+                        sync_policy=resolve_sync_policy(fm),
                     )
 
                 def _on_event_updated(vault_path_, rel_path, fm, fields_changed):
@@ -731,6 +733,7 @@ async def run(
                             gcal_event_id=gcal_event_id,
                             keep_on_cancel=keep_on_cancel,
                             correlation_id=str(fm.get("correlation_id") or ""),
+                            sync_policy=resolve_sync_policy(fm),
                         )
 
                     # Promotion path — first-sync via edit.
@@ -832,6 +835,7 @@ async def run(
                         end_dt=end_dt,
                         correlation_id=str(fm.get("correlation_id") or ""),
                         title_source=title_source,
+                        sync_policy=resolve_sync_policy(fm),
                     )
 
                 def _on_event_deleted(vault_path_, rel_path, pre_delete_fm):
@@ -851,6 +855,7 @@ async def run(
                         correlation_id=str(
                             pre_delete_fm.get("correlation_id") or ""
                         ),
+                        sync_policy=resolve_sync_policy(pre_delete_fm),
                     )
 
                 register_event_create_hook(_on_event_created)

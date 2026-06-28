@@ -2956,7 +2956,21 @@ def _sync_event_to_gcal(
         frontmatter on success so the next conflict-check cycle's
         dedup has its anchor.
     """
-    from alfred.integrations.gcal_sync import sync_event_create_to_gcal
+    from alfred.integrations.gcal_sync import (
+        resolve_sync_policy,
+        sync_event_create_to_gcal,
+    )
+
+    # Per-event sync policy (Step 4 event↔GCal decouple): resolve from the
+    # just-written record so a peer-proposed ``gcal_sync: none`` event is
+    # honoured (the gate is also enforced inside the sync func). The file
+    # always exists here — the handler wrote it immediately before this shim.
+    # Absent ``gcal_sync`` → "sync" (today's behaviour); peer events that
+    # don't carry the field sync exactly as before.
+    try:
+        written_fm = dict(frontmatter.load(str(file_path)).metadata or {})
+    except Exception:  # noqa: BLE001
+        written_fm = {}
 
     return sync_event_create_to_gcal(
         client=request.app.get(_KEY_GCAL_CLIENT),
@@ -2968,6 +2982,7 @@ def _sync_event_to_gcal(
         start_dt=start_dt,
         end_dt=end_dt,
         correlation_id=correlation_id,
+        sync_policy=resolve_sync_policy(written_fm),
     )
 
 # ---------------------------------------------------------------------------
