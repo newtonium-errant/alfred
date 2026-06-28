@@ -3969,13 +3969,27 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_message(update, ctx, text=text, voice=False)
 
 
+# Strong references to in-flight fire-and-forget shadow-capture tasks. The
+# event loop holds only a WEAK reference to a bare ``create_task`` result, so
+# an unreferenced pending task can be garbage-collected mid-flight. The
+# served path happens to be safe (on_voice's frame holds the task while it
+# awaits handle_message), but the REPROMPT path (served-empty / NoTranscript)
+# returns right after a fast ``reply_text`` while the shadow Deepgram call may
+# still be running — exactly the failure/silence clips whose divergence is the
+# corpus's most valuable data. Keep a strong ref until the task completes (the
+# standard asyncio keep-alive idiom): add on spawn, discard in the done-cb.
+_SHADOW_TASKS: set["asyncio.Task[Any]"] = set()
+
+
 def _log_shadow_task_exc(task: "asyncio.Task[Any]") -> None:
     """Done-callback for the fire-and-forget STT shadow-capture task.
 
-    :func:`stt_shadow.capture` already swallows its own errors internally;
-    this surfaces anything that escaped (or a cancellation-time error) so the
-    detached task is never an unobserved-exception orphan. Cancellation at
-    shutdown is expected and ignored."""
+    Two jobs: (1) drop the strong reference from ``_SHADOW_TASKS`` now that the
+    task is done; (2) surface any exception that escaped
+    :func:`stt_shadow.capture` (which already swallows its own errors
+    internally) so the detached task is never an unobserved-exception orphan.
+    Cancellation at shutdown is expected and ignored (but still discarded)."""
+    _SHADOW_TASKS.discard(task)
     if task.cancelled():
         return
     exc = task.exception()
@@ -4058,9 +4072,12 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             duration=update.message.voice.duration,
         )
     )
-    # Done-callback so the fire-and-forget task isn't an unobserved-exception
-    # orphan (capture already swallows internally; this guards the create_task
+    # Strong-ref the task until it completes (see _SHADOW_TASKS) so the loop's
+    # weak ref can't GC an in-flight capture on the reprompt path. The
+    # done-callback both discards the ref and surfaces any orphaned exception
+    # (capture already swallows internally; this guards the create_task
     # machinery itself).
+    _SHADOW_TASKS.add(shadow_task)
     shadow_task.add_done_callback(_log_shadow_task_exc)
 
     # Reprompt on no-transcript OR served-empty (spec decision #4, resolved →

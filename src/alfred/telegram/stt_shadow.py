@@ -203,8 +203,11 @@ async def _capture_inner(
     corpus_dir = Path(getattr(shadow, "dir", "./data/stt_corpus"))
     corpus_dir.mkdir(parents=True, exist_ok=True)
     audio_path = corpus_dir / audio_file
-    # Content-addressed dedupe: identical bytes captured in the same second
-    # map to the same filename — skip the re-write (idempotent).
+    # Filename is timestamp + content-hash, so the skip-if-exists is only a
+    # WITHIN-SECOND idempotency guard (identical bytes captured in the same
+    # second collide on the name and re-write is skipped). Across different
+    # seconds the same audio yields two files — that's fine; one capture event
+    # = one audio file + one corpus line.
     if not audio_path.exists():
         audio_path.write_bytes(audio_bytes)
 

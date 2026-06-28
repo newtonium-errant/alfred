@@ -32,6 +32,7 @@ from alfred.telegram.config import (
 from alfred.telegram.stt_backends import (
     STT_ERR_NETWORK,
     STT_ERR_RATE_LIMIT,
+    NoTranscript,
     SttError,
     SttResult,
 )
@@ -63,6 +64,24 @@ class _FakeEngine:
         if self._error is not None:
             raise self._error
         return self._result
+
+
+class _GatedEngine:
+    """An engine whose transcribe blocks on an asyncio.Event until the test
+    releases it — lets a test hold a capture task in-flight to assert it is
+    strong-referenced (GC-protected) before completion."""
+
+    def __init__(self, backend_id: str, text: str, gate: "asyncio.Event") -> None:
+        self.backend_id = backend_id
+        self.timeout_s = 10.0
+        self._text = text
+        self._gate = gate
+        self.calls = 0
+
+    async def transcribe(self, audio, mime, vocab):
+        self.calls += 1
+        await self._gate.wait()
+        return _res(self._text, self.backend_id)
 
 
 def _res(text: str, backend_id: str, *, latency_ms: int = 100) -> SttResult:
@@ -410,6 +429,73 @@ async def test_on_voice_disabled_shadow_back_compat(talker_config, monkeypatch):
     reply.assert_not_called()
     # Default dir is relative to cwd; disabled capture never touches it.
     assert not (Path(talker_config.stt.shadow_capture.dir) / "corpus.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
+# 5b. KEEP-ALIVE (reviewer WARN fix): the reprompt-path capture must NOT be
+#     GC-dropped — the task is strong-ref'd while in-flight and completes.
+# ---------------------------------------------------------------------------
+
+
+async def test_reprompt_path_capture_not_gc_dropped(
+    talker_config, monkeypatch, tmp_path,
+):
+    """The exposed path (reviewer WARN): on the REPROMPT branch (NoTranscript /
+    served-empty) on_voice replies + RETURNS while the shadow Deepgram call is
+    still in flight. Without a strong ref the loop's weak ref could GC the
+    task and silently drop the most valuable (failure/silence) divergence
+    clips. Pin: the in-flight task is held in ``_SHADOW_TASKS`` until done, and
+    the reprompt-path capture COMPLETES (corpus line written, ref discarded)."""
+    from alfred.telegram import bot
+
+    talker_config.stt.shadow_capture = SttShadowCaptureConfig(
+        enabled=True, dir=str(tmp_path / "corpus"),
+    )
+
+    # Reprompt path: router returns NoTranscript → on_voice replies + returns.
+    _patch_router(monkeypatch, NoTranscript(reason="all_failed"))
+
+    handle_called = {"n": 0}
+
+    async def _fake_handle_message(*args: Any, **kwargs: Any) -> None:
+        handle_called["n"] += 1
+
+    monkeypatch.setattr(bot, "handle_message", _fake_handle_message)
+
+    # Both engines block on the gate so the capture task stays in-flight after
+    # on_voice returns — capture runs BOTH fresh (served_result=None).
+    gate = asyncio.Event()
+    groq = _GatedEngine("groq-whisper", "groq heard this", gate)
+    dg = _GatedEngine("deepgram", "deepgram heard this", gate)
+    monkeypatch.setattr(stt_shadow, "build_chain", lambda cfg: [groq, dg])
+
+    bot._SHADOW_TASKS.clear()  # isolate the module-level keep-alive set
+
+    update, ctx, reply = _build_update_and_ctx(talker_config)
+    await bot.on_voice(update, ctx)
+
+    # Reprompt fired and on_voice returned; the capture is still gated and
+    # MUST be strong-referenced (the GC-protection property).
+    assert handle_called["n"] == 0
+    reply.assert_called_once()
+    assert len(bot._SHADOW_TASKS) == 1, "in-flight capture must be strong-ref'd"
+
+    # Release the engines; let the capture finish.
+    gate.set()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if not bot._SHADOW_TASKS:
+            break
+
+    # Completed → ref discarded AND the reprompt-path capture was NOT dropped.
+    assert bot._SHADOW_TASKS == set(), "completed task must be discarded"
+    jsonl = tmp_path / "corpus" / "corpus.jsonl"
+    assert jsonl.exists(), "reprompt-path capture must still write its line"
+    rows = [json.loads(line) for line in jsonl.read_text().splitlines() if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["groq"]["text"] == "groq heard this"
+    assert rows[0]["deepgram"]["text"] == "deepgram heard this"
+    assert groq.calls == 1 and dg.calls == 1  # both ran fresh (NoTranscript)
 
 
 # ---------------------------------------------------------------------------

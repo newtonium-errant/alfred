@@ -185,6 +185,11 @@ class SttShadowCaptureConfig:
 
     Back-compat: an instance with NO ``shadow_capture:`` block loads with
     ``enabled=False`` and behaves EXACTLY as today (no extra call, no files).
+
+    Only meaningful with a 2-engine ``chain:`` configured (Groq + Deepgram):
+    a 1-engine legacy single-Groq chain records ``deepgram={error:
+    "not_in_chain"}`` and ``divergence=1.0`` every note (no second engine to
+    compare). All current production configs carry the 2-engine chain.
     """
 
     enabled: bool = False
