@@ -849,6 +849,13 @@ async def run(
                             end_dt=end_dt,
                             correlation_id=str(fm.get("correlation_id") or ""),
                             title_source=title_source,
+                            # Thread the per-event policy — the PROMOTION path
+                            # (date-only event later gains start/end) must honour
+                            # gcal_sync:none like the other create-like branches.
+                            # Was unthreaded since §2 (deeper indent missed the
+                            # §2 replace_all); a remind-only event that gained a
+                            # time would otherwise LEAK onto GCal.
+                            sync_policy=resolve_sync_policy(fm),
                         )
 
                     # No-op path — never synced AND still no datetimes.

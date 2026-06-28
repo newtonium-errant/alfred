@@ -481,3 +481,88 @@ def test_talker_daemon_update_hook_calls_collapse_key_removed_helper():
     assert '"gcal.collapse_key_removed"' in source, (
         "the NOTE-F helper must emit gcal.collapse_key_removed (ILB signal)"
     )
+
+
+# ---------------------------------------------------------------------------
+# gcal_sync policy LEAK on the PROMOTION path (skill-qa catch).
+#
+# The promotion branch (date-only event later gains start/end → reaches a
+# ``sync_event_create_to_gcal(...)`` call) was the lone create-like branch
+# that did NOT thread ``sync_policy=`` — unthreaded since §2 (it lives at a
+# deeper indent than the create-hook block, so §2's replace_all missed it).
+# A ``gcal_sync: none`` remind-only event that later gained a time would LEAK
+# onto GCal. Two pins: a SOURCE-pin that genuinely fails without the fix (the
+# call site lacked the kwarg), and a behavioral semantics pin.
+# ---------------------------------------------------------------------------
+
+
+def test_promotion_path_threads_sync_policy_source_pin():
+    """LOAD-BEARING: the production promotion-path ``sync_event_create_to_gcal``
+    call MUST pass ``sync_policy=resolve_sync_policy(fm)``. Fails without the
+    fix (the kwarg was absent on this call site → gcal_sync:none leaked)."""
+    here = Path(__file__).resolve().parent
+    source = (
+        here.parent / "src" / "alfred" / "telegram" / "daemon.py"
+    ).read_text(encoding="utf-8")
+
+    # Anchor on the promotion gate, then the NEXT create call after it, then
+    # its closing paren — assert sync_policy is threaded within that span.
+    promo_idx = source.find(
+        "if not gcal_event_id and start_raw and end_raw:"
+    )
+    assert promo_idx > 0, "promotion gate not found in _on_event_updated"
+    create_idx = source.find("sync_event_create_to_gcal(", promo_idx)
+    assert create_idx > promo_idx, "promotion create call not found"
+    close_idx = source.find("\n                        )", create_idx)
+    assert close_idx > create_idx, "promotion create close-paren not found"
+    promo_create_span = source[create_idx:close_idx]
+    assert "sync_policy=resolve_sync_policy(fm)" in promo_create_span, (
+        "the PROMOTION-path sync_event_create_to_gcal must thread "
+        "sync_policy=resolve_sync_policy(fm) — without it a gcal_sync:none "
+        "event that gains a time LEAKS onto GCal (the §2 omission)."
+    )
+
+
+def test_promotion_shape_none_policy_does_not_create():
+    """Behavioral semantics: a promotion-shaped event (no gcal_event_id, has
+    start/end) carrying gcal_sync:none → resolve_sync_policy → 'none' → the
+    create func returns the policy noop, NO client.create_event. Proves the
+    threaded value actually suppresses the leak."""
+    import tempfile
+    from datetime import datetime, timezone
+
+    import frontmatter
+
+    from alfred.integrations.gcal_config import GCalConfig
+    from alfred.integrations.gcal_sync import (
+        resolve_sync_policy,
+        sync_event_create_to_gcal,
+    )
+
+    fm = {
+        "type": "event", "name": "Mom Birthday",
+        "start": "2099-06-01T14:00:00-03:00",
+        "end": "2099-06-01T15:00:00-03:00",
+        "gcal_sync": "none",
+    }
+    with tempfile.TemporaryDirectory() as d:
+        fp = Path(d) / "evt.md"
+        fp.write_text(
+            frontmatter.dumps(frontmatter.Post("body\n", **fm)) + "\n",
+            encoding="utf-8",
+        )
+        client = MagicMock()
+        out = sync_event_create_to_gcal(
+            client=client,
+            config=GCalConfig(
+                enabled=True, alfred_calendar_id="cal@g.com",
+                alfred_calendar_label="alfred",
+            ),
+            intended_on=True, file_path=fp, title="Mom Birthday",
+            description="",
+            start_dt=datetime(2099, 6, 1, 14, tzinfo=timezone.utc),
+            end_dt=datetime(2099, 6, 1, 15, tzinfo=timezone.utc),
+            sync_policy=resolve_sync_policy(fm),  # the value the fix threads
+        )
+    assert out == {"noop": "sync_policy_none"}
+    client.create_event.assert_not_called()
