@@ -446,8 +446,17 @@ def _maybe_restore_silent_e(stem: str) -> str:
 _MIN_STEM_LEN = 4
 
 
-def _matches_item(query: str, item_text: str) -> bool:
+def _matches_item(query: str, item_text: str, glossary=None) -> bool:
     """True if ``query`` matches ``item_text`` per the fuzzy rules.
+
+    ``glossary`` (optional, the Phase-2 self-correcting learned glossary —
+    ``match_calibration.Glossary``) is consulted FIRST: an operator-confirmed
+    REJECT for this ``(query_key, item)`` pair short-circuits to False (kills a
+    recurring false-positive); a confirmed CONFIRM (or alias) short-circuits to
+    True (promotes an idiosyncratic phrasing the operator approved). Default
+    ``None`` ⟹ the matcher behaves EXACTLY as before (empty glossary == today;
+    the existing 2-arg call-sites are byte-identical). GUARDRAIL: consulting is
+    READ-ONLY — the glossary is mutated only by an operator reply.
 
     Three checks (any pass → match):
       1. Case-insensitive substring on the raw text (the strict
@@ -474,6 +483,16 @@ def _matches_item(query: str, item_text: str) -> bool:
     """
     if not query or not item_text:
         return False
+    # Phase-2 learned-glossary consult (READ-ONLY) — an operator-approved
+    # verdict for this pair wins over the fuzzy ladder. Empty/None glossary
+    # falls straight through to the unchanged fuzzy checks below.
+    if glossary is not None and not glossary.is_empty():
+        from . import match_calibration as _mc
+        verdict = glossary.verdict(_mc.query_key(query), item_text)
+        if verdict == "reject":
+            return False
+        if verdict == "confirm":
+            return True
     if query.casefold() in item_text.casefold():
         return True
     qstem = _fuzzy_stem(query)
@@ -629,9 +648,13 @@ def _iter_active_routine_items(vault_path: Path) -> list[_ItemCandidate]:
 
 
 def _fuzzy_match_vault_wide(
-    vault_path: Path, item_query: str,
+    vault_path: Path, item_query: str, glossary=None,
 ) -> tuple[list[_ItemCandidate], list[_ItemCandidate]]:
     """Vault-wide fuzzy match for an item.
+
+    ``glossary`` (optional Phase-2 learned glossary) is threaded into
+    :func:`_matches_item` so operator-approved confirm/reject verdicts steer
+    the match. Default ``None`` ⟹ unchanged behaviour.
 
     Returns ``(matches, all_candidates)``:
       * ``matches`` — the subset that matches ``item_query`` per
@@ -644,7 +667,8 @@ def _fuzzy_match_vault_wide(
     """
     all_candidates = _iter_active_routine_items(vault_path)
     matches = [
-        c for c in all_candidates if _matches_item(item_query, c.item_text)
+        c for c in all_candidates
+        if _matches_item(item_query, c.item_text, glossary)
     ]
     return matches, all_candidates
 
@@ -775,9 +799,14 @@ def cmd_done(
                 payload={"record_name_input": record_name},
             )
     else:
-        # Vault-wide fuzzy: find the record by item text.
+        # Vault-wide fuzzy: find the record by item text. Load the Phase-2
+        # learned glossary ONCE here (not per _matches_item call — the scan
+        # invokes the matcher per item) and thread it through. Empty/absent
+        # glossary ⟹ unchanged matcher behaviour.
+        from . import match_calibration as _mc
+        _glossary = _mc.load_glossary(config.match_calibration.corpus_path)
         matches, all_candidates = _fuzzy_match_vault_wide(
-            vault_path, item_text,
+            vault_path, item_text, _glossary,
         )
         if not matches:
             return _emit_canary(

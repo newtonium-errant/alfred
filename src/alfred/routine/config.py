@@ -408,6 +408,9 @@ class MatchCalibrationConfig:
 
     pending_path: str = match_calibration.DEFAULT_PENDING_PATH
     threshold: float = match_calibration.DEFAULT_CONFIDENCE_THRESHOLD
+    # Phase 2: the learned glossary the matcher consults. Mutated ONLY by an
+    # operator reply (Daily Sync reply_dispatch) — the matcher only reads it.
+    corpus_path: str = match_calibration.DEFAULT_CORPUS_PATH
 
 
 @dataclass
@@ -483,6 +486,10 @@ def load_from_unified(raw: dict[str, Any]) -> RoutineConfig:
         ),
         threshold=float(
             mc_raw.get("threshold", match_calibration.DEFAULT_CONFIDENCE_THRESHOLD)
+        ),
+        corpus_path=mc_raw.get(
+            "corpus_path",
+            f"{log_dir}/routine_match_corpus.salem.jsonl",
         ),
     )
 

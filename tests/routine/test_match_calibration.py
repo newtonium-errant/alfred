@@ -145,3 +145,97 @@ def test_capture_writes_only_pending_not_a_glossary(tmp_path: Path) -> None:
     # Pending captured; NO corpus file materialised by the match path.
     assert Path(config.match_calibration.pending_path).exists()
     assert not corpus_guard.exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — corpus (learned glossary) + matcher consultation
+# ---------------------------------------------------------------------------
+
+
+def test_query_key_collapses_phrasings() -> None:
+    """Different phrasings of the same completion → the same key (so a learned
+    verdict generalises)."""
+    assert mc.query_key("I walked the dog") == mc.query_key("walked dog")
+    assert mc.query_key("Walk dog") == mc.query_key("dog, walking")
+
+
+def test_corpus_append_load_last_write_wins(tmp_path: Path) -> None:
+    p = tmp_path / "corpus.jsonl"
+    qk = mc.query_key("walk dog")
+    # reject first, then confirm the SAME pair → confirm wins (last-write).
+    mc.append_corpus(p, mc.MatchCorpusEntry(
+        type=mc.CORPUS_REJECT, query_key=qk, item_text="Walk dog"))
+    mc.append_corpus(p, mc.MatchCorpusEntry(
+        type=mc.CORPUS_CONFIRM, query_key=qk, item_text="Walk dog"))
+    g = mc.load_glossary(p)
+    assert g.verdict(qk, "Walk dog") == "confirm"
+    assert (qk, "Walk dog") not in g.rejected
+
+
+def test_corpus_load_absent_is_empty(tmp_path: Path) -> None:
+    g = mc.load_glossary(tmp_path / "nope.jsonl")
+    assert g.is_empty()
+    assert g.verdict("x", "y") is None
+
+
+def test_corpus_load_schema_tolerant(tmp_path: Path) -> None:
+    p = tmp_path / "corpus.jsonl"
+    p.write_text(
+        json.dumps({"type": mc.CORPUS_REJECT, "query_key": "k",
+                    "item_text": "I", "extra": "ignored"}) + "\n"
+        + "{bad json\n",
+        encoding="utf-8",
+    )
+    g = mc.load_glossary(p)
+    assert g.verdict("k", "I") == "reject"
+
+
+def test_matcher_empty_glossary_equals_baseline() -> None:
+    """The behavior-preservation pin: empty glossary (or None) → byte-identical
+    matcher results to the 2-arg form."""
+    from alfred.routine.cli import _matches_item
+
+    g = mc.Glossary(set(), set(), {})
+    for q, item in [
+        ("walk dog", "Walk the dog every morning before work"),
+        ("xyzzy", "Walk dog"),
+        ("Walk dog", "Walk dog"),
+        ("tilray registration", "Meds"),
+    ]:
+        assert _matches_item(q, item) == _matches_item(q, item, None)
+        assert _matches_item(q, item) == _matches_item(q, item, g)
+
+
+def test_matcher_reject_short_circuits() -> None:
+    """A confirmed-reject pair → matcher returns False even though the fuzzy
+    ladder would have matched."""
+    from alfred.routine.cli import _matches_item
+
+    item = "Walk the dog every morning before work"
+    assert _matches_item("walk dog", item) is True  # fuzzy would match
+    g = mc.Glossary(
+        confirmed=set(),
+        rejected={(mc.query_key("walk dog"), item)},
+        aliases={},
+    )
+    assert _matches_item("walk dog", item, g) is False
+
+
+def test_matcher_confirm_promotes() -> None:
+    """A confirmed-good pair → matcher returns True for a phrasing the fuzzy
+    ladder rejects (zero token overlap)."""
+    from alfred.routine.cli import _matches_item
+
+    assert _matches_item("tilray registration", "Meds") is False  # fuzzy: no
+    g = mc.Glossary(
+        confirmed={(mc.query_key("tilray registration"), "Meds")},
+        rejected=set(), aliases={},
+    )
+    assert _matches_item("tilray registration", "Meds", g) is True
+
+
+def test_corpus_path_default_matches_constant() -> None:
+    """Drift-guard: the routine config corpus default binds the shared constant."""
+    from alfred.routine.config import MatchCalibrationConfig
+
+    assert MatchCalibrationConfig().corpus_path == mc.DEFAULT_CORPUS_PATH
