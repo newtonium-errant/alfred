@@ -1526,7 +1526,7 @@ An event's IDENTITY is its vault record; Google Calendar is just ONE optional ou
 
 > Andrew: *"Add my parents' anniversary, June 14, as a reminder — don't put it on the family calendar."*
 >
-> Salem (internal): remind-only shape → `vault_create(type=event, name="Parents' Anniversary", set_fields={"date": "2026-06-14", "gcal_sync": "none"})`. With `gcal_sync: none`, the create hook's policy gate (`_sync_policy_skip` → `resolve_sync_policy`) no-ops — the event never gets a `gcal_event_id`, never reaches GCal — while the brief still surfaces the reminder.
+> Salem (internal): remind-only shape → `vault_create(type=event, name="Parents' Anniversary", set_fields={"date": "2026-06-14", "gcal_sync": "none"})`. A date-only event has no times to push anyway — the create hook bails at its no-times check (`daemon.py`, `reason="no_start_or_end"`) before any sync runs, so the event never gets a `gcal_event_id` and never reaches GCal, while the brief still surfaces the reminder. And `gcal_sync: none` is the durable guarantee that keeps it off even if `start`/`end` are added later: the promotion path threads the policy into `_sync_policy_skip`, which returns the `sync_policy_none` no-op instead of creating the entry.
 >
 > Reply: *"Added Parents' Anniversary June 14 as a remind-only event — it'll show in your brief but won't go on Andrew's Calendar (S.A.L.E.M.)."*
 
