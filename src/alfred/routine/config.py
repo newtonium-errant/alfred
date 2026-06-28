@@ -56,6 +56,8 @@ from typing import Any
 
 from alfred.common.schedule import ScheduleConfig
 
+from . import match_calibration
+
 
 DEFAULT_TIMEZONE = "America/Halifax"
 # Fires one minute before the brief (06:00 default) so the brief at
@@ -392,6 +394,23 @@ class TierDefaultsConfig:
 
 
 @dataclass
+class MatchCalibrationConfig:
+    """Self-correcting matcher — capture sink + threshold (Phase 1).
+
+    ``threshold`` is the confidence floor below which a vault-wide fuzzy
+    ``routine_done`` match is captured to ``pending_path`` for operator review
+    (GREENLIT Q1 default 0.5; configurable so Phase 1 observability can refine
+    it from real traffic). ``pending_path`` is the per-instance capture JSONL
+    the Daily Sync ``routine_match`` section reads. Both default to the module
+    constants in ``routine.match_calibration``; the operator overrides via the
+    ``routine.match_calibration`` config block.
+    """
+
+    pending_path: str = match_calibration.DEFAULT_PENDING_PATH
+    threshold: float = match_calibration.DEFAULT_CONFIDENCE_THRESHOLD
+
+
+@dataclass
 class RoutineConfig:
     """Top-level routine daemon config.
 
@@ -412,6 +431,9 @@ class RoutineConfig:
     state: StateConfig = field(default_factory=StateConfig)
     tier_defaults: TierDefaultsConfig = field(
         default_factory=TierDefaultsConfig,
+    )
+    match_calibration: MatchCalibrationConfig = field(
+        default_factory=MatchCalibrationConfig,
     )
     log_file: str = "./data/routine.log"
     instance_name: str = ""
@@ -449,6 +471,21 @@ def load_from_unified(raw: dict[str, Any]) -> RoutineConfig:
         section.get("tier_defaults"),
     )
 
+    # Self-correcting matcher capture (Phase 1). Hand-rolled per the routine
+    # config convention. Absent block → module defaults (pending_path under
+    # data/, threshold 0.5). pending_path defaults under the configured log_dir
+    # so it co-locates with the other per-instance state files.
+    mc_raw = section.get("match_calibration", {}) or {}
+    match_calibration_cfg = MatchCalibrationConfig(
+        pending_path=mc_raw.get(
+            "pending_path",
+            f"{log_dir}/routine_match_pending.salem.jsonl",
+        ),
+        threshold=float(
+            mc_raw.get("threshold", match_calibration.DEFAULT_CONFIDENCE_THRESHOLD)
+        ),
+    )
+
     # Resolve instance name via the canonical normaliser. Empty when
     # the operator omitted ``telegram.instance.name`` from config —
     # the daemon-start guard refuses to start in that case (rather
@@ -470,6 +507,7 @@ def load_from_unified(raw: dict[str, Any]) -> RoutineConfig:
         output=output,
         state=state,
         tier_defaults=tier_defaults,
+        match_calibration=match_calibration_cfg,
         log_file=f"{log_dir}/routine.log",
         instance_name=instance_name,
     )
@@ -481,6 +519,7 @@ __all__ = [
     "DUE_PATTERN_TYPES",
     "DuePattern",
     "Item",
+    "MatchCalibrationConfig",
     "OutputConfig",
     "REQUIRED_INSTANCE",
     "RoutineConfig",

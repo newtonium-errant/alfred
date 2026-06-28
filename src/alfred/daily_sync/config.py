@@ -37,6 +37,9 @@ from typing import Any
 import yaml
 
 from alfred.common.schedule import ScheduleConfig
+from alfred.routine.match_calibration import (
+    DEFAULT_PENDING_PATH as _ROUTINE_MATCH_PENDING_DEFAULT,
+)
 
 ENV_RE = re.compile(r"\$\{(\w+)\}")
 
@@ -173,6 +176,23 @@ class FrictionAnalyzerConfig:
 
 
 @dataclass
+class RoutineMatchConfig:
+    """Self-correcting routine matcher — Daily Sync surface (Phase 1).
+
+    ``enabled`` defaults OFF — instances opt in via
+    ``daily_sync.routine_match.enabled: true`` (Salem is the first, routine
+    being Salem-only). ``pending_path`` MUST match the routine tool's
+    ``routine.match_calibration.pending_path`` (the routine CLI writes it; this
+    section reads it) — both default to the shared
+    ``routine.match_calibration.DEFAULT_PENDING_PATH`` constant so they can't
+    drift (pinned in tests).
+    """
+
+    enabled: bool = False
+    pending_path: str = _ROUTINE_MATCH_PENDING_DEFAULT
+
+
+@dataclass
 class DailySyncConfig:
     """Top-level Daily Sync config.
 
@@ -194,6 +214,11 @@ class DailySyncConfig:
     # the first such instance.
     friction_analyzer: FrictionAnalyzerConfig = field(
         default_factory=FrictionAnalyzerConfig,
+    )
+    # Self-correcting routine matcher surface (Phase 1) — defaulted-OFF;
+    # Salem opts in via ``daily_sync.routine_match.enabled: true``.
+    routine_match: RoutineMatchConfig = field(
+        default_factory=RoutineMatchConfig,
     )
     # Path to the config file this DailySyncConfig was loaded from.
     # Carried so lazy/late loaders (the canonical-proposals queue-path
@@ -220,6 +245,7 @@ _DATACLASS_MAP: dict[str, type] = {
     "attribution": AttributionConfig,
     "friction_analyzer": FrictionAnalyzerConfig,
     "thresholds": FrictionThresholdsConfig,
+    "routine_match": RoutineMatchConfig,
 }
 
 

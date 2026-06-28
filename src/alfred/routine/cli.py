@@ -852,6 +852,38 @@ def cmd_done(
             record=chosen.record_name,
             confidence=confidence,
         )
+        # Self-correcting matcher — Phase 1 CAPTURE. A LOW-confidence fuzzy
+        # match (below the configured threshold) is captured to the pending
+        # sink for operator review in the Daily Sync ``routine_match`` section.
+        # GUARDRAIL: this writes ONLY to the pending sink — never the learned
+        # glossary (which is mutated only by an operator reply). Best-effort:
+        # a capture failure must NEVER break the completion (capture is
+        # observability, the completion is the operator's actual intent).
+        # Captured with the ORIGINAL query (``item_text`` here, before the
+        # canonicalise reassignment below).
+        if confidence < config.match_calibration.threshold:
+            try:
+                from datetime import datetime, timezone
+
+                from . import match_calibration as _mc
+                _mc.append_pending(
+                    config.match_calibration.pending_path,
+                    _mc.PendingMatch(
+                        query=item_text,
+                        matched_to=chosen.item_text,
+                        record=chosen.record_name,
+                        confidence=confidence,
+                        completion_date=iso,
+                        captured_at=datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "routine.match_calibration.capture_failed",
+                    error=str(exc),
+                    query=item_text,
+                    matched_to=chosen.item_text,
+                )
         resolved_record = chosen.record_name
         item_text = chosen.item_text  # canonicalise to verbatim text
         resolved_path = chosen.path

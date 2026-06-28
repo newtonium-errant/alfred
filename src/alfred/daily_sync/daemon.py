@@ -43,6 +43,7 @@ from . import (
     friction_section,
     pending_items_section,
     radar_section,
+    routine_match_section,
     triage_section,
 )
 from .assembler import assemble_message
@@ -266,6 +267,13 @@ async def fire_once(
     # with the already-resolved variable.
     triage_section.set_vault_path(vault_path)
     triage_section.register()
+    # Self-correcting routine matcher surface (Phase 1, read-only): lists
+    # low-confidence routine_done fuzzy matches from the routine capture sink.
+    # Registered unconditionally — the provider returns None when
+    # ``routine_match.enabled`` is False (Salem opts in via config), so other
+    # instances stay unaffected. The pending path is read from config inside
+    # the provider (no set_* holder needed).
+    routine_match_section.register()
 
     body = assemble_message(config, today)
     items = email_section.consume_last_batch()
