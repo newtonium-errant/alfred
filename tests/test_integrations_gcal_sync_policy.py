@@ -105,6 +105,24 @@ def test_gcal_sync_in_event_gcal_fields():
     assert "gcal_sync" in EVENT_GCAL_FIELDS
 
 
+def test_disabled_precedence_over_policy_none(tmp_path):
+    """§2 review coverage pin: gcal globally disabled + policy none →
+    returns ``{}`` (disabled-precedence skip), NOT the ``sync_policy_none``
+    noop. The global gate runs before the policy gate, so a disabled
+    instance behaves byte-identically regardless of the per-event policy."""
+    client = MagicMock()
+    file_path = _seed_event(
+        tmp_path, fm={"type": "event", "name": "B", "gcal_sync": "none"},
+    )
+    out = sync_event_create_to_gcal(
+        client=client, config=_make_config(enabled=False), intended_on=False,
+        file_path=file_path, title="B", description="",
+        start_dt=_START, end_dt=_END, sync_policy="none",
+    )
+    assert out == {}  # disabled precedence, NOT {"noop": "sync_policy_none"}
+    client.create_event.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # The gate — none → noop, NO client call (all four funcs)
 # ---------------------------------------------------------------------------

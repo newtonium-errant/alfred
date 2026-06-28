@@ -587,8 +587,10 @@ async def run(
                 # ``sync_event_create_to_gcal`` via the
                 # ``_sync_event_to_gcal`` shim, no double-fire).
                 from alfred.integrations.gcal_sync import (
+                    resolve_collapse_key,
                     resolve_gcal_title,
                     resolve_sync_policy,
+                    sync_collapse_group,
                     sync_event_cancellation_to_gcal,
                     sync_event_create_to_gcal,
                     sync_event_delete_to_gcal,
@@ -620,6 +622,20 @@ async def run(
                     which omits the ``gcal_sync`` key entirely.
                     """
                     from datetime import datetime as _dt
+                    # §3 collapse: a keyed member routes to the group
+                    # coordinator (ONE umbrella entry) instead of the plain
+                    # per-event create. Absent key → plain path below.
+                    collapse_key = resolve_collapse_key(fm)
+                    if collapse_key:
+                        return sync_collapse_group(
+                            client=_bound_client,
+                            config=_bound_config,
+                            vault_path=vault_path_,
+                            collapse_key=collapse_key,
+                            group_date=fm.get("date") or fm.get("start"),
+                            intended_on=_bound_intended_on,
+                            correlation_id=str(fm.get("correlation_id") or ""),
+                        )
                     start_raw = fm.get("start")
                     end_raw = fm.get("end")
                     if not start_raw or not end_raw:
@@ -711,6 +727,21 @@ async def run(
                     for the contract.
                     """
                     from datetime import datetime as _dt
+                    # §3 collapse: any edit of a keyed member (incl. a cancel,
+                    # or the edit that ADDS the key) routes to the group
+                    # coordinator — idempotent recompute of the umbrella.
+                    # Absent key → the plain cancel/promote/patch paths below.
+                    collapse_key = resolve_collapse_key(fm)
+                    if collapse_key:
+                        return sync_collapse_group(
+                            client=_bound_client,
+                            config=_bound_config,
+                            vault_path=vault_path_,
+                            collapse_key=collapse_key,
+                            group_date=fm.get("date") or fm.get("start"),
+                            intended_on=_bound_intended_on,
+                            correlation_id=str(fm.get("correlation_id") or ""),
+                        )
                     gcal_event_id = str(fm.get("gcal_event_id") or "")
                     start_raw = fm.get("start")
                     end_raw = fm.get("end")
@@ -847,6 +878,28 @@ async def run(
                     LLM tool_result.
                     """
                     gcal_event_id = str(pre_delete_fm.get("gcal_event_id") or "")
+                    # §3 collapse: deleting a keyed member recomputes the
+                    # group (the file is already gone from the scan). If the
+                    # deleted member was the PRIMARY, pass its id as
+                    # orphan_event_id so the coordinator PROMOTES it onto a
+                    # surviving member (or tears the entry down if last).
+                    collapse_key = resolve_collapse_key(pre_delete_fm)
+                    if collapse_key:
+                        return sync_collapse_group(
+                            client=_bound_client,
+                            config=_bound_config,
+                            vault_path=vault_path_,
+                            collapse_key=collapse_key,
+                            group_date=(
+                                pre_delete_fm.get("date")
+                                or pre_delete_fm.get("start")
+                            ),
+                            intended_on=_bound_intended_on,
+                            correlation_id=str(
+                                pre_delete_fm.get("correlation_id") or ""
+                            ),
+                            orphan_event_id=gcal_event_id,
+                        )
                     return sync_event_delete_to_gcal(
                         client=_bound_client,
                         config=_bound_config,

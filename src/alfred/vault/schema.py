@@ -1165,14 +1165,27 @@ REMINDER_FIELDS: tuple[str, ...] = (
 #     Resolved via ``alfred.integrations.gcal_sync.resolve_sync_policy``;
 #     the gate lives INSIDE the four sync funcs so all entry points
 #     (hooks, backfill CLI, peer propose-create) honour it un-bypassably.
+#   - ``gcal_collapse_key``   — same-day collapse SERIES LABEL (consolidation
+#     Step 4 §3, the rTMS umbrella). A CLEAN label (e.g. ``"rTMS"``), NOT
+#     date-stamped: events sharing ``(gcal_collapse_key, date)`` project to
+#     ONE GCal entry spanning earliest-start → latest-end (title auto-summary
+#     ``"<key> — N sessions (HH:MM–HH:MM)"``). The first synced / existing-id
+#     member is the PRIMARY (owns the single ``gcal_event_id``); siblings are
+#     "synced via the primary" (carry the key, no own id). ABSENT → no
+#     collapse (the plain per-event path; today's behaviour). Operators /
+#     Salem set it via ``vault_edit`` (rides the talker ``edit`` permission,
+#     like ``gcal_title``); the sync layer's ``sync_collapse_group``
+#     coordinator does the grouping. Resolved via
+#     ``alfred.integrations.gcal_sync.resolve_collapse_key``.
 #
-# All five are opt-in per record. None are required.
+# All six are opt-in per record. None are required.
 EVENT_GCAL_FIELDS: tuple[str, ...] = (
     "gcal_event_id",
     "gcal_calendar",
     "gcal_keep_on_cancel",
     "gcal_title",
     "gcal_sync",
+    "gcal_collapse_key",
 )
 
 # Optional frontmatter field on ``task`` records that participates in

@@ -47,7 +47,7 @@ diagnostic value).
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -143,6 +143,13 @@ def resolve_sync_policy(fm: dict) -> str:
     This is the canonical resolver (mirrors :func:`resolve_gcal_title`);
     all sync entry points (the daemon hooks, the backfill CLI, the peer
     propose-create handler) MUST use it rather than re-deriving the rule.
+
+    NOTE (deferred, §2 review): flipping an ALREADY-synced event to
+    ``gcal_sync: none`` does NOT retract its existing GCal entry — the
+    update/delete gate just no-ops, so the prior projection lingers on the
+    calendar. To retract it, explicitly delete the event (fires the GCal
+    delete/cancel hook). New events created with ``none`` never get a
+    ``gcal_event_id`` → never reach the calendar (the common path).
     """
     raw = fm.get("gcal_sync")
     if isinstance(raw, str):
@@ -160,6 +167,24 @@ def resolve_sync_policy(fm: dict) -> str:
                 resolved=SYNC_POLICY_SYNC,
             )
     return SYNC_POLICY_SYNC
+
+
+def resolve_collapse_key(fm: dict) -> str:
+    """Resolve a vault event's GCal collapse key from its frontmatter (§3).
+
+    ``gcal_collapse_key`` is a CLEAN SERIES LABEL (e.g. ``"rTMS"``), NOT
+    date-stamped — the date dimension comes from the event's own ``date``, so
+    a collapse group is ``(key, date)`` and the SAME key on every rTMS event
+    auto-separates by day. Returns the stripped key, or ``""`` when absent /
+    blank / non-string (→ no collapse; the plain per-event sync path applies).
+
+    Canonical resolver (mirrors :func:`resolve_gcal_title` /
+    :func:`resolve_sync_policy`); all callers MUST use it.
+    """
+    raw = fm.get("gcal_collapse_key")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -811,4 +836,338 @@ def sync_event_cancellation_to_gcal(
         "cancelled": True,
         "event_id": gcal_event_id,
         "path": "delete",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Same-day collapse (§3) — the rTMS umbrella coordinator
+# ---------------------------------------------------------------------------
+
+
+def _coerce_dt(raw: Any) -> datetime | None:
+    """Parse a frontmatter start/end value to a ``datetime`` (or None)."""
+    if isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_event_date(fm: dict) -> date | None:
+    """Resolve an event's group date — ``date`` field first, else
+    ``start``.date(). Returns None when neither is parseable."""
+    d = fm.get("date")
+    if isinstance(d, datetime):
+        return d.date()
+    if isinstance(d, date):
+        return d
+    if isinstance(d, str) and d.strip():
+        try:
+            return date.fromisoformat(d.strip())
+        except ValueError:
+            start = _coerce_dt(d)
+            if start is not None:
+                return start.date()
+    start = _coerce_dt(fm.get("start"))
+    if start is not None:
+        return start.date()
+    return None
+
+
+def _normalize_group_date(group_date: Any) -> date | None:
+    if isinstance(group_date, datetime):
+        return group_date.date()
+    if isinstance(group_date, date):
+        return group_date
+    if isinstance(group_date, str) and group_date.strip():
+        try:
+            return date.fromisoformat(group_date.strip()[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _collapse_title(key: str, n: int, span_start: datetime, span_end: datetime) -> str:
+    """Auto-summary title for a collapse group (operator Q1):
+    ``"<key> — N sessions (HH:MM–HH:MM)"`` (en-dash separator)."""
+    return (
+        f"{key} — {n} session{'s' if n != 1 else ''} "
+        f"({span_start:%H:%M}–{span_end:%H:%M})"
+    )
+
+
+def _clear_gcal_ids(file_path: Path, correlation_id: str = "") -> None:
+    """Direct-frontmatter clear of ``gcal_event_id`` + ``gcal_calendar`` on a
+    secondary member (no vault_edit → no hook re-fire; mirrors the
+    cancellation-path writeback)."""
+    try:
+        post = frontmatter.load(str(file_path))
+        changed = False
+        for k in ("gcal_event_id", "gcal_calendar"):
+            if k in post:
+                del post[k]
+                changed = True
+        if changed:
+            text = frontmatter.dumps(post)
+            if not text.endswith("\n"):
+                text += "\n"
+            file_path.write_text(text, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "gcal.collapse_clear_writeback_failed",
+            error=str(exc), path=str(file_path), correlation_id=correlation_id,
+        )
+
+
+def _write_primary_id(
+    file_path: Path, event_id: str, calendar_label: str, correlation_id: str = "",
+) -> None:
+    """Direct-frontmatter writeback of the primary's ``gcal_event_id`` +
+    ``gcal_calendar`` (no vault_edit → no hook re-fire)."""
+    try:
+        post = frontmatter.load(str(file_path))
+        post["gcal_event_id"] = event_id
+        post["gcal_calendar"] = calendar_label
+        text = frontmatter.dumps(post)
+        if not text.endswith("\n"):
+            text += "\n"
+        file_path.write_text(text, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "gcal.collapse_primary_writeback_failed",
+            error=str(exc), event_id=event_id, path=str(file_path),
+            correlation_id=correlation_id,
+        )
+
+
+def sync_collapse_group(
+    *,
+    client: Any,
+    config: Any,
+    vault_path: Any,
+    collapse_key: str,
+    group_date: Any,
+    intended_on: bool = False,
+    correlation_id: str = "",
+    orphan_event_id: str = "",
+) -> dict[str, Any]:
+    """Reconcile one same-day collapse group to ONE GCal entry (§3).
+
+    A collapse group = all ``event`` records sharing ``(gcal_collapse_key,
+    date)``. The group projects to a SINGLE GCal entry spanning
+    earliest-start → latest-end across sync-eligible members, titled with the
+    auto-summary ``"<key> — N sessions (HH:MM–HH:MM)"`` (operator Q1).
+
+    IDEMPOTENT full recompute — safe to call on every member create/update/
+    delete (the no-double-create guarantee: the group keeps exactly ONE
+    ``gcal_event_id``, on the PRIMARY). Election + reconcile:
+
+      * PRIMARY = an eligible member that already has a ``gcal_event_id``
+        (ADOPT its entry — operator Q2, e.g. the manually-created umbrella);
+        else the earliest-start eligible member (deterministic, path
+        tie-break). ``orphan_event_id`` (passed by the delete hook when the
+        deleted member WAS the primary) is adopted onto the elected survivor
+        (operator Q3 PROMOTE).
+      * RECONCILE: every other GCal id found in the group (duplicates +
+        the orphan when not reused) is DELETED so the group converges to one.
+      * Eligible = members with ``gcal_sync != "none"`` AND parseable
+        start+end (§2 × §3: a ``none`` member never contributes / never
+        projects; a member without times can't contribute a span).
+      * No eligible members → DELETE any lingering group entry + clear ids
+        (last-member-delete → remove the entry, operator Q3).
+
+    Writeback is direct-frontmatter (no ``vault_edit`` → no hook re-fire):
+    the primary gets ``gcal_event_id`` + ``gcal_calendar``; every other
+    member's stale ids are cleared.
+
+    Returns (per ``intentionally_left_blank`` — every outcome is explicit):
+      * ``{}`` — gcal disabled (skip).
+      * ``{"noop": "no_collapse_key"}`` / ``{"noop": "no_eligible_members"}``.
+      * ``{"collapsed": True, "action": "created"|"patched"|"deleted",
+        "collapse_key", "date", "primary_event_id", "member_count",
+        "title", "span": [start_iso, end_iso], "reconciled_deleted": [...]}``.
+      * ``{"error": {...}}`` on a GCal failure / bad input.
+    """
+    skip = _gcal_skip_check(
+        client=client, config=config, intended_on=intended_on,
+        correlation_id=correlation_id, op="collapse",
+    )
+    if skip is not None:
+        return skip
+
+    key = (collapse_key or "").strip()
+    if not key:
+        return {"noop": "no_collapse_key"}
+    gdate = _normalize_group_date(group_date)
+    if gdate is None:
+        return {
+            "error": {
+                "code": "bad_request",
+                "detail": f"collapse group_date unparseable: {group_date!r}",
+            }
+        }
+
+    from alfred.integrations.gcal import GCalError
+
+    calendar_label = getattr(config, "alfred_calendar_label", "") or "alfred"
+    calendar_id = config.alfred_calendar_id
+
+    # --- scan the group --------------------------------------------------
+    event_dir = Path(vault_path) / "event"
+    eligible: list[dict[str, Any]] = []
+    all_ids: dict[str, Path] = {}  # event_id -> the file carrying it
+    if event_dir.is_dir():
+        for md in sorted(event_dir.glob("*.md")):
+            try:
+                fm = dict(frontmatter.load(str(md)).metadata or {})
+            except Exception:  # noqa: BLE001
+                continue
+            if resolve_collapse_key(fm) != key:
+                continue
+            if _coerce_event_date(fm) != gdate:
+                continue
+            eid = str(fm.get("gcal_event_id") or "")
+            if eid:
+                all_ids[eid] = md
+            if resolve_sync_policy(fm) == SYNC_POLICY_NONE:
+                continue  # §2: never projects, never contributes a span
+            if str(fm.get("status") or "").strip().lower() == "cancelled":
+                continue  # a cancelled session leaves the group (excluded from span)
+            start = _coerce_dt(fm.get("start"))
+            end = _coerce_dt(fm.get("end"))
+            if start is None or end is None:
+                continue  # can't contribute a span (Q6)
+            eligible.append(
+                {"path": md, "start": start, "end": end, "gcal_event_id": eid}
+            )
+
+    # --- no eligible members → tear down the entry (last-member-delete) ---
+    if not eligible:
+        ids_to_delete = {
+            i for i in (set(all_ids) | ({orphan_event_id} if orphan_event_id else set()))
+            if i
+        }
+        if not ids_to_delete:
+            # Nothing matched + nothing to remove → clean no-op (not a
+            # spurious "deleted"). Per ILB this is the explicit idle signal.
+            log.info(
+                "gcal.collapse_no_members",
+                collapse_key=key, date=gdate.isoformat(),
+                correlation_id=correlation_id,
+            )
+            return {"noop": "no_eligible_members"}
+        deleted: list[str] = []
+        for eid in sorted(i for i in ids_to_delete if i):
+            try:
+                client.delete_event(calendar_id, eid)
+                deleted.append(eid)
+            except GCalError as exc:
+                log.warning(
+                    "gcal.collapse_teardown_delete_failed",
+                    error=str(exc), gcal_event_id=eid,
+                    correlation_id=correlation_id,
+                )
+        for md in set(all_ids.values()):
+            _clear_gcal_ids(md, correlation_id)
+        log.info(
+            "gcal.collapse_torn_down",
+            collapse_key=key, date=gdate.isoformat(),
+            deleted=deleted, correlation_id=correlation_id,
+        )
+        return {
+            "collapsed": True, "action": "deleted",
+            "collapse_key": key, "date": gdate.isoformat(),
+            "primary_event_id": "", "member_count": 0,
+            "reconciled_deleted": deleted,
+        }
+
+    eligible.sort(key=lambda m: (m["start"], str(m["path"])))
+
+    # --- elect the primary + its id --------------------------------------
+    elig_with_id = [m for m in eligible if m["gcal_event_id"]]
+    if elig_with_id:
+        primary = elig_with_id[0]
+        primary_id = primary["gcal_event_id"]
+    elif orphan_event_id:
+        primary = eligible[0]
+        primary_id = orphan_event_id  # PROMOTE the orphaned entry onto a survivor
+    else:
+        primary = eligible[0]
+        primary_id = ""  # → create fresh
+
+    # --- reconcile: delete every OTHER id in the group -------------------
+    candidate_ids = set(all_ids)
+    if orphan_event_id:
+        candidate_ids.add(orphan_event_id)
+    reconciled_deleted: list[str] = []
+    for eid in sorted(i for i in candidate_ids if i and i != primary_id):
+        try:
+            client.delete_event(calendar_id, eid)
+            reconciled_deleted.append(eid)
+        except GCalError as exc:
+            log.warning(
+                "gcal.collapse_reconcile_delete_failed",
+                error=str(exc), gcal_event_id=eid,
+                correlation_id=correlation_id,
+            )
+
+    # --- compute span + auto-summary title -------------------------------
+    span_start = min(m["start"] for m in eligible)
+    span_end = max(m["end"] for m in eligible)
+    title = _collapse_title(key, len(eligible), span_start, span_end)
+
+    common: dict[str, Any] = {"start": span_start, "end": span_end, "title": title}
+    if getattr(config, "default_time_zone", ""):
+        common["time_zone"] = config.default_time_zone
+
+    # --- create or patch the single entry --------------------------------
+    action = ""
+    try:
+        if not primary_id:
+            primary_id = client.create_event(
+                calendar_id, description="", **common,
+            )
+            action = "created"
+        else:
+            updated = client.update_event(calendar_id, primary_id, **common)
+            if updated is None:
+                # Adopted/primary id was stale (404) — create a fresh entry.
+                primary_id = client.create_event(
+                    calendar_id, description="", **common,
+                )
+                action = "created"
+            else:
+                action = "patched"
+    except GCalError as exc:
+        code = classify_gcal_error(exc)
+        log.warning(
+            "gcal.collapse_sync_failed",
+            error=str(exc), error_code=code, collapse_key=key,
+            date=gdate.isoformat(), correlation_id=correlation_id,
+        )
+        return {"error": {"code": code, "detail": str(exc)}}
+
+    # --- writeback: primary owns the id; everyone else is cleared --------
+    _write_primary_id(primary["path"], primary_id, calendar_label, correlation_id)
+    for md in set(all_ids.values()):
+        if md != primary["path"]:
+            _clear_gcal_ids(md, correlation_id)
+
+    log.info(
+        "gcal.collapse_synced",
+        collapse_key=key, date=gdate.isoformat(), action=action,
+        primary_event_id=primary_id, member_count=len(eligible),
+        title=title, reconciled_deleted=reconciled_deleted,
+        correlation_id=correlation_id,
+    )
+    return {
+        "collapsed": True, "action": action,
+        "collapse_key": key, "date": gdate.isoformat(),
+        "primary_event_id": primary_id, "member_count": len(eligible),
+        "title": title,
+        "span": [span_start.isoformat(), span_end.isoformat()],
+        "reconciled_deleted": reconciled_deleted,
     }

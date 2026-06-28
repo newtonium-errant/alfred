@@ -883,8 +883,17 @@ def cmd_gcal(args: argparse.Namespace) -> None:
             infer_times=bool(getattr(args, "infer_times", False)),
             wants_json=wants_json,
         ))
+    if subcmd == "collapse":
+        sys.exit(gcal_cli.cmd_collapse(
+            raw,
+            collapse_key=getattr(args, "key", ""),
+            group_date=getattr(args, "date", ""),
+            wants_json=wants_json,
+        ))
 
-    print("Usage: alfred gcal {authorize|status|test-write|backfill}")
+    print(
+        "Usage: alfred gcal {authorize|status|test-write|backfill|collapse}"
+    )
     sys.exit(1)
 
 
@@ -3982,6 +3991,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     gcal_backfill_p.add_argument(
+        "--json", action="store_true", default=False,
+        help="Emit machine-readable JSON instead of human-readable output",
+    )
+
+    # gcal collapse — §3 same-day umbrella. Recompute ONE collapse group
+    # (events sharing gcal_collapse_key on --date) into a single GCal entry
+    # in one pass — the churn-free batch/backfill path (the talker also
+    # collapses incrementally via vault_edit).
+    gcal_collapse_p = gcal_sub.add_parser(
+        "collapse",
+        help=(
+            "Reconcile a same-day collapse group (gcal_collapse_key + date) "
+            "into one umbrella GCal entry"
+        ),
+    )
+    gcal_collapse_p.add_argument(
+        "--key", required=True,
+        help="The gcal_collapse_key series label (e.g. 'rTMS')",
+    )
+    gcal_collapse_p.add_argument(
+        "--date", required=True,
+        help="The group date (YYYY-MM-DD)",
+    )
+    gcal_collapse_p.add_argument(
         "--json", action="store_true", default=False,
         help="Emit machine-readable JSON instead of human-readable output",
     )

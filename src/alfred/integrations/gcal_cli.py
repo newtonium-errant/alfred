@@ -935,3 +935,88 @@ def cmd_backfill(
             _print("  No event records found in vault.")
 
     return 0 if not failed else 1
+
+
+def cmd_collapse(
+    raw: dict,
+    *,
+    collapse_key: str,
+    group_date: str,
+    wants_json: bool = False,
+) -> int:
+    """Reconcile ONE same-day collapse group into a single GCal entry (§3).
+
+    The churn-free batch / backfill path: given a ``gcal_collapse_key`` series
+    label + a date, recompute the whole group in one pass (the talker also
+    collapses incrementally via per-event ``vault_edit``, which converges but
+    re-patches per edit). Delegates to
+    :func:`alfred.integrations.gcal_sync.sync_collapse_group` — the same
+    coordinator the daemon hooks use, so behaviour is identical.
+    """
+    from .gcal import GCalClient
+    from .gcal_config import load_from_unified
+    from .gcal_sync import sync_collapse_group
+
+    config = load_from_unified(raw)
+    if not config.enabled:
+        msg = "GCal is disabled in config (gcal.enabled: false)"
+        _print(json.dumps({"ok": False, "error": msg}) if wants_json
+               else f"ERROR: {msg}")
+        return 1
+    if not config.alfred_calendar_id:
+        msg = "alfred_calendar_id not configured (set ALFRED_GCAL_CALENDAR_ID)"
+        _print(json.dumps({"ok": False, "error": msg}) if wants_json
+               else f"ERROR: {msg}")
+        return 1
+    key = (collapse_key or "").strip()
+    if not key:
+        msg = "--key is required (the gcal_collapse_key series label)"
+        _print(json.dumps({"ok": False, "error": msg}) if wants_json
+               else f"ERROR: {msg}")
+        return 1
+    try:
+        gdate = date.fromisoformat((group_date or "").strip())
+    except ValueError:
+        msg = f"--date must be YYYY-MM-DD, got: {group_date!r}"
+        _print(json.dumps({"ok": False, "error": msg}) if wants_json
+               else f"ERROR: {msg}")
+        return 1
+
+    vault_path = _resolve_vault_path(raw)
+    client = GCalClient(
+        credentials_path=config.credentials_path,
+        token_path=config.token_path,
+        scopes=config.scopes,
+    )
+
+    result = sync_collapse_group(
+        client=client,
+        config=config,
+        vault_path=vault_path,
+        collapse_key=key,
+        group_date=gdate,
+        intended_on=True,
+        correlation_id=f"collapse-cli-{key}-{gdate.isoformat()}",
+    )
+
+    err = result.get("error")
+    if wants_json:
+        _print(json.dumps({"ok": err is None, **result}, indent=2, sort_keys=True))
+    elif err is not None:
+        _print(f"ERROR: collapse failed [{err.get('code')}]: {err.get('detail')}")
+    elif result.get("collapsed"):
+        _print(
+            f"GCal collapse — {result.get('action')}: "
+            f"{result.get('title') or key}  "
+            f"({result.get('member_count', 0)} members, "
+            f"primary {result.get('primary_event_id') or '—'})"
+        )
+        if result.get("reconciled_deleted"):
+            _print(f"  Reconciled (deleted dups): {result['reconciled_deleted']}")
+    else:
+        # Per ILB — explicit "ran, nothing to do" (no key match / disabled).
+        _print(
+            f"GCal collapse — nothing to do for key={key!r} "
+            f"date={gdate.isoformat()} ({result.get('noop') or 'no action'})"
+        )
+    return 1 if err is not None else 0
