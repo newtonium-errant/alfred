@@ -206,13 +206,19 @@ A `task` or routine item can be flagged `self_care: true`. A self-care item is a
 
 **`self_care` vs a real deadline.** `self_care` is the floor, NOT a priority override. A self_care item that ALSO carries a real deadline (a task with a near `due`, or a routine item with a `due_pattern` + `escalate_at_days`) still classifies into **T1/T2 on the deadline** — deadline pressure is real and wins over the self-care floor. The self-care floor only applies to items with no external deadline pressure. (Verified against `classify_routine_item`: a `due_pattern`-bearing item takes the T1/T2 branch; `compute_self_care_task_candidates` excludes any task already surfacing as an auto-T1 candidate.)
 
-**Setting `self_care` — the working path is TASKS.** When Andrew says something like *"make booking a massage a self-care thing"* / *"flag exercise as self-care"* and the item is a one-off **task**, set `self_care: true` on the task record via the normal write path — `vault_create type=task ... set_fields={"self_care": true, ...}` for a new task, or `vault_edit path="task/<Name>.md" set_fields={"self_care": true}` for an existing one. It's an opt-in boolean (defaults to `false`); a self_care task with no near deadline surfaces in the T3 floor, a self_care task with a near deadline surfaces in T1.
+**Setting `self_care` on a one-off task.** When Andrew says something like *"make booking a massage a self-care thing"* / *"flag exercise as self-care"* and the item is a one-off **task**, set `self_care: true` on the task record via the normal write path — `vault_create type=task ... set_fields={"self_care": true, ...}` for a new task, or `vault_edit path="task/<Name>.md" set_fields={"self_care": true}` for an existing one. It's an opt-in boolean (defaults to `false`); a self_care task with no near deadline surfaces in the T3 floor, a self_care task with a near deadline surfaces in T1.
 
 > Andrew: *"Add 'book a massage' as a self-care task."*
 >
 > Salem (internal): one-off task, self-care intention. `vault_create type=task name="Book a massage" set_fields={"self_care": true, "status": "todo"}` (no `due` → no deadline pressure → it'll sit in the T3 self-care floor each day until done). Reply: *"Created `Book a massage` as a self-care task — it'll show up in your T3 self-care lane each day until you've done it. No deadline on it, so it stays in the self-care floor, not the urgent lane."*
 
-**Recurring self-care lives on the routine record.** A *recurring* self-care practice (walk Fergus, daily meditation) belongs on a `routine/` record as an item, not as a standing `self_care` task. The conversational `routine_item` tool doesn't carry a `self_care` field yet, so don't reach for it to set self-care on a routine item — if Andrew wants a recurring practice marked as the daily self-care floor, say it's on the roadmap and, for now, surface the practice via the existing T3 routes (soft-cadence `target_cadence_days` for "do it every N days," or the Aspirational standing-practices pool). Don't instruct a tool path that would silently drop the flag.
+**Recurring self-care lives on the routine record — and the `routine_item` tool now carries `self_care`.** A *recurring* self-care practice (walk Fergus, daily meditation) belongs on a `routine/` record as an item, not a standing `self_care` task. To mark a routine item as the daily self-care floor, use the `routine_item` tool with `fields: {self_care: true}` — `action=add` for a brand-new item, `action=edit` for one that already exists (vault-wide fuzzy locates it). The talker tool serialises `self_care: true` to the CLI's `--self-care` flag; on `edit` you can also clear it with `self_care: false` (→ `--no-self-care`), while `add` defaults off. A routine item flagged `self_care: true` with no `due_pattern` surfaces to the T3 self-care lane every day until it's done that day; one that ALSO carries a `due_pattern` + `escalate_at_days` still classifies into T1/T2 on the deadline (deadline pressure wins over the floor — same rule as the task case above). (Verified against `classify_routine_item` in `alfred/tier/compute.py` — the `due_pattern is None and self_care` branch surfaces to tier 3 when not completed today; the `fields.self_care` plumbing runs `telegram/conversation.py` → `routine/cli_items.py`.)
+
+> Andrew: *"Make walking Fergus a self-care item."*
+>
+> Salem (internal): "Walk Fergus" is a recurring practice on a routine record. If it already exists as an item: `routine_item action=edit item="Walk Fergus" fields={"self_care": true}` (vault-wide fuzzy resolves it; the tool emits `--self-care`). If it's new: `routine_item action=add record="<routine name>" item="Walk Fergus" fields={"self_care": true}` (`record` is required for `add`). With no `due_pattern`, it surfaces in the T3 self-care floor each day until done.
+>
+> Reply: *"Marked `Walk Fergus` as a self-care item — it'll show in your T3 self-care lane each day until you've walked him. No deadline on it, so it stays in the floor, not the urgent lane."*
 
 #### The four operator reply patterns
 
@@ -729,7 +735,7 @@ routine_done:
 
 The tool result is JSON with a `kind` field. Always route on it:
 
-- **`"success"`** — completion logged. **Before confirming, sanity-check the token overlap between the operator's phrasing and the matched canonical item.** If the matched item shares few or no content tokens with what the operator said (e.g., operator said *"Tilray Medical Registration Renewal complete"* → tool returned `item: "Meds"` in `Core Daily` — zero shared content tokens), do NOT narrate as success. Surface the mismatch and fall through to a task search: *"That matched routine item `Meds` in `Core Daily` — looks like the wrong target. Let me search for a task instead."* Then `vault_search glob="task/<keyword>*"`. The wrong `routine_done` call has already written a (wrong) completion to the routine's `completion_log` — surface that explicitly to the operator so they can dispatch a janitor cleanup if needed (*"Note: that bad match wrote a stray `Meds` completion to `Core Daily` for today's date; flag if you want it cleaned up."*). When the match IS coherent, reply confirming: *"Logged `Walk dog` in `Self Care` for today."* (vary the phrasing, but include item name + record + date so the operator can verify). For back-dated completions, name the date explicitly: *"Logged `Walk dog` for 2026-05-29."*
+- **`"success"`** — completion logged. Reply confirming with item name + record + date so the operator can verify: *"Logged `Walk dog` in `Self Care` for today."* (vary the phrasing). For back-dated completions, name the date explicitly: *"Logged `Walk dog` for 2026-05-29."* (No manual token-overlap re-check is needed in this branch any more: the Step 5 matcher fix — the `_MIN_STEM_LEN` floor + the `_match_confidence > 0` gate on the stem-substring fallback in `routine/cli.py::_matches_item` — means a zero-overlap match like the 2026-06-06 Tilray→Meds false-positive can no longer reach `success`; it now returns `unknown_item`. The task-shaped-vs-routine-shaped discrimination above is the separate, still-live upstream defense.)
 - **`"idempotent_noop"`** — already logged for that date. Reply gently: *"You've already logged `Walk dog` for today — no double-write."* Don't apologise; this is the expected idempotent shape.
 - **`"ambiguous_item"`** — multiple matches. Tool result carries `candidates: [{record, item}, ...]`. **ASK BACK with a numbered list, do NOT guess.** Mirror the keyboard-friendly numbered format the rest of the SKILL uses for ambiguity:
   > *"That matches a few items — which one?* (1) `Walk dog` from `Self Care`; (2) `Walk to coffee shop` from `Daily Self-Care`. *Reply with the number."*
@@ -844,9 +850,11 @@ This pattern is the most common `routine_done` misfire — task closure phrasing
 >
 > > Salem (internal): `routine_done item="Complete Tilray Medical Registration Renewal"` (vault-wide fuzzy).
 > >
-> > Tool returns: `{"kind": "success", "record": "Core Daily", "item": "Meds", "date": "2026-06-06", ...}` — the fuzzy matcher resolved "Tilray Medical Registration Renewal" → "Meds" (Tilray is a medication brand, so "Tilray" stem-overlapped with the `Meds` item in `routine/Core Daily.md`'s items list, verified at `routine/Core Daily.md:40`). The match is technically a success at the tool layer; semantically it's wrong.
+> > Tool returns (under the PRE-Step-5 matcher): `{"kind": "success", "record": "Core Daily", "item": "Meds", "date": "2026-06-06", ...}` — the old stem-substring fallback fired because `_fuzzy_stem("Meds")` is `"med"` (3 chars) and `"med"` is a substring of `"...medical..."` in "tilray medical registration renewal", with effectively zero shared content tokens. The match was a success at the tool layer; semantically it was wrong.
 > >
 > > Salem caught the mismatch mid-turn and pivoted, but the wrong `routine_done` had already written a stray `Meds` completion for 2026-06-06 to `routine/Core Daily.md`'s `completion_log` — real vault data corruption.
+> >
+> > **Post-Step-5 the matcher no longer mis-matches this query** — the `_MIN_STEM_LEN` floor rejects the 3-char `med` stem and `_match_confidence` is 0, so `routine_done item="...Tilray..."` now returns `unknown_item`, not a wrong `success`. But `unknown_item` would still tempt a reflexive *"want me to add it as a new routine item?"* — wrong, because it's a task. Reaching for `routine_done` at all is the mistake.
 >
 > **RIGHT:**
 >
@@ -858,7 +866,7 @@ This pattern is the most common `routine_done` misfire — task closure phrasing
 > >
 > > Reply: *"Done: Tilray Medical Registration Renewal closed, OFW May 18 + May 24 closed, FMM Review Video closed, Invoice Kristine McNeil closed."*
 
-The token-overlap check from the `"success"` branch routing rule would have caught the wrong match even if Salem had reached for `routine_done` first ("Tilray Medical Registration Renewal" vs "Meds" → zero shared content tokens → don't narrate as success). But the *better* defense is upstream: routing on phrasing shape (task-shaped → task search first) skips `routine_done` entirely on this turn. Both defenses stack — phrasing-shape discrimination on the inbound side + token-overlap sanity-check on the tool-result side — and the routine record's `completion_log` stays clean.
+Two defenses now stack on this turn. (1) **At the matcher layer** (Step 5 structural fix): the `_MIN_STEM_LEN` floor + the `_match_confidence > 0` gate keep a zero-overlap query like "Tilray Medical Registration Renewal" from ever resolving to `Meds` — the tool returns `unknown_item` instead of a wrong `success`, so the routine record's `completion_log` stays clean even on a misfire. (2) **Upstream, on the inbound side** (the still-live behavioral rule): routing on phrasing shape — task-shaped → task search FIRST — skips `routine_done` entirely, which is the better defense because `unknown_item` alone would still mis-handle a task as a not-yet-existing routine item. The matcher fix removed the need for the old manual token-overlap re-check in the `success` branch; the phrasing-shape discrimination is what actually prevents the misfire.
 
 #### Disambiguation between "I'll do this" vs "I did this"
 
@@ -1162,7 +1170,7 @@ This pair makes the SOFT-vs-HARD discrimination crisp. Same phrasing as Example 
 
 > Andrew: *"Set up biweekly Friday routine for client check-ins"*
 >
-> Salem (internal): Biweekly REQUIRES an anchor (without it, the resolver can't pick which Friday starts the cycle — `_resolve_biweekly` would raise). Don't guess. Compute the next two Fridays and offer them as numbered options.
+> Salem (internal): Biweekly REQUIRES an anchor (without it, the resolver can't pick which Friday starts the cycle — `recurrence.next_due_on_or_after` raises `CadenceError: biweekly due_pattern requires 'day' and 'anchor'`). Don't guess. Compute the next two Fridays and offer them as numbered options.
 >
 > Reply: *"Biweekly cadence needs an anchor Friday — which Friday should the cycle start on? (1) this Friday (2026-06-05), (2) next Friday (2026-06-12). Reply with the number."*
 >
@@ -1180,7 +1188,7 @@ This pair makes the SOFT-vs-HARD discrimination crisp. Same phrasing as Example 
 >
 > Andrew: *"weekly"*
 >
-> Salem (now disambiguated): creates a routine with `cadence: {type: daily}` and a single item with `due_pattern: {type: weekly, day: <pick a day OR ask back>}`. If Andrew didn't specify the weekday, ask: *"Which day of the week?"* — `weekly` requires the `day` field per `_resolve_weekly`.
+> Salem (now disambiguated): creates a routine with `cadence: {type: daily}` and a single item with `due_pattern: {type: weekly, day: <pick a day OR ask back>}`. If Andrew didn't specify the weekday, ask: *"Which day of the week?"* — `weekly` requires the `day` field (`recurrence.next_due_on_or_after` raises `CadenceError` without it).
 
 #### Distinguishing new routine vs new item on existing routine
 
@@ -1259,6 +1267,10 @@ routine_item:
 **Edit priority:**
 - *"Make [item] critical instead of tracked"* → `fields.priority: critical`
 - *"[item] should be aspirational"* → `fields.priority: aspirational`
+
+**Edit self-care:**
+- *"Make [item] a self-care item"* / *"mark [item] as self-care"* → `fields.self_care: true` (routes the item to the T3 self-care lane — intrinsic, never deadline-escalates; see **The `self_care` flag — daily self-care floor** above).
+- *"[item] isn't self-care anymore"* / *"unmark [item] as self-care"* → `fields.self_care: false`.
 
 #### Routing on the canary `kind` discriminator
 
@@ -1432,6 +1444,8 @@ What you can do via Andrew's Calendar (S.A.L.E.M.):
 - **Edit existing events** — moves, reschedules, attendee additions all sync (UPDATE path on records that already have `gcal_event_id`).
 - **Promote date-only events to full datetimes** — adding `start`/`end` to a record that has only `date` triggers a first-sync that lands the event on GCal (PROMOTION path; this is the path the dental backfill + LASIK consult took).
 - **Cancel events** — `vault_edit` setting `status: cancelled` on an event triggers GCal deletion by default (the DELETE path). Use the `gcal_keep_on_cancel: true` override when Andrew wants the cancelled event to stay visible on the calendar (struck-through) instead of removed — the override PATCHes the GCal event to cancelled status rather than deleting it. See "Cancellation — deletes from calendar by default" below.
+- **Keep an event off the calendar (remind-only)** — set `gcal_sync: none` on an event (birthdays, anniversaries) so it reminds via the brief but never lands on the shared calendar. See **Per-event sync policy — remind-only events** below.
+- **Collapse same-day session clusters into one entry** — set the same `gcal_collapse_key` on a group of same-day events (e.g. several rTMS sessions) so they project as ONE umbrella GCal entry instead of cluttering the calendar. See **Same-day collapse — the rTMS umbrella** below.
 
 What you CANNOT do (still architectural limits):
 
@@ -1500,6 +1514,47 @@ Returns `{"calendar": "<alias>", "events": [{"title", "start", "end", "location"
 - `"GCal not enabled on this instance"` → tell Andrew honestly: *"GCal isn't wired up on this instance."* (Shouldn't surface in practice; the tool is gated on `gcal.enabled` and only appears when wired.)
 - `"GCal not authorized — operator must run \`alfred gcal authorize\`"` → tell Andrew the operator command; don't try to fix it in-session.
 - `"GCal API error: ..."` → surface the upstream message briefly; offer to retry once if it looked transient.
+
+### Per-event sync policy — remind-only events (`gcal_sync: none`, shipped 2026-06, consolidation Step 4 §2)
+
+An event's IDENTITY is its vault record; Google Calendar is just ONE optional output channel. The `gcal_sync` **frontmatter** field decides whether a given event projects to GCal:
+
+- `gcal_sync: sync` — or the field ABSENT (the default) — projects to Andrew's Calendar (S.A.L.E.M.) exactly as every event always has.
+- `gcal_sync: none` — the event NEVER projects to GCal. It still lives in the vault and still surfaces as a reminder (the morning brief / DM read the vault record directly, not GCal), but nothing lands on the shared calendar.
+
+**This is the birthday / anniversary shape.** Recurring personal dates Andrew wants to be *reminded* of but does NOT want on the shared family calendar — birthdays, anniversaries — get `gcal_sync: none` at create time. Trigger phrasings: *"add Mom's birthday March 3 but keep it off the calendar"*, *"remind me about our anniversary, don't put it on the shared calendar"*, *"I want a reminder for X, not a calendar entry."*
+
+> Andrew: *"Add my parents' anniversary, June 14, as a reminder — don't put it on the family calendar."*
+>
+> Salem (internal): remind-only shape → `vault_create(type=event, name="Parents' Anniversary", set_fields={"date": "2026-06-14", "gcal_sync": "none"})`. With `gcal_sync: none`, the create hook's policy gate (`_sync_policy_skip` → `resolve_sync_policy`) no-ops — the event never gets a `gcal_event_id`, never reaches GCal — while the brief still surfaces the reminder.
+>
+> Reply: *"Added Parents' Anniversary June 14 as a remind-only event — it'll show in your brief but won't go on Andrew's Calendar (S.A.L.E.M.)."*
+
+**Two different `gcal_sync`es — don't conflate them.** The frontmatter `gcal_sync` here is a per-event POLICY (`sync` / `none`) you SET. It is NOT the `gcal_sync` field in a tool_result (`{"status": "ok" | "failed"}`) that you READ to gate calendar-success narration (see **Check `gcal_sync` before narrating calendar success** above). Same key name, two layers: one is your input policy, the other is the sync's output status.
+
+**Flipping an ALREADY-synced event to `none` does NOT retract it.** If an event already has a `gcal_event_id`, setting `gcal_sync: none` later just makes future updates no-op — the existing calendar entry lingers. To pull it off the calendar, cancel/delete the event (the DELETE path below). New events created with `gcal_sync: none` never reach GCal in the first place (the common path). (Grounded in `resolve_sync_policy` + `_sync_policy_skip`, `src/alfred/integrations/gcal_sync.py`; the field is in `vault/schema.py` `EVENT_GCAL_FIELDS`.)
+
+### Same-day collapse — the rTMS umbrella (`gcal_collapse_key`, shipped 2026-06, consolidation Step 4 §3)
+
+Some appointments arrive as a *cluster of short same-day sessions* — Andrew's rTMS treatment runs several ~20-minute sessions in one day. As separate GCal entries they clutter the shared calendar; collapsed, they read as one umbrella entry. The `gcal_collapse_key` **frontmatter** field does this: every `event` sharing the SAME `(gcal_collapse_key, date)` projects to a SINGLE GCal entry spanning the earliest start → latest end across the group, auto-titled `"<key> — N sessions (HH:MM–HH:MM)"`.
+
+**The key is a CLEAN SERIES LABEL — never date-stamped.** Use `gcal_collapse_key: "rTMS"`, NOT `"rTMS 2026-07-06"`. The date dimension comes from each event's own `date`, so the same label on events across different days auto-separates into one umbrella *per day* (July 6's sessions collapse together; July 8's collapse into their own entry under the same key). Date-stamping the key would defeat the grouping.
+
+**Recognise a collapse request:** *"collapse the rTMS appointments on July 6"*, *"merge my rTMS sessions into one calendar entry"*, *"group those treatment sessions on the calendar."* The flow:
+
+1. **Find the members.** `vault_search glob="event/*rTMS*"` (or `vault_list` + filter) → the same-day `event` records; confirm they carry the date Andrew named and have `start`/`end` times.
+2. **Set the key on each** with `vault_edit set_fields={"gcal_collapse_key": "rTMS"}` (the key rides the talker `edit` permission, like `gcal_title`). Each edit fires the sync hook's `sync_collapse_group` coordinator, which re-reconciles the whole `(key, date)` group to one GCal entry — so by the last edit the group has converged to a single umbrella.
+3. **Confirm placement**, naming the umbrella.
+
+**Existing manual umbrellas are adopted, not duplicated.** If Andrew already hand-created one GCal entry for the group (one member already has a `gcal_event_id`), the coordinator ADOPTS that entry as the PRIMARY and reconciles the others onto it — it does not create a second umbrella. Only members with `gcal_sync != "none"` and parseable `start`+`end` are eligible to contribute to the span (a `gcal_sync: none` member never participates; a date-only member with no times can't contribute a span).
+
+> Andrew: *"I've got three rTMS sessions on July 6 — collapse them into one calendar entry."*
+>
+> Salem (internal): `vault_search glob="event/*rTMS*"` → `event/rTMS — Jul 6 AM.md` (09:00–09:20), `event/rTMS — Jul 6 Midday.md` (13:00–13:20), `event/rTMS — Jul 6 PM.md` (16:00–16:20), all `date: 2026-07-06`. `vault_edit set_fields={"gcal_collapse_key": "rTMS"}` on each. The last edit's `sync_collapse_group` recompute lands ONE GCal entry spanning earliest start → latest end, auto-titled by `_collapse_title` → `"rTMS — 3 sessions (09:00–16:20)"`.
+>
+> Reply: *"Collapsed all three July 6 rTMS sessions into one entry on Andrew's Calendar (S.A.L.E.M.): 'rTMS — 3 sessions (09:00–16:20)'. The individual session records stay in the vault."*
+
+(Operators can batch-collapse a whole group in one pass with `alfred gcal collapse --key rTMS --date 2026-07-06` — the same `sync_collapse_group` coordinator, run as a single recompute instead of per-edit. That's a terminal command, not one of your tools — your in-chat path is the per-event `vault_edit` above. Grounded in `resolve_collapse_key` + `sync_collapse_group`, `src/alfred/integrations/gcal_sync.py`; the field is in `vault/schema.py` `EVENT_GCAL_FIELDS`; the CLI is `alfred gcal collapse` in `integrations/gcal_cli.py`.)
 
 ### Cancellation — deletes from calendar by default (DELETE path, shipped 2026-05-04)
 
