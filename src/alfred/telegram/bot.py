@@ -52,6 +52,7 @@ from . import (
     session_types,
     speed_pref,
     stt_backends,
+    stt_shadow,
     transcribe,
     tts as tts_mod,
     vision,
@@ -3968,6 +3969,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_message(update, ctx, text=text, voice=False)
 
 
+def _log_shadow_task_exc(task: "asyncio.Task[Any]") -> None:
+    """Done-callback for the fire-and-forget STT shadow-capture task.
+
+    :func:`stt_shadow.capture` already swallows its own errors internally;
+    this surfaces anything that escaped (or a cancellation-time error) so the
+    detached task is never an unobserved-exception orphan. Cancellation at
+    shutdown is expected and ignored."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning(
+            "stt.shadow_capture_task_error",
+            error=str(exc)[:300],
+            error_type=type(exc).__name__,
+        )
+
+
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Voice message entry point — download, transcribe, then dispatch."""
     config: TalkerConfig = ctx.application.bot_data[_KEY_CONFIG]
@@ -4020,6 +4039,30 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         config.stt.vocab_terms,
         config.stt.total_budget_s,
     )
+
+    # STT shadow-capture (default-OFF; R1-baseline corpus builder for the STT
+    # test series). Fire-and-forget so NOTHING in the capture path (the extra
+    # engine call, disk writes, a timeout/error) can block, delay, or break
+    # the served turn below — isolation is the load-bearing property. No-op
+    # when ``stt.shadow_capture.enabled`` is false. Runs for BOTH the served
+    # and the NoTranscript cases: when NoTranscript, served_result=None →
+    # capture runs both engines fresh.
+    shadow_task = asyncio.create_task(
+        stt_shadow.capture(
+            audio_bytes,
+            "audio/ogg",
+            result if isinstance(result, stt_backends.SttResult) else None,
+            config.stt,
+            instance_name=config.instance.name,
+            chat_id=chat_id,
+            duration=update.message.voice.duration,
+        )
+    )
+    # Done-callback so the fire-and-forget task isn't an unobserved-exception
+    # orphan (capture already swallows internally; this guards the create_task
+    # machinery itself).
+    shadow_task.add_done_callback(_log_shadow_task_exc)
+
     # Reprompt on no-transcript OR served-empty (spec decision #4, resolved →
     # reprompt-on-empty). The router correctly SERVEs a genuine-silence
     # primary's empty result (has_speech_signal=False) without re-spending on

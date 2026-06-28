@@ -170,6 +170,28 @@ class SttBackendConfig:
 
 
 @dataclass
+class SttShadowCaptureConfig:
+    """STT shadow-capture — R1-baseline corpus builder (STT test series,
+    ``algernon-stt-test-series-2026-06-27``).
+
+    DEFAULT-OFF, additive, fully isolated from the served voice turn. When
+    ``enabled`` every voice note runs BOTH engines (Groq still serves the
+    user via the M1 chain; the second engine is the only extra call) and the
+    audio + both transcripts + their word-level divergence are appended to a
+    replayable corpus under ``dir``. The corpus.jsonl is shaped to be
+    consumed directly by the replay harness (``stt_replay.py`` modes
+    ``divergences`` / ``score``) — the live capture IS R1's data, no replay
+    pass needed.
+
+    Back-compat: an instance with NO ``shadow_capture:`` block loads with
+    ``enabled=False`` and behaves EXACTLY as today (no extra call, no files).
+    """
+
+    enabled: bool = False
+    dir: str = "./data/stt_corpus"
+
+
+@dataclass
 class STTConfig:
     # --- legacy single-backend fields (back-compat) ---
     # Existing per-instance configs (Salem/KAL-LE/Hypatia) carry only these
@@ -185,6 +207,10 @@ class STTConfig:
     total_budget_s: float = 30.0           # global per-message chain deadline
     min_transcript_chars: int = 3          # "empty" threshold (post-trim)
     chain: list[SttBackendConfig] = field(default_factory=list)
+    # --- shadow-capture (R1-baseline corpus builder; default-OFF) ---
+    shadow_capture: SttShadowCaptureConfig = field(
+        default_factory=SttShadowCaptureConfig
+    )
 
     def effective_chain(self) -> list[SttBackendConfig]:
         """The chain to run — the explicit ``chain`` if configured, else a
@@ -644,6 +670,12 @@ _DATACLASS_MAP: dict[str, type] = {
     "vault": VaultConfig,
     "anthropic": AnthropicConfig,
     "stt": STTConfig,
+    # ``shadow_capture`` is a sub-block of ``stt`` — its name is unique (no
+    # other dataclass has a field by this key), so registering it here lets
+    # ``_build`` recurse stt.shadow_capture → SttShadowCaptureConfig without
+    # the collision footgun. All its fields default, so the empty-dict trap
+    # is moot (omitted block → enabled=False).
+    "shadow_capture": SttShadowCaptureConfig,
     "session": SessionConfig,
     "logging": LoggingConfig,
     "instance": InstanceConfig,
