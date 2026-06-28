@@ -944,3 +944,77 @@ def test_item_kind_constants_match_skill_routing_table() -> None:
         f"code: {sorted(extra_in_skill)!r}. Talker will never see "
         f"these. Add the constant or remove from the SKILL table."
     )
+
+
+# --- self_care SET-path (06-27 gap) ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_routine_item_add_argv_self_care(tmp_path, monkeypatch):
+    """fields={'self_care': true} on add → argv carries --self-care."""
+    config = _salem_config(tmp_path)
+    sess = _session()
+    captured = {}
+
+    def fake_run(argv, *args, **kwargs):
+        captured["argv"] = argv
+        return _fake_completed_proc(
+            stdout=json.dumps({
+                "ok": True, "kind": "added", "record": "Self Care",
+                "item": "Meditate",
+            }),
+        )
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    await conversation._execute_tool(
+        tool_name="routine_item",
+        tool_input={
+            "action": "add", "record": "Self Care", "item": "Meditate",
+            "fields": {"priority": "aspirational", "self_care": True},
+        },
+        vault_path=str(tmp_path / "vault"),
+        state=StateManager(config.session.state_path),
+        session=sess, config=config,
+    )
+    assert "--self-care" in captured["argv"]
+    assert "--no-self-care" not in captured["argv"]
+
+
+@pytest.mark.asyncio
+async def test_routine_item_edit_argv_no_self_care(tmp_path, monkeypatch):
+    """fields={'self_care': false} on edit → argv carries --no-self-care
+    (the explicit-off form; add has no off-flag)."""
+    config = _salem_config(tmp_path)
+    sess = _session()
+    captured = {}
+
+    def fake_run(argv, *args, **kwargs):
+        captured["argv"] = argv
+        return _fake_completed_proc(
+            stdout=json.dumps({
+                "ok": True, "kind": "edited", "record": "Daily",
+                "item": "Stretch",
+            }),
+        )
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    await conversation._execute_tool(
+        tool_name="routine_item",
+        tool_input={
+            "action": "edit", "record": "Daily", "item": "Stretch",
+            "fields": {"self_care": False},
+        },
+        vault_path=str(tmp_path / "vault"),
+        state=StateManager(config.session.state_path),
+        session=sess, config=config,
+    )
+    assert "--no-self-care" in captured["argv"]
+    assert "--self-care" not in captured["argv"]
+
+
+def test_routine_item_schema_fields_documents_self_care():
+    """The tool's ``fields`` schema must advertise self_care so the talker
+    knows it can pass it (the SET-path's prompt-facing surface)."""
+    schema = conversation._ROUTINE_ITEM_TOOL_SCHEMA["input_schema"]
+    fields_desc = schema["properties"]["fields"]["description"]
+    assert "self_care" in fields_desc

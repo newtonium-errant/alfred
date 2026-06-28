@@ -1316,3 +1316,128 @@ def test_all_item_kind_constants_exported_via_cli_all() -> None:
         f"routine.cli __all__ missing ITEM_KIND_* constants: "
         f"{sorted(missing)!r}"
     )
+
+
+# ===========================================================================
+# self_care SET-path (06-27 gap) — SET↔READ round-trip with the Q2 read side
+# ===========================================================================
+
+
+def test_item_add_self_care_round_trips(tmp_path: Path) -> None:
+    """``self_care=True`` is written into the new item (the hardcoded
+    add-mutator allowlist previously DROPPED it silently)."""
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Self Care", {
+        "type": "routine", "name": "Self Care",
+        "cadence": {"type": "daily"}, "items": [],
+    })
+    config = _config(vault, tmp_path)
+
+    code = cmd_item_add(
+        config, record_name="Self Care", item_text="Meditate",
+        priority="aspirational", self_care=True,
+    )
+    assert code == 0
+    item = _read_fm(vault, "Self Care")["items"][0]
+    assert item["self_care"] is True
+
+
+def test_item_add_without_self_care_omits_field(tmp_path: Path) -> None:
+    """Absent self_care → the field is NOT written (behavior-preserving;
+    reads as not-self-care)."""
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Daily", {
+        "type": "routine", "name": "Daily",
+        "cadence": {"type": "daily"}, "items": [],
+    })
+    config = _config(vault, tmp_path)
+
+    code = cmd_item_add(config, record_name="Daily", item_text="Brush AM")
+    assert code == 0
+    assert "self_care" not in _read_fm(vault, "Daily")["items"][0]
+
+
+def test_item_edit_sets_and_unsets_self_care(tmp_path: Path) -> None:
+    """edit can both set (self_care=True) and unset (self_care=False)."""
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Daily", {
+        "type": "routine", "name": "Daily",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Stretch", "priority": "aspirational"}],
+    })
+    config = _config(vault, tmp_path)
+
+    assert cmd_item_edit(
+        config, record_name="Daily", item_text="Stretch", self_care=True,
+    ) == 0
+    assert _read_fm(vault, "Daily")["items"][0]["self_care"] is True
+
+    assert cmd_item_edit(
+        config, record_name="Daily", item_text="Stretch", self_care=False,
+    ) == 0
+    assert _read_fm(vault, "Daily")["items"][0]["self_care"] is False
+
+
+def test_self_care_set_then_read_routes_to_t3(tmp_path: Path) -> None:
+    """SET↔READ end-to-end: a self_care item set via the CLI is parsed by
+    the Q2 read side (Item.from_dict) and routed to the T3 lane by
+    classify_routine_item — proving the SET path reaches the existing
+    compute path with the SAME field name/semantics."""
+    from datetime import date
+
+    from alfred.routine.config import Item
+    from alfred.tier.compute import classify_routine_item
+
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Self Care", {
+        "type": "routine", "name": "Self Care",
+        "cadence": {"type": "daily"}, "items": [],
+    })
+    config = _config(vault, tmp_path)
+    assert cmd_item_add(
+        config, record_name="Self Care", item_text="Walk Fergus",
+        priority="aspirational", self_care=True,
+    ) == 0
+
+    item = Item.from_dict(_read_fm(vault, "Self Care")["items"][0])
+    assert item is not None and item.self_care is True
+
+    result = classify_routine_item(
+        priority=None, due_pattern=None, surface_at_days=None,
+        escalate_at_days=None, target_cadence_days=None,
+        completion_log={}, item_text=item.text, today=date(2026, 7, 1),
+        self_care=item.self_care,
+        default_escalate_at_days=None, default_surface_at_days=None,
+    )
+    assert result.tier == 3  # self-care → T3 lane
+
+
+def test_non_self_care_item_not_routed_to_t3(tmp_path: Path) -> None:
+    """A plain item (no self_care, no due_pattern, no target_cadence) →
+    classify returns tier None (NOT T3)."""
+    from datetime import date
+
+    from alfred.routine.config import Item
+    from alfred.tier.compute import classify_routine_item
+
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Daily", {
+        "type": "routine", "name": "Daily",
+        "cadence": {"type": "daily"}, "items": [],
+    })
+    config = _config(vault, tmp_path)
+    assert cmd_item_add(
+        config, record_name="Daily", item_text="Brush AM",
+    ) == 0
+
+    item = Item.from_dict(_read_fm(vault, "Daily")["items"][0])
+    assert item is not None and item.self_care is False
+
+    result = classify_routine_item(
+        priority=None, due_pattern=None, surface_at_days=None,
+        escalate_at_days=None, target_cadence_days=None,
+        completion_log={}, item_text=item.text, today=date(2026, 7, 1),
+        self_care=item.self_care,
+        default_escalate_at_days=None, default_surface_at_days=None,
+    )
+    assert result.tier is None

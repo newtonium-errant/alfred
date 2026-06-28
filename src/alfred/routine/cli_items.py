@@ -101,7 +101,7 @@ from .cli import (
     _matches_item,
     _routine_path,
 )
-from .config import DuePattern, RoutineConfig
+from .config import DuePattern, RoutineConfig, _coerce_self_care
 
 log = structlog.get_logger(__name__)
 
@@ -602,6 +602,7 @@ def _validate_field_bundle(
     surface_at_days: Any = None,
     escalate_at_days: Any = None,
     due_pattern: Any = None,
+    self_care: Any = None,
 ) -> tuple[dict, str | None]:
     """Validate a bundle of operator-supplied item fields.
 
@@ -639,6 +640,13 @@ def _validate_field_bundle(
         return {}, err
     if dp is not None:
         out["due_pattern"] = dp
+
+    # self_care (Q2 read-side → T3 lane). The SET-path: when supplied,
+    # coerce via the SAME ``_coerce_self_care`` the read side uses so
+    # SET↔READ round-trip exactly. Absent (None) → not written (item has
+    # no self_care field → reads False; behavior-preserving default).
+    if self_care is not None:
+        out["self_care"] = _coerce_self_care(self_care)
 
     return out, None
 
@@ -748,6 +756,7 @@ def cmd_item_add(
     surface_at_days: Any = None,
     escalate_at_days: Any = None,
     due_pattern: Any = None,
+    self_care: Any = None,
 ) -> int:
     """Append a new item to the routine record's items list.
 
@@ -782,6 +791,7 @@ def cmd_item_add(
         surface_at_days=surface_at_days,
         escalate_at_days=escalate_at_days,
         due_pattern=due_pattern,
+        self_care=self_care,
     )
     if err is not None:
         return _emit_canary(
@@ -845,6 +855,7 @@ def cmd_item_add(
             "surface_at_days",
             "escalate_at_days",
             "due_pattern",
+            "self_care",
         ):
             if k in new_fields:
                 new_item[k] = new_fields[k]
@@ -1005,6 +1016,7 @@ def cmd_item_edit(
     surface_at_days: Any = None,
     escalate_at_days: Any = None,
     due_pattern: Any = None,
+    self_care: Any = None,
     clear_due_pattern: bool = False,
     clear_target_cadence_days: bool = False,
 ) -> int:
@@ -1039,6 +1051,7 @@ def cmd_item_edit(
         surface_at_days=surface_at_days,
         escalate_at_days=escalate_at_days,
         due_pattern=due_pattern,
+        self_care=self_care,
     )
     if err is not None:
         return _emit_canary(

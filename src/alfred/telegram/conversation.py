@@ -545,8 +545,10 @@ _ROUTINE_ITEM_TOOL_SCHEMA = {
                     "``due_pattern`` (dict per DUE_PATTERN_TYPES; "
                     "hard cadence), ``surface_at_days`` (int > 0; "
                     "T2 ramp), ``escalate_at_days`` (int >= 0; T1 "
-                    "escalation). 'edit'-only: ``text`` (new item "
-                    "text — rename, migrates completion_log), "
+                    "escalation), ``self_care`` (bool; routes the item "
+                    "to the T3 self-care lane — intrinsic, never "
+                    "deadline-escalates). 'edit'-only: ``text`` (new "
+                    "item text — rename, migrates completion_log), "
                     "``clear_due_pattern`` (bool; switch hard → "
                     "soft), ``clear_target_cadence_days`` (bool; "
                     "switch soft → hard). Omit entirely for 'remove' "
@@ -2357,6 +2359,20 @@ async def _dispatch_routine_item(
                 # supplied a JSON literal — but typically it's a dict
                 # from the model).
                 argv.extend(["--due-pattern", str(due_pattern)])
+        # self_care → the T3 self-care lane (SET path; read side already
+        # routes it). The model passes a JSON bool; tolerate truthy
+        # strings defensively (the CLI re-coerces via _coerce_self_care).
+        self_care = fields.get("self_care")
+        if self_care is not None:
+            truthy = self_care is True or (
+                isinstance(self_care, str)
+                and self_care.strip().lower() in ("true", "yes", "1", "on")
+            )
+            if truthy:
+                argv.append("--self-care")
+            elif action == "edit":
+                # Explicit off — edit-only (add defaults off, no off-flag).
+                argv.append("--no-self-care")
 
     if action == "edit":
         new_text = fields.get("text")

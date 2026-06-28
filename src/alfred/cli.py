@@ -1820,6 +1820,7 @@ def cmd_routine(args: argparse.Namespace) -> None:
                         args, "escalate_at_days", None,
                     ),
                     due_pattern=getattr(args, "due_pattern", None),
+                    self_care=getattr(args, "self_care", None),
                 )
             elif action in ("remove", "edit"):
                 # Both share the two-positional-form pattern from B1's
@@ -1859,6 +1860,7 @@ def cmd_routine(args: argparse.Namespace) -> None:
                             args, "escalate_at_days", None,
                         ),
                         due_pattern=getattr(args, "due_pattern", None),
+                        self_care=getattr(args, "self_care", None),
                         clear_due_pattern=getattr(
                             args, "clear_due_pattern", False,
                         ),
@@ -3693,6 +3695,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     item_add.add_argument(
+        "--self-care", dest="self_care",
+        action="store_true", default=None,
+        help=(
+            "Mark the item as self-care (routes to the T3 self-care lane "
+            "in the tier view — intrinsic, never deadline-escalates). "
+            "Default off; omit for a non-self-care item."
+        ),
+    )
+    item_add.add_argument(
         "--json", action="store_true", default=False, help="Emit JSON",
     )
 
@@ -3799,6 +3810,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Strip target_cadence_days from the item. Required when "
             "switching soft → hard cadence."
+        ),
+    )
+    item_edit.add_argument(
+        "--self-care", dest="self_care",
+        action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "Mark (--self-care) or unmark (--no-self-care) the item as "
+            "self-care → the T3 self-care lane. Omit to leave unchanged."
         ),
     )
     item_edit.add_argument(
