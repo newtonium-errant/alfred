@@ -50,6 +50,46 @@ _MISSING_CONFIG_EXIT = 78
 _SWEEP_INTERVAL_SECONDS = 60
 
 
+def _warn_if_collapse_key_removed(
+    rel_path: str, fm: dict, fields_changed: list,
+) -> bool:
+    """NOTE-F (ILB): warn when ``gcal_collapse_key`` was removed this edit.
+
+    When the key is in ``fields_changed`` AND ``resolve_collapse_key(fm)`` is
+    now empty, the collapse group the member just LEFT only reconciles on the
+    NEXT edit of a remaining member (the update hook receives post-edit fm, so
+    the old key isn't available to recompute the old group immediately). If the
+    un-keyed event was the group's PRIMARY, the remaining sessions are
+    TRANSIENTLY UNPROJECTED from the calendar until then — a silent absence on
+    a live medical calendar, the intentionally-left-blank antipattern. Emit an
+    explicit operator-visible signal naming the force-reconcile command.
+
+    Returns True iff the warn fired (key was removed). Module-level (not inline
+    in the daemon closure) so the emission is unit-testable via capture_logs —
+    per ``feedback_log_emission_test_pattern.md`` the pin must drive the
+    production code path. The structural fix (plumb pre-edit fm into the update
+    hook to recompute BOTH groups) is a queued follow-up.
+    """
+    from alfred.integrations.gcal_sync import resolve_collapse_key
+
+    if "gcal_collapse_key" in fields_changed and not resolve_collapse_key(fm):
+        log.warning(
+            "gcal.collapse_key_removed",
+            rel_path=rel_path,
+            date=str(fm.get("date") or fm.get("start") or ""),
+            detail=(
+                "gcal_collapse_key removed from this event; the collapse "
+                "group it left reconciles only on the next edit of a "
+                "remaining member. If this was the group's primary, the "
+                "remaining sessions are transiently unprojected — run "
+                "`alfred gcal collapse --key <key> --date <date>` to "
+                "force-reconcile now."
+            ),
+        )
+        return True
+    return False
+
+
 # --- Validation -----------------------------------------------------------
 
 
@@ -742,6 +782,12 @@ async def run(
                             intended_on=_bound_intended_on,
                             correlation_id=str(fm.get("correlation_id") or ""),
                         )
+                    # NOTE-F (ILB): the key was REMOVED this edit → surface
+                    # the deferred-group-reconcile gap (see the helper). Then
+                    # fall through to the plain per-event path: an un-keyed
+                    # ex-primary still carries its gcal_event_id and is treated
+                    # as a standalone synced event below.
+                    _warn_if_collapse_key_removed(rel_path, fm, fields_changed)
                     gcal_event_id = str(fm.get("gcal_event_id") or "")
                     start_raw = fm.get("start")
                     end_raw = fm.get("end")

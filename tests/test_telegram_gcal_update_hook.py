@@ -408,3 +408,76 @@ def test_talker_daemon_update_hook_has_promotion_branch():
         "anymore — that gate blocked the promotion path. Decision "
         "authority lives in the hook closure now."
     )
+
+
+# ---------------------------------------------------------------------------
+# NOTE-F (ILB): collapse_key-removed warning — §3 review fold-in.
+#
+# The warn is a module-level helper (``_warn_if_collapse_key_removed``) the
+# update closure calls, so the emission is unit-testable on the production
+# code path (per ``feedback_log_emission_test_pattern.md``).
+# ---------------------------------------------------------------------------
+
+
+def test_collapse_key_removed_emits_ilb_warning():
+    """Key removed this edit (in fields_changed, now absent from fm) → the
+    ILB warn fires so the deferred group-reconcile isn't a silent absence."""
+    import structlog
+
+    from alfred.telegram.daemon import _warn_if_collapse_key_removed
+
+    fm = {"type": "event", "name": "rTMS Slot 1", "date": "2026-07-06"}
+    with structlog.testing.capture_logs() as cap:
+        fired = _warn_if_collapse_key_removed(
+            "event/rTMS Slot 1.md", fm, ["gcal_collapse_key"],
+        )
+    assert fired is True
+    warns = [c for c in cap if c.get("event") == "gcal.collapse_key_removed"]
+    assert len(warns) == 1
+    assert warns[0]["rel_path"] == "event/rTMS Slot 1.md"
+    assert warns[0]["date"] == "2026-07-06"
+    assert "force-reconcile" in warns[0]["detail"]
+
+
+def test_collapse_key_removed_no_warn_when_not_in_fields_changed():
+    """Edit that didn't touch the key → no warn (returns False)."""
+    import structlog
+
+    from alfred.telegram.daemon import _warn_if_collapse_key_removed
+
+    fm = {"type": "event", "name": "x", "date": "2026-07-06"}
+    with structlog.testing.capture_logs() as cap:
+        fired = _warn_if_collapse_key_removed("event/x.md", fm, ["title"])
+    assert fired is False
+    assert not [c for c in cap if c.get("event") == "gcal.collapse_key_removed"]
+
+
+def test_collapse_key_removed_no_warn_when_key_still_present():
+    """Key in fields_changed but STILL present (a re-key, not a removal) →
+    no warn; the closure's collapse branch handles the present-key case."""
+    import structlog
+
+    from alfred.telegram.daemon import _warn_if_collapse_key_removed
+
+    fm = {"type": "event", "name": "x", "gcal_collapse_key": "rTMS"}
+    with structlog.testing.capture_logs() as cap:
+        fired = _warn_if_collapse_key_removed(
+            "event/x.md", fm, ["gcal_collapse_key"],
+        )
+    assert fired is False
+    assert not [c for c in cap if c.get("event") == "gcal.collapse_key_removed"]
+
+
+def test_talker_daemon_update_hook_calls_collapse_key_removed_helper():
+    """Source-pin: the production ``_on_event_updated`` closure must call the
+    NOTE-F helper, and the helper must emit ``gcal.collapse_key_removed``."""
+    here = Path(__file__).resolve().parent
+    source = (
+        here.parent / "src" / "alfred" / "telegram" / "daemon.py"
+    ).read_text(encoding="utf-8")
+    assert (
+        "_warn_if_collapse_key_removed(rel_path, fm, fields_changed)" in source
+    ), "the update closure must call the NOTE-F collapse-key-removed helper"
+    assert '"gcal.collapse_key_removed"' in source, (
+        "the NOTE-F helper must emit gcal.collapse_key_removed (ILB signal)"
+    )
