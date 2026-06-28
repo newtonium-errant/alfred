@@ -877,7 +877,7 @@ def test_routine_auto_t1_renders_with_routine_wikilink_and_confirm(
     tmp_path: Path,
 ) -> None:
     """Routine item due tomorrow with ``escalate_at_days: 1`` →
-    auto-T1 surface, render shape: ``- [ ] <text> — <reason>, from
+    auto-T1 surface, render shape: ``- <text> — <reason>, from
     [[routine/<record>]]  *(confirm? reply "T1 confirm")*``.
 
     NOW = 2026-05-28 (Thu). weekly day=fri → due 2026-05-29 (tomorrow).
@@ -902,7 +902,7 @@ def test_routine_auto_t1_renders_with_routine_wikilink_and_confirm(
     assert "[[routine/Weekly Chores]]" in body
     # Auto-surfaced (not yet confirmed) gets the confirm prompt.
     assert T1_CONFIRM_PROMPT in body
-    # Render shape: ``- [ ] Garbage Out — due tomorrow, from [[routine/Weekly Chores]]``
+    # Render shape: ``- Garbage Out — due tomorrow, from [[routine/Weekly Chores]]``
     t1_lines = [
         ln for ln in body.splitlines()
         if "Garbage Out" in ln and "[[routine/Weekly Chores]]" in ln
@@ -1169,7 +1169,7 @@ def test_routine_auto_t1_includes_formatted_due_date(tmp_path: Path) -> None:
     embeds the formatted due date in the head.
 
     NOW = 2026-05-28 Thu. weekly day=fri → due 2026-05-29 (Friday).
-    Format: ``- [ ] <text> — due Fri May 29 (<reason>, from
+    Format: ``- <text> — due Fri May 29 (<reason>, from
     [[routine/<record>]])  *(confirm)*``.
 
     Pinned per the dispatch worked example so a date-format regression
@@ -1196,7 +1196,7 @@ def test_routine_auto_t1_includes_formatted_due_date(tmp_path: Path) -> None:
 def test_routine_auto_t2_includes_formatted_due_date(tmp_path: Path) -> None:
     """Same dispatch worked-example shape for the T2 auto subsection.
 
-    Format: ``- [ ] <text> — due Mon Jun 1 (<reason>, from
+    Format: ``- <text> — due Mon Jun 1 (<reason>, from
     [[routine/<record>]])  *(reply "T2 confirm" ...)*``."""
     _write_routine(
         tmp_path,
@@ -1302,16 +1302,16 @@ def test_curated_for_today_all_three_tiers_populated_renders_entries(
     # All operator-committed entries render as bare wikilinks /
     # free text. No confirm prompts.
     assert (
-        "- [ ] [[task/Complete Personal Taxes — Andrew Newton]]" in body
+        "- [[task/Complete Personal Taxes — Andrew Newton]]" in body
     )
     assert (
-        "- [ ] [[task/RRTS Corporate Taxes — Awaiting Accountant]]" in body
+        "- [[task/RRTS Corporate Taxes — Awaiting Accountant]]" in body
     )
     assert (
-        "- [ ] [[task/Prep Blue Cross Call List for Medical "
+        "- [[task/Prep Blue Cross Call List for Medical "
         "Admin Handoff]]"
     ) in body
-    assert "- [ ] dog walk" in body
+    assert "- dog walk" in body
     # No confirm prompts in the curated-only view.
     assert T1_CONFIRM_PROMPT not in body
     assert T2_ROUTINE_CONFIRM_PROMPT not in body
@@ -1336,7 +1336,7 @@ def test_curated_for_today_t1_only_populated_other_buckets_show_sentinel(
     body = render_curated_tier_section_for_today(curation)
     # T1 populated → plain header.
     assert "### T1\n" in body
-    assert "- [ ] [[task/Solo T1 Entry]]" in body
+    assert "- [[task/Solo T1 Entry]]" in body
     # T2 + T3 empty → suffix sentinel.
     assert "### T2 — (no items yet)" in body
     assert "### T3 — (no items yet)" in body
@@ -1367,7 +1367,7 @@ def test_curated_for_today_routine_origin_entry_renders_with_from_wikilink(
     tmp_path: Path,
 ) -> None:
     """Routine-origin T1/T2 entries render with the
-    ``- [ ] <text> (from [[routine/<record>]])`` shape — matches the
+    ``- <text> (from [[routine/<record>]])`` shape — matches the
     brief's curated routine-entry shape (shared via the per-entry
     helper). NO confirm prompts."""
     curation = DailyCuration(
@@ -1395,11 +1395,11 @@ def test_curated_for_today_routine_origin_entry_renders_with_from_wikilink(
     body = render_curated_tier_section_for_today(curation)
     # Routine-origin shape: <text> (from [[routine/<record>]])
     assert (
-        "- [ ] Pay Clinic Rental to Hussein Rafih "
+        "- Pay Clinic Rental to Hussein Rafih "
         "(from [[routine/Recurring Bills + Admin]])"
     ) in body
     assert (
-        "- [ ] Garbage Out (from [[routine/Weekly Chores]])"
+        "- Garbage Out (from [[routine/Weekly Chores]])"
     ) in body
     # No confirm prompts — operator already committed.
     assert T1_CONFIRM_PROMPT not in body
@@ -1410,7 +1410,7 @@ def test_curated_for_today_t3_free_text_renders_without_wikilink(
     tmp_path: Path,
 ) -> None:
     """T3 entries are free-text intentions — render as
-    ``- [ ] <item>`` with no wikilink wrap."""
+    ``- <item>`` with no wikilink wrap."""
     curation = DailyCuration(
         t1=[],
         t2=[],
@@ -1420,8 +1420,8 @@ def test_curated_for_today_t3_free_text_renders_without_wikilink(
         ],
     )
     body = render_curated_tier_section_for_today(curation)
-    assert "- [ ] dog walk" in body
-    assert "- [ ] Read for an hour" in body
+    assert "- dog walk" in body
+    assert "- Read for an hour" in body
     # T3 entries do NOT wrap in [[wikilink]] form — free text only.
     assert "[[dog walk]]" not in body
     assert "[[task/dog walk]]" not in body
@@ -1588,7 +1588,7 @@ def test_curated_today_filter_hides_closed_task(tmp_path: Path) -> None:
         t2=[], t3=[],
     )
     body = render_curated_tier_section_for_today(curation, vault_path=tmp_path)
-    assert "- [ ] [[task/Open Task]]" in body
+    assert "- [[task/Open Task]]" in body
     # The closed task is HIDDEN (operator wants it gone, not struck).
     assert "Call Hedley Newton" not in body
 
@@ -1658,7 +1658,7 @@ def test_curated_today_filter_keeps_t3_free_text(tmp_path: Path) -> None:
         t3=[T3Entry(item="dog walk", source="aspirational")],
     )
     body = render_curated_tier_section_for_today(curation, vault_path=tmp_path)
-    assert "- [ ] dog walk" in body
+    assert "- dog walk" in body
 
 
 def test_curated_today_filter_fails_open_on_missing_record(
@@ -1743,7 +1743,7 @@ def test_curated_today_filter_log_reports_filtered_count(
 #   * Subhead appears when auto-T3 candidates present.
 #   * NO subhead when no auto-T3 candidates (don't pollute empty).
 #   * Curated-only when no auto candidates (backward-compat).
-#   * Render line shape: ``- [ ] [[routine/<record>]] — <item> *(...)*``
+#   * Render line shape: ``- [[routine/<record>]] — <item> *(...)*``
 #   * Never-completed items use the "never done" label.
 #   * Ordering: curated entries FIRST, then auto subsection BELOW.
 #   * ILB acknowledgement (talker deferred note) surfaces in the brief.
@@ -1956,7 +1956,7 @@ def test_t3_auto_render_line_shape_with_days_count(
     tmp_path: Path,
 ) -> None:
     """Render shape pin for completed-at-least-once items:
-    ``- [ ] [[routine/<record>]] — <item> *(Nd days since last;
+    ``- [[routine/<record>]] — <item> *(Nd days since last;
     target every Md)*``"""
     _write_routine(
         tmp_path,
@@ -1980,7 +1980,7 @@ def test_t3_auto_render_line_shape_with_days_count(
     assert len(walk_lines) == 1
     line = walk_lines[0]
     # Render shape: includes record wikilink + item text + annotation.
-    assert line.startswith("- [ ] [[routine/Self Care]] — Walk dog ")
+    assert line.startswith("- [[routine/Self Care]] — Walk dog ")
     assert "*(4 days since last; target every 3d)*" in line
 
 

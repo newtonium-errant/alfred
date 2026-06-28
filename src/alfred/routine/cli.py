@@ -363,6 +363,16 @@ def _maybe_restore_silent_e(stem: str) -> str:
     return stem
 
 
+# Min stem length for the check-2 stem-substring fallback (Step 5
+# structural fix, 2026-06-06 Tilray→Meds). A stem shorter than this (e.g.
+# "med" from "Meds", 3 chars) substrings into unrelated tokens
+# ("medical", "medium", "comedian") far too eagerly, so the substring
+# fallback is skipped below that floor. Legitimate short/exact matches are
+# caught by check 1 (original-text substring) or check 3 (token
+# containment), so this floor only suppresses the false-positive class.
+_MIN_STEM_LEN = 4
+
+
 def _matches_item(query: str, item_text: str) -> bool:
     """True if ``query`` matches ``item_text`` per the fuzzy rules.
 
@@ -397,19 +407,28 @@ def _matches_item(query: str, item_text: str) -> bool:
     istem = _fuzzy_stem(item_text)
     if not qstem or not istem:
         return False
-    # TODO P4-followup: structural fix — add min_stem_length floor
-    # here. Short stems (e.g. "med" from "Meds") match too
-    # aggressively into unrelated tokens ("medical", "medium",
-    # "comedian"). The 2026-06-06 Tilray→Meds incident is the
-    # canonical failure: ``_fuzzy_stem("Meds") == "med"`` (3 chars
-    # after the conservative -s strip), then ``"med" in "tilray
-    # medical registration renewal"`` fires via substring containment
-    # at this check, returning True with effectively zero shared
-    # content tokens. Confidence instrumentation (this ship, P4
-    # Surface b) is upstream of the tightening; tune after measuring
-    # N=10+ low-confidence matches in production logs by grepping
-    # ``routine_done.matched confidence=0.0`` in talker logs.
-    if qstem in istem or istem in qstem:
+    # Check 2: stem-substring containment — gated by TWO structural
+    # guards (Step 5 structural fix, 2026-06-06 Tilray→Meds). The bare
+    # substring check matched too aggressively: ``_fuzzy_stem("Meds")
+    # == "med"`` (3 chars), and ``"med" in "tilray medical registration
+    # renewal"`` fired here, returning True with effectively zero shared
+    # content tokens.
+    #   (A) min-stem-length floor — skip the fallback when EITHER stem
+    #       is below ``_MIN_STEM_LEN`` (catches the 3-char "med").
+    #   (B) confidence gate — require non-zero token-overlap confidence
+    #       (``_match_confidence > 0``); zero overlap is not a match.
+    # BOTH must pass = defense-in-depth (Tilray→Meds fails both). The
+    # self-correcting matcher LOOP is a separate deferred piece; this is
+    # the structural close only. Legitimate short/exact matches are
+    # caught by check 1 (original-text substring) above or check 3
+    # (token containment) below — this only suppresses the
+    # substring-only zero-overlap false-positive class.
+    if (
+        (qstem in istem or istem in qstem)
+        and len(qstem) >= _MIN_STEM_LEN
+        and len(istem) >= _MIN_STEM_LEN
+        and _match_confidence(query, item_text) > 0.0
+    ):
         return True
     # Token-set overlap with stop-word filter.
     q_tokens = {
@@ -745,13 +764,22 @@ def cmd_done(
         # ``test_routine_done_matched_log_emission_fires_on_success``
         # in ``tests/routine/test_routine_done_confidence.py``.
         confidence = _match_confidence(item_text, chosen.item_text)
-        log.info(
-            "routine_done.matched",
-            query=item_text,
-            matched_to=chosen.item_text,
-            record=chosen.record_name,
-            confidence=confidence,
-        )
+        # Suppress on ``wants_json`` for the SAME reason as the other
+        # routine.cli.done logs below (884-896, 944-951): structlog's
+        # default sink writes to stdout in CLI context, interleaving the
+        # rendered log line with the JSON canary and breaking the
+        # talker-subprocess / test parse contract (the long-standing
+        # ``test_vault_wide_fuzzy_*`` JSONDecodeError was THIS line, the
+        # only matched-log that escaped the gate). The confidence
+        # emission test pins it on the ``wants_json=False`` path.
+        if not wants_json:
+            log.info(
+                "routine_done.matched",
+                query=item_text,
+                matched_to=chosen.item_text,
+                record=chosen.record_name,
+                confidence=confidence,
+            )
         resolved_record = chosen.record_name
         item_text = chosen.item_text  # canonicalise to verbatim text
         resolved_path = chosen.path

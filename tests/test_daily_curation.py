@@ -331,8 +331,8 @@ def test_save_tier_curation_preserves_other_frontmatter(
         "critical_pending:\n"
         "  - Kiki Insulin @ 12:00\n"
         "---\n\n"
-        "## Critical\n\n- [ ] Kiki Insulin @ 12:00\n\n"
-        "## Tracked\n\n- [ ] Walk Fergus *(no completions yet)*\n",
+        "## Critical\n\n- Kiki Insulin @ 12:00\n\n"
+        "## Tracked\n\n- Walk Fergus *(no completions yet)*\n",
         encoding="utf-8",
     )
 
@@ -822,7 +822,7 @@ def test_lost_update_curation_survives_interleaved_aggregator(
     daily_file.write_text(
         "---\ntype: daily\ndate: '2026-05-29'\n"
         "routines_contributing:\n- Daily R\n"
-        "critical_pending: []\n---\n\n## Tracked\n- [ ] Brush AM\n",
+        "critical_pending: []\n---\n\n## Tracked\n- Brush AM\n",
         encoding="utf-8",
     )
 

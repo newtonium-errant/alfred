@@ -15,15 +15,15 @@ Output shape (``vault/daily/<date>.md``):
     ---
 
     ## Critical
-    - [ ] Kiki Insulin @ 12:00
+    - Kiki Insulin @ 12:00
     ...
 
     ## Tracked
-    - [ ] Dog Walk *(last: 4 days ago — past 3-day threshold)*
+    - Dog Walk *(last: 4 days ago — past 3-day threshold)*
     ...
 
     ## Aspirational
-    - [ ] Reading for pleasure
+    - Reading for pleasure
     ...
 
 Section headers are emitted UNCONDITIONALLY (intentionally-left-blank
@@ -686,12 +686,12 @@ def _collect_items_for_today(
 
 
 def _format_item_line(item: dict) -> str:
-    """Render one ``- [ ] ...`` checklist line."""
+    """Render one ``- ...`` checklist line."""
     text = item["text"]
     suffix_parts: list[str] = []
     if item["priority"] == "critical" and item["time"]:
         suffix_parts.append(f"@ {item['time']}")
-    line = f"- [ ] {text}"
+    line = f"- {text}"
     if suffix_parts:
         line += " " + " ".join(suffix_parts)
     if item["annotation"]:
@@ -700,7 +700,7 @@ def _format_item_line(item: dict) -> str:
 
 
 def _render_section(items: list[dict], header: str) -> str:
-    """Compose ``## {header}\n\n- [ ] ...`` for one priority bucket.
+    """Compose ``## {header}\n\n- ...`` for one priority bucket.
 
     Always emits the header — per intentionally-left-blank, the operator
     sees three section headers every day so absence-of-items is

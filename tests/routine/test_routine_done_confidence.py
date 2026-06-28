@@ -4,20 +4,20 @@ Pins the ``_match_confidence`` helper output for known shapes + the
 ``routine_done.matched`` log emission on the single-match success
 path of :func:`cmd_done`.
 
-These tests are instrumentation-only — no threshold tightening on
-the matcher itself. The brief explicitly says instrument first,
-measure, then tune. The TODO P4-followup comment in
-``routine/cli.py::_matches_item`` (line ~400) documents the deferred
-structural fix.
+The ``_match_confidence`` helper output is instrumentation (pinned for
+known shapes). Step 5 (2026-06-XX) then APPLIED the structural matcher
+fix in ``routine/cli.py::_matches_item`` — the check-2 stem-substring
+fallback is now gated by a min-stem-length floor AND a confidence>0
+requirement. (The self-correcting matcher LOOP remains deferred — this
+is the structural close only.)
 
-Canonical false-positive shape pinned: the 2026-06-06 Tilray
-conversation friction where the operator said *"Tilray Medical
-Registration Renewal complete"* and the matcher fired against the
-``Meds`` routine item — near-zero token overlap, but the stem
-substring check (``"med" in "tilray medical registration renewal"``)
-returned True. This test pins ``_match_confidence`` = 0.0 for that
-exact pair so a future tightening pass can use confidence as the
-gate.
+Canonical false-positive shape: the 2026-06-06 Tilray conversation
+friction where the operator said *"Tilray Medical Registration Renewal
+complete"* and the matcher fired against the ``Meds`` routine item —
+near-zero token overlap, but the stem substring check (``"med" in
+"tilray medical registration renewal"``) returned True. ``_match_confidence``
+= 0.0 for that pair (pinned below); and post-Step-5 the matcher itself
+NO LONGER matches it (``test_tilray_shape_no_longer_matches_meds``).
 """
 
 from __future__ import annotations
@@ -207,16 +207,16 @@ def test_routine_done_matched_log_emission_fires_on_success(tmp_path: Path) -> N
     assert 0.0 <= event["confidence"] <= 1.0
 
 
-def test_routine_done_matched_log_carries_zero_confidence_on_tilray_shape(
-    tmp_path: Path,
-) -> None:
-    """The 2026-06-06 incident shape produces ``confidence=0.0``.
+def test_tilray_shape_no_longer_matches_meds(tmp_path: Path) -> None:
+    """STRUCTURAL-FIX regression pin (Step 5): the 2026-06-06 Tilray→Meds
+    false positive NO LONGER matches.
 
-    End-to-end pin: the operator's phrasing reaches the matcher, the
-    matcher fires (because check-2 substring containment is too
-    aggressive), the log emits with confidence=0.0. Operator-grep
-    on ``confidence=0.0`` in talker logs will surface this exact
-    failure mode without re-instrumenting.
+    Was the bug: ``_fuzzy_stem("Meds") == "med"`` (3 chars) substringed
+    into the query stem at check-2, matching with zero token overlap. The
+    Step-5 gates (min-stem-length floor + confidence>0) both reject it, so
+    the matcher falls through to a clean no-match → the ``unknown_item``
+    canary fires and NO ``routine_done.matched`` log is emitted (nothing
+    matched). Operator gets asked back rather than silently wronged.
     """
     vault = tmp_path / "vault"
     _write_routine(vault, "Core Daily", {
@@ -228,19 +228,16 @@ def test_routine_done_matched_log_carries_zero_confidence_on_tilray_shape(
     config = _config(vault, tmp_path)
 
     with structlog.testing.capture_logs() as captured:
-        cmd_done(
+        code = cmd_done(
             config, "", "Tilray Medical Registration Renewal",
             today_override="2026-06-07",
         )
 
+    # No match → no matched-log fired (the false positive is gone).
     matches = [c for c in captured if c.get("event") == "routine_done.matched"]
-    # The matcher's check-2 substring fallback DID fire (this is the
-    # bug we're surfacing). Confidence on the resulting match is 0.0.
-    assert len(matches) == 1
-    event = matches[0]
-    assert event["query"] == "Tilray Medical Registration Renewal"
-    assert event["matched_to"] == "Meds"
-    assert event["confidence"] == 0.0
+    assert matches == []
+    # No-match canary (exit 1) — the operator is asked back, not wronged.
+    assert code == 1
 
 
 def test_routine_done_matched_log_carries_high_confidence_on_genuine_match(

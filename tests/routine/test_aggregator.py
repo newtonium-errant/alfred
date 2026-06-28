@@ -334,8 +334,8 @@ def test_critical_pending_in_frontmatter(tmp_path: Path) -> None:
         "Red Pill Pippin @ 16:00",
     ]
     body = post.content
-    assert "- [ ] Kiki Insulin @ 12:00" in body
-    assert "- [ ] Red Pill Pippin @ 16:00" in body
+    assert "- Kiki Insulin @ 12:00" in body
+    assert "- Red Pill Pippin @ 16:00" in body
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +525,7 @@ def test_render_daily_body_section_headers_emitted_even_when_section_empty() -> 
     assert "## Critical" in body
     assert "## Tracked" in body
     assert "## Aspirational" in body
-    assert "- [ ] X" in body
+    assert "- X" in body
     assert "no critical routines today" in body
 
 
@@ -624,7 +624,7 @@ def test_aggregator_preserves_tier_curation(tmp_path: Path) -> None:
     # Body recomputed (pre-existing body line dropped, sections present).
     assert "## Critical" in post.content
     assert "## Tracked" in post.content
-    assert "- [ ] Brush AM" in post.content
+    assert "- Brush AM" in post.content
     assert "pre-existing body" not in post.content
 
     # The preserved_tier_curation log event fires with the canonical

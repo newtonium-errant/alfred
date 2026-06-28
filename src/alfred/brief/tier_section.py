@@ -21,8 +21,8 @@ Render shape (the section body — the brief renderer wraps it under
 ``## Open Tasks by Tier``):
 
     ### T1 — Imminent deadlines (auto-surfaced — confirm or drop)
-    - [ ] [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
-    - [ ] [[task/Pay Clinic Rental]] — due tomorrow
+    - [[task/Steph Yang ROE]] — due today  *(confirm? reply "T1 confirm")*
+    - [[task/Pay Clinic Rental]] — due tomorrow
 
     ### T2 — On the radar
     *(empty — reply "T2 add <items from selection pool below or anywhere>")*
@@ -379,13 +379,13 @@ def _render_t1_entry(
 
     Origin discrimination:
       * Task-origin (``entry.task`` populated) — renders as
-        ``- [ ] [[task/Name]] — due today  *(confirm)*``. Reason
+        ``- [[task/Name]] — due today  *(confirm)*``. Reason
         lookup keyed on record name.
       * Routine-origin (``entry.routine_item`` populated) — renders as
-        ``- [ ] <text> — due <date> (<reason>, from
+        ``- <text> — due <date> (<reason>, from
         [[routine/<record>]])  *(confirm)*`` when an auto-T1 candidate
         matches (date + reason inline); otherwise
-        ``- [ ] <text> (from [[routine/<record>]])`` for operator-
+        ``- <text> (from [[routine/<record>]])`` for operator-
         added entries the auto layer doesn't know about.
 
     Confirm-affordance logic (same for both origins):
@@ -399,7 +399,7 @@ def _render_t1_entry(
     added a T1 entry that wasn't auto-surfaced).
 
     Worked example (the canonical dispatch shape):
-      ``- [ ] Garbage Out — due Fri May 29 (escalate window (1d before
+      ``- Garbage Out — due Fri May 29 (escalate window (1d before
       due), from [[routine/Weekly Chores]])  *(confirm? reply "T1 confirm")*``
     """
     # Routine-origin discrimination — exactly one of task / routine_item
@@ -411,24 +411,24 @@ def _render_t1_entry(
         due_iso = auto_t1_due_iso_by_routine_key.get((record, text), "")
         if reason and due_iso:
             head = (
-                f"- [ ] {text} — due {_format_due_date(due_iso)} "
+                f"- {text} — due {_format_due_date(due_iso)} "
                 f"({reason}, from [[routine/{record}]])"
             )
         elif reason:
             head = (
-                f"- [ ] {text} — {reason}, from [[routine/{record}]]"
+                f"- {text} — {reason}, from [[routine/{record}]]"
             )
         else:
-            head = f"- [ ] {text} (from [[routine/{record}]])"
+            head = f"- {text} (from [[routine/{record}]])"
     else:
         # Task-origin path (the original Tier-V2 Ship 1 shape).
         task_str = entry.task or ""
         record_name = _wikilink_to_record_name(task_str) or ""
         reason = auto_t1_reason_by_name.get(record_name, "")
         if reason:
-            head = f"- [ ] {task_str} — {reason}"
+            head = f"- {task_str} — {reason}"
         else:
-            head = f"- [ ] {task_str}"
+            head = f"- {task_str}"
 
     if entry.confirmed is True:
         return head
@@ -449,8 +449,8 @@ def _render_t2_entry(entry: T1T2Entry) -> str:
     if entry.routine_item is not None:
         record = str(entry.routine_item.get("record", ""))
         text = str(entry.routine_item.get("text", ""))
-        return f"- [ ] {text} (from [[routine/{record}]])"
-    return f"- [ ] {entry.task or ''}"
+        return f"- {text} (from [[routine/{record}]])"
+    return f"- {entry.task or ''}"
 
 
 def _render_auto_t2_routine_entry(candidate: Any) -> str:
@@ -459,7 +459,7 @@ def _render_auto_t2_routine_entry(candidate: Any) -> str:
     ``candidate`` is an :class:`alfred.tier.compute.AutoT1Candidate`
     with ``origin == "routine"``. Renders as:
 
-      ``- [ ] <text> — due <date> (<reason>, from
+      ``- <text> — due <date> (<reason>, from
       [[routine/<record>]])  *(reply "T2 confirm" to keep on today's
       list)*``
 
@@ -478,7 +478,7 @@ def _render_auto_t2_routine_entry(candidate: Any) -> str:
     reason = candidate.surface_reason
     due_display = _format_due_date(candidate.due_iso)
     return (
-        f"- [ ] {text} — due {due_display} "
+        f"- {text} — due {due_display} "
         f"({reason}, from [[routine/{record}]])"
         f"  {T2_ROUTINE_CONFIRM_PROMPT}"
     )
@@ -489,7 +489,7 @@ def _render_t3_entry(entry: T3Entry) -> str:
 
     Note T3 entries carry ``item:`` (free-text) not ``task:`` (wikilink).
     """
-    return f"- [ ] {entry.item}"
+    return f"- {entry.item}"
 
 
 def _render_auto_t3_routine_entry(candidate: Any) -> str:
@@ -498,7 +498,7 @@ def _render_auto_t3_routine_entry(candidate: Any) -> str:
     ``candidate`` is an :class:`alfred.tier.compute.AutoT3Candidate`.
     Renders as:
 
-      ``- [ ] [[routine/<record>]] — <item> *(Nd days since last;
+      ``- [[routine/<record>]] — <item> *(Nd days since last;
       target every Md)*``
 
     For never-completed items (``days_since_last_completed is None``)
@@ -530,7 +530,7 @@ def _render_auto_t3_routine_entry(candidate: Any) -> str:
             days_since=days_since, target=target,
         )
     return (
-        f"- [ ] [[routine/{record}]] — {text} {annotation}"
+        f"- [[routine/{record}]] — {text} {annotation}"
     )
 
 

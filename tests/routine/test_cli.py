@@ -864,6 +864,32 @@ def test_matches_item_stem_tolerant() -> None:
     assert _matches_item("walking", "Walk dog")
 
 
+def test_matches_item_rejects_short_stem_zero_overlap() -> None:
+    """Step 5 structural fix: the check-2 stem-substring fallback is gated
+    by a min-stem-length floor AND a confidence>0 requirement, so the
+    2026-06-06 Tilray→Meds class of false positive NO LONGER matches.
+
+      * "Meds" → stem "med" (3 chars < floor) substringed into the query
+        stem with zero shared content tokens → both gates reject.
+      * Legitimate short/exact + token-overlap matches still pass (caught
+        by check 1 / check 3), proven by the assertions above + here.
+    """
+    from alfred.routine.cli import _matches_item
+    # The canonical false positive — now rejected (gate A: "med" < floor).
+    assert not _matches_item(
+        "Tilray Medical Registration Renewal", "Meds"
+    )
+    # Another short-stem char-substring with zero token overlap (gate A:
+    # "pay" < floor; "pay" is a substring of "payment").
+    assert not _matches_item("Payment received", "Pay")
+    # Gate B specifically: both stems >= floor, but zero token overlap
+    # ("edit" is a substring of "meditation") → confidence 0.0 → rejected.
+    assert not _matches_item("Meditation practice", "Edit")
+    # Regression guard: genuine matches with real token overlap survive.
+    assert _matches_item("walking", "Walk dog")
+    assert _matches_item("I walked the dog", "Walk dog")
+
+
 def test_matches_item_token_set_with_stop_words() -> None:
     """'I walked the dog' → tokens {walk, dog} (after stop-word
     filter) ⊆ {walk, dog} from 'Walk dog' → match. This is the
