@@ -238,6 +238,77 @@ export async function callTransportTo(
   return { status: res.status, body: await parseJsonOrNull(res) };
 }
 
+// --- Streaming (SSE) transport helpers (CONTRACT §1 / hardening) -------------
+// Return the RAW fetch Response so the BFF can pass `res.body` straight through
+// without buffering. Accept: text/event-stream; an AbortSignal tears down the
+// relay on client disconnect (the backend detaches and keeps run_turn running —
+// decision S4). DO NOT call parseJsonOrNull here (it would buffer the stream).
+
+export interface StreamCallOptions {
+  body?: unknown;
+  /** Instance-signed session token → X-Alfred-Session (home/session path). */
+  sessionToken?: string | null;
+  /** Aborts the BFF↔transport relay when the browser disconnects. */
+  signal?: AbortSignal;
+}
+
+/** Home/session-path SSE relay — injects the home peer token + session token. */
+export async function callTransportStream(
+  method: 'POST',
+  path: string,
+  opts: StreamCallOptions = {},
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${peerToken()}`,
+    'X-Alfred-Client': PEER_CLIENT,
+    Accept: 'text/event-stream',
+  };
+  if (opts.sessionToken) {
+    headers['X-Alfred-Session'] = opts.sessionToken;
+  }
+  if (opts.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+  return fetch(`${baseUrl()}${path}`, {
+    method,
+    headers,
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    signal: opts.signal,
+  });
+}
+
+export interface ChatStreamCallOptions {
+  body?: unknown;
+  /** The verified display name asserted as X-Alfred-User (relay path). */
+  userName: string;
+  signal?: AbortSignal;
+}
+
+/** Cross-instance SSE relay — injects the TARGET peer token + the asserted user. */
+export async function callChatStream(
+  targetName: string,
+  method: 'POST',
+  path: string,
+  opts: ChatStreamCallOptions,
+): Promise<Response> {
+  const target = resolveChatTarget(targetName);
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${target.token}`,
+    'X-Alfred-Client': target.client,
+    'X-Alfred-User': opts.userName,
+    Accept: 'text/event-stream',
+  };
+  if (opts.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+  return fetch(`${target.baseUrl}${path}`, {
+    method,
+    headers,
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    signal: opts.signal,
+  });
+}
+
 // --- Cross-instance chat target resolution (Model B — trust-the-relay) -------
 // Mirrors the ingest target block above, with a DISTINCT env prefix + a DISTINCT
 // per-instance peer token. Chat uses the target's `web` peer token (full talker

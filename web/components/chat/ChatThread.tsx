@@ -9,9 +9,12 @@ import type { ChatMessage } from '../../lib/algernon/types';
 export function ChatThread({
   messages,
   sending,
+  workingLabel,
 }: {
   messages: ChatMessage[];
   sending: boolean;
+  /** Live tool-activity label shown on the typing indicator (streaming). */
+  workingLabel?: string | null;
 }) {
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -35,7 +38,7 @@ export function ChatThread({
       {messages.map((m) => (
         <MessageBubble key={m.id} role={m.role} text={m.text} ts={m.ts} />
       ))}
-      {sending && <TypingIndicator />}
+      {sending && <TypingIndicator label={workingLabel} />}
       <div ref={endRef} />
     </div>
   );

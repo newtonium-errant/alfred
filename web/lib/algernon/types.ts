@@ -28,6 +28,26 @@ export interface ChatTurnResponse {
   session_key: string;
   ts: string;
   user_ts: string;
+  // Retry-safety (CONTRACT S6): true when the backend returned a cached result
+  // for a repeated idempotency_key instead of re-running the turn. Optional —
+  // absent on a fresh turn and on old backends.
+  deduped?: boolean;
+}
+
+// --- Streamed turn (SSE) — CONTRACT §1 --------------------------------------
+// The typed mirror of the /chat/stream SSE frames. `status` frames surface tool
+// activity on the in-flight turn; the terminal `done` frame's data IS a
+// ChatTurnResponse (byte-identical to /chat/turn); `error` is the standard
+// envelope. Keep-alive comment frames carry no event (see ./sse).
+export interface StreamStatusEvent {
+  phase: string;
+  tool?: string;
+  iteration?: number;
+}
+export type StreamDoneEvent = ChatTurnResponse;
+export interface StreamErrorEvent {
+  error: string;
+  detail?: string;
 }
 
 // GET /chat/history/{session_key} → { turns: [...] }

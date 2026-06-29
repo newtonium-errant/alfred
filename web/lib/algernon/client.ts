@@ -50,6 +50,29 @@ export const chatApi = {
       `/api/chat/history/${encodeURIComponent(sessionKey)}` +
         (instance ? `?instance=${encodeURIComponent(instance)}` : ''),
     ),
+  // Opens the SSE turn stream and returns the RAW Response so useChat can read
+  // res.body.getReader() (the success signal is the terminal `done` frame, not a
+  // JSON body). Validation errors come back as JSON BEFORE the stream begins —
+  // useChat checks res.ok / content-type before reading. `signal` lets the caller
+  // abort the fetch (e.g. on unmount). NOTE: a non-network failure surfaces via
+  // the response status, not a throw; only a true network error throws here.
+  stream: (
+    sessionKey: string,
+    message: string,
+    opts: ChatTurnOptions & { signal?: AbortSignal } = {},
+  ): Promise<Response> =>
+    fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify({
+        session_key: sessionKey,
+        message,
+        kind: opts.kind ?? 'text',
+        ...(opts.instance ? { instance: opts.instance } : {}),
+        ...(opts.idempotencyKey ? { idempotency_key: opts.idempotencyKey } : {}),
+      }),
+      signal: opts.signal,
+    }),
 };
 
 // BROWSER-side ingest client. Same-origin BFF only (`/api/ingest/*`) — the BFF

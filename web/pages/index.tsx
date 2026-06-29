@@ -31,7 +31,7 @@ export default function ChatPage() {
   const [instance, setInstance] = useState<string>(HOME_INSTANCE_NAME);
 
   // Chat bootstraps once signed in, scoped to the active instance.
-  const { messages, status, error, sending, unauthenticated, send, newChat } = useChat({
+  const { messages, status, error, sending, working, unauthenticated, send, newChat } = useChat({
     enabled: authed,
     instance,
   });
@@ -132,7 +132,7 @@ export default function ChatPage() {
                 Loading the conversation…
               </p>
             ) : (
-              <ChatThread messages={messages} sending={sending} />
+              <ChatThread messages={messages} sending={sending} workingLabel={working} />
             )}
           </div>
 
