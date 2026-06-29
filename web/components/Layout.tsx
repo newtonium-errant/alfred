@@ -21,10 +21,13 @@ type LayoutProps = {
   maxWidthClassName?: string;
 };
 
-// The app's surfaces. M1 ships Chat only; Routines lands in M3 (the no-shame
-// display). Keeping this an array preserves honeydew's nav structure so M3 adds
-// a link without re-architecting the header.
-const NAV_LINKS = [{ href: '/', label: 'Chat' }] as const;
+// The app's surfaces. Chat + the cross-instance Ingest surface; Routines lands in
+// M3 (the no-shame display). Keeping this an array preserves honeydew's nav
+// structure so a new surface adds a link without re-architecting the header.
+const NAV_LINKS = [
+  { href: '/', label: 'Chat' },
+  { href: '/ingest', label: 'Ingest' },
+] as const;
 
 // Sticky melon header + centered content container with the warm page wash.
 // Borrowed from honeydew's Layout (the render/interaction layer); its Supabase
