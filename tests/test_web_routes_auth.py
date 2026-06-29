@@ -36,6 +36,7 @@ from alfred.transport.state import TransportState
 from alfred.web import routes_auth as auth_routes_mod
 from alfred.web.auth import SESSION_HEADER, make_session_token
 from alfred.web.config import WebAuthConfig, WebConfig, WebEmailConfig, WebUser
+from alfred.web.keys import KEY_WEB_AUTH_STATE, KEY_WEB_CONFIG
 from alfred.web.routes_chat import register_web_routes
 from alfred.web.state import WebAuthState
 
@@ -281,3 +282,58 @@ async def test_verify_rejects_session_token_as_magic(
         "/auth/verify", json={"token": session_token}, headers=_PEER_HEADERS
     )
     assert r.status == 401
+
+
+# ---------------------------------------------------------------------------
+# MINT-path secret guard (B2-NOTE→B3): both handlers MUST call
+# resolve_signing_secret BEFORE minting, so a placeholder/empty secret can
+# never sign a token. Routes can't be mounted with an unconfigured secret
+# (register_web_routes guard + daemon boot check), so these drive the
+# handlers directly with the deps stashed on a bare app to prove the
+# in-handler guard fires before any make_*_token call.
+# ---------------------------------------------------------------------------
+
+
+class _FakeReq:
+    def __init__(self, app: dict, body: dict) -> None:
+        self.app = app
+        self._body = body
+
+    async def json(self) -> dict:
+        return self._body
+
+
+async def test_login_handler_resolves_secret_before_mint(tmp_path) -> None:
+    # Reaches resolve_signing_secret only after the email/base_url/user gates
+    # pass — so configure those, leave session_secret empty.
+    cfg = WebConfig(
+        enabled=True,
+        users=[WebUser(name="andrew", role="owner", email="andrew@example.com")],
+        auth=WebAuthConfig(session_secret="", base_url="https://x.example.com"),
+        email=WebEmailConfig(
+            api_key="DUMMY_RESEND_TEST_KEY", from_address="bot@example.com"
+        ),
+    )
+    app = {
+        KEY_WEB_CONFIG: cfg,
+        KEY_WEB_AUTH_STATE: WebAuthState.create(tmp_path / "n.json"),
+    }
+    req = _FakeReq(app, {"email": "andrew@example.com"})
+    with pytest.raises(ValueError, match="session_secret"):
+        await auth_routes_mod._handle_auth_login(req)
+
+
+async def test_verify_handler_resolves_secret_before_mint(tmp_path) -> None:
+    cfg = WebConfig(
+        enabled=True,
+        users=[WebUser(name="andrew", role="owner")],
+        auth=WebAuthConfig(session_secret=""),
+    )
+    app = {
+        KEY_WEB_CONFIG: cfg,
+        KEY_WEB_AUTH_STATE: WebAuthState.create(tmp_path / "n.json"),
+    }
+    # Non-empty token clears the missing-token gate → reaches the secret guard.
+    req = _FakeReq(app, {"token": "any-nonempty-token"})
+    with pytest.raises(ValueError, match="session_secret"):
+        await auth_routes_mod._handle_auth_verify(req)
