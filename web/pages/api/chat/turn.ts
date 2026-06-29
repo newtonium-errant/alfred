@@ -1,4 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
+import type { ZodIssue } from 'zod';
 import { resolveSessionToken } from '../../../lib/algernon/identity';
 import { chatTurnBodySchema } from '../../../lib/algernon/schemas';
 import { TransportConfigError, callTransport } from '../../../lib/algernon/transport';
@@ -20,7 +21,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   if (!parsed.success) {
     return res.status(400).json({
       error: 'invalid_request',
-      detail: parsed.error.issues.map((i) => i.message).join('; '),
+      detail: parsed.error.issues.map((i: ZodIssue) => i.message).join('; '),
     });
   }
 
