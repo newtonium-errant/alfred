@@ -266,11 +266,22 @@ def scan_tickets(
     record has no ``ticket_uid`` field yet — the caller mints one).
 
     Eligible = ``status == "open"`` AND (uid not in state OR the state
-    entry lacks ``issue_number``). Defensive frontmatter parsing
-    (mirrors ``vera_ticket_digest._scan_open_tickets``): a malformed
-    file logs + skips, never kills the tick.
+    entry lacks ``issue_number``) AND NOT held by the de-PHI interlock
+    (below). Defensive frontmatter parsing (mirrors
+    ``vera_ticket_digest._scan_open_tickets``): a malformed file logs +
+    skips, never kills the tick.
+
+    🔒 De-PHI held-state interlock (2026-06-29, RRTS bug-report → VERA
+    lane): an ``origin: rrts`` ticket is EXCLUDED until its
+    ``de_phi_status == "cleared"``. Default-deny — a missing or
+    ``pending`` ``de_phi_status`` on an rrts ticket keeps it HELD.
+    Telegram-origin tickets (``origin != "rrts"``) forward as today.
+    NOTHING in this arc sets ``cleared`` (the separate de-PHI arc does),
+    so RRTS-origin tickets stay held by construction — they can never
+    auto-forward to KAL-LE/GitHub (the US hop) before de-PHI ships.
     """
     scanned = 0
+    held_rrts = 0
     eligible: list[dict[str, Any]] = []
     ticket_dir = vault_path / "ticket"
     if not ticket_dir.exists():
@@ -296,6 +307,15 @@ def scan_tickets(
         scanned += 1
         if str(fm.get("status") or "") != "open":
             continue
+        # 🔒 De-PHI held-state interlock — the keystone of the RRTS lane.
+        # An RRTS-origin ticket must never auto-forward to KAL-LE/GitHub
+        # until it has been de-PHI'd. Default-deny: anything other than an
+        # explicit ``cleared`` keeps an ``origin: rrts`` ticket held.
+        origin = str(fm.get("origin") or "")
+        de_phi = str(fm.get("de_phi_status") or "")
+        if origin == "rrts" and de_phi != "cleared":
+            held_rrts += 1
+            continue
         relpath = f"ticket/{md_file.name}"
         uid_raw = fm.get("ticket_uid")
         uid = uid_raw if isinstance(uid_raw, str) and uid_raw else ""
@@ -309,6 +329,18 @@ def scan_tickets(
             "body": post.content,
             "uid": uid,
         })
+    if held_rrts:
+        # Intentionally-left-blank: the held-by-de-PHI count is logged so a
+        # permanently-held RRTS ticket queue is observably distinct from a
+        # broken forwarder. This is the EXPECTED steady state until the
+        # de-PHI arc ships — an operator grepping ``held_rrts_pending`` sees
+        # the interlock working, not a stall.
+        log.info(
+            "ticket_forward.held_rrts_pending",
+            count=held_rrts,
+            detail="origin: rrts tickets held — de_phi_status != cleared "
+                   "(not forwarded; awaiting the separate de-PHI arc)",
+        )
     return scanned, eligible
 
 

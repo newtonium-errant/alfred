@@ -60,6 +60,8 @@ def _write_ticket(
     status: str = "open",
     created: str = "2026-06-10",
     uid: str | None = None,
+    origin: str | None = None,
+    de_phi_status: str | None = None,
 ) -> Path:
     ticket_dir = vault / "ticket"
     ticket_dir.mkdir(parents=True, exist_ok=True)
@@ -75,6 +77,13 @@ def _write_ticket(
     ]
     if uid:
         lines.append(f"ticket_uid: {uid}")
+    # Held-state fields (RRTS bug-report → VERA lane). Omitted by default so
+    # existing callers model telegram-origin tickets (origin absent → never
+    # held).
+    if origin is not None:
+        lines.append(f"origin: {origin}")
+    if de_phi_status is not None:
+        lines.append(f"de_phi_status: {de_phi_status}")
     lines += ["---", "", "## Repro", "1. Step one", ""]
     path = ticket_dir / f"{name}.md"
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -228,6 +237,103 @@ def test_scan_selection_rules(tmp_path):  # type: ignore[no-untyped-def]
     parse_failed = _log_events(captured, "ticket_forward.scan_parse_failed")
     assert len(parse_failed) == 1
     assert "broken.md" in parse_failed[0]["path"]
+
+
+# ---------------------------------------------------------------------------
+# 🔒 De-PHI held-state interlock — the keystone of the RRTS lane
+# ---------------------------------------------------------------------------
+
+
+def test_rrts_pending_ticket_not_forwarded(tmp_path):  # type: ignore[no-untyped-def]
+    """An open ``origin: rrts`` ticket with ``de_phi_status: pending`` is
+    HELD — excluded from the eligible set. This is the load-bearing
+    interlock: nothing in this arc sets ``cleared``, so it stays held."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "RRTS bug", origin="rrts", de_phi_status="pending")
+
+    state = TicketForwardState(path=tmp_path / "state.json")
+    scanned, eligible = scan_tickets(vault, state)
+
+    assert scanned == 1
+    assert eligible == []
+
+
+def test_rrts_missing_de_phi_status_not_forwarded(tmp_path):  # type: ignore[no-untyped-def]
+    """Default-DENY: an ``origin: rrts`` ticket with NO ``de_phi_status``
+    field at all is still held (missing != cleared)."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "RRTS no-status", origin="rrts")
+
+    state = TicketForwardState(path=tmp_path / "state.json")
+    scanned, eligible = scan_tickets(vault, state)
+
+    assert scanned == 1
+    assert eligible == []
+
+
+def test_rrts_cleared_ticket_is_forwarded(tmp_path):  # type: ignore[no-untyped-def]
+    """Once (the separate de-PHI arc) sets ``de_phi_status: cleared`` on an
+    ``origin: rrts`` ticket, it becomes eligible — the interlock releases."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "RRTS cleared", origin="rrts", de_phi_status="cleared")
+
+    state = TicketForwardState(path=tmp_path / "state.json")
+    scanned, eligible = scan_tickets(vault, state)
+
+    assert scanned == 1
+    assert {item["relpath"] for item in eligible} == {"ticket/RRTS cleared.md"}
+
+
+def test_telegram_origin_ticket_forwarded_as_today(tmp_path):  # type: ignore[no-untyped-def]
+    """Telegram-origin tickets (origin absent OR != "rrts") forward exactly
+    as before — the interlock only gates ``origin: rrts``."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "Telegram bug")  # no origin
+    _write_ticket(vault, "Telegram explicit", origin="telegram", de_phi_status="n/a")
+
+    state = TicketForwardState(path=tmp_path / "state.json")
+    scanned, eligible = scan_tickets(vault, state)
+
+    assert scanned == 2
+    assert {item["relpath"] for item in eligible} == {
+        "ticket/Telegram bug.md",
+        "ticket/Telegram explicit.md",
+    }
+
+
+def test_held_rrts_pending_logged(tmp_path):  # type: ignore[no-untyped-def]
+    """ILB: the held count is logged so a permanently-held RRTS queue is
+    observably distinct from a broken forwarder (the EXPECTED steady state
+    until de-PHI ships)."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "Held one", origin="rrts", de_phi_status="pending")
+    _write_ticket(vault, "Held two", origin="rrts")
+
+    state = TicketForwardState(path=tmp_path / "state.json")
+    with structlog.testing.capture_logs() as captured:
+        scan_tickets(vault, state)
+
+    held = _log_events(captured, "ticket_forward.held_rrts_pending")
+    assert len(held) == 1
+    assert held[0]["count"] == 2
+
+
+def test_rrts_cleared_reuses_file_time_uid(tmp_path):  # type: ignore[no-untyped-def]
+    """A cleared rrts ticket carrying a file-time ``ticket_uid`` surfaces
+    that SAME uid in the eligible set — the forwarder reuses it (never
+    re-mints). Pins the file-time-mint → forwarder-reuse contract."""
+    vault = tmp_path / "vault"
+    file_time_uid = mint_ticket_uid("ticket/RRTS reuse.md", "2026-06-29")
+    _write_ticket(
+        vault, "RRTS reuse", created="2026-06-29",
+        uid=file_time_uid, origin="rrts", de_phi_status="cleared",
+    )
+
+    state = TicketForwardState(path=tmp_path / "state.json")
+    _scanned, eligible = scan_tickets(vault, state)
+
+    assert len(eligible) == 1
+    assert eligible[0]["uid"] == file_time_uid
 
 
 # ---------------------------------------------------------------------------
