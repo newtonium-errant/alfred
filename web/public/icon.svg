@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Flowers for Algernon — a daisy bloom">
+  <!-- Full-bleed brand-green background (maskable-safe: bloom stays within the centre 80% safe zone) -->
+  <rect width="512" height="512" fill="#7bbf4f"/>
+  <g transform="translate(256,256)">
+    <!-- soft halo behind the bloom for depth -->
+    <circle cx="0" cy="0" r="172" fill="#ffffff" opacity="0.08"/>
+    <!-- 12 petals, 30° apart, cream-white -->
+    <g fill="#fbfdf6">
+      <g transform="rotate(0)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(30)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(60)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(90)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(120)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(150)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(180)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(210)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(240)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(270)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(300)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+      <g transform="rotate(330)"><ellipse cx="0" cy="-104" rx="30" ry="74"/></g>
+    </g>
+    <!-- golden centre disc -->
+    <circle cx="0" cy="0" r="56" fill="#f4c430"/>
+    <circle cx="0" cy="0" r="56" fill="none" stroke="#dca81c" stroke-width="4"/>
+    <!-- subtle stippled florets on the disc -->
+    <g fill="#dca81c" opacity="0.55">
+      <circle cx="-22" cy="-14" r="5"/><circle cx="6" cy="-24" r="5"/><circle cx="24" cy="2" r="5"/>
+      <circle cx="-10" cy="20" r="5"/><circle cx="16" cy="22" r="5"/><circle cx="-26" cy="12" r="5"/>
+      <circle cx="0" cy="0" r="5"/>
+    </g>
+  </g>
+</svg>
