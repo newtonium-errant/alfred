@@ -117,6 +117,17 @@ class Session:
     # Telegram session records carry the empty defaults.
     last_turn_key: str = ""
     last_turn_result: dict[str, Any] = field(default_factory=dict)
+    # RRTS-intake completion signal (2026-06-29, RRTS bug-report → VERA
+    # lane). When VERA files a ticket under the vouched ``rrts_intake``
+    # scope, the create path records ``{filed, ticket_uid, title}`` here so
+    # the synchronous ``/chat/turn`` + ``/chat/stream`` response can surface
+    # the local ticket reference (the §9.7 completion signal — the GitHub
+    # issue number does NOT exist yet at filing time; it's minted downstream
+    # ~15 min later). ``run_turn`` CLEARS this at the start of every turn so
+    # the signal reflects THIS turn only (no cross-turn leak). Empty default;
+    # set only on the rrts_intake create path — Telegram + owner-web chat
+    # carry the empty default. Persisted + filtered like ``last_turn_result``.
+    last_filed_ticket: dict[str, Any] = field(default_factory=dict)
 
     # --- serialization ---
 
@@ -135,6 +146,7 @@ class Session:
             "documents": self.documents,
             "last_turn_key": self.last_turn_key,
             "last_turn_result": self.last_turn_result,
+            "last_filed_ticket": self.last_filed_ticket,
         }
 
     @classmethod
@@ -207,6 +219,9 @@ class Session:
         # rehydrated sessions — filter-then-coerce to the empty defaults.
         last_turn_key = str(filtered.get("last_turn_key", "") or "")
         last_turn_result = dict(filtered.get("last_turn_result") or {})
+        # RRTS-intake completion signal: missing on Telegram + pre-RRTS-lane
+        # rehydrated sessions — coerce to the empty default.
+        last_filed_ticket = dict(filtered.get("last_filed_ticket") or {})
 
         return cls(
             session_id=session_id,
@@ -222,6 +237,7 @@ class Session:
             documents=documents,
             last_turn_key=last_turn_key,
             last_turn_result=last_turn_result,
+            last_filed_ticket=last_filed_ticket,
         )
 
 

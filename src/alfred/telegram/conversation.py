@@ -1748,7 +1748,7 @@ def _build_today_block_text(
 
 
 def _build_sender_identity_text(
-    user_name: str | None, user_role: str,
+    user_name: str | None, user_role: str, channel: str | None = None,
 ) -> str:
     """Render the per-message sender-identity block text.
 
@@ -1764,19 +1764,36 @@ def _build_sender_identity_text(
     rebuilt every turn (uncached tail position) — it is genuinely
     dynamic-per-message, NOT a static SKILL template var.
 
+    ``channel`` (2026-06-29, RRTS bug-report → VERA lane) surfaces the
+    EXPLICIT arrival channel — ``"web"`` (the web bug widget / relay) or
+    ``"telegram"`` — as ``channel: <value>`` in the sender parenthetical
+    PLUS a one-line statement. This is the in-conversation signal VERA's
+    SKILL keys its per-channel PHI rule on (web reports = capture PHI
+    faithfully and hold; telegram = minimize). It must be available DURING
+    the conversation — the ticket's ``origin`` frontmatter field is set at
+    file-time, too late to steer in-conversation PHI behaviour. ``None`` /
+    empty omits the channel clause (back-compat).
+
     Callers gate on ``user_name`` being non-None (see ``run_turn``): the
     block is omitted entirely on single-user instances so their behaviour
     is byte-identical. The role-fallback wording here is for the case
     where a multi-user instance has a roster entry WITHOUT a name set.
     """
     who = user_name if user_name else f"the {user_role} user"
+    channel_clause = f", channel: {channel}" if channel else ""
+    channel_line = (
+        f"\n\nThis message arrived via the **{channel}** channel."
+        if channel else ""
+    )
     return (
         "## Current message sender\n\n"
-        f"This message was sent by **{who}** (role: {user_role}). "
+        f"This message was sent by **{who}** (role: {user_role}"
+        f"{channel_clause}). "
         "When attributing authorship for THIS message — e.g. setting a "
         "record's reporter/author field — use this sender. The sender "
         "can change between messages in a shared chat, so re-read this "
         "block each turn rather than assuming a fixed author."
+        f"{channel_line}"
     )
 
 
@@ -3521,12 +3538,27 @@ def resolve_scope(tool_set: str, role: str) -> str:
     any non-owner role → ``vera_ops`` scope. Every other tool_set is
     role-independent and returns unchanged (single-role instances).
 
+    VOUCHED RRTS-relay reporter (2026-06-29, RRTS bug-report → VERA lane):
+    the web relay assigns the synthetic ``RRTS_INTAKE_ROLE`` to a
+    JWT-vouched RRTS staff user (``web/auth.py::_resolve_relay_identity``).
+    It is NOT a config role (owner/ops) — it's an auth-path sentinel that
+    ALWAYS resolves to the fixed ``rrts_intake`` scope, name- AND
+    tool_set-independent (the asserted name is provenance only, never
+    authz). Checked FIRST so the held-intake scope can never be widened by
+    any tool_set/role combination. A Telegram caller can never carry this
+    role (config roles are owner/ops only), so the branch is unreachable
+    off the vouched web path.
+
     ``tool_set`` empty / falsy → ``"talker"`` (Salem's legacy default,
     preserved from the pre-VERA inline resolution). ``role`` empty / falsy
     is treated as owner (back-compat: a flat-allowlist instance whose
     users carry no explicit role default to owner — see
     ``config.AllowedUser`` and ``bot._role_for``).
     """
+    from alfred.vault.scope import RRTS_INTAKE_ROLE, RRTS_INTAKE_SCOPE
+
+    if role == RRTS_INTAKE_ROLE:
+        return RRTS_INTAKE_SCOPE
     ts = tool_set or "talker"
     if ts == "vera":
         return "vera" if (role or _OWNER_ROLE) == _OWNER_ROLE else "vera_ops"
@@ -3541,6 +3573,7 @@ async def _execute_tool(
     session: Session,
     config: TalkerConfig | None = None,
     user_role: str = _OWNER_ROLE,
+    user_name: str | None = None,
 ) -> str:
     """Execute one tool_use block and return JSON-stringified result.
 
@@ -3560,6 +3593,14 @@ async def _execute_tool(
     :func:`resolve_scope` to pick the vault scope. Defaults to ``"owner"``
     so single-role callers (every instance except VERA) and legacy test
     callers route exactly as before.
+
+    ``user_name`` (2026-06-29, RRTS bug-report → VERA lane) is the sending
+    user's display name, plumbed from ``run_turn``. Used by the
+    ``rrts_intake`` ticket-create path to deterministically stamp the
+    vouched ``reporter`` (provenance, not authz). ``None`` — the default
+    and the value on every Telegram + single-user path — leaves the
+    reporter to the agent (the existing VERA-Telegram mechanism via the
+    sender-identity system block).
     """
     from pathlib import Path
 
@@ -3836,6 +3877,45 @@ async def _execute_tool(
             if record_type == "daily" and "date" not in sf:
                 sf["date"] = name
 
+            # RRTS-intake held-ticket stamping (2026-06-29, RRTS bug-report
+            # → VERA lane). When a ticket is filed under the vouched
+            # ``rrts_intake`` scope, deterministically stamp the held-state
+            # provenance + mint the file-time ticket_uid. These are NOT
+            # LLM-set: ``origin`` / ``de_phi_status`` are infra provenance
+            # (the SovServ boundary marker), ``source: web`` records the web
+            # channel (the VERA SKILL keeps ``source`` Telegram-only and
+            # routes web provenance to ``origin`` — cross-agent contract
+            # 2026-06-29; ``source`` is a soft field, not gate-enforced),
+            # ``reporter`` is the vouched name (provenance, never authz), and
+            # ``ticket_uid`` is the pipeline dedupe key the forwarder REUSES
+            # (never re-mints — see ticket_forward.run_forward_once). 🔒
+            # ``de_phi_status: pending`` is the LOAD-BEARING interlock: the
+            # forward guard (ticket_forward.scan_tickets) excludes
+            # ``origin: rrts`` tickets until ``de_phi_status == "cleared"``,
+            # and NOTHING in this arc sets ``cleared``, so the ticket stays
+            # held until the separate de-PHI arc ships.
+            rrts_filed: dict[str, Any] | None = None
+            if active_scope == scope.RRTS_INTAKE_SCOPE and record_type == "ticket":
+                from alfred.transport.ticket_forward import mint_ticket_uid
+
+                created_iso = _dt.date.today().isoformat()
+                # ticket directory is "ticket"; the forwarder scans the same
+                # path and re-mints from the same (relpath, created) inputs,
+                # so the file-time uid and any forwarder fallback agree.
+                relpath_for_uid = f"ticket/{name}.md"
+                ticket_uid = mint_ticket_uid(relpath_for_uid, created_iso)
+                sf["origin"] = "rrts"
+                sf["de_phi_status"] = "pending"
+                sf["source"] = "web"
+                sf["ticket_uid"] = ticket_uid
+                if user_name and user_name.strip():
+                    sf["reporter"] = user_name.strip()
+                rrts_filed = {
+                    "filed": True,
+                    "ticket_uid": ticket_uid,
+                    "title": name,
+                }
+
             if body:
                 wrapped_body, audit_entry = attribution.with_inferred_marker(
                     body,
@@ -3854,6 +3934,15 @@ async def _execute_tool(
                 body=body,
                 scope=active_scope,
             )
+            # RRTS-intake completion signal — record the synchronous
+            # ``{filed, ticket_uid, title}`` on the session so the
+            # ``/chat/turn`` + ``/chat/stream`` response can surface the
+            # local ticket reference (§9.7; the GitHub issue number is
+            # minted downstream ~15 min later, NOT available here). Set
+            # AFTER the create succeeds so a failed create surfaces no
+            # false "filed" signal. ``run_turn`` cleared this at turn start.
+            if rrts_filed is not None:
+                session.last_filed_ticket = rrts_filed
             # Mutation is already tracked in ``session.vault_ops`` (via
             # ``append_vault_op`` → session-record frontmatter) and in
             # ``data/vault_audit.log`` once that wiring lands. The
@@ -4236,6 +4325,7 @@ async def run_turn(
     image_blocks: list[dict[str, Any]] | None = None,
     user_role: str = _OWNER_ROLE,
     user_name: str | None = None,
+    channel: str = "telegram",
     on_event: Callable[[dict[str, Any]], Awaitable[Any]] | None = None,
 ) -> str:
     """Run one user turn through the model, handling tool_use internally.
@@ -4274,6 +4364,17 @@ async def run_turn(
     per-message: the block is rebuilt each turn because the sender can
     change between turns in a shared chat.
 
+    ``channel`` (2026-06-29, RRTS bug-report → VERA lane) is the EXPLICIT
+    arrival channel surfaced in the sender-identity block as
+    ``channel: <value>`` — ``"web"`` (the web bug widget / relay, passed by
+    the web ``/chat/*`` handlers) or ``"telegram"`` (the default, the bot
+    path). It is the in-conversation signal VERA's SKILL keys its
+    per-channel PHI rule on (web = capture PHI faithfully + hold; telegram
+    = minimize). Needed DURING the conversation — the ticket's ``origin``
+    frontmatter is set at file-time, too late to steer PHI behaviour. Only
+    surfaced when the sender block is built (multi-user instances); the
+    default keeps Telegram byte-identical.
+
     ``on_event`` (web SSE streaming, Tier 1) is an optional async callback
     fired with a small status dict at each tool invocation
     (``{"phase": "tool", "tool": <name>, "iteration": <n>}``) so a streaming
@@ -4298,6 +4399,14 @@ async def run_turn(
     ignored on every turn after open. Regression-tested in
     ``tests/telegram/test_run_turn_session_model.py``.
     """
+    # RRTS-intake completion signal — clear at the START of every turn so
+    # ``session.last_filed_ticket`` reflects THIS turn only (no cross-turn
+    # leak: a turn that files a ticket sets it in ``_execute_tool``; the
+    # next turn that files nothing leaves it empty). Telegram + owner-web
+    # chat never set it, so this is a harmless no-op there. (2026-06-29,
+    # RRTS bug-report → VERA lane.)
+    session.last_filed_ticket = {}
+
     # Append the user's message first so it's visible inside the loop.
     # Vision: when image blocks are attached we store the user turn as a
     # content-block list (image-then-text per Anthropic best-practice
@@ -4351,7 +4460,7 @@ async def run_turn(
     # turns in a shared chat); ``_build_system_blocks`` places it in the
     # uncached tail so per-message rebuilds don't churn the cache prefix.
     sender_identity_block = (
-        _build_sender_identity_text(user_name, user_role)
+        _build_sender_identity_text(user_name, user_role, channel=channel)
         if user_name
         else None
     )
@@ -4614,6 +4723,7 @@ async def run_turn(
                         session,
                         config=config,
                         user_role=user_role,
+                        user_name=user_name,
                     )
                     is_error = False
                 except asyncio.CancelledError:

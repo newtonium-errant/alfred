@@ -41,11 +41,15 @@ byte-unchanged for every instance that doesn't opt in (M1 = Salem only).
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
 from typing import Any, Callable
 
 from aiohttp import web
+
+from alfred.vault.scope import RRTS_INTAKE_ROLE
 
 from .auth import resolve_web_identity
 from .config import WebConfig, resolve_signing_secret
@@ -63,6 +67,49 @@ from .keys import (
 from .utils import get_logger
 
 log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Image-carry (2026-06-29, RRTS bug-report → VERA lane) — the §9.6 wire schema
+# ---------------------------------------------------------------------------
+#
+# A chat turn body MAY carry an optional ``images`` field so the Honeydew
+# screenshot reaches VERA's vision (text-only today). The wire schema
+# (ratified here, published to worksplit §9.6):
+#
+#     {
+#       "session_key": "...", "message": "...", "kind": "text",
+#       "images": [
+#         { "media_type": "image/png", "data": "<base64>" }
+#       ]
+#     }
+#
+# * ``images`` is OPTIONAL — absent / empty → text-only (byte-identical to
+#   the pre-feature path).
+# * Each entry: ``media_type`` ∈ ALLOWED_IMAGE_MEDIA_TYPES, ``data`` is the
+#   base64-encoded image bytes (NO ``data:`` URI prefix).
+# * Per-image decoded-size cap MAX_IMAGE_BYTES; per-turn count cap
+#   MAX_IMAGES_PER_TURN. Validation returns a 400 ``{"error":"image_invalid"}``
+#   (BEFORE the SSE stream opens, on /chat/stream).
+# * Intake-only: the image reaches VERA's vision + is persisted to VERA's
+#   own inbox (sovereign audit trail). It is NOT egressed (de-PHI/egress is
+#   out of scope for this arc).
+#
+# Anthropic's vision API accepts jpeg / png / gif / webp (per
+# telegram/vision.py::DEFAULT_TELEGRAM_PHOTO_MIME context). The Anthropic
+# Messages API caps a single base64 image at ~5 MB, so 5 MiB is the per-image
+# decoded bound; a Honeydew page screenshot is well under that.
+ALLOWED_IMAGE_MEDIA_TYPES: frozenset[str] = frozenset({
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+})
+MAX_IMAGE_BYTES: int = 5 * 1024 * 1024  # 5 MiB decoded, per image
+MAX_IMAGES_PER_TURN: int = 4
+_IMAGE_EXT_BY_MEDIA_TYPE: dict[str, str] = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +163,151 @@ async def _read_json_body(request: web.Request) -> dict[str, Any]:
     return body if isinstance(body, dict) else {}
 
 
+def _parse_image_blocks(
+    body: dict[str, Any],
+) -> tuple[list[dict[str, Any]] | None, list[tuple[str, bytes]], str | None]:
+    """Parse + validate the optional ``images`` field on a chat turn body.
+
+    Returns ``(image_blocks, raws, error)``:
+
+    * ``image_blocks`` — a list of Anthropic vision content blocks (built via
+      ``telegram.vision.build_image_block``, reused — not reinvented), or
+      ``None`` when no images were carried (text-only turn).
+    * ``raws`` — ``[(media_type, raw_bytes), ...]`` for the inbox-persist
+      pass (the sovereign audit trail). Empty when no images.
+    * ``error`` — a human-readable validation message, or ``None`` on
+      success. The handler turns a non-None error into a 400.
+
+    Validation (fail-loud, never silently drop a screenshot): ``images`` must
+    be a list; each entry a dict with a known ``media_type`` and a non-empty,
+    valid base64 ``data`` string decoding to >0 and <= MAX_IMAGE_BYTES bytes;
+    at most MAX_IMAGES_PER_TURN entries.
+    """
+    from alfred.telegram import vision
+
+    images = body.get("images")
+    if images is None:
+        return None, [], None
+    if not isinstance(images, list):
+        return None, [], "images must be a list of {media_type, data} objects"
+    if not images:
+        return None, [], None
+    if len(images) > MAX_IMAGES_PER_TURN:
+        return None, [], (
+            f"too many images ({len(images)}); max {MAX_IMAGES_PER_TURN} "
+            f"per turn"
+        )
+
+    blocks: list[dict[str, Any]] = []
+    raws: list[tuple[str, bytes]] = []
+    for i, item in enumerate(images):
+        if not isinstance(item, dict):
+            return None, [], f"images[{i}] must be an object"
+        media_type = str(item.get("media_type") or "").strip().lower()
+        if media_type not in ALLOWED_IMAGE_MEDIA_TYPES:
+            return None, [], (
+                f"images[{i}].media_type must be one of "
+                f"{sorted(ALLOWED_IMAGE_MEDIA_TYPES)}; got {media_type!r}"
+            )
+        data = item.get("data")
+        if not isinstance(data, str) or not data.strip():
+            return None, [], (
+                f"images[{i}].data must be a non-empty base64 string"
+            )
+        try:
+            # ``validate=True`` rejects non-alphabet characters (a bare
+            # ``standard_b64decode`` silently DISCARDS them — we want a
+            # malformed payload to fail loud as a 400, not decode to junk).
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return None, [], f"images[{i}].data is not valid base64"
+        if not raw:
+            return None, [], f"images[{i}].data decoded to empty bytes"
+        if len(raw) > MAX_IMAGE_BYTES:
+            return None, [], (
+                f"images[{i}] is {len(raw)} bytes; max {MAX_IMAGE_BYTES} "
+                f"({MAX_IMAGE_BYTES // (1024 * 1024)} MiB) per image"
+            )
+        blocks.append(vision.build_image_block(raw, media_type=media_type))
+        raws.append((media_type, raw))
+    return blocks, raws, None
+
+
+def _persist_web_images(
+    raws: list[tuple[str, bytes]],
+    vault_path: str,
+    *,
+    user: str,
+    session_key: str,
+) -> None:
+    """Persist carried screenshots to VERA's inbox (sovereign audit trail).
+
+    Mirrors the Telegram photo handler's best-effort inbox save (the model
+    can still see the image from in-memory bytes even if persistence fails,
+    so a save error never blocks the turn). The file_unique_id is a content
+    hash so a retransmit dedupes to the same filename. Intake-only — the
+    image is stored in VERA's own vault; it is NOT egressed.
+    """
+    from alfred.telegram import vision
+
+    for media_type, raw in raws:
+        ext = _IMAGE_EXT_BY_MEDIA_TYPE.get(media_type, "img")
+        unique_id = hashlib.sha256(raw).hexdigest()[:8]
+        try:
+            vision.save_image_to_inbox(
+                raw, vault_path, unique_id, extension=ext,
+            )
+        except Exception as exc:  # noqa: BLE001 — audit trail is best-effort
+            # Intentionally-left-blank: the decision NOT to abort the turn
+            # lives in the log (action=...) so an operator tailing the log
+            # sees the policy without re-reading source — mirrors the
+            # Telegram photo_save_failed contract.
+            log.warning(
+                "web.chat.image_save_failed",
+                user=user,
+                session_key=session_key,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                vault_path=vault_path,
+                action="continuing_to_llm_in_memory_only",
+            )
+
+
+def _validate_turn_images(
+    body: dict[str, Any],
+    talker_config: Any,
+) -> tuple[
+    list[dict[str, Any]] | None,
+    list[tuple[str, bytes]],
+    tuple[int, dict[str, str]] | None,
+]:
+    """Vision-gate + parse the optional ``images`` field for a chat turn.
+
+    Shared by ``/chat/turn`` + ``/chat/stream`` so both reject identically.
+    Returns ``(image_blocks, raws, error)`` where ``error`` is a
+    ``(status, json_payload)`` tuple on failure (the handler returns it
+    verbatim) or ``None`` on success. A vision-disabled instance that is
+    handed images fails LOUD (400) rather than silently dropping the
+    screenshot — mirrors the Telegram vision-disabled gate.
+    """
+    images_present = (
+        isinstance(body.get("images"), list) and bool(body.get("images"))
+    )
+    vision_enabled = bool(
+        getattr(getattr(talker_config, "vision", None), "enabled", True)
+    )
+    if images_present and not vision_enabled:
+        return None, [], (400, {
+            "error": "vision_disabled",
+            "detail": "this instance has vision disabled; remove the "
+                      "images field",
+        })
+    blocks, raws, err = _parse_image_blocks(body)
+    if err is not None:
+        return None, [], (400, {"error": "image_invalid", "detail": err})
+    return blocks, raws, None
+
+
 def _build_turn_payload(
     session_obj: Any,
     pre_len: int,
@@ -139,17 +331,50 @@ def _build_turn_payload(
 
     ``deduped`` is always present (default ``False``) for shape symmetry
     with the idempotency-dedup fast path.
+
+    RRTS-intake completion signal (2026-06-29, RRTS bug-report → VERA lane):
+    when THIS turn filed a ticket under the vouched ``rrts_intake`` scope,
+    ``run_turn`` recorded ``{filed, ticket_uid, title}`` on
+    ``session_obj.last_filed_ticket`` (cleared at turn start, so it reflects
+    this turn only). The extra keys are added ONLY when a ticket was filed —
+    a normal turn's payload shape is unchanged. This is the §9.7 synchronous
+    completion signal: a LOCAL ticket reference (``ticket_uid``); the GitHub
+    issue number does NOT exist at filing time (minted downstream ~15 min
+    later) and is intentionally absent here.
     """
     transcript = session_obj.transcript or []
     assistant_ts = transcript[-1].get("_ts", "") if transcript else ""
     user_ts = transcript[pre_len].get("_ts", "") if len(transcript) > pre_len else ""
-    return {
+    payload: dict[str, Any] = {
         "reply": reply,
         "session_key": session_key,
         "ts": assistant_ts,
         "user_ts": user_ts,
         "deduped": deduped,
     }
+    filed = getattr(session_obj, "last_filed_ticket", None)
+    if isinstance(filed, dict) and filed.get("ticket_uid"):
+        payload["filed"] = True
+        payload["ticket_uid"] = filed["ticket_uid"]
+        payload["title"] = filed.get("title", "")
+    return payload
+
+
+def _user_name_for(identity: Any, web_config: WebConfig) -> str | None:
+    """The display name to thread to ``run_turn`` (sender-identity block).
+
+    Threaded when the instance is multi-user (parity with the Telegram
+    ``_name_for`` path) OR when the identity is a VOUCHED RRTS reporter
+    (``RRTS_INTAKE_ROLE``) — the vouched name IS the ticket ``reporter`` and
+    MUST reach ``run_turn`` even though VERA's relay carries an empty
+    ``web.users`` roster (vouched = no fixed list, so ``len(users) > 1`` is
+    False there). On a single-user session-mode instance it stays ``None``
+    so the system blocks are byte-identical to Telegram. (2026-06-29, RRTS
+    bug-report → VERA lane.)
+    """
+    if getattr(identity, "role", "") == RRTS_INTAKE_ROLE:
+        return identity.user
+    return identity.user if len(web_config.users) > 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +541,15 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
     idempotency_key = body.get("idempotency_key")
     idempotency_key = idempotency_key if isinstance(idempotency_key, str) else ""
 
+    # Image-carry (optional) — parse + validate BEFORE run_turn so a bad
+    # screenshot is a 400, not a half-run turn. Vision-disabled instances
+    # fail loud when images are carried (mirrors the Telegram vision gate).
+    image_blocks, image_raws, image_err = _validate_turn_images(
+        body, talker_config,
+    )
+    if image_err is not None:
+        return web.json_response(image_err[1], status=image_err[0])
+
     active_dict = state_mgr.get_active(identity.synthetic_chat_id)
     if active_dict is None or active_dict.get("session_id") != session_key:
         return web.json_response({"error": "no_such_session"}, status=404)
@@ -363,10 +597,15 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
         # ``_ts`` clock ``append_turn`` writes — no new clock invented.
         pre_len = len(session_obj.transcript)
 
-        # ``user_name`` only when the instance is multi-user — parity with
-        # the Telegram ``_name_for`` path. On a single-user instance it
-        # stays None so the system blocks are byte-identical to Telegram.
-        user_name = identity.user if len(web_config.users) > 1 else None
+        user_name = _user_name_for(identity, web_config)
+
+        # Persist carried screenshots to the inbox (sovereign audit trail,
+        # best-effort) BEFORE the turn — mirrors the Telegram photo handler.
+        if image_raws:
+            _persist_web_images(
+                image_raws, talker_config.vault.path,
+                user=identity.user, session_key=session_key,
+            )
 
         try:
             reply = await run_turn(
@@ -380,6 +619,8 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
                 user_kind=kind,
                 user_role=identity.role,
                 user_name=user_name,
+                channel="web",
+                image_blocks=image_blocks,
             )
         except Exception as exc:  # noqa: BLE001 — surface engine errors as 502
             log.warning(
@@ -475,6 +716,15 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
     idempotency_key = body.get("idempotency_key")
     idempotency_key = idempotency_key if isinstance(idempotency_key, str) else ""
 
+    # Image-carry (optional) — validate BEFORE the SSE handshake so a bad
+    # screenshot is a JSON 400 (the §9.4 "validation 400/404/409 BEFORE the
+    # stream opens" contract), not a mid-stream error frame.
+    image_blocks, image_raws, image_err = _validate_turn_images(
+        body, talker_config,
+    )
+    if image_err is not None:
+        return web.json_response(image_err[1], status=image_err[0])
+
     active_dict = state_mgr.get_active(identity.synthetic_chat_id)
     if active_dict is None or active_dict.get("session_id") != session_key:
         return web.json_response({"error": "no_such_session"}, status=404)
@@ -514,7 +764,17 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
 
     # pre_len captured BEFORE the run_turn task is launched/awaited.
     pre_len = len(session_obj.transcript)
-    user_name = identity.user if len(web_config.users) > 1 else None
+    user_name = _user_name_for(identity, web_config)
+
+    # Persist carried screenshots to the inbox (sovereign audit trail,
+    # best-effort) BEFORE launching the turn task — mirrors /chat/turn +
+    # the Telegram photo handler. Skipped on a dedup HIT (run_turn never
+    # fires there; the original turn already persisted).
+    if image_raws and status != "hit":
+        _persist_web_images(
+            image_raws, talker_config.vault.path,
+            user=identity.user, session_key=session_key,
+        )
 
     # --- SSE handshake (HTTP status locks here) ----------------------------
     resp = web.StreamResponse(
@@ -575,6 +835,8 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
             user_kind=kind,
             user_role=identity.role,
             user_name=user_name,
+            channel="web",
+            image_blocks=image_blocks,
             on_event=_on_event,
         )
     )

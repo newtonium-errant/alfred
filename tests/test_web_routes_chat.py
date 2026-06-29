@@ -14,6 +14,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import frontmatter
 import pytest
 import structlog
 from aiohttp.test_utils import make_mocked_request
@@ -1266,3 +1267,415 @@ def test_register_web_routes_relay_logs_no_auth(tmp_path) -> None:
     registered = [c for c in captured if c.get("event") == "web.routes.registered"]
     assert len(registered) == 1
     assert registered[0]["mode"] == "relay"
+
+
+# ===========================================================================
+# RRTS bug-report → VERA lane (2026-06-29) — vouched intake + image-carry
+# ===========================================================================
+
+# Obviously-fake test secret (builder.md GitGuardian rule).
+DUMMY_RRTS_RELAY_TOKEN = "DUMMY_RRTS_RELAY_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_01234"
+
+# 1x1 transparent PNG (~67 bytes decoded). Smallest valid image fixture.
+TINY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDw"
+    "ADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+
+def _rrts_transport_config() -> TransportConfig:
+    """Transport config with the ``rrts_relay`` vouched peer AND a sibling
+    ``web_ingest`` peer (both ``allowed_clients: [web]``) — so the peer-pin
+    regression can prove web_ingest is still rejected on /chat/*."""
+    return TransportConfig(
+        server=ServerConfig(),
+        auth=AuthConfig(
+            tokens={
+                "rrts_relay": AuthTokenEntry(
+                    token=DUMMY_RRTS_RELAY_TOKEN,
+                    allowed_clients=["web"],
+                ),
+                "web_ingest": AuthTokenEntry(
+                    token=DUMMY_WEB_INGEST_TOKEN,
+                    allowed_clients=["web"],
+                ),
+            }
+        ),
+        state=StateConfig(),
+    )
+
+
+def _rrts_headers(name: str = "Dana Dispatcher") -> dict[str, str]:
+    """rrts_relay peer headers: bearer + X-Alfred-Client: web + asserted
+    (vouched) staff name. The name is NOT in any roster — vouched."""
+    return {
+        "Authorization": f"Bearer {DUMMY_RRTS_RELAY_TOKEN}",
+        "X-Alfred-Client": "web",
+        USER_HEADER: name,
+    }
+
+
+@pytest.fixture
+async def rrts_web_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """Transport app in relay mode with the rrts_relay peer + a fake LLM
+    scripted to file ONE ticket (tool_use vault_create → final text)."""
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_rrts_transport_config(), tstate)
+
+    state_mgr = StateManager(tmp_path / "talker_state.json")
+    state_mgr.load()
+    talker_config = _make_talker_config(tmp_path)
+    web_auth_state = WebAuthState.create(tmp_path / "web_auth_state.json")
+    web_auth_state.load()
+    fake = FakeAnthropicClient(
+        [
+            FakeResponse(
+                content=[
+                    FakeBlock(
+                        type="tool_use",
+                        id="tc1",
+                        name="vault_create",
+                        input={
+                            "type": "ticket",
+                            "name": "Portal login 500",
+                            "set_fields": {
+                                "ticket_type": "bug",
+                                "area": "Dashboard",
+                            },
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+            ),
+            FakeResponse(
+                content=[FakeBlock(type="text", text="Filed it — thanks!")]
+            ),
+        ]
+    )
+    register_web_routes(
+        app,
+        # Empty roster — the vouched rrts_relay path needs no web.users.
+        web_config=_relay_web_config(users=[]),
+        web_auth_state=web_auth_state,
+        anthropic_client=fake,
+        state_mgr=state_mgr,
+        talker_config=talker_config,
+        system_prompt_provider=lambda: "SYSTEM PROMPT",
+        vault_context_str="VAULT CONTEXT",
+        allowed_user_ids=[1],
+    )
+    app["_t_state_mgr"] = state_mgr
+    app["_t_talker_config"] = talker_config
+    return await aiohttp_client(app)
+
+
+# --- peer-pin on the live routes ------------------------------------------
+
+
+async def test_rrts_relay_drives_chat_open(rrts_web_client) -> None:
+    """The rrts_relay peer (X-Alfred-Client: web + rrts_relay token) clears
+    BOTH layers and opens a session for the vouched staff user."""
+    r = await rrts_web_client.post("/chat/open", json={}, headers=_rrts_headers())
+    assert r.status == 200
+    assert (await r.json())["session_key"]
+
+
+async def test_web_ingest_token_still_401_on_chat(rrts_web_client) -> None:
+    """Peer-pin regression: extending the pin to accept rrts_relay must NOT
+    re-open the web_ingest escalation. A valid web_ingest token + the same
+    X-Alfred-Client: web + a vouched name is still rejected on /chat/*."""
+    headers = {
+        "Authorization": f"Bearer {DUMMY_WEB_INGEST_TOKEN}",
+        "X-Alfred-Client": "web",
+        USER_HEADER: "Dana Dispatcher",
+    }
+    r = await rrts_web_client.post("/chat/open", json={}, headers=headers)
+    assert r.status == 401
+
+
+# --- vouched ticket-create + completion signal ----------------------------
+
+
+async def test_rrts_relay_files_held_ticket_with_completion_signal(
+    rrts_web_client,
+) -> None:
+    """End-to-end: the vouched relay opens a session, the LLM files a ticket
+    via vault_create, and the turn response carries the §9.7 completion
+    signal (filed + local ticket_uid + title). The ticket lands HELD with
+    origin/de_phi_status/source/reporter stamped deterministically."""
+    from datetime import date
+
+    from alfred.transport.ticket_forward import mint_ticket_uid
+
+    headers = _rrts_headers("Dana Dispatcher")
+    r = await rrts_web_client.post("/chat/open", json={}, headers=headers)
+    session_key = (await r.json())["session_key"]
+
+    r = await rrts_web_client.post(
+        "/chat/turn",
+        json={"session_key": session_key, "message": "the portal 500s on login"},
+        headers=headers,
+    )
+    assert r.status == 200
+    body = await r.json()
+
+    # Completion signal — synchronous local ticket reference (no GH issue #).
+    expected_uid = mint_ticket_uid(
+        "ticket/Portal login 500.md", date.today().isoformat(),
+    )
+    assert body["filed"] is True
+    assert body["ticket_uid"] == expected_uid
+    assert body["title"] == "Portal login 500"
+    assert "github_issue" not in body  # minted downstream, not at filing
+
+    # The held ticket landed with the deterministic stamps.
+    vault_path = Path(rrts_web_client.app["_t_talker_config"].vault.path)
+    ticket = vault_path / "ticket" / "Portal login 500.md"
+    assert ticket.exists()
+    post = frontmatter.load(str(ticket))
+    assert post.metadata["origin"] == "rrts"
+    assert post.metadata["de_phi_status"] == "pending"
+    assert post.metadata["source"] == "web"
+    assert post.metadata["reporter"] == "Dana Dispatcher"
+    assert post.metadata["ticket_uid"] == expected_uid
+
+
+async def test_normal_turn_has_no_completion_signal(web_client) -> None:
+    """A non-filing turn's payload shape is unchanged — no filed/ticket_uid
+    keys leak in (the completion signal is gated on an actual filing)."""
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={"session_key": sk, "message": "just chatting"},
+        headers=headers,
+    )
+    body = await r.json()
+    assert "filed" not in body
+    assert "ticket_uid" not in body
+
+
+# --- image-carry (the §9.6 wire schema) -----------------------------------
+
+
+async def test_chat_turn_carries_image_to_vision(web_client) -> None:
+    """A carried image becomes a vision content-block on the user turn
+    (image reaches run_turn) AND is persisted to the inbox (sovereign audit
+    trail). Session mode is used (vision works in both modes)."""
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk,
+            "message": "what's broken here?",
+            "images": [{"media_type": "image/png", "data": TINY_PNG_B64}],
+        },
+        headers=headers,
+    )
+    assert r.status == 200
+
+    state_mgr = web_client.app["_t_state_mgr"]
+    active = state_mgr.get_active(synthetic_chat_id("andrew"))
+    content = active["transcript"][0]["content"]
+    assert isinstance(content, list)
+    assert any(b.get("type") == "image" for b in content)
+
+    inbox = Path(web_client.app["_t_talker_config"].vault.path) / "inbox"
+    assert list(inbox.glob("screenshot-*")), "screenshot not persisted to inbox"
+
+
+async def test_chat_turn_without_images_stays_bare_string(web_client) -> None:
+    """Regression: no images → the user turn is a bare string (byte-identical
+    to the pre-feature path), not a content-block list."""
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    await web_client.post(
+        "/chat/turn",
+        json={"session_key": sk, "message": "no image here"},
+        headers=headers,
+    )
+    state_mgr = web_client.app["_t_state_mgr"]
+    active = state_mgr.get_active(synthetic_chat_id("andrew"))
+    assert isinstance(active["transcript"][0]["content"], str)
+
+
+async def test_chat_turn_rejects_bad_base64(web_client) -> None:
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk, "message": "hi",
+            "images": [{"media_type": "image/png", "data": "!!!notbase64!!!"}],
+        },
+        headers=headers,
+    )
+    assert r.status == 400
+    assert (await r.json())["error"] == "image_invalid"
+
+
+async def test_chat_turn_rejects_bad_media_type(web_client) -> None:
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk, "message": "hi",
+            "images": [{"media_type": "image/tiff", "data": TINY_PNG_B64}],
+        },
+        headers=headers,
+    )
+    assert r.status == 400
+    assert (await r.json())["error"] == "image_invalid"
+
+
+async def test_chat_turn_rejects_too_many_images(web_client) -> None:
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk, "message": "hi",
+            "images": [
+                {"media_type": "image/png", "data": TINY_PNG_B64}
+                for _ in range(5)
+            ],
+        },
+        headers=headers,
+    )
+    assert r.status == 400
+    assert (await r.json())["error"] == "image_invalid"
+
+
+async def test_chat_turn_rejects_oversized_image(web_client, monkeypatch) -> None:
+    monkeypatch.setattr("alfred.web.routes_chat.MAX_IMAGE_BYTES", 10)
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk, "message": "hi",
+            "images": [{"media_type": "image/png", "data": TINY_PNG_B64}],
+        },
+        headers=headers,
+    )
+    assert r.status == 400
+    assert (await r.json())["error"] == "image_invalid"
+
+
+async def test_chat_turn_image_save_failure_is_nonfatal_and_logged(
+    web_client, monkeypatch,
+) -> None:
+    """Inbox persistence is best-effort: a save failure logs (with the
+    continue-anyway action) and the turn still completes — the model still
+    saw the in-memory image. Mirrors the Telegram photo_save_failed
+    contract; pins the log emission so observability can't silently
+    degrade."""
+    def _boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "alfred.telegram.vision.save_image_to_inbox", _boom,
+    )
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    with structlog.testing.capture_logs() as captured:
+        r = await web_client.post(
+            "/chat/turn",
+            json={
+                "session_key": sk, "message": "look",
+                "images": [{"media_type": "image/png", "data": TINY_PNG_B64}],
+            },
+            headers=headers,
+        )
+    assert r.status == 200  # turn proceeds despite the save failure
+    matches = [
+        c for c in captured if c.get("event") == "web.chat.image_save_failed"
+    ]
+    assert len(matches) == 1
+    assert matches[0]["action"] == "continuing_to_llm_in_memory_only"
+
+
+async def test_chat_turn_vision_disabled_rejects_images(web_client) -> None:
+    """A vision-disabled instance handed images fails LOUD (400) rather than
+    silently dropping the screenshot."""
+    web_client.app["_t_talker_config"].vision.enabled = False
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={
+            "session_key": sk, "message": "hi",
+            "images": [{"media_type": "image/png", "data": TINY_PNG_B64}],
+        },
+        headers=headers,
+    )
+    assert r.status == 400
+    assert (await r.json())["error"] == "vision_disabled"
+
+
+async def test_chat_stream_rejects_bad_image_before_stream(web_client) -> None:
+    """On /chat/stream, image validation returns a JSON 400 BEFORE the SSE
+    stream opens (the §9.4 validation-first contract)."""
+    headers = _session_headers()
+    sk = (await (await web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    r = await web_client.post(
+        "/chat/stream",
+        json={
+            "session_key": sk, "message": "hi",
+            "images": [{"media_type": "image/png", "data": "!!!bad!!!"}],
+        },
+        headers=headers,
+    )
+    assert r.status == 400
+    assert r.content_type == "application/json"
+    assert (await r.json())["error"] == "image_invalid"
+
+
+# --- per-turn channel marker (in-conversation PHI signal) ------------------
+
+
+def test_sender_block_carries_channel_marker() -> None:
+    """The sender-identity block surfaces an EXPLICIT channel marker so
+    VERA's SKILL can key its per-channel PHI rule on a signal (not a
+    reporter-population heuristic). Pins the exact reported shape."""
+    from alfred.telegram.conversation import _build_sender_identity_text
+
+    web = _build_sender_identity_text("Dana", "rrts_intake", channel="web")
+    assert "channel: web" in web
+    assert "via the **web** channel" in web
+
+    tg = _build_sender_identity_text("Ben", "ops", channel="telegram")
+    assert "channel: telegram" in tg
+    assert "via the **telegram** channel" in tg
+
+    # Back-compat: no channel → no channel clause (byte-identical to the
+    # pre-feature block).
+    none = _build_sender_identity_text("Ben", "ops")
+    assert "channel:" not in none
+    assert "channel" not in none.lower().split("authorship")[0]
+
+
+async def test_rrts_turn_surfaces_web_channel_in_system(rrts_web_client) -> None:
+    """End-to-end: a web (rrts_relay) turn surfaces ``channel: web`` in the
+    system blocks the engine sees — the in-conversation signal, available
+    BEFORE the ticket's file-time ``origin`` is set."""
+    from alfred.web.keys import KEY_WEB_ANTHROPIC
+
+    headers = _rrts_headers()
+    sk = (await (await rrts_web_client.post("/chat/open", json={}, headers=headers)).json())["session_key"]
+    await rrts_web_client.post(
+        "/chat/turn",
+        json={"session_key": sk, "message": "the portal is broken"},
+        headers=headers,
+    )
+    fake = rrts_web_client.app[KEY_WEB_ANTHROPIC]
+    system = fake.messages.calls[0].get("system")
+    rendered = (
+        system if isinstance(system, str)
+        else " ".join(
+            b.get("text", "") for b in (system or []) if isinstance(b, dict)
+        )
+    )
+    assert "channel: web" in rendered
