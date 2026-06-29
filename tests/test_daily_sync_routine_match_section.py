@@ -112,3 +112,61 @@ def test_daily_sync_loads_routine_match_block() -> None:
     })
     assert cfg.routine_match.enabled is True
     assert cfg.routine_match.pending_path == "/x/p.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b — RoutineMatchItem display item + consume_last_batch (routing surface)
+# ---------------------------------------------------------------------------
+
+
+def test_consume_last_batch_returns_numbered_routine_match_items(tmp_path: Path) -> None:
+    """After the section renders, consume_last_batch yields RoutineMatchItems
+    carrying the GLOBAL item_number (start_index offset) + the captured-match
+    fields — the routing surface the daemon persists for reply_dispatch."""
+    p = tmp_path / "pending.jsonl"
+    _seed_pending(
+        p,
+        mc.PendingMatch(query="walk doggo", matched_to="Walk dog",
+                        record="Daily", confidence=0.40,
+                        completion_date="2026-06-28", captured_at="t1"),
+        mc.PendingMatch(query="meds", matched_to="Take meds",
+                        record="Health", confidence=0.33),
+    )
+    rms.routine_match_section(_cfg(p), date(2026, 6, 28), start_index=5)
+    batch = rms.consume_last_batch()
+    assert [i.item_number for i in batch] == [5, 6]
+    assert batch[0].query == "walk doggo"
+    assert batch[0].matched_to == "Walk dog"
+    assert batch[0].record == "Daily"
+    assert batch[0].confidence == 0.40
+    assert batch[0].completion_date == "2026-06-28"
+    # to_dict carries item_number so the dispatcher can route "item 5 confirm".
+    d = batch[0].to_dict()
+    assert d["item_number"] == 5 and d["query"] == "walk doggo"
+    # consume clears the holder.
+    assert rms.consume_last_batch() == []
+
+
+def test_routine_match_item_from_dict_schema_tolerant() -> None:
+    """from_dict drops unknown keys, defaults absent optional ones (load
+    contract) — a row written by a newer/older tool version never crashes."""
+    item = rms.RoutineMatchItem.from_dict({
+        "item_number": 3, "query": "q", "matched_to": "m", "record": "r",
+        "confidence": 0.2, "future_field": "ignored",
+    })
+    assert item.item_number == 3 and item.query == "q"
+    assert item.completion_date == "" and item.captured_at == ""
+
+
+def test_disabled_clears_holder(tmp_path: Path) -> None:
+    """Disabled → section omitted AND the batch holder cleared (no stale items
+    leak into a later fire's persist)."""
+    p = tmp_path / "pending.jsonl"
+    _seed_pending(p, mc.PendingMatch(
+        query="q", matched_to="m", record="R", confidence=0.2))
+    # First an enabled fire populates the holder…
+    rms.routine_match_section(_cfg(p), date(2026, 6, 28))
+    assert rms.peek_last_batch_count() == 1
+    # …then a disabled fire must clear it.
+    rms.routine_match_section(_cfg(p, enabled=False), date(2026, 6, 28))
+    assert rms.peek_last_batch_count() == 0

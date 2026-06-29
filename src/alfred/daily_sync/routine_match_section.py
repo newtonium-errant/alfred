@@ -20,11 +20,13 @@ intentionally-left-blank sentinel line when enabled-but-empty.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date as date_type
+from typing import Any
 
 import structlog
 
-from alfred.routine.match_calibration import PendingMatch, load_pending
+from alfred.routine.match_calibration import load_pending
 
 from . import assembler
 from .config import DailySyncConfig
@@ -35,15 +37,62 @@ log = structlog.get_logger(__name__)
 # routine-match calibration with the other review/calibration surfaces.
 _PRIORITY = 27
 
-# Module-level batch holder (mirrors friction_section / radar_section) so the
-# daemon can read the surfaced items back after the assembler runs — Phase 2
-# stashes them into ``last_batch`` for reply routing. Phase 1 populates it but
-# nothing consumes it yet (harmless).
-_LAST_BATCH_HOLDER: dict[str, list[PendingMatch]] = {"items": []}
+
+@dataclass
+class RoutineMatchItem:
+    """One Daily Sync routine-match review item (display + routing).
+
+    Mirrors :class:`alfred.daily_sync.attribution_section.AttributionItem`:
+    the underlying capture record (``PendingMatch``) is the AuditEntry-analog,
+    and this is the AttributionItem-analog — it carries the ``item_number``
+    (GLOBAL across Daily Sync sections, assigned by the section provider from
+    the assembler's ``start_index``) plus the captured-match fields, persisted
+    into ``last_batch.routine_match_items`` so the reply dispatcher can route a
+    confirm/reject to the right pending match without re-reading the capture
+    sink.
+
+    ``PendingMatch`` stays a pure capture record (no ``item_number`` — that's a
+    per-Daily-Sync-render concern); this display item carries the routing key.
+    """
+
+    item_number: int  # 1-indexed, GLOBAL across Daily Sync sections
+    query: str  # the operator's free-text completion phrase
+    matched_to: str  # the routine item text the matcher chose
+    record: str  # the routine record the item lives on
+    confidence: float  # the _match_confidence score at capture time
+    completion_date: str = ""  # the date the completion was logged for
+    captured_at: str = ""  # ISO timestamp of capture
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "item_number": self.item_number,
+            "query": self.query,
+            "matched_to": self.matched_to,
+            "record": self.record,
+            "confidence": self.confidence,
+            "completion_date": self.completion_date,
+            "captured_at": self.captured_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RoutineMatchItem":
+        """Schema-tolerant construct — filter to known fields (load contract)."""
+        known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        return cls(**known)
 
 
-def consume_last_batch() -> list[PendingMatch]:
-    """Return and clear the most recently-surfaced batch."""
+# Module-level batch holder (mirrors attribution_section / friction_section) so
+# the daemon can read the surfaced items back after the assembler runs and
+# persist them into ``last_batch`` for reply routing (Phase 2b).
+_LAST_BATCH_HOLDER: dict[str, list[RoutineMatchItem]] = {"items": []}
+
+
+def consume_last_batch() -> list[RoutineMatchItem]:
+    """Return and clear the most recently-surfaced batch.
+
+    Called by the daemon after :func:`assemble_message` so it can persist the
+    item ↔ pending-match mapping into ``last_batch.routine_match_items``.
+    """
     items = _LAST_BATCH_HOLDER.get("items", [])
     _LAST_BATCH_HOLDER["items"] = []
     return items
@@ -55,13 +104,13 @@ def peek_last_batch_count() -> int:
     return len(_LAST_BATCH_HOLDER.get("items", []))
 
 
-def _format_pending(entry: PendingMatch, item_no: int) -> str:
-    """Render one pending match as a numbered review line."""
-    record = entry.record or "?"
+def _format_item(item: RoutineMatchItem) -> str:
+    """Render one routine-match review item as a numbered line."""
+    record = item.record or "?"
     return (
-        f"{item_no}. “{entry.query}” → "
-        f"“{entry.matched_to}” "
-        f"(conf {entry.confidence:.2f}) on {record}"
+        f"{item.item_number}. “{item.query}” → "
+        f"“{item.matched_to}” "
+        f"(conf {item.confidence:.2f}) on {record}"
     )
 
 
@@ -83,9 +132,23 @@ def routine_match_section(
         return None
 
     pending = load_pending(rm.pending_path)
-    _LAST_BATCH_HOLDER["items"] = list(pending)
+    # Number the items GLOBALLY from the assembler's start_index so the reply
+    # dispatcher can route "item N confirm" against the persisted batch.
+    items = [
+        RoutineMatchItem(
+            item_number=start_index + i,
+            query=p.query,
+            matched_to=p.matched_to,
+            record=p.record,
+            confidence=p.confidence,
+            completion_date=p.completion_date,
+            captured_at=p.captured_at,
+        )
+        for i, p in enumerate(pending)
+    ]
+    _LAST_BATCH_HOLDER["items"] = items
 
-    if not pending:
+    if not items:
         # ILB: enabled but nothing to review — explicit, not silent.
         log.info(
             "routine_match.no_pending",
@@ -98,14 +161,12 @@ def routine_match_section(
 
     log.info(
         "routine_match.surfaced",
-        count=len(pending),
+        count=len(items),
         pending_path=rm.pending_path,
     )
     lines = ["Routine match review — confirm/reject these fuzzy matches:"]
-    item_no = start_index
-    for entry in pending:
-        lines.append(_format_pending(entry, item_no))
-        item_no += 1
+    for item in items:
+        lines.append(_format_item(item))
     return "\n".join(lines)
 
 
@@ -127,6 +188,7 @@ def register() -> None:
 
 
 __all__ = [
+    "RoutineMatchItem",
     "consume_last_batch",
     "peek_last_batch_count",
     "register",

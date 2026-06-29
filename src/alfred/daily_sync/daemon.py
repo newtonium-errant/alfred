@@ -131,6 +131,7 @@ def _build_state_payload(
     pending_items: list[Any] | None = None,
     radar_items: list[Any] | None = None,
     friction_items: list[Any] | None = None,
+    routine_match_items: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Construct the per-fire batch payload persisted to the state file.
 
@@ -143,8 +144,11 @@ def _build_state_payload(
     pending-items batch. ``radar_items`` (distiller-radar Phase 3b) is
     the parallel distiller-radar batch. ``friction_items`` (K3 c2) is
     the parallel KAL-LE friction-queue batch — informational items
-    today; smart-routing dispatcher hooks deferred. The reply parser
-    reads every list to resolve item numbers against a Telegram reply.
+    today; smart-routing dispatcher hooks deferred. ``routine_match_items``
+    (self-correcting matcher Phase 2b) is the parallel low-confidence
+    routine-match review batch — confirm/reject routes a verdict into the
+    learned glossary corpus. The reply parser reads every list to resolve
+    item numbers against a Telegram reply.
     """
     payload: dict[str, Any] = {
         "date": today_iso,
@@ -171,6 +175,10 @@ def _build_state_payload(
     if friction_items:
         payload["friction_items"] = [
             item.to_dict() for item in friction_items if hasattr(item, "to_dict")
+        ]
+    if routine_match_items:
+        payload["routine_match_items"] = [
+            item.to_dict() for item in routine_match_items if hasattr(item, "to_dict")
         ]
     return payload
 
@@ -283,6 +291,7 @@ async def fire_once(
     radar_items = radar_section.consume_last_batch()
     friction_items = friction_section.consume_last_batch()
     triage_items = triage_section.consume_last_batch()
+    routine_match_items = routine_match_section.consume_last_batch()
 
     log.info(
         "daily_sync.assembled",
@@ -294,6 +303,7 @@ async def fire_once(
         radar_items_count=len(radar_items),
         friction_items_count=len(friction_items),
         triage_items_count=len(triage_items),
+        routine_match_items_count=len(routine_match_items),
         body_length=len(body),
         manual=manual,
         dedupe_key=dedupe_key,
@@ -313,6 +323,7 @@ async def fire_once(
     if (
         items or attribution_items or proposal_items
         or pending_items or radar_items or friction_items
+        or routine_match_items
     ) and message_ids:
         state["last_batch"] = _build_state_payload(
             today_iso,
@@ -323,6 +334,7 @@ async def fire_once(
             pending_items=pending_items,
             radar_items=radar_items,
             friction_items=friction_items,
+            routine_match_items=routine_match_items,
         )
     state["last_fired_date"] = today_iso
     # Clear-on-success: reaching this save point means the fire
@@ -341,6 +353,7 @@ async def fire_once(
         "pending_items_count": len(pending_items),
         "radar_items_count": len(radar_items),
         "friction_items_count": len(friction_items),
+        "routine_match_items_count": len(routine_match_items),
         "message_ids": message_ids,
         "body": body,
         "dedupe_key": dedupe_key,

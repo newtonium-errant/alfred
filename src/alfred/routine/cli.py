@@ -890,7 +890,19 @@ def cmd_done(
         # observability, the completion is the operator's actual intent).
         # Captured with the ORIGINAL query (``item_text`` here, before the
         # canonicalise reassignment below).
-        if confidence < config.match_calibration.threshold:
+        #
+        # Phase 2b loop-closer: skip re-capture when the operator has ALREADY
+        # ruled on this (query_key, item) pair — a confirm verdict in the
+        # glossary promoted this match, so re-surfacing it for review every
+        # completion would be review-queue noise. (A reject verdict can't reach
+        # the success path — it would have excluded the item from ``matches`` —
+        # so the only reachable verdict here is confirm.)
+        _already_ruled = (
+            not _glossary.is_empty()
+            and _glossary.verdict(_mc.query_key(item_text), chosen.item_text)
+            is not None
+        )
+        if confidence < config.match_calibration.threshold and not _already_ruled:
             try:
                 from datetime import datetime, timezone
 

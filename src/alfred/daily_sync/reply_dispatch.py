@@ -37,6 +37,13 @@ from typing import Any
 import frontmatter
 import structlog
 
+from alfred.routine.match_calibration import (
+    CORPUS_CONFIRM,
+    CORPUS_REJECT,
+    MatchCorpusEntry,
+    append_corpus,
+    query_key,
+)
 from alfred.vault.attribution import (
     confirm_marker,
     parse_audit_entries,
@@ -115,6 +122,22 @@ def _last_batch_pending_items(config: DailySyncConfig) -> list[dict[str, Any]]:
     state = load_state(config.state.path)
     batch = state.get("last_batch") or {}
     items = batch.get("pending_items") or []
+    return [i for i in items if isinstance(i, dict)]
+
+
+def _last_batch_routine_match_items(config: DailySyncConfig) -> list[dict[str, Any]]:
+    """Return the routine-match review items the daemon stashed at fire time.
+
+    Each item carries ``item_number``, ``query``, ``matched_to``,
+    ``record``, ``confidence`` (+ ``completion_date`` / ``captured_at``).
+    Empty list when the most recent fire had no low-confidence routine
+    matches. The reply dispatcher routes a ``confirm`` / ``reject`` verb
+    against whichever items list claims the item_number; for routine-match
+    items the verdict appends a row to the learned-glossary corpus.
+    """
+    state = load_state(config.state.path)
+    batch = state.get("last_batch") or {}
+    items = batch.get("routine_match_items") or []
     return [i for i in items if isinstance(i, dict)]
 
 
@@ -490,9 +513,129 @@ def _canonical_proposals_queue_path(
     return path or None
 
 
+def _routine_match_corpus_path(
+    config: DailySyncConfig | None = None,
+) -> str | None:
+    """Return the learned-glossary corpus path from the routine config.
+
+    The corpus the routine matcher consults lives at
+    ``routine.match_calibration.corpus_path``. The dispatcher MUST write
+    operator verdicts to that SAME file (the matcher reads it), so we
+    resolve it from the routine config rather than duplicating the path
+    into the daily_sync config (which would risk an operator-override
+    drift: matcher reads the override, dispatcher writes the default).
+
+    Threads ``config.config_path`` so a per-instance daily_sync daemon
+    reads ITS OWN config file. ``config=None`` / ``config.config_path is
+    None`` fall back to ``"config.yaml"`` for backward compat with test
+    fixtures that don't thread the path. Returns ``None`` when the config
+    can't be resolved — the dispatcher then buckets a routine-match
+    confirm/reject as an execution failure (corpus not writable) rather
+    than silently dropping the verdict. Mirrors
+    :func:`_canonical_proposals_queue_path`.
+    """
+    config_path = "config.yaml"
+    if config is not None and config.config_path:
+        config_path = config.config_path
+    try:
+        import yaml as _yaml
+
+        from alfred.routine.config import load_from_unified as _load_routine
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = _yaml.safe_load(f) or {}
+        routine_config = _load_routine(raw)
+    except Exception as exc:  # noqa: BLE001
+        log.info(
+            "daily_sync.routine_match.config_unavailable",
+            error=str(exc),
+        )
+        return None
+    return routine_config.match_calibration.corpus_path or None
+
+
 def _now_iso() -> str:
     """Wall-clock ISO-8601 UTC. Wrapped so tests can monkeypatch."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_routine_match_correction(
+    correction: ReplyCorrection,
+    item: dict[str, Any],
+    corpus_path: str,
+) -> tuple[str | None, bool]:
+    """Apply one routine-match confirm/reject (self-correcting matcher Phase 2b).
+
+    Returns ``(error_str_or_None, did_write)``.
+
+    On confirm: append a :data:`CORPUS_CONFIRM` row to the learned-glossary
+    corpus keyed by ``query_key(query)`` → the matched item. The matcher
+    consults this on its next vault-wide scan, promoting the operator's
+    idiosyncratic phrasing to a fast-path TRUE.
+
+    On reject: append a :data:`CORPUS_REJECT` row, short-circuiting the
+    matcher to FALSE for that ``(query_key, item)`` pair so the recurring
+    false-positive stops firing.
+
+    Modifier / tier verbs make no sense on a routine-match item (they only
+    apply to email calibration) — bucketed as an "only accept" unparsed
+    string so the dispatcher shows the verb-mismatch hint.
+
+    GUARDRAIL (no-silent-mutation): this is the ONLY path that writes the
+    corpus. The match/capture path (``routine.cli.cmd_done``) writes ONLY
+    the pending sink, never the corpus. The corpus is operator-reply-only.
+    """
+    if not (correction.ok or correction.reject):
+        return (
+            f"item {correction.item_number}: routine matches only "
+            f"accept `confirm`/`keep`/`yes` or `reject`/`delete`/`no`",
+            False,
+        )
+
+    query = str(item.get("query") or "")
+    matched_to = str(item.get("matched_to") or "")
+    record = str(item.get("record") or "")
+    try:
+        confidence = float(item.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    if not query or not matched_to:
+        return (
+            f"item {correction.item_number} routine-match metadata missing",
+            False,
+        )
+
+    entry_type = CORPUS_REJECT if correction.reject else CORPUS_CONFIRM
+    try:
+        append_corpus(
+            corpus_path,
+            MatchCorpusEntry(
+                type=entry_type,
+                query_key=query_key(query),
+                item_text=matched_to,
+                record=record,
+                confidence_at_capture=confidence,
+                action_at=_now_iso(),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "daily_sync.routine_match.corpus_write_failed",
+            query=query,
+            matched_to=matched_to,
+            error=str(exc),
+        )
+        return (f"item {correction.item_number}: corpus write failed", False)
+
+    log.info(
+        "daily_sync.routine_match.verdict_recorded",
+        item_number=correction.item_number,
+        verdict="reject" if correction.reject else "confirm",
+        query=query,
+        matched_to=matched_to,
+    )
+    return (None, True)
 
 
 def _resolve_attribution_correction(
@@ -1654,6 +1797,32 @@ def _format_attribution_applied_line(
     return f"Item {item_number}: {agent} marker in {record_path} — {verb}"
 
 
+def _format_routine_match_applied_line(
+    item: dict[str, Any],
+    *,
+    action: str,
+) -> str:
+    """Return a one-liner describing a routine-match confirm/reject.
+
+    Format::
+
+        "Item N: \"walk doggo\" → \"Walk dog\" — confirmed (learned)"
+        "Item N: \"walk doggo\" → \"Walk dog\" — rejected (won't match)"
+    """
+    item_number = item.get("item_number") or "?"
+    query = str(item.get("query") or "").strip() or "(unknown)"
+    matched_to = str(item.get("matched_to") or "").strip() or "(unknown)"
+    if action == "reject":
+        return (
+            f"Item {item_number}: \"{query}\" → \"{matched_to}\" "
+            f"— rejected (won't match)"
+        )
+    return (
+        f"Item {item_number}: \"{query}\" → \"{matched_to}\" "
+        f"— confirmed (learned)"
+    )
+
+
 # Verb-mismatch markers — substrings the resolvers (and the dispatch
 # loop's pre-resolver gates) emit when Andrew's verb doesn't match
 # what the item type accepts. Used by :func:`_is_verb_mismatch_error`
@@ -1701,6 +1870,7 @@ def _compose_calibration_hint(
     has_attribution: bool,
     has_proposal: bool,
     has_pending: bool,
+    has_routine_match: bool = False,
 ) -> str:
     """Build the "Tip: ..." hint based on which item types are in the batch.
 
@@ -1725,7 +1895,7 @@ def _compose_calibration_hint(
     suggest). Falls through cleanly without a stray "Tip:" prefix.
     """
     verbs: list[str] = []
-    if has_attribution or has_proposal:
+    if has_attribution or has_proposal or has_routine_match:
         verbs.append("'N confirm' / 'N reject'")
     if has_pending:
         verbs.append("'N noted' / 'N show me'")
@@ -2100,6 +2270,10 @@ def handle_daily_sync_reply(
     pending_by_num = {
         int(i.get("item_number", 0)): i for i in pending_items
     }
+    routine_match_items = _last_batch_routine_match_items(config)
+    routine_match_by_num = {
+        int(i.get("item_number", 0)): i for i in routine_match_items
+    }
 
     parsed: ReplyParseResult = parse_reply(reply_text)
 
@@ -2108,6 +2282,7 @@ def handle_daily_sync_reply(
     attribution_written = 0
     proposal_written = 0  # propose-person c2
     pending_written = 0  # Pending Items Queue Phase 1
+    routine_match_written = 0  # self-correcting matcher Phase 2b — glossary verdicts
     applied_lines: list[str] = []  # c3 — one per-item summary line per accepted correction
     errors: list[str] = list(parsed.unparsed)
     unparsed_item_numbers: list[int] = []  # c3 — numeric IDs of items that hit a verb/shape mismatch
@@ -2115,6 +2290,9 @@ def handle_daily_sync_reply(
     corpus_path = _attribution_corpus_path(config)
     proposals_queue_path = (
         _canonical_proposals_queue_path(config) if proposal_items else None
+    )
+    routine_match_corpus_path = (
+        _routine_match_corpus_path(config) if routine_match_items else None
     )
 
     def _bucket_resolver_error(item_number: int, err: str) -> None:
@@ -2265,6 +2443,40 @@ def handle_daily_sync_reply(
                             item, resolution_id="noted", summary=summary,
                         )
                     )
+        # Self-correcting matcher Phase 2b — ✅ confirms every low-confidence
+        # routine match in one shot (each was a CORRECT fuzzy match, so the
+        # operator-approved verdict promotes all of them to the glossary).
+        # Reject is never an all_ok action.
+        if routine_match_items:
+            if routine_match_corpus_path is None:
+                for item in routine_match_items:
+                    try:
+                        item_num = int(item.get("item_number", 0))
+                    except (TypeError, ValueError):
+                        item_num = 0
+                    _bucket_resolver_error(
+                        item_num,
+                        f"item {item.get('item_number')}: routine-match "
+                        f"corpus not configured",
+                    )
+            else:
+                for item in routine_match_items:
+                    synthetic = ReplyCorrection(
+                        item_number=int(item.get("item_number", 0)),
+                        ok=True,
+                    )
+                    err, did_write = _resolve_routine_match_correction(
+                        synthetic, item, routine_match_corpus_path,
+                    )
+                    if err is not None:
+                        _bucket_resolver_error(synthetic.item_number, err)
+                    elif did_write:
+                        routine_match_written += 1
+                        applied_lines.append(
+                            _format_routine_match_applied_line(
+                                item, action="confirm",
+                            )
+                        )
 
     else:
         for correction in parsed.corrections:
@@ -2272,6 +2484,7 @@ def handle_daily_sync_reply(
             attribution_item = attribution_by_num.get(correction.item_number)
             proposal_item = proposal_by_num.get(correction.item_number)
             pending_item = pending_by_num.get(correction.item_number)
+            routine_match_item = routine_match_by_num.get(correction.item_number)
 
             if email_item is not None:
                 # Reject verb makes no sense on an email item.
@@ -2390,9 +2603,36 @@ def handle_daily_sync_reply(
                             summary=summary,
                         )
                     )
+            elif routine_match_item is not None:
+                # Self-correcting matcher Phase 2b — confirm/reject a
+                # low-confidence routine match. Confirm promotes the
+                # phrasing in the glossary; reject suppresses the
+                # recurring false-positive. Both write the corpus (the
+                # ONLY corpus-write path — capture writes pending only).
+                if routine_match_corpus_path is None:
+                    _bucket_resolver_error(
+                        correction.item_number,
+                        f"item {correction.item_number}: routine-match "
+                        f"corpus not configured",
+                    )
+                    continue
+                err, did_write = _resolve_routine_match_correction(
+                    correction, routine_match_item, routine_match_corpus_path,
+                )
+                if err is not None:
+                    _bucket_resolver_error(correction.item_number, err)
+                    continue
+                if did_write:
+                    routine_match_written += 1
+                    applied_lines.append(
+                        _format_routine_match_applied_line(
+                            routine_match_item,
+                            action="reject" if correction.reject else "confirm",
+                        )
+                    )
             else:
-                # No matching item in any of the four batch maps. This
-                # is parse-stage "wrong number" — the user typed an item
+                # No matching item in any of the batch maps. This is
+                # parse-stage "wrong number" — the user typed an item
                 # number that wasn't in the batch. Belongs to
                 # ``unparsed_item_numbers`` (gets the calibration hint),
                 # NOT execution_errors. The error string lacks one of
@@ -2403,7 +2643,8 @@ def handle_daily_sync_reply(
                 unparsed_item_numbers.append(correction.item_number)
 
     written_count = (
-        email_written + attribution_written + proposal_written + pending_written
+        email_written + attribution_written + proposal_written
+        + pending_written + routine_match_written
     )
     # 2026-05-18 — N (items corrected) vs M (corpus rows written). When
     # an email correction lands on a c5 cluster of size K > 1, the corpus
@@ -2417,6 +2658,7 @@ def handle_daily_sync_reply(
         + attribution_written
         + proposal_written
         + pending_written
+        + routine_match_written
     )
 
     # c3 — user-facing body. Per-item summary lines go in (capped at 5
@@ -2430,6 +2672,7 @@ def handle_daily_sync_reply(
         has_attribution=bool(attribution_items),
         has_proposal=bool(proposal_items),
         has_pending=bool(pending_items),
+        has_routine_match=bool(routine_match_items),
     )
     body = _build_confirmation_body(
         parsed_all_ok=parsed.all_ok,
@@ -2451,6 +2694,7 @@ def handle_daily_sync_reply(
         attribution_written=attribution_written,
         proposal_written=proposal_written,
         pending_written=pending_written,
+        routine_match_written=routine_match_written,
         corrections_count=corrections_count,
         written_count=written_count,
         unparsed=len(errors),
@@ -2485,6 +2729,7 @@ def handle_daily_sync_reply(
         "attribution_count": attribution_written,
         "proposal_count": proposal_written,
         "pending_count": pending_written,
+        "routine_match_count": routine_match_written,
         "unparsed": errors,
         # 2026-05-16 — NOTE-1 closeout. ``unparsed`` is a mixed bucket
         # (both parse-shape failures and execution failures) for
