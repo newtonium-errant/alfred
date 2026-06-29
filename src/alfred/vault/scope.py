@@ -886,6 +886,49 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "allow_body_insert_at": {},
         "allow_body_replace": {},
     },
+    # ``rrts_intake`` — the VOUCHED RRTS bug-report intake scope
+    # (2026-06-29, RRTS bug-report → VERA lane). RRTS staff converse with
+    # VERA through the web bug widget → a host-side relay (the
+    # ``rrts_relay`` peer) → VERA's ``/chat/*`` endpoints. The relay has
+    # already JWT-verified the staff user, so VERA trusts the asserted
+    # ``X-Alfred-User`` as ``reporter`` PROVENANCE (never authz — every
+    # ``rrts_relay`` request resolves to THIS fixed scope regardless of the
+    # asserted name; see ``web/auth.py::_resolve_relay_identity`` +
+    # ``telegram/conversation.py::resolve_scope``).
+    #
+    # Scope shape (scope-first matrix, the principal artifact):
+    #   * read/search/list/context = True — VERA needs to read the vault to
+    #     run the bug-vs-enhancement interview + screenshot reference.
+    #   * create = ``rrts_intake_ticket_only`` → RRTS_INTAKE_CREATE_TYPES
+    #     {ticket}. ONLY tickets; anything else fails loud at gate 2.
+    #     Fail-CLOSED on an empty record_type.
+    #   * edit / move / delete = DENIED — intake is create-once. The ticket
+    #     is filed HELD (origin: rrts, de_phi_status: pending) and the
+    #     reporter cannot subsequently mutate, relocate, or destroy it.
+    #   * allow_body_writes = True — the Claude-Code handoff brief body IS
+    #     the payload (same as the vera / vera_ops create posture).
+    #   * body_insert_at / body_replace = {} (deny-all) — intake never
+    #     patches or rewrites an existing body; it files a new held ticket.
+    #
+    # 🔒 LOAD-BEARING: every ticket this scope files is stamped held
+    # (``de_phi_status: pending``) by the create path, and the forward
+    # guard (``transport/ticket_forward.scan_tickets``) refuses to forward
+    # any ``origin: rrts`` ticket until ``de_phi_status == "cleared"`` —
+    # which NOTHING in this arc sets. RRTS-origin tickets are therefore
+    # permanently held until the (separate) de-PHI arc ships.
+    "rrts_intake": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": "rrts_intake_ticket_only",
+        "edit": False,
+        "move": False,
+        "delete": False,
+        "allow_body_writes": True,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
 }
 
 
@@ -1384,6 +1427,34 @@ CANONICAL_RECORD_TYPES: set[str] = {
 WEB_INGEST_CREATE_TYPES: set[str] = {"document", "note", "source"}
 
 
+# --- RRTS bug-report intake (2026-06-29) ----------------------------------
+#
+# The VOUCHED RRTS bug-report → VERA lane. RRTS staff reach VERA through the
+# web bug widget → a host-side relay (the ``rrts_relay`` transport peer) →
+# VERA's ``/chat/*`` endpoints. Three identifiers tie the lane together:
+#
+#   * ``RRTS_INTAKE_SCOPE`` — the fixed vault scope every ``rrts_relay``
+#     request resolves to (create tickets ONLY, all held). The asserted
+#     reporter name NEVER widens it.
+#   * ``RRTS_INTAKE_ROLE`` — the synthetic ROLE the web relay assigns a
+#     vouched RRTS reporter (see ``web/auth.py::_resolve_relay_identity``).
+#     It is NOT a config role (owner/ops) — it's an auth-path sentinel that
+#     ``telegram/conversation.py::resolve_scope`` maps to RRTS_INTAKE_SCOPE,
+#     name- and tool_set-independent. Kept identical to the scope string for
+#     simplicity (the role IS "I am an rrts-intake reporter").
+#   * ``RRTS_INTAKE_CREATE_TYPES`` — the create allowlist for the scope
+#     (gate 2). ``ticket`` ONLY; the ``rrts_intake_ticket_only`` gate fails
+#     loud on any other type AND fail-CLOSED on an empty type.
+#
+# Keep RRTS_INTAKE_CREATE_TYPES in sync with the ``available_in_scopes``
+# ``rrts_intake`` tag on the ``ticket`` TypeDefinition in schema.py (gate 1).
+# Contract-pinned in tests/test_rrts_intake_scope.py — widening the set is a
+# deliberate matrix change; update the pin in the same commit.
+RRTS_INTAKE_SCOPE: str = "rrts_intake"
+RRTS_INTAKE_ROLE: str = "rrts_intake"
+RRTS_INTAKE_CREATE_TYPES: set[str] = {"ticket"}
+
+
 # Per-scope hint mapping: when a peer instance attempts vault_create on
 # a canonical type, the error message points at the right propose tool.
 # Salem (talker scope) is the canonical owner — it creates these types
@@ -1728,6 +1799,32 @@ def check_scope(
                 f"Scope '{scope}' can only create web-ingest types "
                 f"({', '.join(sorted(WEB_INGEST_CREATE_TYPES))}). "
                 f"Got: '{record_type}'."
+            )
+        return
+
+    if permission == "rrts_intake_ticket_only":
+        # VOUCHED RRTS bug-report intake create gate (2026-06-29). The
+        # allowlist is RRTS_INTAKE_CREATE_TYPES {ticket} — the only thing
+        # the rrts_relay-driven vouched scope may do. NO canonical-type
+        # propose hint (VERA owns its own tickets; there's no peer Salem to
+        # propose to). Fail-CLOSED on an empty record_type (mirrors the
+        # type-restricted gates' posture): an empty value is a caller bug,
+        # not a licence to create any type. Every ticket created here is
+        # stamped held by the create path — see
+        # ``telegram/conversation.py`` vault_create branch + the forward
+        # guard in ``transport/ticket_forward.scan_tickets``.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'rrts_intake_ticket_only' is "
+                f"type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass record_type."
+            )
+        if record_type not in RRTS_INTAKE_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create rrts-intake types "
+                f"({', '.join(sorted(RRTS_INTAKE_CREATE_TYPES))}). "
+                f"Got: '{record_type}'. The vouched RRTS intake scope "
+                f"files held tickets only; it cannot create any other type."
             )
         return
 

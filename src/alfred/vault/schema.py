@@ -510,6 +510,19 @@ _DEFINITIONS: list[TypeDefinition] = [
     # ``is_leaf=True`` — tickets are terminal: nothing in the VERA vault
     # links INTO a ticket, so zero inbound wikilinks is the norm, not an
     # ORPHAN001 defect (same reasoning as note / run / the learning types).
+    #
+    # Held-state fields (2026-06-29, RRTS bug-report → VERA lane) —
+    # ``origin`` (e.g. ``"rrts"`` / ``"telegram"``) + ``de_phi_status``
+    # (``"pending"`` default for rrts-origin, ``"cleared"`` set later by the
+    # separate de-PHI arc, ``"n/a"`` for telegram-origin zero-PHI tickets)
+    # are OPTIONAL free-text frontmatter (NOT in required_fields, NOT
+    # status-gated). Schema-tolerance is automatic: they're plain
+    # frontmatter, so a ticket WITHOUT them loads + validates exactly as
+    # before (the forward guard reads them via ``fm.get(...)`` with a
+    # default-deny on rrts-origin). 🔒 The forward guard
+    # (``transport/ticket_forward.scan_tickets``) EXCLUDES any
+    # ``origin: rrts`` ticket whose ``de_phi_status != "cleared"`` — the
+    # held-state interlock. Nothing in this arc sets ``cleared``.
     TypeDefinition(
         name="ticket",
         directory="ticket",
@@ -528,6 +541,13 @@ _DEFINITIONS: list[TypeDefinition] = [
             # reaches the scope gate. See
             # scope.py::VERA_TICKET_OUTCOME_EDIT_FIELDS.
             "vera_ticket_outcome",
+            # ``rrts_intake`` (2026-06-29, RRTS bug-report → VERA lane) —
+            # the vouched web-relay intake scope files held tickets. Gate 1
+            # must admit ``ticket`` under this scope or vault_create is
+            # rejected as "Unknown type under scope 'rrts_intake'" before
+            # the scope gate (``rrts_intake_ticket_only``) ever runs. See
+            # scope.py::RRTS_INTAKE_CREATE_TYPES.
+            "rrts_intake",
         }),
         is_leaf=True,
     ),
