@@ -228,10 +228,10 @@ def resolve_signing_secret(auth: WebAuthConfig) -> str:
     sign/verify; (2) ``register_web_routes``' startup guard; and (3) the
     talker daemon's web-wiring boot check (``daemon.py``), gated on
     ``web.enabled``. Sites (2)+(3) mean an enabled-but-unconfigured instance
-    fails to MOUNT the web surface at startup (fail-closed — loud
-    ``web_secret_unconfigured`` error), rather than booting clean and dying
-    at first login. Web is opt-in, so the core talker daemon stays up — the
-    misconfig disables only the web surface.
+    refuses to mount the web surface at startup (fail-closed — loud
+    ``web_secret_unconfigured`` error; the talker daemon continues serving
+    Telegram/transport), rather than booting clean and dying at first login.
+    Web is opt-in — the misconfig disables only the web surface.
     """
     secret = auth.session_secret or ""
     if _is_unresolved(secret):
