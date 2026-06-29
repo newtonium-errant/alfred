@@ -223,9 +223,15 @@ def resolve_signing_secret(auth: WebAuthConfig) -> str:
     the only safe behaviour — this is the load-bearing reason the WARN fix
     migrated to the coalesce-to-literal env semantics.
 
-    Called by the auth token codec (Sub-arc B) before any sign/verify, and
-    by the daemon's web wiring so an enabled-but-unconfigured instance
-    refuses to start rather than serving forgeable sessions.
+    Actual call sites (kept honest — comment-lies-about-behavior class):
+    (1) ``require_web_session`` / the auth token codec, before any
+    sign/verify; (2) ``register_web_routes``' startup guard; and (3) the
+    talker daemon's web-wiring boot check (``daemon.py``), gated on
+    ``web.enabled``. Sites (2)+(3) mean an enabled-but-unconfigured instance
+    fails to MOUNT the web surface at startup (fail-closed — loud
+    ``web_secret_unconfigured`` error), rather than booting clean and dying
+    at first login. Web is opt-in, so the core talker daemon stays up — the
+    misconfig disables only the web surface.
     """
     secret = auth.session_secret or ""
     if _is_unresolved(secret):
