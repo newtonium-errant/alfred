@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { loginBodySchema } from '../../../lib/algernon/schemas';
-import { TransportConfigError, callTransport } from '../../../lib/algernon/transport';
+import { callTransport } from '../../../lib/algernon/transport';
+import { sendTransportError } from '../../../lib/algernon/bffError';
 
 // POST /api/auth/login {email} → relays to transport POST /auth/login, which
 // sends the magic-link email (Resend). The backend's response is UNIFORM
@@ -24,11 +25,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
     return res.status(status).json(body ?? {});
   } catch (e) {
-    if (e instanceof TransportConfigError) {
-      return res.status(500).json({ error: 'transport_misconfigured', detail: e.message });
-    }
-    return res
-      .status(502)
-      .json({ error: 'transport_unreachable', detail: (e as Error).message });
+    return sendTransportError(res, 'auth/login', e);
   }
 }

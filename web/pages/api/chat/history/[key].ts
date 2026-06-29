@@ -1,7 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { resolveSessionToken } from '../../../../lib/algernon/identity';
 import { sessionKeySchema } from '../../../../lib/algernon/schemas';
-import { TransportConfigError, callTransport } from '../../../../lib/algernon/transport';
+import { callTransport } from '../../../../lib/algernon/transport';
+import { sendTransportError } from '../../../../lib/algernon/bffError';
 
 // GET /api/chat/history/{key} → relays to transport GET /chat/history/{key}.
 // Returns the current active session's transcript (flattened to {role,text,ts}).
@@ -30,11 +31,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     );
     return res.status(status).json(body ?? { turns: [] });
   } catch (e) {
-    if (e instanceof TransportConfigError) {
-      return res.status(500).json({ error: 'transport_misconfigured', detail: e.message });
-    }
-    return res
-      .status(502)
-      .json({ error: 'transport_unreachable', detail: (e as Error).message });
+    return sendTransportError(res, 'chat/history', e);
   }
 }

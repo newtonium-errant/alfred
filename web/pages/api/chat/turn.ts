@@ -2,7 +2,8 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import type { ZodIssue } from 'zod';
 import { resolveSessionToken } from '../../../lib/algernon/identity';
 import { chatTurnBodySchema } from '../../../lib/algernon/schemas';
-import { TransportConfigError, callTransport } from '../../../lib/algernon/transport';
+import { callTransport } from '../../../lib/algernon/transport';
+import { sendTransportError } from '../../../lib/algernon/bffError';
 
 // POST /api/chat/turn → validates the body (zod, the trust boundary) then relays
 // to transport POST /chat/turn, which runs one turn through `run_turn`.
@@ -40,11 +41,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     });
     return res.status(status).json(body ?? {});
   } catch (e) {
-    if (e instanceof TransportConfigError) {
-      return res.status(500).json({ error: 'transport_misconfigured', detail: e.message });
-    }
-    return res
-      .status(502)
-      .json({ error: 'transport_unreachable', detail: (e as Error).message });
+    return sendTransportError(res, 'chat/turn', e);
   }
 }
