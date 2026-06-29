@@ -4,7 +4,7 @@ These routes mount on the EXISTING transport aiohttp app (inside the
 talker daemon). They build the exact same args the Telegram caller builds
 (``bot.py``'s ``run_turn`` call site) and ``await run_turn(...)`` — so the
 engine behaviour is byte-identical to Telegram: same scope-enforced vault
-bridge, same system blocks, same tool loop.
+bridge, same system blocks, same tool loop. Non-streaming.
 
 Route surface (M1, non-streaming):
 
@@ -12,12 +12,20 @@ Route surface (M1, non-streaming):
     POST /chat/turn                  → { reply, session_key }
     GET  /chat/history/{session_key} → { turns: [...] }
 
-Auth layering: every non-``/health`` route is already gated by the
-transport ``auth_middleware`` (Layer 1, peer token — "this front-end may
-talk to me"). Sub-arc A resolves the *user* identity from a client-supplied
-name (spoofable — curl/local-only, never public). Sub-arc B replaces
-``_resolve_request_identity`` with ``require_web_session`` (Layer 2, an
-instance-signed session token) without touching the rest of this module.
+Auth layering: every non-``/health`` route is gated by the transport
+``auth_middleware`` (Layer 1, peer token — "this front-end may talk to
+me"). Sub-arc B adds Layer 2: each ``/chat/*`` handler resolves the
+*verified named user* via :func:`alfred.web.auth.require_web_session` (an
+instance-signed ``X-Alfred-Session`` token), fail-closed 401.
+
+M1 deferral (NOTE-1): web turns do NOT inject ``calibration_str`` /
+``pushback_level`` — those are populated by the Telegram session-type
+router at open (``_calibration_snapshot`` / ``_pushback_level`` on the
+active dict), which is out of M1 scope, and calibration is keyed to a
+per-user person-record path that ``web.users`` don't carry. Web chat thus
+lacks operator voice-calibration + challenge-tuning until a later
+milestone — flagged so the capability audit doesn't claim parity it
+doesn't have.
 
 Opt-in inertness: :func:`register_web_routes` mounts NOTHING when the
 ``web`` config is absent / disabled — the transport server stays
@@ -30,31 +38,21 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from .config import WebConfig
-from .identity import (
-    WebIdentity,
-    check_synthetic_id_collisions,
-    resolve_identity_from_name,
+from .auth import require_web_session
+from .config import WebConfig, resolve_signing_secret
+from .identity import check_synthetic_id_collisions
+from .keys import (
+    KEY_WEB_ANTHROPIC,
+    KEY_WEB_AUTH_STATE,
+    KEY_WEB_CONFIG,
+    KEY_WEB_STATE_MGR,
+    KEY_WEB_SYSTEM_PROVIDER,
+    KEY_WEB_TALKER_CONFIG,
+    KEY_WEB_VAULT_CTX,
 )
 from .utils import get_logger
 
 log = get_logger(__name__)
-
-
-# Application storage keys — namespaced so they never collide with the
-# transport's own ``transport.*`` keys on the shared Application.
-_KEY_WEB_CONFIG = "web.config"
-_KEY_WEB_ANTHROPIC = "web.anthropic_client"
-_KEY_WEB_STATE_MGR = "web.state_mgr"
-_KEY_WEB_TALKER_CONFIG = "web.talker_config"
-_KEY_WEB_SYSTEM_PROVIDER = "web.system_prompt_provider"
-_KEY_WEB_VAULT_CTX = "web.vault_context_str"
-
-# Sub-arc A identity header (spoofable, peer-gated, curl/local-only). The
-# body ``user`` field is preferred for POSTs; this header is the fallback
-# that also works for the GET history route. Replaced by an instance-signed
-# session token (``X-Alfred-Session``) in Sub-arc B.
-_HEADER_WEB_USER = "X-Web-User"
 
 
 # ---------------------------------------------------------------------------
@@ -99,30 +97,6 @@ def _flatten_transcript_for_web(
     return out
 
 
-def _resolve_request_identity(
-    request: web.Request,
-    web_config: WebConfig,
-    body: dict[str, Any] | None,
-) -> WebIdentity | None:
-    """Resolve the driving user for this request (Sub-arc A path).
-
-    Identity comes from (in order) the request body ``user`` field, the
-    ``?user=`` query param, or the ``X-Web-User`` header — whichever is
-    present. All three are client-supplied and spoofable; this path is
-    peer-gated and curl/local-only until Sub-arc B's signed session token
-    replaces it. Returns ``None`` (→ fail-closed 403) when no name resolves
-    against the allowlist.
-    """
-    name: str | None = None
-    if isinstance(body, dict):
-        raw = body.get("user")
-        if isinstance(raw, str):
-            name = raw
-    if not name:
-        name = request.query.get("user") or request.headers.get(_HEADER_WEB_USER)
-    return resolve_identity_from_name(web_config, name)
-
-
 async def _read_json_body(request: web.Request) -> dict[str, Any]:
     """Best-effort JSON body read; returns ``{}`` on empty / invalid body."""
     try:
@@ -146,14 +120,13 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
     the fresh session (the user must not be wedged out of chat by a stale
     record write).
     """
-    web_config: WebConfig = request.app[_KEY_WEB_CONFIG]
-    state_mgr = request.app[_KEY_WEB_STATE_MGR]
-    talker_config = request.app[_KEY_WEB_TALKER_CONFIG]
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    state_mgr = request.app[KEY_WEB_STATE_MGR]
+    talker_config = request.app[KEY_WEB_TALKER_CONFIG]
 
-    body = await _read_json_body(request)
-    identity = _resolve_request_identity(request, web_config, body)
+    identity = require_web_session(request, web_config)
     if identity is None:
-        return web.json_response({"error": "unknown_user"}, status=403)
+        return web.json_response({"error": "invalid_session"}, status=401)
 
     # Lazy imports — the session module pulls vault ops (heavy) only when a
     # request actually fires, keeping this module import-light for tests.
@@ -205,18 +178,18 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
     final text (non-streaming). The engine appends turns + persists vault
     mutations internally, exactly as for Telegram.
     """
-    web_config: WebConfig = request.app[_KEY_WEB_CONFIG]
-    client = request.app[_KEY_WEB_ANTHROPIC]
-    state_mgr = request.app[_KEY_WEB_STATE_MGR]
-    talker_config = request.app[_KEY_WEB_TALKER_CONFIG]
-    system_prompt_provider: Callable[[], str] = request.app[_KEY_WEB_SYSTEM_PROVIDER]
-    vault_context_str: str = request.app[_KEY_WEB_VAULT_CTX]
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    client = request.app[KEY_WEB_ANTHROPIC]
+    state_mgr = request.app[KEY_WEB_STATE_MGR]
+    talker_config = request.app[KEY_WEB_TALKER_CONFIG]
+    system_prompt_provider: Callable[[], str] = request.app[KEY_WEB_SYSTEM_PROVIDER]
+    vault_context_str: str = request.app[KEY_WEB_VAULT_CTX]
+
+    identity = require_web_session(request, web_config)
+    if identity is None:
+        return web.json_response({"error": "invalid_session"}, status=401)
 
     body = await _read_json_body(request)
-    identity = _resolve_request_identity(request, web_config, body)
-    if identity is None:
-        return web.json_response({"error": "unknown_user"}, status=403)
-
     session_key = body.get("session_key")
     message = body.get("message")
     if not isinstance(message, str) or not message.strip():
@@ -282,12 +255,12 @@ async def _handle_chat_history(request: web.Request) -> web.StreamResponse:
     M1 surfaces the CURRENT active session only (closed-session / vault-
     record history is a later milestone). Tool plumbing is flattened out.
     """
-    web_config: WebConfig = request.app[_KEY_WEB_CONFIG]
-    state_mgr = request.app[_KEY_WEB_STATE_MGR]
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    state_mgr = request.app[KEY_WEB_STATE_MGR]
 
-    identity = _resolve_request_identity(request, web_config, None)
+    identity = require_web_session(request, web_config)
     if identity is None:
-        return web.json_response({"error": "unknown_user"}, status=403)
+        return web.json_response({"error": "invalid_session"}, status=401)
 
     session_key = request.match_info.get("session_key", "")
     active_dict = state_mgr.get_active(identity.synthetic_chat_id)
@@ -316,6 +289,7 @@ def register_web_routes(
     app: web.Application,
     *,
     web_config: WebConfig | None,
+    web_auth_state: Any,
     anthropic_client: Any,
     state_mgr: Any,
     talker_config: Any,
@@ -323,18 +297,24 @@ def register_web_routes(
     vault_context_str: str,
     allowed_user_ids: "list[int] | None" = None,
 ) -> bool:
-    """Mount the web chat routes onto ``app`` — IFF web is enabled.
+    """Mount the web chat + auth routes onto ``app`` — IFF web is enabled.
 
     Returns ``True`` when routes were mounted, ``False`` when the web
     surface is absent / disabled (opt-in inertness: nothing is registered
     and the transport server is byte-unchanged). Must be called BEFORE the
-    app is started (aiohttp forbids route additions on a started app);
-    the daemon calls it adjacent to ``wire_transport_app``, the same
-    pre-start window.
+    app is started (aiohttp forbids route additions on a started app); the
+    daemon calls it adjacent to ``wire_transport_app``, the same pre-start
+    window.
 
-    Runs the synthetic-id collision guard (fail-loud) before stashing any
-    runtime deps — a colliding mapping aborts startup rather than silently
-    cross-wiring two users' sessions.
+    Two fail-loud startup guards run BEFORE any dep is stashed or route is
+    mounted, so a misconfigured instance refuses to mount the web surface
+    rather than serving something broken:
+
+    1. synthetic-id collision guard — a colliding name→id mapping aborts
+       (provable, not probable; see ``identity.py``);
+    2. signing-secret guard — an enabled-but-unconfigured
+       ``web.auth.session_secret`` (empty / unresolved ``${...}``) aborts,
+       so we never serve forgeable sessions.
     """
     if web_config is None or not web_config.enabled:
         # Intentionally-left-blank: disabled is a deliberate state, logged
@@ -346,30 +326,49 @@ def register_web_routes(
         )
         return False
 
-    # Fail-loud collision guard — provable, not probable (see identity.py).
+    # Guard 1 — synthetic-id collisions (fail-loud).
     mapping = check_synthetic_id_collisions(
         web_config.users, allowed_user_ids or []
     )
+    # Guard 2 — signing secret must resolve (fail-loud); raises ValueError
+    # on empty / unresolved placeholder. Done here so an enabled instance
+    # with no real secret refuses to mount rather than minting/serving
+    # forgeable tokens later.
+    resolve_signing_secret(web_config.auth)
+
     log.info(
         "web.routes.collision_check_clean",
         users=len(web_config.users),
         synthetic_ids=sorted(mapping.values()),
     )
 
-    app[_KEY_WEB_CONFIG] = web_config
-    app[_KEY_WEB_ANTHROPIC] = anthropic_client
-    app[_KEY_WEB_STATE_MGR] = state_mgr
-    app[_KEY_WEB_TALKER_CONFIG] = talker_config
-    app[_KEY_WEB_SYSTEM_PROVIDER] = system_prompt_provider
-    app[_KEY_WEB_VAULT_CTX] = vault_context_str
+    app[KEY_WEB_CONFIG] = web_config
+    app[KEY_WEB_AUTH_STATE] = web_auth_state
+    app[KEY_WEB_ANTHROPIC] = anthropic_client
+    app[KEY_WEB_STATE_MGR] = state_mgr
+    app[KEY_WEB_TALKER_CONFIG] = talker_config
+    app[KEY_WEB_SYSTEM_PROVIDER] = system_prompt_provider
+    app[KEY_WEB_VAULT_CTX] = vault_context_str
 
     app.router.add_post("/chat/open", _handle_chat_open)
     app.router.add_post("/chat/turn", _handle_chat_turn)
     app.router.add_get("/chat/history/{session_key}", _handle_chat_history)
 
+    # Auth routes (/auth/login, /auth/verify) — imported here (not at module
+    # top) so routes_auth can import this module's siblings without a cycle.
+    from .routes_auth import register_auth_handlers
+
+    register_auth_handlers(app)
+
     log.info(
         "web.routes.registered",
         users=len(web_config.users),
-        routes=["/chat/open", "/chat/turn", "/chat/history/{session_key}"],
+        routes=[
+            "/chat/open",
+            "/chat/turn",
+            "/chat/history/{session_key}",
+            "/auth/login",
+            "/auth/verify",
+        ],
     )
     return True

@@ -1488,24 +1488,60 @@ async def run(
     # other instance's transport server is byte-unchanged. Must run BEFORE
     # ``run_server`` starts the app (this is still the pre-start window).
     try:
-        from alfred.web.config import load_from_unified as load_web_config
+        from alfred.web.config import (
+            load_from_unified as load_web_config,
+            resolve_signing_secret,
+        )
         from alfred.web.routes_chat import register_web_routes
+        from alfred.web.state import WebAuthState
 
         web_config = load_web_config(raw)
         if transport_app is not None and web_config.enabled:
-            allowed_user_ids = [
-                getattr(u, "id", u) for u in config.allowed_users
-            ]
-            register_web_routes(
-                transport_app,
-                web_config=web_config,
-                anthropic_client=client,
-                state_mgr=state_mgr,
-                talker_config=config,
-                system_prompt_provider=system_prompt_provider,
-                vault_context_str=vault_context_str,
-                allowed_user_ids=allowed_user_ids,
-            )
+            # Boot-time fail-loud secret check (the reviewer-flagged trap:
+            # without this, an enabled-but-unconfigured instance boots clean
+            # and only errors lazily at FIRST login via the token codec).
+            # Surfacing it HERE makes the failure happen at startup. Web is
+            # an OPT-IN add-on, so a missing secret disables the web surface
+            # loudly (fail-closed — never serve forgeable sessions) WITHOUT
+            # taking down the core talker daemon (Telegram / transport stay
+            # up). ``register_web_routes`` re-checks (defense-in-depth). A
+            # flag (not a raise) keeps this path from hitting the generic
+            # ``web_routes_setup_failed`` handler below — the dedicated
+            # ``web_secret_unconfigured`` error is logged exactly once.
+            secret_ok = True
+            try:
+                resolve_signing_secret(web_config.auth)
+            except ValueError as exc:
+                log.error(
+                    "talker.daemon.web_secret_unconfigured",
+                    error=str(exc),
+                    detail=(
+                        "web.enabled=true but session_secret is empty / "
+                        "unresolved — web surface NOT mounted (fail-closed). "
+                        "Set ALFRED_WEB_SESSION_SECRET to enable web chat."
+                    ),
+                )
+                secret_ok = False
+
+            if secret_ok:
+                allowed_user_ids = [
+                    getattr(u, "id", u) for u in config.allowed_users
+                ]
+                # Single-use magic-link nonce store (persists across restart
+                # within the link TTL window).
+                web_auth_state = WebAuthState.create(web_config.state_path)
+                web_auth_state.load()
+                register_web_routes(
+                    transport_app,
+                    web_config=web_config,
+                    web_auth_state=web_auth_state,
+                    anthropic_client=client,
+                    state_mgr=state_mgr,
+                    talker_config=config,
+                    system_prompt_provider=system_prompt_provider,
+                    vault_context_str=vault_context_str,
+                    allowed_user_ids=allowed_user_ids,
+                )
         else:
             # Intentionally-left-blank: a disabled / unmountable web
             # surface is logged so "no web routes" is distinguishable from

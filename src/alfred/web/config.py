@@ -14,36 +14,36 @@ without crashing (the load-time schema-tolerance contract).
 The named-user allowlist (``web.users``) IS the user table — no DB. Each
 entry is ``{name, role, email}``. Auth (magic-link / HMAC session token /
 Resend sender) is wired in Sub-arc B; this module carries the config those
-will read. The fail-loud-on-empty ``session_secret`` guard lives at the
-auth-use site (Sub-arc B), NOT at load time — Sub-arc A has no secret use.
+will read.
+
+Env substitution uses the canonical :func:`alfred._env.substitute_env_in_value`
+(NOT a local hand-roll). Its coalesce semantics are load-bearing here: an
+env var that is absent OR explicitly empty resolves to the literal
+``${VAR}`` placeholder, so :func:`resolve_signing_secret` can fail loud on
+BOTH cases (empty + unresolved) rather than silently HMAC-signing tokens
+with a placeholder/garbage key. Per ``feedback_substitute_env_consolidation``
++ ``feedback_env_injection_load_bearing``.
 """
 
 from __future__ import annotations
 
-import os
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
-ENV_RE = re.compile(r"\$\{([^}]+)\}")
+from alfred._env import substitute_env_in_value
 
 
-def _substitute_env(value: Any) -> Any:
-    """Recursively replace ``${VAR}`` placeholders with environment vars.
+def _is_unresolved(value: str | None) -> bool:
+    """True when a config string is empty OR an unresolved ``${VAR}``.
 
-    An unset variable is left as its literal ``${VAR}`` text (matching the
-    sibling config loaders) rather than collapsing to an empty string, so a
-    missing env var is visible in config rather than silently blank.
+    The canonical :func:`alfred._env.substitute_env_in_value` leaves an env
+    var that is absent OR set to the empty string as its literal
+    ``${VAR}`` placeholder. So "unconfigured" has exactly two surface forms
+    — empty string and a leftover ``${...}`` — and this predicate is the
+    single place that recognises both. Used by the signing-secret guard
+    (fail-loud) and the Resend-creds check (soft-fail → 503).
     """
-    if isinstance(value, str):
-        def _replace(m: re.Match) -> str:
-            return os.environ.get(m.group(1), m.group(0))
-        return ENV_RE.sub(_replace, value)
-    if isinstance(value, dict):
-        return {k: _substitute_env(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_substitute_env(v) for v in value]
-    return value
+    return (not value) or value.startswith("${")
 
 
 # --- Dataclasses -----------------------------------------------------------
@@ -108,6 +108,10 @@ class WebConfig:
     users: list[WebUser] = field(default_factory=list)
     auth: WebAuthConfig = field(default_factory=WebAuthConfig)
     email: WebEmailConfig = field(default_factory=WebEmailConfig)
+    # Tool-scoped state path for the single-use magic-link nonce store
+    # (per the load() schema-tolerance contract's "default state paths must
+    # be tool-scoped" rule). Overridable per-instance.
+    state_path: str = "./data/web_auth_state.json"
 
 
 # --- Hand-rolled construction ----------------------------------------------
@@ -191,7 +195,7 @@ def load_from_unified(raw: dict[str, Any]) -> WebConfig:
     when the section is absent — which the daemon treats as "do not mount
     web routes" (opt-in inertness).
     """
-    raw = _substitute_env(raw or {})
+    raw = substitute_env_in_value(raw or {})
     section = raw.get("web", {}) or {}
     if not isinstance(section, dict):
         section = {}
@@ -200,4 +204,41 @@ def load_from_unified(raw: dict[str, Any]) -> WebConfig:
         users=_build_users(section.get("users")),
         auth=_build_auth(section.get("auth")),
         email=_build_email(section.get("email")),
+        state_path=str(
+            section.get("state_path", "./data/web_auth_state.json")
+            or "./data/web_auth_state.json"
+        ),
     )
+
+
+def resolve_signing_secret(auth: WebAuthConfig) -> str:
+    """Return the validated HMAC signing secret, or fail loud.
+
+    Raises :class:`ValueError` when the secret is empty OR an unresolved
+    ``${VAR}`` placeholder (env var absent or set to empty — both coalesce
+    to the literal placeholder via the canonical substituter). Never sign
+    web session / magic-link tokens with an empty or placeholder key: a
+    silent garbage key would either mint tokens nobody can verify or, worse,
+    make forgery trivial depending on the bug. Fail-loud at the use site is
+    the only safe behaviour — this is the load-bearing reason the WARN fix
+    migrated to the coalesce-to-literal env semantics.
+
+    Actual call sites (kept honest — comment-lies-about-behavior class):
+    (1) ``require_web_session`` / the auth token codec, before any
+    sign/verify; (2) ``register_web_routes``' startup guard; and (3) the
+    talker daemon's web-wiring boot check (``daemon.py``), gated on
+    ``web.enabled``. Sites (2)+(3) mean an enabled-but-unconfigured instance
+    refuses to mount the web surface at startup (fail-closed — loud
+    ``web_secret_unconfigured`` error; the talker daemon continues serving
+    Telegram/transport), rather than booting clean and dying at first login.
+    Web is opt-in — the misconfig disables only the web surface.
+    """
+    secret = auth.session_secret or ""
+    if _is_unresolved(secret):
+        raise ValueError(
+            "web.auth.session_secret is unset or unresolved (empty or a "
+            "literal ${...} placeholder) — refusing to sign web tokens with "
+            "an empty/placeholder key. Set ALFRED_WEB_SESSION_SECRET (or "
+            "web.auth.session_secret) to a strong random value."
+        )
+    return secret

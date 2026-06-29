@@ -8,12 +8,16 @@ sidesteps the shared ``_build`` collision footgun.
 
 from __future__ import annotations
 
+import pytest
+
 from alfred.web.config import (
     WebAuthConfig,
     WebConfig,
     WebEmailConfig,
     WebUser,
+    _is_unresolved,
     load_from_unified,
+    resolve_signing_secret,
 )
 
 
@@ -27,6 +31,15 @@ def test_absent_web_block_is_disabled_default() -> None:
     assert isinstance(cfg.email, WebEmailConfig)
     assert cfg.auth.session_ttl_hours == 168
     assert cfg.email.provider == "resend"
+    # Tool-scoped default nonce-store path.
+    assert cfg.state_path == "./data/web_auth_state.json"
+
+
+def test_state_path_override() -> None:
+    cfg = load_from_unified(
+        {"web": {"enabled": True, "state_path": "./data/custom_web_nonces.json"}}
+    )
+    assert cfg.state_path == "./data/custom_web_nonces.json"
 
 
 def test_non_dict_web_section_is_tolerated() -> None:
@@ -115,6 +128,46 @@ def test_unset_env_var_left_literal() -> None:
         {"web": {"enabled": True, "auth": {"session_secret": "${DEFINITELY_UNSET_WEB_VAR}"}}}
     )
     assert cfg.auth.session_secret == "${DEFINITELY_UNSET_WEB_VAR}"
+
+
+def test_emptied_env_var_resolves_to_literal(monkeypatch) -> None:
+    """An env var set to "" coalesces to the literal ${VAR} (canonical _env).
+
+    This is the reconciled semantic the WARN fix brought in: an operator
+    who EMPTIES the secret to break auth gets the same fail-loud-able
+    literal placeholder as one who never set it (NOT a silent empty string).
+    """
+    monkeypatch.setenv("TEST_WEB_EMPTY_SECRET", "")
+    cfg = load_from_unified(
+        {"web": {"enabled": True, "auth": {"session_secret": "${TEST_WEB_EMPTY_SECRET}"}}}
+    )
+    assert cfg.auth.session_secret == "${TEST_WEB_EMPTY_SECRET}"
+
+
+def test_is_unresolved_predicate() -> None:
+    assert _is_unresolved("") is True
+    assert _is_unresolved(None) is True
+    assert _is_unresolved("${ALFRED_WEB_SESSION_SECRET}") is True
+    assert _is_unresolved("a-real-secret") is False
+
+
+def test_resolve_signing_secret_returns_valid() -> None:
+    auth = WebAuthConfig(session_secret="a-strong-random-secret")
+    assert resolve_signing_secret(auth) == "a-strong-random-secret"
+
+
+def test_resolve_signing_secret_fails_loud_on_empty() -> None:
+    with pytest.raises(ValueError, match="session_secret"):
+        resolve_signing_secret(WebAuthConfig(session_secret=""))
+
+
+def test_resolve_signing_secret_fails_loud_on_unresolved_placeholder() -> None:
+    # An emptied/absent ALFRED_WEB_SESSION_SECRET arrives here as a literal
+    # ${...} placeholder — MUST trip the guard, never HMAC-sign with it.
+    with pytest.raises(ValueError, match="unresolved"):
+        resolve_signing_secret(
+            WebAuthConfig(session_secret="${ALFRED_WEB_SESSION_SECRET}")
+        )
 
 
 def test_auth_email_schema_tolerance_unknown_keys_dropped() -> None:
