@@ -34,8 +34,17 @@ describe('ingestBodySchema', () => {
     expect(ingestBodySchema.safeParse({ ...valid, title: '   ' }).success).toBe(false);
   });
 
-  it('rejects an empty / whitespace-only body', () => {
+  it('rejects an all-whitespace body (non-empty-after-trim, via .refine)', () => {
     expect(ingestBodySchema.safeParse({ ...valid, body: '   ' }).success).toBe(false);
+    expect(ingestBodySchema.safeParse({ ...valid, body: '\n\t  \n' }).success).toBe(false);
+  });
+
+  it('relays the body VERBATIM — leading/trailing whitespace preserved (CONTRACT §2)', () => {
+    const raw = '  leading and trailing\n\n';
+    const r = ingestBodySchema.safeParse({ ...valid, body: raw });
+    expect(r.success).toBe(true);
+    // The parsed value must be the ORIGINAL untrimmed body (verbatim guarantee).
+    if (r.success) expect(r.data.body).toBe(raw);
   });
 
   it('rejects an empty target', () => {
@@ -61,10 +70,19 @@ describe('ingestBodySchema', () => {
     expect(ingestBodySchema.safeParse({ ...valid, body: 'x'.repeat(MAX_INGEST_CHARS + 1) }).success).toBe(false);
   });
 
-  it('trims title/body/source (the parsed value is trimmed)', () => {
-    const r = ingestBodySchema.safeParse({ ...valid, title: '  Spaced  ' });
+  it('trims title + source (metadata) but leaves the body UNtouched', () => {
+    const r = ingestBodySchema.safeParse({
+      ...valid,
+      title: '  Spaced  ',
+      source: '  src  ',
+      body: '  body kept  ',
+    });
     expect(r.success).toBe(true);
-    if (r.success) expect(r.data.title).toBe('Spaced');
+    if (r.success) {
+      expect(r.data.title).toBe('Spaced');
+      expect(r.data.source).toBe('src');
+      expect(r.data.body).toBe('  body kept  '); // verbatim — not trimmed
+    }
   });
 });
 

@@ -152,6 +152,19 @@ describe('POST /api/ingest/submit', () => {
     });
   });
 
+  it('relays the body VERBATIM (untrimmed) to the target (CONTRACT §2)', async () => {
+    mockResolveSessionToken.mockReturnValue('tok');
+    mockReadDisplayIdentity.mockReturnValue({ name: 'andrew', role: 'owner' });
+    mockCallTransportTo.mockResolvedValue({ status: 201, body: { status: 'created' } });
+    const raw = '  leading + trailing whitespace kept\n\n';
+    const { res } = mockRes();
+    await handler(postReq({ ...validBody, body: raw }), res);
+
+    const [, , , opts] = mockCallTransportTo.mock.calls[0];
+    // The relayed body is the ORIGINAL untrimmed artifact, not a trimmed copy.
+    expect(opts.body.body).toBe(raw);
+  });
+
   it('relays a backend 409 title_collision through verbatim', async () => {
     mockResolveSessionToken.mockReturnValue('tok');
     mockReadDisplayIdentity.mockReturnValue({ name: 'andrew', role: 'owner' });

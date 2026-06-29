@@ -53,7 +53,13 @@ export const ingestBodySchema = z.object({
   target: z.string().trim().min(1).max(64),
   record_type: z.enum(INGEST_RECORD_TYPES),
   title: z.string().trim().min(1).max(300),
-  body: z.string().trim().min(1).max(MAX_INGEST_CHARS),
+  // The artifact body is written VERBATIM (CONTRACT §2) — do NOT trim/mutate it
+  // (trimming would strip the artifact's own leading/trailing whitespace). Validate
+  // non-empty-AFTER-trim via .refine() while relaying the ORIGINAL untrimmed value.
+  body: z
+    .string()
+    .max(MAX_INGEST_CHARS)
+    .refine((s) => s.trim().length > 0, { message: 'A body is required.' }),
   source: z.string().trim().min(1).max(500),
 });
 
