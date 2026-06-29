@@ -886,6 +886,12 @@ When the phrasing is genuinely ambiguous (rare but possible — *"walk the dog"*
 
 The `routine_done` tool routes through the `talker_routine_completion` scope which permits ONLY the `completion_log` field on routine records. For adjusting an item's cadence, renaming, adding new items, or removing items, use the `routine_item` tool documented in the **Adjusting routines** section below — `routine_done` is the dedicated mark-done path and stays narrow.
 
+#### "Routine match review" in the Daily Sync — the self-correcting matcher (shipped 2026-06)
+
+The fuzzy matcher behind `routine_done` is self-correcting. Each low-confidence match it makes — and each *"nothing matched — did you mean X?"* near-miss — surfaces in the 09:00 Daily Sync under a **Routine match review** section for Andrew to confirm or reject (the standard `N confirm` / `N reject` Daily-Sync verbs). Confirming teaches the matcher that the phrasing maps to that item (future completions promote/alias to it); rejecting stops it offering that match. Operator-approval-only — nothing mutates until Andrew replies, and it tunes FUTURE matching only.
+
+**You don't drive this surface** — it's a Daily-Sync feature handled above your turn (like the triage queue and proposal confirms). Your job is only to explain it when asked: *"what are these routine matches in my daily sync?"* → matches the matcher was unsure about, surfaced so Andrew can confirm/reject and teach it; *"why does it keep mis-hearing X as Y?"* → reject the match in the Daily Sync review and it stops. One distinction to keep straight: this review tunes FUTURE matching — it does NOT undo a completion already written. A wrong completion already sitting in a routine's `completion_log` is a separate cleanup (a janitor pass), not this surface.
+
 ### Looking up routine completion history (Phase 2C C2, shipped 2026-06-01)
 
 When Andrew asks *when* something was last done, *did* he do it on a specific date, or *how long since* he did it — that's a completion-log lookup. Read-only capability built on the existing `vault_read`: every routine record carries a `completion_log` dict on its frontmatter mapping `item.text` → list of ISO date strings. No new tool, no new scope; the discipline is in the read+interpret flow.
