@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    /* Warm melon page wash + base text color. */
+    background-color: theme('colors.honeydew.50');
+    color: theme('colors.honeydew.900');
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background-color: theme('colors.honeydew.50');
+  }
+
+  /* Belt-and-suspenders: the PAGE must never scroll sideways. A too-wide child
+     (e.g. the kanban board on a narrow iOS viewport) must scroll INSIDE its own
+     container, never shift the whole body/document. overflow-x: clip (not hidden)
+     is used deliberately: `hidden` on html/body left the documentElement itself
+     horizontally scrollable in Chromium (viewport-propagation quirk), whereas
+     `clip` reliably prevents any horizontal scroll without creating a scroll
+     container — so it also can't disturb the sticky header's containing block. */
+  html,
+  body {
+    overflow-x: clip;
+  }
+
+  /* Visible, friendly focus ring for keyboard users across all interactive els. */
+  :focus-visible {
+    outline: 2px solid theme('colors.honeydew.600');
+    outline-offset: 2px;
+  }
+}
