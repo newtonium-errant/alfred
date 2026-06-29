@@ -237,3 +237,118 @@ export async function callTransportTo(
 
   return { status: res.status, body: await parseJsonOrNull(res) };
 }
+
+// --- Cross-instance chat target resolution (Model B — trust-the-relay) -------
+// Mirrors the ingest target block above, with a DISTINCT env prefix + a DISTINCT
+// per-instance peer token. Chat uses the target's `web` peer token (full talker
+// scope via run_turn); ingest keeps `web_ingest` (deterministic-create-only) —
+// two distinct tokens per instance (decision M4). The BFF is the SOLE holder.
+//   ALFRED_WEB_CHAT_<NAME>_URL    — the target transport base URL (loopback)
+//   ALFRED_WEB_CHAT_<NAME>_TOKEN  — that target's dedicated `web` peer token
+//   ALFRED_WEB_CHAT_<NAME>_LABEL  — (optional) display label; defaults to <NAME>
+// A target is "configured" only when BOTH its URL and token are present
+// (fail-closed). These are CROSS-INSTANCE relay targets; the HOME instance is
+// NOT listed here (it rides the existing session path via callTransport) — the
+// BFF synthesises the home entry separately (see web/pages/api/chat/targets.ts).
+const CHAT_ENV_PREFIX = 'ALFRED_WEB_CHAT_';
+
+export interface ChatTargetMeta {
+  name: string;
+  label: string;
+}
+
+/**
+ * The configured CROSS-INSTANCE chat relay targets, derived from env. Scans every
+ * `ALFRED_WEB_CHAT_<NAME>_URL` that also has a matching `_TOKEN`. Returns metadata
+ * ONLY (name/label) — never a URL or token. Sorted by label. Empty array when none
+ * is configured (single-instance deploys still work — the home target is added by
+ * the route layer). The home instance is intentionally excluded here even if an
+ * `ALFRED_WEB_CHAT_<HOME>_*` pair is set: the home rides the session path, so its
+ * relay env would be a misconfiguration and must not shadow the session route.
+ */
+export function listCrossInstanceChatTargets(): ChatTargetMeta[] {
+  const out: ChatTargetMeta[] = [];
+  const seen = new Set<string>();
+  for (const key of Object.keys(process.env)) {
+    const m = key.match(/^ALFRED_WEB_CHAT_([A-Z0-9_]+)_URL$/);
+    if (!m) continue;
+    const name = m[1];
+    if (seen.has(name)) continue;
+    const url = process.env[`${CHAT_ENV_PREFIX}${name}_URL`];
+    const token = process.env[`${CHAT_ENV_PREFIX}${name}_TOKEN`];
+    if (!url || !url.trim() || !token || !token.trim()) continue; // fail-closed
+    seen.add(name);
+    const label = (process.env[`${CHAT_ENV_PREFIX}${name}_LABEL`] || name).trim();
+    out.push({ name, label });
+  }
+  out.sort((a, b) => a.label.localeCompare(b.label));
+  return out;
+}
+
+export interface ResolvedChatTarget {
+  baseUrl: string;
+  token: string;
+  client: string;
+}
+
+/**
+ * Resolve a cross-instance chat target name to its server-side URL + token.
+ * Throws TransportConfigError when the name is malformed or the env pair is
+ * missing (→ the BFF maps to a generic 500, leaking no topology). The BFF
+ * validates the name against listCrossInstanceChatTargets() FIRST (→ 400 unknown
+ * target) so this is the missing-env / misconfig path.
+ */
+export function resolveChatTarget(name: string): ResolvedChatTarget {
+  if (!isValidTargetName(name)) {
+    throw new TransportConfigError(`invalid chat target name: ${name}`);
+  }
+  const key = name.toUpperCase();
+  const url = process.env[`${CHAT_ENV_PREFIX}${key}_URL`];
+  const token = process.env[`${CHAT_ENV_PREFIX}${key}_TOKEN`];
+  if (!url || !url.trim()) {
+    throw new TransportConfigError(`${CHAT_ENV_PREFIX}${key}_URL is not set`);
+  }
+  if (!token || !token.trim()) {
+    throw new TransportConfigError(`${CHAT_ENV_PREFIX}${key}_TOKEN is not set`);
+  }
+  return { baseUrl: url.replace(/\/+$/, ''), token, client: PEER_CLIENT };
+}
+
+export interface ChatRelayOptions {
+  body?: unknown;
+  /** The verified display name asserted to the target as X-Alfred-User (Model B). */
+  userName: string;
+}
+
+/**
+ * Relay a buffered JSON chat call to a CHOSEN cross-instance target. Uses that
+ * target's dedicated `web` peer token + base URL, and asserts the verified user
+ * via X-Alfred-User (NOT a session token — the target is in relay mode and
+ * re-resolves the name against its own web.users). Possession of the target token
+ * IS the chat authority (the BFF is the sole holder).
+ */
+export async function callChatTo(
+  targetName: string,
+  method: 'GET' | 'POST',
+  path: string,
+  opts: ChatRelayOptions,
+): Promise<TransportResult> {
+  const target = resolveChatTarget(targetName);
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${target.token}`,
+    'X-Alfred-Client': target.client,
+    'X-Alfred-User': opts.userName,
+    Accept: 'application/json',
+  };
+  if (opts.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const res = await fetch(`${target.baseUrl}${path}`, {
+    method,
+    headers,
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+
+  return { status: res.status, body: await parseJsonOrNull(res) };
+}

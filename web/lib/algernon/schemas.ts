@@ -9,6 +9,16 @@ import { z } from 'zod';
 // it generously. (The engine has its own limits; this is the edge guard.)
 export const MAX_MESSAGE_CHARS = 8000;
 
+// An instance selector — the routing token from GET /api/chat/targets (home
+// display name or a cross-instance env segment). Bounded; absent ⇒ home instance.
+export const chatInstanceSchema = z.string().trim().min(1).max(64);
+
+// A client-minted idempotency key (UUID per logical turn, resent on retry). The
+// backend dedups the last (key, message-hash) → cached result so a retry of a
+// turn that already ran does NOT double-act (e.g. a vault write). Bounded edge
+// guard (CONTRACT S6); absent ⇒ no dedup.
+export const idempotencyKeySchema = z.string().min(1).max(200);
+
 // POST /api/chat/turn body.
 export const chatTurnBodySchema = z.object({
   session_key: z.string().min(1),
@@ -16,9 +26,19 @@ export const chatTurnBodySchema = z.object({
   // M1 is text-first; the field is accepted (forward-compat with M2 voice) but
   // defaults to "text". Anything other than "voice" normalises to "text".
   kind: z.enum(['text', 'voice']).optional(),
+  // Cross-instance selector (multi-instance switcher). Absent / the home name ⇒
+  // the existing same-instance session path. BFF-only — stripped before relay.
+  instance: chatInstanceSchema.optional(),
+  // Retry-safety (CONTRACT S6). Relayed verbatim to the transport.
+  idempotency_key: idempotencyKeySchema.optional(),
 });
 
 export type ChatTurnBody = z.infer<typeof chatTurnBodySchema>;
+
+// POST /api/chat/open body — only the (optional) instance selector. BFF-only.
+export const chatOpenBodySchema = z.object({
+  instance: chatInstanceSchema.optional(),
+});
 
 // A session_key path/param must be a non-empty string (the backend issues uuids).
 export const sessionKeySchema = z.string().min(1).max(200);

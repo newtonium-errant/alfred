@@ -1,14 +1,18 @@
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import Head from 'next/head';
 import { useRouter } from 'next/router';
 import { Layout } from '../components/Layout';
 import { ChatThread } from '../components/chat/ChatThread';
+import { ChatTargetPicker } from '../components/chat/ChatTargetPicker';
 import { Composer } from '../components/chat/Composer';
 import { Button } from '../components/ui/button';
 import { authApi } from '../lib/algernon/authClient';
+import { chatApi } from '../lib/algernon/client';
 import { useChat } from '../lib/algernon/useChat';
 import { useSession } from '../lib/algernon/useSession';
+import { HOME_INSTANCE_NAME } from '../lib/algernon/instance';
 import { display, subtle } from '../lib/typography';
+import type { ChatTarget } from '../lib/algernon/types';
 
 const INSTANCE_NAME = process.env.NEXT_PUBLIC_INSTANCE_NAME || 'Algernon';
 
@@ -22,11 +26,36 @@ export default function ChatPage() {
   const { user, loading: sessionLoading } = useSession();
   const authed = !sessionLoading && user !== null;
 
-  // Chat only bootstraps once we know the user is signed in.
+  // The configured chat instances + the active selection (defaults to home).
+  const [targets, setTargets] = useState<ChatTarget[]>([]);
+  const [instance, setInstance] = useState<string>(HOME_INSTANCE_NAME);
+
+  // Chat bootstraps once signed in, scoped to the active instance.
   const { messages, status, error, sending, unauthenticated, send, newChat } = useChat({
     enabled: authed,
+    instance,
   });
   const booting = status === 'booting';
+
+  // Load the instance switcher's options once signed in (metadata only; the
+  // picker hides itself when only the home instance is configured).
+  useEffect(() => {
+    if (!authed) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { targets: t } = await chatApi.targets();
+        if (!cancelled) setTargets(t);
+      } catch {
+        /* non-fatal: the switcher just stays single-instance (home). */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [authed]);
+
+  const activeLabel = targets.find((t) => t.name === instance)?.label || INSTANCE_NAME;
 
   // Redirect signed-out visitors to login — either /api/auth/me said "no session"
   // or a /chat call returned 401 invalid_session.
@@ -73,18 +102,26 @@ export default function ChatPage() {
             <h1 className={display}>Chat</h1>
             <p className={`mt-1 ${subtle}`}>
               Signed in as <span className="font-semibold text-honeydew-700">{user.name}</span>{' '}
-              · a vault-grounded conversation with {INSTANCE_NAME}.
+              · a vault-grounded conversation with {activeLabel}.
             </p>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            data-testid="new-chat"
-            onClick={() => void newChat()}
-            disabled={booting || sending}
-          >
-            New chat
-          </Button>
+          <div className="flex shrink-0 items-end gap-2">
+            <ChatTargetPicker
+              targets={targets}
+              instance={instance}
+              onInstanceChange={setInstance}
+              disabled={booting || sending}
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="new-chat"
+              onClick={() => void newChat()}
+              disabled={booting || sending}
+            >
+              New chat
+            </Button>
+          </div>
         </div>
 
         <div className="mt-6 flex min-h-[55vh] flex-col gap-4">

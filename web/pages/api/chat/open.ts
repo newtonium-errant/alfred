@@ -1,10 +1,14 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { resolveSessionToken } from '../../../lib/algernon/identity';
-import { callTransport } from '../../../lib/algernon/transport';
+import { callChatTo, callTransport } from '../../../lib/algernon/transport';
+import { gateCrossInstance, isHomeInstance } from '../../../lib/algernon/chatRouting';
 import { sendTransportError } from '../../../lib/algernon/bffError';
 
-// POST /api/chat/open → relays to transport POST /chat/open. Archives+closes any
-// prior session for this user and opens a fresh one (the backend's behaviour).
+// POST /api/chat/open → opens a fresh session (archives+closes the prior one).
+// Home instance (absent / home selector): the existing session-token path,
+// UNCHANGED. Cross-instance selector: gate session (401) → owner-only (403) →
+// known target (400), then relay to that instance over its peer token + the
+// asserted X-Alfred-User. The `instance` field is BFF-only (stripped before relay).
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
@@ -16,10 +20,29 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(401).json({ error: 'invalid_session' });
   }
 
+  const instance = typeof req.body?.instance === 'string' ? req.body.instance : undefined;
+
+  if (isHomeInstance(instance)) {
+    try {
+      const { status, body } = await callTransport('POST', '/chat/open', {
+        body: {},
+        sessionToken,
+      });
+      return res.status(status).json(body ?? {});
+    } catch (e) {
+      return sendTransportError(res, 'chat/open', e);
+    }
+  }
+
+  const gate = gateCrossInstance(req, instance as string);
+  if (!gate.ok) {
+    return res.status(gate.status).json(gate.body);
+  }
+
   try {
-    const { status, body } = await callTransport('POST', '/chat/open', {
+    const { status, body } = await callChatTo(gate.targetName, 'POST', '/chat/open', {
       body: {},
-      sessionToken,
+      userName: gate.userName,
     });
     return res.status(status).json(body ?? {});
   } catch (e) {

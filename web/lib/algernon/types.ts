@@ -35,6 +35,23 @@ export interface ChatHistoryResponse {
   turns: HistoryTurn[];
 }
 
+// --- Cross-instance chat (multi-instance switcher, Model B) ------------------
+// One instance the owner can chat with. `name` is the routing selector that the
+// picker round-trips (the home instance's display name, or a cross-instance env
+// segment like KALLE); `label` is the display name; `home` flags the default
+// session-path instance. NO secrets — the BFF holds every target URL/token
+// server-side; the browser only sees {name, label, home}.
+export interface ChatTarget {
+  name: string;
+  label: string;
+  home?: boolean;
+}
+
+// GET /api/chat/targets → the configured chat instances (home + cross-instance).
+export interface ChatTargetsResponse {
+  targets: ChatTarget[];
+}
+
 // The backend error envelope: { error: <code>, detail?: <string> }.
 export interface ApiErrorBody {
   error: string;

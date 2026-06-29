@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { chatApi } from './client';
 import { ApiError } from './http';
+import { HOME_INSTANCE_NAME } from './instance';
 import type { ChatKind, ChatMessage, HistoryTurn } from './types';
 
 // Client-side chat state + the session resume model (team-lead confirmed):
@@ -12,8 +13,19 @@ import type { ChatKind, ChatMessage, HistoryTurn } from './types';
 //
 // `enabled` gates the initial bootstrap so the page can wait until the user is
 // known to be signed in (avoids a guaranteed-401 /chat call when signed out).
+//
+// MULTI-INSTANCE: `instance` selects which assistant this thread talks to. The
+// session_key is scoped PER-INSTANCE in localStorage (algernon:session_key:<inst>)
+// so switching instances shows that instance's own thread; changing `instance`
+// re-bootstraps. The home instance keeps the existing same-instance path.
 
-const SESSION_KEY_STORAGE = 'algernon:session_key';
+const SESSION_KEY_PREFIX = 'algernon:session_key';
+// The pre-multi-instance key (no instance suffix). Migrated once to the home key.
+const LEGACY_SESSION_KEY = 'algernon:session_key';
+
+function storageKeyFor(instance: string): string {
+  return `${SESSION_KEY_PREFIX}:${instance}`;
+}
 
 let _idSeq = 0;
 function nextId(): string {
@@ -25,17 +37,32 @@ function turnToMessage(t: HistoryTurn): ChatMessage {
   return { id: nextId(), role: t.role, text: t.text, ts: t.ts };
 }
 
-function readStored(): string | null {
+function readStored(instance: string): string | null {
   try {
-    return localStorage.getItem(SESSION_KEY_STORAGE);
+    const k = storageKeyFor(instance);
+    const v = localStorage.getItem(k);
+    if (v) return v;
+    // One-time migration of the legacy unsuffixed key → the home instance key.
+    if (instance === HOME_INSTANCE_NAME) {
+      const legacy = localStorage.getItem(LEGACY_SESSION_KEY);
+      if (legacy && legacy !== k) {
+        try {
+          localStorage.setItem(k, legacy);
+        } catch {
+          /* ignore */
+        }
+        return legacy;
+      }
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-function writeStored(key: string): void {
+function writeStored(instance: string, key: string): void {
   try {
-    localStorage.setItem(SESSION_KEY_STORAGE, key);
+    localStorage.setItem(storageKeyFor(instance), key);
   } catch {
     /* private mode / storage disabled — session just won't persist across loads */
   }
@@ -50,6 +77,8 @@ export type ChatStatus = 'booting' | 'ready' | 'sending' | 'error';
 export interface UseChatOptions {
   /** Bootstrap only once the user is known signed in. Defaults true. */
   enabled?: boolean;
+  /** Which assistant this thread talks to. Defaults to the home instance. */
+  instance?: string;
 }
 
 export interface UseChat {
@@ -89,6 +118,7 @@ function friendlyError(e: unknown): string {
 
 export function useChat(options: UseChatOptions = {}): UseChat {
   const enabled = options.enabled ?? true;
+  const instance = options.instance || HOME_INSTANCE_NAME;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [status, setStatus] = useState<ChatStatus>('booting');
   const [error, setError] = useState<string | null>(null);
@@ -102,20 +132,22 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   }, []);
 
   const openFresh = useCallback(async () => {
-    const { session_key } = await chatApi.open();
+    const { session_key } = await chatApi.open(instance);
     sessionKeyRef.current = session_key;
-    writeStored(session_key);
+    writeStored(instance, session_key);
     setMessages([]);
-  }, []);
+  }, [instance]);
 
   const bootstrap = useCallback(async () => {
     setStatus('booting');
     setError(null);
+    sessionKeyRef.current = null;
+    setMessages([]);
     try {
-      const stored = readStored();
+      const stored = readStored(instance);
       if (stored) {
         try {
-          const { turns } = await chatApi.history(stored);
+          const { turns } = await chatApi.history(stored, instance);
           sessionKeyRef.current = stored;
           setMessages(turns.map(turnToMessage));
           setStatus('ready');
@@ -132,8 +164,10 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     } catch (e) {
       fail(e);
     }
-  }, [openFresh, fail]);
+  }, [instance, openFresh, fail]);
 
+  // Re-bootstrap whenever the active instance changes — each instance has its own
+  // independent thread (per-instance session key).
   useEffect(() => {
     if (enabled) void bootstrap();
   }, [enabled, bootstrap]);
@@ -151,7 +185,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
       setMessages((prev) => [...prev, { id: userId, role: 'user', text, ts: '' }]);
       setStatus('sending');
       try {
-        const { reply, ts, user_ts } = await chatApi.turn(key, text, kind);
+        const { reply, ts, user_ts } = await chatApi.turn(key, text, { kind, instance });
         setMessages((prev) => [
           ...prev.map((m) =>
             m.id === userId ? { ...m, ts: user_ts || '' } : m,
@@ -164,7 +198,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
         fail(e);
       }
     },
-    [fail],
+    [instance, fail],
   );
 
   const newChat = useCallback(async () => {
