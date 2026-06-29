@@ -19,10 +19,15 @@ export interface ChatOpenResponse {
   session_key: string;
 }
 
-// POST /chat/turn  { session_key, message, kind } → { reply, session_key }
+// POST /chat/turn  { session_key, message, kind } → { reply, session_key, ts, user_ts }
+// `ts` = assistant turn stamp, `user_ts` = user turn stamp (both ISO-8601 UTC).
+// Team-lead-APPROVED additive contract bump (BUILD_DECISIONS §1 / decision G):
+// both default to '' on the backend so the fields are always present.
 export interface ChatTurnResponse {
   reply: string;
   session_key: string;
+  ts: string;
+  user_ts: string;
 }
 
 // GET /chat/history/{session_key} → { turns: [...] }
@@ -60,4 +65,46 @@ export interface AuthVerifyResponse {
   name: string;
   role: string;
   exp?: number;
+}
+
+// --- Cross-instance ingest (BUILD_DECISIONS §2 / §3) -------------------------
+// Typed mirror of the backend transport POST /vault/ingest contract + the BFF
+// ingest routes. The BFF holds each target's peer token server-side; the browser
+// talks ONLY to the same-origin BFF and never sees a target URL or token.
+
+// One configurable ingest target the operator can write to. `name` is the
+// server-side env segment (round-trips back as the submit `target`); `label` is
+// the display name; `recordTypes` constrains the type picker. NO secrets.
+export interface IngestTarget {
+  name: string;
+  label: string;
+  recordTypes: string[];
+}
+
+// GET /api/ingest/targets → the configured targets (data-driven from env).
+export interface IngestTargetsResponse {
+  targets: IngestTarget[];
+}
+
+// POST /api/ingest/submit → the backend /vault/ingest result (verbatim relay).
+export interface IngestSubmitResponse {
+  status: string;
+  path: string;
+  record_type: string;
+  instance: string;
+}
+
+// --- Web STT (BUILD_DECISIONS §4) -------------------------------------------
+// POST /stt/transcribe response. The editable transcript is the human-in-the-loop
+// correction surface (self-correcting design); low_confidence/empty/degraded are
+// explicit signals (intentionally-left-blank) so a fallible transcript is never
+// silently auto-committed. `transcript` is always present (may be '').
+export interface SttTranscribeResponse {
+  transcript: string;
+  backend_used?: string;
+  fell_back?: boolean;
+  tier?: string;
+  low_confidence?: boolean;
+  empty?: boolean;
+  degraded?: boolean;
 }

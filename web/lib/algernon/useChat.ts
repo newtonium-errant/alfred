@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { chatApi } from './client';
 import { ApiError } from './http';
-import type { ChatMessage, HistoryTurn } from './types';
+import type { ChatKind, ChatMessage, HistoryTurn } from './types';
 
 // Client-side chat state + the session resume model (team-lead confirmed):
 //   * persist the session_key in localStorage,
@@ -59,7 +59,8 @@ export interface UseChat {
   sending: boolean;
   /** True once any call reported 401 invalid_session — the page redirects to /login. */
   unauthenticated: boolean;
-  send: (text: string) => Promise<void>;
+  /** `kind` tags the backend turn counter ('voice' for transcript-originated sends). */
+  send: (text: string, kind?: ChatKind) => Promise<void>;
   newChat: () => Promise<void>;
 }
 
@@ -138,18 +139,24 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   }, [enabled, bootstrap]);
 
   const send = useCallback(
-    async (raw: string) => {
+    async (raw: string, kind: ChatKind = 'text') => {
       const text = raw.trim();
       const key = sessionKeyRef.current;
       if (!text || !key) return;
       setError(null);
-      setMessages((prev) => [...prev, { id: nextId(), role: 'user', text, ts: '' }]);
+      // Hoist the optimistic user bubble's id so we can patch its ts once the
+      // backend returns the real user-turn stamp (keeps live == resume — the same
+      // message wouldn't visibly shift its time on the next history reload).
+      const userId = nextId();
+      setMessages((prev) => [...prev, { id: userId, role: 'user', text, ts: '' }]);
       setStatus('sending');
       try {
-        const { reply } = await chatApi.turn(key, text);
+        const { reply, ts, user_ts } = await chatApi.turn(key, text, kind);
         setMessages((prev) => [
-          ...prev,
-          { id: nextId(), role: 'assistant', text: reply, ts: '' },
+          ...prev.map((m) =>
+            m.id === userId ? { ...m, ts: user_ts || '' } : m,
+          ),
+          { id: nextId(), role: 'assistant', text: reply, ts: ts || '' },
         ]);
         setStatus('ready');
       } catch (e) {

@@ -1,11 +1,22 @@
-import { cn } from '../../lib/utils';
+import { cn, formatMessageTime } from '../../lib/utils';
 import type { ChatRole } from '../../lib/algernon/types';
 
 // One chat message. Text is rendered as escaped React children (never
 // dangerouslySetInnerHTML) — the untrusted-data discipline: model + vault text
 // is free text. `whitespace-pre-wrap` preserves the assistant's line breaks.
-export function MessageBubble({ role, text }: { role: ChatRole; text: string }) {
+// `ts` is the turn's ISO-8601 stamp; a muted time renders only when it formats to
+// a non-empty string (empty/invalid → nothing, never "Invalid Date").
+export function MessageBubble({
+  role,
+  text,
+  ts,
+}: {
+  role: ChatRole;
+  text: string;
+  ts: string;
+}) {
   const isUser = role === 'user';
+  const time = formatMessageTime(ts);
   return (
     <div
       className={cn('flex', isUser ? 'justify-end' : 'justify-start')}
@@ -20,6 +31,15 @@ export function MessageBubble({ role, text }: { role: ChatRole; text: string }) 
         )}
       >
         {text}
+        {time && (
+          <time
+            dateTime={ts}
+            data-testid={`msg-time-${role}`}
+            className="mt-1 block text-xs opacity-60"
+          >
+            {time}
+          </time>
+        )}
       </div>
     </div>
   );
