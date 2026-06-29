@@ -100,9 +100,9 @@ def test_register_adds_provider(tmp_path: Path) -> None:
 
 
 def test_pending_path_default_matches_routine_tool() -> None:
-    """Drift-guard: the Daily Sync section's pending-path default MUST equal the
-    routine tool's capture default (same file — the CLI writes, the section
-    reads). Both bind the shared module constant."""
+    """Drift-guard: the Daily Sync section's pending-path dataclass default MUST
+    equal the routine tool's capture default (same file — the CLI writes, the
+    section reads). Both bind the shared module constant."""
     assert RoutineMatchConfig().pending_path == mc.DEFAULT_PENDING_PATH
 
 
@@ -116,7 +116,64 @@ def test_daily_sync_loads_routine_match_block() -> None:
         },
     })
     assert cfg.routine_match.enabled is True
+    # Explicit daily_sync override is honoured (intentional split — non-silent).
     assert cfg.routine_match.pending_path == "/x/p.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# pending-path single-source (reviewer NOTE #2) — load-time derivation
+# ---------------------------------------------------------------------------
+
+
+def test_pending_path_derives_from_routine_override() -> None:
+    """Single-source: when ``routine.match_calibration.pending_path`` is
+    overridden and the daily_sync field is NOT, daily_sync TRACKS the routine
+    override — the silent-drift surface is closed (the routine CLI writes the
+    file the section reads, even under a custom path)."""
+    from alfred.daily_sync.config import load_from_unified
+
+    cfg = load_from_unified({
+        "daily_sync": {"enabled": True, "routine_match": {"enabled": True}},
+        "routine": {"match_calibration": {"pending_path": "/custom/pend.jsonl"}},
+        "telegram": {"instance": {"name": "Salem"}},
+    })
+    assert cfg.routine_match.pending_path == "/custom/pend.jsonl"
+
+
+def test_pending_path_explicit_daily_sync_override_wins_over_routine() -> None:
+    """An explicit ``daily_sync.routine_match.pending_path`` is honoured even
+    when routine sets its own — the operator's deliberate split is respected
+    (not silently overwritten by the derivation)."""
+    from alfred.daily_sync.config import load_from_unified
+
+    cfg = load_from_unified({
+        "daily_sync": {
+            "enabled": True,
+            "routine_match": {"enabled": True, "pending_path": "/ds/explicit.jsonl"},
+        },
+        "routine": {"match_calibration": {"pending_path": "/custom/pend.jsonl"}},
+        "telegram": {"instance": {"name": "Salem"}},
+    })
+    assert cfg.routine_match.pending_path == "/ds/explicit.jsonl"
+
+
+def test_pending_path_no_override_tracks_routine_default() -> None:
+    """No overrides anywhere → daily_sync tracks the routine tool's RESOLVED
+    default (which honours ``logging.dir``), still landing on the shared
+    constant when log dir is the default ``./data``."""
+    from alfred.daily_sync.config import load_from_unified
+    from alfred.routine.config import load_from_unified as load_routine
+
+    raw = {
+        "daily_sync": {"enabled": True, "routine_match": {"enabled": True}},
+        "telegram": {"instance": {"name": "Salem"}},
+    }
+    cfg = load_from_unified(raw)
+    # Tracks routine's resolved default — single source of the resolution logic.
+    assert (
+        cfg.routine_match.pending_path
+        == load_routine(raw).match_calibration.pending_path
+    )
 
 
 # ---------------------------------------------------------------------------

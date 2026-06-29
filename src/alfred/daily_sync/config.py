@@ -181,11 +181,22 @@ class RoutineMatchConfig:
 
     ``enabled`` defaults OFF — instances opt in via
     ``daily_sync.routine_match.enabled: true`` (Salem is the first, routine
-    being Salem-only). ``pending_path`` MUST match the routine tool's
-    ``routine.match_calibration.pending_path`` (the routine CLI writes it; this
-    section reads it) — both default to the shared
-    ``routine.match_calibration.DEFAULT_PENDING_PATH`` constant so they can't
-    drift (pinned in tests).
+    being Salem-only).
+
+    **pending_path single-source contract (reviewer NOTE #2).** The routine
+    CLI WRITES this capture sink (``routine.cli.cmd_done``); this Daily Sync
+    section READS it — they MUST be the SAME file. Rather than hold an
+    independently-defaulted duplicate (which silently drifts if an operator
+    overrides ``routine.match_calibration.pending_path`` but forgets this one),
+    :func:`load_from_unified` DERIVES this field from the routine tool's
+    resolved config at LOAD time: absent an explicit
+    ``daily_sync.routine_match.pending_path``, it tracks
+    ``routine.match_calibration.pending_path`` (including operator overrides).
+    The dataclass default below stays the shared
+    ``routine.match_calibration.DEFAULT_PENDING_PATH`` constant as the
+    final fallback. An explicit ``daily_sync.routine_match.pending_path`` is
+    still honoured (for the operator who genuinely wants them split — an
+    intentional, non-silent choice).
     """
 
     enabled: bool = False
@@ -281,6 +292,29 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
         cfg = DailySyncConfig(enabled=False)
     else:
         cfg = _build(DailySyncConfig, section)
+    # Single-source the routine_match pending_path (reviewer NOTE #2). The
+    # routine CLI WRITES this capture sink; this section READS it — same file.
+    # Derive the default from the routine tool's resolved config so an operator
+    # override of ``routine.match_calibration.pending_path`` propagates here
+    # instead of silently drifting. An explicit
+    # ``daily_sync.routine_match.pending_path`` is honoured (intentional split).
+    # See ``RoutineMatchConfig`` for the full contract; mirrors the Phase-2b
+    # corpus_path single-source (reply_dispatch reads the routine config).
+    rm_section = section.get("routine_match") if isinstance(section, dict) else None
+    rm_explicit = isinstance(rm_section, dict) and "pending_path" in rm_section
+    if not rm_explicit:
+        try:
+            from alfred.routine.config import load_from_unified as _load_routine
+
+            cfg.routine_match.pending_path = (
+                _load_routine(raw).match_calibration.pending_path
+            )
+        except Exception:  # noqa: BLE001
+            # Never let routine-config resolution break daily_sync load — keep
+            # the dataclass default (the shared constant, which is also what the
+            # routine tool defaults to, so they still match in the no-override
+            # case).
+            pass
     # Synthetic ``_config_path`` key — set by the CLI in
     # ``_load_unified_config`` before handing ``raw`` to the
     # orchestrator, carried through ``multiprocessing`` pickling to
