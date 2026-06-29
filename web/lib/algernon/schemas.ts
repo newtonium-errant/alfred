@@ -22,3 +22,13 @@ export type ChatTurnBody = z.infer<typeof chatTurnBodySchema>;
 
 // A session_key path/param must be a non-empty string (the backend issues uuids).
 export const sessionKeySchema = z.string().min(1).max(200);
+
+// POST /api/auth/login body. Light edge guard; the backend is the authority on
+// the uniform { status:"sent" } response (no account enumeration). We only ensure
+// a non-empty string is present so we can return the contract's email_required.
+export const loginBodySchema = z.object({
+  email: z.string().trim().min(1).max(320),
+});
+
+// The magic-link token posted to /api/auth/verify (via the callback).
+export const authTokenSchema = z.string().min(1).max(4096);

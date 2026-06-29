@@ -44,3 +44,20 @@ export interface ChatMessage {
   text: string;
   ts: string;
 }
+
+// The signed-in user, DISPLAY ONLY. Authorization is the instance-signed session
+// token (never this); the name/role here are just what the UI shows. Mirrors the
+// non-secret fields of POST /auth/verify's response.
+export interface SessionUser {
+  name: string;
+  role: string;
+}
+
+// POST /auth/verify → { session_token, name, role, exp }. `session_token` is the
+// instance-signed credential the BFF stores httpOnly + relays as X-Alfred-Session.
+export interface AuthVerifyResponse {
+  session_token: string;
+  name: string;
+  role: string;
+  exp?: number;
+}

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ChatApiError, chatApi } from './client';
+import { chatApi } from './client';
+import { ApiError } from './http';
 import type { ChatMessage, HistoryTurn } from './types';
 
 // Client-side chat state + the session resume model (team-lead confirmed):
@@ -8,6 +9,9 @@ import type { ChatMessage, HistoryTurn } from './types';
 //   * open a FRESH session ONLY when there's no stored key or history 404s.
 // /chat/open archives+closes the prior session, so we never call it on every
 // load — that would destroy continuity.
+//
+// `enabled` gates the initial bootstrap so the page can wait until the user is
+// known to be signed in (avoids a guaranteed-401 /chat call when signed out).
 
 const SESSION_KEY_STORAGE = 'algernon:session_key';
 
@@ -37,19 +41,30 @@ function writeStored(key: string): void {
   }
 }
 
+function isUnauthenticated(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 401 && e.code === 'invalid_session';
+}
+
 export type ChatStatus = 'booting' | 'ready' | 'sending' | 'error';
+
+export interface UseChatOptions {
+  /** Bootstrap only once the user is known signed in. Defaults true. */
+  enabled?: boolean;
+}
 
 export interface UseChat {
   messages: ChatMessage[];
   status: ChatStatus;
   error: string | null;
   sending: boolean;
+  /** True once any call reported 401 invalid_session — the page redirects to /login. */
+  unauthenticated: boolean;
   send: (text: string) => Promise<void>;
   newChat: () => Promise<void>;
 }
 
 function friendlyError(e: unknown): string {
-  if (e instanceof ChatApiError) {
+  if (e instanceof ApiError) {
     switch (e.code) {
       case 'invalid_session':
         return 'Your session has ended — please sign in again.';
@@ -71,11 +86,19 @@ function friendlyError(e: unknown): string {
   return 'Something went wrong. Please try again.';
 }
 
-export function useChat(): UseChat {
+export function useChat(options: UseChatOptions = {}): UseChat {
+  const enabled = options.enabled ?? true;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [status, setStatus] = useState<ChatStatus>('booting');
   const [error, setError] = useState<string | null>(null);
+  const [unauthenticated, setUnauthenticated] = useState(false);
   const sessionKeyRef = useRef<string | null>(null);
+
+  const fail = useCallback((e: unknown) => {
+    if (isUnauthenticated(e)) setUnauthenticated(true);
+    setStatus('error');
+    setError(friendlyError(e));
+  }, []);
 
   const openFresh = useCallback(async () => {
     const { session_key } = await chatApi.open();
@@ -100,41 +123,42 @@ export function useChat(): UseChat {
           // Only a 404 (session gone) falls through to opening a fresh one. Any
           // other failure is surfaced — opening a new session would likely fail
           // the same way and would silently lose the resume attempt.
-          if (!(e instanceof ChatApiError && e.status === 404)) throw e;
+          if (!(e instanceof ApiError && e.status === 404)) throw e;
         }
       }
       await openFresh();
       setStatus('ready');
     } catch (e) {
-      setStatus('error');
-      setError(friendlyError(e));
+      fail(e);
     }
-  }, [openFresh]);
+  }, [openFresh, fail]);
 
   useEffect(() => {
-    void bootstrap();
-  }, [bootstrap]);
+    if (enabled) void bootstrap();
+  }, [enabled, bootstrap]);
 
-  const send = useCallback(async (raw: string) => {
-    const text = raw.trim();
-    const key = sessionKeyRef.current;
-    if (!text || !key) return;
-    setError(null);
-    setMessages((prev) => [...prev, { id: nextId(), role: 'user', text, ts: '' }]);
-    setStatus('sending');
-    try {
-      const { reply } = await chatApi.turn(key, text);
-      setMessages((prev) => [
-        ...prev,
-        { id: nextId(), role: 'assistant', text: reply, ts: '' },
-      ]);
-      setStatus('ready');
-    } catch (e) {
-      // The user's message stays in the thread; the error banner invites a retry.
-      setStatus('error');
-      setError(friendlyError(e));
-    }
-  }, []);
+  const send = useCallback(
+    async (raw: string) => {
+      const text = raw.trim();
+      const key = sessionKeyRef.current;
+      if (!text || !key) return;
+      setError(null);
+      setMessages((prev) => [...prev, { id: nextId(), role: 'user', text, ts: '' }]);
+      setStatus('sending');
+      try {
+        const { reply } = await chatApi.turn(key, text);
+        setMessages((prev) => [
+          ...prev,
+          { id: nextId(), role: 'assistant', text: reply, ts: '' },
+        ]);
+        setStatus('ready');
+      } catch (e) {
+        // The user's message stays in the thread; the error banner invites a retry.
+        fail(e);
+      }
+    },
+    [fail],
+  );
 
   const newChat = useCallback(async () => {
     setStatus('booting');
@@ -143,16 +167,16 @@ export function useChat(): UseChat {
       await openFresh();
       setStatus('ready');
     } catch (e) {
-      setStatus('error');
-      setError(friendlyError(e));
+      fail(e);
     }
-  }, [openFresh]);
+  }, [openFresh, fail]);
 
   return {
     messages,
     status,
     error,
     sending: status === 'sending',
+    unauthenticated,
     send,
     newChat,
   };
