@@ -1460,6 +1460,10 @@ async def run(
             ticket_intake_config=ticket_intake_config,
             ticket_intake_github_client=ticket_intake_github_client,
             ticket_outcome_resolve_callable=ticket_outcome_resolver_fn,
+            # Cross-instance verbatim ingest route (2026-06-29). Opt-in via
+            # transport.ingest.enabled (default False → route not mounted).
+            ingest_enabled=transport_config.ingest.enabled,
+            ingest_config=transport_config.ingest,
         )
         log.info(
             "talker.daemon.transport_configured",

@@ -588,7 +588,12 @@ _DEFINITIONS: list[TypeDefinition] = [
         name="document",
         directory=None,
         statuses=None,
-        available_in_scopes=frozenset({"hypatia"}),
+        # ``web_ingest`` (2026-06-29, cross-instance ingest) — gate 1 must
+        # admit ``document`` under the web_ingest scope. KNOWN_TYPES_BY_SCOPE
+        # auto-derives, so tagging here is the ONLY edit needed (do NOT touch
+        # a KNOWN_TYPES_BY_SCOPE literal). Gate 2 (web_ingest_types_only)
+        # enforces the {document, note, source} create policy.
+        available_in_scopes=frozenset({"hypatia", "web_ingest"}),
     ),
     TypeDefinition(
         name="concept",
@@ -600,7 +605,8 @@ _DEFINITIONS: list[TypeDefinition] = [
         name="source",
         directory=None,
         statuses=None,
-        available_in_scopes=frozenset({"hypatia"}),
+        # ``web_ingest`` (2026-06-29) — see the ``document`` note above.
+        available_in_scopes=frozenset({"hypatia", "web_ingest"}),
     ),
     TypeDefinition(
         name="citation",

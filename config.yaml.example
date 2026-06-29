@@ -370,9 +370,35 @@ transport:
       #   token: "${ALFRED_WEB_PEER_TOKEN}"
       #   allowed_clients:
       #     - web
+      # Cross-instance verbatim ingest (2026-06-29) — the Next BFF holds a
+      # DEDICATED ``web_ingest`` peer token PER TARGET instance (its own
+      # secret, NEVER reusing ``local`` or the chat ``web`` token) and
+      # presents ``X-Alfred-Client: web``. Possession of this token IS the
+      # authority to write to this instance's vault via POST /vault/ingest;
+      # role gating (owner-only) lives at the BFF. Only present on instances
+      # that enable the ``transport.ingest`` block below.
+      # web_ingest:
+      #   token: "${ALFRED_WEB_INGEST_TOKEN}"
+      #   allowed_clients:
+      #     - web
   state:
     path: "./data/transport_state.json"
     dead_letter_max_age_days: 30
+
+  # Cross-instance verbatim document ingest (2026-06-29). Opt-in route
+  # ``POST /vault/ingest`` that writes a single VERBATIM {document, note,
+  # source} record into THIS instance's vault with provenance frontmatter.
+  # The write is a DETERMINISTIC vault_create (no run_turn, no LLM, no
+  # chunking) — that is what fixes the Telegram large-markdown wrong-order
+  # problem and guarantees verbatim fidelity. Default ``enabled: false`` —
+  # an un-opted-in instance never mounts the route (the transport server
+  # stays byte-unchanged). Requires the ``web_ingest`` auth token above.
+  # ingest:
+  #   enabled: true
+  #   max_body_chars: 262144     # verbatim-body size ceiling (chars) → 413
+  #   # types: [document, note, source]   # optional per-instance NARROWING
+  #   #   of the universal {document, note, source} set; can only narrow,
+  #   #   never widen (the web_ingest scope gate is the hard ceiling).
 
   # Salem-only: per-peer canonical record permissions (Phase A inter-
   # instance comms). Each peer gets a per-record-type field allowlist.

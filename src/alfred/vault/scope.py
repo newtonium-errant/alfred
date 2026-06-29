@@ -855,6 +855,37 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "allow_body_insert_at": {"*": True},
         "allow_body_replace": {"*": True},
     },
+    # ``web_ingest`` — cross-instance verbatim document ingest (2026-06-29).
+    # The peer-token-gated ``POST /vault/ingest`` transport route writes a
+    # single VERBATIM record into THIS instance's vault under this scope. The
+    # write is a deterministic ``vault_create`` (NO run_turn, NO LLM): the
+    # operator pastes/uploads an artifact on the web surface, the BFF relays
+    # it to the chosen target's transport, and it lands as a {document, note,
+    # source} record with provenance frontmatter.
+    #
+    # Scope shape (scope-first matrix, the principal artifact):
+    #   * read/search/list/context = True — needed so the handler can resolve
+    #     a title collision (the 409-exists path) before writing.
+    #   * create = ``web_ingest_types_only`` → WEB_INGEST_CREATE_TYPES
+    #     {document, note, source}. Anything else fails loud at gate 2.
+    #   * edit/move/delete = False — ingest is create-once; mutation +
+    #     relocation + destruction of ingested records is OUT of this scope.
+    #   * allow_body_writes = True — the verbatim body IS the payload.
+    #   * body_insert_at / body_replace = {} (deny-all) — ingest never patches
+    #     or rewrites an existing body; it creates a new record or 409s.
+    "web_ingest": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": "web_ingest_types_only",
+        "edit": False,
+        "move": False,
+        "delete": False,
+        "allow_body_writes": True,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
 }
 
 
@@ -1337,6 +1368,22 @@ CANONICAL_RECORD_TYPES: set[str] = {
 }
 
 
+# ``web_ingest`` create allowlist (2026-06-29). The universal record-type
+# set for the cross-instance verbatim ingest route — MVP Decision B
+# (BUILD_DECISIONS.md): {document, note, source}, code-level (per-instance
+# config-driven types deferred). None of these are canonical types, so the
+# ``web_ingest_types_only`` gate skips the CANONICAL_RECORD_TYPES propose-
+# hint guard the kalle/hypatia gates carry (web ingest writes DIRECTLY to
+# the target's own vault — there is no peer-proposes-to-Salem semantics).
+#
+# Keep this in sync with the ``available_in_scopes`` ``web_ingest`` tags on
+# the ``document`` + ``source`` TypeDefinitions in schema.py (gate 1);
+# ``note`` is SCOPE_CANONICAL so gate 1 already admits it under every scope.
+# Contract-pinned in tests/test_web_ingest_scope.py — widening this set is a
+# deliberate matrix change; update the pin in the same commit.
+WEB_INGEST_CREATE_TYPES: set[str] = {"document", "note", "source"}
+
+
 # Per-scope hint mapping: when a peer instance attempts vault_create on
 # a canonical type, the error message points at the right propose tool.
 # Salem (talker scope) is the canonical owner — it creates these types
@@ -1658,6 +1705,29 @@ def check_scope(
             raise ScopeError(
                 f"Scope '{scope}' can only create hypatia types "
                 f"({', '.join(sorted(HYPATIA_CREATE_TYPES))}). Got: '{record_type}'"
+            )
+        return
+
+    if permission == "web_ingest_types_only":
+        # Cross-instance verbatim ingest create gate (2026-06-29). The
+        # universal set is WEB_INGEST_CREATE_TYPES {document, note, source}.
+        # NO canonical-type propose hint (unlike the kalle / hypatia gates
+        # above): web ingest writes DIRECTLY to the target's own vault, and
+        # none of the allowed types are canonical — there is no
+        # peer-proposes-to-Salem path to point at. Fail-CLOSED on an empty
+        # record_type (mirrors the type-restricted edit gates' posture): an
+        # empty value is a caller bug, not a licence to create any type.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'web_ingest_types_only' is "
+                f"type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass record_type."
+            )
+        if record_type not in WEB_INGEST_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create web-ingest types "
+                f"({', '.join(sorted(WEB_INGEST_CREATE_TYPES))}). "
+                f"Got: '{record_type}'."
             )
         return
 

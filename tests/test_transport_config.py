@@ -289,3 +289,43 @@ def test_query_block_clamps_max_limit_to_ceiling() -> None:
     cfg = load_from_unified(raw)
     q = cfg.canonical.peer_permissions["hypatia"]["event"].query
     assert q.max_limit == FILTER_LIMIT_CEILING
+
+
+# ---------------------------------------------------------------------------
+# Ingest block (cross-instance verbatim ingest, 2026-06-29)
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_defaults_disabled() -> None:
+    """No ``ingest`` block → disabled, default 256 KiB cap, no type narrow."""
+    from alfred.transport.config import DEFAULT_INGEST_MAX_BODY_CHARS, IngestConfig
+
+    cfg = load_from_unified({})
+    assert isinstance(cfg.ingest, IngestConfig)
+    assert cfg.ingest.enabled is False
+    assert cfg.ingest.max_body_chars == DEFAULT_INGEST_MAX_BODY_CHARS == 262144
+    assert cfg.ingest.types == []
+
+
+def test_ingest_block_overrides_apply() -> None:
+    raw = {
+        "transport": {
+            "ingest": {
+                "enabled": True,
+                "max_body_chars": 1000,
+                "types": ["document", "note"],
+            },
+        },
+    }
+    cfg = load_from_unified(raw)
+    assert cfg.ingest.enabled is True
+    assert cfg.ingest.max_body_chars == 1000
+    assert cfg.ingest.types == ["document", "note"]
+
+
+def test_ingest_max_body_chars_floored_at_one() -> None:
+    """A zero/negative cap can't wedge the route into an always-413 state."""
+    cfg = load_from_unified(
+        {"transport": {"ingest": {"enabled": True, "max_body_chars": 0}}}
+    )
+    assert cfg.ingest.max_body_chars == 1

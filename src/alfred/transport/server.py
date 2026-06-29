@@ -40,7 +40,7 @@ from typing import Any
 
 from aiohttp import web
 
-from .config import TransportConfig
+from .config import DEFAULT_INGEST_MAX_BODY_CHARS, TransportConfig
 from .state import TransportState
 from .utils import get_logger
 
@@ -693,6 +693,8 @@ def wire_transport_app(
     ticket_intake_config: Any | None = None,
     ticket_intake_github_client: Any | None = None,
     ticket_outcome_resolve_callable: _TicketOutcomeResolveCallable | None = None,
+    ingest_enabled: bool = False,
+    ingest_config: Any | None = None,
 ) -> None:
     """Wire all transport-app dependencies in one place.
 
@@ -768,6 +770,16 @@ def wire_transport_app(
             ``build_github_client`` factory; a failed build means the
             daemon logs ``transport.ticket_intake.disabled`` and
             passes ``None`` here (the daemon must still start).
+        ingest_enabled: Mount the cross-instance ``POST /vault/ingest``
+            route (2026-06-29). Default ``False`` — an un-opted-in
+            instance never mounts the route (opt-in inertness, same as
+            the web-chat surface). Wired via
+            :func:`routes_ingest.register_ingest_routes`; the route
+            inherits ``auth_middleware`` peer-gating automatically.
+        ingest_config: The typed
+            :class:`alfred.transport.config.IngestConfig` carrying
+            ``max_body_chars`` + the optional per-instance ``types``
+            narrowing list. Read only when ``ingest_enabled`` is True.
 
     Logging: emits one info event per registered resource so a
     misconfigured instance has a single grep target
@@ -788,6 +800,7 @@ def wire_transport_app(
         register_ticket_outcome_resolver_callable,
         register_vault_path,
     )
+    from .routes_ingest import register_ingest_routes
 
     # Identity is unconditional — every instance has a name.
     register_instance_identity(app, name=instance_name, alias=instance_alias)
@@ -983,6 +996,38 @@ def wire_transport_app(
             reason="gcal_intended_on flag not set (instance did not "
                    "opt into GCal, OR opted in and client constructed "
                    "successfully so no sentinel needed)",
+        )
+
+    # Cross-instance verbatim ingest route (2026-06-29). Opt-in via
+    # ``transport.ingest.enabled``; register_ingest_routes emits its own
+    # explicit disabled-skip log (intentionally-left-blank) when off, so
+    # the wire-level branch only needs to surface the wired case.
+    if ingest_enabled:
+        register_ingest_routes(
+            app,
+            enabled=True,
+            instance_name=instance_name,
+            max_body_chars=getattr(
+                ingest_config, "max_body_chars", DEFAULT_INGEST_MAX_BODY_CHARS,
+            ),
+            types=list(getattr(ingest_config, "types", []) or []),
+        )
+        log.info(
+            "transport.wire_transport_app.ingest_registered",
+            max_body_chars=getattr(
+                ingest_config, "max_body_chars", DEFAULT_INGEST_MAX_BODY_CHARS,
+            ),
+        )
+    else:
+        # Still call the registrar so its own disabled-skip log fires —
+        # keeps the "ran, did not mount" signal greppable + symmetric.
+        register_ingest_routes(
+            app, enabled=False, instance_name=instance_name,
+        )
+        log.debug(
+            "transport.wire_transport_app.ingest_skipped",
+            reason="transport.ingest.enabled is false / absent (instance "
+                   "did not opt into the cross-instance ingest route)",
         )
 
 

@@ -345,6 +345,38 @@ class StateConfig:
     dead_letter_max_age_days: int = 30
 
 
+# Default body-size cap for the cross-instance ingest route (256 KiB).
+# Bounds the DoS surface the 8000-char chat cap doesn't cover; the BFF
+# enforces the same ceiling (CONTRACT §5 ``MAX_INGEST_CHARS``).
+DEFAULT_INGEST_MAX_BODY_CHARS: int = 262144
+
+
+@dataclass
+class IngestConfig:
+    """Cross-instance verbatim document ingest route config (2026-06-29).
+
+    The opt-in ``POST /vault/ingest`` route on the transport app. Default
+    ``enabled=False`` — an un-opted-in instance never mounts the route, so
+    every non-ingest instance's transport server stays byte-unchanged
+    (same opt-in inertness posture as the ``web:`` chat surface).
+
+    ``max_body_chars`` is the verbatim-body size ceiling (chars), enforced
+    in the handler with a 413 ``body_too_large``. The BFF caps the same
+    value (defense-in-depth across the trust boundary).
+
+    ``types`` is an OPTIONAL per-instance NARROWING of the universal create
+    set (``WEB_INGEST_CREATE_TYPES`` = {document, note, source}). When set,
+    the handler validates the request type against the INTERSECTION of this
+    list and the code-level ceiling — it can only narrow, never widen
+    (``check_scope``'s ``web_ingest_types_only`` gate is the hard ceiling).
+    Empty / absent (the default) → the full universal set.
+    """
+
+    enabled: bool = False
+    max_body_chars: int = DEFAULT_INGEST_MAX_BODY_CHARS
+    types: list[str] = field(default_factory=list)
+
+
 @dataclass
 class TransportConfig:
     """Typed config for the transport module."""
@@ -354,6 +386,7 @@ class TransportConfig:
     auth: AuthConfig = field(default_factory=AuthConfig)
     state: StateConfig = field(default_factory=StateConfig)
     canonical: CanonicalConfig = field(default_factory=CanonicalConfig)
+    ingest: IngestConfig = field(default_factory=IngestConfig)
     peers: dict[str, PeerEntry] = field(default_factory=dict)
 
 
@@ -560,6 +593,32 @@ def _build_canonical(data: dict[str, Any]) -> CanonicalConfig:
     )
 
 
+def _build_ingest(data: dict[str, Any]) -> IngestConfig:
+    """Build the optional ``ingest`` block (defaults = disabled).
+
+    ``max_body_chars`` is int-coerced with the dataclass default as a
+    fallback and floored at 1 so a zero/negative config value can't wedge
+    the route into an always-413 state. ``types`` keeps only non-empty
+    string entries (a per-instance narrowing list).
+    """
+    if not isinstance(data, dict):
+        return IngestConfig()
+
+    try:
+        max_body_chars = max(1, int(data.get("max_body_chars", DEFAULT_INGEST_MAX_BODY_CHARS)))
+    except (TypeError, ValueError):
+        max_body_chars = DEFAULT_INGEST_MAX_BODY_CHARS
+
+    types_raw = data.get("types", []) or []
+    types = [str(t) for t in types_raw if isinstance(t, str) and t.strip()]
+
+    return IngestConfig(
+        enabled=bool(data.get("enabled", False)),
+        max_body_chars=max_body_chars,
+        types=types,
+    )
+
+
 def _build_peers(data: dict[str, Any]) -> dict[str, PeerEntry]:
     """Build the ``peers`` dict: peer_name → :class:`PeerEntry`."""
     out: dict[str, PeerEntry] = {}
@@ -601,6 +660,8 @@ def _build(cls: type, data: dict[str, Any]) -> Any:
             })
         if "canonical" in data and isinstance(data["canonical"], dict):
             kwargs["canonical"] = _build_canonical(data["canonical"])
+        if "ingest" in data and isinstance(data["ingest"], dict):
+            kwargs["ingest"] = _build_ingest(data["ingest"])
         if "peers" in data and isinstance(data["peers"], dict):
             kwargs["peers"] = _build_peers(data["peers"])
         return TransportConfig(**kwargs)

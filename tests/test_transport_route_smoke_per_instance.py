@@ -770,6 +770,12 @@ async def test_wire_transport_app_logs_skip_for_omitted_kwargs(
         # that aren't a ticket-pipeline origin (every instance except
         # VERA) skip-log here.
         "transport.wire_transport_app.ticket_outcome_resolver_skipped",
+        # Cross-instance verbatim ingest (2026-06-29) — instances that
+        # don't enable transport.ingest (every instance by default)
+        # skip-log here. register_ingest_routes ALSO emits its own
+        # ``transport.ingest.disabled`` info log; this debug event is the
+        # wire-level skip signal.
+        "transport.wire_transport_app.ingest_skipped",
     }
     actual_skips = set(skip_events)
     missing = expected_skips - actual_skips
