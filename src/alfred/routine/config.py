@@ -411,6 +411,10 @@ class MatchCalibrationConfig:
     # Phase 2: the learned glossary the matcher consults. Mutated ONLY by an
     # operator reply (Daily Sync reply_dispatch) — the matcher only reads it.
     corpus_path: str = match_calibration.DEFAULT_CORPUS_PATH
+    # Phase 3 (no-match / alias path): min-plausibility floor for surfacing a
+    # "did you mean…" suggestion when a completion matches nothing. Below it the
+    # closest candidate is too unrelated to suggest (ILB "nothing close").
+    no_match_floor: float = match_calibration.DEFAULT_NO_MATCH_FLOOR
 
 
 @dataclass
@@ -490,6 +494,9 @@ def load_from_unified(raw: dict[str, Any]) -> RoutineConfig:
         corpus_path=mc_raw.get(
             "corpus_path",
             f"{log_dir}/routine_match_corpus.salem.jsonl",
+        ),
+        no_match_floor=float(
+            mc_raw.get("no_match_floor", match_calibration.DEFAULT_NO_MATCH_FLOOR)
         ),
     )
 

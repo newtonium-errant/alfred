@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import frontmatter
 import pytest
 import structlog
 import yaml
@@ -317,6 +318,129 @@ def test_roundtrip_confirm_is_consultable_by_matcher(
     glossary = mc.load_glossary(rcfg.match_calibration.corpus_path)
     assert glossary.verdict(mc.query_key("walk dog"), "Walk the dog every morning before work") == "confirm"
     assert _matches_item("walk dog", "Walk the dog every morning before work", glossary) is True
+
+
+def _no_match_item(
+    num: int,
+    *,
+    query: str,
+    matched_to: str,
+    record: str = "Daily",
+    confidence: float = 0.5,
+) -> dict:
+    item = _routine_match_item(
+        num, query=query, matched_to=matched_to,
+        record=record, confidence=confidence,
+    )
+    item["kind"] = mc.KIND_NO_MATCH
+    return item
+
+
+def test_no_match_confirm_writes_alias_row(tmp_path: Path, corpus_path: Path) -> None:
+    """Phase 3: confirming a 'did you mean…' suggestion writes a CORPUS_ALIAS
+    row (closes the false-negative), not a plain confirm."""
+    cfg = _config(tmp_path)
+    _seed_state(cfg, routine_match_items=[
+        _no_match_item(5, query="feed the birds", matched_to="Feed the cat"),
+    ])
+
+    result = handle_daily_sync_reply(cfg, parent_message_id=100, reply_text="5 confirm")
+
+    assert result["routine_match_count"] == 1
+    rows = _read_corpus(corpus_path)
+    assert len(rows) == 1
+    assert rows[0]["type"] == mc.CORPUS_ALIAS
+    assert rows[0]["query_key"] == mc.query_key("feed the birds")
+    assert rows[0]["item_text"] == "Feed the cat"
+    assert "aliased (now matches)" in result["message"]
+
+
+def test_no_match_reject_writes_reject_row(tmp_path: Path, corpus_path: Path) -> None:
+    """Rejecting a 'did you mean…' suggestion writes a CORPUS_REJECT row so the
+    capture path doesn't re-ask it."""
+    cfg = _config(tmp_path)
+    _seed_state(cfg, routine_match_items=[
+        _no_match_item(5, query="feed the birds", matched_to="Feed the cat"),
+    ])
+
+    result = handle_daily_sync_reply(cfg, parent_message_id=100, reply_text="5 reject")
+
+    assert result["routine_match_count"] == 1
+    rows = _read_corpus(corpus_path)
+    assert len(rows) == 1
+    assert rows[0]["type"] == mc.CORPUS_REJECT
+
+
+def test_roundtrip_alias_matches_next_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full false-negative loop: a completion that matched NOTHING is captured
+    as a suggestion; the operator confirms the alias; the NEXT cmd_done now
+    MATCHES that item."""
+    from alfred.routine.cli import cmd_done
+
+    vault = tmp_path / "vault"
+    corpus = tmp_path / "corpus.jsonl"
+    _write_routine(vault, "Daily", [{"text": "Feed the cat"}])
+    rcfg = _routine_config(vault, tmp_path, corpus)
+
+    # Capture: "feed the birds" matches nothing → no_match suggestion captured.
+    assert cmd_done(rcfg, "", "feed the birds", today_override="2026-06-28") == 1
+    pending = mc.load_pending(rcfg.match_calibration.pending_path)
+    assert len(pending) == 1 and pending[0].kind == mc.KIND_NO_MATCH
+
+    # Operator confirms the alias.
+    monkeypatch.setattr(rd, "_routine_match_corpus_path", lambda *a, **kw: str(corpus))
+    dcfg = _config(tmp_path)
+    _seed_state(dcfg, routine_match_items=[
+        _no_match_item(
+            1, query=pending[0].query, matched_to=pending[0].matched_to,
+            record=pending[0].record, confidence=pending[0].confidence,
+        ),
+    ])
+    assert handle_daily_sync_reply(
+        dcfg, parent_message_id=100, reply_text="1 confirm",
+    )["routine_match_count"] == 1
+
+    # Feedback: the same phrasing now MATCHES (exactly one) → success.
+    assert cmd_done(rcfg, "", "feed the birds", today_override="2026-06-29") == 0
+    post = frontmatter.load(str(vault / "routine" / "Daily.md"))
+    log = post.metadata.get("completion_log") or {}
+    assert "2026-06-29" in (log.get("Feed the cat") or [])
+
+
+def test_roundtrip_no_match_reject_not_resurfaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject a 'did you mean…' suggestion → the next no-match completion does
+    NOT re-capture it (recorded, not re-asked)."""
+    from alfred.routine.cli import cmd_done
+
+    vault = tmp_path / "vault"
+    corpus = tmp_path / "corpus.jsonl"
+    _write_routine(vault, "Daily", [{"text": "Feed the cat"}])
+    rcfg = _routine_config(vault, tmp_path, corpus)
+
+    assert cmd_done(rcfg, "", "feed the birds", today_override="2026-06-28") == 1
+    pending = mc.load_pending(rcfg.match_calibration.pending_path)
+    assert len(pending) == 1
+
+    monkeypatch.setattr(rd, "_routine_match_corpus_path", lambda *a, **kw: str(corpus))
+    dcfg = _config(tmp_path)
+    _seed_state(dcfg, routine_match_items=[
+        _no_match_item(
+            1, query=pending[0].query, matched_to=pending[0].matched_to,
+            record=pending[0].record, confidence=pending[0].confidence,
+        ),
+    ])
+    assert handle_daily_sync_reply(
+        dcfg, parent_message_id=100, reply_text="1 reject",
+    )["routine_match_count"] == 1
+
+    # Feedback: same completion no longer re-captured (still 1 pending row,
+    # the original) AND still no match (reject ≠ alias).
+    assert cmd_done(rcfg, "", "feed the birds", today_override="2026-06-29") == 1
+    assert len(mc.load_pending(rcfg.match_calibration.pending_path)) == 1
 
 
 def test_roundtrip_reject_suppresses_next_match(

@@ -158,6 +158,30 @@ def test_routine_match_item_from_dict_schema_tolerant() -> None:
     assert item.completion_date == "" and item.captured_at == ""
 
 
+def test_no_match_item_renders_did_you_mean(tmp_path: Path) -> None:
+    """Phase 3: a no_match item renders the 'did you mean…' shape, distinct from
+    the low_conf 'X → Y (conf)' shape; both carry through consume_last_batch."""
+    p = tmp_path / "pending.jsonl"
+    _seed_pending(
+        p,
+        mc.PendingMatch(query="walk doggo", matched_to="Walk dog",
+                        record="Daily", confidence=0.40),  # low_conf (default)
+        mc.PendingMatch(query="feed the birds", matched_to="Feed the cat",
+                        record="Daily", confidence=0.50,
+                        kind=mc.KIND_NO_MATCH),
+    )
+    out = rms.routine_match_section(_cfg(p), date(2026, 6, 28), start_index=1)
+    assert out is not None
+    # low_conf shape
+    assert "“walk doggo” → “Walk dog”" in out and "conf 0.40" in out
+    # no_match shape — distinct, suggestion-framed, no "conf" phrasing
+    assert "nothing matched — did you mean “Feed the cat”?" in out
+    # kind survives into the routing surface
+    batch = rms.consume_last_batch()
+    assert [i.kind for i in batch] == ["low_conf", "no_match"]
+    assert batch[1].to_dict()["kind"] == "no_match"
+
+
 def test_disabled_clears_holder(tmp_path: Path) -> None:
     """Disabled → section omitted AND the batch holder cleared (no stale items
     leak into a later fire's persist)."""

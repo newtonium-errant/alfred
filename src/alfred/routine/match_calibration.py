@@ -40,6 +40,12 @@ log = structlog.get_logger(__name__)
 # starting floor (GREENLIT Q1) — observability refines it from real traffic.
 DEFAULT_PENDING_PATH = "./data/routine_match_pending.salem.jsonl"
 DEFAULT_CONFIDENCE_THRESHOLD = 0.5
+# Phase 3 (no-match / alias path) min-plausibility floor. When a completion
+# matches NOTHING, the closest candidate is only surfaced as a "did you mean…"
+# alias suggestion if its ``_match_confidence`` clears this floor — below it the
+# suggestion would be noise (a wildly-unrelated item), so we emit the ILB
+# "nothing close" signal instead. Tunable via ``routine.match_calibration``.
+DEFAULT_NO_MATCH_FLOOR = 0.3
 # The learned glossary (Phase 2) — operator-approved confirm/reject/alias rows
 # the matcher consults. Mutated ONLY by an operator reply through the Daily Sync
 # reply_dispatch; never by a match. Per-instance, mirrors the pending sink.
@@ -56,11 +62,18 @@ class PendingMatch:
     """
 
     query: str  # the operator's free-text completion phrase
-    matched_to: str  # the routine item text the matcher chose
+    matched_to: str  # the routine item the matcher chose (low_conf) OR the
+    # closest "did you mean" candidate (no_match — Phase 3)
     record: str  # the routine record name the item lives on
     confidence: float  # the _match_confidence score at capture time
     completion_date: str = ""  # the date the completion was logged for
     captured_at: str = ""  # ISO timestamp of capture
+    # Phase 3: capture KIND. ``"low_conf"`` = a below-threshold match the
+    # matcher MADE (confirm/reject → glossary). ``"no_match"`` = nothing
+    # matched and ``matched_to`` is the closest candidate suggestion
+    # (confirm → alias, reject → suppress). Default ``"low_conf"`` keeps
+    # Phase-1/2 rows (written without the field) loading unchanged.
+    kind: str = "low_conf"
 
     @classmethod
     def from_dict(cls, data: dict) -> "PendingMatch":
@@ -126,6 +139,10 @@ def load_pending(path: str | Path) -> list[PendingMatch]:
 # Sync ``reply_dispatch`` (confirm/reject/alias) — NEVER by a match. The matcher
 # only READS the glossary. An empty glossary ⟹ the matcher behaves exactly as
 # before (the consult is purely additive).
+
+# Capture KINDs (PendingMatch.kind / RoutineMatchItem.kind).
+KIND_LOW_CONF = "low_conf"  # the matcher made a below-threshold match
+KIND_NO_MATCH = "no_match"  # nothing matched; matched_to is the closest candidate
 
 # Corpus row types.
 CORPUS_CONFIRM = "match_confirm"  # operator confirmed a low-conf match was right
@@ -267,7 +284,10 @@ def load_glossary(path: str | Path) -> Glossary:
 __all__ = [
     "DEFAULT_PENDING_PATH",
     "DEFAULT_CONFIDENCE_THRESHOLD",
+    "DEFAULT_NO_MATCH_FLOOR",
     "DEFAULT_CORPUS_PATH",
+    "KIND_LOW_CONF",
+    "KIND_NO_MATCH",
     "CORPUS_CONFIRM",
     "CORPUS_REJECT",
     "CORPUS_ALIAS",

@@ -239,3 +239,153 @@ def test_corpus_path_default_matches_constant() -> None:
     from alfred.routine.config import MatchCalibrationConfig
 
     assert MatchCalibrationConfig().corpus_path == mc.DEFAULT_CORPUS_PATH
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — no-match / alias capture (the false-NEGATIVE half of the loop)
+# ---------------------------------------------------------------------------
+
+
+def test_no_match_floor_default_matches_constant() -> None:
+    """Drift-guard: the routine config no_match_floor default binds the constant."""
+    from alfred.routine.config import MatchCalibrationConfig
+
+    assert MatchCalibrationConfig().no_match_floor == mc.DEFAULT_NO_MATCH_FLOOR
+
+
+def test_no_match_captures_closest_candidate(tmp_path: Path) -> None:
+    """A completion that matches NOTHING but has a plausible closest candidate
+    → one no_match pending row carrying the closest as matched_to."""
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Daily", {
+        "type": "routine", "name": "Daily", "status": "active",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Feed the cat"}],
+    })
+    config = _config(vault, tmp_path)
+
+    code = cmd_done(config, "", "feed the birds", today_override="2026-06-28")
+
+    assert code == 1  # still the unknown_item canary — capture is additive
+    rows = mc.load_pending(config.match_calibration.pending_path)
+    assert len(rows) == 1
+    assert rows[0].kind == mc.KIND_NO_MATCH
+    assert rows[0].query == "feed the birds"
+    assert rows[0].matched_to == "Feed the cat"  # the closest candidate
+    assert rows[0].record == "Daily"
+    assert rows[0].confidence >= config.match_calibration.no_match_floor
+
+
+def test_no_match_below_floor_captures_nothing(tmp_path: Path) -> None:
+    """A completion with NO plausible candidate (closest below the floor) →
+    no capture (ILB 'nothing close' instead of a bad suggestion)."""
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Daily", {
+        "type": "routine", "name": "Daily", "status": "active",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Feed the cat"}],
+    })
+    config = _config(vault, tmp_path)
+
+    import structlog
+    with structlog.testing.capture_logs() as cap:
+        code = cmd_done(config, "", "xyzzy nonexistent", today_override="2026-06-28")
+
+    assert code == 1
+    assert mc.load_pending(config.match_calibration.pending_path) == []
+    assert [
+        c for c in cap
+        if c.get("event") == "routine.match_calibration.no_match_nothing_close"
+    ]
+
+
+def test_no_match_empty_vault_captures_nothing(tmp_path: Path) -> None:
+    """No active routine items at all → ILB 'nothing close' (reason flagged), no
+    capture, no crash."""
+    vault = tmp_path / "vault"
+    (vault / "routine").mkdir(parents=True)
+    config = _config(vault, tmp_path)
+
+    import structlog
+    with structlog.testing.capture_logs() as cap:
+        code = cmd_done(config, "", "feed the birds", today_override="2026-06-28")
+
+    assert code == 1
+    assert mc.load_pending(config.match_calibration.pending_path) == []
+    nothing = [
+        c for c in cap
+        if c.get("event") == "routine.match_calibration.no_match_nothing_close"
+    ]
+    assert nothing and nothing[0].get("reason") == "no_active_items"
+
+
+def test_no_match_capture_writes_only_pending_not_corpus(tmp_path: Path) -> None:
+    """no-silent-alias guardrail: the no-match capture writes ONLY the pending
+    sink — it must NOT create/mutate the corpus (aliasing is operator-reply
+    only)."""
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Daily", {
+        "type": "routine", "name": "Daily", "status": "active",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Feed the cat"}],
+    })
+    config = _config(vault, tmp_path)
+    config.match_calibration.corpus_path = str(tmp_path / "corpus.jsonl")
+
+    cmd_done(config, "", "feed the birds", today_override="2026-06-28")
+
+    assert Path(config.match_calibration.pending_path).exists()
+    assert not Path(config.match_calibration.corpus_path).exists()
+
+
+def test_no_match_already_rejected_is_not_recaptured(tmp_path: Path) -> None:
+    """A no-match suggestion the operator already REJECTED is not re-surfaced
+    (recorded, not re-asked) — the capture path consults the glossary."""
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Daily", {
+        "type": "routine", "name": "Daily", "status": "active",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Feed the cat"}],
+    })
+    config = _config(vault, tmp_path)
+    config.match_calibration.corpus_path = str(tmp_path / "corpus.jsonl")
+    # Operator previously rejected the (feed the birds → Feed the cat) suggestion.
+    mc.append_corpus(config.match_calibration.corpus_path, mc.MatchCorpusEntry(
+        type=mc.CORPUS_REJECT,
+        query_key=mc.query_key("feed the birds"),
+        item_text="Feed the cat",
+    ))
+
+    import structlog
+    with structlog.testing.capture_logs() as cap:
+        cmd_done(config, "", "feed the birds", today_override="2026-06-28")
+
+    assert mc.load_pending(config.match_calibration.pending_path) == []
+    assert [
+        c for c in cap
+        if c.get("event") == "routine.match_calibration.no_match_already_rejected"
+    ]
+
+
+def test_no_match_capture_emits_captured_log(tmp_path: Path) -> None:
+    """Observability pin: a surfaced no-match suggestion emits the
+    ``no_match_captured`` event with the candidate + score."""
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Daily", {
+        "type": "routine", "name": "Daily", "status": "active",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Feed the cat"}],
+    })
+    config = _config(vault, tmp_path)
+
+    import structlog
+    with structlog.testing.capture_logs() as cap:
+        cmd_done(config, "", "feed the birds", today_override="2026-06-28")
+
+    captured = [
+        c for c in cap
+        if c.get("event") == "routine.match_calibration.no_match_captured"
+    ]
+    assert len(captured) == 1
+    assert captured[0]["candidate"] == "Feed the cat"
+    assert captured[0]["query"] == "feed the birds"

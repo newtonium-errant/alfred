@@ -673,6 +673,96 @@ def _fuzzy_match_vault_wide(
     return matches, all_candidates
 
 
+def _capture_no_match(
+    config: "RoutineConfig",
+    query: str,
+    all_candidates: list[_ItemCandidate],
+    completion_date: str,
+    glossary,
+) -> None:
+    """Self-correcting matcher — Phase 3 no-match / alias CAPTURE.
+
+    A vault-wide completion that matched NOTHING is the false-NEGATIVE signal
+    (the mirror of the low-confidence false-positive Phase 1 captures). We
+    compute the CLOSEST active-routine item by ``_match_confidence`` and surface
+    it as a "did you mean…" alias suggestion for operator review — confirm →
+    alias (the phrasing now matches), reject → suppressed.
+
+    Guardrails:
+      * MIN-PLAUSIBILITY FLOOR — only suggest when the closest score clears
+        ``no_match_floor``; below it the suggestion is noise, so we emit the ILB
+        ``no_match_nothing_close`` signal instead (idle distinguishable from
+        broken). Empty candidate list → same ILB signal.
+      * No re-asking a rejected suggestion — if the operator already rejected
+        this ``(query_key, candidate)`` pair, skip (recorded, not re-asked).
+      * Writes ONLY the pending sink (``no_match`` kind) — never the corpus
+        (operator-reply-only). Best-effort: the caller wraps this so a capture
+        failure never breaks the completion's canary.
+
+    A confirmed alias makes the matcher MATCH the phrasing next time, so it
+    never reaches this branch again (no confirm-suppression check needed here).
+    """
+    from . import match_calibration as _mc
+
+    if not all_candidates:
+        log.info(
+            "routine.match_calibration.no_match_nothing_close",
+            query=query,
+            reason="no_active_items",
+        )
+        return
+
+    best: _ItemCandidate | None = None
+    best_score = 0.0
+    for c in all_candidates:
+        score = _match_confidence(query, c.item_text)
+        if score > best_score:
+            best_score = score
+            best = c
+
+    floor = config.match_calibration.no_match_floor
+    if best is None or best_score < floor:
+        log.info(
+            "routine.match_calibration.no_match_nothing_close",
+            query=query,
+            best_score=round(best_score, 3),
+            floor=floor,
+        )
+        return
+
+    if not glossary.is_empty() and (
+        glossary.verdict(_mc.query_key(query), best.item_text) == "reject"
+    ):
+        log.info(
+            "routine.match_calibration.no_match_already_rejected",
+            query=query,
+            candidate=best.item_text,
+        )
+        return
+
+    from datetime import datetime, timezone
+
+    _mc.append_pending(
+        config.match_calibration.pending_path,
+        _mc.PendingMatch(
+            query=query,
+            matched_to=best.item_text,
+            record=best.record_name,
+            confidence=best_score,
+            completion_date=completion_date,
+            captured_at=datetime.now(timezone.utc).isoformat(),
+            kind=_mc.KIND_NO_MATCH,
+        ),
+    )
+    log.info(
+        "routine.match_calibration.no_match_captured",
+        query=query,
+        candidate=best.item_text,
+        record=best.record_name,
+        score=round(best_score, 3),
+    )
+
+
 def _validate_completed_at(
     completed_at: str | None,
     tz_name: str,
@@ -809,6 +899,20 @@ def cmd_done(
             vault_path, item_text, _glossary,
         )
         if not matches:
+            # Phase 3 — no-match / alias CAPTURE (best-effort, additive). The
+            # closest plausible candidate is surfaced as a "did you mean…"
+            # suggestion for operator review; a capture failure must NEVER
+            # change the unknown_item canary the operator sees.
+            try:
+                _capture_no_match(
+                    config, item_text, all_candidates, iso, _glossary,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "routine.match_calibration.no_match_capture_failed",
+                    error=str(exc),
+                    query=item_text,
+                )
             return _emit_canary(
                 wants_json=wants_json,
                 kind=DONE_KIND_UNKNOWN_ITEM,

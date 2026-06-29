@@ -57,11 +57,15 @@ class RoutineMatchItem:
 
     item_number: int  # 1-indexed, GLOBAL across Daily Sync sections
     query: str  # the operator's free-text completion phrase
-    matched_to: str  # the routine item text the matcher chose
+    matched_to: str  # the matched item (low_conf) OR closest candidate (no_match)
     record: str  # the routine record the item lives on
     confidence: float  # the _match_confidence score at capture time
     completion_date: str = ""  # the date the completion was logged for
     captured_at: str = ""  # ISO timestamp of capture
+    # Phase 3: "low_conf" (confirm/reject a below-threshold match) or
+    # "no_match" (confirm = alias the phrasing, reject = suppress the
+    # suggestion). Default keeps Phase-2b rows (no kind) loading unchanged.
+    kind: str = "low_conf"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +76,7 @@ class RoutineMatchItem:
             "confidence": self.confidence,
             "completion_date": self.completion_date,
             "captured_at": self.captured_at,
+            "kind": self.kind,
         }
 
     @classmethod
@@ -105,8 +110,21 @@ def peek_last_batch_count() -> int:
 
 
 def _format_item(item: RoutineMatchItem) -> str:
-    """Render one routine-match review item as a numbered line."""
+    """Render one routine-match review item as a numbered line.
+
+    Two shapes by kind:
+      * ``low_conf`` — a below-threshold match the matcher MADE:
+        ``N. "query" → "matched_to" (conf X.XX) on record``
+      * ``no_match`` — nothing matched; ``matched_to`` is the closest
+        candidate suggestion:
+        ``N. "query" → nothing matched — did you mean "matched_to"? (on record)``
+    """
     record = item.record or "?"
+    if item.kind == "no_match":
+        return (
+            f"{item.item_number}. “{item.query}” → nothing matched — "
+            f"did you mean “{item.matched_to}”? (on {record})"
+        )
     return (
         f"{item.item_number}. “{item.query}” → "
         f"“{item.matched_to}” "
@@ -143,6 +161,7 @@ def routine_match_section(
             confidence=p.confidence,
             completion_date=p.completion_date,
             captured_at=p.captured_at,
+            kind=p.kind,
         )
         for i, p in enumerate(pending)
     ]

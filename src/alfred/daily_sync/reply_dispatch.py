@@ -38,8 +38,10 @@ import frontmatter
 import structlog
 
 from alfred.routine.match_calibration import (
+    CORPUS_ALIAS,
     CORPUS_CONFIRM,
     CORPUS_REJECT,
+    KIND_NO_MATCH,
     MatchCorpusEntry,
     append_corpus,
     query_key,
@@ -564,18 +566,23 @@ def _resolve_routine_match_correction(
     item: dict[str, Any],
     corpus_path: str,
 ) -> tuple[str | None, bool]:
-    """Apply one routine-match confirm/reject (self-correcting matcher Phase 2b).
+    """Apply one routine-match confirm/reject (self-correcting matcher).
 
-    Returns ``(error_str_or_None, did_write)``.
+    Returns ``(error_str_or_None, did_write)``. Routes by the item's KIND:
 
-    On confirm: append a :data:`CORPUS_CONFIRM` row to the learned-glossary
-    corpus keyed by ``query_key(query)`` → the matched item. The matcher
-    consults this on its next vault-wide scan, promoting the operator's
-    idiosyncratic phrasing to a fast-path TRUE.
+    ``low_conf`` (Phase 2b — a below-threshold match the matcher MADE):
+      * confirm → :data:`CORPUS_CONFIRM` (promote the phrasing to a fast-path
+        TRUE the matcher's next vault-wide scan honours).
+      * reject → :data:`CORPUS_REJECT` (short-circuit the recurring
+        false-positive to FALSE for that ``(query_key, item)`` pair).
 
-    On reject: append a :data:`CORPUS_REJECT` row, short-circuiting the
-    matcher to FALSE for that ``(query_key, item)`` pair so the recurring
-    false-positive stops firing.
+    ``no_match`` (Phase 3 — nothing matched; ``matched_to`` is the closest
+    "did you mean…" candidate):
+      * confirm → :data:`CORPUS_ALIAS` (the phrasing now MATCHES that item —
+        the false-NEGATIVE is closed; load_glossary also adds the pair to the
+        confirmed set so the matcher's existing verdict consult promotes it).
+      * reject → :data:`CORPUS_REJECT` (recorded so the capture path doesn't
+        re-ask this suggestion).
 
     Modifier / tier verbs make no sense on a routine-match item (they only
     apply to email calibration) — bucketed as an "only accept" unparsed
@@ -595,6 +602,7 @@ def _resolve_routine_match_correction(
     query = str(item.get("query") or "")
     matched_to = str(item.get("matched_to") or "")
     record = str(item.get("record") or "")
+    kind = str(item.get("kind") or "low_conf")
     try:
         confidence = float(item.get("confidence") or 0.0)
     except (TypeError, ValueError):
@@ -606,7 +614,16 @@ def _resolve_routine_match_correction(
             False,
         )
 
-    entry_type = CORPUS_REJECT if correction.reject else CORPUS_CONFIRM
+    # Pick the corpus row type by (kind, verb). A no_match confirm is an
+    # ALIAS (closes a false-negative); everything else is the Phase-2b
+    # confirm/reject pair.
+    if correction.reject:
+        entry_type = CORPUS_REJECT
+    elif kind == KIND_NO_MATCH:
+        entry_type = CORPUS_ALIAS
+    else:
+        entry_type = CORPUS_CONFIRM
+
     try:
         append_corpus(
             corpus_path,
@@ -628,10 +645,15 @@ def _resolve_routine_match_correction(
         )
         return (f"item {correction.item_number}: corpus write failed", False)
 
+    _verdict = (
+        "reject" if correction.reject
+        else ("alias" if kind == KIND_NO_MATCH else "confirm")
+    )
     log.info(
         "daily_sync.routine_match.verdict_recorded",
         item_number=correction.item_number,
-        verdict="reject" if correction.reject else "confirm",
+        verdict=_verdict,
+        kind=kind,
         query=query,
         matched_to=matched_to,
     )
@@ -1804,23 +1826,24 @@ def _format_routine_match_applied_line(
 ) -> str:
     """Return a one-liner describing a routine-match confirm/reject.
 
-    Format::
+    Format (by kind + verb)::
 
-        "Item N: \"walk doggo\" → \"Walk dog\" — confirmed (learned)"
-        "Item N: \"walk doggo\" → \"Walk dog\" — rejected (won't match)"
+        low_conf confirm: "Item N: \"walk doggo\" → \"Walk dog\" — confirmed (learned)"
+        low_conf reject:  "Item N: \"walk doggo\" → \"Walk dog\" — rejected (won't match)"
+        no_match confirm: "Item N: \"feed birds\" → \"Feed cat\" — aliased (now matches)"
+        no_match reject:  "Item N: \"feed birds\" → \"Feed cat\" — rejected (won't suggest)"
     """
     item_number = item.get("item_number") or "?"
     query = str(item.get("query") or "").strip() or "(unknown)"
     matched_to = str(item.get("matched_to") or "").strip() or "(unknown)"
+    is_no_match = str(item.get("kind") or "low_conf") == KIND_NO_MATCH
     if action == "reject":
-        return (
-            f"Item {item_number}: \"{query}\" → \"{matched_to}\" "
-            f"— rejected (won't match)"
-        )
-    return (
-        f"Item {item_number}: \"{query}\" → \"{matched_to}\" "
-        f"— confirmed (learned)"
-    )
+        tail = "rejected (won't suggest)" if is_no_match else "rejected (won't match)"
+    elif is_no_match:
+        tail = "aliased (now matches)"
+    else:
+        tail = "confirmed (learned)"
+    return f"Item {item_number}: \"{query}\" → \"{matched_to}\" — {tail}"
 
 
 # Verb-mismatch markers — substrings the resolvers (and the dispatch
