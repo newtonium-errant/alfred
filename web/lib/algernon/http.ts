@@ -57,3 +57,21 @@ export async function getJson<T>(url: string): Promise<T> {
   }
   return parseOrThrow<T>(res);
 }
+
+// POST a binary blob (audio) with the blob's mime as Content-Type (NOT
+// application/json), routing the response through the same parseOrThrow / ApiError
+// machinery so STT edge errors (413/415/401/502) surface as the same ApiError the
+// chat UI already understands. Used by the STT client (→ BFF /api/stt/transcribe).
+export async function postBlob<T>(url: string, blob: Blob, contentType: string): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': contentType },
+      body: blob,
+    });
+  } catch (e) {
+    throw new ApiError(0, 'network_error', (e as Error).message);
+  }
+  return parseOrThrow<T>(res);
+}

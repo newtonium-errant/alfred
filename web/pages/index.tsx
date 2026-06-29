@@ -109,7 +109,7 @@ export default function ChatPage() {
             </p>
           )}
 
-          <Composer onSend={(t) => void send(t)} disabled={booting || sending} />
+          <Composer onSend={(t, kind) => void send(t, kind)} disabled={booting || sending} />
         </div>
       </Layout>
     </>

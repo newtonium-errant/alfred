@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { Composer } from '../components/chat/Composer';
 
 describe('Composer', () => {
-  it('sends on Enter and clears the input', async () => {
+  it('sends on Enter and clears the input; tags a typed turn kind="text"', async () => {
     const user = userEvent.setup();
     const onSend = vi.fn();
     render(<Composer onSend={onSend} />);
@@ -14,7 +14,8 @@ describe('Composer', () => {
     await user.keyboard('{Enter}');
 
     expect(onSend).toHaveBeenCalledTimes(1);
-    expect(onSend).toHaveBeenCalledWith('hello world');
+    // A keyboard-typed turn carries kind:'text' (voice tag is only for transcripts).
+    expect(onSend).toHaveBeenCalledWith('hello world', 'text');
     expect(input.value).toBe('');
   });
 
