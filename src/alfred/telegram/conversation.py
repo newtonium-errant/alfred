@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import json
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Final
 from zoneinfo import ZoneInfo
@@ -4235,6 +4236,7 @@ async def run_turn(
     image_blocks: list[dict[str, Any]] | None = None,
     user_role: str = _OWNER_ROLE,
     user_name: str | None = None,
+    on_event: Callable[[dict[str, Any]], Awaitable[Any]] | None = None,
 ) -> str:
     """Run one user turn through the model, handling tool_use internally.
 
@@ -4271,6 +4273,18 @@ async def run_turn(
     the system blocks byte-identical to pre-feature behaviour. Dynamic
     per-message: the block is rebuilt each turn because the sender can
     change between turns in a shared chat.
+
+    ``on_event`` (web SSE streaming, Tier 1) is an optional async callback
+    fired with a small status dict at each tool invocation
+    (``{"phase": "tool", "tool": <name>, "iteration": <n>}``) so a streaming
+    transport can surface "searching the vault…" status frames. ``None`` —
+    the default and the value on EVERY Telegram call — makes this path
+    byte-identical to pre-feature behaviour (the callback is never built or
+    fired). The callback is invoked defensively: any exception it raises is
+    swallowed so a dropped SSE client can NEVER wedge the turn (detach-on-
+    disconnect — run_turn always completes server-side). NO token streaming
+    here (Tier 2 is deferred); the buffered ``create()`` + tool loop are
+    untouched.
 
     Returns the final assistant text. Tool-use blocks and their results are
     appended to the session transcript (so the next turn sees the full
@@ -4514,6 +4528,23 @@ async def run_turn(
                     iteration=iteration,
                     tool=tool_name,
                 )
+
+                # Tier-1 SSE status frame (web streaming). Best-effort: a
+                # raised callback (e.g. the SSE client dropped mid-turn) is
+                # swallowed so the turn ALWAYS completes server-side
+                # (detach-on-disconnect). None on every Telegram call →
+                # byte-identical to pre-feature behaviour.
+                if on_event is not None:
+                    try:
+                        await on_event(
+                            {
+                                "phase": "tool",
+                                "tool": tool_name,
+                                "iteration": iteration,
+                            }
+                        )
+                    except Exception:  # noqa: BLE001 — status emission never wedges the turn
+                        pass
 
                 # Truncation pre-check (Layer 2 of the Hypatia 2026-05-21
                 # essay-planning fix). When stop_reason=max_tokens AND

@@ -40,6 +40,8 @@ byte-unchanged for every instance that doesn't opt in (M1 = Salem only).
 
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Any, Callable
 
 from aiohttp import web
@@ -110,6 +112,74 @@ async def _read_json_body(request: web.Request) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 — malformed body → treat as empty
         return {}
     return body if isinstance(body, dict) else {}
+
+
+def _build_turn_payload(
+    session_obj: Any, pre_len: int, reply: str, session_key: str,
+) -> dict[str, Any]:
+    """Assemble the post-turn response payload — the SINGLE source of truth.
+
+    Both ``/chat/turn`` (buffered JSON body) and ``/chat/stream``'s terminal
+    ``done`` frame build the payload through this helper so the two are
+    byte-identical (the frozen contract's final shape arrives either way).
+
+    Reads the per-turn ``_ts`` stamps ``run_turn`` wrote (in place) to
+    ``session_obj.transcript`` via ``append_turn``: the assistant turn is
+    appended LAST (``transcript[-1]``), the user turn first at ``pre_len``.
+    ``pre_len`` MUST be captured BEFORE ``run_turn`` runs. Both stamps
+    default to ``""`` so the fields are ALWAYS present (never null/missing),
+    mirroring the pre-stamp "" contract ``/chat/history`` already uses.
+    """
+    transcript = session_obj.transcript or []
+    assistant_ts = transcript[-1].get("_ts", "") if transcript else ""
+    user_ts = transcript[pre_len].get("_ts", "") if len(transcript) > pre_len else ""
+    return {
+        "reply": reply,
+        "session_key": session_key,
+        "ts": assistant_ts,
+        "user_ts": user_ts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# SSE (Server-Sent Events) — streaming chat turns (Tier-1 keep-alive)
+# ---------------------------------------------------------------------------
+
+# Keep-alive heartbeat interval. A long turn (10-23s observed) holds the
+# browser↔BFF socket open with no bytes flowing; periodic comment frames
+# every KEEPALIVE_SECS keep that leg alive. Module-level so a test can
+# patch it to a tiny value without monkeypatching the loop.
+KEEPALIVE_SECS = 5.0
+
+
+async def _sse_write_event(
+    resp: web.StreamResponse, event: str, data: dict[str, Any],
+) -> None:
+    """Write one ``event: <name>\\ndata: <json>\\n\\n`` SSE frame."""
+    payload = json.dumps(data, separators=(",", ":"))
+    await resp.write(f"event: {event}\ndata: {payload}\n\n".encode("utf-8"))
+
+
+def _consume_detached_task(task: "asyncio.Task[Any]") -> None:
+    """Retrieve a detached (client-dropped) ``run_turn`` task's result.
+
+    Detach-on-disconnect: when the SSE client drops mid-turn we stop the
+    write loop and return, leaving ``run_turn`` to finish server-side (the
+    reply is persisted by ``append_turn`` so the FE reconciles via
+    ``/chat/history``). This done-callback retrieves the result/exception so
+    asyncio doesn't log "exception never retrieved" on the orphaned task.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning(
+            "web.chat.stream_detached_task_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            detail="run_turn raised after the SSE client disconnected; "
+                   "no reply was persisted for this turn",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -254,13 +324,9 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
             status=502,
         )
 
-    # Extract the per-turn stamps run_turn just wrote (in place) to
-    # ``session_obj.transcript`` via ``append_turn``. Both default to ""
-    # so the response fields are ALWAYS present (never null/missing) —
-    # mirroring the pre-stamp "" contract ``/chat/history`` already uses.
-    transcript = session_obj.transcript or []
-    assistant_ts = transcript[-1].get("_ts", "") if transcript else ""
-    user_ts = transcript[pre_len].get("_ts", "") if len(transcript) > pre_len else ""
+    # Assemble the response via the shared helper so the buffered body is
+    # byte-identical to the stream's terminal ``done`` frame.
+    payload = _build_turn_payload(session_obj, pre_len, reply, session_key)
 
     log.info(
         "web.chat.turn_complete",
@@ -268,17 +334,165 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
         session_key=session_key,
         user_kind=kind,
         reply_chars=len(reply or ""),
-        assistant_ts=assistant_ts,
-        user_ts=user_ts,
+        assistant_ts=payload["ts"],
+        user_ts=payload["user_ts"],
     )
-    return web.json_response(
-        {
-            "reply": reply,
-            "session_key": session_key,
-            "ts": assistant_ts,
-            "user_ts": user_ts,
-        }
+    return web.json_response(payload)
+
+
+async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
+    """POST /chat/stream — one user turn, streamed over Server-Sent Events.
+
+    Tier-1 keep-alive streaming (the safety-critical ``run_turn`` core stays
+    BYTE-IDENTICAL — it runs as a detached task; we only emit periodic
+    heartbeat frames around it). The terminal ``done`` frame carries the
+    EXACT ``/chat/turn`` payload (shared ``_build_turn_payload`` helper).
+
+    Frame protocol:
+      * ``event: status\\ndata: {"phase":"tool","tool":...,"iteration":...}``
+        — emitted per tool invocation (0+), via ``run_turn(on_event=...)``.
+      * ``: keepalive\\n\\n`` — comment frames every ``KEEPALIVE_SECS``.
+      * ``event: done\\ndata: <ChatTurnResponse>`` — terminal success.
+      * ``event: error\\ndata: {"error","detail"}`` — engine failure.
+
+    ALL validation (auth / body / session-match) returns a JSON 401/400/404
+    BEFORE ``resp.prepare()`` — the HTTP status locks once the SSE response
+    is prepared, so an error after that point could not set a status.
+
+    Detach-on-disconnect: if the client drops mid-turn we stop the write
+    loop and return, but do NOT cancel the ``run_turn`` task — it finishes
+    server-side and the reply is persisted by ``append_turn``, so the FE
+    reconciles via ``/chat/history`` (never a false "couldn't reach the
+    assistant" when the turn actually completed).
+    """
+    web_config: WebConfig = request.app[KEY_WEB_CONFIG]
+    client = request.app[KEY_WEB_ANTHROPIC]
+    state_mgr = request.app[KEY_WEB_STATE_MGR]
+    talker_config = request.app[KEY_WEB_TALKER_CONFIG]
+    system_prompt_provider: Callable[[], str] = request.app[KEY_WEB_SYSTEM_PROVIDER]
+    vault_context_str: str = request.app[KEY_WEB_VAULT_CTX]
+
+    # --- validation (JSON errors BEFORE prepare; status locks after) -------
+    identity = resolve_web_identity(request, web_config)
+    if identity is None:
+        return web.json_response({"error": "invalid_session"}, status=401)
+
+    body = await _read_json_body(request)
+    session_key = body.get("session_key")
+    message = body.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return web.json_response({"error": "message_required"}, status=400)
+    kind = "voice" if body.get("kind") == "voice" else "text"
+
+    active_dict = state_mgr.get_active(identity.synthetic_chat_id)
+    if active_dict is None or active_dict.get("session_id") != session_key:
+        return web.json_response({"error": "no_such_session"}, status=404)
+
+    from alfred.telegram.conversation import run_turn
+    from alfred.telegram.session import Session
+
+    session_obj = Session.from_dict(active_dict)
+    # pre_len captured BEFORE the run_turn task is launched/awaited.
+    pre_len = len(session_obj.transcript)
+    user_name = identity.user if len(web_config.users) > 1 else None
+
+    # --- SSE handshake (HTTP status locks here) ----------------------------
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
+    await resp.prepare(request)
+
+    # Status-frame callback. Best-effort: on a dropped client we latch
+    # ``client_gone`` so subsequent emits no-op and a write error never
+    # raises into run_turn (detach-on-disconnect).
+    client_gone = {"v": False}
+
+    async def _on_event(ev: dict[str, Any]) -> None:
+        if client_gone["v"]:
+            return
+        try:
+            await _sse_write_event(resp, "status", ev)
+        except (ConnectionResetError, RuntimeError, asyncio.CancelledError):
+            client_gone["v"] = True
+
+    task = asyncio.create_task(
+        run_turn(
+            client=client,
+            state=state_mgr,
+            session=session_obj,
+            user_message=message,
+            config=talker_config,
+            vault_context_str=vault_context_str,
+            system_prompt=system_prompt_provider(),
+            user_kind=kind,
+            user_role=identity.role,
+            user_name=user_name,
+            on_event=_on_event,
+        )
+    )
+
+    # --- keep-alive loop ---------------------------------------------------
+    while True:
+        done, _pending = await asyncio.wait({task}, timeout=KEEPALIVE_SECS)
+        if task in done:
+            break
+        try:
+            await resp.write(b": keepalive\n\n")
+        except (ConnectionResetError, RuntimeError):
+            # Client dropped mid-turn — DETACH: stop writing, let run_turn
+            # finish server-side; the FE reconciles via /chat/history.
+            client_gone["v"] = True
+            log.info(
+                "web.chat.stream_client_disconnected",
+                user=identity.user,
+                session_key=session_key,
+                detail="client dropped mid-turn — detaching; run_turn "
+                       "continues server-side, reply recoverable via history",
+            )
+            task.add_done_callback(_consume_detached_task)
+            return resp
+
+    # --- terminal frame ----------------------------------------------------
+    try:
+        reply = task.result()
+    except Exception as exc:  # noqa: BLE001 — engine failure → SSE error frame
+        log.warning(
+            "web.chat.stream_engine_error",
+            user=identity.user,
+            session_key=session_key,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        if not client_gone["v"]:
+            try:
+                await _sse_write_event(
+                    resp, "error", {"error": "engine_error", "detail": str(exc)}
+                )
+            except (ConnectionResetError, RuntimeError):
+                pass
+        return resp
+
+    payload = _build_turn_payload(session_obj, pre_len, reply, session_key)
+    log.info(
+        "web.chat.stream_complete",
+        user=identity.user,
+        session_key=session_key,
+        user_kind=kind,
+        reply_chars=len(reply or ""),
+        assistant_ts=payload["ts"],
+        user_ts=payload["user_ts"],
+    )
+    if not client_gone["v"]:
+        try:
+            await _sse_write_event(resp, "done", payload)
+        except (ConnectionResetError, RuntimeError):
+            pass
+    return resp
 
 
 async def _handle_chat_history(request: web.Request) -> web.StreamResponse:
@@ -393,11 +607,13 @@ def register_web_routes(
 
     app.router.add_post("/chat/open", _handle_chat_open)
     app.router.add_post("/chat/turn", _handle_chat_turn)
+    app.router.add_post("/chat/stream", _handle_chat_stream)
     app.router.add_get("/chat/history/{session_key}", _handle_chat_history)
 
     mounted_routes = [
         "/chat/open",
         "/chat/turn",
+        "/chat/stream",
         "/chat/history/{session_key}",
     ]
 

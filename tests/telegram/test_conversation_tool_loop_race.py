@@ -1434,6 +1434,113 @@ async def test_run_turn_normal_tool_use_stop_does_not_log_nonstandard(
     )
 
 
+# ---------------------------------------------------------------------------
+# on_event status callback (web SSE Tier-1 streaming, 2026-06-29)
+# ---------------------------------------------------------------------------
+#
+# Additive optional ``on_event`` kwarg on run_turn fires
+# {phase:'tool', tool, iteration} at the existing talker.tool.invoke point
+# so a streaming transport can surface "searching the vault…" frames.
+# Default None → byte-identical to pre-feature behaviour (covered implicitly
+# by every other test in this file, which never passes on_event).
+
+
+async def test_run_turn_fires_on_event_per_tool_invocation(
+    tmp_path, monkeypatch,
+):
+    """on_event is awaited once per tool_use block, carrying the tool name
+    + iteration, at the real tool-invoke point inside the loop."""
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+
+    tool_use_response = FakeResponse(
+        content=[
+            FakeBlock(type="tool_use", id="t1", name="vault_search",
+                      input={"query": "x"}),
+            FakeBlock(type="tool_use", id="t2", name="vault_create",
+                      input={"type": "note", "name": "y"}),
+        ],
+        stop_reason="tool_use",
+    )
+    final_response = FakeResponse(
+        content=[FakeBlock(type="text", text="all done")],
+        stop_reason="end_turn",
+    )
+    client = FakeAnthropicClient([tool_use_response, final_response])
+
+    async def _stub_execute(*args, **kwargs):
+        return '{"ok": true}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    events: list[dict] = []
+
+    async def _on_event(ev):
+        events.append(ev)
+
+    result = await conversation.run_turn(
+        client=client,
+        state=state_mgr,
+        session=session,
+        user_message="do two things",
+        config=config,
+        vault_context_str="",
+        system_prompt="test",
+        on_event=_on_event,
+    )
+    assert result == "all done"
+    # One event per tool_use block, in order, carrying the contract shape.
+    assert events == [
+        {"phase": "tool", "tool": "vault_search", "iteration": 0},
+        {"phase": "tool", "tool": "vault_create", "iteration": 0},
+    ]
+
+
+async def test_run_turn_on_event_exception_does_not_wedge_turn(
+    tmp_path, monkeypatch,
+):
+    """A raising on_event (e.g. dropped SSE client) is swallowed — the turn
+    still completes server-side (detach-on-disconnect)."""
+    from tests.telegram.conftest import (
+        FakeAnthropicClient, FakeBlock, FakeResponse,
+    )
+
+    config, state_mgr, session = _build_run_turn_inputs(tmp_path)
+    tool_use_response = FakeResponse(
+        content=[FakeBlock(type="tool_use", id="t1", name="vault_search",
+                           input={"query": "x"})],
+        stop_reason="tool_use",
+    )
+    final_response = FakeResponse(
+        content=[FakeBlock(type="text", text="completed anyway")],
+        stop_reason="end_turn",
+    )
+    client = FakeAnthropicClient([tool_use_response, final_response])
+
+    async def _stub_execute(*args, **kwargs):
+        return '{"ok": true}'
+
+    monkeypatch.setattr(conversation, "_execute_tool", _stub_execute)
+
+    async def _boom_on_event(ev):
+        raise ConnectionResetError("client gone")
+
+    result = await conversation.run_turn(
+        client=client,
+        state=state_mgr,
+        session=session,
+        user_message="search",
+        config=config,
+        vault_context_str="",
+        system_prompt="test",
+        on_event=_boom_on_event,
+    )
+    assert result == "completed anyway"
+
+
 async def test_run_turn_max_tokens_no_tool_use_falls_through_to_end_turn(
     tmp_path, monkeypatch,
 ):

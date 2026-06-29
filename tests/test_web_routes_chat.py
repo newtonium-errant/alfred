@@ -10,6 +10,8 @@ aiohttp's ``aiohttp_client`` fixture to spin up the real transport
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -137,7 +139,10 @@ async def web_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
     web_auth_state = WebAuthState.create(tmp_path / "web_auth_state.json")
     web_auth_state.load()
     fake = FakeAnthropicClient(
-        [FakeResponse(content=[FakeBlock(type="text", text="hello from salem")])]
+        [
+            FakeResponse(content=[FakeBlock(type="text", text="hello from salem")])
+            for _ in range(4)
+        ]
     )
     register_web_routes(
         app,
@@ -440,6 +445,280 @@ async def test_reopen_archives_prior_session(web_client) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SSE streaming — /chat/stream (Tier-1 keep-alive)
+# ---------------------------------------------------------------------------
+
+
+def _parse_sse(text: str) -> list[tuple[str, object]]:
+    """Parse an SSE byte-stream into ``(event_or_'comment', data)`` tuples.
+
+    ``data`` is the JSON-decoded payload for named events, or the raw line
+    for ``: comment`` (keepalive) frames.
+    """
+    out: list[tuple[str, object]] = []
+    for block in text.split("\n\n"):
+        block = block.strip("\n")
+        if not block:
+            continue
+        if block.startswith(":"):
+            out.append(("comment", block))
+            continue
+        event_name = ""
+        data_str = ""
+        for line in block.split("\n"):
+            if line.startswith("event:"):
+                event_name = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data_str = line[len("data:"):].strip()
+        out.append((event_name, json.loads(data_str) if data_str else None))
+    return out
+
+
+async def _read_sse(resp) -> list[tuple[str, object]]:
+    raw = (await resp.read()).decode("utf-8")
+    return _parse_sse(raw)
+
+
+async def test_stream_done_payload_byte_matches_turn(web_client) -> None:
+    """The terminal ``done`` frame is built by the SAME helper as
+    ``/chat/turn`` → identical key set + identical reply for the same
+    engine output. (ts/user_ts differ only because they are distinct
+    turns; the SHAPE is byte-identical.)"""
+    headers = _session_headers()
+
+    # Buffered turn on session A.
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key_a = (await r.json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn", json={"session_key": key_a, "message": "hi"}, headers=headers
+    )
+    turn_body = await r.json()
+
+    # Streamed turn on session B (reopen archives A).
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key_b = (await r.json())["session_key"]
+    resp = await web_client.post(
+        "/chat/stream",
+        json={"session_key": key_b, "message": "hi"},
+        headers=headers,
+    )
+    assert resp.status == 200
+    assert resp.headers["Content-Type"] == "text/event-stream"
+    events = await _read_sse(resp)
+    done = [d for (e, d) in events if e == "done"]
+    assert len(done) == 1
+    done_payload = done[0]
+
+    # Same key set (byte-identical shape).
+    assert set(done_payload.keys()) == set(turn_body.keys())
+    # Same engine reply text.
+    assert done_payload["reply"] == turn_body["reply"] == "hello from salem"
+    assert done_payload["session_key"] == key_b
+    # Per-turn stamps present + non-empty for a real turn.
+    assert done_payload["ts"]
+    assert done_payload["user_ts"]
+
+
+async def test_stream_validation_returns_json_before_prepare(web_client) -> None:
+    """Auth/body/session errors are JSON (not SSE) so the status is real."""
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+
+    # Missing message → 400 JSON.
+    resp = await web_client.post(
+        "/chat/stream", json={"session_key": key, "message": "  "}, headers=headers
+    )
+    assert resp.status == 400
+    assert resp.headers["Content-Type"].startswith("application/json")
+    assert (await resp.json())["error"] == "message_required"
+
+    # Unknown session → 404 JSON.
+    resp = await web_client.post(
+        "/chat/stream",
+        json={"session_key": "nope", "message": "hi"},
+        headers=headers,
+    )
+    assert resp.status == 404
+    assert (await resp.json())["error"] == "no_such_session"
+
+    # No session token → 401 JSON.
+    resp = await web_client.post(
+        "/chat/stream",
+        json={"session_key": key, "message": "hi"},
+        headers=_PEER_HEADERS,
+    )
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "invalid_session"
+
+
+async def test_stream_keepalive_frames_on_slow_turn(
+    web_client, monkeypatch
+) -> None:
+    """A turn that outlasts KEEPALIVE_SECS emits ``: keepalive`` frames
+    before the terminal ``done``."""
+    from alfred.web import routes_chat as rc
+
+    monkeypatch.setattr(rc, "KEEPALIVE_SECS", 0.05)
+
+    async def _slow_run_turn(**kwargs):
+        await asyncio.sleep(0.18)
+        return "slow reply"
+
+    monkeypatch.setattr(
+        "alfred.telegram.conversation.run_turn", _slow_run_turn
+    )
+
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    resp = await web_client.post(
+        "/chat/stream",
+        json={"session_key": key, "message": "take your time"},
+        headers=headers,
+    )
+    events = await _read_sse(resp)
+    comments = [d for (e, d) in events if e == "comment"]
+    assert any("keepalive" in str(c) for c in comments)
+    done = [d for (e, d) in events if e == "done"]
+    assert len(done) == 1
+    assert done[0]["reply"] == "slow reply"
+
+
+async def test_stream_status_frames_from_on_event(
+    web_client, monkeypatch
+) -> None:
+    """run_turn's ``on_event`` callback surfaces as ``status`` frames."""
+
+    async def _run_turn_with_status(**kwargs):
+        on_event = kwargs.get("on_event")
+        assert on_event is not None
+        await on_event({"phase": "tool", "tool": "vault_search", "iteration": 1})
+        return "done searching"
+
+    monkeypatch.setattr(
+        "alfred.telegram.conversation.run_turn", _run_turn_with_status
+    )
+
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    resp = await web_client.post(
+        "/chat/stream",
+        json={"session_key": key, "message": "search the vault"},
+        headers=headers,
+    )
+    events = await _read_sse(resp)
+    status = [d for (e, d) in events if e == "status"]
+    assert len(status) == 1
+    assert status[0] == {"phase": "tool", "tool": "vault_search", "iteration": 1}
+    done = [d for (e, d) in events if e == "done"]
+    assert len(done) == 1
+    assert done[0]["reply"] == "done searching"
+
+
+async def test_stream_engine_error_frame(web_client, monkeypatch) -> None:
+    """A run_turn exception surfaces as a terminal ``error`` frame (the SSE
+    response is already 200 — status locks at prepare)."""
+
+    async def _boom_run_turn(**kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr("alfred.telegram.conversation.run_turn", _boom_run_turn)
+
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    resp = await web_client.post(
+        "/chat/stream",
+        json={"session_key": key, "message": "explode"},
+        headers=headers,
+    )
+    assert resp.status == 200
+    events = await _read_sse(resp)
+    errors = [d for (e, d) in events if e == "error"]
+    assert len(errors) == 1
+    assert errors[0]["error"] == "engine_error"
+    assert "kaboom" in errors[0]["detail"]
+    assert not [d for (e, d) in events if e == "done"]
+
+
+async def test_stream_complete_emits_log(web_client) -> None:
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    with structlog.testing.capture_logs() as captured:
+        resp = await web_client.post(
+            "/chat/stream",
+            json={"session_key": key, "message": "hi"},
+            headers=headers,
+        )
+        await _read_sse(resp)
+    done = [c for c in captured if c.get("event") == "web.chat.stream_complete"]
+    assert len(done) == 1
+    assert done[0]["assistant_ts"]
+    assert done[0]["user_ts"]
+
+
+async def test_stream_works_in_relay_mode(relay_web_client) -> None:
+    headers = _relay_headers()
+    r = await relay_web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    resp = await relay_web_client.post(
+        "/chat/stream",
+        json={"session_key": key, "message": "hi kalle"},
+        headers=headers,
+    )
+    assert resp.status == 200
+    events = await _read_sse(resp)
+    done = [d for (e, d) in events if e == "done"]
+    assert len(done) == 1
+    assert done[0]["reply"] == "hello from kalle"
+
+
+# ---------------------------------------------------------------------------
+# Shared post-turn payload helper (the byte-identical source of truth)
+# ---------------------------------------------------------------------------
+
+
+def test_build_turn_payload_is_deterministic() -> None:
+    from types import SimpleNamespace
+
+    from alfred.web.routes_chat import _build_turn_payload
+
+    session = SimpleNamespace(
+        transcript=[
+            {"role": "user", "content": "hi", "_ts": "2026-06-29T00:00:00Z"},
+            {"role": "assistant", "content": "yo", "_ts": "2026-06-29T00:00:01Z"},
+        ]
+    )
+    a = _build_turn_payload(session, 0, "yo", "sess-1")
+    b = _build_turn_payload(session, 0, "yo", "sess-1")
+    assert a == b
+    assert a == {
+        "reply": "yo",
+        "session_key": "sess-1",
+        "ts": "2026-06-29T00:00:01Z",
+        "user_ts": "2026-06-29T00:00:00Z",
+    }
+
+
+def test_build_turn_payload_empty_transcript_defaults_blank() -> None:
+    from types import SimpleNamespace
+
+    from alfred.web.routes_chat import _build_turn_payload
+
+    session = SimpleNamespace(transcript=[])
+    payload = _build_turn_payload(session, 0, "reply", "sess-1")
+    assert payload == {
+        "reply": "reply",
+        "session_key": "sess-1",
+        "ts": "",
+        "user_ts": "",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Pure transcript-flatten helper
 # ---------------------------------------------------------------------------
 
@@ -572,7 +851,7 @@ def test_register_web_routes_none_config_mounts_nothing(tmp_path) -> None:
     assert _mounted_web_paths(app) == []
 
 
-def test_register_web_routes_enabled_mounts_five(tmp_path) -> None:
+def test_register_web_routes_enabled_mounts_chat_and_auth(tmp_path) -> None:
     tstate = TransportState.create(tmp_path / "transport_state.json")
     app = build_app(_transport_config(), tstate)
     mounted = register_web_routes(
@@ -582,6 +861,7 @@ def test_register_web_routes_enabled_mounts_five(tmp_path) -> None:
     assert set(_mounted_web_paths(app)) == {
         "/chat/open",
         "/chat/turn",
+        "/chat/stream",
         "/chat/history/{session_key}",
         "/auth/login",
         "/auth/verify",
@@ -631,6 +911,7 @@ def test_register_web_routes_relay_skips_auth_and_secret_guard(tmp_path) -> None
     # /chat/* present, /auth/* absent.
     assert "/chat/open" in paths
     assert "/chat/turn" in paths
+    assert "/chat/stream" in paths
     assert "/chat/history/{session_key}" in paths
     assert "/auth/login" not in paths
     assert "/auth/verify" not in paths
