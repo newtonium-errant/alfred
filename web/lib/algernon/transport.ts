@@ -18,6 +18,34 @@ const PEER_CLIENT = process.env.ALFRED_WEB_PEER_CLIENT || 'web';
 /** Thrown when required transport env is missing — surfaced as a 500 by the BFF. */
 export class TransportConfigError extends Error {}
 
+/** Thrown when a buffered BFF→transport call exceeds its timeout — BFF maps to 504. */
+export class TransportTimeoutError extends Error {}
+
+// Buffered BFF→transport timeout (CONTRACT S8). A wedged transport returns a
+// clean 504 rather than a hung/dropped socket. Generous default (~60s) vs the
+// observed 10–23s turns; env-overridable. Streaming (callTransportStream/
+// callChatStream) is EXEMPT — it uses SSE keep-alive, not a turn-length budget.
+function transportTimeoutMs(): number {
+  const raw = parseInt(process.env.ALFRED_WEB_TRANSPORT_TIMEOUT_MS || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60000;
+}
+
+async function fetchJsonWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const ms = transportTimeoutMs();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (e) {
+    if (controller.signal.aborted) {
+      throw new TransportTimeoutError(`transport call timed out after ${ms}ms`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function baseUrl(): string {
   const url = process.env.ALFRED_WEB_TRANSPORT_URL;
   if (!url) {
@@ -63,7 +91,7 @@ export async function callTransport(
     headers['Content-Type'] = 'application/json';
   }
 
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await fetchJsonWithTimeout(`${baseUrl()}${path}`, {
     method,
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
@@ -229,7 +257,7 @@ export async function callTransportTo(
     headers['Content-Type'] = 'application/json';
   }
 
-  const res = await fetch(`${target.baseUrl}${path}`, {
+  const res = await fetchJsonWithTimeout(`${target.baseUrl}${path}`, {
     method,
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,

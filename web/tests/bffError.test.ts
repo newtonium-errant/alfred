@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NextApiResponse } from 'next';
 import { sendTransportError } from '../lib/algernon/bffError';
-import { TransportConfigError } from '../lib/algernon/transport';
+import { TransportConfigError, TransportTimeoutError } from '../lib/algernon/transport';
 
 // Regression-pin the FE-2 reviewer security note: the BFF must NEVER return the
 // internal cause (env-var names, raw fetch errors) to the client — only the
@@ -44,6 +44,17 @@ describe('sendTransportError', () => {
 
     expect(status).toHaveBeenCalledWith(502);
     expect(json).toHaveBeenCalledWith({ error: 'transport_unreachable' });
+    expect(json.mock.calls[0][0]).not.toHaveProperty('detail');
+  });
+
+  it('504 gateway_timeout — distinct from 502, generic code, NO detail (S8)', () => {
+    const { res, status, json } = mockRes();
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    sendTransportError(res, 'chat/turn', new TransportTimeoutError('timed out after 60000ms'));
+
+    expect(status).toHaveBeenCalledWith(504);
+    expect(json).toHaveBeenCalledWith({ error: 'gateway_timeout' });
     expect(json.mock.calls[0][0]).not.toHaveProperty('detail');
   });
 });

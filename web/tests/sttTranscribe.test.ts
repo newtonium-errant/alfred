@@ -17,6 +17,7 @@ vi.mock('../lib/algernon/identity', () => ({
 vi.mock('../lib/algernon/transport', () => ({
   callTransportBinary: mockCallTransportBinary,
   TransportConfigError: class TransportConfigError extends Error {},
+  TransportTimeoutError: class TransportTimeoutError extends Error {},
 }));
 
 import handler from '../pages/api/stt/transcribe';

@@ -33,6 +33,7 @@ vi.mock('../lib/algernon/transport', () => ({
   callChatTo: mockCallChatTo,
   listCrossInstanceChatTargets: mockListCrossInstanceChatTargets,
   TransportConfigError: class TransportConfigError extends Error {},
+  TransportTimeoutError: class TransportTimeoutError extends Error {},
 }));
 
 import turnHandler from '../pages/api/chat/turn';

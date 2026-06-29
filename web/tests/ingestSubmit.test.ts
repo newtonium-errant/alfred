@@ -26,6 +26,7 @@ vi.mock('../lib/algernon/transport', () => ({
   callTransportTo: mockCallTransportTo,
   listIngestTargets: mockListIngestTargets,
   TransportConfigError: class TransportConfigError extends Error {},
+  TransportTimeoutError: class TransportTimeoutError extends Error {},
 }));
 
 import handler from '../pages/api/ingest/submit';

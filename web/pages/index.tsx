@@ -31,7 +31,20 @@ export default function ChatPage() {
   const [instance, setInstance] = useState<string>(HOME_INSTANCE_NAME);
 
   // Chat bootstraps once signed in, scoped to the active instance.
-  const { messages, status, error, sending, working, unauthenticated, send, newChat } = useChat({
+  const {
+    messages,
+    status,
+    error,
+    sending,
+    working,
+    notice,
+    unauthenticated,
+    retryable,
+    send,
+    retry,
+    newChat,
+    endChat,
+  } = useChat({
     enabled: authed,
     instance,
   });
@@ -121,6 +134,15 @@ export default function ChatPage() {
             >
               New chat
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="end-chat"
+              onClick={() => void endChat()}
+              disabled={booting || sending}
+            >
+              End chat
+            </Button>
           </div>
         </div>
 
@@ -136,14 +158,37 @@ export default function ChatPage() {
             )}
           </div>
 
-          {error && (
+          {notice && (
+            // A calm, non-error confirmation (e.g. after ending a chat) — never
+            // danger-red, which is reserved for true system errors.
             <p
+              role="status"
+              data-testid="chat-notice"
+              className="rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-700"
+            >
+              {notice}
+            </p>
+          )}
+
+          {error && (
+            <div
               role="alert"
               data-testid="chat-error"
-              className="rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
+              className="flex items-center justify-between gap-3 rounded-xl bg-danger-bg px-3 py-2 text-sm text-danger"
             >
-              {error}
-            </p>
+              <span>{error}</span>
+              {retryable && (
+                <button
+                  type="button"
+                  data-testid="chat-retry"
+                  onClick={() => void retry()}
+                  disabled={sending}
+                  className="shrink-0 rounded-lg border border-danger px-2 py-1 font-semibold hover:opacity-80 disabled:opacity-60"
+                >
+                  Try again
+                </button>
+              )}
+            </div>
           )}
 
           <Composer onSend={(t, kind) => void send(t, kind)} disabled={booting || sending} />

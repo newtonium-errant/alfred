@@ -30,6 +30,7 @@ vi.mock('../lib/algernon/transport', () => ({
   callChatStream: mockCallChatStream,
   listCrossInstanceChatTargets: mockListCrossInstanceChatTargets,
   TransportConfigError: class TransportConfigError extends Error {},
+  TransportTimeoutError: class TransportTimeoutError extends Error {},
 }));
 
 import handler from '../pages/api/chat/stream';

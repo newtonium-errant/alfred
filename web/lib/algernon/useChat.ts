@@ -103,6 +103,24 @@ function safeJson<T>(s: string): T | null {
   }
 }
 
+// A bare "/end" control (exact or start-of-message — mirroring bot.py's
+// _detect_inline_command line-local convention, NOT mid-prose) ends the session.
+// "/endNote" or "tell me about /end" are NOT commands. (CONTRACT S7.)
+function isEndCommand(text: string): boolean {
+  return /^\/end(\s|$)/.test(text.trim());
+}
+
+// A turn in flight, retained so an explicit retry resends the SAME idempotency
+// key (the backend returns the cached result if the turn already ran). (S6.)
+interface PendingTurn {
+  key: string;
+  userId: string;
+  text: string;
+  kind: ChatKind;
+  priorLen: number;
+  idk: string;
+}
+
 // A live, human label for a stream `status` frame (tool activity on a long turn).
 function workingLabelFor(s: StreamStatusEvent | null): string {
   if (s && s.phase === 'tool' && s.tool) {
@@ -140,11 +158,20 @@ export interface UseChat {
   sending: boolean;
   /** Live tool-activity label while a streamed turn is in flight (null otherwise). */
   working: string | null;
+  /** A transient, non-error confirmation (e.g. after ending a chat). */
+  notice: string | null;
   /** True once any call reported 401 invalid_session — the page redirects to /login. */
   unauthenticated: boolean;
+  /** True when the last turn failed recoverably and retry() will resend it. */
+  retryable: boolean;
   /** `kind` tags the backend turn counter ('voice' for transcript-originated sends). */
   send: (text: string, kind?: ChatKind) => Promise<void>;
+  /** Resend the last failed turn with the SAME idempotency key (no double-act). */
+  retry: () => Promise<void>;
+  /** Start a fresh chat (archives the prior session). */
   newChat: () => Promise<void>;
+  /** End the chat (archives+opens fresh) and show a confirmation — the real /end. */
+  endChat: () => Promise<void>;
 }
 
 function friendlyError(e: unknown): string {
@@ -161,6 +188,12 @@ function friendlyError(e: unknown): string {
       case 'transport_unreachable':
       case 'network_error':
         return "Can't reach the assistant right now. Try again shortly.";
+      case 'timeout':
+      case 'gateway_timeout':
+        // The turn may still be finishing server-side — recovery-flavored, not the
+        // dead "can't reach" (CONTRACT S8). Reconcile runs first; this is the copy
+        // shown only when reconcile found no reply yet.
+        return 'That took longer than expected — checking if it went through. You can try again.';
       case 'transport_misconfigured':
         return 'The chat backend isn’t configured yet.';
       default:
@@ -177,8 +210,11 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   const [status, setStatus] = useState<ChatStatus>('booting');
   const [error, setError] = useState<string | null>(null);
   const [working, setWorking] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [retryable, setRetryable] = useState(false);
   const [unauthenticated, setUnauthenticated] = useState(false);
   const sessionKeyRef = useRef<string | null>(null);
+  const pendingRef = useRef<PendingTurn | null>(null);
   // Mirrors `messages` for synchronous reads inside async send flows (e.g. the
   // pre-send transcript length used by the history-reconcile "did it grow?" check).
   const messagesRef = useRef<ChatMessage[]>([]);
@@ -202,6 +238,9 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   const bootstrap = useCallback(async () => {
     setStatus('booting');
     setError(null);
+    setNotice(null);
+    setRetryable(false);
+    pendingRef.current = null;
     sessionKeyRef.current = null;
     setMessages([]);
     try {
@@ -266,50 +305,39 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     setStatus('ready');
   }, []);
 
-  // Non-stream fallback (kept per CONTRACT §6) — used when the browser/runtime
-  // can't read a streaming body. The shared idempotency key makes this safe.
-  const bufferedTurn = useCallback(
-    async (key: string, userId: string, text: string, kind: ChatKind, priorLen: number, idk: string) => {
-      try {
-        const d = await chatApi.turn(key, text, { kind, instance, idempotencyKey: idk });
-        finalizeReply(userId, d);
-      } catch (e) {
-        if (isRecoverable(e) && (await reconcileFromHistory(key, priorLen))) return;
-        fail(e);
-      }
-    },
-    [instance, finalizeReply, reconcileFromHistory, fail],
-  );
-
-  const send = useCallback(
-    async (raw: string, kind: ChatKind = 'text') => {
-      const text = raw.trim();
-      const key = sessionKeyRef.current;
-      if (!text || !key) return;
+  // Run (or re-run) one logical turn. Streaming primary, buffered fallback, with
+  // the S5 reconcile so a completed-but-lost turn never dead-errors. Outcome
+  // bookkeeping: a success clears the pending turn + retryable; a RECOVERABLE
+  // failure (network/timeout) keeps the pending turn so retry() can resend the
+  // SAME idempotency key (the backend dedups if it already ran).
+  const runTurn = useCallback(
+    async (ctx: PendingTurn) => {
+      const { key, userId, text, kind, priorLen, idk } = ctx;
       setError(null);
       setWorking(null);
-      // Snapshot the transcript length BEFORE the optimistic bubble so the
-      // reconcile "did the transcript grow?" check compares against persisted turns.
-      const priorLen = messagesRef.current.length;
-      // Mint an idempotency key per logical turn (resent on the buffered fallback)
-      // so a retry of a turn that already ran returns the cached result instead of
-      // double-acting (e.g. a vault write). (CONTRACT S6.)
-      const idk = crypto.randomUUID();
-      // Hoist the optimistic user bubble's id so we can patch its ts once the
-      // backend returns the real user-turn stamp (keeps live == resume).
-      const userId = nextId();
-      setMessages((prev) => [...prev, { id: userId, role: 'user', text, ts: '' }]);
       setStatus('sending');
+
+      const onSuccess = () => {
+        pendingRef.current = null;
+        setRetryable(false);
+      };
+      const onDefinitive = (e: unknown) => {
+        pendingRef.current = null;
+        setRetryable(false);
+        fail(e);
+      };
+      const onRecoverable = (e: unknown) => {
+        setRetryable(true); // pendingRef kept → retry() resends the same key
+        fail(e);
+      };
 
       let res: Response;
       try {
         res = await chatApi.stream(key, text, { kind, instance, idempotencyKey: idk });
       } catch (e) {
-        // Network failure reaching our own BFF — the turn likely never ran, but it
-        // MIGHT have; reconcile, then fall back to a definitive failure.
         const err = e instanceof ApiError ? e : new ApiError(0, 'network_error');
-        if (await reconcileFromHistory(key, priorLen)) return;
-        fail(err);
+        if (await reconcileFromHistory(key, priorLen)) onSuccess();
+        else onRecoverable(err);
         return;
       }
 
@@ -319,20 +347,35 @@ export function useChat(options: UseChatOptions = {}): UseChat {
         if (!res.ok) {
           const body = (await res.json().catch(() => null)) as { error?: string; detail?: string } | null;
           const err = new ApiError(res.status, body?.error || 'request_failed', body?.detail);
-          if (isRecoverable(err) && (await reconcileFromHistory(key, priorLen))) return;
-          fail(err);
+          if (isRecoverable(err)) {
+            if (await reconcileFromHistory(key, priorLen)) onSuccess();
+            else onRecoverable(err);
+          } else {
+            onDefinitive(err);
+          }
           return;
         }
-        // 200 but no readable body (old runtime) → the non-stream fallback.
-        await bufferedTurn(key, userId, text, kind, priorLen, idk);
+        // 200 but no readable body (old runtime) → the non-stream fallback. The
+        // shared idempotency key makes this safe even after the stream attempt.
+        try {
+          const d = await chatApi.turn(key, text, { kind, instance, idempotencyKey: idk });
+          finalizeReply(userId, d);
+          onSuccess();
+        } catch (e) {
+          if (isRecoverable(e)) {
+            if (await reconcileFromHistory(key, priorLen)) onSuccess();
+            else onRecoverable(e);
+          } else {
+            onDefinitive(e);
+          }
+        }
         return;
       }
 
-      // usableStream above already verified res.body + getReader.
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       const parser = createSseParser();
-      let finalized = false;
+      let settled = false;
       try {
         for (;;) {
           const { value, done } = await reader.read();
@@ -344,16 +387,18 @@ export function useChat(options: UseChatOptions = {}): UseChat {
               const d = safeJson<StreamDoneEvent>(ev.data);
               if (d) {
                 finalizeReply(userId, d);
-                finalized = true;
+                onSuccess();
+                settled = true;
               }
             } else if (ev.event === 'error') {
               const er = safeJson<StreamErrorEvent>(ev.data);
               const err = new ApiError(502, er?.error || 'engine_error', er?.detail);
-              finalized = true;
-              if (isRecoverable(err) && (await reconcileFromHistory(key, priorLen))) {
-                // adopted — nothing more to do
+              settled = true;
+              if (isRecoverable(err)) {
+                if (await reconcileFromHistory(key, priorLen)) onSuccess();
+                else onRecoverable(err);
               } else {
-                fail(err);
+                onDefinitive(err);
               }
             }
           }
@@ -366,19 +411,77 @@ export function useChat(options: UseChatOptions = {}): UseChat {
 
       // Stream closed WITHOUT a terminal done/error → the turn may have completed
       // server-side; reconcile rather than dead-error (CONTRACT S5).
-      if (!finalized) {
-        if (!(await reconcileFromHistory(key, priorLen))) {
-          setStatus('error');
-          setError(friendlyError(new ApiError(0, 'network_error')));
-        }
+      if (!settled) {
+        if (await reconcileFromHistory(key, priorLen)) onSuccess();
+        else onRecoverable(new ApiError(0, 'network_error'));
       }
     },
-    [instance, fail, reconcileFromHistory, finalizeReply, bufferedTurn],
+    [instance, fail, reconcileFromHistory, finalizeReply],
   );
+
+  // The real /end: archive+open a fresh session and show a transient confirmation
+  // (the web path never sent "/end" to the model — that just made it role-play
+  // "session closed" while the session stayed live). (CONTRACT S7.)
+  const endChat = useCallback(async () => {
+    setStatus('booting');
+    setError(null);
+    setNotice(null);
+    setRetryable(false);
+    pendingRef.current = null;
+    try {
+      await openFresh();
+      setStatus('ready');
+      setNotice('Saved your conversation — started a new chat.');
+    } catch (e) {
+      fail(e);
+    }
+  }, [openFresh, fail]);
+
+  const send = useCallback(
+    async (raw: string, kind: ChatKind = 'text') => {
+      const text = raw.trim();
+      const key = sessionKeyRef.current;
+      if (!text || !key) return;
+      // Intercept a bare "/end" control BEFORE it reaches the model (S7).
+      if (isEndCommand(text)) {
+        await endChat();
+        return;
+      }
+      setError(null);
+      setNotice(null);
+      setWorking(null);
+      // Snapshot the transcript length BEFORE the optimistic bubble so the
+      // reconcile "did the transcript grow?" check compares against persisted turns.
+      const priorLen = messagesRef.current.length;
+      // Mint an idempotency key per logical turn so a retry of a turn that already
+      // ran returns the cached result instead of double-acting (a vault write). (S6.)
+      const idk = crypto.randomUUID();
+      // Hoist the optimistic user bubble's id so we can patch its ts once the
+      // backend returns the real user-turn stamp (keeps live == resume).
+      const userId = nextId();
+      setMessages((prev) => [...prev, { id: userId, role: 'user', text, ts: '' }]);
+      const ctx: PendingTurn = { key, userId, text, kind, priorLen, idk };
+      pendingRef.current = ctx;
+      await runTurn(ctx);
+    },
+    [endChat, runTurn],
+  );
+
+  // Resend the last failed turn with the SAME idempotency key. The optimistic
+  // user bubble is already in the thread, so we do NOT re-append it.
+  const retry = useCallback(async () => {
+    const ctx = pendingRef.current;
+    if (!ctx) return;
+    setNotice(null);
+    await runTurn(ctx);
+  }, [runTurn]);
 
   const newChat = useCallback(async () => {
     setStatus('booting');
     setError(null);
+    setNotice(null);
+    setRetryable(false);
+    pendingRef.current = null;
     try {
       await openFresh();
       setStatus('ready');
@@ -393,8 +496,12 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     error,
     sending: status === 'sending',
     working,
+    notice,
     unauthenticated,
+    retryable,
     send,
+    retry,
     newChat,
+    endChat,
   };
 }
