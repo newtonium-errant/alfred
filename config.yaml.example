@@ -478,6 +478,35 @@ transport:
 #   # Future: V.E.R.A. (RRTS calendar) and STAY-C (client calendar) will
 #   # each define their own gcal block in their own config.<instance>.yaml.
 
+# --- Web front-end (Frontend M1) -------------------------------------------
+# A browser chat with this instance, vault-grounded and scope-enforced,
+# sharing the EXACT ``run_turn`` engine the Telegram talker uses. The routes
+# mount on the existing transport server (no second port). DISABLED by
+# default — an absent or ``enabled: false`` block mounts NO web routes and
+# leaves the transport server byte-unchanged (opt-in; M1 targets Salem only).
+#
+# web:
+#   enabled: true
+#   # The named-user allowlist — this IS the user table (no DB). Each entry's
+#   # ``name`` is the stable handle (→ a reserved synthetic session id);
+#   # ``role`` maps to the existing run_turn scope rail (owner / ops);
+#   # ``email`` is the magic-link delivery address (Sub-arc B).
+#   users:
+#     - { name: andrew, role: owner, email: "you@example.com" }
+#     # - { name: ben,  role: ops,   email: "ben@example.com" }
+#   auth:
+#     # Instance HMAC signing secret for session + magic-link tokens
+#     # (Sub-arc B). Fails loud at the auth-use site if web is enabled and
+#     # this is empty — never sign with an empty key.
+#     session_secret: "${ALFRED_WEB_SESSION_SECRET}"
+#     session_ttl_hours: 168          # 7-day session token lifetime
+#     magic_link_ttl_minutes: 15      # short-lived, single-use login link
+#     base_url: "${ALFRED_WEB_BASE_URL}"   # public origin (cloudflared subdomain)
+#   email:
+#     provider: resend
+#     api_key: "${RESEND_API_KEY}"
+#     from_address: "${ALFRED_WEB_FROM_ADDRESS}"
+
 telegram:
   # Telegram bot token from @BotFather
   bot_token: "${TELEGRAM_BOT_TOKEN}"

@@ -1474,6 +1474,55 @@ async def run(
         log.exception("talker.daemon.transport_setup_failed")
         transport_app = None
 
+    # ---- Web chat surface (Frontend M1) ----------------------------------
+    # The browser chat is a SECOND adapter onto ``run_turn``, mounted on the
+    # transport app. The daemon wires it (not ``wire_transport_app``)
+    # because the web handlers need talker runtime — the Anthropic client,
+    # the StateManager, the TalkerConfig, the per-turn system-prompt
+    # provider, and the boot-time vault-context snapshot — which live here,
+    # not in the transport layer. Same "daemon wires the runtime closures"
+    # shape as the GCal vault-ops hooks above.
+    #
+    # Opt-in: ``register_web_routes`` mounts NOTHING when ``web.enabled`` is
+    # false / absent (the common case — M1 targets Salem only), so every
+    # other instance's transport server is byte-unchanged. Must run BEFORE
+    # ``run_server`` starts the app (this is still the pre-start window).
+    try:
+        from alfred.web.config import load_from_unified as load_web_config
+        from alfred.web.routes_chat import register_web_routes
+
+        web_config = load_web_config(raw)
+        if transport_app is not None and web_config.enabled:
+            allowed_user_ids = [
+                getattr(u, "id", u) for u in config.allowed_users
+            ]
+            register_web_routes(
+                transport_app,
+                web_config=web_config,
+                anthropic_client=client,
+                state_mgr=state_mgr,
+                talker_config=config,
+                system_prompt_provider=system_prompt_provider,
+                vault_context_str=vault_context_str,
+                allowed_user_ids=allowed_user_ids,
+            )
+        else:
+            # Intentionally-left-blank: a disabled / unmountable web
+            # surface is logged so "no web routes" is distinguishable from
+            # "wiring silently skipped".
+            log.info(
+                "talker.daemon.web_routes_not_mounted",
+                reason=(
+                    "transport app unavailable"
+                    if transport_app is None
+                    else "web.enabled=false / web block absent"
+                ),
+            )
+    except Exception:  # noqa: BLE001
+        # Web surface is non-fatal — the talker still handles Telegram +
+        # the outbound transport even if web wiring fails.
+        log.exception("talker.daemon.web_routes_setup_failed")
+
     # ---- Shutdown coordination -------------------------------------------
     # The event ties three things together: SIGTERM, the sweeper loop, and
     # the long-poll runner. Whichever fires first wins; the others observe
