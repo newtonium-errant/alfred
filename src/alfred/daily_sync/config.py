@@ -34,12 +34,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import structlog
 import yaml
 
 from alfred.common.schedule import ScheduleConfig
 from alfred.routine.match_calibration import (
     DEFAULT_PENDING_PATH as _ROUTINE_MATCH_PENDING_DEFAULT,
 )
+
+log = structlog.get_logger(__name__)
 
 ENV_RE = re.compile(r"\$\{(\w+)\}")
 
@@ -309,12 +312,17 @@ def load_from_unified(raw: dict[str, Any]) -> DailySyncConfig:
             cfg.routine_match.pending_path = (
                 _load_routine(raw).match_calibration.pending_path
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # Never let routine-config resolution break daily_sync load — keep
             # the dataclass default (the shared constant, which is also what the
             # routine tool defaults to, so they still match in the no-override
-            # case).
-            pass
+            # case). Emit a debug line (reviewer ILB note on 9b89cb7): a real
+            # routine-config breakage would silently re-introduce the read/write
+            # drift via the constant fallback — this makes that diagnosable.
+            log.debug(
+                "daily_sync.routine_match.pending_path_derive_failed",
+                error=str(exc),
+            )
     # Synthetic ``_config_path`` key — set by the CLI in
     # ``_load_unified_config`` before handing ``raw`` to the
     # orchestrator, carried through ``multiprocessing`` pickling to

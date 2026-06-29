@@ -176,6 +176,37 @@ def test_pending_path_no_override_tracks_routine_default() -> None:
     )
 
 
+def test_pending_path_derive_failure_logs_debug(monkeypatch) -> None:
+    """Reviewer ILB note (on 9b89cb7): a routine-config resolution failure during
+    pending_path derivation must be LOGGED (debug), not silently swallowed — a
+    real breakage would re-introduce read/write drift via the constant fallback,
+    and silence makes it undiagnosable. The fallback still keeps daily_sync load
+    from crashing (lands on the dataclass default)."""
+    from alfred.daily_sync.config import load_from_unified
+
+    def _boom(raw):  # noqa: ANN001
+        raise RuntimeError("routine config boom")
+
+    # Function-level ``from alfred.routine.config import load_from_unified`` in
+    # the derivation reads the module attribute at call time → patching it here
+    # makes the derivation raise.
+    monkeypatch.setattr("alfred.routine.config.load_from_unified", _boom)
+
+    with structlog.testing.capture_logs() as cap:
+        cfg = load_from_unified({
+            "daily_sync": {"enabled": True, "routine_match": {"enabled": True}},
+        })
+
+    # Fell back to the dataclass default (the shared constant) — no crash.
+    assert cfg.routine_match.pending_path == mc.DEFAULT_PENDING_PATH
+    matches = [
+        c for c in cap
+        if c.get("event") == "daily_sync.routine_match.pending_path_derive_failed"
+    ]
+    assert len(matches) == 1
+    assert "boom" in matches[0]["error"]
+
+
 # ---------------------------------------------------------------------------
 # Phase 2b — RoutineMatchItem display item + consume_last_batch (routing surface)
 # ---------------------------------------------------------------------------
