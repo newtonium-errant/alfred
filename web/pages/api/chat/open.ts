@@ -1,5 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
+import type { ZodIssue } from 'zod';
 import { resolveSessionToken } from '../../../lib/algernon/identity';
+import { chatOpenBodySchema } from '../../../lib/algernon/schemas';
 import { callChatTo, callTransport } from '../../../lib/algernon/transport';
 import { gateCrossInstance, isHomeInstance } from '../../../lib/algernon/chatRouting';
 import { sendTransportError } from '../../../lib/algernon/bffError';
@@ -20,7 +22,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(401).json({ error: 'invalid_session' });
   }
 
-  const instance = typeof req.body?.instance === 'string' ? req.body.instance : undefined;
+  // Boundary-validate the (optional) instance selector via zod, matching the
+  // other chat routes. The cross-instance allowlist + isValidTargetName still gate
+  // the relay; this is the trust-boundary edge guard for shape consistency.
+  const parsed = chatOpenBodySchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: 'invalid_request',
+      detail: parsed.error.issues.map((i: ZodIssue) => i.message).join('; '),
+    });
+  }
+  const instance = parsed.data.instance;
 
   if (isHomeInstance(instance)) {
     try {

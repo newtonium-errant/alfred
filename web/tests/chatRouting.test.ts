@@ -207,6 +207,16 @@ describe('POST /api/chat/open — routing', () => {
     expect(json).toHaveBeenCalledWith({ error: 'forbidden' });
     expect(mockCallChatTo).not.toHaveBeenCalled();
   });
+
+  it('400 invalid_request on a malformed body (zod boundary-validated)', async () => {
+    mockResolveSessionToken.mockReturnValue('tok');
+    const { res, status, json } = mockRes();
+    await openHandler(postReq({ instance: 123 }), res); // instance not a string
+    expect(status).toHaveBeenCalledWith(400);
+    expect(json.mock.calls[0][0].error).toBe('invalid_request');
+    expect(mockCallTransport).not.toHaveBeenCalled();
+    expect(mockCallChatTo).not.toHaveBeenCalled();
+  });
 });
 
 describe('GET /api/chat/history/[key] — routing', () => {

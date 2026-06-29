@@ -63,4 +63,20 @@ describe('createSseParser', () => {
     const evs = p.push('data: {"hi":1}\n\n');
     expect(evs[0].event).toBe('message');
   });
+
+  it('parses CRLF-delimited frames (\\r\\n\\r\\n boundary + \\r\\n lines)', () => {
+    const p = createSseParser();
+    const evs = p.push(
+      'event: done\r\ndata: {"reply":"hi","session_key":"k","ts":"","user_ts":""}\r\n\r\n',
+    );
+    expect(evs).toHaveLength(1);
+    expect(evs[0].event).toBe('done');
+    // No trailing \r leaks into the data payload.
+    expect(JSON.parse(evs[0].data).reply).toBe('hi');
+  });
+
+  it('skips a CRLF keep-alive comment frame', () => {
+    const p = createSseParser();
+    expect(p.push(': keepalive\r\n\r\n')).toEqual([]);
+  });
 });

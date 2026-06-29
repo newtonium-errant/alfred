@@ -1,5 +1,5 @@
 // A minimal Server-Sent-Events frame parser for the chat stream consumer. SSE
-// frames are separated by a blank line ("\n\n"); within a frame, `event:` names
+// frames are separated by a blank line (LF "\n\n" or CRLF "\r\n\r\n"); `event:` names
 // the type and `data:` carries the payload (multiple data lines join with "\n").
 // Comment frames (lines starting with ":", e.g. the backend's `: keepalive`) carry
 // no event and are skipped — they exist only to keep the wire warm (CONTRACT §1).
@@ -15,10 +15,16 @@ export interface SseEvent {
   data: string;
 }
 
+// Frame boundary: a blank line. Tolerate CRLF (\r\n\r\n) as well as LF (\n\n) so
+// a CRLF-normalizing intermediary can't silently break frame parsing — today's
+// wire is loopback LF, this is cheap defensive insurance.
+const FRAME_SEP = /\r?\n\r?\n/;
+
 function parseFrame(raw: string): SseEvent | null {
   let event = 'message';
   const dataLines: string[] = [];
-  for (const line of raw.split('\n')) {
+  // Split lines on CRLF or LF so a CRLF wire doesn't leave a trailing \r on data.
+  for (const line of raw.split(/\r?\n/)) {
     // Blank line or comment (`:` prefix, incl. `: keepalive`) → ignore.
     if (line === '' || line.startsWith(':')) continue;
     const idx = line.indexOf(':');
@@ -41,10 +47,12 @@ export function createSseParser() {
     push(chunk: string): SseEvent[] {
       buffer += chunk;
       const events: SseEvent[] = [];
-      let idx: number;
-      while ((idx = buffer.indexOf('\n\n')) !== -1) {
-        const raw = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
+      // Non-global exec always finds the FIRST boundary; we slice past it each
+      // pass, so the next exec finds the next boundary (no lastIndex bookkeeping).
+      let m: RegExpExecArray | null;
+      while ((m = FRAME_SEP.exec(buffer)) !== null) {
+        const raw = buffer.slice(0, m.index);
+        buffer = buffer.slice(m.index + m[0].length);
         const ev = parseFrame(raw);
         if (ev) events.push(ev);
       }

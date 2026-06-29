@@ -215,12 +215,19 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   const [unauthenticated, setUnauthenticated] = useState(false);
   const sessionKeyRef = useRef<string | null>(null);
   const pendingRef = useRef<PendingTurn | null>(null);
+  // The in-flight streamed turn's AbortController — aborted on unmount or when a
+  // re-bootstrap (instance switch) supersedes the turn, tearing down the
+  // browser→BFF fetch (the backend detaches and keeps run_turn running, S4).
+  const abortRef = useRef<AbortController | null>(null);
   // Mirrors `messages` for synchronous reads inside async send flows (e.g. the
   // pre-send transcript length used by the history-reconcile "did it grow?" check).
   const messagesRef = useRef<ChatMessage[]>([]);
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  // Abort any in-flight stream when the hook unmounts.
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   const fail = useCallback((e: unknown) => {
     if (isUnauthenticated(e)) setUnauthenticated(true);
@@ -236,6 +243,8 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   }, [instance]);
 
   const bootstrap = useCallback(async () => {
+    // Supersede any in-flight turn from the previous instance/thread.
+    abortRef.current?.abort();
     setStatus('booting');
     setError(null);
     setNotice(null);
@@ -317,6 +326,10 @@ export function useChat(options: UseChatOptions = {}): UseChat {
       setWorking(null);
       setStatus('sending');
 
+      // Per-turn AbortController — unmount / instance-switch aborts the fetch.
+      const ac = new AbortController();
+      abortRef.current = ac;
+
       const onSuccess = () => {
         pendingRef.current = null;
         setRetryable(false);
@@ -333,8 +346,11 @@ export function useChat(options: UseChatOptions = {}): UseChat {
 
       let res: Response;
       try {
-        res = await chatApi.stream(key, text, { kind, instance, idempotencyKey: idk });
+        res = await chatApi.stream(key, text, { kind, instance, idempotencyKey: idk, signal: ac.signal });
       } catch (e) {
+        // Aborted by unmount / instance switch → the turn is being abandoned; do
+        // not reconcile or touch state (the component is gone or re-bootstrapping).
+        if (ac.signal.aborted) return;
         const err = e instanceof ApiError ? e : new ApiError(0, 'network_error');
         if (await reconcileFromHistory(key, priorLen)) onSuccess();
         else onRecoverable(err);
@@ -408,6 +424,9 @@ export function useChat(options: UseChatOptions = {}): UseChat {
       } finally {
         setWorking(null);
       }
+
+      // Aborted mid-stream by unmount / instance switch → abandon silently.
+      if (ac.signal.aborted) return;
 
       // Stream closed WITHOUT a terminal done/error → the turn may have completed
       // server-side; reconcile rather than dead-error (CONTRACT S5).
