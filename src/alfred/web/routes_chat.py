@@ -386,6 +386,13 @@ def register_web_routes(
 
     register_auth_handlers(app)
 
+    # STT route (/stt/transcribe) — same lazy-import anti-cycle pattern.
+    # Rides the web opt-in (M1 = Salem only); reuses the live STT fallback
+    # chain over the talker config already stashed on the app.
+    from .routes_stt import register_stt_handlers
+
+    register_stt_handlers(app)
+
     log.info(
         "web.routes.registered",
         users=len(web_config.users),
@@ -395,6 +402,7 @@ def register_web_routes(
             "/chat/history/{session_key}",
             "/auth/login",
             "/auth/verify",
+            "/stt/transcribe",
         ],
     )
     return True
