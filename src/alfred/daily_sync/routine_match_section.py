@@ -173,8 +173,12 @@ def routine_match_section(
             "routine_match.no_pending",
             pending_path=rm.pending_path,
         )
+        # Markdown ``##`` section header to match the sibling sections
+        # (attribution / friction / radar). The assembler joins section
+        # outputs verbatim with ``\n\n`` — it does NOT wrap titles — so each
+        # section emits its own header.
         return (
-            "Routine match review\n"
+            "## Routine match review\n\n"
             "No low-confidence routine matches to review."
         )
 
@@ -183,10 +187,13 @@ def routine_match_section(
         count=len(items),
         pending_path=rm.pending_path,
     )
-    lines = ["Routine match review — confirm/reject these fuzzy matches:"]
+    plural = "s" if len(items) != 1 else ""
+    lines = [f"## Routine match review ({len(items)} item{plural})", ""]
     for item in items:
         lines.append(_format_item(item))
-    return "\n".join(lines)
+    lines.append("")
+    lines.append("Reply with `N confirm` / `N reject`.")
+    return "\n".join(lines).rstrip()
 
 
 def register() -> None:

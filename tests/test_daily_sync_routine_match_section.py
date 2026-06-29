@@ -47,6 +47,9 @@ def test_enabled_empty_emits_ilb_sentinel(tmp_path: Path) -> None:
             _cfg(tmp_path / "pending.jsonl"), date(2026, 6, 28),
         )
     assert out is not None
+    # Markdown ``##`` header consistent with sibling sections (attribution /
+    # friction / radar) — the assembler doesn't wrap titles.
+    assert out.startswith("## Routine match review")
     assert "No low-confidence routine matches to review" in out
     # ILB log pinned (per feedback_log_emission_test_pattern).
     assert [c for c in cap if c.get("event") == "routine_match.no_pending"]
@@ -64,6 +67,8 @@ def test_enabled_with_pending_renders_numbered_list(tmp_path: Path) -> None:
     with structlog.testing.capture_logs() as cap:
         out = rms.routine_match_section(_cfg(p), date(2026, 6, 28), start_index=1)
     assert out is not None
+    # ``##`` header with item count, matching the sibling sections.
+    assert out.startswith("## Routine match review (2 items)")
     assert "walk doggo" in out and "Walk dog" in out
     assert "0.40" in out and "0.33" in out
     assert "1." in out and "2." in out
