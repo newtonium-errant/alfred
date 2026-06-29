@@ -207,6 +207,15 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
 
     session_obj = Session.from_dict(active_dict)
 
+    # Capture transcript length BEFORE the turn so we can locate the user
+    # turn afterwards (it is appended first, at index ``pre_len``). The
+    # assistant turn is appended LAST, so ``transcript[-1]`` is the reply.
+    # Both stamps are read back off the existing ``_ts`` clock that
+    # ``append_turn`` writes (session.py) — we do NOT invent a new clock.
+    # This mirrors the per-turn ``ts`` ``/chat/history`` already surfaces,
+    # so a live bubble is byte-identical to what history later returns.
+    pre_len = len(session_obj.transcript)
+
     # ``user_name`` only when the instance is multi-user — parity with the
     # Telegram ``_name_for`` path. On a single-user instance (the common M1
     # case) it stays None so the sender-identity system block is omitted and
@@ -239,14 +248,31 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
             status=502,
         )
 
+    # Extract the per-turn stamps run_turn just wrote (in place) to
+    # ``session_obj.transcript`` via ``append_turn``. Both default to ""
+    # so the response fields are ALWAYS present (never null/missing) —
+    # mirroring the pre-stamp "" contract ``/chat/history`` already uses.
+    transcript = session_obj.transcript or []
+    assistant_ts = transcript[-1].get("_ts", "") if transcript else ""
+    user_ts = transcript[pre_len].get("_ts", "") if len(transcript) > pre_len else ""
+
     log.info(
         "web.chat.turn_complete",
         user=identity.user,
         session_key=session_key,
         user_kind=kind,
         reply_chars=len(reply or ""),
+        assistant_ts=assistant_ts,
+        user_ts=user_ts,
     )
-    return web.json_response({"reply": reply, "session_key": session_key})
+    return web.json_response(
+        {
+            "reply": reply,
+            "session_key": session_key,
+            "ts": assistant_ts,
+            "user_ts": user_ts,
+        }
+    )
 
 
 async def _handle_chat_history(request: web.Request) -> web.StreamResponse:

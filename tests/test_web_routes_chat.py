@@ -212,6 +212,50 @@ async def test_open_turn_history_roundtrip(web_client) -> None:
     assert all(t["ts"] for t in turns)
 
 
+async def test_turn_returns_per_turn_timestamps(web_client) -> None:
+    """`/chat/turn` additively returns ``ts`` (assistant) + ``user_ts``
+    (user), both from the existing ``_ts`` clock. Both always present,
+    non-empty for a real turn, and byte-identical to what /chat/history
+    later surfaces (live == resume)."""
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    session_key = (await r.json())["session_key"]
+
+    r = await web_client.post(
+        "/chat/turn",
+        json={"session_key": session_key, "message": "hi there"},
+        headers=headers,
+    )
+    assert r.status == 200
+    body = await r.json()
+    assert "ts" in body and "user_ts" in body
+    assert body["ts"], "assistant turn ts must be non-empty"
+    assert body["user_ts"], "user turn ts must be non-empty"
+
+    # Live == resume: the stamps match what history projects per turn.
+    r = await web_client.get(f"/chat/history/{session_key}", headers=headers)
+    turns = (await r.json())["turns"]
+    assert turns[0]["ts"] == body["user_ts"]
+    assert turns[-1]["ts"] == body["ts"]
+
+
+async def test_turn_timestamps_present_in_log(web_client) -> None:
+    """The turn_complete log carries assistant_ts/user_ts (observability)."""
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    session_key = (await r.json())["session_key"]
+    with structlog.testing.capture_logs() as captured:
+        await web_client.post(
+            "/chat/turn",
+            json={"session_key": session_key, "message": "hi"},
+            headers=headers,
+        )
+    done = [c for c in captured if c.get("event") == "web.chat.turn_complete"]
+    assert len(done) == 1
+    assert done[0]["assistant_ts"]
+    assert done[0]["user_ts"]
+
+
 async def test_session_persisted_under_synthetic_id(web_client) -> None:
     state_mgr = web_client.app["_t_state_mgr"]
     r = await web_client.post("/chat/open", json={}, headers=_session_headers())
