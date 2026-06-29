@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { resolveIdentity } from '../../../lib/algernon/identity';
+import { resolveSessionToken } from '../../../lib/algernon/identity';
 import { TransportConfigError, callTransport } from '../../../lib/algernon/transport';
 
 // POST /api/chat/open → relays to transport POST /chat/open. Archives+closes any
@@ -10,13 +10,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: 'method_not_allowed' });
   }
 
-  const identity = resolveIdentity(req);
-  if (!identity) {
-    return res.status(401).json({ error: 'not_authenticated' });
+  const sessionToken = resolveSessionToken(req);
+  if (!sessionToken) {
+    return res.status(401).json({ error: 'invalid_session' });
   }
 
   try {
-    const { status, body } = await callTransport('POST', '/chat/open', identity, {});
+    const { status, body } = await callTransport('POST', '/chat/open', {
+      body: {},
+      sessionToken,
+    });
     return res.status(status).json(body ?? {});
   } catch (e) {
     if (e instanceof TransportConfigError) {

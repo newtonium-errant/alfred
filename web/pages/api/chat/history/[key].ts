@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { resolveIdentity } from '../../../../lib/algernon/identity';
+import { resolveSessionToken } from '../../../../lib/algernon/identity';
 import { sessionKeySchema } from '../../../../lib/algernon/schemas';
 import { TransportConfigError, callTransport } from '../../../../lib/algernon/transport';
 
@@ -11,9 +11,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: 'method_not_allowed' });
   }
 
-  const identity = resolveIdentity(req);
-  if (!identity) {
-    return res.status(401).json({ error: 'not_authenticated' });
+  const sessionToken = resolveSessionToken(req);
+  if (!sessionToken) {
+    return res.status(401).json({ error: 'invalid_session' });
   }
 
   const raw = req.query.key;
@@ -26,7 +26,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const { status, body } = await callTransport(
       'GET',
       `/chat/history/${encodeURIComponent(parsed.data)}`,
-      identity,
+      { sessionToken },
     );
     return res.status(status).json(body ?? { turns: [] });
   } catch (e) {

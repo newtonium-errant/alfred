@@ -51,6 +51,8 @@ export interface UseChat {
 function friendlyError(e: unknown): string {
   if (e instanceof ChatApiError) {
     switch (e.code) {
+      case 'invalid_session':
+        return 'Your session has ended — please sign in again.';
       case 'unknown_user':
         return "This account isn't on the allowlist for this instance.";
       case 'no_such_session':

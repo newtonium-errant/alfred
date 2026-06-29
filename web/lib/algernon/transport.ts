@@ -1,18 +1,18 @@
-import type { WebIdentity } from './identity';
-
 // SERVER-ONLY. The BFF's call into the Algernon transport. Holds the peer token
 // + base URL (server-side env, NEVER NEXT_PUBLIC_), so the browser never sees
 // them. Imported only by `pages/api/*` route handlers.
 //
-// Transport auth (src/alfred/transport/server.py auth_middleware) requires:
+// Transport auth (src/alfred/transport/server.py auth_middleware) requires on
+// EVERY route (incl. /auth/*):
 //   - Authorization: Bearer <peer token>     (Layer 1: "this front-end may talk")
 //   - X-Alfred-Client: <peer/client name>    (allowlist enforcement)
-// The web user identity (Layer 2, Sub-arc A) rides on:
-//   - X-Web-User: <name>                      (resolved + relayed server-side)
+// User identity (Layer 2, B3 live contract) on /chat/* rides on:
+//   - X-Alfred-Session: <instance-signed session token>   (verified server-side)
+// The /auth/* routes carry NO session token (the user isn't signed in yet).
 
 // The peer/client name the transport knows this front-end by. Must match the
-// backend's web peer entry in `auth.tokens` (Sub-arc B3). Config-driven so a
-// backend rename is a config change, not a code change.
+// backend's web peer entry in `auth.tokens`. Config-driven so a backend rename is
+// a config change, not a code change. Defaults to "web".
 const PEER_CLIENT = process.env.ALFRED_WEB_PEER_CLIENT || 'web';
 
 /** Thrown when required transport env is missing — surfaced as a 500 by the BFF. */
@@ -34,6 +34,13 @@ function peerToken(): string {
   return token;
 }
 
+export interface CallOptions {
+  /** JSON request body (POST). Omit for a GET / empty-body request. */
+  body?: unknown;
+  /** Instance-signed session token → X-Alfred-Session. Omit for /auth/* routes. */
+  sessionToken?: string | null;
+}
+
 export interface TransportResult {
   status: number;
   body: unknown;
@@ -42,23 +49,24 @@ export interface TransportResult {
 export async function callTransport(
   method: 'GET' | 'POST',
   path: string,
-  identity: WebIdentity,
-  jsonBody?: unknown,
+  opts: CallOptions = {},
 ): Promise<TransportResult> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${peerToken()}`,
     'X-Alfred-Client': PEER_CLIENT,
-    'X-Web-User': identity.user,
     Accept: 'application/json',
   };
-  if (jsonBody !== undefined) {
+  if (opts.sessionToken) {
+    headers['X-Alfred-Session'] = opts.sessionToken;
+  }
+  if (opts.body !== undefined) {
     headers['Content-Type'] = 'application/json';
   }
 
   const res = await fetch(`${baseUrl()}${path}`, {
     method,
     headers,
-    body: jsonBody !== undefined ? JSON.stringify(jsonBody) : undefined,
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   });
 
   let body: unknown = null;

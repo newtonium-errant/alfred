@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TransportConfigError, callTransport } from '../lib/algernon/transport';
 
-// Locks the BFF→transport auth contract in code: the transport's auth_middleware
-// (src/alfred/transport/server.py) requires Bearer peer token + X-Alfred-Client,
-// and routes_chat resolves identity from X-Web-User (Sub-arc A). A drift here is
-// a 401/403 in production.
+// Locks the BFF→transport auth contract in code. The transport's auth_middleware
+// (src/alfred/transport/server.py) requires Bearer peer token + X-Alfred-Client
+// on EVERY route; /chat/* identity (B3 live contract) is the verified
+// X-Alfred-Session token. A drift here is a 401 in production.
 
 const ORIG_ENV = { ...process.env };
 
@@ -21,19 +21,17 @@ describe('callTransport', () => {
     vi.restoreAllMocks();
   });
 
-  it('sends Bearer token + X-Alfred-Client + X-Web-User, trims trailing slash', async () => {
+  it('sends Bearer peer token + X-Alfred-Client + X-Alfred-Session; trims slash; no X-Web-User', async () => {
     const fetchMock = vi.fn(async () => ({
       status: 200,
       json: async () => ({ reply: 'hi', session_key: 'k' }),
     }));
     vi.stubGlobal('fetch', fetchMock);
 
-    const res = await callTransport(
-      'POST',
-      '/chat/turn',
-      { user: 'andrew' },
-      { session_key: 'k', message: 'hi', kind: 'text' },
-    );
+    const res = await callTransport('POST', '/chat/turn', {
+      body: { session_key: 'k', message: 'hi', kind: 'text' },
+      sessionToken: 'sess-token-abc',
+    });
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ reply: 'hi', session_key: 'k' });
@@ -43,38 +41,42 @@ describe('callTransport', () => {
     expect(init.method).toBe('POST');
     expect(init.headers.Authorization).toBe('Bearer secret-token');
     expect(init.headers['X-Alfred-Client']).toBe('web');
-    expect(init.headers['X-Web-User']).toBe('andrew');
+    expect(init.headers['X-Alfred-Session']).toBe('sess-token-abc');
+    expect(init.headers['X-Web-User']).toBeUndefined();
     expect(init.headers['Content-Type']).toBe('application/json');
     expect(init.body).toBe(JSON.stringify({ session_key: 'k', message: 'hi', kind: 'text' }));
   });
 
-  it('omits Content-Type + body on a GET', async () => {
+  it('omits Content-Type + body on a GET, still sends the session token', async () => {
     const fetchMock = vi.fn(async () => ({ status: 200, json: async () => ({ turns: [] }) }));
     vi.stubGlobal('fetch', fetchMock);
 
-    await callTransport('GET', '/chat/history/abc', { user: 'andrew' });
+    await callTransport('GET', '/chat/history/abc', { sessionToken: 'tok' });
 
     const [, init] = fetchMock.mock.calls[0] as any[];
     expect(init.method).toBe('GET');
     expect(init.body).toBeUndefined();
     expect(init.headers['Content-Type']).toBeUndefined();
-    expect(init.headers['X-Web-User']).toBe('andrew');
+    expect(init.headers['X-Alfred-Session']).toBe('tok');
   });
 
-  it('defaults X-Alfred-Client to "web" when unset', async () => {
-    // PEER_CLIENT is read at module load; this just documents the default is "web"
-    // (set in beforeEach to the same value the module default would produce).
-    const fetchMock = vi.fn(async () => ({ status: 200, json: async () => ({}) }));
+  it('omits X-Alfred-Session for token-less /auth/* calls but keeps peer auth', async () => {
+    const fetchMock = vi.fn(async () => ({ status: 200, json: async () => ({ status: 'sent' }) }));
     vi.stubGlobal('fetch', fetchMock);
-    await callTransport('POST', '/chat/open', { user: 'a' }, {});
+
+    await callTransport('POST', '/auth/login', { body: { email: 'a@b.c' } });
+
     const [, init] = fetchMock.mock.calls[0] as any[];
+    expect(init.headers.Authorization).toBe('Bearer secret-token');
     expect(init.headers['X-Alfred-Client']).toBe('web');
+    expect(init.headers['X-Alfred-Session']).toBeUndefined();
+    expect(init.body).toBe(JSON.stringify({ email: 'a@b.c' }));
   });
 
   it('throws TransportConfigError when the base URL is missing', async () => {
     delete process.env.ALFRED_WEB_TRANSPORT_URL;
     await expect(
-      callTransport('POST', '/chat/open', { user: 'a' }, {}),
+      callTransport('POST', '/chat/open', { body: {}, sessionToken: 'tok' }),
     ).rejects.toBeInstanceOf(TransportConfigError);
   });
 
@@ -83,7 +85,7 @@ describe('callTransport', () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
     await expect(
-      callTransport('POST', '/chat/open', { user: 'a' }, {}),
+      callTransport('POST', '/chat/open', { body: {}, sessionToken: 'tok' }),
     ).rejects.toBeInstanceOf(TransportConfigError);
     expect(fetchMock).not.toHaveBeenCalled();
   });
