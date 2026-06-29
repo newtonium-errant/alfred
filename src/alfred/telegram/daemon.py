@@ -1512,20 +1512,27 @@ async def run(
             # flag (not a raise) keeps this path from hitting the generic
             # ``web_routes_setup_failed`` handler below — the dedicated
             # ``web_secret_unconfigured`` error is logged exactly once.
+            # ``relay`` auth mode (cross-instance chat) mints no session
+            # tokens, so it has no signing secret to check — skip the guard
+            # so an enabled relay instance with no secret still mounts. The
+            # Layer-1 ``web`` peer token is its authority instead.
+            web_mode = getattr(web_config.auth, "mode", "session") or "session"
             secret_ok = True
-            try:
-                resolve_signing_secret(web_config.auth)
-            except ValueError as exc:
-                log.error(
-                    "talker.daemon.web_secret_unconfigured",
-                    error=str(exc),
-                    detail=(
-                        "web.enabled=true but session_secret is empty / "
-                        "unresolved — web surface NOT mounted (fail-closed). "
-                        "Set ALFRED_WEB_SESSION_SECRET to enable web chat."
-                    ),
-                )
-                secret_ok = False
+            if web_mode != "relay":
+                try:
+                    resolve_signing_secret(web_config.auth)
+                except ValueError as exc:
+                    log.error(
+                        "talker.daemon.web_secret_unconfigured",
+                        error=str(exc),
+                        detail=(
+                            "web.enabled=true but session_secret is empty / "
+                            "unresolved — web surface NOT mounted "
+                            "(fail-closed). Set ALFRED_WEB_SESSION_SECRET to "
+                            "enable web chat."
+                        ),
+                    )
+                    secret_ok = False
 
             if secret_ok:
                 allowed_user_ids = [

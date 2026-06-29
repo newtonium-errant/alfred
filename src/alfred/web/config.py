@@ -73,12 +73,33 @@ class WebAuthConfig:
     ``web.enabled`` and the secret is empty (never sign with an empty key).
     ``base_url`` is the public front-end origin (the cloudflared subdomain)
     used to build magic-link URLs.
+
+    ``mode`` (cross-instance chat, 2026-06-29) selects the identity model
+    the ``/chat/*`` handlers use:
+
+    * ``"session"`` (default) — the existing instance-signed
+      ``X-Alfred-Session`` token path. The login instance (Salem) mints +
+      verifies its own session tokens; ``session_secret`` is REQUIRED.
+    * ``"relay"`` — trust-the-relay (mirrors ``/vault/ingest``). The BFF
+      authenticates the owner on the login instance, then relays to this
+      instance carrying its dedicated ``web`` peer token (Layer 1 authority)
+      plus an asserted ``X-Alfred-User`` header (the verified NAME only).
+      This instance re-resolves the name against its OWN ``web.users`` to
+      derive role + synthetic session id. No session minting / verification
+      happens here, so ``session_secret`` is NOT required in relay mode (the
+      signing-secret guard is skipped at register + boot).
+
+    An unknown / mistyped value coalesces to the safe ``"session"`` default
+    (which then fails loud at the signing-secret guard if no secret is set,
+    so a typo'd-relay instance fails closed rather than serving an
+    unverified surface).
     """
 
     session_secret: str = ""
     session_ttl_hours: int = 168
     magic_link_ttl_minutes: int = 15
     base_url: str = ""
+    mode: str = "session"
 
 
 @dataclass
@@ -152,6 +173,12 @@ def _build_auth(raw: Any) -> WebAuthConfig:
     known = WebAuthConfig.__dataclass_fields__
     filtered = {k: v for k, v in raw.items() if k in known}
     defaults = WebAuthConfig()
+    # Validate ``mode`` ∈ {session, relay}; an unknown / mistyped value
+    # coalesces to the safe ``session`` default (fail-closed — a typo'd
+    # relay instance then trips the signing-secret guard instead of serving
+    # an unverified surface).
+    mode_raw = str(filtered.get("mode", defaults.mode) or defaults.mode).strip().lower()
+    mode = mode_raw if mode_raw in {"session", "relay"} else defaults.mode
     return WebAuthConfig(
         session_secret=str(filtered.get("session_secret", "") or ""),
         session_ttl_hours=_int(
@@ -162,6 +189,7 @@ def _build_auth(raw: Any) -> WebAuthConfig:
             defaults.magic_link_ttl_minutes,
         ),
         base_url=str(filtered.get("base_url", "") or ""),
+        mode=mode,
     )
 
 

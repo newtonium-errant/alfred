@@ -14,9 +14,15 @@ Route surface (M1, non-streaming):
 
 Auth layering: every non-``/health`` route is gated by the transport
 ``auth_middleware`` (Layer 1, peer token — "this front-end may talk to
-me"). Sub-arc B adds Layer 2: each ``/chat/*`` handler resolves the
-*verified named user* via :func:`alfred.web.auth.require_web_session` (an
-instance-signed ``X-Alfred-Session`` token), fail-closed 401.
+me"). Layer 2 resolves the *verified named user* via the mode-aware
+:func:`alfred.web.auth.resolve_web_identity`, fail-closed 401:
+
+* ``session`` mode (the login instance, e.g. Salem) — an instance-signed
+  ``X-Alfred-Session`` token (``require_web_session``).
+* ``relay`` mode (cross-instance targets, e.g. KAL-LE / Hypatia / VERA) —
+  an asserted ``X-Alfred-User`` header (verified NAME only, gated by the
+  Layer-1 ``web`` peer token), re-resolved against THIS instance's own
+  ``web.users``. Mirrors the ``/vault/ingest`` relay-auth model.
 
 M1 deferral (NOTE-1): web turns do NOT inject ``calibration_str`` /
 ``pushback_level`` — those are populated by the Telegram session-type
@@ -38,7 +44,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from .auth import require_web_session
+from .auth import resolve_web_identity
 from .config import WebConfig, resolve_signing_secret
 from .identity import check_synthetic_id_collisions
 from .keys import (
@@ -124,7 +130,7 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
     state_mgr = request.app[KEY_WEB_STATE_MGR]
     talker_config = request.app[KEY_WEB_TALKER_CONFIG]
 
-    identity = require_web_session(request, web_config)
+    identity = resolve_web_identity(request, web_config)
     if identity is None:
         return web.json_response({"error": "invalid_session"}, status=401)
 
@@ -185,7 +191,7 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
     system_prompt_provider: Callable[[], str] = request.app[KEY_WEB_SYSTEM_PROVIDER]
     vault_context_str: str = request.app[KEY_WEB_VAULT_CTX]
 
-    identity = require_web_session(request, web_config)
+    identity = resolve_web_identity(request, web_config)
     if identity is None:
         return web.json_response({"error": "invalid_session"}, status=401)
 
@@ -284,7 +290,7 @@ async def _handle_chat_history(request: web.Request) -> web.StreamResponse:
     web_config: WebConfig = request.app[KEY_WEB_CONFIG]
     state_mgr = request.app[KEY_WEB_STATE_MGR]
 
-    identity = require_web_session(request, web_config)
+    identity = resolve_web_identity(request, web_config)
     if identity is None:
         return web.json_response({"error": "invalid_session"}, status=401)
 
@@ -337,10 +343,14 @@ def register_web_routes(
     rather than serving something broken:
 
     1. synthetic-id collision guard — a colliding name→id mapping aborts
-       (provable, not probable; see ``identity.py``);
+       (provable, not probable; see ``identity.py``); runs in BOTH modes.
     2. signing-secret guard — an enabled-but-unconfigured
        ``web.auth.session_secret`` (empty / unresolved ``${...}``) aborts,
-       so we never serve forgeable sessions.
+       so we never serve forgeable sessions. **Session mode only** — a
+       ``relay``-mode instance never mints / verifies session tokens
+       (possession of the Layer-1 ``web`` peer token IS the authority), so
+       it has no signing secret to guard and the ``/auth/{login,verify}``
+       routes are NOT mounted.
     """
     if web_config is None or not web_config.enabled:
         # Intentionally-left-blank: disabled is a deliberate state, logged
@@ -352,19 +362,24 @@ def register_web_routes(
         )
         return False
 
-    # Guard 1 — synthetic-id collisions (fail-loud).
+    mode = getattr(web_config.auth, "mode", "session") or "session"
+    relay_mode = mode == "relay"
+
+    # Guard 1 — synthetic-id collisions (fail-loud). Runs in both modes.
     mapping = check_synthetic_id_collisions(
         web_config.users, allowed_user_ids or []
     )
     # Guard 2 — signing secret must resolve (fail-loud); raises ValueError
-    # on empty / unresolved placeholder. Done here so an enabled instance
-    # with no real secret refuses to mount rather than minting/serving
-    # forgeable tokens later.
-    resolve_signing_secret(web_config.auth)
+    # on empty / unresolved placeholder. SESSION MODE ONLY — a relay
+    # instance mints no tokens, so a missing secret is expected and must
+    # NOT block mounting.
+    if not relay_mode:
+        resolve_signing_secret(web_config.auth)
 
     log.info(
         "web.routes.collision_check_clean",
         users=len(web_config.users),
+        mode=mode,
         synthetic_ids=sorted(mapping.values()),
     )
 
@@ -380,29 +395,43 @@ def register_web_routes(
     app.router.add_post("/chat/turn", _handle_chat_turn)
     app.router.add_get("/chat/history/{session_key}", _handle_chat_history)
 
-    # Auth routes (/auth/login, /auth/verify) — imported here (not at module
-    # top) so routes_auth can import this module's siblings without a cycle.
-    from .routes_auth import register_auth_handlers
+    mounted_routes = [
+        "/chat/open",
+        "/chat/turn",
+        "/chat/history/{session_key}",
+    ]
 
-    register_auth_handlers(app)
+    # Auth routes (/auth/login, /auth/verify) — SESSION MODE ONLY. A relay
+    # instance has no login surface (login/magic-link lives on the
+    # session-mode login instance, e.g. Salem). Imported here (not at module
+    # top) so routes_auth can import this module's siblings without a cycle.
+    if not relay_mode:
+        from .routes_auth import register_auth_handlers
+
+        register_auth_handlers(app)
+        mounted_routes += ["/auth/login", "/auth/verify"]
+    else:
+        # Intentionally-left-blank: relay mode deliberately omits the login
+        # surface, logged so "no /auth routes" is a deliberate state, not a
+        # silent wiring skip.
+        log.info(
+            "web.routes.relay_mode_no_auth",
+            detail="relay auth mode — /auth/login + /auth/verify NOT mounted "
+                   "(relay instances never mint / verify session tokens)",
+        )
 
     # STT route (/stt/transcribe) — same lazy-import anti-cycle pattern.
-    # Rides the web opt-in (M1 = Salem only); reuses the live STT fallback
-    # chain over the talker config already stashed on the app.
+    # Rides the web opt-in; reuses the live STT fallback chain over the
+    # talker config already stashed on the app. Mounted in BOTH modes.
     from .routes_stt import register_stt_handlers
 
     register_stt_handlers(app)
+    mounted_routes.append("/stt/transcribe")
 
     log.info(
         "web.routes.registered",
         users=len(web_config.users),
-        routes=[
-            "/chat/open",
-            "/chat/turn",
-            "/chat/history/{session_key}",
-            "/auth/login",
-            "/auth/verify",
-            "/stt/transcribe",
-        ],
+        mode=mode,
+        routes=mounted_routes,
     )
     return True

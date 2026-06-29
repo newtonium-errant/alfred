@@ -360,12 +360,20 @@ transport:
           - janitor
           - curator
           - talker
-      # Web front-end (Frontend M1) — the Next BFF holds THIS dedicated
-      # peer token (its own secret, never reusing ``local``) and presents
-      # ``X-Alfred-Client: web``. This is Layer 1 ("this front-end may talk
-      # to me"); the per-user X-Alfred-Session token (Layer 2) is verified
-      # by the web handlers, not here. Only present on instances that enable
-      # the ``web:`` block below.
+      # Web front-end chat — the Next BFF holds THIS dedicated peer token
+      # (its own secret, never reusing ``local`` or the ``web_ingest`` token
+      # below) and presents ``X-Alfred-Client: web``. This is Layer 1 ("this
+      # front-end may drive chat on me"). It is REQUIRED whenever the
+      # ``web:`` block below is enabled — in BOTH auth modes:
+      #   * session mode (Salem, the login instance): Layer 1 here + the
+      #     per-user X-Alfred-Session token (Layer 2) verified by the web
+      #     handlers.
+      #   * relay mode (KAL-LE / Hypatia / VERA cross-instance chat):
+      #     possession of THIS token IS the authority; the BFF additionally
+      #     asserts the verified user NAME in ``X-Alfred-User`` (the target
+      #     re-resolves it against its own ``web.users``). Each relay
+      #     instance needs its OWN distinct ``web`` token
+      #     (e.g. ``${ALFRED_KALLE_WEB_PEER_TOKEN}``).
       # web:
       #   token: "${ALFRED_WEB_PEER_TOKEN}"
       #   allowed_clients:
@@ -524,6 +532,19 @@ transport:
 # Requires a dedicated ``transport.auth.tokens.web`` peer entry above (the
 # BFF's Layer-1 token). Magic-link login emails via Resend.
 #
+# Auth model (``auth.mode``, cross-instance chat 2026-06-29):
+#   * ``session`` (default) — the LOGIN instance (Salem). Mints + verifies
+#     its own instance-signed X-Alfred-Session tokens; ``session_secret`` +
+#     ``email`` (magic-link) are REQUIRED.
+#   * ``relay`` — a TARGET instance (KAL-LE / Hypatia / VERA). The owner
+#     authenticates ONCE on the login instance; the BFF relays here carrying
+#     this instance's ``web`` peer token (Layer-1 authority) + an asserted
+#     ``X-Alfred-User`` header (verified NAME only). This instance
+#     re-resolves the name against its own ``users`` to derive role +
+#     session. NO ``session_secret`` / ``email`` needed in relay mode (no
+#     token minting); ``/auth/login`` + ``/auth/verify`` are NOT mounted.
+#
+# --- Login instance (Salem) — session mode ---
 # web:
 #   enabled: true
 #   # Single-use magic-link nonce store (tool-scoped default shown).
@@ -536,9 +557,10 @@ transport:
 #     - { name: andrew, role: owner, email: "you@example.com" }
 #     # - { name: ben,  role: ops,   email: "ben@example.com" }
 #   auth:
+#     mode: session                   # default; explicit for clarity
 #     # Instance HMAC signing secret for session + magic-link tokens
 #     # (Sub-arc B). Fails loud at the auth-use site if web is enabled and
-#     # this is empty — never sign with an empty key.
+#     # this is empty — never sign with an empty key. (Session mode only.)
 #     session_secret: "${ALFRED_WEB_SESSION_SECRET}"
 #     session_ttl_hours: 168          # 7-day session token lifetime
 #     magic_link_ttl_minutes: 15      # short-lived, single-use login link
@@ -547,6 +569,17 @@ transport:
 #     provider: resend
 #     api_key: "${RESEND_API_KEY}"
 #     from_address: "${ALFRED_WEB_FROM_ADDRESS}"
+#
+# --- Target instance (KAL-LE / Hypatia / VERA) — relay mode ---
+# Pair this with a DEDICATED ``transport.auth.tokens.web`` entry above
+# (this instance's own ``web`` peer token, distinct from its ``web_ingest``
+# token and from every other instance's ``web`` token).
+# web:
+#   enabled: true
+#   auth:
+#     mode: relay                     # trust-the-relay; no secret/email
+#   users:
+#     - { name: andrew, role: owner }   # email omitted — no magic-link here
 
 telegram:
   # Telegram bot token from @BotFather

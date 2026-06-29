@@ -49,6 +49,13 @@ TOKEN_SESSION = "session"
 # form, consistent with the existing ``X-Alfred-Client`` peer header).
 SESSION_HEADER = "X-Alfred-Session"
 
+# The header the BFF relays the asserted (verified-on-the-login-instance)
+# user NAME in, for cross-instance ``relay``-mode chat. Mirrors ingest's
+# ``X-Alfred-Ingest-User`` — provenance/identity only, NEVER authz: the
+# Layer-1 peer token IS the authority, and the target re-resolves the name
+# against its OWN ``web.users`` allowlist.
+USER_HEADER = "X-Alfred-User"
+
 
 # ---------------------------------------------------------------------------
 # Compact token codec (stdlib HMAC, no dependency)
@@ -220,3 +227,64 @@ def require_web_session(
     if payload is None:
         return None
     return resolve_identity_from_name(web_config, payload.get("u"))
+
+
+def _resolve_relay_identity(
+    request: "web.Request", web_config: WebConfig,
+) -> WebIdentity | None:
+    """Resolve the driving user from the asserted ``X-Alfred-User`` header.
+
+    The ``relay`` auth model (mirrors ``/vault/ingest``): the request has
+    already passed Layer-1 peer-token auth in the transport
+    ``auth_middleware`` — possession of this instance's dedicated ``web``
+    peer token IS the authority. The BFF (sole holder of that token) asserts
+    the verified user NAME (never a role) in ``X-Alfred-User``; this instance
+    re-resolves that name against its OWN ``web.users`` allowlist to derive
+    role + synthetic session id. The BFF cannot escalate (it asserts name
+    only); config decides what the user may do.
+
+    Fail-closed (→ the handler emits a 401):
+
+    * missing / empty ``X-Alfred-User`` → reject (logged);
+    * name not in this instance's ``web.users`` → reject (logged).
+    """
+    name = request.headers.get(USER_HEADER, "")
+    if not name or not name.strip():
+        # Intentionally-left-blank: a fail-closed reject is logged so a
+        # mis-wired BFF (peer token present, asserted user absent) is
+        # observably distinct from a healthy idle route.
+        log.warning(
+            "web.auth.relay_user_missing",
+            detail="relay mode but X-Alfred-User absent — rejecting (401)",
+        )
+        return None
+    identity = resolve_identity_from_name(web_config, name)
+    if identity is None:
+        log.warning(
+            "web.auth.relay_user_unknown",
+            name=name.strip()[:64],
+            detail="X-Alfred-User not in this instance's web.users — "
+                   "rejecting (401)",
+        )
+        return None
+    return identity
+
+
+def resolve_web_identity(
+    request: "web.Request", web_config: WebConfig,
+) -> WebIdentity | None:
+    """Mode-aware identity dispatcher for the ``/chat/*`` handlers.
+
+    Returns the same ``WebIdentity | None`` shape as
+    :func:`require_web_session` so the route swap is a trivial one-liner at
+    each handler. Dispatch on ``web.auth.mode``:
+
+    * ``"session"`` (default) — the existing instance-signed
+      ``X-Alfred-Session`` token path (``require_web_session``), UNCHANGED.
+    * ``"relay"`` — the asserted ``X-Alfred-User`` path
+      (``_resolve_relay_identity``), gated by the Layer-1 peer token.
+    """
+    mode = getattr(web_config.auth, "mode", "session") or "session"
+    if mode == "relay":
+        return _resolve_relay_identity(request, web_config)
+    return require_web_session(request, web_config)

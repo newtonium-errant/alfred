@@ -36,7 +36,7 @@ from alfred.transport.config import (
 )
 from alfred.transport.server import build_app
 from alfred.transport.state import TransportState
-from alfred.web.auth import SESSION_HEADER, make_session_token
+from alfred.web.auth import SESSION_HEADER, USER_HEADER, make_session_token
 from alfred.web.config import WebAuthConfig, WebConfig, WebUser
 from alfred.web.identity import synthetic_chat_id
 from alfred.web.routes_chat import (
@@ -116,6 +116,15 @@ def _web_config(users=None) -> WebConfig:
     )
 
 
+def _relay_web_config(users=None) -> WebConfig:
+    """A relay-mode web config — NO session_secret (no token minting)."""
+    return WebConfig(
+        enabled=True,
+        users=users if users is not None else [WebUser(name="andrew", role="owner")],
+        auth=WebAuthConfig(mode="relay", session_secret=""),
+    )
+
+
 @pytest.fixture
 async def web_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
     """A transport app with web routes mounted + a one-reply fake client."""
@@ -144,6 +153,46 @@ async def web_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
     app["_t_state_mgr"] = state_mgr
     app["_t_talker_config"] = talker_config
     return await aiohttp_client(app)
+
+
+@pytest.fixture
+async def relay_web_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
+    """A transport app with web routes mounted in RELAY mode.
+
+    Relay mode: no session_secret, no /auth routes; the asserted
+    ``X-Alfred-User`` header is the identity (gated by the Layer-1 peer
+    token the transport app already enforces).
+    """
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_transport_config(), tstate)
+
+    state_mgr = StateManager(tmp_path / "talker_state.json")
+    state_mgr.load()
+    talker_config = _make_talker_config(tmp_path)
+    web_auth_state = WebAuthState.create(tmp_path / "web_auth_state.json")
+    web_auth_state.load()
+    fake = FakeAnthropicClient(
+        [FakeResponse(content=[FakeBlock(type="text", text="hello from kalle")])]
+    )
+    register_web_routes(
+        app,
+        web_config=_relay_web_config(),
+        web_auth_state=web_auth_state,
+        anthropic_client=fake,
+        state_mgr=state_mgr,
+        talker_config=talker_config,
+        system_prompt_provider=lambda: "SYSTEM PROMPT",
+        vault_context_str="VAULT CONTEXT",
+        allowed_user_ids=[1],
+    )
+    app["_t_state_mgr"] = state_mgr
+    app["_t_talker_config"] = talker_config
+    return await aiohttp_client(app)
+
+
+def _relay_headers(name: str = "andrew") -> dict[str, str]:
+    """Peer headers (Layer 1) + the asserted user name (relay identity)."""
+    return {**_PEER_HEADERS, USER_HEADER: name}
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +313,72 @@ async def test_session_persisted_under_synthetic_id(web_client) -> None:
     assert active is not None
     assert active["session_id"] == session_key
     assert active["chat_id"] == synthetic_chat_id("andrew")
+
+
+# ---------------------------------------------------------------------------
+# Relay mode (cross-instance chat) — asserted X-Alfred-User identity
+# ---------------------------------------------------------------------------
+
+
+async def test_relay_requires_peer_token(relay_web_client) -> None:
+    # Even in relay mode the Layer-1 peer token is mandatory (auth_middleware).
+    resp = await relay_web_client.post(
+        "/chat/open", json={}, headers={USER_HEADER: "andrew"}
+    )
+    assert resp.status == 401
+
+
+async def test_relay_missing_user_header_fails_closed(relay_web_client) -> None:
+    # Valid peer token but NO X-Alfred-User → fail-closed 401.
+    resp = await relay_web_client.post("/chat/open", json={}, headers=_PEER_HEADERS)
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "invalid_session"
+
+
+async def test_relay_unknown_user_fails_closed(relay_web_client) -> None:
+    # Valid peer token + an asserted name NOT in this instance's web.users.
+    resp = await relay_web_client.post(
+        "/chat/open", json={}, headers=_relay_headers("stranger")
+    )
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "invalid_session"
+
+
+async def test_relay_session_token_does_not_authenticate(relay_web_client) -> None:
+    # A signed session token must NOT authenticate in relay mode — only the
+    # asserted X-Alfred-User header (gated by the peer token) does.
+    token = make_session_token(
+        "andrew", "owner", secret=DUMMY_WEB_SIGNING_SECRET, ttl_hours=168
+    )
+    resp = await relay_web_client.post(
+        "/chat/open", json={}, headers={**_PEER_HEADERS, SESSION_HEADER: token}
+    )
+    assert resp.status == 401
+
+
+async def test_relay_open_turn_history_roundtrip(relay_web_client) -> None:
+    headers = _relay_headers()
+    r = await relay_web_client.post("/chat/open", json={}, headers=headers)
+    assert r.status == 200
+    session_key = (await r.json())["session_key"]
+    assert session_key
+
+    r = await relay_web_client.post(
+        "/chat/turn",
+        json={"session_key": session_key, "message": "hi kalle"},
+        headers=headers,
+    )
+    assert r.status == 200
+    body = await r.json()
+    assert body["reply"] == "hello from kalle"
+    assert body["session_key"] == session_key
+
+    r = await relay_web_client.get(
+        f"/chat/history/{session_key}", headers=headers
+    )
+    assert r.status == 200
+    turns = (await r.json())["turns"]
+    assert [t["role"] for t in turns] == ["user", "assistant"]
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +605,7 @@ def test_register_web_routes_collision_fails_loud(tmp_path, monkeypatch) -> None
 
 def test_register_web_routes_unconfigured_secret_fails_loud(tmp_path) -> None:
     # Enabled but no signing secret → resolve_signing_secret guard aborts.
+    # (Session mode — the default.)
     tstate = TransportState.create(tmp_path / "transport_state.json")
     app = build_app(_transport_config(), tstate)
     cfg = WebConfig(
@@ -500,3 +616,35 @@ def test_register_web_routes_unconfigured_secret_fails_loud(tmp_path) -> None:
     with pytest.raises(ValueError, match="session_secret"):
         register_web_routes(app, web_config=cfg, **_register_kwargs(tmp_path))
     assert _mounted_web_paths(app) == []
+
+
+def test_register_web_routes_relay_skips_auth_and_secret_guard(tmp_path) -> None:
+    # Relay mode mounts /chat/* WITHOUT a signing secret AND WITHOUT the
+    # /auth login surface (relay instances never mint / verify tokens).
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_transport_config(), tstate)
+    mounted = register_web_routes(
+        app, web_config=_relay_web_config(), **_register_kwargs(tmp_path)
+    )
+    assert mounted is True
+    paths = set(_mounted_web_paths(app))
+    # /chat/* present, /auth/* absent.
+    assert "/chat/open" in paths
+    assert "/chat/turn" in paths
+    assert "/chat/history/{session_key}" in paths
+    assert "/auth/login" not in paths
+    assert "/auth/verify" not in paths
+
+
+def test_register_web_routes_relay_logs_no_auth(tmp_path) -> None:
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_transport_config(), tstate)
+    with structlog.testing.capture_logs() as captured:
+        register_web_routes(
+            app, web_config=_relay_web_config(), **_register_kwargs(tmp_path)
+        )
+    events = [c["event"] for c in captured]
+    assert "web.routes.relay_mode_no_auth" in events
+    registered = [c for c in captured if c.get("event") == "web.routes.registered"]
+    assert len(registered) == 1
+    assert registered[0]["mode"] == "relay"

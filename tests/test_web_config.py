@@ -233,3 +233,53 @@ def test_int_coercion_for_ttl_fields() -> None:
     )
     assert cfg.auth.session_ttl_hours == 72
     assert cfg.auth.magic_link_ttl_minutes == 15  # default fallback
+
+
+# ---------------------------------------------------------------------------
+# auth.mode (cross-instance chat: session vs relay)
+# ---------------------------------------------------------------------------
+
+
+def test_auth_mode_defaults_to_session() -> None:
+    cfg = load_from_unified({"web": {"enabled": True}})
+    assert cfg.auth.mode == "session"
+
+
+def test_auth_mode_relay_loads() -> None:
+    cfg = load_from_unified(
+        {"web": {"enabled": True, "auth": {"mode": "relay"}}}
+    )
+    assert cfg.auth.mode == "relay"
+
+
+def test_auth_mode_is_case_insensitive() -> None:
+    cfg = load_from_unified(
+        {"web": {"enabled": True, "auth": {"mode": "RELAY"}}}
+    )
+    assert cfg.auth.mode == "relay"
+
+
+def test_auth_mode_unknown_coalesces_to_session() -> None:
+    # A typo must fail closed to the secret-requiring default, never serve
+    # an unverified surface under an unknown mode.
+    cfg = load_from_unified(
+        {"web": {"enabled": True, "auth": {"mode": "relayed"}}}
+    )
+    assert cfg.auth.mode == "session"
+
+
+def test_auth_mode_relay_does_not_require_secret() -> None:
+    # Relay mode carries no session_secret — that is valid (no token
+    # minting). The loader must not invent one or fail.
+    cfg = load_from_unified(
+        {
+            "web": {
+                "enabled": True,
+                "auth": {"mode": "relay"},
+                "users": [{"name": "andrew", "role": "owner"}],
+            }
+        }
+    )
+    assert cfg.auth.mode == "relay"
+    assert cfg.auth.session_secret == ""
+    assert cfg.enabled is True
