@@ -193,9 +193,14 @@ def _relay_config(users=None) -> WebConfig:
     )
 
 
-def _req_with_user(name: str | None):
+def _req_with_user(name: str | None, *, peer: str = "web"):
+    """Build a relay request. ``peer`` is the matched transport peer NAME
+    that ``auth_middleware`` would have stashed; the relay path pins it to
+    the chat ``web`` peer."""
     headers = {USER_HEADER: name} if name is not None else {}
-    return make_mocked_request("POST", "/chat/turn", headers=headers)
+    req = make_mocked_request("POST", "/chat/turn", headers=headers)
+    req["transport_peer"] = peer
+    return req
 
 
 def test_resolve_web_identity_session_mode_uses_session_token() -> None:
@@ -265,3 +270,25 @@ def test_resolve_web_identity_relay_needs_no_signing_secret() -> None:
     cfg = _relay_config()  # session_secret=""
     ident = resolve_web_identity(_req_with_user("andrew"), cfg)
     assert ident is not None
+
+
+def test_resolve_web_identity_relay_wrong_peer_fails_closed_and_logs() -> None:
+    # WARN-1 regression pin: a request that cleared Layer 1 as the
+    # ``web_ingest`` peer (e.g. the ingest token + X-Alfred-Client: web)
+    # must NOT drive a chat turn even with a valid known X-Alfred-User —
+    # the peer-pin rejects it before identity resolution.
+    cfg = _relay_config()
+    with structlog.testing.capture_logs() as captured:
+        ident = resolve_web_identity(
+            _req_with_user("andrew", peer="web_ingest"), cfg
+        )
+    assert ident is None
+    events = [c["event"] for c in captured]
+    assert "web.auth.relay_wrong_peer" in events
+
+
+def test_resolve_web_identity_relay_missing_peer_fails_closed() -> None:
+    # No transport_peer at all (would only happen off the auth_middleware
+    # path) → fail-closed.
+    cfg = _relay_config()
+    assert resolve_web_identity(_req_with_user("andrew", peer=""), cfg) is None

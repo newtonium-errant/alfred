@@ -56,6 +56,17 @@ SESSION_HEADER = "X-Alfred-Session"
 # against its OWN ``web.users`` allowlist.
 USER_HEADER = "X-Alfred-User"
 
+# The transport peer NAME (``auth.tokens`` key) whose token authorises a
+# relay-mode chat turn. The relay path PINS this explicitly rather than
+# trusting ``X-Alfred-Client`` / ``allowed_clients`` alone: the chat ``web``
+# token and the ``web_ingest`` token BOTH carry ``allowed_clients: [web]``,
+# so a request bearing the deterministic-create-only ``web_ingest`` token +
+# ``X-Alfred-Client: web`` clears Layer 1 (resolving ``transport_peer =
+# "web_ingest"``) — without this pin it would then drive a FULL talker-scope
+# chat turn (privilege escalation). See CLAUDE.md "Relay / asserted-identity
+# routes — peer-pin requirement".
+WEB_CHAT_PEER = "web"
+
 
 # ---------------------------------------------------------------------------
 # Compact token codec (stdlib HMAC, no dependency)
@@ -245,9 +256,29 @@ def _resolve_relay_identity(
 
     Fail-closed (→ the handler emits a 401):
 
+    * presenting peer is not the chat ``web`` peer → reject (logged) — the
+      peer-pin that blocks a ``web_ingest`` token from escalating to full
+      chat scope;
     * missing / empty ``X-Alfred-User`` → reject (logged);
     * name not in this instance's ``web.users`` → reject (logged).
     """
+    # Peer-pin (defense-in-depth): only the dedicated chat ``web`` peer may
+    # drive a relay chat turn. ``transport_peer`` is the matched peer NAME
+    # set by ``auth_middleware``; pinning it closes the shared-``allowed_clients``
+    # escalation where the ``web_ingest`` token + ``X-Alfred-Client: web``
+    # clears Layer 1 as peer ``web_ingest``.
+    peer = request.get("transport_peer", "")
+    if peer != WEB_CHAT_PEER:
+        log.warning(
+            "web.auth.relay_wrong_peer",
+            peer=peer or "(none)",
+            expected=WEB_CHAT_PEER,
+            detail="relay chat requires the dedicated 'web' peer token — "
+                   "refusing to honor X-Alfred-User from another peer "
+                   "(e.g. web_ingest) — rejecting (401)",
+        )
+        return None
+
     name = request.headers.get(USER_HEADER, "")
     if not name or not name.strip():
         # Intentionally-left-blank: a fail-closed reject is logged so a

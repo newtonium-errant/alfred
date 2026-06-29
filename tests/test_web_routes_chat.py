@@ -57,6 +57,7 @@ from tests.telegram.conftest import (  # shared fake SDK client
 # Obviously-fake test secrets — never a real provider prefix (builder.md
 # GitGuardian rule).
 DUMMY_WEB_PEER_TOKEN = "DUMMY_WEB_PEER_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_0123456"
+DUMMY_WEB_INGEST_TOKEN = "DUMMY_WEB_INGEST_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_01234"
 DUMMY_WEB_SIGNING_SECRET = "DUMMY_WEB_SIGNING_SECRET_FOR_TESTING_ONLY_0123456789"
 
 _PEER_HEADERS = {
@@ -95,13 +96,20 @@ def _make_talker_config(tmp_path: Path) -> TalkerConfig:
 
 
 def _transport_config() -> TransportConfig:
-    """Transport config carrying a dedicated ``web`` peer-token entry."""
+    """Transport config with the dedicated chat ``web`` peer AND a sibling
+    ``web_ingest`` peer (both ``allowed_clients: [web]``) — so the WARN-1
+    escalation test can present a valid Layer-1 ``web_ingest`` token and
+    prove the Layer-2 peer-pin blocks it from driving chat."""
     return TransportConfig(
         server=ServerConfig(),
         auth=AuthConfig(
             tokens={
                 "web": AuthTokenEntry(
                     token=DUMMY_WEB_PEER_TOKEN,
+                    allowed_clients=["web"],
+                ),
+                "web_ingest": AuthTokenEntry(
+                    token=DUMMY_WEB_INGEST_TOKEN,
                     allowed_clients=["web"],
                 ),
             }
@@ -359,6 +367,56 @@ async def test_relay_session_token_does_not_authenticate(relay_web_client) -> No
         "/chat/open", json={}, headers={**_PEER_HEADERS, SESSION_HEADER: token}
     )
     assert resp.status == 401
+
+
+def _ingest_token_chat_headers(name: str = "andrew") -> dict[str, str]:
+    """The WARN-1 escalation attempt: a VALID Layer-1 ``web_ingest`` token +
+    ``X-Alfred-Client: web`` (clears auth_middleware as peer ``web_ingest``)
+    + a known asserted user. Must be peer-pinned out at Layer 2."""
+    return {
+        "Authorization": f"Bearer {DUMMY_WEB_INGEST_TOKEN}",
+        "X-Alfred-Client": "web",
+        USER_HEADER: name,
+    }
+
+
+async def test_relay_web_ingest_token_cannot_drive_chat_turn(
+    relay_web_client,
+) -> None:
+    # WARN-1 regression pin: the deterministic-create-only web_ingest token
+    # must NOT escalate to a full chat turn even though it shares
+    # allowed_clients:[web] and asserts a known user.
+    headers = _ingest_token_chat_headers("andrew")
+    resp = await relay_web_client.post("/chat/open", json={}, headers=headers)
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "invalid_session"
+
+    # Also the run-turn surfaces (open a real session first via the web peer).
+    ok = await relay_web_client.post(
+        "/chat/open", json={}, headers=_relay_headers()
+    )
+    key = (await ok.json())["session_key"]
+    resp = await relay_web_client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "hi"},
+        headers=headers,
+    )
+    assert resp.status == 401
+    resp = await relay_web_client.post(
+        "/chat/stream",
+        json={"session_key": key, "message": "hi"},
+        headers=headers,
+    )
+    assert resp.status == 401
+
+
+async def test_relay_web_ingest_token_chat_logs_wrong_peer(relay_web_client) -> None:
+    with structlog.testing.capture_logs() as captured:
+        await relay_web_client.post(
+            "/chat/open", json={}, headers=_ingest_token_chat_headers()
+        )
+    events = [c["event"] for c in captured]
+    assert "web.auth.relay_wrong_peer" in events
 
 
 async def test_relay_open_turn_history_roundtrip(relay_web_client) -> None:
@@ -895,6 +953,41 @@ async def test_concurrent_turn_guard_rejects_second(web_client, monkeypatch) -> 
     assert counter["n"] == 1, "only one turn should have run"
     rejected = r1 if r1.status == 409 else r2
     assert (await rejected.json())["error"] == "turn_in_flight"
+
+
+async def test_in_flight_released_on_engine_error(web_client, monkeypatch) -> None:
+    """NIT-2: the concurrent-guard slot must be released on the ENGINE-ERROR
+    path (the ``finally`` branch), not just on success — a turn that 502s
+    must not wedge the session against all future turns."""
+    calls = {"n": 0}
+
+    async def _flaky_run_turn(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")  # first turn → 502
+        from alfred.telegram.session import append_turn
+
+        append_turn(kwargs["state"], kwargs["session"], "user", kwargs["user_message"])
+        append_turn(kwargs["state"], kwargs["session"], "assistant", "recovered")
+        return "recovered"
+
+    monkeypatch.setattr("alfred.telegram.conversation.run_turn", _flaky_run_turn)
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+
+    r1 = await web_client.post(
+        "/chat/turn", json={"session_key": key, "message": "a"}, headers=headers
+    )
+    assert r1.status == 502
+    # The in-flight slot must have been released by `finally` despite the
+    # engine error — the next turn for the same session succeeds.
+    r2 = await web_client.post(
+        "/chat/turn", json={"session_key": key, "message": "b"}, headers=headers
+    )
+    assert r2.status == 200
+    assert (await r2.json())["reply"] == "recovered"
+    assert calls["n"] == 2
 
 
 async def test_turn_in_flight_cleared_after_completion(web_client, monkeypatch) -> None:

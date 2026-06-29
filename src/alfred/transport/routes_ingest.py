@@ -14,11 +14,15 @@ ordering is never rearranged by an agent.
 
 Auth: Layer 1 (peer token + ``X-Alfred-Client: web``) is enforced
 automatically by the transport ``auth_middleware`` for every non-``/health``
-route — this handler inherits it the moment it mounts. The asserted user
-(``X-Alfred-Ingest-User`` header / ``ingested_by`` body field) is PROVENANCE
-METADATA only, NEVER an authz principal: possession of the target's
-``web_ingest`` token IS the authority to write. Role gating (owner-only)
-lives at the BFF, which holds the token.
+route — this handler inherits it the moment it mounts. The handler ALSO
+peer-pins ``transport_peer == "web_ingest"`` (``INGEST_PEER_NAME``): the
+chat ``web`` token and this ``web_ingest`` token share
+``allowed_clients: [web]``, so ``allowed_clients`` alone can't distinguish
+them — without the pin a full-chat ``web`` token could drive an ingest
+write. The asserted user (``X-Alfred-Ingest-User`` header / ``ingested_by``
+body field) is PROVENANCE METADATA only, NEVER an authz principal:
+possession of the target's ``web_ingest`` token IS the authority to write.
+Role gating (owner-only) lives at the BFF, which holds the token.
 
 Two vault gates fire inside ``vault_create``:
   1. ``_validate_type(record_type, scope='web_ingest')`` — gate 1; passes
@@ -59,6 +63,17 @@ _MAX_TITLE_CHARS = 300
 _MAX_SOURCE_CHARS = 500
 _MAX_INGESTED_BY_CHARS = 200
 
+# The transport peer NAME (``auth.tokens`` key) whose token authorises a
+# verbatim ingest write. PINNED explicitly (not trusting
+# ``X-Alfred-Client`` / ``allowed_clients`` alone): the chat ``web`` token
+# and this ``web_ingest`` token BOTH carry ``allowed_clients: [web]``, so
+# without this pin a request bearing the FULL-chat ``web`` token +
+# ``X-Alfred-Client: web`` would clear Layer 1 (resolving ``transport_peer
+# = "web"``) and drive a deterministic ingest write under a token meant for
+# chat. See CLAUDE.md "Relay / asserted-identity routes — peer-pin
+# requirement".
+INGEST_PEER_NAME = "web_ingest"
+
 
 def _json_error(status: int, error: str, **extra: Any) -> web.Response:
     """Consistent error shape — ``{"error": <code>, ...}`` (CONTRACT §2)."""
@@ -84,6 +99,22 @@ async def _handle_vault_ingest(request: web.Request) -> web.StreamResponse:
 
     peer = request.get("transport_peer", "")
     instance = request.app.get(_KEY_INGEST_INSTANCE, "") or ""
+
+    # Peer-pin (defense-in-depth): only the dedicated ``web_ingest`` peer
+    # may drive a verbatim ingest write. ``transport_peer`` is the matched
+    # peer NAME set by ``auth_middleware``; pinning it closes the shared-
+    # ``allowed_clients`` escalation where a full-chat ``web`` token +
+    # ``X-Alfred-Client: web`` clears Layer 1 as peer ``web``.
+    if peer != INGEST_PEER_NAME:
+        log.warning(
+            "transport.ingest.rejected",
+            reason="wrong_peer",
+            peer=peer or "(none)",
+            expected=INGEST_PEER_NAME,
+            detail="ingest requires the dedicated 'web_ingest' peer token — "
+                   "refusing a write from another peer (e.g. web)",
+        )
+        return _json_error(401, "wrong_peer")
 
     vault_path = _get_vault_path(request)
     if vault_path is None:

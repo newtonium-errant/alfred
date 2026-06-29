@@ -41,6 +41,12 @@ from alfred.transport.state import TransportState
 DUMMY_INGEST_PEER_TOKEN = (
     "DUMMY_WEB_INGEST_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_0123456"
 )
+# A sibling chat ``web`` token (distinct from the ingest token) so the
+# WARN-1 peer-pin escalation test can present a valid Layer-1 ``web`` token
+# and prove the ingest handler refuses it.
+DUMMY_WEB_CHAT_TOKEN = (
+    "DUMMY_WEB_CHAT_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_012345678"
+)
 
 _PEER_HEADERS = {
     "Authorization": f"Bearer {DUMMY_INGEST_PEER_TOKEN}",
@@ -50,12 +56,20 @@ _PEER_HEADERS = {
 
 
 def _transport_config() -> TransportConfig:
+    """The ingest token lives under the dedicated ``web_ingest`` peer (the
+    production peer NAME the handler peer-pins on). A sibling chat ``web``
+    peer (same ``allowed_clients: [web]``) is present so the escalation test
+    can present a valid Layer-1 ``web`` token."""
     return TransportConfig(
         server=ServerConfig(),
         auth=AuthConfig(
             tokens={
-                "web": AuthTokenEntry(
+                "web_ingest": AuthTokenEntry(
                     token=DUMMY_INGEST_PEER_TOKEN,
+                    allowed_clients=["web"],
+                ),
+                "web": AuthTokenEntry(
+                    token=DUMMY_WEB_CHAT_TOKEN,
                     allowed_clients=["web"],
                 ),
             }
@@ -256,6 +270,30 @@ async def test_ingest_note_and_source_types(ingest_client) -> None:
 async def test_ingest_requires_peer_token(ingest_client) -> None:
     resp = await ingest_client.post("/vault/ingest", json=_payload())
     assert resp.status == 401
+
+
+async def test_ingest_rejects_chat_web_token(ingest_client) -> None:
+    # WARN-1 regression pin: a VALID Layer-1 chat ``web`` token (clears
+    # auth_middleware as peer ``web`` since web/web_ingest share
+    # allowed_clients:[web]) must NOT drive an ingest write — the peer-pin
+    # rejects it (the ``web`` token is for full chat, not deterministic
+    # ingest).
+    headers = {
+        "Authorization": f"Bearer {DUMMY_WEB_CHAT_TOKEN}",
+        "X-Alfred-Client": "web",
+        "Content-Type": "application/json",
+    }
+    with structlog.testing.capture_logs() as captured:
+        resp = await ingest_client.post(
+            "/vault/ingest", json=_payload(title="Escalation Doc"), headers=headers
+        )
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "wrong_peer"
+    rejected = [c for c in captured if c.get("event") == "transport.ingest.rejected"]
+    assert any(r.get("reason") == "wrong_peer" for r in rejected)
+    # And the write did NOT land.
+    vault = ingest_client.app["_vault"]
+    assert not (vault / "document" / "Escalation Doc.md").exists()
 
 
 async def test_ingest_vault_not_configured(aiohttp_client, tmp_path) -> None:
