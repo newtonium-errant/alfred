@@ -91,9 +91,11 @@ from .cli import (
     ITEM_KIND_DUPLICATE_ITEM,
     ITEM_KIND_EDITED,
     ITEM_KIND_INVALID_FIELD,
+    ITEM_KIND_NOT_LOGGED,
     ITEM_KIND_REMOVED,
     ITEM_KIND_UNKNOWN_ITEM,
     ITEM_KIND_UNKNOWN_RECORD,
+    ITEM_KIND_UNLOGGED,
     _check_salem_only,
     _emit_canary,
     _fuzzy_match_vault_wide,
@@ -101,6 +103,7 @@ from .cli import (
     _json_stdout_safe,
     _matches_item,
     _routine_path,
+    _today_iso,
 )
 from .config import DuePattern, RoutineConfig, _coerce_self_care
 
@@ -1220,8 +1223,180 @@ def cmd_item_edit(
     )
 
 
+# ---------------------------------------------------------------------------
+# cmd_undone — surgical single-date un-log (the inverse of cmd_done)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_undone_date(
+    date_str: str | None, tz_name: str,
+) -> tuple[str, str | None]:
+    """Resolve the date to un-log. Returns ``(iso, error)``.
+
+    Default = today in ``tz_name`` (mirrors ``cmd_done``'s today-resolution).
+    A provided value is parse-validated as ``YYYY-MM-DD``. Unlike
+    ``cmd_done``'s ``_validate_completed_at``, there is NO future-date
+    rejection — a future date simply can't be present in the log, so it
+    falls through to the ``not_logged`` no-op rather than erroring.
+    """
+    from datetime import date as date_type
+
+    iso_today = _today_iso(tz_name)
+    if date_str is None or not str(date_str).strip():
+        return iso_today, None
+    try:
+        parsed = date_type.fromisoformat(str(date_str).strip()[:10])
+    except ValueError:
+        return iso_today, (
+            f"date {date_str!r} is not a valid ISO date (expected YYYY-MM-DD)"
+        )
+    return parsed.isoformat(), None
+
+
+@_json_stdout_safe
+def cmd_undone(
+    config: RoutineConfig,
+    record_name: str,
+    item_text: str,
+    *,
+    date: str | None = None,
+    wants_json: bool = False,
+) -> int:
+    """Remove ONE completion date from ``completion_log[item]`` — the surgical
+    inverse of :func:`alfred.routine.cli.cmd_done`.
+
+    ``record_name`` may be empty/whitespace to trigger vault-wide fuzzy match
+    on the item text (same routing as ``done`` / ``item remove``). ``date`` is
+    an optional ``YYYY-MM-DD`` (default today in ``config.schedule.timezone``)
+    naming the entry to remove.
+
+    Returns the exit code (0 on success OR the date-not-present no-op; 1 on a
+    resolution canary). Reuses ``_resolve_record_for_item_op`` (record/item
+    resolution + its unknown_record / unknown_item / ambiguous_item canaries)
+    and ``_atomic_item_mutate`` (single-write mutation, with the ``aborted``
+    gate leaving the file untouched on the no-op).
+
+    Semantics:
+      * date present → removed; remaining dates retained; if the list empties,
+        ``completion_log[item]`` is kept as ``[]`` (NOT dropped — mirrors
+        ``cmd_done``'s shape; only ``item remove`` drops the whole key because
+        it removes the whole ITEM). Canary ``unlogged``, exit 0.
+      * date NOT present → ``aborted=True`` (file bytes + mtime untouched);
+        canary ``not_logged`` + explicit "‹item› was not logged on ‹date›"
+        message, exit 0. The desired end-state already holds — an idempotent
+        no-op, NOT a silent success (intentionally-left-blank).
+      * item / record not found / ambiguous → the shared resolver canaries.
+
+    Scope: Salem-only via ``_check_salem_only`` (same direct-frontmatter-write
+    gate as ``done`` / ``item remove`` — no ``vault_edit`` / ``check_scope``
+    round-trip). Deliberately NOT coupled to the matcher reject corpus: un-log
+    names the item explicitly (or vault-wide fuzzy → exactly one) and writes
+    ONLY ``completion_log`` — no confidence judgment, no glossary/pending write.
+    """
+    _check_salem_only(config)
+    vault_path = Path(config.vault_path)
+
+    iso, date_error = _resolve_undone_date(date, config.schedule.timezone)
+    if date_error is not None:
+        return _emit_canary(
+            wants_json=wants_json,
+            kind=ITEM_KIND_INVALID_FIELD,
+            exit_code=1,
+            message=date_error,
+            payload={"date_input": date},
+        )
+
+    resolved_path, resolved_record, canonical_item, code = (
+        _resolve_record_for_item_op(
+            vault_path, record_name, item_text, wants_json=wants_json,
+        )
+    )
+    if code != 0:
+        return code
+    assert resolved_path is not None
+
+    def _mutator(
+        items: list[dict],
+        completion_log: dict[str, list[str]],
+    ) -> _MutationResult:
+        dates = completion_log.get(canonical_item, [])
+        if iso not in dates:
+            # ILB no-op: the desired end-state (not logged on this date)
+            # already holds → leave the file untouched (aborted gate).
+            return _MutationResult(
+                items=items,
+                completion_log=completion_log,
+                payload_extras={},
+                aborted=True,
+            )
+        new_dates = [d for d in dates if d != iso]
+        new_completion_log = dict(completion_log)
+        # Keep ``[]`` when the list empties (mirror cmd_done; don't drop key).
+        new_completion_log[canonical_item] = new_dates
+        return _MutationResult(
+            items=items,
+            completion_log=new_completion_log,
+            payload_extras={
+                "removed": True,
+                "remaining_dates": new_dates,
+            },
+        )
+
+    result = _atomic_item_mutate(resolved_path, _mutator)
+
+    if result.aborted:
+        if not wants_json:
+            log.info(
+                "routine.cli.item.not_logged",
+                record=resolved_record,
+                item=canonical_item,
+                date=iso,
+                path=str(resolved_path.relative_to(vault_path)),
+            )
+        return _emit_canary(
+            wants_json=wants_json,
+            kind=ITEM_KIND_NOT_LOGGED,
+            exit_code=0,
+            message=(
+                f"{canonical_item!r} was not logged on {iso} — "
+                f"nothing to remove."
+            ),
+            payload={
+                "record": resolved_record,
+                "item": canonical_item,
+                "date": iso,
+                "path": str(resolved_path.relative_to(vault_path)),
+                "removed": False,
+            },
+        )
+
+    if not wants_json:
+        log.info(
+            "routine.cli.item.unlogged",
+            record=resolved_record,
+            item=canonical_item,
+            date=iso,
+            path=str(resolved_path.relative_to(vault_path)),
+            remaining=len(result.payload_extras.get("remaining_dates", [])),
+        )
+    return _emit_canary(
+        wants_json=wants_json,
+        kind=ITEM_KIND_UNLOGGED,
+        exit_code=0,
+        message=f"Un-logged: {resolved_record} / {canonical_item} @ {iso}",
+        payload={
+            "record": resolved_record,
+            "item": canonical_item,
+            "date": iso,
+            "path": str(resolved_path.relative_to(vault_path)),
+            **result.payload_extras,
+        },
+    )
+
+
 __all__ = [
     "cmd_item_add",
     "cmd_item_remove",
     "cmd_item_edit",
+    "cmd_undone",
 ]

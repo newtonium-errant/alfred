@@ -443,6 +443,71 @@ _ROUTINE_DONE_TOOL_SCHEMA = {
 }
 
 
+# Routine un-log (2026-06) — ``routine_undone`` schema. The surgical inverse
+# of ``routine_done``: removes ONE logged completion date. Salem-only;
+# subprocess runs ``alfred routine undone`` under the same narrow
+# ``talker_routine_completion`` scope (completion_log only). Deliberately a
+# pure data-fix — NOT coupled to the Daily-Sync matcher confirm/reject loop.
+_ROUTINE_UNDONE_TOOL_SCHEMA = {
+    "name": "routine_undone",
+    "description": (
+        "Remove ONE logged completion from a routine item — the inverse of "
+        "routine_done. Salem-only. Use this when the operator says they did "
+        "NOT actually do something they'd marked done, or logged it by "
+        "mistake (e.g. 'I didn't actually walk the dog yesterday', 'remove my "
+        "meds from today', 'I logged exercise by mistake'). Fuzzy-matches the "
+        "item across all active routines — pass just ``item`` for vault-wide "
+        "match (preferred), or ``record`` + ``item`` to target a specific "
+        "routine. Removes the entry for ONE date (default today). Returns a "
+        "structured ``kind`` discriminator you MUST route on:\n"
+        "  * 'unlogged' — the completion was removed; confirm it\n"
+        "  * 'not_logged' — that date wasn't logged in the first place; tell "
+        "the operator gently ('you hadn't logged that, nothing to remove') — "
+        "this is NOT an error\n"
+        "  * 'ambiguous_item' — multiple matches; ASK BACK with the numbered "
+        "candidate list (do NOT guess)\n"
+        "  * 'unknown_item' — no matching item; tell the operator + list "
+        "known items if helpful\n"
+        "  * 'unknown_record' — explicit record name not found\n"
+        "Date handling: resolve the operator's phrasing to YYYY-MM-DD BEFORE "
+        "calling — 'yesterday' → today−1, 'two days ago' → today−2, 'last "
+        "Tuesday' → most-recent-past-Tuesday — and pass it as ``date``. "
+        "Default (omit ``date``) is today. This is a pure data-fix; it does "
+        "NOT touch the Daily-Sync match confirm/reject loop."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "item": {
+                "type": "string",
+                "description": (
+                    "The item text the operator named. Fuzzy match "
+                    "(substring + stem-tolerant) — phrasing needn't be exact."
+                ),
+            },
+            "record": {
+                "type": "string",
+                "description": (
+                    "OPTIONAL: routine record name (e.g. 'For Self Health'). "
+                    "Omit to fuzzy-match the item across all active routines "
+                    "vault-wide (preferred)."
+                ),
+            },
+            "date": {
+                "type": "string",
+                "description": (
+                    "OPTIONAL: YYYY-MM-DD date whose completion entry to "
+                    "remove. Omit for today. Resolve relative dates "
+                    "('yesterday', 'last Tuesday') to YYYY-MM-DD yourself "
+                    "before calling."
+                ),
+            },
+        },
+        "required": ["item"],
+    },
+}
+
+
 # Phase 2B B3 (2026-05-30) — ``routine_item`` schema.
 #
 # Salem-only tool for item-level CRUD on existing routine records.
@@ -1053,6 +1118,8 @@ HYPATIA_VAULT_TOOLS: list[dict[str, Any]] = [
 SALEM_VAULT_TOOLS: list[dict[str, Any]] = [
     *TALKER_VAULT_TOOLS,
     _ROUTINE_DONE_TOOL_SCHEMA,
+    # Routine un-log (2026-06) — surgical single-date removal, inverse of done.
+    _ROUTINE_UNDONE_TOOL_SCHEMA,
     # Phase 2B B3 (2026-05-30) — item-level CRUD on existing routines.
     _ROUTINE_ITEM_TOOL_SCHEMA,
 ]
@@ -2201,6 +2268,166 @@ async def _dispatch_routine_done(
     # above cover observability. A future ship can widen
     # _dispatch_routine_done's signature to thread the StateManager
     # if session.vault_ops tracking becomes load-bearing.
+    return _dumps(parsed)
+
+
+# --- routine_undone dispatch (un-log, 2026-06) ---------------------------
+
+
+async def _dispatch_routine_undone(
+    *,
+    tool_input: dict[str, Any],
+    session: Session,
+    config: TalkerConfig | None,
+) -> str:
+    """Dispatch one ``routine_undone`` tool_use block — the inverse of
+    ``routine_done``.
+
+    Salem-only. Subprocess invokes ``python -m alfred routine undone`` under
+    the narrow ``talker_routine_completion`` scope (same as ``routine_done`` —
+    un-log mutates ONLY completion_log). The CLI emits the structured ``kind``
+    canary (unlogged / not_logged / unknown_record / unknown_item /
+    ambiguous_item) — Salem routes on it. Mirrors ``_dispatch_routine_done``'s
+    adapter shape (tool-set gate → arg parse → subprocess → reversed-line JSON
+    scan → failure contract). The LLM resolves relative dates to YYYY-MM-DD per
+    the tool schema and passes ``date``; the dispatch forwards it to ``--date``.
+    """
+    import asyncio
+    import json
+    import os
+    import subprocess
+    import sys
+
+    # Reuse the generic subprocess-failure canary constants (kind-agnostic).
+    from alfred.routine.cli import (
+        DONE_KIND_SUBPROCESS_ERROR,
+        DONE_KIND_TIMEOUT,
+    )
+
+    # --- Tool-set gating (Salem-only) ------------------------------------
+    tool_set = ""
+    if config is not None:
+        tool_set = (config.instance.tool_set or "").lower()
+    if tool_set in {"kalle", "hypatia"}:
+        log.warning(
+            "talker.routine_undone.wrong_tool_set",
+            tool_set=tool_set,
+            session_id=session.session_id,
+        )
+        return _dumps({
+            "error": (
+                "routine_undone is Salem-only — routine subsystem refuses "
+                "non-Salem instances"
+            ),
+            "tool_set": tool_set,
+        })
+
+    # --- Argument parsing ------------------------------------------------
+    if not isinstance(tool_input, dict):
+        return _dumps({"error": "routine_undone requires a dict tool_input"})
+    item = tool_input.get("item", "")
+    record = tool_input.get("record", "") or ""
+    date = tool_input.get("date", "") or ""
+    if not isinstance(item, str) or not item.strip():
+        return _dumps({"error": "routine_undone requires a non-empty 'item'"})
+
+    # --- Build argv ------------------------------------------------------
+    #   python -m alfred routine undone <record> <item> [--date]
+    #   python -m alfred routine undone <item>          [--date]
+    argv: list[str] = [sys.executable, "-m", "alfred", "routine", "undone"]
+    if isinstance(record, str) and record.strip():
+        argv.append(record.strip())
+    argv.append(item.strip())
+    if isinstance(date, str) and date.strip():
+        argv.extend(["--date", date.strip()])
+    argv.append("--json")
+
+    log.info(
+        "talker.routine_undone.invoke",
+        session_id=session.session_id,
+        item=item[:200],
+        record=record[:200] if record else "",
+        date=date or "(today)",
+    )
+
+    # --- Subprocess execution -------------------------------------------
+    def _run() -> subprocess.CompletedProcess:
+        # ALFRED_VAULT_SCOPE is forward-compat plumbing (the CLI path rewrites
+        # frontmatter directly, gated by _check_salem_only — see
+        # _dispatch_routine_done's note). Reuse the narrow completion-only
+        # scope: un-log touches ONLY completion_log.
+        env = {**os.environ, "ALFRED_VAULT_SCOPE": "talker_routine_completion"}
+        return subprocess.run(
+            argv, capture_output=True, text=True, env=env, timeout=30,
+        )
+
+    try:
+        proc = await asyncio.to_thread(_run)
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "talker.routine_undone.timeout",
+            session_id=session.session_id,
+            argv=argv,
+        )
+        return _dumps({
+            "error": "routine_undone timed out (30s)",
+            "kind": DONE_KIND_TIMEOUT,
+        })
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "talker.routine_undone.subprocess_crashed",
+            session_id=session.session_id,
+            error=str(exc),
+        )
+        return _dumps({
+            "error": f"routine_undone subprocess crashed: {exc}",
+            "kind": DONE_KIND_SUBPROCESS_ERROR,
+        })
+
+    raw_stdout = (proc.stdout or "").strip()
+    raw_stderr = (proc.stderr or "").strip()
+
+    # --- Parse the canary JSON (reversed-line scan) ----------------------
+    parsed: dict[str, Any] | None = None
+    if raw_stdout:
+        for line in reversed(raw_stdout.splitlines()):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                parsed = json.loads(stripped)
+                break
+            except json.JSONDecodeError:
+                continue
+
+    # --- Failure contract: non-zero exit WITHOUT a canary ----------------
+    if parsed is None or not isinstance(parsed, dict) or "kind" not in parsed:
+        log.warning(
+            "talker.routine_undone.nonzero_exit_no_canary",
+            session_id=session.session_id,
+            code=proc.returncode,
+            stderr=raw_stderr[:500],
+            stdout_tail=raw_stdout[-2000:] if raw_stdout else "",
+            argv=argv,
+        )
+        return _dumps({
+            "error": (
+                f"routine_undone failed without canary: exit "
+                f"{proc.returncode}; "
+                f"stderr={raw_stderr[:300]!r}; "
+                f"stdout={raw_stdout[-300:]!r}"
+            ),
+            "kind": DONE_KIND_SUBPROCESS_ERROR,
+        })
+
+    log.info(
+        "talker.routine_undone.result",
+        session_id=session.session_id,
+        kind=parsed.get("kind"),
+        record=parsed.get("record", ""),
+        item=parsed.get("item", "")[:200] if isinstance(parsed.get("item"), str) else "",
+        date=parsed.get("date", ""),
+    )
     return _dumps(parsed)
 
 
@@ -3360,6 +3587,16 @@ async def _execute_tool(
     # Salem can route on it.
     if tool_name == "routine_done":
         return await _dispatch_routine_done(
+            tool_input=tool_input,
+            session=session,
+            config=config,
+        )
+
+    # ``routine_undone`` (Salem, un-log 2026-06) — surgical single-date
+    # removal, the inverse of routine_done. Same dispatch shape; routes via
+    # subprocess against the same narrow ``talker_routine_completion`` scope.
+    if tool_name == "routine_undone":
+        return await _dispatch_routine_undone(
             tool_input=tool_input,
             session=session,
             config=config,

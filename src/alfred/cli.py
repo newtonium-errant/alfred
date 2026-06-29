@@ -1794,6 +1794,23 @@ def cmd_routine(args: argparse.Namespace) -> None:
                 wants_json=wants_json,
                 completed_at=getattr(args, "completed_at", None),
             )
+        elif subcmd == "undone":
+            # Inverse of ``done`` — identical two-positional routing.
+            record_or_item = getattr(args, "record_or_item", "")
+            item = getattr(args, "item", None)
+            if item is None:
+                record_name_arg = ""
+                item_text_arg = record_or_item
+            else:
+                record_name_arg = record_or_item
+                item_text_arg = item
+            code = rcli.cmd_undone(
+                config,
+                record_name=record_name_arg,
+                item_text=item_text_arg,
+                date=getattr(args, "date", None),
+                wants_json=wants_json,
+            )
         elif subcmd == "run-now":
             code = rcli.cmd_run_now(config, wants_json=wants_json)
         elif subcmd == "status":
@@ -1875,7 +1892,7 @@ def cmd_routine(args: argparse.Namespace) -> None:
                 sys.exit(1)
         else:
             print(
-                "Usage: alfred routine {done|run-now|status|item}"
+                "Usage: alfred routine {done|undone|run-now|status|item}"
             )
             sys.exit(1)
     except ScopeError as exc:
@@ -3601,6 +3618,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     routine_done.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+    # Surgical single-date un-log — the inverse of ``done``. Same
+    # two-positional shape (record + item, OR item-alone for vault-wide
+    # fuzzy). Removes ONE date from completion_log[item]; a date that
+    # isn't logged is an explicit no-op (not_logged canary, exit 0).
+    routine_undone = routine_sub.add_parser(
+        "undone",
+        help="Remove one logged completion date (inverse of done; default: today)",
+    )
+    routine_undone.add_argument(
+        "record_or_item",
+        help=(
+            "Routine record name (e.g. 'For Self Health') OR — when "
+            "<item> is omitted — the item text to fuzzy-match vault-wide."
+        ),
+    )
+    routine_undone.add_argument(
+        "item",
+        nargs="?",
+        default=None,
+        help=(
+            "Item text within the routine (e.g. 'Dog Walk'). Omit to "
+            "treat <record_or_item> as the item text and do a vault-wide "
+            "fuzzy match."
+        ),
+    )
+    routine_undone.add_argument(
+        "--date",
+        dest="date",
+        default=None,
+        help=(
+            "The YYYY-MM-DD completion date to remove. Defaults to today "
+            "(in config.schedule.timezone). A date that isn't logged is a "
+            "no-op (nothing removed)."
+        ),
+    )
+    routine_undone.add_argument(
         "--json", action="store_true", default=False, help="Emit JSON",
     )
     routine_run = routine_sub.add_parser(

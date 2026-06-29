@@ -210,6 +210,13 @@ ITEM_KIND_AMBIGUOUS_ITEM = "ambiguous_item"
 ITEM_KIND_CADENCE_CONFLICT = "cadence_conflict"
 ITEM_KIND_DUPLICATE_ITEM = "duplicate_item"
 ITEM_KIND_INVALID_FIELD = "invalid_field"
+# Un-log (surgical single-date removal — the inverse of ``done``).
+# ``unlogged`` = a date was removed; ``not_logged`` = the date wasn't present
+# (idempotent no-op, exit 0 — DISTINCT from done's ``idempotent_noop`` so the
+# talker can voice "you hadn't logged that, nothing to remove" vs "already
+# logged"). Per the intentionally-left-blank principle the no-op is explicit.
+ITEM_KIND_UNLOGGED = "unlogged"
+ITEM_KIND_NOT_LOGGED = "not_logged"
 
 
 def _check_salem_only(config: RoutineConfig) -> None:
@@ -1300,7 +1307,11 @@ def _emit_canary(
     if wants_json:
         import json
         body: dict[str, Any] = {"ok": ok, "kind": kind}
-        if not ok or kind == DONE_KIND_IDEMPOTENT_NOOP:
+        # ``not_logged`` (un-log no-op) is the exit-0 analog of
+        # ``idempotent_noop`` — surface its human-readable message in JSON too
+        # (the ILB "you hadn't logged that" signal the talker voices). Both are
+        # non-error exit-0 states, so the message lands under ``message``.
+        if not ok or kind in (DONE_KIND_IDEMPOTENT_NOOP, ITEM_KIND_NOT_LOGGED):
             body["error" if not ok else "message"] = message
         body.update(payload)
         # Single-line JSON — see docstring for the rationale (subprocess
@@ -1403,6 +1414,7 @@ __all__ = [
     "cmd_item_add",
     "cmd_item_remove",
     "cmd_item_edit",
+    "cmd_undone",
     # Phase 2B B1 cross-agent contract — canary kind discriminator
     # constants. Talker subprocess wrapper imports these so the
     # raw-string literals don't drift between layers. SKILL.md's
@@ -1441,4 +1453,9 @@ __all__ = [
 # because Python's import machinery resolves the partially-loaded
 # `cli` module when `cli_items` imports from it — every symbol
 # cli_items.py needs is defined above this line.
-from .cli_items import cmd_item_add, cmd_item_edit, cmd_item_remove  # noqa: E402, F401
+from .cli_items import (  # noqa: E402, F401
+    cmd_item_add,
+    cmd_item_edit,
+    cmd_item_remove,
+    cmd_undone,
+)
