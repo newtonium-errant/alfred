@@ -677,6 +677,248 @@ async def test_stream_works_in_relay_mode(relay_web_client) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Idempotency dedup + concurrent-turn guard
+# ---------------------------------------------------------------------------
+
+
+def _make_counting_run_turn(counter: dict, *, reply: str = "stub reply", delay: float = 0.0):
+    """A run_turn stand-in that appends real turns (so payload ts read-back
+    works) and counts invocations. Optional ``delay`` to force overlap."""
+
+    async def _run_turn(**kwargs):
+        counter["n"] += 1
+        if delay:
+            await asyncio.sleep(delay)
+        from alfred.telegram.session import append_turn
+
+        session = kwargs["session"]
+        state = kwargs["state"]
+        append_turn(
+            state, session, "user", kwargs["user_message"],
+            kind=kwargs.get("user_kind", "text"),
+        )
+        append_turn(state, session, "assistant", reply)
+        return reply
+
+    return _run_turn
+
+
+async def test_turn_normal_response_includes_deduped_false(web_client) -> None:
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    r = await web_client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "hi"},
+        headers=headers,
+    )
+    body = await r.json()
+    assert body["deduped"] is False
+
+
+async def test_turn_idempotent_retry_returns_cached_without_rerun(
+    web_client, monkeypatch
+) -> None:
+    counter = {"n": 0}
+    monkeypatch.setattr(
+        "alfred.telegram.conversation.run_turn",
+        _make_counting_run_turn(counter, reply="paid the rent"),
+    )
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    idk = "idem-key-abc-123"
+
+    # First submit — runs run_turn once.
+    r = await web_client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "I paid the rent", "idempotency_key": idk},
+        headers=headers,
+    )
+    first = await r.json()
+    assert first["reply"] == "paid the rent"
+    assert first["deduped"] is False
+    assert counter["n"] == 1
+
+    # Retry with the SAME key + message — cached, run_turn NOT re-invoked.
+    r = await web_client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "I paid the rent", "idempotency_key": idk},
+        headers=headers,
+    )
+    second = await r.json()
+    assert second["deduped"] is True
+    assert second["reply"] == "paid the rent"
+    assert second["ts"] == first["ts"]
+    assert second["user_ts"] == first["user_ts"]
+    assert counter["n"] == 1, "run_turn must NOT run again on a dedup hit"
+
+
+async def test_turn_idempotent_retry_emits_dedup_log(
+    web_client, monkeypatch
+) -> None:
+    counter = {"n": 0}
+    monkeypatch.setattr(
+        "alfred.telegram.conversation.run_turn", _make_counting_run_turn(counter)
+    )
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    idk = "idem-key-xyz"
+    await web_client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "hi", "idempotency_key": idk},
+        headers=headers,
+    )
+    with structlog.testing.capture_logs() as captured:
+        await web_client.post(
+            "/chat/turn",
+            json={"session_key": key, "message": "hi", "idempotency_key": idk},
+            headers=headers,
+        )
+    deduped = [c for c in captured if c.get("event") == "web.chat.turn_deduped"]
+    assert len(deduped) == 1
+    assert deduped[0]["session_key"] == key
+
+
+async def test_turn_same_key_different_message_runs_fresh(
+    web_client, monkeypatch
+) -> None:
+    counter = {"n": 0}
+    monkeypatch.setattr(
+        "alfred.telegram.conversation.run_turn", _make_counting_run_turn(counter)
+    )
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    idk = "reused-key"
+    await web_client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "first message", "idempotency_key": idk},
+        headers=headers,
+    )
+    assert counter["n"] == 1
+    with structlog.testing.capture_logs() as captured:
+        r = await web_client.post(
+            "/chat/turn",
+            json={
+                "session_key": key,
+                "message": "DIFFERENT message",
+                "idempotency_key": idk,
+            },
+            headers=headers,
+        )
+    body = await r.json()
+    assert body["deduped"] is False
+    assert counter["n"] == 2, "different message under a reused key must run fresh"
+    warns = [
+        c for c in captured
+        if c.get("event") == "web.chat.idempotency_key_reused_new_message"
+    ]
+    assert len(warns) == 1
+
+
+async def test_turn_no_idempotency_key_never_caches(web_client, monkeypatch) -> None:
+    counter = {"n": 0}
+    monkeypatch.setattr(
+        "alfred.telegram.conversation.run_turn", _make_counting_run_turn(counter)
+    )
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    for _ in range(2):
+        await web_client.post(
+            "/chat/turn", json={"session_key": key, "message": "hi"}, headers=headers
+        )
+    assert counter["n"] == 2, "no idempotency_key → every submit runs fresh"
+
+
+async def test_stream_idempotent_retry_returns_cached_done_frame(
+    web_client, monkeypatch
+) -> None:
+    counter = {"n": 0}
+    monkeypatch.setattr(
+        "alfred.telegram.conversation.run_turn",
+        _make_counting_run_turn(counter, reply="streamed reply"),
+    )
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    idk = "stream-idem-1"
+
+    # First stream — runs once.
+    resp = await web_client.post(
+        "/chat/stream",
+        json={"session_key": key, "message": "go", "idempotency_key": idk},
+        headers=headers,
+    )
+    events = await _read_sse(resp)
+    done1 = [d for (e, d) in events if e == "done"][0]
+    assert done1["deduped"] is False
+    assert counter["n"] == 1
+
+    # Retry — cached done frame, deduped:true, run_turn NOT re-invoked.
+    resp = await web_client.post(
+        "/chat/stream",
+        json={"session_key": key, "message": "go", "idempotency_key": idk},
+        headers=headers,
+    )
+    events = await _read_sse(resp)
+    done2 = [d for (e, d) in events if e == "done"][0]
+    assert done2["deduped"] is True
+    assert done2["reply"] == "streamed reply"
+    assert counter["n"] == 1
+
+
+async def test_concurrent_turn_guard_rejects_second(web_client, monkeypatch) -> None:
+    counter = {"n": 0}
+    monkeypatch.setattr(
+        "alfred.telegram.conversation.run_turn",
+        _make_counting_run_turn(counter, delay=0.15),
+    )
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+
+    # Fire two turns concurrently — the second must be rejected 409 while
+    # the first is still in flight (prevents double-append).
+    r1, r2 = await asyncio.gather(
+        web_client.post(
+            "/chat/turn", json={"session_key": key, "message": "a"}, headers=headers
+        ),
+        web_client.post(
+            "/chat/turn", json={"session_key": key, "message": "b"}, headers=headers
+        ),
+    )
+    statuses = sorted([r1.status, r2.status])
+    assert statuses == [200, 409]
+    assert counter["n"] == 1, "only one turn should have run"
+    rejected = r1 if r1.status == 409 else r2
+    assert (await rejected.json())["error"] == "turn_in_flight"
+
+
+async def test_turn_in_flight_cleared_after_completion(web_client, monkeypatch) -> None:
+    counter = {"n": 0}
+    monkeypatch.setattr(
+        "alfred.telegram.conversation.run_turn", _make_counting_run_turn(counter)
+    )
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    # Two SEQUENTIAL turns — the guard must release after the first so the
+    # second is not falsely rejected.
+    r1 = await web_client.post(
+        "/chat/turn", json={"session_key": key, "message": "a"}, headers=headers
+    )
+    r2 = await web_client.post(
+        "/chat/turn", json={"session_key": key, "message": "b"}, headers=headers
+    )
+    assert r1.status == 200
+    assert r2.status == 200
+    assert counter["n"] == 2
+
+
+# ---------------------------------------------------------------------------
 # Shared post-turn payload helper (the byte-identical source of truth)
 # ---------------------------------------------------------------------------
 
@@ -700,6 +942,7 @@ def test_build_turn_payload_is_deterministic() -> None:
         "session_key": "sess-1",
         "ts": "2026-06-29T00:00:01Z",
         "user_ts": "2026-06-29T00:00:00Z",
+        "deduped": False,
     }
 
 
@@ -715,6 +958,7 @@ def test_build_turn_payload_empty_transcript_defaults_blank() -> None:
         "session_key": "sess-1",
         "ts": "",
         "user_ts": "",
+        "deduped": False,
     }
 
 

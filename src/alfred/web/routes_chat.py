@@ -41,6 +41,7 @@ byte-unchanged for every instance that doesn't opt in (M1 = Salem only).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from typing import Any, Callable
 
@@ -53,6 +54,7 @@ from .keys import (
     KEY_WEB_ANTHROPIC,
     KEY_WEB_AUTH_STATE,
     KEY_WEB_CONFIG,
+    KEY_WEB_INFLIGHT,
     KEY_WEB_STATE_MGR,
     KEY_WEB_SYSTEM_PROVIDER,
     KEY_WEB_TALKER_CONFIG,
@@ -115,7 +117,12 @@ async def _read_json_body(request: web.Request) -> dict[str, Any]:
 
 
 def _build_turn_payload(
-    session_obj: Any, pre_len: int, reply: str, session_key: str,
+    session_obj: Any,
+    pre_len: int,
+    reply: str,
+    session_key: str,
+    *,
+    deduped: bool = False,
 ) -> dict[str, Any]:
     """Assemble the post-turn response payload — the SINGLE source of truth.
 
@@ -129,6 +136,9 @@ def _build_turn_payload(
     ``pre_len`` MUST be captured BEFORE ``run_turn`` runs. Both stamps
     default to ``""`` so the fields are ALWAYS present (never null/missing),
     mirroring the pre-stamp "" contract ``/chat/history`` already uses.
+
+    ``deduped`` is always present (default ``False``) for shape symmetry
+    with the idempotency-dedup fast path.
     """
     transcript = session_obj.transcript or []
     assistant_ts = transcript[-1].get("_ts", "") if transcript else ""
@@ -138,6 +148,58 @@ def _build_turn_payload(
         "session_key": session_key,
         "ts": assistant_ts,
         "user_ts": user_ts,
+        "deduped": deduped,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Turn idempotency (retry-safe dedup) + concurrent-turn guard
+# ---------------------------------------------------------------------------
+
+
+def _msg_hash(message: str) -> str:
+    """Stable hash of a turn's user message (idempotency key-match guard)."""
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+
+def _dedup_check(
+    session_obj: Any, idempotency_key: str, message: str,
+) -> tuple[str | None, dict[str, Any]]:
+    """Classify a turn against the session's last-turn idempotency cache.
+
+    Returns one of:
+      * ``("hit", cached)`` — same key AND same message → return the cached
+        result, do NOT re-run ``run_turn`` (retry-safe; critical for
+        vault-writing turns).
+      * ``("stale", {})`` — same key but a DIFFERENT message (a client
+        reusing a key) → run fresh + warn.
+      * ``(None, {})`` — no key / no match → run fresh (normal path).
+    """
+    if not idempotency_key:
+        return None, {}
+    if session_obj.last_turn_key != idempotency_key:
+        return None, {}
+    cached = session_obj.last_turn_result or {}
+    if cached.get("msg_hash") == _msg_hash(message):
+        return "hit", dict(cached)
+    return "stale", {}
+
+
+def _cached_turn_payload(
+    cached: dict[str, Any], session_key: str,
+) -> dict[str, Any]:
+    """Build the ``deduped: True`` response from a cached turn result.
+
+    Same shape as :func:`_build_turn_payload` (the frozen contract) so a
+    deduped reply is indistinguishable on the wire except for the
+    ``deduped`` flag.
+    """
+    return {
+        "reply": cached.get("reply", ""),
+        "session_key": session_key,
+        "ts": cached.get("ts", ""),
+        "user_ts": cached.get("user_ts", ""),
+        "deduped": True,
     }
 
 
@@ -158,28 +220,6 @@ async def _sse_write_event(
     """Write one ``event: <name>\\ndata: <json>\\n\\n`` SSE frame."""
     payload = json.dumps(data, separators=(",", ":"))
     await resp.write(f"event: {event}\ndata: {payload}\n\n".encode("utf-8"))
-
-
-def _consume_detached_task(task: "asyncio.Task[Any]") -> None:
-    """Retrieve a detached (client-dropped) ``run_turn`` task's result.
-
-    Detach-on-disconnect: when the SSE client drops mid-turn we stop the
-    write loop and return, leaving ``run_turn`` to finish server-side (the
-    reply is persisted by ``append_turn`` so the FE reconciles via
-    ``/chat/history``). This done-callback retrieves the result/exception so
-    asyncio doesn't log "exception never retrieved" on the orphaned task.
-    """
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        log.warning(
-            "web.chat.stream_detached_task_failed",
-            error=str(exc),
-            error_type=type(exc).__name__,
-            detail="run_turn raised after the SSE client disconnected; "
-                   "no reply was persisted for this turn",
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -273,71 +313,120 @@ async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:
     # Lenient kind coercion: anything other than "voice" is "text" (kind
     # only tags the user turn's ``_kind`` counter; it never gates behaviour).
     kind = "voice" if body.get("kind") == "voice" else "text"
+    idempotency_key = body.get("idempotency_key")
+    idempotency_key = idempotency_key if isinstance(idempotency_key, str) else ""
 
     active_dict = state_mgr.get_active(identity.synthetic_chat_id)
     if active_dict is None or active_dict.get("session_id") != session_key:
         return web.json_response({"error": "no_such_session"}, status=404)
 
     from alfred.telegram.conversation import run_turn
-    from alfred.telegram.session import Session
+    from alfred.telegram.session import Session, record_turn_idempotency
 
     session_obj = Session.from_dict(active_dict)
 
-    # Capture transcript length BEFORE the turn so we can locate the user
-    # turn afterwards (it is appended first, at index ``pre_len``). The
-    # assistant turn is appended LAST, so ``transcript[-1]`` is the reply.
-    # Both stamps are read back off the existing ``_ts`` clock that
-    # ``append_turn`` writes (session.py) — we do NOT invent a new clock.
-    # This mirrors the per-turn ``ts`` ``/chat/history`` already surfaces,
-    # so a live bubble is byte-identical to what history later returns.
-    pre_len = len(session_obj.transcript)
-
-    # ``user_name`` only when the instance is multi-user — parity with the
-    # Telegram ``_name_for`` path. On a single-user instance (the common M1
-    # case) it stays None so the sender-identity system block is omitted and
-    # the system blocks are byte-identical to Telegram.
-    user_name = identity.user if len(web_config.users) > 1 else None
-
-    try:
-        reply = await run_turn(
-            client=client,
-            state=state_mgr,
-            session=session_obj,
-            user_message=message,
-            config=talker_config,
-            vault_context_str=vault_context_str,
-            system_prompt=system_prompt_provider(),
-            user_kind=kind,
-            user_role=identity.role,
-            user_name=user_name,
-        )
-    except Exception as exc:  # noqa: BLE001 — surface engine errors as 502
-        log.warning(
-            "web.chat.engine_error",
+    # --- idempotency dedup (BEFORE run_turn) -------------------------------
+    status, cached = _dedup_check(session_obj, idempotency_key, message)
+    if status == "hit":
+        log.info(
+            "web.chat.turn_deduped",
             user=identity.user,
             session_key=session_key,
-            error=str(exc),
-            error_type=type(exc).__name__,
+            idempotency_key_prefix=idempotency_key[:8],
+            detail="cached result returned; run_turn NOT re-invoked",
         )
-        return web.json_response(
-            {"error": "engine_error", "detail": str(exc)},
-            status=502,
+        return web.json_response(_cached_turn_payload(cached, session_key))
+    if status == "stale":
+        log.warning(
+            "web.chat.idempotency_key_reused_new_message",
+            user=identity.user,
+            session_key=session_key,
+            idempotency_key_prefix=idempotency_key[:8],
+            detail="same idempotency_key, different message — running fresh",
         )
 
-    # Assemble the response via the shared helper so the buffered body is
-    # byte-identical to the stream's terminal ``done`` frame.
-    payload = _build_turn_payload(session_obj, pre_len, reply, session_key)
+    # --- concurrent-turn guard (prevents double-append) --------------------
+    in_flight = request.app[KEY_WEB_INFLIGHT]
+    if session_key in in_flight:
+        log.warning(
+            "web.chat.turn_in_flight",
+            user=identity.user,
+            session_key=session_key,
+            detail="a turn is already running for this session — rejecting",
+        )
+        return web.json_response({"error": "turn_in_flight"}, status=409)
+    in_flight.add(session_key)
+    try:
+        # Capture transcript length BEFORE the turn so we can locate the
+        # user turn afterwards (appended first, at ``pre_len``); the
+        # assistant turn is appended LAST. Both stamps are read off the
+        # ``_ts`` clock ``append_turn`` writes — no new clock invented.
+        pre_len = len(session_obj.transcript)
 
-    log.info(
-        "web.chat.turn_complete",
-        user=identity.user,
-        session_key=session_key,
-        user_kind=kind,
-        reply_chars=len(reply or ""),
-        assistant_ts=payload["ts"],
-        user_ts=payload["user_ts"],
-    )
-    return web.json_response(payload)
+        # ``user_name`` only when the instance is multi-user — parity with
+        # the Telegram ``_name_for`` path. On a single-user instance it
+        # stays None so the system blocks are byte-identical to Telegram.
+        user_name = identity.user if len(web_config.users) > 1 else None
+
+        try:
+            reply = await run_turn(
+                client=client,
+                state=state_mgr,
+                session=session_obj,
+                user_message=message,
+                config=talker_config,
+                vault_context_str=vault_context_str,
+                system_prompt=system_prompt_provider(),
+                user_kind=kind,
+                user_role=identity.role,
+                user_name=user_name,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface engine errors as 502
+            log.warning(
+                "web.chat.engine_error",
+                user=identity.user,
+                session_key=session_key,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return web.json_response(
+                {"error": "engine_error", "detail": str(exc)},
+                status=502,
+            )
+
+        # Assemble the response via the shared helper so the buffered body
+        # is byte-identical to the stream's terminal ``done`` frame.
+        payload = _build_turn_payload(
+            session_obj, pre_len, reply, session_key, deduped=False
+        )
+
+        # Cache for retry-safe dedup (only when a key was supplied).
+        if idempotency_key:
+            record_turn_idempotency(
+                state_mgr,
+                session_obj,
+                key=idempotency_key,
+                result={
+                    "reply": reply,
+                    "ts": payload["ts"],
+                    "user_ts": payload["user_ts"],
+                    "msg_hash": _msg_hash(message),
+                },
+            )
+
+        log.info(
+            "web.chat.turn_complete",
+            user=identity.user,
+            session_key=session_key,
+            user_kind=kind,
+            reply_chars=len(reply or ""),
+            assistant_ts=payload["ts"],
+            user_ts=payload["user_ts"],
+            deduped=False,
+        )
+        return web.json_response(payload)
+    finally:
+        in_flight.discard(session_key)
 
 
 async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
@@ -383,15 +472,46 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
     if not isinstance(message, str) or not message.strip():
         return web.json_response({"error": "message_required"}, status=400)
     kind = "voice" if body.get("kind") == "voice" else "text"
+    idempotency_key = body.get("idempotency_key")
+    idempotency_key = idempotency_key if isinstance(idempotency_key, str) else ""
 
     active_dict = state_mgr.get_active(identity.synthetic_chat_id)
     if active_dict is None or active_dict.get("session_id") != session_key:
         return web.json_response({"error": "no_such_session"}, status=404)
 
     from alfred.telegram.conversation import run_turn
-    from alfred.telegram.session import Session
+    from alfred.telegram.session import Session, record_turn_idempotency
 
     session_obj = Session.from_dict(active_dict)
+
+    # --- idempotency decision (sync, pre-prepare) --------------------------
+    status, cached = _dedup_check(session_obj, idempotency_key, message)
+    if status == "stale":
+        log.warning(
+            "web.chat.idempotency_key_reused_new_message",
+            user=identity.user,
+            session_key=session_key,
+            idempotency_key_prefix=idempotency_key[:8],
+            detail="same idempotency_key, different message — running fresh",
+        )
+
+    # --- concurrent-turn guard (JSON 409 BEFORE prepare; reserve atomically
+    #     so a second concurrent stream can't slip through the prepare await).
+    #     A dedup HIT never runs run_turn, so it skips the guard.
+    in_flight = request.app[KEY_WEB_INFLIGHT]
+    reserved = False
+    if status != "hit":
+        if session_key in in_flight:
+            log.warning(
+                "web.chat.turn_in_flight",
+                user=identity.user,
+                session_key=session_key,
+                detail="a turn is already running for this session — rejecting",
+            )
+            return web.json_response({"error": "turn_in_flight"}, status=409)
+        in_flight.add(session_key)
+        reserved = True
+
     # pre_len captured BEFORE the run_turn task is launched/awaited.
     pre_len = len(session_obj.transcript)
     user_name = identity.user if len(web_config.users) > 1 else None
@@ -405,7 +525,30 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
             "X-Accel-Buffering": "no",
         },
     )
-    await resp.prepare(request)
+    try:
+        await resp.prepare(request)
+    except BaseException:
+        # Never leak the in-flight reservation if the handshake fails.
+        if reserved:
+            in_flight.discard(session_key)
+        raise
+
+    # --- dedup HIT → emit the cached result as the terminal frame ----------
+    if status == "hit":
+        log.info(
+            "web.chat.stream_deduped",
+            user=identity.user,
+            session_key=session_key,
+            idempotency_key_prefix=idempotency_key[:8],
+            detail="cached result returned; run_turn NOT re-invoked",
+        )
+        try:
+            await _sse_write_event(
+                resp, "done", _cached_turn_payload(cached, session_key)
+            )
+        except (ConnectionResetError, RuntimeError):
+            pass
+        return resp
 
     # Status-frame callback. Best-effort: on a dropped client we latch
     # ``client_gone`` so subsequent emits no-op and a write error never
@@ -436,6 +579,29 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
         )
     )
 
+    def _cleanup(done_task: "asyncio.Task[Any]") -> None:
+        # Always release the in-flight reservation when the task finishes
+        # (normal completion OR a detached client-drop). Also retrieve the
+        # result/exception so asyncio never logs "exception never retrieved"
+        # on a detached task; log only the detached-failure case (the normal
+        # path logs stream_engine_error via the inline task.result()).
+        in_flight.discard(session_key)
+        if done_task.cancelled():
+            return
+        exc = done_task.exception()
+        if exc is not None and client_gone["v"]:
+            log.warning(
+                "web.chat.stream_detached_task_failed",
+                user=identity.user,
+                session_key=session_key,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                detail="run_turn raised after the SSE client disconnected; "
+                       "no reply was persisted for this turn",
+            )
+
+    task.add_done_callback(_cleanup)
+
     # --- keep-alive loop ---------------------------------------------------
     while True:
         done, _pending = await asyncio.wait({task}, timeout=KEEPALIVE_SECS)
@@ -445,7 +611,8 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
             await resp.write(b": keepalive\n\n")
         except (ConnectionResetError, RuntimeError):
             # Client dropped mid-turn — DETACH: stop writing, let run_turn
-            # finish server-side; the FE reconciles via /chat/history.
+            # finish server-side; the FE reconciles via /chat/history. The
+            # ``_cleanup`` done-callback releases the in-flight reservation.
             client_gone["v"] = True
             log.info(
                 "web.chat.stream_client_disconnected",
@@ -454,7 +621,6 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
                 detail="client dropped mid-turn — detaching; run_turn "
                        "continues server-side, reply recoverable via history",
             )
-            task.add_done_callback(_consume_detached_task)
             return resp
 
     # --- terminal frame ----------------------------------------------------
@@ -477,7 +643,24 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
                 pass
         return resp
 
-    payload = _build_turn_payload(session_obj, pre_len, reply, session_key)
+    payload = _build_turn_payload(
+        session_obj, pre_len, reply, session_key, deduped=False
+    )
+
+    # Cache for retry-safe dedup (only when a key was supplied).
+    if idempotency_key:
+        record_turn_idempotency(
+            state_mgr,
+            session_obj,
+            key=idempotency_key,
+            result={
+                "reply": reply,
+                "ts": payload["ts"],
+                "user_ts": payload["user_ts"],
+                "msg_hash": _msg_hash(message),
+            },
+        )
+
     log.info(
         "web.chat.stream_complete",
         user=identity.user,
@@ -486,6 +669,7 @@ async def _handle_chat_stream(request: web.Request) -> web.StreamResponse:
         reply_chars=len(reply or ""),
         assistant_ts=payload["ts"],
         user_ts=payload["user_ts"],
+        deduped=False,
     )
     if not client_gone["v"]:
         try:
@@ -604,6 +788,9 @@ def register_web_routes(
     app[KEY_WEB_TALKER_CONFIG] = talker_config
     app[KEY_WEB_SYSTEM_PROVIDER] = system_prompt_provider
     app[KEY_WEB_VAULT_CTX] = vault_context_str
+    # Per-app concurrent-turn guard set (NOT module-global — concurrent test
+    # apps in one process must not share in-flight state).
+    app[KEY_WEB_INFLIGHT] = set()
 
     app.router.add_post("/chat/open", _handle_chat_open)
     app.router.add_post("/chat/turn", _handle_chat_turn)

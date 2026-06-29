@@ -103,6 +103,20 @@ class Session:
     # field omitted when empty so pre-document session records /
     # consumers see no shape drift.
     documents: list[dict[str, Any]] = field(default_factory=list)
+    # Web-turn idempotency (2026-06-29 cross-instance chat hardening). The
+    # web ``/chat/turn`` + ``/chat/stream`` handlers cache the LAST logical
+    # turn's idempotency key + result here so a client retry (same key,
+    # same message) returns the cached reply instead of re-running
+    # ``run_turn`` (critical for vault-writing turns like "I paid the
+    # rent"). ``last_turn_key`` is the client-minted UUID; the
+    # ``last_turn_result`` dict holds ``{reply, ts, user_ts, msg_hash}``.
+    # Last-only (not a ring buffer) — covers the observed sequential-retry
+    # incident. Both empty by default; persisted via ``to_dict`` and
+    # filtered back in ``from_dict`` per the load-time schema-tolerance
+    # contract. Telegram never sets them (it has no idempotency surface), so
+    # Telegram session records carry the empty defaults.
+    last_turn_key: str = ""
+    last_turn_result: dict[str, Any] = field(default_factory=dict)
 
     # --- serialization ---
 
@@ -119,6 +133,8 @@ class Session:
             "outbound_failures": self.outbound_failures,
             "images": self.images,
             "documents": self.documents,
+            "last_turn_key": self.last_turn_key,
+            "last_turn_result": self.last_turn_result,
         }
 
     @classmethod
@@ -187,6 +203,11 @@ class Session:
             filtered.get("opening_model") or filtered.get("model", "")
         )
 
+        # Web-turn idempotency: missing on Telegram + pre-2026-06-29
+        # rehydrated sessions — filter-then-coerce to the empty defaults.
+        last_turn_key = str(filtered.get("last_turn_key", "") or "")
+        last_turn_result = dict(filtered.get("last_turn_result") or {})
+
         return cls(
             session_id=session_id,
             chat_id=chat_id,
@@ -199,6 +220,8 @@ class Session:
             outbound_failures=outbound_failures,
             images=images,
             documents=documents,
+            last_turn_key=last_turn_key,
+            last_turn_result=last_turn_result,
         )
 
 
@@ -233,6 +256,30 @@ def _persist(state: StateManager, session: Session) -> None:
             merged[key] = value
     state.set_active(session.chat_id, merged)
     state.save()
+
+
+def record_turn_idempotency(
+    state: StateManager,
+    session: Session,
+    *,
+    key: str,
+    result: dict[str, Any],
+) -> None:
+    """Cache the last logical turn's idempotency key + result, then persist.
+
+    The web ``/chat/turn`` + ``/chat/stream`` handlers call this AFTER a
+    fresh ``run_turn`` so a subsequent client retry carrying the same
+    ``key`` (and same message hash) returns the cached ``result`` instead of
+    re-running the turn. ``result`` is ``{reply, ts, user_ts, msg_hash}``.
+
+    Mutates the ``Session`` in place and round-trips it through the existing
+    module-private ``_persist`` (which preserves the stashed ``_*`` keys and
+    the current transcript) — a public entry point so the web handler never
+    reaches into ``_persist`` directly.
+    """
+    session.last_turn_key = key
+    session.last_turn_result = dict(result)
+    _persist(state, session)
 
 
 def _slug_from_dt(dt: datetime) -> str:

@@ -15,3 +15,8 @@ KEY_WEB_TALKER_CONFIG = "web.talker_config"
 KEY_WEB_SYSTEM_PROVIDER = "web.system_prompt_provider"
 KEY_WEB_VAULT_CTX = "web.vault_context_str"
 KEY_WEB_AUTH_STATE = "web.auth_state"
+# Per-app in-flight set of session_keys with a run_turn task currently
+# running — the concurrent-turn guard (prevents a double-submit from
+# double-appending to the transcript). Stashed per-app (NOT module-global)
+# so concurrent test apps in one process don't share state.
+KEY_WEB_INFLIGHT = "web.inflight_session_keys"

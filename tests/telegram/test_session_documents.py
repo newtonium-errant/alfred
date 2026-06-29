@@ -74,6 +74,83 @@ def test_session_to_from_dict_preserves_documents() -> None:
     assert rehydrated.documents[0]["bytes"] == 12345
 
 
+def test_session_to_from_dict_preserves_idempotency_fields() -> None:
+    """Web-turn idempotency fields survive a round-trip through state."""
+    sess = _make_session()
+    sess.last_turn_key = "idem-uuid-123"
+    sess.last_turn_result = {
+        "reply": "paid the rent",
+        "ts": "2026-06-29T12:00:01+00:00",
+        "user_ts": "2026-06-29T12:00:00+00:00",
+        "msg_hash": "deadbeef",
+    }
+
+    raw = sess.to_dict()
+    assert raw["last_turn_key"] == "idem-uuid-123"
+    assert raw["last_turn_result"]["reply"] == "paid the rent"
+
+    rehydrated = Session.from_dict(raw)
+    assert rehydrated.last_turn_key == "idem-uuid-123"
+    assert rehydrated.last_turn_result["msg_hash"] == "deadbeef"
+
+
+def test_session_from_dict_pre_idempotency_records_default_empty() -> None:
+    """A state file written before the idempotency fields shipped loads
+    cleanly — filter-then-coerce to the empty defaults (the load-time
+    schema-tolerance contract)."""
+    pre_idem_dict = {
+        "session_id": "sess-old",
+        "chat_id": 1,
+        "started_at": "2026-06-01T12:00:00+00:00",
+        "last_message_at": "2026-06-01T12:05:00+00:00",
+        "model": "claude-opus-4-7",
+        "transcript": [],
+        "vault_ops": [],
+        "opening_model": "claude-opus-4-7",
+        "outbound_failures": [],
+        "images": [],
+        "documents": [],
+        # NO last_turn_key / last_turn_result — pre-2026-06-29 shape.
+    }
+    sess = Session.from_dict(pre_idem_dict)
+    assert sess.last_turn_key == ""
+    assert sess.last_turn_result == {}
+
+
+def test_session_from_dict_coerces_null_idempotency_result() -> None:
+    """A null/None ``last_turn_result`` coerces to an empty dict, not None."""
+    raw = _make_session().to_dict()
+    raw["last_turn_result"] = None
+    raw["last_turn_key"] = None
+    sess = Session.from_dict(raw)
+    assert sess.last_turn_key == ""
+    assert sess.last_turn_result == {}
+
+
+def test_record_turn_idempotency_persists() -> None:
+    """``record_turn_idempotency`` sets the fields + persists via _persist,
+    so a fresh ``get_active`` → ``from_dict`` sees the cache."""
+    import tempfile
+
+    from alfred.telegram.session import open_session, record_turn_idempotency
+
+    with tempfile.TemporaryDirectory() as td:
+        state = StateManager(Path(td) / "state.json")
+        state.load()
+        sess = open_session(state, 9_000_000_000_000_111, model="claude-sonnet-4-6")
+        record_turn_idempotency(
+            state,
+            sess,
+            key="k1",
+            result={"reply": "r", "ts": "t", "user_ts": "u", "msg_hash": "h"},
+        )
+        active = state.get_active(9_000_000_000_000_111)
+        assert active["last_turn_key"] == "k1"
+        reloaded = Session.from_dict(active)
+        assert reloaded.last_turn_key == "k1"
+        assert reloaded.last_turn_result["msg_hash"] == "h"
+
+
 def test_session_from_dict_pre_document_records_default_empty() -> None:
     """A state file written before ``documents`` shipped loads cleanly.
 
