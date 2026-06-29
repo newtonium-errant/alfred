@@ -360,6 +360,16 @@ transport:
           - janitor
           - curator
           - talker
+      # Web front-end (Frontend M1) — the Next BFF holds THIS dedicated
+      # peer token (its own secret, never reusing ``local``) and presents
+      # ``X-Alfred-Client: web``. This is Layer 1 ("this front-end may talk
+      # to me"); the per-user X-Alfred-Session token (Layer 2) is verified
+      # by the web handlers, not here. Only present on instances that enable
+      # the ``web:`` block below.
+      # web:
+      #   token: "${ALFRED_WEB_PEER_TOKEN}"
+      #   allowed_clients:
+      #     - web
   state:
     path: "./data/transport_state.json"
     dead_letter_max_age_days: 30
@@ -485,8 +495,13 @@ transport:
 # default — an absent or ``enabled: false`` block mounts NO web routes and
 # leaves the transport server byte-unchanged (opt-in; M1 targets Salem only).
 #
+# Requires a dedicated ``transport.auth.tokens.web`` peer entry above (the
+# BFF's Layer-1 token). Magic-link login emails via Resend.
+#
 # web:
 #   enabled: true
+#   # Single-use magic-link nonce store (tool-scoped default shown).
+#   state_path: "./data/web_auth_state.json"
 #   # The named-user allowlist — this IS the user table (no DB). Each entry's
 #   # ``name`` is the stable handle (→ a reserved synthetic session id);
 #   # ``role`` maps to the existing run_turn scope rail (owner / ops);

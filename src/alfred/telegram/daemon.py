@@ -1490,15 +1490,21 @@ async def run(
     try:
         from alfred.web.config import load_from_unified as load_web_config
         from alfred.web.routes_chat import register_web_routes
+        from alfred.web.state import WebAuthState
 
         web_config = load_web_config(raw)
         if transport_app is not None and web_config.enabled:
             allowed_user_ids = [
                 getattr(u, "id", u) for u in config.allowed_users
             ]
+            # Single-use magic-link nonce store (persists across restart
+            # within the link TTL window).
+            web_auth_state = WebAuthState.create(web_config.state_path)
+            web_auth_state.load()
             register_web_routes(
                 transport_app,
                 web_config=web_config,
+                web_auth_state=web_auth_state,
                 anthropic_client=client,
                 state_mgr=state_mgr,
                 talker_config=config,

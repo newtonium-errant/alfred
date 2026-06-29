@@ -1,9 +1,11 @@
-"""Tests for ``alfred.web.routes_chat`` — chat over HTTP (Sub-arc A).
+"""Tests for ``alfred.web.routes_chat`` — chat over HTTP (Sub-arc B).
 
-Sub-arc A proves ``run_turn`` over HTTP behind the EXISTING transport peer
-token (no web auth yet). Uses aiohttp's ``aiohttp_client`` fixture to spin
-up the real transport ``Application`` with web routes mounted, plus the
-shared ``FakeAnthropicClient`` so no network calls happen.
+Sub-arc B: ``/chat/*`` now requires BOTH Layer-1 (transport peer token,
+enforced by ``auth_middleware``) AND Layer-2 (a per-user instance-signed
+``X-Alfred-Session`` token, verified by ``require_web_session``). Uses
+aiohttp's ``aiohttp_client`` fixture to spin up the real transport
+``Application`` with web routes mounted, plus the shared
+``FakeAnthropicClient`` so no network calls happen.
 """
 
 from __future__ import annotations
@@ -34,13 +36,15 @@ from alfred.transport.config import (
 )
 from alfred.transport.server import build_app
 from alfred.transport.state import TransportState
-from alfred.web.config import WebConfig, WebUser
+from alfred.web.auth import SESSION_HEADER, make_session_token
+from alfred.web.config import WebAuthConfig, WebConfig, WebUser
 from alfred.web.identity import synthetic_chat_id
 from alfred.web.routes_chat import (
     _flatten_transcript_for_web,
     _handle_chat_history,
     register_web_routes,
 )
+from alfred.web.state import WebAuthState
 
 from tests.telegram.conftest import (  # shared fake SDK client
     FakeAnthropicClient,
@@ -48,13 +52,23 @@ from tests.telegram.conftest import (  # shared fake SDK client
     FakeResponse,
 )
 
-# Obviously-fake peer token — never a real provider prefix (builder.md
+# Obviously-fake test secrets — never a real provider prefix (builder.md
 # GitGuardian rule).
 DUMMY_WEB_PEER_TOKEN = "DUMMY_WEB_PEER_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_0123456"
+DUMMY_WEB_SIGNING_SECRET = "DUMMY_WEB_SIGNING_SECRET_FOR_TESTING_ONLY_0123456789"
+
 _PEER_HEADERS = {
     "Authorization": f"Bearer {DUMMY_WEB_PEER_TOKEN}",
     "X-Alfred-Client": "web",
 }
+
+
+def _session_headers(name: str = "andrew", role: str = "owner") -> dict[str, str]:
+    """Peer headers + a valid Layer-2 session token for ``name``."""
+    token = make_session_token(
+        name, role, secret=DUMMY_WEB_SIGNING_SECRET, ttl_hours=168
+    )
+    return {**_PEER_HEADERS, SESSION_HEADER: token}
 
 
 def _make_talker_config(tmp_path: Path) -> TalkerConfig:
@@ -94,6 +108,14 @@ def _transport_config() -> TransportConfig:
     )
 
 
+def _web_config(users=None) -> WebConfig:
+    return WebConfig(
+        enabled=True,
+        users=users if users is not None else [WebUser(name="andrew", role="owner")],
+        auth=WebAuthConfig(session_secret=DUMMY_WEB_SIGNING_SECRET),
+    )
+
+
 @pytest.fixture
 async def web_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
     """A transport app with web routes mounted + a one-reply fake client."""
@@ -103,16 +125,15 @@ async def web_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
     state_mgr = StateManager(tmp_path / "talker_state.json")
     state_mgr.load()
     talker_config = _make_talker_config(tmp_path)
+    web_auth_state = WebAuthState.create(tmp_path / "web_auth_state.json")
+    web_auth_state.load()
     fake = FakeAnthropicClient(
         [FakeResponse(content=[FakeBlock(type="text", text="hello from salem")])]
     )
-    web_config = WebConfig(
-        enabled=True,
-        users=[WebUser(name="andrew", role="owner", email="a@example.com")],
-    )
     register_web_routes(
         app,
-        web_config=web_config,
+        web_config=_web_config(),
+        web_auth_state=web_auth_state,
         anthropic_client=fake,
         state_mgr=state_mgr,
         talker_config=talker_config,
@@ -120,30 +141,44 @@ async def web_client(aiohttp_client, tmp_path):  # type: ignore[no-untyped-def]
         vault_context_str="VAULT CONTEXT",
         allowed_user_ids=[1],
     )
-    # Stash refs for assertions (set pre-start while the app is mutable).
     app["_t_state_mgr"] = state_mgr
     app["_t_talker_config"] = talker_config
     return await aiohttp_client(app)
 
 
 # ---------------------------------------------------------------------------
-# Peer-auth (Layer 1) — the existing transport gate still guards web routes
+# Layer 1 (peer token) + Layer 2 (session token) gates
 # ---------------------------------------------------------------------------
 
 
 async def test_chat_route_requires_peer_token(web_client) -> None:
-    # No Authorization header → the existing auth_middleware rejects.
-    resp = await web_client.post("/chat/open", json={"user": "andrew"})
+    # No Authorization header → the existing auth_middleware rejects (Layer 1).
+    resp = await web_client.post("/chat/open", json={})
     assert resp.status == 401
 
 
 async def test_chat_route_rejects_wrong_peer_token(web_client) -> None:
     resp = await web_client.post(
         "/chat/open",
-        json={"user": "andrew"},
+        json={},
         headers={"Authorization": "Bearer wrong", "X-Alfred-Client": "web"},
     )
     assert resp.status == 401
+
+
+async def test_chat_requires_session_token(web_client) -> None:
+    # Valid peer token but NO X-Alfred-Session → Layer 2 fail-closed 401.
+    resp = await web_client.post("/chat/open", json={}, headers=_PEER_HEADERS)
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "invalid_session"
+
+
+async def test_chat_rejects_session_for_unlisted_user(web_client) -> None:
+    # A validly-signed token for a user NOT in the allowlist → 401.
+    headers = _session_headers("stranger", "owner")
+    resp = await web_client.post("/chat/open", json={}, headers=headers)
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "invalid_session"
 
 
 # ---------------------------------------------------------------------------
@@ -152,42 +187,34 @@ async def test_chat_route_rejects_wrong_peer_token(web_client) -> None:
 
 
 async def test_open_turn_history_roundtrip(web_client) -> None:
-    # open
-    r = await web_client.post(
-        "/chat/open", json={"user": "andrew"}, headers=_PEER_HEADERS
-    )
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
     assert r.status == 200
     session_key = (await r.json())["session_key"]
     assert session_key
 
-    # turn — drives run_turn with the fake client
     r = await web_client.post(
         "/chat/turn",
-        json={"user": "andrew", "session_key": session_key, "message": "hi there"},
-        headers=_PEER_HEADERS,
+        json={"session_key": session_key, "message": "hi there"},
+        headers=headers,
     )
     assert r.status == 200
     body = await r.json()
     assert body["reply"] == "hello from salem"
     assert body["session_key"] == session_key
 
-    # history — user + assistant turns surfaced, tool plumbing flattened out
-    r = await web_client.get(
-        f"/chat/history/{session_key}?user=andrew", headers=_PEER_HEADERS
-    )
+    r = await web_client.get(f"/chat/history/{session_key}", headers=headers)
     assert r.status == 200
     turns = (await r.json())["turns"]
     assert [t["role"] for t in turns] == ["user", "assistant"]
     assert turns[0]["text"] == "hi there"
     assert turns[1]["text"] == "hello from salem"
-    assert all(t["ts"] for t in turns)  # _ts stamped
+    assert all(t["ts"] for t in turns)
 
 
 async def test_session_persisted_under_synthetic_id(web_client) -> None:
     state_mgr = web_client.app["_t_state_mgr"]
-    r = await web_client.post(
-        "/chat/open", json={"user": "andrew"}, headers=_PEER_HEADERS
-    )
+    r = await web_client.post("/chat/open", json={}, headers=_session_headers())
     session_key = (await r.json())["session_key"]
     active = state_mgr.get_active(synthetic_chat_id("andrew"))
     assert active is not None
@@ -201,44 +228,32 @@ async def test_session_persisted_under_synthetic_id(web_client) -> None:
 
 
 async def test_turn_unknown_session_404(web_client) -> None:
-    await web_client.post(
-        "/chat/open", json={"user": "andrew"}, headers=_PEER_HEADERS
-    )
+    headers = _session_headers()
+    await web_client.post("/chat/open", json={}, headers=headers)
     r = await web_client.post(
         "/chat/turn",
-        json={"user": "andrew", "session_key": "not-a-real-key", "message": "hi"},
-        headers=_PEER_HEADERS,
+        json={"session_key": "not-a-real-key", "message": "hi"},
+        headers=headers,
     )
     assert r.status == 404
     assert (await r.json())["error"] == "no_such_session"
 
 
 async def test_turn_missing_message_400(web_client) -> None:
-    r = await web_client.post(
-        "/chat/open", json={"user": "andrew"}, headers=_PEER_HEADERS
-    )
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
     session_key = (await r.json())["session_key"]
     r = await web_client.post(
         "/chat/turn",
-        json={"user": "andrew", "session_key": session_key, "message": "   "},
-        headers=_PEER_HEADERS,
+        json={"session_key": session_key, "message": "   "},
+        headers=headers,
     )
     assert r.status == 400
     assert (await r.json())["error"] == "message_required"
 
 
-async def test_unknown_user_403(web_client) -> None:
-    r = await web_client.post(
-        "/chat/open", json={"user": "stranger"}, headers=_PEER_HEADERS
-    )
-    assert r.status == 403
-    assert (await r.json())["error"] == "unknown_user"
-
-
 async def test_history_unknown_session_404(web_client) -> None:
-    r = await web_client.get(
-        "/chat/history/nope?user=andrew", headers=_PEER_HEADERS
-    )
+    r = await web_client.get("/chat/history/nope", headers=_session_headers())
     assert r.status == 404
 
 
@@ -250,20 +265,15 @@ async def test_history_unknown_session_404(web_client) -> None:
 async def test_reopen_archives_prior_session(web_client) -> None:
     state_mgr = web_client.app["_t_state_mgr"]
     talker_config = web_client.app["_t_talker_config"]
+    headers = _session_headers()
 
-    r = await web_client.post(
-        "/chat/open", json={"user": "andrew"}, headers=_PEER_HEADERS
-    )
+    r = await web_client.post("/chat/open", json={}, headers=headers)
     first_key = (await r.json())["session_key"]
 
-    # Re-open → prior session closed + archived as a session/ record.
-    r = await web_client.post(
-        "/chat/open", json={"user": "andrew"}, headers=_PEER_HEADERS
-    )
+    r = await web_client.post("/chat/open", json={}, headers=headers)
     second_key = (await r.json())["session_key"]
     assert second_key != first_key
 
-    # Prior session recorded in closed_sessions + a session/ file written.
     closed = state_mgr.state.get("closed_sessions", [])
     assert any(c["session_id"] == first_key for c in closed)
     session_dir = Path(talker_config.vault.path) / "session"
@@ -286,14 +296,13 @@ def test_flatten_transcript_drops_tool_plumbing() -> None:
             ],
             "_ts": "2026-06-29T00:00:01Z",
         },
-        # tool_result turn (role user, no text) → dropped
         {
             "role": "user",
             "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}],
             "_ts": "2026-06-29T00:00:02Z",
         },
         {"role": "assistant", "content": "final answer", "_ts": "2026-06-29T00:00:03Z"},
-        {"role": "system", "content": "ignored"},  # non user/assistant → dropped
+        {"role": "system", "content": "ignored"},
     ]
     out = _flatten_transcript_for_web(transcript)
     assert out == [
@@ -313,29 +322,32 @@ def test_flatten_transcript_empty() -> None:
 
 
 async def test_history_empty_emits_ilb_log(tmp_path) -> None:
-    """An empty (fresh) session's history logs ``web.chat.history_empty``."""
     tstate = TransportState.create(tmp_path / "transport_state.json")
     app = build_app(_transport_config(), tstate)
     state_mgr = StateManager(tmp_path / "talker_state.json")
     state_mgr.load()
-    talker_config = _make_talker_config(tmp_path)
+    web_auth_state = WebAuthState.create(tmp_path / "web_auth_state.json")
+    web_auth_state.load()
     register_web_routes(
         app,
-        web_config=WebConfig(enabled=True, users=[WebUser(name="andrew", role="owner")]),
+        web_config=_web_config(),
+        web_auth_state=web_auth_state,
         anthropic_client=FakeAnthropicClient([]),
         state_mgr=state_mgr,
-        talker_config=talker_config,
+        talker_config=_make_talker_config(tmp_path),
         system_prompt_provider=lambda: "SYS",
         vault_context_str="CTX",
         allowed_user_ids=[1],
     )
-    # Open a fresh (empty-transcript) session.
     sess = open_session(state_mgr, synthetic_chat_id("andrew"), model="claude-sonnet-4-6")
 
+    token = make_session_token(
+        "andrew", "owner", secret=DUMMY_WEB_SIGNING_SECRET, ttl_hours=168
+    )
     req = make_mocked_request(
         "GET",
         f"/chat/history/{sess.session_id}",
-        headers={"X-Web-User": "andrew"},
+        headers={SESSION_HEADER: token},
         match_info={"session_key": sess.session_id},
         app=app,
     )
@@ -351,16 +363,34 @@ async def test_history_empty_emits_ilb_log(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Opt-in inertness: disabled / absent web config mounts NOTHING
+# Opt-in inertness + fail-loud startup guards
 # ---------------------------------------------------------------------------
 
 
-def _chat_routes(app) -> list[str]:
+def _mounted_web_paths(app) -> list[str]:
     return [
         r.resource.canonical
         for r in app.router.routes()
-        if r.resource is not None and r.resource.canonical.startswith("/chat")
+        if r.resource is not None
+        and (
+            r.resource.canonical.startswith("/chat")
+            or r.resource.canonical.startswith("/auth")
+        )
     ]
+
+
+def _register_kwargs(tmp_path, **overrides):
+    base = dict(
+        web_auth_state=WebAuthState.create(tmp_path / "web_auth_state.json"),
+        anthropic_client=FakeAnthropicClient([]),
+        state_mgr=StateManager(tmp_path / "s.json"),
+        talker_config=_make_talker_config(tmp_path),
+        system_prompt_provider=lambda: "SYS",
+        vault_context_str="CTX",
+        allowed_user_ids=[1],
+    )
+    base.update(overrides)
+    return base
 
 
 def test_register_web_routes_disabled_mounts_nothing(tmp_path) -> None:
@@ -369,71 +399,60 @@ def test_register_web_routes_disabled_mounts_nothing(tmp_path) -> None:
     mounted = register_web_routes(
         app,
         web_config=WebConfig(enabled=False, users=[WebUser(name="andrew")]),
-        anthropic_client=FakeAnthropicClient([]),
-        state_mgr=StateManager(tmp_path / "s.json"),
-        talker_config=_make_talker_config(tmp_path),
-        system_prompt_provider=lambda: "SYS",
-        vault_context_str="CTX",
-        allowed_user_ids=[1],
+        **_register_kwargs(tmp_path),
     )
     assert mounted is False
-    assert _chat_routes(app) == []
+    assert _mounted_web_paths(app) == []
 
 
 def test_register_web_routes_none_config_mounts_nothing(tmp_path) -> None:
     tstate = TransportState.create(tmp_path / "transport_state.json")
     app = build_app(_transport_config(), tstate)
-    mounted = register_web_routes(
-        app,
-        web_config=None,
-        anthropic_client=FakeAnthropicClient([]),
-        state_mgr=StateManager(tmp_path / "s.json"),
-        talker_config=_make_talker_config(tmp_path),
-        system_prompt_provider=lambda: "SYS",
-        vault_context_str="CTX",
-    )
+    mounted = register_web_routes(app, web_config=None, **_register_kwargs(tmp_path))
     assert mounted is False
-    assert _chat_routes(app) == []
+    assert _mounted_web_paths(app) == []
 
 
-def test_register_web_routes_enabled_mounts_three(tmp_path) -> None:
+def test_register_web_routes_enabled_mounts_five(tmp_path) -> None:
     tstate = TransportState.create(tmp_path / "transport_state.json")
     app = build_app(_transport_config(), tstate)
     mounted = register_web_routes(
-        app,
-        web_config=WebConfig(enabled=True, users=[WebUser(name="andrew")]),
-        anthropic_client=FakeAnthropicClient([]),
-        state_mgr=StateManager(tmp_path / "s.json"),
-        talker_config=_make_talker_config(tmp_path),
-        system_prompt_provider=lambda: "SYS",
-        vault_context_str="CTX",
-        allowed_user_ids=[1],
+        app, web_config=_web_config(), **_register_kwargs(tmp_path)
     )
     assert mounted is True
-    assert set(_chat_routes(app)) == {
+    assert set(_mounted_web_paths(app)) == {
         "/chat/open",
         "/chat/turn",
         "/chat/history/{session_key}",
+        "/auth/login",
+        "/auth/verify",
     }
 
 
 def test_register_web_routes_collision_fails_loud(tmp_path, monkeypatch) -> None:
     from alfred.web import routes_chat as routes_mod
 
-    monkeypatch.setattr(routes_mod, "check_synthetic_id_collisions",
-                        lambda *a, **k: (_ for _ in ()).throw(ValueError("boom")))
+    monkeypatch.setattr(
+        routes_mod,
+        "check_synthetic_id_collisions",
+        lambda *a, **k: (_ for _ in ()).throw(ValueError("boom")),
+    )
     tstate = TransportState.create(tmp_path / "transport_state.json")
     app = build_app(_transport_config(), tstate)
     with pytest.raises(ValueError, match="boom"):
-        register_web_routes(
-            app,
-            web_config=WebConfig(enabled=True, users=[WebUser(name="andrew")]),
-            anthropic_client=FakeAnthropicClient([]),
-            state_mgr=StateManager(tmp_path / "s.json"),
-            talker_config=_make_talker_config(tmp_path),
-            system_prompt_provider=lambda: "SYS",
-            vault_context_str="CTX",
-            allowed_user_ids=[1],
-        )
-    # Failed guard → no routes mounted.
-    assert _chat_routes(app) == []
+        register_web_routes(app, web_config=_web_config(), **_register_kwargs(tmp_path))
+    assert _mounted_web_paths(app) == []
+
+
+def test_register_web_routes_unconfigured_secret_fails_loud(tmp_path) -> None:
+    # Enabled but no signing secret → resolve_signing_secret guard aborts.
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_transport_config(), tstate)
+    cfg = WebConfig(
+        enabled=True,
+        users=[WebUser(name="andrew", role="owner")],
+        auth=WebAuthConfig(session_secret=""),
+    )
+    with pytest.raises(ValueError, match="session_secret"):
+        register_web_routes(app, web_config=cfg, **_register_kwargs(tmp_path))
+    assert _mounted_web_paths(app) == []

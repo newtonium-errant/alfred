@@ -108,6 +108,10 @@ class WebConfig:
     users: list[WebUser] = field(default_factory=list)
     auth: WebAuthConfig = field(default_factory=WebAuthConfig)
     email: WebEmailConfig = field(default_factory=WebEmailConfig)
+    # Tool-scoped state path for the single-use magic-link nonce store
+    # (per the load() schema-tolerance contract's "default state paths must
+    # be tool-scoped" rule). Overridable per-instance.
+    state_path: str = "./data/web_auth_state.json"
 
 
 # --- Hand-rolled construction ----------------------------------------------
@@ -200,6 +204,10 @@ def load_from_unified(raw: dict[str, Any]) -> WebConfig:
         users=_build_users(section.get("users")),
         auth=_build_auth(section.get("auth")),
         email=_build_email(section.get("email")),
+        state_path=str(
+            section.get("state_path", "./data/web_auth_state.json")
+            or "./data/web_auth_state.json"
+        ),
     )
 
 

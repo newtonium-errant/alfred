@@ -31,6 +31,15 @@ def test_absent_web_block_is_disabled_default() -> None:
     assert isinstance(cfg.email, WebEmailConfig)
     assert cfg.auth.session_ttl_hours == 168
     assert cfg.email.provider == "resend"
+    # Tool-scoped default nonce-store path.
+    assert cfg.state_path == "./data/web_auth_state.json"
+
+
+def test_state_path_override() -> None:
+    cfg = load_from_unified(
+        {"web": {"enabled": True, "state_path": "./data/custom_web_nonces.json"}}
+    )
+    assert cfg.state_path == "./data/custom_web_nonces.json"
 
 
 def test_non_dict_web_section_is_tolerated() -> None:
