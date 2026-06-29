@@ -32,8 +32,14 @@ import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
+from alfred.vault.scope import RRTS_INTAKE_ROLE
+
 from .config import WebConfig, resolve_signing_secret
-from .identity import WebIdentity, resolve_identity_from_name
+from .identity import (
+    WebIdentity,
+    resolve_identity_from_name,
+    synthetic_chat_id,
+)
 from .utils import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -66,6 +72,22 @@ USER_HEADER = "X-Alfred-User"
 # chat turn (privilege escalation). See CLAUDE.md "Relay / asserted-identity
 # routes — peer-pin requirement".
 WEB_CHAT_PEER = "web"
+
+# The transport peer NAME whose token authorises a VOUCHED RRTS bug-report
+# intake chat turn (2026-06-29, RRTS bug-report → VERA lane). The RRTS
+# host-side relay holds this dedicated token + asserts the staff user via
+# ``X-Alfred-User``. Distinct from ``WEB_CHAT_PEER`` because the identity
+# model differs: the ``web`` peer (owner chat) re-resolves the asserted name
+# against this instance's fixed ``web.users`` roster, whereas ``rrts_relay``
+# is VOUCHED — the relay JWT-verified the staff user, so there is NO fixed
+# roster (RRTS staff are not a fixed list; worksplit §2 "any valid full JWT,
+# no role gate"). The asserted name is ``reporter`` PROVENANCE only, never
+# authz — every ``rrts_relay`` request resolves to the fixed ``rrts_intake``
+# scope regardless of name (see ``vault/scope.py::RRTS_INTAKE_SCOPE`` +
+# ``telegram/conversation.py::resolve_scope``). A leaked ``rrts_relay`` token
+# can spoof a reporter name on a HELD ticket — bounded; it cannot escalate
+# scope or reach GitHub (the de-PHI/forward interlock holds).
+RRTS_RELAY_PEER = "rrts_relay"
 
 
 # ---------------------------------------------------------------------------
@@ -247,35 +269,51 @@ def _resolve_relay_identity(
 
     The ``relay`` auth model (mirrors ``/vault/ingest``): the request has
     already passed Layer-1 peer-token auth in the transport
-    ``auth_middleware`` — possession of this instance's dedicated ``web``
-    peer token IS the authority. The BFF (sole holder of that token) asserts
-    the verified user NAME (never a role) in ``X-Alfred-User``; this instance
-    re-resolves that name against its OWN ``web.users`` allowlist to derive
-    role + synthetic session id. The BFF cannot escalate (it asserts name
-    only); config decides what the user may do.
+    ``auth_middleware`` — possession of a dedicated peer token IS the
+    authority. Two peers may drive a relay chat turn, with DIFFERENT
+    identity models:
+
+    * **``web`` peer (owner chat) — FIXED ROSTER.** The BFF asserts the
+      verified user NAME (never a role); this instance re-resolves that name
+      against its OWN ``web.users`` allowlist to derive role + synthetic
+      session id. Name not in the roster → reject. Unchanged behaviour.
+
+    * **``rrts_relay`` peer (RRTS bug-report intake) — VOUCHED.** The RRTS
+      host-side relay has already JWT-verified the staff user, so the
+      asserted name is trusted as ``reporter`` PROVENANCE with NO fixed
+      ``web.users`` check (RRTS staff are not a fixed list — worksplit §2).
+      The name is provenance only, NEVER authz: the identity ALWAYS carries
+      the synthetic ``RRTS_INTAKE_ROLE`` → ``resolve_scope`` maps it to the
+      fixed ``rrts_intake`` scope regardless of name. ``synthetic_chat_id``
+      keys a per-reporter session so each staff member has an independent
+      thread. (Security: a leaked ``rrts_relay`` token can spoof a reporter
+      name on a HELD ticket — bounded; it cannot escalate scope or reach
+      GitHub.)
 
     Fail-closed (→ the handler emits a 401):
 
-    * presenting peer is not the chat ``web`` peer → reject (logged) — the
-      peer-pin that blocks a ``web_ingest`` token from escalating to full
-      chat scope;
+    * presenting peer is neither ``web`` nor ``rrts_relay`` → reject
+      (logged) — the peer-pin that blocks a ``web_ingest`` token from
+      escalating to full chat scope;
     * missing / empty ``X-Alfred-User`` → reject (logged);
-    * name not in this instance's ``web.users`` → reject (logged).
+    * (``web`` peer only) name not in this instance's ``web.users`` →
+      reject (logged).
     """
-    # Peer-pin (defense-in-depth): only the dedicated chat ``web`` peer may
-    # drive a relay chat turn. ``transport_peer`` is the matched peer NAME
-    # set by ``auth_middleware``; pinning it closes the shared-``allowed_clients``
-    # escalation where the ``web_ingest`` token + ``X-Alfred-Client: web``
-    # clears Layer 1 as peer ``web_ingest``.
+    # Peer-pin (defense-in-depth): only the dedicated chat ``web`` peer or
+    # the vouched ``rrts_relay`` peer may drive a relay chat turn.
+    # ``transport_peer`` is the matched peer NAME set by ``auth_middleware``;
+    # pinning it closes the shared-``allowed_clients`` escalation where the
+    # ``web_ingest`` token + ``X-Alfred-Client: web`` clears Layer 1 as peer
+    # ``web_ingest``.
     peer = request.get("transport_peer", "")
-    if peer != WEB_CHAT_PEER:
+    if peer not in (WEB_CHAT_PEER, RRTS_RELAY_PEER):
         log.warning(
             "web.auth.relay_wrong_peer",
             peer=peer or "(none)",
-            expected=WEB_CHAT_PEER,
-            detail="relay chat requires the dedicated 'web' peer token — "
-                   "refusing to honor X-Alfred-User from another peer "
-                   "(e.g. web_ingest) — rejecting (401)",
+            expected=f"{WEB_CHAT_PEER} | {RRTS_RELAY_PEER}",
+            detail="relay chat requires the dedicated 'web' or 'rrts_relay' "
+                   "peer token — refusing to honor X-Alfred-User from "
+                   "another peer (e.g. web_ingest) — rejecting (401)",
         )
         return None
 
@@ -289,6 +327,27 @@ def _resolve_relay_identity(
             detail="relay mode but X-Alfred-User absent — rejecting (401)",
         )
         return None
+
+    # VOUCHED path — ``rrts_relay``. No fixed roster; the asserted name is
+    # reporter provenance and the identity carries the fixed intake role.
+    if peer == RRTS_RELAY_PEER:
+        clean = name.strip()
+        log.info(
+            "web.auth.relay_vouched_identity",
+            reporter=clean[:64],
+            scope_role=RRTS_INTAKE_ROLE,
+            detail="rrts_relay vouched user — asserted name trusted as "
+                   "reporter provenance; resolving to fixed rrts_intake "
+                   "scope (name is NOT authz)",
+        )
+        return WebIdentity(
+            user=clean,
+            role=RRTS_INTAKE_ROLE,
+            synthetic_chat_id=synthetic_chat_id(clean),
+        )
+
+    # FIXED-ROSTER path — the ``web`` peer (owner chat). Re-resolve the
+    # asserted name against THIS instance's ``web.users`` allowlist.
     identity = resolve_identity_from_name(web_config, name)
     if identity is None:
         log.warning(

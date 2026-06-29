@@ -292,3 +292,85 @@ def test_resolve_web_identity_relay_missing_peer_fails_closed() -> None:
     # path) → fail-closed.
     cfg = _relay_config()
     assert resolve_web_identity(_req_with_user("andrew", peer=""), cfg) is None
+
+
+# ---------------------------------------------------------------------------
+# VOUCHED RRTS-relay identity (2026-06-29, RRTS bug-report → VERA lane)
+# ---------------------------------------------------------------------------
+
+
+def test_rrts_relay_vouched_user_resolves_with_no_roster() -> None:
+    """The vouched path: the rrts_relay peer asserts an ARBITRARY staff name
+    that is NOT in web.users, and it STILL resolves — VERA trusts the
+    JWT-vouched name as reporter provenance (no fixed roster). The identity
+    carries the synthetic RRTS_INTAKE_ROLE → resolve_scope → rrts_intake."""
+    from alfred.vault.scope import RRTS_INTAKE_ROLE
+    from alfred.web.auth import RRTS_RELAY_PEER
+
+    cfg = _relay_config(users=[])  # NO roster at all
+    ident = resolve_web_identity(
+        _req_with_user("Dana The RRTS Dispatcher", peer=RRTS_RELAY_PEER), cfg,
+    )
+    assert ident is not None
+    assert ident.user == "Dana The RRTS Dispatcher"
+    assert ident.role == RRTS_INTAKE_ROLE
+    assert ident.synthetic_chat_id == synthetic_chat_id(
+        "Dana The RRTS Dispatcher"
+    )
+
+
+def test_rrts_relay_scope_is_fixed_regardless_of_name() -> None:
+    """Two different asserted names both resolve to the FIXED rrts_intake
+    role — the name is provenance only, never authz/scope."""
+    from alfred.vault.scope import RRTS_INTAKE_ROLE
+    from alfred.web.auth import RRTS_RELAY_PEER
+
+    cfg = _relay_config(users=[])
+    a = resolve_web_identity(_req_with_user("Alice", peer=RRTS_RELAY_PEER), cfg)
+    b = resolve_web_identity(_req_with_user("Bob", peer=RRTS_RELAY_PEER), cfg)
+    assert a is not None and b is not None
+    assert a.role == b.role == RRTS_INTAKE_ROLE
+    # Provenance differs (the reporter), scope/role does not.
+    assert a.user != b.user
+
+
+def test_rrts_relay_logs_vouched_identity() -> None:
+    from alfred.web.auth import RRTS_RELAY_PEER
+
+    cfg = _relay_config(users=[])
+    with structlog.testing.capture_logs() as captured:
+        resolve_web_identity(_req_with_user("Carol", peer=RRTS_RELAY_PEER), cfg)
+    events = [c for c in captured if c.get("event") == "web.auth.relay_vouched_identity"]
+    assert len(events) == 1
+    assert events[0]["reporter"] == "Carol"
+
+
+def test_rrts_relay_missing_user_fails_closed() -> None:
+    from alfred.web.auth import RRTS_RELAY_PEER
+
+    cfg = _relay_config(users=[])
+    assert resolve_web_identity(
+        _req_with_user(None, peer=RRTS_RELAY_PEER), cfg,
+    ) is None
+
+
+def test_web_peer_keeps_fixed_roster_check() -> None:
+    """The ``web`` peer (owner chat) is NOT vouched — an unknown name is
+    still rejected against web.users. Only rrts_relay is vouched."""
+    cfg = _relay_config(users=[WebUser(name="andrew", role="owner")])
+    # Known user resolves; unknown rejected.
+    assert resolve_web_identity(_req_with_user("andrew", peer="web"), cfg) is not None
+    assert resolve_web_identity(_req_with_user("stranger", peer="web"), cfg) is None
+
+
+def test_web_ingest_peer_still_rejected_after_rrts_relay_added() -> None:
+    """Regression: extending the peer-pin to accept rrts_relay must NOT
+    re-open the web_ingest escalation — web_ingest is still wrong-peer."""
+    cfg = _relay_config(users=[WebUser(name="andrew", role="owner")])
+    with structlog.testing.capture_logs() as captured:
+        ident = resolve_web_identity(
+            _req_with_user("andrew", peer="web_ingest"), cfg,
+        )
+    assert ident is None
+    events = [c["event"] for c in captured]
+    assert "web.auth.relay_wrong_peer" in events
