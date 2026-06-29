@@ -230,6 +230,39 @@ async def test_stt_audio_too_large(stt_client, monkeypatch) -> None:
     assert (await resp.json())["error"] == "audio_too_large"
 
 
+async def test_stt_streams_past_1mb_client_max_size(stt_client, monkeypatch) -> None:
+    """REGRESSION PIN — the handler must STREAM the body via
+    request.content.iter_chunked, NOT request.read()/post()/multipart(),
+    which enforce the shared transport app's default 1 MB client_max_size.
+
+    This sends a >1 MB audio body (1 MB + 4 KB) with MAX_AUDIO_BYTES at its
+    real 25 MB default (NOT patched down) and asserts the handler ACCEPTS
+    it (200, not 413). A regression swapping the streaming read for
+    request.read() would 413 here (and 413 every real voice note >1 MB)
+    while passing every other test in this file — exactly the spec's #1
+    backend gotcha. test_stt_audio_too_large above only sends 200 bytes
+    under a monkeypatched 50-byte cap, so it never crosses the 1 MB
+    client_max_size and does NOT cover this surface."""
+    _patch_chain(
+        monkeypatch,
+        served=stt_backends.SttResult(
+            text="transcript from a large note",
+            backend_id="groq-whisper",
+            tier="comparable",
+        ),
+    )
+    big_audio = b"\x00" * (1024 * 1024 + 4096)  # >1 MB, under the 25 MB cap
+    resp = await stt_client.post(
+        "/stt/transcribe", data=big_audio, headers=_audio_headers("audio/webm")
+    )
+    assert resp.status == 200, (
+        "handler 413'd a >1MB body — the streaming iter_chunked read was "
+        "likely swapped for request.read()/post(), which enforces the "
+        "app's 1MB client_max_size"
+    )
+    assert (await resp.json())["transcript"] == "transcript from a large note"
+
+
 # ---------------------------------------------------------------------------
 # Outcome mapping (CONTRACT §4)
 # ---------------------------------------------------------------------------
