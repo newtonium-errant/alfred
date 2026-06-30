@@ -560,6 +560,55 @@ def _run_ticket_forward(raw: dict[str, Any], suppress_stdout: bool = False) -> N
     asyncio.run(run_daemon(config, raw))
 
 
+def _run_fix_drafter(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """KAL-LE on-box auto-fix drafter daemon entry point (Phase 1B).
+
+    Runs on KAL-LE (the Forgejo box). Gate 2 of the FORGEJO-ONLY triple-
+    gate: ``sys.exit(78)`` unless ``fix_drafter.enabled`` AND
+    ``github.forge_type == "forgejo"`` AND the security-critical
+    per-instance fields (instance / work_root / vera_vault_root) are
+    present. On master (github config, no ``fix_drafter:`` block) the
+    auto-start gate (gate 1) never selects it, and even if forced via
+    ``--only`` this runner exits 78. The op-layer forge-fence (gate 3) is
+    the last line in github_ops.
+
+    Mirrors ``_run_ticket_forward`` — own log file, setup_logging wiring.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/fix_drafter.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    from alfred.brief.utils import setup_logging
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
+    from alfred.transport.fix_drafter import (
+        load_fix_drafter_config,
+        run_daemon,
+    )
+    from alfred.integrations.github_ops import FORGE_FORGEJO, load_github_config
+    import sys
+    import structlog
+    log = structlog.get_logger(__name__)
+    config = load_fix_drafter_config(raw)
+    if not config.enabled:
+        log.warning("fix_drafter.daemon.disabled_in_config")
+        sys.exit(78)
+    if not config.instance:
+        log.warning("fix_drafter.daemon.missing_instance")
+        sys.exit(78)
+    gh = load_github_config(raw)
+    forge_type = gh.forge_type if gh is not None else ""
+    if forge_type != FORGE_FORGEJO:
+        log.warning("fix_drafter.daemon.wrong_forge_type", forge_type=forge_type)
+        sys.exit(78)
+    if not config.work_root:
+        log.warning("fix_drafter.daemon.missing_work_root")
+        sys.exit(78)
+    if not config.vera_vault_root:
+        log.warning("fix_drafter.daemon.missing_vera_vault_root")
+        sys.exit(78)
+    asyncio.run(run_daemon(config, raw))
+
+
 def _run_digest(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Digest daemon entry — KAL-LE weekly cross-arc synthesis.
 
@@ -909,6 +958,7 @@ TOOL_RUNNERS = {
     "daily_sync": _run_daily_sync,
     "brief_digest_push": _run_brief_digest_push,
     "ticket_forward": _run_ticket_forward,
+    "fix_drafter": _run_fix_drafter,
     "digest": _run_digest,
     "pending_items_pusher": _run_pending_items_pusher,
     "radar_day": _run_radar_day,
@@ -993,6 +1043,10 @@ SPAWN_PRIORITY: tuple[str, ...] = (
     # cadence, nothing latency-sensitive at boot. Slots after the
     # other peer-push daemon (brief_digest_push) it most resembles.
     "ticket_forward",
+    # KAL-LE on-box auto-fix drafter (Phase 1B) — batch tier: 5-min
+    # scanner; FORGEJO-ONLY (triple-gated). Slots after ticket_forward
+    # (its upstream in the pipeline).
+    "fix_drafter",
     "digest",
     "radar_day",
     "friction_analyzer",
@@ -1118,6 +1172,18 @@ def run_all(
         # instance leaves the block absent (KAL-LE is the receiver).
         if "ticket_forward" in raw and (raw.get("ticket_forward") or {}).get("enabled"):
             tools.append("ticket_forward")
+        # KAL-LE on-box auto-fix drafter (Phase 1B). Gate 1 of the
+        # FORGEJO-ONLY triple-gate: auto-starts ONLY when
+        # ``fix_drafter.enabled`` AND ``github.forge_type == "forgejo"``.
+        # A github-config box (the default everywhere today) never starts
+        # it — so the code ships INERT on master. The daemon's own startup
+        # gate (gate 2) + the op-layer forge-fence (gate 3) are the others.
+        if (
+            "fix_drafter" in raw
+            and (raw.get("fix_drafter") or {}).get("enabled")
+            and (raw.get("github") or {}).get("forge_type") == "forgejo"
+        ):
+            tools.append("fix_drafter")
         # KAL-LE weekly cross-arc digest. Auto-starts when ``digest:``
         # is in config AND ``enabled: true``. Default off so subordinates
         # that don't write digests don't fire one.
@@ -1245,7 +1311,7 @@ def run_all(
         # ``test_dispatcher_two_arg_branch_matches_two_arg_tools`` in
         # ``tests/orchestrator/test_tool_dispatch.py`` so a missing
         # entry trips a test rather than a TypeError on first spawn.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "ticket_forward", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared", "routine"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "ticket_forward", "fix_drafter", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared", "routine"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

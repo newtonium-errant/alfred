@@ -563,3 +563,66 @@ def test_workers_json_records_started_tools(
             break
         time.sleep(0.05)
     assert {"curator", "janitor"}.issubset(started)
+
+
+def _run_with_fix_drafter(
+    raw, orch_dirs, install_per_tool_fakes, fire_sentinel_after,
+):
+    """Shared harness: wire fix_drafter + the base fakes, run to sentinel."""
+    all_fakes = dict(ALL_FAKES)
+    all_fakes["fix_drafter"] = fake_runner_2arg
+    _wire_touch_files(raw, orch_dirs, list(all_fakes))
+    install_per_tool_fakes({
+        t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
+        for t in all_fakes
+    })
+    fire_sentinel_after(0.6)
+    orchestrator.run_all(
+        raw, only=None, skills_dir=orch_dirs["skills"],
+        pid_path=orch_dirs["pid_path"], live_mode=False,
+    )
+
+
+def test_fix_drafter_skipped_on_github_config(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """Gate 1 forge-selectivity: fix_drafter.enabled BUT github.forge_type
+    is github → NOT started (GitHub keeps its GH-Action drafter)."""
+    raw = orchestrator_raw_config
+    raw["fix_drafter"] = {"enabled": True}
+    raw["github"] = {"forge_type": "github"}
+
+    _run_with_fix_drafter(raw, orch_dirs, install_per_tool_fakes, fire_sentinel_after)
+
+    # Wait until the required trio is up so fix_drafter's absence is real.
+    for _ in range(30):
+        started = _read_started_tools(orch_dirs["data"])
+        if {"curator", "janitor", "distiller"}.issubset(started):
+            break
+        time.sleep(0.05)
+    assert "fix_drafter" not in started, (
+        f"fix_drafter must NOT start on a github-config box, got {started}"
+    )
+
+
+def test_fix_drafter_starts_on_forgejo_config(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """Gate 1 forge-selectivity: fix_drafter.enabled AND
+    github.forge_type==forgejo → started."""
+    raw = orchestrator_raw_config
+    raw["fix_drafter"] = {"enabled": True}
+    raw["github"] = {"forge_type": "forgejo"}
+
+    _run_with_fix_drafter(raw, orch_dirs, install_per_tool_fakes, fire_sentinel_after)
+
+    for _ in range(30):
+        started = _read_started_tools(orch_dirs["data"])
+        if "fix_drafter" in started:
+            break
+        time.sleep(0.05)
+    assert "fix_drafter" in started, (
+        f"fix_drafter must start on a forgejo-config box, got {started}"
+    )

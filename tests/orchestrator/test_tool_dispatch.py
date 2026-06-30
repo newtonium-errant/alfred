@@ -59,6 +59,11 @@ EXPECTED_TOOLS = {
     # scanner pushing open tickets to KAL-LE as kind=ticket.
     # Auto-starts on instances with ``ticket_forward.enabled: true``.
     "ticket_forward",
+    # KAL-LE on-box auto-fix drafter (Phase 1B) — 5-min FORGEJO-ONLY
+    # scanner that drafts/opens auto-fix PRs. Auto-starts on instances
+    # with ``fix_drafter.enabled: true`` AND ``github.forge_type:
+    # forgejo`` (the triple-gate's config layer).
+    "fix_drafter",
 }
 
 TWO_ARG_TOOLS = {
@@ -70,6 +75,7 @@ TWO_ARG_TOOLS = {
     "cloudflared",
     "routine",
     "ticket_forward",
+    "fix_drafter",
 }
 THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "instructor", "talker"}
 

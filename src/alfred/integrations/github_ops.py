@@ -18,11 +18,25 @@ therefore enforced by two code-level facts working together:
    build time, never silently grants access.
 
 VERA never talks to GitHub: it pushes tickets to KAL-LE over the peer
-protocol and receives issue link-backs. GitHub Actions owns PR
-creation under its own app identity; merging is the operator via
-branch protection. This module's job is the narrow KAL-LE slice:
-create/search issues at intake, read issues/PRs for the digest's
-effectiveness loop.
+protocol and receives issue link-backs. Merging is ALWAYS the operator
+via branch protection — :data:`GITHUB_OPS` carries no ``pr_merge`` key,
+permanently and by design.
+
+PR CREATION is forge-split (Phase 1B, 2026-06-30):
+  * **GitHub path** — GitHub Actions owns PR creation under its own app
+    identity; ``pr_create`` is FORGE-FENCED denied on a github-config
+    client (the historic "all PR writes denied" rule still holds for
+    GitHub, see :meth:`GitHubOpsClient._forge_fence`).
+  * **Forgejo path** — the sovereign Forgejo box has no GitHub Actions,
+    so KAL-LE's on-box ``fix_drafter`` daemon authors the draft PR. The
+    matrix reverses the historic deny at the thinnest seam: ONE new
+    write op (``pr_create``), ONE new caller (``fix_drafter``), gated to
+    Forgejo only. The git branch-push itself is git-over-HTTP, NOT a REST
+    op — it never enters this matrix.
+
+This module's job is the narrow KAL-LE slice: create/search issues at
+intake, read issues/PRs for the digest's effectiveness loop, and (on
+Forgejo) scan/open auto-fix PRs for the on-box drafter.
 
 Scope-first (CLAUDE.md): :data:`GITHUB_OPS` — the op × caller-context
 allowlist matrix — is the principal artifact of this module. Every
@@ -93,18 +107,33 @@ DEFAULT_AUDIT_LOG_PATH = "./data/github_ops_audit.jsonl"
 #
 # DENY-ROWS BY DESIGN (absent op == denied; the gate has no default-
 # allow path):
+#   "fix_drafter"   — KAL-LE's on-box auto-fix drafter daemon (Phase
+#                     1B, Forgejo-ONLY): scans open auto-fix issues,
+#                     re-verifies the auto-fix label, crash-recovery
+#                     dedups against open PRs, opens the draft PR. A
+#                     SEPARATE caller from ticket_intake/digest by
+#                     least-privilege design — its entire allowance is
+#                     {issue_get, issue_list, pr_list, pr_create}.
+#
+# DENY-ROWS BY DESIGN (absent op == denied; the gate has no default-
+# allow path):
 #   * issue_comment / issue_close — reserved future ops, operator-
 #     gated. The MVP pipeline never mutates an issue after creation;
 #     widening requires touching this matrix AND its contract-pin test
 #     in the same commit.
-#   * ALL pr writes (pr_create / pr_merge / pr_comment / pr_review /
-#     pr_close / ...) — PERMANENTLY denied. GitHub Actions owns PRs
-#     under its own app identity; merge authority is the operator via
-#     branch protection. KAL-LE only ever READS PR state.
-#   * repo contents / workflows / settings — not even in the PAT's
-#     permission set (fine-grained PAT: Issues RW, Pull requests READ,
-#     Metadata R). Listed here so nobody "helpfully" adds them later
-#     without noticing the credential can't do it anyway.
+#   * pr_merge — PERMANENTLY denied (no key, never added). The operator
+#     is the single merge authority via Forgejo branch protection; this
+#     mirrors claude-auto-fix's never-merge rule. The most load-bearing
+#     deny in the matrix.
+#   * pr_comment / pr_review / pr_close — operator owns the PR lifecycle
+#     after the drafter opens it; the drafter only ever CREATES.
+#   * pr_create — a WRITE op, but NOT permanently denied any more: it is
+#     allowed to ``fix_drafter`` and FORGE-FENCED to Forgejo (see
+#     :meth:`GitHubOpsClient._forge_fence`). On a github box it raises
+#     before any HTTP — GitHub Actions still owns PR creation there.
+#   * repo contents / workflows / settings / branch_protection — not in
+#     the PAT's permission set; branch creation happens via git push,
+#     not REST. Listed so nobody "helpfully" adds them later.
 #
 # op -> frozenset of allowed caller contexts. Absent op == denied.
 GITHUB_OPS: dict[str, frozenset[str]] = {
@@ -112,11 +141,32 @@ GITHUB_OPS: dict[str, frozenset[str]] = {
     "issue_label_add": frozenset({"ticket_intake"}),   # create-time labels only at MVP
     "label_list":      frozenset({"ticket_intake"}),   # Forgejo name→id resolution (inside issue_create)
     "issue_search":    frozenset({"ticket_intake"}),   # marker-based dedupe recovery
-    "issue_get":       frozenset({"digest"}),          # linked-PR/outcome check
+    # +fix_drafter: authoritative pre-draft auto-fix-label re-verify
+    # (forgejo on-box drafter). NOT forge-fenced — digest still reads
+    # issues on github; fix_drafter never runs on a github box (triple-
+    # gated) so the widened caller can't reach a github client in prod.
+    "issue_get":       frozenset({"digest", "fix_drafter"}),
     "issue_timeline":  frozenset({"digest"}),
     "pr_get":          frozenset({"digest"}),          # effectiveness-loop capture (ratified amendment)
     "pr_reviews":      frozenset({"digest"}),          # disposition derivation (merged_after_rework)
+    # --- Forgejo on-box auto-fix drafter (Phase 1B, fix_drafter) ------------
+    # FORGE-FENCED to Forgejo (see _forge_fence): a github-config client
+    # raises before any HTTP. GitHub keeps its claude-auto-fix.yml
+    # GH-Action drafter; the on-box flow is the Forgejo replacement.
+    "issue_list":      frozenset({"fix_drafter"}),     # scan open auto-fix issues (the work queue)
+    "pr_list":         frozenset({"fix_drafter"}),     # crash-recovery dedup (adopt/resume head.ref)
+    "pr_create":       frozenset({"fix_drafter"}),     # the ONE PR write op — forgejo-only; operator still merges
 }
+
+# Ops that are FORGEJO-ONLY — a second policy gate OUTSIDE the op×caller
+# matrix (the matrix has no forge dimension). :meth:`_forge_fence` raises
+# :class:`GitHubOpsDenied` for these on a github-config client BEFORE the
+# op×caller gate, so "KAL-LE never opens PRs on GitHub" is enforced at the
+# privilege boundary, not just at the daemon's startup gate. A refactor
+# that drops this is caught by ``test_pr_create_denied_on_github_config``.
+_FORGEJO_ONLY_OPS: frozenset[str] = frozenset(
+    {"issue_list", "pr_list", "pr_create"},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +668,51 @@ class GitHubOpsClient:
             )
             raise
 
+    def _forge_fence(
+        self,
+        op: str,
+        caller: str,
+        *,
+        ticket_uid: str = "",
+        correlation_id: str = "",
+        issue_number: int | None = None,
+    ) -> None:
+        """Second policy gate (outside the op×caller matrix): the drafter
+        ops in :data:`_FORGEJO_ONLY_OPS` are Forgejo-only.
+
+        Runs BEFORE :meth:`_gate`. On a github-config client it audits an
+        ``outcome="denied"`` row, logs ``github_ops.forge_denied`` (op in
+        the field, greppable), and raises :class:`GitHubOpsDenied` — never
+        touching HTTP. A no-op for non-fenced ops and for Forgejo clients.
+        """
+        if op not in _FORGEJO_ONLY_OPS:
+            return
+        if self._config.forge_type == FORGE_FORGEJO:
+            return
+        reason = (
+            f"GitHub op '{op}' is forgejo-only (github path: GitHub Actions "
+            f"owns PR creation); forge_type={self._config.forge_type!r}"
+        )
+        append_github_audit(
+            self._config.audit_log_path,
+            op=op,
+            repo=self._config.repo,
+            caller=caller,
+            outcome="denied",
+            ticket_uid=ticket_uid,
+            issue_number=issue_number,
+            correlation_id=correlation_id,
+            error=reason,
+        )
+        log.warning(
+            "github_ops.forge_denied",
+            op=op,
+            caller=caller,
+            forge_type=self._config.forge_type,
+            repo=self._config.repo,
+        )
+        raise GitHubOpsDenied(reason)
+
     async def _request_audited(
         self,
         *,
@@ -1089,6 +1184,153 @@ class GitHubOpsClient:
             ),
             correlation_id=correlation_id,
         )
+
+    # --- on-box auto-fix drafter ops (Phase 1B, fix_drafter, FORGEJO) --------
+
+    async def issue_list(
+        self,
+        *,
+        labels: str,
+        state: str,
+        caller: str,
+        correlation_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """GET /repos/{repo}/issues — the open auto-fix work queue.
+
+        FORGEJO-ONLY (forge-fenced). Forgejo shape-divergence, same
+        silent-break class as :meth:`_issue_search_marker_forgejo`: the
+        response is a **BARE LIST**, NOT GitHub's ``{"items": [...]}``.
+        Parsing ``data.get("items")`` on a list returns ``None`` → the
+        drafter would see an empty queue forever (silent dark). ``type=
+        issues`` excludes PRs from the issue index; ``labels`` is the
+        comma-name filter (``"auto-fix"``); ``state`` is the lifecycle
+        filter (``"open"``). Returns the list of issue dicts (each with
+        ``number``/``title``/``body``/``labels``); empty list on no match.
+        """
+        self._forge_fence(
+            "issue_list", caller, correlation_id=correlation_id,
+        )
+        resp = await self._request_audited(
+            op="issue_list",
+            caller=caller,
+            method="GET",
+            url=f"{self._config.api_base}/repos/{self._config.repo}/issues",
+            params={
+                "type": "issues",   # exclude PRs from the issue index
+                "state": state,
+                "labels": labels,
+                "limit": 50,
+            },
+            correlation_id=correlation_id,
+        )
+        data = resp.json()
+        # Forgejo returns a BARE LIST (NOT GitHub's {"items": [...]}).
+        issues = [i for i in data if isinstance(i, dict)] if isinstance(data, list) else []
+        append_github_audit(
+            self._config.audit_log_path,
+            op="issue_list",
+            repo=self._config.repo,
+            caller=caller,
+            outcome="ok",
+            http_status=resp.status_code,
+            correlation_id=correlation_id,
+            extra={"count": len(issues)},
+        )
+        return issues
+
+    async def pr_list(
+        self,
+        *,
+        state: str,
+        caller: str,
+        correlation_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """GET /repos/{repo}/pulls — crash-recovery dedup source.
+
+        FORGEJO-ONLY (forge-fenced). BARE LIST parse (same firebreak as
+        :meth:`issue_list`). ``state="all"`` so a closed/merged auto-fix
+        PR is still found (never re-draft a landed fix). The caller
+        filters ``head.ref`` client-side. Returns the list of PR dicts
+        (each with ``number``/``html_url``/``head``); empty on no match.
+        """
+        self._forge_fence(
+            "pr_list", caller, correlation_id=correlation_id,
+        )
+        resp = await self._request_audited(
+            op="pr_list",
+            caller=caller,
+            method="GET",
+            url=f"{self._config.api_base}/repos/{self._config.repo}/pulls",
+            params={"state": state, "limit": 50},
+            correlation_id=correlation_id,
+        )
+        data = resp.json()
+        prs = [p for p in data if isinstance(p, dict)] if isinstance(data, list) else []
+        append_github_audit(
+            self._config.audit_log_path,
+            op="pr_list",
+            repo=self._config.repo,
+            caller=caller,
+            outcome="ok",
+            http_status=resp.status_code,
+            correlation_id=correlation_id,
+            extra={"count": len(prs)},
+        )
+        return prs
+
+    async def pr_create(
+        self,
+        *,
+        head: str,
+        base: str,
+        title: str,
+        body: str,
+        caller: str,
+        issue_number: int | None = None,
+        correlation_id: str = "",
+    ) -> dict[str, Any]:
+        """POST /repos/{repo}/pulls — the ONE PR write op. FORGEJO-ONLY.
+
+        Forge-fenced: a github-config client raises
+        :class:`GitHubOpsDenied` before any HTTP (GitHub Actions owns PR
+        creation there). Body shape ``{head, base, title, body}`` —
+        Forgejo's ``CreatePullRequestOption`` has NO ``draft`` boolean,
+        so WIP-ness is signaled by the caller's ``"WIP: "`` title prefix
+        (cosmetic; the HARD never-auto-merge guarantee is branch
+        protection + the permanent ``pr_merge``-deny, not the prefix).
+        Returns ``{number, html_url}``; audited ``outcome="created"``.
+        """
+        self._forge_fence(
+            "pr_create", caller,
+            correlation_id=correlation_id, issue_number=issue_number,
+        )
+        resp = await self._request_audited(
+            op="pr_create",
+            caller=caller,
+            method="POST",
+            url=f"{self._config.api_base}/repos/{self._config.repo}/pulls",
+            json_body={
+                "head": head,
+                "base": base,
+                "title": title,
+                "body": body,
+            },
+            correlation_id=correlation_id,
+        )
+        data = resp.json()
+        number = data.get("number")
+        append_github_audit(
+            self._config.audit_log_path,
+            op="pr_create",
+            repo=self._config.repo,
+            caller=caller,
+            outcome="created",
+            issue_number=issue_number,
+            http_status=resp.status_code,
+            correlation_id=correlation_id,
+            extra={"pr_number": number, "head": head, "base": base},
+        )
+        return {"number": number, "html_url": data.get("html_url", "")}
 
 
 __all__ = [

@@ -162,20 +162,40 @@ class TestMatrixPin:
             "issue_label_add": frozenset({"ticket_intake"}),
             "label_list":      frozenset({"ticket_intake"}),
             "issue_search":    frozenset({"ticket_intake"}),
-            "issue_get":       frozenset({"digest"}),
+            "issue_get":       frozenset({"digest", "fix_drafter"}),
             "issue_timeline":  frozenset({"digest"}),
             "pr_get":          frozenset({"digest"}),
             "pr_reviews":      frozenset({"digest"}),
+            "issue_list":      frozenset({"fix_drafter"}),
+            "pr_list":         frozenset({"fix_drafter"}),
+            "pr_create":       frozenset({"fix_drafter"}),
         }
 
-    def test_no_pr_write_ops_in_matrix(self) -> None:
-        """Deny-row pin: PR writes are permanently absent (GHA owns
-        PRs; merge authority is the operator via branch protection)."""
+    def test_pr_writes_other_than_create_permanently_denied(self) -> None:
+        """Deny-row pin: every PR write EXCEPT ``pr_create`` is
+        permanently absent. ``pr_merge`` is the load-bearing deny —
+        merge authority is the operator via branch protection, never
+        KAL-LE. ``pr_create`` is now a Forgejo-only ``fix_drafter`` op
+        (Phase 1B) so it is deliberately NOT in this denied set; its
+        own pins are ``test_pr_create_is_fix_drafter_only`` +
+        ``test_pr_create_denied_on_github_config``.
+        """
         for denied_op in (
-            "pr_create", "pr_merge", "pr_comment", "pr_review",
+            "pr_merge", "pr_comment", "pr_review",
             "pr_close", "issue_comment", "issue_close",
         ):
             assert denied_op not in GITHUB_OPS
+
+    def test_pr_create_is_fix_drafter_only(self) -> None:
+        """``pr_create`` is allowed to exactly one caller — the on-box
+        drafter. Never ticket_intake, never digest."""
+        assert GITHUB_OPS["pr_create"] == frozenset({"fix_drafter"})
+
+    def test_drafter_ops_are_fix_drafter_only(self) -> None:
+        """The three drafter ops are gated to ``fix_drafter`` alone."""
+        assert GITHUB_OPS["issue_list"] == frozenset({"fix_drafter"})
+        assert GITHUB_OPS["pr_list"] == frozenset({"fix_drafter"})
+        assert "fix_drafter" in GITHUB_OPS["issue_get"]
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1141,180 @@ class TestDigestReads:
         client = GitHubOpsClient(cfg)
         with pytest.raises(GitHubOpsDenied):
             await client.pr_get(number=12, caller="ticket_intake")
+
+
+# ---------------------------------------------------------------------------
+# On-box auto-fix drafter ops (Phase 1B, fix_drafter, FORGEJO)
+# ---------------------------------------------------------------------------
+
+
+def _raises_if_called():
+    async def _should_not_run(*a, **k):  # pragma: no cover - asserts non-call
+        raise AssertionError("HTTP must not be attempted on a forge-denied op")
+    return _should_not_run
+
+
+class TestDrafterOps:
+    async def test_issue_list_bare_list_parse_forgejo(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Forgejo issue_list returns a BARE LIST (not {"items": [...]}) —
+        the silent-break firebreak. Params carry type/state/labels/limit."""
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(200, [
+            {"number": 7, "title": "bug a", "body": "b", "labels": [{"name": "auto-fix"}]},
+            {"number": 9, "title": "bug b", "body": "b2", "labels": [{"name": "auto-fix"}]},
+        ]))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+
+        issues = await client.issue_list(
+            labels="auto-fix", state="open", caller="fix_drafter",
+        )
+        assert [i["number"] for i in issues] == [7, 9]
+        call = fake.calls[0]
+        assert call["url"] == (
+            f"{FORGEJO_API_BASE}/repos/{TEST_REPO}/issues"
+        )
+        assert call["params"] == {
+            "type": "issues", "state": "open", "labels": "auto-fix", "limit": 50,
+        }
+        rows = read_github_audit(cfg.audit_log_path)
+        assert rows[0]["op"] == "issue_list"
+        assert rows[0]["outcome"] == "ok"
+        assert rows[0]["count"] == 2
+
+    async def test_issue_list_non_list_response_is_empty(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A {"items": [...]} (GitHub-shaped) body on the forgejo path is
+        treated as EMPTY, not parsed — the bare-list contract is strict."""
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(200, {"items": [{"number": 7}]}))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+        issues = await client.issue_list(
+            labels="auto-fix", state="open", caller="fix_drafter",
+        )
+        assert issues == []
+
+    async def test_pr_list_bare_list_parse_forgejo(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(200, [
+            {"number": 3, "html_url": "u3", "head": {"ref": "auto-fix/issue-7"}},
+            {"number": 4, "html_url": "u4", "head": {"ref": "other"}},
+        ]))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+
+        prs = await client.pr_list(state="all", caller="fix_drafter")
+        assert [p["number"] for p in prs] == [3, 4]
+        call = fake.calls[0]
+        assert call["url"] == f"{FORGEJO_API_BASE}/repos/{TEST_REPO}/pulls"
+        assert call["params"] == {"state": "all", "limit": 50}
+        rows = read_github_audit(cfg.audit_log_path)
+        assert rows[0]["op"] == "pr_list"
+        assert rows[0]["count"] == 2
+
+    async def test_pr_create_posts_head_base_title_body(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(
+            201, {"number": 42, "html_url": "pr-url"}, method="POST",
+        ))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+
+        out = await client.pr_create(
+            head="auto-fix/issue-7", base="main",
+            title="WIP: bug a", body="Closes #7\n\nsummary",
+            caller="fix_drafter", issue_number=7,
+        )
+        assert out == {"number": 42, "html_url": "pr-url"}
+        call = fake.calls[0]
+        assert call["method"] == "POST"
+        assert call["url"] == f"{FORGEJO_API_BASE}/repos/{TEST_REPO}/pulls"
+        # No `draft` key — Forgejo signals WIP via the title prefix.
+        assert call["json_body"] == {
+            "head": "auto-fix/issue-7", "base": "main",
+            "title": "WIP: bug a", "body": "Closes #7\n\nsummary",
+        }
+        rows = read_github_audit(cfg.audit_log_path)
+        assert rows[0]["op"] == "pr_create"
+        assert rows[0]["outcome"] == "created"
+        assert rows[0]["issue_number"] == 7
+        assert rows[0]["pr_number"] == 42
+
+    async def test_pr_create_denied_on_github_config(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """FORGE-FENCE PIN: a github-config client → pr_create raises
+        GitHubOpsDenied, audits outcome=denied, performs ZERO HTTP.
+
+        Also pins the ``github_ops.forge_denied`` log emission (builder
+        checklist #9) — observability of the policy block."""
+        cfg = _config(tmp_path)  # github default (forge_type omitted)
+        client = GitHubOpsClient(cfg)
+        monkeypatch.setattr(
+            github_ops_mod, "_github_request", _raises_if_called(),
+        )
+        with structlog.testing.capture_logs() as captured:
+            with pytest.raises(GitHubOpsDenied):
+                await client.pr_create(
+                    head="auto-fix/issue-7", base="main",
+                    title="WIP: x", body="Closes #7",
+                    caller="fix_drafter", issue_number=7,
+                )
+        rows = read_github_audit(cfg.audit_log_path)
+        assert len(rows) == 1
+        assert rows[0]["op"] == "pr_create"
+        assert rows[0]["outcome"] == "denied"
+        assert rows[0]["caller"] == "fix_drafter"
+        forge_logs = [
+            c for c in captured if c.get("event") == "github_ops.forge_denied"
+        ]
+        assert len(forge_logs) == 1
+        assert forge_logs[0]["op"] == "pr_create"
+        assert forge_logs[0]["forge_type"] == "github"
+
+    async def test_issue_list_and_pr_list_denied_on_github_config(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The forge-fence covers all three drafter ops, not just
+        pr_create — zero HTTP on a github client."""
+        cfg = _config(tmp_path)  # github default
+        client = GitHubOpsClient(cfg)
+        monkeypatch.setattr(
+            github_ops_mod, "_github_request", _raises_if_called(),
+        )
+        with pytest.raises(GitHubOpsDenied):
+            await client.issue_list(
+                labels="auto-fix", state="open", caller="fix_drafter",
+            )
+        with pytest.raises(GitHubOpsDenied):
+            await client.pr_list(state="all", caller="fix_drafter")
+        rows = read_github_audit(cfg.audit_log_path)
+        assert {r["op"] for r in rows} == {"issue_list", "pr_list"}
+        assert all(r["outcome"] == "denied" for r in rows)
+
+    async def test_drafter_op_denied_for_wrong_caller_on_forgejo(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Even on forgejo, pr_create is denied to a non-drafter caller —
+        the op×caller gate runs after the forge-fence passes."""
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        monkeypatch.setattr(
+            github_ops_mod, "_github_request", _raises_if_called(),
+        )
+        with pytest.raises(GitHubOpsDenied):
+            await client.pr_create(
+                head="auto-fix/issue-7", base="main",
+                title="WIP: x", body="Closes #7", caller="digest",
+            )
 
 
 # ---------------------------------------------------------------------------

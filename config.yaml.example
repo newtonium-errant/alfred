@@ -1136,3 +1136,68 @@ scaffold:
 # --- on VERA: ---
 # ticket_outcome:
 #   receiver_enabled: true
+
+# On-box auto-fix drafter — KAL-LE-ONLY, FORGEJO-ONLY (pipeline Phase 1B).
+# The Forgejo replacement for GitHub's claude-auto-fix.yml GH-Action: a
+# 5-minute scanner over open `auto-fix`-labeled Forgejo issues that drafts
+# a minimal fix in a throwaway shallow clone via a SANDBOXED `claude` run,
+# pushes auto-fix/issue-N, and opens a DRAFT PR (Closes #N). The operator
+# is the only merge authority (branch protection + the permanent pr_merge
+# matrix-deny). REPLACES the GH-Action drafter ONLY on the forgejo path;
+# a box still on `github` keeps its GH-Action drafter and never starts this.
+#
+# TRIPLE-GATE (the daemon stays INERT unless all three pass):
+#   1. auto-start: requires `fix_drafter.enabled: true` AND
+#      `github.forge_type: forgejo` (so a github-config box never starts it).
+#   2. daemon startup (_run_fix_drafter): exits 78 unless enabled + forgejo
+#      + instance/work_root/sandbox.vera_vault_root are all set.
+#   3. op-layer forge-fence: pr_create/issue_list/pr_list raise on a github
+#      client (github_ops._forge_fence) — never opens PRs on GitHub.
+#
+# INFRA PRECONDITIONS at cutover (NOT code — the operator deploys these):
+#   * a `kalle-drafter` unprivileged system user (no login, no sudo, cannot
+#     read VERA's PHI vault) for the systemd-run sandbox to drop to.
+#   * a localhost Anthropic forward-proxy CONNECT-allowlisting exactly
+#     api.anthropic.com:443 (sandbox egress is localhost-only).
+#   * the dedicated drafter Anthropic key in the box .env, referenced by
+#     name via sandbox.drafter_key_env (default ALGERNON_KALLE_DRAFTER_-
+#     ANTHROPIC_KEY) — NEVER hardcode the value here.
+#   * Forgejo branch protection on `main` (operator-only merge, required
+#     approvals) + kalle-bot collaborator role = Write (NOT Admin).
+# The git token is reused from github.pat (${ALGERNON_KALLE_FORGEJO_TOKEN});
+# no new token scope is required (write:repository covers push + pulls POST).
+# fix_drafter:
+#   enabled: true
+#   instance: "KAL-LE"             # must match github.instance / telegram.instance.name
+#   interval_minutes: 5
+#   clone_base_url: "http://127.0.0.1:3001"   # git http root (NOT /api/v1)
+#   base_branch: "main"            # the transport-admin-portal default branch
+#   work_root: "/var/lib/kalle-drafter/work"  # OUTSIDE /home (ProtectHome=tmpfs masks /home)
+#   max_empty_diff_retries: 2      # latch needs_human after N no-op drafts
+#   max_attempts: 5                # latch needs_human after N total fresh-draft attempts
+#   # RECORDS ISOLATION (load-bearing): the ONLY sandbox-writable dirs are the
+#   # per-issue clone (under work_root) + the bash-audit's PARENT dir. So
+#   # hook_audit_path lives in its OWN dedicated dir ALONGSIDE work_root,
+#   # OUTSIDE /home — and the AUTHORITATIVE records (state below + the github:
+#   # github_ops audit) MUST live elsewhere (here: /home/.alfred, masked by
+#   # ProtectHome, daemon-written). The daemon REFUSES to run (fail-closed)
+#   # if state or the github_ops audit resolves under work_root or the
+#   # bash-audit dir. The per-command bash-audit is best-effort + same-UID-
+#   # visible BY DESIGN (the model can tamper it); it is NOT authoritative.
+#   hook_audit_path: "/var/lib/kalle-drafter/audit/fix_drafter_bash_audit.jsonl"
+#   state:
+#     path: "/home/andrew/.alfred/kalle/data/fix_drafter_state.json"  # NOT under work_root / audit dir
+#   claude:
+#     timeout: 1200                # 20 min — drafting is slow
+#     # allowed_tools: [Read, Edit, Write, Glob, Grep, "Bash(pytest:*)", ...]
+#   sandbox:
+#     user: "kalle-drafter"
+#     group: "kalle-drafter"
+#     # launch_prefix: ["sudo"]    # if infra needs a privilege wrapper for systemd-run
+#     memory_max: "4G"
+#     tasks_max: 256
+#     anthropic_proxy_url: "http://127.0.0.1:8119"
+#     drafter_key_env: "ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY"
+#     vera_vault_root: "/home/andrew/dame-bluebird"   # disjointness assert + InaccessiblePaths
+#     box_env_path: "/home/andrew/.alfred/.env"        # belt-and-suspenders InaccessiblePaths
+# requires github.forge_type: forgejo + github.api_base: http://127.0.0.1:3001/api/v1
