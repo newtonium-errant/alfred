@@ -1741,6 +1741,38 @@ async def run(
             ),
             name="transport-server",
         )
+
+        def _on_transport_server_done(task: asyncio.Task) -> None:
+            """Supervise the transport server task.
+
+            ``run_server`` only returns/raises on the genuinely-fatal path
+            (zero bound, or loopback failed — see transport/server.py). A
+            normal shutdown cancels the task. Any OTHER completion means the
+            transport DIED while the daemon believes it's healthy — surface it
+            LOUDLY (intentionally-left-blank: a dead transport must never look
+            like idle) and trigger graceful daemon shutdown so systemd
+            restarts and re-attempts the bind, rather than leaving a healthy
+            daemon with a dead transport (silent orphan).
+            """
+            if task.cancelled():
+                return  # clean shutdown path — expected
+            exc = task.exception()
+            if exc is not None:
+                log.error(
+                    "transport.server.task_died",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+            elif not shutdown_event.is_set():
+                log.error(
+                    "transport.server.task_died",
+                    detail="run_server returned without a shutdown request",
+                )
+            else:
+                return  # returned because shutdown was requested — expected
+            shutdown_event.set()
+
+        transport_server_task.add_done_callback(_on_transport_server_done)
         # VERA MVP: tolerate AllowedUser or bare-int entry (see the
         # pending-items resolver site above for the getattr rationale).
         _sched_first_user = (

@@ -148,10 +148,24 @@ class _FakeRunner:
         self.cleaned = True
 
 
-def _install_fake_aiohttp(monkeypatch):
-    """Patch aiohttp.web AppRunner/TCPSite to record binds without sockets."""
+def _install_fake_aiohttp(monkeypatch, fail_hosts=()):
+    """Patch aiohttp.web AppRunner/TCPSite to record binds without sockets.
+
+    ``fail_hosts`` — addresses whose ``start()`` raises ``OSError`` (errno 99,
+    EADDRNOTAVAIL) to simulate a non-assignable bind (e.g. the WireGuard
+    overlay IP when wg0 is down). Returns ``(created, started, runners)`` —
+    ``runners`` lets a test assert ``cleanup()`` ran on the fatal path.
+    """
     created: list[tuple[str, int]] = []
     started: list[str] = []
+    runners: list[_FakeRunner] = []
+    fail = set(fail_hosts)
+
+    orig_runner_init = _FakeRunner.__init__
+
+    def _recording_init(self, app) -> None:
+        orig_runner_init(self, app)
+        runners.append(self)
 
     class _FakeSite:
         def __init__(self, runner, host, port) -> None:
@@ -161,11 +175,14 @@ def _install_fake_aiohttp(monkeypatch):
             created.append((host, port))
 
         async def start(self) -> None:
+            if self.host in fail:
+                raise OSError(99, "Cannot assign requested address")
             started.append(self.host)
 
+    monkeypatch.setattr(_FakeRunner, "__init__", _recording_init)
     monkeypatch.setattr("aiohttp.web.AppRunner", _FakeRunner)
     monkeypatch.setattr("aiohttp.web.TCPSite", _FakeSite)
-    return created, started
+    return created, started, runners
 
 
 async def test_run_server_string_host_single_site(
@@ -173,7 +190,7 @@ async def test_run_server_string_host_single_site(
 ) -> None:
     from alfred.transport.server import run_server
 
-    created, started = _install_fake_aiohttp(monkeypatch)
+    created, started, _runners = _install_fake_aiohttp(monkeypatch)
     cfg = TransportConfig(server=ServerConfig(host="127.0.0.1", port=8891))
     ev = asyncio.Event()
     ev.set()
@@ -198,7 +215,7 @@ async def test_run_server_list_host_binds_each(
 ) -> None:
     from alfred.transport.server import run_server
 
-    created, started = _install_fake_aiohttp(monkeypatch)
+    created, started, _runners = _install_fake_aiohttp(monkeypatch)
     cfg = TransportConfig(
         server=ServerConfig(host=["127.0.0.1", "10.99.0.1"], port=8894),
     )
@@ -217,6 +234,8 @@ async def test_run_server_list_host_binds_each(
     assert len(bound) == 1
     assert bound[0]["hosts"] == ["127.0.0.1", "10.99.0.1"]
     assert bound[0]["host_count"] == 2
+    assert bound[0]["failed"] == 0
+    assert bound[0]["port"] == 8894
 
 
 # --- health probe resolves to localhost when host is a list -----------------
@@ -283,3 +302,145 @@ def test_inject_transport_host_string_unchanged(
     _inject_transport_env_vars(raw)
     assert os.environ["ALFRED_TRANSPORT_HOST"] == "192.168.1.1"
     assert os.environ["ALFRED_TRANSPORT_PORT"] == "9999"
+
+
+# --- A: failure-isolated bind loop (the live-PHI robustness fix) -------------
+
+
+async def test_run_server_partial_bind_failure_keeps_loopback_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-assignable overlay address (wg0 down) must NOT abort the transport
+    — loopback stays up, the failure is warned, run_server does NOT propagate.
+
+    Would have FAILED against 58009e8: the un-guarded ``await site.start()``
+    raised OSError out of the loop → whole transport dead.
+    """
+    from alfred.transport.server import run_server
+
+    created, started, _runners = _install_fake_aiohttp(
+        monkeypatch, fail_hosts={"10.99.0.1"},
+    )
+    cfg = TransportConfig(
+        server=ServerConfig(host=["127.0.0.1", "10.99.0.1"], port=8894),
+    )
+    ev = asyncio.Event()
+    ev.set()
+    with structlog.testing.capture_logs() as cap:
+        await run_server(object(), cfg, shutdown_event=ev)  # must NOT raise
+
+    assert started == ["127.0.0.1"]  # loopback up; overlay failed
+    failed = [c for c in cap if c.get("event") == "transport.server.bind_failed"]
+    assert [c["host"] for c in failed] == ["10.99.0.1"]
+    bound = [c for c in cap if c.get("event") == "transport.server.bound"]
+    assert len(bound) == 1
+    assert bound[0]["hosts"] == ["127.0.0.1"]
+    assert bound[0]["failed"] == 1
+
+
+async def test_run_server_loopback_failure_is_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loopback (the co-located lifeline) failing → run_server RAISES even if
+    an overlay bound, so the daemon supervisor restarts. Cleanup still runs."""
+    from alfred.transport.server import run_server
+
+    _created, started, runners = _install_fake_aiohttp(
+        monkeypatch, fail_hosts={"127.0.0.1"},
+    )
+    cfg = TransportConfig(
+        server=ServerConfig(host=["127.0.0.1", "10.99.0.1"], port=8894),
+    )
+    ev = asyncio.Event()
+    ev.set()
+    with pytest.raises(RuntimeError):
+        await run_server(object(), cfg, shutdown_event=ev)
+    # The overlay may have bound, but loopback-failed is fatal regardless.
+    assert "127.0.0.1" not in started
+    # cleanup() ALWAYS runs on the failure path (no socket leak).
+    assert runners and runners[0].cleaned
+
+
+async def test_run_server_zero_bound_is_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every bind failing → run_server RAISES (nothing to serve)."""
+    from alfred.transport.server import run_server
+
+    _created, _started, runners = _install_fake_aiohttp(
+        monkeypatch, fail_hosts={"127.0.0.1", "10.99.0.1"},
+    )
+    cfg = TransportConfig(
+        server=ServerConfig(host=["127.0.0.1", "10.99.0.1"], port=8894),
+    )
+    ev = asyncio.Event()
+    ev.set()
+    with pytest.raises(RuntimeError):
+        await run_server(object(), cfg, shutdown_event=ev)
+    assert runners and runners[0].cleaned
+
+
+async def test_run_server_binds_loopback_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A misordered ``[overlay, loopback]`` config still attempts loopback
+    first (so a slow/failing overlay can't starve the lifeline)."""
+    from alfred.transport.server import run_server
+
+    created, started, _runners = _install_fake_aiohttp(monkeypatch)
+    cfg = TransportConfig(
+        server=ServerConfig(host=["10.99.0.1", "127.0.0.1"], port=8894),
+    )
+    ev = asyncio.Event()
+    ev.set()
+    await run_server(object(), cfg, shutdown_event=ev)
+    assert started[0] == "127.0.0.1"  # loopback attempted first despite order
+
+
+# --- C: wildcard fail-closed guard (never 0.0.0.0, in code not comment) ------
+
+
+def test_host_list_drops_wildcard_and_garbage() -> None:
+    """The single choke point DROPS any all-interfaces / un-resolvable entry
+    and NEVER falls back to a wildcard.
+
+    Would have FAILED against 58009e8: host_list() did a bare
+    ``normalize_host_list() or [LOOPBACK_HOST]`` — a configured ``0.0.0.0``
+    sailed through to an all-interfaces bind on the no-TLS PHI transport.
+    """
+    # int 0 → str-coerced "0" → getaddrinfo → 0.0.0.0 → wildcard → dropped.
+    assert ServerConfig(host=0).host_list() == ["127.0.0.1"]
+    # Explicit 0.0.0.0 in a list → dropped; the real address kept.
+    kept = ServerConfig(host=["127.0.0.1", "0.0.0.0"]).host_list()
+    assert "0.0.0.0" not in kept
+    assert kept == ["127.0.0.1"]
+    # IPv6 unspecified likewise.
+    assert "::" not in ServerConfig(host=["127.0.0.1", "::"]).host_list()
+    # All-garbage / all-wildcard → fail-safe to loopback, NEVER a wildcard.
+    assert ServerConfig(host=["0.0.0.0", "*", ""]).host_list() == ["127.0.0.1"]
+    assert ServerConfig(host="0.0.0.0").host_list() == ["127.0.0.1"]
+
+
+# --- E: full loopback recognition + IPv6-safe probe URL ----------------------
+
+
+def test_resolve_local_host_recognises_ipv6_and_localhost_loopback() -> None:
+    from alfred.transport.config import resolve_local_host
+
+    assert resolve_local_host(["::1", "10.99.0.1"]) == "::1"
+    assert resolve_local_host(["10.99.0.1", "::1"]) == "::1"
+    assert resolve_local_host(["localhost", "10.99.0.1"]) == "localhost"
+    assert resolve_local_host(["127.0.0.5", "10.99.0.1"]) == "127.0.0.5"
+
+
+async def test_health_probe_url_ipv6_safe() -> None:
+    """An ``::1`` loopback target must yield a bracketed, parseable URL."""
+    from alfred.transport.health import _check_port_reachable
+
+    raw = {
+        "transport": {
+            "server": {"host": ["10.99.0.1", "::1"], "port": 1},
+        },
+    }
+    result = await _check_port_reachable(raw)
+    assert result.data["url"] == "http://[::1]:1/health"

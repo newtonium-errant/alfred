@@ -130,7 +130,11 @@ async def _check_port_reachable(raw: dict[str, Any]) -> CheckResult:
     # a malformed URL like ``http://['127.0.0.1', ...]:8891/health``.
     host = resolve_local_host(server.get("host", "127.0.0.1"))
     port = server.get("port", 8891)
-    url = f"http://{host}:{port}/health"
+    # IPv6-safe URL: an IPv6 literal (e.g. a ``::1`` loopback target) MUST be
+    # bracketed, else ``http://::1:8891/health`` is unparseable. A ``:`` in the
+    # host means IPv6 → wrap it.
+    host_for_url = f"[{host}]" if ":" in host else host
+    url = f"http://{host_for_url}:{port}/health"
 
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:

@@ -40,7 +40,11 @@ from typing import Any
 
 from aiohttp import web
 
-from .config import DEFAULT_INGEST_MAX_BODY_CHARS, TransportConfig
+from .config import (
+    DEFAULT_INGEST_MAX_BODY_CHARS,
+    TransportConfig,
+    host_is_loopback,
+)
 from .state import TransportState
 from .utils import get_logger
 
@@ -1043,28 +1047,71 @@ async def run_server(
     never call this function.
     """
     runner = web.AppRunner(app)
-    await runner.setup()
-    # One TCPSite per bind address (a TCPSite binds a single host). The
-    # normalized host_list() is single-element for a string ``host``
-    # (byte-identical to the pre-Stage-3.5 single-bind path) and N-element
-    # for the multi-bind list form; every site shares the one AppRunner +
-    # the one port. Bind exactly the named addresses — never 0.0.0.0.
-    hosts = config.server.host_list()
-    for host in hosts:
-        site = web.TCPSite(runner, host=host, port=config.server.port)
-        await site.start()
+    # setup() + the bind loop live INSIDE the try so runner.cleanup() ALWAYS
+    # runs on the failure path (a partial-bind exception must not leak the
+    # AppRunner's sockets).
+    try:
+        await runner.setup()
+        # One TCPSite per bind address (a TCPSite binds a single host). The
+        # validated host_list() is single-element for a string ``host``
+        # (byte-identical to the pre-Stage-3.5 single-bind path) and N-element
+        # for the multi-bind list form; every site shares the one AppRunner +
+        # the one port. Bind exactly the named addresses — never 0.0.0.0.
+        #
+        # Bind LOOPBACK FIRST so a misordered config (e.g.
+        # ``[10.99.0.1, 127.0.0.1]``) can't starve loopback — the co-located
+        # lifeline (health probe + orchestrator env-inject target) must bind.
+        hosts = sorted(
+            config.server.host_list(),
+            key=lambda h: 0 if host_is_loopback(h) else 1,
+        )
+        bound: list[str] = []
+        loopback_failed = False
+        for host in hosts:
+            # Failure-isolate each bind: a non-assignable address (e.g. the
+            # WireGuard overlay IP when wg0 is down → OSError EADDRNOTAVAIL)
+            # must NOT abort the whole transport. Warn + continue; hard-fail
+            # only on the genuinely-fatal conditions below.
+            try:
+                site = web.TCPSite(runner, host=host, port=config.server.port)
+                await site.start()
+            except OSError as exc:
+                log.warning(
+                    "transport.server.bind_failed",
+                    host=host,
+                    port=config.server.port,
+                    error=str(exc),
+                )
+                if host_is_loopback(host):
+                    loopback_failed = True
+                continue
+            bound.append(host)
+            log.info(
+                "transport.server.listening",
+                host=host,
+                port=config.server.port,
+            )
+        # Hard-fail ONLY when nothing bound OR loopback specifically failed —
+        # loopback is the co-located lifeline, so its absence is fatal even if
+        # an overlay address bound. Raising propagates to the daemon's
+        # transport-task supervisor (telegram/daemon.py), which logs
+        # ``transport.server.task_died`` + triggers graceful shutdown so
+        # systemd restarts and re-attempts. Otherwise: proceed degraded-but-up.
+        if not bound or loopback_failed:
+            raise RuntimeError(
+                "transport bind failed (fatal): "
+                f"bound={bound} loopback_failed={loopback_failed} "
+                f"requested={hosts}"
+            )
+        # Truthful summary — the addresses that ACTUALLY bound + how many were
+        # dropped/failed (not a claim that everything in the list bound).
         log.info(
-            "transport.server.listening",
-            host=host,
+            "transport.server.bound",
+            hosts=bound,
+            host_count=len(bound),
+            failed=len(hosts) - len(bound),
             port=config.server.port,
         )
-    log.info(
-        "transport.server.bound",
-        hosts=hosts,
-        host_count=len(hosts),
-        port=config.server.port,
-    )
-    try:
         if shutdown_event is None:
             # Park forever — caller will cancel the task.
             while True:

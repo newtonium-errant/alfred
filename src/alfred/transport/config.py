@@ -14,6 +14,8 @@ loader.
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,71 @@ log = get_logger(__name__)
 # list. A co-located caller must reach the transport over loopback, not
 # an overlay/peer IP that also appears in the bind list.
 LOOPBACK_HOST: str = "127.0.0.1"
+
+
+def host_is_loopback(host: str) -> bool:
+    """True if ``host`` names a loopback target — the WHOLE loopback set, not
+    just ``127.0.0.1``: any ``127.0.0.0/8`` address, ``::1``, or ``"localhost"``.
+
+    A co-located caller (health probe, orchestrator env-inject) must reach the
+    transport over loopback; recognising the full set means ``["::1", ...]`` or
+    ``["localhost", ...]`` still resolves to a loopback target rather than the
+    overlay IP.
+    """
+    s = (host or "").strip()
+    if not s:
+        return False
+    if s.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(s).is_loopback
+    except ValueError:
+        return False
+
+
+def _classify_bind_host(host: str) -> str:
+    """Classify a bind-host candidate: ``"ok"`` | ``"wildcard"`` | ``"invalid"``.
+
+    Fail-CLOSED guard for ``host_list`` — on a PHI box with no TLS / rate-limit
+    on the transport, an all-interfaces bind is a policy breach, so we enforce
+    "never 0.0.0.0" in CODE, not a comment:
+
+      * ``"wildcard"`` — resolves to an unspecified/all-interfaces address
+        (``0.0.0.0`` / ``::``). Caught for IP literals via
+        ``ipaddress(...).is_unspecified`` AND for the numeric-string forms
+        (``"0"`` / ``"00"`` → ``getaddrinfo`` → ``0.0.0.0``) by resolving.
+      * ``"invalid"`` — empty, ``"*"``, the ``str``-coerced ``"None"`` / a
+        bogus port int, or anything that doesn't resolve to a real address.
+      * ``"ok"`` — a concrete, bindable, non-wildcard address.
+
+    ``getaddrinfo`` here is bounded: a bind address is an IP literal or
+    ``localhost`` (resolved locally), never a remote hostname, so there's no
+    meaningful DNS-hang risk at startup.
+    """
+    s = (host or "").strip()
+    if not s or s == "*":
+        return "invalid"
+    # Fast path: a clean IP literal.
+    try:
+        ip = ipaddress.ip_address(s)
+        return "wildcard" if ip.is_unspecified else "ok"
+    except ValueError:
+        pass
+    # Not an IP literal — resolve (catches "0"/"00" → 0.0.0.0, "localhost" → ok,
+    # rejects un-resolvable garbage like the str-coerced "None").
+    try:
+        infos = socket.getaddrinfo(s, None)
+    except (socket.gaierror, UnicodeError, OSError, ValueError):
+        return "invalid"
+    if not infos:
+        return "invalid"
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        try:
+            if ipaddress.ip_address(sockaddr[0]).is_unspecified:
+                return "wildcard"
+        except (ValueError, IndexError):
+            continue
+    return "ok"
 
 
 def normalize_host_list(value: Any) -> list[str]:
@@ -91,8 +158,11 @@ def resolve_local_host(value: Any, default: str = LOOPBACK_HOST) -> str:
         return default
     if len(hosts) == 1:
         return hosts[0]
-    if LOOPBACK_HOST in hosts:
-        return LOOPBACK_HOST
+    # Prefer ANY loopback target (127.0.0.0/8, ::1, "localhost"), not just the
+    # literal 127.0.0.1 — so ["::1", "10.99.0.1"] resolves to the loopback.
+    for h in hosts:
+        if host_is_loopback(h):
+            return h
     return hosts[0]
 
 
@@ -120,14 +190,34 @@ class ServerConfig:
     port: int = 8891
 
     def host_list(self) -> list[str]:
-        """Normalized, de-duplicated, order-preserved bind list.
+        """Normalized, de-duplicated, validated bind list — the SINGLE choke
+        point that enforces the bind allowlist.
 
-        A string ``host`` yields a single-element list (one ``TCPSite``);
-        a list yields each address once. Fail-safe: an empty/garbage
-        value falls back to ``[LOOPBACK_HOST]`` so the server never binds
-        nothing (which would silently take the transport offline).
+        A string ``host`` yields a single-element list (one ``TCPSite``); a
+        list yields each address once, order-preserved. Each entry is then
+        fail-CLOSED validated (:func:`_classify_bind_host`): any wildcard /
+        all-interfaces address (``0.0.0.0`` / ``::`` / ``"0"`` / ``"00"``) or
+        un-resolvable garbage (``"*"``, the ``str``-coerced ``"None"`` / a bogus
+        int) is DROPPED with a loud WARN — NEVER bound. This is why a PHI box
+        with no TLS on the transport can't be tricked into an all-interfaces
+        bind by config.
+
+        Fail-safe: if validation empties the list, fall back to
+        ``[LOOPBACK_HOST]`` — the server NEVER binds nothing (silent offline)
+        and NEVER falls back to a wildcard.
         """
-        return normalize_host_list(self.host) or [LOOPBACK_HOST]
+        kept: list[str] = []
+        for h in normalize_host_list(self.host):
+            verdict = _classify_bind_host(h)
+            if verdict == "ok":
+                kept.append(h)
+            else:
+                log.warning(
+                    "transport.server.host_dropped",
+                    host=h,
+                    reason=verdict,  # "wildcard" | "invalid"
+                )
+        return kept or [LOOPBACK_HOST]
 
     def host_display(self) -> str:
         """Human-readable bind list, comma-joined.
