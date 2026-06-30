@@ -127,13 +127,19 @@ def write_message_file(path: str | Path, record: MessageRecord) -> None:
 def validate_record(
     record: MessageRecord,
     registry: "ProjectRegistry | None" = None,
+    *,
+    valid_kinds: "frozenset[str] | None" = None,
 ) -> list[str]:
     """Return a list of validation errors (empty == valid).
 
     Structural checks (every required field present + a known ``kind``).
-    When ``registry`` is given, ALSO checks the destination is registered
-    (the ``unknown destination`` error, classified as *undeliverable*
-    rather than *malformed* by :func:`router.scan_spool`)."""
+    ``valid_kinds`` defaults to :data:`MESSAGE_KINDS`; the router widens it
+    to ``MESSAGE_KINDS | CONTRACT_KINDS`` so a Layer-2 contract message
+    (kind=propose/counter/…) is not malform-quarantined. When ``registry``
+    is given, ALSO checks the destination is registered (the ``unknown
+    destination`` error, classified as *undeliverable* rather than
+    *malformed* by :func:`router.scan_spool`)."""
+    accepted = valid_kinds if valid_kinds is not None else MESSAGE_KINDS
     errors: list[str] = []
     if not record.id:
         errors.append("missing id")
@@ -143,7 +149,7 @@ def validate_record(
         errors.append("missing to")
     if not record.kind:
         errors.append("missing kind")
-    elif record.kind not in MESSAGE_KINDS:
+    elif record.kind not in accepted:
         errors.append(f"invalid kind: {record.kind}")
     if not record.correlation_id:
         errors.append("missing correlation_id")

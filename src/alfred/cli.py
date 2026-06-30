@@ -3207,6 +3207,20 @@ def _msg_status(args: argparse.Namespace, config, wants_json: bool) -> None:
         print("  (no projects registered)")
 
 
+def cmd_contract(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred contract`` — Layer-2 contract negotiation.
+
+    ``check`` is the script build-gate (its exit code propagates), so this
+    handler ``sys.exit``s with the subcommand's return code."""
+    raw = _load_unified_config(args.config)
+    wants_json = bool(getattr(args, "json", False))
+    _setup_logging_from_config(
+        raw, tool="contracts", suppress_stdout=wants_json,
+    )
+    from alfred.contracts.cli import dispatch
+    sys.exit(dispatch(args, raw))
+
+
 def cmd_msg(args: argparse.Namespace) -> None:
     """Dispatcher for ``alfred msg`` — the inter-project message bus.
 
@@ -4216,6 +4230,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", default=False, help="Emit JSON",
     )
 
+    # contract — Layer-2 contract negotiation (the meet-in-the-middle gate)
+    from alfred.contracts.cli import build_subparser as _build_contract_subparser
+    _build_contract_subparser(sub)
+
     # instance — Stage 3.5 multi-instance scaffolding + Algernon
     # platform wrapper (Phase 1, 2026-05-28)
     instance_p = sub.add_parser(
@@ -4526,6 +4544,7 @@ def main() -> None:
         "routine": cmd_routine,
         "ticket-forward": cmd_ticket_forward,
         "msg": cmd_msg,
+        "contract": cmd_contract,
         "audit": cmd_audit,
         "scaffold": cmd_scaffold,
         "reviews": cmd_reviews,

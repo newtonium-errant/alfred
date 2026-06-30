@@ -39,6 +39,7 @@ from alfred.common.schedule import (
 from . import (
     attribution_section,
     canonical_proposals_section,
+    contracts_awaiting_section,
     email_section,
     friction_section,
     pending_items_section,
@@ -238,6 +239,12 @@ async def fire_once(
     # (the queue path lives under transport.canonical.proposals_path),
     # so it doesn't need set_vault_path.
     canonical_proposals_section.register()
+    # contracts_awaiting_section reads the contracts store itself (the
+    # store path lives under the contracts: config block), like
+    # canonical_proposals. Priority 16 — right after canonical proposals;
+    # both are operator-decision queues. Dormant: renders nothing until a
+    # contract converges or blocks.
+    contracts_awaiting_section.register()
     # pending_items_section reads queue + aggregate paths from the
     # pending_items config block. Priority 5 puts it ABOVE email at
     # 10. When raw_config is plumbed through, stash it so the section

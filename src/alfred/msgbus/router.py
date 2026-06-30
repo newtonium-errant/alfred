@@ -26,6 +26,7 @@ import structlog
 
 from .config import MessageBusConfig
 from .record import (
+    MESSAGE_KINDS,
     MessageRecord,
     message_filename,
     parse_message_file,
@@ -34,6 +35,16 @@ from .record import (
 )
 from .registry import ProjectRegistry
 from .state import MessageBusEntry, MessageBusState
+
+# Layer-2 contract kinds — imported from the pure contracts.schema (NO
+# msgbus↔contracts load cycle: schema imports nothing from msgbus; the
+# contracts.router import is lazy, inside run_route_once). The bus accepts
+# these kinds (so they aren't malform-quarantined) and dispatches them to
+# the contract solver instead of plain inbox-routing.
+from alfred.contracts.schema import CONTRACT_KINDS
+
+# Kinds the spool scanner accepts as structurally valid.
+_ACCEPTED_KINDS: frozenset[str] = MESSAGE_KINDS | CONTRACT_KINDS
 
 log = structlog.get_logger(__name__)
 
@@ -180,9 +191,11 @@ def scan_spool(
 
         # Structural validation (the id is mint-if-absent below, so a
         # missing id is NOT malformed — every OTHER missing field / bad
-        # kind is).
+        # kind is). Accept BOTH plain message kinds AND contract kinds so a
+        # Layer-2 contract message isn't malform-quarantined.
         structural = [
-            e for e in validate_record(record) if e != "missing id"
+            e for e in validate_record(record, valid_kinds=_ACCEPTED_KINDS)
+            if e != "missing id"
         ]
         if structural:
             log.warning(
@@ -248,14 +261,21 @@ async def run_route_once(
             error_type=exc.__class__.__name__,
         )
         empty = {
-            "scanned": 0, "routed": 0, "skipped_dup": 0,
-            "malformed": 0, "undeliverable": 0, "failed": 0,
+            "scanned": 0, "routed": 0, "contracts_applied": 0,
+            "skipped_dup": 0, "malformed": 0, "undeliverable": 0, "failed": 0,
         }
         log.info("msgbus.route.tick", scan_error=True, **empty)
         return {**empty, "scan_error": True, "results": [], "by_destination": {}}
 
     failed = 0
     post_mint_skipped = 0
+    contracts_applied = 0
+    runtime_undeliverable = 0
+    # Independent off-switch: contract messages are only dispatched to the
+    # solver when ``contracts.enabled``. A bus-on/contracts-off box cleanly
+    # quarantines them (cheap dict read — no contracts import for the gate,
+    # keeping the bus decoupled).
+    contracts_enabled = bool((raw.get("contracts") or {}).get("enabled"))
     results: list[dict[str, Any]] = []
     by_destination: dict[str, int] = {}
     # Count DISTINCT placed ids so `routed` can never exceed files actually
@@ -276,11 +296,57 @@ async def run_route_once(
             # saved in-loop per message, so this single check catches BOTH
             # the 2nd-identical-in-tick AND the cross-tick re-drop-after-drain
             # — without it, id-less messages were lost (intra-tick overwrite)
-            # and duplicated (re-delivered after drain).
+            # and duplicated (re-delivered after drain). For a CONTRACT
+            # message this also prevents a double-APPLY (a re-applied counter
+            # would double-bump the version).
             if record.id in state.entries or record.id in placed_ids:
                 post_mint_skipped += 1
                 _quarantine(src_path, spool_root, _ROUTED_DIR, "already_routed")
                 results.append({"id": record.id, "outcome": "skipped_dup"})
+                continue
+
+            # LAYER-2 DISPATCH: a contract-kind message is handed to the
+            # contract solver instead of being placed as a plain inbox
+            # message. Lazy import keeps the bus decoupled + dormant (only
+            # imported when such a message actually appears). The bus id is
+            # recorded in state (dedup) + the spool file archived, exactly
+            # like a routed message, so a re-drop is a no-op skip.
+            if record.kind in CONTRACT_KINDS:
+                if not contracts_enabled:
+                    # Off-switch: don't process contract messages on a box
+                    # with the bus on but contracts off — quarantine instead.
+                    log.warning(
+                        "msgbus.route.contracts_disabled",
+                        id=record.id, kind=record.kind,
+                    )
+                    _quarantine(
+                        src_path, spool_root, _UNDELIVERABLE_DIR,
+                        "contracts_disabled",
+                    )
+                    runtime_undeliverable += 1
+                    results.append({
+                        "id": record.id, "outcome": "contracts_disabled",
+                    })
+                    continue
+                from alfred.contracts.router import handle_bus_contract_message
+                cres = handle_bus_contract_message(
+                    src_path, registry=registry, raw=raw,
+                )
+                state.entries[record.id] = MessageBusEntry(
+                    id=record.id, from_project=record.from_project,
+                    to_project=record.to_project, kind=record.kind,
+                    correlation_id=record.correlation_id,
+                    routed_at=_now_iso(), dest_path="(contract)", attempts=1,
+                )
+                state.save()
+                _quarantine(src_path, spool_root, _ROUTED_DIR, "contract")
+                contracts_applied += 1
+                results.append({
+                    "id": record.id,
+                    "kind": record.kind,
+                    "outcome": "contract_applied" if cres.get("ok") else "contract_rejected",
+                    "contract_id": cres.get("contract_id", ""),
+                })
                 continue
 
             inbox = registry.inbox_for(record.to_project)
@@ -365,9 +431,10 @@ async def run_route_once(
         "scanned": scan.scanned,
         # Loss-safe: distinct placed ids, never more than files placed.
         "routed": len(placed_ids),
+        "contracts_applied": contracts_applied,
         "skipped_dup": scan.skipped_dup + post_mint_skipped,
         "malformed": scan.malformed,
-        "undeliverable": scan.undeliverable,
+        "undeliverable": scan.undeliverable + runtime_undeliverable,
         "failed": failed,
     }
     # ILB: every tick emits the summary so idle is distinguishable from broken.

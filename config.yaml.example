@@ -1243,3 +1243,30 @@ scaffold:
 #       inbox_path: "/home/andrew/transport-admin-portal/.msgbus/inbox"
 #     - name: aftermath-lab
 #       inbox_path: "/home/andrew/aftermath-lab/.msgbus/inbox"
+
+# Layer-2 contract negotiation — the meet-in-the-middle solver, built ON
+# the message bus above. The bus carries INFO; contracts carry AGREEMENT:
+# one KAL-LE-held versioned contract artifact per seam, six negotiation
+# kinds (propose/counter/accept/ratify/reject/block) that ride the bus, a
+# draft→proposed→countered→ratified→blocked state machine, and a build-gate
+# (`alfred contract check <id>` exits 0 only when ratified).
+#
+# Contracts are `.md`-under-data artifacts (`<store_path>/<id>.md`,
+# frontmatter = machine state, body = the interface spec), NOT vault
+# records (no schema.py / scope.py coupling).
+#
+# AUTHORITY: propose/counter/accept/block are agent actions (ride the bus,
+# actor must be a participant); ratify/reject are OPERATOR-ONLY via
+# `alfred contract ratify/reject` (an agent emitting ratify is fail-closed
+# rejected). DORMANT-SAFE: no daemon; with no contracts the CLI no-ops, the
+# bus dispatch hook only fires on a contract-kind message, the brief
+# section renders nothing.
+#
+# SERIAL-APPLY: the contract file is rewritten whole per apply — safe only
+# because the KAL-LE routing daemon is single-process. A parallelizing
+# router would need a lock.
+# contracts:
+#   enabled: true
+#   store_path: "/home/andrew/.alfred/kalle/data/contracts"   # <id>.md per contract
+#   audit_log_path: ""        # defaults to <store_path>/contract_audit.jsonl
+#   operator_id: "andrew"     # stamps ratified_by; the ratify/reject authority
