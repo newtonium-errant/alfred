@@ -609,6 +609,40 @@ def _run_fix_drafter(raw: dict[str, Any], suppress_stdout: bool = False) -> None
     asyncio.run(run_daemon(config, raw))
 
 
+def _run_message_bus(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
+    """Inter-project message bus routing daemon entry point (V1, KAL-LE).
+
+    Auto-starts when ``message_bus:`` is in config AND ``enabled: true``
+    — the kill-switch. ``sys.exit(78)`` unless enabled + a spool path +
+    ≥1 registered project (a misconfigured block never spins a useless
+    daemon). A box without the block never selects it (INERT).
+
+    Mirrors ``_run_ticket_forward`` — own log file, setup_logging wiring.
+    """
+    log_cfg = raw.get("logging", {})
+    log_file = f"{log_cfg.get('dir', './data')}/message_bus.log"
+    if suppress_stdout:
+        _silence_stdio(log_file)
+    from alfred.brief.utils import setup_logging
+    setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
+    from alfred.msgbus.config import load_message_bus_config
+    from alfred.msgbus.router import run_daemon
+    import sys
+    import structlog
+    log = structlog.get_logger(__name__)
+    config = load_message_bus_config(raw)
+    if not config.enabled:
+        log.warning("msgbus.daemon.disabled_in_config")
+        sys.exit(78)
+    if not config.spool_path:
+        log.warning("msgbus.daemon.missing_spool_path")
+        sys.exit(78)
+    if not config.projects:
+        log.warning("msgbus.daemon.no_projects")
+        sys.exit(78)
+    asyncio.run(run_daemon(config, raw))
+
+
 def _run_digest(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     """Digest daemon entry — KAL-LE weekly cross-arc synthesis.
 
@@ -959,6 +993,7 @@ TOOL_RUNNERS = {
     "brief_digest_push": _run_brief_digest_push,
     "ticket_forward": _run_ticket_forward,
     "fix_drafter": _run_fix_drafter,
+    "message_bus": _run_message_bus,
     "digest": _run_digest,
     "pending_items_pusher": _run_pending_items_pusher,
     "radar_day": _run_radar_day,
@@ -1047,6 +1082,9 @@ SPAWN_PRIORITY: tuple[str, ...] = (
     # scanner; FORGEJO-ONLY (triple-gated). Slots after ticket_forward
     # (its upstream in the pipeline).
     "fix_drafter",
+    # Inter-project message bus router (V1) — batch tier: 5-min
+    # filesystem scanner, nothing latency-sensitive at boot.
+    "message_bus",
     "digest",
     "radar_day",
     "friction_analyzer",
@@ -1184,6 +1222,14 @@ def run_all(
             and (raw.get("github") or {}).get("forge_type") == "forgejo"
         ):
             tools.append("fix_drafter")
+        # Inter-project message bus router (V1, KAL-LE coordinator).
+        # Auto-starts when ``message_bus:`` is in config AND
+        # ``enabled: true`` — the kill-switch. A box without the block
+        # never starts it (INERT). KAL-LE (the broker) turns it on; other
+        # instances carry the ``projects`` block read-only (for the brief
+        # section) with ``enabled`` off.
+        if "message_bus" in raw and (raw.get("message_bus") or {}).get("enabled"):
+            tools.append("message_bus")
         # KAL-LE weekly cross-arc digest. Auto-starts when ``digest:``
         # is in config AND ``enabled: true``. Default off so subordinates
         # that don't write digests don't fire one.
@@ -1311,7 +1357,7 @@ def run_all(
         # ``test_dispatcher_two_arg_branch_matches_two_arg_tools`` in
         # ``tests/orchestrator/test_tool_dispatch.py`` so a missing
         # entry trips a test rather than a TypeError on first spawn.
-        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "ticket_forward", "fix_drafter", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared", "routine"):
+        if tool in ("surveyor", "mail", "brief", "bit", "daily_sync", "brief_digest_push", "ticket_forward", "fix_drafter", "message_bus", "digest", "pending_items_pusher", "radar_day", "friction_analyzer", "cloudflared", "routine"):
             p = multiprocessing.Process(target=runner, args=(raw, suppress_stdout), name=f"alfred-{tool}")
         else:
             p = multiprocessing.Process(target=runner, args=(raw, skills_dir_str, suppress_stdout), name=f"alfred-{tool}")

@@ -1201,3 +1201,45 @@ scaffold:
 #     vera_vault_root: "/home/andrew/dame-bluebird"   # disjointness assert + InaccessiblePaths
 #     box_env_path: "/home/andrew/.alfred/.env"        # belt-and-suspenders InaccessiblePaths
 # requires github.forge_type: forgejo + github.api_base: http://127.0.0.1:3001/api/v1
+
+# Inter-project message bus (V1) — the KAL-LE coordinator's Layer 1.
+# A FILESYSTEM message bus: senders drop a frontmatter+body message-record
+# into ONE shared spool; the KAL-LE `message_bus` routing daemon validates
+# → dedups by stable id → atomically places it into the destination
+# project's `.msgbus/inbox/` → optionally pings the operator. Sessions
+# drain their inbox on start (`alfred msg inbox <project> drain`).
+#
+# Records are routing ENVELOPES (plain .md under `.msgbus/`), NOT vault
+# records — no schema.py / scope.py coupling.
+#
+# ONE-BOX ASSUMPTION (by settled design): every participating project lives
+# on the SAME machine, so routing is shared-filesystem reads/writes. If any
+# project ever leaves this box, the bus needs a git/HTTP transport (a v2
+# rebuild, not an extension).
+#
+# Cross-repo write perms: the KAL-LE router (one unix user) must be able to
+# write every project's `.msgbus/inbox/`; if a repo is owned by a different
+# user (e.g. the kalle-drafter sandbox user), the inbox dir needs a shared
+# group. Flag at deploy.
+#
+# KAL-LE (the broker) sets enabled:true + the registry. Other instances
+# carry the same `projects` block read-only with enabled:false. (The brief
+# inbound-messages section — render_inbound_messages_section — is built but
+# NOT yet auto-rendered in the morning brief; it lands at the
+# brief-integration/activation step. Today, drain via `alfred msg inbox`.)
+# message_bus:
+#   enabled: true                          # kill-switch (broker only)
+#   self_project: aftermath-lab            # default for `alfred msg inbox` (no arg)
+#   interval_minutes: 5
+#   spool_path: "/home/andrew/.msgbus/spool"   # neutral, per-user (+ routed/malformed/undeliverable)
+#   state:
+#     path: "/home/andrew/.alfred/kalle/data/message_bus_state.json"
+#   notify:
+#     telegram: true                       # optional operator ping on new inbound
+#   projects:
+#     - name: alfred
+#       inbox_path: "/home/andrew/alfred/.msgbus/inbox"
+#     - name: transport-admin-portal
+#       inbox_path: "/home/andrew/transport-admin-portal/.msgbus/inbox"
+#     - name: aftermath-lab
+#       inbox_path: "/home/andrew/aftermath-lab/.msgbus/inbox"

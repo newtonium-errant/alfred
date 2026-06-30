@@ -3007,6 +3007,237 @@ def cmd_surveyor_cleanup_alfred_tags(args: argparse.Namespace) -> None:
         print("\nRe-run with --apply to mutate the vault.")
 
 
+# ---------------------------------------------------------------------------
+# alfred msg — inter-project message bus (V1)
+# ---------------------------------------------------------------------------
+
+
+def _msg_send(args: argparse.Namespace, config) -> None:
+    """`alfred msg send` — mint an id + drop a valid message into the spool.
+
+    Structural-validate only (NOT against the registry — the sender need
+    not hold the full registry; the router quarantines an unknown ``to`` as
+    undeliverable). A fresh thread mints a ``correlation_id``; ``--reply-to``
+    + an echoed ``--correlation-id`` thread a reply."""
+    import uuid
+
+    from alfred.msgbus.record import (
+        MessageRecord,
+        _now_iso,
+        message_filename,
+        validate_record,
+        write_message_file,
+    )
+    from alfred.msgbus.router import mint_message_id
+
+    from_project = getattr(args, "from_project", "") or config.self_project
+    if not from_project:
+        print(
+            "alfred msg send: --from required (or set message_bus.self_project)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    body = ""
+    body_file = getattr(args, "body_file", "") or ""
+    body_inline = getattr(args, "body", "") or ""
+    if body_file:
+        body = sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8")
+    elif body_inline:
+        body = sys.stdin.read() if body_inline == "-" else body_inline
+
+    correlation_id = (
+        getattr(args, "correlation_id", "") or f"cnv-{uuid.uuid4().hex[:12]}"
+    )
+    created = _now_iso()
+    record = MessageRecord(
+        from_project=from_project,
+        to_project=args.to,
+        kind=args.kind,
+        correlation_id=correlation_id,
+        created=created,
+        subject=args.subject,
+        reply_to=getattr(args, "reply_to", "") or "",
+        precedence=getattr(args, "precedence", "") or "R",
+        body=body,
+    )
+    record.id = mint_message_id(
+        from_project, args.to, created, args.subject, body,
+    )
+
+    errors = validate_record(record)  # structural only (no registry)
+    if errors:
+        print(
+            "alfred msg send: invalid message — " + "; ".join(errors),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    dest = Path(config.spool_path) / message_filename(record)
+    write_message_file(dest, record)
+    print(f"queued {record.id} → {args.to} ({args.kind}) [{correlation_id}]")
+
+
+def _msg_inbox(args: argparse.Namespace, config) -> None:
+    """`alfred msg inbox [<project>] {list|read <id>|drain}`.
+
+    ``<project>`` defaults to ``message_bus.self_project`` (honors the
+    config doc — the no-arg form uses this instance's own project)."""
+    from alfred.msgbus.inbox import (
+        count_unread,
+        drain_inbox,
+        list_inbox,
+        read_message,
+    )
+
+    project = (getattr(args, "project", "") or "") or config.self_project
+    if not project:
+        print(
+            "alfred msg inbox: project required "
+            "(or set message_bus.self_project)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    registry = config.registry()
+    inbox = registry.inbox_for(project)
+    if inbox is None:
+        print(
+            f"alfred msg inbox: unknown project {project!r} "
+            f"(registry: {registry.names()})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    action = args.inbox_action
+    if action == "list":
+        records = list_inbox(inbox)
+        if not records:
+            # Intentionally-left-blank — explicit empty line.
+            print(f"  (inbox empty — 0 unread for {project})")
+        for r in records:
+            print(f"  {r.id}  [{r.kind}] {r.from_project} → {r.subject}")
+        print(f"unread: {count_unread(inbox)}")
+    elif action == "read":
+        mid = getattr(args, "message_id", "") or ""
+        if not mid:
+            print("alfred msg inbox read: message id required", file=sys.stderr)
+            sys.exit(1)
+        rec = read_message(inbox, mid)
+        if rec is None:
+            print(f"not found: {mid}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"# {rec.subject}\n"
+            f"id: {rec.id}  from: {rec.from_project}  kind: {rec.kind}  "
+            f"correlation: {rec.correlation_id}\n"
+        )
+        print(rec.body)
+    elif action == "drain":
+        drained = drain_inbox(inbox, mark_read=True)
+        if not drained:
+            print(f"  (nothing to drain — 0 unread for {project})")
+        for r in drained:
+            print(f"  drained {r.id}  [{r.kind}] {r.subject}")
+        print(f"drained: {len(drained)}")
+
+
+def _msg_route_once(
+    args: argparse.Namespace, config, raw: dict, wants_json: bool
+) -> None:
+    """`alfred msg route-once` — run one routing tick (the probe surface)."""
+    import asyncio
+
+    from alfred.msgbus.router import run_route_once
+
+    if not config.spool_path:
+        print("alfred msg route-once: no spool_path configured", file=sys.stderr)
+        sys.exit(1)
+    if not config.projects:
+        print("alfred msg route-once: no projects registered", file=sys.stderr)
+        sys.exit(1)
+
+    result = asyncio.run(run_route_once(config, raw))
+    if wants_json:
+        print(json.dumps(result, indent=2))
+    else:
+        for r in result.get("results", []):
+            bits = [r.get("outcome", "?"), r.get("id", ""), r.get("to", "")]
+            print("  " + " · ".join(str(b) for b in bits if b))
+        if not result.get("results"):
+            # Intentionally-left-blank — explicit zero-work line.
+            print("  (no messages to route)")
+        print(
+            f"tick: scanned={result['scanned']} routed={result['routed']} "
+            f"skipped_dup={result['skipped_dup']} "
+            f"malformed={result['malformed']} "
+            f"undeliverable={result['undeliverable']} "
+            f"failed={result['failed']}"
+        )
+    sys.exit(0 if not result.get("failed") else 1)
+
+
+def _msg_status(args: argparse.Namespace, config, wants_json: bool) -> None:
+    """`alfred msg status` — bus state + per-project unread counts."""
+    from alfred.msgbus.inbox import count_unread
+    from alfred.msgbus.state import MessageBusState
+
+    state = MessageBusState.load(config.state_path)
+    registry = config.registry()
+    per_project = {
+        name: count_unread(registry.inbox_for(name))
+        for name in registry.names()
+        if registry.inbox_for(name) is not None
+    }
+    summary = {
+        "enabled": config.enabled,
+        "spool_path": config.spool_path,
+        "routed_lifetime": len(state.entries),
+        "unread_by_project": per_project,
+    }
+    if wants_json:
+        print(json.dumps(summary, indent=2))
+        return
+    print(f"message bus: enabled={config.enabled} spool={config.spool_path}")
+    print(f"  routed (lifetime): {len(state.entries)}")
+    if per_project:
+        for name, n in sorted(per_project.items()):
+            print(f"  {name}: {n} unread")
+    else:
+        # Intentionally-left-blank — explicit empty-registry line.
+        print("  (no projects registered)")
+
+
+def cmd_msg(args: argparse.Namespace) -> None:
+    """Dispatcher for ``alfred msg`` — the inter-project message bus.
+
+    ``send`` mints + drops a message into the spool; ``inbox <project>
+    {list|read|drain}`` inspects/drains a project inbox; ``route-once`` is
+    the daemon's single-tick probe; ``status`` summarizes bus state."""
+    raw = _load_unified_config(args.config)
+    wants_json = bool(getattr(args, "json", False))
+    _setup_logging_from_config(
+        raw, tool="message_bus", suppress_stdout=wants_json,
+    )
+    from alfred.msgbus.config import load_message_bus_config
+
+    config = load_message_bus_config(raw)
+    subcmd = getattr(args, "msg_cmd", None)
+    if subcmd == "send":
+        _msg_send(args, config)
+    elif subcmd == "inbox":
+        _msg_inbox(args, config)
+    elif subcmd == "route-once":
+        _msg_route_once(args, config, raw, wants_json)
+    elif subcmd == "status":
+        _msg_status(args, config, wants_json)
+    else:
+        print(
+            "usage: alfred msg {send|inbox|route-once|status}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 # --- Argument parser ---
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3913,6 +4144,78 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", default=False, help="Emit JSON",
     )
 
+    # msg — inter-project message bus (V1): send / inbox / route-once / status
+    msg_p = sub.add_parser(
+        "msg",
+        help=(
+            "Inter-project message bus — send a message, drain a project "
+            "inbox, run the router, or show bus status"
+        ),
+    )
+    msg_sub = msg_p.add_subparsers(dest="msg_cmd")
+    msg_send = msg_sub.add_parser(
+        "send", help="Mint an id + drop a message into the spool",
+    )
+    msg_send.add_argument("--to", required=True, help="Destination project slug")
+    msg_send.add_argument(
+        "--kind", required=True,
+        choices=["handover", "request", "fyi", "reply"],
+    )
+    msg_send.add_argument("--subject", required=True, help="One-line title")
+    msg_send.add_argument(
+        "--from", dest="from_project", default="",
+        help="Sender project slug (default: message_bus.self_project)",
+    )
+    msg_send.add_argument(
+        "--correlation-id", dest="correlation_id", default="",
+        help="Thread id (default: mint a fresh one)",
+    )
+    msg_send.add_argument(
+        "--reply-to", dest="reply_to", default="",
+        help="id of the message being answered (on kind=reply)",
+    )
+    msg_send.add_argument(
+        "--precedence", default="R", choices=["Z", "O", "P", "R"],
+    )
+    msg_body = msg_send.add_mutually_exclusive_group()
+    msg_body.add_argument(
+        "--body-file", dest="body_file", default="",
+        help="Read the body from a file ('-' for stdin)",
+    )
+    msg_body.add_argument(
+        "--body", default="", help="Inline body ('-' for stdin)",
+    )
+    msg_inbox = msg_sub.add_parser(
+        "inbox", help="Inspect/drain a project inbox",
+    )
+    # project FIRST + optional (the `inbox <project> {list|read|drain}`
+    # surface). argparse assigns the lone token of `inbox list` to the
+    # required choices-positional, so project defaults to self_project —
+    # verified across all forms (project-first is the ONLY ordering that
+    # keeps `inbox <project> list` AND `inbox list` both parsing).
+    msg_inbox.add_argument(
+        "project", nargs="?", default="",
+        help="Project slug (default: message_bus.self_project)",
+    )
+    msg_inbox.add_argument(
+        "inbox_action", choices=["list", "read", "drain"],
+    )
+    msg_inbox.add_argument(
+        "message_id", nargs="?", default="", help="Message id (for read)",
+    )
+    msg_route = msg_sub.add_parser(
+        "route-once", help="Run one routing tick now (the probe surface)",
+    )
+    msg_route.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+    msg_status = msg_sub.add_parser(
+        "status", help="Show bus state + per-project unread counts",
+    )
+    msg_status.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON",
+    )
+
     # instance — Stage 3.5 multi-instance scaffolding + Algernon
     # platform wrapper (Phase 1, 2026-05-28)
     instance_p = sub.add_parser(
@@ -4222,6 +4525,7 @@ def main() -> None:
         "bit": cmd_bit,
         "routine": cmd_routine,
         "ticket-forward": cmd_ticket_forward,
+        "msg": cmd_msg,
         "audit": cmd_audit,
         "scaffold": cmd_scaffold,
         "reviews": cmd_reviews,

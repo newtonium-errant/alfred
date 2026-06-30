@@ -626,3 +626,79 @@ def test_fix_drafter_starts_on_forgejo_config(
     assert "fix_drafter" in started, (
         f"fix_drafter must start on a forgejo-config box, got {started}"
     )
+
+
+def _run_with_message_bus(
+    raw, orch_dirs, install_per_tool_fakes, fire_sentinel_after,
+):
+    all_fakes = dict(ALL_FAKES)
+    all_fakes["message_bus"] = fake_runner_2arg
+    _wire_touch_files(raw, orch_dirs, list(all_fakes))
+    install_per_tool_fakes({
+        t: (3 if t in {"curator", "janitor", "distiller", "instructor", "talker"} else 2)
+        for t in all_fakes
+    })
+    fire_sentinel_after(0.6)
+    orchestrator.run_all(
+        raw, only=None, skills_dir=orch_dirs["skills"],
+        pid_path=orch_dirs["pid_path"], live_mode=False,
+    )
+
+
+def test_message_bus_skipped_without_block(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """INERT: no ``message_bus`` block → router not started."""
+    raw = orchestrator_raw_config  # no message_bus block
+
+    _run_with_message_bus(raw, orch_dirs, install_per_tool_fakes, fire_sentinel_after)
+
+    for _ in range(30):
+        started = _read_started_tools(orch_dirs["data"])
+        if {"curator", "janitor", "distiller"}.issubset(started):
+            break
+        time.sleep(0.05)
+    assert "message_bus" not in started, (
+        f"message_bus must NOT start without its config block, got {started}"
+    )
+
+
+def test_message_bus_starts_when_enabled(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """``message_bus.enabled: true`` → router started (the broker box)."""
+    raw = orchestrator_raw_config
+    raw["message_bus"] = {"enabled": True}
+
+    _run_with_message_bus(raw, orch_dirs, install_per_tool_fakes, fire_sentinel_after)
+
+    for _ in range(30):
+        started = _read_started_tools(orch_dirs["data"])
+        if "message_bus" in started:
+            break
+        time.sleep(0.05)
+    assert "message_bus" in started, (
+        f"message_bus must start when enabled, got {started}"
+    )
+
+
+def test_message_bus_skipped_when_disabled(
+    orchestrator_raw_config, orch_dirs, fast_sleep,
+    install_per_tool_fakes, fire_sentinel_after,
+) -> None:
+    """``message_bus.enabled: false`` → router not started."""
+    raw = orchestrator_raw_config
+    raw["message_bus"] = {"enabled": False}
+
+    _run_with_message_bus(raw, orch_dirs, install_per_tool_fakes, fire_sentinel_after)
+
+    for _ in range(30):
+        started = _read_started_tools(orch_dirs["data"])
+        if {"curator", "janitor", "distiller"}.issubset(started):
+            break
+        time.sleep(0.05)
+    assert "message_bus" not in started, (
+        f"message_bus must NOT start when disabled, got {started}"
+    )

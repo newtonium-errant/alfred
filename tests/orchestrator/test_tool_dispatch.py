@@ -64,6 +64,10 @@ EXPECTED_TOOLS = {
     # with ``fix_drafter.enabled: true`` AND ``github.forge_type:
     # forgejo`` (the triple-gate's config layer).
     "fix_drafter",
+    # Inter-project message bus router (V1) — 5-min filesystem scanner
+    # routing message-records into per-project inboxes. Auto-starts on
+    # instances with ``message_bus.enabled: true`` (KAL-LE the broker).
+    "message_bus",
 }
 
 TWO_ARG_TOOLS = {
@@ -76,6 +80,7 @@ TWO_ARG_TOOLS = {
     "routine",
     "ticket_forward",
     "fix_drafter",
+    "message_bus",
 }
 THREE_ARG_TOOLS = {"curator", "janitor", "distiller", "instructor", "talker"}
 
