@@ -1044,11 +1044,24 @@ async def run_server(
     """
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host=config.server.host, port=config.server.port)
-    await site.start()
+    # One TCPSite per bind address (a TCPSite binds a single host). The
+    # normalized host_list() is single-element for a string ``host``
+    # (byte-identical to the pre-Stage-3.5 single-bind path) and N-element
+    # for the multi-bind list form; every site shares the one AppRunner +
+    # the one port. Bind exactly the named addresses — never 0.0.0.0.
+    hosts = config.server.host_list()
+    for host in hosts:
+        site = web.TCPSite(runner, host=host, port=config.server.port)
+        await site.start()
+        log.info(
+            "transport.server.listening",
+            host=host,
+            port=config.server.port,
+        )
     log.info(
-        "transport.server.listening",
-        host=config.server.host,
+        "transport.server.bound",
+        hosts=hosts,
+        host_count=len(hosts),
         port=config.server.port,
     )
     try:

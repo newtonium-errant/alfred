@@ -40,6 +40,62 @@ log = get_logger(__name__)
 # --- Dataclasses ------------------------------------------------------------
 
 
+# The loopback address the local health probe and the orchestrator's
+# ALFRED_TRANSPORT_HOST injection prefer when ``host`` is a multi-bind
+# list. A co-located caller must reach the transport over loopback, not
+# an overlay/peer IP that also appears in the bind list.
+LOOPBACK_HOST: str = "127.0.0.1"
+
+
+def normalize_host_list(value: Any) -> list[str]:
+    """De-duplicated, order-preserved bind list from a ``host`` value.
+
+    Accepts the back-compat string form (single bind → one-element list)
+    or the Stage 3.5 list form (``["127.0.0.1", "10.99.0.1"]`` → both,
+    de-duplicated, order-preserved). ``None`` / empty-string / empty-list
+    → ``[]`` (callers decide the fail-safe). Non-string scalars are
+    ``str``-coerced so a stray YAML value doesn't crash the loader.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        s = value.strip()
+        return [s] if s else []
+    if isinstance(value, (list, tuple)):
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in value:
+            s = str(item).strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+    s = str(value).strip()
+    return [s] if s else []
+
+
+def resolve_local_host(value: Any, default: str = LOOPBACK_HOST) -> str:
+    """Single loopback-preferred address from a ``host`` value (str|list).
+
+    Used where a co-located caller must reach the transport over a
+    loopback interface — the local health probe and the orchestrator's
+    ``ALFRED_TRANSPORT_HOST`` injection. A single host (string, or a
+    one-element list) passes through unchanged (full back-compat for the
+    pre-Stage-3.5 string case). For a multi-bind list, prefer an explicit
+    ``127.0.0.1`` if present, else the first entry. Empty / missing →
+    ``default`` (callers that must distinguish "unset" pass ``""``).
+    """
+    hosts = normalize_host_list(value)
+    if not hosts:
+        return default
+    if len(hosts) == 1:
+        return hosts[0]
+    if LOOPBACK_HOST in hosts:
+        return LOOPBACK_HOST
+    return hosts[0]
+
+
 @dataclass
 class ServerConfig:
     """HTTP server bind address.
@@ -49,10 +105,37 @@ class ServerConfig:
     connections from other hosts; until then, exposing the port to
     non-loopback interfaces is a policy mistake (no TLS, shared-secret
     auth, no rate-limiting outside per-chat Telegram floor).
+
+    ``host`` accepts either a single address string (the back-compat
+    default — one bind, byte-identical behavior) OR a list of addresses
+    (Stage 3.5 — bind every address in the list against the one shared
+    port). Use :meth:`host_list` to read the normalized bind list and
+    :meth:`host_display` for a human-readable render; never read ``host``
+    raw at a bind/probe site (a list value would break a ``str``-shaped
+    consumer). The list form is deliberately an explicit allowlist — we
+    bind exactly the named addresses and nothing else, never ``0.0.0.0``.
     """
 
-    host: str = "127.0.0.1"
+    host: str | list[str] = LOOPBACK_HOST
     port: int = 8891
+
+    def host_list(self) -> list[str]:
+        """Normalized, de-duplicated, order-preserved bind list.
+
+        A string ``host`` yields a single-element list (one ``TCPSite``);
+        a list yields each address once. Fail-safe: an empty/garbage
+        value falls back to ``[LOOPBACK_HOST]`` so the server never binds
+        nothing (which would silently take the transport offline).
+        """
+        return normalize_host_list(self.host) or [LOOPBACK_HOST]
+
+    def host_display(self) -> str:
+        """Human-readable bind list, comma-joined.
+
+        A single host renders byte-identically to the old ``host`` string
+        (e.g. ``"127.0.0.1"``); a list renders ``"127.0.0.1, 10.99.0.1"``.
+        """
+        return ", ".join(self.host_list())
 
 
 @dataclass

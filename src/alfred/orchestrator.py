@@ -260,12 +260,19 @@ def _inject_transport_env_vars(raw: dict[str, Any]) -> None:
     """
     import structlog
     from alfred._env import resolve_env_placeholders
+    from alfred.transport.config import resolve_local_host
 
     log = structlog.get_logger(__name__)
     transport = raw.get("transport", {}) or {}
 
     server = transport.get("server", {}) or {}
-    host = str(server.get("host", "") or "")
+    # ``host`` may be a single string (legacy) or a multi-bind list
+    # (Stage 3.5). The co-located transport client reaches the server over
+    # loopback, so resolve to a loopback-preferred single address rather
+    # than str()-ing the raw value (a list would inject the malformed
+    # literal "['127.0.0.1', ...]"). default="" preserves the existing
+    # "host unset → don't inject, client falls back to its own default".
+    host = resolve_local_host(server.get("host", ""), default="")
     port = server.get("port")
     if host and "ALFRED_TRANSPORT_HOST" not in os.environ:
         os.environ["ALFRED_TRANSPORT_HOST"] = host

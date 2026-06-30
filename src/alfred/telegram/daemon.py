@@ -1467,7 +1467,9 @@ async def run(
         )
         log.info(
             "talker.daemon.transport_configured",
-            host=transport_config.server.host,
+            # host_display() renders single-host byte-identically and a
+            # multi-bind list as "127.0.0.1, 10.99.0.1" (never a raw list).
+            host=transport_config.server.host_display(),
             port=transport_config.server.port,
             peers=list(transport_config.auth.tokens.keys()),
         )

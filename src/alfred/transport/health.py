@@ -25,7 +25,11 @@ import httpx
 
 from alfred.health.aggregator import register_check
 from alfred.health.types import CheckResult, Status, ToolHealth
-from alfred.transport.config import PeerEntry, load_from_unified
+from alfred.transport.config import (
+    PeerEntry,
+    load_from_unified,
+    resolve_local_host,
+)
 
 
 def _peer_attr(entry: "PeerEntry | dict[str, Any]", key: str) -> str:
@@ -120,7 +124,11 @@ async def _check_port_reachable(raw: dict[str, Any]) -> CheckResult:
     """
     transport_cfg = raw.get("transport", {}) or {}
     server = transport_cfg.get("server", {}) or {}
-    host = server.get("host", "127.0.0.1")
+    # The local probe must hit a loopback interface. ``host`` may be a
+    # single string (legacy) or a multi-bind list (Stage 3.5); resolve to
+    # a loopback-preferred single address so a list value never produces
+    # a malformed URL like ``http://['127.0.0.1', ...]:8891/health``.
+    host = resolve_local_host(server.get("host", "127.0.0.1"))
     port = server.get("port", 8891)
     url = f"http://{host}:{port}/health"
 

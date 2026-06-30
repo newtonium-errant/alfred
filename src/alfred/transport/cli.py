@@ -57,7 +57,9 @@ def cmd_status(raw: dict[str, Any], wants_json: bool = False) -> int:
     report = asyncio.run(health_check(raw, mode="quick"))
 
     payload: dict[str, Any] = {
-        "host": config.server.host,
+        # host_display() renders a single host byte-identically to the old
+        # string; a multi-bind list renders "127.0.0.1, 10.99.0.1".
+        "host": config.server.host_display(),
         "port": config.server.port,
         "pending_queue": len(state.pending_queue),
         "dead_letter": len(state.dead_letter),
@@ -80,7 +82,7 @@ def cmd_status(raw: dict[str, Any], wants_json: bool = False) -> int:
     print("=" * 60)
     print("TRANSPORT STATUS")
     print("=" * 60)
-    print(f"  Server:          {config.server.host}:{config.server.port}")
+    print(f"  Server:          {config.server.host_display()}:{config.server.port}")
     print(f"  Pending queue:   {len(state.pending_queue)}")
     print(f"  Dead-letter:     {len(state.dead_letter)}")
     print(f"  Send log (recent): {len(state.send_log)}")
