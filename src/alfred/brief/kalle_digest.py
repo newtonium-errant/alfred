@@ -484,15 +484,22 @@ def assemble_digest(
 #      scoreboard, all purely from the (just-updated) state.
 #
 # PR-DISCOVERY STRATEGY (one deterministic strategy, documented): scan
-# the issue timeline (GitHub returns it oldest-first) for the FIRST
-# ``cross-referenced`` event whose source is a pull request
-# (``source.issue.pull_request`` present) and take that PR's number.
-# ``issue_get``'s ``pull_request`` field was REJECTED as the primary
-# strategy: that field only exists when the issue itself IS a PR, never
-# when a PR merely references the issue — useless for "which PR fixes
-# this ticket". Once a PR number is captured in state, later checks
-# skip timeline discovery and go straight to pr_get (cheaper, and
-# stable against later unrelated cross-references).
+# the issue timeline for the FIRST cross-reference whose referenced
+# entity is a pull request. FORGE-AWARE — the timeline shape differs:
+#   * GitHub  — an event with ``event == "cross-referenced"`` and a
+#     ``source.issue`` that is a PR (``source.issue.pull_request``
+#     present).
+#   * Forgejo — a comment with a cross-ref ``type``
+#     (``pull_ref|issue_ref|comment_ref|commit_ref``) and a ``ref_issue``
+#     (a full Issue; a PR carries a truthy ``pull_request`` field).
+# In both, take the PR's ``number``. ``issue_get``'s ``pull_request``
+# field was REJECTED as the primary strategy: that field only exists when
+# the issue itself IS a PR, never when a PR merely references the issue —
+# useless for "which PR fixes this ticket". Once a PR number is captured
+# in state, later checks skip timeline discovery and go straight to
+# pr_get (cheaper, and stable against later unrelated cross-references).
+# forge_type threads from the github_ops client's config to the
+# dispatcher (``_first_cross_referenced_pr``).
 #
 # Concurrency note: the intake handler (talker process) and this
 # assembler (brief_digest_push process) share the state file via
@@ -558,8 +565,20 @@ def _nights_since(ts: Any, now: datetime) -> int | None:
     return max(0, (now.astimezone(timezone.utc).date() - parsed.date()).days)
 
 
-def _first_cross_referenced_pr(timeline: Any) -> int | None:
-    """The PR-discovery strategy (see the section comment above)."""
+# Forgejo timeline cross-reference comment types (the entity that
+# references this issue). A PR reference is distinguished from a plain
+# issue reference by ``ref_issue["pull_request"]`` being truthy, not by
+# the type alone — so accept any cross-ref type and gate on the
+# ref_issue shape.
+_FORGEJO_CROSS_REF_TYPES = frozenset({
+    "pull_ref", "issue_ref", "comment_ref", "commit_ref",
+})
+
+
+def _first_cross_referenced_pr_github(timeline: Any) -> int | None:
+    """GitHub PR-discovery: first ``cross-referenced`` event whose
+    ``source.issue`` is a PR (``pull_request`` present). Pre-port
+    behavior, unchanged."""
     if not isinstance(timeline, list):
         return None
     for event in timeline:
@@ -581,29 +600,76 @@ def _first_cross_referenced_pr(timeline: Any) -> int | None:
     return None
 
 
+def _first_cross_referenced_pr_forgejo(timeline: Any) -> int | None:
+    """Forgejo PR-discovery: first cross-ref comment (``type`` in the
+    cross-ref set) whose ``ref_issue`` is a PR (``pull_request`` truthy)."""
+    if not isinstance(timeline, list):
+        return None
+    for event in timeline:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") not in _FORGEJO_CROSS_REF_TYPES:
+            continue
+        ref_issue = event.get("ref_issue")
+        if not isinstance(ref_issue, dict):
+            continue
+        if not ref_issue.get("pull_request"):
+            continue  # the referencing entity is a plain issue — not a PR
+        number = ref_issue.get("number")
+        if isinstance(number, int) and not isinstance(number, bool):
+            return number
+    return None
+
+
+def _first_cross_referenced_pr(timeline: Any, forge_type: str = "github") -> int | None:
+    """Dispatch the PR-discovery strategy by forge type (see the section
+    comment above). GitHub and Forgejo expose different timeline shapes;
+    ``forge_type`` threads from the github_ops client's config."""
+    if forge_type == "forgejo":
+        return _first_cross_referenced_pr_forgejo(timeline)
+    return _first_cross_referenced_pr_github(timeline)
+
+
+# Review states meaning "changes were requested": GitHub uses
+# ``CHANGES_REQUESTED``, Forgejo uses ``REQUEST_CHANGES``. Accept BOTH
+# (a set membership check, no forge branch) so the merged_after_rework
+# derivation works on either forge.
+_REWORK_REVIEW_STATES = frozenset({"CHANGES_REQUESTED", "REQUEST_CHANGES"})
+
+
 async def _check_one_ticket_outcome(
     client: Any,
     entry: Any,
     *,
     now: datetime,
 ) -> bool:
-    """Evaluate one non-terminal issue-bearing entry against GitHub.
+    """Evaluate one non-terminal issue-bearing entry against the forge.
 
     Mutates the entry in place (the caller saves state) and returns
     True when the disposition CHANGED. Disposition rules (ratified):
-      * PR merged + zero CHANGES_REQUESTED reviews → ``merged_clean``
-      * PR merged + any CHANGES_REQUESTED review → ``merged_after_rework``
+      * PR merged + zero changes-requested reviews → ``merged_clean``
+      * PR merged + any changes-requested review → ``merged_after_rework``
+        (``CHANGES_REQUESTED`` on GitHub, ``REQUEST_CHANGES`` on Forgejo —
+        both accepted)
       * PR closed without merge → ``closed_unmerged``
       * no PR (or PR still open) AND the issue is
         ``TICKET_STALLED_NIGHTS``+ nights old → ``stalled`` (non-terminal)
       * else → leave as-is (``""`` stays ``""``)
+
+    Forge-aware: ``forge_type`` (from the client's config) selects the
+    timeline-shape parser; the review-state check accepts both forges'
+    enums without branching.
     """
+    forge_type = str(
+        getattr(getattr(client, "config", None), "forge_type", "github")
+        or "github"
+    )
     pr_number = entry.pr_number
     if pr_number is None:
         timeline = await client.issue_timeline(
             number=entry.issue_number, caller="digest",
         )
-        pr_number = _first_cross_referenced_pr(timeline)
+        pr_number = _first_cross_referenced_pr(timeline, forge_type)
 
     old_disposition = entry.disposition
     new_disposition = old_disposition
@@ -624,9 +690,11 @@ async def _check_one_ticket_outcome(
                 number=pr_number, caller="digest",
             )
             reviews = reviews if isinstance(reviews, list) else []
+            # Accept both forges' "changes requested" enums (see
+            # _REWORK_REVIEW_STATES) — no forge branch needed here.
             rework = any(
                 isinstance(review, dict)
-                and review.get("state") == "CHANGES_REQUESTED"
+                and review.get("state") in _REWORK_REVIEW_STATES
                 for review in reviews
             )
             new_disposition = (

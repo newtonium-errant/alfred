@@ -21,6 +21,7 @@ import structlog
 from alfred.brief.kalle_digest import (
     TICKET_TERMINAL_DISPOSITIONS,
     DigestData,
+    _first_cross_referenced_pr,
     assemble_digest,
     assemble_ticket_pipeline_section,
     check_ticket_outcomes,
@@ -450,11 +451,13 @@ class FakeDigestGitHubClient:
         prs: dict[int, dict[str, Any]] | None = None,
         reviews: dict[int, list[dict[str, Any]]] | None = None,
         timeline_exc: dict[int, BaseException] | None = None,
+        forge_type: str = "github",
     ) -> None:
         self.config = GitHubOpsConfig(
             repo="acme/site",
             pat="DUMMY_GITHUB_TEST_PAT",
             instance="KAL-LE",
+            forge_type=forge_type,
             audit_log_path=str(audit_path),
         )
         self.timelines = timelines or {}
@@ -488,7 +491,12 @@ class FakeDigestGitHubClient:
 
 
 def _xref_event(pr_number: int) -> dict[str, Any]:
-    """A timeline cross-referenced event whose source is a PR."""
+    """A GitHub timeline cross-referenced event whose source is a PR.
+
+    GitHub shape (the DEFAULT FakeDigestGitHubClient forge_type): an
+    ``event == "cross-referenced"`` + ``source.issue`` carrying a
+    ``pull_request``. The forgejo variant is ``_xref_event_forgejo``.
+    """
     return {
         "event": "cross-referenced",
         "source": {
@@ -500,6 +508,25 @@ def _xref_event(pr_number: int) -> dict[str, Any]:
                         f"{pr_number}"
                     ),
                 },
+            },
+        },
+    }
+
+
+def _xref_event_forgejo(pr_number: int) -> dict[str, Any]:
+    """A Forgejo timeline cross-ref comment whose ref_issue is a PR.
+
+    Forgejo shape: a ``type`` (cross-ref values pull_ref/issue_ref/...) +
+    a ``ref_issue`` (a full Issue; a PR carries a truthy ``pull_request``
+    field). NOT GitHub's ``event: cross-referenced`` + ``source.issue``.
+    """
+    return {
+        "type": "pull_ref",
+        "ref_issue": {
+            "number": pr_number,
+            "pull_request": {
+                "merged": False,
+                "url": f"https://git.algernon.test/acme/site/pulls/{pr_number}",
             },
         },
     }
@@ -800,7 +827,7 @@ async def test_check_outcomes_merged_after_rework(tmp_path: Path) -> None:
         timelines={7: [_xref_event(456)]},
         prs={456: {"state": "closed", "merged_at": "2026-06-11T00:00:00Z"}},
         reviews={456: [
-            {"state": "CHANGES_REQUESTED"},
+            {"state": "CHANGES_REQUESTED"},   # GitHub's enum (default fake)
             {"state": "APPROVED"},
         ]},
     )
@@ -809,6 +836,102 @@ async def test_check_outcomes_merged_after_rework(tmp_path: Path) -> None:
     )
     assert changed == 1
     assert state.entries["uid-1"].disposition == "merged_after_rework"
+
+
+# ---------------------------------------------------------------------------
+# Forge-aware — PR-discovery (timeline shape) + review-enum pins
+# ---------------------------------------------------------------------------
+
+
+def test_first_cross_referenced_pr_github_shape() -> None:
+    """BACKWARD-COMPAT: the github branch reads ``event ==
+    "cross-referenced"`` + ``source.issue`` (a PR). Default forge_type."""
+    assert _first_cross_referenced_pr([_xref_event(456)]) == 456
+    assert _first_cross_referenced_pr([_xref_event(456)], "github") == 456
+
+
+def test_first_cross_referenced_pr_forgejo_shape() -> None:
+    """PR-discovery pin (forgejo). A Forgejo timeline comment uses
+    ``type`` (cross-ref values) + ``ref_issue`` (a PR carries a truthy
+    ``pull_request``). FAILS against the pre-port code, which read only
+    GitHub's ``event``/``source.issue`` → returned None → every ticket
+    reports false 'stalled' forever."""
+    timeline = [
+        # a plain comment — no cross-ref type
+        {"type": "comment", "body": "looking into it"},
+        # a cross-ref whose ref_issue is a plain ISSUE, not a PR (skip)
+        {"type": "issue_ref", "ref_issue": {"number": 99}},
+        # the real PR cross-ref
+        _xref_event_forgejo(456),
+    ]
+    assert _first_cross_referenced_pr(timeline, "forgejo") == 456
+
+
+def test_cross_ref_shapes_dont_leak_across_forges() -> None:
+    """The branch is REAL: a github-shaped timeline parsed as forgejo (and
+    vice-versa) finds nothing — proving forge_type actually selects the
+    parser, not a both-shapes-accidentally-work fallback."""
+    assert _first_cross_referenced_pr([_xref_event(456)], "forgejo") is None
+    assert _first_cross_referenced_pr([_xref_event_forgejo(456)], "github") is None
+
+
+async def test_review_enum_accepts_both_forge_values(tmp_path: Path) -> None:
+    """Review-enum pin: BOTH GitHub's ``CHANGES_REQUESTED`` and Forgejo's
+    ``REQUEST_CHANGES`` drive merged_after_rework (set membership, no
+    branch). The REQUEST_CHANGES half FAILS against the pre-port code
+    (which matched only CHANGES_REQUESTED → rework never detected on
+    Forgejo → metric silently always merged_clean)."""
+    for enum_value in ("CHANGES_REQUESTED", "REQUEST_CHANGES"):
+        audit_path = tmp_path / f"audit_{enum_value}.jsonl"
+        state = _mem_state(tmp_path, {
+            "uid-1": TicketIntakeEntry(
+                recorded_at=_ago(days=2),
+                kalle_relpath="ticket/A.md",
+                issue_number=7,
+                issue_created_at=_ago(days=2),
+            ),
+        })
+        fake = FakeDigestGitHubClient(
+            audit_path,
+            timelines={7: [_xref_event(456)]},
+            prs={456: {"state": "closed", "merged_at": "2026-06-11T00:00:00Z"}},
+            reviews={456: [{"state": enum_value}]},
+        )
+        await check_ticket_outcomes(
+            state, fake, now=NOW, audit_log_path=str(audit_path),
+        )
+        assert state.entries["uid-1"].disposition == "merged_after_rework", enum_value
+
+
+async def test_forgejo_end_to_end_threads_forge_type_from_config(
+    tmp_path: Path,
+) -> None:
+    """End-to-end forgejo pin: a forge_type='forgejo' client → the digest
+    parses the Forgejo timeline shape (PR discovery) AND accepts
+    REQUEST_CHANGES. Proves forge_type threads config → client →
+    _check_one_ticket_outcome → _first_cross_referenced_pr."""
+    audit_path = tmp_path / "audit.jsonl"
+    state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=2),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(days=2),
+        ),
+    })
+    fake = FakeDigestGitHubClient(
+        audit_path,
+        forge_type="forgejo",
+        timelines={7: [_xref_event_forgejo(456)]},
+        prs={456: {"state": "closed", "merged_at": "2026-06-11T00:00:00Z"}},
+        reviews={456: [{"state": "REQUEST_CHANGES"}]},
+    )
+    await check_ticket_outcomes(
+        state, fake, now=NOW, audit_log_path=str(audit_path),
+    )
+    entry = state.entries["uid-1"]
+    assert entry.pr_number == 456            # forgejo timeline parsed
+    assert entry.disposition == "merged_after_rework"  # REQUEST_CHANGES accepted
 
 
 async def test_check_outcomes_closed_unmerged(tmp_path: Path) -> None:

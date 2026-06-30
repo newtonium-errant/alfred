@@ -727,6 +727,13 @@ brief:
   # newest-releases page, so a baseline that isn't on that page makes
   # all 20 newest releases candidates on the first check.
   #
+  # Multi-host: each watch may set its own ``api_base`` (default GitHub)
+  # and an OPTIONAL ``token`` / ``token_env`` (``token_env`` reads the
+  # named env var at load time and wins over a literal ``token``). A
+  # public GitHub watch needs neither; a private Forgejo repo needs a
+  # token or it 403/404s. The response shapes (PR state, releases) match
+  # across GitHub + Forgejo, so only the base + auth differ per item.
+  #
   # Example (the North Mini Code spike watches, 2026-06-11):
   # watches:
   #   - id: llamacpp-cohere2moe-pr
@@ -1014,19 +1021,31 @@ scaffold:
     - ".obsidian"
     - ".gitkeep"
 
-# GitHub ops — KAL-LE-ONLY GitHub access for the VERA→KAL-LE→GitHub
-# ticket pipeline (ratified 2026-06-11). Exactly one instance holds a
-# GitHub credential: a fine-grained PAT scoped to ONE repo with
-# Issues RW + Pull requests READ + Metadata R. Other instances leave
-# this block out entirely — ``build_github_client`` additionally
-# fail-louds when the running instance's name doesn't match
+# GitHub ops — KAL-LE-ONLY forge access for the VERA→KAL-LE→tracker
+# ticket pipeline (ratified 2026-06-11; Forgejo data-plane port
+# 2026-06-30). Exactly one instance holds the forge credential. Other
+# instances leave this block out entirely — ``build_github_client``
+# additionally fail-louds when the running instance's name doesn't match
 # ``instance`` below (the code-gate half of the privilege boundary).
 #
 # The env var name is operator-chosen and deliberately NOT
 # ALFRED_*-prefixed (it's an Algernon-platform credential, not a
 # legacy-namespace one).
 #
-# label_map: optional ticket_type / priority value → GitHub label(s).
+# forge_type: OPTIONAL, "github" (default) | "forgejo". Selects the
+# data-plane shapes. DEFAULT "github" is byte-identical to pre-port
+# behavior — a box still on GitHub is unaffected. Set "forgejo" (with a
+# Forgejo api_base) to opt into the sovereign-tracker shapes (per-repo
+# issue search, []int64 labels). Cutover AND rollback are a one-line flip
+# of forge_type + api_base. An unknown value warns + falls back to github.
+#
+# api_base: OPTIONAL forge base URL. Omitted → GitHub
+# (``https://api.github.com``). For a sovereign Forgejo point this at
+# ``https://git.<domain>/api/v1`` (and set forge_type: forgejo).
+# Authorization uses the ``token`` scheme + Accept: application/json,
+# which both GitHub and Forgejo accept (no per-forge header branch).
+#
+# label_map: optional ticket_type / priority value → forge label(s).
 # A value may be a single label ("bug") OR a list (["bug", "auto-fix"]);
 # bare strings normalize to 1-element lists, so the single-string form
 # still works. The resolved per-issue set is ``labels`` below + every
@@ -1041,6 +1060,13 @@ scaffold:
 # github:
 #   repo: "newtonium-errant/transport-admin-portal"
 #   pat: "${ALGERNON_KALLE_GITHUB_PAT}"
+#   # Default GitHub (forge_type + api_base omitted). To move this
+#   # instance to the sovereign Forgejo, set the two lines below — naming
+#   # the Forgejo org "newtonium-errant" keeps the repo string
+#   # byte-identical, so only forge_type + api_base + token change:
+#   #   forge_type: "forgejo"
+#   #   api_base: "https://git.algernon.example/api/v1"
+#   #   pat: "${ALGERNON_KALLE_FORGEJO_TOKEN}"
 #   # CASE-SENSITIVE: must equal telegram.instance.name EXACTLY
 #   # ("KAL-LE", not "kal-le") — build_github_client's instance gate
 #   # does a strict string compare and fail-louds on mismatch.

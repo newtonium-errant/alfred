@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -108,6 +109,16 @@ class WatchItemConfig:
     pattern: str = ""
     baseline_tag: str = ""
     on_flip_note: str = ""
+    # Multi-host support: per-item forge base URL (default GitHub) and an
+    # OPTIONAL per-item auth token. A private Forgejo repo 403/404s
+    # unauthenticated; public GitHub needs neither. ``token`` is the
+    # resolved value (the loader reads ``token_env`` from the environment
+    # when set, else falls back to a literal ``token``); ``token_env``
+    # is retained only for diagnostics. repr=False on the resolved token —
+    # it's a credential.
+    api_base: str = "https://api.github.com"
+    token: str = field(default="", repr=False)
+    token_env: str = ""
 
     def state_key(self) -> str:
         """Stable key for the persisted watch state. Explicit ``id`` wins.
@@ -277,6 +288,15 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
             number = int(w.get("number", 0) or 0)
         except (TypeError, ValueError):
             number = 0
+        # Resolve the optional per-item auth token: ``token_env`` (read
+        # from the environment at load time) wins over a literal
+        # ``token``. Left empty for public GitHub (the default). A private
+        # Forgejo repo needs one or its fetches 403/404.
+        token_env = str(w.get("token_env", "") or "")
+        if token_env:
+            resolved_token = os.environ.get(token_env, "") or ""
+        else:
+            resolved_token = str(w.get("token", "") or "")
         watches.append(WatchItemConfig(
             id=str(w.get("id", "") or ""),
             label=str(w.get("label", "") or ""),
@@ -286,6 +306,9 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
             pattern=str(w.get("pattern", "") or ""),
             baseline_tag=str(w.get("baseline_tag", "") or ""),
             on_flip_note=str(w.get("on_flip_note", "") or ""),
+            api_base=str(w.get("api_base", "") or "https://api.github.com"),
+            token=resolved_token,
+            token_env=token_env,
         ))
 
     # Resolved-key hygiene (review nit a1): an empty ``id`` means the

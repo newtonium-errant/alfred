@@ -63,9 +63,11 @@ def _release_item(**overrides) -> WatchItemConfig:  # type: ignore[no-untyped-de
 
 
 def _patch_pr(monkeypatch, payload, *, calls: list | None = None):  # type: ignore[no-untyped-def]
-    async def _fake(client, repo, number):  # type: ignore[no-untyped-def]
+    # The fetchers now take per-item ``api_base`` + ``auth_token`` kwargs
+    # (multi-host Forgejo port). The fake accepts and records them.
+    async def _fake(client, repo, number, *, api_base="", auth_token=""):  # type: ignore[no-untyped-def]
         if calls is not None:
-            calls.append((repo, number))
+            calls.append((repo, number, api_base, auth_token))
         if isinstance(payload, Exception):
             raise payload
         return payload
@@ -74,9 +76,9 @@ def _patch_pr(monkeypatch, payload, *, calls: list | None = None):  # type: igno
 
 
 def _patch_releases(monkeypatch, payload, *, calls: list | None = None):  # type: ignore[no-untyped-def]
-    async def _fake(client, repo):  # type: ignore[no-untyped-def]
+    async def _fake(client, repo, *, api_base="", auth_token=""):  # type: ignore[no-untyped-def]
         if calls is not None:
-            calls.append(repo)
+            calls.append((repo, api_base, auth_token))
         if isinstance(payload, Exception):
             raise payload
         return payload
@@ -167,6 +169,54 @@ async def test_pr_reopen_flip_is_loud_then_quiet(tmp_path, monkeypatch) -> None:
     assert FLIP_MARKER in out2 and "MERGED" in out2
     out3 = await check_and_format_watches([_pr_item()], state_path)
     assert DONE_TAIL in out3 and FLIP_MARKER not in out3
+
+
+# ---------------------------------------------------------------------------
+# Multi-host (Forgejo port) — per-item api_base + optional auth threading
+# ---------------------------------------------------------------------------
+
+_FORGEJO_BASE = "https://git.algernon.test/api/v1"
+_DUMMY_FORGEJO_TOKEN = "DUMMY_FORGEJO_TEST_TOKEN"
+
+
+async def test_pr_item_threads_api_base_and_auth_token(tmp_path, monkeypatch) -> None:
+    """● Multi-host pin: a watch's per-item ``api_base`` + ``token`` reach
+    the fetcher. A private Forgejo repo 403/404s without the token; a
+    GitHub watch and a Forgejo watch coexist with different bases. FAILS
+    against pre-port ``_fetch_pr`` (no api_base/auth_token params →
+    TypeError on the keyword call)."""
+    calls: list = []
+    _patch_pr(monkeypatch, {"state": "open", "merged_at": None}, calls=calls)
+    item = _pr_item(api_base=_FORGEJO_BASE, token=_DUMMY_FORGEJO_TOKEN)
+    await check_and_format_watches([item], tmp_path / "s.json")
+    assert len(calls) == 1
+    _repo, _number, api_base, auth_token = calls[0]
+    assert api_base == _FORGEJO_BASE
+    assert auth_token == _DUMMY_FORGEJO_TOKEN
+
+
+async def test_release_item_threads_api_base_and_auth_token(tmp_path, monkeypatch) -> None:
+    calls: list = []
+    _patch_releases(monkeypatch, _RELEASES_NO_MATCH, calls=calls)
+    item = _release_item(api_base=_FORGEJO_BASE, token=_DUMMY_FORGEJO_TOKEN)
+    await check_and_format_watches([item], tmp_path / "s.json")
+    assert len(calls) == 1
+    _repo, api_base, auth_token = calls[0]
+    assert api_base == _FORGEJO_BASE
+    assert auth_token == _DUMMY_FORGEJO_TOKEN
+
+
+async def test_github_watch_defaults_to_github_base_unauthenticated(
+    tmp_path, monkeypatch,
+) -> None:
+    """A plain GitHub watch (no api_base/token configured) still works:
+    default GitHub base, empty auth (back-compat during cutover)."""
+    calls: list = []
+    _patch_pr(monkeypatch, {"state": "open", "merged_at": None}, calls=calls)
+    await check_and_format_watches([_pr_item()], tmp_path / "s.json")
+    _repo, _number, api_base, auth_token = calls[0]
+    assert api_base == "https://api.github.com"
+    assert auth_token == ""
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +540,56 @@ def test_load_from_unified_defaults_to_no_watches() -> None:
 
     cfg = load_from_unified({"brief": {}})
     assert cfg.watches == []
+
+
+def test_load_from_unified_parses_api_base_and_token(monkeypatch) -> None:
+    """Forgejo port: per-item ``api_base`` loads verbatim; ``token_env``
+    resolves from the environment at load time and wins over a literal
+    ``token``; omitting both = GitHub default base, no auth."""
+    from alfred.brief.config import load_from_unified
+
+    monkeypatch.setenv("ALGERNON_TEST_WATCH_TOKEN", "DUMMY_FORGEJO_TEST_TOKEN")
+    cfg = load_from_unified({
+        "brief": {
+            "watches": [
+                {"id": "fj", "type": "github_pr", "repo": "o/r", "number": 1,
+                 "api_base": "https://git.algernon.test/api/v1",
+                 "token_env": "ALGERNON_TEST_WATCH_TOKEN"},
+                {"id": "gh", "type": "github_pr", "repo": "o/r", "number": 2},
+                {"id": "lit", "type": "github_pr", "repo": "o/r", "number": 3,
+                 "token": "DUMMY_LITERAL_TEST_TOKEN"},
+            ],
+        },
+    })
+    by_id = {w.id: w for w in cfg.watches}
+    # token_env resolves from the environment
+    assert by_id["fj"].api_base == "https://git.algernon.test/api/v1"
+    assert by_id["fj"].token == "DUMMY_FORGEJO_TEST_TOKEN"
+    assert by_id["fj"].token_env == "ALGERNON_TEST_WATCH_TOKEN"
+    # default base, no auth
+    assert by_id["gh"].api_base == "https://api.github.com"
+    assert by_id["gh"].token == ""
+    # literal token fallback (no token_env)
+    assert by_id["lit"].token == "DUMMY_LITERAL_TEST_TOKEN"
+
+
+def test_load_from_unified_token_env_unset_yields_empty(monkeypatch) -> None:
+    """An unset ``token_env`` resolves to empty (no crash) — the fetch
+    then runs unauthenticated and a private repo surfaces a watch-error
+    line, not a load failure."""
+    from alfred.brief.config import load_from_unified
+
+    monkeypatch.delenv("ALGERNON_TEST_MISSING_TOKEN", raising=False)
+    cfg = load_from_unified({
+        "brief": {
+            "watches": [
+                {"id": "fj", "type": "github_pr", "repo": "o/r", "number": 1,
+                 "token_env": "ALGERNON_TEST_MISSING_TOKEN"},
+            ],
+        },
+    })
+    assert cfg.watches[0].token == ""
+    assert cfg.watches[0].token_env == "ALGERNON_TEST_MISSING_TOKEN"
 
 
 def test_loader_warns_on_non_dict_entry_and_missing_id() -> None:

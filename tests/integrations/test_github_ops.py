@@ -37,9 +37,17 @@ from alfred.integrations import github_ops as github_ops_mod
 
 DUMMY_PAT = "DUMMY_GITHUB_TEST_PAT"
 TEST_REPO = "newtonium-errant/transport-admin-portal"
+TEST_OWNER, TEST_NAME = TEST_REPO.split("/")
+GITHUB_API_BASE = "https://api.github.com"
+# Sovereign Forgejo base — forge_type is config-selected; the forgejo
+# fixtures opt in via _forgejo_config / _forgejo_raw. The DEFAULT _config
+# is GitHub (forge_type/api_base omitted) — the byte-identical baseline.
+FORGEJO_API_BASE = "https://git.algernon.test/api/v1"
 
 
 def _config(tmp_path: Path, **overrides) -> GitHubOpsConfig:
+    """GitHub-default config (forge_type/api_base left at the dataclass
+    defaults) — the pre-port behavior baseline."""
     kwargs = dict(
         repo=TEST_REPO,
         pat=DUMMY_PAT,
@@ -48,6 +56,16 @@ def _config(tmp_path: Path, **overrides) -> GitHubOpsConfig:
     )
     kwargs.update(overrides)
     return GitHubOpsConfig(**kwargs)
+
+
+def _forgejo_config(tmp_path: Path, **overrides) -> GitHubOpsConfig:
+    """Forgejo-selected config (forge_type=forgejo + a Forgejo base)."""
+    return _config(
+        tmp_path,
+        forge_type="forgejo",
+        api_base=FORGEJO_API_BASE,
+        **overrides,
+    )
 
 
 def _raw(tmp_path: Path, **overrides) -> dict:
@@ -59,6 +77,15 @@ def _raw(tmp_path: Path, **overrides) -> dict:
     )
     section.update(overrides)
     return {"github": section}
+
+
+def _forgejo_raw(tmp_path: Path, **overrides) -> dict:
+    return _raw(
+        tmp_path,
+        forge_type="forgejo",
+        api_base=FORGEJO_API_BASE,
+        **overrides,
+    )
 
 
 def _response(
@@ -90,6 +117,31 @@ class _CapturingRequest:
         return self.response
 
 
+class _RoutingRequest:
+    """Monkeypatch stand-in routing each call to a (method, url-substring)
+    response. Needed since ``issue_create`` now makes TWO calls — the
+    Forgejo ``GET /labels`` name→id pre-fetch, then the issue POST. A call
+    matching no route raises (a missed endpoint is a loud failure, never a
+    silent None)."""
+
+    def __init__(self, routes: list[tuple[str, str, httpx.Response]]) -> None:
+        self.routes = routes
+        self.calls: list[dict] = []
+
+    async def __call__(self, method, url, *, headers, params=None, json_body=None):
+        self.calls.append({
+            "method": method,
+            "url": url,
+            "headers": headers,
+            "params": params,
+            "json_body": json_body,
+        })
+        for m, substr, resp in self.routes:
+            if method == m and substr in url:
+                return resp
+        raise AssertionError(f"no route for {method} {url}")
+
+
 # ---------------------------------------------------------------------------
 # THE MATRIX PIN — contract freeze
 # ---------------------------------------------------------------------------
@@ -108,6 +160,7 @@ class TestMatrixPin:
         assert GITHUB_OPS == {
             "issue_create":    frozenset({"ticket_intake"}),
             "issue_label_add": frozenset({"ticket_intake"}),
+            "label_list":      frozenset({"ticket_intake"}),
             "issue_search":    frozenset({"ticket_intake"}),
             "issue_get":       frozenset({"digest"}),
             "issue_timeline":  frozenset({"digest"}),
@@ -290,6 +343,54 @@ class TestLoadGithubConfig:
         ]
         assert len(stripped) == 1
         assert stripped[0]["location"] == "base-labels"
+
+    def test_api_base_is_config_driven(self, tmp_path: Path) -> None:
+        """The forge base is config-driven: an explicit ``api_base`` is
+        loaded verbatim; omitting it falls back to the GitHub default."""
+        cfg = load_github_config(_raw(tmp_path, api_base=FORGEJO_API_BASE))
+        assert cfg is not None
+        assert cfg.api_base == FORGEJO_API_BASE
+
+    def test_api_base_defaults_to_github_when_absent(self) -> None:
+        cfg = load_github_config({"github": {"repo": TEST_REPO}})
+        assert cfg is not None
+        assert cfg.api_base == GITHUB_API_BASE
+
+    def test_forge_type_defaults_to_github(self, tmp_path: Path) -> None:
+        """BACKWARD-COMPAT: an omitted forge_type → 'github' (the
+        byte-identical-to-pre-port path). A box still on GitHub config is
+        unaffected by this deploy."""
+        cfg = load_github_config(_raw(tmp_path))  # no forge_type key
+        assert cfg is not None
+        assert cfg.forge_type == "github"
+        assert cfg.api_base == GITHUB_API_BASE
+
+    def test_forge_type_loads_forgejo(self, tmp_path: Path) -> None:
+        cfg = load_github_config(_forgejo_raw(tmp_path))
+        assert cfg is not None
+        assert cfg.forge_type == "forgejo"
+        assert cfg.api_base == FORGEJO_API_BASE
+
+    def test_forge_type_normalized_lowercase(self, tmp_path: Path) -> None:
+        cfg = load_github_config(_raw(tmp_path, forge_type="ForgeJo"))
+        assert cfg is not None
+        assert cfg.forge_type == "forgejo"
+
+    def test_unknown_forge_type_warns_and_falls_back_to_github(
+        self, tmp_path: Path,
+    ) -> None:
+        """A typo (``forgejoo``) must NOT silently select wrong shapes —
+        warn + fall back to the known-good github path."""
+        with structlog.testing.capture_logs() as captured:
+            cfg = load_github_config(_raw(tmp_path, forge_type="forgejoo"))
+        assert cfg is not None
+        assert cfg.forge_type == "github"
+        warns = [
+            c for c in captured
+            if c.get("event") == "github.config.unknown_forge_type"
+        ]
+        assert len(warns) == 1
+        assert warns[0]["forge_type"] == "forgejoo"
 
     def test_env_substitution_is_local(self, monkeypatch) -> None:
         """The unified loader does NOT substitute ${VAR}; this loader
@@ -486,8 +587,19 @@ class TestBuildGithubClient:
 
 
 class TestIssueCreate:
-    async def test_happy_path(self, tmp_path: Path, monkeypatch) -> None:
-        cfg = _config(tmp_path)
+    @staticmethod
+    def _labels_response(labels: list[dict]) -> httpx.Response:
+        return _response(200, labels, url=f"{FORGEJO_API_BASE}/x/labels")
+
+    async def test_github_path_posts_label_names_unchanged(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """BACKWARD-COMPAT: on the default GitHub config, issue_create
+        POSTs label NAME strings directly — NO labels GET pre-fetch,
+        single call, github.com URL, and the EXACT pre-port headers
+        (``Bearer`` + ``application/vnd.github+json``) — byte-identical to
+        pre-port."""
+        cfg = _config(tmp_path)  # github default
         client = GitHubOpsClient(cfg)
         fake = _CapturingRequest(_response(
             201,
@@ -504,28 +616,219 @@ class TestIssueCreate:
             caller="ticket_intake",
             correlation_id="corr-1",
         )
-
-        assert result == {
-            "number": 42,
-            "html_url": f"https://github.com/{TEST_REPO}/issues/42",
-        }
-        assert len(fake.calls) == 1
+        assert result["number"] == 42
+        assert len(fake.calls) == 1  # POST only — no labels GET on github
         call = fake.calls[0]
         assert call["method"] == "POST"
         assert call["url"] == f"https://api.github.com/repos/{TEST_REPO}/issues"
+        # GitHub headers byte-identical to pre-port (Bearer + vnd.github+json).
         assert call["headers"]["Authorization"] == f"Bearer {DUMMY_PAT}"
         assert call["headers"]["Accept"] == "application/vnd.github+json"
-        assert call["headers"]["User-Agent"] == "algernon-github-ops"
+        # Names POSTed unchanged (NOT resolved to ints).
         assert call["json_body"]["labels"] == ["auto-fix", "bug"]
-        assert call["json_body"]["title"] == "VERA: portal 500 on login"
+        rows = read_github_audit(cfg.audit_log_path)
+        assert [r["op"] for r in rows] == ["issue_create"]  # no label_list row
+        assert rows[0]["outcome"] == "created"
 
+    async def test_forgejo_resolves_label_ids(self, tmp_path: Path, monkeypatch) -> None:
+        """Forgejo flow: a GET /labels name→id pre-fetch resolves the
+        config NAME strings to integer IDs, then the POST body carries
+        []int64 — never the names (Forgejo drops name-labels silently).
+        Headers use the ``token`` scheme + ``application/json``."""
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        labels_resp = self._labels_response([
+            {"id": 10, "name": "auto-fix"},
+            {"id": 20, "name": "bug"},
+            {"id": 30, "name": "enhancement"},
+        ])
+        create_resp = _response(
+            201,
+            {"number": 42, "html_url": f"{FORGEJO_API_BASE}/{TEST_REPO}/issues/42"},
+            method="POST",
+        )
+        fake = _RoutingRequest([
+            ("GET", f"/repos/{TEST_OWNER}/{TEST_NAME}/labels", labels_resp),
+            ("POST", f"/repos/{TEST_REPO}/issues", create_resp),
+        ])
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+
+        result = await client.issue_create(
+            title="VERA: portal 500 on login",
+            body=f"details\n\n{issue_marker('t-42')}",
+            labels=["auto-fix", "bug"],
+            ticket_uid="t-42",
+            caller="ticket_intake",
+            correlation_id="corr-1",
+        )
+
+        assert result == {
+            "number": 42,
+            "html_url": f"{FORGEJO_API_BASE}/{TEST_REPO}/issues/42",
+        }
+        # Two calls: labels GET (name→id), then issue POST.
+        assert len(fake.calls) == 2
+        labels_call = fake.calls[0]
+        assert labels_call["method"] == "GET"
+        assert labels_call["url"] == (
+            f"{FORGEJO_API_BASE}/repos/{TEST_OWNER}/{TEST_NAME}/labels"
+        )
+        post_call = fake.calls[1]
+        assert post_call["method"] == "POST"
+        assert post_call["url"] == f"{FORGEJO_API_BASE}/repos/{TEST_REPO}/issues"
+        assert post_call["headers"]["Authorization"] == f"token {DUMMY_PAT}"
+        assert post_call["headers"]["Accept"] == "application/json"
+        assert post_call["headers"]["User-Agent"] == "algernon-github-ops"
+        # The KEY assertion: names resolved to integer IDs ([]int64).
+        assert post_call["json_body"]["labels"] == [10, 20]
+        assert post_call["json_body"]["title"] == "VERA: portal 500 on login"
+
+        rows = read_github_audit(cfg.audit_log_path)
+        # One label_list (ok) row + one issue_create (created) row.
+        assert [r["op"] for r in rows] == ["label_list", "issue_create"]
+        created = rows[1]
+        assert created["outcome"] == "created"
+        assert created["issue_number"] == 42
+        assert created["ticket_uid"] == "t-42"
+        assert created["correlation_id"] == "corr-1"
+
+    async def test_forgejo_label_names_resolve_to_ids(self, tmp_path: Path, monkeypatch) -> None:
+        """Name→id resolution pin: each config label NAME maps to its
+        Forgejo integer id via the labels map; case-insensitive."""
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        labels_resp = self._labels_response([
+            {"id": 7, "name": "Bug"},        # mixed case in the forge
+            {"id": 9, "name": "auto-fix"},
+        ])
+        fake = _RoutingRequest([
+            ("GET", "/labels", labels_resp),
+            ("POST", "/issues", _response(201, {"number": 1, "html_url": ""}, method="POST")),
+        ])
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+        await client.issue_create(
+            title="t", body="b", labels=["bug", "auto-fix"],
+            ticket_uid="t-1", caller="ticket_intake",
+        )
+        post_call = fake.calls[1]
+        assert post_call["json_body"]["labels"] == [7, 9]
+
+    async def test_forgejo_unresolved_label_warns_and_is_dropped_not_silent(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """SILENT-FAILURE FIREBREAK (forgejo path): a label name with no
+        matching forge id must WARN loudly (``github_ops.label_unresolved``)
+        and be dropped — never silently swallowed (a dropped ``auto-fix``
+        takes the whole auto-fix flow dark while looking healthy). The
+        resolved labels still carry the names that DID match."""
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        labels_resp = self._labels_response([
+            {"id": 20, "name": "bug"},
+            # NOTE: no "auto-fix" label exists in this forge repo.
+        ])
+        fake = _RoutingRequest([
+            ("GET", "/labels", labels_resp),
+            ("POST", "/issues", _response(201, {"number": 1, "html_url": ""}, method="POST")),
+        ])
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+        with structlog.testing.capture_logs() as captured:
+            await client.issue_create(
+                title="t", body="b", labels=["bug", "auto-fix"],
+                ticket_uid="t-1", caller="ticket_intake",
+            )
+        post_call = fake.calls[1]
+        assert post_call["json_body"]["labels"] == [20]  # auto-fix dropped
+        warns = [
+            c for c in captured
+            if c.get("event") == "github_ops.label_unresolved"
+        ]
+        assert len(warns) == 1
+        assert warns[0]["label"] == "auto-fix"
+        assert warns[0]["repo"] == TEST_REPO
+        assert warns[0]["ticket_uid"] == "t-1"
+
+    async def test_forgejo_empty_labels_skips_label_list_fetch(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """No labels → no GET /labels round-trip (early return); the POST
+        body carries an empty []int64."""
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(201, {"number": 1, "html_url": ""}, method="POST"))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+        await client.issue_create(
+            title="t", body="b", labels=[],
+            ticket_uid="t-1", caller="ticket_intake",
+        )
+        assert len(fake.calls) == 1  # POST only — no labels GET
+        assert fake.calls[0]["method"] == "POST"
+        assert fake.calls[0]["json_body"]["labels"] == []
+
+    async def test_forgejo_create_denial_skips_label_fetch(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """On the forgejo path the create op is gated BEFORE the label
+        pre-fetch — a denied caller audits ONE issue_create denied row and
+        makes NO labels GET."""
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        called: list = []
+
+        async def _should_not_run(method, url, *, headers, params=None, json_body=None):
+            called.append(url)
+            return _response(200, [])
+
+        monkeypatch.setattr(github_ops_mod, "_github_request", _should_not_run)
+        with pytest.raises(GitHubOpsDenied):
+            await client.issue_create(
+                title="t", body="b", labels=["auto-fix"],
+                ticket_uid="t-1", caller="digest",  # wrong context
+            )
+        assert called == []  # no labels GET, no POST
         rows = read_github_audit(cfg.audit_log_path)
         assert len(rows) == 1
         assert rows[0]["op"] == "issue_create"
-        assert rows[0]["outcome"] == "created"
-        assert rows[0]["issue_number"] == 42
-        assert rows[0]["ticket_uid"] == "t-42"
-        assert rows[0]["correlation_id"] == "corr-1"
+        assert rows[0]["outcome"] == "denied"
+
+    async def test_forgejo_label_list_500_raises_and_makes_no_issue_post(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """FIREBREAK PIN (auto-fix-never-silently-lost): if the forgejo
+        label_list GET fails (HTTP 500), issue_create must RAISE
+        (HTTPStatusError) and make ZERO issue POSTs — an issue is NEVER
+        created without its resolved labels (which would drop ``auto-fix``
+        and take the whole flow dark while looking healthy). c3's
+        containment then retries the entire intake; the marker-search
+        guard prevents a duplicate on retry."""
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        posts: list = []
+
+        async def _req(method, url, *, headers, params=None, json_body=None):
+            if method == "GET" and "/labels" in url:
+                return _response(500, {"message": "Internal Server Error"})
+            if method == "POST" and "/issues" in url:
+                posts.append(url)
+                return _response(201, {"number": 1, "html_url": ""}, method="POST")
+            raise AssertionError(f"unexpected {method} {url}")
+
+        monkeypatch.setattr(github_ops_mod, "_github_request", _req)
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.issue_create(
+                title="t", body="b", labels=["auto-fix"],
+                ticket_uid="t-1", caller="ticket_intake",
+            )
+        # The load-bearing assertion: NO issue was ever POSTed.
+        assert posts == []
+        # And no "created" issue row — only the label_list error row.
+        rows = read_github_audit(cfg.audit_log_path)
+        assert not any(r["outcome"] == "created" for r in rows)
+        assert any(
+            r["op"] == "label_list" and r["outcome"] == "error"
+            and r["http_status"] == 500
+            for r in rows
+        )
 
     async def test_http_error_audited_and_propagates(
         self, tmp_path: Path, monkeypatch
@@ -572,10 +875,28 @@ class TestIssueCreate:
 
 
 class TestIssueSearchMarker:
-    async def test_hit_returns_first_match(
+    @staticmethod
+    def _issue(number: int, *, marker_uid: str | None, state: str = "open") -> dict:
+        """A Forgejo issue dict; its body carries the marker iff
+        ``marker_uid`` is set."""
+        body = "some ticket text"
+        if marker_uid is not None:
+            body = f"{body}\n\n{issue_marker(marker_uid)}"
+        return {
+            "number": number,
+            "html_url": f"{FORGEJO_API_BASE}/{TEST_REPO}/issues/{number}",
+            "state": state,
+            "body": body,
+        }
+
+    # ----- GitHub path (pre-port behavior, unchanged) -------------------
+
+    async def test_github_hit_returns_first_match(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        cfg = _config(tmp_path)
+        """BACKWARD-COMPAT: github config → global /search/issues +
+        ``{items}`` parse + the mandatory ``is:issue`` query."""
+        cfg = _config(tmp_path)  # github default
         client = GitHubOpsClient(cfg)
         fake = _CapturingRequest(_response(200, {
             "total_count": 1,
@@ -595,7 +916,6 @@ class TestIssueSearchMarker:
             "html_url": f"https://github.com/{TEST_REPO}/issues/7",
             "state": "open",
         }
-        # The search queries the INNER marker text on the right repo.
         call = fake.calls[0]
         assert call["url"] == "https://api.github.com/search/issues"
         assert call["params"]["q"] == (
@@ -603,14 +923,81 @@ class TestIssueSearchMarker:
         )
         rows = read_github_audit(cfg.audit_log_path)
         assert rows[0]["op"] == "issue_search"
+        assert rows[0]["issue_number"] == 7
+        assert rows[0]["match_count"] == 1
+
+    async def test_github_miss_returns_none(self, tmp_path: Path, monkeypatch) -> None:
+        cfg = _config(tmp_path)  # github default
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(200, {"total_count": 0, "items": []}))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+        hit = await client.issue_search_marker(
+            ticket_uid="t-none", caller="ticket_intake",
+        )
+        assert hit is None
+        rows = read_github_audit(cfg.audit_log_path)
+        assert rows[0]["issue_number"] is None
+        assert rows[0]["match_count"] == 0
+
+    async def test_github_query_contains_mandatory_qualifiers(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """REGRESSION PIN (2026-06-11 422 outage): GitHub's /search/issues
+        REQUIRES a type qualifier — a query missing ``is:issue`` 422s."""
+        cfg = _config(tmp_path)  # github default
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(200, {"total_count": 0, "items": []}))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+        await client.issue_search_marker(
+            ticket_uid="t-pin", caller="ticket_intake",
+        )
+        q = fake.calls[0]["params"]["q"]
+        assert "is:issue" in q
+        assert f"repo:{TEST_REPO}" in q
+        assert "in:body" in q
+        assert "algernon-ticket: t-pin" in q
+
+    # ----- Forgejo path -------------------------------------------------
+
+    async def test_forgejo_hit_returns_first_body_matched_issue(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        # Forgejo returns a BARE LIST (not GitHub's {"items": [...]}).
+        fake = _CapturingRequest(_response(
+            200, [self._issue(7, marker_uid="t-7", state="open")],
+        ))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+
+        hit = await client.issue_search_marker(
+            ticket_uid="t-7", caller="ticket_intake",
+        )
+        assert hit == {
+            "number": 7,
+            "html_url": f"{FORGEJO_API_BASE}/{TEST_REPO}/issues/7",
+            "state": "open",
+        }
+        # Forgejo per-repo issue endpoint + the type/state/q/limit params.
+        call = fake.calls[0]
+        assert call["url"] == (
+            f"{FORGEJO_API_BASE}/repos/{TEST_OWNER}/{TEST_NAME}/issues"
+        )
+        assert call["params"] == {
+            "type": "issues", "state": "all", "q": "t-7", "limit": 50,
+        }
+        rows = read_github_audit(cfg.audit_log_path)
+        assert rows[0]["op"] == "issue_search"
         assert rows[0]["outcome"] == "ok"
         assert rows[0]["issue_number"] == 7
         assert rows[0]["match_count"] == 1
 
-    async def test_miss_returns_none(self, tmp_path: Path, monkeypatch) -> None:
-        cfg = _config(tmp_path)
+    async def test_forgejo_miss_returns_none_on_bare_empty_list(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        cfg = _forgejo_config(tmp_path)
         client = GitHubOpsClient(cfg)
-        fake = _CapturingRequest(_response(200, {"total_count": 0, "items": []}))
+        fake = _CapturingRequest(_response(200, []))
         monkeypatch.setattr(github_ops_mod, "_github_request", fake)
 
         hit = await client.issue_search_marker(
@@ -622,33 +1009,50 @@ class TestIssueSearchMarker:
         assert rows[0]["issue_number"] is None
         assert rows[0]["match_count"] == 0
 
-    async def test_query_contains_mandatory_qualifiers(
+    async def test_forgejo_dedup_firebreak_bare_list_body_match_state_all(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """REGRESSION PIN (2026-06-11 422 outage): /search/issues now
-        REQUIRES a type qualifier — every query missing ``is:issue``
-        422s with "Query must include 'is:issue' or 'is:pull-request'"
-        (60/60 audit-row failure on KAL-LE's first live tick).
+        """REGRESSION PIN — the duplicate-mint firebreak (forgejo path).
 
-        String-level on purpose: a refactor that rebuilds the query
-        must not silently drop any of these four parts.
+        Three stacked correctness checks, each a duplicate-mint cause if
+        broken (verified to FAIL against the pre-port GitHub code):
+
+        1. **BARE LIST parse** — the response is a list, not
+           ``{"items": [...]}``. The old ``data.get("items")`` returns
+           None on a list → no hit → re-mint. Here a hit MUST be found.
+        2. **``state=all``** — the matching issue is CLOSED (a wont_fix /
+           resolved ticket). Forgejo defaults to ``state=open``; without
+           ``state=all`` it'd be invisible → re-mint.
+        3. **client-side body match is AUTHORITATIVE** — the list also
+           contains a coarse-``q`` false positive (an OPEN issue whose
+           body does NOT carry the marker). The dedupe must pick the
+           CLOSED marker-bearing issue, not the first/open false positive.
         """
-        cfg = _config(tmp_path)
+        cfg = _forgejo_config(tmp_path)
         client = GitHubOpsClient(cfg)
-        fake = _CapturingRequest(_response(200, {"total_count": 0, "items": []}))
+        fake = _CapturingRequest(_response(200, [
+            # coarse-q false positive: no marker in body, returned first
+            self._issue(11, marker_uid=None, state="open"),
+            # the real match: marker in body, and CLOSED (state=all surfaces it)
+            self._issue(7, marker_uid="t-7", state="closed"),
+        ]))
         monkeypatch.setattr(github_ops_mod, "_github_request", fake)
 
-        await client.issue_search_marker(
-            ticket_uid="t-pin", caller="ticket_intake",
+        hit = await client.issue_search_marker(
+            ticket_uid="t-7", caller="ticket_intake",
         )
-        q = fake.calls[0]["params"]["q"]
-        assert "is:issue" in q
-        assert f"repo:{TEST_REPO}" in q
-        assert "in:body" in q
-        assert "algernon-ticket: t-pin" in q
+        assert hit is not None
+        assert hit["number"] == 7           # the marker-bearing one, not #11
+        assert hit["state"] == "closed"     # state=all surfaced it
+        assert fake.calls[0]["params"]["state"] == "all"
+        rows = read_github_audit(cfg.audit_log_path)
+        assert rows[0]["match_count"] == 1       # only the body-matched issue
+        assert rows[0]["prefilter_count"] == 2   # the coarse list had two
 
 
 class TestDigestReads:
+    # Read ops are forge-agnostic (same path shape; only the base differs).
+    # Default github config → github.com URLs, matching pre-port behavior.
     async def test_issue_get(self, tmp_path: Path, monkeypatch) -> None:
         cfg = _config(tmp_path)
         client = GitHubOpsClient(cfg)
@@ -694,6 +1098,20 @@ class TestDigestReads:
         rows = read_github_audit(cfg.audit_log_path)
         assert [r["op"] for r in rows] == ["pr_get", "pr_reviews"]
         assert all(r["outcome"] == "ok" for r in rows)
+
+    async def test_forgejo_base_threaded_into_digest_reads(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The config api_base threads into the read ops too — a forgejo
+        config hits the forgejo base."""
+        cfg = _forgejo_config(tmp_path)
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(200, {"merged_at": None}))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+        await client.pr_get(number=12, caller="digest")
+        assert fake.calls[0]["url"] == (
+            f"{FORGEJO_API_BASE}/repos/{TEST_REPO}/pulls/12"
+        )
 
     async def test_digest_read_denied_for_intake_caller(
         self, tmp_path: Path, monkeypatch

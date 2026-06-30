@@ -29,9 +29,12 @@ watch ALWAYS produces a line):
   (per-item containment here; the daemon adds a section-boundary
   guard on top, same idiom as weather/874c751).
 
-Transport: unauthenticated GitHub REST via httpx (60 req/hr unauth is
-plenty at one brief per day; deliberately NOT shelling out to ``gh``
-from the daemon). Timeouts short.
+Transport: forge REST via httpx — genuinely multi-host, so the base URL
+is PER-ITEM (``api_base``, default GitHub) and the auth token is
+optional PER-ITEM (``token`` / ``token_env``). Public GitHub works
+unauthenticated (60 req/hr is plenty at one brief per day); a private
+Forgejo repo needs the per-item token or it 403/404s. Deliberately NOT
+shelling out to ``gh`` from the daemon. Timeouts short.
 
 State: ``<data_dir>/brief_watches_state.json`` — last-seen per watch
 id, atomic write, load-time schema-tolerance filter per the CLAUDE.md
@@ -56,13 +59,16 @@ log = get_logger(__name__)
 
 GITHUB_API_BASE = "https://api.github.com"
 
-# Short — the brief shouldn't stall on a slow GitHub day; a timeout is
+# Short — the brief shouldn't stall on a slow forge day; a timeout is
 # just a "watch unavailable" line.
 _TIMEOUT_SECONDS = 10.0
 
-# Unauthenticated GitHub REST requires a User-Agent.
+# Base client headers. ``Accept: application/json`` works on both GitHub
+# and Forgejo; a User-Agent is required by GitHub's unauth REST. The
+# optional per-item ``Authorization`` is merged in at request time (see
+# ``_auth_headers``), not here — the client is shared across items.
 _HEADERS = {
-    "Accept": "application/vnd.github+json",
+    "Accept": "application/json",
     "User-Agent": "alfred-brief-watches",
 }
 
@@ -153,17 +159,44 @@ def _now_iso() -> str:
 # weather-module convention) --------------------------------------------------
 
 
-async def _fetch_pr(client: httpx.AsyncClient, repo: str, number: int) -> dict:
-    resp = await client.get(f"{GITHUB_API_BASE}/repos/{repo}/pulls/{number}")
+def _auth_headers(auth_token: str) -> dict[str, str] | None:
+    """Per-item ``Authorization: token <tok>`` header, or None when the
+    item has no token (public GitHub stays unauthenticated). The ``token``
+    scheme works on both GitHub and Forgejo."""
+    return {"Authorization": f"token {auth_token}"} if auth_token else None
+
+
+async def _fetch_pr(
+    client: httpx.AsyncClient,
+    repo: str,
+    number: int,
+    *,
+    api_base: str = GITHUB_API_BASE,
+    auth_token: str = "",
+) -> dict:
+    resp = await client.get(
+        f"{api_base}/repos/{repo}/pulls/{number}",
+        headers=_auth_headers(auth_token),
+    )
     resp.raise_for_status()
     data = resp.json()
     return data if isinstance(data, dict) else {}
 
 
-async def _fetch_releases(client: httpx.AsyncClient, repo: str) -> list[dict]:
+async def _fetch_releases(
+    client: httpx.AsyncClient,
+    repo: str,
+    *,
+    api_base: str = GITHUB_API_BASE,
+    auth_token: str = "",
+) -> list[dict]:
     resp = await client.get(
-        f"{GITHUB_API_BASE}/repos/{repo}/releases",
-        params={"per_page": _RELEASES_PER_PAGE},
+        f"{api_base}/repos/{repo}/releases",
+        # Send BOTH page-size params: GitHub honors ``per_page`` (→
+        # byte-identical to pre-port), Forgejo honors ``limit``. Each forge
+        # ignores the other's param, so this serves both without a branch.
+        params={"per_page": _RELEASES_PER_PAGE, "limit": _RELEASES_PER_PAGE},
+        headers=_auth_headers(auth_token),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -188,7 +221,10 @@ async def _check_pr(
         # nagging (quietly) until the operator removes the item.
         return f"- {label}: {ident} — {prev.upper()} {DONE_TAIL}"
 
-    data = await _fetch_pr(client, item.repo, item.number)
+    data = await _fetch_pr(
+        client, item.repo, item.number,
+        api_base=item.api_base, auth_token=item.token,
+    )
     current = "merged" if data.get("merged_at") else str(data.get("state") or "unknown")
     st.last_state = current
     st.last_checked = _now_iso()
@@ -236,7 +272,10 @@ async def _check_release_mention(
             f"- {label}: watch unavailable "
             f"(config error: invalid pattern regex: {exc})"
         )
-    releases = await _fetch_releases(client, item.repo)
+    releases = await _fetch_releases(
+        client, item.repo,
+        api_base=item.api_base, auth_token=item.token,
+    )
 
     # Candidates = releases strictly newer than the boundary. GitHub
     # returns newest-first; walk until we hit the boundary tag. The
