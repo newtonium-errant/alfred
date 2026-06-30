@@ -166,6 +166,21 @@ def resolve_local_host(value: Any, default: str = LOOPBACK_HOST) -> str:
     return hosts[0]
 
 
+def format_host_for_url(host: str) -> str:
+    """Bracket an IPv6 host for use in a URL authority; pass IPv4/names through.
+
+    The SINGLE source of truth for "host → URL-safe host", shared by every
+    co-located client that builds ``http://<host>:<port>`` from a
+    :func:`resolve_local_host` result (the health probe + the transport client's
+    base URL). ``resolve_local_host`` can now return a bare IPv6 literal
+    (``::1``); without bracketing, ``f"http://{host}:{port}"`` yields the
+    unparseable ``http://::1:8891``. A ``:`` in the host means IPv6 → wrap it.
+    Centralised so the two call sites can't drift.
+    """
+    h = host or ""
+    return f"[{h}]" if ":" in h else h
+
+
 @dataclass
 class ServerConfig:
     """HTTP server bind address.

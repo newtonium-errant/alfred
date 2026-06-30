@@ -376,6 +376,38 @@ async def _close_open_sessions_on_shutdown(
     return closed_paths
 
 
+def _classify_transport_task_outcome(
+    *,
+    cancelled: bool,
+    exc: BaseException | None,
+    shutdown_requested: bool,
+) -> str:
+    """Pure decision for the transport-server task supervisor.
+
+    Returns one of:
+      * ``"silent"`` — expected completion (the task was CANCELLED on clean
+        shutdown, OR ``run_server`` returned because a shutdown WAS requested).
+        No log, no shutdown trigger.
+      * ``"died_exception"`` — the task raised (``run_server`` hit the
+        genuinely-fatal bind path: zero bound / loopback failed). Caller logs
+        ``transport.server.task_died`` with the exception + triggers shutdown.
+      * ``"died_returned"`` — the task returned WITHOUT an exception and WITHOUT
+        a shutdown request → the transport silently stopped while the daemon
+        believes it's healthy. Caller logs + triggers shutdown.
+
+    Extracted from the supervisor closure so the four-branch decision is
+    unit-testable (the "a dead transport never looks idle" guarantee). The two
+    death branches drive systemd restart via the daemon's shutdown_event.
+    """
+    if cancelled:
+        return "silent"
+    if exc is not None:
+        return "died_exception"
+    if shutdown_requested:
+        return "silent"
+    return "died_returned"
+
+
 # --- Main entry -----------------------------------------------------------
 
 
@@ -1754,22 +1786,26 @@ async def run(
             restarts and re-attempts the bind, rather than leaving a healthy
             daemon with a dead transport (silent orphan).
             """
-            if task.cancelled():
-                return  # clean shutdown path — expected
-            exc = task.exception()
-            if exc is not None:
+            cancelled = task.cancelled()
+            exc = None if cancelled else task.exception()
+            outcome = _classify_transport_task_outcome(
+                cancelled=cancelled,
+                exc=exc,
+                shutdown_requested=shutdown_event.is_set(),
+            )
+            if outcome == "silent":
+                return  # expected: clean cancel, or shutdown-requested return
+            if outcome == "died_exception":
                 log.error(
                     "transport.server.task_died",
                     error=str(exc),
                     error_type=type(exc).__name__,
                 )
-            elif not shutdown_event.is_set():
+            else:  # "died_returned"
                 log.error(
                     "transport.server.task_died",
                     detail="run_server returned without a shutdown request",
                 )
-            else:
-                return  # returned because shutdown was requested — expected
             shutdown_event.set()
 
         transport_server_task.add_done_callback(_on_transport_server_done)

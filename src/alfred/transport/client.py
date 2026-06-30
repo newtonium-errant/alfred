@@ -60,9 +60,14 @@ _REQUEST_TIMEOUT = 15.0
 
 
 def _resolve_base_url() -> str:
+    from alfred.transport.config import format_host_for_url
+
     host = os.environ.get("ALFRED_TRANSPORT_HOST", DEFAULT_HOST)
     port = os.environ.get("ALFRED_TRANSPORT_PORT", str(DEFAULT_PORT))
-    return f"http://{host}:{port}"
+    # IPv6-safe: ALFRED_TRANSPORT_HOST may be a bare ``::1`` (orchestrator
+    # injects resolve_local_host's result). Bracket via the shared helper so
+    # this and health.py's probe URL can't drift.
+    return f"http://{format_host_for_url(host)}:{port}"
 
 
 def _resolve_token() -> str:

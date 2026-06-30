@@ -1103,6 +1103,22 @@ async def run_server(
                 f"bound={bound} loopback_failed={loopback_failed} "
                 f"requested={hosts}"
             )
+        # Loopback OMITTED from config (e.g. host: [10.99.0.1]) → we bound
+        # overlay-only and the co-located web BFF / health probe / client are
+        # unserved. That's the operator's explicit choice (NOT fatal), but it
+        # must not be SILENT (intentionally-left-blank) — emit a distinct loud
+        # WARN so a missing loopback is visible, not a mystery 'connection
+        # refused' downstream.
+        if not any(host_is_loopback(h) for h in bound):
+            log.warning(
+                "transport.server.no_loopback_bound",
+                bound=bound,
+                detail=(
+                    "no loopback address among the bound hosts — co-located "
+                    "callers (web BFF, health probe, transport client) cannot "
+                    "reach the transport over loopback"
+                ),
+            )
         # Truthful summary — the addresses that ACTUALLY bound + how many were
         # dropped/failed (not a claim that everything in the list bound).
         log.info(

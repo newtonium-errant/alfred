@@ -444,3 +444,89 @@ async def test_health_probe_url_ipv6_safe() -> None:
     }
     result = await _check_port_reachable(raw)
     assert result.data["url"] == "http://[::1]:1/health"
+
+
+# --- fix2.1: the transport CLIENT base URL is IPv6-safe too (shared helper) ---
+
+
+def test_client_resolve_base_url_brackets_ipv6(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every co-located push builds its base URL from ALFRED_TRANSPORT_HOST,
+    which can be a bare ``::1`` — it MUST bracket, via the same shared helper
+    as the health probe (so they can't drift)."""
+    from alfred.transport.client import _resolve_base_url
+
+    monkeypatch.setenv("ALFRED_TRANSPORT_HOST", "::1")
+    monkeypatch.setenv("ALFRED_TRANSPORT_PORT", "8891")
+    assert _resolve_base_url() == "http://[::1]:8891"
+    # IPv4 / hostname pass through unbracketed (back-compat).
+    monkeypatch.setenv("ALFRED_TRANSPORT_HOST", "127.0.0.1")
+    assert _resolve_base_url() == "http://127.0.0.1:8891"
+
+
+def test_format_host_for_url_shared_helper() -> None:
+    from alfred.transport.config import format_host_for_url
+
+    assert format_host_for_url("::1") == "[::1]"
+    assert format_host_for_url("fd00::1") == "[fd00::1]"
+    assert format_host_for_url("127.0.0.1") == "127.0.0.1"
+    assert format_host_for_url("localhost") == "localhost"
+
+
+# --- fix2.2: supervisor outcome classifier (all four branches) ---------------
+
+
+def test_classify_transport_task_outcome_all_branches() -> None:
+    """The 'a dead transport never looks idle' decision — pinned per branch."""
+    from alfred.telegram.daemon import _classify_transport_task_outcome as cls
+
+    # Cancelled → clean shutdown path, silent.
+    assert cls(cancelled=True, exc=None, shutdown_requested=False) == "silent"
+    # Raised → fatal bind path; surface + restart.
+    assert cls(
+        cancelled=False, exc=RuntimeError("x"), shutdown_requested=False,
+    ) == "died_exception"
+    # Returned with NO shutdown requested → silent stop while daemon "healthy".
+    assert cls(
+        cancelled=False, exc=None, shutdown_requested=False,
+    ) == "died_returned"
+    # Returned BECAUSE shutdown was requested → expected, silent.
+    assert cls(
+        cancelled=False, exc=None, shutdown_requested=True,
+    ) == "silent"
+
+
+# --- fix2.3: loopback OMITTED from config → loud WARN, not fatal -------------
+
+
+async def test_run_server_no_loopback_bound_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An overlay-only config (loopback omitted) binds + proceeds (operator's
+    choice, NOT fatal) but emits a distinct loud WARN — never silent."""
+    from alfred.transport.server import run_server
+
+    _created, started, _runners = _install_fake_aiohttp(monkeypatch)
+    cfg = TransportConfig(server=ServerConfig(host=["10.99.0.1"], port=8894))
+    ev = asyncio.Event()
+    ev.set()
+    with structlog.testing.capture_logs() as cap:
+        await run_server(object(), cfg, shutdown_event=ev)  # must NOT raise
+
+    assert started == ["10.99.0.1"]  # overlay bound, transport up
+    warns = [c for c in cap if c.get("event") == "transport.server.no_loopback_bound"]
+    assert len(warns) == 1
+    assert warns[0]["bound"] == ["10.99.0.1"]
+    # A normal loopback-present config does NOT warn.
+    _c2, _s2, _r2 = _install_fake_aiohttp(monkeypatch)
+    cfg2 = TransportConfig(
+        server=ServerConfig(host=["127.0.0.1", "10.99.0.1"], port=8894),
+    )
+    ev2 = asyncio.Event()
+    ev2.set()
+    with structlog.testing.capture_logs() as cap2:
+        await run_server(object(), cfg2, shutdown_event=ev2)
+    assert not [
+        c for c in cap2 if c.get("event") == "transport.server.no_loopback_bound"
+    ]
