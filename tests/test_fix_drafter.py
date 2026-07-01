@@ -143,11 +143,12 @@ class FakeRun:
         self.fail: dict[str, tuple[int, str, str]] = {}
 
     async def __call__(self, argv, *, env=None, input_text=None,
-                       timeout=None, cwd=None):
+                       timeout=None, cwd=None, umask=None):
         self.calls.append({
             "argv": list(argv),
             "env": dict(env) if env else None,
             "input_text": input_text,
+            "umask": umask,
         })
         if "systemd-run" in argv:
             return self.fail.get("model", (0, self.model_stdout, ""))
@@ -341,6 +342,9 @@ def test_build_sandbox_command_carries_hardening_directives(tmp_path, monkeypatc
         f"InaccessiblePaths={cfg.box_env_path}",
         f"HTTPS_PROXY={cfg.anthropic_proxy_url}",
         "ReadWritePaths=/var/lib/kalle-drafter/work/issue-7/repo",
+        # cross-UID bridge (GAP-1): the model's own edits stay group-writable
+        # so the daemon (andrew) can commit them.
+        "UMask=0002",
     ):
         assert directive in blob, f"missing directive: {directive}"
     # launched ONLY through systemd-run (no bare claude).
@@ -552,6 +556,74 @@ async def test_credential_never_in_git_argv_or_model_env(
     # model env has no token.
     model = fake.model_call()
     assert DUMMY_TOKEN not in json.dumps(model["env"])
+
+
+# ---------------------------------------------------------------------------
+# GAP-1 (cross-UID clone ownership) — child-scoped umask, no daemon leak
+# ---------------------------------------------------------------------------
+
+
+async def test_umask_param_makes_child_files_group_writable(tmp_path):
+    """Pin (a) MECHANISM (real subprocess): _run_subprocess(umask=0o002)
+    creates GROUP-WRITABLE files (so the clone tree kalle-drafter must edit
+    is writable), while the default umask does NOT — proving the child-scoped
+    umask controls it."""
+    import os as _os
+    from alfred.transport.fix_drafter import _run_subprocess
+
+    gw = tmp_path / "group_writable"
+    rc, _, _ = await _run_subprocess(["touch", str(gw)], umask=0o002)
+    assert rc == 0
+    assert gw.stat().st_mode & 0o020, "umask=0o002 child file must be group-writable"
+
+    # control: an explicit non-group-write umask child → NOT group-writable
+    ngw = tmp_path / "not_group_writable"
+    rc2, _, _ = await _run_subprocess(["touch", str(ngw)], umask=0o022)
+    assert rc2 == 0
+    assert not (ngw.stat().st_mode & 0o020)
+
+
+async def test_clone_group_writable_no_daemon_umask_leak(
+    tmp_path, monkeypatch, _drafter_key
+):
+    """Pin (b) THE DOUBLE-ASSERT — the whole point of GAP-1:
+      * ONLY the clone step carries the group-writable child umask (0o002);
+        no other git step / the model run does.
+      * the daemon's PROCESS-GLOBAL umask is UNCHANGED across the cycle AND
+        the daemon-written state file is NOT group-writable — so the fix
+        never leaks group-write onto the authoritative records.
+    """
+    import os as _os
+
+    cfg = _config(tmp_path)
+    client = FakeClient(tmp_path)
+    state = FixDrafterState(path=Path(cfg.state_path))
+    fake = FakeRun()
+    _patch_run(monkeypatch, fake)
+
+    # pin the process umask so the state-file mode is deterministic; capture
+    # it to prove the daemon never mutates it process-globally.
+    before = _os.umask(0o022)
+    _os.umask(before)  # restore immediately (umask() both sets + returns)
+    try:
+        await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
+                        state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+    finally:
+        after = _os.umask(0o022)
+        _os.umask(after)
+
+    # (b1) the clone — and ONLY the clone — used the group-writable umask.
+    clone = next(c for c in fake.calls if "clone" in c["argv"])
+    assert clone["umask"] == 0o002
+    for c in fake.calls:
+        if "clone" not in c["argv"]:
+            assert c["umask"] is None, f"non-clone step leaked a umask: {c['argv'][:3]}"
+
+    # (b2) NO daemon process-global umask leak.
+    assert after == before == 0o022, "daemon process umask must be unchanged"
+    # (b3) the authoritative state file is NOT group-writable.
+    st_mode = Path(cfg.state_path).stat().st_mode
+    assert not (st_mode & 0o020), "state file must NOT be group-writable (no umask leak)"
 
 
 async def test_disjointness_fail_closed_refuses_before_model(

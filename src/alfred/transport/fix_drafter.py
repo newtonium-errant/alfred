@@ -370,6 +370,7 @@ async def _run_subprocess(
     input_text: str | None = None,
     timeout: float | None = None,
     cwd: str | None = None,
+    umask: int | None = None,
 ) -> tuple[int, str, str]:
     """Run a subprocess; return ``(returncode, stdout, stderr)``.
 
@@ -377,7 +378,16 @@ async def _run_subprocess(
     run, so tests mock exactly one function. A timeout returns code 124
     (matching ``timeout(1)``) with a synthetic stderr rather than raising,
     so the per-issue containment treats it as a loud failure.
+
+    ``umask`` (when set) applies ONLY in the forked child via
+    ``preexec_fn`` — it is CHILD-SCOPED and never touches the daemon's
+    process-global umask. The clone step passes ``0o002`` so the working
+    tree is group-writable (the cross-UID bridge: andrew clones,
+    kalle-drafter edits via the shared group) WITHOUT leaking group-write
+    onto the daemon's own state / REST-audit writes (which never route
+    through here). os.umask is async-signal-safe → preexec_fn-safe.
     """
+    preexec = (lambda: os.umask(umask)) if umask is not None else None
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
@@ -385,6 +395,7 @@ async def _run_subprocess(
         stdin=asyncio.subprocess.PIPE if input_text is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        preexec_fn=preexec,
     )
     stdin_bytes = input_text.encode("utf-8") if input_text is not None else None
     try:
@@ -559,6 +570,12 @@ def build_sandbox_command(
         "PrivateTmp=yes",
         "ProtectProc=invisible",
         "ProcSubset=pid",
+        # CROSS-UID BRIDGE: the model (kalle-drafter) edits a clone the
+        # daemon (andrew) created — its own edits must stay group-writable
+        # so the daemon can then commit them. Transient-unit-scoped, so no
+        # process-global umask leak. Pairs with the clone's child-scoped
+        # 0o002 (_run_subprocess) + the shared-group/setgid work_root (infra).
+        "UMask=0002",
         # privilege drop
         "NoNewPrivileges=yes",
         "CapabilityBoundingSet=",
@@ -1113,7 +1130,15 @@ async def _fresh_draft(
                 "outcome": "refused_disjointness",
             }
 
-        # 2. shallow single-branch clone (token-less remote URL).
+        # 2. shallow single-branch clone (token-less remote URL). CHILD-
+        # SCOPED umask 0o002 so the working tree is GROUP-WRITABLE — the
+        # cross-UID bridge: the daemon (andrew) clones, the sandboxed model
+        # (kalle-drafter) edits via the shared `drafter` group. preexec_fn
+        # confines the umask to the git-clone child; the daemon's own
+        # process umask is untouched, so state / REST-audit stay 0644 (NOT
+        # group-writable — no records-integrity leak). Pairs with the
+        # sandbox unit's ``UMask=0002`` (build_sandbox_command) + the
+        # shared-group/setgid work_root (infra, per the cutover runbook).
         rc, out, err = await _run_subprocess(
             [
                 "git", "clone", "--depth", "1", "--single-branch",
@@ -1121,6 +1146,7 @@ async def _fresh_draft(
             ],
             env=git_env,
             timeout=config.git_timeout,
+            umask=0o002,
         )
         if rc != 0:
             log.warning(
