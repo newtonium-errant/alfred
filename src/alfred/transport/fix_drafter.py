@@ -540,21 +540,48 @@ def write_drafter_hook_files(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_drafter_key(config: FixDrafterConfig) -> str:
+    """Resolve the dedicated drafter Anthropic key ROBUSTLY.
+
+    The fix_drafter daemon runs in a RE-EXEC'd child that does NOT inherit
+    the main process's runtime ``os.environ`` — where ``auto_load_dotenv``
+    injected the box ``.env``. So ``os.environ.get(drafter_key_env)`` is
+    empty in the daemon, and claude would run un-authed ("Not logged in").
+    Resolution order:
+      1. ``os.environ`` (respects an explicit env override, if inherited).
+      2. the box ``.env`` file directly (``load_dotenv_file`` — the SAME
+         source alfred uses for config substitution). The daemon CAN read
+         it; ``box_env_path`` is only ``InaccessiblePaths`` for the SANDBOX.
+    Returns "" when the key is nowhere (the caller fails loud).
+    """
+    val = os.environ.get(config.drafter_key_env, "")
+    if val:
+        return val
+    if config.box_env_path:
+        from alfred._env import load_dotenv_file
+        env = load_dotenv_file(config.box_env_path)  # never raises; {} on missing
+        return str(env.get(config.drafter_key_env, "") or "")
+    return ""
+
+
 def build_sandbox_command(
     *,
     clone_dir: str,
     config: FixDrafterConfig,
     settings_path: str,
+    drafter_key: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Construct the hardened ``systemd-run`` invocation for the model run.
 
     Returns ``(argv, subprocess_env)``. The dedicated drafter Anthropic
     key is imported into the transient unit BY NAME
     (``--setenv=ANTHROPIC_API_KEY``, value travels over D-Bus) so the
-    secret NEVER appears in argv (``ps``-visible). The Forgejo token is
-    NEVER in this env or argv — the model has no push/clone capability
-    (the daemon owns git). The directive list is the security contract;
-    it is pinned by test.
+    secret NEVER appears in argv (``ps``-visible). ``drafter_key`` may be
+    passed pre-resolved (the daemon resolves + fail-loud-checks it once
+    before calling here); when ``None`` it is resolved via
+    :func:`_resolve_drafter_key`. The Forgejo token is NEVER in this env or
+    argv — the model has no push/clone capability (the daemon owns git).
+    The directive list is the security contract; it is pinned by test.
     """
     audit_dir = str(Path(config.hook_audit_path).resolve().parent)
 
@@ -627,9 +654,10 @@ def build_sandbox_command(
     # claude site that KEEPS an Anthropic key (the home-masked sandbox has
     # no OAuth creds), and it uses the DEDICATED drafter key, not the
     # personal Max-plan auth.
+    key = drafter_key if drafter_key is not None else _resolve_drafter_key(config)
     sub_env: dict[str, str] = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "ANTHROPIC_API_KEY": os.environ.get(config.drafter_key_env, ""),
+        "ANTHROPIC_API_KEY": key,
     }
     return argv, sub_env
 
@@ -1193,9 +1221,31 @@ async def _fresh_draft(
             control_dir, audit_path=config.hook_audit_path
         )
 
-        # 5. run the sandboxed model — ONLY through the hardened unit.
+        # 5. resolve the drafter key + FAIL LOUD before launching claude.
+        #    The re-exec'd daemon doesn't inherit the main process's runtime
+        #    os.environ (where .env was auto-loaded), so the key is resolved
+        #    from os.environ OR the box .env file directly. An empty key
+        #    would otherwise surface as a cryptic claude "Not logged in" —
+        #    ILB: name drafter_key_env + box_env_path and stop before the run.
+        drafter_key = _resolve_drafter_key(config)
+        if not drafter_key:
+            log.error(
+                "fix_drafter.drafter_key_missing",
+                issue_number=issue_number,
+                drafter_key_env=config.drafter_key_env,
+                box_env_path=config.box_env_path,
+                detail=(
+                    "the dedicated drafter Anthropic key resolved EMPTY (not "
+                    "in os.environ, not in the box .env) — claude would run "
+                    "un-authed; refusing to launch the model"
+                ),
+            )
+            return {"issue_number": issue_number, "outcome": "drafter_key_missing"}
+
+        # run the sandboxed model — ONLY through the hardened unit.
         argv, sub_env = build_sandbox_command(
             clone_dir=clone_dir, config=config, settings_path=settings_path,
+            drafter_key=drafter_key,
         )
         rc, model_out, model_err = await _run_subprocess(
             argv, env=sub_env, input_text=_build_drafter_prompt(title, body),

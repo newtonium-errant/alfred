@@ -392,6 +392,72 @@ def test_build_sandbox_command_launch_prefix(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Drafter-key resolution (live bug: re-exec'd daemon doesn't inherit os.environ)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_drafter_key_from_box_env_when_absent_from_environ(tmp_path, monkeypatch):
+    """Pin (a): the re-exec'd daemon's os.environ lacks the key → resolve it
+    from the box .env file directly (the same source alfred substitutes from)."""
+    from alfred.transport.fix_drafter import _resolve_drafter_key
+
+    monkeypatch.delenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "OTHER=x\nALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY=DUMMY_FROM_DOTENV_KEY\n"
+    )
+    cfg = _config(tmp_path, box_env_path=str(env_file))
+    assert _resolve_drafter_key(cfg) == "DUMMY_FROM_DOTENV_KEY"
+
+
+def test_resolve_drafter_key_environ_takes_precedence(tmp_path, monkeypatch):
+    """os.environ wins over the .env file (respects an explicit override)."""
+    from alfred.transport.fix_drafter import _resolve_drafter_key
+
+    monkeypatch.setenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", "DUMMY_FROM_ENV")
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY=DUMMY_FROM_DOTENV\n")
+    cfg = _config(tmp_path, box_env_path=str(env_file))
+    assert _resolve_drafter_key(cfg) == "DUMMY_FROM_ENV"
+
+
+def test_resolve_drafter_key_flows_into_sub_env(tmp_path, monkeypatch):
+    """The .env-resolved key reaches sub_env (the name-only --setenv value)
+    and STILL never appears in argv."""
+    from alfred.transport.fix_drafter import build_sandbox_command as _bsc
+
+    monkeypatch.delenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY=DUMMY_DOTENV_ROUNDTRIP\n")
+    cfg = _config(tmp_path, box_env_path=str(env_file))
+    argv, sub_env = _bsc(clone_dir="/w/repo", config=cfg, settings_path="/w/s.json")
+    assert sub_env["ANTHROPIC_API_KEY"] == "DUMMY_DOTENV_ROUNDTRIP"
+    assert "--setenv=ANTHROPIC_API_KEY" in argv          # name-only import
+    assert "DUMMY_DOTENV_ROUNDTRIP" not in " ".join(argv)  # never ps-visible
+
+
+async def test_empty_key_fails_loud_before_claude_launch(tmp_path, monkeypatch):
+    """Pin (b): key nowhere (not in os.environ, not in the box .env) → the
+    fail-loud path fires (drafter_key_missing) and claude is NEVER launched —
+    a clear error, not a cryptic 'Not logged in'."""
+    monkeypatch.delenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", raising=False)
+    cfg = _config(tmp_path, box_env_path=str(tmp_path / "nonexistent.env"))
+    client = FakeClient(tmp_path)
+    state = FixDrafterState(path=Path(cfg.state_path))
+    fake = FakeRun()
+    _patch_run(monkeypatch, fake)
+    with structlog.testing.capture_logs() as captured:
+        res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
+                              state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+    assert res["outcome"] == "drafter_key_missing"
+    assert fake.model_call() is None            # claude NEVER launched
+    missing = [c for c in captured if c.get("event") == "fix_drafter.drafter_key_missing"]
+    assert len(missing) == 1
+    assert missing[0]["drafter_key_env"] == cfg.drafter_key_env
+    assert missing[0]["box_env_path"] == cfg.box_env_path
+
+
+# ---------------------------------------------------------------------------
 # PreToolUse hook gate
 # ---------------------------------------------------------------------------
 
