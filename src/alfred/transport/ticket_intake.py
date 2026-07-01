@@ -255,6 +255,21 @@ class TicketIntakeEntry:
     disposition: str = ""
     ticket_to_pr_latency_days: float | None = None
     outcome_checked_at: str = ""
+    # --- self-describing cross-repo PR origin (Option B, C4b) ---
+    # When the fix PR lives on a DIFFERENT app repo than the central
+    # tracker, ``pr_number`` alone is ambiguous — it's the APP repo's PR
+    # number, meaningless against the central client. These record WHICH
+    # repo/forge that number belongs to, stamped by
+    # ``kalle_digest._check_one_ticket_outcome`` whenever a cross-repo PR is
+    # resolved. They make the intake entry self-sufficient: later passes
+    # route the poll to the app repo from the ENTRY itself, INDEPENDENT of
+    # the drafter's (separately wipeable) ``load_pr_links`` state file — so
+    # a wiped drafter state can never leave ``pr_number`` (an app number)
+    # to be wrongly polled against the central tracker. Empty == same-repo
+    # (or legacy) → the timeline path. Additive + backward-safe via the
+    # schema-tolerance loader (existing entries default "").
+    pr_app_repo: str = ""
+    pr_app_forge_type: str = ""
     # --- c7 outcome write-back idempotency flag ---
     # Set to the ISO timestamp of the FIRST successful KAL-LE→VERA
     # outcome write-back (``brief.kalle_digest.check_ticket_outcomes``).

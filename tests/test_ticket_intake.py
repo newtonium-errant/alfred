@@ -951,6 +951,27 @@ def test_intake_state_schema_tolerance(tmp_path):  # type: ignore[no-untyped-def
     # c5 reserved fields default cleanly.
     assert entry.disposition == ""
     assert entry.pr_number is None
+    # C4b self-describing cross-repo fields default cleanly on a legacy entry.
+    assert entry.pr_app_repo == ""
+    assert entry.pr_app_forge_type == ""
+
+
+def test_intake_entry_c4b_cross_repo_marker_round_trip(tmp_path):  # type: ignore[no-untyped-def]
+    """C4b pin (d): ``pr_app_repo``/``pr_app_forge_type`` round-trip through
+    the schema-tolerant loader; a legacy entry lacking them loads with
+    defaults ``""`` (no crash)."""
+    e = TicketIntakeEntry.from_dict({
+        "issue_number": 7, "pr_number": 99,
+        "pr_app_repo": "org/app1", "pr_app_forge_type": "github",
+        "field_from_the_future": "ignored",
+    })
+    assert e.pr_app_repo == "org/app1"
+    assert e.pr_app_forge_type == "github"
+    assert e.pr_number == 99
+    # legacy entry — the two fields absent → defaults.
+    legacy = TicketIntakeEntry.from_dict({"issue_number": 9})
+    assert legacy.pr_app_repo == ""
+    assert legacy.pr_app_forge_type == ""
 
 
 def test_intake_state_corrupt_file_starts_empty(tmp_path):  # type: ignore[no-untyped-def]

@@ -662,13 +662,18 @@ async def _check_one_ticket_outcome(
     timeline-shape parser; the review-state check accepts both forges'
     enums without branching.
 
-    CROSS-REPO (Option B, C4): ``pr_links`` (issue_number → the drafter's
-    durable linkage ``{pr_number, app_repo, app_forge_type, ...}`` from
-    :func:`alfred.transport.fix_drafter.load_pr_links`) plus
-    ``app_client_factory`` ((app_repo, app_forge_type) → a per-APP-repo
-    read client) let this loop find a fix PR that lives on a DIFFERENT app
-    repo than the central tracker. Both default absent → the same-repo
-    ``issue_timeline`` path runs BYTE-IDENTICALLY to before.
+    CROSS-REPO (Option B, C4/C4b): ``pr_links`` (issue_number → the
+    drafter's linkage ``{pr_number, app_repo, app_forge_type, ...}`` from
+    :func:`alfred.transport.fix_drafter.load_pr_links`, used for FIRST
+    discovery) plus ``app_client_factory`` ((app_repo, app_forge_type) → a
+    per-APP-repo read client) let this loop find a fix PR that lives on a
+    DIFFERENT app repo than the central tracker. On the first cross-repo
+    resolution the origin repo/forge is stamped onto the entry
+    (``pr_app_repo``/``pr_app_forge_type``); thereafter routing is driven by
+    that self-describing marker, INDEPENDENT of ``pr_links`` — so a wiped
+    drafter-state file can never leave an app-repo ``pr_number`` to be
+    polled against the central tracker. Both params absent AND no marker →
+    the same-repo ``issue_timeline`` path runs BYTE-IDENTICALLY to before.
     """
     forge_type = str(
         getattr(getattr(client, "config", None), "forge_type", "github")
@@ -679,41 +684,75 @@ async def _check_one_ticket_outcome(
     )
     pr_number = entry.pr_number
 
-    # CROSS-REPO linkage takes precedence: when the drafter opened the fix
-    # PR on a DIFFERENT app repo than the central tracker, the tracker
-    # timeline can NEVER surface it (the cross-ref lives on the app repo) →
-    # the same-repo path below would report a false ``stalled`` forever. A
-    # link whose ``app_repo`` equals the central repo is a SAME-REPO ticket
-    # (single-repo instances stamp the central repo) and is left to the
-    # timeline path, so single-repo stays byte-identical. When a genuine
-    # cross-repo link matches, poll the fix PR on the APP-repo client.
-    poll_client = client
+    # CROSS-REPO routing (Option B, C4b) — SELF-DESCRIBING. When the fix PR
+    # lives on a DIFFERENT app repo than the central tracker, ``pr_number``
+    # is the APP repo's number and is MEANINGLESS against the central client
+    # — polling it there could hit an unrelated same-numbered central PR and
+    # latch a WRONG terminal outcome. The origin repo/forge is recorded on
+    # the intake entry itself (``pr_app_repo`` / ``pr_app_forge_type``), so a
+    # cross-repo ticket ALWAYS routes to the app repo regardless of whether
+    # the drafter's (separately wipeable) ``load_pr_links`` state is present.
+    #
+    # Binding source, in precedence order:
+    #   1. the entry's OWN persisted marker (authoritative; survives a
+    #      drafter-state wipe),
+    #   2. else the drafter's transient link for FIRST discovery (a link
+    #      naming the central repo is a same-repo ticket → left to timeline).
+    app_repo = str(getattr(entry, "pr_app_repo", "") or "")
+    app_forge = str(getattr(entry, "pr_app_forge_type", "") or "")
     link = (pr_links or {}).get(entry.issue_number)
-    if (
-        link
-        and str(link.get("app_repo") or "")
-        and str(link.get("app_repo")) != central_repo
-        and link.get("pr_number") is not None
-        and app_client_factory is not None
-    ):
-        app_client = app_client_factory(
-            str(link.get("app_repo") or ""),
-            str(link.get("app_forge_type") or "github"),
-        )
-        if app_client is not None:
-            poll_client = app_client
-            pr_number = link.get("pr_number")
-            log.info(
-                "kalle.digest.ticket_pipeline_cross_repo_link",
-                issue_number=entry.issue_number,
-                app_repo=str(link.get("app_repo") or ""),
-                app_forge_type=str(link.get("app_forge_type") or "github"),
-                pr_number=pr_number,
-            )
+    if not app_repo and link:
+        link_repo = str(link.get("app_repo") or "")
+        if link_repo and link_repo != central_repo:
+            app_repo = link_repo
+            app_forge = str(link.get("app_forge_type") or "github")
+            if pr_number is None and link.get("pr_number") is not None:
+                pr_number = link.get("pr_number")
 
-    if pr_number is None:
+    is_cross_repo = bool(app_repo) and app_repo != central_repo
+
+    poll_client = client
+    if is_cross_repo:
+        app_client = (
+            app_client_factory(app_repo, app_forge or "github")
+            if app_client_factory is not None
+            else None
+        )
+        if app_client is None:
+            # Can't reach the app repo THIS pass (no factory / transient
+            # missing-token / unknown repo). NEVER central-poll an app-repo
+            # PR number and never run the central timeline for a known
+            # cross-repo entry — leave the persisted number, marker, and
+            # disposition untouched and retry next pass (self-correcting once
+            # the client builds). Only ``outcome_checked_at`` advances so
+            # staleness stays visible. Emits an explicit signal so a stuck
+            # token is distinguishable from an idle ticket (ILB).
+            log.info(
+                "kalle.digest.ticket_pipeline_cross_repo_poll_unavailable",
+                issue_number=entry.issue_number,
+                app_repo=app_repo,
+            )
+            entry.outcome_checked_at = now.isoformat()
+            return False
+        poll_client = app_client
+        # Stamp the self-describing marker so later passes route to the app
+        # repo from the ENTRY, independent of the drafter's link state.
+        entry.pr_app_repo = app_repo
+        entry.pr_app_forge_type = app_forge or "github"
+        log.info(
+            "kalle.digest.ticket_pipeline_cross_repo_link",
+            issue_number=entry.issue_number,
+            app_repo=app_repo,
+            app_forge_type=app_forge or "github",
+            pr_number=pr_number,
+        )
+
+    if pr_number is None and not is_cross_repo:
         # SAME-REPO path (GitHub-Action drafter / single-repo Option-B):
-        # discover the linked PR via the tracker issue's timeline.
+        # discover the linked PR via the tracker issue's timeline. Skipped
+        # for a cross-repo entry — its PR is never cross-referenced on the
+        # central tracker, and a central-discovered number must never be
+        # polled on the app client.
         timeline = await client.issue_timeline(
             number=entry.issue_number, caller="digest",
         )
@@ -1257,16 +1296,20 @@ async def assemble_ticket_pipeline_section(
                 )
 
         if client is not None:
-            # C4 — Option B cross-repo PR-link consumer. Load the drafter's
-            # durable linkage (issue_number → {pr_number, app_repo,
-            # app_forge_type}) + a factory that builds a per-app-repo READ
-            # client, so a fix PR living on a DIFFERENT app repo than the
-            # central tracker resolves to its real disposition instead of a
-            # false ``stalled``. Only engaged when the drafter has
+            # C4/C4b — Option B cross-repo PR-link consumer. Load the
+            # drafter's linkage (issue_number → {pr_number, app_repo,
+            # app_forge_type}) for FIRST discovery + a factory that builds a
+            # per-app-repo READ client, so a fix PR living on a DIFFERENT app
+            # repo than the central tracker resolves to its real disposition
+            # instead of a false ``stalled``. Engaged when the drafter has
             # ``projects`` configured (Option B multi-repo); single-repo
             # instances build no factory → the same-repo timeline path is
-            # untouched. Best-effort: any failure logs + falls back to the
-            # timeline path, never crashing the pass.
+            # untouched. The factory is built whenever ``projects`` is set —
+            # NOT gated on ``pr_links`` being non-empty — because a ticket's
+            # self-describing ``pr_app_repo`` marker must still route to the
+            # app repo AFTER the drafter state file is wiped (C4b). Best-
+            # effort: any failure logs + falls back to the timeline path,
+            # never crashing the pass.
             pr_links: dict[int, dict[str, Any]] = {}
             app_client_factory: Callable[[str, str], Any] | None = None
             try:
@@ -1286,18 +1329,17 @@ async def assemble_ticket_pipeline_section(
                         count=len(pr_links),
                         state_path=drafter_config.state_path,
                     )
-                    if pr_links:
-                        _poll_audit = client.config.audit_log_path
+                    _poll_audit = client.config.audit_log_path
 
-                        def app_client_factory(
-                            app_repo: str, app_forge_type: str,
-                        ) -> Any:
-                            return poll_client_for_app_repo(
-                                drafter_config,
-                                app_repo,
-                                app_forge_type,
-                                audit_log_path=_poll_audit,
-                            )
+                    def app_client_factory(
+                        app_repo: str, app_forge_type: str,
+                    ) -> Any:
+                        return poll_client_for_app_repo(
+                            drafter_config,
+                            app_repo,
+                            app_forge_type,
+                            audit_log_path=_poll_audit,
+                        )
             except Exception as exc:  # noqa: BLE001 — best-effort consumer
                 log.warning(
                     "kalle.digest.cross_repo_link_load_failed",

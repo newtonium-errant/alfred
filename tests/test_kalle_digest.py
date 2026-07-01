@@ -1205,13 +1205,17 @@ async def test_same_repo_link_uses_timeline_not_app_client(
     assert called == []                      # factory never consulted
 
 
-async def test_cross_repo_factory_none_falls_back_to_timeline(
+async def test_cross_repo_factory_none_does_not_central_poll(
     tmp_path: Path,
 ) -> None:
-    """C4: when the per-app-repo client can't be built (factory returns None —
-    e.g. token missing this pass), fall back to the tracker timeline rather
-    than polling the CENTRAL tracker with an app-repo PR number (which could
-    hit an unrelated same-numbered central PR)."""
+    """C4b: a cross-repo ticket whose per-app-repo client can't be built
+    (factory returns None — e.g. transient missing-token) must NOT be polled
+    against the central tracker AND must NOT run the central timeline (a
+    central-discovered number could then be mis-polled). The pass leaves the
+    disposition + persisted number untouched and retries next pass — only
+    ``outcome_checked_at`` advances, with an explicit ``poll_unavailable``
+    signal. (Corrects the C4 ``falls_back_to_timeline`` behavior, which the
+    review flagged as unsafe once an app number is persisted.)"""
     audit_path = tmp_path / "audit.jsonl"
     state = _mem_state(tmp_path, {
         "uid-1": TicketIntakeEntry(
@@ -1221,7 +1225,7 @@ async def test_cross_repo_factory_none_falls_back_to_timeline(
             issue_created_at=_ago(days=5),
         ),
     })
-    central = FakeDigestGitHubClient(audit_path)  # empty timeline → no PR
+    central = FakeDigestGitHubClient(audit_path)  # would 'stalled' if polled
 
     def factory(app_repo: str, app_forge_type: str) -> Any:
         return None
@@ -1232,16 +1236,23 @@ async def test_cross_repo_factory_none_falls_back_to_timeline(
             "app_forge_type": "github", "status": "pr_open",
         },
     }
-    changed = await check_ticket_outcomes(
-        state, central, now=NOW, audit_log_path=str(audit_path),
-        pr_links=pr_links, app_client_factory=factory,
-    )
-    # fell back to the timeline (queried), found no PR → stalled (5 nights);
-    # the central client was NEVER polled with the app-repo number 99.
-    assert central.timeline_calls == [7]
+    with structlog.testing.capture_logs() as captured:
+        changed = await check_ticket_outcomes(
+            state, central, now=NOW, audit_log_path=str(audit_path),
+            pr_links=pr_links, app_client_factory=factory,
+        )
+    # NEVER central-polled (no pr_get) and NEVER ran the central timeline.
     assert central.pr_get_calls == []
-    assert state.entries["uid-1"].disposition == "stalled"
-    assert changed == 1
+    assert central.timeline_calls == []
+    # disposition unchanged; only outcome_checked_at advances (staleness).
+    assert changed == 0
+    entry = state.entries["uid-1"]
+    assert entry.disposition == ""
+    assert entry.outcome_checked_at != ""
+    ev = _log_events(
+        captured, "kalle.digest.ticket_pipeline_cross_repo_poll_unavailable",
+    )
+    assert len(ev) == 1 and ev[0]["app_repo"] == "org/app1"
 
 
 async def test_no_pr_links_is_byte_identical_same_repo(tmp_path: Path) -> None:
@@ -1359,6 +1370,253 @@ async def test_assemble_section_wires_cross_repo_consumer_end_to_end(
     assert len(_log_events(
         captured, "kalle.digest.ticket_pipeline_cross_repo_link",
     )) == 1
+
+
+# ---------------------------------------------------------------------------
+# C4b — self-describing intake linkage (marker survives a drafter-state wipe)
+# ---------------------------------------------------------------------------
+
+
+async def test_c4b_marker_routes_to_app_client_without_pr_links(
+    tmp_path: Path,
+) -> None:
+    """C4b pin (a): a cross-repo entry carrying its OWN self-describing marker
+    (``pr_app_repo`` != central) routes to the app-repo client even when the
+    drafter's ``pr_links`` is ABSENT (state file wiped) — the central tracker
+    is NEVER polled with the persisted app number."""
+    audit_path = tmp_path / "audit.jsonl"
+    state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=5),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(days=5),
+            pr_number=99,                # the APP repo's PR number (persisted)
+            pr_app_repo="org/app1",      # self-describing origin marker
+            pr_app_forge_type="github",
+        ),
+    })
+    central = FakeDigestGitHubClient(
+        audit_path,
+        timeline_exc={7: RuntimeError("central must not be queried")},
+    )
+    app = FakeDigestGitHubClient(
+        audit_path,
+        prs={99: {"state": "closed", "merged_at": _ago(hours=2)}},
+        reviews={99: []},
+    )
+    app.config.repo = "org/app1"
+    calls: list[tuple[str, str]] = []
+
+    def factory(app_repo: str, app_forge_type: str) -> Any:
+        calls.append((app_repo, app_forge_type))
+        return app
+
+    # pr_links ABSENT (None) — the drafter state file is gone.
+    changed = await check_ticket_outcomes(
+        state, central, now=NOW, audit_log_path=str(audit_path),
+        pr_links=None, app_client_factory=factory,
+    )
+    assert changed == 1
+    assert state.entries["uid-1"].disposition == "merged_clean"
+    assert app.pr_get_calls == [99]           # polled the APP repo
+    assert central.pr_get_calls == []
+    assert central.timeline_calls == []       # central never touched
+    assert calls == [("org/app1", "github")]  # factory built from the marker
+
+
+async def test_c4b_transient_factory_none_after_persisted_app_number(
+    tmp_path: Path,
+) -> None:
+    """C4b pin (b) — THE regression the review flagged. A transient
+    factory-None (missing-token) AFTER a prior pass persisted an APP
+    ``pr_number`` + marker must NOT central-poll that app number. The trap:
+    the central client holds a MERGED PR at the same number 99 — a central
+    poll would latch a false ``merged_clean`` and mis-push a c7 outcome.
+    Disposition + persisted number are preserved for next pass instead."""
+    audit_path = tmp_path / "audit.jsonl"
+    state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=5),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(days=5),
+            pr_number=99,
+            pr_state="open",
+            pr_app_repo="org/app1",
+            pr_app_forge_type="github",
+        ),
+    })
+    central = FakeDigestGitHubClient(
+        audit_path,
+        # the trap: central PR #99 is merged — a central poll would flip the
+        # disposition to a WRONG merged_clean.
+        prs={99: {"state": "closed", "merged_at": _ago(hours=1)}},
+        timeline_exc={7: RuntimeError("central timeline must not run")},
+    )
+
+    def factory(app_repo: str, app_forge_type: str) -> Any:
+        return None   # transient: token missing this pass
+
+    with structlog.testing.capture_logs() as captured:
+        changed = await check_ticket_outcomes(
+            state, central, now=NOW, audit_log_path=str(audit_path),
+            pr_links=None, app_client_factory=factory,
+        )
+    assert changed == 0
+    entry = state.entries["uid-1"]
+    assert entry.disposition == ""            # NOT a false merged_clean
+    assert entry.pr_number == 99              # app number preserved
+    assert entry.pr_app_repo == "org/app1"    # marker preserved
+    assert central.pr_get_calls == []         # central NEVER polled with 99
+    ev = _log_events(
+        captured, "kalle.digest.ticket_pipeline_cross_repo_poll_unavailable",
+    )
+    assert len(ev) == 1 and ev[0]["app_repo"] == "org/app1"
+
+
+async def test_c4b_marker_equals_central_uses_timeline(tmp_path: Path) -> None:
+    """C4b pin (c): an entry whose ``pr_app_repo`` EQUALS the central repo (a
+    same-repo ticket, defensively) → the timeline path runs and the factory is
+    NEVER consulted. Byte-identical."""
+    audit_path = tmp_path / "audit.jsonl"
+    state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=2),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(days=2),
+            pr_app_repo="acme/site",   # == the FakeDigestGitHubClient central
+        ),
+    })
+    central = FakeDigestGitHubClient(
+        audit_path,
+        timelines={7: [_xref_event(456)]},
+        prs={456: {"state": "closed", "merged_at": _ago(hours=1)}},
+        reviews={456: []},
+    )
+    called: list[str] = []
+
+    def factory(app_repo: str, app_forge_type: str) -> Any:
+        called.append(app_repo)
+        return FakeDigestGitHubClient(audit_path)
+
+    changed = await check_ticket_outcomes(
+        state, central, now=NOW, audit_log_path=str(audit_path),
+        pr_links=None, app_client_factory=factory,
+    )
+    assert changed == 1
+    assert state.entries["uid-1"].disposition == "merged_clean"
+    assert central.timeline_calls == [7]
+    assert central.pr_get_calls == [456]
+    assert called == []                       # factory never consulted
+
+
+async def test_c4b_link_driven_resolution_stamps_marker(tmp_path: Path) -> None:
+    """C4b: the FIRST cross-repo resolution (from the drafter link) STAMPS the
+    self-describing marker onto the entry, so later passes route from the
+    entry itself — independent of the (wipeable) drafter link."""
+    audit_path = tmp_path / "audit.jsonl"
+    state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=1),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(days=1),
+        ),
+    })
+    central = FakeDigestGitHubClient(audit_path)
+    app = FakeDigestGitHubClient(
+        audit_path,
+        prs={99: {"state": "open", "merged_at": None}},   # still open
+    )
+    app.config.repo = "org/app1"
+
+    def factory(app_repo: str, app_forge_type: str) -> Any:
+        return app
+
+    pr_links = {
+        7: {
+            "pr_number": 99, "app_repo": "org/app1",
+            "app_forge_type": "github", "status": "pr_open",
+        },
+    }
+    await check_ticket_outcomes(
+        state, central, now=NOW, audit_log_path=str(audit_path),
+        pr_links=pr_links, app_client_factory=factory,
+    )
+    entry = state.entries["uid-1"]
+    assert entry.pr_app_repo == "org/app1"     # stamped from the link
+    assert entry.pr_app_forge_type == "github"
+    assert entry.pr_number == 99               # app number persisted alongside
+    assert app.pr_get_calls == [99]
+
+
+async def test_c4b_assemble_marker_survives_drafter_state_wipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4b end-to-end: with ``fix_drafter.projects`` configured but the
+    drafter state file ABSENT (wiped → ``load_pr_links`` empty), an intake
+    entry carrying its own marker STILL routes to the app-repo client through
+    the real assembler. Pins the factory-gating fix (built from ``projects``,
+    NOT gated on ``pr_links`` being non-empty)."""
+    import alfred.transport.fix_drafter as fdmod
+
+    intake_state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=5),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(days=5),
+            pr_number=99,
+            pr_app_repo="org/app1",
+            pr_app_forge_type="github",
+        ),
+    })
+    intake_state.save()
+    # drafter state file does NOT exist → load_pr_links returns {}.
+    drafter_state_path = tmp_path / "MISSING_fix_drafter_state.json"
+
+    app = FakeDigestGitHubClient(
+        tmp_path / "app_audit.jsonl",
+        prs={99: {"state": "closed", "merged_at": _ago(hours=3)}},
+        reviews={99: []},
+    )
+    app.config.repo = "org/app1"
+    monkeypatch.setattr(
+        fdmod, "poll_client_for_app_repo",
+        lambda cfg, app_repo, app_forge_type, audit_log_path="": app,
+    )
+
+    raw = {
+        "vault": {"path": str(tmp_path / "vault")},
+        "telegram": {"instance": {"name": "KAL-LE"}},
+        "github": {
+            "repo": "acme/site", "pat": "DUMMY_GITHUB_TEST_PAT",
+            "instance": "KAL-LE", "forge_type": "forgejo",
+            "audit_log_path": str(tmp_path / "central_audit.jsonl"),
+        },
+        "ticket_intake": {
+            "enabled": True, "state": {"path": str(intake_state.path)},
+        },
+        "fix_drafter": {
+            "state": {"path": str(drafter_state_path)},
+            "projects": {"app1": {
+                "slug": "app1", "repo": "org/app1",
+                "forge_type": "github", "token_env": "APP1_TOKEN",
+            }},
+        },
+    }
+    with structlog.testing.capture_logs() as captured:
+        out = await assemble_ticket_pipeline_section(raw, now=NOW)
+
+    assert "PR#99 MERGED" in out
+    assert app.pr_get_calls == [99]            # routed to the app repo
+    reloaded = TicketIntakeState.load(intake_state.path)
+    assert reloaded.entries["uid-1"].disposition == "merged_clean"
+    # the drafter link was empty (count 0) yet the marker still routed.
+    loaded = _log_events(captured, "kalle.digest.cross_repo_links_loaded")
+    assert len(loaded) == 1 and loaded[0]["count"] == 0
 
 
 async def test_per_ticket_failure_contained(tmp_path: Path) -> None:
