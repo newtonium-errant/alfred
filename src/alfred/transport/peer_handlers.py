@@ -3045,15 +3045,19 @@ def _build_issue_body(
     auth_peer: str,
     body: str,
     ticket_uid: str,
+    project_slug: str = "",
 ) -> str:
     """Compose the GitHub issue body — deterministic, no LLM.
 
     Metadata header (absent optionals omitted entirely — no
     empty-trailing-colon lines), blank line, ticket body verbatim,
-    blank line, the ``algernon-ticket`` marker (the dedupe join key
-    ``issue_search_marker`` recovers on).
+    blank line, the ``algernon-ticket`` dedupe marker, and (Option B) the
+    ``algernon-project`` routing marker when ``project_slug`` is set — the
+    on-box drafter parses it to pick the APP repo for the fix PR. The slug
+    is deterministic infra provenance (the vouched relay peer), NOT PHI, so
+    it's body-safe (mirrors the algernon-ticket marker's placement).
     """
-    from alfred.integrations.github_ops import issue_marker
+    from alfred.integrations.github_ops import issue_marker, project_marker
 
     header_lines: list[str] = []
 
@@ -3074,7 +3078,10 @@ def _build_issue_body(
     body_text = body.strip()
     if body_text:
         parts.append(body_text)
-    parts.append(issue_marker(ticket_uid))
+    markers = [issue_marker(ticket_uid)]
+    if project_slug:
+        markers.append(project_marker(project_slug))
+    parts.append("\n".join(markers))
     return "\n\n".join(parts) + "\n"
 
 
@@ -3531,12 +3538,20 @@ async def _handle_ticket_intake(
 
     # --- (f) Post the GitHub issue --------------------------------------
     issue_title = f"[{fm_ticket_type}] {fm_title}"
+    # Option B: resolve the project slug from the AUTHENTICATED relay peer
+    # (deterministic infra provenance — vouched, not asserted). Empty map or
+    # unmapped peer → no marker → single-repo drafter behavior (Phase 0).
+    project_slug = ""
+    pbc = getattr(intake_config, "project_by_client", {}) or {}
+    if isinstance(pbc, dict):
+        project_slug = str(pbc.get(auth_peer, "") or "")
     issue_body = _build_issue_body(
         fm=fm_in,
         relpath=relpath,
         auth_peer=auth_peer,
         body=body_in,
         ticket_uid=ticket_uid,
+        project_slug=project_slug,
     )
     labels = _assemble_labels(
         github_client.config, fm_in, correlation_id=correlation_id,

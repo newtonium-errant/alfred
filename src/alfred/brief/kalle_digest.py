@@ -666,6 +666,18 @@ async def _check_one_ticket_outcome(
     )
     pr_number = entry.pr_number
     if pr_number is None:
+        # SAME-REPO path (GitHub-Action drafter / single-repo Option-B):
+        # discover the linked PR via the tracker issue's timeline.
+        #
+        # OPTION B CROSS-REPO SEAM (flagged follow-up): when the fix PR lives
+        # on a DIFFERENT app repo than the central tracker, the timeline can
+        # NEVER surface it. The durable linkage is written by the drafter into
+        # its state — read it via
+        # ``alfred.transport.fix_drafter.load_pr_links(<drafter state.path>)``
+        # → ``{issue_number: {pr_number, pr_url, app_repo, app_forge_type}}``,
+        # then poll ``pr_get``/``pr_reviews`` on a per-app-repo client
+        # (``build_client_for_repo``) instead of ``client`` below. Wiring that
+        # per-repo poll into this loop is the remaining C4 integration.
         timeline = await client.issue_timeline(
             number=entry.issue_number, caller="digest",
         )

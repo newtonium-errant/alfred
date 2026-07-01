@@ -993,6 +993,45 @@ def test_intake_config_loader_defaults_and_overrides():  # type: ignore[no-untyp
     })
     assert cfg.enabled is True
     assert cfg.state_path == "/tmp/x.json"
+    # Option B: project_by_client absent → empty (backward-compat)
+    assert cfg.project_by_client == {}
+
+
+def test_intake_config_loads_project_by_client():  # type: ignore[no-untyped-def]
+    """Option B: authenticated relay peer → project slug map."""
+    from alfred.transport.ticket_intake import load_ticket_intake_config
+
+    cfg = load_ticket_intake_config({
+        "ticket_intake": {
+            "enabled": True,
+            "project_by_client": {"vera": "transport-admin-portal", "": "skip", "x": ""},
+        },
+    })
+    assert cfg.project_by_client == {"vera": "transport-admin-portal"}  # blank keys/vals dropped
+
+
+def test_build_issue_body_stamps_project_marker():  # type: ignore[no-untyped-def]
+    """Option B: a project_slug stamps the algernon-project routing marker
+    (alongside the algernon-ticket dedupe marker); absent → no marker
+    (backward-compat)."""
+    from alfred.transport.peer_handlers import _build_issue_body
+    from alfred.integrations.github_ops import project_marker, issue_marker
+
+    fm = {"reporter": "Alice", "area": "billing"}
+    with_slug = _build_issue_body(
+        fm=fm, relpath="ticket/t.md", auth_peer="vera", body="it breaks",
+        ticket_uid="vera-1", project_slug="transport-admin-portal",
+    )
+    assert project_marker("transport-admin-portal") in with_slug
+    assert issue_marker("vera-1") in with_slug          # dedupe marker still present
+    assert "it breaks" in with_slug
+
+    without = _build_issue_body(
+        fm=fm, relpath="ticket/t.md", auth_peer="vera", body="it breaks",
+        ticket_uid="vera-1",
+    )
+    assert "algernon-project" not in without            # no routing marker (Phase 0)
+    assert issue_marker("vera-1") in without
 
 
 # ---------------------------------------------------------------------------

@@ -380,6 +380,12 @@ class FixDrafterEntry:
     empty_diff_count: int = 0
     pr_number: int | None = None
     pr_url: str = ""
+    # Option B cross-repo linkage: the issue lives on the CENTRAL tracker
+    # (this entry's key), but the PR lives on the APP repo. These make the
+    # linkage SELF-DESCRIBING so the effectiveness loop can find + poll the
+    # cross-repo PR (see :func:`load_pr_links` + the kalle_digest seam).
+    app_repo: str = ""
+    app_forge_type: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> "FixDrafterEntry":
@@ -442,6 +448,42 @@ class FixDrafterState:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, default=str)
         os.replace(tmp_path, self.path)
+
+
+def load_pr_links(state_path: str | Path) -> dict[int, dict[str, Any]]:
+    """The CROSS-REPO LINKAGE reader (Option B effectiveness-loop seam).
+
+    Under Option B the issue lives on the CENTRAL tracker but the fix PR
+    lives on the APP repo, so ``Closes #N`` / the tracker timeline can NEVER
+    surface it — ``kalle_digest._first_cross_referenced_pr`` would return
+    None → every ticket reports false ``stalled`` forever. The drafter writes
+    the linkage into its OWN state as the durable write-back; this reader
+    exposes it keyed by CENTRAL issue number:
+
+        {issue_number: {pr_number, pr_url, app_repo, app_forge_type, status}}
+
+    kalle_digest's ``_check_one_ticket_outcome`` should consult this (by the
+    drafter ``state.path``) for a cross-repo entry and poll ``pr_get``/
+    ``pr_reviews`` via a per-APP-repo client (``build_client_for_repo`` with
+    the entry's ``app_repo``/``app_forge_type``) instead of the central
+    client + timeline. Only entries that actually opened a PR are returned."""
+    state = FixDrafterState.load(state_path)
+    out: dict[int, dict[str, Any]] = {}
+    for key, entry in state.entries.items():
+        if entry.pr_number is None:
+            continue
+        try:
+            n = int(key)
+        except (TypeError, ValueError):
+            continue
+        out[n] = {
+            "pr_number": entry.pr_number,
+            "pr_url": entry.pr_url,
+            "app_repo": entry.app_repo,
+            "app_forge_type": entry.app_forge_type,
+            "status": entry.status,
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1211,7 +1253,7 @@ async def _open_pr(
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code if exc.response is not None else 0
         if status_code == 409:
-            adopted = await _adopt_existing_pr(target.client, state, entry, branch)
+            adopted = await _adopt_existing_pr(target, state, entry, branch)
             if adopted is not None:
                 return adopted
         log.warning(
@@ -1237,12 +1279,15 @@ async def _open_pr(
 
     entry.pr_number = pr.get("number")
     entry.pr_url = str(pr.get("html_url") or "")
+    entry.app_repo = target.repo          # cross-repo linkage (self-describing)
+    entry.app_forge_type = target.forge_type
     entry.status = "pr_open"
     state.save()
     log.info(
         "fix_drafter.pr_opened",
         issue_number=issue_number,
         pr_number=entry.pr_number,
+        app_repo=target.repo,
         outcome=outcome,
     )
     return {
@@ -1253,19 +1298,22 @@ async def _open_pr(
 
 
 async def _adopt_existing_pr(
-    client: Any,
+    target: ProjectTarget,
     state: FixDrafterState,
     entry: FixDrafterEntry,
     branch: str,
 ) -> dict[str, Any] | None:
-    """Layer-3 adopt: a PR already exists for this branch → record it and
-    skip. Returns the result dict, or ``None`` if no PR is found."""
-    prs = await client.pr_list(state="all", caller=_CALLER)
+    """Layer-3 adopt: a PR already exists for this branch on the APP repo →
+    record it (+ the self-describing cross-repo linkage) and skip. Returns
+    the result dict, or ``None`` if no PR is found."""
+    prs = await target.client.pr_list(state="all", caller=_CALLER)
     match = _find_pr_for_branch(prs, branch)
     if match is None:
         return None
     entry.pr_number = match.get("number")
     entry.pr_url = str(match.get("html_url") or "")
+    entry.app_repo = target.repo
+    entry.app_forge_type = target.forge_type
     entry.status = "pr_open"
     state.save()
     log.info(
@@ -1377,7 +1425,7 @@ async def draft_one(
         if branch_exists:
             # --- Layer 3: PR existence — adopt or resume-at-pr_create ONLY
             #     (pr_list / pr_create on the APP repo = target.client).
-            adopted = await _adopt_existing_pr(target.client, state, entry, branch)
+            adopted = await _adopt_existing_pr(target, state, entry, branch)
             if adopted is not None:
                 return adopted
             # Branch pushed on a prior tick but PR-open never landed →
@@ -1896,6 +1944,7 @@ __all__ = [
     "build_sandbox_command",
     "draft_one",
     "load_fix_drafter_config",
+    "load_pr_links",
     "run_daemon",
     "run_drafter_once",
     "scan_auto_fix_issues",

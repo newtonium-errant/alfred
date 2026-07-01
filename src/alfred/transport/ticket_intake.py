@@ -93,6 +93,14 @@ class TicketIntakeConfig:
 
     enabled: bool = False
     state_path: str = DEFAULT_TICKET_INTAKE_STATE_PATH
+    # Option B: authenticated relay PEER (transport auth.tokens key /
+    # X-Alfred-Client) → project slug. DETERMINISTIC INFRA PROVENANCE (the
+    # peer is authenticated, so the slug is vouched, not asserted) — NOT
+    # LLM-classified, NOT an ``if peer == X`` literal. The slug is stamped
+    # into the tracker issue body via the algernon-project marker; the
+    # on-box drafter routes the fix PR to the mapped app repo. Empty map →
+    # no marker → single-repo drafter behavior (Phase 0).
+    project_by_client: dict = field(default_factory=dict)
 
 
 def load_ticket_intake_config(raw: dict[str, Any]) -> TicketIntakeConfig:
@@ -111,9 +119,18 @@ def load_ticket_intake_config(raw: dict[str, Any]) -> TicketIntakeConfig:
     if isinstance(state_raw, dict):
         state_path = str(state_raw.get("path", "") or "")
 
+    pbc_raw = section.get("project_by_client") or {}
+    project_by_client: dict[str, str] = {}
+    if isinstance(pbc_raw, dict):
+        for peer, slug in pbc_raw.items():
+            peer_s, slug_s = str(peer or ""), str(slug or "")
+            if peer_s and slug_s:
+                project_by_client[peer_s] = slug_s
+
     return TicketIntakeConfig(
         enabled=bool(section.get("enabled", False)),
         state_path=state_path or DEFAULT_TICKET_INTAKE_STATE_PATH,
+        project_by_client=project_by_client,
     )
 
 

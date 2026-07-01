@@ -1336,6 +1336,67 @@ async def test_dephi_scan_refuses_phi_diff(tmp_path, monkeypatch, _drafter_key):
     assert "patient@example.com" not in json.dumps(refused[0])
 
 
+# --- cross-repo linkage write-back (the effectiveness-loop seam) ---
+
+
+def _app_target(app_client, repo, forge, cfg, token="APPTOK"):
+    return fix_drafter.ProjectTarget(
+        slug="app1", repo=repo, clone_base_url=cfg.clone_base_url,
+        forge_type=forge, api_base="", base_branch=cfg.base_branch,
+        token=token, client=app_client,
+    )
+
+
+async def test_open_pr_stamps_cross_repo_linkage_and_load_pr_links(
+    tmp_path, monkeypatch, _drafter_key
+):
+    """The drafter writes the app-repo PR linkage back into its state
+    (self-describing: app_repo + forge), keyed by the CENTRAL issue number —
+    the durable write-back that ``load_pr_links`` exposes to the digest."""
+    cfg = _config(tmp_path)
+    central = FakeClient(tmp_path)        # central tracker (label re-verify)
+    app = FakeClient(tmp_path)            # app repo (pr_create / pr_list)
+    state = FixDrafterState(path=Path(cfg.state_path))
+    fake = FakeRun()
+    _patch_run(monkeypatch, fake)
+    target = _app_target(app, "org/app1", "github", cfg)
+
+    res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg,
+                          central, state, target=target)
+    assert res["outcome"] == "drafted"
+    assert "pr_create" in app.calls        # PR opened on the APP client
+    assert "pr_create" not in central.calls
+    e = state.entries["7"]
+    assert e.app_repo == "org/app1"
+    assert e.app_forge_type == "github"
+    assert e.pr_number == 99
+
+    links = fix_drafter.load_pr_links(cfg.state_path)
+    assert links[7]["app_repo"] == "org/app1"
+    assert links[7]["app_forge_type"] == "github"
+    assert links[7]["pr_number"] == 99
+    # entries without a PR are excluded.
+    state.entries["8"] = FixDrafterEntry(issue_number=8, status="drafting")
+    state.save()
+    assert 8 not in fix_drafter.load_pr_links(cfg.state_path)
+
+
+def test_fix_drafter_entry_linkage_schema_tolerance(tmp_path):
+    """The new app_repo/app_forge_type fields round-trip + tolerate absence
+    (an older state file without them loads fine)."""
+    data = {"entries": {"7": {
+        "issue_number": 7, "pr_number": 5, "app_repo": "org/app1",
+        "app_forge_type": "github", "future_x": "drop",
+    }}}
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps(data))
+    state = FixDrafterState.load(p)
+    assert state.entries["7"].app_repo == "org/app1"
+    # legacy entry (no linkage fields) → defaults, no crash.
+    p.write_text(json.dumps({"entries": {"9": {"issue_number": 9}}}))
+    assert FixDrafterState.load(p).entries["9"].app_repo == ""
+
+
 # ---------------------------------------------------------------------------
 # orchestrator registration
 # ---------------------------------------------------------------------------
