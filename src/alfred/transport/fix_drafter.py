@@ -120,6 +120,13 @@ class FixDrafterConfig:
     # Throwaway clone root — MUST be outside /home so ProtectHome=tmpfs
     # doesn't mask it (ReadWritePaths re-exposes it). Empty → fail loud.
     work_root: str = ""
+    # DAEMON-ONLY dir for the ephemeral Anthropic-key EnvironmentFile (0700,
+    # daemon-owned). MUST NOT be under work_root or the audit dir (both are
+    # sandbox-writable). Empty → derived as <work_root parent>/keys (e.g.
+    # /var/lib/kalle-drafter/keys). The unit reads the 0600 keyfile as ROOT
+    # via ``-p EnvironmentFile=`` (survives sudo env_reset); the value never
+    # crosses the sudo env boundary and never lands in argv.
+    keyfile_dir: str = ""
     claude_command: str = "claude"
     claude_timeout: int = 1200
     git_timeout: int = 300
@@ -232,6 +239,7 @@ def load_fix_drafter_config(raw: dict[str, Any]) -> FixDrafterConfig:
             or "auto-fix/issue-"
         ),
         work_root=str(section.get("work_root", "") or ""),
+        keyfile_dir=str(section.get("keyfile_dir", "") or ""),
         claude_command=str(section.get("claude_command", "claude") or "claude"),
         claude_timeout=claude_timeout,
         git_timeout=_coerce_int(section.get("git_timeout", 300), 300),
@@ -564,26 +572,85 @@ def _resolve_drafter_key(config: FixDrafterConfig) -> str:
     return ""
 
 
+# Ephemeral keyfile naming — the startup sweep + the per-run cleanup both
+# key on this prefix.
+_KEYFILE_PREFIX = "drafter-key-"
+
+
+def _keyfile_dir(config: FixDrafterConfig) -> Path:
+    """The DAEMON-ONLY dir for the ephemeral Anthropic-key EnvironmentFile.
+    Explicit ``keyfile_dir`` or, by default, ``<work_root parent>/keys`` —
+    a SIBLING of work_root/audit (never UNDER them, so the sandbox's
+    ReadWritePaths can never re-expose it)."""
+    if config.keyfile_dir:
+        return Path(config.keyfile_dir)
+    return Path(config.work_root).parent / "keys"
+
+
+def _write_keyfile(config: FixDrafterConfig, key: str) -> str:
+    """Write the drafter key to an EPHEMERAL 0600 daemon-owned keyfile in the
+    systemd ``EnvironmentFile`` format (``ANTHROPIC_API_KEY=<value>``).
+
+    The unit reads this as ROOT (``-p EnvironmentFile=``), so the value
+    NEVER crosses the sudo env boundary (which strips ``--setenv`` under
+    ``env_reset``) and NEVER appears in argv. The 0600 mode blocks the
+    kalle-drafter sandbox user; the dir is 0700 daemon-only + also named in
+    the unit's ``InaccessiblePaths`` (belt-and-suspenders)."""
+    key_dir = _keyfile_dir(config)
+    key_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(key_dir, 0o700)  # daemon-only dir
+    # mkstemp creates the file 0600 by design (umask-independent); the
+    # explicit chmod is a belt-and-suspenders pin target.
+    old_umask = os.umask(0o077)
+    try:
+        fd, path = tempfile.mkstemp(prefix=_KEYFILE_PREFIX, dir=str(key_dir))
+    finally:
+        os.umask(old_umask)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"ANTHROPIC_API_KEY={key}\n")
+    os.chmod(path, 0o600)
+    return path
+
+
+def _sweep_stale_keyfiles(config: FixDrafterConfig) -> None:
+    """Startup crash-defense: remove any keyfiles a prior crashed run left
+    behind (the per-run cleanup unlinks in a finally, so at steady state the
+    dir is empty). Never raises."""
+    key_dir = _keyfile_dir(config)
+    try:
+        stale = list(key_dir.glob(f"{_KEYFILE_PREFIX}*"))
+    except OSError:
+        return
+    for p in stale:
+        _unlink_quiet(str(p))
+    if stale:
+        log.info("fix_drafter.keyfiles_swept", count=len(stale), dir=str(key_dir))
+
+
 def build_sandbox_command(
     *,
     clone_dir: str,
     config: FixDrafterConfig,
     settings_path: str,
-    drafter_key: str | None = None,
+    keyfile_path: str,
 ) -> tuple[list[str], dict[str, str]]:
     """Construct the hardened ``systemd-run`` invocation for the model run.
 
-    Returns ``(argv, subprocess_env)``. The dedicated drafter Anthropic
-    key is imported into the transient unit BY NAME
-    (``--setenv=ANTHROPIC_API_KEY``, value travels over D-Bus) so the
-    secret NEVER appears in argv (``ps``-visible). ``drafter_key`` may be
-    passed pre-resolved (the daemon resolves + fail-loud-checks it once
-    before calling here); when ``None`` it is resolved via
-    :func:`_resolve_drafter_key`. The Forgejo token is NEVER in this env or
-    argv — the model has no push/clone capability (the daemon owns git).
-    The directive list is the security contract; it is pinned by test.
+    Returns ``(argv, subprocess_env)``. The dedicated drafter Anthropic key
+    is passed via ``-p EnvironmentFile=<keyfile_path>`` — systemd reads that
+    0600 daemon-owned file as ROOT, so the value SURVIVES the sudo env
+    boundary (``--setenv`` is stripped by sudo ``env_reset`` without
+    ``SETENV``) and NEVER appears in argv (``ps``-visible) NOR in
+    ``subprocess_env`` (which now carries ONLY ``PATH``). The daemon writes
+    + cleans up ``keyfile_path`` (see :func:`_write_keyfile` / the
+    ``_fresh_draft`` finally). The keyfile's dir is added to
+    ``InaccessiblePaths`` (the 0600 already blocks the sandbox user; this is
+    explicit belt-and-suspenders). The Forgejo token is NEVER here — the
+    model has no git capability. The directive list is the security
+    contract; it is pinned by test.
     """
     audit_dir = str(Path(config.hook_audit_path).resolve().parent)
+    keyfile_dir = str(Path(keyfile_path).resolve().parent)
 
     props: list[str] = [
         f"User={config.sandbox_user}",
@@ -627,37 +694,35 @@ def build_sandbox_command(
         f"MemoryMax={config.sandbox_memory_max}",
         f"TasksMax={config.sandbox_tasks_max}",
     ]
-    # belt-and-suspenders for any out-of-/home secret root.
-    for inaccessible in (config.vera_vault_root, config.box_env_path):
+    # belt-and-suspenders for any out-of-/home secret root + the keyfile dir
+    # (the 0600 keyfile already blocks the sandbox user; be explicit anyway).
+    for inaccessible in (config.vera_vault_root, config.box_env_path, keyfile_dir):
         if inaccessible:
             props.append(f"InaccessiblePaths={inaccessible}")
     # proxy URLs are not secret -> inline as unit env.
     props.append(f"Environment=HTTPS_PROXY={config.anthropic_proxy_url}")
     props.append(f"Environment=HTTP_PROXY={config.anthropic_proxy_url}")
 
+    # The drafter key rides an EnvironmentFile that systemd reads as ROOT —
+    # so it survives the sudo env boundary AND never appears in argv. Only
+    # the PATH to the file is in argv; the VALUE is never here.
+    props.append(f"EnvironmentFile={keyfile_path}")
+
     argv: list[str] = list(config.sandbox_launch_prefix)
     argv += ["systemd-run", "--pipe", "--wait", "--collect", "-q"]
     for prop in props:
         argv += ["-p", prop]
-    # Import the drafter key by NAME — value comes from subprocess_env
-    # below, travels over D-Bus, and never lands in argv.
-    argv.append("--setenv=ANTHROPIC_API_KEY")
     argv.append("--")
     argv.append(config.claude_command)
     argv += ["-p", "-"]
     argv += ["--allowedTools", ",".join(config.claude_allowed_tools)]
     argv += ["--settings", settings_path]
 
-    # The subprocess environment carries ONLY the drafter key (for the
-    # name-only --setenv import) + PATH. The Forgejo token is deliberately
-    # absent. claude_subprocess_env is NOT used here: this is the one
-    # claude site that KEEPS an Anthropic key (the home-masked sandbox has
-    # no OAuth creds), and it uses the DEDICATED drafter key, not the
-    # personal Max-plan auth.
-    key = drafter_key if drafter_key is not None else _resolve_drafter_key(config)
+    # The subprocess environment carries ONLY PATH. The Anthropic key rides
+    # the EnvironmentFile (NOT this env — sudo's env_reset would strip it),
+    # and the Forgejo token is deliberately absent (the model has no git).
     sub_env: dict[str, str] = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "ANTHROPIC_API_KEY": key,
     }
     return argv, sub_env
 
@@ -1147,6 +1212,9 @@ async def _fresh_draft(
     os.chmod(work_item_dir, 0o2750)
     clone_dir = os.path.join(work_item_dir, "repo")
     control_dir = os.path.join(work_item_dir, "control")
+    # The ephemeral Anthropic-key EnvironmentFile — written mid-flow (step
+    # 5), ALWAYS unlinked in the finally (even on failure/timeout/exception).
+    keyfile_path: str | None = None
     try:
         # 1. disjointness assertion FIRST — fail-closed BEFORE any write
         #    (clone_dir is already known), so a misconfigured work_root
@@ -1242,10 +1310,16 @@ async def _fresh_draft(
             )
             return {"issue_number": issue_number, "outcome": "drafter_key_missing"}
 
-        # run the sandboxed model — ONLY through the hardened unit.
+        # 5b. write the resolved key to an ephemeral 0600 daemon-owned
+        #     EnvironmentFile (systemd reads it as ROOT → survives the sudo
+        #     env boundary that strips --setenv; value never in argv/env).
+        #     ALWAYS unlinked in the finally below.
+        keyfile_path = _write_keyfile(config, drafter_key)
+
+        # 5c. run the sandboxed model — ONLY through the hardened unit.
         argv, sub_env = build_sandbox_command(
             clone_dir=clone_dir, config=config, settings_path=settings_path,
-            drafter_key=drafter_key,
+            keyfile_path=keyfile_path,
         )
         rc, model_out, model_err = await _run_subprocess(
             argv, env=sub_env, input_text=_build_drafter_prompt(title, body),
@@ -1335,6 +1409,9 @@ async def _fresh_draft(
             summary=_extract_summary(model_out), outcome="drafted",
         )
     finally:
+        # Delete the ephemeral keyfile FIRST — even on failure / timeout /
+        # exception the secret never outlives the run.
+        _unlink_quiet(keyfile_path)
         shutil.rmtree(work_item_dir, ignore_errors=True)
 
 
@@ -1486,6 +1563,9 @@ async def run_daemon(
         work_root=config.work_root,
         state_path=config.state_path,
     )
+    # Crash defense: sweep any ephemeral keyfiles a prior crashed run left
+    # behind (steady state the per-run finally already unlinks them).
+    _sweep_stale_keyfiles(config)
     while True:
         try:
             await run_drafter_once(config, raw)

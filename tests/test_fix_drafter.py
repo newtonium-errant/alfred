@@ -319,13 +319,17 @@ def test_records_outside_sandbox_fails_audit_under_bash_audit_dir(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+# A stand-in keyfile path (build_sandbox_command takes the PATH, never the value).
+_KEYFILE = "/var/lib/kalle-drafter/keys/drafter-key-abc123"
+
+
 def test_build_sandbox_command_carries_hardening_directives(tmp_path, monkeypatch):
-    monkeypatch.setenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", DUMMY_KEY)
     cfg = _config(tmp_path)
     argv, sub_env = build_sandbox_command(
         clone_dir="/var/lib/kalle-drafter/work/issue-7/repo",
         config=cfg,
         settings_path="/var/lib/kalle-drafter/work/issue-7/control/s.json",
+        keyfile_path=_KEYFILE,
     )
     blob = " ".join(argv)
     # privilege drop + isolation directives (the security contract).
@@ -340,11 +344,13 @@ def test_build_sandbox_command_carries_hardening_directives(tmp_path, monkeypatc
         "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
         f"InaccessiblePaths={cfg.vera_vault_root}",
         f"InaccessiblePaths={cfg.box_env_path}",
+        # the keyfile DIR is also masked (belt-and-suspenders over the 0600).
+        "InaccessiblePaths=/var/lib/kalle-drafter/keys",
         f"HTTPS_PROXY={cfg.anthropic_proxy_url}",
         "ReadWritePaths=/var/lib/kalle-drafter/work/issue-7/repo",
-        # cross-UID bridge (GAP-1): the model's own edits stay group-writable
-        # so the daemon (andrew) can commit them.
         "UMask=0002",
+        # the key rides an EnvironmentFile (systemd reads it as root).
+        f"EnvironmentFile={_KEYFILE}",
     ):
         assert directive in blob, f"missing directive: {directive}"
     # launched ONLY through systemd-run (no bare claude).
@@ -354,38 +360,43 @@ def test_build_sandbox_command_carries_hardening_directives(tmp_path, monkeypatc
     assert cfg.claude_command in argv
 
 
-def test_build_sandbox_command_key_by_name_never_in_argv(tmp_path, monkeypatch):
-    """The dedicated Anthropic key is imported by NAME (--setenv) so the
-    secret never lands in argv (ps-visible); it rides subprocess_env."""
-    monkeypatch.setenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", DUMMY_KEY)
+def test_build_sandbox_command_key_via_environmentfile_never_in_argv_or_env(
+    tmp_path, monkeypatch
+):
+    """The drafter key is passed via `-p EnvironmentFile=<path>` — systemd
+    reads it as ROOT (survives the sudo env boundary). Only the PATH is in
+    argv; the VALUE is nowhere in argv, and sub_env carries NO key (the old
+    `--setenv`/sub_env mechanism is gone — sudo env_reset stripped it)."""
     cfg = _config(tmp_path)
     argv, sub_env = build_sandbox_command(
         clone_dir="/w/repo", config=cfg, settings_path="/w/s.json",
+        keyfile_path=_KEYFILE,
     )
-    assert "--setenv=ANTHROPIC_API_KEY" in argv
-    assert DUMMY_KEY not in " ".join(argv)        # never ps-visible
-    assert sub_env["ANTHROPIC_API_KEY"] == DUMMY_KEY  # rides the env block
+    assert f"EnvironmentFile={_KEYFILE}" in argv           # path only
+    assert "--setenv=ANTHROPIC_API_KEY" not in argv        # old mechanism removed
+    assert "ANTHROPIC_API_KEY" not in sub_env              # (e) not in the env either
+    # a hypothetical key VALUE never appears in argv (only the file path does).
+    assert "sk-" not in " ".join(argv)
 
 
-def test_build_sandbox_command_no_forgejo_token_in_model_env(tmp_path, monkeypatch):
-    """The model env carries ONLY the drafter key + PATH — never the
-    Forgejo token (the model has no git capability)."""
-    monkeypatch.setenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", DUMMY_KEY)
+def test_build_sandbox_command_sub_env_is_path_only(tmp_path, monkeypatch):
+    """sub_env carries ONLY PATH — no drafter key, no Forgejo token."""
     monkeypatch.setenv("ALGERNON_KALLE_FORGEJO_TOKEN", DUMMY_TOKEN)
     cfg = _config(tmp_path)
     argv, sub_env = build_sandbox_command(
         clone_dir="/w/repo", config=cfg, settings_path="/w/s.json",
+        keyfile_path=_KEYFILE,
     )
-    assert set(sub_env.keys()) == {"PATH", "ANTHROPIC_API_KEY"}
+    assert set(sub_env.keys()) == {"PATH"}
     assert DUMMY_TOKEN not in json.dumps(sub_env)
     assert DUMMY_TOKEN not in " ".join(argv)
 
 
 def test_build_sandbox_command_launch_prefix(tmp_path, monkeypatch):
-    monkeypatch.setenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", DUMMY_KEY)
     cfg = _config(tmp_path, sandbox_launch_prefix=["sudo"])
     argv, _ = build_sandbox_command(
         clone_dir="/w/repo", config=cfg, settings_path="/w/s.json",
+        keyfile_path=_KEYFILE,
     )
     assert argv[0] == "sudo"
     assert argv[1] == "systemd-run"
@@ -421,40 +432,107 @@ def test_resolve_drafter_key_environ_takes_precedence(tmp_path, monkeypatch):
     assert _resolve_drafter_key(cfg) == "DUMMY_FROM_ENV"
 
 
-def test_resolve_drafter_key_flows_into_sub_env(tmp_path, monkeypatch):
-    """The .env-resolved key reaches sub_env (the name-only --setenv value)
-    and STILL never appears in argv."""
-    from alfred.transport.fix_drafter import build_sandbox_command as _bsc
+# ---------------------------------------------------------------------------
+# Ephemeral key EnvironmentFile — 0600, cleaned up, fail-loud-first, swept
+# ---------------------------------------------------------------------------
+
+
+def test_write_keyfile_0600_and_content(tmp_path):
+    """Pin (a): the keyfile is 0600 daemon-owned, EnvironmentFile-shaped,
+    in a 0700 daemon-only dir."""
+    import os as _os
+    import stat as _stat
+    from alfred.transport.fix_drafter import _write_keyfile
+
+    key_dir = tmp_path / "keys"
+    cfg = _config(tmp_path, keyfile_dir=str(key_dir))
+    path = _write_keyfile(cfg, "SECRETKEY123")
+    try:
+        assert Path(path).read_text() == "ANTHROPIC_API_KEY=SECRETKEY123\n"
+        assert _stat.S_IMODE(_os.stat(path).st_mode) == 0o600
+        assert _stat.S_IMODE(_os.stat(key_dir).st_mode) == 0o700
+        # the key dir is a SIBLING of work_root, never under it.
+        assert not str(Path(path).resolve()).startswith(str(Path(cfg.work_root).resolve()))
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+async def test_keyfile_written_then_cleaned_up_in_finally_on_exception(
+    tmp_path, monkeypatch
+):
+    """Pin (c): the keyfile is written for the run, then ALWAYS unlinked in
+    the finally — even when the model run raises."""
+    import alfred.transport.fix_drafter as fd
+
+    monkeypatch.setenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", DUMMY_KEY)
+    cfg = _config(tmp_path, keyfile_dir=str(tmp_path / "keys"))
+    client = FakeClient(tmp_path)
+    state = FixDrafterState(path=Path(cfg.state_path))
+
+    captured: dict = {}
+    real_write = fd._write_keyfile
+    def _spy_write(config, key):
+        p = real_write(config, key)
+        captured["path"] = p
+        assert Path(p).exists()  # written before the model run
+        return p
+    monkeypatch.setattr(fd, "_write_keyfile", _spy_write)
+
+    async def _run(argv, **kw):
+        if "systemd-run" in argv:
+            raise RuntimeError("model boom")   # force the finally path
+        return (0, "", "")                     # ls-remote empty → fresh; clone/switch ok
+    monkeypatch.setattr(fd, "_run_subprocess", _run)
+
+    with pytest.raises(RuntimeError):
+        await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
+                        state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+    assert "path" in captured                  # keyfile WAS written
+    assert not Path(captured["path"]).exists()  # ...and cleaned up in finally
+
+
+async def test_empty_key_fails_loud_before_writing_keyfile(tmp_path, monkeypatch):
+    """Pin (b)+(d): key nowhere → fail-loud (drafter_key_missing), claude
+    NEVER launched, and NO keyfile is written (the resolve+check runs first)."""
+    import alfred.transport.fix_drafter as fd
 
     monkeypatch.delenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", raising=False)
-    env_file = tmp_path / ".env"
-    env_file.write_text("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY=DUMMY_DOTENV_ROUNDTRIP\n")
-    cfg = _config(tmp_path, box_env_path=str(env_file))
-    argv, sub_env = _bsc(clone_dir="/w/repo", config=cfg, settings_path="/w/s.json")
-    assert sub_env["ANTHROPIC_API_KEY"] == "DUMMY_DOTENV_ROUNDTRIP"
-    assert "--setenv=ANTHROPIC_API_KEY" in argv          # name-only import
-    assert "DUMMY_DOTENV_ROUNDTRIP" not in " ".join(argv)  # never ps-visible
-
-
-async def test_empty_key_fails_loud_before_claude_launch(tmp_path, monkeypatch):
-    """Pin (b): key nowhere (not in os.environ, not in the box .env) → the
-    fail-loud path fires (drafter_key_missing) and claude is NEVER launched —
-    a clear error, not a cryptic 'Not logged in'."""
-    monkeypatch.delenv("ALGERNON_KALLE_DRAFTER_ANTHROPIC_KEY", raising=False)
-    cfg = _config(tmp_path, box_env_path=str(tmp_path / "nonexistent.env"))
+    cfg = _config(tmp_path, box_env_path=str(tmp_path / "nonexistent.env"),
+                  keyfile_dir=str(tmp_path / "keys"))
     client = FakeClient(tmp_path)
     state = FixDrafterState(path=Path(cfg.state_path))
     fake = FakeRun()
     _patch_run(monkeypatch, fake)
+
+    wrote: list = []
+    monkeypatch.setattr(fd, "_write_keyfile", lambda c, k: wrote.append(k) or "/x")
+
     with structlog.testing.capture_logs() as captured:
         res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
                               state, pat=DUMMY_TOKEN, repo=TEST_REPO)
     assert res["outcome"] == "drafter_key_missing"
     assert fake.model_call() is None            # claude NEVER launched
+    assert wrote == []                          # NO keyfile written on the fail path
     missing = [c for c in captured if c.get("event") == "fix_drafter.drafter_key_missing"]
     assert len(missing) == 1
     assert missing[0]["drafter_key_env"] == cfg.drafter_key_env
     assert missing[0]["box_env_path"] == cfg.box_env_path
+
+
+def test_sweep_stale_keyfiles(tmp_path):
+    """Startup crash-defense: stale keyfiles are swept; non-keyfiles left."""
+    from alfred.transport.fix_drafter import _KEYFILE_PREFIX, _sweep_stale_keyfiles
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir()
+    stale = key_dir / f"{_KEYFILE_PREFIX}stale"
+    stale.write_text("ANTHROPIC_API_KEY=x\n")
+    other = key_dir / "not-a-keyfile"
+    other.write_text("keep")
+    cfg = _config(tmp_path, keyfile_dir=str(key_dir))
+    _sweep_stale_keyfiles(cfg)
+    assert not stale.exists()    # swept
+    assert other.exists()        # untouched
 
 
 # ---------------------------------------------------------------------------

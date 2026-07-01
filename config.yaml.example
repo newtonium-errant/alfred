@@ -1173,6 +1173,12 @@ scaffold:
 #   clone_base_url: "http://127.0.0.1:3001"   # git http root (NOT /api/v1)
 #   base_branch: "main"            # the transport-admin-portal default branch
 #   work_root: "/var/lib/kalle-drafter/work"  # OUTSIDE /home (ProtectHome=tmpfs masks /home)
+#   # keyfile_dir: optional. DAEMON-ONLY dir (0700) for the ephemeral 0600
+#   # Anthropic-key EnvironmentFile the unit reads as root (survives sudo).
+#   # Default: <work_root parent>/keys (e.g. /var/lib/kalle-drafter/keys) — a
+#   # SIBLING of work_root/audit, never under them. Also masked via
+#   # InaccessiblePaths. Written per-run, deleted in a finally + swept at start.
+#   # keyfile_dir: "/var/lib/kalle-drafter/keys"
 #   max_empty_diff_retries: 2      # latch needs_human after N no-op drafts
 #   max_attempts: 5                # latch needs_human after N total fresh-draft attempts
 #   # RECORDS ISOLATION (load-bearing): the ONLY sandbox-writable dirs are the
