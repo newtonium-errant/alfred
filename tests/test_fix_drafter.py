@@ -51,6 +51,12 @@ def _log_events(captured, event):
     return [c for c in captured if c.get("event") == event]
 
 
+def _tgt(client, cfg):
+    """Single-repo ProjectTarget wrapping the FakeClient (central == app repo)
+    — the byte-identical zero-config target for the draft-cycle tests."""
+    return fix_drafter._target_from_central(client, cfg)
+
+
 def _config(tmp_path: Path, **overrides) -> FixDrafterConfig:
     work_root = tmp_path / "work"
     work_root.mkdir(exist_ok=True)
@@ -93,6 +99,8 @@ class FakeClient:
             pat=DUMMY_TOKEN,
             audit_log_path=str(tmp_path / "github_ops_audit.jsonl"),
             forge_type="forgejo",
+            api_base="https://git.algernon.test/api/v1",
+            instance="KAL-LE",
         )
         self._issues = list(issues or [])
         self._labels = list(labels)
@@ -139,6 +147,7 @@ class FakeRun:
         self.calls: list[dict] = []
         self.ls_remote_stdout = ""          # empty => branch absent
         self.status_stdout = " M src/a.py\n"  # non-empty => diff present
+        self.diff_stdout = "+clean generic fix\n"  # staged diff (de-PHI scan)
         self.model_stdout = "Fixed the bug by adding a guard."
         self.fail: dict[str, tuple[int, str, str]] = {}
 
@@ -158,6 +167,8 @@ class FakeRun:
             return self.fail.get("clone", (0, "", ""))
         if "switch" in argv:
             return self.fail.get("switch", (0, "", ""))
+        if "diff" in argv:
+            return self.fail.get("diff", (0, self.diff_stdout, ""))
         if "status" in argv:
             return self.fail.get("status", (0, self.status_stdout, ""))
         if "push" in argv:
@@ -227,6 +238,36 @@ def test_config_loads_nested_blocks():
     assert cfg.box_env_path == "/etc/algernon.env"
     assert cfg.anthropic_proxy_url == "http://127.0.0.1:9000"
     assert cfg.drafter_key_env == "MY_KEY_ENV"
+
+
+def test_config_projects_absent_is_empty():
+    """Backward-compat: no `projects` key → {} → single-repo fallback."""
+    cfg = load_fix_drafter_config({"fix_drafter": {"enabled": True}})
+    assert cfg.projects == {}
+    assert cfg.default_project == ""
+
+
+def test_config_loads_projects_handrolled():
+    """Option B: the projects dict-of-dicts parses into ProjectConfig; a
+    malformed entry (no repo) is skipped (tolerant loader)."""
+    raw = {"fix_drafter": {
+        "enabled": True,
+        "default_project": "app1",
+        "projects": {
+            "app1": {"repo": "org/app1", "forge_type": "github",
+                     "token_env": "APP1_TOKEN", "base_branch": "main"},
+            "app2": {"repo": "org/app2", "forge_type": "forgejo",
+                     "api_base": "https://git.x/api/v1", "token_env": "APP2_TOKEN"},
+            "bad": {"forge_type": "github"},   # no repo → skipped
+        },
+    }}
+    cfg = load_fix_drafter_config(raw)
+    assert set(cfg.projects) == {"app1", "app2"}      # "bad" skipped
+    assert cfg.default_project == "app1"
+    assert cfg.projects["app1"].repo == "org/app1"
+    assert cfg.projects["app1"].token_env == "APP1_TOKEN"
+    assert cfg.projects["app2"].forge_type == "forgejo"
+    assert cfg.projects["app2"].api_base == "https://git.x/api/v1"
 
 
 def test_state_schema_tolerance(tmp_path):
@@ -486,7 +527,7 @@ async def test_keyfile_written_then_cleaned_up_in_finally_on_exception(
 
     with pytest.raises(RuntimeError):
         await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                        state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                        state, target=_tgt(client, cfg))
     assert "path" in captured                  # keyfile WAS written
     assert not Path(captured["path"]).exists()  # ...and cleaned up in finally
 
@@ -509,7 +550,7 @@ async def test_empty_key_fails_loud_before_writing_keyfile(tmp_path, monkeypatch
 
     with structlog.testing.capture_logs() as captured:
         res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                              state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                              state, target=_tgt(client, cfg))
     assert res["outcome"] == "drafter_key_missing"
     assert fake.model_call() is None            # claude NEVER launched
     assert wrote == []                          # NO keyfile written on the fail path
@@ -630,7 +671,7 @@ async def test_fresh_draft_end_to_end(tmp_path, monkeypatch, _drafter_key):
     _patch_run(monkeypatch, fake)
 
     issue = {"number": 7, "title": "the bug", "body": "it breaks"}
-    res = await draft_one(issue, cfg, client, state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+    res = await draft_one(issue, cfg, client, state, target=_tgt(client, cfg))
 
     assert res["outcome"] == "drafted"
     assert res["pr_number"] == 99
@@ -641,11 +682,16 @@ async def test_fresh_draft_end_to_end(tmp_path, monkeypatch, _drafter_key):
     assert "pr_create" in client.calls
     # state recorded pr_open.
     assert state.entries["7"].status == "pr_open"
-    # PR shape: WIP title prefix + Closes #N body.
+    # PR shape: WIP title prefix + PHI-CLEAN body (id-only, no Closes, no
+    # raw title, no model summary).
     assert client.pr_create_args["head"] == "auto-fix/issue-7"
     assert client.pr_create_args["base"] == "main"
     assert client.pr_create_args["title"].startswith("WIP:")
-    assert client.pr_create_args["body"].startswith("Closes #7")
+    body = client.pr_create_args["body"]
+    assert "Closes #" not in body                 # cross-repo: no auto-close
+    assert "the bug" not in body                   # raw issue title never echoed
+    assert "Fixed the bug" not in body             # model stdout never echoed
+    assert "tracker issue id 7" in body            # references the tracker id
 
 
 async def test_push_is_single_explicit_refspec(tmp_path, monkeypatch, _drafter_key):
@@ -655,7 +701,7 @@ async def test_push_is_single_explicit_refspec(tmp_path, monkeypatch, _drafter_k
     fake = FakeRun()
     _patch_run(monkeypatch, fake)
     await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client, state,
-                    pat=DUMMY_TOKEN, repo=TEST_REPO)
+                    target=_tgt(client, cfg))
     push = next(c["argv"] for c in fake.calls if "push" in c["argv"])
     assert push[-3:] == ["push", "origin", "auto-fix/issue-7:auto-fix/issue-7"]
     # never a wildcard push.
@@ -671,7 +717,7 @@ async def test_daemon_refuses_bare_invoke(tmp_path, monkeypatch, _drafter_key):
     fake = FakeRun()
     _patch_run(monkeypatch, fake)
     await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client, state,
-                    pat=DUMMY_TOKEN, repo=TEST_REPO)
+                    target=_tgt(client, cfg))
     model = fake.model_call()
     assert model is not None
     assert model["argv"][0] == "systemd-run"
@@ -688,7 +734,7 @@ async def test_credential_never_in_git_argv_or_model_env(
     fake = FakeRun()
     _patch_run(monkeypatch, fake)
     await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client, state,
-                    pat=DUMMY_TOKEN, repo=TEST_REPO)
+                    target=_tgt(client, cfg))
     # token NEVER in any subprocess argv.
     for c in fake.calls:
         assert DUMMY_TOKEN not in " ".join(c["argv"])
@@ -751,7 +797,7 @@ async def test_clone_group_writable_no_daemon_umask_leak(
     saved = _os.umask(0o022)
     try:
         await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                        state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                        state, target=_tgt(client, cfg))
         # read the CURRENT umask without disturbing it
         current = _os.umask(0o022)
         _os.umask(current)
@@ -793,7 +839,7 @@ async def test_work_item_dir_grants_group_traverse(
     monkeypatch.setattr(fix_drafter.shutil, "rmtree", lambda *a, **k: None)
 
     await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                    state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                    state, target=_tgt(client, cfg))
 
     work_dirs = list(Path(cfg.work_root).glob("issue-7-*"))
     assert len(work_dirs) == 1
@@ -814,7 +860,7 @@ async def test_disjointness_fail_closed_refuses_before_model(
     _patch_run(monkeypatch, fake)
     with structlog.testing.capture_logs() as captured:
         res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                              state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                              state, target=_tgt(client, cfg))
     assert res["outcome"] == "refused_disjointness"
     # disjointness now runs BEFORE the clone (deliverable C) — neither the
     # clone nor the model ever ran (refused before any write).
@@ -830,7 +876,7 @@ async def test_empty_vault_root_fails_closed(tmp_path, monkeypatch, _drafter_key
     fake = FakeRun()
     _patch_run(monkeypatch, fake)
     res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                          state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                          state, target=_tgt(client, cfg))
     assert res["outcome"] == "refused_disjointness"
     assert fake.model_call() is None
 
@@ -850,7 +896,7 @@ async def test_label_reverify_refuses_without_auto_fix(
     _patch_run(monkeypatch, fake)
     with structlog.testing.capture_logs() as captured:
         res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                              state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                              state, target=_tgt(client, cfg))
     assert res["outcome"] == "refused_not_auto_fix"
     # never cloned, never ran the model.
     assert not fake.has_stage("clone")
@@ -875,7 +921,7 @@ async def test_branch_exists_with_pr_adopts(tmp_path, monkeypatch, _drafter_key)
     fake.ls_remote_stdout = "abc123\trefs/heads/auto-fix/issue-7\n"  # branch exists
     _patch_run(monkeypatch, fake)
     res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                          state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                          state, target=_tgt(client, cfg))
     assert res["outcome"] == "adopted"
     assert res["pr_number"] == 42
     assert state.entries["7"].status == "pr_open"
@@ -898,7 +944,7 @@ async def test_branch_exists_no_pr_resumes_at_pr_create_only(
     fake.ls_remote_stdout = "abc123\trefs/heads/auto-fix/issue-7\n"  # branch exists
     _patch_run(monkeypatch, fake)
     res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                          state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                          state, target=_tgt(client, cfg))
     assert res["outcome"] == "resumed"
     assert res["pr_number"] == 99
     # resume opened the PR but did NOT clone or run the model.
@@ -923,7 +969,7 @@ async def test_pr_create_409_is_adopt(tmp_path, monkeypatch, _drafter_key):
     fake = FakeRun()
     _patch_run(monkeypatch, fake)
     res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                          state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                          state, target=_tgt(client, cfg))
     assert res["outcome"] == "adopted"
     assert res["pr_number"] == 55
     assert state.entries["7"].status == "pr_open"
@@ -946,14 +992,14 @@ async def test_empty_diff_latches_needs_human_after_retries(
 
     issue = {"number": 7, "title": "t", "body": "b"}
     # first empty diff → retry (not latched, never pushed).
-    res1 = await draft_one(issue, cfg, client, state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+    res1 = await draft_one(issue, cfg, client, state, target=_tgt(client, cfg))
     assert res1["outcome"] == "empty_diff"
     assert state.entries["7"].status != "needs_human"
     assert not fake.has_stage("push")
 
     # second empty diff → latch needs_human.
     with structlog.testing.capture_logs() as captured:
-        res2 = await draft_one(issue, cfg, client, state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+        res2 = await draft_one(issue, cfg, client, state, target=_tgt(client, cfg))
     assert res2["outcome"] == "needs_human"
     assert state.entries["7"].status == "needs_human"
     nh = _log_events(captured, "fix_drafter.needs_human")
@@ -979,7 +1025,7 @@ async def test_max_attempts_latches_needs_human(tmp_path, monkeypatch, _drafter_
     _patch_run(monkeypatch, fake)
     with structlog.testing.capture_logs() as captured:
         res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                              state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                              state, target=_tgt(client, cfg))
     assert res["outcome"] == "needs_human"
     assert state.entries["7"].status == "needs_human"
     # latched BEFORE the clone/model — no minutes burned this attempt.
@@ -1003,7 +1049,7 @@ async def test_clone_failure_isolated(tmp_path, monkeypatch, _drafter_key):
     fake.fail["clone"] = (128, "", "fatal: could not read")
     _patch_run(monkeypatch, fake)
     res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                          state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                          state, target=_tgt(client, cfg))
     assert res["outcome"] == "clone_failed"
     assert fake.model_call() is None  # never ran the model
     assert "pr_create" not in client.calls
@@ -1017,7 +1063,7 @@ async def test_push_failure_no_pr(tmp_path, monkeypatch, _drafter_key):
     fake.fail["push"] = (1, "", "remote rejected")
     _patch_run(monkeypatch, fake)
     res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
-                          state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+                          state, target=_tgt(client, cfg))
     assert res["outcome"] == "push_failed"
     assert "pr_create" not in client.calls
 
@@ -1107,6 +1153,187 @@ async def test_run_once_client_build_failure_emits_tick(tmp_path, monkeypatch):
     assert summary["scanned"] == 0
     assert len(_log_events(captured, "fix_drafter.client_build_failed")) == 1
     assert len(_log_events(captured, "fix_drafter.tick")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Option B — cross-repo routing (ProjectTarget) + PHI-clean PR + de-PHI scan
+# ---------------------------------------------------------------------------
+
+
+def _project(**kw):
+    from alfred.transport.fix_drafter import ProjectConfig
+    base = dict(slug="app1", repo="org/app1", forge_type="github",
+                api_base="", base_branch="main", token_env="APP1_TOKEN",
+                clone_base_url="")
+    base.update(kw)
+    return ProjectConfig(**base)
+
+
+def test_backward_compat_single_repo_target_byte_identical(tmp_path):
+    """CRITICAL PIN: no `projects` → the target is derived ENTIRELY from the
+    central client + config, so clone/push/pr all hit github.repo with the
+    central credential — BYTE-IDENTICAL to today."""
+    cfg = _config(tmp_path)  # no projects
+    client = FakeClient(tmp_path)
+    target, reason = fix_drafter._resolve_project_target(
+        {"number": 7, "body": "it breaks"}, cfg, client,
+    )
+    assert reason == ""
+    assert target.slug == ""
+    assert target.repo == client.config.repo          # github.repo
+    assert target.client is client                     # SAME central client
+    assert target.token == client.config.pat           # central credential
+    assert target.base_branch == cfg.base_branch
+    assert target.clone_base_url == cfg.clone_base_url
+    # clone url is byte-identical to the pre-Option-B _clone_url(config, repo).
+    assert target.clone_url() == fix_drafter._clone_url(cfg, client.config.repo)
+
+
+def test_cross_repo_marker_resolves_app_target(tmp_path, monkeypatch):
+    """A project marker → a SECOND client for the APP repo (different repo,
+    possibly different forge)."""
+    monkeypatch.setenv("APP1_TOKEN", "DUMMY_APP1_TOKEN")
+    cfg = _config(tmp_path, projects={"app1": _project(repo="org/app1", forge_type="github")},
+                  default_project="app1")
+    client = FakeClient(tmp_path)  # central = forgejo tracker
+    from alfred.integrations.github_ops import project_marker
+    issue = {"number": 7, "body": f"it breaks\n\n{project_marker('app1')}"}
+    target, reason = fix_drafter._resolve_project_target(issue, cfg, client)
+    assert reason == ""
+    assert target.slug == "app1"
+    assert target.repo == "org/app1"                   # the APP repo, not central
+    assert target.forge_type == "github"               # follows the app forge
+    assert target.token == "DUMMY_APP1_TOKEN"
+    assert target.client is not client                 # a DISTINCT app-repo client
+    assert target.client.config.repo == "org/app1"
+
+
+def test_markerless_ambiguous_when_multi_project_fails_loud(tmp_path, monkeypatch):
+    """N>1 projects + a markerless issue → FAIL-LOUD (never default-route to
+    the wrong app repo)."""
+    monkeypatch.setenv("APP1_TOKEN", "t1")
+    monkeypatch.setenv("APP2_TOKEN", "t2")
+    cfg = _config(tmp_path, projects={
+        "app1": _project(slug="app1", repo="org/app1", token_env="APP1_TOKEN"),
+        "app2": _project(slug="app2", repo="org/app2", token_env="APP2_TOKEN"),
+    })
+    client = FakeClient(tmp_path)
+    target, reason = fix_drafter._resolve_project_target(
+        {"number": 7, "body": "no marker here"}, cfg, client,
+    )
+    assert target is None
+    assert reason == "markerless_ambiguous"
+
+
+def test_markerless_single_project_uses_it(tmp_path, monkeypatch):
+    """N==1 markerless → the single project (the Phase-1 soak path)."""
+    monkeypatch.setenv("APP1_TOKEN", "t1")
+    cfg = _config(tmp_path, projects={"app1": _project(token_env="APP1_TOKEN")},
+                  default_project="app1")
+    client = FakeClient(tmp_path)
+    target, reason = fix_drafter._resolve_project_target(
+        {"number": 7, "body": "no marker"}, cfg, client,
+    )
+    assert reason == "" and target.slug == "app1"
+
+
+def test_unknown_project_marker_fails_loud(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP1_TOKEN", "t1")
+    cfg = _config(tmp_path, projects={"app1": _project(token_env="APP1_TOKEN")})
+    client = FakeClient(tmp_path)
+    from alfred.integrations.github_ops import project_marker
+    issue = {"number": 7, "body": project_marker("ghost")}
+    target, reason = fix_drafter._resolve_project_target(issue, cfg, client)
+    assert target is None and reason == "unknown_project:ghost"
+
+
+def test_missing_token_fails_loud(tmp_path, monkeypatch):
+    monkeypatch.delenv("APP1_TOKEN", raising=False)
+    cfg = _config(tmp_path, box_env_path=str(tmp_path / "none.env"),
+                  projects={"app1": _project(token_env="APP1_TOKEN")}, default_project="app1")
+    client = FakeClient(tmp_path)
+    target, reason = fix_drafter._resolve_project_target(
+        {"number": 7, "body": "x"}, cfg, client,
+    )
+    assert target is None and reason == "missing_token:app1"
+
+
+async def test_run_once_project_unresolved_latches_needs_human(tmp_path, monkeypatch, _drafter_key):
+    """run_drafter_once: a markerless issue under N>1 projects → needs_human,
+    NO draft (clone/model never run)."""
+    monkeypatch.setenv("APP1_TOKEN", "t1")
+    monkeypatch.setenv("APP2_TOKEN", "t2")
+    cfg = _config(tmp_path, projects={
+        "app1": _project(slug="app1", repo="org/app1", token_env="APP1_TOKEN"),
+        "app2": _project(slug="app2", repo="org/app2", token_env="APP2_TOKEN"),
+    })
+    client = FakeClient(tmp_path, issues=[{"number": 7, "title": "t", "body": "no marker"}])
+    monkeypatch.setattr(
+        "alfred.integrations.github_ops.build_github_client",
+        lambda raw, instance: client,
+    )
+    fake = FakeRun()
+    _patch_run(monkeypatch, fake)
+    with structlog.testing.capture_logs() as captured:
+        summary = await run_drafter_once(cfg, {"github": {}})
+    assert summary["needs_human"] == 1
+    assert not fake.has_stage("clone")             # never drafted
+    unresolved = _log_events(captured, "fix_drafter.project_unresolved")
+    assert len(unresolved) == 1 and unresolved[0]["reason"] == "markerless_ambiguous"
+
+
+# --- PHI-clean PR surface + de-PHI diff scan ---
+
+
+def test_phi_clean_pr_title_and_body():
+    from alfred.transport.fix_drafter import _phi_clean_pr_body, _phi_clean_pr_title, ProjectTarget
+    t = ProjectTarget(slug="app1", repo="org/app1", clone_base_url="", forge_type="github",
+                      api_base="", base_branch="main", token="x", client=None)
+    title = _phi_clean_pr_title(42)
+    body = _phi_clean_pr_body(42, t)
+    assert "42" in title and "WIP:" in title
+    assert "Closes #" not in body                  # cross-repo: never auto-close
+    assert "#42" not in body                        # no wrong same-repo autolink
+    assert "tracker issue id 42" in body
+
+
+def test_scan_diff_for_phi_classes():
+    from alfred.transport.fix_drafter import _scan_diff_for_phi
+    diff = (
+        "+++ b/x.py\n"
+        "+patient = 'redacted'          # phi_keyword\n"
+        "+email = 'a@b.com'             # email\n"
+        "+card = '123 456 789 000'      # long_digit_run\n"
+        "-old = 1\n"
+        " context email z@y.com         # NOT added → ignored\n"
+    )
+    hits = _scan_diff_for_phi(diff)
+    assert "phi_keyword" in hits and "email" in hits and "long_digit_run" in hits
+    # a clean diff → no hits
+    assert _scan_diff_for_phi("+return x + 1\n+def foo():\n") == []
+
+
+async def test_dephi_scan_refuses_phi_diff(tmp_path, monkeypatch, _drafter_key):
+    """A drafted diff carrying obvious PHI on added lines → REFUSE
+    (phi_scan_refused, needs_human), NEVER pushed; the log names CLASSES only."""
+    cfg = _config(tmp_path)
+    client = FakeClient(tmp_path)
+    state = FixDrafterState(path=Path(cfg.state_path))
+    fake = FakeRun()
+    fake.diff_stdout = "+++ b/t.py\n+contact = 'patient@example.com'\n"  # email + phi_keyword
+    _patch_run(monkeypatch, fake)
+    with structlog.testing.capture_logs() as captured:
+        res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
+                              state, target=_tgt(client, cfg))
+    assert res["outcome"] == "phi_scan_refused"
+    assert state.entries["7"].status == "needs_human"
+    assert not fake.has_stage("push")              # NEVER pushed the PHI diff
+    assert "pr_create" not in client.calls
+    refused = _log_events(captured, "fix_drafter.phi_scan_refused")
+    assert len(refused) == 1
+    assert "email" in refused[0]["pattern_classes"]
+    # the log must NOT contain the matched PHI value.
+    assert "patient@example.com" not in json.dumps(refused[0])
 
 
 # ---------------------------------------------------------------------------

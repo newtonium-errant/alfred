@@ -100,6 +100,47 @@ _DEFAULT_ALLOWED_TOOLS: tuple[str, ...] = (
 
 
 @dataclass
+class ProjectConfig:
+    """One entry of ``fix_drafter.projects`` (Option B, central bug-intake).
+
+    Maps a project ``slug`` (stamped into the tracker issue via the
+    ``algernon-project`` marker) → the APP repo the drafter opens the fix PR
+    against. The app repo may be a DIFFERENT forge than the central sovereign
+    tracker (e.g. GitHub app code + Forgejo tracker). ``token_env`` names the
+    env var holding that repo's push/PR credential (never a literal)."""
+
+    slug: str = ""
+    repo: str = ""
+    clone_base_url: str = ""   # empty → falls back to fix_drafter.clone_base_url
+    forge_type: str = "github"
+    api_base: str = ""         # REST base for the app-repo client (forgejo MUST set)
+    base_branch: str = ""      # empty → falls back to fix_drafter.base_branch
+    token_env: str = ""
+
+
+@dataclass
+class ProjectTarget:
+    """The RESOLVED app-repo target for one issue: everything the drafter
+    needs to clone/push/open-PR against the app repo. Built per-issue from
+    the project marker (:func:`_resolve_project_target`). In the single-repo
+    (no ``projects``) case it is derived from the central client → BYTE-
+    IDENTICAL to today's behavior."""
+
+    slug: str
+    repo: str
+    clone_base_url: str
+    forge_type: str
+    api_base: str
+    base_branch: str
+    token: str          # resolved credential value (never logged)
+    client: Any         # app-repo github_ops client (pr_create / pr_list)
+
+    def clone_url(self) -> str:
+        # token-less remote — auth rides the ephemeral gitconfig extraHeader.
+        return f"{self.clone_base_url.rstrip('/')}/{self.repo}.git"
+
+
+@dataclass
 class FixDrafterConfig:
     """Typed view of the ``fix_drafter:`` config section (KAL-LE-only).
 
@@ -108,6 +149,11 @@ class FixDrafterConfig:
     daemon startup gate rather than guessing a wrong path (per the
     fail-loud-on-empty rule). The clone credential + repo + api_base come
     from the shared ``github:`` client (single validated source).
+
+    Option B (central bug-intake): ``projects`` (slug → :class:`ProjectConfig`)
+    + ``default_project`` decouple the drafter's PR target from the scan
+    source. ABSENT/EMPTY ``projects`` == today's single-repo behavior against
+    ``github.repo``, BYTE-IDENTICAL (the zero-config fallback).
     """
 
     enabled: bool = False
@@ -175,6 +221,11 @@ class FixDrafterConfig:
     vera_vault_root: str = ""
     # Box .env path — belt-and-suspenders InaccessiblePaths entry.
     box_env_path: str = ""
+    # --- Option B: cross-repo routing (ABSENT = single-repo byte-identical) ---
+    # slug -> ProjectConfig. Empty → the drafter targets github.repo (the
+    # central client) for every issue, exactly as today.
+    projects: dict = field(default_factory=dict)
+    default_project: str = ""
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -224,6 +275,31 @@ def load_fix_drafter_config(raw: dict[str, Any]) -> FixDrafterConfig:
         if isinstance(launch_prefix_raw, list)
         else []
     )
+
+    # HAND-ROLLED (Option B): the ``projects`` map is a dict-of-dicts; routing
+    # it through the generic ``_build`` would collide on ``_DATACLASS_MAP``
+    # keys, per CLAUDE.md. Parse each entry into a ProjectConfig; a malformed
+    # entry (no slug/repo) is skipped (tolerant loader). Absent → {} → the
+    # single-repo fallback in ``_resolve_project_target``.
+    projects_raw = section.get("projects") or {}
+    projects: dict[str, ProjectConfig] = {}
+    if isinstance(projects_raw, dict):
+        for slug, praw in projects_raw.items():
+            if not isinstance(praw, dict):
+                continue
+            slug_s = str(slug or "")
+            repo_s = str(praw.get("repo", "") or "")
+            if not slug_s or not repo_s:
+                continue
+            projects[slug_s] = ProjectConfig(
+                slug=slug_s,
+                repo=repo_s,
+                clone_base_url=str(praw.get("clone_base_url", "") or ""),
+                forge_type=str(praw.get("forge_type", "github") or "github"),
+                api_base=str(praw.get("api_base", "") or ""),
+                base_branch=str(praw.get("base_branch", "") or ""),
+                token_env=str(praw.get("token_env", "") or ""),
+            )
 
     return FixDrafterConfig(
         enabled=bool(section.get("enabled", False)),
@@ -276,6 +352,8 @@ def load_fix_drafter_config(raw: dict[str, Any]) -> FixDrafterConfig:
         ),
         vera_vault_root=str(sandbox_raw.get("vera_vault_root", "") or ""),
         box_env_path=str(sandbox_raw.get("box_env_path", "") or ""),
+        projects=projects,
+        default_project=str(section.get("default_project", "") or ""),
     )
 
 
@@ -562,14 +640,119 @@ def _resolve_drafter_key(config: FixDrafterConfig) -> str:
          it; ``box_env_path`` is only ``InaccessiblePaths`` for the SANDBOX.
     Returns "" when the key is nowhere (the caller fails loud).
     """
-    val = os.environ.get(config.drafter_key_env, "")
+    return _resolve_env_var(config, config.drafter_key_env)
+
+
+def _resolve_env_var(config: FixDrafterConfig, var_name: str) -> str:
+    """Resolve a named env var ROBUSTLY (os.environ → the box .env).
+
+    The re-exec'd daemon doesn't inherit the main process's runtime
+    ``os.environ`` (where ``auto_load_dotenv`` injected the box .env), so a
+    per-project push credential (``ProjectConfig.token_env``) — like the
+    drafter key — must fall back to reading ``box_env_path`` directly (the
+    daemon CAN; it's ``InaccessiblePaths`` for the SANDBOX only). Returns ""
+    when nowhere (the caller fails loud)."""
+    if not var_name:
+        return ""
+    val = os.environ.get(var_name, "")
     if val:
         return val
     if config.box_env_path:
         from alfred._env import load_dotenv_file
         env = load_dotenv_file(config.box_env_path)  # never raises; {} on missing
-        return str(env.get(config.drafter_key_env, "") or "")
+        return str(env.get(var_name, "") or "")
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Option B — per-issue project-target resolution (cross-repo, cross-forge)
+# ---------------------------------------------------------------------------
+
+
+def _target_from_central(central_client: Any, config: FixDrafterConfig) -> ProjectTarget:
+    """Single-repo (no ``projects``) target — derived ENTIRELY from the
+    central client + config, so clone/push/pr_create all hit ``github.repo``
+    with the central credential: BYTE-IDENTICAL to today."""
+    cc = central_client.config
+    return ProjectTarget(
+        slug="",
+        repo=cc.repo,
+        clone_base_url=config.clone_base_url,
+        forge_type=cc.forge_type,
+        api_base=cc.api_base,
+        base_branch=config.base_branch,
+        token=cc.pat,
+        client=central_client,
+    )
+
+
+def _build_target_from_project(
+    proj: ProjectConfig, central_client: Any, config: FixDrafterConfig
+) -> ProjectTarget:
+    """Build the app-repo target for a resolved project: a SECOND github_ops
+    client (may be a different forge than the central tracker) + the resolved
+    push credential. The instance gate is deliberately bypassed
+    (:func:`build_client_for_repo`) — the credential-holder identity was
+    validated on the central client."""
+    from alfred.integrations.github_ops import GITHUB_API_BASE, build_client_for_repo
+
+    token = _resolve_env_var(config, proj.token_env)
+    api_base = proj.api_base or (
+        GITHUB_API_BASE if proj.forge_type == "github" else ""
+    )
+    app_client = build_client_for_repo(
+        repo=proj.repo,
+        pat=token,
+        forge_type=proj.forge_type,
+        api_base=api_base,
+        audit_log_path=central_client.config.audit_log_path,
+        instance=central_client.config.instance,
+    )
+    return ProjectTarget(
+        slug=proj.slug,
+        repo=proj.repo,
+        clone_base_url=proj.clone_base_url or config.clone_base_url,
+        forge_type=proj.forge_type,
+        api_base=api_base,
+        base_branch=proj.base_branch or config.base_branch,
+        token=token,
+        client=app_client,
+    )
+
+
+def _resolve_project_target(
+    issue: dict[str, Any], config: FixDrafterConfig, central_client: Any
+) -> tuple[ProjectTarget | None, str]:
+    """Resolve the app-repo target for one issue. Returns ``(target, "")`` on
+    success or ``(None, reason)`` for a fail-loud (needs_human).
+
+    Fail-loud rules (NEVER silently draft against the wrong repo):
+      * ``projects`` empty → single-repo central target (never fails).
+      * markerless + N>1 projects → ``markerless_ambiguous`` (do NOT default
+        once more than one app is live).
+      * markerless + N==1 → the single project (default_project or the sole
+        entry) — the Phase-1 soak path.
+      * marker names an unknown slug → ``unknown_project:<slug>``.
+      * resolved project's token env is empty → ``missing_token:<slug>``.
+    """
+    from alfred.integrations.github_ops import parse_project_marker
+
+    if not config.projects:
+        return _target_from_central(central_client, config), ""
+
+    slug = parse_project_marker(str(issue.get("body") or ""))
+    if not slug:
+        if len(config.projects) > 1:
+            return None, "markerless_ambiguous"
+        slug = config.default_project or next(iter(config.projects))
+
+    proj = config.projects.get(slug)
+    if proj is None:
+        return None, f"unknown_project:{slug}"
+    target = _build_target_from_project(proj, central_client, config)
+    if not target.token:
+        return None, f"missing_token:{slug}"
+    return target, ""
 
 
 # Ephemeral keyfile naming — the startup sweep + the per-run cleanup both
@@ -878,12 +1061,50 @@ _DRAFTER_PREAMBLE = (
     "- Edit only the files needed for this fix. Keep the change small.\n"
     "- Do NOT commit, push, open PRs, merge, or touch CI/workflows/secrets.\n"
     "- You may run the project's tests (pytest / npm test / etc.) to verify.\n"
-    "- When done, print a one-paragraph summary of what you changed.\n\n"
+    "- PRIVACY (LOAD-BEARING): the issue text below may contain SENSITIVE "
+    "REPORTED DATA (personal / patient information, names, dates, IDs, "
+    "screenshots-turned-text). This fix PR may land on a PUBLIC repo. NEVER "
+    "copy ANY reported data, quoted issue text, user-supplied values, names, "
+    "dates, or identifiers into the code you write — no test fixtures, "
+    "comments, log lines, or strings derived from the report. Describe and "
+    "fix the underlying defect GENERICALLY; invent neutral placeholder data "
+    "if a test needs a value.\n"
+    "- When done, print a one-paragraph summary of what you changed "
+    "(the summary is NOT used in the PR — it is discarded).\n\n"
 )
 
 
 def _build_drafter_prompt(title: str, body: str) -> str:
     return f"{_DRAFTER_PREAMBLE}# Issue: {title}\n\n{body}\n"
+
+
+# Light de-PHI scan on the drafted diff (Option B). BOUNDED, not proven-clean
+# — operator-ACCEPTED residual — pairs with the preamble hardening. Scans only
+# ADDED lines (the model's contribution). Returns the matched pattern CLASSES,
+# never the matched values (so a PHI hit is never itself logged).
+_PHI_DIFF_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    # a run of 9+ digits (allowing spaces/dashes): phone / health-card / SIN shape.
+    ("long_digit_run", re.compile(r"\b\d[\d\s-]{7,}\d\b")),
+    ("phi_keyword", re.compile(
+        r"(?i)\b(patient|health\s*card|ohip|\bsin\b|date\s*of\s*birth|\bdob\b|"
+        r"medical\s*record|\bmrn\b)\b"
+    )),
+)
+
+
+def _scan_diff_for_phi(diff_text: str) -> list[str]:
+    """Return the DISTINCT PHI pattern-CLASSES found on ADDED diff lines
+    (never the matched values). Empty list = clean by this bounded scan."""
+    hits: set[str] = set()
+    for line in (diff_text or "").splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        added = line[1:]
+        for name, rx in _PHI_DIFF_PATTERNS:
+            if rx.search(added):
+                hits.add(name)
+    return sorted(hits)
 
 
 def _extract_summary(model_stdout: str) -> str:
@@ -924,13 +1145,41 @@ def select_eligible(
 
 
 # ---------------------------------------------------------------------------
+# PHI-clean PR surface (Option B — the app repo may be PUBLIC GitHub)
+# ---------------------------------------------------------------------------
+
+
+def _phi_clean_pr_title(issue_number: int) -> str:
+    """Neutral, id-only WIP title — NO raw issue title (the issue title can
+    carry PHI, and the model was fed the full PHI body)."""
+    return f"WIP: auto-fix draft (tracker issue {issue_number})"
+
+
+def _phi_clean_pr_body(issue_number: int, target: ProjectTarget) -> str:
+    """Bare cross-repo reference to the CENTRAL tracker issue by ID ONLY.
+
+    Deliberately: NO raw title, NO ``_extract_summary(model_out)`` stdout tail
+    (the model read the PHI issue body), and NO ``Closes #N`` — the issue is
+    on a DIFFERENT (central sovereign) repo, so ``#N`` would false-link/close
+    an app-repo issue. The reverse linkage (app-repo PR ↔ tracker issue) is
+    written back onto the tracker issue separately (the effectiveness-loop
+    seam). Plain ``id`` (no ``#``) so no wrong same-repo auto-link fires."""
+    return (
+        f"Automated draft fix for central bug-intake tracker issue id "
+        f"{issue_number}.\n\n"
+        "References the tracker issue by id only — carries no reported "
+        "content. Operator review + merge required (never auto-merged)."
+    )
+
+
+# ---------------------------------------------------------------------------
 # PR-open (shared by fresh-draft + resume; never half-open)
 # ---------------------------------------------------------------------------
 
 
 async def _open_pr(
     config: FixDrafterConfig,
-    client: Any,
+    target: ProjectTarget,
     state: FixDrafterState,
     entry: FixDrafterEntry,
     branch: str,
@@ -939,17 +1188,21 @@ async def _open_pr(
     summary: str,
     outcome: str,
 ) -> dict[str, Any]:
-    """Open the draft PR against an ALREADY-pushed branch. A 409 (PR
-    already exists) is treated as adopt. On any other failure the entry
-    stays ``branch_pushed`` so the next tick resumes here — never
-    half-open, never re-draft."""
+    """Open the draft PR on the APP repo (``target``) against an ALREADY-
+    pushed branch. A 409 (PR already exists) is treated as adopt. On any
+    other failure the entry stays ``branch_pushed`` so the next tick resumes
+    here — never half-open, never re-draft.
+
+    PHI-CLEAN PR (Option B): the title/body carry NO raw issue title and NO
+    model-stdout summary — only a neutral id reference (see
+    :func:`_phi_clean_pr_title` / :func:`_phi_clean_pr_body`)."""
     issue_number = entry.issue_number
-    pr_title = f"WIP: {title}".strip()
-    pr_body = f"Closes #{issue_number}\n\n{summary}".strip()
+    pr_title = _phi_clean_pr_title(issue_number)
+    pr_body = _phi_clean_pr_body(issue_number, target)
     try:
-        pr = await client.pr_create(
+        pr = await target.client.pr_create(
             head=branch,
-            base=config.base_branch,
+            base=target.base_branch,
             title=pr_title,
             body=pr_body,
             caller=_CALLER,
@@ -958,7 +1211,7 @@ async def _open_pr(
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code if exc.response is not None else 0
         if status_code == 409:
-            adopted = await _adopt_existing_pr(client, state, entry, branch)
+            adopted = await _adopt_existing_pr(target.client, state, entry, branch)
             if adopted is not None:
                 return adopted
         log.warning(
@@ -1065,16 +1318,20 @@ def _handle_empty_diff(
 async def draft_one(
     issue: dict[str, Any],
     config: FixDrafterConfig,
-    client: Any,
+    central_client: Any,
     state: FixDrafterState,
     *,
-    pat: str,
-    repo: str,
+    target: ProjectTarget,
 ) -> dict[str, Any]:
     """Draft (or adopt/resume) one auto-fix issue. Owns the ephemeral
     gitconfig lifecycle; delegates the fresh-draft clone lifecycle to
     :func:`_fresh_draft`. Three-layer dedup, ground-truth authoritative,
-    never half-open."""
+    never half-open.
+
+    Option B: the ISSUE lives on the CENTRAL tracker (``central_client`` —
+    the label re-verify reads it there); clone/push/pr_create/pr_list/adopt
+    run against the APP repo (``target``). Single-repo == both are the same
+    central client/repo (byte-identical)."""
     issue_number = int(issue.get("number") or 0)
     title = str(issue.get("title") or "")
     body = str(issue.get("body") or "")
@@ -1095,11 +1352,12 @@ async def draft_one(
     if entry.status in {"pr_open", "needs_human"}:
         return {"issue_number": issue_number, "outcome": "skipped"}
 
-    clone_url = _clone_url(config, repo)
-    gitconfig_path = _write_temp_gitconfig(pat)
+    clone_url = target.clone_url()
+    gitconfig_path = _write_temp_gitconfig(target.token)
     git_env = _git_env(gitconfig_path)
     try:
         # --- Layer 2: git ground-truth — does the branch already exist?
+        #     (on the APP repo — target.client / target.clone_url).
         rc, out, err = await _run_subprocess(
             ["git", "ls-remote", "--heads", clone_url, branch],
             env=git_env,
@@ -1117,8 +1375,9 @@ async def draft_one(
 
         branch_exists = bool(out.strip())
         if branch_exists:
-            # --- Layer 3: PR existence — adopt or resume-at-pr_create ONLY.
-            adopted = await _adopt_existing_pr(client, state, entry, branch)
+            # --- Layer 3: PR existence — adopt or resume-at-pr_create ONLY
+            #     (pr_list / pr_create on the APP repo = target.client).
+            adopted = await _adopt_existing_pr(target.client, state, entry, branch)
             if adopted is not None:
                 return adopted
             # Branch pushed on a prior tick but PR-open never landed →
@@ -1126,7 +1385,7 @@ async def draft_one(
             entry.status = "branch_pushed"
             state.save()
             return await _open_pr(
-                config, client, state, entry, branch, title,
+                config, target, state, entry, branch, title,
                 summary="(resumed: branch already pushed on a prior tick)",
                 outcome="resumed",
             )
@@ -1149,15 +1408,16 @@ async def draft_one(
             )
             return {"issue_number": issue_number, "outcome": "needs_human"}
 
-        # Re-verify the auto-fix label BEFORE any clone.
-        issue_data = await client.issue_get(number=issue_number, caller=_CALLER)
+        # Re-verify the auto-fix label BEFORE any clone — on the CENTRAL
+        # tracker (that's where the issue lives).
+        issue_data = await central_client.issue_get(number=issue_number, caller=_CALLER)
         labels = _label_names(issue_data.get("labels"))
         if _AUTO_FIX_LABEL not in labels:
             from alfred.integrations.github_ops import append_github_audit
             append_github_audit(
-                config.audit_log_path or client.config.audit_log_path,
+                config.audit_log_path or central_client.config.audit_log_path,
                 op="fix_drafter_label_reverify",
-                repo=repo,
+                repo=central_client.config.repo,
                 caller=_CALLER,
                 outcome="denied",
                 issue_number=issue_number,
@@ -1175,7 +1435,7 @@ async def draft_one(
             }
 
         return await _fresh_draft(
-            config, client, state, entry, branch, title, body,
+            config, target, state, entry, branch, title, body,
             git_env=git_env, clone_url=clone_url,
         )
     finally:
@@ -1184,7 +1444,7 @@ async def draft_one(
 
 async def _fresh_draft(
     config: FixDrafterConfig,
-    client: Any,
+    target: ProjectTarget,
     state: FixDrafterState,
     entry: FixDrafterEntry,
     branch: str,
@@ -1246,7 +1506,7 @@ async def _fresh_draft(
         rc, out, err = await _run_subprocess(
             [
                 "git", "clone", "--depth", "1", "--single-branch",
-                "--branch", config.base_branch, clone_url, clone_dir,
+                "--branch", target.base_branch, clone_url, clone_dir,
             ],
             env=git_env,
             timeout=config.git_timeout,
@@ -1353,7 +1613,8 @@ async def _fresh_draft(
         if not status_out.strip():
             return _handle_empty_diff(state, entry, config)
 
-        # 7. commit (LOCAL, no token).
+        # 7. stage (LOCAL, no token) — add BEFORE the de-PHI scan so new
+        #    files show in the staged diff.
         rc, out, err = await _run_subprocess(
             ["git", "-C", clone_dir, "add", "-A"]
         )
@@ -1364,6 +1625,32 @@ async def _fresh_draft(
                 stdout_tail=out[-2000:] if out else "",
             )
             return {"issue_number": issue_number, "outcome": "draft_failed"}
+
+        # 7b. LIGHT de-PHI scan on the staged diff BEFORE commit/push (Option
+        #     B — the PR may land on a PUBLIC repo). Bounded, not proven-clean
+        #     (operator-accepted residual) + preamble hardening. A hit REFUSES
+        #     (needs_human) — NEVER push a diff carrying obvious PHI. The log
+        #     names the pattern CLASSES only, never the matched values.
+        rc, diff_out, _ = await _run_subprocess(
+            ["git", "-C", clone_dir, "diff", "--cached"]
+        )
+        phi_hits = _scan_diff_for_phi(diff_out) if rc == 0 else []
+        if phi_hits:
+            entry.status = "needs_human"
+            state.save()
+            log.error(
+                "fix_drafter.phi_scan_refused",
+                issue_number=issue_number,
+                pattern_classes=phi_hits,
+                detail=(
+                    "the drafted diff matched obvious-PHI pattern classes on "
+                    "added lines — refusing to push to a possibly-public app "
+                    "repo (needs_human). Values are NOT logged."
+                ),
+            )
+            return {"issue_number": issue_number, "outcome": "phi_scan_refused"}
+
+        # 8. commit (LOCAL, no token).
         rc, out, err = await _run_subprocess(
             ["git", "-C", clone_dir, "commit", "-m",
              f"auto-fix: draft for #{issue_number}"]
@@ -1403,10 +1690,11 @@ async def _fresh_draft(
         entry.status = "branch_pushed"
         state.save()
 
-        # 11. open the draft PR.
+        # 11. open the draft PR (PHI-clean surface — summary is IGNORED now,
+        #     kept only for the resume-path signature symmetry).
         return await _open_pr(
-            config, client, state, entry, branch, title,
-            summary=_extract_summary(model_out), outcome="drafted",
+            config, target, state, entry, branch, title,
+            summary="", outcome="drafted",
         )
     finally:
         # Delete the ephemeral keyfile FIRST — even on failure / timeout /
@@ -1457,8 +1745,9 @@ async def run_drafter_once(
         log.info("fix_drafter.tick", **counts)
         return {**counts, "results": results}
 
-    pat = client.config.pat
-    repo = client.config.repo
+    # `client` is the CENTRAL tracker client (scan + label re-verify). The
+    # per-issue APP-repo target is resolved in the loop below (Option B).
+    central_client = client
 
     # FAIL-CLOSED records guard (gate A): refuse the whole tick if an
     # authoritative record (drafter state, the REST github_ops audit) would
@@ -1509,9 +1798,34 @@ async def run_drafter_once(
 
     for issue in eligible:
         issue_number = issue.get("number")
+        # Option B: resolve the APP-repo target from the issue's project
+        # marker. A None target is a FAIL-LOUD (needs_human) — never silently
+        # draft against the wrong repo.
+        target, reason = _resolve_project_target(issue, config, central_client)
+        if target is None:
+            key = str(int(issue_number)) if issue_number is not None else ""
+            if key:
+                entry = state.entries.get(key)
+                if entry is None:
+                    entry = FixDrafterEntry(issue_number=int(issue_number))
+                    state.entries[key] = entry
+                entry.status = "needs_human"
+            log.warning(
+                "fix_drafter.project_unresolved",
+                issue_number=issue_number,
+                reason=reason,
+                project_count=len(config.projects),
+            )
+            counts["needs_human"] += 1
+            results.append({
+                "issue_number": issue_number,
+                "outcome": "needs_human",
+                "reason": reason,
+            })
+            continue
         try:
             res = await draft_one(
-                issue, config, client, state, pat=pat, repo=repo,
+                issue, config, central_client, state, target=target,
             )
         except Exception as exc:  # noqa: BLE001 — isolate per issue
             log.warning(

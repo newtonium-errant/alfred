@@ -1181,6 +1181,24 @@ scaffold:
 #   # keyfile_dir: "/var/lib/kalle-drafter/keys"
 #   max_empty_diff_retries: 2      # latch needs_human after N no-op drafts
 #   max_attempts: 5                # latch needs_human after N total fresh-draft attempts
+#   # --- Option B: cross-repo routing (central bug-intake) ------------------
+#   # ABSENT/EMPTY `projects` == TODAY's single-repo behavior against
+#   # github.repo, BYTE-IDENTICAL (the zero-config fallback). With `projects`,
+#   # github.repo is the CENTRAL sovereign tracker (SCAN + label re-verify);
+#   # each issue's `<!-- algernon-project: <slug> -->` body marker (stamped by
+#   # intake) picks the APP repo the fix PR is opened against — which may be a
+#   # DIFFERENT forge (GitHub app code + Forgejo tracker). A markerless issue
+#   # with >1 project FAILS LOUD (needs_human) — never silently mis-routes.
+#   # token_env names the app repo's push/PR credential ${VAR} (never literal).
+#   # default_project: transport-admin-portal
+#   # projects:
+#   #   transport-admin-portal:
+#   #     repo: "newtonium-errant/transport-admin-portal"
+#   #     forge_type: "github"           # app code stays PHI-free on GitHub
+#   #     api_base: "https://api.github.com"
+#   #     clone_base_url: "https://github.com"   # git http root (empty → fix_drafter.clone_base_url)
+#   #     base_branch: "main"
+#   #     token_env: "ALGERNON_KALLE_TAP_GH_TOKEN"
 #   # RECORDS ISOLATION (load-bearing): the ONLY sandbox-writable dirs are the
 #   # per-issue clone (under work_root) + the bash-audit's PARENT dir. So
 #   # hook_audit_path lives in its OWN dedicated dir ALONGSIDE work_root,

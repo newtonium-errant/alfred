@@ -56,6 +56,7 @@ dir create, single append write, never raises).
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -196,6 +197,27 @@ ISSUE_MARKER_TEMPLATE = "<!-- algernon-ticket: {ticket_uid} -->"
 def issue_marker(ticket_uid: str) -> str:
     """Render the issue-body marker for one ticket UID."""
     return ISSUE_MARKER_TEMPLATE.format(ticket_uid=ticket_uid)
+
+
+# Project routing marker (Option B, 2026-07-01). The intake stamps this into
+# the CENTRAL tracker issue body (deterministic infra provenance — the
+# authenticated relay peer → project slug); the on-box drafter parses it to
+# pick the APP repo to draft the fix against. The slug is NOT PHI → body-safe
+# (mirrors the algernon-ticket dedupe marker's placement).
+PROJECT_MARKER_TEMPLATE = "<!-- algernon-project: {slug} -->"
+_PROJECT_MARKER_RE = re.compile(r"<!--\s*algernon-project:\s*([A-Za-z0-9._-]+)\s*-->")
+
+
+def project_marker(slug: str) -> str:
+    """Render the project-routing marker for one project slug."""
+    return PROJECT_MARKER_TEMPLATE.format(slug=slug)
+
+
+def parse_project_marker(body: str) -> str:
+    """Extract the project slug from an issue body, or "" when absent.
+    A slug is a safe filesystem/URL token ([A-Za-z0-9._-])."""
+    m = _PROJECT_MARKER_RE.search(str(body or ""))
+    return m.group(1) if m else ""
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +602,38 @@ def build_github_client(
         )
         raise GitHubOpsWrongInstance(reason)
 
+    return GitHubOpsClient(config)
+
+
+def build_client_for_repo(
+    *,
+    repo: str,
+    pat: str,
+    forge_type: str = FORGE_GITHUB,
+    api_base: str = "",
+    audit_log_path: str = DEFAULT_AUDIT_LOG_PATH,
+    instance: str = "",
+) -> "GitHubOpsClient":
+    """Build a client for an ARBITRARY (repo, forge) — DELIBERATELY bypassing
+    the instance gate (Option B, 2026-07-01).
+
+    The credential-holder identity was already validated on the central
+    tracker client (:func:`build_github_client`); the on-box drafter then
+    builds a SECOND client per app repo to open PHI-clean fix PRs against
+    it. That app repo may be a different forge (GitHub) than the central
+    tracker (Forgejo) — the ``_headers`` forge-conditional handles the auth
+    dispatch. ``api_base`` defaults to the GitHub base when omitted; a
+    forgejo target MUST pass its ``/api/v1`` base. The ``fix_drafter`` caller
+    is still gated by :data:`GITHUB_OPS` per op, and ``pr_merge`` stays
+    permanently denied — this factory does NOT widen the op matrix."""
+    config = GitHubOpsConfig(
+        repo=repo,
+        pat=pat,
+        instance=instance,
+        forge_type=(forge_type if forge_type in FORGE_TYPES else FORGE_GITHUB),
+        api_base=api_base or GITHUB_API_BASE,
+        audit_log_path=audit_log_path or DEFAULT_AUDIT_LOG_PATH,
+    )
     return GitHubOpsClient(config)
 
 
@@ -1355,8 +1409,12 @@ __all__ = [
     "GitHubOpsWrongInstance",
     "ISSUE_MARKER_TEMPLATE",
     "append_github_audit",
+    "build_client_for_repo",
     "build_github_client",
     "issue_marker",
+    "PROJECT_MARKER_TEMPLATE",
+    "parse_project_marker",
+    "project_marker",
     "load_github_config",
     "read_github_audit",
 ]
