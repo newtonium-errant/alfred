@@ -1081,6 +1081,286 @@ async def test_known_pr_skips_timeline_discovery(tmp_path: Path) -> None:
     assert fake.pr_get_calls == [456]
 
 
+# ---------------------------------------------------------------------------
+# C4 — Option B cross-repo PR-link consumer (load_pr_links + app-repo client)
+# ---------------------------------------------------------------------------
+
+
+async def test_cross_repo_link_resolves_via_app_client_not_timeline(
+    tmp_path: Path,
+) -> None:
+    """C4 pin (a): a ticket whose drafter link names a DIFFERENT app repo is
+    polled on a per-app-repo client → merged_clean, NOT a false stalled. The
+    central tracker timeline is NEVER queried for it, and the poll hits the
+    APP client."""
+    audit_path = tmp_path / "audit.jsonl"
+    state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=5),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            # old enough that a false 'no PR' would report stalled.
+            issue_created_at=_ago(days=5),
+            ticket_type="bug",
+        ),
+    })
+    # central tracker (forgejo): its timeline can NEVER surface the app-repo
+    # PR — querying it here is a bug (the cross-ref lives on the app repo).
+    central = FakeDigestGitHubClient(
+        audit_path,
+        forge_type="forgejo",
+        timeline_exc={
+            7: RuntimeError("central timeline must NOT be queried cross-repo"),
+        },
+    )
+    # the APP repo (github) carries the merged PR + a clean review.
+    app = FakeDigestGitHubClient(
+        audit_path,
+        prs={99: {"state": "closed", "merged_at": _ago(hours=6)}},
+        reviews={99: [{"state": "APPROVED"}]},
+    )
+    app.config.repo = "org/app1"
+    factory_calls: list[tuple[str, str]] = []
+
+    def factory(app_repo: str, app_forge_type: str) -> Any:
+        factory_calls.append((app_repo, app_forge_type))
+        return app
+
+    pr_links = {
+        7: {
+            "pr_number": 99, "app_repo": "org/app1",
+            "app_forge_type": "github", "status": "pr_open",
+        },
+    }
+    with structlog.testing.capture_logs() as captured:
+        changed = await check_ticket_outcomes(
+            state, central, now=NOW, audit_log_path=str(audit_path),
+            pr_links=pr_links, app_client_factory=factory,
+        )
+    assert changed == 1
+    entry = state.entries["uid-1"]
+    assert entry.disposition == "merged_clean"   # NOT a false stalled
+    assert entry.pr_number == 99
+    assert entry.pr_state == "merged"
+    # polled the APP client; the central timeline was never touched.
+    assert app.pr_get_calls == [99]
+    assert app.pr_reviews_calls == [99]
+    assert central.timeline_calls == []
+    assert factory_calls == [("org/app1", "github")]
+    # log-emission pin (discipline #9): the cross-repo link line fires + fields.
+    ev = _log_events(captured, "kalle.digest.ticket_pipeline_cross_repo_link")
+    assert len(ev) == 1
+    assert ev[0]["issue_number"] == 7
+    assert ev[0]["app_repo"] == "org/app1"
+    assert ev[0]["app_forge_type"] == "github"
+    assert ev[0]["pr_number"] == 99
+
+
+async def test_same_repo_link_uses_timeline_not_app_client(
+    tmp_path: Path,
+) -> None:
+    """C4 pin (b): a link whose app_repo EQUALS the central repo is a same-repo
+    ticket (single-repo instances stamp the central repo) → the timeline path
+    runs and the app_client_factory is NEVER consulted. Byte-identical to
+    pre-C4."""
+    audit_path = tmp_path / "audit.jsonl"
+    state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=2),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(days=2),
+            ticket_type="bug",
+        ),
+    })
+    # central repo defaults to "acme/site" (FakeDigestGitHubClient).
+    central = FakeDigestGitHubClient(
+        audit_path,
+        timelines={7: [_xref_event(456)]},
+        prs={456: {"state": "closed", "merged_at": _ago(hours=3)}},
+        reviews={456: []},
+    )
+    called: list[str] = []
+
+    def factory(app_repo: str, app_forge_type: str) -> Any:
+        called.append(app_repo)
+        return FakeDigestGitHubClient(audit_path)
+
+    # the link names the CENTRAL repo → same-repo, must NOT engage cross-repo.
+    pr_links = {
+        7: {
+            "pr_number": 456, "app_repo": "acme/site",
+            "app_forge_type": "github", "status": "pr_open",
+        },
+    }
+    changed = await check_ticket_outcomes(
+        state, central, now=NOW, audit_log_path=str(audit_path),
+        pr_links=pr_links, app_client_factory=factory,
+    )
+    assert changed == 1
+    assert state.entries["uid-1"].disposition == "merged_clean"
+    assert state.entries["uid-1"].pr_number == 456
+    assert central.timeline_calls == [7]     # resolved via the timeline
+    assert central.pr_get_calls == [456]     # polled on the CENTRAL client
+    assert called == []                      # factory never consulted
+
+
+async def test_cross_repo_factory_none_falls_back_to_timeline(
+    tmp_path: Path,
+) -> None:
+    """C4: when the per-app-repo client can't be built (factory returns None —
+    e.g. token missing this pass), fall back to the tracker timeline rather
+    than polling the CENTRAL tracker with an app-repo PR number (which could
+    hit an unrelated same-numbered central PR)."""
+    audit_path = tmp_path / "audit.jsonl"
+    state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=5),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(days=5),
+        ),
+    })
+    central = FakeDigestGitHubClient(audit_path)  # empty timeline → no PR
+
+    def factory(app_repo: str, app_forge_type: str) -> Any:
+        return None
+
+    pr_links = {
+        7: {
+            "pr_number": 99, "app_repo": "org/app1",
+            "app_forge_type": "github", "status": "pr_open",
+        },
+    }
+    changed = await check_ticket_outcomes(
+        state, central, now=NOW, audit_log_path=str(audit_path),
+        pr_links=pr_links, app_client_factory=factory,
+    )
+    # fell back to the timeline (queried), found no PR → stalled (5 nights);
+    # the central client was NEVER polled with the app-repo number 99.
+    assert central.timeline_calls == [7]
+    assert central.pr_get_calls == []
+    assert state.entries["uid-1"].disposition == "stalled"
+    assert changed == 1
+
+
+async def test_no_pr_links_is_byte_identical_same_repo(tmp_path: Path) -> None:
+    """C4 backward-compat: pr_links/app_client_factory absent (the default,
+    every single-repo instance) → the same-repo timeline path runs exactly as
+    before."""
+    audit_path = tmp_path / "audit.jsonl"
+    state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=2),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(days=2),
+        ),
+    })
+    central = FakeDigestGitHubClient(
+        audit_path,
+        timelines={7: [_xref_event(456)]},
+        prs={456: {"state": "closed", "merged_at": _ago(hours=1)}},
+        reviews={456: []},
+    )
+    with structlog.testing.capture_logs() as captured:
+        changed = await check_ticket_outcomes(
+            state, central, now=NOW, audit_log_path=str(audit_path),
+        )
+    assert changed == 1
+    assert state.entries["uid-1"].disposition == "merged_clean"
+    assert central.timeline_calls == [7]
+    # no cross-repo log line when the consumer is inert.
+    assert _log_events(
+        captured, "kalle.digest.ticket_pipeline_cross_repo_link",
+    ) == []
+
+
+async def test_assemble_section_wires_cross_repo_consumer_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C4 wiring pin: the assembler loads the drafter's pr_links (gated on
+    ``fix_drafter.projects``), builds the per-app-repo factory, and resolves a
+    cross-repo ticket to merged — through the REAL
+    ``assemble_ticket_pipeline_section`` path. Also pins the
+    ``cross_repo_links_loaded`` ILB log (discipline #9)."""
+    import alfred.transport.fix_drafter as fdmod
+
+    # intake state — the cross-repo ticket (issue 7), old enough to false-stall.
+    intake_state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(days=5),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(days=5),
+            ticket_type="bug",
+        ),
+    })
+    intake_state.save()
+
+    # drafter state — the durable linkage the consumer reads (issue 7 → PR 99
+    # on the app repo org/app1).
+    drafter_state_path = tmp_path / "fix_drafter_state.json"
+    drafter_state_path.write_text(json.dumps({"entries": {"7": {
+        "issue_number": 7, "pr_number": 99, "pr_url": "http://app/pr/99",
+        "app_repo": "org/app1", "app_forge_type": "github", "status": "pr_open",
+    }}}))
+
+    # the app-repo poll client (merged PR + clean review) — patched in so no
+    # real HTTP is made against the app repo.
+    app = FakeDigestGitHubClient(
+        tmp_path / "app_audit.jsonl",
+        prs={99: {"state": "closed", "merged_at": _ago(hours=4)}},
+        reviews={99: [{"state": "APPROVED"}]},
+    )
+    app.config.repo = "org/app1"
+    monkeypatch.setattr(
+        fdmod, "poll_client_for_app_repo",
+        lambda cfg, app_repo, app_forge_type, audit_log_path="": app,
+    )
+
+    raw = {
+        "vault": {"path": str(tmp_path / "vault")},
+        "telegram": {"instance": {"name": "KAL-LE"}},
+        "github": {
+            "repo": "acme/site", "pat": "DUMMY_GITHUB_TEST_PAT",
+            "instance": "KAL-LE", "forge_type": "forgejo",
+            "audit_log_path": str(tmp_path / "central_audit.jsonl"),
+        },
+        "ticket_intake": {
+            "enabled": True, "state": {"path": str(intake_state.path)},
+        },
+        "fix_drafter": {
+            "state": {"path": str(drafter_state_path)},
+            "projects": {"app1": {
+                "slug": "app1", "repo": "org/app1",
+                "forge_type": "github", "token_env": "APP1_TOKEN",
+            }},
+        },
+    }
+    with structlog.testing.capture_logs() as captured:
+        out = await assemble_ticket_pipeline_section(raw, now=NOW)
+
+    # the cross-repo PR resolved to merged (NOT a false 'no PR yet — stalled').
+    assert "PR#99 MERGED" in out
+    assert "no PR yet" not in out
+    # the app client was polled; the central tracker timeline never was.
+    assert app.pr_get_calls == [99]
+    assert app.pr_reviews_calls == [99]
+    # state persisted the flip.
+    reloaded = TicketIntakeState.load(intake_state.path)
+    assert reloaded.entries["uid-1"].disposition == "merged_clean"
+    assert reloaded.entries["uid-1"].pr_number == 99
+    # ILB pin: the loader logged the link count (idle distinguishable).
+    loaded = _log_events(captured, "kalle.digest.cross_repo_links_loaded")
+    assert len(loaded) == 1
+    assert loaded[0]["count"] == 1
+    # and the cross-repo resolution line fired.
+    assert len(_log_events(
+        captured, "kalle.digest.ticket_pipeline_cross_repo_link",
+    )) == 1
+
+
 async def test_per_ticket_failure_contained(tmp_path: Path) -> None:
     """One issue's API failure logs + skips that entry only."""
     audit_path = tmp_path / "audit.jsonl"

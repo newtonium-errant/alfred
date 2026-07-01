@@ -486,6 +486,86 @@ def load_pr_links(state_path: str | Path) -> dict[int, dict[str, Any]]:
     return out
 
 
+def poll_client_for_app_repo(
+    config: FixDrafterConfig,
+    app_repo: str,
+    app_forge_type: str = "github",
+    *,
+    audit_log_path: str = "",
+) -> Any | None:
+    """Build a READ-poll github_ops client for an app repo named in a
+    cross-repo PR link (Option B effectiveness-loop consumer, C4).
+
+    kalle_digest's ``_check_one_ticket_outcome`` calls this to poll
+    ``pr_get``/``pr_reviews`` on the APP repo (where the fix PR actually
+    lives) instead of the central tracker, so a cross-repo ticket resolves
+    to its real disposition rather than a false ``stalled``. Resolves the
+    matching ``fix_drafter.projects`` entry (by ``repo``) for its
+    ``token_env`` + ``api_base``, then delegates to
+    :func:`build_client_for_repo` — the SAME per-app-repo client the drafter
+    opens the PR with, minus the mutating ops (the ``GITHUB_OPS`` matrix
+    still gates every call; ``pr_merge`` stays permanently denied).
+
+    Fail-SOFT (returns None, logged) rather than raising when the app repo
+    is not a configured project or its token env is empty — the digest then
+    falls back to the same-repo timeline path (reporting ``stalled`` only if
+    that also finds nothing), never crashing the effectiveness pass.
+    """
+    from alfred.integrations.github_ops import (
+        GITHUB_API_BASE,
+        build_client_for_repo,
+    )
+
+    if not app_repo:
+        return None
+    proj = next(
+        (
+            p for p in config.projects.values()
+            if getattr(p, "repo", "") == app_repo
+        ),
+        None,
+    )
+    if proj is None:
+        # A cross-repo link names an app_repo with no matching project —
+        # can't resolve a poll credential. Loud (a real config gap) but
+        # non-fatal: the caller falls back to the same-repo timeline.
+        log.warning(
+            "fix_drafter.poll_client_unknown_app_repo",
+            app_repo=app_repo,
+            detail=(
+                "a cross-repo PR link names an app_repo with no matching "
+                "fix_drafter.projects entry — cannot resolve a poll token; "
+                "the digest falls back to the same-repo timeline path"
+            ),
+        )
+        return None
+    token = _resolve_env_var(config, proj.token_env)
+    if not token:
+        log.warning(
+            "fix_drafter.poll_client_missing_token",
+            app_repo=app_repo,
+            token_env=proj.token_env,
+            detail=(
+                "the app repo's project token env is empty — cannot poll the "
+                "cross-repo PR (needs the box .env credential); the digest "
+                "falls back to the same-repo timeline path"
+            ),
+        )
+        return None
+    forge = app_forge_type or proj.forge_type or "github"
+    api_base = proj.api_base or (
+        GITHUB_API_BASE if forge == "github" else ""
+    )
+    return build_client_for_repo(
+        repo=app_repo,
+        pat=token,
+        forge_type=forge,
+        api_base=api_base,
+        audit_log_path=audit_log_path or config.audit_log_path,
+        instance=config.instance,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Subprocess choke point — the single mockable point for git + the model
 # ---------------------------------------------------------------------------
@@ -1698,10 +1778,14 @@ async def _fresh_draft(
             )
             return {"issue_number": issue_number, "outcome": "phi_scan_refused"}
 
-        # 8. commit (LOCAL, no token).
+        # 8. commit (LOCAL, no token). NON-linking tracker ref (C4): a bare
+        #    ``#N`` auto-links on the APP repo to an UNRELATED same-numbered
+        #    app issue (the number is the CENTRAL tracker's id, not the app
+        #    repo's). "tracker issue N" is plain text — it can't create a
+        #    stray cross-link on whatever forge the app repo lives on.
         rc, out, err = await _run_subprocess(
             ["git", "-C", clone_dir, "commit", "-m",
-             f"auto-fix: draft for #{issue_number}"]
+             f"auto-fix: draft for tracker issue {issue_number}"]
         )
         if rc != 0:
             log.warning(
@@ -1945,6 +2029,7 @@ __all__ = [
     "draft_one",
     "load_fix_drafter_config",
     "load_pr_links",
+    "poll_client_for_app_repo",
     "run_daemon",
     "run_drafter_once",
     "scan_auto_fix_issues",

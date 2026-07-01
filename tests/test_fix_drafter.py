@@ -1398,6 +1398,78 @@ def test_fix_drafter_entry_linkage_schema_tolerance(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# C4 — non-linking commit ref + the digest's per-app-repo poll client
+# ---------------------------------------------------------------------------
+
+
+async def test_commit_message_carries_no_bare_foreign_ref(
+    tmp_path, monkeypatch, _drafter_key
+):
+    """C4 pin (c): the commit message must NOT carry a bare ``#N`` — on the
+    APP repo a bare ``#N`` auto-links to an UNRELATED same-numbered app issue
+    (N is the CENTRAL tracker's id). Use the non-linking ``tracker issue N``
+    plain-text form."""
+    cfg = _config(tmp_path)
+    client = FakeClient(tmp_path)
+    state = FixDrafterState(path=Path(cfg.state_path))
+    fake = FakeRun()
+    _patch_run(monkeypatch, fake)
+    await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client, state,
+                    target=_tgt(client, cfg))
+    commit = next(
+        c["argv"] for c in fake.calls
+        if "commit" in c["argv"] and "-m" in c["argv"]
+    )
+    msg = commit[commit.index("-m") + 1]
+    assert "#" not in msg              # no bare ref at all (no #7, no #N)
+    assert "tracker issue 7" in msg    # the non-linking form
+
+
+def test_poll_client_for_app_repo_resolves_project(tmp_path, monkeypatch):
+    """C4: a cross-repo app_repo resolves to a per-app-repo client built from
+    the matching project's token_env + forge + api_base (the SAME per-repo
+    client the drafter opens the PR with, for the digest's read poll)."""
+    monkeypatch.setenv("APP1_TOKEN", "DUMMY_APP1_TOKEN")
+    cfg = _config(tmp_path, projects={
+        "app1": _project(repo="org/app1", forge_type="github",
+                         token_env="APP1_TOKEN"),
+    })
+    poll = fix_drafter.poll_client_for_app_repo(cfg, "org/app1", "github")
+    assert poll is not None
+    assert poll.config.repo == "org/app1"
+    assert poll.config.forge_type == "github"
+    assert poll.config.pat == "DUMMY_APP1_TOKEN"
+
+
+def test_poll_client_for_app_repo_unknown_repo_returns_none(tmp_path, monkeypatch):
+    """No matching project → None (logged) so the digest falls back to the
+    same-repo timeline instead of crashing."""
+    monkeypatch.setenv("APP1_TOKEN", "t1")
+    cfg = _config(tmp_path, projects={
+        "app1": _project(repo="org/app1", token_env="APP1_TOKEN"),
+    })
+    with structlog.testing.capture_logs() as captured:
+        poll = fix_drafter.poll_client_for_app_repo(cfg, "org/ghost", "github")
+    assert poll is None
+    ev = _log_events(captured, "fix_drafter.poll_client_unknown_app_repo")
+    assert len(ev) == 1 and ev[0]["app_repo"] == "org/ghost"
+
+
+def test_poll_client_for_app_repo_missing_token_returns_none(tmp_path, monkeypatch):
+    """A matching project whose token env is empty → None (logged), NEVER a
+    tokenless client."""
+    monkeypatch.delenv("APP1_TOKEN", raising=False)
+    cfg = _config(tmp_path, box_env_path=str(tmp_path / "none.env"), projects={
+        "app1": _project(repo="org/app1", token_env="APP1_TOKEN"),
+    })
+    with structlog.testing.capture_logs() as captured:
+        poll = fix_drafter.poll_client_for_app_repo(cfg, "org/app1", "github")
+    assert poll is None
+    ev = _log_events(captured, "fix_drafter.poll_client_missing_token")
+    assert len(ev) == 1 and ev[0]["token_env"] == "APP1_TOKEN"
+
+
+# ---------------------------------------------------------------------------
 # orchestrator registration
 # ---------------------------------------------------------------------------
 

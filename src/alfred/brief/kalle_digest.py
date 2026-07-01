@@ -54,7 +54,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .utils import get_logger
 
@@ -642,6 +642,8 @@ async def _check_one_ticket_outcome(
     entry: Any,
     *,
     now: datetime,
+    pr_links: dict[int, dict[str, Any]] | None = None,
+    app_client_factory: Callable[[str, str], Any] | None = None,
 ) -> bool:
     """Evaluate one non-terminal issue-bearing entry against the forge.
 
@@ -659,25 +661,59 @@ async def _check_one_ticket_outcome(
     Forge-aware: ``forge_type`` (from the client's config) selects the
     timeline-shape parser; the review-state check accepts both forges'
     enums without branching.
+
+    CROSS-REPO (Option B, C4): ``pr_links`` (issue_number → the drafter's
+    durable linkage ``{pr_number, app_repo, app_forge_type, ...}`` from
+    :func:`alfred.transport.fix_drafter.load_pr_links`) plus
+    ``app_client_factory`` ((app_repo, app_forge_type) → a per-APP-repo
+    read client) let this loop find a fix PR that lives on a DIFFERENT app
+    repo than the central tracker. Both default absent → the same-repo
+    ``issue_timeline`` path runs BYTE-IDENTICALLY to before.
     """
     forge_type = str(
         getattr(getattr(client, "config", None), "forge_type", "github")
         or "github"
     )
+    central_repo = str(
+        getattr(getattr(client, "config", None), "repo", "") or ""
+    )
     pr_number = entry.pr_number
+
+    # CROSS-REPO linkage takes precedence: when the drafter opened the fix
+    # PR on a DIFFERENT app repo than the central tracker, the tracker
+    # timeline can NEVER surface it (the cross-ref lives on the app repo) →
+    # the same-repo path below would report a false ``stalled`` forever. A
+    # link whose ``app_repo`` equals the central repo is a SAME-REPO ticket
+    # (single-repo instances stamp the central repo) and is left to the
+    # timeline path, so single-repo stays byte-identical. When a genuine
+    # cross-repo link matches, poll the fix PR on the APP-repo client.
+    poll_client = client
+    link = (pr_links or {}).get(entry.issue_number)
+    if (
+        link
+        and str(link.get("app_repo") or "")
+        and str(link.get("app_repo")) != central_repo
+        and link.get("pr_number") is not None
+        and app_client_factory is not None
+    ):
+        app_client = app_client_factory(
+            str(link.get("app_repo") or ""),
+            str(link.get("app_forge_type") or "github"),
+        )
+        if app_client is not None:
+            poll_client = app_client
+            pr_number = link.get("pr_number")
+            log.info(
+                "kalle.digest.ticket_pipeline_cross_repo_link",
+                issue_number=entry.issue_number,
+                app_repo=str(link.get("app_repo") or ""),
+                app_forge_type=str(link.get("app_forge_type") or "github"),
+                pr_number=pr_number,
+            )
+
     if pr_number is None:
         # SAME-REPO path (GitHub-Action drafter / single-repo Option-B):
         # discover the linked PR via the tracker issue's timeline.
-        #
-        # OPTION B CROSS-REPO SEAM (flagged follow-up): when the fix PR lives
-        # on a DIFFERENT app repo than the central tracker, the timeline can
-        # NEVER surface it. The durable linkage is written by the drafter into
-        # its state — read it via
-        # ``alfred.transport.fix_drafter.load_pr_links(<drafter state.path>)``
-        # → ``{issue_number: {pr_number, pr_url, app_repo, app_forge_type}}``,
-        # then poll ``pr_get``/``pr_reviews`` on a per-app-repo client
-        # (``build_client_for_repo``) instead of ``client`` below. Wiring that
-        # per-repo poll into this loop is the remaining C4 integration.
         timeline = await client.issue_timeline(
             number=entry.issue_number, caller="digest",
         )
@@ -693,12 +729,15 @@ async def _check_one_ticket_outcome(
         if nights is not None and nights >= TICKET_STALLED_NIGHTS:
             new_disposition = "stalled"
     else:
-        pr = await client.pr_get(number=pr_number, caller="digest")
+        # ``poll_client`` is the APP-repo client for a cross-repo link, else
+        # the central client — so ``pr_get``/``pr_reviews`` hit the forge the
+        # PR actually lives on.
+        pr = await poll_client.pr_get(number=pr_number, caller="digest")
         pr = pr if isinstance(pr, dict) else {}
         merged_at = pr.get("merged_at")
         if merged_at:
             pr_state = "merged"
-            reviews = await client.pr_reviews(
+            reviews = await poll_client.pr_reviews(
                 number=pr_number, caller="digest",
             )
             reviews = reviews if isinstance(reviews, list) else []
@@ -874,6 +913,8 @@ async def check_ticket_outcomes(
     audit_log_path: str,
     outcome_config: Any = None,
     transport_config: Any = None,
+    pr_links: dict[int, dict[str, Any]] | None = None,
+    app_client_factory: Callable[[str, str], Any] | None = None,
 ) -> int:
     """The effectiveness-loop capture pass. Returns the changed count.
 
@@ -899,6 +940,12 @@ async def check_ticket_outcomes(
     terminal outcome to propagate emits an explicit
     ``kalle.digest.no_ticket_outcomes_to_propagate`` so an idle night is
     distinguishable from a broken push path.
+
+    ``pr_links`` / ``app_client_factory`` default None — the Option B
+    cross-repo consumer (C4). When present, a ticket whose drafter link
+    names an app repo other than the central tracker is polled on a
+    per-app-repo client instead of the tracker timeline. Both absent →
+    every ticket resolves via ``issue_timeline`` exactly as before.
     """
     from alfred.integrations.github_ops import append_github_audit
 
@@ -929,6 +976,7 @@ async def check_ticket_outcomes(
         try:
             changed = await _check_one_ticket_outcome(
                 client, entry, now=now,
+                pr_links=pr_links, app_client_factory=app_client_factory,
             )
         except Exception as exc:  # noqa: BLE001 — per-ticket containment
             log.warning(
@@ -1209,6 +1257,60 @@ async def assemble_ticket_pipeline_section(
                 )
 
         if client is not None:
+            # C4 — Option B cross-repo PR-link consumer. Load the drafter's
+            # durable linkage (issue_number → {pr_number, app_repo,
+            # app_forge_type}) + a factory that builds a per-app-repo READ
+            # client, so a fix PR living on a DIFFERENT app repo than the
+            # central tracker resolves to its real disposition instead of a
+            # false ``stalled``. Only engaged when the drafter has
+            # ``projects`` configured (Option B multi-repo); single-repo
+            # instances build no factory → the same-repo timeline path is
+            # untouched. Best-effort: any failure logs + falls back to the
+            # timeline path, never crashing the pass.
+            pr_links: dict[int, dict[str, Any]] = {}
+            app_client_factory: Callable[[str, str], Any] | None = None
+            try:
+                from alfred.transport.fix_drafter import (
+                    load_fix_drafter_config,
+                    load_pr_links,
+                    poll_client_for_app_repo,
+                )
+
+                drafter_config = load_fix_drafter_config(raw)
+                if drafter_config.projects:
+                    pr_links = load_pr_links(drafter_config.state_path)
+                    # ILB: idle (no cross-repo links yet) is distinguishable
+                    # from broken — emit the count on every enabled pass.
+                    log.info(
+                        "kalle.digest.cross_repo_links_loaded",
+                        count=len(pr_links),
+                        state_path=drafter_config.state_path,
+                    )
+                    if pr_links:
+                        _poll_audit = client.config.audit_log_path
+
+                        def app_client_factory(
+                            app_repo: str, app_forge_type: str,
+                        ) -> Any:
+                            return poll_client_for_app_repo(
+                                drafter_config,
+                                app_repo,
+                                app_forge_type,
+                                audit_log_path=_poll_audit,
+                            )
+            except Exception as exc:  # noqa: BLE001 — best-effort consumer
+                log.warning(
+                    "kalle.digest.cross_repo_link_load_failed",
+                    error=str(exc),
+                    error_type=exc.__class__.__name__,
+                    detail=(
+                        "cross-repo PR linkage unavailable this pass; the "
+                        "same-repo timeline path is unaffected"
+                    ),
+                )
+                pr_links = {}
+                app_client_factory = None
+
             # Build the transport config only when the c7 pusher is
             # enabled — a KAL-LE instance NOT opted into the write-back
             # runs capture-only exactly as before (no transport load).
@@ -1237,6 +1339,8 @@ async def assemble_ticket_pipeline_section(
                 audit_log_path=client.config.audit_log_path,
                 outcome_config=outcome_config,
                 transport_config=transport_config,
+                pr_links=pr_links,
+                app_client_factory=app_client_factory,
             )
             # Atomic save — outcome_checked_at moved even when no
             # disposition flipped (check_ticket_outcomes also saves on
