@@ -1109,6 +1109,14 @@ async def _fresh_draft(
     work_item_dir = tempfile.mkdtemp(
         prefix=f"issue-{issue_number}-", dir=config.work_root
     )
+    # GAP-1 (dir level): mkdtemp hardcodes 0o700 — even under a setgid,
+    # group=drafter work_root the GROUP gets no traverse (x) bit, so the
+    # sandboxed model (kalle-drafter, a drafter member) hits EACCES
+    # traversing INTO the per-issue dir and can't reach the clone. Grant
+    # group r-x traverse + keep setgid (0o2750: owner rwx, group r-x, +sgid)
+    # so the clone subtree stays group=drafter. The umask fix below makes the
+    # clone FILES group-writable; this makes the PATH to them traversable.
+    os.chmod(work_item_dir, 0o2750)
     clone_dir = os.path.join(work_item_dir, "repo")
     control_dir = os.path.join(work_item_dir, "control")
     try:

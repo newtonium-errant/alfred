@@ -601,29 +601,62 @@ async def test_clone_group_writable_no_daemon_umask_leak(
     fake = FakeRun()
     _patch_run(monkeypatch, fake)
 
-    # pin the process umask so the state-file mode is deterministic; capture
-    # it to prove the daemon never mutates it process-globally.
-    before = _os.umask(0o022)
-    _os.umask(before)  # restore immediately (umask() both sets + returns)
+    # FORCE a deterministic baseline umask (0o022) — do NOT read the ambient
+    # (a runner at 0o002 would spuriously fail). Save the real ambient to
+    # restore in finally.
+    saved = _os.umask(0o022)
     try:
         await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
                         state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+        # read the CURRENT umask without disturbing it
+        current = _os.umask(0o022)
+        _os.umask(current)
+
+        # (b1) the clone — and ONLY the clone — used the group-writable umask.
+        clone = next(c for c in fake.calls if "clone" in c["argv"])
+        assert clone["umask"] == 0o002
+        for c in fake.calls:
+            if "clone" not in c["argv"]:
+                assert c["umask"] is None, f"non-clone step leaked a umask: {c['argv'][:3]}"
+
+        # (b2) NO daemon process-global umask leak — the forced 0o022 stands.
+        assert current == 0o022, "daemon must not mutate the process umask"
+        # (b3) the authoritative state file (written under 0o022) is NOT group-writable.
+        st_mode = Path(cfg.state_path).stat().st_mode
+        assert not (st_mode & 0o020), "state file must NOT be group-writable (no umask leak)"
     finally:
-        after = _os.umask(0o022)
-        _os.umask(after)
+        _os.umask(saved)
 
-    # (b1) the clone — and ONLY the clone — used the group-writable umask.
-    clone = next(c for c in fake.calls if "clone" in c["argv"])
-    assert clone["umask"] == 0o002
-    for c in fake.calls:
-        if "clone" not in c["argv"]:
-            assert c["umask"] is None, f"non-clone step leaked a umask: {c['argv'][:3]}"
 
-    # (b2) NO daemon process-global umask leak.
-    assert after == before == 0o022, "daemon process umask must be unchanged"
-    # (b3) the authoritative state file is NOT group-writable.
-    st_mode = Path(cfg.state_path).stat().st_mode
-    assert not (st_mode & 0o020), "state file must NOT be group-writable (no umask leak)"
+async def test_work_item_dir_grants_group_traverse(
+    tmp_path, monkeypatch, _drafter_key
+):
+    """GAP-1 (DIR level, reviewer catch): mkdtemp creates the per-issue dir
+    0o700 → even under a setgid drafter work_root the GROUP has no traverse
+    (x) bit, so kalle-drafter can't reach the clone. The daemon chmods it to
+    0o2750 (owner rwx, group r-x traverse, +setgid). Pin the resulting mode
+    so a regression is caught (a true cross-UID traversal test isn't
+    feasible in-suite — the runbook adds the as-kalle-drafter check)."""
+    import stat as _stat
+
+    cfg = _config(tmp_path)
+    client = FakeClient(tmp_path)
+    state = FixDrafterState(path=Path(cfg.state_path))
+    fake = FakeRun()
+    _patch_run(monkeypatch, fake)
+    # keep the work dir around so its mode is inspectable (the daemon rm-rf's
+    # it in the finally otherwise).
+    monkeypatch.setattr(fix_drafter.shutil, "rmtree", lambda *a, **k: None)
+
+    await draft_one({"number": 7, "title": "t", "body": "b"}, cfg, client,
+                    state, pat=DUMMY_TOKEN, repo=TEST_REPO)
+
+    work_dirs = list(Path(cfg.work_root).glob("issue-7-*"))
+    assert len(work_dirs) == 1
+    mode = _stat.S_IMODE(work_dirs[0].stat().st_mode)
+    assert mode == 0o2750, f"per-issue dir must be 0o2750 (group-traversable + setgid), got {oct(mode)}"
+    # the load-bearing bit specifically: GROUP execute/traverse present.
+    assert mode & 0o010, "group traverse (x) bit must be set"
 
 
 async def test_disjointness_fail_closed_refuses_before_model(
