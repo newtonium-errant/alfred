@@ -1248,57 +1248,85 @@ class TestDrafterOps:
         assert rows[0]["issue_number"] == 7
         assert rows[0]["pr_number"] == 42
 
-    async def test_pr_create_denied_on_github_config(
+    async def test_pr_create_follows_app_repo_forge_on_github(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """FORGE-FENCE PIN: a github-config client → pr_create raises
-        GitHubOpsDenied, audits outcome=denied, performs ZERO HTTP.
-
-        Also pins the ``github_ops.forge_denied`` log emission (builder
-        checklist #9) — observability of the policy block."""
+        """OPTION B FORGE-FENCE REVERSAL: pr_create is NO LONGER forge-fenced
+        — on a github-config client it PROCEEDS (the app repo may be GitHub),
+        makes the HTTP POST, and is NOT forge-denied. (Inverts the old
+        ``test_pr_create_denied_on_github_config``.)"""
         cfg = _config(tmp_path)  # github default (forge_type omitted)
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(
+            201, {"number": 42, "html_url": "u"}, method="POST",
+        ))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+        with structlog.testing.capture_logs() as captured:
+            out = await client.pr_create(
+                head="auto-fix/issue-7", base="main",
+                title="WIP: x", body="ref #7",
+                caller="fix_drafter", issue_number=7,
+            )
+        assert out == {"number": 42, "html_url": "u"}
+        assert len(fake.calls) == 1                # HTTP happened (not denied)
+        rows = read_github_audit(cfg.audit_log_path)
+        assert rows[-1]["op"] == "pr_create" and rows[-1]["outcome"] == "created"
+        # NO forge_denied log for pr_create any more.
+        assert not [c for c in captured if c.get("event") == "github_ops.forge_denied"]
+
+    async def test_pr_list_follows_app_repo_forge_on_github(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """pr_list is no longer forge-fenced either — it PROCEEDS on a github
+        client (crash-recovery dedup runs against the app repo)."""
+        cfg = _config(tmp_path)  # github default
+        client = GitHubOpsClient(cfg)
+        fake = _CapturingRequest(_response(200, []))
+        monkeypatch.setattr(github_ops_mod, "_github_request", fake)
+        prs = await client.pr_list(state="all", caller="fix_drafter")
+        assert prs == []
+        assert len(fake.calls) == 1                # HTTP happened (not denied)
+
+    async def test_issue_list_STILL_forge_pinned_on_github(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """issue_list STAYS Forgejo-pinned — the drafter only ever SCANS the
+        sovereign tracker, never GitHub. A github client → GitHubOpsDenied,
+        ZERO HTTP, a forge_denied log."""
+        cfg = _config(tmp_path)  # github default
         client = GitHubOpsClient(cfg)
         monkeypatch.setattr(
             github_ops_mod, "_github_request", _raises_if_called(),
         )
         with structlog.testing.capture_logs() as captured:
             with pytest.raises(GitHubOpsDenied):
-                await client.pr_create(
-                    head="auto-fix/issue-7", base="main",
-                    title="WIP: x", body="Closes #7",
-                    caller="fix_drafter", issue_number=7,
+                await client.issue_list(
+                    labels="auto-fix", state="open", caller="fix_drafter",
                 )
         rows = read_github_audit(cfg.audit_log_path)
-        assert len(rows) == 1
-        assert rows[0]["op"] == "pr_create"
-        assert rows[0]["outcome"] == "denied"
-        assert rows[0]["caller"] == "fix_drafter"
+        assert rows[-1]["op"] == "issue_list" and rows[-1]["outcome"] == "denied"
         forge_logs = [
             c for c in captured if c.get("event") == "github_ops.forge_denied"
         ]
-        assert len(forge_logs) == 1
-        assert forge_logs[0]["op"] == "pr_create"
-        assert forge_logs[0]["forge_type"] == "github"
+        assert len(forge_logs) == 1 and forge_logs[0]["op"] == "issue_list"
 
-    async def test_issue_list_and_pr_list_denied_on_github_config(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
-        """The forge-fence covers all three drafter ops, not just
-        pr_create — zero HTTP on a github client."""
-        cfg = _config(tmp_path)  # github default
-        client = GitHubOpsClient(cfg)
-        monkeypatch.setattr(
-            github_ops_mod, "_github_request", _raises_if_called(),
-        )
-        with pytest.raises(GitHubOpsDenied):
-            await client.issue_list(
-                labels="auto-fix", state="open", caller="fix_drafter",
-            )
-        with pytest.raises(GitHubOpsDenied):
-            await client.pr_list(state="all", caller="fix_drafter")
-        rows = read_github_audit(cfg.audit_log_path)
-        assert {r["op"] for r in rows} == {"issue_list", "pr_list"}
-        assert all(r["outcome"] == "denied" for r in rows)
+    def test_pr_merge_permanently_denied_on_both_forges(self) -> None:
+        """pr_merge stays a PERMANENT deny UNDER OPTION B — matrix-absent, so
+        the op×caller gate rejects it for ANY caller (the matrix has no forge
+        dimension → the denial holds on both github AND forgejo), and it is
+        NOT smuggled in via the forge set either."""
+        from alfred.integrations.github_ops import _FORGEJO_ONLY_OPS
+        assert "pr_merge" not in GITHUB_OPS
+        assert "pr_merge" not in _FORGEJO_ONLY_OPS
+        for caller in ("fix_drafter", "digest", "ticket_intake"):
+            with pytest.raises(GitHubOpsDenied):
+                _check_github_op("pr_merge", caller)
+
+    def test_forge_only_ops_is_issue_list_only(self) -> None:
+        """CONTRACT PIN (Option B): the forge set is exactly {issue_list}.
+        pr_create/pr_list follow the app-repo forge; issue_list stays pinned."""
+        from alfred.integrations.github_ops import _FORGEJO_ONLY_OPS
+        assert _FORGEJO_ONLY_OPS == frozenset({"issue_list"})
 
     async def test_drafter_op_denied_for_wrong_caller_on_forgejo(
         self, tmp_path: Path, monkeypatch

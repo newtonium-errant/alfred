@@ -121,16 +121,17 @@ DEFAULT_AUDIT_LOG_PATH = "./data/github_ops_audit.jsonl"
 #     gated. The MVP pipeline never mutates an issue after creation;
 #     widening requires touching this matrix AND its contract-pin test
 #     in the same commit.
-#   * pr_merge — PERMANENTLY denied (no key, never added). The operator
-#     is the single merge authority via Forgejo branch protection; this
-#     mirrors claude-auto-fix's never-merge rule. The most load-bearing
-#     deny in the matrix.
-#   * pr_comment / pr_review / pr_close — operator owns the PR lifecycle
-#     after the drafter opens it; the drafter only ever CREATES.
-#   * pr_create — a WRITE op, but NOT permanently denied any more: it is
-#     allowed to ``fix_drafter`` and FORGE-FENCED to Forgejo (see
-#     :meth:`GitHubOpsClient._forge_fence`). On a github box it raises
-#     before any HTTP — GitHub Actions still owns PR creation there.
+#   * pr_merge — PERMANENTLY denied (no key, never added), on BOTH forges.
+#     The operator is the single merge authority via branch protection; this
+#     mirrors claude-auto-fix's never-merge rule. The most load-bearing deny
+#     in the matrix — UNCHANGED by Option B (pinned on both forges).
+#   * pr_review / pr_close — operator owns the PR lifecycle after the
+#     drafter opens it; the drafter only ever CREATES.
+#   * pr_create — a WRITE op allowed to ``fix_drafter``. Under Option B it is
+#     NO LONGER forge-fenced: the drafter opens PHI-clean fix PRs onto the
+#     APP repo, which may legitimately be GitHub — so pr_create/pr_list
+#     FOLLOW THE APP-REPO FORGE (``_FORGEJO_ONLY_OPS`` keeps only
+#     ``issue_list``, the sovereign-tracker scan). ``pr_merge`` stays denied.
 #   * repo contents / workflows / settings / branch_protection — not in
 #     the PAT's permission set; branch creation happens via git push,
 #     not REST. Listed so nobody "helpfully" adds them later.
@@ -161,11 +162,21 @@ GITHUB_OPS: dict[str, frozenset[str]] = {
 # Ops that are FORGEJO-ONLY — a second policy gate OUTSIDE the op×caller
 # matrix (the matrix has no forge dimension). :meth:`_forge_fence` raises
 # :class:`GitHubOpsDenied` for these on a github-config client BEFORE the
-# op×caller gate, so "KAL-LE never opens PRs on GitHub" is enforced at the
-# privilege boundary, not just at the daemon's startup gate. A refactor
-# that drops this is caught by ``test_pr_create_denied_on_github_config``.
+# op×caller gate.
+#
+# Option B (central bug-intake, ratified 2026-07-01): ``pr_create`` +
+# ``pr_list`` were DROPPED from this set. Their original "Forgejo-only"
+# rationale — "GitHub Actions owns PR creation there" — evaporated under B:
+# the on-box drafter is the SOLE PR author (claude-auto-fix.yml /
+# claude-code-action / act_runner are gone), and the drafter now opens
+# PHI-CLEAN fix PRs onto the APP repo, which may legitimately be GitHub
+# (app code stays PHI-free on GitHub; only the central tracker is sovereign
+# Forgejo). So pr_create/pr_list must FOLLOW THE APP-REPO FORGE, not be
+# pinned to Forgejo. ``issue_list`` STAYS Forgejo-pinned (the tracker is the
+# sovereign sink — the drafter only ever SCANS it, never GitHub). ``pr_merge``
+# stays a PERMANENT matrix-deny on BOTH forges (operator is the merge gate).
 _FORGEJO_ONLY_OPS: frozenset[str] = frozenset(
-    {"issue_list", "pr_list", "pr_create"},
+    {"issue_list"},
 )
 
 
