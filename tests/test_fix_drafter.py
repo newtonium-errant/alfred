@@ -1470,6 +1470,100 @@ def test_poll_client_for_app_repo_missing_token_returns_none(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# D1 — forge-dispatched GIT-plane auth (Forgejo token vs GitHub Basic)
+# ---------------------------------------------------------------------------
+
+
+def test_git_auth_header_forge_dispatch():
+    """D1 pins (a)+(b): the git-plane Authorization extraHeader is dispatched
+    by forge. Forgejo (+ default/legacy/gitea) → ``Authorization: token
+    <pat>`` (byte-identical to Phase-0); GitHub → HTTP Basic with
+    ``x-access-token:<pat>`` (the scheme GitHub git-over-HTTPS accepts;
+    confirmed against actions/checkout), NOT the Gitea token scheme."""
+    import base64
+
+    # (a) forgejo / default / legacy / gitea → unchanged token scheme.
+    assert fix_drafter._git_auth_header("PAT", "forgejo") == (
+        "Authorization: token PAT"
+    )
+    assert fix_drafter._git_auth_header("PAT") == "Authorization: token PAT"
+    assert fix_drafter._git_auth_header("PAT", "") == "Authorization: token PAT"
+    assert fix_drafter._git_auth_header("PAT", "gitea") == (
+        "Authorization: token PAT"
+    )
+
+    # (b) github → Basic base64("x-access-token:" + pat); NOT the token scheme.
+    gh = fix_drafter._git_auth_header("PAT", "github")
+    expected = base64.b64encode(b"x-access-token:PAT").decode("ascii")
+    assert gh == f"Authorization: Basic {expected}"
+    assert base64.b64decode(gh.split()[-1]).decode() == "x-access-token:PAT"
+    assert "token PAT" not in gh   # must NOT be the Gitea/Forgejo scheme
+
+
+def test_write_temp_gitconfig_forge_dispatched(tmp_path):
+    """D1: the 0600 temp gitconfig carries the forge-correct extraHeader —
+    Forgejo the token scheme (byte-identical), GitHub the Basic scheme — and
+    the file mode is 0600 either way."""
+    import base64
+    import os
+
+    fj = fix_drafter._write_temp_gitconfig("PAT", "forgejo")
+    try:
+        assert (os.stat(fj).st_mode & 0o777) == 0o600
+        body = Path(fj).read_text(encoding="utf-8")
+        assert "extraHeader = Authorization: token PAT" in body
+    finally:
+        os.unlink(fj)
+
+    # default arg (no forge) → byte-identical to the forgejo path.
+    dflt = fix_drafter._write_temp_gitconfig("PAT")
+    try:
+        assert "extraHeader = Authorization: token PAT" in (
+            Path(dflt).read_text(encoding="utf-8")
+        )
+    finally:
+        os.unlink(dflt)
+
+    gh = fix_drafter._write_temp_gitconfig("PAT", "github")
+    try:
+        assert (os.stat(gh).st_mode & 0o777) == 0o600
+        body = Path(gh).read_text(encoding="utf-8")
+        expected = base64.b64encode(b"x-access-token:PAT").decode("ascii")
+        assert f"extraHeader = Authorization: Basic {expected}" in body
+        assert "Authorization: token" not in body   # NOT the Gitea scheme
+    finally:
+        os.unlink(gh)
+
+
+async def test_github_app_target_credential_never_in_argv_or_url(
+    tmp_path, monkeypatch, _drafter_key
+):
+    """D1 pin (c): even on a GITHUB app target, the token is NEVER in any
+    subprocess argv nor the clone URL — auth rides the 0600
+    GIT_CONFIG_GLOBAL gitconfig (same containment as the Forgejo path)."""
+    gh_token = "DUMMY_APP1_GH_TOKEN"
+    cfg = _config(tmp_path)
+    central = FakeClient(tmp_path)
+    app = FakeClient(tmp_path)
+    state = FixDrafterState(path=Path(cfg.state_path))
+    fake = FakeRun()
+    _patch_run(monkeypatch, fake)
+    target = _app_target(app, "org/app1", "github", cfg, token=gh_token)
+
+    res = await draft_one({"number": 7, "title": "t", "body": "b"}, cfg,
+                          central, state, target=target)
+    assert res["outcome"] == "drafted"
+    # token NEVER in any subprocess argv (git or model).
+    for c in fake.calls:
+        assert gh_token not in " ".join(c["argv"])
+    # clone remote is token-less; no user:token@host; auth rides the gitconfig.
+    clone = next(c for c in fake.calls if "clone" in c["argv"])
+    assert "http://127.0.0.1:3001/org/app1.git" in clone["argv"]
+    assert "@" not in " ".join(clone["argv"])
+    assert clone["env"]["GIT_CONFIG_GLOBAL"]
+
+
+# ---------------------------------------------------------------------------
 # orchestrator registration
 # ---------------------------------------------------------------------------
 

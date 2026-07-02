@@ -44,6 +44,7 @@ code ships INERT.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -1047,18 +1048,51 @@ def _clone_url(config: FixDrafterConfig, repo: str) -> str:
     return f"{config.clone_base_url.rstrip('/')}/{repo}.git"
 
 
-def _write_temp_gitconfig(pat: str) -> str:
+def _git_auth_header(pat: str, forge_type: str = "forgejo") -> str:
+    """The HTTP ``Authorization`` extraHeader value for the GIT plane,
+    FORGE-DISPATCHED (Option B, D1) — the git-http auth scheme differs by
+    forge and is NOT the same as the REST plane's ``github_ops._headers``.
+
+    * ``github`` — GitHub git-over-HTTPS wants HTTP **Basic** auth with the
+      PAT as the password (username conventionally ``x-access-token``, which
+      works for both PATs and App installation tokens). GitHub does NOT
+      accept the Gitea/Forgejo ``Authorization: token <pat>`` scheme for
+      git-http (that scheme is REST-API-only). Confirmed against GitHub's
+      own ``actions/checkout`` git-auth-helper, which sets
+      ``AUTHORIZATION: basic <base64("x-access-token:" + token)>``.
+    * ``forgejo`` (+ default / legacy / gitea) — ``Authorization: token
+      <pat>``, UNCHANGED (Forgejo git-http accepts it; Phase-0 byte-
+      identical).
+
+    The value rides an extraHeader in a 0600 temp gitconfig (never argv,
+    never the clone URL / reflog) — same containment as before, for both
+    schemes.
+    """
+    if forge_type == "github":
+        basic = base64.b64encode(
+            f"x-access-token:{pat}".encode()
+        ).decode("ascii")
+        return f"Authorization: Basic {basic}"
+    return f"Authorization: token {pat}"
+
+
+def _write_temp_gitconfig(pat: str, forge_type: str = "forgejo") -> str:
     """Write a daemon-private 0600 gitconfig carrying the token as an HTTP
     extraHeader. Referenced via GIT_CONFIG_GLOBAL for the daemon's git
     only — NOT under work_root, NOT under /home (the sandbox's PrivateTmp
     + ProtectHome cannot see it regardless), and unlinked after the run.
+
+    The extraHeader's auth scheme is forge-dispatched (see
+    :func:`_git_auth_header`): GitHub git-http needs Basic auth, Forgejo
+    keeps the ``token`` scheme. Only ONE remote is contacted per run, so a
+    global ``[http] extraHeader`` never leaks to an unintended host.
     """
     fd, path = tempfile.mkstemp(prefix="fix-drafter-gitconfig-")
     os.close(fd)
     os.chmod(path, 0o600)
     with open(path, "w", encoding="utf-8") as f:
         f.write("[http]\n")
-        f.write(f"\textraHeader = Authorization: token {pat}\n")
+        f.write(f"\textraHeader = {_git_auth_header(pat, forge_type)}\n")
     return path
 
 
@@ -1481,7 +1515,9 @@ async def draft_one(
         return {"issue_number": issue_number, "outcome": "skipped"}
 
     clone_url = target.clone_url()
-    gitconfig_path = _write_temp_gitconfig(target.token)
+    # Forge-dispatch the git-plane auth by the target's forge (D1): a GitHub
+    # app repo needs Basic auth, a Forgejo tracker keeps the token scheme.
+    gitconfig_path = _write_temp_gitconfig(target.token, target.forge_type)
     git_env = _git_env(gitconfig_path)
     try:
         # --- Layer 2: git ground-truth — does the branch already exist?
