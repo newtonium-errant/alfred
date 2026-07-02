@@ -2010,7 +2010,9 @@ def cmd_ticket_forward(args: argparse.Namespace) -> None:
         pending = len(state.entries) - linked
         open_count = eligible_now = 0
         if config.vault_path:
-            scanned, eligible = scan_tickets(Path(config.vault_path), state)
+            scanned, eligible, _held_rrts = scan_tickets(
+                Path(config.vault_path), state,
+            )
             open_count = scanned
             eligible_now = len(eligible)
         out = {

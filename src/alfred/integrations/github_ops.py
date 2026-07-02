@@ -409,6 +409,18 @@ class GitHubOpsConfig:
     # workflow at creation, ``enhancement: ["enhancement"]`` does not.
     label_map: dict[str, list[str]] = field(default_factory=dict)
     audit_log_path: str = DEFAULT_AUDIT_LOG_PATH
+    # --- RRTS interlock relax: sovereign-tracker attestation (default OFF) ---
+    # Operator attests THIS tracker is a private, in-boundary (tunnel-only)
+    # Forgejo, so VERA may release PHI-bearing RRTS tickets to it. Advertised
+    # as the ``sovereign_tracker`` handshake capability ONLY when all three
+    # hold: forge_type == forgejo AND tracker_sovereign is True AND
+    # api_base == tracker_sovereign_api_base (both non-empty). RISK-1:
+    # ``tracker_sovereign_api_base`` binds the attestation to the EXACT
+    # endpoint — repointing api_base to a public Forgejo drops the capability
+    # (fail-closed). Both default OFF/"" → un-upgraded config is byte-identical
+    # + never advertises sovereignty.
+    tracker_sovereign: bool = False
+    tracker_sovereign_api_base: str = ""
 
 
 def load_github_config(raw: dict[str, Any]) -> GitHubOpsConfig | None:
@@ -532,6 +544,10 @@ def load_github_config(raw: dict[str, Any]) -> GitHubOpsConfig | None:
         audit_log_path=str(
             section.get("audit_log_path", DEFAULT_AUDIT_LOG_PATH)
             or DEFAULT_AUDIT_LOG_PATH
+        ),
+        tracker_sovereign=bool(section.get("tracker_sovereign", False)),
+        tracker_sovereign_api_base=str(
+            section.get("tracker_sovereign_api_base", "") or ""
         ),
     )
 

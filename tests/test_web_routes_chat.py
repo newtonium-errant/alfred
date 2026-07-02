@@ -1517,9 +1517,13 @@ async def test_rrts_server_stamp_overrides_malicious_llm_origin(
     assert post.metadata["origin"] == "rrts"
     assert post.metadata["de_phi_status"] == "pending"
 
-    # ...and the forger's ticket is NOT forward-eligible (still held).
+    # ...and the forger's ticket is NOT forward-eligible (still held). The
+    # scan's 3rd return (held_rrts candidates) is unpacked but not asserted
+    # here — this fixture's create omits `status`, so the record is excluded
+    # by the status!=open gate BEFORE the rrts classification; the eligible==[]
+    # exclusion is the property this keystone pins.
     fwd_state = TicketForwardState(path=tmp_path / "fwd_state.json")
-    _scanned, eligible = scan_tickets(vault_path, fwd_state)
+    _scanned, eligible, _held_rrts = scan_tickets(vault_path, fwd_state)
     assert eligible == []
 
 

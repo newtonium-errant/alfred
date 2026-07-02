@@ -177,6 +177,83 @@ async def test_handshake_generates_correlation_id_if_absent(salem_app):  # type:
 
 
 # ---------------------------------------------------------------------------
+# sovereign_tracker capability (RRTS interlock relax) — the fail-closed guard
+# ---------------------------------------------------------------------------
+
+
+def _sov_client(**overrides):  # type: ignore[no-untyped-def]
+    """A fake intake GitHub client whose config carries the sovereignty
+    conjuncts (all satisfied by default; override to flip one)."""
+    from types import SimpleNamespace
+
+    cfg = dict(
+        forge_type="forgejo",
+        tracker_sovereign=True,
+        tracker_sovereign_api_base="http://10.99.0.1:3001/api/v1",
+        api_base="http://10.99.0.1:3001/api/v1",
+    )
+    cfg.update(overrides)
+    return SimpleNamespace(config=SimpleNamespace(**cfg))
+
+
+def _req_with_intake_client(client):  # type: ignore[no-untyped-def]
+    from types import SimpleNamespace
+
+    from alfred.transport.peer_handlers import _KEY_TICKET_INTAKE_GITHUB
+
+    app: dict = {}
+    if client is not None:
+        app[_KEY_TICKET_INTAKE_GITHUB] = client
+    return SimpleNamespace(app=app)
+
+
+def test_sovereign_tracker_registered_requires_all_conjuncts():  # type: ignore[no-untyped-def]
+    """Pin 9: ``_sovereign_tracker_registered`` is True IFF ALL FOUR conjuncts
+    hold on the intake client's config — flip each direction, incl. RISK-1
+    (endpoint mismatch) and the no-client fail-closed default."""
+    from alfred.transport.peer_handlers import _sovereign_tracker_registered
+
+    # all four satisfied → True
+    assert _sovereign_tracker_registered(_req_with_intake_client(_sov_client())) is True
+    # no intake client stashed → False (fail-closed)
+    assert _sovereign_tracker_registered(_req_with_intake_client(None)) is False
+    # (1) forge_type != forgejo → False (Forgejo shape not proven)
+    assert _sovereign_tracker_registered(
+        _req_with_intake_client(_sov_client(forge_type="github"))
+    ) is False
+    # (2) tracker_sovereign not True → False (operator didn't attest private)
+    assert _sovereign_tracker_registered(
+        _req_with_intake_client(_sov_client(tracker_sovereign=False))
+    ) is False
+    # (3) tracker_sovereign_api_base empty → False (no endpoint attested)
+    assert _sovereign_tracker_registered(
+        _req_with_intake_client(_sov_client(tracker_sovereign_api_base=""))
+    ) is False
+    # (4) RISK-1: api_base repointed away from the attested endpoint (e.g. a
+    #     public Codeberg) → False, even with forgejo + tracker_sovereign True.
+    assert _sovereign_tracker_registered(
+        _req_with_intake_client(_sov_client(api_base="https://codeberg.org/api/v1"))
+    ) is False
+
+
+def test_compute_capabilities_sovereign_tracker_flag():  # type: ignore[no-untyped-def]
+    """Pin 9 (cont.): the ``sovereign_tracker`` capability appears IFF the
+    registration flag is True; the keyword default keeps it off + independent
+    of the other capability flags."""
+    from types import SimpleNamespace
+
+    from alfred.transport.peer_handlers import _compute_capabilities
+
+    cfg = SimpleNamespace(canonical=SimpleNamespace(owner=False))
+    assert "sovereign_tracker" not in _compute_capabilities(cfg)  # default off
+    assert "sovereign_tracker" not in _compute_capabilities(cfg, sovereign_tracker=False)
+    caps = _compute_capabilities(cfg, sovereign_tracker=True)
+    assert "sovereign_tracker" in caps
+    # independent of the other registration flags.
+    assert "ticket_intake" not in caps and "ticket_outcome" not in caps
+
+
+# ---------------------------------------------------------------------------
 # /peer/send
 # ---------------------------------------------------------------------------
 

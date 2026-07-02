@@ -410,6 +410,26 @@ class TestLoadGithubConfig:
         assert "forgejoo" in str(exc.value)
         assert "forgejo" in str(exc.value) and "github" in str(exc.value)
 
+    def test_tracker_sovereign_fields_default_off_and_parse(
+        self, tmp_path: Path,
+    ) -> None:
+        """RRTS interlock relax: tracker_sovereign / tracker_sovereign_api_base
+        default OFF / "" (un-upgraded config byte-identical) and parse when the
+        operator sets them explicitly."""
+        cfg = load_github_config(_raw(tmp_path))  # no sovereignty keys
+        assert cfg is not None
+        assert cfg.tracker_sovereign is False
+        assert cfg.tracker_sovereign_api_base == ""
+        on = load_github_config(_raw(
+            tmp_path,
+            forge_type="forgejo",
+            tracker_sovereign=True,
+            tracker_sovereign_api_base="http://10.99.0.1:3001/api/v1",
+        ))
+        assert on is not None
+        assert on.tracker_sovereign is True
+        assert on.tracker_sovereign_api_base == "http://10.99.0.1:3001/api/v1"
+
     def test_build_client_for_repo_rejects_unsupported_forge(self) -> None:
         """Forge-type guard: the Option-B per-app-repo factory FAILS LOUD on
         an unsupported forge_type (raises GitHubOpsError) rather than silently

@@ -224,7 +224,7 @@ def test_scan_selection_rules(tmp_path):  # type: ignore[no-untyped-def]
     )
 
     with structlog.testing.capture_logs() as captured:
-        scanned, eligible = scan_tickets(vault, state)
+        scanned, eligible, _held = scan_tickets(vault, state)
 
     assert scanned == 5  # the malformed file never parses to a ticket
     names = {item["relpath"] for item in eligible}
@@ -252,10 +252,11 @@ def test_rrts_pending_ticket_not_forwarded(tmp_path):  # type: ignore[no-untyped
     _write_ticket(vault, "RRTS bug", origin="rrts", de_phi_status="pending")
 
     state = TicketForwardState(path=tmp_path / "state.json")
-    scanned, eligible = scan_tickets(vault, state)
+    scanned, eligible, held_rrts = scan_tickets(vault, state)
 
     assert scanned == 1
     assert eligible == []
+    assert len(held_rrts) == 1  # held as a sovereign-relax candidate
 
 
 def test_rrts_missing_de_phi_status_not_forwarded(tmp_path):  # type: ignore[no-untyped-def]
@@ -265,10 +266,11 @@ def test_rrts_missing_de_phi_status_not_forwarded(tmp_path):  # type: ignore[no-
     _write_ticket(vault, "RRTS no-status", origin="rrts")
 
     state = TicketForwardState(path=tmp_path / "state.json")
-    scanned, eligible = scan_tickets(vault, state)
+    scanned, eligible, held_rrts = scan_tickets(vault, state)
 
     assert scanned == 1
     assert eligible == []
+    assert len(held_rrts) == 1  # missing de_phi_status ⇒ held candidate
 
 
 def test_rrts_cleared_ticket_is_forwarded(tmp_path):  # type: ignore[no-untyped-def]
@@ -278,10 +280,11 @@ def test_rrts_cleared_ticket_is_forwarded(tmp_path):  # type: ignore[no-untyped-
     _write_ticket(vault, "RRTS cleared", origin="rrts", de_phi_status="cleared")
 
     state = TicketForwardState(path=tmp_path / "state.json")
-    scanned, eligible = scan_tickets(vault, state)
+    scanned, eligible, held_rrts = scan_tickets(vault, state)
 
     assert scanned == 1
     assert {item["relpath"] for item in eligible} == {"ticket/RRTS cleared.md"}
+    assert held_rrts == []  # cleared ⇒ eligible, not a held candidate
 
 
 def test_telegram_origin_ticket_forwarded_as_today(tmp_path):  # type: ignore[no-untyped-def]
@@ -292,13 +295,14 @@ def test_telegram_origin_ticket_forwarded_as_today(tmp_path):  # type: ignore[no
     _write_ticket(vault, "Telegram explicit", origin="telegram", de_phi_status="n/a")
 
     state = TicketForwardState(path=tmp_path / "state.json")
-    scanned, eligible = scan_tickets(vault, state)
+    scanned, eligible, held_rrts = scan_tickets(vault, state)
 
     assert scanned == 2
     assert {item["relpath"] for item in eligible} == {
         "ticket/Telegram bug.md",
         "ticket/Telegram explicit.md",
     }
+    assert held_rrts == []  # non-rrts ⇒ never held
 
 
 def test_held_rrts_pending_logged(tmp_path):  # type: ignore[no-untyped-def]
@@ -330,10 +334,235 @@ def test_rrts_cleared_reuses_file_time_uid(tmp_path):  # type: ignore[no-untyped
     )
 
     state = TicketForwardState(path=tmp_path / "state.json")
-    _scanned, eligible = scan_tickets(vault, state)
+    _scanned, eligible, _held = scan_tickets(vault, state)
 
     assert len(eligible) == 1
     assert eligible[0]["uid"] == file_time_uid
+
+
+# ---------------------------------------------------------------------------
+# RRTS interlock relax — sovereign-tracker release escape (fail-closed)
+# ---------------------------------------------------------------------------
+
+
+class FakeHandshake:
+    """Async stand-in for ``client.peer_handshake`` — counts calls and
+    returns a configurable capabilities reply (or raises)."""
+
+    def __init__(self, *, capabilities=None, exc=None):  # type: ignore[no-untyped-def]
+        self.calls = 0
+        self._capabilities = list(capabilities or [])
+        self._exc = exc
+
+    async def __call__(self, peer_name, *, config=None, self_name):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        if self._exc is not None:
+            raise self._exc
+        return {"instance": "kalle", "capabilities": list(self._capabilities)}
+
+
+def _patch_handshake(monkeypatch, fake: FakeHandshake) -> None:  # type: ignore[no-untyped-def]
+    # _resolve_sovereign_tracker does `from .client import peer_handshake`,
+    # so patch the source module attribute (re-read on each call).
+    monkeypatch.setattr("alfred.transport.client.peer_handshake", fake)
+
+
+def _rrts_config(tmp_path: Path, *, relax: bool = False) -> TicketForwardConfig:
+    return TicketForwardConfig(
+        enabled=True,
+        self_name="vera",
+        target_peer="kalle",
+        interval_minutes=15,
+        vault_path=str(tmp_path / "vault"),
+        state_path=str(tmp_path / "ticket_forward_state.json"),
+        rrts_relax_enabled=relax,
+    )
+
+
+async def test_relax_off_holds_even_if_handshake_would_attest(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Pin 1: the FLAG is the master intent switch. relax OFF ⇒ an RRTS
+    ticket is HELD even though the (stubbed) handshake DOES advertise
+    ``sovereign_tracker``. Not forwarded; decision identical to today."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "RRTS bug", origin="rrts", de_phi_status="pending")
+    fake_send = FakePeerSend()
+    _patch_peer_send(monkeypatch, fake_send)
+    fake_hs = FakeHandshake(capabilities=["sovereign_tracker"])  # would attest
+    _patch_handshake(monkeypatch, fake_hs)
+
+    result = await run_forward_once(_rrts_config(tmp_path, relax=False), _raw(tmp_path))
+
+    assert result["forwarded"] == 0
+    assert result["rrts_held"] == 1
+    assert result["rrts_released"] == 0
+    assert result["sovereignty_attested"] is False
+    assert fake_send.calls == []          # PHI stayed held
+
+
+async def test_relax_off_is_operationally_inert_no_handshake(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Pin 2 (DEFECT-1): relax OFF ⇒ ``peer_handshake`` is NEVER called and no
+    handshake-failure log is emitted, even with held RRTS candidates present.
+    Traffic-identical to today."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "RRTS bug", origin="rrts", de_phi_status="pending")
+    fake_send = FakePeerSend()
+    _patch_peer_send(monkeypatch, fake_send)
+    fake_hs = FakeHandshake(capabilities=["sovereign_tracker"])
+    _patch_handshake(monkeypatch, fake_hs)
+
+    with structlog.testing.capture_logs() as captured:
+        await run_forward_once(_rrts_config(tmp_path, relax=False), _raw(tmp_path))
+
+    assert fake_hs.calls == 0             # NO handshake round-trip
+    assert _log_events(captured, "ticket_forward.sovereign_handshake_failed") == []
+    assert _log_events(captured, "ticket_forward.rrts_release_withheld") == []
+
+
+async def test_relax_on_no_rrts_candidates_no_handshake(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Pin 3 (DEFECT-1, lazy): relax ON but zero held RRTS candidates ⇒
+    ``peer_handshake`` never called — the common no-RRTS tick pays zero
+    handshake cost."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "Telegram bug")  # non-rrts, forwards normally
+    fake_send = FakePeerSend()
+    _patch_peer_send(monkeypatch, fake_send)
+    fake_hs = FakeHandshake(capabilities=["sovereign_tracker"])
+    _patch_handshake(monkeypatch, fake_hs)
+
+    result = await run_forward_once(_rrts_config(tmp_path, relax=True), _raw(tmp_path))
+
+    assert fake_hs.calls == 0             # no RRTS candidate → no handshake
+    assert result["forwarded"] == 1      # the telegram ticket still forwards
+
+
+async def test_relax_on_sovereign_attested_forwards(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Pin 4: relax ON + a held RRTS candidate + handshake advertises
+    ``sovereign_tracker`` ⇒ the RRTS ticket is RELEASED and forwarded, logged
+    ``rrts_released`` reason=sovereign_relax."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "RRTS bug", origin="rrts", de_phi_status="pending")
+    fake_send = FakePeerSend()
+    _patch_peer_send(monkeypatch, fake_send)
+    fake_hs = FakeHandshake(capabilities=["sovereign_tracker"])
+    _patch_handshake(monkeypatch, fake_hs)
+
+    with structlog.testing.capture_logs() as captured:
+        result = await run_forward_once(_rrts_config(tmp_path, relax=True), _raw(tmp_path))
+
+    assert fake_hs.calls == 1
+    assert result["forwarded"] == 1
+    assert result["rrts_released"] == 1
+    assert result["rrts_held"] == 0
+    assert result["sovereignty_attested"] is True
+    assert len(fake_send.calls) == 1     # full payload put on the wire
+    assert fake_send.calls[0]["payload"]["relpath"] == "ticket/RRTS bug.md"
+    rel = _log_events(captured, "ticket_forward.rrts_released")
+    assert len(rel) == 1 and rel[0]["reason"] == "sovereign_relax"
+    assert rel[0]["target_peer"] == "kalle"
+
+
+async def test_relax_on_not_sovereign_holds_keystone(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Pin 5 (KEYSTONE — rollback / public tracker): relax ON but the
+    handshake does NOT advertise ``sovereign_tracker`` (rollback to a public
+    tracker, or a repointed api_base) ⇒ HELD, ``peer_send`` NOT called,
+    ``rrts_release_withheld`` reason=sovereignty_not_attested."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "RRTS bug", origin="rrts", de_phi_status="pending")
+    fake_send = FakePeerSend()
+    _patch_peer_send(monkeypatch, fake_send)
+    fake_hs = FakeHandshake(capabilities=["ticket_intake"])  # NO sovereign_tracker
+    _patch_handshake(monkeypatch, fake_hs)
+
+    with structlog.testing.capture_logs() as captured:
+        result = await run_forward_once(_rrts_config(tmp_path, relax=True), _raw(tmp_path))
+
+    assert fake_hs.calls == 1
+    assert result["forwarded"] == 0
+    assert result["rrts_held"] == 1
+    assert result["rrts_released"] == 0
+    assert result["sovereignty_attested"] is False
+    assert fake_send.calls == []          # PHI held even with relax ON
+    withheld = _log_events(captured, "ticket_forward.rrts_release_withheld")
+    assert len(withheld) == 1
+    assert withheld[0]["reason"] == "sovereignty_not_attested"
+    assert withheld[0]["count"] == 1
+
+
+async def test_relax_on_handshake_failure_holds(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Pin 6: relax ON but the handshake raises/timeouts ⇒
+    sovereign_attested False, HELD, ``rrts_release_withheld``
+    reason=handshake_failed. No exception path releases."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "RRTS bug", origin="rrts", de_phi_status="pending")
+    fake_send = FakePeerSend()
+    _patch_peer_send(monkeypatch, fake_send)
+    fake_hs = FakeHandshake(exc=TransportServerDown("kalle down"))
+    _patch_handshake(monkeypatch, fake_hs)
+
+    with structlog.testing.capture_logs() as captured:
+        result = await run_forward_once(_rrts_config(tmp_path, relax=True), _raw(tmp_path))
+
+    assert result["forwarded"] == 0
+    assert result["rrts_held"] == 1
+    assert result["sovereignty_attested"] is False
+    assert fake_send.calls == []
+    failed = _log_events(captured, "ticket_forward.sovereign_handshake_failed")
+    assert len(failed) == 1
+    withheld = _log_events(captured, "ticket_forward.rrts_release_withheld")
+    assert len(withheld) == 1 and withheld[0]["reason"] == "handshake_failed"
+
+
+async def test_de_phi_cleared_escape_preserved(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Pin 7: the ORIGINAL escape still works — relax OFF, an RRTS ticket with
+    ``de_phi_status: cleared`` forwards WITHOUT any handshake, logged
+    ``rrts_released`` reason=de_phi_cleared."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "RRTS cleared", origin="rrts", de_phi_status="cleared")
+    fake_send = FakePeerSend()
+    _patch_peer_send(monkeypatch, fake_send)
+    fake_hs = FakeHandshake(capabilities=["sovereign_tracker"])
+    _patch_handshake(monkeypatch, fake_hs)
+
+    with structlog.testing.capture_logs() as captured:
+        result = await run_forward_once(_rrts_config(tmp_path, relax=False), _raw(tmp_path))
+
+    assert result["forwarded"] == 1
+    assert result["rrts_released"] == 1
+    assert fake_hs.calls == 0             # cleared needs no sovereignty proof
+    rel = _log_events(captured, "ticket_forward.rrts_released")
+    assert len(rel) == 1 and rel[0]["reason"] == "de_phi_cleared"
+
+
+async def test_telegram_lane_untouched_by_relax(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Pin 8: a non-rrts (Telegram) ticket forwards regardless of relax /
+    handshake state — the sovereign gate is RRTS-only, adds no dependency to
+    the Telegram lane."""
+    vault = tmp_path / "vault"
+    _write_ticket(vault, "Telegram bug")
+    fake_send = FakePeerSend()
+    _patch_peer_send(monkeypatch, fake_send)
+    # a handshake that would FAIL — must not affect the telegram lane.
+    fake_hs = FakeHandshake(exc=TransportServerDown("down"))
+    _patch_handshake(monkeypatch, fake_hs)
+
+    result = await run_forward_once(_rrts_config(tmp_path, relax=True), _raw(tmp_path))
+
+    assert result["forwarded"] == 1
+    assert result["rrts_released"] == 0
+    assert result["rrts_held"] == 0
+    assert fake_hs.calls == 0             # no RRTS candidate → gate never engaged
+    assert len(fake_send.calls) == 1
+
+
+def test_load_config_rrts_relax_default_off_and_parsed(tmp_path):  # type: ignore[no-untyped-def]
+    """Piece 1: rrts_relax_enabled defaults False (inert) + parses when set."""
+    assert load_ticket_forward_config({}).rrts_relax_enabled is False
+    off = load_ticket_forward_config({"ticket_forward": {"self_name": "vera"}})
+    assert off.rrts_relax_enabled is False
+    on = load_ticket_forward_config(
+        {"ticket_forward": {"rrts_relax_enabled": True}},
+    )
+    assert on.rrts_relax_enabled is True
 
 
 # ---------------------------------------------------------------------------

@@ -1016,6 +1016,7 @@ def _compute_capabilities(
     *,
     ticket_intake: bool = False,
     ticket_outcome: bool = False,
+    sovereign_tracker: bool = False,
 ) -> list[str]:
     """Capability list for /peer/handshake.
 
@@ -1027,8 +1028,13 @@ def _compute_capabilities(
     ``ticket_outcome`` (pipeline c7) is likewise registration-driven —
     advertised only when the VERA-side resolver callable is wired (so a
     sender can check the capability before pushing an outcome write-back
-    and skip the round-trip on a peer that can't apply it). The keyword
-    defaults keep pre-existing call sites byte-identical.
+    and skip the round-trip on a peer that can't apply it).
+    ``sovereign_tracker`` (RRTS interlock relax) is data-plane-coupled —
+    advertised only when the SAME built GitHub client that posts issues
+    attests a private, endpoint-bound Forgejo (see
+    :func:`_sovereign_tracker_registered`), so a rollback to a public
+    tracker drops it and VERA auto-re-holds RRTS PHI. The keyword defaults
+    keep pre-existing call sites byte-identical.
     """
     caps = list(_DEFAULT_CAPABILITIES)
     if config.canonical.owner:
@@ -1037,6 +1043,8 @@ def _compute_capabilities(
         caps.append("ticket_intake")
     if ticket_outcome:
         caps.append("ticket_outcome")
+    if sovereign_tracker:
+        caps.append("sovereign_tracker")
     return caps
 
 
@@ -1086,6 +1094,7 @@ async def _handle_peer_handshake(request: web.Request) -> web.StreamResponse:
             config,
             ticket_intake=_ticket_intake_registered(request),
             ticket_outcome=_ticket_outcome_registered(request),
+            sovereign_tracker=_sovereign_tracker_registered(request),
         ),
         "peers": peers_advertised,
         "correlation_id": correlation_id,
@@ -3227,6 +3236,40 @@ def _ticket_outcome_registered(request: web.Request) -> bool:
     can skip the write-back round-trip on a peer that can't apply it.
     """
     return request.app.get(_KEY_TICKET_OUTCOME_RESOLVER) is not None
+
+
+def _sovereign_tracker_registered(request: web.Request) -> bool:
+    """True iff the intake's built GitHub client attests a SOVEREIGN tracker
+    (RRTS interlock relax). Drives the ``sovereign_tracker`` capability.
+
+    DATA-PLANE-COUPLED (the fail-closed keystone): computed from the SAME
+    :class:`GitHubOpsClient` stashed at ``register_ticket_intake`` that the
+    issue-post data-plane uses — attestation and data-plane are one config
+    object in one process, so they cannot diverge, and a config revert flips
+    BOTH together on daemon restart. Requires ALL FOUR conjuncts on that
+    client's config:
+
+      * ``forge_type == FORGE_FORGEJO`` — the tracker is a Forgejo (shape),
+      * ``tracker_sovereign is True`` — operator attests it's private,
+      * ``tracker_sovereign_api_base`` non-empty — an endpoint IS attested,
+      * ``api_base == tracker_sovereign_api_base`` — RISK-1: the attestation
+        binds THIS endpoint (repointing api_base to a public Forgejo, e.g.
+        Codeberg, drops the capability → VERA re-holds).
+
+    No client stashed (intake not wired) → False (fail-closed).
+    """
+    from alfred.integrations.github_ops import FORGE_FORGEJO
+
+    client = request.app.get(_KEY_TICKET_INTAKE_GITHUB)
+    if client is None:
+        return False
+    cfg = client.config
+    return (
+        cfg.forge_type == FORGE_FORGEJO
+        and cfg.tracker_sovereign is True
+        and bool(cfg.tracker_sovereign_api_base)
+        and cfg.api_base == cfg.tracker_sovereign_api_base
+    )
 
 
 async def _handle_ticket_intake(

@@ -83,6 +83,12 @@ class TicketForwardConfig:
     # unified ``vault.path`` when omitted from the block.
     vault_path: str = ""
     state_path: str = DEFAULT_TICKET_FORWARD_STATE_PATH
+    # RRTS interlock relax (default OFF → held byte-identical to today). The
+    # operator's INTENT to release PHI-bearing RRTS tickets — NOT sufficient
+    # alone: a release also requires the destination tracker to prove
+    # sovereignty live at the handshake (see run_forward_once). Left False,
+    # every RRTS ticket stays held exactly as before.
+    rrts_relax_enabled: bool = False
 
 
 def load_ticket_forward_config(raw: dict[str, Any]) -> TicketForwardConfig:
@@ -112,6 +118,7 @@ def load_ticket_forward_config(raw: dict[str, Any]) -> TicketForwardConfig:
         interval_minutes=interval_minutes,
         vault_path=vault_path,
         state_path=state_path or DEFAULT_TICKET_FORWARD_STATE_PATH,
+        rrts_relax_enabled=bool(section.get("rrts_relax_enabled", False)),
     )
 
 
@@ -257,13 +264,18 @@ def _rejected_reason_detail(body: str) -> tuple[str, str]:
 def scan_tickets(
     vault_path: Path,
     state: TicketForwardState,
-) -> tuple[int, list[dict[str, Any]]]:
+) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
     """Walk ``<vault>/ticket/*.md`` and select forward-eligible records.
 
-    Returns ``(scanned, eligible)`` where ``scanned`` counts every
-    ticket-typed record seen and ``eligible`` is a list of
-    ``{relpath, frontmatter, body, uid}`` dicts (``uid`` empty when the
-    record has no ``ticket_uid`` field yet — the caller mints one).
+    Returns ``(scanned, eligible, held_rrts)`` where ``scanned`` counts
+    every ticket-typed record seen, ``eligible`` is a list of
+    ``{relpath, frontmatter, body, uid}`` dicts ready to forward now
+    (``uid`` empty when the record has no ``ticket_uid`` field yet — the
+    caller mints one), and ``held_rrts`` is the list of ``origin: rrts``
+    candidate items HELD by the de-PHI interlock (same dict shape). The
+    RRTS-interlock-relax release decision is the ASYNC caller's
+    (``run_forward_once``) — it needs a live sovereignty handshake, which
+    a sync file-scan can't do; scan_tickets just surfaces the candidates.
 
     Eligible = ``status == "open"`` AND (uid not in state OR the state
     entry lacks ``issue_number``) AND NOT held by the de-PHI interlock
@@ -272,23 +284,23 @@ def scan_tickets(
     skips, never kills the tick.
 
     🔒 De-PHI held-state interlock (2026-06-29, RRTS bug-report → VERA
-    lane): an ``origin: rrts`` ticket is EXCLUDED until its
-    ``de_phi_status == "cleared"``. Default-deny — a missing or
-    ``pending`` ``de_phi_status`` on an rrts ticket keeps it HELD.
-    Telegram-origin tickets (``origin != "rrts"``) forward as today.
-    NOTHING in this arc sets ``cleared`` (the separate de-PHI arc does),
-    so RRTS-origin tickets stay held by construction — they can never
-    auto-forward to KAL-LE/GitHub (the US hop) before de-PHI ships.
+    lane): an ``origin: rrts`` ticket is EXCLUDED from ``eligible`` until
+    its ``de_phi_status == "cleared"`` — returned in ``held_rrts`` instead.
+    Default-deny — a missing or ``pending`` ``de_phi_status`` on an rrts
+    ticket keeps it HELD. Telegram-origin tickets (``origin != "rrts"``)
+    forward as today. NOTHING in this arc sets ``cleared`` (the separate
+    de-PHI arc does); the ONLY release paths are ``de_phi_status ==
+    "cleared"`` (here) and the sovereign-relax escape (the caller's).
     """
     scanned = 0
-    held_rrts = 0
     eligible: list[dict[str, Any]] = []
+    held_rrts: list[dict[str, Any]] = []
     ticket_dir = vault_path / "ticket"
     if not ticket_dir.exists():
         log.info(
             "ticket_forward.no_ticket_dir", vault_path=str(vault_path),
         )
-        return 0, []
+        return 0, [], []
 
     for md_file in sorted(ticket_dir.glob("*.md")):
         try:
@@ -307,15 +319,6 @@ def scan_tickets(
         scanned += 1
         if str(fm.get("status") or "") != "open":
             continue
-        # 🔒 De-PHI held-state interlock — the keystone of the RRTS lane.
-        # An RRTS-origin ticket must never auto-forward to KAL-LE/GitHub
-        # until it has been de-PHI'd. Default-deny: anything other than an
-        # explicit ``cleared`` keeps an ``origin: rrts`` ticket held.
-        origin = str(fm.get("origin") or "")
-        de_phi = str(fm.get("de_phi_status") or "")
-        if origin == "rrts" and de_phi != "cleared":
-            held_rrts += 1
-            continue
         relpath = f"ticket/{md_file.name}"
         uid_raw = fm.get("ticket_uid")
         uid = uid_raw if isinstance(uid_raw, str) and uid_raw else ""
@@ -323,25 +326,81 @@ def scan_tickets(
             entry = state.entries.get(uid)
             if entry is not None and entry.issue_number is not None:
                 continue  # already linked — ineligible
-        eligible.append({
+        item = {
             "relpath": relpath,
             "frontmatter": fm,
             "body": post.content,
             "uid": uid,
-        })
+        }
+        # 🔒 De-PHI held-state interlock — the keystone of the RRTS lane.
+        # An RRTS-origin ticket must never auto-forward to KAL-LE/GitHub
+        # until either it has been de-PHI'd (``de_phi_status == "cleared"``,
+        # the original escape) OR the caller's live sovereign-relax escape
+        # releases it. Default-deny: an rrts ticket with anything other than
+        # ``cleared`` is HELD here (surfaced as a candidate in ``held_rrts``);
+        # the caller decides release via the handshake.
+        origin = str(fm.get("origin") or "")
+        de_phi = str(fm.get("de_phi_status") or "")
+        if origin == "rrts" and de_phi != "cleared":
+            held_rrts.append(item)
+            continue
+        eligible.append(item)
     if held_rrts:
         # Intentionally-left-blank: the held-by-de-PHI count is logged so a
         # permanently-held RRTS ticket queue is observably distinct from a
-        # broken forwarder. This is the EXPECTED steady state until the
-        # de-PHI arc ships — an operator grepping ``held_rrts_pending`` sees
-        # the interlock working, not a stall.
+        # broken forwarder. This is the EXPECTED steady state until either
+        # the de-PHI arc ships or the operator activates sovereign relax —
+        # an operator grepping ``held_rrts_pending`` sees the interlock
+        # working, not a stall. (The caller may then release these via the
+        # sovereign-relax handshake and log ``rrts_released``.)
         log.info(
             "ticket_forward.held_rrts_pending",
-            count=held_rrts,
+            count=len(held_rrts),
             detail="origin: rrts tickets held — de_phi_status != cleared "
-                   "(not forwarded; awaiting the separate de-PHI arc)",
+                   "(candidates for the sovereign-relax release the caller "
+                   "gates on a live sovereignty handshake)",
         )
-    return scanned, eligible
+    return scanned, eligible, held_rrts
+
+
+async def _resolve_sovereign_tracker(
+    config: TicketForwardConfig,
+    transport_config: Any,
+) -> tuple[bool, bool]:
+    """Live sovereignty check for the RRTS-relax release (the fail-closed
+    gate). Returns ``(attested, handshake_failed)``.
+
+    ``attested`` is True IFF the target peer's ``/peer/handshake`` reply
+    advertises the ``sovereign_tracker`` capability — which KAL-LE computes
+    from the SAME GitHub client that posts issues (see
+    ``peer_handlers._sovereign_tracker_registered``), so a rollback to a
+    public tracker drops the capability and this returns False → HOLD.
+
+    Fail-closed: ANY handshake failure/timeout/non-200 → ``(False, True)``
+    → hold with a ``handshake_failed`` withheld reason. No path releases on
+    error. Called LAZILY by :func:`run_forward_once` — only when relax is on
+    AND there is ≥1 held RRTS candidate — so the common no-RRTS tick pays
+    zero handshake cost (DEFECT-1).
+    """
+    from .client import peer_handshake
+
+    try:
+        reply = await peer_handshake(
+            config.target_peer,
+            config=transport_config,
+            self_name=config.self_name,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-closed: any error holds PHI
+        log.warning(
+            "ticket_forward.sovereign_handshake_failed",
+            target_peer=config.target_peer,
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        return False, True
+    caps = reply.get("capabilities") if isinstance(reply, dict) else None
+    attested = isinstance(caps, list) and "sovereign_tracker" in caps
+    return attested, False
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +445,59 @@ async def run_forward_once(
     vault_path = Path(config.vault_path)
     state = TicketForwardState.load(config.state_path)
 
-    scanned, eligible = scan_tickets(vault_path, state)
+    scanned, eligible, held_rrts = scan_tickets(vault_path, state)
+
+    # --- RRTS interlock relax (default OFF → operationally inert) ----------
+    # Two release escapes for an origin: rrts ticket:
+    #   (1) de_phi_status == "cleared" — already released into `eligible` by
+    #       scan_tickets (PHI removed → safe for ANY tracker). Audit each.
+    #   (2) sovereign relax — a PHI-BEARING release, allowed ONLY when the
+    #       operator's intent flag is on AND the destination tracker proves
+    #       sovereignty LIVE at the handshake. Fail-closed + LAZY: relax OFF,
+    #       or zero held candidates → NO handshake at all (DEFECT-1); any
+    #       handshake failure / missing capability → HOLD (no path releases).
+    rrts_released = 0
+    for item in eligible:
+        ifm = item["frontmatter"]
+        if str(ifm.get("origin") or "") == "rrts":  # eligible rrts ⇒ de_phi cleared
+            log.info(
+                "ticket_forward.rrts_released",
+                ticket_uid=str(ifm.get("ticket_uid") or item.get("uid") or ""),
+                relpath=item["relpath"],
+                target_peer=config.target_peer,
+                reason="de_phi_cleared",
+            )
+            rrts_released += 1
+
+    sovereign_attested = False
+    if config.rrts_relax_enabled and held_rrts:
+        sovereign_attested, handshake_failed = await _resolve_sovereign_tracker(
+            config, transport_config,
+        )
+        if sovereign_attested:
+            for item in held_rrts:
+                ifm = item["frontmatter"]
+                log.info(
+                    "ticket_forward.rrts_released",
+                    ticket_uid=str(ifm.get("ticket_uid") or item.get("uid") or ""),
+                    relpath=item["relpath"],
+                    target_peer=config.target_peer,
+                    reason="sovereign_relax",
+                )
+                rrts_released += 1
+            eligible.extend(held_rrts)
+        else:
+            # Rollback observability: relax is ON + candidates exist but the
+            # tracker is not (or no longer) attested → held. Names WHY so a
+            # silent rollback-hold is an observable event, not a mystery stall.
+            log.warning(
+                "ticket_forward.rrts_release_withheld",
+                reason="handshake_failed" if handshake_failed
+                else "sovereignty_not_attested",
+                count=len(held_rrts),
+                target_peer=config.target_peer,
+            )
+    rrts_held = 0 if sovereign_attested else len(held_rrts)
 
     forwarded = 0
     failed = 0
@@ -637,6 +748,12 @@ async def run_forward_once(
         "pending": pending,
         "failed": failed,
         "aborted": aborted,
+        # RRTS interlock relax — the held-vs-released split + the live
+        # attestation state, visible on every tick (incl. zero-work), so a
+        # rollback-hold is observable, not a mystery stall.
+        "rrts_released": rrts_released,
+        "rrts_held": rrts_held,
+        "sovereignty_attested": sovereign_attested,
     }
     # ILB: every tick — zero-work ticks included — emits the summary so
     # an idle forwarder is distinguishable from a broken one.
