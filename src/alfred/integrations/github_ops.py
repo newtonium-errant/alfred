@@ -418,6 +418,12 @@ def load_github_config(raw: dict[str, Any]) -> GitHubOpsConfig | None:
     that get ``None`` must NOT silently degrade for write ops (use
     :func:`build_github_client`, which fails loud).
 
+    Raises :class:`GitHubOpsError` when ``forge_type`` is present but
+    unsupported (not in :data:`FORGE_TYPES`) — a load-bearing config value
+    fails loud rather than coercing to a wrong-forge client. Callers that
+    read the config for an optional/skippable feature should catch it (the
+    ``fix_drafter`` runner + the ticket-intake builder already do).
+
     Env substitution: the top-level ``_load_unified_config`` does NOT
     substitute ``${VAR}`` placeholders (verified 2026-06-11 — each
     tool's ``load_from_unified`` substitutes its own section, e.g.
@@ -498,23 +504,22 @@ def load_github_config(raw: dict[str, Any]) -> GitHubOpsConfig | None:
             )
             label_map[key] = [v for v in values if v != _AUTO_FIX_LABEL]
 
-    # forge_type selects the data-plane shapes. Default + unknown values
-    # fall back to ``github`` (the byte-identical-to-pre-port path); an
-    # unknown value warns so a config typo (e.g. ``forgejoo``) is
-    # observable rather than silently selecting the wrong shapes.
+    # forge_type selects the data-plane shapes. An omitted value defaults to
+    # ``github`` (the byte-identical-to-pre-port path); an UNSUPPORTED value
+    # FAILS LOUD (forge-type guard, operator directive 2026-07-02) rather than
+    # coercing to github — a Forgejo typo silently coerced into a GitHub client
+    # would then talk the wrong API to the box. Matches the fail-loud-on-
+    # missing-name precedent + the raises in build_client_for_repo /
+    # _git_auth_header: an invalid load-bearing config value stops with a clear
+    # message, not a silent degrade. No coerce anywhere.
     forge_type = str(
         section.get("forge_type", FORGE_GITHUB) or FORGE_GITHUB
     ).strip().lower()
     if forge_type not in FORGE_TYPES:
-        log.warning(
-            "github.config.unknown_forge_type",
-            forge_type=forge_type,
-            detail=(
-                f"forge_type must be one of {sorted(FORGE_TYPES)}; "
-                "falling back to 'github'"
-            ),
+        raise GitHubOpsError(
+            f"forge_type must be one of {sorted(FORGE_TYPES)}; "
+            f"got {forge_type!r}"
         )
-        forge_type = FORGE_GITHUB
 
     return GitHubOpsConfig(
         repo=str(section.get("repo", "") or ""),

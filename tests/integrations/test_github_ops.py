@@ -396,21 +396,19 @@ class TestLoadGithubConfig:
         assert cfg is not None
         assert cfg.forge_type == "forgejo"
 
-    def test_unknown_forge_type_warns_and_falls_back_to_github(
+    def test_unknown_forge_type_fails_loud(
         self, tmp_path: Path,
     ) -> None:
-        """A typo (``forgejoo``) must NOT silently select wrong shapes —
-        warn + fall back to the known-good github path."""
-        with structlog.testing.capture_logs() as captured:
-            cfg = load_github_config(_raw(tmp_path, forge_type="forgejoo"))
-        assert cfg is not None
-        assert cfg.forge_type == "github"
-        warns = [
-            c for c in captured
-            if c.get("event") == "github.config.unknown_forge_type"
-        ]
-        assert len(warns) == 1
-        assert warns[0]["forge_type"] == "forgejoo"
+        """Forge-type guard (operator directive 2026-07-02): a typo
+        (``forgejoo``) FAILS LOUD at config load — raises GitHubOpsError with
+        the FORGE_TYPES message — rather than warning + coercing to github
+        (which would talk the wrong API to the box). No silent forge coerce
+        anywhere."""
+        with pytest.raises(github_ops_mod.GitHubOpsError) as exc:
+            load_github_config(_raw(tmp_path, forge_type="forgejoo"))
+        assert "forge_type must be one of" in str(exc.value)
+        assert "forgejoo" in str(exc.value)
+        assert "forgejo" in str(exc.value) and "github" in str(exc.value)
 
     def test_build_client_for_repo_rejects_unsupported_forge(self) -> None:
         """Forge-type guard: the Option-B per-app-repo factory FAILS LOUD on

@@ -628,6 +628,24 @@ def test_fix_drafter_starts_on_forgejo_config(
     )
 
 
+def test_run_fix_drafter_exits_78_on_invalid_github_forge(tmp_path: Path) -> None:
+    """Forge-type guard: the fix_drafter runner exits 78 (skip-restart) with a
+    clear log when the central github.forge_type is a typo — load_github_config
+    now RAISES, and the runner catches it rather than crash-looping the daemon.
+    (Reaches the github check: enabled + instance are set.)"""
+    raw = {
+        "logging": {"dir": str(tmp_path), "level": "INFO"},
+        "fix_drafter": {"enabled": True, "instance": "KAL-LE"},
+        "github": {
+            "repo": "org/app1", "pat": "P", "instance": "KAL-LE",
+            "forge_type": "gitlab",
+        },
+    }
+    with pytest.raises(SystemExit) as exc:
+        orchestrator._run_fix_drafter(raw, suppress_stdout=False)
+    assert exc.value.code == 78
+
+
 def _run_with_message_bus(
     raw, orch_dirs, install_per_tool_fakes, fire_sentinel_after,
 ):

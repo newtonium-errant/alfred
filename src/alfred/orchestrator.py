@@ -584,7 +584,11 @@ def _run_fix_drafter(raw: dict[str, Any], suppress_stdout: bool = False) -> None
         load_fix_drafter_config,
         run_daemon,
     )
-    from alfred.integrations.github_ops import FORGE_FORGEJO, load_github_config
+    from alfred.integrations.github_ops import (
+        FORGE_FORGEJO,
+        GitHubOpsError,
+        load_github_config,
+    )
     import sys
     import structlog
     log = structlog.get_logger(__name__)
@@ -595,7 +599,18 @@ def _run_fix_drafter(raw: dict[str, Any], suppress_stdout: bool = False) -> None
     if not config.instance:
         log.warning("fix_drafter.daemon.missing_instance")
         sys.exit(78)
-    gh = load_github_config(raw)
+    # load_github_config now FAILS LOUD on an unsupported forge_type (guard):
+    # exit 78 (skip-restart, missing-deps class) with a clear message rather
+    # than crash-looping the daemon on a central-config typo.
+    try:
+        gh = load_github_config(raw)
+    except GitHubOpsError as exc:
+        log.warning(
+            "fix_drafter.daemon.invalid_github_config",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+        )
+        sys.exit(78)
     forge_type = gh.forge_type if gh is not None else ""
     if forge_type != FORGE_FORGEJO:
         log.warning("fix_drafter.daemon.wrong_forge_type", forge_type=forge_type)
