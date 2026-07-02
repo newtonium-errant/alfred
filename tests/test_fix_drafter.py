@@ -1258,6 +1258,24 @@ def test_missing_token_fails_loud(tmp_path, monkeypatch):
     assert target is None and reason == "missing_token:app1"
 
 
+def test_invalid_forge_fails_loud_per_issue(tmp_path, monkeypatch):
+    """Forge-type guard: a project with an unsupported forge_type resolves to
+    a per-issue fail-loud reason (``invalid_forge:<slug>``) — checked BEFORE
+    building the client, so it's a clean needs_human, NOT a raise from
+    build_client_for_repo (which would abort the whole tick, since
+    _resolve_project_target runs outside run_drafter_once's per-issue try)."""
+    monkeypatch.setenv("APP1_TOKEN", "t1")
+    cfg = _config(tmp_path, default_project="app1", projects={
+        "app1": _project(repo="org/app1", forge_type="gitlab",
+                         token_env="APP1_TOKEN"),
+    })
+    client = FakeClient(tmp_path)
+    target, reason = fix_drafter._resolve_project_target(
+        {"number": 7, "body": "x"}, cfg, client,
+    )
+    assert target is None and reason == "invalid_forge:app1"
+
+
 async def test_run_once_project_unresolved_latches_needs_human(tmp_path, monkeypatch, _drafter_key):
     """run_drafter_once: a markerless issue under N>1 projects → needs_human,
     NO draft (clone/model never run)."""
@@ -1280,6 +1298,37 @@ async def test_run_once_project_unresolved_latches_needs_human(tmp_path, monkeyp
     assert not fake.has_stage("clone")             # never drafted
     unresolved = _log_events(captured, "fix_drafter.project_unresolved")
     assert len(unresolved) == 1 and unresolved[0]["reason"] == "markerless_ambiguous"
+
+
+async def test_run_once_invalid_forge_latches_needs_human_no_tick_abort(
+    tmp_path, monkeypatch, _drafter_key
+):
+    """Forge-type guard end-to-end: an issue routed to a project with an
+    unsupported forge_type latches needs_human (never drafts) and the tick
+    completes normally — the guard does NOT abort the whole tick."""
+    monkeypatch.setenv("APP1_TOKEN", "t1")
+    cfg = _config(tmp_path, default_project="app1", projects={
+        "app1": _project(repo="org/app1", forge_type="gitlab",
+                         token_env="APP1_TOKEN"),
+    })
+    client = FakeClient(
+        tmp_path, issues=[{"number": 7, "title": "t", "body": "x"}],
+    )
+    monkeypatch.setattr(
+        "alfred.integrations.github_ops.build_github_client",
+        lambda raw, instance: client,
+    )
+    fake = FakeRun()
+    _patch_run(monkeypatch, fake)
+    with structlog.testing.capture_logs() as captured:
+        summary = await run_drafter_once(cfg, {"github": {}})
+    assert summary["needs_human"] == 1             # per-issue latch
+    assert not fake.has_stage("clone")             # never drafted
+    unresolved = _log_events(captured, "fix_drafter.project_unresolved")
+    assert len(unresolved) == 1
+    assert unresolved[0]["reason"] == "invalid_forge:app1"
+    # tick completed (the summary was returned) — no tick-abort.
+    assert summary["scanned"] == 1
 
 
 # --- PHI-clean PR surface + de-PHI diff scan ---
@@ -1476,21 +1525,17 @@ def test_poll_client_for_app_repo_missing_token_returns_none(tmp_path, monkeypat
 
 def test_git_auth_header_forge_dispatch():
     """D1 pins (a)+(b): the git-plane Authorization extraHeader is dispatched
-    by forge. Forgejo (+ default/legacy/gitea) → ``Authorization: token
+    by forge. Forgejo (+ the ``forgejo`` default) → ``Authorization: token
     <pat>`` (byte-identical to Phase-0); GitHub → HTTP Basic with
     ``x-access-token:<pat>`` (the scheme GitHub git-over-HTTPS accepts;
     confirmed against actions/checkout), NOT the Gitea token scheme."""
     import base64
 
-    # (a) forgejo / default / legacy / gitea → unchanged token scheme.
+    # (a) forgejo + the forgejo default → unchanged token scheme.
     assert fix_drafter._git_auth_header("PAT", "forgejo") == (
         "Authorization: token PAT"
     )
     assert fix_drafter._git_auth_header("PAT") == "Authorization: token PAT"
-    assert fix_drafter._git_auth_header("PAT", "") == "Authorization: token PAT"
-    assert fix_drafter._git_auth_header("PAT", "gitea") == (
-        "Authorization: token PAT"
-    )
 
     # (b) github → Basic base64("x-access-token:" + pat); NOT the token scheme.
     gh = fix_drafter._git_auth_header("PAT", "github")
@@ -1498,6 +1543,17 @@ def test_git_auth_header_forge_dispatch():
     assert gh == f"Authorization: Basic {expected}"
     assert base64.b64decode(gh.split()[-1]).decode() == "x-access-token:PAT"
     assert "token PAT" not in gh   # must NOT be the Gitea/Forgejo scheme
+
+
+def test_git_auth_header_rejects_unsupported_forge():
+    """Forge-type guard: an unsupported forge (not in FORGE_TYPES — incl.
+    ``gitea``/``""``) RAISES rather than silently defaulting to the token
+    scheme. The git-plane half of the cross-plane mismatch guard."""
+    import pytest as _pytest
+
+    for bad in ("gitea", "", "gitlab", "GitHub"):
+        with _pytest.raises(ValueError):
+            fix_drafter._git_auth_header("PAT", bad)
 
 
 def test_write_temp_gitconfig_forge_dispatched(tmp_path):

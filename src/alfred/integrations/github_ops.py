@@ -626,11 +626,22 @@ def build_client_for_repo(
     forgejo target MUST pass its ``/api/v1`` base. The ``fix_drafter`` caller
     is still gated by :data:`GITHUB_OPS` per op, and ``pr_merge`` stays
     permanently denied — this factory does NOT widen the op matrix."""
+    # FAIL-LOUD on an unsupported forge_type rather than silently coercing to
+    # github. A silent coerce would give the REST plane a GitHub Bearer client
+    # while the drafter's GIT plane (fix_drafter._git_auth_header) defaults an
+    # unknown forge to the Forgejo token scheme -> a SILENT cross-plane auth
+    # mismatch. Only github/forgejo are FORGE_TYPES, so this cannot arise from
+    # a valid config; the guard closes the silent-normalize trap.
+    if forge_type not in FORGE_TYPES:
+        raise GitHubOpsError(
+            f"unsupported forge_type {forge_type!r}; must be one of "
+            f"{sorted(FORGE_TYPES)}"
+        )
     config = GitHubOpsConfig(
         repo=repo,
         pat=pat,
         instance=instance,
-        forge_type=(forge_type if forge_type in FORGE_TYPES else FORGE_GITHUB),
+        forge_type=forge_type,
         api_base=api_base or GITHUB_API_BASE,
         audit_log_path=audit_log_path or DEFAULT_AUDIT_LOG_PATH,
     )

@@ -412,6 +412,33 @@ class TestLoadGithubConfig:
         assert len(warns) == 1
         assert warns[0]["forge_type"] == "forgejoo"
 
+    def test_build_client_for_repo_rejects_unsupported_forge(self) -> None:
+        """Forge-type guard: the Option-B per-app-repo factory FAILS LOUD on
+        an unsupported forge_type (raises GitHubOpsError) rather than silently
+        coercing to github — which would give the REST plane a GitHub Bearer
+        client while the drafter's git plane defaults to the Forgejo token
+        scheme (a silent cross-plane auth mismatch)."""
+        with pytest.raises(github_ops_mod.GitHubOpsError) as exc:
+            github_ops_mod.build_client_for_repo(
+                repo="org/app1", pat=DUMMY_PAT, forge_type="gitlab",
+            )
+        # the message names the offending value + the valid set.
+        assert "gitlab" in str(exc.value)
+        assert "forgejo" in str(exc.value) and "github" in str(exc.value)
+
+    def test_build_client_for_repo_builds_valid_forges(self) -> None:
+        """The two supported forges build fine, forge_type preserved (no
+        coercion): github (default GitHub base) + forgejo (explicit base)."""
+        gh = github_ops_mod.build_client_for_repo(
+            repo="org/app1", pat=DUMMY_PAT, forge_type="github",
+        )
+        assert gh.config.forge_type == "github"
+        fj = github_ops_mod.build_client_for_repo(
+            repo="org/app1", pat=DUMMY_PAT, forge_type="forgejo",
+            api_base=FORGEJO_API_BASE,
+        )
+        assert fj.config.forge_type == "forgejo"
+
     def test_env_substitution_is_local(self, monkeypatch) -> None:
         """The unified loader does NOT substitute ${VAR}; this loader
         must do it itself (verified against _load_unified_config)."""

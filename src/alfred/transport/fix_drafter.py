@@ -856,9 +856,12 @@ def _resolve_project_target(
       * markerless + N==1 → the single project (default_project or the sole
         entry) — the Phase-1 soak path.
       * marker names an unknown slug → ``unknown_project:<slug>``.
+      * resolved project's ``forge_type`` unsupported → ``invalid_forge:<slug>``
+        (checked BEFORE building the client, so the per-issue reason is clean
+        rather than a tick-aborting raise from ``build_client_for_repo``).
       * resolved project's token env is empty → ``missing_token:<slug>``.
     """
-    from alfred.integrations.github_ops import parse_project_marker
+    from alfred.integrations.github_ops import FORGE_TYPES, parse_project_marker
 
     if not config.projects:
         return _target_from_central(central_client, config), ""
@@ -872,6 +875,12 @@ def _resolve_project_target(
     proj = config.projects.get(slug)
     if proj is None:
         return None, f"unknown_project:{slug}"
+    if proj.forge_type not in FORGE_TYPES:
+        # Fail-loud per-issue (needs_human) rather than letting the
+        # build_client_for_repo / _git_auth_header guards raise mid-build:
+        # this call is OUTSIDE run_drafter_once's per-issue try, so a raw
+        # raise here would abort the WHOLE tick, not just this issue.
+        return None, f"invalid_forge:{slug}"
     target = _build_target_from_project(proj, central_client, config)
     if not target.token:
         return None, f"missing_token:{slug}"
@@ -1060,9 +1069,14 @@ def _git_auth_header(pat: str, forge_type: str = "forgejo") -> str:
       git-http (that scheme is REST-API-only). Confirmed against GitHub's
       own ``actions/checkout`` git-auth-helper, which sets
       ``AUTHORIZATION: basic <base64("x-access-token:" + token)>``.
-    * ``forgejo`` (+ default / legacy / gitea) — ``Authorization: token
-      <pat>``, UNCHANGED (Forgejo git-http accepts it; Phase-0 byte-
+    * ``forgejo`` (+ the ``forge_type="forgejo"`` default) — ``Authorization:
+      token <pat>``, UNCHANGED (Forgejo git-http accepts it; Phase-0 byte-
       identical).
+    * any other value — raises ``ValueError`` (forge-type guard): only
+      ``github``/``forgejo`` are supported (``FORGE_TYPES``); an unsupported
+      forge must never silently pick a scheme (the git-plane half of the
+      cross-plane mismatch the REST-plane ``build_client_for_repo`` guard
+      also closes).
 
     The value rides an extraHeader in a 0600 temp gitconfig (never argv,
     never the clone URL / reflog) — same containment as before, for both
@@ -1073,7 +1087,19 @@ def _git_auth_header(pat: str, forge_type: str = "forgejo") -> str:
             f"x-access-token:{pat}".encode()
         ).decode("ascii")
         return f"Authorization: Basic {basic}"
-    return f"Authorization: token {pat}"
+    if forge_type == "forgejo":
+        return f"Authorization: token {pat}"
+    # FAIL-LOUD on any other forge (defense-in-depth, forge-type guard):
+    # never silently pick a git-plane scheme for an unsupported forge — that
+    # is the mismatch trap the REST-plane guard (github_ops.build_client_for_
+    # repo) also closes. Only github/forgejo are supported (FORGE_TYPES); the
+    # drafter pre-validates in _resolve_project_target, so this is a backstop.
+    from alfred.integrations.github_ops import FORGE_TYPES
+
+    raise ValueError(
+        f"unsupported forge_type {forge_type!r} for the git plane; "
+        f"must be one of {sorted(FORGE_TYPES)}"
+    )
 
 
 def _write_temp_gitconfig(pat: str, forge_type: str = "forgejo") -> str:
