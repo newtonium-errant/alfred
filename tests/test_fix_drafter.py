@@ -298,6 +298,127 @@ def test_state_corrupt_starts_empty(tmp_path):
     assert state.entries == {}
 
 
+# ---------------------------------------------------------------------------
+# Tracker-scope (anti cross-tracker collision) — reconcile_tracker
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_tracker_change_clears_stale_entries(tmp_path):
+    """Pin (a): a DIFFERENT persisted tracker → entries reset to {} +
+    `tracker_changed` logged (old→new + cleared count). This is the live bug:
+    an old tracker's `needs_human`/`pr_open` entries would collide with the
+    new tracker's reused issue numbers."""
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"tracker": "acme/site", "entries": {
+        "9": {"issue_number": 9, "status": "needs_human"},
+        "11": {"issue_number": 11, "status": "pr_open", "pr_number": 12},
+    }}))
+    state = FixDrafterState.load(p)
+    assert state.tracker == "acme/site" and len(state.entries) == 2
+    with structlog.testing.capture_logs() as captured:
+        changed = state.reconcile_tracker("newton/bug-intake")
+    assert changed is True
+    assert state.entries == {}
+    assert state.tracker == "newton/bug-intake"
+    ev = _log_events(captured, "fix_drafter.state.tracker_changed")
+    assert len(ev) == 1
+    assert ev[0]["old_tracker"] == "acme/site"
+    assert ev[0]["new_tracker"] == "newton/bug-intake"
+    assert ev[0]["cleared"] == 2
+
+
+def test_reconcile_tracker_same_is_byte_identical_noop(tmp_path):
+    """Pin (b): SAME tracker → entries preserved, no-op (returns False, no
+    log). Normal single-tracker operation is unchanged."""
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"tracker": "acme/site", "entries": {
+        "9": {"issue_number": 9, "status": "pr_open"},
+    }}))
+    state = FixDrafterState.load(p)
+    with structlog.testing.capture_logs() as captured:
+        changed = state.reconcile_tracker("acme/site")
+    assert changed is False
+    assert "9" in state.entries and state.tracker == "acme/site"
+    assert _log_events(captured, "fix_drafter.state.tracker_changed") == []
+    assert _log_events(captured, "fix_drafter.state.tracker_stamped") == []
+
+
+def test_reconcile_tracker_legacy_stamps_preserving_entries(tmp_path):
+    """Pin (c): a LEGACY state file (no `tracker` key) → entries preserved +
+    tracker stamped (returns True, `tracker_stamped` logged). Schema-tolerant:
+    the pre-scoping file's entries belong to the current tracker."""
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"entries": {
+        "9": {"issue_number": 9, "status": "pr_open"},
+    }}))
+    state = FixDrafterState.load(p)
+    assert state.tracker == ""            # legacy: no tracker key
+    with structlog.testing.capture_logs() as captured:
+        changed = state.reconcile_tracker("acme/site")
+    assert changed is True
+    assert "9" in state.entries           # entries PRESERVED (not cleared)
+    assert state.tracker == "acme/site"   # stamped
+    ev = _log_events(captured, "fix_drafter.state.tracker_stamped")
+    assert len(ev) == 1 and ev[0]["tracker"] == "acme/site"
+
+
+def test_reconcile_tracker_persists_and_next_load_is_stable(tmp_path):
+    """Pin (d): the reset/stamp is written (save) so the NEXT load reconciles
+    to a no-op — no repeated resets. Also: a blank current tracker is a no-op
+    (can't scope against nothing)."""
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"tracker": "acme/site", "entries": {
+        "9": {"issue_number": 9, "status": "pr_open"},
+    }}))
+    state = FixDrafterState.load(p)
+    assert state.reconcile_tracker("newton/bug-intake") is True
+    state.save()
+    # the saved file carries the new tracker + empty entries.
+    data = json.loads(p.read_text())
+    assert data["tracker"] == "newton/bug-intake" and data["entries"] == {}
+    # next load → same tracker → no-op (stable).
+    reloaded = FixDrafterState.load(p)
+    assert reloaded.tracker == "newton/bug-intake"
+    assert reloaded.reconcile_tracker("newton/bug-intake") is False
+    # blank tracker never resets.
+    assert reloaded.reconcile_tracker("") is False
+
+
+async def test_run_once_clears_state_on_tracker_change(
+    tmp_path, monkeypatch, _drafter_key
+):
+    """WIRING pin: run_drafter_once reconciles the loaded state against the
+    CENTRAL client's repo — a stale-tracker state (an old tracker's
+    `needs_human` for #9) is cleared + re-stamped + persisted, so the new
+    tracker's issue #9 is no longer silently skipped. Reproduces the
+    live-observed Phase-1 collision."""
+    cfg = _config(tmp_path)
+    # a state file from the OLD tracker (FakeClient.config.repo == TEST_REPO,
+    # so "old/tracker" differs → a change).
+    Path(cfg.state_path).write_text(json.dumps({
+        "tracker": "old/tracker",
+        "entries": {"9": {"issue_number": 9, "status": "needs_human"}},
+    }))
+    client = FakeClient(tmp_path, issues=[])   # empty scan — trivial tick
+    monkeypatch.setattr(
+        "alfred.integrations.github_ops.build_github_client",
+        lambda raw, instance: client,
+    )
+    fake = FakeRun()
+    _patch_run(monkeypatch, fake)
+    with structlog.testing.capture_logs() as captured:
+        await run_drafter_once(cfg, {"github": {}})
+    ev = _log_events(captured, "fix_drafter.state.tracker_changed")
+    assert len(ev) == 1
+    assert ev[0]["old_tracker"] == "old/tracker"
+    assert ev[0]["new_tracker"] == TEST_REPO
+    assert ev[0]["cleared"] == 1
+    # persisted: the stale entry is gone + the current tracker is stamped.
+    persisted = json.loads(Path(cfg.state_path).read_text())
+    assert persisted["tracker"] == TEST_REPO
+    assert persisted["entries"] == {}
+
+
 def test_branch_regex():
     assert _BRANCH_REGEX.match("auto-fix/issue-7")
     assert _BRANCH_REGEX.match("auto-fix/issue-123")

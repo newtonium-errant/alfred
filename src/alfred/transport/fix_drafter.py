@@ -408,10 +408,21 @@ class FixDrafterState:
     empty; corrupt file → log + empty). State loss is recoverable: the
     git/PR ground-truth dedup (ls-remote + pr_list) re-derives linkage and
     never double-opens a PR.
+
+    ``tracker`` scopes the state to the CENTRAL tracker (``github.repo``) it
+    was built against. Entries are keyed by BARE ``issue_number``, which is
+    NOT globally unique — a different tracker (e.g. after a Phase-1 tracker
+    change) reuses the same numbers from #1, so stale entries would collide
+    (a stale ``needs_human`` silently skips a NEW same-numbered issue; a
+    stale ``pr_open`` points at the OLD tracker's PR). :meth:`reconcile_
+    tracker` clears the entries when the tracker changes.
     """
 
     path: Path
     entries: dict[str, FixDrafterEntry] = field(default_factory=dict)
+    # The central tracker (github.repo) these entries belong to. Empty on a
+    # legacy state file (pre-scoping) → stamped on the first reconcile.
+    tracker: str = ""
 
     @classmethod
     def load(cls, path: str | Path) -> "FixDrafterState":
@@ -435,12 +446,61 @@ class FixDrafterState:
             for key, entry_data in entries_raw.items():
                 if isinstance(entry_data, dict):
                     entries[str(key)] = FixDrafterEntry.from_dict(entry_data)
-        return cls(path=p, entries=entries)
+        # Schema-tolerant: a legacy file with no ``tracker`` key → "".
+        tracker = ""
+        if isinstance(data, dict):
+            tracker = str(data.get("tracker", "") or "")
+        return cls(path=p, entries=entries, tracker=tracker)
+
+    def reconcile_tracker(self, current_tracker: str) -> bool:
+        """Scope the state to ``current_tracker`` (the central ``github.repo``).
+
+        Returns True when it mutated the state (the caller saves), False on a
+        no-op. Three cases:
+          * persisted tracker DIFFERS from current (a tracker change) → the
+            entries are stale (bare-issue-number collision across trackers) →
+            CLEAR them + re-stamp + log ``fix_drafter.state.tracker_changed``.
+          * persisted tracker EMPTY (legacy pre-scoping file) → keep the
+            entries (they belong to the current tracker) + stamp it + log
+            ``fix_drafter.state.tracker_stamped``.
+          * persisted tracker == current → no-op (normal operation, byte-
+            identical).
+
+        A blank ``current_tracker`` is a no-op (can't scope against nothing —
+        the drafter fails loud on an empty repo elsewhere).
+        """
+        if not current_tracker:
+            return False
+        if self.tracker and self.tracker != current_tracker:
+            log.warning(
+                "fix_drafter.state.tracker_changed",
+                old_tracker=self.tracker,
+                new_tracker=current_tracker,
+                cleared=len(self.entries),
+                detail=(
+                    "central tracker changed — cleared stale entries keyed by "
+                    "bare issue_number (they belong to the old tracker and "
+                    "would collide with the new tracker's reused numbers)"
+                ),
+            )
+            self.entries = {}
+            self.tracker = current_tracker
+            return True
+        if self.tracker != current_tracker:  # legacy "" → first-time stamp
+            log.info(
+                "fix_drafter.state.tracker_stamped",
+                tracker=current_tracker,
+                entries=len(self.entries),
+            )
+            self.tracker = current_tracker
+            return True
+        return False
 
     def save(self) -> None:
         """Atomic write — ``.tmp`` then ``os.replace`` rename."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "tracker": self.tracker,
             "entries": {
                 key: entry.to_dict() for key, entry in self.entries.items()
             },
@@ -1974,6 +2034,13 @@ async def run_drafter_once(
         )
 
     state = FixDrafterState.load(config.state_path)
+    # Scope the state to THIS central tracker: on a tracker change, the stale
+    # entries (keyed by bare issue_number, which the new tracker reuses from
+    # #1) are cleared so a new same-numbered issue isn't silently skipped by a
+    # stale needs_human / adopted onto the old tracker's PR. Persist the reset/
+    # stamp so the next load is stable (no repeated resets).
+    if state.reconcile_tracker(central_client.config.repo):
+        state.save()
 
     try:
         issues = await scan_auto_fix_issues(client)
