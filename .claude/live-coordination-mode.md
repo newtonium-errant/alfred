@@ -23,37 +23,65 @@ operator-requested window, then it drops back to the plain mailbox. It combines:
 session, and is scoped to it. Nothing persists across sessions. Ending the session or the loop
 ends live-mode. There is no always-on live mode.
 
-## Transport cheat-sheet (exact CLI — always `--config config.msgbus.yaml`)
+## Transport cheat-sheet (exact CLI — absolute paths, runs from ANY repo's cwd)
 
-`<self>` = your own project slug (defaults to `message_bus.self_project`, which is `alfred` in
-this repo). `<peer>` = the project you are coordinating with (e.g. `aftermath-rrts`,
-`aftermath-lab`). `<cid>` = the correlation id threading the exchange.
+**Invocation — use these absolute paths verbatim.** This doc is read by agents in `alfred`,
+`aftermath-rrts`, and `aftermath-lab`. The msgbus config lives in the alfred repo and `alfred` is
+**not** on `$PATH`, so every command must use the **absolute binary + absolute config** — a bare
+`alfred --config config.msgbus.yaml` only resolves from `/home/andrew/alfred`'s cwd and will fail
+from any other repo:
+
+```
+/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml  <subcommand …>
+```
+
+**Your project slug (`<self>`) — set your identity on every command.** `<self>` is whichever repo
+THIS session runs in: one of `alfred` | `aftermath-rrts` | `aftermath-lab`. All three share the
+**one** config above, whose `self_project` is `alfred`, so the slug **default is `alfred` no matter
+which repo you're in.** That means: **from any repo you MUST pass your own slug explicitly** — as the
+`msg inbox <self>` positional and as `--from <self>` on `msg send` and every `contract` subcommand —
+or you will silently send AS `alfred` and drain `alfred`'s inbox (wrong sender, wrong mailbox).
+Passing `<self>` explicitly is correct for all three repos, so **always do it** (do not rely on the
+default even from the alfred session). Don't set `<self>`/`<peer>` via a shell variable — an agent's
+Bash calls don't share env, so inline the literal slug in each command. `<peer>` = the project
+you're coordinating with; `<cid>` = the correlation id threading the exchange.
 
 ```bash
-# Drain your own inbox as machine-readable records (INCLUDING body) — the loop surface.
-alfred --config config.msgbus.yaml msg inbox <self> drain --json      # <self> optional; defaults to self_project
+# Drain YOUR OWN inbox as machine-readable records (INCLUDING body) — the loop surface.
+/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml \
+    msg inbox <self> drain --json
 
 # Reply to a message, routed instantly.
-alfred --config config.msgbus.yaml msg send --route --kind reply \
-    --to <peer> --reply-to <message-id> --correlation-id <cid> \
-    --subject "..." --body "..."
+/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml \
+    msg send --route --from <self> --kind reply \
+    --to <peer> --reply-to <message-id> --correlation-id <cid> --subject "..." --body "..."
 
 # One-shot presence ping (used on ENTER and EXIT).
-alfred --config config.msgbus.yaml msg send --route --kind fyi --to <peer> --subject "live-mode online"
+/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml \
+    msg send --route --from <self> --kind fyi --to <peer> --subject "live-mode online"
 
 # Contracts (real-time negotiation) — see the Contracts section.
-alfred --config config.msgbus.yaml contract propose --route --to <peer> --seam <seam-slug> \
+/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml \
+    contract propose --route --from <self> --to <peer> --seam <seam-slug> \
     --subject "..." --item "task-name:owner-project" [--item ...]     # prints a contract_id
-alfred --config config.msgbus.yaml contract counter --route --contract-id <contract_id> --subject "..." --item "..."
-alfred --config config.msgbus.yaml contract accept  --route --contract-id <contract_id>
+/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml \
+    contract counter --route --from <self> --contract-id <contract_id> --subject "..." --item "..."
+/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml \
+    contract accept  --route --from <self> --contract-id <contract_id>
 ```
+
+Prose below shows commands as **sub-command fragments** (`msg …` / `contract …`) for readability —
+prefix every one with the absolute invocation
+(`/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml`) and keep the
+explicit `--from <self>` / `<self>` positional.
 
 Notes on the real surface (verified against master `f9fc0fb`):
 - `msg send --kind` accepts **`handover|request|fyi|reply`** only. `--reply-to` threads a reply to
   a specific message id; `--route`/`--now` are aliases for the same instant-route flag.
-- `msg inbox` puts the **project positional first and optional**: `msg inbox <self> drain --json`
-  and `msg inbox drain --json` both work; the bare form uses `self_project`. Use `--json` only on
-  `drain` — it emits full records with body (`list`/`read` ignore it).
+- `msg inbox` puts the **project positional first**: pass `<self>` explicitly
+  (`msg inbox <self> drain --json`). The bare `msg inbox drain --json` defaults to the config's
+  `self_project` (`alfred`) — right only for the alfred agent, wrong everywhere else. Use `--json`
+  only on `drain` — it emits full records with body (`list`/`read` ignore it).
 - **Contracts thread on `--contract-id`, not `--reply-to`.** `contract propose` **requires
   `--seam`** (the coordination seam slug) and prints the `contract_id` that `counter`/`accept`
   reference. Do not omit `--seam`.
@@ -64,7 +92,7 @@ Notes on the real surface (verified against master `f9fc0fb`):
    coordinating on (or that this is a fresh thread). If the peer slug is ambiguous, confirm it
    against the registry before starting.
 2. **Send the presence ping** (one-shot):
-   `alfred --config config.msgbus.yaml msg send --route --kind fyi --to <peer> --subject "live-mode online"`.
+   `/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml msg send --route --from <self> --kind fyi --to <peer> --subject "live-mode online"`.
    This is the tell that lets the peer (and operator) see whether the other side is also live.
 3. **Kick the self-paced loop.** Start a **self-paced `/loop`** bound to the RUN tick below —
    invoke `/loop` with **no interval** so the model paces itself, targeting ~45s. Self-pacing works
@@ -78,13 +106,13 @@ Initialize a **consecutive-empty-drain counter = 0** in your working notes (used
 
 ## RUN — one light, non-blocking tick per wake
 
-1. **Drain your own inbox:** `alfred --config config.msgbus.yaml msg inbox <self> drain --json`.
+1. **Drain your own inbox:** `/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml msg inbox <self> drain --json`.
 2. **If messages arrived:** for each — read → decide → if it needs a reply or handover, respond
-   **instantly, routed**:
-   - a normal answer: `msg send --route --kind reply --to <peer> --reply-to <id> --correlation-id <cid> ...`
+   **instantly, routed** (prefix each fragment with the absolute invocation):
+   - a normal answer: `msg send --route --from <self> --kind reply --to <peer> --reply-to <id> --correlation-id <cid> ...`
    - a contract move: a drained **`[contract]` `fyi` notice** (subject starts `[contract]`) is
      **ACTIONABLE**, not a skip-it heads-up — read the `contract_id` from its body, then run
-     `contract counter --route --contract-id <id> ...` or `contract accept --route --contract-id <id>`.
+     `contract counter --route --from <self> --contract-id <id> ...` or `contract accept --route --from <self> --contract-id <id>`.
    Reset the empty-drain counter to 0.
 3. **If the drain was empty:** do **ONE short, interruptible** slice of real project work, then let
    the loop re-fire. Increment the empty-drain counter.
@@ -113,7 +141,7 @@ counts your empty drains for you; the mode works only if you hold this disciplin
 
 **On exit (every path):**
 1. Send a final presence ping:
-   `alfred --config config.msgbus.yaml msg send --route --kind fyi --to <peer> --subject "live-mode off"`.
+   `/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml msg send --route --from <self> --kind fyi --to <peer> --subject "live-mode off"`.
 2. Do **one last drain** so nothing that landed on the final tick is missed.
 3. **Omit the next wake** — the self-paced loop ends here — and revert to plain-mailbox behavior
    (drain only on natural turns for the rest of the session).
@@ -156,16 +184,16 @@ skip-it `fyi` — that silently stalls the negotiation.
 With `--route` on both the `msg send` and the contract emit paths, a propose→counter→accept exchange
 converges in a **handful of ~45s ticks** instead of a handful of 5-min cron cycles:
 
-1. You: `contract propose --route --to <peer> --seam <seam-slug> --subject "..." --item "..."` →
+1. You: `contract propose --route --from <self> --to <peer> --seam <seam-slug> --subject "..." --item "..."` →
    the propose is dispatched to the solver and archived; a **`[contract]` `fyi` notice** (carrying
    the `contract_id`) lands in the peer's inbox. Note the `contract_id` your CLI prints.
 2. Peer's loop drains the `[contract]` fyi notice next tick (~45s) and reads the proposal +
    `contract_id` from its body.
-3. Peer: `contract counter --route --contract-id <id> ...` or `contract accept --route --contract-id <id>`
+3. Peer: `contract counter --route --from <self> --contract-id <id> ...` or `contract accept --route --from <self> --contract-id <id>`
    → routes instantly; its `[contract]` notice lands back in your inbox.
 4. Your loop drains that `[contract]` notice (an accept moves the contract to a converged state),
    converges. **The operator ratifies** —
-   `alfred --config config.msgbus.yaml contract ratify <contract_id>`. Ratify stays the
+   `/home/andrew/alfred/.venv/bin/alfred --config /home/andrew/alfred/config.msgbus.yaml contract ratify <contract_id>`. Ratify stays the
    human-in-the-loop gate: propose/counter/accept are agent-side; **ratify is operator-side only.**
 
 Once the contract is accepted (or ratified), the thread has converged → **auto-exit** per EXIT.
@@ -176,17 +204,18 @@ Operator is running an **`alfred`** (Algernon dev) session and an **`aftermath-r
 wants them to agree a division of labor live.
 
 1. Operator, in the alfred session: *"go live coordinating with aftermath-rrts."* → you confirm
-   peer=`aftermath-rrts`, send `msg send --route --kind fyi --to aftermath-rrts --subject "live-mode online"`,
+   `<self>`=`alfred`, peer=`aftermath-rrts`, send
+   `msg send --route --from alfred --kind fyi --to aftermath-rrts --subject "live-mode online"`,
    start the self-paced loop.
 2. Operator, in the RRTS session: *"go live coordinating with alfred."* → the RRTS agent sends its
    own "live-mode online" ping and starts its loop. Both pings drain within a tick — both sides see
    the peer is live.
 3. You propose the split:
-   `contract propose --route --to aftermath-rrts --seam labor-split --subject "split: alfred owns transport, rrts owns vault schema" --item "transport:alfred" --item "vault-schema:aftermath-rrts"`
+   `contract propose --route --from alfred --to aftermath-rrts --seam labor-split --subject "split: alfred owns transport, rrts owns vault schema" --item "transport:alfred" --item "vault-schema:aftermath-rrts"`
    → dispatched + archived; a `[contract]` fyi notice (with the `contract_id`) lands in RRTS's inbox,
    which RRTS drains ~one tick later.
-4. RRTS counters one line: `contract counter --route --contract-id <id> --subject "rrts takes schema + migration, alfred takes transport + config" --item ...`. You drain the resulting `[contract]` notice next tick and agree:
-   `contract accept --route --contract-id <id>`.
+4. RRTS counters one line: `contract counter --route --from aftermath-rrts --contract-id <id> --subject "rrts takes schema + migration, alfred takes transport + config" --item ...`. You drain the resulting `[contract]` notice next tick and agree:
+   `contract accept --route --from alfred --contract-id <id>`.
 5. Both loops see "thread converged" → each **auto-exits**, sends a final "live-mode off" `fyi`,
    does a last drain, and reports the agreed split to its operator.
 6. Operator **ratifies** the contract. Total wall-clock: well under two minutes vs. ~15+ min over
@@ -203,11 +232,22 @@ wants them to agree a division of labor live.
   you in this doc — not guardrails in the CLI. Acceptable for PHI-free single-box dev tooling;
   stated plainly so it isn't mistaken for a hardened mechanism.
 
-## Home + portability
+## Home + portability (single canonical doc + pointer-loaders — no copies)
 
-This doc is the canonical copy for the `alfred` repo. It is loaded on-trigger via the pointer in
-`CLAUDE.md` ("Cross-Project Live-Coordination Mode"). Because real-time needs **both** sides,
-**each participating project should mirror this convention into its own repo's agent instructions**
-(the msgbus registry lists `alfred`, `aftermath-rrts`, `aftermath-lab` as separate repos, each with
-its own `.msgbus/inbox`). Cross-project canonicalization (a single shared copy in `aftermath-lab`,
-which KAL-LE curates) is a team-lead follow-up, not part of this ship.
+**Canonical home:** this file, at the absolute path
+`/home/andrew/alfred/.claude/live-coordination-mode.md` (tracked in the alfred repo, merged to
+master). It stays here deliberately — on a single dev box with every repo under `/home/andrew/`,
+one tracked source of truth that everyone points to has **zero drift**; a mirrored copy in each repo
+would fork on the next edit. (Moving canonical to `aftermath-lab`, which KAL-LE curates, would work
+too but buys nothing for the pointer model and adds a move + re-point, so it wasn't done.)
+
+**Pointer-loaders (not copies).** Each participating repo carries only a thin "Cross-Project
+Live-Coordination Mode" section in its own `CLAUDE.md` that names the trigger, the opt-in default,
+THAT repo's project slug, and points here by absolute path:
+- `alfred` → `/home/andrew/alfred/CLAUDE.md`
+- `aftermath-rrts` → `/home/andrew/aftermath-rrts/CLAUDE.md`
+- `aftermath-lab` → `/home/andrew/aftermath-lab/CLAUDE.md`
+
+Because real-time needs **both** sides live, the operator triggers live-mode in each session
+independently; every repo's agent loads this **same** canonical doc, so there is exactly one
+convention to maintain — editing it here updates every repo at once.
