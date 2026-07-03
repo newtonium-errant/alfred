@@ -82,7 +82,9 @@ Initialize a **consecutive-empty-drain counter = 0** in your working notes (used
 2. **If messages arrived:** for each — read → decide → if it needs a reply or handover, respond
    **instantly, routed**:
    - a normal answer: `msg send --route --kind reply --to <peer> --reply-to <id> --correlation-id <cid> ...`
-   - a contract move: `contract counter --route --contract-id <id> ...` or `contract accept --route --contract-id <id>`.
+   - a contract move: a drained **`[contract]` `fyi` notice** (subject starts `[contract]`) is
+     **ACTIONABLE**, not a skip-it heads-up — read the `contract_id` from its body, then run
+     `contract counter --route --contract-id <id> ...` or `contract accept --route --contract-id <id>`.
    Reset the empty-drain counter to 0.
 3. **If the drain was empty:** do **ONE short, interruptible** slice of real project work, then let
    the loop re-fire. Increment the empty-drain counter.
@@ -137,18 +139,32 @@ side:**
 
 ## Contracts ride on top (real-time negotiation)
 
-Contract semantics are **unchanged** — only delivery latency shrinks. Contract messages arrive as
-ordinary kind-tagged records in the same `drain --json` surface, and the router already dispatches
-them to the contract solver. With `--route` on both the `msg send` and the contract emit paths, a
-propose→counter→accept exchange converges in a **handful of ~45s ticks** instead of a handful of
-5-min cron cycles:
+Contract semantics are **unchanged** — only delivery latency shrinks. But contracts do **not**
+surface as raw records. A routed contract message (`propose`/`counter`/`accept`) is **dispatched to
+the contract solver and archived to `routed/` — it is NEVER placed in the counterparty's inbox**, so
+it does not appear in `drain --json` as a contract record. What the solver drops into each
+counterparty's inbox is a **derived `[contract]` `fyi` notice**: `kind: fyi`, subject
+`[contract] <seam> — <kind> → <state> (v<n>)`, body carrying `contract_id: <id>`, `seam`, `state`,
+`version`, and any `gaps`. **That `fyi` notice — not a raw contract record — is what surfaces on
+`drain --json`.**
+
+**Treat a `[contract]` `fyi` as ACTIONABLE, not a heads-up.** Ordinarily `fyi` means "no reply
+expected," but a `[contract]` notice is a coordination event that expects a response: read the
+`contract_id` from its body and use it for your `counter`/`accept`. Do not misclassify it as a
+skip-it `fyi` — that silently stalls the negotiation.
+
+With `--route` on both the `msg send` and the contract emit paths, a propose→counter→accept exchange
+converges in a **handful of ~45s ticks** instead of a handful of 5-min cron cycles:
 
 1. You: `contract propose --route --to <peer> --seam <seam-slug> --subject "..." --item "..."` →
-   routes instantly → lands in the peer's inbox. Note the printed `contract_id`.
-2. Peer's loop drains it next tick (~45s), surfaces the proposal.
+   the propose is dispatched to the solver and archived; a **`[contract]` `fyi` notice** (carrying
+   the `contract_id`) lands in the peer's inbox. Note the `contract_id` your CLI prints.
+2. Peer's loop drains the `[contract]` fyi notice next tick (~45s) and reads the proposal +
+   `contract_id` from its body.
 3. Peer: `contract counter --route --contract-id <id> ...` or `contract accept --route --contract-id <id>`
-   → instant back to you.
-4. Your loop drains it, converges. **The operator ratifies** —
+   → routes instantly; its `[contract]` notice lands back in your inbox.
+4. Your loop drains that `[contract]` notice (an accept moves the contract to a converged state),
+   converges. **The operator ratifies** —
    `alfred --config config.msgbus.yaml contract ratify <contract_id>`. Ratify stays the
    human-in-the-loop gate: propose/counter/accept are agent-side; **ratify is operator-side only.**
 
@@ -167,8 +183,9 @@ wants them to agree a division of labor live.
    the peer is live.
 3. You propose the split:
    `contract propose --route --to aftermath-rrts --seam labor-split --subject "split: alfred owns transport, rrts owns vault schema" --item "transport:alfred" --item "vault-schema:aftermath-rrts"`
-   → routes instantly; RRTS drains it ~one tick later.
-4. RRTS counters one line: `contract counter --route --contract-id <id> --subject "rrts takes schema + migration, alfred takes transport + config" --item ...`. You drain it next tick and agree:
+   → dispatched + archived; a `[contract]` fyi notice (with the `contract_id`) lands in RRTS's inbox,
+   which RRTS drains ~one tick later.
+4. RRTS counters one line: `contract counter --route --contract-id <id> --subject "rrts takes schema + migration, alfred takes transport + config" --item ...`. You drain the resulting `[contract]` notice next tick and agree:
    `contract accept --route --contract-id <id>`.
 5. Both loops see "thread converged" → each **auto-exits**, sends a final "live-mode off" `fyi`,
    does a last drain, and reports the agreed split to its operator.
