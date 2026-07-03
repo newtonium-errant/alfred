@@ -9,8 +9,11 @@ calls must apply its version bump EXACTLY ONCE — the `flock` on
 from __future__ import annotations
 
 import argparse
+import asyncio
+import fcntl
 import json
 import threading
+import time
 
 import structlog
 
@@ -18,7 +21,7 @@ from alfred.contracts.cli import dispatch as contract_dispatch
 from alfred.contracts.config import load_contract_config
 from alfred.contracts.store import ContractStore
 from alfred.msgbus.config import load_message_bus_config
-from alfred.msgbus.router import route_now
+from alfred.msgbus.router import route_now, run_route_once
 from alfred.cli import _msg_inbox, _msg_send
 
 
@@ -203,6 +206,81 @@ def test_keystone_concurrent_route_now_applies_counter_exactly_once(tmp_path):  
     # exactly one sweep actually ran (the other skipped_locked OR deduped to 0).
     applied = [r for r in results if r.get("contracts_applied", 0) == 1]
     assert len(applied) == 1
+
+
+def test_direct_run_route_once_respects_lock_no_double_apply(tmp_path):  # type: ignore[no-untyped-def]
+    """THE MISSING REGRESSION (the gap that shipped in b63b732): the lock lives
+    in ``run_route_once``, so the CRON/DAEMON path — a DIRECT
+    ``run_route_once``, NOT via ``route_now`` — ALSO serializes on it. While a
+    concurrent sweep holds the lock, a direct ``run_route_once`` SKIPS and does
+    NOT apply the pending counter, so the version is never double-bumped.
+
+    FAILS against b63b732 (the lock was ONLY in ``route_now`` → the direct
+    cron call ran unlocked and applied the counter while another sweep held the
+    lock = the exact double-apply the guard exists to prevent)."""
+    raw = _raw(tmp_path)
+    with structlog.testing.capture_logs():
+        assert contract_dispatch(_cns(
+            contract_cmd="propose", from_project="alfred", to="rrts",
+            seam="s", subject="p", item=["x:alfred"], route=True,
+        ), raw) == 0
+    cid = list(_store(raw).iter_contracts())[0].contract_id
+    with structlog.testing.capture_logs():
+        assert contract_dispatch(_cns(
+            contract_cmd="counter", from_project="rrts", contract_id=cid,
+            subject="c", item=["x:alfred", "y:rrts"], route=False,
+        ), raw) == 0
+    assert _store(raw).load(cid).version == 1
+
+    # a concurrent sweep holds the lock (loaded state, not yet applied).
+    holder = open(tmp_path / "spool" / ".route.lock", "w")
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        # THE CRON/DAEMON PATH: a DIRECT run_route_once (lock_wait=0 default).
+        with structlog.testing.capture_logs():
+            res = asyncio.run(run_route_once(_mb(raw), raw))
+        assert res.get("skipped_locked") is True   # the direct path RESPECTS the lock
+        assert res["contracts_applied"] == 0
+        assert _store(raw).load(cid).version == 1   # counter NOT applied while locked
+    finally:
+        holder.close()
+    # once the holder frees, the counter applies exactly once.
+    with structlog.testing.capture_logs():
+        res2 = asyncio.run(run_route_once(_mb(raw), raw))
+    assert res2["contracts_applied"] == 1
+    assert _store(raw).load(cid).version == 2
+
+
+def test_route_now_routes_promptly_when_racing_inflight_sweep(tmp_path):  # type: ignore[no-untyped-def]
+    """Pin (reviewer #3 — prompt delivery under race): a ``--route`` message
+    racing an IN-FLIGHT sweep (which already snapshotted the spool BEFORE the
+    mint) is still delivered PROMPTLY — the interactive ``route_now`` blocks up
+    to ``ROUTE_NOW_LOCK_WAIT_SECONDS`` for the sweep to release, then routes its
+    own file, instead of stranding it to the next 5-min cron tick."""
+    raw = _raw(tmp_path)
+    # mint into the spool WITHOUT routing (a --route message waiting to go).
+    with structlog.testing.capture_logs():
+        _msg_send(_send_ns(route=False, body="urgent"), _mb(raw), raw)
+
+    # an in-flight sweep holds the lock, releases after 0.3s (< the wait).
+    holder = open(tmp_path / "spool" / ".route.lock", "w")
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _release_soon() -> None:
+        time.sleep(0.3)
+        holder.close()
+
+    releaser = threading.Thread(target=_release_soon)
+    releaser.start()
+    try:
+        with structlog.testing.capture_logs():
+            res = route_now(_mb(raw), raw)   # blocks ~0.3s, then routes
+    finally:
+        releaser.join()
+
+    assert not res.get("skipped_locked")            # NOT deferred to next tick
+    assert res["routed"] == 1                        # routed promptly
+    assert len(_inbox_files(tmp_path, "rrts")) == 1  # delivered
 
 
 # ---------------------------------------------------------------------------

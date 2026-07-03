@@ -233,11 +233,12 @@ def scan_spool(
     return result
 
 
-async def run_route_once(
+async def _run_route_once_locked(
     config: MessageBusConfig,
     raw: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run one routing tick. Returns the summary dict for CLI/tests.
+    """The routing sweep body — runs ONLY while holding the spool lock (its
+    sole caller is :func:`run_route_once`, which acquires the lock first).
 
     Per eligible message: mint id if absent, stamp ``routed_at``/
     ``routed_by``, ATOMICALLY place into ``<dest_inbox>/<id-keyed-name>``,
@@ -446,49 +447,90 @@ async def run_route_once(
     return {**summary, "results": results, "by_destination": by_destination}
 
 
+# Interactive route-on-send waits up to this long for an in-flight sweep to
+# release before routing its own file — so a --route message that races a cron
+# tick which already snapshotted the spool BEFORE the mint is delivered PROMPTLY
+# (a couple seconds), not stranded to the next 5-min cron tick. Background ticks
+# (cron/daemon) use lock_wait=0 (non-blocking skip) — they re-tick anyway.
+ROUTE_NOW_LOCK_WAIT_SECONDS = 3.0
+
+
+def _skipped_locked_result() -> dict[str, Any]:
+    return {
+        "scanned": 0, "routed": 0, "contracts_applied": 0,
+        "skipped_dup": 0, "malformed": 0, "undeliverable": 0,
+        "failed": 0, "skipped_locked": True, "results": [],
+        "by_destination": {},
+    }
+
+
+async def _acquire_route_lock(lock_file: Any, lock_wait: float) -> bool:
+    """Try to take the exclusive spool lock. ``lock_wait <= 0`` → a single
+    non-blocking attempt (returns False immediately if held). ``lock_wait >
+    0`` → poll up to that many seconds (the interactive route-on-send path).
+    Returns True iff acquired."""
+    import fcntl
+    import time
+
+    deadline = time.monotonic() + max(0.0, lock_wait)
+    while True:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (BlockingIOError, OSError):
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+
+
+async def run_route_once(
+    config: MessageBusConfig,
+    raw: dict[str, Any],
+    *,
+    lock_wait: float = 0.0,
+) -> dict[str, Any]:
+    """Run one routing tick, SERIALIZED on ``<spool>/.route.lock`` (Path B).
+
+    THE CONCURRENCY GUARD — the lock lives HERE, not in the caller, so EVERY
+    routing entry point (``route_now`` CLI, the cron ``msg route-once``, AND
+    the daemon loop) serializes on it. Route-on-send makes the router
+    concurrent for the first time: a ``--route`` sweep at the same instant as
+    a 5-min cron/daemon tick. The per-item dedup gate (``if record.id in
+    state.entries``) only protects SEQUENTIAL re-drops — state is saved
+    BETWEEN ticks. Two CONCURRENT sweeps both ``MessageBusState.load()``
+    before either ``.save()``, both pass the gate, and both dispatch a
+    CONTRACT message → the counter's version bump is applied TWICE
+    (version-integrity corruption). Plain messages tolerate the race
+    (idempotent id-keyed re-place); contracts do NOT.
+
+    ``lock_wait`` (seconds): 0 (default — cron/daemon) → non-blocking, a
+    lock-loser returns a ``skipped_locked`` summary + re-ticks later; > 0
+    (route_now) → wait for the in-flight sweep to release then route promptly.
+    """
+    spool_root = Path(config.spool_path)
+    spool_root.mkdir(parents=True, exist_ok=True)
+    lock_path = spool_root / ".route.lock"
+    with open(lock_path, "w") as lock_file:
+        if not await _acquire_route_lock(lock_file, lock_wait):
+            # Another sweep holds the lock and will route the just-minted
+            # file — no double-sweep, no double-apply, no message loss.
+            log.info("msgbus.route.skipped_locked", spool_path=str(spool_root))
+            return _skipped_locked_result()
+        return await _run_route_once_locked(config, raw)
+
+
 def route_now(
     config: MessageBusConfig,
     raw: dict[str, Any],
 ) -> dict[str, Any]:
-    """Locked single-tick route for route-on-send (Path B). Returns the
-    ``run_route_once`` summary, or a ``skipped_locked`` summary when a
-    concurrent sweep already holds the lock.
-
-    THE CONCURRENCY GUARD. Route-on-send makes the router concurrent for the
-    first time: a ``--route`` CLI process runs a sweep at the same instant the
-    5-min cron ticks. The per-item dedup gate (``if record.id in
-    state.entries``) only protects SEQUENTIAL re-drops — state is saved
-    BETWEEN ticks. Two CONCURRENT sweeps both ``MessageBusState.load()``
-    before either ``.save()``, both pass the gate, and both dispatch a
-    CONTRACT message → ``handle_bus_contract_message`` runs twice → the
-    counter's version bump is applied TWICE (version-integrity corruption).
-    For plain messages the same race is harmless (idempotent id-keyed
-    re-place); for contracts it CORRUPTS.
-
-    A NON-BLOCKING ``flock(LOCK_EX)`` on ``<spool>/.route.lock`` serializes
-    sweeps. If the lock is held, we skip cleanly and let the holder's
-    in-flight sweep pick up the just-minted file — still near-instant, never
-    dropped. This is the one concurrency primitive the msgbus introduces.
-    """
-    import fcntl
-
-    spool = Path(config.spool_path)
-    spool.mkdir(parents=True, exist_ok=True)
-    lock_path = spool / ".route.lock"
-    with open(lock_path, "w") as lf:
-        try:
-            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError, OSError):
-            # A sweep already holds the lock and will route the just-minted
-            # file — no double-sweep, no double-apply, no message loss.
-            log.info("msgbus.route_now.skipped_locked", spool_path=str(spool))
-            return {
-                "scanned": 0, "routed": 0, "contracts_applied": 0,
-                "skipped_dup": 0, "malformed": 0, "undeliverable": 0,
-                "failed": 0, "skipped_locked": True, "results": [],
-                "by_destination": {},
-            }
-        return asyncio.run(run_route_once(config, raw))
+    """Route-on-send entry (Path B) — a thin sync wrapper around the
+    self-locking :func:`run_route_once`, on the INTERACTIVE lock-wait path so
+    a ``--route`` message racing an in-flight sweep is delivered PROMPTLY
+    (waits ~seconds) instead of stranded to the next cron tick. Returns the
+    sweep summary (or ``skipped_locked`` only if the wait times out)."""
+    return asyncio.run(
+        run_route_once(config, raw, lock_wait=ROUTE_NOW_LOCK_WAIT_SECONDS),
+    )
 
 
 async def run_daemon(
