@@ -384,6 +384,35 @@ def test_reconcile_tracker_persists_and_next_load_is_stable(tmp_path):
     assert reloaded.reconcile_tracker("") is False
 
 
+def test_load_pr_links_is_pure_no_reconcile_no_write(tmp_path):  # type: ignore[no-untyped-def]
+    """load()-PURITY REGRESSION (tracker-scoping reviewer): ``load_pr_links``
+    — kalle_digest's READ-ONLY nightly consumer — reads a
+    ``fix_drafter_state.json`` whose persisted ``tracker`` DIFFERS from the
+    live tracker WITHOUT triggering ``reconcile_tracker`` and WITHOUT writing
+    the file. This guards against a future refactor that moves reconcile INTO
+    ``load()`` (which would let the nightly digest silently wipe/reset drafter
+    state on every read). The reset MUST stay in the drafter's authoritative
+    load+save path (``run_drafter_once``), never in the shared reader."""
+    p = tmp_path / "fix_drafter_state.json"
+    p.write_text(json.dumps({"tracker": "old/tracker", "entries": {
+        "7": {"issue_number": 7, "pr_number": 99, "app_repo": "org/app1",
+              "app_forge_type": "github", "status": "pr_open"},
+    }}))
+    before = p.read_bytes()
+
+    links = fix_drafter.load_pr_links(str(p))
+
+    # entries are RETURNED (not wiped by a stealth reconcile-on-read).
+    assert links == {7: {
+        "pr_number": 99, "pr_url": "", "app_repo": "org/app1",
+        "app_forge_type": "github", "status": "pr_open",
+    }}
+    # the file is BYTE-UNCHANGED — the read never wrote (no reset).
+    assert p.read_bytes() == before
+    # a plain load still carries the OLD tracker (load() did NOT reconcile).
+    assert fix_drafter.FixDrafterState.load(p).tracker == "old/tracker"
+
+
 async def test_run_once_clears_state_on_tracker_change(
     tmp_path, monkeypatch, _drafter_key
 ):

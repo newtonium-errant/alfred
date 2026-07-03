@@ -1231,8 +1231,7 @@ async def assemble_ticket_pipeline_section(
     """
     try:
         from alfred.integrations.github_ops import (
-            GitHubOpsNotConfigured,
-            GitHubOpsWrongInstance,
+            GitHubOpsError,
             build_github_client,
         )
         from alfred.transport.ticket_intake import (
@@ -1286,13 +1285,19 @@ async def assemble_ticket_pipeline_section(
                 client = build_github_client(
                     raw, _instance_name_from_raw(raw),
                 )
-            except (GitHubOpsNotConfigured, GitHubOpsWrongInstance) as exc:
+            except GitHubOpsError as exc:
+                # Widened to the PARENT class (was NotConfigured/WrongInstance
+                # only): a GitHubOpsError from a bad forge_type now yields a
+                # TARGETED "outcome check unavailable" note + the rest of the
+                # section still renders, instead of falling through to the
+                # §-boundary and degrading the WHOLE ticket-pipeline section.
+                # exc.__class__.__name__ keeps the specific subclass in the log.
                 log.info(
                     "kalle.digest.ticket_pipeline_outcome_check_unavailable",
                     reason=exc.__class__.__name__,
                 )
                 outcome_note = (
-                    "outcome check unavailable: github not configured"
+                    "outcome check unavailable: github config error"
                 )
 
         if client is not None:

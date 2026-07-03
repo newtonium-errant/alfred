@@ -618,6 +618,44 @@ async def test_ticket_pipeline_no_credential_path_still_renders(
     assert _log_events(captured, "kalle.digest.ticket_pipeline_idle") == []
 
 
+async def test_github_error_yields_targeted_note_not_whole_section_degraded(
+    tmp_path: Path,
+) -> None:
+    """Forge-guard reviewer pin: a ``GitHubOpsError`` in the outcome-check
+    client build (e.g. a bad ``forge_type``) is caught by the WIDENED inner
+    except (parent class, was NotConfigured/WrongInstance only) → a TARGETED
+    'outcome check unavailable' note + the rest of the section STILL renders,
+    NOT the §-boundary 'section unavailable' whole-section degrade."""
+    state = _mem_state(tmp_path, {
+        "uid-1": TicketIntakeEntry(
+            recorded_at=_ago(hours=2),
+            kalle_relpath="ticket/A.md",
+            issue_number=7,
+            issue_created_at=_ago(minutes=90),
+            ticket_type="bug",
+        ),
+    })
+    state.save()
+    raw = _raw_with_state(state.path, github=True)
+    raw["github"]["forge_type"] = "gitlab"   # unsupported → GitHubOpsError at build
+
+    with structlog.testing.capture_logs() as captured:
+        out = await assemble_ticket_pipeline_section(raw, now=NOW)
+
+    # TARGETED note (inner except), NOT the outer §-boundary degrade.
+    assert "outcome check unavailable" in out
+    assert "section unavailable" not in out
+    # the rest of the section still renders (state-derived lines).
+    assert "**Ticket pipeline:**" in out
+    assert "- GH#7 → no PR yet" in out
+    # logged with the specific class name (GitHubOpsError for the forge case).
+    unavailable = _log_events(
+        captured, "kalle.digest.ticket_pipeline_outcome_check_unavailable",
+    )
+    assert len(unavailable) == 1
+    assert unavailable[0]["reason"] == "GitHubOpsError"
+
+
 def test_ticket_pipeline_counts_24h_window(tmp_path: Path) -> None:
     """Only activity within 24h of assembly time counts."""
     state = _mem_state(tmp_path, {
