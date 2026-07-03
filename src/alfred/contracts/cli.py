@@ -395,6 +395,30 @@ def _resolve_from(args: argparse.Namespace, mb_config) -> str:  # type: ignore[n
     return (getattr(args, "from_project", "") or "") or mb_config.self_project
 
 
+def _route_or_hint(args: argparse.Namespace, mb, raw: dict) -> None:  # type: ignore[no-untyped-def]
+    """Route-on-send (Path B): ``--route``/``--now`` sweeps the spool NOW —
+    under the SHARED concurrency lock (``route_now``) so a CLI --route sweep
+    can't double-apply a contract against a concurrent cron tick — so the
+    minted message applies + notices instantly. Absent → the manual hint.
+
+    For ``propose --and-accept`` this is called ONCE after BOTH mints: one
+    sweep applies propose-then-accept in filename order (the propose sorts
+    first, so it creates the contract before the self-accept applies)."""
+    if getattr(args, "route", False):
+        from alfred.msgbus.router import route_now
+
+        result = route_now(mb, raw)
+        if result.get("skipped_locked"):
+            print("  routed now: a sweep is already running — it will apply this")
+        else:
+            print(
+                f"  routed now: contracts_applied={result['contracts_applied']} "
+                f"failed={result['failed']}"
+            )
+    else:
+        print("  apply with: alfred msg route-once")
+
+
 def cmd_propose(args: argparse.Namespace, config: ContractConfig, raw: dict) -> int:
     """Mint a ``kind: propose`` contract message into the spool. ``--and-accept``
     ALSO drops the proposer's own ``accept`` (convergence needs EVERY
@@ -463,7 +487,7 @@ def cmd_propose(args: argparse.Namespace, config: ContractConfig, raw: dict) -> 
             f"queued accept  {acc[0]} from {from_project} "
             f"(contract_id={contract_id}) [--and-accept, proposer self-accept]"
         )
-    print("  apply with: alfred msg route-once")
+    _route_or_hint(args, mb, raw)
     return 0
 
 
@@ -543,7 +567,7 @@ def cmd_counter(args: argparse.Namespace, config: ContractConfig, raw: dict) -> 
         f"queued counter {minted[0]} from {from_project} "
         f"(contract_id={args.contract_id}) [{correlation_id}]"
     )
-    print("  apply with: alfred msg route-once")
+    _route_or_hint(args, mb, raw)
     return 0
 
 
@@ -575,7 +599,7 @@ def cmd_accept(args: argparse.Namespace, config: ContractConfig, raw: dict) -> i
         f"queued accept {minted[0]} from {from_project} "
         f"(contract_id={args.contract_id}) [{correlation_id}]"
     )
-    print("  apply with: alfred msg route-once")
+    _route_or_hint(args, mb, raw)
     return 0
 
 
@@ -641,6 +665,10 @@ def build_subparser(sub: "argparse._SubParsersAction") -> None:
         "--and-accept", dest="and_accept", action="store_true", default=False,
         help="also drop the proposer's own accept (convergence needs all participants)",
     )
+    c_propose.add_argument(
+        "--route", "--now", dest="route", action="store_true", default=False,
+        help="route the mint(s) immediately (skip the cron) — Path B",
+    )
 
     c_counter = c_sub.add_parser(
         "counter", help="AGENT: counter an existing contract (re-state terms)",
@@ -651,6 +679,10 @@ def build_subparser(sub: "argparse._SubParsersAction") -> None:
     c_counter.add_argument("--participant", action="append", default=[], metavar="project[:agent[:role]]")
     c_counter.add_argument("--item", action="append", default=[], metavar="name[:owner]")
     c_counter.add_argument("--correlation-id", dest="correlation_id", default="")
+    c_counter.add_argument(
+        "--route", "--now", dest="route", action="store_true", default=False,
+        help="route the mint immediately (skip the cron) — Path B",
+    )
 
     c_accept = c_sub.add_parser(
         "accept", help="AGENT: accept a contract's current version (from a participant)",
@@ -658,6 +690,10 @@ def build_subparser(sub: "argparse._SubParsersAction") -> None:
     c_accept.add_argument("--from", dest="from_project", default="", help="accepting participant (or message_bus.self_project)")
     c_accept.add_argument("--contract-id", dest="contract_id", required=True)
     c_accept.add_argument("--correlation-id", dest="correlation_id", default="")
+    c_accept.add_argument(
+        "--route", "--now", dest="route", action="store_true", default=False,
+        help="route the mint immediately (skip the cron) — Path B",
+    )
 
 
 def dispatch(args: argparse.Namespace, raw: dict) -> int:

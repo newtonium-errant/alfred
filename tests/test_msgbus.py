@@ -667,7 +667,7 @@ def test_msg_send_writes_parseable_spool_file(tmp_path):
         from_project="alfred", correlation_id="", reply_to="",
         precedence="R", body_file="", body="some body",
     )
-    _msg_send(args, cfg)
+    _msg_send(args, cfg, {})
     spool_files = list(Path(cfg.spool_path).glob("*.md"))
     assert len(spool_files) == 1
     rec = parse_message_file(spool_files[0])
@@ -689,7 +689,7 @@ def test_msg_send_reply_echoes_correlation_and_reply_to(tmp_path):
         from_project="aftermath-lab", correlation_id="cnv-thread-1",
         reply_to="msg-parent", precedence="R", body_file="", body="ack",
     )
-    _msg_send(args, cfg)
+    _msg_send(args, cfg, {})
     rec = parse_message_file(list(Path(cfg.spool_path).glob("*.md"))[0])
     assert rec.correlation_id == "cnv-thread-1"
     assert rec.reply_to == "msg-parent"
@@ -705,7 +705,7 @@ async def test_send_then_route_end_to_end(tmp_path):
         from_project="alfred", correlation_id="", reply_to="",
         precedence="R", body_file="", body="hi",
     )
-    _msg_send(args, cfg)
+    _msg_send(args, cfg, {})
     result = await run_route_once(cfg, {})
     assert result["routed"] == 1
     inbox = cfg.registry().inbox_for("aftermath-lab")

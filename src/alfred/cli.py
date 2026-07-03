@@ -3014,7 +3014,7 @@ def cmd_surveyor_cleanup_alfred_tags(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _msg_send(args: argparse.Namespace, config) -> None:
+def _msg_send(args: argparse.Namespace, config, raw: dict) -> None:
     """`alfred msg send` — mint an id + drop a valid message into the spool.
 
     Structural-validate only (NOT against the registry — the sender need
@@ -3079,6 +3079,22 @@ def _msg_send(args: argparse.Namespace, config) -> None:
     write_message_file(dest, record)
     print(f"queued {record.id} → {args.to} ({args.kind}) [{correlation_id}]")
 
+    # Route-on-send (Path B): --route/--now sweeps the spool immediately
+    # (under the concurrency lock) so the message lands in the peer inbox now
+    # instead of waiting for the 5-min cron. Absent → cron-only, unchanged.
+    if getattr(args, "route", False):
+        from alfred.msgbus.router import route_now
+
+        result = route_now(config, raw)
+        if result.get("skipped_locked"):
+            print("routed now: a sweep is already running — it will route this file")
+        else:
+            print(
+                f"routed now: routed={result['routed']} "
+                f"contracts_applied={result['contracts_applied']} "
+                f"failed={result['failed']}"
+            )
+
 
 def _msg_inbox(args: argparse.Namespace, config) -> None:
     """`alfred msg inbox [<project>] {list|read <id>|drain}`.
@@ -3136,6 +3152,14 @@ def _msg_inbox(args: argparse.Namespace, config) -> None:
         print(rec.body)
     elif action == "drain":
         drained = drain_inbox(inbox, mark_read=True)
+        if getattr(args, "json", False):
+            # Path B loop surface: full records INCLUDING body, machine-
+            # parseable, so a live-coordination tick can read + respond. asdict
+            # (not to_summary_dict) so the body travels.
+            from dataclasses import asdict
+
+            print(json.dumps([asdict(r) for r in drained], indent=2))
+            return
         if not drained:
             print(f"  (nothing to drain — 0 unread for {project})")
         for r in drained:
@@ -3239,7 +3263,7 @@ def cmd_msg(args: argparse.Namespace) -> None:
     config = load_message_bus_config(raw)
     subcmd = getattr(args, "msg_cmd", None)
     if subcmd == "send":
-        _msg_send(args, config)
+        _msg_send(args, config, raw)
     elif subcmd == "inbox":
         _msg_inbox(args, config)
     elif subcmd == "route-once":
@@ -4193,6 +4217,10 @@ def build_parser() -> argparse.ArgumentParser:
     msg_send.add_argument(
         "--precedence", default="R", choices=["Z", "O", "P", "R"],
     )
+    msg_send.add_argument(
+        "--route", "--now", dest="route", action="store_true", default=False,
+        help="Route to the peer inbox immediately (skip the cron) — Path B",
+    )
     msg_body = msg_send.add_mutually_exclusive_group()
     msg_body.add_argument(
         "--body-file", dest="body_file", default="",
@@ -4218,6 +4246,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     msg_inbox.add_argument(
         "message_id", nargs="?", default="", help="Message id (for read)",
+    )
+    msg_inbox.add_argument(
+        "--json", action="store_true", default=False,
+        help="drain: emit full records (incl. body) as JSON — Path B loop surface",
     )
     msg_route = msg_sub.add_parser(
         "route-once", help="Run one routing tick now (the probe surface)",

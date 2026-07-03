@@ -446,6 +446,51 @@ async def run_route_once(
     return {**summary, "results": results, "by_destination": by_destination}
 
 
+def route_now(
+    config: MessageBusConfig,
+    raw: dict[str, Any],
+) -> dict[str, Any]:
+    """Locked single-tick route for route-on-send (Path B). Returns the
+    ``run_route_once`` summary, or a ``skipped_locked`` summary when a
+    concurrent sweep already holds the lock.
+
+    THE CONCURRENCY GUARD. Route-on-send makes the router concurrent for the
+    first time: a ``--route`` CLI process runs a sweep at the same instant the
+    5-min cron ticks. The per-item dedup gate (``if record.id in
+    state.entries``) only protects SEQUENTIAL re-drops — state is saved
+    BETWEEN ticks. Two CONCURRENT sweeps both ``MessageBusState.load()``
+    before either ``.save()``, both pass the gate, and both dispatch a
+    CONTRACT message → ``handle_bus_contract_message`` runs twice → the
+    counter's version bump is applied TWICE (version-integrity corruption).
+    For plain messages the same race is harmless (idempotent id-keyed
+    re-place); for contracts it CORRUPTS.
+
+    A NON-BLOCKING ``flock(LOCK_EX)`` on ``<spool>/.route.lock`` serializes
+    sweeps. If the lock is held, we skip cleanly and let the holder's
+    in-flight sweep pick up the just-minted file — still near-instant, never
+    dropped. This is the one concurrency primitive the msgbus introduces.
+    """
+    import fcntl
+
+    spool = Path(config.spool_path)
+    spool.mkdir(parents=True, exist_ok=True)
+    lock_path = spool / ".route.lock"
+    with open(lock_path, "w") as lf:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            # A sweep already holds the lock and will route the just-minted
+            # file — no double-sweep, no double-apply, no message loss.
+            log.info("msgbus.route_now.skipped_locked", spool_path=str(spool))
+            return {
+                "scanned": 0, "routed": 0, "contracts_applied": 0,
+                "skipped_dup": 0, "malformed": 0, "undeliverable": 0,
+                "failed": 0, "skipped_locked": True, "results": [],
+                "by_destination": {},
+            }
+        return asyncio.run(run_route_once(config, raw))
+
+
 async def run_daemon(
     config: MessageBusConfig,
     raw: dict[str, Any],
@@ -528,6 +573,7 @@ __all__ = [
     "ROUTED_BY",
     "ScanResult",
     "mint_message_id",
+    "route_now",
     "run_daemon",
     "run_route_once",
     "scan_spool",
