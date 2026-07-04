@@ -19,7 +19,8 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 from zoneinfo import ZoneInfo
@@ -4310,6 +4311,778 @@ def _should_offer_escalation(
 CAPTURE_SENTINEL: Final[str] = "__ALFRED_CAPTURE_SILENT__"
 
 
+class _SentenceChunker:
+    """Accumulate streamed text deltas and emit sentence-boundaried chunks.
+
+    The streaming voice loop consumes SENTENCE chunks (that's the unit a
+    streaming-TTS backend can start speaking on), so this buffers raw
+    ``text_delta`` fragments until a sentence boundary — a ``.``/``!``/``?``
+    (optionally followed by a closing quote/bracket) that is itself followed
+    by whitespace, or a newline — then flushes the completed sentence.
+
+    Losslessness contract: the concatenation of every chunk returned by
+    ``feed(...)`` across the turn, plus the final ``flush()``, equals the
+    concatenation of every ``feed`` input. The consumer therefore
+    reconstructs the assistant text byte-for-byte — no character is dropped,
+    duplicated, or rewritten. (The turn's authoritative RETURN string is
+    still computed via ``_extract_text`` on the assembled final message, so
+    chunk assembly can never diverge the batch reply.)
+    """
+
+    _ENDERS = ".!?"
+    _TRAILERS = "\"')]}”’"  # closing quote / bracket glyphs
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, text: str) -> list[str]:
+        """Add a text delta; return zero or more newly-completed sentences."""
+        if not text:
+            return []
+        self._buf += text
+        chunks: list[str] = []
+        cut = self._find_cut()
+        while cut is not None:
+            chunks.append(self._buf[:cut])
+            self._buf = self._buf[cut:]
+            cut = self._find_cut()
+        return chunks
+
+    def _find_cut(self) -> int | None:
+        """Index just past the first complete sentence in the buffer, or None."""
+        n = len(self._buf)
+        for i, ch in enumerate(self._buf):
+            if ch == "\n":
+                return i + 1
+            if ch in self._ENDERS:
+                j = i + 1
+                while j < n and self._buf[j] in self._TRAILERS:
+                    j += 1
+                # Only a real boundary once we've actually seen the trailing
+                # whitespace — a bare "1." at the buffer tail might be "1.5".
+                if j < n and self._buf[j].isspace():
+                    return j + 1
+        return None
+
+    def flush(self) -> list[str]:
+        """Emit any buffered partial sentence (trailing text with no boundary)."""
+        if not self._buf:
+            return []
+        rest = self._buf
+        self._buf = ""
+        return [rest]
+
+
+@dataclass
+class _TurnPrep:
+    """Result of the shared per-turn setup (:func:`_prepare_turn`).
+
+    ``capture`` short-circuits the LLM call (capture-mode session): the caller
+    returns / yields ``CAPTURE_SENTINEL`` without building system blocks or
+    tools. On the normal path ``system_blocks`` / ``instance_tools`` /
+    ``vault_path`` are populated for the model loop.
+    """
+
+    capture: bool
+    system_blocks: Any = None
+    instance_tools: Any = None
+    vault_path: str = ""
+
+
+def _prepare_turn(
+    state: StateManager,
+    session: Session,
+    user_message: str,
+    config: TalkerConfig,
+    vault_context_str: str,
+    system_prompt: str,
+    *,
+    user_kind: str,
+    calibration_str: str | None,
+    pushback_level: int | None,
+    session_type: str | None,
+    image_blocks: list[dict[str, Any]] | None,
+    user_role: str,
+    user_name: str | None,
+    channel: str,
+) -> _TurnPrep:
+    """Shared turn setup for both the batch and streaming engines.
+
+    Performs, in order, the exact side effects the pre-refactor ``run_turn``
+    prologue performed: reset ``last_filed_ticket``, append the user turn,
+    handle the capture-mode short-circuit, then (non-capture) build the voice-
+    preferences block, sender-identity block, system blocks, and the per-
+    instance tool list. Keeping this in one place means the batch and
+    streaming paths assemble an IDENTICAL request — no drift between them.
+    """
+    # RRTS-intake completion signal — clear at the START of every turn so
+    # ``session.last_filed_ticket`` reflects THIS turn only (no cross-turn
+    # leak: a turn that files a ticket sets it in ``_execute_tool``; the
+    # next turn that files nothing leaves it empty). Telegram + owner-web
+    # chat never set it, so this is a harmless no-op there. (2026-06-29,
+    # RRTS bug-report → VERA lane.)
+    session.last_filed_ticket = {}
+
+    # Append the user's message first so it's visible inside the loop.
+    # Vision: when image blocks are attached we store the user turn as a
+    # content-block list (image-then-text per Anthropic best-practice
+    # ordering); otherwise the wk1 bare-string shape is preserved.
+    from .vision import build_user_content
+    user_content = build_user_content(user_message, image_blocks)
+    append_turn(state, session, "user", user_content, kind=user_kind)
+
+    # wk2b c2: capture-mode short-circuit. A ``capture`` session is silent
+    # mid-session — the user's message has been appended to the transcript
+    # (so /extract and /brief can see it later) but we DO NOT call the
+    # LLM, DO NOT generate an assistant turn, and DO NOT run escalation
+    # detection. The bot layer recognises the sentinel and posts a
+    # receipt-ack emoji reaction instead of a text reply.
+    if session_type == "capture":
+        log.info(
+            "talker.capture.silent_turn",
+            chat_id=session.chat_id,
+            session_id=session.session_id,
+            user_kind=user_kind,
+            turn_index=len(session.transcript),
+        )
+        return _TurnPrep(capture=True, vault_path=config.vault.path)
+
+    # Operator-preference V1 (project_operator_preferences_v1) — Shape B
+    # voice block. Loaded per-turn rather than per-session because a
+    # preference change between turns should take effect on the next
+    # turn (cheap re-read; preferences are file-on-disk). Defensive:
+    # any load failure returns None and the block is omitted; the
+    # talker keeps running.
+    try:
+        voice_pref_block = load_voice_preferences_block(
+            vault_path=config.vault.path,
+            instance_name=config.instance.name,
+        )
+    except Exception as exc:
+        log.warning(
+            "talker.preferences.block_build_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            detail="continuing without voice preferences block",
+        )
+        voice_pref_block = None
+
+    # Sender-identity block (VERA reporter follow-up 2026-06-09). Built
+    # ONLY when the sending user has a configured display name —
+    # i.e. multi-user instances (VERA). Single-user instances pass
+    # ``user_name=None`` so this stays None and the block is omitted from
+    # the system blocks: byte-identical behaviour for Salem / KAL-LE /
+    # Hypatia. The block is dynamic per-message (sender can change between
+    # turns in a shared chat); ``_build_system_blocks`` places it in the
+    # uncached tail so per-message rebuilds don't churn the cache prefix.
+    sender_identity_block = (
+        _build_sender_identity_text(user_name, user_role, channel=channel)
+        if user_name
+        else None
+    )
+
+    system_blocks = _build_system_blocks(
+        system_prompt,
+        vault_context_str,
+        calibration_str=calibration_str,
+        pushback_level=pushback_level,
+        voice_preferences_block=voice_pref_block,
+        sender_identity_block=sender_identity_block,
+    )
+    vault_path = config.vault.path
+    # Stage 3.5: pick the tool list per instance tool_set. Salem
+    # ("talker") gets vault-only; KAL-LE ("kalle") gets vault + bash_exec.
+    # Defaults to the talker set so any misconfigured instance can't
+    # accidentally surface bash_exec.
+    #
+    # GCal capability gating (2026-05-06): we surface the
+    # ``gcal_list_events`` tool only when the active config has
+    # ``gcal.enabled: true``. Lazy-load mirrors the dispatch path —
+    # one yaml read per turn is cheap and keeps the GCal binding out
+    # of the talker hot path. Failure to load is non-fatal: we fall
+    # back to "no GCal tool" so the model can still answer (just
+    # without calendar reads), matching the pre-feature behaviour
+    # for any instance that doesn't carry a gcal block.
+    gcal_enabled = _resolve_gcal_enabled_for_run_turn(config)
+    instance_tools = tools_for_set(
+        config.instance.tool_set, gcal_enabled=gcal_enabled,
+    )
+    return _TurnPrep(
+        capture=False,
+        system_blocks=system_blocks,
+        instance_tools=instance_tools,
+        vault_path=vault_path,
+    )
+
+
+async def _process_model_response(
+    response: Any,
+    iteration: int,
+    state: StateManager,
+    session: Session,
+    config: TalkerConfig,
+    vault_path: str,
+    user_role: str,
+    user_name: str | None,
+    user_message: str,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Process one model response — the shared side-effect core of a turn.
+
+    Consumed by BOTH engines: ``run_turn`` (batch) feeds the object from
+    ``client.messages.create``; ``run_turn_streaming`` feeds
+    ``stream.get_final_message()``. The processing is IDENTICAL either way —
+    every side effect (the assistant tool_use ``append_turn``, per-tool
+    execution + ``tool_result`` append, cancellation flush, escalation
+    detection + ``state.save``) is byte-for-byte what the pre-refactor inline
+    ``run_turn`` loop body did, so the batch path stays behaviourally unchanged.
+
+    Yields, in order:
+
+    * ``{"type": "tool", "tool": <name>, "iteration": <n>}`` — emitted
+      BEFORE each tool executes, so the caller can fire an ``on_event`` status
+      frame / surface a mid-stream tool marker before the (awaited) tool call
+      (preserves the original ``on_event`` firing point).
+    * exactly one terminal control event as the LAST item::
+
+          {"type": "control", "action": "continue"}                  # run another model turn
+          {"type": "control", "action": "finish", "reply": <text>}   # turn is done
+
+    ``asyncio.CancelledError`` from a tool still propagates (after flushing a
+    well-formed ``tool_results`` set) exactly as before — it surfaces through
+    the caller's ``async for`` unchanged.
+    """
+    stop_reason = getattr(response, "stop_reason", "end_turn")
+
+    # Dispatch is content-based, NOT stop_reason-based (race-fix
+    # 2026-05-09 from Hypatia voice-profile rebuild WARN-2). The
+    # SDK reports ``stop_reason="tool_use"`` only when the model
+    # finished naturally on a tool_use turn. When the response hits
+    # ``max_tokens`` mid-stream — which is exactly what happens when
+    # the model emits a long announcement-paragraph plus several
+    # tool_use blocks each carrying substantial body content — the
+    # final tool_use block(s) still come through the SDK as fully-
+    # formed blocks, but stop_reason flips to ``"max_tokens"``.
+    # Pre-fix the loop's "if stop_reason == 'tool_use'" guard fell
+    # through to the end-turn branch, persisted the tool_use blocks
+    # in the assistant transcript, and returned the partial text
+    # reply — leaving every tool_use id DANGLING with no tool_result.
+    # The 2026-05-03 ``_messages_for_api`` heal masked the symptom
+    # on the NEXT user turn (synthesised tool_result blocks so the
+    # API didn't 400), but the actual tool execution never happened.
+    # User experience: 7 minutes of silence between announcement and
+    # the operator pinging "Progress?" — the mid-stream truncation
+    # was completely invisible.
+    #
+    # Fix: dispatch on whether the response carries any tool_use
+    # blocks, regardless of stop_reason. This lets max_tokens-stop
+    # responses with tool_use blocks STILL execute the (well-formed)
+    # blocks they emitted, append tool_results, and continue the
+    # loop — the next API call will let the model finish whatever
+    # work was truncated. A max_tokens-stop with NO tool_use blocks
+    # falls through to the existing end-turn path (the model just
+    # ran long on text — partial reply is still useful).
+    has_tool_use_blocks = any(
+        getattr(b, "type", None) == "tool_use"
+        for b in (response.content or [])
+    )
+
+    if has_tool_use_blocks:
+        # Observability: when we entered this branch on a non-
+        # ``tool_use`` stop_reason, log it explicitly. The most
+        # common case is ``"max_tokens"`` (model ran out of budget
+        # mid-stream). Per ``feedback_intentionally_left_blank.md``
+        # — silence is ambiguous; emit an explicit signal so the
+        # operator can grep for the truncation pattern. Also surfaces
+        # any future stop_reason that lands tool_use blocks
+        # (``"refusal"`` if a future content-policy stop somehow
+        # produces partial tool_use, etc.).
+        if stop_reason != "tool_use":
+            log.warning(
+                "talker.run_turn.tool_use_with_nonstandard_stop",
+                iteration=iteration,
+                stop_reason=stop_reason,
+                tool_use_count=sum(
+                    1 for b in response.content
+                    if getattr(b, "type", None) == "tool_use"
+                ),
+                detail=(
+                    "Response contained tool_use blocks but "
+                    "stop_reason was not 'tool_use'. Most likely "
+                    "max_tokens-truncated mid-stream — the tool_use "
+                    "blocks the model DID emit will execute "
+                    "normally; the next iteration lets the model "
+                    "finish whatever was cut off. Pre-2026-05-09 "
+                    "fix: this case fell through to end-turn and "
+                    "left the tool_use blocks dangling, presenting "
+                    "as a multi-minute silent gap to the user."
+                ),
+            )
+        # Append assistant turn (list of blocks) so the tool_use IDs are
+        # preserved for the matching tool_result.
+        append_turn(state, session, "assistant", _blocks_to_jsonable(response.content))
+
+        # Execute every tool_use block in order, collect tool_results.
+        #
+        # Per-tool try/except (race-fix 2026-05-03): the assistant
+        # turn above is persisted IMMEDIATELY by ``append_turn``.
+        # Any unhandled exception from ``_execute_tool`` here would
+        # exit the turn with the assistant turn on disk + no
+        # matching tool_result user turn — wedge state. The next
+        # ``run_turn`` call would append a regular user message,
+        # sealing the dangling ``tool_use`` IDs. Subsequent
+        # ``client.messages.create`` then 400s with
+        # ``tool_use ids were found without tool_result blocks
+        # immediately after``. User sees "API error try again";
+        # retry hits the same wall.
+        #
+        # ``_execute_tool`` itself wraps vault ops in try/except
+        # and returns ``{"error": ...}`` JSON for known failure
+        # modes (line ~1104 docstring). But anything outside its
+        # catch — an uncaught import error, a syscall-level
+        # failure (vault disk full mid-write), an asyncio.
+        # CancelledError from daemon shutdown — would propagate.
+        # The per-tool try/except here is the safety net.
+        #
+        # Synthetic tool_result on failure: ``is_error: True`` +
+        # detail naming the exception class so the model can see
+        # what went wrong and recover (apologise, pick a
+        # different tool, retry with different args). The
+        # transcript stays well-formed; the next API call
+        # succeeds.
+        # Pre-collect every tool_use id in this assistant turn so
+        # the cancellation handler can synthesize tool_results for
+        # the un-iterated tail (P0 from QA 2026-05-04). Pre-fix:
+        # CancelledError flushed only the cancelled tool's
+        # synthetic + tools BEFORE it; tools AFTER it never got
+        # iterated → tool_use ids dangling on next API call →
+        # heal fired and the LLM read the heal's "interrupted
+        # before completing" wording back to Andrew as a NEW
+        # symptom. Post-fix: complete the partial tool_results
+        # set with synthetic-cancelled blocks for every remaining
+        # tool_use id before re-raising.
+        all_tool_use_ids: list[str] = [
+            getattr(b, "id", "")
+            for b in response.content
+            if getattr(b, "type", None) == "tool_use"
+            and getattr(b, "id", "")
+        ]
+        tool_results: list[dict[str, Any]] = []
+        for block in response.content:
+            btype = getattr(block, "type", None)
+            if btype != "tool_use":
+                continue
+            tool_name = getattr(block, "name", "")
+            tool_input = getattr(block, "input", {}) or {}
+            tool_use_id = getattr(block, "id", "")
+
+            log.info(
+                "talker.tool.invoke",
+                iteration=iteration,
+                tool=tool_name,
+            )
+
+            # Surface the tool invocation to the caller BEFORE dispatch.
+            # The batch engine maps this to its ``on_event`` SSE status
+            # frame; the streaming engine re-yields it so a voice/web
+            # consumer sees "searching the vault…" mid-stream. Emitting it
+            # here (a yield, cooperatively handed to the caller before the
+            # ``await _execute_tool`` below) preserves the original
+            # "on_event fires before the tool runs" ordering.
+            yield {
+                "phase": "tool",
+                "type": "tool",
+                "tool": tool_name,
+                "iteration": iteration,
+            }
+
+            # Truncation pre-check (Layer 2 of the Hypatia 2026-05-21
+            # essay-planning fix). When stop_reason=max_tokens AND
+            # this tool_use's input matches a known "identifier-only,
+            # no action keys" signature, surface the diagnosis BEFORE
+            # dispatch so the model and the operator see "tool_use
+            # input was truncated" rather than the downstream
+            # generic-error surface.
+            #
+            # Layer 1 (the no-op gate inside vault_edit) catches the
+            # same case and produces a usable error on its own — but
+            # the truncation-aware error is more actionable because
+            # it names the root cause. We synthesize the tool_result
+            # here, skip the dispatch entirely, log the diagnosis,
+            # and continue the loop. The next iteration lets the
+            # model retry with a smaller payload.
+            trunc_diag = _detect_truncated_tool_input(
+                tool_name,
+                tool_input if isinstance(tool_input, dict) else {},
+                stop_reason,
+            )
+            if trunc_diag is not None:
+                log.warning(
+                    "talker.tool.input_truncated",
+                    iteration=iteration,
+                    tool=tool_name,
+                    tool_use_id=tool_use_id,
+                    received_keys=trunc_diag["received_keys"],
+                    expected_action_keys=trunc_diag["expected_action_keys"],
+                    stop_reason=stop_reason,
+                    detail=(
+                        "tool_use input was likely max_tokens-"
+                        "truncated mid-emission — arrived with "
+                        "identifier keys only and no action params. "
+                        "Synthesising an error tool_result so the "
+                        "model can retry with a smaller payload. "
+                        "Recommend the operator consider raising "
+                        "anthropic.max_tokens if this recurs."
+                    ),
+                )
+                error_payload = {
+                    "error": (
+                        f"{tool_name} tool_use input was likely "
+                        f"max_tokens-truncated mid-emission — "
+                        f"arrived with only "
+                        f"{trunc_diag['received_keys']} (no "
+                        f"action keys from "
+                        f"{trunc_diag['expected_action_keys']}). "
+                        f"Retry with a smaller payload or split "
+                        f"the operation across multiple calls."
+                    ),
+                }
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": _dumps(error_payload),
+                    "is_error": True,
+                })
+                continue
+
+            try:
+                result_str = await _execute_tool(
+                    tool_name,
+                    tool_input if isinstance(tool_input, dict) else {},
+                    vault_path,
+                    state,
+                    session,
+                    config=config,
+                    user_role=user_role,
+                    user_name=user_name,
+                )
+                is_error = False
+            except asyncio.CancelledError:
+                # Re-raise — daemon shutdown / task cancellation
+                # must propagate. Before raising, complete the
+                # tool_results set so the persisted transcript is
+                # well-formed when the daemon comes back up and
+                # rehydrates.
+                #
+                # Append the cancelled tool's synthetic FIRST,
+                # THEN walk the remaining (un-iterated) tool_use
+                # ids and synthesize "cancelled" results for each.
+                # Without the second step, every tool AFTER the
+                # cancelled one in this assistant turn dangles,
+                # the next run_turn's heal fires for them, and
+                # the LLM parrots the heal's "interrupted before
+                # completing" content back to the user as a new
+                # symptom (the operator-confusing recurrence
+                # this commit closes).
+                log.warning(
+                    "talker.tool.cancelled",
+                    iteration=iteration,
+                    tool=tool_name,
+                    tool_use_id=tool_use_id,
+                )
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": (
+                        "Tool execution was cancelled (daemon "
+                        "shutdown or task cancellation). Result "
+                        "unavailable."
+                    ),
+                    "is_error": True,
+                })
+                # Synthesize cancelled-results for every tool_use
+                # id AFTER the cancelled one (anything not yet
+                # in tool_results).
+                already_resulted_ids = {
+                    r["tool_use_id"] for r in tool_results
+                    if isinstance(r, dict) and r.get("tool_use_id")
+                }
+                unprocessed_ids = [
+                    tid for tid in all_tool_use_ids
+                    if tid not in already_resulted_ids
+                ]
+                for un_tid in unprocessed_ids:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": un_tid,
+                        "content": (
+                            "Tool execution was cancelled before "
+                            "this tool ran (preceding tool in the "
+                            "same turn was cancelled). Result "
+                            "unavailable."
+                        ),
+                        "is_error": True,
+                    })
+                log.warning(
+                    "talker.tool.cancellation_flushed_full_set",
+                    iteration=iteration,
+                    cancelled_tool_use_id=tool_use_id,
+                    unprocessed_tool_use_ids=unprocessed_ids,
+                    unprocessed_count=len(unprocessed_ids),
+                    total_tool_use_ids_in_turn=len(all_tool_use_ids),
+                    detail=(
+                        "Synthesised tool_result blocks for the "
+                        "un-iterated tail of the assistant turn so "
+                        "no tool_use id dangles after re-raise. "
+                        "Closes the heal-firing-on-restart symptom."
+                    ),
+                )
+                # Flush the COMPLETE tool_results set so the
+                # transcript is well-formed before re-raising.
+                append_turn(state, session, "user", tool_results)
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # Any other exception: synthesize an error
+                # tool_result and continue with the rest of the
+                # tool calls. Per ``feedback_intentionally_left
+                # _blank.md`` — log loudly so the operator knows
+                # what failed.
+                log.warning(
+                    "talker.tool.execute_failed",
+                    iteration=iteration,
+                    tool=tool_name,
+                    tool_use_id=tool_use_id,
+                    error_class=exc.__class__.__name__,
+                    error=str(exc)[:500],
+                    detail=(
+                        "_execute_tool raised an unhandled "
+                        "exception; synthesising an error "
+                        "tool_result so the transcript stays "
+                        "well-formed (preserves tool_use/"
+                        "tool_result pairing)."
+                    ),
+                )
+                result_str = _dumps({
+                    "error": (
+                        f"Tool execution failed with "
+                        f"{exc.__class__.__name__}: {str(exc)[:200]}"
+                    ),
+                })
+                is_error = True
+            tool_result_block: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": result_str,
+            }
+            if is_error:
+                tool_result_block["is_error"] = True
+            tool_results.append(tool_result_block)
+
+        # Feed tool results back as a single user message.
+        append_turn(state, session, "user", tool_results)
+        yield {"type": "control", "action": "continue"}
+        return
+
+    # end_turn (or any non-tool stop): extract text, record, run
+    # escalation detection, finish.
+    text = _extract_text(response.content)
+    append_turn(state, session, "assistant", _blocks_to_jsonable(response.content))
+
+    # Wk3 commit 6: implicit escalation detection. Cheap heuristic —
+    # if the turn looks like the user wants more thinking and we
+    # aren't already on Opus and haven't offered recently, append an
+    # offer to the assistant reply. The user types /opus to confirm
+    # (commit 5 wiring), or ignores, or types /no-auto-escalate to
+    # disable this for the rest of the session.
+    active = state.get_active(session.chat_id)
+    if active is not None:
+        signal = _detect_escalation_signal(session, user_message, text)
+        if signal is not None:
+            if _should_offer_escalation(active, session):
+                log.info(
+                    "talker.model.escalate_offered",
+                    chat_id=session.chat_id,
+                    session_id=session.session_id,
+                    signal=signal,
+                    turn_index=len(session.transcript),
+                )
+                text = text + _ESCALATION_SUFFIX
+                active["_escalation_offered_at_turn"] = len(
+                    session.transcript
+                )
+                state.set_active(session.chat_id, active)
+                state.save()
+
+    yield {"type": "control", "action": "finish", "reply": text}
+
+
+# Warning recorded (as an assistant turn) + returned when a turn spins the
+# full ``MAX_TOOL_ITERATIONS`` without the model ending its turn. Shared by
+# both engines so batch and streaming produce the identical safety-cap reply.
+_ITERATION_CAP_WARNING: Final[str] = (
+    "I hit my internal tool-use limit (10 iterations) on that turn — "
+    "likely stuck in a loop. Please rephrase or try again."
+)
+
+
+async def run_turn_streaming(
+    client: Any,
+    state: StateManager,
+    session: Session,
+    user_message: str,
+    config: TalkerConfig,
+    vault_context_str: str,
+    system_prompt: str,
+    user_kind: str = "text",
+    calibration_str: str | None = None,
+    pushback_level: int | None = None,
+    session_type: str | None = None,
+    image_blocks: list[dict[str, Any]] | None = None,
+    user_role: str = _OWNER_ROLE,
+    user_name: str | None = None,
+    channel: str = "telegram",
+    on_event: Callable[[dict[str, Any]], Awaitable[Any]] | None = None,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Streaming engine — the token/sentence-incremental core of a turn.
+
+    Same parameters and same per-turn side effects as :func:`run_turn`, but
+    drives ``client.messages.stream`` instead of ``client.messages.create``
+    and YIELDS incremental output as it arrives so a streaming-TTS / web-voice
+    consumer can start speaking on the first sentence. ``run_turn`` (the batch
+    surface) does NOT ride this path — it stays on ``messages.create`` for
+    behavioural invariance; both engines share the setup (:func:`_prepare_turn`)
+    and per-response side-effect core (:func:`_process_model_response`), so the
+    tool-use loop / session-record / escalation logic is single-sourced.
+
+    Yields, in order across the full tool-use loop:
+
+    * ``{"type": "text", "text": <sentence chunk>}`` — assistant reply text,
+      sentence-boundaried, streamed as the model emits it (BEFORE any mid-turn
+      tool call, and again AFTER, across successive stream iterations).
+    * ``{"type": "tool", "tool": <name>, "iteration": <n>}`` — a tool
+      invocation, surfaced mid-stream before the tool runs.
+    * exactly one terminal ``{"type": "final", "reply": <full reply str>}`` —
+      carries the SAME string the batch ``run_turn`` would return (final
+      assembled reply, ``CAPTURE_SENTINEL``, or the iteration-cap warning).
+
+    THINKING blocks are consumed but never emitted as reply/spoken text:
+    adaptive-thinking ``thinking_delta`` / ``signature_delta`` events are
+    dropped; only ``text_delta`` feeds the sentence chunker. tool-input
+    ``input_json_delta`` is likewise dropped — the assembled tool_use blocks
+    come from ``stream.get_final_message()``.
+    """
+    prep = _prepare_turn(
+        state,
+        session,
+        user_message,
+        config,
+        vault_context_str,
+        system_prompt,
+        user_kind=user_kind,
+        calibration_str=calibration_str,
+        pushback_level=pushback_level,
+        session_type=session_type,
+        image_blocks=image_blocks,
+        user_role=user_role,
+        user_name=user_name,
+        channel=channel,
+    )
+    if prep.capture:
+        yield {"type": "final", "reply": CAPTURE_SENTINEL}
+        return
+
+    for iteration in range(MAX_TOOL_ITERATIONS):
+        stream_kwargs = messages_create_kwargs(
+            model=session.model,
+            max_tokens=config.anthropic.max_tokens,
+            temperature=config.anthropic.temperature,
+            system=prep.system_blocks,
+            messages=_messages_for_api(session.transcript),
+            tools=prep.instance_tools,
+        )
+        chunker = _SentenceChunker()
+        try:
+            async with client.messages.stream(**stream_kwargs) as stream:
+                async for event in stream:
+                    if getattr(event, "type", None) != "content_block_delta":
+                        continue
+                    delta = getattr(event, "delta", None)
+                    dtype = getattr(delta, "type", None)
+                    if dtype == "text_delta":
+                        piece = getattr(delta, "text", "") or ""
+                        for chunk in chunker.feed(piece):
+                            yield {"type": "text", "text": chunk}
+                    # thinking_delta / signature_delta (adaptive thinking) and
+                    # input_json_delta (tool-use args) are consumed here but
+                    # deliberately NOT yielded — thinking must never surface as
+                    # spoken text; tool args arrive assembled via
+                    # get_final_message() below.
+                final_message = await stream.get_final_message()
+        except anthropic.APIError:
+            # Surface to caller — bot.py translates to a user-facing reply.
+            log.warning("talker.api_error", iteration=iteration)
+            raise
+
+        # Flush the trailing partial sentence (text emitted before a tool_use,
+        # or the tail of the final reply) so it reaches the consumer before the
+        # tool marker / final event.
+        for chunk in chunker.flush():
+            yield {"type": "text", "text": chunk}
+
+        finished_reply: str | None = None
+        async for ev in _process_model_response(
+            final_message,
+            iteration,
+            state,
+            session,
+            config,
+            prep.vault_path,
+            user_role,
+            user_name,
+            user_message,
+        ):
+            etype = ev["type"]
+            if etype == "tool":
+                yield {
+                    "type": "tool",
+                    "tool": ev["tool"],
+                    "iteration": ev["iteration"],
+                }
+                # Best-effort SSE status parity with run_turn: fire on_event if
+                # the consumer wired one. Swallow any error so a dropped client
+                # can never wedge the turn (detach-on-disconnect).
+                if on_event is not None:
+                    try:
+                        await on_event(
+                            {
+                                "phase": "tool",
+                                "tool": ev["tool"],
+                                "iteration": ev["iteration"],
+                            }
+                        )
+                    except Exception:  # noqa: BLE001 — status emission never wedges the turn
+                        pass
+            elif etype == "control":
+                if ev["action"] == "finish":
+                    finished_reply = ev["reply"]
+                # action == "continue" leaves finished_reply None
+                break
+        if finished_reply is not None:
+            yield {"type": "final", "reply": finished_reply}
+            return
+        # continue → next stream iteration
+
+    # Hit the safety cap. Record an explanatory assistant turn so the
+    # transcript reflects what happened, then bail — same terminal reply
+    # as the batch engine.
+    append_turn(state, session, "assistant", _ITERATION_CAP_WARNING)
+    log.warning(
+        "talker.run_turn.iteration_cap",
+        cap=MAX_TOOL_ITERATIONS,
+        session_id=session.session_id,
+    )
+    yield {"type": "final", "reply": _ITERATION_CAP_WARNING}
+
+
 async def run_turn(
     client: Any,
     state: StateManager,
@@ -4399,98 +5172,27 @@ async def run_turn(
     ignored on every turn after open. Regression-tested in
     ``tests/telegram/test_run_turn_session_model.py``.
     """
-    # RRTS-intake completion signal — clear at the START of every turn so
-    # ``session.last_filed_ticket`` reflects THIS turn only (no cross-turn
-    # leak: a turn that files a ticket sets it in ``_execute_tool``; the
-    # next turn that files nothing leaves it empty). Telegram + owner-web
-    # chat never set it, so this is a harmless no-op there. (2026-06-29,
-    # RRTS bug-report → VERA lane.)
-    session.last_filed_ticket = {}
-
-    # Append the user's message first so it's visible inside the loop.
-    # Vision: when image blocks are attached we store the user turn as a
-    # content-block list (image-then-text per Anthropic best-practice
-    # ordering); otherwise the wk1 bare-string shape is preserved.
-    from .vision import build_user_content
-    user_content = build_user_content(user_message, image_blocks)
-    append_turn(state, session, "user", user_content, kind=user_kind)
-
-    # wk2b c2: capture-mode short-circuit. A ``capture`` session is silent
-    # mid-session — the user's message has been appended to the transcript
-    # (so /extract and /brief can see it later) but we DO NOT call the
-    # LLM, DO NOT generate an assistant turn, and DO NOT run escalation
-    # detection. The bot layer recognises the sentinel and posts a
-    # receipt-ack emoji reaction instead of a text reply.
-    if session_type == "capture":
-        log.info(
-            "talker.capture.silent_turn",
-            chat_id=session.chat_id,
-            session_id=session.session_id,
-            user_kind=user_kind,
-            turn_index=len(session.transcript),
-        )
-        return CAPTURE_SENTINEL
-
-    # Operator-preference V1 (project_operator_preferences_v1) — Shape B
-    # voice block. Loaded per-turn rather than per-session because a
-    # preference change between turns should take effect on the next
-    # turn (cheap re-read; preferences are file-on-disk). Defensive:
-    # any load failure returns None and the block is omitted; the
-    # talker keeps running.
-    try:
-        voice_pref_block = load_voice_preferences_block(
-            vault_path=config.vault.path,
-            instance_name=config.instance.name,
-        )
-    except Exception as exc:
-        log.warning(
-            "talker.preferences.block_build_failed",
-            error=str(exc),
-            error_type=type(exc).__name__,
-            detail="continuing without voice preferences block",
-        )
-        voice_pref_block = None
-
-    # Sender-identity block (VERA reporter follow-up 2026-06-09). Built
-    # ONLY when the sending user has a configured display name —
-    # i.e. multi-user instances (VERA). Single-user instances pass
-    # ``user_name=None`` so this stays None and the block is omitted from
-    # the system blocks: byte-identical behaviour for Salem / KAL-LE /
-    # Hypatia. The block is dynamic per-message (sender can change between
-    # turns in a shared chat); ``_build_system_blocks`` places it in the
-    # uncached tail so per-message rebuilds don't churn the cache prefix.
-    sender_identity_block = (
-        _build_sender_identity_text(user_name, user_role, channel=channel)
-        if user_name
-        else None
-    )
-
-    system_blocks = _build_system_blocks(
-        system_prompt,
+    # Shared per-turn setup (user-turn append, capture short-circuit,
+    # system blocks + tool list). Identical assembly to the streaming
+    # engine via ``_prepare_turn`` — one source of truth for the request.
+    prep = _prepare_turn(
+        state,
+        session,
+        user_message,
+        config,
         vault_context_str,
+        system_prompt,
+        user_kind=user_kind,
         calibration_str=calibration_str,
         pushback_level=pushback_level,
-        voice_preferences_block=voice_pref_block,
-        sender_identity_block=sender_identity_block,
+        session_type=session_type,
+        image_blocks=image_blocks,
+        user_role=user_role,
+        user_name=user_name,
+        channel=channel,
     )
-    vault_path = config.vault.path
-    # Stage 3.5: pick the tool list per instance tool_set. Salem
-    # ("talker") gets vault-only; KAL-LE ("kalle") gets vault + bash_exec.
-    # Defaults to the talker set so any misconfigured instance can't
-    # accidentally surface bash_exec.
-    #
-    # GCal capability gating (2026-05-06): we surface the
-    # ``gcal_list_events`` tool only when the active config has
-    # ``gcal.enabled: true``. Lazy-load mirrors the dispatch path —
-    # one yaml read per turn is cheap and keeps the GCal binding out
-    # of the talker hot path. Failure to load is non-fatal: we fall
-    # back to "no GCal tool" so the model can still answer (just
-    # without calendar reads), matching the pre-feature behaviour
-    # for any instance that doesn't carry a gcal block.
-    gcal_enabled = _resolve_gcal_enabled_for_run_turn(config)
-    instance_tools = tools_for_set(
-        config.instance.tool_set, gcal_enabled=gcal_enabled,
-    )
+    if prep.capture:
+        return CAPTURE_SENTINEL
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         try:
@@ -4498,9 +5200,9 @@ async def run_turn(
                 model=session.model,
                 max_tokens=config.anthropic.max_tokens,
                 temperature=config.anthropic.temperature,
-                system=system_blocks,
+                system=prep.system_blocks,
                 messages=_messages_for_api(session.transcript),
-                tools=instance_tools,
+                tools=prep.instance_tools,
             )
             response = await client.messages.create(**create_kwargs)
         except anthropic.APIError:
@@ -4508,384 +5210,55 @@ async def run_turn(
             log.warning("talker.api_error", iteration=iteration)
             raise
 
-        stop_reason = getattr(response, "stop_reason", "end_turn")
-
-        # Dispatch is content-based, NOT stop_reason-based (race-fix
-        # 2026-05-09 from Hypatia voice-profile rebuild WARN-2). The
-        # SDK reports ``stop_reason="tool_use"`` only when the model
-        # finished naturally on a tool_use turn. When the response hits
-        # ``max_tokens`` mid-stream — which is exactly what happens when
-        # the model emits a long announcement-paragraph plus several
-        # tool_use blocks each carrying substantial body content — the
-        # final tool_use block(s) still come through the SDK as fully-
-        # formed blocks, but stop_reason flips to ``"max_tokens"``.
-        # Pre-fix the loop's "if stop_reason == 'tool_use'" guard fell
-        # through to the end-turn branch, persisted the tool_use blocks
-        # in the assistant transcript, and returned the partial text
-        # reply — leaving every tool_use id DANGLING with no tool_result.
-        # The 2026-05-03 ``_messages_for_api`` heal masked the symptom
-        # on the NEXT user turn (synthesised tool_result blocks so the
-        # API didn't 400), but the actual tool execution never happened.
-        # User experience: 7 minutes of silence between announcement and
-        # the operator pinging "Progress?" — the mid-stream truncation
-        # was completely invisible.
-        #
-        # Fix: dispatch on whether the response carries any tool_use
-        # blocks, regardless of stop_reason. This lets max_tokens-stop
-        # responses with tool_use blocks STILL execute the (well-formed)
-        # blocks they emitted, append tool_results, and continue the
-        # loop — the next API call will let the model finish whatever
-        # work was truncated. A max_tokens-stop with NO tool_use blocks
-        # falls through to the existing end-turn path (the model just
-        # ran long on text — partial reply is still useful).
-        has_tool_use_blocks = any(
-            getattr(b, "type", None) == "tool_use"
-            for b in (response.content or [])
-        )
-
-        if has_tool_use_blocks:
-            # Observability: when we entered this branch on a non-
-            # ``tool_use`` stop_reason, log it explicitly. The most
-            # common case is ``"max_tokens"`` (model ran out of budget
-            # mid-stream). Per ``feedback_intentionally_left_blank.md``
-            # — silence is ambiguous; emit an explicit signal so the
-            # operator can grep for the truncation pattern. Also surfaces
-            # any future stop_reason that lands tool_use blocks
-            # (``"refusal"`` if a future content-policy stop somehow
-            # produces partial tool_use, etc.).
-            if stop_reason != "tool_use":
-                log.warning(
-                    "talker.run_turn.tool_use_with_nonstandard_stop",
-                    iteration=iteration,
-                    stop_reason=stop_reason,
-                    tool_use_count=sum(
-                        1 for b in response.content
-                        if getattr(b, "type", None) == "tool_use"
-                    ),
-                    detail=(
-                        "Response contained tool_use blocks but "
-                        "stop_reason was not 'tool_use'. Most likely "
-                        "max_tokens-truncated mid-stream — the tool_use "
-                        "blocks the model DID emit will execute "
-                        "normally; the next iteration lets the model "
-                        "finish whatever was cut off. Pre-2026-05-09 "
-                        "fix: this case fell through to end-turn and "
-                        "left the tool_use blocks dangling, presenting "
-                        "as a multi-minute silent gap to the user."
-                    ),
-                )
-            # Append assistant turn (list of blocks) so the tool_use IDs are
-            # preserved for the matching tool_result.
-            append_turn(state, session, "assistant", _blocks_to_jsonable(response.content))
-
-            # Execute every tool_use block in order, collect tool_results.
-            #
-            # Per-tool try/except (race-fix 2026-05-03): the assistant
-            # turn above is persisted IMMEDIATELY by ``append_turn``.
-            # Any unhandled exception from ``_execute_tool`` here would
-            # exit ``run_turn`` with the assistant turn on disk + no
-            # matching tool_result user turn — wedge state. The next
-            # ``run_turn`` call would append a regular user message,
-            # sealing the dangling ``tool_use`` IDs. Subsequent
-            # ``client.messages.create`` then 400s with
-            # ``tool_use ids were found without tool_result blocks
-            # immediately after``. User sees "API error try again";
-            # retry hits the same wall.
-            #
-            # ``_execute_tool`` itself wraps vault ops in try/except
-            # and returns ``{"error": ...}`` JSON for known failure
-            # modes (line ~1104 docstring). But anything outside its
-            # catch — an uncaught import error, a syscall-level
-            # failure (vault disk full mid-write), an asyncio.
-            # CancelledError from daemon shutdown — would propagate.
-            # The per-tool try/except here is the safety net.
-            #
-            # Synthetic tool_result on failure: ``is_error: True`` +
-            # detail naming the exception class so the model can see
-            # what went wrong and recover (apologise, pick a
-            # different tool, retry with different args). The
-            # transcript stays well-formed; the next API call
-            # succeeds.
-            # Pre-collect every tool_use id in this assistant turn so
-            # the cancellation handler can synthesize tool_results for
-            # the un-iterated tail (P0 from QA 2026-05-04). Pre-fix:
-            # CancelledError flushed only the cancelled tool's
-            # synthetic + tools BEFORE it; tools AFTER it never got
-            # iterated → tool_use ids dangling on next API call →
-            # heal fired and the LLM read the heal's "interrupted
-            # before completing" wording back to Andrew as a NEW
-            # symptom. Post-fix: complete the partial tool_results
-            # set with synthetic-cancelled blocks for every remaining
-            # tool_use id before re-raising.
-            all_tool_use_ids: list[str] = [
-                getattr(b, "id", "")
-                for b in response.content
-                if getattr(b, "type", None) == "tool_use"
-                and getattr(b, "id", "")
-            ]
-            tool_results: list[dict[str, Any]] = []
-            for block in response.content:
-                btype = getattr(block, "type", None)
-                if btype != "tool_use":
-                    continue
-                tool_name = getattr(block, "name", "")
-                tool_input = getattr(block, "input", {}) or {}
-                tool_use_id = getattr(block, "id", "")
-
-                log.info(
-                    "talker.tool.invoke",
-                    iteration=iteration,
-                    tool=tool_name,
-                )
-
+        # Drive the shared per-response core. It performs every side effect
+        # (assistant tool_use append, tool execution + tool_result append,
+        # escalation detection) and signals continue-vs-finish via a terminal
+        # control event — identical behaviour to the pre-refactor inline loop.
+        async for ev in _process_model_response(
+            response,
+            iteration,
+            state,
+            session,
+            config,
+            prep.vault_path,
+            user_role,
+            user_name,
+            user_message,
+        ):
+            etype = ev["type"]
+            if etype == "tool":
                 # Tier-1 SSE status frame (web streaming). Best-effort: a
                 # raised callback (e.g. the SSE client dropped mid-turn) is
                 # swallowed so the turn ALWAYS completes server-side
                 # (detach-on-disconnect). None on every Telegram call →
-                # byte-identical to pre-feature behaviour.
+                # byte-identical to pre-feature behaviour (the callback is
+                # never built or fired).
                 if on_event is not None:
                     try:
                         await on_event(
                             {
                                 "phase": "tool",
-                                "tool": tool_name,
-                                "iteration": iteration,
+                                "tool": ev["tool"],
+                                "iteration": ev["iteration"],
                             }
                         )
                     except Exception:  # noqa: BLE001 — status emission never wedges the turn
                         pass
-
-                # Truncation pre-check (Layer 2 of the Hypatia 2026-05-21
-                # essay-planning fix). When stop_reason=max_tokens AND
-                # this tool_use's input matches a known "identifier-only,
-                # no action keys" signature, surface the diagnosis BEFORE
-                # dispatch so the model and the operator see "tool_use
-                # input was truncated" rather than the downstream
-                # generic-error surface.
-                #
-                # Layer 1 (the no-op gate inside vault_edit) catches the
-                # same case and produces a usable error on its own — but
-                # the truncation-aware error is more actionable because
-                # it names the root cause. We synthesize the tool_result
-                # here, skip the dispatch entirely, log the diagnosis,
-                # and continue the loop. The next iteration lets the
-                # model retry with a smaller payload.
-                trunc_diag = _detect_truncated_tool_input(
-                    tool_name,
-                    tool_input if isinstance(tool_input, dict) else {},
-                    stop_reason,
-                )
-                if trunc_diag is not None:
-                    log.warning(
-                        "talker.tool.input_truncated",
-                        iteration=iteration,
-                        tool=tool_name,
-                        tool_use_id=tool_use_id,
-                        received_keys=trunc_diag["received_keys"],
-                        expected_action_keys=trunc_diag["expected_action_keys"],
-                        stop_reason=stop_reason,
-                        detail=(
-                            "tool_use input was likely max_tokens-"
-                            "truncated mid-emission — arrived with "
-                            "identifier keys only and no action params. "
-                            "Synthesising an error tool_result so the "
-                            "model can retry with a smaller payload. "
-                            "Recommend the operator consider raising "
-                            "anthropic.max_tokens if this recurs."
-                        ),
-                    )
-                    error_payload = {
-                        "error": (
-                            f"{tool_name} tool_use input was likely "
-                            f"max_tokens-truncated mid-emission — "
-                            f"arrived with only "
-                            f"{trunc_diag['received_keys']} (no "
-                            f"action keys from "
-                            f"{trunc_diag['expected_action_keys']}). "
-                            f"Retry with a smaller payload or split "
-                            f"the operation across multiple calls."
-                        ),
-                    }
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": _dumps(error_payload),
-                        "is_error": True,
-                    })
-                    continue
-
-                try:
-                    result_str = await _execute_tool(
-                        tool_name,
-                        tool_input if isinstance(tool_input, dict) else {},
-                        vault_path,
-                        state,
-                        session,
-                        config=config,
-                        user_role=user_role,
-                        user_name=user_name,
-                    )
-                    is_error = False
-                except asyncio.CancelledError:
-                    # Re-raise — daemon shutdown / task cancellation
-                    # must propagate. Before raising, complete the
-                    # tool_results set so the persisted transcript is
-                    # well-formed when the daemon comes back up and
-                    # rehydrates.
-                    #
-                    # Append the cancelled tool's synthetic FIRST,
-                    # THEN walk the remaining (un-iterated) tool_use
-                    # ids and synthesize "cancelled" results for each.
-                    # Without the second step, every tool AFTER the
-                    # cancelled one in this assistant turn dangles,
-                    # the next run_turn's heal fires for them, and
-                    # the LLM parrots the heal's "interrupted before
-                    # completing" content back to the user as a new
-                    # symptom (the operator-confusing recurrence
-                    # this commit closes).
-                    log.warning(
-                        "talker.tool.cancelled",
-                        iteration=iteration,
-                        tool=tool_name,
-                        tool_use_id=tool_use_id,
-                    )
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": (
-                            "Tool execution was cancelled (daemon "
-                            "shutdown or task cancellation). Result "
-                            "unavailable."
-                        ),
-                        "is_error": True,
-                    })
-                    # Synthesize cancelled-results for every tool_use
-                    # id AFTER the cancelled one (anything not yet
-                    # in tool_results).
-                    already_resulted_ids = {
-                        r["tool_use_id"] for r in tool_results
-                        if isinstance(r, dict) and r.get("tool_use_id")
-                    }
-                    unprocessed_ids = [
-                        tid for tid in all_tool_use_ids
-                        if tid not in already_resulted_ids
-                    ]
-                    for un_tid in unprocessed_ids:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": un_tid,
-                            "content": (
-                                "Tool execution was cancelled before "
-                                "this tool ran (preceding tool in the "
-                                "same turn was cancelled). Result "
-                                "unavailable."
-                            ),
-                            "is_error": True,
-                        })
-                    log.warning(
-                        "talker.tool.cancellation_flushed_full_set",
-                        iteration=iteration,
-                        cancelled_tool_use_id=tool_use_id,
-                        unprocessed_tool_use_ids=unprocessed_ids,
-                        unprocessed_count=len(unprocessed_ids),
-                        total_tool_use_ids_in_turn=len(all_tool_use_ids),
-                        detail=(
-                            "Synthesised tool_result blocks for the "
-                            "un-iterated tail of the assistant turn so "
-                            "no tool_use id dangles after re-raise. "
-                            "Closes the heal-firing-on-restart symptom."
-                        ),
-                    )
-                    # Flush the COMPLETE tool_results set so the
-                    # transcript is well-formed before re-raising.
-                    append_turn(state, session, "user", tool_results)
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    # Any other exception: synthesize an error
-                    # tool_result and continue with the rest of the
-                    # tool calls. Per ``feedback_intentionally_left
-                    # _blank.md`` — log loudly so the operator knows
-                    # what failed.
-                    log.warning(
-                        "talker.tool.execute_failed",
-                        iteration=iteration,
-                        tool=tool_name,
-                        tool_use_id=tool_use_id,
-                        error_class=exc.__class__.__name__,
-                        error=str(exc)[:500],
-                        detail=(
-                            "_execute_tool raised an unhandled "
-                            "exception; synthesising an error "
-                            "tool_result so the transcript stays "
-                            "well-formed (preserves tool_use/"
-                            "tool_result pairing)."
-                        ),
-                    )
-                    result_str = _dumps({
-                        "error": (
-                            f"Tool execution failed with "
-                            f"{exc.__class__.__name__}: {str(exc)[:200]}"
-                        ),
-                    })
-                    is_error = True
-                tool_result_block: dict[str, Any] = {
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": result_str,
-                }
-                if is_error:
-                    tool_result_block["is_error"] = True
-                tool_results.append(tool_result_block)
-
-            # Feed tool results back as a single user message.
-            append_turn(state, session, "user", tool_results)
-            continue
-
-        # end_turn (or any non-tool stop): extract text, record, run
-        # escalation detection, return.
-        text = _extract_text(response.content)
-        append_turn(state, session, "assistant", _blocks_to_jsonable(response.content))
-
-        # Wk3 commit 6: implicit escalation detection. Cheap heuristic —
-        # if the turn looks like the user wants more thinking and we
-        # aren't already on Opus and haven't offered recently, append an
-        # offer to the assistant reply. The user types /opus to confirm
-        # (commit 5 wiring), or ignores, or types /no-auto-escalate to
-        # disable this for the rest of the session.
-        active = state.get_active(session.chat_id)
-        if active is not None:
-            signal = _detect_escalation_signal(session, user_message, text)
-            if signal is not None:
-                if _should_offer_escalation(active, session):
-                    log.info(
-                        "talker.model.escalate_offered",
-                        chat_id=session.chat_id,
-                        session_id=session.session_id,
-                        signal=signal,
-                        turn_index=len(session.transcript),
-                    )
-                    text = text + _ESCALATION_SUFFIX
-                    active["_escalation_offered_at_turn"] = len(
-                        session.transcript
-                    )
-                    state.set_active(session.chat_id, active)
-                    state.save()
-
-        return text
+            elif etype == "control":
+                if ev["action"] == "finish":
+                    return ev["reply"]
+                # action == "continue" → run the next model iteration.
+                break
 
     # Hit the safety cap. Record an explanatory assistant turn so the
     # transcript reflects what happened, then bail.
-    warning = (
-        "I hit my internal tool-use limit (10 iterations) on that turn — "
-        "likely stuck in a loop. Please rephrase or try again."
-    )
-    append_turn(state, session, "assistant", warning)
+    append_turn(state, session, "assistant", _ITERATION_CAP_WARNING)
     log.warning(
         "talker.run_turn.iteration_cap",
         cap=MAX_TOOL_ITERATIONS,
         session_id=session.session_id,
     )
-    return warning
+    return _ITERATION_CAP_WARNING
 
 
 # --- Helpers --------------------------------------------------------------
