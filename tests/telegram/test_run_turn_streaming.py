@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import anthropic
@@ -627,6 +628,169 @@ async def test_streaming_api_error_propagates_and_logs(tmp_path):
                 pass
 
     assert any(c.get("event") == "talker.api_error" for c in caplog)
+
+
+# ---------------------------------------------------------------------------
+# Hardened edge behaviours on the STREAMING path
+# ---------------------------------------------------------------------------
+#
+# The 1577 existing telegram tests exercise these via the batch/``create``
+# path, and both engines share ``_process_model_response`` so the LOGIC is
+# proven there. These pins prove the STREAMING wrapper drives that shared core
+# correctly for the non-obvious edges — content-based dispatch on a
+# ``max_tokens`` stop, CancelledError full-tail-flush propagation, and the
+# escalation suffix reaching the final reply.
+
+
+@pytest.mark.asyncio
+async def test_streaming_max_tokens_race_executes_tool_use(tmp_path, monkeypatch):
+    """A ``stop_reason == "max_tokens"`` final message that STILL carries
+    tool_use blocks executes them (content-based dispatch), logs the
+    nonstandard-stop warning, and continues to the next stream iteration —
+    with the pre-tool text flushed BEFORE the tool marker."""
+    monkeypatch.setattr(
+        conversation, "_execute_tool", AsyncMock(return_value='{"ok": true}')
+    )
+    scripts = [
+        (
+            [_text_delta("Working on it. ")],
+            _FinalMsg(
+                [
+                    _TextBlk("Working on it. "),
+                    _ToolBlk("t1", "vault_search", {"query": "x"}),
+                ],
+                "max_tokens",  # truncated mid-stream, but tool_use blocks are well-formed
+            ),
+        ),
+        (
+            [_text_delta("Done.")],
+            _FinalMsg([_TextBlk("Done.")], "end_turn"),
+        ),
+    ]
+    cfg = _config(tmp_path)
+    with structlog.testing.capture_logs() as caplog:
+        events = await _collect(
+            conversation.run_turn_streaming(
+                client=_streaming_client(scripts),
+                state=StateManager(cfg.session.state_path),
+                session=_session(),
+                user_message="do a big thing",
+                config=cfg,
+                vault_context_str="",
+                system_prompt="sys",
+            )
+        )
+
+    # The (well-formed) tool_use block executed despite the max_tokens stop.
+    assert conversation._execute_tool.await_count == 1
+    # Nonstandard-stop observability fired with the real stop_reason.
+    warns = [
+        c for c in caplog
+        if c.get("event") == "talker.run_turn.tool_use_with_nonstandard_stop"
+    ]
+    assert len(warns) == 1 and warns[0]["stop_reason"] == "max_tokens"
+    # Ordering: pre-tool text flushed, THEN the tool marker, THEN post-tool text.
+    kinds = [e["type"] for e in events]
+    ti = kinds.index("tool")
+    assert [e["text"] for e in events[:ti] if e["type"] == "text"] == ["Working on it. "]
+    assert [e["text"] for e in events[ti + 1:] if e["type"] == "text"] == ["Done."]
+    assert [e for e in events if e["type"] == "final"][0]["reply"] == "Done."
+
+
+@pytest.mark.asyncio
+async def test_streaming_cancellation_flushes_full_tail_and_propagates(
+    tmp_path, monkeypatch
+):
+    """A tool raising ``CancelledError`` mid-turn (3 tool_use blocks) flushes a
+    WELL-FORMED tool_results set for the whole un-iterated tail, logs the
+    full-set flush, and re-raises out of ``run_turn_streaming`` (daemon-shutdown
+    propagation) — no tool_use id left dangling."""
+    monkeypatch.setattr(
+        conversation,
+        "_execute_tool",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    final = _FinalMsg(
+        [
+            _ToolBlk("t1", "vault_search", {"query": "a"}),
+            _ToolBlk("t2", "vault_search", {"query": "b"}),
+            _ToolBlk("t3", "vault_search", {"query": "c"}),
+        ],
+        "tool_use",
+    )
+    client = MagicMock()
+    client.messages = MagicMock()
+    client.messages.stream = lambda **kw: _FakeStreamCtx([], final)
+
+    cfg = _config(tmp_path)
+    sess = _session()
+    state = StateManager(cfg.session.state_path)
+
+    async def _drain():
+        async for _ in conversation.run_turn_streaming(
+            client=client,
+            state=state,
+            session=sess,
+            user_message="cancel me",
+            config=cfg,
+            vault_context_str="",
+            system_prompt="sys",
+        ):
+            pass
+
+    with structlog.testing.capture_logs() as caplog:
+        with pytest.raises(asyncio.CancelledError):
+            await _drain()
+
+    # Only the first tool actually dispatched; the tail was synthesised.
+    assert conversation._execute_tool.await_count == 1
+    # Transcript is well-formed: user, assistant(3 tool_use), user(3 tool_result).
+    assert [t["role"] for t in sess.transcript] == ["user", "assistant", "user"]
+    results = sess.transcript[-1]["content"]
+    assert [r["tool_use_id"] for r in results] == ["t1", "t2", "t3"]
+    assert all(r.get("is_error") for r in results)  # every result flagged error
+    # Full-set flush logged, tail count == 2 (t2, t3).
+    flush = [
+        c for c in caplog
+        if c.get("event") == "talker.tool.cancellation_flushed_full_set"
+    ]
+    assert len(flush) == 1 and flush[0]["unprocessed_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_streaming_escalation_suffix_reaches_final_reply(tmp_path):
+    """With an active non-Opus session + an escalation keyword, the streaming
+    final reply carries the ``/opus`` offer suffix and the offer turn is
+    stashed — identical to the batch escalation path."""
+    cfg = _config(tmp_path)
+    state = StateManager(cfg.session.state_path)
+    sess = Session(
+        session_id="esc-stream",
+        chat_id=7,
+        started_at=datetime(2026, 6, 27, tzinfo=timezone.utc),
+        last_message_at=datetime(2026, 6, 27, tzinfo=timezone.utc),
+        model="claude-sonnet-4-6",  # non-Opus → offer is eligible
+    )
+    state.set_active(7, sess.to_dict())
+
+    scripts = [([_text_delta("ok")], _FinalMsg([_TextBlk("ok")], "end_turn"))]
+    events = await _collect(
+        conversation.run_turn_streaming(
+            client=_streaming_client(scripts),
+            state=state,
+            session=sess,
+            user_message="Please think harder about this.",
+            config=cfg,
+            vault_context_str="",
+            system_prompt="sys",
+        )
+    )
+
+    reply = [e for e in events if e["type"] == "final"][0]["reply"]
+    assert "/opus to confirm" in reply
+    active = state.get_active(7)
+    assert active is not None
+    assert active.get("_escalation_offered_at_turn") is not None
 
 
 # ---------------------------------------------------------------------------
