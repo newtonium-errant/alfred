@@ -3,6 +3,7 @@ import { act, renderHook } from '@testing-library/react';
 import type { RefObject } from 'react';
 import { ApiError } from '../lib/algernon/http';
 import { useVoice } from '../lib/algernon/useVoice';
+import type { VoiceConfigResponse } from '../lib/algernon/types';
 
 // Scripted WebRTC state machine test. A FakeRTCPeerConnection lets us drive the
 // gathering / connection transitions deterministically; getUserMedia + voiceApi
@@ -164,6 +165,15 @@ function lastPC(): FakeRTCPeerConnection {
 
 describe('useVoice', () => {
   it('runs idle → requesting-mic → connecting and POSTs the offer after gathering', async () => {
+    // Non-empty ICE list so we can pin that config.ice_servers flows into the pc.
+    const iceServers = [{ urls: ['stun:stun.example.net:3478'] }];
+    mockConfig.mockResolvedValue({
+      available: true,
+      reason: null,
+      ice_servers: iceServers,
+      max_sessions: 2,
+      yours: [],
+    });
     const { result } = renderHook(() => useVoice({ audioRef, enabled: true }));
     await act(async () => {
       await result.current.start();
@@ -172,6 +182,8 @@ describe('useVoice', () => {
     expect(mockGetUserMedia).toHaveBeenCalledTimes(1);
     expect(mockOffer).toHaveBeenCalledTimes(1);
     expect(mockOffer).toHaveBeenCalledWith('offer-sdp'); // localDescription.sdp
+    // The server-provided ICE list is what the RTCPeerConnection was built with.
+    expect((lastPC().config as { iceServers: unknown }).iceServers).toBe(iceServers);
     expect(result.current.state).toBe('connecting');
     expect(result.current.voiceSessionId).toBe('vs-123');
 
@@ -378,5 +390,59 @@ describe('useVoice', () => {
     act(() => result.current.reset());
     expect(result.current.state).toBe('idle');
     expect(result.current.error).toBeNull();
+  });
+
+  it('aborts an in-flight start() on unmount — no mic acquired, no pc built after teardown', async () => {
+    // Hold config pending so start() is suspended at `await voiceApi.config()`
+    // when the component unmounts (the hot-mic leak window).
+    let resolveConfig!: (v: VoiceConfigResponse) => void;
+    mockConfig.mockReturnValue(new Promise<VoiceConfigResponse>((res) => (resolveConfig = res)));
+
+    let startPromise: Promise<void> | undefined;
+    const { result, unmount } = renderHook(() => useVoice({ audioRef, enabled: true }));
+    await act(async () => {
+      startPromise = result.current.start(); // suspends at the pending config
+    });
+    expect(mockConfig).toHaveBeenCalledTimes(1);
+    expect(mockGetUserMedia).not.toHaveBeenCalled();
+
+    unmount(); // bumps genRef BEFORE teardown → the resumed start() must bail
+
+    await act(async () => {
+      resolveConfig({
+        available: true,
+        reason: null,
+        ice_servers: [],
+        max_sessions: 2,
+        yours: [],
+      });
+      await startPromise;
+    });
+
+    // The stale guard must have fired: no mic acquired, no pc constructed.
+    expect(mockGetUserMedia).not.toHaveBeenCalled();
+    expect(FakeRTCPeerConnection.instances.length).toBe(0);
+  });
+
+  it('tears down a live call when enabled flips to false (instance switch)', async () => {
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => useVoice({ audioRef, enabled }),
+      { initialProps: { enabled: true } },
+    );
+    await act(async () => {
+      await result.current.start();
+    });
+    act(() => lastPC().emitConnectionState('connected'));
+    expect(result.current.state).toBe('live');
+    const pc = lastPC();
+    (global.fetch as unknown as ReturnType<typeof vi.fn>).mockClear();
+
+    act(() => rerender({ enabled: false }));
+
+    expect(result.current.state).toBe('idle');
+    expect(pc.closed).toBe(true);
+    const fetchMock = global.fetch as unknown as ReturnType<typeof vi.fn>;
+    expect(fetchMock.mock.calls.some((c) => c[0] === '/api/voice/close')).toBe(true);
+    expect(lastMicTrack.stop).toHaveBeenCalled();
   });
 });

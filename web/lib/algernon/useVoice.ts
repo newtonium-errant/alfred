@@ -408,9 +408,13 @@ export function useVoice(opts: { audioRef: RefObject<HTMLAudioElement>; enabled:
     }
   }, [enabled, closeAndReset]);
 
-  // Best-effort teardown on unmount (fires the keepalive close beacon).
+  // Best-effort teardown on unmount (fires the keepalive close beacon). Bump the
+  // generation BEFORE teardown (as fail()/closeAndReset() do) so an in-flight
+  // start() awaiting config/getUserMedia/offer sees stale() and bails — it must
+  // NOT acquire a fresh mic or build a new pc after the component is gone.
   useEffect(() => {
     return () => {
+      genRef.current += 1;
       if (sessionIdRef.current) sendVoiceCloseBeacon(sessionIdRef.current);
       teardownLocal();
     };
