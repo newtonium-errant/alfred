@@ -506,3 +506,170 @@ describe('useVoice speaking lifecycle (V2 TTS talk-back)', () => {
     expect(dc.readyState).toBe('closed');
   });
 });
+
+describe('useVoice V3 barge-in event orderings (FE frozen; ratified §1.6 table)', () => {
+  // Reach 'speaking' for turn t1 (currentTurnIdRef=t1, speakingTurnIdRef=t1) — the
+  // PRE-FINAL state. onTurnFinal adopts so replyText clears into the thread.
+  async function reachSpeaking(onTurnFinal?: () => Promise<boolean>) {
+    const rendered = await goLive({ onTurnFinal });
+    const { dc } = rendered;
+    activateDictation(dc);
+    emit(dc, { type: 'turn_started', turn_id: 't1' });
+    emit(dc, { type: 'turn_text', turn_id: 't1', seq: 0, text: 'You have ' });
+    emit(dc, { type: 'speaking_started', turn_id: 't1' });
+    return rendered;
+  }
+
+  it('POST-FINAL × CONFIRM: speaking → thinking → (listening blip) → new turn; no discard notice', async () => {
+    const onTurnFinal = vi.fn().mockResolvedValue(true);
+    const { result, dc } = await reachSpeaking(onTurnFinal);
+    // t1 finishes its text → post-final playout (still 'speaking', reply adopted).
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'orig reply' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('speaking');
+    expect(result.current.replyText).toBe('');
+
+    // Barge: the user speaks over the drain (confirmed).
+    emit(dc, { type: 'stt_partial', utterance_id: 'u2', text: 'actually wait' });
+    expect(result.current.partialTranscript).toBe('actually wait');
+    expect(result.current.voiceTurnState).toBe('speaking'); // partials never touch the pill
+    expect(result.current.discardNotice).toBe(false);
+
+    emit(dc, { type: 'stt_final', utterance_id: 'u2', text: 'actually never mind that' });
+    expect(result.current.voiceTurnState).toBe('thinking'); // barge registered
+
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' });
+    expect(result.current.voiceTurnState).toBe('listening'); // honest rescue blip (currentTurnId null)
+    expect(result.current.discardNotice).toBe(false);
+
+    emit(dc, { type: 'turn_started', turn_id: 't2' });
+    expect(result.current.voiceTurnState).toBe('thinking');
+    expect(result.current.canCancel).toBe(true);
+    emit(dc, { type: 'turn_text', turn_id: 't2', seq: 0, text: 'The new answer.' });
+    expect(result.current.voiceTurnState).toBe('replying');
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't2', reply: 'The new answer.' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('listening');
+    // discardNotice never fired anywhere on the confirm path.
+    expect(result.current.discardNotice).toBe(false);
+  });
+
+  it('PRE-FINAL × CONFIRM: speaking_done blips replying, turn_cancelled clears the old reply', async () => {
+    const { result, dc } = await reachSpeaking();
+    expect(result.current.replyText).toBe('You have '); // t1 still streaming
+
+    emit(dc, { type: 'stt_partial', utterance_id: 'u2', text: 'no wait' });
+    expect(result.current.replyText).toBe('You have '); // NOT cleared (currentTurnId non-null)
+    expect(result.current.partialTranscript).toBe('no wait');
+
+    emit(dc, { type: 'stt_final', utterance_id: 'u2', text: 'no wait stop' });
+    expect(result.current.voiceTurnState).toBe('thinking');
+
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' });
+    expect(result.current.voiceTurnState).toBe('replying'); // honest blip (currentTurnId still t1)
+
+    emit(dc, { type: 'state', state: 'turn_cancelled', turn_id: 't1' });
+    expect(result.current.replyText).toBe(''); // old turn's reply cleared
+    expect(result.current.canCancel).toBe(false);
+    expect(result.current.voiceTurnState).toBe('listening');
+    expect(result.current.partialTranscript).toBe('no wait stop'); // barging input survives
+
+    emit(dc, { type: 'turn_started', turn_id: 't2' });
+    expect(result.current.voiceTurnState).toBe('thinking');
+    emit(dc, { type: 'turn_text', turn_id: 't2', seq: 0, text: 'Okay.' });
+    expect(result.current.replyText).toBe('Okay.'); // fresh accumulation
+  });
+
+  it('speaking_done null-check ISOLATED: a stray done from thinking must NOT flip to replying', async () => {
+    // The uniquely-isolating case: currentTurnIdRef is SET (t1) but speakingTurnIdRef
+    // is NULL — reached by turn_started, which lands 'thinking'. Here guard-vs-no-guard
+    // DIVERGE: WITH the null-check the stray speaking_done is a no-op ('thinking'
+    // holds); WITHOUT it, speaking_done would run its `currentTurnId !== null ?
+    // 'replying' : 'listening'` branch and WRONGLY flip the pill to 'replying'.
+    const { result, dc } = await goLive();
+    activateDictation(dc);
+    emit(dc, { type: 'turn_started', turn_id: 't1' });
+    expect(result.current.voiceTurnState).toBe('thinking');
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' }); // stray — no speaking window
+    expect(result.current.voiceTurnState).toBe('thinking'); // guard: no-op, NOT 'replying'
+
+    // Observable idempotency (kept): a duplicate AFTER a real speaking_done is inert.
+    emit(dc, { type: 'speaking_started', turn_id: 't1' }); // opens the speaking window
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' }); // real → 'replying' (t1 active)
+    expect(result.current.voiceTurnState).toBe('replying');
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' }); // dup
+    expect(result.current.voiceTurnState).toBe('replying'); // unchanged (speakingTurnIdRef already null)
+  });
+
+  it('barge-DISABLED (V2 discard) rescue pin: stt_final→thinking, discard→notice, speaking_done{drained}→listening', async () => {
+    // The LOAD-BEARING transition the zero-source decision rests on: speaking_done
+    // is the ONLY thing that rescues the pill from the 'thinking' a discarded final
+    // leaves behind. A preserve-'thinking' guard here would wedge V2 forever.
+    const onTurnFinal = vi.fn().mockResolvedValue(true);
+    const { result, dc } = await reachSpeaking(onTurnFinal);
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'r' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('speaking'); // post-final drain
+
+    emit(dc, { type: 'stt_final', utterance_id: 'u2', text: 'mm hmm' }); // final surfaced (honesty)
+    expect(result.current.voiceTurnState).toBe('thinking'); // the trap seed
+    emit(dc, { type: 'utterance_discarded', utterance_id: 'u2' });
+    expect(result.current.discardNotice).toBe(true);
+    expect(result.current.voiceTurnState).toBe('thinking'); // discard does NOT rescue
+
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'drained' });
+    expect(result.current.voiceTurnState).toBe('listening'); // RESCUED (currentTurnId null)
+    expect(result.current.discardNotice).toBe(false);
+  });
+
+  it('PRE-FINAL × VETO (backchannel): notice fires, T1 finishes text-only, lands listening (no wedge)', async () => {
+    const onTurnFinal = vi.fn().mockResolvedValue(true);
+    const { result, dc } = await reachSpeaking(onTurnFinal); // 'speaking', t1 pre-final, reply 'You have '
+    emit(dc, { type: 'stt_final', utterance_id: 'u2', text: 'mm hmm' });
+    expect(result.current.voiceTurnState).toBe('thinking');
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' }); // Stage A: audio cut
+    expect(result.current.voiceTurnState).toBe('replying'); // t1 still in flight
+    emit(dc, { type: 'utterance_discarded', utterance_id: 'u2' }); // Stage B: veto → notice
+    expect(result.current.discardNotice).toBe(true);
+
+    // T1 CONTINUES text-only (audio permanently truncated — accepted mode) + finishes.
+    emit(dc, { type: 'turn_text', turn_id: 't1', seq: 1, text: 'two meetings.' });
+    expect(result.current.replyText).toBe('You have two meetings.'); // reply completes
+    expect(result.current.voiceTurnState).toBe('replying');
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'You have two meetings.' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('listening'); // no wedge
+
+    // Notice lifecycle: no turn boundary cleared it, so it LINGERS into 'listening'
+    // (honest current behavior — an accepted residual, NOT a permanent wedge) and
+    // clears on the next turn_started.
+    expect(result.current.discardNotice).toBe(true);
+    emit(dc, { type: 'turn_started', turn_id: 't2' });
+    expect(result.current.discardNotice).toBe(false);
+  });
+
+  it('PRE-FINAL × VETO (echo): silent — no notice, T1 finishes, lands listening', async () => {
+    const onTurnFinal = vi.fn().mockResolvedValue(true);
+    const { result, dc } = await reachSpeaking(onTurnFinal);
+    // Echo veto: audio cut (Stage A) with NO surfaced final and NO discard notice.
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' });
+    expect(result.current.voiceTurnState).toBe('replying'); // t1 pre-final
+    expect(result.current.discardNotice).toBe(false); // silent
+
+    emit(dc, { type: 'turn_text', turn_id: 't1', seq: 1, text: 'done.' });
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'You have done.' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('listening');
+    expect(result.current.discardNotice).toBe(false);
+  });
+});
