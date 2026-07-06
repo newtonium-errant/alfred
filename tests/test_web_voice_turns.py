@@ -663,6 +663,34 @@ async def test_tts_char_cap_whole_sentence() -> None:
     await driver.aclose()
 
 
+async def test_tts_cap_is_clean_prefix_stop() -> None:
+    # QA NOTE 1: once capped, a LATER SHORT sentence must NOT slip under the cap
+    # (the skipped long one wasn't counted) — otherwise spoken-prefix → gap →
+    # resume. Cap is a clean prefix stop: zero further feed after the cap.
+    chunks = [
+        {"type": "text", "text": "x" * 15},   # fed (15 ≤ 20)
+        {"type": "text", "text": "y" * 10},   # 25 > 20 → caps, not fed
+        {"type": "text", "text": "z" * 3},    # 15+3=18 ≤ 20 — but capped ⇒ NOT fed
+        {"type": "final", "reply": "x" * 15 + "y" * 10 + "z" * 3},
+    ]
+    ch = FakeChannel()
+    stub = _StubTts(max_chars=20)
+    driver = VoiceTurnDriver(_deps(_FakeState(_active()), rts=_scripted_rts(chunks)), "v1")
+    driver.attach_tts(stub)
+    driver.attach_channel(ch)
+    _hello(driver)
+    with structlog.testing.capture_logs() as cap:
+        await driver.submit_utterance("hi")
+        final = await _wait_for(ch, {"turn_final"})
+    feeds = [c[2] for c in stub.calls if c[0] == "feed"]
+    assert feeds == ["x" * 15]                       # ONLY the prefix — no later short
+    assert final["tts_capped"] is True
+    assert final["tts_chars"] == 15                  # the skipped short didn't count
+    capped = [c for c in cap if c.get("event") == "web.voice.tts.turn_capped"]
+    assert len(capped) == 1                          # logged exactly once
+    await driver.aclose()
+
+
 async def test_tts_half_duplex_discards_while_speaking() -> None:
     ch = FakeChannel()
     driver = VoiceTurnDriver(_deps(_FakeState(_active()), rts=_scripted_rts([])), "v1")

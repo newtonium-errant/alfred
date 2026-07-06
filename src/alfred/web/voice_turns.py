@@ -540,15 +540,19 @@ class VoiceTurnDriver:
                 # loop body await-free (§1.16). Per-turn char cap on whole-
                 # sentence boundaries (contract §1.3): the sentence that WOULD
                 # cross the cap is not fed; the fed prefix still speaks.
-                if self._tts is not None and not self._tts_off_session:
+                # The cap is a clean PREFIX STOP: once capped, feed nothing more.
+                # Without ``not self._tts_capped`` a later SHORT sentence would
+                # slip under the cap (the skipped long one wasn't counted in
+                # _tts_chars_fed), giving spoken-prefix → gap → resume (QA NOTE 1).
+                if (self._tts is not None and not self._tts_off_session
+                        and not self._tts_capped):
                     if self._tts_chars_fed + len(txt) > self._tts_max_chars:
-                        if not self._tts_capped:
-                            self._tts_capped = True
-                            log.info(
-                                "web.voice.tts.turn_capped",
-                                voice_session_id=self._vid, turn_id=turn_id,
-                                chars_fed=self._tts_chars_fed,
-                            )
+                        self._tts_capped = True
+                        log.info(
+                            "web.voice.tts.turn_capped",
+                            voice_session_id=self._vid, turn_id=turn_id,
+                            chars_fed=self._tts_chars_fed,
+                        )
                     else:
                         self._tts.feed_text(turn_id, txt)
                         self._tts_chars_fed += len(txt)

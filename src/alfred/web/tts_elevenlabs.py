@@ -320,6 +320,12 @@ class ElevenLabsStreamProvider(TTSStreamProvider):
             await ws.send_str(json.dumps({"text": ""}))
         except Exception:  # noqa: BLE001 — best-effort flush
             pass
+        # V3 REVISIT (QA NOTE 2, deferred): this drain runs on the worker's
+        # sender task, so a cancel command queued behind an in-flight
+        # end_of_reply serializes behind it (≤ _END_DRAIN_S) at the PROVIDER
+        # level. The AUDIBLE interrupt is already immediate (the driver flushes
+        # the playout synchronously); only the ws teardown waits. Acceptable
+        # for V2; revisit when cancels become routine (barge-in).
         if self._recv_task is not None:
             try:
                 await asyncio.wait_for(self._recv_task, _END_DRAIN_S)
