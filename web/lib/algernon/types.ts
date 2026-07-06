@@ -145,3 +145,55 @@ export interface SttTranscribeResponse {
   empty?: boolean;
   degraded?: boolean;
 }
+
+// --- Web voice (V0) — typed mirror of the FROZEN backend contract (CONTRACT §2)
+// The backend (src/alfred/web/routes_voice.py) owns these shapes; do not drift
+// them without a team-lead sync. The BFF relays them verbatim — the browser talks
+// ONLY to the same-origin /api/voice/* routes and never sees a peer token.
+
+// One ICE server the browser should use in its RTCPeerConfiguration. `urls` is a
+// list (STUN/TURN); TURN entries additionally carry username/credential. V0 with a
+// public-IP host-candidate server usually returns an EMPTY list.
+export interface VoiceIceServer {
+  urls: string[];
+  username?: string;
+  credential?: string;
+}
+
+// One of the CALLER'S OWN live sessions (yours-scoped — never a global registry,
+// security W9). Surfaced by GET /voice/config so the UI could reconcile a stale
+// call; V0 uses it only to know a prior session is still open.
+export interface VoiceSessionSummary {
+  voice_session_id: string;
+  connection_state: string;
+  age_seconds: number;
+}
+
+// GET /voice/config → the capability/ICE/own-sessions probe. `available` false
+// (reason 'aiortc_missing') means the routes are mounted but the engine is missing
+// — the UI treats it exactly like disabled (no voice affordance).
+export interface VoiceConfigResponse {
+  available: boolean;
+  reason: string | null;
+  ice_servers: VoiceIceServer[];
+  max_sessions: number;
+  yours: VoiceSessionSummary[];
+}
+
+// POST /voice/offer → the SDP answer + server-minted id. `expires_at` is
+// now + max_session_seconds (ISO-8601). Media flows DIRECT browser↔server after
+// this; no further signalling until close.
+export interface VoiceOfferResponse {
+  voice_session_id: string;
+  sdp: string;
+  type: 'answer';
+  expires_at: string;
+}
+
+// POST /voice/close → idempotent + owner-bound (CONTRACT §1.5). `closed:false`
+// with reason 'not_found' covers unknown / already-closed / another user's id —
+// indistinguishable by design (no existence leak).
+export interface VoiceCloseResponse {
+  closed: boolean;
+  reason?: string;
+}
