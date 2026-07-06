@@ -708,9 +708,10 @@ def test_assistant_registered_log_has_pipeline_and_provider(tmp_path, monkeypatc
 class _FakeDriver:
     """No-op turn driver so binding tests don't spawn a real loop task."""
 
-    def __init__(self, deps, voice_session_id) -> None:
+    def __init__(self, deps, voice_session_id, **kwargs) -> None:
         self.deps = deps
         self.vid = voice_session_id
+        self.kwargs = kwargs   # accept the V3 barge= ctor kwarg
 
     async def aclose(self, reason: str = "") -> None:
         return None

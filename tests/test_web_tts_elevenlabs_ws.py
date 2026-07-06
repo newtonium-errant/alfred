@@ -107,10 +107,12 @@ def test_parse_malformed_is_empty() -> None:
 
 
 class _ElevenScriptServer:
-    def __init__(self, *, audio=None, status=None, drop_on_text=False) -> None:
+    def __init__(self, *, audio=None, status=None, drop_on_text=False,
+                 no_final=False) -> None:
         self.audio = audio if audio is not None else [b"\x10\x11\x12\x13"]
         self.status = status
         self.drop_on_text = drop_on_text
+        self.no_final = no_final   # send audio but never isFinal (drain-hang)
         self.api_key: str | None = None
         self.query: dict = {}
         self.received: list = []
@@ -138,6 +140,9 @@ class _ElevenScriptServer:
                     await ws.send_str(json.dumps({
                         "audio": base64.b64encode(chunk).decode(),
                     }))
+                if self.no_final:
+                    await asyncio.sleep(60)      # hang — the drain must be interrupted
+                    return ws
                 await ws.send_str(json.dumps({"isFinal": True}))
                 await ws.close()
                 return ws
@@ -273,6 +278,38 @@ async def test_close_idempotent() -> None:
         await prov.begin_turn("t1")
         await prov.close()
         await prov.close()                      # no raise
+    finally:
+        await server.close()
+
+
+async def test_request_cancel_safe_before_any_turn() -> None:
+    # reg-W1: request_cancel must be a clean no-op before any begin_turn
+    # (the interrupt event is created at construction, not in begin_turn).
+    prov = ElevenLabsStreamProvider(_cfg())
+    prov.request_cancel()          # must NOT raise AttributeError
+    prov.request_cancel()          # idempotent
+    await prov.close()
+
+
+async def test_request_cancel_breaks_drain_no_timeout_error() -> None:
+    # §1.2 / D2-13a: request_cancel during end_of_reply's drain breaks it AT ONCE
+    # (not after the 30 s bound) and emits NO drain_timeout error (protects the
+    # 3-strike fatal latch).
+    script = _ElevenScriptServer(audio=[b"\x01\x02"], no_final=True)
+    server = await _server(script)
+    try:
+        prov = _provider(server)
+        got, task = await _collect(prov)
+        await prov.begin_turn("t1")
+        await prov.feed_text("hi")
+        eor = asyncio.ensure_future(prov.end_of_reply())   # would drain 30 s
+        await asyncio.sleep(0.1)                            # audio arrives, drain starts
+        prov.request_cancel()                              # SYNC — breaks the drain
+        await asyncio.wait_for(eor, timeout=3.0)           # completes promptly, not 30 s
+        await prov.close()
+        await task
+        errs = [e for e in got if e.type == EVENT_ERROR]
+        assert errs == []                                  # no drain_timeout error
     finally:
         await server.close()
 

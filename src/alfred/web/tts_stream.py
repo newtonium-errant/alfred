@@ -124,6 +124,14 @@ class TTSStreamProvider(ABC):
     async def cancel_turn(self) -> None:
         """Abort synthesis ASAP; suppress the current turn's remaining events."""
 
+    def request_cancel(self) -> None:
+        """V3 barge primitive (contract §1.2) — SYNCHRONOUS, callable directly
+        from ``worker.interrupt_speech`` (NOT via the sender queue, which made
+        the V2 cancel mechanically circular). Abort the in-flight turn's
+        synthesis ASAP without awaiting. Default: no-op (a provider with no
+        interruptible I/O — the fake — has nothing to break)."""
+        return None
+
     @abstractmethod
     async def close(self) -> None:
         """Session-final. Idempotent. Ends :meth:`events`."""
@@ -200,6 +208,10 @@ class FakeTTSProvider(TTSStreamProvider):
         self._chars_fed += len(chunk)
 
     async def cancel_turn(self) -> None:
+        self._cancelled_turn = True
+
+    def request_cancel(self) -> None:
+        # Sync barge primitive (§1.2): suppress the in-progress turn's audio.
         self._cancelled_turn = True
 
     async def end_of_reply(self) -> None:

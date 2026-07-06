@@ -341,3 +341,63 @@ Dev smoke is keyless via `provider: fake` (a 440 Hz tone proportional to the
 reply, audible through the real WebRTC/Opus path). Real ElevenLabs is validated
 by a one-turn live gate test (`ELEVENLABS_API_KEY` present) and at box
 activation.
+
+---
+
+## V3 — barge-in (speak-to-interrupt)
+
+`web.voice.tts.barge_in.enabled: true` (on top of `tts.enabled`) lets you
+**interrupt** Alfred mid-reply: start talking while he's speaking and playback
+stops, your utterance becomes the next turn. Default-OFF; disabled = V2
+half-duplex (finals while speaking are discarded) byte-identical.
+
+### Two-stage commit (why it's not trigger-happy)
+
+- **Stage A** — a qualifying STT *partial* while speaking interrupts the AUDIO
+  only (silent on the wire). It does NOT commit a turn.
+- **Stage B** — the utterance's *final* re-runs the SAME gates; only on pass
+  does the barge commit (cancel any running turn + submit the new one).
+
+Suppression pipeline (in order): `too_early` (first 700 ms) → interrupt-phrase
+bypass (`stop` / `wait` / **the instance name** — "Salem!" — + config extras) →
+backchannel (`yeah` / `uh huh` / …) → `min_words`/`min_chars` floor → **echo
+gate**. The echo gate compares your words against what Alfred actually spoke
+(`echo_score ≥ echo_threshold` ⇒ suppress) so his own voice bleeding into the
+mic (Bluetooth / imperfect AEC) can't self-interrupt — including a 2 s
+post-drain grace window for the echo tail. The score is garble-resistant (a
+single ASR substitution / dropped / split word still matches).
+
+### Honesty
+
+- **Latency envelope: ~0.7-1.6 s** perceived stop-after-you-start-talking
+  (interrupt phrases faster than generic speech). Measured at smoke, reported.
+- **Truncated audio is accepted:** a barge flush is destructive (there's no
+  duck/hold), so the interrupted reply's audio is cut — its text still completes
+  and persists in history.
+- **Storm breaker:** 3 consecutive confirmed barges each landing <2 s into
+  playback auto-disable barge for the session (`web.voice.barge.storm_disabled`).
+- No Deepgram / VAD change — the partial transcript IS the trigger (SpeechStarted
+  stays dark; zero added cost/latency).
+
+### Observability (grep `web.voice.barge.*` — ids / ms / scores only, no text)
+
+| Event | Meaning |
+|---|---|
+| `web.voice.barge.enabled` / `.disabled reason=not_enabled\|tts_unavailable` | mount state |
+| `web.voice.barge.config_clamped` | a setting / list entry was clamped or dropped |
+| `web.voice.barge.triggered` | Stage-A audio interrupt fired |
+| `web.voice.barge.suppressed reason=too_early\|backchannel\|too_short\|echo` | a partial/final was gated out |
+| `web.voice.barge.confirmed` | Stage-B committed the barge |
+| `web.voice.barge.late_suppressed reason=echo` | echo caught at Stage B / in the post-drain grace window |
+| `web.voice.barge.outcome outcome=completed\|empty\|cancelled` | the barge's turn resolved (learner-ready: `empty` = false barge) |
+| `web.voice.barge.storm_disabled` | storm breaker tripped |
+
+Barge events carry `utterance_id`, `turn_id`, `ms_into_speaking`, `score`
+(echo), `reason` — a V3.1 self-correcting arc joins these (+ the client cancel
+logs, which carry ISO timestamps) to tune the per-user thresholds.
+
+### Config + deploy
+
+Set `web.voice.tts.barge_in.enabled: true` + the block (see
+`config.yaml.example`). No new env. Merges INERT; activation of the whole voice
+stack (V1 dictation + V2 talk-back + V3 barge) is one operator-gated config flip.

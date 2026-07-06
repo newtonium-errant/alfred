@@ -454,10 +454,20 @@ class VoiceTtsWorker:
         contexts."""
         # 1. Flush playout first so a pump blocked on enqueue_pcm can drain.
         self._playout.flush(reason)
-        # 2. Mark the current turn cancelled + purge queued commands.
+        # 2. SYNCHRONOUS provider cancel (contract §1.2 / reg-W1) — sets the
+        #    provider's _cancelled + interrupt event RIGHT NOW (not via the
+        #    sender queue, which is circular when the sender is blocked in the
+        #    end_of_reply drain). Closes the late-audio-resurrection hazard: the
+        #    recv loop drops further audio, and the drain breaks at once.
+        try:
+            self._provider.request_cancel()
+        except Exception:  # noqa: BLE001 — a bad provider must not wedge the driver
+            log.warning("web.voice.tts.request_cancel_error", voice_session_id=self._vid)
+        # 3. Mark the current turn cancelled + purge queued commands.
         self._cancelled_turn = self._active_turn_id
         self._drain_cmd_queue()
-        # 3. Tell the sender to abort the provider turn.
+        # 4. Belt-and-braces: queue a provider cancel_turn for full ws teardown
+        #    (idempotent — request_cancel already broke the drain).
         self._enqueue_cmd(("cancel", self._active_turn_id or "", ""))
         log.info(
             "web.voice.tts.interrupted", voice_session_id=self._vid,

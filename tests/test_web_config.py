@@ -512,3 +512,35 @@ def test_voice_tts_unresolved_key_stays_placeholder(monkeypatch) -> None:
         }}},
     })
     assert _is_unresolved(cfg.voice.tts.api_key)
+
+
+# ---------------------------------------------------------------------------
+# web.voice.tts.barge_in block (V3)
+# ---------------------------------------------------------------------------
+
+
+def test_barge_in_absent_is_defaults() -> None:
+    cfg = load_from_unified({"web": {"enabled": True, "voice": {"tts": {}}}})
+    b = cfg.voice.tts.barge_in
+    assert b.enabled is False and b.too_early_ms == 700 and b.echo_threshold == 0.8
+    assert b.min_words == 2 and b.echo_grace_s == 2.0
+
+
+def test_barge_in_full_block_and_coercions() -> None:
+    cfg = load_from_unified({"web": {"enabled": True, "voice": {"tts": {"barge_in": {
+        "enabled": True, "too_early_ms": "500", "min_words": 3, "min_chars": 8,
+        "echo_threshold": "0.7", "echo_grace_s": 1.5,
+        "interrupt_extra": ["abort", 5], "backchannel_extra": ["cool"],
+    }}}}})
+    b = cfg.voice.tts.barge_in
+    assert b.enabled is True and b.too_early_ms == 500      # str→int
+    assert b.echo_threshold == 0.7                          # str→float
+    assert b.interrupt_extra == ["abort"]                   # non-str dropped
+    assert b.backchannel_extra == ["cool"]
+
+
+def test_barge_in_schema_tolerance() -> None:
+    cfg = load_from_unified({"web": {"enabled": True, "voice": {"tts": {"barge_in": {
+        "enabled": True, "future_knob": "x",
+    }}}}})
+    assert cfg.voice.tts.barge_in.enabled is True

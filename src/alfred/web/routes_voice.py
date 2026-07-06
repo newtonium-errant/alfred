@@ -80,6 +80,8 @@ _KNOWN_PIPELINES = frozenset({"echo", "assistant"})
 _KNOWN_STT_PROVIDERS = frozenset({"deepgram", "fake"})
 # V2 TTS providers the code knows how to drive (fail-closed → text-only voice).
 _KNOWN_TTS_PROVIDERS = frozenset({"elevenlabs", "fake"})
+# App-key for the mount-normalized V3 barge settings (None = disabled).
+_KEY_WEB_BARGE = "web.barge_settings"
 
 
 def _base_mime(content_type: str) -> str:
@@ -216,7 +218,9 @@ async def _offer_assistant(
         identity=identity,
         chat_session_key=chat_session_key,
     )
-    driver = VoiceTurnDriver(deps, voice_session_id=vid)
+    driver = VoiceTurnDriver(
+        deps, voice_session_id=vid, barge=request.app.get(_KEY_WEB_BARGE),
+    )
     try:
         vid, answer_sdp = await manager.open_session(
             identity, sdp, turn_binding=driver, voice_session_id=vid,
@@ -381,6 +385,15 @@ def register_voice_handlers(
     tts_worker_factory = None
     if voice.pipeline == "assistant":
         tts_worker_factory = _build_assistant_tts(voice)
+
+    # Gate 3d — V3 barge-in (§1.3): requires tts.enabled. Build the mount-
+    # normalized settings (or None = disabled → V2 discard byte-identical, §1.12)
+    # and stash for the per-request driver ctor. Mount-time ILB both ways.
+    if voice.pipeline == "assistant":
+        app[_KEY_WEB_BARGE] = _build_barge(
+            voice, app.get(KEY_WEB_TALKER_CONFIG),
+            tts_mounted=tts_worker_factory is not None,
+        )
 
     # Reserved ICE knob observability — udp_port_range is accepted but has no
     # aiortc/aioice knob (aiortc#487), so it is NEVER a silent no-op.
@@ -633,6 +646,41 @@ def _make_tts_provider(tts_norm: Any, vid: str):
     from .tts_elevenlabs import ElevenLabsStreamProvider
 
     return ElevenLabsStreamProvider(tts_norm, voice_session_id=vid)
+
+
+# ---------------------------------------------------------------------------
+# V3 barge-in — mount gate + settings (§1.3)
+# ---------------------------------------------------------------------------
+
+
+def _build_barge(voice: Any, talker_config: Any, *, tts_mounted: bool):
+    """Return the mount-normalized ``BargeSettings`` (or ``None`` = disabled →
+    V2 discard byte-identical). Requires ``tts.enabled``; a barge-enabled but
+    tts-unusable mount disables barge with a loud log. Mount-time ILB both ways
+    (contract §1.3). Config clamps + list-cap drops log ``config_clamped``."""
+    from .barge_in import normalize_barge_settings
+
+    bcfg = voice.tts.barge_in
+    if not bcfg.enabled:
+        log.info("web.voice.barge.disabled", reason="not_enabled")
+        return None
+    if not tts_mounted:
+        log.error(
+            "web.voice.barge.disabled", reason="tts_unavailable",
+            detail="barge_in requires a usable web.voice.tts block — disabled",
+        )
+        return None
+    instance_name = getattr(getattr(talker_config, "instance", None), "name", "") or ""
+    settings, warnings = normalize_barge_settings(bcfg, instance_name=instance_name)
+    for warning in warnings:
+        log.warning("web.voice.barge.config_clamped", detail=warning)
+    log.info(
+        "web.voice.barge.enabled",
+        too_early_ms=settings.too_early_ms,
+        echo_threshold=settings.echo_threshold,
+        interrupt_phrases=len(settings.interrupt_phrases),
+    )
+    return settings
 
 
 def _resolve_chat_binding(request: web.Request, identity: Any, body: dict):

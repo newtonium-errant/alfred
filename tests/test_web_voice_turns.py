@@ -822,3 +822,224 @@ async def test_tts_v3_seam_is_single_dispatch_point() -> None:
     await _wait_for(ch, {"turn_final"})
     assert ("interrupt", "barge_in") in stub.calls   # V3 body used the same funnel
     await driver.aclose()
+
+
+# ---------------------------------------------------------------------------
+# V3 barge-in — the §1.6 ratified event-ordering table (4 cases + pins)
+# ---------------------------------------------------------------------------
+
+from alfred.web.barge_in import BargeSettings   # noqa: E402
+
+
+def _barge_settings(**over) -> BargeSettings:
+    base = dict(
+        enabled=True, too_early_ms=700, min_words=2, min_chars=6,
+        echo_threshold=0.8, echo_grace_s=2.0,
+        interrupt_phrases=frozenset({"stop", "salem"}),
+        backchannel_phrases=frozenset({"yeah", "ok"}),
+    )
+    base.update(over)
+    return BargeSettings(**base)
+
+
+def _barge_driver(rts, clk, **sover) -> VoiceTurnDriver:
+    return VoiceTurnDriver(
+        _deps(_FakeState(_active()), rts=rts), "v1",
+        barge=_barge_settings(**sover), clock=lambda: clk[0],
+    )
+
+
+def _two_phase_rts(gate: asyncio.Event):
+    """T1 (first call) hangs on ``gate``; T2 (second call) completes."""
+    async def rts(**kw):
+        rts.calls.append(kw["user_message"])
+        kw["session"].transcript.append(
+            {"role": "user", "content": kw["user_message"], "_ts": "t"})
+        if len(rts.calls) == 1:
+            await gate.wait()
+        yield {"type": "final", "reply": "done:" + kw["user_message"]}
+        kw["session"].transcript.append({"role": "assistant", "content": "x", "_ts": "t2"})
+    rts.calls = []
+    return rts
+
+
+def _types(ch: FakeChannel) -> list[str]:
+    return [f.get("type") for f in ch.sent]
+
+
+def _one_speaking_done(ch: FakeChannel) -> None:
+    assert sum(1 for f in ch.sent if f.get("type") == "speaking_done") == 1
+
+
+# --- CASE 1: POST-FINAL × CONFIRM ---
+async def test_barge_case1_post_final_confirm() -> None:
+    clk = [1000.0]
+    ch, stub = FakeChannel(), _StubTts()
+    d = _barge_driver(_scripted_rts([{"type": "final", "reply": "the answer here"}]), clk)
+    d.attach_tts(stub)
+    d.attach_channel(ch)
+    _hello(d)
+    d.on_speaking_started("t1")                 # post-final: no in-flight turn
+    clk[0] = 1002.0                             # past too_early
+    await d.submit_utterance("what about the quarterly budget")
+    await _wait_for(ch, {"turn_final"})
+    t = _types(ch)
+    assert t.index("stt_final") < t.index("speaking_done") < t.index("turn_started")
+    sd = next(f for f in ch.sent if f["type"] == "speaking_done")
+    assert sd["reason"] == "barged_in"
+    _one_speaking_done(ch)
+    await d.aclose()
+
+
+# --- CASE 2: PRE-FINAL × CONFIRM (+ no double speaking_done, ruling 4) ---
+async def test_barge_case2_pre_final_confirm_one_speaking_done() -> None:
+    clk = [1000.0]
+    gate = asyncio.Event()
+    ch, stub = FakeChannel(), _StubTts()
+    d = _barge_driver(_two_phase_rts(gate), clk)
+    d.attach_tts(stub)
+    d.attach_channel(ch)
+    _hello(d)
+    await d.submit_utterance("first")           # T1 starts + hangs
+    ts = await _wait_for(ch, {"turn_started"})
+    d.on_speaking_started(ts["turn_id"])        # T1 speaking (pre-final)
+    clk[0] = 1005.0
+    await d.submit_utterance("what about the quarterly budget")   # barge confirm → cancels T1
+    await _wait_for(ch, {"turn_final"})          # T2 completes
+    t = _types(ch)
+    assert t.index("stt_final") < t.index("speaking_done")
+    assert "turn_cancelled" in [f.get("state") for f in ch.sent]  # T1 cancelled
+    # ruling 4: the CancelledError branch's interrupt_speech is a wire no-op.
+    _one_speaking_done(ch)
+    gate.set()
+    await d.aclose()
+
+
+# --- CASE 3: POST-FINAL × VETO ---
+async def test_barge_case3_veto_backchannel_no_wedge() -> None:
+    clk = [1000.0]
+    ch, stub = FakeChannel(), _StubTts()
+    d = _barge_driver(_scripted_rts([]), clk)
+    d.attach_tts(stub)
+    d.attach_channel(ch)
+    _hello(d)
+    d.on_speaking_started("t1")
+    clk[0] = 1002.0
+    # Force a Stage-A latch so the veto must rescue the pill (speaking_done).
+    d._barge_utt_id = None
+    d._utt_id = "u1"
+    d._stage_a("what about the quarterly budget")   # passes → interrupt audio + latch
+    assert d._barge_utt_id == "u1"
+    await d.submit_utterance("yeah")                # final = backchannel → VETO
+    await asyncio.sleep(0.02)
+    t = _types(ch)
+    assert "stt_final" in t and "utterance_discarded" in t
+    sd = [f for f in ch.sent if f.get("type") == "speaking_done"]
+    assert len(sd) == 1 and sd[0]["reason"] == "barged_in"   # lifecycle rescue
+    assert d._speaking_turn_id is None              # pill un-stuck (no wedge)
+    await d.aclose()
+
+
+async def test_barge_case3_veto_echo_silent_but_lifecycle() -> None:
+    # In-window echo veto (Stage A fired): Option A — speaking_done only, no
+    # stt_final / notice surfaced (ruling 2).
+    clk = [1000.0]
+    ch, stub = FakeChannel(), _StubTts()
+    d = _barge_driver(_scripted_rts([]), clk)
+    d.attach_tts(stub)
+    d.attach_channel(ch)
+    _hello(d)
+    d._spoken_text = "the quarterly report shows revenue grew twelve percent"
+    d.on_speaking_started("t1")
+    clk[0] = 1002.0
+    d._utt_id = "u1"
+    d._barge_utt_id = "u1"                           # simulate Stage-A latch
+    with structlog.testing.capture_logs() as cap:
+        await d.submit_utterance(d._spoken_text)     # final = echo → VETO
+        await asyncio.sleep(0.02)
+    sd = [f for f in ch.sent if f.get("type") == "speaking_done"]
+    assert len(sd) == 1 and sd[0]["reason"] == "barged_in"
+    # No stt_final / utterance_discarded for the echo utterance.
+    assert not any(f.get("type") == "utterance_discarded" for f in ch.sent)
+    late = [c for c in cap if c.get("event") == "web.voice.barge.late_suppressed"]
+    assert late and late[0]["reason"] == "echo"
+    await d.aclose()
+
+
+# --- STORM BREAKER (§1.8) ---
+async def test_barge_storm_disables_session() -> None:
+    clk = [1000.0]
+    ch = FakeChannel()
+    d = _barge_driver(_scripted_rts([{"type": "final", "reply": "ok answer here"}]), clk)
+    d.attach_tts(_StubTts())
+    d.attach_channel(ch)
+    _hello(d)
+    with structlog.testing.capture_logs() as cap:
+        for _ in range(3):
+            d.on_speaking_started("t")
+            clk[0] += 0.8                            # past too_early (700ms), <2s
+            await d.submit_utterance("what about the quarterly budget")
+            await _wait_for(ch, {"turn_final"})
+            clk[0] += 0.01
+    assert d._barge_disabled_session is True
+    assert any(c.get("event") == "web.voice.barge.storm_disabled" for c in cap)
+    await d.aclose()
+
+
+# --- GRACE WINDOW late echo (§1.5) ---
+async def test_barge_grace_window_late_echo_suppressed() -> None:
+    clk = [1000.0]
+    ch = FakeChannel()
+    d = _barge_driver(_scripted_rts([{"type": "final", "reply": "x"}]), clk)
+    d.attach_tts(_StubTts())
+    d.attach_channel(ch)
+    _hello(d)
+    d._spoken_text = "the quarterly report shows revenue grew twelve percent"
+    d.on_speaking_started("t1")                     # a real speaking window …
+    d.on_speaking_done("t1", "drained")             # … then drain opens the grace window
+    with structlog.testing.capture_logs() as cap:
+        await d.submit_utterance(d._spoken_text)     # not speaking, but echo in grace
+        await asyncio.sleep(0.02)
+    assert d._pending is None                        # not queued
+    assert not any(f.get("type") == "stt_final" for f in ch.sent)   # silent
+    late = [c for c in cap if c.get("event") == "web.voice.barge.late_suppressed"]
+    assert late and late[0]["reason"] == "echo"
+    await d.aclose()
+
+
+# --- Missed-barge signal: cancel log carries last_suppressed_utt (§1.9b(c)) ---
+async def test_barge_cancel_carries_last_suppressed() -> None:
+    import json
+    clk = [1000.0]
+    ch = FakeChannel()
+    d = _barge_driver(_scripted_rts([]), clk)
+    d.attach_tts(_StubTts())
+    d.attach_channel(ch)
+    _hello(d)
+    d.on_speaking_started("t1")
+    clk[0] = 1002.0
+    await d.submit_utterance("yeah")             # backchannel → suppressed (utt id set)
+    with structlog.testing.capture_logs() as cap:
+        d.on_client_message(json.dumps({"v": 1, "type": "cancel"}))
+    cancels = [c for c in cap if str(c.get("event", "")).startswith("web.voice.cancel")
+               or c.get("event") == "web.voice.client_cancel"]
+    assert cancels and cancels[0].get("last_suppressed_utt")   # the missed utterance id
+    await d.aclose()
+
+
+# --- DISABLED ARM = V2 byte-identical (regression pin, §1.12) ---
+async def test_barge_disabled_is_v2_discard() -> None:
+    ch = FakeChannel()
+    driver = VoiceTurnDriver(_deps(_FakeState(_active()), rts=_scripted_rts([])), "v1",
+                             barge=_barge_settings(enabled=False))
+    driver.attach_tts(_StubTts())
+    driver.attach_channel(ch)
+    _hello(driver)
+    driver.on_speaking_started("t1")
+    with structlog.testing.capture_logs() as cap:
+        await driver.submit_utterance("what about the quarterly budget")
+        await asyncio.sleep(0.02)
+    # V2 behaviour: stt_final + utterance_discarded, NO barge events.
+    assert "stt_final" in _types(ch) and "utterance_discarded" in _types(ch)
+    assert not any(str(c.get("event", "")).startswith("web.voice.barge") for c in cap)
+    await driver.aclose()

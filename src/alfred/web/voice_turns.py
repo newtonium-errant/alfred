@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -88,12 +89,16 @@ class TurnDeps:
 class VoiceTurnDriver:
     """One per assistant-pipeline voice session. Sole owner of the datachannel."""
 
-    def __init__(self, deps: TurnDeps, voice_session_id: str) -> None:
+    def __init__(
+        self, deps: TurnDeps, voice_session_id: str, *,
+        barge: Any = None, clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._deps = deps
         self._vid = voice_session_id
         self._channel: Any = None
         self._hello_received = False
         self._closed = False
+        self._clock = clock
 
         # depth-1 latest-wins queue
         self._pending: tuple[str, str] | None = None
@@ -124,6 +129,22 @@ class VoiceTurnDriver:
         self._tts_error_emitted = False
         self._tts_chars_fed = 0
         self._tts_capped = False
+
+        # V3 barge-in (§1.1-§1.8). ``_barge`` is a mount-normalized BargeSettings
+        # (ctor-threaded, NOT a getattr chain); None / disabled ⇒ V2 discard
+        # behaviour byte-identical at the driver/wire layer (§1.12).
+        self._barge = barge
+        self._barge_utt_id: str | None = None      # Stage-A latch (§1.1)
+        self._spoken_text = ""                     # per-turn fed-text echo buffer (§1.5)
+        self._speaking_started_at: float | None = None
+        self._speaking_done_grace_until = 0.0      # post-drain echo-tail window
+        self._barge_storm_count = 0                # consecutive <2s confirmed barges
+        self._barge_disabled_session = False       # storm-breaker latch (§1.8)
+        self._barge_origin: str | None = None      # the T1 a pending barge interrupted
+        self._suppress_logged: set[tuple[str, str]] = set()  # dedup (utt_id, reason)
+        # Most recent suppressed utterance (id, clock) — a client cancel within
+        # ~10 s stamps it on the cancel log = the missed-barge signal (§1.9b(c)).
+        self._last_suppressed: tuple[str, float] | None = None
 
         # observability latches / counters
         self._drops: dict[str, int] = {}
@@ -221,23 +242,43 @@ class VoiceTurnDriver:
                 log.warning("web.voice.hello_callback_error", voice_session_id=self._vid)
 
     def _on_cancel(self, turn_id: Any) -> None:
+        # A client cancel arriving within ~10 s of a suppression IS the
+        # missed-barge signal (§1.9b(c)) — stamp the id on every cancel log so
+        # the V3.1 learner joins on it explicitly (not fragile time-proximity).
+        last_supp = self._recent_suppressed_utt()
         current = self._current_turn_id
         if turn_id is not None and turn_id != current:
             log.info(
                 "web.voice.cancel_stale",
                 voice_session_id=self._vid, given=turn_id, current=current,
+                last_suppressed_utt=last_supp,
             )
             return
         # Clear any queued utterance (walkie-talkie "never mind").
         self._pending = None
+        self._barge_utt_id = None    # a client cancel clears the barge latch (§1.1)
         # Audio dies FIRST — the user must never hear stale speech after
         # cancelling; then the CancelledError branch emits turn_cancelled
         # (ordering pinned: speaking_done → turn_cancelled).
         self.interrupt_speech("client_cancel")
         if self._current_task is not None and not self._current_task.done():
+            log.info(
+                "web.voice.client_cancel", voice_session_id=self._vid,
+                turn_id=current or "", last_suppressed_utt=last_supp,
+            )
             self._current_task.cancel()
         else:
-            log.info("web.voice.cancel_noop", voice_session_id=self._vid)
+            log.info(
+                "web.voice.cancel_noop", voice_session_id=self._vid,
+                last_suppressed_utt=last_supp,
+            )
+
+    def _recent_suppressed_utt(self) -> str:
+        """The most recent suppressed utterance_id if within ~10 s (else '')."""
+        ls = self._last_suppressed
+        if ls is not None and (self._clock() - ls[1]) <= 10.0:
+            return ls[0]
+        return ""
 
     # -- V2 TTS seam (talk-back plane) --------------------------------------
 
@@ -252,6 +293,8 @@ class VoiceTurnDriver:
         """Worker callback — first TTS audio enqueued for ``turn_id`` (sets the
         half-duplex gate + emits the distinct-type DC event, contract §1.1)."""
         self._speaking_turn_id = turn_id
+        self._speaking_started_at = self._clock()
+        self._barge_utt_id = None    # a new speaking window clears the Stage-A latch (§1.1)
         self.emit({
             "v": EVENT_VERSION, "type": "speaking_started", "turn_id": turn_id,
         })
@@ -263,6 +306,13 @@ class VoiceTurnDriver:
         if self._speaking_turn_id != turn_id:
             return
         self._speaking_turn_id = None
+        if self._barge is not None:
+            # Post-drain echo-tail grace (§1.5): the spoken buffer stays live (it
+            # resets at the NEXT turn start), so finals within echo_grace_s of a
+            # natural drain still run the echo gate (Bluetooth self-turn tail).
+            self._speaking_done_grace_until = self._clock() + self._barge.echo_grace_s
+            if reason == "drained":
+                self._barge_storm_count = 0   # a normal completion breaks a storm (§1.8)
         self.emit({
             "v": EVENT_VERSION, "type": "speaking_done",
             "turn_id": turn_id, "reason": reason,
@@ -273,6 +323,7 @@ class VoiceTurnDriver:
         or 3 consecutive transient failures, contract §1.4). Emits
         ``tts_unavailable`` ONCE; the session LIVES (text-only degrade)."""
         self._tts_off_session = True
+        self._barge_utt_id = None    # fail-open the barge latch too
         if self._speaking_turn_id is not None:
             # Fail-open the half-duplex gate — a lost done must not deafen us.
             done_turn = self._speaking_turn_id
@@ -289,32 +340,178 @@ class VoiceTurnDriver:
             reason=getattr(ev, "reason", ""),
         )
 
-    def interrupt_speech(self, reason: str) -> None:
-        """The single audio-plane cancel funnel (contract §1.7) — SYNC, callable
-        from await-free contexts. Flushes the worker's playout (via the worker's
-        own flush-first-then-abort primitive) and emits ``speaking_done`` if a
-        turn was mid-speech. Call sites: client cancel, CancelledError branch,
-        engine-error branch, new-turn stale-audio flush, aclose. **V3 barge-in
-        calls this exact function** from :meth:`_utterance_while_speaking`."""
+    # -- audio-plane interrupt split (contract §1.6 ruling 1) ---------------
+
+    def _interrupt_audio(self, reason: str) -> None:
+        """Audio plane ONLY — flush the playout + ``request_cancel`` the provider
+        (via the worker), with NO wire event and WITHOUT clearing
+        ``_speaking_turn_id``. Barge Stage A uses this (silent, §1.6); Stage B
+        and every V2 call site go through :meth:`interrupt_speech`."""
         if self._tts is not None:
             self._tts.interrupt_speech(reason)
+
+    def interrupt_speech(self, reason: str, *, wire_reason: str = "cancelled") -> None:
+        """The audio-plane cancel funnel (contract §1.7) — SYNC. Interrupts the
+        audio, then emits EXACTLY ONE ``speaking_done{wire_reason}`` if a turn was
+        mid-speech (guarded — a second call after ``_speaking_turn_id`` cleared is
+        a wire no-op). V2 call sites use the default ``wire_reason='cancelled'``
+        (disabled-arm byte-identical, §1.12); barge Stage-B passes ``'barged_in'``
+        (ruling 3 — the SAME literal on confirm AND veto; the LOGS disambiguate)."""
+        self._interrupt_audio(reason)
         if self._speaking_turn_id is not None:
             done_turn = self._speaking_turn_id
             self._speaking_turn_id = None
             self.emit({
                 "v": EVENT_VERSION, "type": "speaking_done",
-                "turn_id": done_turn, "reason": "cancelled",
+                "turn_id": done_turn, "reason": wire_reason,
             })
 
-    def _utterance_while_speaking(self, utterance_id: str, text: str) -> None:
-        """THE V3 policy seam (contract §1.9) — the SOLE decision point for a
-        final arriving while a turn is speaking. V2 (half-duplex): discard +
-        notice, do NOT queue. V3 (barge-in): swap this body to
-        ``interrupt_speech("barge_in")`` + re-submit."""
+    # -- V3 barge helpers ---------------------------------------------------
+
+    def _barge_on(self) -> bool:
+        return (self._barge is not None and self._barge.enabled
+                and not self._barge_disabled_session)
+
+    def _elapsed_speaking_ms(self) -> float:
+        if self._speaking_started_at is None:
+            return 0.0
+        return (self._clock() - self._speaking_started_at) * 1000.0
+
+    def _in_echo_grace(self) -> bool:
+        return self._clock() < self._speaking_done_grace_until
+
+    def _is_echo(self, text: str) -> bool:
+        from .barge_in import echo_score
+        return echo_score(text, self._spoken_text) >= self._barge.echo_threshold
+
+    def _log_barge(self, event: str, utterance_id: str, *, reason: str = "",
+                   score: float = 0.0, turn_id: str = "", dedup: bool = False) -> None:
+        """Uniform, learner-ready barge telemetry (§1.9 / §1.9b): ids / ms / score
+        only, never transcript text. Suppression logs deduped per (utt_id, reason)."""
+        if dedup:
+            key = (utterance_id, reason)
+            if key in self._suppress_logged:
+                return
+            self._suppress_logged.add(key)
+        if "suppress" in event:   # remember for the missed-barge cancel join (§1.9b(c))
+            self._last_suppressed = (utterance_id, self._clock())
+        fields: dict[str, Any] = {
+            "voice_session_id": self._vid, "utterance_id": utterance_id,
+            "turn_id": turn_id or (self._speaking_turn_id or ""),
+            "ms_into_speaking": int(self._elapsed_speaking_ms()),
+        }
+        if reason:
+            fields["reason"] = reason
+        if score:
+            fields["score"] = round(score, 3)
+        log.info(event, **fields)
+
+    def _barge_outcome(self, barged_turn_id: str | None, new_turn_id: str,
+                       outcome: str) -> None:
+        """Learner-ready outcome of a CONFIRMED barge's turn (§1.9b) — lets an
+        offline learner label false barges (empty / cancelled) vs good
+        (completed). ``superseded`` folds into ``cancelled`` at this granularity."""
+        if not barged_turn_id:
+            return
         log.info(
-            "web.voice.utterance_discarded_speaking",
-            voice_session_id=self._vid, utterance_id=utterance_id,
+            "web.voice.barge.outcome", voice_session_id=self._vid,
+            barged_turn_id=barged_turn_id, new_turn_id=new_turn_id, outcome=outcome,
         )
+
+    def _register_confirmed_barge(self) -> None:
+        """Barge-storm circuit breaker (§1.8): 3 consecutive confirmed barges
+        each landing <2 s into playback auto-disables barge for the session."""
+        if self._elapsed_speaking_ms() < 2000:
+            self._barge_storm_count += 1
+        else:
+            self._barge_storm_count = 0
+        if self._barge_storm_count >= 3:
+            self._barge_disabled_session = True
+            log.warning(
+                "web.voice.barge.storm_disabled", voice_session_id=self._vid,
+                consecutive=self._barge_storm_count,
+            )
+
+    def _stage_a(self, text: str) -> None:
+        """Stage A (§1.1) — a partial while speaking. Passing the FULL pipeline
+        interrupts the AUDIO ONLY (silent wire, no ``speaking_done``) + latches
+        the utterance id for the Stage-B re-confirm. Suppressions are logged."""
+        if self._barge_utt_id == self._utt_id:
+            return  # already latched this utterance
+        from .barge_in import evaluate_barge
+        d = evaluate_barge(text, elapsed_ms=self._elapsed_speaking_ms(),
+                           spoken=self._spoken_text, settings=self._barge)
+        if d.barge:
+            self._interrupt_audio("barge_partial")   # SILENT — no wire event (§1.6)
+            self._barge_utt_id = self._utt_id
+            self._log_barge("web.voice.barge.triggered", self._utt_id or "")
+        else:
+            self._log_barge("web.voice.barge.suppressed", self._utt_id or "",
+                            reason=d.reason, score=d.score, dedup=True)
+
+    def _emit_stt_final(self, utterance_id: str, text: str) -> None:
+        self.emit({
+            "v": EVENT_VERSION, "type": "stt_final",
+            "utterance_id": utterance_id, "text": text, "ts": _now_iso(),
+        })
+
+    def _confirm_barge(self, utterance_id: str, text: str) -> None:
+        """Stage-B confirm (§1.7): stt_final → speaking_done{barged_in} → (pre-
+        final) cancel the in-flight turn → submit via the EXISTING latest-wins
+        ``_pending`` (which the barge path MUST NOT clear)."""
+        barged_turn = self._speaking_turn_id or ""
+        self._register_confirmed_barge()
+        self._emit_stt_final(utterance_id, text)               # honest — becomes a turn
+        self.interrupt_speech("barge_confirm", wire_reason="barged_in")  # speaking_done{barged_in}
+        self._log_barge("web.voice.barge.confirmed", utterance_id, turn_id=barged_turn)
+        self._barge_origin = barged_turn                       # → T2's barge.outcome
+        if self._current_task is not None and not self._current_task.done():
+            self._current_task.cancel()   # pre-final: CancelledError → turn_cancelled(T1)
+        self._pending = (utterance_id, text)                   # NOT cleared (§1.7)
+        self._wake.set()
+
+    def _utterance_while_speaking(self, utterance_id: str, text: str) -> None:
+        """THE V3 policy seam (contract §1.6 / §1.9) — the SOLE decision point for
+        a final arriving while a turn is speaking. Disabled arm = V2 discard
+        (byte-identical wire). Enabled arm = the ratified §1.6 table: Stage-B
+        re-runs the pipeline; confirm barges, veto surfaces per reason."""
+        if not self._barge_on():
+            # V2 body byte-identical: stt_final (honest) then the discard notice.
+            self._emit_stt_final(utterance_id, text)
+            log.info(
+                "web.voice.utterance_discarded_speaking",
+                voice_session_id=self._vid, utterance_id=utterance_id,
+            )
+            self.emit({
+                "v": EVENT_VERSION, "type": "utterance_discarded",
+                "utterance_id": utterance_id,
+            })
+            return
+
+        # Stage B (§1.1) — did this utterance's partial already flush audio?
+        stage_a_fired = (self._barge_utt_id == utterance_id)
+        self._barge_utt_id = None   # consume the latch
+        from .barge_in import evaluate_barge
+        d = evaluate_barge(text, elapsed_ms=self._elapsed_speaking_ms(),
+                           spoken=self._spoken_text, settings=self._barge)
+        if d.barge:
+            self._confirm_barge(utterance_id, text)
+            return
+        # VETO. echo = SILENT surface (no stt_final / notice); Option A: if Stage A
+        # already flushed audio, emit the lifecycle speaking_done{barged_in} so the
+        # pill can't stick at 'speaking' with dead audio (ruling 2 — (c) > (e)).
+        if d.reason == "echo":
+            self._log_barge("web.voice.barge.late_suppressed", utterance_id,
+                            reason="echo", score=d.score, dedup=True)
+            if stage_a_fired:
+                self.interrupt_speech("barge_veto", wire_reason="barged_in")
+            return
+        # backchannel / too_short / too_early veto = honest stt_final + notice.
+        self._emit_stt_final(utterance_id, text)
+        self._log_barge("web.voice.barge.suppressed", utterance_id,
+                        reason=d.reason, score=d.score, dedup=True)
+        if stage_a_fired:
+            self.interrupt_speech("barge_veto", wire_reason="barged_in")
         self.emit({
             "v": EVENT_VERSION, "type": "utterance_discarded",
             "utterance_id": utterance_id,
@@ -330,29 +527,40 @@ class VoiceTurnDriver:
             "v": EVENT_VERSION, "type": "stt_partial",
             "utterance_id": self._utt_id, "text": text, "ts": _now_iso(),
         })
+        # Stage A (§1.1): a qualifying partial while speaking interrupts audio
+        # ONLY (silent wire) + latches the utterance for the Stage-B re-confirm.
+        if self._barge_on() and self._speaking_turn_id is not None:
+            self._stage_a(text)
 
     async def submit_utterance(self, text: str) -> None:
-        """Worker ``on_utterance`` — EOU fired; queue a turn (latest-wins)."""
+        """Worker ``on_utterance`` — EOU fired; queue a turn (latest-wins).
+
+        stt_final is owned by the branch (the barge enabled arm may SUPPRESS it
+        for an echo final, §1.6(e)), so it is NOT emitted unconditionally here."""
         uid = self._utt_id or uuid4().hex
         self._utt_id = None
-        self.emit({
-            "v": EVENT_VERSION, "type": "stt_final",
-            "utterance_id": uid, "text": text, "ts": _now_iso(),
-        })
         if self._closed:
+            self._emit_stt_final(uid, text)   # honest final even at close (V2)
             log.info(
                 "web.voice.utterance_after_close",
                 voice_session_id=self._vid, utterance_id=uid,
             )
             return
-        # Half-duplex gate (contract §1.9): a final arriving WHILE a turn is
-        # speaking is discarded (browser AEC needs 2-5 s to adapt; first-
-        # exchange echo leak is expected). stt_final was still emitted above
-        # (transcript honesty). The queue / latest-wins path is untouched when
-        # nothing is playing (LLM-thinking window = genuine speech).
+        # Half-duplex / barge gate (contract §1.6/§1.9): a final arriving WHILE a
+        # turn is speaking goes to the SOLE decision seam (which owns stt_final).
         if self._speaking_turn_id is not None:
             self._utterance_while_speaking(uid, text)
             return
+        # Not speaking, but maybe a late echo tail within the post-drain grace
+        # window (§1.5) — the Bluetooth self-turn case. Suppress SILENTLY.
+        if self._barge_on() and self._in_echo_grace():
+            from .barge_in import echo_score
+            score = echo_score(text, self._spoken_text)
+            if score >= self._barge.echo_threshold:
+                self._log_barge("web.voice.barge.late_suppressed", uid,
+                                reason="echo", score=score, dedup=True)
+                return
+        self._emit_stt_final(uid, text)
         if self._pending is not None:
             dropped_id = self._pending[0]
             log.info(
@@ -409,6 +617,11 @@ class VoiceTurnDriver:
             self.interrupt_speech("new_turn")
         self._tts_chars_fed = 0
         self._tts_capped = False
+        self._spoken_text = ""   # echo buffer reset at NEXT-turn start (§1.5)
+        # If this turn was born from a confirmed barge, remember which speaking
+        # turn it interrupted so its resolution can emit barge.outcome (§1.9b).
+        barge_origin = self._barge_origin
+        self._barge_origin = None
 
         reserved = await self._reserve_inflight()
         if not reserved:
@@ -475,6 +688,8 @@ class VoiceTurnDriver:
                 voice_session_id=self._vid, turn_id=turn_id,
                 reply_chars=len(reply or ""),
             )
+            self._barge_outcome(barge_origin, turn_id,
+                                "completed" if (reply or "").strip() else "empty")
         except asyncio.CancelledError:
             # Audio dies first (idempotent if _on_cancel already flushed), then
             # the turn_cancelled state — ordering pinned speaking_done →
@@ -485,12 +700,14 @@ class VoiceTurnDriver:
                 "v": EVENT_VERSION, "type": "state", "state": "turn_cancelled",
                 "turn_id": turn_id,
             })
+            self._barge_outcome(barge_origin, turn_id, "cancelled")
             raise
         except Exception as exc:  # noqa: BLE001 — engine error → wire error, session lives
             # A half-spoken reply followed by an error frame is worse than
             # silence+error — flush the audio (symmetric with cancel).
             self.interrupt_speech("engine_error")
             self._emit_error("engine_error", detail=str(exc), turn_id=turn_id)
+            self._barge_outcome(barge_origin, turn_id, "empty")
             log.warning(
                 "web.voice.engine_error",
                 voice_session_id=self._vid, turn_id=turn_id,
@@ -556,6 +773,10 @@ class VoiceTurnDriver:
                     else:
                         self._tts.feed_text(turn_id, txt)
                         self._tts_chars_fed += len(txt)
+                        # Accumulate the ACTUALLY-fed text for the barge echo
+                        # gate (§1.5 — only what was spoken can be self-heard).
+                        if self._barge is not None:
+                            self._spoken_text += txt + " "
             elif ctype == "tool":
                 self.emit({
                     "v": EVENT_VERSION, "type": "turn_tool", "turn_id": turn_id,
@@ -669,6 +890,8 @@ class VoiceTurnDriver:
         if self._closed:
             return
         self._closed = True
+        self._barge_utt_id = None    # clear the barge latch (§1.1)
+        self._spoken_text = ""       # clear the echo buffer (sec-W5)
         # Flush any in-flight TTS audio first (the worker's own aclose is driven
         # separately by _drain_pipeline). None-safe when no worker attached.
         self.interrupt_speech("driver_close")

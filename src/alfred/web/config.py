@@ -165,6 +165,24 @@ class WebVoiceSttConfig:
 
 
 @dataclass
+class BargeInConfig:
+    """V3 barge-in config (``web.voice.tts.barge_in``). ``enabled`` defaults
+    False → V2 discard behavior byte-identical (driver/wire layer). Requires
+    ``tts.enabled``; a barge-enabled but tts-unusable mount disables barge with a
+    loud ``web.voice.barge.disabled``. Numeric fields + list caps are clamped at
+    mount by ``normalize_barge_settings`` (contract §1.3)."""
+
+    enabled: bool = False
+    too_early_ms: int = 700           # suppress barges in the first N ms of speech
+    min_words: int = 2                # utterance floor
+    min_chars: int = 6                # utterance floor ("oh no" edge, reality-W8)
+    echo_threshold: float = 0.8       # echo_score ≥ this → suppress (self-hearing)
+    echo_grace_s: float = 2.0         # post-drain echo-tail window (§1.5)
+    backchannel_extra: list = field(default_factory=list)   # ≤64 entries, ≤48 chars
+    interrupt_extra: list = field(default_factory=list)     # ≤64 entries, ≤48 chars
+
+
+@dataclass
 class WebVoiceTtsConfig:
     """Streaming-TTS config for the V2 talk-back plane (``web.voice.tts``).
 
@@ -196,6 +214,7 @@ class WebVoiceTtsConfig:
     max_buffer_seconds: int = 30        # playout backpressure ceiling; clamp [5,120]
     inactivity_timeout_s: int = 180     # ElevenLabs idle window; clamp [20,180]
     zero_retention: bool = False        # True → enable_logging=false (plan-gated)
+    barge_in: BargeInConfig = field(default_factory=BargeInConfig)  # V3
 
 
 @dataclass
@@ -388,6 +407,32 @@ def _build_voice_stt(raw: Any) -> WebVoiceSttConfig:
     )
 
 
+def _build_barge_in(raw: Any) -> BargeInConfig:
+    """Hand-roll ``BargeInConfig`` (nested on tts, contract §1.3) with a
+    schema-tolerance filter. ``backchannel_extra`` / ``interrupt_extra`` are
+    kept as raw str lists here; normalization + caps happen at mount in
+    ``normalize_barge_settings``."""
+    if not isinstance(raw, dict):
+        return BargeInConfig()
+    known = BargeInConfig.__dataclass_fields__
+    filtered = {k: v for k, v in raw.items() if k in known}
+    defaults = BargeInConfig()
+
+    def _strlist(v: Any) -> list:
+        return [e for e in v if isinstance(e, str)] if isinstance(v, list) else []
+
+    return BargeInConfig(
+        enabled=bool(filtered.get("enabled", False)),
+        too_early_ms=_int(filtered.get("too_early_ms"), defaults.too_early_ms),
+        min_words=_int(filtered.get("min_words"), defaults.min_words),
+        min_chars=_int(filtered.get("min_chars"), defaults.min_chars),
+        echo_threshold=_float(filtered.get("echo_threshold"), defaults.echo_threshold),
+        echo_grace_s=_float(filtered.get("echo_grace_s"), defaults.echo_grace_s),
+        backchannel_extra=_strlist(filtered.get("backchannel_extra")),
+        interrupt_extra=_strlist(filtered.get("interrupt_extra")),
+    )
+
+
 def _build_voice_tts(raw: Any) -> WebVoiceTtsConfig:
     """Hand-roll ``WebVoiceTtsConfig`` with a schema-tolerance filter.
 
@@ -423,6 +468,7 @@ def _build_voice_tts(raw: Any) -> WebVoiceTtsConfig:
             filtered.get("inactivity_timeout_s"), defaults.inactivity_timeout_s,
         ),
         zero_retention=bool(filtered.get("zero_retention", defaults.zero_retention)),
+        barge_in=_build_barge_in(filtered.get("barge_in")),
     )
 
 
@@ -479,6 +525,14 @@ def _int(value: Any, default: int) -> int:
     """Coerce to int, falling back to ``default`` on None / bad input."""
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float(value: Any, default: float) -> float:
+    """Coerce to float, falling back to ``default`` on None / bad input."""
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 

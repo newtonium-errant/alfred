@@ -641,6 +641,23 @@ transport:
 #       max_buffer_seconds: 30        # playout backpressure ceiling; clamp [5,120]
 #       inactivity_timeout_s: 180     # ElevenLabs idle window; clamp [20,180]
 #       zero_retention: false         # true → enable_logging=false (plan-gated)
+#       # --- V3 barge-in (speak-to-interrupt) — OPTIONAL, requires tts.enabled.
+#       # enabled:false (default) = V2 half-duplex (finals while speaking are
+#       # discarded). Enabled: a qualifying utterance while Alfred speaks
+#       # interrupts playback and becomes the next turn. Two-stage commit (a
+#       # partial interrupts audio; the final re-confirms) with an echo gate so
+#       # Alfred's own voice (Bluetooth/AEC leak) can't self-interrupt. Perceived
+#       # stop latency ~0.7-1.6s (interrupt phrases faster). 3 rapid barges auto-
+#       # disable barge for the session (storm breaker).
+#       barge_in:
+#         enabled: false
+#         too_early_ms: 700           # suppress barges in the first N ms of speech
+#         min_words: 2                # utterance floor
+#         min_chars: 6                # utterance floor
+#         echo_threshold: 0.8         # echo_score ≥ this → suppress (self-hearing)
+#         echo_grace_s: 2.0           # post-drain echo-tail window
+#         interrupt_extra: []         # extra interrupt phrases (≤64, ≤48 chars ea.)
+#         backchannel_extra: []       # extra "keep going" phrases to ignore
 #
 # --- Target instance (KAL-LE / Hypatia / VERA) — relay mode ---
 # Pair this with a DEDICATED ``transport.auth.tokens.web`` entry above

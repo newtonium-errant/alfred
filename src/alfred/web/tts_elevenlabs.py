@@ -194,6 +194,10 @@ class ElevenLabsStreamProvider(TTSStreamProvider):
         # session-level event stream (spans every turn; ends on close/fatal)
         self._events: asyncio.Queue[TTSEvent | None] = asyncio.Queue()
         self._closed = False
+        # V3 (§1.2 / reg-W1): the interrupt event is created at CONSTRUCTION so
+        # request_cancel() is safe before ANY begin_turn (a no-turn cancel is a
+        # clean no-op). It breaks end_of_reply's drain and is cleared per turn.
+        self._interrupt_ev = asyncio.Event()
 
         # per-turn state
         self._turn_id = ""
@@ -227,6 +231,7 @@ class ElevenLabsStreamProvider(TTSStreamProvider):
         self._cancelled = False
         self._turn_failed = False
         self._sent_any = False
+        self._interrupt_ev.clear()   # fresh per turn (reg-W1)
         self._ws = None
         self._session = None
         self._recv_task = None
@@ -262,6 +267,13 @@ class ElevenLabsStreamProvider(TTSStreamProvider):
                 reason=TTS_ERR_NETWORK, fatal=False,
             )
             raise _HandshakeFailed(TTS_ERR_NETWORK, None) from None
+        if self._cancelled:
+            # sec-W4: a cancel landed DURING the prewarm handshake — close the
+            # freshly-opened ws + ClientSession here so they don't leak (nothing
+            # downstream will adopt them once cancelled).
+            await ws.close()
+            await session.close()
+            return
         self._session = session
         self._ws = ws
         # InitializeConnection: voice_settings ride the first message.
@@ -320,29 +332,48 @@ class ElevenLabsStreamProvider(TTSStreamProvider):
             await ws.send_str(json.dumps({"text": ""}))
         except Exception:  # noqa: BLE001 — best-effort flush
             pass
-        # V3 REVISIT (QA NOTE 2, deferred): this drain runs on the worker's
-        # sender task, so a cancel command queued behind an in-flight
-        # end_of_reply serializes behind it (≤ _END_DRAIN_S) at the PROVIDER
-        # level. The AUDIBLE interrupt is already immediate (the driver flushes
-        # the playout synchronously); only the ws teardown waits. Acceptable
-        # for V2; revisit when cancels become routine (barge-in).
+        # V3 §1.2 (resolves the V2 NOTE-2 serialization): interruptible drain —
+        # race the receiver's isFinal against the interrupt event that
+        # request_cancel() sets SYNCHRONOUSLY from the driver, so a barge/cancel
+        # breaks the ≤_END_DRAIN_S wait at once instead of serializing behind it.
+        # A drain_timeout is emitted ONLY on a genuine timeout, never when the
+        # interrupt fired (protects the 3-strike _CONSECUTIVE_FATAL latch).
         if self._recv_task is not None:
+            interrupt_wait = asyncio.ensure_future(self._interrupt_ev.wait())
             try:
-                await asyncio.wait_for(self._recv_task, _END_DRAIN_S)
-            except (asyncio.TimeoutError, TimeoutError):
+                done, _ = await asyncio.wait(
+                    {self._recv_task, interrupt_wait},
+                    timeout=_END_DRAIN_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                interrupt_wait.cancel()
+            if self._recv_task not in done and not self._cancelled:
                 self._recv_task.cancel()
                 self._events.put_nowait(TTSEvent(
                     type=EVENT_ERROR, turn_id=self._turn_id,
                     reason=TTS_ERR_NETWORK, detail="drain_timeout", fatal=False,
                 ))
-            except Exception:  # noqa: BLE001
-                pass
         await self._teardown_turn_ws()
 
     async def cancel_turn(self) -> None:
         """Abort synthesis ASAP; suppress the turn's remaining events."""
         self._cancelled = True
+        self._interrupt_ev.set()
         await self._teardown_turn_ws()
+
+    def request_cancel(self) -> None:
+        """V3 barge primitive (§1.2) — SYNC, called directly from
+        ``worker.interrupt_speech`` (never via the sender queue, which is what
+        made the V2 mechanism circular). Sets ``_cancelled`` (the recv loop
+        checks it before every put, closing the late-audio-resurrection hazard),
+        breaks the drain via ``_interrupt_ev``, and cancels a prewarm
+        ``_connect_task`` so a cancel during the handshake can't leak the ws."""
+        self._cancelled = True
+        self._interrupt_ev.set()
+        ct = self._connect_task
+        if ct is not None and not ct.done():
+            ct.cancel()
 
     # -- receive loop + keepalive -------------------------------------------
 
