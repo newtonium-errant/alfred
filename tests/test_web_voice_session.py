@@ -411,6 +411,25 @@ async def test_reaper_lazy_starts_on_first_open() -> None:
     assert mgr.reaper_alive() is False
 
 
+async def test_aclose_awaits_reaper_and_drains_bg_tasks() -> None:
+    """Shutdown drain: aclose cancels+AWAITS the reaper and awaits the
+    detached connection-state close tasks, so the loop never tears down with
+    a pending task (code-reviewer NOTE 1)."""
+    pc = FakePC()
+    mgr = _manager(pc_factory=lambda: pc, reaper_interval_seconds=30)
+    await mgr.open_session(_identity("a", 1), _OFFER_SDP)
+    assert mgr.reaper_alive() is True
+    # A failed-state change spawns a detached close task into _bg_tasks; it is
+    # still pending immediately after fire() (no await point yielded to it).
+    pc.connectionState = "failed"
+    await pc.fire("connectionstatechange")
+    bg = list(mgr._bg_tasks)
+    assert bg, "expected a detached close task from the failed-state handler"
+    await mgr.aclose()
+    assert all(t.done() for t in bg)  # aclose awaited them
+    assert mgr.reaper_alive() is False  # reaper cancelled + awaited
+
+
 # ---------------------------------------------------------------------------
 # advertised_ip SDP rewrite — pure function
 # ---------------------------------------------------------------------------

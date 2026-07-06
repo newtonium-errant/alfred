@@ -205,6 +205,9 @@ class _FakeManager:
     async def close_all(self, reason) -> None:  # on_shutdown drain (teardown)
         return None
 
+    async def aclose(self) -> None:  # on_shutdown drain (teardown)
+        return None
+
     def stop_reaper(self) -> None:
         return None
 

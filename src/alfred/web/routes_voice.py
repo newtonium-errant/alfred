@@ -304,7 +304,10 @@ def register_voice_handlers(
             mgr: VoiceSessionManager | None = _app.get(KEY_WEB_VOICE_MANAGER)
             if mgr is not None:
                 await mgr.close_all(reason="daemon_shutdown")
-                mgr.stop_reaper()
+                # aclose cancels + AWAITS the reaper and drains the detached
+                # connection-state close tasks, so shutdown never leaves a
+                # pending task ("Task was destroyed but it is pending").
+                await mgr.aclose()
 
         # Fired by run_server's ``runner.cleanup()`` (transport/server.py) —
         # zero daemon.py changes.

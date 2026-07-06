@@ -537,10 +537,31 @@ class VoiceSessionManager:
             log.info("web.voice.reaper_started", interval_s=self.reaper_interval)
 
     def stop_reaper(self) -> None:
-        """Cancel the reaper loop (called from the on_shutdown drain)."""
+        """Cancel the reaper loop (fire-and-forget cancel; :meth:`aclose`
+        awaits it on the shutdown path)."""
         if self._reaper_task is not None:
             self._reaper_task.cancel()
             self._reaper_task = None
+
+    async def aclose(self) -> None:
+        """Shutdown drain — cancel + AWAIT the reaper, then await any detached
+        connection-state close tasks.
+
+        Called from the on_shutdown hook AFTER ``close_all``. Awaiting the
+        cancelled reaper + the ``_bg_tasks`` (spawned by the
+        connectionstatechange failed/closed handlers) means the event loop
+        never tears down with pending tasks — no "Task was destroyed but it
+        is pending" noise at daemon shutdown.
+        """
+        reaper = self._reaper_task
+        self.stop_reaper()
+        if reaper is not None:
+            try:
+                await reaper
+            except asyncio.CancelledError:
+                pass
+        if self._bg_tasks:
+            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
 
     async def _reaper_loop(self) -> None:
         """Sweep every ``reaper_interval`` s; a poisoned iteration is logged
