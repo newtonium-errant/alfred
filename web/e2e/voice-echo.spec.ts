@@ -1,8 +1,11 @@
 import { expect, test } from '@playwright/test';
+import { plantSessionCookies } from './authCookies';
 
-// OPT-IN V0 voice echo smoke — NOT part of any gate. The team lead runs it after
+// OPT-IN voice ECHO smoke — NOT part of any gate. The team lead runs it after
 // integration. It proves audio actually round-trips: mic tone → WebRTC → aiortc
-// echo → browser playback.
+// echo → browser playback. (V1: the panel now shows the dictation sub-state, and
+// the echo pipeline never sends the dictation `ready`, so the "dictation isn't
+// active" notice is the EXPECTED, asserted outcome here — not a failure.)
 //
 // PREREQS (all manual — this spec does NOT start them):
 //   1. `npx playwright install chromium`   (browser binary, not pulled by npm ci)
@@ -34,11 +37,12 @@ import { expect, test } from '@playwright/test';
 // (localhost forwarding is TCP-only, microsoft/WSL#8783). This smoke MUST run its
 // Chromium INSIDE WSL2 (as configured) — same network namespace as aiortc.
 //
-// Assertion: after the panel reaches "Live", the hidden <audio> element's remote
-// MediaStream carries non-silent audio — measured via a WebAudio AnalyserNode RMS
-// over ~1.5s (a getStats() inbound-rtp bytesReceived check would need the pc
-// exposed on window, which the shipped hook deliberately does not do; RMS on the
-// received stream is a stronger end-to-end signal that echo audio truly flows).
+// Assertion: after the panel reaches live (the "● Listening" pill) AND surfaces
+// the echo-mode "dictation isn't active" notice, the hidden <audio> element's
+// remote MediaStream carries non-silent audio — measured via a WebAudio
+// AnalyserNode RMS over ~1.5s (a getStats() inbound-rtp bytesReceived check would
+// need the pc exposed on window, which the shipped hook deliberately does not do;
+// RMS on the received stream is a stronger end-to-end signal that echo flows).
 
 test('mic tone echoes back through the live voice panel', async ({ page, context, baseURL }) => {
   const token = process.env.VOICE_SMOKE_SESSION_TOKEN;
@@ -47,27 +51,8 @@ test('mic tone echoes back through the live voice panel', async ({ page, context
     'Set VOICE_SMOKE_SESSION_TOKEN (a minted dev session token) to run the voice echo smoke.',
   );
 
-  // Plant the production httpOnly session + identity cookies so the page auth gate
-  // (→ /api/auth/me → readDisplayIdentity) admits us instead of redirecting to
-  // /login. encodeURIComponent to match the BFF's serializeCookie so Next's
-  // req.cookies decode round-trips (see the AUTH note in the header).
   const url = baseURL || process.env.VOICE_SMOKE_BASE_URL || 'http://127.0.0.1:3000';
-  await context.addCookies([
-    {
-      name: 'algernon_session',
-      value: encodeURIComponent(token as string),
-      url,
-      httpOnly: true,
-      sameSite: 'Lax',
-    },
-    {
-      name: 'algernon_identity',
-      value: encodeURIComponent(JSON.stringify({ name: 'andrew', role: 'owner' })),
-      url,
-      httpOnly: true,
-      sameSite: 'Lax',
-    },
-  ]);
+  await plantSessionCookies(context, url, token as string);
 
   await page.goto('/');
 
@@ -75,9 +60,14 @@ test('mic tone echoes back through the live voice panel', async ({ page, context
   await expect(start).toBeEnabled({ timeout: 15_000 });
   await start.click();
 
-  // The pill reaches Live once the pc connects (host-candidate-only, sub-second
-  // in-netns; generous ceiling for CI-ish machines).
-  await expect(page.getByTestId('voice-status')).toContainText('Live', { timeout: 20_000 });
+  // The pill reaches live+listening once the pc connects (host-candidate-only,
+  // sub-second in-netns; generous ceiling for CI-ish machines).
+  await expect(page.getByTestId('voice-status')).toContainText('Listening', { timeout: 20_000 });
+
+  // Echo mode never sends the dictation `ready`, so after the ~5s watchdog the
+  // panel surfaces the non-fatal "dictation isn't active" notice — the EXPECTED
+  // outcome for the echo pipeline (a feature assertion, not a failure).
+  await expect(page.getByTestId('voice-dictation-unavailable')).toBeVisible({ timeout: 9_000 });
 
   // Measure received-audio energy off the hidden <audio> element's srcObject.
   const rms = await page.evaluate(async () => {

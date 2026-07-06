@@ -202,8 +202,9 @@ describe('useVoice dictation datachannel', () => {
     expect(result.current.error).toBeNull();
   });
 
-  it('no ready within the watchdog → a NON-fatal dictation-unavailable notice', async () => {
+  it('echo/absent pipeline: no ready within the watchdog → a NON-fatal notice', async () => {
     vi.useFakeTimers();
+    // Default config has no `pipeline` field ⇒ the benign path.
     const { result } = renderHook(() => useVoice({ audioRef, enabled: true, sessionKey: 'sess-1' }));
     await act(async () => {
       const p = result.current.start();
@@ -218,6 +219,32 @@ describe('useVoice dictation datachannel', () => {
     });
     expect(result.current.dictationUnavailable).toBe(true);
     expect(result.current.state).toBe('live'); // NOT a hard fail
+  });
+
+  it('assistant pipeline: no ready within the watchdog is FATAL (channel-failed)', async () => {
+    mockConfig.mockResolvedValue({
+      available: true,
+      reason: null,
+      ice_servers: [],
+      max_sessions: 2,
+      yours: [],
+      pipeline: 'assistant',
+    });
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useVoice({ audioRef, enabled: true, sessionKey: 'sess-1' }));
+    await act(async () => {
+      const p = result.current.start();
+      await vi.advanceTimersByTimeAsync(0);
+      await p;
+    });
+    act(() => lastPC().emitConnectionState('connected'));
+    expect(result.current.state).toBe('live');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(result.current.state).toBe('error');
+    expect(result.current.error?.code).toBe('channel-failed');
+    expect(h.micTrack.stop).toHaveBeenCalled(); // hot mic released
   });
 
   it('a channel close during our own hangup does not error', async () => {

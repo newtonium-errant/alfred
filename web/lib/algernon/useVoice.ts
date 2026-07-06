@@ -173,6 +173,7 @@ export function useVoice(opts: {
   const sessionIdRef = useRef<string | null>(null);
   const closingRef = useRef(false); // suppress the 'closed' event we cause ourselves
   const dictationActiveRef = useRef(false); // true once state:ready seen
+  const assistantPipelineRef = useRef(false); // config.pipeline === 'assistant'
   const currentTurnIdRef = useRef<string | null>(null);
   const currentUtteranceIdRef = useRef<string | null>(null);
   // Latest opts mirrored to refs so async closures read the current value.
@@ -206,6 +207,7 @@ export function useVoice(opts: {
   // Reset the V1 dictation surface to its empty baseline.
   const resetDictation = useCallback(() => {
     dictationActiveRef.current = false;
+    assistantPipelineRef.current = false;
     currentTurnIdRef.current = null;
     currentUtteranceIdRef.current = null;
     setVoiceTurnState('listening');
@@ -504,6 +506,10 @@ export function useVoice(opts: {
       fail('voice-disabled');
       return;
     }
+    // Only the assistant pipeline streams to cloud STT + emits dictation `ready`,
+    // so only then is a missing/dead dictation channel fatal (CONTRACT §17b).
+    // Echo / absent field ⇒ the benign dictation-unavailable path.
+    assistantPipelineRef.current = config.pipeline === 'assistant';
 
     // 2. Mic — the tap that got us here is the gesture; constraints are hints
     //    (unsupported ones don't throw).
@@ -586,14 +592,17 @@ export function useVoice(opts: {
         if (stateRef.current === 'connecting' || stateRef.current === 'live') {
           setState('live');
         }
-        // Dictation-ready watchdog. If the server never confirms dictation (echo
-        // pipeline, or a dead dictation pipeline) surface a NON-fatal notice — the
-        // audio session stays up, the transcript just never populates.
+        // Dictation-ready watchdog. If the server never confirms dictation:
+        //  - assistant pipeline ⇒ FATAL 'channel-failed' (a hot mic is streaming to
+        //    cloud STT with no visible transcript — the privacy hazard, CONTRACT §17b);
+        //  - echo / absent pipeline ⇒ a NON-fatal notice (the audio session stays up).
         if (!dcReadyRef.current && !dictationActiveRef.current) {
           dcReadyRef.current = setTimeout(() => {
             dcReadyRef.current = null;
             if (genRef.current !== gen || closingRef.current) return;
-            if (!dictationActiveRef.current) setDictationUnavailable(true);
+            if (dictationActiveRef.current) return;
+            if (assistantPipelineRef.current) fail('channel-failed');
+            else setDictationUnavailable(true);
           }, DC_READY_TIMEOUT_MS);
         }
       } else if (cs === 'failed') {
