@@ -9,7 +9,8 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "smoke:voice": "playwright test -c playwright.voice.config.ts"
+    "smoke:voice": "playwright test -c playwright.voice.config.ts e2e/voice-echo.spec.ts",
+    "smoke:voice:dictation": "playwright test -c playwright.voice.config.ts e2e/voice-dictation.spec.ts"
   },
   "dependencies": {
     "class-variance-authority": "^0.7.1",

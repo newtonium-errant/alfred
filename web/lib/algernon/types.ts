@@ -178,6 +178,11 @@ export interface VoiceConfigResponse {
   ice_servers: VoiceIceServer[];
   max_sessions: number;
   yours: VoiceSessionSummary[];
+  // V1 (CONTRACT §17b, additive): which server pipeline is active. Only
+  // 'assistant' streams to cloud STT and emits the dictation `ready` — so only
+  // then is a missing/dead dictation channel FATAL. Absent (older backend) or
+  // 'echo' ⇒ the benign dictation-unavailable path. Tolerate absence.
+  pipeline?: 'echo' | 'assistant';
 }
 
 // POST /voice/offer → the SDP answer + server-minted id. `expires_at` is
