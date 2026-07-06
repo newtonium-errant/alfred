@@ -214,7 +214,25 @@ export const voiceDcEventSchema = z.discriminatedUnion('type', [
     reply_chars: z.number().optional(),
     truncated: z.boolean().optional(),
   }),
+  // --- V2 streaming TTS talk-back (ADDITIVE — VOICE-V2-CONTRACT §1.1). Old V1
+  //     clients console.debug-drop these three (harmless: tts only fires when the
+  //     server has it enabled). The shipped `state` enum stays UNTOUCHED — these
+  //     are their OWN types, not state-enum extensions.
+  z.object({ v: dcVersion, type: z.literal('speaking_started'), turn_id: z.string() }),
+  z.object({
+    v: dcVersion,
+    type: z.literal('speaking_done'),
+    turn_id: z.string(),
+    // Opaque bounded reason ('drained'|'cancelled'|'error' expected) — NOT z.enum,
+    // so a future value (e.g. a V3 'barged_in') degrades to an unknown string
+    // rather than a dropped frame.
+    reason: z.string().max(64).optional(),
+  }),
+  // Half-duplex: an utterance final arriving while the assistant is speaking is
+  // discarded server-side; this is the honest "heard you, hold on" notice.
+  z.object({ v: dcVersion, type: z.literal('utterance_discarded'), utterance_id: z.string() }),
   // No `stt_error` — an unrecoverable STT death is error{code:'stt_unavailable'}.
+  // A non-fatal TTS degrade is error{code:'tts_unavailable'} (its own FE branch).
   z.object({
     v: dcVersion,
     type: z.literal('error'),

@@ -329,3 +329,180 @@ describe('useVoice dictation datachannel', () => {
     expect(dc.readyState).toBe('closed');
   });
 });
+
+describe('useVoice speaking lifecycle (V2 TTS talk-back)', () => {
+  // Reach 'speaking': live → dictation ready → a turn whose reply is streaming AND
+  // whose TTS playout has started.
+  async function goSpeaking(opts: { onTurnFinal?: () => Promise<boolean> } = {}) {
+    const rendered = await goLive(opts);
+    const { dc } = rendered;
+    activateDictation(dc);
+    emit(dc, { type: 'turn_started', turn_id: 't1' });
+    emit(dc, { type: 'turn_text', turn_id: 't1', seq: 0, text: 'You have ' });
+    emit(dc, { type: 'speaking_started', turn_id: 't1' });
+    return rendered;
+  }
+
+  it('speaking_started → speaking; turn_text WHILE speaking keeps speaking + accumulates', async () => {
+    const { result, dc } = await goSpeaking();
+    expect(result.current.voiceTurnState).toBe('speaking');
+    emit(dc, { type: 'turn_text', turn_id: 't1', seq: 1, text: 'two meetings.' });
+    expect(result.current.voiceTurnState).toBe('speaking'); // no ping-pong back to replying
+    expect(result.current.replyText).toBe('You have two meetings.');
+  });
+
+  it('turn_final while speaking stays speaking; onTurnFinal fires + reply adopts', async () => {
+    const onTurnFinal = vi.fn().mockResolvedValue(true);
+    const { result, dc } = await goSpeaking({ onTurnFinal });
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'You have two meetings.' }));
+      await Promise.resolve();
+    });
+    expect(onTurnFinal).toHaveBeenCalledTimes(1);
+    expect(result.current.voiceTurnState).toBe('speaking'); // audio still playing
+    expect(result.current.replyText).toBe(''); // adopted into the thread
+    expect(result.current.canCancel).toBe(false);
+  });
+
+  it('speaking_done after turn_final → listening', async () => {
+    const onTurnFinal = vi.fn().mockResolvedValue(true);
+    const { result, dc } = await goSpeaking({ onTurnFinal });
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'r' }));
+      await Promise.resolve();
+    });
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'drained' });
+    expect(result.current.voiceTurnState).toBe('listening');
+  });
+
+  it('speaking_done BEFORE turn_final → replying, then turn_final → listening', async () => {
+    const { result, dc } = await goSpeaking();
+    emit(dc, { type: 'speaking_done', turn_id: 't1' });
+    expect(result.current.voiceTurnState).toBe('replying'); // text still in flight
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'r' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('listening');
+  });
+
+  it('a turn with NO speaking events → turn_final → listening (V1 byte-identical pin)', async () => {
+    const onTurnFinal = vi.fn().mockResolvedValue(true);
+    const { result, dc } = await goLive({ onTurnFinal });
+    activateDictation(dc);
+    emit(dc, { type: 'turn_started', turn_id: 't1' });
+    emit(dc, { type: 'turn_text', turn_id: 't1', seq: 0, text: 'text reply' });
+    expect(result.current.voiceTurnState).toBe('replying');
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'text reply' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('listening');
+  });
+
+  it('speaking_started arriving AFTER turn_final → speaking → listening', async () => {
+    const onTurnFinal = vi.fn().mockResolvedValue(true);
+    const { result, dc } = await goLive({ onTurnFinal });
+    activateDictation(dc);
+    emit(dc, { type: 'turn_started', turn_id: 't1' });
+    emit(dc, { type: 'turn_text', turn_id: 't1', seq: 0, text: 'short' });
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'short' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('listening');
+    emit(dc, { type: 'speaking_started', turn_id: 't1' }); // audio starts after text done
+    expect(result.current.voiceTurnState).toBe('speaking');
+    emit(dc, { type: 'speaking_done', turn_id: 't1' });
+    expect(result.current.voiceTurnState).toBe('listening');
+  });
+
+  it('turn_cancelled mid-speaking → listening; a stray speaking_done is a no-op', async () => {
+    const { result, dc } = await goSpeaking();
+    emit(dc, { type: 'state', state: 'turn_cancelled', turn_id: 't1' });
+    expect(result.current.voiceTurnState).toBe('listening');
+    expect(result.current.replyText).toBe('');
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'cancelled' }); // stale/dup
+    expect(result.current.voiceTurnState).toBe('listening'); // idempotent, unchanged
+  });
+
+  it('error{tts_unavailable} is non-destructive (its OWN branch, not the generic one)', async () => {
+    const { result, dc } = await goLive();
+    activateDictation(dc);
+    emit(dc, { type: 'turn_started', turn_id: 't1' });
+    emit(dc, { type: 'turn_text', turn_id: 't1', seq: 0, text: 'streaming reply' });
+    expect(result.current.voiceTurnState).toBe('replying');
+    emit(dc, { type: 'error', code: 'tts_unavailable', detail: 'tier' });
+    expect(result.current.ttsUnavailable).toBe(true);
+    expect(result.current.state).toBe('live');
+    expect(result.current.replyText).toBe('streaming reply'); // NOT cleared
+    expect(result.current.voiceTurnState).toBe('replying'); // unchanged
+    expect(result.current.turnError).toBeNull();
+  });
+
+  it('speaking_started clears a prior tts-unavailable notice (self-heal)', async () => {
+    const { result, dc } = await goLive();
+    activateDictation(dc);
+    emit(dc, { type: 'error', code: 'tts_unavailable' });
+    expect(result.current.ttsUnavailable).toBe(true);
+    emit(dc, { type: 'turn_started', turn_id: 't1' });
+    emit(dc, { type: 'speaking_started', turn_id: 't1' });
+    expect(result.current.ttsUnavailable).toBe(false);
+  });
+
+  it('utterance_discarded shows the honest notice; cleared when speaking ends', async () => {
+    const { result, dc } = await goSpeaking();
+    emit(dc, { type: 'utterance_discarded', utterance_id: 'u9' });
+    expect(result.current.discardNotice).toBe(true);
+    emit(dc, { type: 'speaking_done', turn_id: 't1' });
+    expect(result.current.discardNotice).toBe(false);
+  });
+
+  it('toggleSpeakerMute flips the audio element .muted (client-local)', async () => {
+    const { result } = await goSpeaking();
+    expect(h.audioEl.muted).toBe(false);
+    act(() => result.current.toggleSpeakerMute());
+    expect(h.audioEl.muted).toBe(true);
+    expect(result.current.speakerMuted).toBe(true);
+    act(() => result.current.toggleSpeakerMute());
+    expect(h.audioEl.muted).toBe(false);
+    expect(result.current.speakerMuted).toBe(false);
+  });
+
+  it('hangup resets speaker mute AND unmutes the audio element (and no-ops when idle)', async () => {
+    const { result } = await goSpeaking();
+    act(() => result.current.toggleSpeakerMute());
+    expect(h.audioEl.muted).toBe(true);
+    act(() => result.current.hangup());
+    expect(result.current.speakerMuted).toBe(false);
+    expect(h.audioEl.muted).toBe(false);
+    expect(result.current.state).toBe('idle');
+    act(() => result.current.toggleSpeakerMute()); // idle → no-op
+    expect(h.audioEl.muted).toBe(false);
+  });
+
+  it('canCancel gates the cancel frame: sent during the turn, silent post-final', async () => {
+    const { result, dc } = await goSpeaking();
+    expect(result.current.canCancel).toBe(true);
+    dc.sent.length = 0;
+    act(() => result.current.cancelTurn());
+    expect(dc.sent).toHaveLength(1);
+    expect(JSON.parse(dc.sent[0])).toEqual({ v: 1, type: 'cancel', turn_id: 't1' });
+    // Post-final playout: the turn id is cleared → cancel is a no-op (honest control).
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'r' }));
+      await Promise.resolve();
+    });
+    expect(result.current.canCancel).toBe(false);
+    dc.sent.length = 0;
+    act(() => result.current.cancelTurn());
+    expect(dc.sent).toHaveLength(0);
+  });
+
+  it('unmount mid-speaking keeps the hot-mic pin green', async () => {
+    const { dc, unmount } = await goSpeaking();
+    unmount();
+    expect(h.micTrack.stop).toHaveBeenCalled();
+    expect(dc.readyState).toBe('closed');
+  });
+});

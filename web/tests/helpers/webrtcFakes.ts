@@ -155,8 +155,8 @@ export interface VoiceGlobals {
   micTrack: FakeTrack;
   getUserMedia: ReturnType<typeof vi.fn>;
   fetchMock: ReturnType<typeof vi.fn>;
-  audioEl: { srcObject: unknown; play: ReturnType<typeof vi.fn> };
-  audioRef: { current: { srcObject: unknown; play: ReturnType<typeof vi.fn> } };
+  audioEl: { srcObject: unknown; muted: boolean; play: ReturnType<typeof vi.fn> };
+  audioRef: { current: { srcObject: unknown; muted: boolean; play: ReturnType<typeof vi.fn> } };
   setPlay: (resolves: boolean) => void;
 }
 
@@ -174,7 +174,9 @@ export function installVoiceGlobals(): VoiceGlobals {
   const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
   (global as unknown as { fetch: unknown }).fetch = fetchMock;
 
-  const audioEl = { srcObject: null as unknown, play: vi.fn().mockResolvedValue(undefined) };
+  // `muted` is the ONLY new element property V2 touches (speaker-mute); no pause,
+  // no sample content — the fakes stay state/property-only.
+  const audioEl = { srcObject: null as unknown, muted: false, play: vi.fn().mockResolvedValue(undefined) };
   const audioRef = { current: audioEl };
   const setPlay = (resolves: boolean) => {
     audioEl.play = resolves

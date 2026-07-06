@@ -171,6 +171,32 @@ describe('voiceDcEventSchema (canonical D2 vocabulary)', () => {
     expect(r.success).toBe(true);
     if (r.success) expect('future' in r.data).toBe(false);
   });
+
+  // --- V2 additive TTS talk-back events ---
+  it('accepts the three additive V2 events with v:1', () => {
+    expect(ok({ v: 1, type: 'speaking_started', turn_id: 't1' })).toBe(true);
+    expect(ok({ v: 1, type: 'speaking_done', turn_id: 't1' })).toBe(true); // reason optional
+    expect(ok({ v: 1, type: 'speaking_done', turn_id: 't1', reason: 'drained' })).toBe(true);
+    expect(ok({ v: 1, type: 'speaking_done', turn_id: 't1', reason: 'barged_in' })).toBe(true); // opaque, not enum
+    expect(ok({ v: 1, type: 'utterance_discarded', utterance_id: 'u1' })).toBe(true);
+  });
+
+  it('rejects the V2 events without v:1', () => {
+    expect(ok({ type: 'speaking_started', turn_id: 't1' })).toBe(false);
+    expect(ok({ v: 1, type: 'speaking_started' })).toBe(false); // missing turn_id
+    expect(ok({ v: 1, type: 'utterance_discarded' })).toBe(false); // missing utterance_id
+  });
+
+  it('strips unknown keys on the V2 events (non-strict, forward-compat)', () => {
+    const r = voiceDcEventSchema.safeParse({
+      v: 1,
+      type: 'speaking_started',
+      turn_id: 't1',
+      word_timings: [1, 2],
+    });
+    expect(r.success).toBe(true);
+    if (r.success) expect('word_timings' in r.data).toBe(false);
+  });
 });
 
 describe('client frame builders', () => {
