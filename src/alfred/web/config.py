@@ -165,6 +165,40 @@ class WebVoiceSttConfig:
 
 
 @dataclass
+class WebVoiceTtsConfig:
+    """Streaming-TTS config for the V2 talk-back plane (``web.voice.tts``).
+
+    ``enabled`` defaults False → the V1 path is byte-identical (stock silence
+    outbound source, no TTS worker). Invalid config DEGRADES voice to text-only
+    (``web.voice.disabled_tts``) — it NEVER unmounts ``/voice/*`` (TTS is an
+    enhancement, unlike STT which is the product; contract §1.4/§1.13).
+
+    ``provider`` is lowercased/stripped but NOT coalesced on unknown values so
+    the mount gate can log the raw typo. ``elevenlabs`` needs a resolved
+    ``api_key``; ``fake`` needs no key (keyless dev/test). ``output_format`` /
+    ``max_tts_chars_per_turn`` / ``max_buffer_seconds`` / ``inactivity_timeout_s``
+    are clamped at mount by ``normalize_tts_settings``.
+
+    EGRESS (contract §1.14): enabling this streams every assistant VOICE REPLY
+    (only the reply sentence chunks — never system prompt / vault context /
+    user text) to the TTS provider. A per-instance decision — Salem accepted;
+    VERA / sovereign instances must NOT enable it.
+    """
+
+    enabled: bool = False
+    provider: str = ""                  # "" = unconfigured; "elevenlabs" | "fake"
+    api_key: str = ""                   # ${ELEVENLABS_API_KEY}
+    model: str = "eleven_flash_v2_5"
+    voice: str = "Rachel"               # friendly name or raw id (telegram.tts.resolve_voice_id)
+    output_format: str = "pcm_24000"    # clamp → pcm_16000|22050|24000|44100
+    auto_mode: bool = True              # sentence-triggered generation
+    max_tts_chars_per_turn: int = 4096  # per-turn spoken cap; clamp [200,20000]
+    max_buffer_seconds: int = 30        # playout backpressure ceiling; clamp [5,120]
+    inactivity_timeout_s: int = 180     # ElevenLabs idle window; clamp [20,180]
+    zero_retention: bool = False        # True → enable_logging=false (plan-gated)
+
+
+@dataclass
 class WebVoiceConfig:
     """Typed config for the WebRTC voice surface (``web.voice``).
 
@@ -197,6 +231,7 @@ class WebVoiceConfig:
     reaper_interval_seconds: int = 15
     ice: VoiceIceConfig = field(default_factory=VoiceIceConfig)
     stt: WebVoiceSttConfig = field(default_factory=WebVoiceSttConfig)
+    tts: WebVoiceTtsConfig = field(default_factory=WebVoiceTtsConfig)
 
 
 @dataclass
@@ -353,13 +388,52 @@ def _build_voice_stt(raw: Any) -> WebVoiceSttConfig:
     )
 
 
+def _build_voice_tts(raw: Any) -> WebVoiceTtsConfig:
+    """Hand-roll ``WebVoiceTtsConfig`` with a schema-tolerance filter.
+
+    Mirrors ``_build_voice_stt`` — dict guard, ``__dataclass_fields__`` filter,
+    ``_int`` / ``bool`` coercions. ``provider`` is lowercased/stripped but NOT
+    coalesced on unknown values so the mount gate can log the raw typo.
+    ``api_key`` env substitution rides the module-wide ``substitute_env_in_value``
+    already applied at ``load_from_unified``; ``_is_unresolved`` recognises an
+    unset/empty ``${ELEVENLABS_API_KEY}`` at the mount gate.
+    """
+    if not isinstance(raw, dict):
+        return WebVoiceTtsConfig()
+    known = WebVoiceTtsConfig.__dataclass_fields__
+    filtered = {k: v for k, v in raw.items() if k in known}
+    defaults = WebVoiceTtsConfig()
+    return WebVoiceTtsConfig(
+        enabled=bool(filtered.get("enabled", False)),
+        provider=str(filtered.get("provider", "") or "").strip().lower(),
+        api_key=str(filtered.get("api_key", "") or ""),
+        model=str(filtered.get("model", defaults.model) or defaults.model),
+        voice=str(filtered.get("voice", defaults.voice) or defaults.voice),
+        output_format=str(filtered.get("output_format", defaults.output_format)
+                          or defaults.output_format).strip().lower(),
+        auto_mode=bool(filtered.get("auto_mode", defaults.auto_mode)),
+        max_tts_chars_per_turn=_int(
+            filtered.get("max_tts_chars_per_turn"),
+            defaults.max_tts_chars_per_turn,
+        ),
+        max_buffer_seconds=_int(
+            filtered.get("max_buffer_seconds"), defaults.max_buffer_seconds,
+        ),
+        inactivity_timeout_s=_int(
+            filtered.get("inactivity_timeout_s"), defaults.inactivity_timeout_s,
+        ),
+        zero_retention=bool(filtered.get("zero_retention", defaults.zero_retention)),
+    )
+
+
 def _build_voice(raw: Any) -> WebVoiceConfig:
     """Hand-roll ``WebVoiceConfig`` with a schema-tolerance filter.
 
     Mirrors ``_build_auth`` — isinstance-dict guard, ``__dataclass_fields__``
     filter, ``_int`` coercion for the timeouts / cap, and nested hand-rolled
-    ``ice`` + ``stt`` blocks (NO ``_build`` / ``_DATACLASS_MAP`` — this module
-    hand-rolls everything to sidestep the key-name collision footgun).
+    ``ice`` + ``stt`` + ``tts`` blocks (NO ``_build`` / ``_DATACLASS_MAP`` —
+    this module hand-rolls everything to sidestep the key-name collision
+    footgun).
     """
     if not isinstance(raw, dict):
         return WebVoiceConfig()
@@ -397,6 +471,7 @@ def _build_voice(raw: Any) -> WebVoiceConfig:
         ),
         ice=_build_voice_ice(filtered.get("ice")),
         stt=_build_voice_stt(filtered.get("stt")),
+        tts=_build_voice_tts(filtered.get("tts")),
     )
 
 

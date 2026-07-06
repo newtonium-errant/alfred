@@ -244,3 +244,100 @@ script; then idle + `web.voice.stt.script_exhausted`).
 | `web.voice.utterance_superseded` | latest-wins queue replaced a pending utterance |
 | `web.voice.turn_complete` / `.engine_error` / `.turn_session_gone` / `.turn_slot_timeout` | turn outcomes |
 | `web.voice.driver_closed` | turn driver teardown (carries aggregate drop counts) |
+
+---
+
+## V2 — TTS talk-back (streaming spoken reply)
+
+`web.voice.tts.enabled: true` (on top of `pipeline: assistant`) makes Alfred
+**speak** its reply: as `run_turn_streaming` yields sentence chunks, they feed a
+streaming TTS provider (ElevenLabs `eleven_flash_v2_5` over a per-turn
+WebSocket); the synthesized PCM streams back over the SAME outbound WebRTC track
+the V1 silence source used. **Half-duplex** — Alfred listens OR speaks, not both.
+
+**Default-OFF and merged inert**: `tts.enabled: false` is the default and keeps
+V1 byte-identical (stock 8 kHz silence outbound, no TTS worker). TTS is an
+*enhancement* — an absent / disabled / misconfigured / keyless tts block
+**degrades voice to text-only** (loud `web.voice.disabled_tts reason=...`); it
+NEVER unmounts `/voice/*` (unlike STT, which is the product). A fatal TTS error
+mid-session degrades to text-only + one `tts_unavailable` DC event — the session
+LIVES (asymmetry vs STT's fail-honest close: the text reply plane is fully
+functional).
+
+### The outbound track is the playout source (no runtime swap)
+
+When tts is enabled the outbound track is a `TTSPlayoutSource` for the whole
+session — one constant frame spec (`s16 / mono / 48000 Hz / 960-sample`),
+silence-fill when idle, speech when queued. pts is a running sample counter
+assigned at emission (`+960` every frame, silence and speech alike); `flush()`
+drops queued audio but never touches the counter → monotonic by construction, so
+the V1→V2 pts/format-continuity hazard is satisfied without any mid-stream swap.
+
+### Egress posture (per-instance decision — read before enabling)
+
+Enabling tts sends **every assistant voice reply** — and ONLY the reply sentence
+chunks, never the system prompt / vault context / user text — to
+`api.elevenlabs.io` for that instance.
+
+- **Salem** = accepted residual (single-operator, the owner's own replies).
+- **VERA / sovereign voice** = do **NOT** enable tts (keep the reply plane local).
+
+`zero_retention: true` requests `enable_logging=false` (plan-gated at
+ElevenLabs; default `false` inherits their logging default — ratify at deploy).
+
+### Cost honesty
+
+`eleven_flash_v2_5` ≈ **0.5 credits/char** ≈ **$40-99/mo at 30-60 min/day of
+spoken replies** — ElevenLabs dominates the voice bill (far above Deepgram STT).
+**CHECK YOUR KEY TIER before activation** — the free tier lasts ≈ days of real
+use. Cost is bounded per turn by `max_tts_chars_per_turn` (default 4000 chars ≈
+4 min of speech) and per session by `max_session_seconds`.
+
+### Self-hearing / AEC caveats
+
+Half-duplex relies on the browser's acoustic echo canceller (AEC) as line one +
+a **server-side gate** as the backstop: while Alfred is speaking, an utterance
+final is DISCARDED (`utterance_discarded` DC event; the transcript still shows
+what was heard). Notes for the runbook:
+
+- **First-exchange echo leak is EXPECTED.** Safari AEC needs ~2-5 s to adapt;
+  early replies may briefly transcribe Alfred's own voice as a discarded final.
+  Not a bug — the server gate prevents a self-conversation loop.
+- **Speakerphone / Bluetooth / non-default output routing** can escape AEC →
+  more `utterance_discarded` events. Prefer the PWA's PC-fed audio element (the
+  well-cancelled path). On iOS check the output route + volume if replies are
+  inaudible.
+
+### Cartesia seam (not built)
+
+The `TTSStreamProvider` ABC maps 1:1 onto Cartesia Sonic (begin_turn→context_id,
+feed_text→transcript+continue, end_of_reply→flush, `interrupt_speech`→cancel,
+native `pcm_s16le`). Adding it = a new `tts_cartesia.py` + one
+`_KNOWN_TTS_PROVIDERS` entry + one factory case; zero changes to the
+worker/playout/driver/config shape.
+
+### V2 observability (grep these — NO reply text, chars/bytes/ms/status only)
+
+| Event | Meaning |
+|---|---|
+| `web.voice.registered tts_provider=` | tts mounted alongside the assistant pipeline |
+| `web.voice.disabled_tts reason=not_enabled\|tts_unconfigured\|unknown_tts_provider\|tts_key_missing` | tts off / misconfigured → voice mounts text-only |
+| `web.voice.tts.config_clamped` | a tts setting was clamped at mount |
+| `web.voice.tts.worker_started` / `.worker_closed` | TTS worker lifecycle (close summary carries turns/chars/audio counts) |
+| `web.voice.tts.connected` / `.turn_done` | per-turn ws connect / turn synthesized |
+| `web.voice.tts.turn_capped` | per-turn spoken cap hit (fed prefix still speaks) |
+| `web.voice.tts.turn_degraded` | a transient (network/rate-limit) per-turn failure (retry next turn) |
+| `web.voice.tts.latched_off` / `.degraded_text_only` | auth/bad-request or 3 consecutive failures → TTS off for the session (session LIVES) |
+| `web.voice.tts.interrupted` / `.flush` | audio-plane cancel (client cancel / new-turn / engine-error / teardown) |
+| `web.voice.tts.feed_overflow` / `.backpressure`/`.underrun` | text-queue drop-newest / playout buffer pressure |
+| `web.voice.utterance_discarded_speaking` | half-duplex gate dropped a final while speaking |
+
+### Config + deploy
+
+Set `web.voice.tts.enabled: true` + the `web.voice.tts` block (see
+`config.yaml.example`); `ELEVENLABS_API_KEY` must be in the box `.env`. The
+media-plane deploy is UNCHANGED from V0/V1 (the outbound track already existed).
+Dev smoke is keyless via `provider: fake` (a 440 Hz tone proportional to the
+reply, audible through the real WebRTC/Opus path). Real ElevenLabs is validated
+by a one-turn live gate test (`ELEVENLABS_API_KEY` present) and at box
+activation.

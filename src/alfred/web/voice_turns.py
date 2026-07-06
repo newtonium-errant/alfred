@@ -112,6 +112,19 @@ class VoiceTurnDriver:
         # ONLY after a live datachannel is confirmed (contract §17b).
         self._hello_callbacks: list[Callable[[], None]] = []
 
+        # V2 TTS talk-back plane (all None-safe when no worker is attached →
+        # V1 behaviour byte-identical). ``_speaking_turn_id`` is the half-duplex
+        # gate (contract §1.9): utterance finals arriving while it is set are
+        # discarded. ``_tts_off_session`` latches TTS off on a fatal provider
+        # error (§1.4); TTS failure NEVER closes the session.
+        self._tts: Any = None
+        self._tts_max_chars = 4096
+        self._speaking_turn_id: str | None = None
+        self._tts_off_session = False
+        self._tts_error_emitted = False
+        self._tts_chars_fed = 0
+        self._tts_capped = False
+
         # observability latches / counters
         self._drops: dict[str, int] = {}
         self._unknown_types_logged: set[str] = set()
@@ -217,10 +230,95 @@ class VoiceTurnDriver:
             return
         # Clear any queued utterance (walkie-talkie "never mind").
         self._pending = None
+        # Audio dies FIRST — the user must never hear stale speech after
+        # cancelling; then the CancelledError branch emits turn_cancelled
+        # (ordering pinned: speaking_done → turn_cancelled).
+        self.interrupt_speech("client_cancel")
         if self._current_task is not None and not self._current_task.done():
             self._current_task.cancel()
         else:
             log.info("web.voice.cancel_noop", voice_session_id=self._vid)
+
+    # -- V2 TTS seam (talk-back plane) --------------------------------------
+
+    def attach_tts(self, worker: Any) -> None:
+        """Late-attach the TTS worker (mirrors :meth:`attach_channel`); wired in
+        ``_wire_media`` once the playout source exists. None-safe everywhere —
+        absent worker ⇒ V1 behaviour byte-identical."""
+        self._tts = worker
+        self._tts_max_chars = getattr(worker, "max_chars_per_turn", 4096)
+
+    def on_speaking_started(self, turn_id: str) -> None:
+        """Worker callback — first TTS audio enqueued for ``turn_id`` (sets the
+        half-duplex gate + emits the distinct-type DC event, contract §1.1)."""
+        self._speaking_turn_id = turn_id
+        self.emit({
+            "v": EVENT_VERSION, "type": "speaking_started", "turn_id": turn_id,
+        })
+
+    def on_speaking_done(self, turn_id: str, reason: str) -> None:
+        """Worker callback — playout for ``turn_id`` drained / cancelled /
+        errored. Clears the gate + emits ``speaking_done`` (paired 1:1 with
+        ``speaking_started``; guarded against a double-emit)."""
+        if self._speaking_turn_id != turn_id:
+            return
+        self._speaking_turn_id = None
+        self.emit({
+            "v": EVENT_VERSION, "type": "speaking_done",
+            "turn_id": turn_id, "reason": reason,
+        })
+
+    def on_tts_fatal(self, ev: Any) -> None:
+        """Worker callback — TTS latched off for the session (auth/bad-request,
+        or 3 consecutive transient failures, contract §1.4). Emits
+        ``tts_unavailable`` ONCE; the session LIVES (text-only degrade)."""
+        self._tts_off_session = True
+        if self._speaking_turn_id is not None:
+            # Fail-open the half-duplex gate — a lost done must not deafen us.
+            done_turn = self._speaking_turn_id
+            self._speaking_turn_id = None
+            self.emit({
+                "v": EVENT_VERSION, "type": "speaking_done",
+                "turn_id": done_turn, "reason": "error",
+            })
+        if not self._tts_error_emitted:
+            self._tts_error_emitted = True
+            self._emit_error("tts_unavailable", detail=getattr(ev, "reason", ""))
+        log.warning(
+            "web.voice.tts.degraded_text_only", voice_session_id=self._vid,
+            reason=getattr(ev, "reason", ""),
+        )
+
+    def interrupt_speech(self, reason: str) -> None:
+        """The single audio-plane cancel funnel (contract §1.7) — SYNC, callable
+        from await-free contexts. Flushes the worker's playout (via the worker's
+        own flush-first-then-abort primitive) and emits ``speaking_done`` if a
+        turn was mid-speech. Call sites: client cancel, CancelledError branch,
+        engine-error branch, new-turn stale-audio flush, aclose. **V3 barge-in
+        calls this exact function** from :meth:`_utterance_while_speaking`."""
+        if self._tts is not None:
+            self._tts.interrupt_speech(reason)
+        if self._speaking_turn_id is not None:
+            done_turn = self._speaking_turn_id
+            self._speaking_turn_id = None
+            self.emit({
+                "v": EVENT_VERSION, "type": "speaking_done",
+                "turn_id": done_turn, "reason": "cancelled",
+            })
+
+    def _utterance_while_speaking(self, utterance_id: str, text: str) -> None:
+        """THE V3 policy seam (contract §1.9) — the SOLE decision point for a
+        final arriving while a turn is speaking. V2 (half-duplex): discard +
+        notice, do NOT queue. V3 (barge-in): swap this body to
+        ``interrupt_speech("barge_in")`` + re-submit."""
+        log.info(
+            "web.voice.utterance_discarded_speaking",
+            voice_session_id=self._vid, utterance_id=utterance_id,
+        )
+        self.emit({
+            "v": EVENT_VERSION, "type": "utterance_discarded",
+            "utterance_id": utterance_id,
+        })
 
     # -- facet-1 seam (STT worker callbacks) --------------------------------
 
@@ -246,6 +344,14 @@ class VoiceTurnDriver:
                 "web.voice.utterance_after_close",
                 voice_session_id=self._vid, utterance_id=uid,
             )
+            return
+        # Half-duplex gate (contract §1.9): a final arriving WHILE a turn is
+        # speaking is discarded (browser AEC needs 2-5 s to adapt; first-
+        # exchange echo leak is expected). stt_final was still emitted above
+        # (transcript honesty). The queue / latest-wins path is untouched when
+        # nothing is playing (LLM-thinking window = genuine speech).
+        if self._speaking_turn_id is not None:
+            self._utterance_while_speaking(uid, text)
             return
         if self._pending is not None:
             dropped_id = self._pending[0]
@@ -296,6 +402,14 @@ class VoiceTurnDriver:
         turn_id = ""
         self._current_turn_id = None
 
+        # New-turn stale-audio flush: a previous turn's audio may still be
+        # draining (playout lags text; the inflight slot released at stream
+        # end). Latest-wins in the audio plane matches the walkie-talkie intent.
+        if self._speaking_turn_id is not None:
+            self.interrupt_speech("new_turn")
+        self._tts_chars_fed = 0
+        self._tts_capped = False
+
         reserved = await self._reserve_inflight()
         if not reserved:
             self._emit_error("turn_slot_timeout", utterance_id=utterance_id)
@@ -327,8 +441,17 @@ class VoiceTurnDriver:
                 "utterance_id": utterance_id, "session_key": d.chat_session_key,
                 "ts": _now_iso(),
             })
+            # Pre-warm the TTS provider WS so the ~150-400 ms connect hides in
+            # the LLM's turn_started→first-sentence gap (contract §1.3).
+            if self._tts is not None and not self._tts_off_session:
+                self._tts.begin_turn(turn_id)
 
             reply = await self._drive_stream(turn_id, session_obj, text)
+
+            # Flush the TTS turn (force final generation + drain) — only on a
+            # SUCCESSFUL stream (never on error/cancel — those interrupt).
+            if self._tts is not None and not self._tts_off_session:
+                self._tts.end_of_reply(turn_id)
 
             transcript = session_obj.transcript or []
             assistant_ts = transcript[-1].get("_ts", "") if transcript else ""
@@ -336,24 +459,37 @@ class VoiceTurnDriver:
                 transcript[pre_len].get("_ts", "")
                 if len(transcript) > pre_len else ""
             )
-            self.emit({
+            final_event: dict[str, Any] = {
                 "v": EVENT_VERSION, "type": "turn_final", "turn_id": turn_id,
                 "reply": reply, "ts": assistant_ts, "user_ts": user_ts,
                 "reply_chars": len(reply or ""), "truncated": False,
-            })
+            }
+            if self._tts is not None:
+                # Additive spoken-vs-shown delta (contract §1 turn-facet); old
+                # FEs strip these unknown keys.
+                final_event["tts_chars"] = self._tts_chars_fed
+                final_event["tts_capped"] = self._tts_capped
+            self.emit(final_event)
             log.info(
                 "web.voice.turn_complete",
                 voice_session_id=self._vid, turn_id=turn_id,
                 reply_chars=len(reply or ""),
             )
         except asyncio.CancelledError:
-            # Best-effort — the channel is usually already dead on teardown.
+            # Audio dies first (idempotent if _on_cancel already flushed), then
+            # the turn_cancelled state — ordering pinned speaking_done →
+            # turn_cancelled. Covers teardown-initiated cancels (aclose path)
+            # where _on_cancel never ran.
+            self.interrupt_speech("turn_cancelled")
             self.emit({
                 "v": EVENT_VERSION, "type": "state", "state": "turn_cancelled",
                 "turn_id": turn_id,
             })
             raise
         except Exception as exc:  # noqa: BLE001 — engine error → wire error, session lives
+            # A half-spoken reply followed by an error frame is worse than
+            # silence+error — flush the audio (symmetric with cancel).
+            self.interrupt_speech("engine_error")
             self._emit_error("engine_error", detail=str(exc), turn_id=turn_id)
             log.warning(
                 "web.voice.engine_error",
@@ -394,11 +530,28 @@ class VoiceTurnDriver:
         async for chunk in agen:
             ctype = chunk.get("type")
             if ctype == "text":
+                txt = chunk.get("text", "")
                 self.emit({
                     "v": EVENT_VERSION, "type": "turn_text", "turn_id": turn_id,
-                    "seq": self._seq, "text": chunk.get("text", ""),
+                    "seq": self._seq, "text": txt,
                 })
                 self._seq += 1
+                # Feed the sentence chunk to TTS — SYNC put_nowait, keeps this
+                # loop body await-free (§1.16). Per-turn char cap on whole-
+                # sentence boundaries (contract §1.3): the sentence that WOULD
+                # cross the cap is not fed; the fed prefix still speaks.
+                if self._tts is not None and not self._tts_off_session:
+                    if self._tts_chars_fed + len(txt) > self._tts_max_chars:
+                        if not self._tts_capped:
+                            self._tts_capped = True
+                            log.info(
+                                "web.voice.tts.turn_capped",
+                                voice_session_id=self._vid, turn_id=turn_id,
+                                chars_fed=self._tts_chars_fed,
+                            )
+                    else:
+                        self._tts.feed_text(turn_id, txt)
+                        self._tts_chars_fed += len(txt)
             elif ctype == "tool":
                 self.emit({
                     "v": EVENT_VERSION, "type": "turn_tool", "turn_id": turn_id,
@@ -512,6 +665,9 @@ class VoiceTurnDriver:
         if self._closed:
             return
         self._closed = True
+        # Flush any in-flight TTS audio first (the worker's own aclose is driven
+        # separately by _drain_pipeline). None-safe when no worker attached.
+        self.interrupt_speech("driver_close")
         if self._pending is not None:
             log.info(
                 "web.voice.queued_utterance_dropped",

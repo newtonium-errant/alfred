@@ -78,6 +78,8 @@ MAX_SESSION_KEY_CHARS = 128
 _KNOWN_PIPELINES = frozenset({"echo", "assistant"})
 # Assistant STT providers the code knows how to drive (fail-closed otherwise).
 _KNOWN_STT_PROVIDERS = frozenset({"deepgram", "fake"})
+# V2 TTS providers the code knows how to drive (fail-closed → text-only voice).
+_KNOWN_TTS_PROVIDERS = frozenset({"elevenlabs", "fake"})
 
 
 def _base_mime(content_type: str) -> str:
@@ -308,6 +310,7 @@ async def _handle_voice_config(request: web.Request) -> web.StreamResponse:
         "available": available,
         "reason": None if available else "aiortc_missing",
         "pipeline": voice.pipeline,   # echo | assistant (FE hard-fail-vs-benign)
+        "tts": bool(available and getattr(manager, "tts_enabled", False)),
         "ice_servers": ice_servers,
         "max_sessions": voice.max_sessions,
         "yours": yours,
@@ -371,6 +374,14 @@ def register_voice_handlers(
         if stt_worker_factory is None:
             return False  # _build_assistant_stt logged the specific reason
 
+    # Gate 3c — V2 TTS talk-back (contract §1.13): an OPTIONAL enhancement on
+    # the assistant pipeline. Absent / disabled / misconfigured tts DEGRADES to
+    # text-only voice (returns None + a loud log) — it NEVER unmounts /voice/*
+    # (unlike STT, which IS the product). Voice mounts regardless.
+    tts_worker_factory = None
+    if voice.pipeline == "assistant":
+        tts_worker_factory = _build_assistant_tts(voice)
+
     # Reserved ICE knob observability — udp_port_range is accepted but has no
     # aiortc/aioice knob (aiortc#487), so it is NEVER a silent no-op.
     if voice.ice.udp_port_range:
@@ -385,7 +396,10 @@ def register_voice_handlers(
     # Gate 4 — aiortc availability decides full-mount vs 503 mode.
     available, reason = aiortc_available()
     if available:
-        manager = VoiceSessionManager(voice, stt_worker_factory=stt_worker_factory)
+        manager = VoiceSessionManager(
+            voice, stt_worker_factory=stt_worker_factory,
+            tts_worker_factory=tts_worker_factory,
+        )
         app[KEY_WEB_VOICE_MANAGER] = manager
 
         async def _voice_shutdown(_app: web.Application) -> None:
@@ -405,6 +419,7 @@ def register_voice_handlers(
             max_sessions=voice.max_sessions,
             pipeline=voice.pipeline,
             stt_provider=voice.stt.provider if voice.pipeline == "assistant" else "",
+            tts_provider=voice.tts.provider if tts_worker_factory is not None else "",
             stun_servers=len(voice.ice.stun_servers),
             advertised_ip=bool(voice.ice.advertised_ip),
             available=True,
@@ -528,6 +543,96 @@ def _make_stt_provider(stt_norm: Any, vid: str):
     from .stt_deepgram import DeepgramStreamProvider
 
     return DeepgramStreamProvider(stt_norm, voice_session_id=vid)
+
+
+# ---------------------------------------------------------------------------
+# Assistant pipeline (V2) — TTS worker factory (degrade-not-no-mount)
+# ---------------------------------------------------------------------------
+
+
+def _build_assistant_tts(voice: Any):
+    """Validate the V2 TTS config and return a ``(playout, worker)`` factory,
+    or ``None`` (voice STILL mounts — TTS is an enhancement, contract §1.13).
+
+    Fail-open matrix — every miss returns None + a loud log, voice mounts
+    text-only: disabled → ``not_enabled`` (SW6 mount-time signal); empty
+    provider → ``tts_unconfigured``; unknown provider → ``unknown_tts_provider``
+    (raw typo preserved); ``elevenlabs`` + unresolved key → ``tts_key_missing``.
+    ``fake`` always mounts (keyless dev / test)."""
+    tts = voice.tts
+    if not tts.enabled:
+        # SW6: log disabled-by-config AT MOUNT so off-by-config is
+        # log-distinguishable from dead-by-error (latched_off) and healthy.
+        log.info("web.voice.disabled_tts", reason="not_enabled")
+        return None
+    provider = tts.provider
+    if not provider:
+        log.error(
+            "web.voice.disabled_tts", reason="tts_unconfigured",
+            detail="web.voice.tts.enabled=true but no provider (elevenlabs | "
+                   "fake) — voice mounts text-only",
+        )
+        return None
+    if provider not in _KNOWN_TTS_PROVIDERS:
+        log.error(
+            "web.voice.disabled_tts", reason="unknown_tts_provider",
+            provider=provider,
+            detail="unknown web.voice.tts.provider — voice mounts text-only",
+        )
+        return None
+    if provider == "elevenlabs" and _is_unresolved(tts.api_key):
+        log.error(
+            "web.voice.disabled_tts", reason="tts_key_missing",
+            detail="provider: elevenlabs but api_key (${ELEVENLABS_API_KEY}) is "
+                   "empty/unresolved — voice mounts text-only",
+        )
+        return None
+
+    from .tts_stream import normalize_tts_settings
+
+    tts_norm, warnings = normalize_tts_settings(tts)
+    for warning in warnings:
+        log.warning("web.voice.tts.config_clamped", detail=warning)
+    return _make_tts_worker_factory(tts_norm)
+
+
+def _make_tts_worker_factory(tts_norm: Any):
+    """Return ``factory(vid, driver) -> (playout, worker)`` closing over the
+    normalized TTS config. Binds the worker's speaking / fatal callbacks to the
+    driver (NO ``schedule_close`` — TTS fatal degrades to text-only, §1.4)."""
+
+    def factory(vid: str, driver: Any):
+        from .voice_tts import TTSPlayoutSource, VoiceTtsWorker
+
+        provider = _make_tts_provider(tts_norm, vid)
+        playout = TTSPlayoutSource(
+            source_rate=provider.output_rate,
+            voice_session_id=vid,
+            max_buffer_seconds=tts_norm.max_buffer_seconds,
+        )
+        worker = VoiceTtsWorker(
+            provider=provider,
+            playout=playout,
+            voice_session_id=vid,
+            on_speaking_started=driver.on_speaking_started if driver else None,
+            on_speaking_done=driver.on_speaking_done if driver else None,
+            on_fatal=driver.on_tts_fatal if driver else None,
+            max_chars_per_turn=tts_norm.max_tts_chars_per_turn,
+        )
+        worker.start()
+        return playout, worker
+
+    return factory
+
+
+def _make_tts_provider(tts_norm: Any, vid: str):
+    if tts_norm.provider == "fake":
+        from .tts_stream import FakeTTSProvider
+
+        return FakeTTSProvider(voice_session_id=vid)
+    from .tts_elevenlabs import ElevenLabsStreamProvider
+
+    return ElevenLabsStreamProvider(tts_norm, voice_session_id=vid)
 
 
 def _resolve_chat_binding(request: web.Request, identity: Any, body: dict):

@@ -45,6 +45,7 @@ from alfred.web.config import (
     WebUser,
     WebVoiceConfig,
     WebVoiceSttConfig,
+    WebVoiceTtsConfig,
 )
 from alfred.web.identity import synthetic_chat_id
 from alfred.web.keys import KEY_WEB_STATE_MGR, KEY_WEB_VOICE_MANAGER
@@ -191,6 +192,7 @@ class _FakeManager:
         self.open_exc: Exception | None = None
         self.close_result = True
         self._yours: list[_FakeSession] = []
+        self.tts_enabled = False   # set by _patch_available from the factory kw
 
     async def open_session(self, identity, sdp, **kwargs):
         # Accept the assistant-path kwargs (turn_binding, voice_session_id).
@@ -225,9 +227,14 @@ def _patch_available(monkeypatch, manager: _FakeManager | None) -> None:
     The factory swallows ``stt_worker_factory`` (passed by register in both
     echo and assistant modes)."""
     monkeypatch.setattr(routes_voice, "aiortc_available", lambda: (True, ""))
-    monkeypatch.setattr(
-        routes_voice, "VoiceSessionManager", lambda voice, **kw: manager,
-    )
+
+    def _mk(voice, **kw):
+        # Reflect the real manager's tts_enabled (set from the factory kw) so
+        # /voice/config's tts flag round-trips through the fake.
+        manager.tts_enabled = kw.get("tts_worker_factory") is not None
+        return manager
+
+    monkeypatch.setattr(routes_voice, "VoiceSessionManager", _mk)
 
 
 # ---------------------------------------------------------------------------
@@ -768,3 +775,79 @@ async def test_assistant_offer_bad_key_400(aiohttp_client, tmp_path, monkeypatch
                                    "session_key": "not-the-active-one"})
     assert resp.status == 400
     assert (await resp.json())["error"] == "bad_session_key"
+
+
+# ---------------------------------------------------------------------------
+# V2 TTS — gate 3c (degrade-not-no-mount) + /voice/config tts flag
+# ---------------------------------------------------------------------------
+
+
+def _assistant_tts_config(*, tts_enabled: bool = True, tts_provider: str = "fake",
+                          **tts_over) -> WebVoiceConfig:
+    stt = WebVoiceSttConfig(provider="fake")
+    tts = WebVoiceTtsConfig(enabled=tts_enabled, provider=tts_provider, **tts_over)
+    return WebVoiceConfig(enabled=True, max_sessions=2, pipeline="assistant",
+                          ice=VoiceIceConfig(), stt=stt, tts=tts)
+
+
+def test_tts_fake_mounts_with_tts(tmp_path, monkeypatch) -> None:
+    _patch_available(monkeypatch, _FakeManager(_assistant_tts_config()))
+    with structlog.testing.capture_logs() as cap:
+        app = _build_app(tmp_path, _web_config(voice=_assistant_tts_config()))
+    assert "/voice/offer" in _route_paths(app)
+    reg = [c for c in cap if c.get("event") == "web.voice.registered"]
+    assert reg and reg[0]["tts_provider"] == "fake"
+
+
+def test_tts_disabled_voice_still_mounts_text_only(tmp_path, monkeypatch) -> None:
+    _patch_available(monkeypatch, _FakeManager(_assistant_tts_config(tts_enabled=False)))
+    with structlog.testing.capture_logs() as cap:
+        app = _build_app(tmp_path, _web_config(voice=_assistant_tts_config(tts_enabled=False)))
+    assert "/voice/offer" in _route_paths(app)      # voice MOUNTS (STT is the product)
+    reasons = [c.get("reason") for c in cap if c.get("event") == "web.voice.disabled_tts"]
+    assert "not_enabled" in reasons                 # SW6 mount-time signal
+
+
+def test_tts_unknown_provider_degrades_text_only(tmp_path, monkeypatch) -> None:
+    _patch_available(monkeypatch, _FakeManager(_assistant_tts_config(tts_provider="coqui")))
+    with structlog.testing.capture_logs() as cap:
+        app = _build_app(tmp_path, _web_config(voice=_assistant_tts_config(tts_provider="coqui")))
+    assert "/voice/offer" in _route_paths(app)      # NOT unmounted — TTS is an add-on
+    reasons = [c.get("reason") for c in cap if c.get("event") == "web.voice.disabled_tts"]
+    assert "unknown_tts_provider" in reasons
+
+
+def test_tts_elevenlabs_missing_key_degrades(tmp_path, monkeypatch) -> None:
+    cfg = _assistant_tts_config(tts_provider="elevenlabs", api_key="${ELEVENLABS_API_KEY}")
+    _patch_available(monkeypatch, _FakeManager(cfg))
+    with structlog.testing.capture_logs() as cap:
+        app = _build_app(tmp_path, _web_config(voice=cfg))
+    assert "/voice/offer" in _route_paths(app)
+    reasons = [c.get("reason") for c in cap if c.get("event") == "web.voice.disabled_tts"]
+    assert "tts_key_missing" in reasons
+
+
+def test_tts_unconfigured_degrades(tmp_path, monkeypatch) -> None:
+    cfg = _assistant_tts_config(tts_provider="")
+    _patch_available(monkeypatch, _FakeManager(cfg))
+    with structlog.testing.capture_logs() as cap:
+        app = _build_app(tmp_path, _web_config(voice=cfg))
+    assert "/voice/offer" in _route_paths(app)
+    reasons = [c.get("reason") for c in cap if c.get("event") == "web.voice.disabled_tts"]
+    assert "tts_unconfigured" in reasons
+
+
+async def test_config_reports_tts_true_when_mounted(aiohttp_client, tmp_path, monkeypatch) -> None:
+    _patch_available(monkeypatch, _FakeManager(_assistant_tts_config()))
+    app = _build_app(tmp_path, _web_config(voice=_assistant_tts_config()))
+    client = await aiohttp_client(app)
+    resp = await client.get("/voice/config", headers=_headers())
+    assert (await resp.json())["tts"] is True
+
+
+async def test_config_reports_tts_false_when_disabled(aiohttp_client, tmp_path, monkeypatch) -> None:
+    _patch_available(monkeypatch, _FakeManager(_assistant_tts_config(tts_enabled=False)))
+    app = _build_app(tmp_path, _web_config(voice=_assistant_tts_config(tts_enabled=False)))
+    client = await aiohttp_client(app)
+    resp = await client.get("/voice/config", headers=_headers())
+    assert (await resp.json())["tts"] is False

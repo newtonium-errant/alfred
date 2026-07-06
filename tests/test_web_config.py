@@ -13,6 +13,7 @@ import pytest
 from alfred.web.config import (
     VoiceIceConfig,
     WebVoiceSttConfig,
+    WebVoiceTtsConfig,
     WebAuthConfig,
     WebConfig,
     WebEmailConfig,
@@ -445,3 +446,69 @@ def test_voice_stt_unresolved_key_stays_placeholder() -> None:
         }}},
     })
     assert _is_unresolved(cfg.voice.stt.api_key)
+
+
+# ---------------------------------------------------------------------------
+# web.voice.tts block (V2 talk-back)
+# ---------------------------------------------------------------------------
+
+
+def test_voice_tts_absent_is_defaults() -> None:
+    cfg = load_from_unified({"web": {"enabled": True, "voice": {"enabled": True}}})
+    assert isinstance(cfg.voice.tts, WebVoiceTtsConfig)
+    assert cfg.voice.tts.enabled is False        # default-off → V1 byte-identical
+    assert cfg.voice.tts.provider == ""
+    assert cfg.voice.tts.model == "eleven_flash_v2_5"
+    assert cfg.voice.tts.output_format == "pcm_24000"
+    assert cfg.voice.tts.max_tts_chars_per_turn == 4096
+
+
+def test_voice_tts_full_block_provider_and_format_lowercased() -> None:
+    cfg = load_from_unified({
+        "web": {"enabled": True, "voice": {"tts": {
+            "enabled": True, "provider": "ElevenLabs", "api_key": "k",
+            "voice": "Rachel", "output_format": "PCM_24000", "auto_mode": False,
+            "max_tts_chars_per_turn": 2000, "max_buffer_seconds": 20,
+            "inactivity_timeout_s": 60, "zero_retention": True,
+        }}},
+    })
+    tts = cfg.voice.tts
+    assert tts.enabled is True
+    assert tts.provider == "elevenlabs"          # stripped + lowercased
+    assert tts.output_format == "pcm_24000"      # lowercased
+    assert tts.auto_mode is False
+    assert tts.max_tts_chars_per_turn == 2000
+    assert tts.zero_retention is True
+
+
+def test_voice_tts_schema_tolerance_and_int_coercion() -> None:
+    cfg = load_from_unified({
+        "web": {"enabled": True, "voice": {"tts": {
+            "provider": "elevenlabs", "max_buffer_seconds": "25", "future_knob": "x",
+        }}},
+    })
+    assert cfg.voice.tts.max_buffer_seconds == 25   # str → int
+    assert cfg.voice.tts.provider == "elevenlabs"
+
+
+def test_voice_tts_api_key_env_substitution(monkeypatch) -> None:
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "el-secret-xyz")
+    cfg = load_from_unified({
+        "web": {"enabled": True, "voice": {"tts": {
+            "provider": "elevenlabs", "api_key": "${ELEVENLABS_API_KEY}",
+        }}},
+    })
+    assert cfg.voice.tts.api_key == "el-secret-xyz"
+
+
+def test_voice_tts_unresolved_key_stays_placeholder(monkeypatch) -> None:
+    # Pin the env absent — another suite (test_per_tool_telemetry) sets
+    # ELEVENLABS_API_KEY, which would bleed and resolve the placeholder in a
+    # full run (dispatcher env-var hygiene contract).
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    cfg = load_from_unified({
+        "web": {"enabled": True, "voice": {"tts": {
+            "provider": "elevenlabs", "api_key": "${ELEVENLABS_API_KEY}",
+        }}},
+    })
+    assert _is_unresolved(cfg.voice.tts.api_key)

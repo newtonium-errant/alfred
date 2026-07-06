@@ -617,6 +617,30 @@ transport:
 #       utterance_end_ms: 1000        # word-gap fallback; 0=off; clamp [1000,5000]
 #       min_utterance_chars: 3        # EOU noise floor
 #       smart_format: true            # tune off (→ punctuate) if it delays finals
+#     # --- V2 TTS talk-back (streaming spoken reply) — OPTIONAL enhancement on
+#     # the assistant pipeline. enabled:false (default) = V1 byte-identical (no
+#     # spoken reply). Invalid/keyless tts DEGRADES to text-only voice (loud
+#     # web.voice.disabled_tts) — it NEVER unmounts /voice/*.
+#     # EGRESS POSTURE: enabling tts sends every assistant VOICE REPLY (only the
+#     # reply sentence chunks — never system prompt / vault context / user text)
+#     # to api.elevenlabs.io — a per-instance decision (Salem = accepted; do NOT
+#     # enable tts on VERA/sovereign voice).
+#     # COST: eleven_flash_v2_5 ≈ 0.5 credits/char ≈ $40-99/mo at 30-60 min/day —
+#     # ElevenLabs dominates the voice bill. CHECK YOUR KEY TIER before activation
+#     # (free tier lasts ≈ days). zero_retention:true requests enable_logging=false
+#     # (plan-gated at ElevenLabs; default false inherits their logging default).
+#     tts:
+#       enabled: false                # true only with pipeline: assistant
+#       provider: ""                  # "elevenlabs" | "fake" (keyless dev/test)
+#       api_key: "${ELEVENLABS_API_KEY}"  # elevenlabs: unresolved → text-only
+#       model: "eleven_flash_v2_5"
+#       voice: "Rachel"               # friendly name or a raw ElevenLabs voice id
+#       output_format: "pcm_24000"    # clamp → pcm_16000|22050|24000|44100
+#       auto_mode: true               # sentence-triggered generation
+#       max_tts_chars_per_turn: 4096  # per-turn spoken cap; clamp [200,20000]
+#       max_buffer_seconds: 30        # playout backpressure ceiling; clamp [5,120]
+#       inactivity_timeout_s: 180     # ElevenLabs idle window; clamp [20,180]
+#       zero_retention: false         # true → enable_logging=false (plan-gated)
 #
 # --- Target instance (KAL-LE / Hypatia / VERA) — relay mode ---
 # Pair this with a DEDICATED ``transport.auth.tokens.web`` entry above

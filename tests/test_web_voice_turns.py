@@ -552,3 +552,245 @@ async def test_stale_cancel_ignored() -> None:
     stale = [c for c in cap if c.get("event") == "web.voice.cancel_stale"]
     assert len(stale) == 1
     await driver.aclose()
+
+
+# ---------------------------------------------------------------------------
+# V2 TTS driver hooks (recording stub worker; no aiortc/av)
+# ---------------------------------------------------------------------------
+
+
+class _StubTts:
+    """Records the driver's sync/await-free calls into the TTS worker."""
+
+    def __init__(self, max_chars: int = 4000) -> None:
+        self.max_chars_per_turn = max_chars
+        self.calls: list = []
+
+    def begin_turn(self, turn_id: str) -> None:
+        self.calls.append(("begin", turn_id))
+
+    def feed_text(self, turn_id: str, text: str) -> None:
+        self.calls.append(("feed", turn_id, text))
+
+    def end_of_reply(self, turn_id: str) -> None:
+        self.calls.append(("end", turn_id))
+
+    def interrupt_speech(self, reason: str) -> None:
+        self.calls.append(("interrupt", reason))
+
+
+def _types(ch: FakeChannel) -> list[str]:
+    return [f["type"] for f in ch.sent]
+
+
+def test_tts_driver_api_is_sync() -> None:
+    import inspect
+    for name in ("interrupt_speech", "_utterance_while_speaking", "attach_tts",
+                 "on_speaking_started", "on_speaking_done", "on_tts_fatal"):
+        assert not inspect.iscoroutinefunction(getattr(VoiceTurnDriver, name))
+
+
+async def test_tts_feed_order_and_end_once() -> None:
+    chunks = [
+        {"type": "text", "text": "Hello. "},
+        {"type": "text", "text": "World."},
+        {"type": "final", "reply": "Hello. World."},
+    ]
+    ch = FakeChannel()
+    stub = _StubTts()
+    driver = VoiceTurnDriver(_deps(_FakeState(_active()), rts=_scripted_rts(chunks)), "v1")
+    driver.attach_tts(stub)
+    driver.attach_channel(ch)
+    _hello(driver)
+    await driver.submit_utterance("hi")
+    await _wait_for(ch, {"turn_final"})
+    assert stub.calls[0][0] == "begin"
+    feeds = [c for c in stub.calls if c[0] == "feed"]
+    assert [c[2] for c in feeds] == ["Hello. ", "World."]
+    assert len([c for c in stub.calls if c[0] == "end"]) == 1
+    await driver.aclose()
+
+
+async def test_tts_no_worker_is_v1_byte_identical() -> None:
+    # No attach_tts → all hooks no-op; turn_final has NO tts_chars key.
+    ch = FakeChannel()
+    driver = VoiceTurnDriver(
+        _deps(_FakeState(_active()), rts=_scripted_rts([{"type": "final", "reply": "ok"}])), "v1")
+    driver.attach_channel(ch)
+    _hello(driver)
+    await driver.submit_utterance("hi")
+    final = await _wait_for(ch, {"turn_final"})
+    assert "tts_chars" not in final and "tts_capped" not in final
+    await driver.aclose()
+
+
+async def test_tts_turn_final_carries_spoken_delta() -> None:
+    ch = FakeChannel()
+    driver = VoiceTurnDriver(
+        _deps(_FakeState(_active()), rts=_scripted_rts(
+            [{"type": "text", "text": "spoken"}, {"type": "final", "reply": "spoken"}])), "v1")
+    driver.attach_tts(_StubTts())
+    driver.attach_channel(ch)
+    _hello(driver)
+    await driver.submit_utterance("hi")
+    final = await _wait_for(ch, {"turn_final"})
+    assert final["tts_chars"] == len("spoken") and final["tts_capped"] is False
+    await driver.aclose()
+
+
+async def test_tts_char_cap_whole_sentence() -> None:
+    chunks = [
+        {"type": "text", "text": "x" * 10},
+        {"type": "text", "text": "y" * 10},
+        {"type": "text", "text": "z" * 10},   # would cross the cap → not fed
+        {"type": "final", "reply": "x" * 10 + "y" * 10 + "z" * 10},
+    ]
+    ch = FakeChannel()
+    stub = _StubTts(max_chars=20)
+    driver = VoiceTurnDriver(_deps(_FakeState(_active()), rts=_scripted_rts(chunks)), "v1")
+    driver.attach_tts(stub)
+    driver.attach_channel(ch)
+    _hello(driver)
+    with structlog.testing.capture_logs() as cap:
+        await driver.submit_utterance("hi")
+        final = await _wait_for(ch, {"turn_final"})
+    feeds = [c for c in stub.calls if c[0] == "feed"]
+    assert len(feeds) == 2                          # whole-sentence, never crosses
+    assert len([c for c in stub.calls if c[0] == "end"]) == 1   # still flushed
+    assert final["tts_chars"] == 20 and final["tts_capped"] is True
+    capped = [c for c in cap if c.get("event") == "web.voice.tts.turn_capped"]
+    assert len(capped) == 1
+    await driver.aclose()
+
+
+async def test_tts_half_duplex_discards_while_speaking() -> None:
+    ch = FakeChannel()
+    driver = VoiceTurnDriver(_deps(_FakeState(_active()), rts=_scripted_rts([])), "v1")
+    driver.attach_tts(_StubTts())
+    driver.attach_channel(ch)
+    _hello(driver)
+    driver.on_speaking_started("spk")               # gate ON
+    with structlog.testing.capture_logs() as cap:
+        await driver.submit_utterance("heard you")
+        await asyncio.sleep(0.05)
+    # stt_final STILL emitted (honesty) + a distinct utterance_discarded event.
+    assert "stt_final" in _types(ch)
+    assert "utterance_discarded" in _types(ch)
+    assert driver._pending is None                  # NOT queued
+    assert "turn_started" not in _types(ch)         # no turn ran
+    disc = [c for c in cap if c.get("event") == "web.voice.utterance_discarded_speaking"]
+    assert len(disc) == 1
+    await driver.aclose()
+
+
+async def test_tts_fatal_fails_open_gate() -> None:
+    ch = FakeChannel()
+    driver = VoiceTurnDriver(
+        _deps(_FakeState(_active()), rts=_scripted_rts([{"type": "final", "reply": "ok"}])), "v1")
+    driver.attach_tts(_StubTts())
+    driver.attach_channel(ch)
+    _hello(driver)
+    driver.on_speaking_started("spk")
+    driver.on_tts_fatal(SimpleNamespace(reason="auth"))   # clears the gate
+    assert driver._speaking_turn_id is None
+    # Next utterance runs a turn (not discarded).
+    await driver.submit_utterance("go")
+    await _wait_for(ch, {"turn_final"})
+    await driver.aclose()
+
+
+async def test_tts_fatal_latches_once_and_stops_feeding() -> None:
+    ch = FakeChannel()
+    stub = _StubTts()
+    driver = VoiceTurnDriver(
+        _deps(_FakeState(_active()), rts=_scripted_rts(
+            [{"type": "text", "text": "hi"}, {"type": "final", "reply": "hi"}])), "v1")
+    driver.attach_tts(stub)
+    driver.attach_channel(ch)
+    _hello(driver)
+    driver.on_tts_fatal(SimpleNamespace(reason="auth"))
+    driver.on_tts_fatal(SimpleNamespace(reason="auth"))   # latched — no 2nd emit
+    await driver.submit_utterance("go")
+    await _wait_for(ch, {"turn_final"})
+    errs = [f for f in ch.sent if f.get("type") == "error" and f.get("code") == "tts_unavailable"]
+    assert len(errs) == 1                            # once per session
+    assert not any(c[0] in ("begin", "feed", "end") for c in stub.calls)  # latched off
+    await driver.aclose()
+
+
+async def test_tts_new_turn_flushes_stale_audio() -> None:
+    ch = FakeChannel()
+    stub = _StubTts()
+    driver = VoiceTurnDriver(
+        _deps(_FakeState(_active()), rts=_scripted_rts([{"type": "final", "reply": "ok"}])), "v1")
+    driver.attach_tts(stub)
+    driver.attach_channel(ch)
+    _hello(driver)
+    # Simulate the real scenario: utterance B was queued during turn A's
+    # LLM-thinking window (before A spoke), A then started speaking + completed
+    # (inflight released) with its audio STILL draining. B runs next while
+    # _speaking_turn_id is set — the half-duplex gate is bypassed because B was
+    # queued pre-speech, so queue B directly (not via the now-gated submit).
+    driver._speaking_turn_id = "old"                 # a prior turn still draining
+    driver._pending = ("uid-b", "go")
+    driver._wake.set()
+    await _wait_for(ch, {"turn_final"})
+    assert ("interrupt", "new_turn") in stub.calls
+    # speaking_done(old) emitted BEFORE the new turn_started.
+    done_idx = next(i for i, f in enumerate(ch.sent) if f.get("type") == "speaking_done")
+    start_idx = next(i for i, f in enumerate(ch.sent) if f.get("type") == "turn_started")
+    assert done_idx < start_idx
+    await driver.aclose()
+
+
+async def test_tts_client_cancel_speaking_done_before_turn_cancelled() -> None:
+    import json
+    ch = FakeChannel()
+    started = asyncio.Event()
+
+    async def hang_rts(**kw):
+        kw["session"].transcript.append({"role": "user", "content": "x", "_ts": "t"})
+        started.set()
+        await asyncio.sleep(3600)
+        yield {"type": "final", "reply": "never"}
+
+    stub = _StubTts()
+    driver = VoiceTurnDriver(_deps(_FakeState(_active()), rts=hang_rts), "v1")
+    driver.attach_tts(stub)
+    driver.attach_channel(ch)
+    _hello(driver)
+    await driver.submit_utterance("go")
+    await asyncio.wait_for(started.wait(), 1.0)
+    ts = next(f for f in ch.sent if f["type"] == "turn_started")
+    driver.on_speaking_started(ts["turn_id"])        # simulate first audio
+    driver.on_client_message(json.dumps({"v": 1, "type": "cancel"}))
+    await _wait_for(ch, {"turn_cancelled"})
+    assert ("interrupt", "client_cancel") in stub.calls
+    done_idx = next(i for i, f in enumerate(ch.sent) if f.get("type") == "speaking_done")
+    canc_idx = next(i for i, f in enumerate(ch.sent) if f.get("state") == "turn_cancelled")
+    assert done_idx < canc_idx                       # speaking_done → turn_cancelled
+    await driver.aclose()
+
+
+async def test_tts_v3_seam_is_single_dispatch_point() -> None:
+    # Pin that barge-in is a body-swap at _utterance_while_speaking: monkeypatch
+    # it to interrupt + queue and observe the turn runs (audio cancelled).
+    ch = FakeChannel()
+    stub = _StubTts()
+    driver = VoiceTurnDriver(
+        _deps(_FakeState(_active()), rts=_scripted_rts([{"type": "final", "reply": "barged"}])), "v1")
+    driver.attach_tts(stub)
+    driver.attach_channel(ch)
+    _hello(driver)
+
+    def _barge(uid, text):
+        driver.interrupt_speech("barge_in")
+        driver._pending = (uid, text)
+        driver._wake.set()
+
+    driver._utterance_while_speaking = _barge
+    driver.on_speaking_started("spk")
+    await driver.submit_utterance("interrupt me")
+    await _wait_for(ch, {"turn_final"})
+    assert ("interrupt", "barge_in") in stub.calls   # V3 body used the same funnel
+    await driver.aclose()

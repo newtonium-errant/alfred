@@ -244,6 +244,7 @@ class VoiceSessionManager:
         description_factory: Callable[[str, str], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
         stt_worker_factory: Callable[[str], Any] | None = None,
+        tts_worker_factory: Callable[[str, Any], Any] | None = None,
     ) -> None:
         self._config = voice_config
         self.max_sessions = int(voice_config.max_sessions)
@@ -259,6 +260,10 @@ class VoiceSessionManager:
         self.advertised_ip = voice_config.ice.advertised_ip
         # None = V0 echo (byte-identical); set = V1 assistant STT tap.
         self._stt_worker_factory = stt_worker_factory
+        # None = V1 (stock silence outbound, byte-identical); set = V2 TTS
+        # talk-back (the playout source IS the outbound track for the session).
+        self._tts_worker_factory = tts_worker_factory
+        self.tts_enabled = tts_worker_factory is not None
 
         self._pc_factory = pc_factory or self._default_pc_factory
         self._description_factory = (
@@ -458,19 +463,33 @@ class VoiceSessionManager:
             keepalive["relay"] = relay
 
             if self._stt_worker_factory is not None:
-                # Assistant: tap the mic for STT; send silence outbound (keeps
-                # the m-line/sender alive for the V2 TTS source swap). The mic
-                # is NOT echoed.
+                # Assistant: tap the mic for STT. Outbound is silence (V1) or
+                # the TTS playout source (V2) — either keeps the m-line/sender
+                # alive. The mic is NOT echoed.
                 stt_input = relay.subscribe(track)
-                outbound = _voice_pipeline_track(_silence_source())
+                turn_driver = keepalive.get("turn_driver")
+                if self._tts_worker_factory is not None:
+                    # V2: the TTS playout source IS the outbound track for the
+                    # whole session (NO runtime swap — constant s16/mono/48k
+                    # frames + monotonic pts by construction, §1.5).
+                    playout, tts_worker = self._tts_worker_factory(vid, turn_driver)
+                    outbound = _voice_pipeline_track(playout)
+                    keepalive["tts_playout"] = playout
+                    keepalive["tts_worker"] = tts_worker
+                    if turn_driver is not None:
+                        turn_driver.attach_tts(tts_worker)
+                else:
+                    # V1: stock silence outbound (byte-identical).
+                    outbound = _voice_pipeline_track(_silence_source())
                 pc.addTrack(outbound)
                 keepalive["outbound"] = outbound
-                worker = self._stt_worker_factory(
-                    vid, keepalive.get("turn_driver"), self,
-                )
+                worker = self._stt_worker_factory(vid, turn_driver, self)
                 worker.start(stt_input)
                 keepalive["stt_worker"] = worker
-                log.info("web.voice.assistant_tap", voice_session_id=vid)
+                log.info(
+                    "web.voice.assistant_tap", voice_session_id=vid,
+                    tts=self._tts_worker_factory is not None,
+                )
             else:
                 # Echo (V0): loop the mic back to the browser.
                 outbound = _voice_pipeline_track(relay.subscribe(track))
@@ -633,6 +652,18 @@ class VoiceSessionManager:
             except Exception as exc:  # noqa: BLE001 — teardown must not raise
                 log.warning(
                     "web.voice.driver_close_error",
+                    voice_session_id=session.voice_session_id,
+                    error_class=type(exc).__name__,
+                )
+        # V2 TTS worker LAST (after the driver, whose turn-cancel already
+        # flushed the playout via the CancelledError hook). No-op in V1.
+        tts_worker = session.keepalive.get("tts_worker")
+        if tts_worker is not None:
+            try:
+                await asyncio.wait_for(tts_worker.aclose(reason=reason), timeout=5.0)
+            except Exception as exc:  # noqa: BLE001 — teardown must not raise
+                log.warning(
+                    "web.voice.tts.close_error",
                     voice_session_id=session.voice_session_id,
                     error_class=type(exc).__name__,
                 )
