@@ -225,6 +225,24 @@ async def test_no_connect_when_no_audio() -> None:
     await w.aclose()
 
 
+async def test_end_of_track_sentinel_delivered_when_queue_full() -> None:
+    # NOTE 2: with a bounded queue kept full by drop-oldest, the reader's
+    # end-of-track sentinel must STILL reach the sender. WITHOUT the drop-oldest
+    # retry, the reader's put_nowait(None) raises QueueFull → the sentinel is
+    # lost → the sender hangs forever on queue.get(). WITH the fix both the
+    # reader and sender tasks complete. (The synchronous fake track bursts, so
+    # drop-oldest discards the audio and nothing is fed — that's fine; this test
+    # pins SENTINEL DELIVERY, not feed count.)
+    prov = _ScriptedProvider()
+    w = _worker(prov, queue_max_chunks=1)  # queue at capacity after one chunk
+    frames = [b"\x00" * 3200 for _ in range(6)]
+    w.start(_FakeTrack(frames))
+    await asyncio.wait_for(w._reader_task, timeout=5)   # would RAISE without the fix
+    await asyncio.wait_for(w._sender_task, timeout=5)   # would HANG without the fix
+    assert w._sender_task.done() and not w._sender_task.cancelled()
+    await w.aclose()
+
+
 # ---------------------------------------------------------------------------
 # Hello-gate (contract §17b) — no cloud STT egress until the client hello
 # ---------------------------------------------------------------------------

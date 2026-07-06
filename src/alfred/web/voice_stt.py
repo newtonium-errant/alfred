@@ -199,7 +199,18 @@ class VoiceSttWorker:
             if tail:
                 self._enqueue(tail)
         finally:
-            self._queue.put_nowait(None)  # sentinel — never blocks (see _enqueue)
+            # Deliver the end-of-track sentinel EVEN IF the bounded queue is at
+            # capacity — drop-oldest keeps it full, and put_nowait raises
+            # QueueFull (it never blocks, but it CAN raise). Mirror _enqueue's
+            # drop-oldest so the sender always receives the sentinel + finalizes.
+            try:
+                self._queue.put_nowait(None)
+            except asyncio.QueueFull:
+                try:
+                    self._queue.get_nowait()  # drop the oldest chunk
+                except asyncio.QueueEmpty:  # pragma: no cover - race guard
+                    pass
+                self._queue.put_nowait(None)
 
     def _enqueue(self, chunk: bytes) -> None:
         """Drop-OLDEST on a full queue (stale audio is worthless to live STT)."""

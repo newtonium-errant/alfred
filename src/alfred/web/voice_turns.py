@@ -479,7 +479,10 @@ class VoiceTurnDriver:
                     turn_id: str = "", utterance_id: str = "") -> None:
         event: dict[str, Any] = {"v": EVENT_VERSION, "type": "error", "code": code}
         if detail:
-            event["detail"] = detail
+            # The FE's zod schema caps detail at 1024 chars and drops the WHOLE
+            # frame if exceeded — a giant engine exception would leave the user
+            # with a dead turn and no error. Truncate, never let it reject.
+            event["detail"] = detail[:1024]
         if turn_id:
             event["turn_id"] = turn_id
         if utterance_id:

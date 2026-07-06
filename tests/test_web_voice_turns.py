@@ -348,6 +348,49 @@ async def test_binding_reverify_gone_drops_turn() -> None:
     await driver.aclose()
 
 
+async def test_binding_reverify_gone_during_slot_wait() -> None:
+    # The literal W1 race: /chat/open replaces the active session WHILE the
+    # driver is waiting for the KEY_WEB_INFLIGHT slot. The re-verify AFTER the
+    # wait must catch it → no_such_session, engine never runs.
+    ch = FakeChannel()
+    in_flight = {_KEY}  # slot held → the driver waits
+    state = _FakeState(_active(key=_KEY))
+    rts = _scripted_rts([{"type": "final", "reply": "should not run"}])
+    driver = VoiceTurnDriver(_deps(state, rts=rts, in_flight=in_flight, key=_KEY), "v1")
+    driver.attach_channel(ch)
+    _hello(driver)
+    await driver.submit_utterance("go")
+    await asyncio.sleep(0.1)  # driver is now blocked waiting on the slot
+    assert rts.calls == []
+    # A concurrent /chat/open replaced the active session mid-wait.
+    state.set_active(_OWNER, _active(key="replaced-by-chat-open"))
+    in_flight.discard(_KEY)  # free the slot → driver reserves, then re-verifies
+    err = await _wait_for(ch, {"error"})
+    assert err["code"] == "no_such_session"
+    assert rts.calls == []  # the during-wait replacement was caught
+    assert _KEY not in in_flight  # slot released
+    await driver.aclose()
+
+
+async def test_engine_error_detail_truncated_to_1024() -> None:
+    # NOTE 1: a giant engine exception must NOT produce a >1024-char detail
+    # (the FE zod caps at 1024 and would drop the whole error frame).
+    ch = FakeChannel()
+
+    async def boom_rts(**kw):
+        raise RuntimeError("X" * 5000)
+        yield  # generator
+
+    driver = VoiceTurnDriver(_deps(_FakeState(_active()), rts=boom_rts), "v1")
+    driver.attach_channel(ch)
+    _hello(driver)
+    await driver.submit_utterance("go")
+    err = await _wait_for(ch, {"error"})
+    assert err["code"] == "engine_error"
+    assert len(err["detail"]) == 1024  # truncated, not dropped
+    await driver.aclose()
+
+
 # ---------------------------------------------------------------------------
 # In-flight guard (shared KEY_WEB_INFLIGHT)
 # ---------------------------------------------------------------------------
