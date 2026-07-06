@@ -187,6 +187,13 @@ describe('voiceDcEventSchema (canonical D2 vocabulary)', () => {
     expect(ok({ v: 1, type: 'utterance_discarded' })).toBe(false); // missing utterance_id
   });
 
+  it('rejects speaking_done with an over-cap reason (64-char bound pinned)', () => {
+    // An over-cap reason drops the WHOLE frame → a stuck 'Speaking…' pill until
+    // self-recovery. Trusted-server-only so low risk, but the bound gets its pin.
+    expect(ok({ v: 1, type: 'speaking_done', turn_id: 't1', reason: 'x'.repeat(65) })).toBe(false);
+    expect(ok({ v: 1, type: 'speaking_done', turn_id: 't1', reason: 'x'.repeat(64) })).toBe(true);
+  });
+
   it('strips unknown keys on the V2 events (non-strict, forward-compat)', () => {
     const r = voiceDcEventSchema.safeParse({
       v: 1,
