@@ -132,6 +132,25 @@ def test_normalize_clamps_threshold() -> None:
 def test_normalize_clamps_too_early() -> None:
     s, w = normalize_barge_settings(BargeInConfig(too_early_ms=99999))
     assert s.too_early_ms == 5000
+    assert any("too_early_ms" in x for x in w)
+
+
+def test_normalize_clamps_min_words_with_warning() -> None:
+    s, w = normalize_barge_settings(BargeInConfig(min_words=99))
+    assert s.min_words == 20
+    assert any("min_words" in x for x in w)
+
+
+def test_normalize_clamps_min_chars_with_warning() -> None:
+    s, w = normalize_barge_settings(BargeInConfig(min_chars=9999))
+    assert s.min_chars == 200
+    assert any("min_chars" in x for x in w)
+
+
+def test_normalize_clamps_echo_grace_with_warning() -> None:
+    s, w = normalize_barge_settings(BargeInConfig(echo_grace_s=99.0))
+    assert s.echo_grace_s == 30.0
+    assert any("echo_grace_s" in x for x in w)
 
 
 def test_normalize_caps_list_entries() -> None:

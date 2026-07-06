@@ -211,11 +211,17 @@ def normalize_barge_settings(
     if too_early != cfg.too_early_ms:
         warnings.append(f"too_early_ms {cfg.too_early_ms} clamped to {too_early}")
     min_words = _clamp(int(cfg.min_words), 1, 20)
+    if min_words != cfg.min_words:
+        warnings.append(f"min_words {cfg.min_words} clamped to {min_words}")
     min_chars = _clamp(int(cfg.min_chars), 1, 200)
+    if min_chars != cfg.min_chars:
+        warnings.append(f"min_chars {cfg.min_chars} clamped to {min_chars}")
     threshold = _clamp(float(cfg.echo_threshold), 0.0, 1.0)
     if threshold != cfg.echo_threshold:
         warnings.append(f"echo_threshold {cfg.echo_threshold} clamped to {threshold}")
     grace = _clamp(float(cfg.echo_grace_s), 0.0, 30.0)
+    if grace != cfg.echo_grace_s:
+        warnings.append(f"echo_grace_s {cfg.echo_grace_s} clamped to {grace}")
 
     interrupt_extra = _normalize_list(list(cfg.interrupt_extra), warnings, "interrupt_extra")
     backchannel_extra = _normalize_list(list(cfg.backchannel_extra), warnings, "backchannel_extra")

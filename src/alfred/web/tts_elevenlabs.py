@@ -245,48 +245,67 @@ class ElevenLabsStreamProvider(TTSStreamProvider):
 
     async def _open_turn_ws(self, turn_id: str) -> None:
         session = aiohttp.ClientSession()
+        # True once the session is adopted into self._session (the normal
+        # teardown path then owns closing it). Until then, any exit — including
+        # a CancelledError raised THROUGH ws_connect by request_cancel — must
+        # close it here or it leaks (sec-W4 / reg-W1, see the finally).
+        adopted = False
         headers = {"xi-api-key": self._cfg.api_key}
         try:
-            ws = await session.ws_connect(self._url(), headers=headers)
-        except aiohttp.WSServerHandshakeError as exc:
-            status = getattr(exc, "status", None)
-            reason = _classify_handshake_status(status)
-            await session.close()
-            # §1.4: class + status ONLY — never str(exc) (can embed headers).
-            log.warning(
-                "web.voice.tts.error", voice_session_id=self._vid,
-                error_class="WSServerHandshakeError", status=status,
-                reason=reason, fatal=_is_fatal_class(reason),
+            try:
+                ws = await session.ws_connect(self._url(), headers=headers)
+            except aiohttp.WSServerHandshakeError as exc:
+                status = getattr(exc, "status", None)
+                reason = _classify_handshake_status(status)
+                await session.close()
+                # §1.4: class + status ONLY — never str(exc) (can embed headers).
+                log.warning(
+                    "web.voice.tts.error", voice_session_id=self._vid,
+                    error_class="WSServerHandshakeError", status=status,
+                    reason=reason, fatal=_is_fatal_class(reason),
+                )
+                raise _HandshakeFailed(reason, status) from None
+            except Exception as exc:  # noqa: BLE001 — connect errors → network
+                await session.close()
+                log.warning(
+                    "web.voice.tts.error", voice_session_id=self._vid,
+                    error_class=type(exc).__name__, status=None,
+                    reason=TTS_ERR_NETWORK, fatal=False,
+                )
+                raise _HandshakeFailed(TTS_ERR_NETWORK, None) from None
+            if self._cancelled:
+                # sec-W4: a cancel landed DURING the prewarm handshake but AFTER
+                # ws_connect returned — close the freshly-opened ws here; the
+                # (un-adopted) session is closed by the finally.
+                await ws.close()
+                return
+            self._session = session
+            self._ws = ws
+            adopted = True   # from here the normal teardown path owns the session
+            # InitializeConnection: voice_settings ride the first message.
+            await ws.send_str(json.dumps({
+                "text": " ", "voice_settings": _VOICE_SETTINGS,
+            }))
+            self._last_send = self._clock()
+            self._recv_task = asyncio.ensure_future(self._receive_loop(turn_id))
+            self._keepalive_task = asyncio.ensure_future(self._keepalive_loop())
+            log.info(
+                "web.voice.tts.connected", voice_session_id=self._vid,
+                provider=self.provider_id,
             )
-            raise _HandshakeFailed(reason, status) from None
-        except Exception as exc:  # noqa: BLE001 — connect errors → network
-            await session.close()
-            log.warning(
-                "web.voice.tts.error", voice_session_id=self._vid,
-                error_class=type(exc).__name__, status=None,
-                reason=TTS_ERR_NETWORK, fatal=False,
-            )
-            raise _HandshakeFailed(TTS_ERR_NETWORK, None) from None
-        if self._cancelled:
-            # sec-W4: a cancel landed DURING the prewarm handshake — close the
-            # freshly-opened ws + ClientSession here so they don't leak (nothing
-            # downstream will adopt them once cancelled).
-            await ws.close()
-            await session.close()
-            return
-        self._session = session
-        self._ws = ws
-        # InitializeConnection: voice_settings ride the first message.
-        await ws.send_str(json.dumps({
-            "text": " ", "voice_settings": _VOICE_SETTINGS,
-        }))
-        self._last_send = self._clock()
-        self._recv_task = asyncio.ensure_future(self._receive_loop(turn_id))
-        self._keepalive_task = asyncio.ensure_future(self._keepalive_loop())
-        log.info(
-            "web.voice.tts.connected", voice_session_id=self._vid,
-            provider=self.provider_id,
-        )
+        finally:
+            # sec-W4 / reg-W1: request_cancel() cancels _connect_task; if that
+            # lands while ws_connect is suspended, CancelledError propagates PAST
+            # the except clauses above WITHOUT closing the session (it was never
+            # adopted into self._session, so teardown never sees it) → leak. Close
+            # any un-adopted session here. Idempotent with the handshake-except /
+            # sec-W4 closes via the session.closed guard; does not swallow the
+            # in-flight CancelledError (except Exception ≠ BaseException).
+            if not adopted and not session.closed:
+                try:
+                    await session.close()
+                except Exception:  # noqa: BLE001 — cleanup must not mask the exit
+                    pass
 
     async def feed_text(self, chunk: str) -> None:
         if self._closed or self._cancelled or self._turn_failed:

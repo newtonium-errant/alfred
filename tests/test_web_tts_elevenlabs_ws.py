@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 
+import aiohttp
 import pytest
 import structlog
 from aiohttp import web
@@ -108,11 +109,12 @@ def test_parse_malformed_is_empty() -> None:
 
 class _ElevenScriptServer:
     def __init__(self, *, audio=None, status=None, drop_on_text=False,
-                 no_final=False) -> None:
+                 no_final=False, connect_delay=0.0) -> None:
         self.audio = audio if audio is not None else [b"\x10\x11\x12\x13"]
         self.status = status
         self.drop_on_text = drop_on_text
         self.no_final = no_final   # send audio but never isFinal (drain-hang)
+        self.connect_delay = connect_delay   # delay BEFORE prepare → client ws_connect hangs
         self.api_key: str | None = None
         self.query: dict = {}
         self.received: list = []
@@ -121,6 +123,10 @@ class _ElevenScriptServer:
     async def handler(self, request: web.Request) -> web.StreamResponse:
         if self.status is not None:
             raise web.HTTPUnauthorized() if self.status == 401 else web.HTTPBadRequest()
+        if self.connect_delay:
+            # Hold the 101 upgrade so the client's ws_connect stays suspended
+            # (lets a test cancel the prewarm task mid-handshake).
+            await asyncio.sleep(self.connect_delay)
         self.connections += 1
         self.api_key = request.headers.get("xi-api-key")
         self.query = dict(request.query)
@@ -311,6 +317,41 @@ async def test_request_cancel_breaks_drain_no_timeout_error() -> None:
         errs = [e for e in got if e.type == EVENT_ERROR]
         assert errs == []                                  # no drain_timeout error
     finally:
+        await server.close()
+
+
+async def test_request_cancel_during_prewarm_closes_session(monkeypatch) -> None:
+    # sec-W4 / reg-W1: request_cancel() landing while the prewarm ws_connect is
+    # SUSPENDED cancels _connect_task; CancelledError then propagates past
+    # _open_turn_ws's except clauses WITHOUT closing the ClientSession (it was
+    # never adopted into self._session). The try/finally must close the
+    # un-adopted session — else it leaks (aiohttp "Unclosed client session").
+    script = _ElevenScriptServer(connect_delay=30.0)   # ws_connect never completes
+    server = await _server(script)
+    created: list = []
+    real_cls = aiohttp.ClientSession
+
+    def _spy(*a, **k):
+        s = real_cls(*a, **k)
+        created.append(s)
+        return s
+
+    monkeypatch.setattr("alfred.web.tts_elevenlabs.aiohttp.ClientSession", _spy)
+    try:
+        prov = _provider(server)
+        await prov.begin_turn("t1")            # prewarm starts; ws_connect suspends
+        await asyncio.sleep(0.1)               # let the connect task reach ws_connect
+        assert created, "prewarm never created a ClientSession"
+        assert not created[0].closed           # still open, mid-handshake
+        ct = prov._connect_task
+        prov.request_cancel()                  # SYNC — cancels the suspended connect
+        try:
+            await ct                            # let the CancelledError + finally run
+        except asyncio.CancelledError:
+            pass
+        assert created[0].closed is True       # the finally closed it — no leak
+    finally:
+        await prov.close()
         await server.close()
 
 
