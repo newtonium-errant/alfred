@@ -33,8 +33,9 @@ export type VoiceState =
   | 'closing'
   | 'error';
 
-// The dictation lifecycle WITHIN 'live' (always 'listening' when not live).
-export type VoiceTurnState = 'listening' | 'thinking' | 'replying';
+// The dictation lifecycle WITHIN 'live' (always 'listening' when not live). V2
+// adds 'speaking': the assistant's reply is being spoken aloud (streaming TTS).
+export type VoiceTurnState = 'listening' | 'thinking' | 'replying' | 'speaking';
 
 export type VoiceErrorCode =
   | 'unsupported'
@@ -74,10 +75,21 @@ export interface UseVoice {
   toolName: string | null;
   /** Live but the server never confirmed dictation (echo pipeline / dead dictation). */
   dictationUnavailable: boolean;
+  // --- V2 talk-back surface ---
+  /** Local speaker mute (audio element `.muted`). Client-local: the server keeps synthesizing. */
+  speakerMuted: boolean;
+  /** TTS is degraded for this session (non-fatal) — replies still arrive as text. */
+  ttsUnavailable: boolean;
+  /** A brief "heard you — hold on" notice: an utterance was discarded while speaking (half-duplex). */
+  discardNotice: boolean;
+  /** True while a turn is in flight (a cancel frame would act). Mirrors the internal turn id. */
+  canCancel: boolean;
   /** The user gesture — request mic + negotiate. Only acts from idle. */
   start: () => Promise<void>;
   /** Flip the mic track (live only). No renegotiation. Muting doubles as "over". */
   toggleMute: () => void;
+  /** Flip remote-audio playback muting (live only). Client-local — does NOT stop synthesis. */
+  toggleSpeakerMute: () => void;
   /** Cancel the in-flight turn (sends a cancel frame; the call stays live). */
   cancelTurn: () => void;
   /** Tear the call down (best-effort close beacon + local teardown). */
@@ -163,6 +175,10 @@ export function useVoice(opts: {
   const [turnError, setTurnError] = useState<string | null>(null);
   const [toolName, setToolName] = useState<string | null>(null);
   const [dictationUnavailable, setDictationUnavailable] = useState(false);
+  const [speakerMuted, setSpeakerMuted] = useState(false);
+  const [ttsUnavailable, setTtsUnavailable] = useState(false);
+  const [discardNotice, setDiscardNotice] = useState(false);
+  const [canCancel, setCanCancel] = useState(false);
 
   // All live handles in refs so async callbacks never close over stale state.
   const stateRef = useRef<VoiceState>('idle');
@@ -176,6 +192,9 @@ export function useVoice(opts: {
   const assistantPipelineRef = useRef(false); // config.pipeline === 'assistant'
   const currentTurnIdRef = useRef<string | null>(null);
   const currentUtteranceIdRef = useRef<string | null>(null);
+  // The turn whose reply is being SPOKEN. Deliberately separate from
+  // currentTurnIdRef — speaking outlives turn_final (which clears the turn id).
+  const speakingTurnIdRef = useRef<string | null>(null);
   // Latest opts mirrored to refs so async closures read the current value.
   const sessionKeyRef = useRef<string | null>(opts.sessionKey ?? null);
   const onTurnFinalRef = useRef(opts.onTurnFinal);
@@ -204,19 +223,26 @@ export function useVoice(opts: {
     }
   }, []);
 
-  // Reset the V1 dictation surface to its empty baseline.
+  // Reset the dictation + talk-back surface to its empty baseline.
   const resetDictation = useCallback(() => {
     dictationActiveRef.current = false;
     assistantPipelineRef.current = false;
     currentTurnIdRef.current = null;
     currentUtteranceIdRef.current = null;
+    speakingTurnIdRef.current = null;
     setVoiceTurnState('listening');
     setPartialTranscript('');
     setReplyText('');
     setTurnError(null);
     setToolName(null);
     setDictationUnavailable(false);
-  }, []);
+    setTtsUnavailable(false);
+    setDiscardNotice(false);
+    setCanCancel(false);
+    // Symmetric with setMuted(false): drop any speaker mute + unmute the element.
+    setSpeakerMuted(false);
+    if (audioRef.current) audioRef.current.muted = false;
+  }, [audioRef]);
 
   // Stop the mic, close the dc + pc, detach playback, clear timers. NO network, NO
   // React state — safe to call from an unmount cleanup.
@@ -301,6 +327,17 @@ export function useVoice(opts: {
     setMuted(!track.enabled);
   }, []);
 
+  // Speaker mute: silence remote-audio PLAYBACK locally (audio element .muted).
+  // Deliberately client-local — the server keeps synthesizing (ElevenLabs egress
+  // continues); a server-notified mute is deferred to V3 where interrupt subsumes it.
+  const toggleSpeakerMute = useCallback(() => {
+    if (stateRef.current !== 'live') return;
+    const el = audioRef.current;
+    if (!el) return;
+    el.muted = !el.muted;
+    setSpeakerMuted(el.muted);
+  }, [audioRef]);
+
   const cancelTurn = useCallback(() => {
     if (stateRef.current !== 'live') return;
     const dc = dcRef.current;
@@ -344,15 +381,21 @@ export function useVoice(opts: {
         } else if (evt.state === 'superseded') {
           // A newer utterance replaced the in-flight turn — drop the abandoned
           // reply and show we're processing the newer one (partials keep rendering).
+          // The server flushes any prior playout, so clear the speaking ref.
           setReplyText('');
           setTurnError(null);
           setToolName(null);
+          speakingTurnIdRef.current = null;
+          setDiscardNotice(false);
           setVoiceTurnState('thinking');
         } else if (evt.state === 'turn_cancelled') {
           setReplyText('');
           setToolName(null);
-          setVoiceTurnState('listening');
           currentTurnIdRef.current = null;
+          speakingTurnIdRef.current = null;
+          setCanCancel(false);
+          setDiscardNotice(false);
+          setVoiceTurnState('listening');
         }
         return;
       case 'stt_partial':
@@ -374,6 +417,10 @@ export function useVoice(opts: {
         return;
       case 'turn_started':
         currentTurnIdRef.current = evt.turn_id;
+        setCanCancel(true);
+        // A new turn ⇒ the server flushed prior playout; drop the speaking ref.
+        speakingTurnIdRef.current = null;
+        setDiscardNotice(false);
         setReplyText('');
         setToolName(null);
         setVoiceTurnState('thinking');
@@ -381,15 +428,21 @@ export function useVoice(opts: {
       case 'turn_text':
         setReplyText((r) => r + evt.text); // server owns spacing
         setToolName(null);
-        setVoiceTurnState('replying');
+        // Don't ping-pong the pill: while the reply is being SPOKEN, keep
+        // 'speaking' (text still streams into the reply region; the pill reports
+        // the audible activity, which outranks the silent text stream).
+        if (speakingTurnIdRef.current === null) setVoiceTurnState('replying');
         return;
       case 'turn_tool':
         setToolName(evt.tool ?? null);
         return;
       case 'turn_final': {
-        setVoiceTurnState('listening');
         currentTurnIdRef.current = null;
+        setCanCancel(false);
         setToolName(null);
+        // If the reply is already being spoken, stay 'speaking' until speaking_done;
+        // otherwise the turn is done → 'listening'.
+        setVoiceTurnState(speakingTurnIdRef.current !== null ? 'speaking' : 'listening');
         setReplyText(evt.reply); // full persisted reply (in case chunks dropped)
         const onFinal = onTurnFinalRef.current;
         if (onFinal) {
@@ -411,9 +464,36 @@ export function useVoice(opts: {
         }
         return;
       }
+      case 'speaking_started':
+        // May arrive before OR after turn_final (short replies finish text first).
+        // Must NOT read currentTurnIdRef — a post-final arrival is legal.
+        speakingTurnIdRef.current = evt.turn_id;
+        setTtsUnavailable(false); // TTS is clearly working — self-heal the notice
+        setDiscardNotice(false);
+        setVoiceTurnState('speaking');
+        return;
+      case 'speaking_done':
+        // Idempotent: a stale/dup done for a turn we're not speaking is a no-op.
+        if (speakingTurnIdRef.current === null) return;
+        speakingTurnIdRef.current = null;
+        setDiscardNotice(false);
+        // If text is still streaming (audio finished first) go back to 'replying';
+        // otherwise the turn is fully done → 'listening'.
+        setVoiceTurnState(currentTurnIdRef.current !== null ? 'replying' : 'listening');
+        return;
+      case 'utterance_discarded':
+        // Half-duplex: the user spoke while the assistant was speaking; the final
+        // was dropped server-side. Surface the honest notice (clears when speaking ends).
+        setDiscardNotice(true);
+        return;
       case 'error':
         if (evt.code === 'stt_unavailable') {
           fail('stt-failed');
+        } else if (evt.code === 'tts_unavailable') {
+          // Non-fatal TTS degrade — its OWN branch (CONTRACT §1.2). Must NOT touch
+          // replyText / turnError / voiceTurnState / the turn id: the generic branch
+          // below would wrongly clear the streaming reply mid-turn.
+          setTtsUnavailable(true);
         } else {
           // A per-turn failure (e.g. no_such_session) — non-fatal, call stays live.
           setTurnError(evt.detail || 'That didn’t go through — try saying it again.');
@@ -421,6 +501,7 @@ export function useVoice(opts: {
           setToolName(null);
           setVoiceTurnState('listening');
           currentTurnIdRef.current = null;
+          setCanCancel(false);
         }
         return;
     }
@@ -739,8 +820,13 @@ export function useVoice(opts: {
     turnError,
     toolName,
     dictationUnavailable,
+    speakerMuted,
+    ttsUnavailable,
+    discardNotice,
+    canCancel,
     start,
     toggleMute,
+    toggleSpeakerMute,
     cancelTurn,
     hangup,
     retryAudio,

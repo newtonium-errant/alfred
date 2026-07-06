@@ -56,19 +56,35 @@ export function VoicePanel({
     turnError,
     toolName,
     dictationUnavailable,
+    speakerMuted,
+    ttsUnavailable,
+    discardNotice,
+    canCancel,
   } = voice;
 
   // A voice turn needs the chat session_key (bound at offer time); gate start on it.
   const notReady = sessionKey == null;
-  const inTurn = voiceTurnState === 'thinking' || voiceTurnState === 'replying';
+  // Stop shows while the turn is still cancellable — including the speaking-overlap
+  // window (cancel also kills audio), but NOT during post-final playout where a
+  // cancel frame would no-op (an honest, non-dead control).
+  const inTurn =
+    voiceTurnState === 'thinking' ||
+    voiceTurnState === 'replying' ||
+    (voiceTurnState === 'speaking' && canCancel);
 
-  const pill = muted
-    ? { cls: PROGRESS_PILL, label: 'Muted', pulse: false }
-    : voiceTurnState === 'thinking'
-      ? { cls: PROGRESS_PILL, label: 'Thinking…', pulse: true }
-      : voiceTurnState === 'replying'
-        ? { cls: DONE_PILL, label: 'Replying…', pulse: false }
-        : { cls: DONE_PILL, label: '● Listening', pulse: false };
+  // Precedence: speaking (audible) > muted (mic) > thinking > replying > listening.
+  // 'Speaking…' pulses (audible activity); mic-mute stays visible via the Mute
+  // button's own label + aria-pressed.
+  const pill =
+    voiceTurnState === 'speaking'
+      ? { cls: DONE_PILL, label: 'Speaking…', pulse: true }
+      : muted
+        ? { cls: PROGRESS_PILL, label: 'Muted', pulse: false }
+        : voiceTurnState === 'thinking'
+          ? { cls: PROGRESS_PILL, label: 'Thinking…', pulse: true }
+          : voiceTurnState === 'replying'
+            ? { cls: DONE_PILL, label: 'Replying…', pulse: false }
+            : { cls: DONE_PILL, label: '● Listening', pulse: false };
 
   return (
     <div
@@ -144,6 +160,15 @@ export function VoicePanel({
                 >
                   {muted ? 'Unmute' : 'Mute'}
                 </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  data-testid="voice-speaker-mute"
+                  aria-pressed={speakerMuted}
+                  onClick={() => voice.toggleSpeakerMute()}
+                >
+                  {speakerMuted ? 'Unmute speaker' : 'Mute speaker'}
+                </Button>
                 {inTurn && (
                   <Button
                     variant="outline"
@@ -214,6 +239,20 @@ export function VoicePanel({
           {state === 'live' && dictationUnavailable && (
             <p data-testid="voice-dictation-unavailable" className={subtle}>
               Dictation isn’t active for this session.
+            </p>
+          )}
+
+          {/* Non-fatal TTS degrade — replies still arrive as text. */}
+          {state === 'live' && ttsUnavailable && (
+            <p data-testid="voice-tts-unavailable" className={subtle}>
+              Voice replies aren’t available right now — replies arrive as text.
+            </p>
+          )}
+
+          {/* Half-duplex: heard the user mid-reply but discarded it (honest, brief). */}
+          {state === 'live' && discardNotice && (
+            <p role="status" data-testid="voice-discard-notice" className={subtle}>
+              Heard you — hold on a moment.
             </p>
           )}
 

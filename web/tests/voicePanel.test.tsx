@@ -17,6 +17,7 @@ import { VoicePanel } from '../components/chat/VoicePanel';
 const actions = {
   start: vi.fn(),
   toggleMute: vi.fn(),
+  toggleSpeakerMute: vi.fn(),
   cancelTurn: vi.fn(),
   hangup: vi.fn(),
   retryAudio: vi.fn(),
@@ -36,6 +37,10 @@ function setVoice(overrides: Partial<UseVoice> = {}) {
     turnError: null,
     toolName: null,
     dictationUnavailable: false,
+    speakerMuted: false,
+    ttsUnavailable: false,
+    discardNotice: false,
+    canCancel: false,
     ...actions,
     ...overrides,
   });
@@ -127,6 +132,56 @@ describe('VoicePanel', () => {
       const mute = screen.getByTestId('voice-mute');
       expect(mute.textContent).toContain('Unmute');
       expect(mute.getAttribute('aria-pressed')).toBe('true');
+    });
+
+    // --- V2 talk-back ---
+    it('speaking shows the Speaking pill and outranks mic-muted', () => {
+      setVoice({ state: 'live', muted: true, voiceTurnState: 'speaking', voiceSessionId: 'vs-1' });
+      render(<VoicePanel instance={HOME_INSTANCE_NAME} sessionKey="s1" />);
+      // 'Speaking…' reports the audible activity even while the mic is muted;
+      // mic-mute stays visible via the Mute button's own label + aria-pressed.
+      expect(screen.getByTestId('voice-status').textContent).toContain('Speaking');
+      expect(screen.getByTestId('voice-mute').getAttribute('aria-pressed')).toBe('true');
+    });
+
+    it('Stop shows during speaking ONLY while the turn is still cancellable', () => {
+      setVoice({ state: 'live', voiceTurnState: 'speaking', canCancel: true, voiceSessionId: 'vs-1' });
+      const { rerender } = render(<VoicePanel instance={HOME_INSTANCE_NAME} sessionKey="s1" />);
+      expect(screen.getByTestId('voice-cancel')).not.toBeNull();
+      // Post-final playout (canCancel false): the Stop control hides (cancel would no-op).
+      setVoice({ state: 'live', voiceTurnState: 'speaking', canCancel: false, voiceSessionId: 'vs-1' });
+      rerender(<VoicePanel instance={HOME_INSTANCE_NAME} sessionKey="s1" />);
+      expect(screen.queryByTestId('voice-cancel')).toBeNull();
+    });
+
+    it('wires the speaker-mute control (aria-pressed reflects speakerMuted)', () => {
+      setVoice({ state: 'live', voiceTurnState: 'speaking', speakerMuted: true, voiceSessionId: 'vs-1' });
+      render(<VoicePanel instance={HOME_INSTANCE_NAME} sessionKey="s1" />);
+      const sp = screen.getByTestId('voice-speaker-mute');
+      expect(sp.textContent).toContain('Unmute speaker');
+      expect(sp.getAttribute('aria-pressed')).toBe('true');
+      fireEvent.click(sp);
+      expect(actions.toggleSpeakerMute).toHaveBeenCalledTimes(1);
+    });
+
+    it('renders the tts-unavailable + utterance-discarded notices when set (live-only)', () => {
+      setVoice({
+        state: 'live',
+        voiceTurnState: 'speaking',
+        ttsUnavailable: true,
+        discardNotice: true,
+        voiceSessionId: 'vs-1',
+      });
+      render(<VoicePanel instance={HOME_INSTANCE_NAME} sessionKey="s1" />);
+      expect(screen.getByTestId('voice-tts-unavailable').textContent).toContain('as text');
+      expect(screen.getByTestId('voice-discard-notice').textContent).toContain('Heard you');
+    });
+
+    it('omits the V2 notices when unset', () => {
+      setVoice({ state: 'live', voiceTurnState: 'listening', voiceSessionId: 'vs-1' });
+      render(<VoicePanel instance={HOME_INSTANCE_NAME} sessionKey="s1" />);
+      expect(screen.queryByTestId('voice-tts-unavailable')).toBeNull();
+      expect(screen.queryByTestId('voice-discard-notice')).toBeNull();
     });
 
     it('renders the live transcript, streaming reply, tool line, and turn-error regions', () => {
