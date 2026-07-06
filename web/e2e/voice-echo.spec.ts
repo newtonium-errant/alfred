@@ -11,9 +11,24 @@ import { expect, test } from '@playwright/test';
 //        - `alfred up` (talker transport listening on its loopback port)
 //   3. Next dev server in-WSL2: `npm run dev` (defaults to :3000)
 //        - .env.local: NEXT_PUBLIC_VOICE_ENABLED=1, ALFRED_WEB_TRANSPORT_URL,
-//          ALFRED_WEB_PEER_TOKEN, and ALFRED_WEB_DEV_SESSION_TOKEN (a dev session
-//          token so the BFF is authenticated without the email round-trip).
-//   4. Run: `npm run smoke:voice`   (override host via VOICE_SMOKE_BASE_URL)
+//          ALFRED_WEB_PEER_TOKEN (the BFF→transport peer token).
+//   4. Run WITH a minted session token (the spec skips without it):
+//        VOICE_SMOKE_SESSION_TOKEN=<token> npm run smoke:voice
+//        (override host via VOICE_SMOKE_BASE_URL)
+//
+// AUTH: the PAGE has its own gate (useSession → /api/auth/me →
+// readDisplayIdentity), SEPARATE from the BFF's session check. A server-side
+// ALFRED_WEB_DEV_SESSION_TOKEN authenticates the /api/voice/* calls but does NOT
+// satisfy the page gate — the browser redirects to /login and voice-start never
+// renders. So this spec authenticates the BROWSER by planting the two production
+// httpOnly cookies before goto('/'):
+//   - algernon_session  = the session token (→ resolveSessionToken; also lets the
+//                          BFF relay X-Alfred-Session, so the dev-token env is
+//                          not needed when this cookie is present)
+//   - algernon_identity = JSON {name, role} (→ readDisplayIdentity → page gate)
+// Both values are encodeURIComponent-encoded to match the BFF's serializeCookie
+// (lib/algernon/identity.ts:63) so Next's req.cookies decode round-trips — a RAW
+// JSON identity value risks the browser rejecting the ',' / '"' cookie octets.
 //
 // WSL2 trap: a Windows-side browser CANNOT complete media to aiortc inside WSL2
 // (localhost forwarding is TCP-only, microsoft/WSL#8783). This smoke MUST run its
@@ -25,7 +40,35 @@ import { expect, test } from '@playwright/test';
 // exposed on window, which the shipped hook deliberately does not do; RMS on the
 // received stream is a stronger end-to-end signal that echo audio truly flows).
 
-test('mic tone echoes back through the live voice panel', async ({ page }) => {
+test('mic tone echoes back through the live voice panel', async ({ page, context, baseURL }) => {
+  const token = process.env.VOICE_SMOKE_SESSION_TOKEN;
+  test.skip(
+    !token,
+    'Set VOICE_SMOKE_SESSION_TOKEN (a minted dev session token) to run the voice echo smoke.',
+  );
+
+  // Plant the production httpOnly session + identity cookies so the page auth gate
+  // (→ /api/auth/me → readDisplayIdentity) admits us instead of redirecting to
+  // /login. encodeURIComponent to match the BFF's serializeCookie so Next's
+  // req.cookies decode round-trips (see the AUTH note in the header).
+  const url = baseURL || process.env.VOICE_SMOKE_BASE_URL || 'http://127.0.0.1:3000';
+  await context.addCookies([
+    {
+      name: 'algernon_session',
+      value: encodeURIComponent(token as string),
+      url,
+      httpOnly: true,
+      sameSite: 'Lax',
+    },
+    {
+      name: 'algernon_identity',
+      value: encodeURIComponent(JSON.stringify({ name: 'andrew', role: 'owner' })),
+      url,
+      httpOnly: true,
+      sameSite: 'Lax',
+    },
+  ]);
+
   await page.goto('/');
 
   const start = page.getByTestId('voice-start');
