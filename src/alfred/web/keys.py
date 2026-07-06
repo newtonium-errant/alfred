@@ -20,3 +20,8 @@ KEY_WEB_AUTH_STATE = "web.auth_state"
 # double-appending to the transcript). Stashed per-app (NOT module-global)
 # so concurrent test apps in one process don't share state.
 KEY_WEB_INFLIGHT = "web.inflight_session_keys"
+# Per-app VoiceSessionManager for the WebRTC voice surface (V0 echo), or
+# ``None`` when voice is mounted in aiortc-missing 503 mode. Stashed per-app
+# (NOT module-global) for the same reason as KEY_WEB_INFLIGHT — concurrent
+# test apps in one process must not share the RTCPeerConnection registry.
+KEY_WEB_VOICE_MANAGER = "web.voice_manager"

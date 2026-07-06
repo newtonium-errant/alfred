@@ -11,10 +11,12 @@ from __future__ import annotations
 import pytest
 
 from alfred.web.config import (
+    VoiceIceConfig,
     WebAuthConfig,
     WebConfig,
     WebEmailConfig,
     WebUser,
+    WebVoiceConfig,
     _is_unresolved,
     load_from_unified,
     resolve_signing_secret,
@@ -283,3 +285,96 @@ def test_auth_mode_relay_does_not_require_secret() -> None:
     assert cfg.auth.mode == "relay"
     assert cfg.auth.session_secret == ""
     assert cfg.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# web.voice block (V0 WebRTC voice)
+# ---------------------------------------------------------------------------
+
+
+def test_voice_absent_is_disabled_default() -> None:
+    # An absent voice block → all-default (disabled) WebVoiceConfig, so the
+    # /voice/* routes stay unmounted (byte-identical route table).
+    cfg = load_from_unified({"web": {"enabled": True}})
+    assert isinstance(cfg.voice, WebVoiceConfig)
+    assert cfg.voice.enabled is False
+    assert cfg.voice.max_sessions == 2
+    assert cfg.voice.pipeline == "echo"
+    assert cfg.voice.offer_timeout_seconds == 10
+    assert cfg.voice.reaper_interval_seconds == 15
+    assert isinstance(cfg.voice.ice, VoiceIceConfig)
+    assert cfg.voice.ice.stun_servers == []
+
+
+def test_voice_full_block_loads() -> None:
+    cfg = load_from_unified(
+        {
+            "web": {
+                "enabled": True,
+                "voice": {
+                    "enabled": True,
+                    "max_sessions": 4,
+                    "pipeline": "echo",
+                    "offer_timeout_seconds": 12,
+                    "connect_deadline_seconds": 25,
+                    "idle_timeout_seconds": 90,
+                    "max_session_seconds": 900,
+                    "reaper_interval_seconds": 20,
+                    "ice": {
+                        "advertised_ip": "203.0.113.9",
+                        "stun_servers": ["stun:stun.l.google.com:19302"],
+                        "udp_port_range": "40000-40100",
+                    },
+                },
+            }
+        }
+    )
+    v = cfg.voice
+    assert v.enabled is True
+    assert v.max_sessions == 4
+    assert v.offer_timeout_seconds == 12
+    assert v.connect_deadline_seconds == 25
+    assert v.idle_timeout_seconds == 90
+    assert v.max_session_seconds == 900
+    assert v.reaper_interval_seconds == 20
+    assert v.ice.advertised_ip == "203.0.113.9"
+    assert v.ice.stun_servers == ["stun:stun.l.google.com:19302"]
+    assert v.ice.udp_port_range == "40000-40100"
+
+
+def test_voice_int_coercion_and_schema_tolerance() -> None:
+    # String ints coerce; a bad int falls back to the default; an unknown key
+    # is dropped (schema-tolerance).
+    cfg = load_from_unified(
+        {
+            "web": {
+                "enabled": True,
+                "voice": {
+                    "enabled": True,
+                    "max_sessions": "3",          # str → 3
+                    "offer_timeout_seconds": "oops",  # bad → default 10
+                    "future_knob": "ignored",     # unknown → dropped
+                },
+            }
+        }
+    )
+    assert cfg.voice.max_sessions == 3
+    assert cfg.voice.offer_timeout_seconds == 10
+
+
+def test_voice_stun_servers_drops_non_str_entries() -> None:
+    cfg = load_from_unified(
+        {
+            "web": {
+                "enabled": True,
+                "voice": {"ice": {"stun_servers": ["stun:a:1", 42, "", "  stun:b:2 "]}},
+            }
+        }
+    )
+    # Non-str / blank dropped; surviving entries stripped.
+    assert cfg.voice.ice.stun_servers == ["stun:a:1", "stun:b:2"]
+
+
+def test_voice_non_dict_block_tolerated() -> None:
+    cfg = load_from_unified({"web": {"enabled": True, "voice": "nonsense"}})
+    assert cfg.voice.enabled is False  # defaults, no crash

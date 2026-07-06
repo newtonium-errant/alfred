@@ -87,6 +87,14 @@ voice = [
     # SDK-based calls later without another pip install.
     "deepgram-sdk>=3.0",
 ]
+# V0 WebRTC voice (PWA voice arc, 2026-07-05): server-side aiortc for the
+# browser mic → echo transport. NOTE the extra is named ``webrtc`` NOT
+# ``voice`` — ``voice`` is ALREADY the talker stack above (line 43), and
+# reusing it would drag av/ffmpeg into every talker install. aiortc pulls
+# ``av`` (bundles ffmpeg) + ``aioice`` + ``pylibsrtp``; the ``web.voice``
+# config block is gate-checked (enabled + pipeline) BEFORE any lazy import,
+# so an instance that doesn't opt in pays zero import cost.
+webrtc = ["aiortc>=1.14"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -113,6 +121,7 @@ all = [
     "alfred-vault[surveyor]",
     "alfred-vault[temporal]",
     "alfred-vault[voice]",
+    "alfred-vault[webrtc]",
     "alfred-vault[gcal]",
 ]
 

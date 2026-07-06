@@ -117,6 +117,56 @@ class WebEmailConfig:
 
 
 @dataclass
+class VoiceIceConfig:
+    """ICE knobs for the V0 WebRTC voice surface (``web.voice.ice``).
+
+    * ``advertised_ip`` — when set, the answer SDP's ``a=candidate ... typ
+      host`` connection addresses are rewritten to this IP (1:1-NAT deploys
+      where the box's on-interface address is private but a public IP
+      forwards to it). Empty = no rewrite (the OVH box carries its public IP
+      on-interface, so host candidates are already correct — leave unset).
+      APPLIED in V0 (pure SDP rewrite, see ``voice_session``).
+    * ``stun_servers`` — STUN URLs applied to the server RTCConfiguration AND
+      served to the browser via ``GET /voice/config``. Empty = host-candidate
+      only (direct UDP; sufficient when the server has a public IP).
+    * ``udp_port_range`` — RESERVED (``"min-max"``). aioice has no port-range
+      knob (aiortc#487), so this is accepted-and-logged-UNAPPLIED
+      (``web.voice.ice_option_unapplied``) — never a silent no-op.
+    """
+
+    advertised_ip: str = ""
+    stun_servers: list[str] = field(default_factory=list)
+    udp_port_range: str = ""
+
+
+@dataclass
+class WebVoiceConfig:
+    """Typed config for the V0 WebRTC voice surface (``web.voice``).
+
+    ``enabled`` defaults False — an absent or disabled ``voice:`` block means
+    the ``/voice/*`` routes are NOT mounted (opt-in inertness; the route
+    table is byte-identical for every instance that doesn't opt in). All
+    timeouts live here (NOT as module constants) so a deploy can tune them
+    without a code change. ``pipeline`` is an enum — only ``"echo"`` is valid
+    in V0; any other value fails closed (routes NOT mounted, loud log), so a
+    typo can never silently serve an unintended pipeline.
+    """
+
+    enabled: bool = False
+    max_sessions: int = 2
+    pipeline: str = "echo"
+    offer_timeout_seconds: int = 10
+    connect_deadline_seconds: int = 30
+    idle_timeout_seconds: int = 120
+    max_session_seconds: int = 1800
+    # Reaper sweep cadence. Not in the documented example block (advanced
+    # knob) but config-overridable per §4 "REAPER_INTERVAL from config or
+    # 15s"; schema-tolerant so an older config without it still loads.
+    reaper_interval_seconds: int = 15
+    ice: VoiceIceConfig = field(default_factory=VoiceIceConfig)
+
+
+@dataclass
 class WebConfig:
     """Typed config for the ``web:`` section.
 
@@ -129,6 +179,7 @@ class WebConfig:
     users: list[WebUser] = field(default_factory=list)
     auth: WebAuthConfig = field(default_factory=WebAuthConfig)
     email: WebEmailConfig = field(default_factory=WebEmailConfig)
+    voice: WebVoiceConfig = field(default_factory=WebVoiceConfig)
     # Tool-scoped state path for the single-use magic-link nonce store
     # (per the load() schema-tolerance contract's "default state paths must
     # be tool-scoped" rule). Overridable per-instance.
@@ -208,6 +259,76 @@ def _build_email(raw: Any) -> WebEmailConfig:
     )
 
 
+def _str_list(raw: Any) -> list[str]:
+    """Coerce a config value to a list of non-empty strings.
+
+    Drops non-str / blank entries (a malformed STUN entry can never be a
+    usable ICE server URL) rather than constructing a garbage list.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for entry in raw:
+        if isinstance(entry, str) and entry.strip():
+            out.append(entry.strip())
+    return out
+
+
+def _build_voice_ice(raw: Any) -> VoiceIceConfig:
+    """Hand-roll ``VoiceIceConfig`` with a schema-tolerance filter."""
+    if not isinstance(raw, dict):
+        return VoiceIceConfig()
+    known = VoiceIceConfig.__dataclass_fields__
+    filtered = {k: v for k, v in raw.items() if k in known}
+    return VoiceIceConfig(
+        advertised_ip=str(filtered.get("advertised_ip", "") or ""),
+        stun_servers=_str_list(filtered.get("stun_servers")),
+        udp_port_range=str(filtered.get("udp_port_range", "") or ""),
+    )
+
+
+def _build_voice(raw: Any) -> WebVoiceConfig:
+    """Hand-roll ``WebVoiceConfig`` with a schema-tolerance filter.
+
+    Mirrors ``_build_auth`` — isinstance-dict guard, ``__dataclass_fields__``
+    filter, ``_int`` coercion for the timeouts / cap, and a nested
+    hand-rolled ``ice`` block (NO ``_build`` / ``_DATACLASS_MAP`` — this
+    module hand-rolls everything to sidestep the key-name collision footgun).
+    """
+    if not isinstance(raw, dict):
+        return WebVoiceConfig()
+    known = WebVoiceConfig.__dataclass_fields__
+    filtered = {k: v for k, v in raw.items() if k in known}
+    defaults = WebVoiceConfig()
+    return WebVoiceConfig(
+        enabled=bool(filtered.get("enabled", False)),
+        max_sessions=_int(filtered.get("max_sessions"), defaults.max_sessions),
+        pipeline=str(filtered.get("pipeline", defaults.pipeline)
+                     or defaults.pipeline),
+        offer_timeout_seconds=_int(
+            filtered.get("offer_timeout_seconds"),
+            defaults.offer_timeout_seconds,
+        ),
+        connect_deadline_seconds=_int(
+            filtered.get("connect_deadline_seconds"),
+            defaults.connect_deadline_seconds,
+        ),
+        idle_timeout_seconds=_int(
+            filtered.get("idle_timeout_seconds"),
+            defaults.idle_timeout_seconds,
+        ),
+        max_session_seconds=_int(
+            filtered.get("max_session_seconds"),
+            defaults.max_session_seconds,
+        ),
+        reaper_interval_seconds=_int(
+            filtered.get("reaper_interval_seconds"),
+            defaults.reaper_interval_seconds,
+        ),
+        ice=_build_voice_ice(filtered.get("ice")),
+    )
+
+
 def _int(value: Any, default: int) -> int:
     """Coerce to int, falling back to ``default`` on None / bad input."""
     try:
@@ -232,6 +353,7 @@ def load_from_unified(raw: dict[str, Any]) -> WebConfig:
         users=_build_users(section.get("users")),
         auth=_build_auth(section.get("auth")),
         email=_build_email(section.get("email")),
+        voice=_build_voice(section.get("voice")),
         state_path=str(
             section.get("state_path", "./data/web_auth_state.json")
             or "./data/web_auth_state.json"

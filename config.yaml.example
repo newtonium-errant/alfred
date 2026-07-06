@@ -569,6 +569,32 @@ transport:
 #     provider: resend
 #     api_key: "${RESEND_API_KEY}"
 #     from_address: "${ALFRED_WEB_FROM_ADDRESS}"
+#   # --- V0 WebRTC voice (PWA voice arc) ---
+#   # Browser mic → WebRTC → this server → echo back (V0 = "audio transport
+#   # up"; no STT/TTS/chat coupling yet). DISABLED by default — an absent or
+#   # ``enabled: false`` block mounts NO /voice/* routes (route table
+#   # byte-identical). Session-mode ONLY (relay instances never mount voice).
+#   # Requires the ``webrtc`` pip extra:  pip install 'alfred-vault[webrtc]'
+#   # (aiortc; the daemon stays up + logs loudly if enabled-but-not-installed,
+#   # serving /voice/offer as 503 voice_unavailable). Deploy also needs an
+#   # inbound-UDP ufw allow for the ephemeral range — see docs/voice_v0.md.
+#   voice:
+#     enabled: false
+#     max_sessions: 2                 # single-operator: 1 live + 1 grace slot
+#     pipeline: echo                  # only 'echo' valid in V0; unknown → no-mount
+#     offer_timeout_seconds: 10       # negotiation wall-clock cap (→ 504)
+#     connect_deadline_seconds: 30    # never-reached-"connected" reap
+#     idle_timeout_seconds: 120       # connected-then-idle reap
+#     max_session_seconds: 1800       # absolute lifetime (→ expires_at)
+#     # reaper_interval_seconds: 15   # advanced: sweep cadence (default 15)
+#     ice:
+#       # Rewrite answer-SDP host-candidate addrs to a public IP (1:1-NAT
+#       # deploys only; LEAVE EMPTY when the box's public IP is on-interface,
+#       # e.g. the OVH box — verify with ``ip addr`` first).
+#       advertised_ip: ""
+#       stun_servers: []              # e.g. ["stun:stun.l.google.com:19302"]
+#       udp_port_range: ""            # RESERVED — aioice has no port knob
+#                                     # (aiortc#487); accepted + logged, unapplied
 #
 # --- Target instance (KAL-LE / Hypatia / VERA) — relay mode ---
 # Pair this with a DEDICATED ``transport.auth.tokens.web`` entry above

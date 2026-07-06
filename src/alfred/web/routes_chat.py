@@ -1093,6 +1093,17 @@ def register_web_routes(
     register_stt_handlers(app)
     mounted_routes.append("/stt/transcribe")
 
+    # Voice routes (/voice/*) — V0 WebRTC echo, default-OFF behind
+    # web.voice.enabled. register_voice_handlers is self-gating (returns
+    # False + mounts nothing when voice is absent/disabled/relay-mode/
+    # mis-piped, so the route table stays byte-identical); when it mounts it
+    # also appends its own on_shutdown drain (no daemon.py change). Same
+    # lazy-import anti-cycle pattern as STT.
+    from .routes_voice import register_voice_handlers
+
+    if register_voice_handlers(app, web_config=web_config):
+        mounted_routes += ["/voice/offer", "/voice/close", "/voice/config"]
+
     log.info(
         "web.routes.registered",
         users=len(web_config.users),

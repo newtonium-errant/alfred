@@ -164,4 +164,83 @@ curl -sS "$BASE/chat/history/<uuid>" "${_PEER[@]}" "${_SESSION[@]}"
   it in UI copy.
 - **One active session per user.** A second `/chat/open` archives the prior
   session and starts fresh (mirrors Telegram).
+
+---
+
+## Voice V0 — WebRTC echo transport (`/voice/*`)
+
+V0 = "audio transport up": browser mic → WebRTC → this server → **echo back**.
+No STT/TTS/chat coupling. **Default-OFF** behind `web.voice.enabled` — an
+absent/disabled block mounts NO `/voice/*` routes (route table
+byte-identical). Full runbook (WSL2 UDP trap, deploy ufw, iOS QA):
+[`docs/voice_v0.md`](../../../docs/voice_v0.md).
+
+Same two-layer auth as `/chat/*` (peer token + `X-Alfred-Session`), plus a
+**peer-pin to the `web` peer** (`WEB_CHAT_PEER`) on every route — a
+`web_ingest` token (which shares `allowed_clients: [web]`) is refused with the
+same 401 as a bad session. **Session-mode only** (relay instances never mount
+voice). Requires `pip install 'alfred-vault[webrtc]'` (aiortc); enabled-but-
+missing mounts the routes in a loud **503 mode**.
+
+Signaling rides the BFF relay; **media flows DIRECT browser↔server UDP**
+(never through the BFF/cloudflared). **Vanilla ICE** — one offer/answer
+round-trip, all candidates embedded, no `/candidate`, no renegotiation;
+reconnect = a fresh `POST /voice/offer`.
+
+### `GET /voice/config` (Layer 1 + Layer 2)
+
+```bash
+curl -sS "$BASE/voice/config" "${_PEER[@]}" "${_SESSION[@]}"
+# → {"available":true,"reason":null,
+#    "ice_servers":[{"urls":["stun:..."]}],   # from web.voice.ice.stun_servers
+#    "max_sessions":2,
+#    "yours":[{"voice_session_id":"<hex>","connection_state":"connected","age_seconds":12}]}
+#   available:false + reason:"aiortc_missing" when the webrtc extra isn't installed.
+#   NO global active-session count (yours-scoped only).
+```
+
+### `POST /voice/offer` (Layer 1 + Layer 2)
+
+```bash
+# The browser: getUserMedia → addTrack → createOffer → setLocalDescription →
+# WAIT iceGatheringState=="complete" (vanilla ICE) → POST the full offer SDP.
+curl -sS -X POST "$BASE/voice/offer" "${_PEER[@]}" "${_SESSION[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{"sdp":"<offer sdp, all candidates embedded>","type":"offer"}'
+# → {"voice_session_id":"<32-hex>","sdp":"<answer sdp>","type":"answer",
+#    "expires_at":"<iso8601, now + max_session_seconds>"}
+```
+
+`session_key` (optional, ≤128 chars) is a V0 forward-hook — accepted, capped,
+logged, **ignored** (no chat coupling yet). Same-user re-offer (page reload)
+closes the caller's previous session (`reason=replaced`) before opening the
+new one.
+
+### `POST /voice/close` (Layer 1 + Layer 2)
+
+```bash
+curl -sS -X POST "$BASE/voice/close" "${_PEER[@]}" "${_SESSION[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{"voice_session_id":"<hex>"}'
+# → {"closed":true}   (own live session)
+# → {"closed":false,"reason":"not_found"}   (unknown / already-closed / ANOTHER
+#     user's id — indistinguishable, owner-bound, no existence leak)
+```
+
+The `pagehide`/hangup keepalive close MUST carry `Content-Type:
+application/json` (security W7) or it 415s.
+
+### Error reference (`/voice/*`)
+
+| Route | Status | Body | When |
+|---|---|---|---|
+| any `/voice/*` | `401` | `{"error":"invalid_session"}` | peer-pin fail OR session fail (indistinguishable) |
+| `/voice/offer` | `415` | `{"error":"unsupported_media_type"}` | `Content-Type` ≠ `application/json` |
+| `/voice/offer` | `400` | `{"error":"bad_json"}` / `sdp_required` / `invalid_sdp_type` | malformed body / no sdp / `type`≠`offer` |
+| `/voice/offer` | `413` | `{"error":"sdp_too_large","max_bytes":131072}` | offer SDP > 128 KB |
+| `/voice/offer` | `429` | `{"error":"too_many_sessions","max_sessions":N}` | cap (incl. in-flight negotiations) |
+| `/voice/offer` | `502` | `{"error":"negotiation_failed"}` | aiortc negotiation raised |
+| `/voice/offer` | `504` | `{"error":"voice_offer_timeout"}` | negotiation exceeded `offer_timeout_seconds` |
+| `/voice/offer` | `503` | `{"error":"voice_unavailable","reason":"aiortc_missing"}` | enabled but webrtc extra absent |
+| `/voice/close` | `400` | `{"error":"voice_session_id_required"}` | missing/blank id |
 ```
