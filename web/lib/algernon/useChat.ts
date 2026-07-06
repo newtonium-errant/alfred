@@ -172,6 +172,14 @@ export interface UseChat {
   newChat: () => Promise<void>;
   /** End the chat (archives+opens fresh) and show a confirmation — the real /end. */
   endChat: () => Promise<void>;
+  /** The active session_key (null while booting) — voice binds it at offer time. */
+  sessionKey: string | null;
+  /**
+   * Adopt the server transcript into the thread (used after a voice turn persists).
+   * No-ops (false) while a TYPED turn is pending/retryable — adopting then would
+   * drop the optimistic user bubble. Returns true iff the thread was updated.
+   */
+  refreshFromHistory: () => Promise<boolean>;
 }
 
 function friendlyError(e: unknown): string {
@@ -213,6 +221,10 @@ export function useChat(options: UseChatOptions = {}): UseChat {
   const [notice, setNotice] = useState<string | null>(null);
   const [retryable, setRetryable] = useState(false);
   const [unauthenticated, setUnauthenticated] = useState(false);
+  // session_key held in a ref for synchronous reads inside async send flows, AND
+  // mirrored to state so the page can plumb it to VoicePanel (voice binds it at
+  // offer time). setKey keeps the two in lockstep.
+  const [sessionKey, setSessionKey] = useState<string | null>(null);
   const sessionKeyRef = useRef<string | null>(null);
   const pendingRef = useRef<PendingTurn | null>(null);
   // The in-flight streamed turn's AbortController — aborted on unmount or when a
@@ -235,12 +247,17 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     setError(friendlyError(e));
   }, []);
 
+  const setKey = useCallback((k: string | null) => {
+    sessionKeyRef.current = k;
+    setSessionKey(k);
+  }, []);
+
   const openFresh = useCallback(async () => {
     const { session_key } = await chatApi.open(instance);
-    sessionKeyRef.current = session_key;
+    setKey(session_key);
     writeStored(instance, session_key);
     setMessages([]);
-  }, [instance]);
+  }, [instance, setKey]);
 
   const bootstrap = useCallback(async () => {
     // Supersede any in-flight turn from the previous instance/thread.
@@ -250,14 +267,14 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     setNotice(null);
     setRetryable(false);
     pendingRef.current = null;
-    sessionKeyRef.current = null;
+    setKey(null);
     setMessages([]);
     try {
       const stored = readStored(instance);
       if (stored) {
         try {
           const { turns } = await chatApi.history(stored, instance);
-          sessionKeyRef.current = stored;
+          setKey(stored);
           setMessages(turns.map(turnToMessage));
           setStatus('ready');
           return;
@@ -273,7 +290,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     } catch (e) {
       fail(e);
     }
-  }, [instance, openFresh, fail]);
+  }, [instance, openFresh, fail, setKey]);
 
   // Re-bootstrap whenever the active instance changes — each instance has its own
   // independent thread (per-instance session key).
@@ -303,6 +320,16 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     },
     [instance],
   );
+
+  // Public reconcile wrapper for a voice-driven turn: adopt the persisted exchange
+  // into the visible thread. Guards against a pending TYPED turn (whose optimistic
+  // bubble adoption would clobber) and a not-yet-booted session.
+  const refreshFromHistory = useCallback(async (): Promise<boolean> => {
+    if (pendingRef.current) return false;
+    const key = sessionKeyRef.current;
+    if (!key) return false;
+    return reconcileFromHistory(key, messagesRef.current.length);
+  }, [reconcileFromHistory]);
 
   // Finalise the optimistic bubbles from the terminal `done` payload (patch the
   // user-turn ts + append the assistant reply) — identical to the buffered path.
@@ -522,5 +549,7 @@ export function useChat(options: UseChatOptions = {}): UseChat {
     retry,
     newChat,
     endChat,
+    sessionKey,
+    refreshFromHistory,
   };
 }

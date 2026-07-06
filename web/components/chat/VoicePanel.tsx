@@ -4,12 +4,13 @@ import { useVoice } from '../../lib/algernon/useVoice';
 import { HOME_INSTANCE_NAME, isHomeInstance } from '../../lib/algernon/instance';
 import { subtle } from '../../lib/typography';
 
-// V0 voice affordance, embedded in the chat surface (above the Composer). Two
+// Voice affordance embedded in the chat surface (above the Composer). Two
 // fail-closed gates: a DISPLAY flag (NEXT_PUBLIC_VOICE_ENABLED — absent ⇒ renders
-// NOTHING, capability default-off) and a Salem-only instance guard (cross-instance
-// selection ⇒ a disabled control + an explicit hint, never a silent dead button).
-// The authoritative gate is the backend (web.voice.enabled → GET /voice/config);
-// the display flag only decides whether to show the affordance at all.
+// NOTHING) and a Salem-only instance guard (cross-instance ⇒ disabled control +
+// explicit hint). The authoritative gate is the backend (web.voice.enabled → GET
+// /voice/config). V1 adds the dictation surface: the live pill reflects the turn
+// sub-state (listening/thinking/replying), the transcript + streaming reply render
+// live, and the completed exchange is adopted into the chat thread via onTurnFinal.
 //
 // Reads process.env per-render (Next inlines NEXT_PUBLIC_* to a literal at build)
 // so the flag is testable via stubbed env without a module reset.
@@ -18,15 +19,56 @@ function voiceDisplayEnabled(): boolean {
   return v === '1' || v === 'true';
 }
 
-export function VoicePanel({ instance }: { instance: string }) {
+const DONE_PILL =
+  'inline-flex items-center gap-1 rounded-full bg-status-done px-2.5 py-1 text-sm font-semibold text-status-done-fg';
+const PROGRESS_PILL =
+  'inline-flex items-center gap-1 rounded-full bg-status-progress px-2.5 py-1 text-sm font-semibold text-status-progress-fg';
+
+export function VoicePanel({
+  instance,
+  sessionKey,
+  onTurnFinal,
+}: {
+  instance: string;
+  sessionKey?: string | null;
+  onTurnFinal?: () => Promise<boolean>;
+}) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const homeOk = isHomeInstance(instance);
   // Hooks run unconditionally (rules-of-hooks); the display gate returns below.
-  const voice = useVoice({ audioRef, enabled: voiceDisplayEnabled() && homeOk });
+  const voice = useVoice({
+    audioRef,
+    enabled: voiceDisplayEnabled() && homeOk,
+    sessionKey,
+    onTurnFinal,
+  });
 
   if (!voiceDisplayEnabled()) return null;
 
-  const { state, muted, audioBlocked, error } = voice;
+  const {
+    state,
+    muted,
+    audioBlocked,
+    error,
+    voiceTurnState,
+    partialTranscript,
+    replyText,
+    turnError,
+    toolName,
+    dictationUnavailable,
+  } = voice;
+
+  // A voice turn needs the chat session_key (bound at offer time); gate start on it.
+  const notReady = sessionKey == null;
+  const inTurn = voiceTurnState === 'thinking' || voiceTurnState === 'replying';
+
+  const pill = muted
+    ? { cls: PROGRESS_PILL, label: 'Muted', pulse: false }
+    : voiceTurnState === 'thinking'
+      ? { cls: PROGRESS_PILL, label: 'Thinking…', pulse: true }
+      : voiceTurnState === 'replying'
+        ? { cls: DONE_PILL, label: 'Replying…', pulse: false }
+        : { cls: DONE_PILL, label: '● Listening', pulse: false };
 
   return (
     <div
@@ -49,14 +91,22 @@ export function VoicePanel({ instance }: { instance: string }) {
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-2">
             {state === 'idle' && (
-              <Button
-                variant="outline"
-                size="sm"
-                data-testid="voice-start"
-                onClick={() => void voice.start()}
-              >
-                🎙 Voice
-              </Button>
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  data-testid="voice-start"
+                  disabled={notReady}
+                  onClick={() => void voice.start()}
+                >
+                  🎙 Voice
+                </Button>
+                {notReady && (
+                  <span data-testid="voice-loading-hint" className={subtle}>
+                    Chat is still loading…
+                  </span>
+                )}
+              </>
             )}
 
             {(state === 'requesting-mic' || state === 'connecting' || state === 'closing') && (
@@ -76,15 +126,14 @@ export function VoicePanel({ instance }: { instance: string }) {
 
             {state === 'live' && (
               <>
-                <span
-                  data-testid="voice-status"
-                  className={
-                    muted
-                      ? 'inline-flex items-center gap-1 rounded-full bg-status-progress px-2.5 py-1 text-sm font-semibold text-status-progress-fg'
-                      : 'inline-flex items-center gap-1 rounded-full bg-status-done px-2.5 py-1 text-sm font-semibold text-status-done-fg'
-                  }
-                >
-                  {muted ? 'Muted' : '● Live — echo test'}
+                <span data-testid="voice-status" className={pill.cls}>
+                  {pill.pulse && (
+                    <span
+                      aria-hidden
+                      className="h-2 w-2 rounded-full bg-current motion-safe:animate-pulse"
+                    />
+                  )}
+                  {pill.label}
                 </span>
                 <Button
                   variant="outline"
@@ -95,6 +144,16 @@ export function VoicePanel({ instance }: { instance: string }) {
                 >
                   {muted ? 'Unmute' : 'Mute'}
                 </Button>
+                {inTurn && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    data-testid="voice-cancel"
+                    onClick={() => voice.cancelTurn()}
+                  >
+                    Stop
+                  </Button>
+                )}
                 <Button
                   variant="destructive"
                   size="sm"
@@ -107,8 +166,58 @@ export function VoicePanel({ instance }: { instance: string }) {
             )}
           </div>
 
-          {/* Autoplay edge (iOS/Safari): the pc is live but playback was blocked.
-              A distinct NON-red notice with a fresh-gesture recovery button. */}
+          {/* Live transcript of the current utterance. */}
+          {state === 'live' && partialTranscript && (
+            <p
+              data-testid="voice-transcript"
+              aria-live="polite"
+              className={subtle}
+            >
+              {partialTranscript}
+            </p>
+          )}
+
+          {/* The active tool during a tool turn — honest UX for 10–23s turns. */}
+          {state === 'live' && toolName && (
+            <p
+              data-testid="voice-tool"
+              aria-live="polite"
+              className="text-sm text-honeydew-600"
+            >
+              Using {toolName}…
+            </p>
+          )}
+
+          {/* Streaming reply — clears once the exchange is adopted into the thread. */}
+          {replyText && (
+            <div
+              data-testid="voice-reply"
+              aria-live="polite"
+              className="max-h-40 overflow-y-auto rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-800"
+            >
+              {replyText}
+            </div>
+          )}
+
+          {/* Non-fatal per-turn failure notice (call stays live) — honeydew, not red. */}
+          {turnError && (
+            <p
+              role="status"
+              data-testid="voice-turn-error"
+              className="rounded-xl bg-honeydew-100 px-3 py-2 text-sm text-honeydew-700"
+            >
+              {turnError}
+            </p>
+          )}
+
+          {/* Live but dictation never confirmed (echo pipeline / dead dictation). */}
+          {state === 'live' && dictationUnavailable && (
+            <p data-testid="voice-dictation-unavailable" className={subtle}>
+              Dictation isn’t active for this session.
+            </p>
+          )}
+
+          {/* Autoplay edge (iOS/Safari): the pc is live but playback was blocked. */}
           {audioBlocked && (state === 'live' || state === 'connecting') && (
             <div
               data-testid="voice-audio-blocked"

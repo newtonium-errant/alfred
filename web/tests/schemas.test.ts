@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  MAX_DC_TEXT_CHARS,
   MAX_MESSAGE_CHARS,
   MAX_SDP_CHARS,
   chatTurnBodySchema,
+  voiceCancelFrame,
   voiceCloseBodySchema,
+  voiceDcEventSchema,
+  voiceHelloFrame,
   voiceOfferBodySchema,
 } from '../lib/algernon/schemas';
 
@@ -122,5 +126,59 @@ describe('voiceCloseBodySchema', () => {
   it('rejects an empty voice_session_id', () => {
     const r = voiceCloseBodySchema.safeParse({ voice_session_id: '' });
     expect(r.success).toBe(false);
+  });
+});
+
+describe('voiceDcEventSchema (canonical D2 vocabulary)', () => {
+  const ok = (obj: unknown) => voiceDcEventSchema.safeParse(obj).success;
+
+  it('accepts every server event type with v:1', () => {
+    expect(ok({ v: 1, type: 'state', state: 'ready', chat_session_key: 'k', voice_session_id: 'vs' })).toBe(true);
+    expect(ok({ v: 1, type: 'state', state: 'superseded' })).toBe(true);
+    expect(ok({ v: 1, type: 'state', state: 'turn_cancelled', turn_id: 't1' })).toBe(true);
+    expect(ok({ v: 1, type: 'stt_partial', utterance_id: 'u1', text: 'hi', ts: 1 })).toBe(true);
+    expect(ok({ v: 1, type: 'stt_final', utterance_id: 'u1', text: 'hello', ts: 'x' })).toBe(true);
+    expect(ok({ v: 1, type: 'turn_started', turn_id: 't1' })).toBe(true);
+    expect(ok({ v: 1, type: 'turn_text', turn_id: 't1', seq: 0, text: 'a' })).toBe(true);
+    expect(ok({ v: 1, type: 'turn_tool', turn_id: 't1', tool: 'vault_search' })).toBe(true);
+    expect(ok({ v: 1, type: 'turn_final', turn_id: 't1', reply: 'done', ts: 'a', user_ts: 'b', reply_chars: 4, truncated: false })).toBe(true);
+    expect(ok({ v: 1, type: 'error', code: 'stt_unavailable', detail: 'down' })).toBe(true);
+  });
+
+  it('rejects an unknown state enum value', () => {
+    expect(ok({ v: 1, type: 'state', state: 'exploded' })).toBe(false);
+  });
+
+  it('rejects a frame without v:1 (protocol version pinned)', () => {
+    expect(ok({ type: 'turn_started', turn_id: 't1' })).toBe(false);
+    expect(ok({ v: 2, type: 'turn_started', turn_id: 't1' })).toBe(false);
+  });
+
+  it('rejects an unknown event type (dropped by the caller via the lenient probe)', () => {
+    expect(ok({ v: 1, type: 'tts_started', text: 'v2' })).toBe(false);
+  });
+
+  it('rejects an over-cap text chunk', () => {
+    expect(ok({ v: 1, type: 'turn_text', turn_id: 't1', seq: 0, text: 'x'.repeat(MAX_DC_TEXT_CHARS + 1) })).toBe(false);
+  });
+
+  it('rejects turn_final with a non-string reply', () => {
+    expect(ok({ v: 1, type: 'turn_final', turn_id: 't1', reply: 42 })).toBe(false);
+  });
+
+  it('accepts (and strips) unknown extra keys — non-strict', () => {
+    const r = voiceDcEventSchema.safeParse({ v: 1, type: 'turn_started', turn_id: 't1', future: 'x' });
+    expect(r.success).toBe(true);
+    if (r.success) expect('future' in r.data).toBe(false);
+  });
+});
+
+describe('client frame builders', () => {
+  it('hello carries v:1', () => {
+    expect(JSON.parse(voiceHelloFrame())).toEqual({ v: 1, type: 'hello' });
+  });
+  it('cancel carries v:1 + the turn_id when given', () => {
+    expect(JSON.parse(voiceCancelFrame('t9'))).toEqual({ v: 1, type: 'cancel', turn_id: 't9' });
+    expect(JSON.parse(voiceCancelFrame())).toEqual({ v: 1, type: 'cancel' });
   });
 });

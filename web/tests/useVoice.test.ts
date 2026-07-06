@@ -4,6 +4,14 @@ import type { RefObject } from 'react';
 import { ApiError } from '../lib/algernon/http';
 import { useVoice } from '../lib/algernon/useVoice';
 import type { VoiceConfigResponse } from '../lib/algernon/types';
+import {
+  FakeMediaStream,
+  FakeRTCPeerConnection,
+  installVoiceGlobals,
+  lastPC,
+  makeTrack,
+  type FakeTrack,
+} from './helpers/webrtcFakes';
 
 // Scripted WebRTC state machine test. A FakeRTCPeerConnection lets us drive the
 // gathering / connection transitions deterministically; getUserMedia + voiceApi
@@ -23,119 +31,21 @@ vi.mock('../lib/algernon/voiceClient', async (importOriginal) => {
   };
 });
 
-// --- Fakes ------------------------------------------------------------------
-
-class FakeMediaStream {
-  constructor(private tracks: FakeTrack[] = []) {}
-  getTracks() {
-    return this.tracks;
-  }
-  getAudioTracks() {
-    return this.tracks;
-  }
-}
-
-interface FakeTrack {
-  kind: string;
-  enabled: boolean;
-  stop: ReturnType<typeof vi.fn>;
-}
-
-function makeTrack(): FakeTrack {
-  return { kind: 'audio', enabled: true, stop: vi.fn() };
-}
-
-type Listener = () => void;
-
-class FakeRTCPeerConnection {
-  static instances: FakeRTCPeerConnection[] = [];
-  static autoGather = true;
-
-  config: RTCConfiguration;
-  localDescription: { type: string; sdp: string } | null = null;
-  remoteDescription: unknown = null;
-  iceGatheringState = 'new';
-  connectionState = 'new';
-  ontrack: ((ev: { streams: FakeMediaStream[]; track: unknown }) => void) | null = null;
-  onconnectionstatechange: (() => void) | null = null;
-  closed = false;
-  tracks: Array<{ track: FakeTrack; stream: FakeMediaStream }> = [];
-  private listeners: Record<string, Listener[]> = {};
-
-  constructor(config: RTCConfiguration) {
-    this.config = config;
-    FakeRTCPeerConnection.instances.push(this);
-  }
-
-  addTrack(track: FakeTrack, stream: FakeMediaStream) {
-    this.tracks.push({ track, stream });
-  }
-  addEventListener(type: string, cb: Listener) {
-    (this.listeners[type] ||= []).push(cb);
-  }
-  removeEventListener(type: string, cb: Listener) {
-    this.listeners[type] = (this.listeners[type] || []).filter((f) => f !== cb);
-  }
-  async createOffer() {
-    return { type: 'offer', sdp: 'offer-sdp' };
-  }
-  async setLocalDescription(desc: { type: string; sdp?: string }) {
-    this.localDescription = { type: desc.type, sdp: desc.sdp ?? 'offer-sdp' };
-    this.iceGatheringState = FakeRTCPeerConnection.autoGather ? 'complete' : 'gathering';
-  }
-  async setRemoteDescription(desc: unknown) {
-    this.remoteDescription = desc;
-  }
-  close() {
-    this.closed = true;
-    this.connectionState = 'closed';
-  }
-
-  // test drivers
-  completeGathering() {
-    this.iceGatheringState = 'complete';
-    (this.listeners['icegatheringstatechange'] || []).forEach((f) => f());
-  }
-  emitConnectionState(s: string) {
-    this.connectionState = s;
-    this.onconnectionstatechange?.();
-  }
-  emitTrack(stream: FakeMediaStream) {
-    this.ontrack?.({ streams: [stream], track: {} });
-  }
-}
-
-// --- Harness ----------------------------------------------------------------
+// --- Harness (fakes shared via tests/helpers/webrtcFakes) --------------------
 
 let lastMicTrack: FakeTrack;
 let mockGetUserMedia: ReturnType<typeof vi.fn>;
 let audioEl: { srcObject: unknown; play: ReturnType<typeof vi.fn> };
 let audioRef: RefObject<HTMLAudioElement>;
-
-function setPlay(resolves: boolean) {
-  audioEl.play = resolves
-    ? vi.fn().mockResolvedValue(undefined)
-    : vi.fn().mockRejectedValue(new DOMException('blocked', 'NotAllowedError'));
-}
+let setPlay: (resolves: boolean) => void;
 
 beforeEach(() => {
-  FakeRTCPeerConnection.instances = [];
-  FakeRTCPeerConnection.autoGather = true;
-  (global as unknown as { RTCPeerConnection: unknown }).RTCPeerConnection = FakeRTCPeerConnection;
-  (global as unknown as { MediaStream: unknown }).MediaStream = FakeMediaStream;
-
-  lastMicTrack = makeTrack();
-  mockGetUserMedia = vi.fn().mockResolvedValue(new FakeMediaStream([lastMicTrack]));
-  Object.defineProperty(global.navigator, 'mediaDevices', {
-    value: { getUserMedia: mockGetUserMedia },
-    configurable: true,
-  });
-  (global as unknown as { fetch: unknown }).fetch = vi
-    .fn()
-    .mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
-
-  audioEl = { srcObject: null, play: vi.fn().mockResolvedValue(undefined) };
-  audioRef = { current: audioEl } as unknown as RefObject<HTMLAudioElement>;
+  const h = installVoiceGlobals();
+  lastMicTrack = h.micTrack;
+  mockGetUserMedia = h.getUserMedia;
+  audioEl = h.audioEl;
+  audioRef = h.audioRef as unknown as RefObject<HTMLAudioElement>;
+  setPlay = h.setPlay;
 
   mockConfig.mockReset().mockResolvedValue({
     available: true,
@@ -157,12 +67,6 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function lastPC(): FakeRTCPeerConnection {
-  const pc = FakeRTCPeerConnection.instances.at(-1);
-  if (!pc) throw new Error('no RTCPeerConnection was constructed');
-  return pc;
-}
-
 describe('useVoice', () => {
   it('runs idle → requesting-mic → connecting and POSTs the offer after gathering', async () => {
     // Non-empty ICE list so we can pin that config.ice_servers flows into the pc.
@@ -181,7 +85,12 @@ describe('useVoice', () => {
     expect(mockConfig).toHaveBeenCalledTimes(1);
     expect(mockGetUserMedia).toHaveBeenCalledTimes(1);
     expect(mockOffer).toHaveBeenCalledTimes(1);
-    expect(mockOffer).toHaveBeenCalledWith('offer-sdp'); // localDescription.sdp
+    expect(mockOffer).toHaveBeenCalledWith('offer-sdp', undefined); // sdp + (no) sessionKey
+    // The dictation datachannel is created BEFORE the offer so its SCTP m-section
+    // rides the initial vanilla-ICE offer (no renegotiation).
+    const ops = lastPC().ops;
+    expect(ops.indexOf('createDataChannel:voice')).toBeGreaterThanOrEqual(0);
+    expect(ops.indexOf('createDataChannel:voice')).toBeLessThan(ops.indexOf('createOffer'));
     // The server-provided ICE list is what the RTCPeerConnection was built with.
     expect((lastPC().config as { iceServers: unknown }).iceServers).toBe(iceServers);
     expect(result.current.state).toBe('connecting');
@@ -323,7 +232,20 @@ describe('useVoice', () => {
 
     expect(lastMicTrack.stop).toHaveBeenCalled();
     expect(pc.closed).toBe(true);
+    // The datachannel is closed and its handlers nulled in teardownLocal.
+    expect(pc.lastChannel().readyState).toBe('closed');
+    expect(pc.lastChannel().onmessage).toBeNull();
     expect(result.current.state).toBe('idle');
+  });
+
+  it('binds the chat sessionKey into the offer (and start is gated by it in the UI)', async () => {
+    const { result } = renderHook(() =>
+      useVoice({ audioRef, enabled: true, sessionKey: 'sess-abc' }),
+    );
+    await act(async () => {
+      await result.current.start();
+    });
+    expect(mockOffer).toHaveBeenCalledWith('offer-sdp', 'sess-abc');
   });
 
   it('fires the close beacon on unmount', async () => {

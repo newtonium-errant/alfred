@@ -45,6 +45,8 @@ export default function ChatPage() {
     retry,
     newChat,
     endChat,
+    sessionKey,
+    refreshFromHistory,
   } = useChat({
     enabled: authed,
     instance,
@@ -192,10 +194,16 @@ export default function ChatPage() {
             </div>
           )}
 
-          {/* V0 voice (echo transport). Renders nothing unless NEXT_PUBLIC_VOICE_ENABLED
-              is on; a cross-instance selection disables it (Salem-only). Passing the
-              active `instance` lets it auto-hang-up a live call on an instance switch. */}
-          <VoicePanel instance={instance} />
+          {/* Voice panel. Renders nothing unless NEXT_PUBLIC_VOICE_ENABLED is on; a
+              cross-instance selection disables it (Salem-only). `instance` drives the
+              auto-hangup-on-switch; `sessionKey` binds the voice offer to this chat
+              session and gates start; `onTurnFinal` adopts a completed voice turn
+              into the thread. */}
+          <VoicePanel
+            instance={instance}
+            sessionKey={sessionKey}
+            onTurnFinal={refreshFromHistory}
+          />
 
           <Composer onSend={(t, kind) => void send(t, kind)} disabled={booting || sending} />
         </div>

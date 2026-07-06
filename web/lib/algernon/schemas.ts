@@ -143,3 +143,100 @@ export const voiceCloseBodySchema = z.object({
 });
 
 export type VoiceCloseBody = z.infer<typeof voiceCloseBodySchema>;
+
+// --- Web voice (V1) datachannel wire protocol (VOICE-V1-CONTRACT §1.1) --------
+// DELIBERATE CONVENTION DEVIATION: zod normally guards only the browser→BFF
+// request boundary; server→client JSON (SSE frames, API responses) uses
+// safeJson<T> + a types.ts interface. The voice datachannel is a NEW inbound
+// parse surface — untrusted server text driving a client state machine over a
+// direct browser↔server channel that never passes through the BFF — so it gets
+// the same bounded, discriminated validation the request boundary does. This is
+// the CANONICAL D2 turn-plane vocabulary (the design facet's assumed schema was
+// rejected). `v:1` rides EVERY frame in BOTH directions. Non-strict per member
+// (zod strips unknown keys) so V2 can add fields/events without breaking V1.
+export const VOICE_DC_PROTOCOL_VERSION = 1;
+// Per-frame text cap (partials, finals, one reply sentence chunk). The DoS edge
+// guard for a channel with no BFF in front of it.
+export const MAX_DC_TEXT_CHARS = 8192;
+// turn_final carries the WHOLE persisted reply (the trigger for history-reconcile)
+// — a much larger ceiling than a single chunk so a long reply never fails the
+// union and silently drops the reconcile trigger.
+export const MAX_DC_REPLY_CHARS = 100_000;
+
+const dcVersion = z.literal(VOICE_DC_PROTOCOL_VERSION);
+
+export const voiceDcEventSchema = z.discriminatedUnion('type', [
+  // Lifecycle/control. `ready` additionally carries the bound session ids.
+  z.object({
+    v: dcVersion,
+    type: z.literal('state'),
+    state: z.enum(['ready', 'superseded', 'turn_cancelled']),
+    chat_session_key: z.string().optional(),
+    voice_session_id: z.string().optional(),
+    turn_id: z.string().optional(),
+  }),
+  // stt_final IS the end-of-utterance marker (there is no separate `utterance`).
+  z.object({
+    v: dcVersion,
+    type: z.literal('stt_partial'),
+    utterance_id: z.string(),
+    text: z.string().max(MAX_DC_TEXT_CHARS),
+    ts: z.union([z.string(), z.number()]).optional(),
+  }),
+  z.object({
+    v: dcVersion,
+    type: z.literal('stt_final'),
+    utterance_id: z.string(),
+    text: z.string().max(MAX_DC_TEXT_CHARS),
+    ts: z.union([z.string(), z.number()]).optional(),
+  }),
+  z.object({ v: dcVersion, type: z.literal('turn_started'), turn_id: z.string() }),
+  z.object({
+    v: dcVersion,
+    type: z.literal('turn_text'),
+    turn_id: z.string(),
+    seq: z.number(),
+    text: z.string().max(MAX_DC_TEXT_CHARS),
+  }),
+  z.object({
+    v: dcVersion,
+    type: z.literal('turn_tool'),
+    turn_id: z.string().optional(),
+    tool: z.string().max(128).optional(),
+  }),
+  z.object({
+    v: dcVersion,
+    type: z.literal('turn_final'),
+    turn_id: z.string(),
+    reply: z.string().max(MAX_DC_REPLY_CHARS),
+    ts: z.string().optional(),
+    user_ts: z.string().optional(),
+    reply_chars: z.number().optional(),
+    truncated: z.boolean().optional(),
+  }),
+  // No `stt_error` — an unrecoverable STT death is error{code:'stt_unavailable'}.
+  z.object({
+    v: dcVersion,
+    type: z.literal('error'),
+    code: z.string().max(128),
+    detail: z.string().max(1024).optional(),
+    turn_id: z.string().optional(),
+    utterance_id: z.string().optional(),
+  }),
+]);
+
+export type VoiceDcEvent = z.infer<typeof voiceDcEventSchema>;
+
+// Client→server frames (exactly hello + cancel, both carrying v:1). Serialized
+// here so the wire version is set in one place.
+export function voiceHelloFrame(): string {
+  return JSON.stringify({ v: VOICE_DC_PROTOCOL_VERSION, type: 'hello' });
+}
+
+export function voiceCancelFrame(turnId?: string): string {
+  return JSON.stringify({
+    v: VOICE_DC_PROTOCOL_VERSION,
+    type: 'cancel',
+    ...(turnId ? { turn_id: turnId } : {}),
+  });
+}
