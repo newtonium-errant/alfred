@@ -2,18 +2,19 @@ import { defineConfig } from '@playwright/test';
 import path from 'path';
 
 // OPT-IN voice smokes — DELIBERATELY OUTSIDE the test/typecheck/lint/build gates
-// (they need a running backend + real WebRTC). Three specs, run ONE AT A TIME
+// (they need a running backend + real WebRTC). Four specs, run ONE AT A TIME
 // against the matching backend config: `npm run smoke:voice` (echo),
 // `npm run smoke:voice:dictation` (assistant), `npm run smoke:voice:tts`
-// (assistant + fake TTS). Each pins an explicit spec file so they never all run
-// against a single backend config. Chromium's fake-media flags feed the checked-in
-// sine tone as the mic; media stays inside WSL2 (same netns as aiortc) to dodge the
-// Windows↔WSL2 UDP trap.
+// (assistant + fake TTS), `npm run smoke:voice:barge` (assistant + fake TTS +
+// barge_in). Each pins an explicit spec file so they never all run against a single
+// backend config. Chromium's fake-media flags feed the checked-in sine tone as the
+// mic; media stays inside WSL2 (same netns as aiortc) to dodge the Windows↔WSL2 UDP
+// trap.
 const TONE = path.join(__dirname, 'e2e', 'fixtures', 'tone.wav');
 
 export default defineConfig({
   testDir: './e2e',
-  testMatch: /voice-(echo|dictation|tts)\.spec\.ts/,
+  testMatch: /voice-(echo|dictation|tts|barge)\.spec\.ts/,
   fullyParallel: false,
   workers: 1,
   timeout: 60_000,

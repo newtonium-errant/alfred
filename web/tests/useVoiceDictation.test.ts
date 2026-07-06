@@ -506,3 +506,112 @@ describe('useVoice speaking lifecycle (V2 TTS talk-back)', () => {
     expect(dc.readyState).toBe('closed');
   });
 });
+
+describe('useVoice V3 barge-in event orderings (FE frozen; ratified §1.6 table)', () => {
+  // Reach 'speaking' for turn t1 (currentTurnIdRef=t1, speakingTurnIdRef=t1) — the
+  // PRE-FINAL state. onTurnFinal adopts so replyText clears into the thread.
+  async function reachSpeaking(onTurnFinal?: () => Promise<boolean>) {
+    const rendered = await goLive({ onTurnFinal });
+    const { dc } = rendered;
+    activateDictation(dc);
+    emit(dc, { type: 'turn_started', turn_id: 't1' });
+    emit(dc, { type: 'turn_text', turn_id: 't1', seq: 0, text: 'You have ' });
+    emit(dc, { type: 'speaking_started', turn_id: 't1' });
+    return rendered;
+  }
+
+  it('POST-FINAL × CONFIRM: speaking → thinking → (listening blip) → new turn; no discard notice', async () => {
+    const onTurnFinal = vi.fn().mockResolvedValue(true);
+    const { result, dc } = await reachSpeaking(onTurnFinal);
+    // t1 finishes its text → post-final playout (still 'speaking', reply adopted).
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'orig reply' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('speaking');
+    expect(result.current.replyText).toBe('');
+
+    // Barge: the user speaks over the drain (confirmed).
+    emit(dc, { type: 'stt_partial', utterance_id: 'u2', text: 'actually wait' });
+    expect(result.current.partialTranscript).toBe('actually wait');
+    expect(result.current.voiceTurnState).toBe('speaking'); // partials never touch the pill
+    expect(result.current.discardNotice).toBe(false);
+
+    emit(dc, { type: 'stt_final', utterance_id: 'u2', text: 'actually never mind that' });
+    expect(result.current.voiceTurnState).toBe('thinking'); // barge registered
+
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' });
+    expect(result.current.voiceTurnState).toBe('listening'); // honest rescue blip (currentTurnId null)
+    expect(result.current.discardNotice).toBe(false);
+
+    emit(dc, { type: 'turn_started', turn_id: 't2' });
+    expect(result.current.voiceTurnState).toBe('thinking');
+    expect(result.current.canCancel).toBe(true);
+    emit(dc, { type: 'turn_text', turn_id: 't2', seq: 0, text: 'The new answer.' });
+    expect(result.current.voiceTurnState).toBe('replying');
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't2', reply: 'The new answer.' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('listening');
+    // discardNotice never fired anywhere on the confirm path.
+    expect(result.current.discardNotice).toBe(false);
+  });
+
+  it('PRE-FINAL × CONFIRM: speaking_done blips replying, turn_cancelled clears the old reply', async () => {
+    const { result, dc } = await reachSpeaking();
+    expect(result.current.replyText).toBe('You have '); // t1 still streaming
+
+    emit(dc, { type: 'stt_partial', utterance_id: 'u2', text: 'no wait' });
+    expect(result.current.replyText).toBe('You have '); // NOT cleared (currentTurnId non-null)
+    expect(result.current.partialTranscript).toBe('no wait');
+
+    emit(dc, { type: 'stt_final', utterance_id: 'u2', text: 'no wait stop' });
+    expect(result.current.voiceTurnState).toBe('thinking');
+
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' });
+    expect(result.current.voiceTurnState).toBe('replying'); // honest blip (currentTurnId still t1)
+
+    emit(dc, { type: 'state', state: 'turn_cancelled', turn_id: 't1' });
+    expect(result.current.replyText).toBe(''); // old turn's reply cleared
+    expect(result.current.canCancel).toBe(false);
+    expect(result.current.voiceTurnState).toBe('listening');
+    expect(result.current.partialTranscript).toBe('no wait stop'); // barging input survives
+
+    emit(dc, { type: 'turn_started', turn_id: 't2' });
+    expect(result.current.voiceTurnState).toBe('thinking');
+    emit(dc, { type: 'turn_text', turn_id: 't2', seq: 0, text: 'Okay.' });
+    expect(result.current.replyText).toBe('Okay.'); // fresh accumulation
+  });
+
+  it('a duplicate speaking_done{barged_in} is a no-op (idempotency at the null-check)', async () => {
+    const { result, dc } = await reachSpeaking();
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' });
+    expect(result.current.voiceTurnState).toBe('replying'); // currentTurnId t1 (pre-final)
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'barged_in' }); // dup
+    expect(result.current.voiceTurnState).toBe('replying'); // unchanged (speakingTurnIdRef already null)
+  });
+
+  it('barge-DISABLED (V2 discard) rescue pin: stt_final→thinking, discard→notice, speaking_done{drained}→listening', async () => {
+    // The LOAD-BEARING transition the zero-source decision rests on: speaking_done
+    // is the ONLY thing that rescues the pill from the 'thinking' a discarded final
+    // leaves behind. A preserve-'thinking' guard here would wedge V2 forever.
+    const onTurnFinal = vi.fn().mockResolvedValue(true);
+    const { result, dc } = await reachSpeaking(onTurnFinal);
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'r' }));
+      await Promise.resolve();
+    });
+    expect(result.current.voiceTurnState).toBe('speaking'); // post-final drain
+
+    emit(dc, { type: 'stt_final', utterance_id: 'u2', text: 'mm hmm' }); // final surfaced (honesty)
+    expect(result.current.voiceTurnState).toBe('thinking'); // the trap seed
+    emit(dc, { type: 'utterance_discarded', utterance_id: 'u2' });
+    expect(result.current.discardNotice).toBe(true);
+    expect(result.current.voiceTurnState).toBe('thinking'); // discard does NOT rescue
+
+    emit(dc, { type: 'speaking_done', turn_id: 't1', reason: 'drained' });
+    expect(result.current.voiceTurnState).toBe('listening'); // RESCUED (currentTurnId null)
+    expect(result.current.discardNotice).toBe(false);
+  });
+});
