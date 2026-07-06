@@ -189,7 +189,7 @@ export function VoicePanel({
           )}
 
           {/* Streaming reply — clears once the exchange is adopted into the thread. */}
-          {replyText && (
+          {state === 'live' && replyText && (
             <div
               data-testid="voice-reply"
               aria-live="polite"

@@ -125,6 +125,47 @@ describe('useVoice dictation datachannel', () => {
     expect(result.current.replyText).toBe('Hello there.'); // retained (graceful)
   });
 
+  it('a stale onTurnFinal resolution cannot clobber a fresh session (isolates the reconcile gen-guard)', async () => {
+    // Turn 1's onTurnFinal is held PENDING so it resolves only AFTER teardown —
+    // this isolates the generation guard at the async reconcile continuation
+    // (handler-nulling doesn't help: the .then is already scheduled).
+    let resolveAdopt!: (v: boolean) => void;
+    const onTurnFinal = vi
+      .fn()
+      .mockImplementation(() => new Promise<boolean>((r) => (resolveAdopt = r)));
+    const { result, dc } = await goLive({ onTurnFinal });
+    activateDictation(dc);
+    emit(dc, { type: 'turn_started', turn_id: 't1' });
+    emit(dc, { type: 'turn_text', turn_id: 't1', seq: 0, text: 'first reply' });
+    await act(async () => {
+      dc.emitMessage(f({ type: 'turn_final', turn_id: 't1', reply: 'first reply' }));
+      await Promise.resolve();
+    });
+    expect(onTurnFinal).toHaveBeenCalledTimes(1); // called, but its promise is pending
+
+    // Tear the call down (bumps genRef → the pending .then's captured gen is stale).
+    act(() => result.current.hangup());
+
+    // Open a SECOND session and stream a new reply into the panel.
+    await act(async () => {
+      await result.current.start();
+    });
+    act(() => lastPC().emitConnectionState('connected'));
+    const dc2 = lastPC().lastChannel();
+    activateDictation(dc2);
+    emit(dc2, { type: 'turn_started', turn_id: 't2' });
+    emit(dc2, { type: 'turn_text', turn_id: 't2', seq: 0, text: 'second reply' });
+    expect(result.current.replyText).toBe('second reply');
+
+    // Turn 1's onTurnFinal FINALLY resolves — the gen guard must stop its
+    // continuation from clearing the SECOND session's reply.
+    await act(async () => {
+      resolveAdopt(true);
+      await Promise.resolve();
+    });
+    expect(result.current.replyText).toBe('second reply'); // NOT clobbered by the stale continuation
+  });
+
   it('turn_tool surfaces the tool name during the turn', async () => {
     const { result, dc } = await goLive();
     activateDictation(dc);
