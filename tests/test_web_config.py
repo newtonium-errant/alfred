@@ -12,6 +12,7 @@ import pytest
 
 from alfred.web.config import (
     VoiceIceConfig,
+    WebVoiceSttConfig,
     WebAuthConfig,
     WebConfig,
     WebEmailConfig,
@@ -378,3 +379,69 @@ def test_voice_stun_servers_drops_non_str_entries() -> None:
 def test_voice_non_dict_block_tolerated() -> None:
     cfg = load_from_unified({"web": {"enabled": True, "voice": "nonsense"}})
     assert cfg.voice.enabled is False  # defaults, no crash
+
+
+# ---------------------------------------------------------------------------
+# web.voice.stt block (V1 assistant pipeline)
+# ---------------------------------------------------------------------------
+
+
+def test_voice_stt_absent_is_defaults() -> None:
+    cfg = load_from_unified({"web": {"enabled": True, "voice": {"enabled": True}}})
+    assert isinstance(cfg.voice.stt, WebVoiceSttConfig)
+    assert cfg.voice.stt.provider == ""       # unconfigured (mount gate rejects)
+    assert cfg.voice.stt.model == "nova-3"
+    assert cfg.voice.stt.smart_format is True
+    assert cfg.voice.no_speech_close_s == 600
+
+
+def test_voice_stt_full_block_and_provider_lowercased() -> None:
+    cfg = load_from_unified({
+        "web": {"enabled": True, "voice": {
+            "enabled": True, "pipeline": "assistant", "no_speech_close_s": 300,
+            "stt": {
+                "provider": "Deepgram", "api_key": "k", "model": "nova-3",
+                "language": "en", "sample_rate": 16000, "endpointing_ms": 250,
+                "utterance_end_ms": 1200, "min_utterance_chars": 4,
+                "smart_format": False,
+            },
+        }},
+    })
+    stt = cfg.voice.stt
+    assert stt.provider == "deepgram"        # stripped + lowercased
+    assert stt.api_key == "k"
+    assert stt.endpointing_ms == 250
+    assert stt.utterance_end_ms == 1200
+    assert stt.min_utterance_chars == 4
+    assert stt.smart_format is False
+    assert cfg.voice.no_speech_close_s == 300
+
+
+def test_voice_stt_schema_tolerance_and_int_coercion() -> None:
+    cfg = load_from_unified({
+        "web": {"enabled": True, "voice": {"stt": {
+            "provider": "deepgram", "endpointing_ms": "250", "future_knob": "ignored",
+        }}},
+    })
+    assert cfg.voice.stt.endpointing_ms == 250  # str → int
+    assert cfg.voice.stt.provider == "deepgram"
+
+
+def test_voice_stt_api_key_env_substitution(monkeypatch) -> None:
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg-secret-xyz")
+    cfg = load_from_unified({
+        "web": {"enabled": True, "voice": {"stt": {
+            "provider": "deepgram", "api_key": "${DEEPGRAM_API_KEY}",
+        }}},
+    })
+    assert cfg.voice.stt.api_key == "dg-secret-xyz"
+
+
+def test_voice_stt_unresolved_key_stays_placeholder() -> None:
+    # No env → the placeholder survives so _is_unresolved trips the mount gate.
+    cfg = load_from_unified({
+        "web": {"enabled": True, "voice": {"stt": {
+            "provider": "deepgram", "api_key": "${DEEPGRAM_API_KEY}",
+        }}},
+    })
+    assert _is_unresolved(cfg.voice.stt.api_key)

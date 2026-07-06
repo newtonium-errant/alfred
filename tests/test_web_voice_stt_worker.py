@@ -1,0 +1,353 @@
+"""Unit tests for ``alfred.web.voice_stt`` — PcmChunker + VoiceSttWorker.
+
+UNCONDITIONAL (no av/aiortc): the ``resample_fn`` seam replaces
+``av.AudioResampler`` and a fake track + scripted provider drive the worker
+logic — chunk math, drop-oldest backpressure, EOU accumulation, the
+min-chars floor, lazy connect, sentinel→finalize, on_fatal, aclose idempotence
++ closing-flag suppression, stats.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+import structlog
+
+from alfred.web.stt_stream import (
+    EVENT_ERROR,
+    EVENT_FINAL,
+    EVENT_PARTIAL,
+    EVENT_UTTERANCE_END,
+    STTEvent,
+    STTStreamProvider,
+)
+from alfred.web.voice_stt import PcmChunker, VoiceSttWorker
+
+
+# ---------------------------------------------------------------------------
+# PcmChunker — pure byte math
+# ---------------------------------------------------------------------------
+
+
+def test_chunker_chunk_size() -> None:
+    assert PcmChunker(16000, 100).chunk_bytes == 3200
+    assert PcmChunker(16000, 20).chunk_bytes == 640
+
+
+def test_chunker_emits_complete_chunks() -> None:
+    c = PcmChunker(16000, 100)
+    assert c.push(b"\x00" * 1600) == []          # half a chunk, nothing yet
+    out = c.push(b"\x00" * 1600)                 # completes one 3200-B chunk
+    assert len(out) == 1 and len(out[0]) == 3200
+    assert c.flush() == b""
+
+
+def test_chunker_multiple_chunks_and_tail() -> None:
+    c = PcmChunker(16000, 100)
+    out = c.push(b"\x00" * 7000)  # 2 full chunks (6400) + 600 tail
+    assert [len(x) for x in out] == [3200, 3200]
+    assert len(c.flush()) == 600
+
+
+# ---------------------------------------------------------------------------
+# Test doubles
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedProvider(STTStreamProvider):
+    """A provider whose event stream the test drives directly."""
+
+    provider_id = "scripted"
+
+    def __init__(self) -> None:
+        self.q: asyncio.Queue = asyncio.Queue()
+        self.connect_calls = 0
+        self.feeds = 0
+        self.finalize_calls = 0
+        self.closed = False
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+
+    async def feed(self, chunk: bytes) -> None:
+        self.feeds += 1
+
+    async def finalize(self) -> None:
+        self.finalize_calls += 1
+
+    async def close(self) -> None:
+        self.closed = True
+        self.q.put_nowait(None)
+
+    async def events(self):
+        while True:
+            ev = await self.q.get()
+            if ev is None:
+                return
+            yield ev
+
+    def emit(self, ev: STTEvent) -> None:
+        self.q.put_nowait(ev)
+
+
+class _FakeTrack:
+    """Yields the given frames, then raises (simulating MediaStreamError)."""
+
+    def __init__(self, frames: list) -> None:
+        self._frames = list(frames)
+
+    async def recv(self):
+        if self._frames:
+            return self._frames.pop(0)
+        raise RuntimeError("end-of-track")
+
+
+def _worker(provider, *, on_utterance=None, on_partial=None, on_fatal=None,
+            min_utterance_chars=3, queue_max_chunks=50, hello_gate=False):
+    async def _noop(_):
+        return None
+    return VoiceSttWorker(
+        provider=provider,
+        voice_session_id="v1",
+        on_utterance=on_utterance or _noop,
+        on_partial=on_partial,
+        on_fatal=on_fatal,
+        min_utterance_chars=min_utterance_chars,
+        queue_max_chunks=queue_max_chunks,
+        resample_fn=lambda f: [f] if isinstance(f, (bytes, bytearray)) else [],
+        hello_gate=hello_gate,  # tests feed immediately unless a gate test
+    )
+
+
+# ---------------------------------------------------------------------------
+# Drop-oldest backpressure
+# ---------------------------------------------------------------------------
+
+
+async def test_enqueue_drop_oldest_counts_and_logs() -> None:
+    w = _worker(_ScriptedProvider(), queue_max_chunks=2)
+    with structlog.testing.capture_logs() as cap:
+        for i in range(5):
+            w._enqueue(bytes([i]))
+    assert w.stats["dropped_chunks"] == 3
+    # The queue holds the NEWEST 2 (drop-oldest).
+    remaining = [w._queue.get_nowait() for _ in range(w._queue.qsize())]
+    assert remaining == [bytes([3]), bytes([4])]
+    drops = [c for c in cap if c.get("event") == "web.voice.stt.backpressure_drop"]
+    assert len(drops) == 1  # first drop logged (rate-limited)
+    assert drops[0]["dropped_chunks_total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# EOU accumulation + min-chars floor
+# ---------------------------------------------------------------------------
+
+
+async def test_eou_accumulates_finals() -> None:
+    prov = _ScriptedProvider()
+    got: list[str] = []
+
+    async def on_utt(text):
+        got.append(text)
+
+    w = _worker(prov, on_utterance=on_utt)
+    w.start(_FakeTrack([]))
+    prov.emit(STTEvent(type=EVENT_FINAL, text="hello"))
+    prov.emit(STTEvent(type=EVENT_FINAL, text="world"))
+    prov.emit(STTEvent(type=EVENT_UTTERANCE_END, trigger="speech_final"))
+    await asyncio.sleep(0.03)
+    assert got == ["hello world"]
+    assert w.stats["finals"] == 2 and w.stats["utterances"] == 1
+    await w.aclose()
+
+
+async def test_eou_below_floor_is_empty_signal() -> None:
+    prov = _ScriptedProvider()
+    got: list[str] = []
+
+    async def on_utt(text):
+        got.append(text)
+
+    w = _worker(prov, on_utterance=on_utt, min_utterance_chars=3)
+    w.start(_FakeTrack([]))
+    with structlog.testing.capture_logs() as cap:
+        prov.emit(STTEvent(type=EVENT_FINAL, text="ok"))  # 2 chars < 3
+        prov.emit(STTEvent(type=EVENT_UTTERANCE_END, trigger="speech_final"))
+        await asyncio.sleep(0.03)
+    assert got == []  # below floor — no turn
+    empties = [c for c in cap if c.get("event") == "web.voice.stt.utterance_empty"]
+    assert len(empties) == 1
+    await w.aclose()
+
+
+async def test_partials_forwarded() -> None:
+    prov = _ScriptedProvider()
+    partials: list[str] = []
+
+    async def on_p(text):
+        partials.append(text)
+
+    w = _worker(prov, on_partial=on_p)
+    w.start(_FakeTrack([]))
+    prov.emit(STTEvent(type=EVENT_PARTIAL, text="hel"))
+    prov.emit(STTEvent(type=EVENT_PARTIAL, text="hello"))
+    await asyncio.sleep(0.03)
+    assert partials == ["hel", "hello"]
+    assert w.stats["partials"] == 2
+    await w.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Reader/sender: lazy connect + finalize
+# ---------------------------------------------------------------------------
+
+
+async def test_lazy_connect_and_finalize_on_end() -> None:
+    prov = _ScriptedProvider()
+    w = _worker(prov)
+    # One 3200-B frame → exactly one chunk; track then ends.
+    w.start(_FakeTrack([b"\x00" * 3200]))
+    await asyncio.sleep(0.05)
+    assert prov.connect_calls == 1   # lazy connect on the first chunk
+    assert prov.feeds == 1
+    assert prov.finalize_calls == 1  # flush on end-of-track sentinel
+    assert w.stats["chunks_sent"] == 1
+    await w.aclose()
+
+
+async def test_no_connect_when_no_audio() -> None:
+    prov = _ScriptedProvider()
+    w = _worker(prov)
+    w.start(_FakeTrack([]))  # empty track → no chunks
+    await asyncio.sleep(0.03)
+    assert prov.connect_calls == 0  # zero STT cost when no media flows
+    await w.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Hello-gate (contract §17b) — no cloud STT egress until the client hello
+# ---------------------------------------------------------------------------
+
+
+async def test_hello_gate_blocks_feed_until_allowed() -> None:
+    prov = _ScriptedProvider()
+    w = _worker(prov, hello_gate=True)
+    with structlog.testing.capture_logs() as cap:
+        # Track is flowing (chunks are produced) but NO hello yet.
+        w.start(_FakeTrack([b"\x00" * 3200, b"\x11" * 3200]))
+        await asyncio.sleep(0.05)
+        assert prov.connect_calls == 0   # provider untouched — no cloud egress
+        assert prov.feeds == 0
+        waiting = [c for c in cap if c.get("event") == "web.voice.stt.waiting_hello"]
+        assert len(waiting) == 1         # ILB — waiting-for-hello signalled once
+        # Now the DC hello arrives → feeding begins.
+        w.allow_feed()
+        await asyncio.sleep(0.05)
+    assert prov.connect_calls == 1
+    assert prov.feeds >= 1
+    started = [c for c in cap if c.get("event") == "web.voice.stt.started_on_hello"]
+    assert len(started) == 1
+    await w.aclose()
+
+
+# ---------------------------------------------------------------------------
+# on_fatal
+# ---------------------------------------------------------------------------
+
+
+async def test_on_fatal_fires_on_fatal_error_event() -> None:
+    prov = _ScriptedProvider()
+    fatals: list = []
+
+    async def on_fatal(ev):
+        fatals.append(ev)
+
+    w = _worker(prov, on_fatal=on_fatal)
+    w.start(_FakeTrack([]))
+    prov.emit(STTEvent(type=EVENT_ERROR, reason="network", detail="1011", fatal=True))
+    await asyncio.sleep(0.03)
+    assert len(fatals) == 1
+    assert fatals[0].reason == "network"
+    await w.aclose()
+
+
+# ---------------------------------------------------------------------------
+# aclose idempotence + closing-flag suppression
+# ---------------------------------------------------------------------------
+
+
+async def test_aclose_idempotent_single_summary() -> None:
+    prov = _ScriptedProvider()
+    w = _worker(prov)
+    w.start(_FakeTrack([]))
+    with structlog.testing.capture_logs() as cap:
+        await w.aclose()
+        await w.aclose()  # second is a no-op
+    summaries = [c for c in cap if c.get("event") == "web.voice.stt.worker_closed"]
+    assert len(summaries) == 1
+    assert prov.closed is True
+
+
+async def test_closing_flag_suppresses_utterance() -> None:
+    prov = _ScriptedProvider()
+    got: list[str] = []
+
+    async def on_utt(text):
+        got.append(text)
+
+    w = _worker(prov, on_utterance=on_utt)
+    w._closing = True  # simulate teardown-in-progress before the event arrives
+    w.start(_FakeTrack([]))
+    with structlog.testing.capture_logs() as cap:
+        prov.emit(STTEvent(type=EVENT_FINAL, text="hello there"))
+        prov.emit(STTEvent(type=EVENT_UTTERANCE_END, trigger="speech_final"))
+        await asyncio.sleep(0.03)
+    assert got == []  # teardown must not fire new chat turns
+    discarded = [
+        c for c in cap if c.get("event") == "web.voice.stt.utterance_discarded_on_close"
+    ]
+    assert len(discarded) == 1
+    await w.aclose()
+
+
+async def test_worker_closed_summary_carries_stats() -> None:
+    prov = _ScriptedProvider()
+    w = _worker(prov)
+    w.start(_FakeTrack([]))
+    with structlog.testing.capture_logs() as cap:
+        await w.aclose(reason="test_reason")
+    summary = [c for c in cap if c.get("event") == "web.voice.stt.worker_closed"][0]
+    assert summary["reason"] == "test_reason"
+    assert "utterances" in summary and "dropped_chunks" in summary
+
+
+# ---------------------------------------------------------------------------
+# Resampler return-shape coercion (PyAV<10 fallback)
+# ---------------------------------------------------------------------------
+
+
+async def test_frame_to_pcm_coerces_non_list_resample_return() -> None:
+    # PyAV>=10 (av>=14, pinned by aiortc>=1.14) returns a LIST from resample();
+    # PyAV<10 returned a single frame. The reader must coerce a single-frame
+    # return into a 1-element list rather than crash — this pins that defensive
+    # coercion so a future refactor of _frame_to_pcm can't silently drop it.
+    class _Frame:
+        def __init__(self, data: bytes) -> None:
+            self.planes = [data]
+
+    class _SingleFrameResampler:
+        def resample(self, frame):
+            return _Frame(b"\x01\x02")  # single frame, NOT a list
+
+    class _NoneResampler:
+        def resample(self, frame):
+            return None  # some flush calls yield nothing
+
+    w = VoiceSttWorker(  # real reader path (resample_fn=None)
+        provider=_ScriptedProvider(),
+        voice_session_id="v1",
+        on_utterance=lambda _t: None,
+    )
+    assert w._frame_to_pcm(object(), _SingleFrameResampler()) == [b"\x01\x02"]
+    assert w._frame_to_pcm(object(), _NoneResampler()) == []

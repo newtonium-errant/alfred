@@ -37,12 +37,23 @@ mounted + a loud log.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
+from uuid import uuid4
 
 from aiohttp import web
 
 from .auth import WEB_CHAT_PEER, require_web_session
-from .config import WebConfig
-from .keys import KEY_WEB_CONFIG, KEY_WEB_VOICE_MANAGER
+from .config import WebConfig, _is_unresolved
+from .keys import (
+    KEY_WEB_ANTHROPIC,
+    KEY_WEB_CONFIG,
+    KEY_WEB_INFLIGHT,
+    KEY_WEB_STATE_MGR,
+    KEY_WEB_SYSTEM_PROVIDER,
+    KEY_WEB_TALKER_CONFIG,
+    KEY_WEB_VAULT_CTX,
+    KEY_WEB_VOICE_MANAGER,
+)
 from .utils import get_logger
 from .voice_session import (
     NegotiationFailed,
@@ -59,9 +70,14 @@ log = get_logger(__name__)
 # client_max_size envelope (real offers are ~2-20 KB). 128 KB.
 MAX_SDP_BYTES = 128 * 1024
 
-# Optional forward-hook: an opaque chat-session correlation key. V0 caps its
-# length, logs its presence, and IGNORES it (contract §1.7). Never rejected.
+# session_key cap. In echo (V0) it's a logged-and-ignored forward-hook; in
+# assistant (V1) it BINDS the voice session to the caller's chat session.
 MAX_SESSION_KEY_CHARS = 128
+
+# Pipeline enum. Anything outside this set fails closed (no mount).
+_KNOWN_PIPELINES = frozenset({"echo", "assistant"})
+# Assistant STT providers the code knows how to drive (fail-closed otherwise).
+_KNOWN_STT_PROVIDERS = frozenset({"deepgram", "fake"})
 
 
 def _base_mime(content_type: str) -> str:
@@ -93,7 +109,11 @@ def _require_voice_identity(request: web.Request, web_config: WebConfig):
 
 
 async def _handle_voice_offer(request: web.Request) -> web.StreamResponse:
-    """POST /voice/offer — negotiate an echo session (contract §2)."""
+    """POST /voice/offer — negotiate a voice session (contract §2).
+
+    Echo pipeline (V0) negotiates the hear-yourself session directly; the
+    assistant pipeline (V1) dispatches to :func:`_offer_assistant` after the
+    shared auth + SDP validation below."""
     web_config: WebConfig = request.app[KEY_WEB_CONFIG]
     identity = _require_voice_identity(request, web_config)
     if identity is None:
@@ -130,16 +150,20 @@ async def _handle_voice_offer(request: web.Request) -> web.StreamResponse:
             {"error": "sdp_too_large", "max_bytes": MAX_SDP_BYTES}, status=413,
         )
 
-    # session_key — length-cap, log presence, IGNORE (forward-hook §1.7).
+    # Assistant pipeline (V1): bind to the caller's chat session + drive the
+    # reply plane over a datachannel. Echo (V0) keeps session_key as a
+    # logged-and-ignored forward-hook (byte-identical).
+    if web_config.voice.pipeline == "assistant":
+        return await _offer_assistant(request, identity, body, sdp, manager, web_config)
+
     raw_key = body.get("session_key")
-    session_key_present = isinstance(raw_key, str) and bool(raw_key.strip())
-    if session_key_present:
+    if isinstance(raw_key, str) and raw_key.strip():
         log.info(
             "web.voice.session_key_ignored",
             user=identity.user,
             length=min(len(raw_key), MAX_SESSION_KEY_CHARS),
-            detail="session_key accepted as a V0 forward-hook — capped, "
-                   "logged, and ignored (no chat coupling yet)",
+            detail="echo pipeline — session_key accepted as a forward-hook, "
+                   "capped, logged, and ignored (no chat coupling)",
         )
 
     try:
@@ -163,6 +187,61 @@ async def _handle_voice_offer(request: web.Request) -> web.StreamResponse:
         "sdp": answer_sdp,
         "type": "answer",
         "expires_at": expires_at,
+    })
+
+
+async def _offer_assistant(
+    request: web.Request, identity: Any, body: dict, sdp: str,
+    manager: VoiceSessionManager, web_config: WebConfig,
+) -> web.StreamResponse:
+    """Assistant-pipeline offer: resolve the chat binding, build the turn
+    driver, negotiate, and return the answer + additive ``chat_session_key``."""
+    chat_session_key, err = _resolve_chat_binding(request, identity, body)
+    if err is not None:
+        return err
+
+    from .voice_turns import TurnDeps, VoiceTurnDriver
+
+    vid = uuid4().hex
+    deps = TurnDeps(
+        client=request.app[KEY_WEB_ANTHROPIC],
+        state_mgr=request.app[KEY_WEB_STATE_MGR],
+        talker_config=request.app[KEY_WEB_TALKER_CONFIG],
+        web_config=web_config,
+        system_prompt_provider=request.app[KEY_WEB_SYSTEM_PROVIDER],
+        vault_context_str=request.app[KEY_WEB_VAULT_CTX],
+        in_flight=request.app[KEY_WEB_INFLIGHT],
+        identity=identity,
+        chat_session_key=chat_session_key,
+    )
+    driver = VoiceTurnDriver(deps, voice_session_id=vid)
+    try:
+        vid, answer_sdp = await manager.open_session(
+            identity, sdp, turn_binding=driver, voice_session_id=vid,
+        )
+    except TooManySessions as exc:
+        await driver.aclose(reason="offer_rejected")  # tear down the loop task
+        return web.json_response(
+            {"error": "too_many_sessions", "max_sessions": exc.max_sessions},
+            status=429,
+        )
+    except VoiceOfferTimeout:
+        await driver.aclose(reason="offer_rejected")
+        return web.json_response({"error": "voice_offer_timeout"}, status=504)
+    except NegotiationFailed:
+        await driver.aclose(reason="offer_rejected")
+        return web.json_response({"error": "negotiation_failed"}, status=502)
+
+    expires_at = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=web_config.voice.max_session_seconds)
+    ).isoformat()
+    return web.json_response({
+        "voice_session_id": vid,
+        "sdp": answer_sdp,
+        "type": "answer",
+        "expires_at": expires_at,
+        "chat_session_key": chat_session_key,
     })
 
 
@@ -228,6 +307,7 @@ async def _handle_voice_config(request: web.Request) -> web.StreamResponse:
     return web.json_response({
         "available": available,
         "reason": None if available else "aiortc_missing",
+        "pipeline": voice.pipeline,   # echo | assistant (FE hard-fail-vs-benign)
         "ice_servers": ice_servers,
         "max_sessions": voice.max_sessions,
         "yours": yours,
@@ -272,16 +352,24 @@ def register_voice_handlers(
         )
         return False
 
-    # Gate 3 — pipeline enum (fail-closed on anything but 'echo').
-    if voice.pipeline != "echo":
+    # Gate 3 — pipeline enum (fail-closed on anything unknown).
+    if voice.pipeline not in _KNOWN_PIPELINES:
         log.error(
             "web.voice.disabled",
             reason="unknown_pipeline",
             pipeline=voice.pipeline,
-            detail="only 'echo' is valid in V0 — refusing to mount an "
-                   "unknown pipeline (fail-closed; daemon lives)",
+            detail="pipeline must be 'echo' or 'assistant' — refusing to "
+                   "mount an unknown pipeline (fail-closed; daemon lives)",
         )
         return False
+
+    # Gate 3b — the assistant pipeline needs a usable STT provider config;
+    # fail closed (no mount, loud log) if it's absent / unknown / keyless.
+    stt_worker_factory = None
+    if voice.pipeline == "assistant":
+        stt_worker_factory = _build_assistant_stt(voice)
+        if stt_worker_factory is None:
+            return False  # _build_assistant_stt logged the specific reason
 
     # Reserved ICE knob observability — udp_port_range is accepted but has no
     # aiortc/aioice knob (aiortc#487), so it is NEVER a silent no-op.
@@ -297,7 +385,7 @@ def register_voice_handlers(
     # Gate 4 — aiortc availability decides full-mount vs 503 mode.
     available, reason = aiortc_available()
     if available:
-        manager = VoiceSessionManager(voice)
+        manager = VoiceSessionManager(voice, stt_worker_factory=stt_worker_factory)
         app[KEY_WEB_VOICE_MANAGER] = manager
 
         async def _voice_shutdown(_app: web.Application) -> None:
@@ -315,6 +403,8 @@ def register_voice_handlers(
         log.info(
             "web.voice.registered",
             max_sessions=voice.max_sessions,
+            pipeline=voice.pipeline,
+            stt_provider=voice.stt.provider if voice.pipeline == "assistant" else "",
             stun_servers=len(voice.ice.stun_servers),
             advertised_ip=bool(voice.ice.advertised_ip),
             available=True,
@@ -335,3 +425,146 @@ def register_voice_handlers(
     app.router.add_post("/voice/close", _handle_voice_close)
     app.router.add_get("/voice/config", _handle_voice_config)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Assistant pipeline (V1) — STT worker factory + chat-session binding
+# ---------------------------------------------------------------------------
+
+
+def _build_assistant_stt(voice: Any):
+    """Validate the assistant STT config and return a worker factory, or
+    ``None`` after logging the fail-closed no-mount reason.
+
+    Fail-closed matrix (contract §2 / design §4): empty provider →
+    ``stt_unconfigured``; unknown provider → ``unknown_stt_provider``;
+    ``deepgram`` with an unresolved key → ``stt_key_missing``. ``fake`` always
+    mounts (the keyless dev / test path). Clamps are logged as
+    ``web.voice.stt.config_clamped``."""
+    stt = voice.stt
+    provider = stt.provider
+    if not provider:
+        log.error(
+            "web.voice.disabled", reason="stt_unconfigured",
+            detail="pipeline: assistant requires a web.voice.stt block with a "
+                   "provider (deepgram | fake)",
+        )
+        return None
+    if provider not in _KNOWN_STT_PROVIDERS:
+        log.error(
+            "web.voice.disabled", reason="unknown_stt_provider",
+            provider=provider,
+            detail="unknown web.voice.stt.provider — fail-closed no-mount",
+        )
+        return None
+    if provider == "deepgram" and _is_unresolved(stt.api_key):
+        log.error(
+            "web.voice.disabled", reason="stt_key_missing",
+            detail="provider: deepgram but api_key (${DEEPGRAM_API_KEY}) is "
+                   "empty/unresolved — fail-closed no-mount",
+        )
+        return None
+
+    from .stt_stream import normalize_stt_settings
+
+    stt_norm, warnings = normalize_stt_settings(stt)
+    for warning in warnings:
+        log.warning("web.voice.stt.config_clamped", detail=warning)
+    return _make_stt_worker_factory(stt_norm)
+
+
+def _make_stt_worker_factory(stt_norm: Any):
+    """Return ``factory(vid, driver, manager) -> VoiceSttWorker`` closing over
+    the normalized STT config. The worker's callbacks bridge to the per-session
+    turn driver (partials / utterances) and, fail-honest, close the session on
+    a fatal STT error (contract §1.15)."""
+
+    def factory(vid: str, driver: Any, manager: Any):
+        from .voice_stt import VoiceSttWorker
+
+        provider = _make_stt_provider(stt_norm, vid)
+        on_partial = driver.emit_stt_partial if driver is not None else None
+
+        async def _drop_utterance(_text: str) -> None:
+            # Defensive: assistant mode always wires a driver; if somehow
+            # absent, an utterance has nowhere to go — do NOT drive a turn.
+            return None
+
+        on_utterance = driver.submit_utterance if driver is not None else _drop_utterance
+
+        async def on_fatal(ev: Any) -> None:
+            if driver is not None:
+                driver.emit_stt_unavailable(ev.reason)
+            manager.schedule_close(vid, reason="stt_failed")
+
+        worker = VoiceSttWorker(
+            provider=provider,
+            voice_session_id=vid,
+            on_utterance=on_utterance,
+            on_partial=on_partial,
+            on_fatal=on_fatal,
+            min_utterance_chars=stt_norm.min_utterance_chars,
+            sample_rate=stt_norm.sample_rate,
+            hello_gate=True,  # §17b: connect/feed the provider only on DC hello
+        )
+        # Release the hello-gate when the client's DC hello arrives. With no
+        # driver (no feedback channel) open it immediately — a DC-less session
+        # can never send hello, and blocking forever would just leak the worker
+        # (the fatal-STT close path still applies).
+        if driver is not None:
+            driver.add_hello_callback(worker.allow_feed)
+        else:
+            worker.allow_feed()
+        return worker
+
+    return factory
+
+
+def _make_stt_provider(stt_norm: Any, vid: str):
+    if stt_norm.provider == "fake":
+        from .stt_stream import FakeStreamProvider
+
+        return FakeStreamProvider(voice_session_id=vid)
+    from .stt_deepgram import DeepgramStreamProvider
+
+    return DeepgramStreamProvider(stt_norm, voice_session_id=vid)
+
+
+def _resolve_chat_binding(request: web.Request, identity: Any, body: dict):
+    """Resolve the voice session's chat binding (assistant pipeline, §1.14).
+
+    Returns ``(chat_session_key, None)`` on success or ``(None, response)``
+    with a fail-closed 400. Explicit ``session_key`` must equal the caller's
+    active chat session (else ``bad_session_key`` — single body for
+    missing-vs-mismatch, no existence leak); absent → reuse the active session,
+    else auto-open one (NEVER close-then-open — that would 404 the chat tab)."""
+    state_mgr = request.app[KEY_WEB_STATE_MGR]
+    talker_config = request.app[KEY_WEB_TALKER_CONFIG]
+    owner = identity.synthetic_chat_id
+
+    raw_key = body.get("session_key")
+    if isinstance(raw_key, str) and raw_key.strip():
+        active = state_mgr.get_active(owner)
+        if active is None or active.get("session_id") != raw_key:
+            log.info("web.voice.bad_session_key", user=identity.user)
+            return None, web.json_response({"error": "bad_session_key"}, status=400)
+        bind_mode = "explicit"
+        key = raw_key
+    else:
+        active = state_mgr.get_active(owner)
+        if active is not None and active.get("session_id"):
+            key = active["session_id"]
+            bind_mode = "reused"
+        else:
+            from alfred.telegram.session import open_session
+
+            session_obj = open_session(
+                state_mgr, owner, model=talker_config.anthropic.model,
+            )
+            key = session_obj.session_id
+            bind_mode = "opened"
+    log.info(
+        "web.voice.session_bound",
+        user=identity.user, bind_mode=bind_mode, session_key_prefix=key[:8],
+    )
+    return key, None

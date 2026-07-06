@@ -581,11 +581,16 @@ transport:
 #   voice:
 #     enabled: false
 #     max_sessions: 2                 # single-operator: 1 live + 1 grace slot
-#     pipeline: echo                  # only 'echo' valid in V0; unknown → no-mount
+#     # echo (V0, default) = hear yourself; assistant (V1) = streaming STT →
+#     # text reply over a datachannel. Unknown value → fail-closed no-mount.
+#     pipeline: echo
 #     offer_timeout_seconds: 10       # negotiation wall-clock cap (→ 504)
 #     connect_deadline_seconds: 30    # never-reached-"connected" reap
 #     idle_timeout_seconds: 120       # connected-then-idle reap
 #     max_session_seconds: 1800       # absolute lifetime (→ expires_at)
+#     no_speech_close_s: 600          # assistant: close a CONNECTED session
+#                                     # with zero speech after this window
+#                                     # (bounds billable silent mic-open)
 #     # reaper_interval_seconds: 15   # advanced: sweep cadence (default 15)
 #     ice:
 #       # Rewrite answer-SDP host-candidate addrs to a public IP (1:1-NAT
@@ -595,6 +600,23 @@ transport:
 #       stun_servers: []              # e.g. ["stun:stun.l.google.com:19302"]
 #       udp_port_range: ""            # RESERVED — aioice has no port knob
 #                                     # (aiortc#487); accepted + logged, unapplied
+#     # --- V1 assistant pipeline (streaming STT) — REQUIRED when
+#     # pipeline: assistant. Fail-closed no-mount if provider is absent/unknown,
+#     # or deepgram + api_key unresolved. EGRESS POSTURE: assistant streams
+#     # CONTINUOUS mic audio (all ambient speech) to the cloud STT provider —
+#     # a per-instance decision (Salem = accepted; do NOT enable cloud STT on
+#     # VERA/sovereign voice). Cost ≈ $0.46/hr mic-open (nova-3 streaming),
+#     # billed through silence, bounded by no_speech_close_s + max_session_seconds.
+#     stt:
+#       provider: ""                  # "deepgram" | "fake" (keyless dev/test)
+#       api_key: "${DEEPGRAM_API_KEY}"  # deepgram: unresolved → no-mount
+#       model: "nova-3"
+#       language: "en"
+#       sample_rate: 16000            # V1: 16000 only (else clamps)
+#       endpointing_ms: 300           # speech_final silence window; clamp [10,5000]
+#       utterance_end_ms: 1000        # word-gap fallback; 0=off; clamp [1000,5000]
+#       min_utterance_chars: 3        # EOU noise floor
+#       smart_format: true            # tune off (→ punctuate) if it delays finals
 #
 # --- Target instance (KAL-LE / Hypatia / VERA) — relay mode ---
 # Pair this with a DEDICATED ``transport.auth.tokens.web`` entry above

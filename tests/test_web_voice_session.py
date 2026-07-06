@@ -464,3 +464,104 @@ def test_rewrite_advertised_ip_multiple_host_candidates() -> None:
     assert "203.0.113.9 5 typ host" in out
     assert "203.0.113.9 6 typ host" in out
     assert "192.168.1.5" not in out and "10.0.0.9" not in out
+
+
+# ---------------------------------------------------------------------------
+# V1 assistant pipeline — worker/driver drain + no-speech reaper
+# ---------------------------------------------------------------------------
+
+
+class _FakePipelineWorker:
+    def __init__(self, finals: int = 0) -> None:
+        self.stats = {"finals": finals}
+        self.aclose_calls: list[str] = []
+
+    async def aclose(self, reason: str = "") -> None:
+        self.aclose_calls.append(reason)
+
+
+class _FakePipelineDriver:
+    def __init__(self) -> None:
+        self.aclose_calls: list[str] = []
+
+    async def aclose(self, reason: str = "") -> None:
+        self.aclose_calls.append(reason)
+
+
+async def test_factory_none_is_echo_no_worker() -> None:
+    mgr = _manager()
+    assert mgr._stt_worker_factory is None  # echo path (byte-identical)
+
+
+async def test_close_drains_worker_and_driver() -> None:
+    pc = FakePC()
+    mgr = _manager(pc_factory=lambda: pc)
+    vid, _ = await mgr.open_session(_identity("a", 1), _OFFER_SDP)
+    worker = _FakePipelineWorker()
+    driver = _FakePipelineDriver()
+    mgr._sessions[vid].keepalive["stt_worker"] = worker
+    mgr._sessions[vid].keepalive["turn_driver"] = driver
+    await mgr.close(vid, reason="client_close")
+    assert worker.aclose_calls == ["client_close"]
+    assert driver.aclose_calls == ["client_close"]
+
+
+async def test_close_drain_swallows_worker_error() -> None:
+    class _BadWorker(_FakePipelineWorker):
+        async def aclose(self, reason: str = "") -> None:
+            raise RuntimeError("worker teardown boom")
+
+    pc = FakePC()
+    mgr = _manager(pc_factory=lambda: pc)
+    vid, _ = await mgr.open_session(_identity("a", 1), _OFFER_SDP)
+    mgr._sessions[vid].keepalive["stt_worker"] = _BadWorker()
+    with structlog.testing.capture_logs() as cap:
+        assert await mgr.close(vid, reason="client_close") is True  # survives
+    assert any(c.get("event") == "web.voice.stt.close_error" for c in cap)
+
+
+async def test_no_speech_reaper_closes_silent_assistant_session() -> None:
+    now = [1000.0]
+    mgr = _manager(clock=lambda: now[0], no_speech_close_s=600)
+    pc = FakePC()
+    # register a session directly (bypassing on_track, which needs aiortc media)
+    vid, _ = await mgr.open_session(_identity("a", 1), _OFFER_SDP)
+    s = mgr._sessions[vid]
+    s.connected_once = True
+    s.connection_state = "connected"
+    s.connected_at = 1000.0
+    s.keepalive["stt_worker"] = _FakePipelineWorker(finals=0)
+    now[0] = 1000.0 + 601  # past no_speech window, under absolute
+    with structlog.testing.capture_logs() as cap:
+        await mgr._reap_once()
+    assert mgr.active_count() == 0
+    closes = [c for c in cap if c.get("event") == "web.voice.session.close"]
+    assert closes[0]["reason"] == "no_speech"
+
+
+async def test_no_speech_reaper_spares_session_with_finals() -> None:
+    now = [1000.0]
+    mgr = _manager(clock=lambda: now[0], no_speech_close_s=600)
+    vid, _ = await mgr.open_session(_identity("a", 1), _OFFER_SDP)
+    s = mgr._sessions[vid]
+    s.connected_once = True
+    s.connection_state = "connected"
+    s.connected_at = 1000.0
+    s.keepalive["stt_worker"] = _FakePipelineWorker(finals=3)  # speech happened
+    now[0] = 1000.0 + 601
+    await mgr._reap_once()
+    assert mgr.active_count() == 1
+
+
+async def test_no_speech_reaper_exempts_echo_session() -> None:
+    now = [1000.0]
+    mgr = _manager(clock=lambda: now[0], no_speech_close_s=600)
+    vid, _ = await mgr.open_session(_identity("a", 1), _OFFER_SDP)
+    s = mgr._sessions[vid]
+    s.connected_once = True
+    s.connection_state = "connected"
+    s.connected_at = 1000.0
+    # No stt_worker (echo) → no_speech never applies.
+    now[0] = 1000.0 + 601
+    await mgr._reap_once()
+    assert mgr.active_count() == 1

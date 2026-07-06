@@ -44,10 +44,14 @@ from alfred.web.config import (
     WebConfig,
     WebUser,
     WebVoiceConfig,
+    WebVoiceSttConfig,
 )
-from alfred.web.keys import KEY_WEB_VOICE_MANAGER
+from alfred.web.identity import synthetic_chat_id
+from alfred.web.keys import KEY_WEB_STATE_MGR, KEY_WEB_VOICE_MANAGER
 from alfred.web.routes_chat import register_web_routes
 from alfred.web.state import WebAuthState
+
+import alfred.web.voice_turns as voice_turns_mod
 
 from tests.telegram.conftest import FakeAnthropicClient
 
@@ -188,10 +192,13 @@ class _FakeManager:
         self.close_result = True
         self._yours: list[_FakeSession] = []
 
-    async def open_session(self, identity, sdp):
+    async def open_session(self, identity, sdp, **kwargs):
+        # Accept the assistant-path kwargs (turn_binding, voice_session_id).
+        self.open_kwargs = kwargs
         if self.open_exc is not None:
             raise self.open_exc
-        return self.open_result
+        vid = kwargs.get("voice_session_id") or self.open_result[0]
+        return vid, self.open_result[1]
 
     async def close_owned(self, vid, owner, reason):
         return self.close_result
@@ -213,10 +220,13 @@ class _FakeManager:
 
 
 def _patch_available(monkeypatch, manager: _FakeManager | None) -> None:
-    """Force the aiortc-available mount path + inject a fake manager."""
+    """Force the aiortc-available mount path + inject a fake manager.
+
+    The factory swallows ``stt_worker_factory`` (passed by register in both
+    echo and assistant modes)."""
     monkeypatch.setattr(routes_voice, "aiortc_available", lambda: (True, ""))
     monkeypatch.setattr(
-        routes_voice, "VoiceSessionManager", lambda voice: manager,
+        routes_voice, "VoiceSessionManager", lambda voice, **kw: manager,
     )
 
 
@@ -257,9 +267,11 @@ def test_voice_not_mounted_in_relay_mode(tmp_path) -> None:
 
 
 def test_voice_not_mounted_unknown_pipeline(tmp_path) -> None:
+    # "assistant" is now a KNOWN pipeline (V1); use a genuinely-unknown value
+    # to pin the fail-closed no-mount for an unrecognised pipeline.
     with structlog.testing.capture_logs() as cap:
         app = _build_app(
-            tmp_path, _web_config(voice=_voice_config(pipeline="assistant")),
+            tmp_path, _web_config(voice=_voice_config(pipeline="banana")),
         )
     assert not any(p.startswith("/voice") for p in _route_paths(app))
     disabled = [
@@ -587,9 +599,18 @@ async def test_config_available_shape(voice_client) -> None:
     body = await resp.json()
     assert body["available"] is True
     assert body["reason"] is None
+    assert body["pipeline"] == "echo"   # §17b: FE hard-fail-vs-benign hint
     assert body["max_sessions"] == 2
     assert body["ice_servers"] == []
     assert body["yours"] == []
+
+
+async def test_config_pipeline_assistant(aiohttp_client, tmp_path, monkeypatch) -> None:
+    _patch_available(monkeypatch, _FakeManager(_assistant_config()))
+    app = _build_app(tmp_path, _web_config(voice=_assistant_config()))
+    client = await aiohttp_client(app)
+    resp = await client.get("/voice/config", headers=_headers())
+    assert (await resp.json())["pipeline"] == "assistant"
 
 
 async def test_config_ice_servers_from_stun(aiohttp_client, tmp_path, monkeypatch) -> None:
@@ -619,3 +640,131 @@ async def test_config_yours_scoped_to_caller(voice_client) -> None:
 async def test_config_401_without_session(voice_client) -> None:
     resp = await voice_client.get("/voice/config", headers=_PEER_HEADERS)
     assert resp.status == 401
+
+
+# ---------------------------------------------------------------------------
+# V1 assistant pipeline — mount gates
+# ---------------------------------------------------------------------------
+
+
+def _assistant_config(provider: str = "fake", **stt_over) -> WebVoiceConfig:
+    stt = WebVoiceSttConfig(provider=provider, **stt_over)
+    return WebVoiceConfig(enabled=True, max_sessions=2, pipeline="assistant",
+                          ice=VoiceIceConfig(), stt=stt)
+
+
+def test_assistant_mounts_with_fake_provider(tmp_path, monkeypatch) -> None:
+    _patch_available(monkeypatch, _FakeManager(_assistant_config()))
+    app = _build_app(tmp_path, _web_config(voice=_assistant_config()))
+    assert "/voice/offer" in _route_paths(app)
+
+
+def test_assistant_no_mount_deepgram_missing_key(tmp_path) -> None:
+    with structlog.testing.capture_logs() as cap:
+        app = _build_app(tmp_path, _web_config(
+            voice=_assistant_config(provider="deepgram", api_key="${DEEPGRAM_API_KEY}"),
+        ))
+    assert not any(p.startswith("/voice") for p in _route_paths(app))
+    reasons = [c.get("reason") for c in cap if c.get("event") == "web.voice.disabled"]
+    assert "stt_key_missing" in reasons
+
+
+def test_assistant_no_mount_unknown_provider(tmp_path) -> None:
+    with structlog.testing.capture_logs() as cap:
+        app = _build_app(tmp_path, _web_config(voice=_assistant_config(provider="whisperx")))
+    assert not any(p.startswith("/voice") for p in _route_paths(app))
+    reasons = [c.get("reason") for c in cap if c.get("event") == "web.voice.disabled"]
+    assert "unknown_stt_provider" in reasons
+
+
+def test_assistant_no_mount_empty_stt(tmp_path) -> None:
+    with structlog.testing.capture_logs() as cap:
+        app = _build_app(tmp_path, _web_config(voice=_assistant_config(provider="")))
+    assert not any(p.startswith("/voice") for p in _route_paths(app))
+    reasons = [c.get("reason") for c in cap if c.get("event") == "web.voice.disabled"]
+    assert "stt_unconfigured" in reasons
+
+
+def test_assistant_registered_log_has_pipeline_and_provider(tmp_path, monkeypatch) -> None:
+    _patch_available(monkeypatch, _FakeManager(_assistant_config()))
+    with structlog.testing.capture_logs() as cap:
+        _build_app(tmp_path, _web_config(voice=_assistant_config()))
+    reg = [c for c in cap if c.get("event") == "web.voice.registered"]
+    assert reg and reg[0]["pipeline"] == "assistant" and reg[0]["stt_provider"] == "fake"
+
+
+# ---------------------------------------------------------------------------
+# V1 assistant pipeline — offer/session binding (§1.14)
+# ---------------------------------------------------------------------------
+
+
+class _FakeDriver:
+    """No-op turn driver so binding tests don't spawn a real loop task."""
+
+    def __init__(self, deps, voice_session_id) -> None:
+        self.deps = deps
+        self.vid = voice_session_id
+
+    async def aclose(self, reason: str = "") -> None:
+        return None
+
+
+async def _assistant_client(aiohttp_client, tmp_path, monkeypatch):
+    """Voice-enabled assistant app with a fake manager + fake driver, plus a
+    real StateManager the binding path reads/writes."""
+    manager = _FakeManager(_assistant_config())
+    _patch_available(monkeypatch, manager)
+    monkeypatch.setattr(voice_turns_mod, "VoiceTurnDriver", _FakeDriver)
+    app = _build_app(tmp_path, _web_config(voice=_assistant_config()))
+    return await aiohttp_client(app)
+
+
+def _open_chat_session(app) -> str:
+    """Pre-seed an active chat session for 'andrew'; return its session_id."""
+    from alfred.telegram.session import open_session
+    state_mgr = app[KEY_WEB_STATE_MGR]
+    sess = open_session(state_mgr, synthetic_chat_id("andrew"), model="claude-sonnet-4-6")
+    return sess.session_id
+
+
+async def test_assistant_offer_absent_key_reuses_active(aiohttp_client, tmp_path, monkeypatch) -> None:
+    client = await _assistant_client(aiohttp_client, tmp_path, monkeypatch)
+    key = _open_chat_session(client.app)
+    resp = await client.post("/voice/offer", headers=_headers(),
+                             json={"sdp": "v=0\r\n", "type": "offer"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["chat_session_key"] == key      # reused the active session
+    assert "voice_session_id" in body
+
+
+async def test_assistant_offer_absent_key_auto_opens(aiohttp_client, tmp_path, monkeypatch) -> None:
+    client = await _assistant_client(aiohttp_client, tmp_path, monkeypatch)
+    # No active session pre-seeded.
+    resp = await client.post("/voice/offer", headers=_headers(),
+                             json={"sdp": "v=0\r\n", "type": "offer"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["chat_session_key"]  # a session was auto-opened
+    # state now has an active session with that id
+    active = client.app[KEY_WEB_STATE_MGR].get_active(synthetic_chat_id("andrew"))
+    assert active["session_id"] == body["chat_session_key"]
+
+
+async def test_assistant_offer_explicit_key_matches(aiohttp_client, tmp_path, monkeypatch) -> None:
+    client = await _assistant_client(aiohttp_client, tmp_path, monkeypatch)
+    key = _open_chat_session(client.app)
+    resp = await client.post("/voice/offer", headers=_headers(),
+                             json={"sdp": "v=0\r\n", "type": "offer", "session_key": key})
+    assert resp.status == 200
+    assert (await resp.json())["chat_session_key"] == key
+
+
+async def test_assistant_offer_bad_key_400(aiohttp_client, tmp_path, monkeypatch) -> None:
+    client = await _assistant_client(aiohttp_client, tmp_path, monkeypatch)
+    _open_chat_session(client.app)  # active exists but with a DIFFERENT id
+    resp = await client.post("/voice/offer", headers=_headers(),
+                             json={"sdp": "v=0\r\n", "type": "offer",
+                                   "session_key": "not-the-active-one"})
+    assert resp.status == 400
+    assert (await resp.json())["error"] == "bad_session_key"

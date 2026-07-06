@@ -168,3 +168,79 @@ All structured under `web.voice.*`, **no SDP bodies ever logged** (byte-size
 | `web.voice.reject reason=too_many_sessions` | cap hit (incl. in-flight negotiations) |
 | `web.voice.track_received` / `.track_ignored` / `.track_ended` | media |
 | `web.voice.reaper_started` / `.reaper_error` | reaper task |
+
+---
+
+## V1 — assistant pipeline (streaming STT → text reply)
+
+`pipeline: assistant` turns the live WebRTC session into a walkie-talkie
+dictation chat: the mic is tapped for **streaming STT** (a second
+`relay.subscribe` off the inbound track feeds a `VoiceSttWorker` → Deepgram
+`nova-3` over a WebSocket), silence is sent outbound (the V2 TTS source-swap
+seam is kept alive), end-of-utterance text drives the SAME
+`run_turn_streaming` engine the chat UI uses, and the reply streams back over
+a **`voice` datachannel**. Voice turns land in the exact `/chat/history` the
+browser renders. NO TTS yet (that's V2).
+
+**Default-OFF and merged inert**: `pipeline: echo` stays the default; flip to
+`assistant` per-instance at deploy. Unknown `pipeline`, absent/unknown STT
+provider, or `deepgram` with an unresolved `${DEEPGRAM_API_KEY}` all
+fail-closed (no mount, loud `web.voice.disabled`).
+
+### Egress posture (per-instance decision — read before enabling)
+
+`pipeline: assistant` streams **CONTINUOUS mic audio — all ambient speech in
+the room — to the cloud STT provider** for the whole time the session is
+connected. This is a per-instance privacy call:
+
+- **Salem** = accepted residual (single-operator, owner's own mic).
+- **VERA / sovereign voice** = a SEPARATE arc; do **NOT** enable cloud STT
+  there.
+
+There is **no push-to-talk or wake-word** in V1 — any speech becomes a
+persisted chat turn. **Mute is the only gate.** Say this plainly in any UI
+copy.
+
+### Cost honesty
+
+Deepgram `nova-3` streaming is ~$0.0077/min PAYG ≈ **$0.46/hr while the mic is
+open**, billed **through silence** (STT runs whenever media flows). Bounded
+by `no_speech_close_s` (default 600 s — a connected session with zero speech
+closes with `reason=no_speech`) and `max_session_seconds` (1800 s absolute).
+Verify the box's Deepgram project concurrency/billing in the console at ship.
+
+### iOS caveats
+
+- **Screen lock kills the session.** An in-flight turn still **completes
+  server-side** and appears in history on return — that's the expected flow,
+  not a bug. Wake Lock (frontend) mitigates while the screen is unlocked.
+- Same getUserMedia / autoplay caveats as V0 apply.
+
+### Config + deploy
+
+Set `web.voice.pipeline: assistant` + the `web.voice.stt` block (see
+`config.yaml.example`); `DEEPGRAM_API_KEY` must be in the box `.env`. The
+media-plane deploy (ufw UDP range, direct-UDP, BFF timeout floor) is
+UNCHANGED from V0 above — only the signaling adds a datachannel m-line (noise
+in the SDP). Dev smoke is keyless via `provider: fake` (a finite 3-utterance
+script; then idle + `web.voice.stt.script_exhausted`).
+
+### V1 observability (grep these — NO transcript text, chars/counts only)
+
+| Event | Meaning |
+|---|---|
+| `web.voice.registered pipeline= stt_provider=` | assistant mount |
+| `web.voice.disabled reason=stt_unconfigured\|unknown_stt_provider\|stt_key_missing` | assistant fail-closed no-mount |
+| `web.voice.stt.config_clamped` | an STT setting was clamped at mount |
+| `web.voice.assistant_tap` | mic tapped for STT on a session |
+| `web.voice.stt.worker_started` / `.connected` / `.worker_closed` | STT worker lifecycle (close summary carries utterances/finals/dropped counts) |
+| `web.voice.stt.utterance_end` / `.utterance_empty` | EOU fired / below-floor noise |
+| `web.voice.stt.backpressure_drop` | audio queue drop-oldest (first + every 50th) |
+| `web.voice.stt.reconnect` / `.error fatal=true` | Deepgram reconnect / fatal (→ session closes `reason=stt_failed`) |
+| `web.voice.session_bound bind_mode=explicit\|reused\|opened` | chat-session binding at offer |
+| `web.voice.bad_session_key` | offer session_key didn't match the active chat session (400) |
+| `web.voice.session.close reason=no_speech` | silent-connected assistant session reaped |
+| `web.voice.dc_drop` / `.dc_backpressure_drop` / `.dc_event_truncated` | datachannel send drops / oversize turn_final |
+| `web.voice.utterance_superseded` | latest-wins queue replaced a pending utterance |
+| `web.voice.turn_complete` / `.engine_error` / `.turn_session_gone` / `.turn_slot_timeout` | turn outcomes |
+| `web.voice.driver_closed` | turn driver teardown (carries aggregate drop counts) |

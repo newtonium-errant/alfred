@@ -1,9 +1,14 @@
-"""V0 WebRTC voice — session manager + media seam (echo transport).
+"""WebRTC voice — session manager + media seam (echo + assistant pipelines).
 
 The ``/voice/*`` routes (``routes_voice``) are the wire surface; this module
 owns the server side of the WebRTC negotiation and the live-session
-registry. V0 = "audio transport up": the browser's mic track is echoed
-straight back so the operator hears themselves — no STT/TTS/chat coupling.
+registry. V0 ``echo`` = "audio transport up": the mic is echoed straight back.
+V1 ``assistant`` = the mic is tapped for streaming STT (a SECOND
+``relay.subscribe`` feeding a ``VoiceSttWorker``) while silence is sent
+outbound; end-of-utterance text drives ``run_turn_streaming`` via a
+``VoiceTurnDriver`` and the reply streams back over the ``voice`` datachannel.
+The pipeline is selected purely by whether ``stt_worker_factory`` /
+``turn_binding`` are wired — echo stays byte-identical when they are not.
 
 Design constraints (contract §1, §4):
 
@@ -152,10 +157,17 @@ def _voice_pipeline_track(source: Any) -> Any:
     ``MediaRelay().subscribe(inbound_track)`` passthrough (echo). The lazy
     class body keeps this module free of any top-level aiortc import.
 
-    THIS IS THE V1 INSERTION POINT: to add the Deepgram STT tap, feed a
-    SECOND ``relay.subscribe(track)`` to an STT consumer alongside this one
-    (you MUST relay — a raw track has exactly one consumer, aiortc#175); to
-    add TTS (V2) swap the ``source`` feeding ``recv()``. Neither touches the
+    V1 (assistant): the outbound source is :func:`_silence_source` (the mic is
+    tapped for STT via a SECOND ``relay.subscribe(track)`` — you MUST relay, a
+    raw track has exactly one consumer, aiortc#175). The m-line + RTCRtpSender
+    are kept alive precisely so V2 can swap the source with NO renegotiation.
+
+    V2 (TTS) SOURCE-SWAP HAZARD: the TTS source that replaces ``recv()`` MUST
+    continue the frame ``pts`` MONOTONICALLY across the swap (or be wrapped in
+    a pts-normalizing shim) — a pts discontinuity desyncs the RTP timestamp /
+    jitter buffer. Likewise a sample-format/rate CHANGE mid-stream can raise in
+    the Opus encoder / any downstream resampler; normalize to the negotiated
+    format before the swap. Neither the swap nor V1's STT tap touches the
     offer/answer wire contract.
     """
     global _PIPELINE_TRACK_CLS
@@ -174,6 +186,16 @@ def _voice_pipeline_track(source: Any) -> Any:
 
         _PIPELINE_TRACK_CLS = VoicePipelineTrack
     return _PIPELINE_TRACK_CLS(source)
+
+
+def _silence_source() -> Any:
+    """A stock aiortc silence generator (20 ms silent s16 frames, real-time
+    paced) — the V1 assistant-pipeline outbound source. Lazy import keeps this
+    module aiortc-free at import time. Wrapped in a :func:`_voice_pipeline_track`
+    so V2 TTS is a source swap (see that function's swap-hazard note)."""
+    from aiortc.mediastreams import AudioStreamTrack
+
+    return AudioStreamTrack()
 
 
 # --- Session record --------------------------------------------------------
@@ -196,8 +218,11 @@ class VoiceSession:
     last_state_change: float
     connection_state: str = "new"
     connected_once: bool = False
-    # Holds strong refs (MediaRelay, outbound track) so they aren't GC'd for
-    # the session's lifetime.
+    # Monotonic time of the FIRST "connected" transition — the base for the
+    # assistant-pipeline no-speech reaper (§1.6). 0.0 until connected.
+    connected_at: float = 0.0
+    # Holds strong refs (MediaRelay, outbound track, stt_worker, turn_driver)
+    # so they aren't GC'd for the session's lifetime.
     keepalive: dict[str, Any] = field(default_factory=dict)
 
 
@@ -218,6 +243,7 @@ class VoiceSessionManager:
         pc_factory: Callable[[], Any] | None = None,
         description_factory: Callable[[str, str], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        stt_worker_factory: Callable[[str], Any] | None = None,
     ) -> None:
         self._config = voice_config
         self.max_sessions = int(voice_config.max_sessions)
@@ -225,9 +251,14 @@ class VoiceSessionManager:
         self.connect_deadline = float(voice_config.connect_deadline_seconds)
         self.idle_timeout = float(voice_config.idle_timeout_seconds)
         self.max_session_seconds = float(voice_config.max_session_seconds)
+        self.no_speech_close_s = float(
+            getattr(voice_config, "no_speech_close_s", 600)
+        )
         self.reaper_interval = float(voice_config.reaper_interval_seconds)
         self.stun_servers = list(voice_config.ice.stun_servers)
         self.advertised_ip = voice_config.ice.advertised_ip
+        # None = V0 echo (byte-identical); set = V1 assistant STT tap.
+        self._stt_worker_factory = stt_worker_factory
 
         self._pc_factory = pc_factory or self._default_pc_factory
         self._description_factory = (
@@ -282,8 +313,14 @@ class VoiceSessionManager:
 
     async def open_session(
         self, identity: "WebIdentity", offer_sdp: str,
+        *, turn_binding: Any = None, voice_session_id: str | None = None,
     ) -> tuple[str, str]:
-        """Negotiate a new echo session. Returns ``(voice_session_id, answer_sdp)``.
+        """Negotiate a new session. Returns ``(voice_session_id, answer_sdp)``.
+
+        ``turn_binding`` (assistant pipeline) is a pre-built ``VoiceTurnDriver``
+        stashed BEFORE ``setRemoteDescription`` so the on_track / on_datachannel
+        handlers (which fire synchronously during negotiation, before the
+        :class:`VoiceSession` exists) can reach it via the keepalive dict.
 
         Raises :class:`TooManySessions` (→ 429), :class:`VoiceOfferTimeout`
         (→ 504), or :class:`NegotiationFailed` (→ 502).
@@ -314,11 +351,13 @@ class VoiceSessionManager:
 
         # 3. Reserve the slot, then build + negotiate.
         self._in_flight += 1
-        vid = uuid4().hex
+        vid = voice_session_id or uuid4().hex
         pc = self._pc_factory()
         keepalive: dict[str, Any] = {}
+        if turn_binding is not None:
+            keepalive["turn_driver"] = turn_binding
         try:
-            self._wire_media(pc, vid, keepalive)
+            self._wire_media(pc, vid, keepalive, turn_driver=turn_binding)
             self._wire_connection_state(pc, vid)
             try:
                 async with asyncio.timeout(self.offer_timeout):
@@ -382,9 +421,17 @@ class VoiceSessionManager:
 
     # -- media + state wiring -----------------------------------------------
 
-    def _wire_media(self, pc: Any, vid: str, keepalive: dict[str, Any]) -> None:
-        """Register the ``on('track')`` echo handler (fires during
-        setRemoteDescription, so the echoed sender lands in the answer)."""
+    def _wire_media(
+        self, pc: Any, vid: str, keepalive: dict[str, Any],
+        *, turn_driver: Any = None,
+    ) -> None:
+        """Register the ``on('track')`` handler (fires during
+        setRemoteDescription, so the outbound sender lands in the answer).
+
+        Echo (``stt_worker_factory is None``) loops the mic back. Assistant
+        taps the mic for STT via a SECOND ``relay.subscribe`` and sends silence
+        outbound (the V2 TTS source-swap seam). When ``turn_driver`` is present
+        the ``voice`` datachannel is also wired for the reply plane."""
 
         @pc.on("track")
         def on_track(track: Any) -> None:  # pragma: no cover - needs aiortc media
@@ -395,29 +442,63 @@ class VoiceSessionManager:
                     voice_session_id=vid, kind=track.kind, reason="non_audio",
                 )
                 return
-            if keepalive.get("echo_wired"):
-                # First-audio-track-only echo (security W3).
+            if keepalive.get("audio_handled"):
+                # First-audio-track-only (security W3).
                 log.info(
                     "web.voice.track_ignored",
                     voice_session_id=vid, kind=track.kind,
                     reason="additional_audio_track",
                 )
                 return
-            keepalive["echo_wired"] = True
+            keepalive["audio_handled"] = True
 
             from aiortc.contrib.media import MediaRelay
 
             relay = MediaRelay()
-            outbound = _voice_pipeline_track(relay.subscribe(track))
-            pc.addTrack(outbound)
-            # Strong refs — the relay + outbound track must outlive this
-            # handler frame or the echo stops.
             keepalive["relay"] = relay
-            keepalive["outbound"] = outbound
+
+            if self._stt_worker_factory is not None:
+                # Assistant: tap the mic for STT; send silence outbound (keeps
+                # the m-line/sender alive for the V2 TTS source swap). The mic
+                # is NOT echoed.
+                stt_input = relay.subscribe(track)
+                outbound = _voice_pipeline_track(_silence_source())
+                pc.addTrack(outbound)
+                keepalive["outbound"] = outbound
+                worker = self._stt_worker_factory(
+                    vid, keepalive.get("turn_driver"), self,
+                )
+                worker.start(stt_input)
+                keepalive["stt_worker"] = worker
+                log.info("web.voice.assistant_tap", voice_session_id=vid)
+            else:
+                # Echo (V0): loop the mic back to the browser.
+                outbound = _voice_pipeline_track(relay.subscribe(track))
+                pc.addTrack(outbound)
+                keepalive["outbound"] = outbound
 
             @track.on("ended")
             def on_ended() -> None:
                 log.info("web.voice.track_ended", voice_session_id=vid, kind=track.kind)
+
+        if turn_driver is not None:
+            @pc.on("datachannel")
+            def on_datachannel(channel: Any) -> None:  # pragma: no cover - needs aiortc
+                label = getattr(channel, "label", "")
+                if label != "voice" or keepalive.get("dc_attached"):
+                    log.info(
+                        "web.voice.dc_ignored",
+                        voice_session_id=vid, label=label,
+                        reason="not_voice_label" if label != "voice"
+                        else "additional_channel",
+                    )
+                    return
+                keepalive["dc_attached"] = True
+                turn_driver.attach_channel(channel)
+
+                @channel.on("message")
+                def on_message(raw: Any) -> None:
+                    turn_driver.on_client_message(raw)
 
     def _wire_connection_state(self, pc: Any, vid: str) -> None:
         """Register ``on('connectionstatechange')`` → state log + auto-close."""
@@ -429,8 +510,9 @@ class VoiceSessionManager:
             if session is not None:
                 session.connection_state = state
                 session.last_state_change = self._clock()
-                if state == "connected":
+                if state == "connected" and not session.connected_once:
                     session.connected_once = True
+                    session.connected_at = self._clock()
             log.info("web.voice.session.state", voice_session_id=vid, state=state)
             if state == "connected" and session is not None:
                 log.info(
@@ -451,6 +533,11 @@ class VoiceSessionManager:
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
+    def schedule_close(self, voice_session_id: str, reason: str) -> None:
+        """Detached, fail-honest close (V1 STT fatal → reason=stt_failed). The
+        worker's on_fatal wiring calls this; the manager owns the task ref."""
+        self._spawn(self.close(voice_session_id, reason=reason))
+
     # -- close --------------------------------------------------------------
 
     async def close(self, voice_session_id: str, reason: str) -> bool:
@@ -459,6 +546,10 @@ class VoiceSessionManager:
         session = self._sessions.pop(voice_session_id, None)
         if session is None:
             return False
+        # Drain the assistant-pipeline STT worker + turn driver BEFORE the pc
+        # (bounded + swallowed, mirroring _safe_close_pc) so a wedged worker /
+        # driver can't stall teardown. No-ops in echo mode (keys absent).
+        await self._drain_pipeline(session, reason)
         await self._safe_close_pc(session.pc)
         log.info(
             "web.voice.session.close",
@@ -519,6 +610,32 @@ class VoiceSessionManager:
                 "web.voice.pc_close_error",
                 error=str(exc), error_type=type(exc).__name__,
             )
+
+    async def _drain_pipeline(self, session: VoiceSession, reason: str) -> None:
+        """Bounded, swallowed teardown of the assistant STT worker + turn
+        driver (V1). No-op in echo mode. Converges here because close() is the
+        single choke point every teardown path (client_close / reaper /
+        replacement / connection-state / shutdown) already funnels through."""
+        worker = session.keepalive.get("stt_worker")
+        if worker is not None:
+            try:
+                await asyncio.wait_for(worker.aclose(reason=reason), timeout=5.0)
+            except Exception as exc:  # noqa: BLE001 — teardown must not raise
+                log.warning(
+                    "web.voice.stt.close_error",
+                    voice_session_id=session.voice_session_id,
+                    error_class=type(exc).__name__,
+                )
+        driver = session.keepalive.get("turn_driver")
+        if driver is not None:
+            try:
+                await asyncio.wait_for(driver.aclose(reason=reason), timeout=10.0)
+            except Exception as exc:  # noqa: BLE001 — teardown must not raise
+                log.warning(
+                    "web.voice.driver_close_error",
+                    voice_session_id=session.voice_session_id,
+                    error_class=type(exc).__name__,
+                )
 
     # -- reaper -------------------------------------------------------------
 
@@ -594,5 +711,26 @@ class VoiceSessionManager:
                 and (now - s.last_state_change) >= self.idle_timeout
             ):
                 doomed.append((vid, "idle_timeout"))
+            elif self._no_speech_expired(s, now):
+                doomed.append((vid, "no_speech"))
         for vid, reason in doomed:
             await self.close(vid, reason=reason)
+
+    def _no_speech_expired(self, s: VoiceSession, now: float) -> bool:
+        """Assistant-pipeline no-speech reaper (§1.6): a CONNECTED session that
+        has produced ZERO stt finals for ``no_speech_close_s`` closes with
+        reason=no_speech — idle_timeout only fires post-disconnect, so without
+        this an abandoned connected tab streams billable silence. Echo sessions
+        (no ``stt_worker``) are exempt."""
+        worker = s.keepalive.get("stt_worker")
+        if worker is None or not s.connected_once or s.connection_state != "connected":
+            return False
+        try:
+            finals = worker.stats.get("finals", 0)
+        except Exception:  # noqa: BLE001 - defensive
+            return False
+        return (
+            finals == 0
+            and bool(s.connected_at)
+            and (now - s.connected_at) >= self.no_speech_close_s
+        )

@@ -140,16 +140,43 @@ class VoiceIceConfig:
 
 
 @dataclass
+class WebVoiceSttConfig:
+    """Streaming-STT config for the V1 assistant pipeline (``web.voice.stt``).
+
+    Required when ``pipeline: assistant`` — the mount gate fails closed (no
+    mount, loud log) if ``provider`` is empty/unknown, or if ``provider:
+    deepgram`` and ``api_key`` is unresolved. ``provider: fake`` needs no key
+    (the keyless dev-box + unit-test path). ``endpointing_ms`` /
+    ``utterance_end_ms`` / ``sample_rate`` are clamped at mount by
+    ``normalize_stt_settings`` (``web.voice.stt.config_clamped`` on any clamp).
+    ``smart_format`` is a config field (contract §1.8) so it can be tuned off
+    (→ punctuate=true) without a code change if it delays finals on real audio.
+    """
+
+    provider: str = ""            # "" = unconfigured; "deepgram" | "fake"
+    api_key: str = ""
+    model: str = "nova-3"
+    language: str = "en"
+    sample_rate: int = 16000      # V1: 16000 only (else clamps)
+    endpointing_ms: int = 300     # speech_final silence window; clamp [10,5000]
+    utterance_end_ms: int = 1000  # word-gap fallback; 0=off; clamp [1000,5000]
+    min_utterance_chars: int = 3  # EOU noise floor (mirrors talker stt)
+    smart_format: bool = True
+
+
+@dataclass
 class WebVoiceConfig:
-    """Typed config for the V0 WebRTC voice surface (``web.voice``).
+    """Typed config for the WebRTC voice surface (``web.voice``).
 
     ``enabled`` defaults False — an absent or disabled ``voice:`` block means
     the ``/voice/*`` routes are NOT mounted (opt-in inertness; the route
     table is byte-identical for every instance that doesn't opt in). All
     timeouts live here (NOT as module constants) so a deploy can tune them
-    without a code change. ``pipeline`` is an enum — only ``"echo"`` is valid
-    in V0; any other value fails closed (routes NOT mounted, loud log), so a
-    typo can never silently serve an unintended pipeline.
+    without a code change. ``pipeline`` is an enum — ``"echo"`` (V0 default,
+    hear-yourself) or ``"assistant"`` (V1 streaming STT → text reply); any
+    other value fails closed (routes NOT mounted, loud log), so a typo can
+    never silently serve an unintended pipeline. ``assistant`` additionally
+    requires a usable ``stt`` block.
     """
 
     enabled: bool = False
@@ -159,11 +186,17 @@ class WebVoiceConfig:
     connect_deadline_seconds: int = 30
     idle_timeout_seconds: int = 120
     max_session_seconds: int = 1800
+    # Assistant pipeline: a connected session with ZERO stt finals for this
+    # window closes with reason=no_speech (contract §1.6) — idle_timeout only
+    # fires post-disconnect, so without this an abandoned CONNECTED tab
+    # streams billable silence for the full max_session_seconds.
+    no_speech_close_s: int = 600
     # Reaper sweep cadence. Not in the documented example block (advanced
     # knob) but config-overridable per §4 "REAPER_INTERVAL from config or
     # 15s"; schema-tolerant so an older config without it still loads.
     reaper_interval_seconds: int = 15
     ice: VoiceIceConfig = field(default_factory=VoiceIceConfig)
+    stt: WebVoiceSttConfig = field(default_factory=WebVoiceSttConfig)
 
 
 @dataclass
@@ -287,13 +320,46 @@ def _build_voice_ice(raw: Any) -> VoiceIceConfig:
     )
 
 
+def _build_voice_stt(raw: Any) -> WebVoiceSttConfig:
+    """Hand-roll ``WebVoiceSttConfig`` with a schema-tolerance filter.
+
+    Mirrors ``_build_voice_ice`` — dict guard, ``__dataclass_fields__``
+    filter, ``_int`` coercions. ``provider`` is lowercased/stripped but NOT
+    coalesced on unknown values, so the mount gate can log the raw typo.
+    ``api_key`` env substitution rides the module-wide ``substitute_env_in_value``
+    already applied at ``load_from_unified``; ``_is_unresolved`` recognises an
+    unset/empty ``${DEEPGRAM_API_KEY}`` at the mount gate.
+    """
+    if not isinstance(raw, dict):
+        return WebVoiceSttConfig()
+    known = WebVoiceSttConfig.__dataclass_fields__
+    filtered = {k: v for k, v in raw.items() if k in known}
+    defaults = WebVoiceSttConfig()
+    return WebVoiceSttConfig(
+        provider=str(filtered.get("provider", "") or "").strip().lower(),
+        api_key=str(filtered.get("api_key", "") or ""),
+        model=str(filtered.get("model", defaults.model) or defaults.model),
+        language=str(filtered.get("language", defaults.language)
+                     or defaults.language),
+        sample_rate=_int(filtered.get("sample_rate"), defaults.sample_rate),
+        endpointing_ms=_int(filtered.get("endpointing_ms"), defaults.endpointing_ms),
+        utterance_end_ms=_int(
+            filtered.get("utterance_end_ms"), defaults.utterance_end_ms,
+        ),
+        min_utterance_chars=_int(
+            filtered.get("min_utterance_chars"), defaults.min_utterance_chars,
+        ),
+        smart_format=bool(filtered.get("smart_format", defaults.smart_format)),
+    )
+
+
 def _build_voice(raw: Any) -> WebVoiceConfig:
     """Hand-roll ``WebVoiceConfig`` with a schema-tolerance filter.
 
     Mirrors ``_build_auth`` — isinstance-dict guard, ``__dataclass_fields__``
-    filter, ``_int`` coercion for the timeouts / cap, and a nested
-    hand-rolled ``ice`` block (NO ``_build`` / ``_DATACLASS_MAP`` — this
-    module hand-rolls everything to sidestep the key-name collision footgun).
+    filter, ``_int`` coercion for the timeouts / cap, and nested hand-rolled
+    ``ice`` + ``stt`` blocks (NO ``_build`` / ``_DATACLASS_MAP`` — this module
+    hand-rolls everything to sidestep the key-name collision footgun).
     """
     if not isinstance(raw, dict):
         return WebVoiceConfig()
@@ -321,11 +387,16 @@ def _build_voice(raw: Any) -> WebVoiceConfig:
             filtered.get("max_session_seconds"),
             defaults.max_session_seconds,
         ),
+        no_speech_close_s=_int(
+            filtered.get("no_speech_close_s"),
+            defaults.no_speech_close_s,
+        ),
         reaper_interval_seconds=_int(
             filtered.get("reaper_interval_seconds"),
             defaults.reaper_interval_seconds,
         ),
         ice=_build_voice_ice(filtered.get("ice")),
+        stt=_build_voice_stt(filtered.get("stt")),
     )
 
 
