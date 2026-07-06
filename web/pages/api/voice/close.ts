@@ -1,0 +1,42 @@
+import type { NextApiRequest, NextApiResponse } from 'next';
+import type { ZodIssue } from 'zod';
+import { resolveSessionToken } from '../../../lib/algernon/identity';
+import { voiceCloseBodySchema } from '../../../lib/algernon/schemas';
+import { callTransport } from '../../../lib/algernon/transport';
+import { sendTransportError } from '../../../lib/algernon/bffError';
+
+// POST /api/voice/close → idempotent, owner-bound teardown. 405 → session (401) →
+// zod (400) → verbatim relay of the transport's POST /voice/close ({closed} /
+// {closed:false, reason:'not_found'}). Called both by the in-app hangup and by the
+// pagehide/unmount keepalive beacon (a Blob typed application/json — a plain JSON
+// string body would arrive as text/plain and 400 at the transport's zod boundary;
+// SECURITY W7). The peer token is injected server-side; the browser never sees it.
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).json({ error: 'method_not_allowed' });
+  }
+
+  const sessionToken = resolveSessionToken(req);
+  if (!sessionToken) {
+    return res.status(401).json({ error: 'invalid_session' });
+  }
+
+  const parsed = voiceCloseBodySchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: 'invalid_request',
+      detail: parsed.error.issues.map((i: ZodIssue) => i.message).join('; '),
+    });
+  }
+
+  try {
+    const { status, body } = await callTransport('POST', '/voice/close', {
+      body: parsed.data,
+      sessionToken,
+    });
+    return res.status(status).json(body ?? {});
+  } catch (e) {
+    return sendTransportError(res, 'voice/close', e);
+  }
+}

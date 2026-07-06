@@ -5,6 +5,7 @@ import { Layout } from '../components/Layout';
 import { ChatThread } from '../components/chat/ChatThread';
 import { ChatTargetPicker } from '../components/chat/ChatTargetPicker';
 import { Composer } from '../components/chat/Composer';
+import { VoicePanel } from '../components/chat/VoicePanel';
 import { Button } from '../components/ui/button';
 import { authApi } from '../lib/algernon/authClient';
 import { chatApi } from '../lib/algernon/client';
@@ -190,6 +191,11 @@ export default function ChatPage() {
               )}
             </div>
           )}
+
+          {/* V0 voice (echo transport). Renders nothing unless NEXT_PUBLIC_VOICE_ENABLED
+              is on; a cross-instance selection disables it (Salem-only). Passing the
+              active `instance` lets it auto-hang-up a live call on an instance switch. */}
+          <VoicePanel instance={instance} />
 
           <Composer onSend={(t, kind) => void send(t, kind)} disabled={booting || sending} />
         </div>

@@ -116,3 +116,30 @@ export function normaliseAudioMime(contentType: string | undefined | null): stri
   const base = contentType.split(';')[0].trim().toLowerCase();
   return (AUDIO_MIME_ALLOWLIST as readonly string[]).includes(base) ? base : null;
 }
+
+// --- Web voice (V0) trust-boundary constants + schemas (CONTRACT §7) ---------
+// The WebRTC signalling offer/close bodies cross the BFF trust boundary like every
+// other route — parsed here before relay. A vanilla-ICE offer (all candidates
+// embedded, host-only) is a few KB; 64 KiB is the DoS edge guard, mirrored by the
+// backend's own 131072-byte cap (the backend measures BYTES, we cap CHARS — a
+// lower ceiling, still comfortably above a real offer). The optional `session_key`
+// is a V0 forward-hook (bound to a chat session in V1): length-capped here, logged
+// + ignored server-side. Do NOT `.strict()` these — zod's default strips unknown
+// keys, and the contract requires we accept-and-drop extras rather than 400 them.
+export const MAX_SDP_CHARS = 65536;
+
+export const voiceOfferBodySchema = z.object({
+  sdp: z.string().min(1).max(MAX_SDP_CHARS),
+  type: z.literal('offer'),
+  session_key: z.string().min(1).max(128).optional(),
+});
+
+export type VoiceOfferBody = z.infer<typeof voiceOfferBodySchema>;
+
+// The server-minted 32-hex session id echoed back to /voice/close. Bounded edge
+// guard (the backend is the authority on the exact format); absent ⇒ 400.
+export const voiceCloseBodySchema = z.object({
+  voice_session_id: z.string().min(1).max(128),
+});
+
+export type VoiceCloseBody = z.infer<typeof voiceCloseBodySchema>;
