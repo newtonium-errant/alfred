@@ -23,9 +23,13 @@ import { plantSessionCookies } from './authCookies';
 // The fake-mic (--use-file-for-fake-audio-capture, playwright.voice.config.ts)
 // feeds the checked-in tone continuously; the FakeStreamProvider fires its
 // scripted utterances on feed-count (contract §1.7), so the exact transcript/reply
-// STRINGS are harness-defined — this spec asserts STRUCTURE + streaming + thread
-// adoption, not exact copy. WSL2 trap: run Chromium INSIDE WSL2 (same netns as
-// aiortc) or ICE never completes (microsoft/WSL#8783).
+// STRINGS are harness-defined — this spec asserts DURABLE STRUCTURE (a full
+// exchange in the persisted thread), not exact copy and not the transient in-panel
+// regions: with fake providers a turn completes in milliseconds, so the transcript
+// + streaming reply clear into the thread faster than Playwright can poll them (an
+// inherent race on an instant pipeline). The live streaming display is covered at
+// the vitest layer. WSL2 trap: run Chromium INSIDE WSL2 (same netns as aiortc) or
+// ICE never completes (microsoft/WSL#8783).
 
 test('a spoken utterance streams a transcript + reply and lands in the thread', async ({
   page,
@@ -50,23 +54,24 @@ test('a spoken utterance streams a transcript + reply and lands in the thread', 
   await start.click();
 
   // Reaches live+listening; the assistant pipeline confirms dictation (state:ready),
-  // so the echo-mode "dictation unavailable" notice must NOT appear.
+  // so the echo-mode "dictation unavailable" notice must NOT appear. (These two are
+  // STABLE — the pill returns to Listening between/after turns, and the notice never
+  // fires once dictation is confirmed.)
   await expect(page.getByTestId('voice-status')).toContainText('Listening', { timeout: 20_000 });
   await expect(page.getByTestId('voice-dictation-unavailable')).toHaveCount(0);
 
-  // The scripted utterance's final transcript appears (structure, not exact copy).
-  const transcript = page.getByTestId('voice-transcript');
-  await expect(transcript).toBeVisible({ timeout: 20_000 });
-  await expect(transcript).not.toHaveText('');
-
-  // The streamed reply appears in the panel...
-  await expect(page.getByTestId('voice-reply')).toBeVisible({ timeout: 20_000 });
-
-  // ...and after turn_final the exchange is adopted into the chat thread (a new
-  // assistant bubble), which is the durable record of the turn.
-  await expect(page.getByTestId('chat-thread').getByTestId('msg-assistant').last()).toBeVisible({
-    timeout: 20_000,
-  });
+  // DURABLE outcome — assert the persisted thread, NOT the transient panel regions.
+  // With fake providers a turn completes in milliseconds: the transcript/reply
+  // stream and then clear as the turn is adopted into the thread, faster than
+  // Playwright can poll a `toBeVisible` on those regions (inherent race). The
+  // in-panel streaming display is covered at the vitest layer; the e2e smoke's job
+  // is the durable loop: a full exchange (the transcribed user turn + its assistant
+  // reply) landing in the chat thread.
+  const thread = page.getByTestId('chat-thread');
+  await expect(thread.getByTestId('msg-user').last()).toBeVisible({ timeout: 20_000 });
+  await expect(thread.getByTestId('msg-user').last()).not.toHaveText('');
+  await expect(thread.getByTestId('msg-assistant').last()).toBeVisible({ timeout: 20_000 });
+  await expect(thread.getByTestId('msg-assistant').last()).not.toHaveText('');
 
   await page.getByTestId('voice-hangup').click();
   await expect(page.getByTestId('voice-start')).toBeVisible({ timeout: 10_000 });
