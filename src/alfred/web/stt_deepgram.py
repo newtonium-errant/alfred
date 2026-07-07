@@ -176,8 +176,16 @@ class DeepgramStreamProvider(STTStreamProvider):
 
         self._session: aiohttp.ClientSession | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
-        self._events: asyncio.Queue[STTEvent | None] | None = None
-        self._ready: asyncio.Event | None = None
+        # EAGER (one per provider lifetime). The worker spawns its event PUMP —
+        # `async for ev in provider.events()` → `await self._events.get()` —
+        # immediately in start(), BEFORE the sender lazily connect()s on the
+        # first chunk. If these were created in connect() the pump would call
+        # `.get()` on None → AttributeError → the pump task dies SILENTLY
+        # (fire-and-forget) and nothing consumes Deepgram's events → zero
+        # partials/finals (the live phone-test failure). events() MUST be safe
+        # before connect; connect()/reconnect MUST NOT reassign them.
+        self._events: asyncio.Queue[STTEvent | None] = asyncio.Queue()
+        self._ready: asyncio.Event = asyncio.Event()
         self._recv_task: asyncio.Task | None = None
         self._keepalive_task: asyncio.Task | None = None
 
@@ -199,8 +207,8 @@ class DeepgramStreamProvider(STTStreamProvider):
     # -- connect ------------------------------------------------------------
 
     async def connect(self) -> None:
-        self._events = asyncio.Queue()
-        self._ready = asyncio.Event()
+        # NB: _events / _ready are created EAGERLY in __init__ (see there) and
+        # are NEVER reassigned here — the pump reads events() before this runs.
         self._session = aiohttp.ClientSession()
         try:
             await self._open_ws()  # raises _HandshakeFailed on handshake error

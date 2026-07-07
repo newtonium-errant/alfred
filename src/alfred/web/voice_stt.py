@@ -255,6 +255,18 @@ class VoiceSttWorker:
             tail = self._chunker.flush()
             if tail:
                 self._enqueue(tail)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — unexpected reader death = no audio
+            # Not the normal end-of-track (that's the inner break) — a resample
+            # or chunker blow-up. Silent no-audio is this incident's class; log
+            # loud. The finally still delivers the sentinel so the sender ends.
+            log.warning(
+                "web.voice.stt.reader_died",
+                voice_session_id=self._vid,
+                error_class=type(exc).__name__, fatal=True,
+                detail="STT media reader died — no audio will reach the provider",
+            )
         finally:
             # Deliver the end-of-track sentinel EVEN IF the bounded queue is at
             # capacity — drop-oldest keeps it full, and put_nowait raises
@@ -317,29 +329,73 @@ class VoiceSttWorker:
         log.info("web.voice.stt.started_on_hello", voice_session_id=self._vid)
 
     async def _sender(self) -> None:
-        # Hello-gate: do NOT touch the provider until the client's hello. The
-        # reader keeps chunking (drop-oldest bounds the queue) while we wait.
-        await self._await_hello_gate()
-        connected = False
-        while True:
-            item = await self._queue.get()
-            if item is None:  # end-of-track sentinel
-                break
-            if not connected:
-                await self._provider.connect()  # lazy connect on first chunk
-                connected = True
-            await self._provider.feed(item)
-            self._chunks_sent += 1
-            self._account_input_energy(item)
-        if connected:
-            try:
-                await self._provider.finalize()
-            except Exception:  # noqa: BLE001 — best-effort trailing flush
-                pass
+        try:
+            # Hello-gate: do NOT touch the provider until the client's hello. The
+            # reader keeps chunking (drop-oldest bounds the queue) while we wait.
+            await self._await_hello_gate()
+            connected = False
+            while True:
+                item = await self._queue.get()
+                if item is None:  # end-of-track sentinel
+                    break
+                if not connected:
+                    await self._provider.connect()  # lazy connect on first chunk
+                    connected = True
+                await self._provider.feed(item)
+                self._chunks_sent += 1
+                self._account_input_energy(item)
+            if connected:
+                try:
+                    await self._provider.finalize()
+                except Exception:  # noqa: BLE001 — best-effort trailing flush
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — sender death = audio never reaches STT
+            # E.g. a connect() handshake failure propagating raw: without this
+            # the sender dies silently and the pump blocks forever on an empty
+            # queue → zero transcripts, invisibly. Log loud + fail-honest.
+            log.warning(
+                "web.voice.stt.sender_died",
+                voice_session_id=self._vid,
+                error_class=type(exc).__name__, fatal=True,
+                detail="STT sender died — audio not reaching the provider",
+            )
+            if self._on_fatal is not None and not self._closing:
+                try:
+                    await self._on_fatal(STTEvent(
+                        type=EVENT_ERROR, reason="sender_died",
+                        detail=type(exc).__name__, fatal=True))
+                except Exception:  # noqa: BLE001 — on_fatal must not re-raise here
+                    pass
 
     # -- event-pump ---------------------------------------------------------
 
     async def _pump(self) -> None:
+        try:
+            await self._pump_events()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a dead pump = SILENTLY dead STT
+            # THE live phone-test incident's class: the pump died (provider
+            # events() blew up) and nothing consumed transcripts → zero results,
+            # invisibly. NEVER let it vanish — log loud + fail-honest (surface
+            # via on_fatal so the session closes instead of zombie-ing mute).
+            log.warning(
+                "web.voice.stt.pump_died",
+                voice_session_id=self._vid,
+                error_class=type(exc).__name__, fatal=True,
+                detail="STT event pump died — no transcripts will flow",
+            )
+            if self._on_fatal is not None and not self._closing:
+                try:
+                    await self._on_fatal(STTEvent(
+                        type=EVENT_ERROR, reason="pump_died",
+                        detail=type(exc).__name__, fatal=True))
+                except Exception:  # noqa: BLE001 — on_fatal must not re-raise here
+                    pass
+
+    async def _pump_events(self) -> None:
         buffer: list[str] = []
         async for ev in self._provider.events():
             if ev.type == EVENT_PARTIAL:

@@ -382,6 +382,155 @@ async def test_input_quiet_warns_once_after_silence() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pump-before-lazy-connect (the live phone-test root cause)
+# ---------------------------------------------------------------------------
+
+
+class _EagerQueueProvider(STTStreamProvider):
+    """Mimics the FIXED Deepgram: events queue EAGER in __init__, connect is
+    lazy. The worker's pump reads events() BEFORE the sender connect()s, so an
+    eager queue is what makes that ordering safe (blocks empty until feed)."""
+
+    provider_id = "eager"
+
+    def __init__(self) -> None:
+        self._events: asyncio.Queue = asyncio.Queue()   # EAGER (the fix)
+        self.connected = False
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def feed(self, chunk: bytes) -> None:
+        self._events.put_nowait(STTEvent(type=EVENT_PARTIAL, text="hel"))
+        self._events.put_nowait(STTEvent(type=EVENT_FINAL, text="hello there"))
+        self._events.put_nowait(STTEvent(type=EVENT_UTTERANCE_END, trigger="t"))
+
+    async def finalize(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        self._events.put_nowait(None)
+
+    async def events(self):
+        while True:
+            ev = await self._events.get()
+            if ev is None:
+                return
+            yield ev
+
+
+class _LazyQueueProvider(STTStreamProvider):
+    """Mimics the PRE-FIX Deepgram: events queue created in connect(), None
+    before. events() → ``await None.get()`` → AttributeError → the pump dies."""
+
+    provider_id = "lazy"
+
+    def __init__(self) -> None:
+        self._events = None   # LAZY — THE bug
+
+    async def connect(self) -> None:
+        self._events = asyncio.Queue()
+
+    async def feed(self, chunk: bytes) -> None:
+        if self._events is not None:
+            self._events.put_nowait(STTEvent(type=EVENT_PARTIAL, text="x"))
+
+    async def finalize(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        if self._events is not None:
+            self._events.put_nowait(None)
+
+    async def events(self):
+        while True:
+            ev = await self._events.get()   # AttributeError if _events is None
+            if ev is None:
+                return
+            yield ev
+
+
+def _worker_direct(provider, **kw):
+    async def _noop(_):
+        return None
+    return VoiceSttWorker(
+        provider=provider, voice_session_id="v1",
+        on_utterance=kw.pop("on_utterance", None) or _noop,
+        on_fatal=kw.pop("on_fatal", None),
+        resample_fn=lambda f: [f] if isinstance(f, (bytes, bytearray)) else [],
+        hello_gate=False, **kw,
+    )
+
+
+async def test_deepgram_events_queue_is_eager_before_connect() -> None:
+    # Fix pin: the real DeepgramStreamProvider must create _events/_ready in
+    # __init__ (not connect()) so the worker pump can read events() before the
+    # sender lazily connects. Pre-fix: both None → pump AttributeError → silent.
+    from alfred.web.config import WebVoiceSttConfig
+    from alfred.web.stt_deepgram import DeepgramStreamProvider
+
+    prov = DeepgramStreamProvider(
+        WebVoiceSttConfig(provider="deepgram", api_key="x", model="nova-3"),
+        voice_session_id="v")
+    assert prov._events is not None
+    assert prov._ready is not None
+
+    # events() must be safe to start awaiting BEFORE connect (blocks, no raise).
+    async def _consume():
+        async for ev in prov.events():
+            return ev.type
+
+    task = asyncio.ensure_future(_consume())
+    await asyncio.sleep(0.02)
+    assert not task.done()                       # pump alive, blocked on empty q
+    prov._events.put_nowait(STTEvent(type=EVENT_PARTIAL, text="hi"))
+    assert await asyncio.wait_for(task, timeout=1) == EVENT_PARTIAL
+
+
+async def test_worker_pump_before_connect_reaches_callbacks() -> None:
+    # Positive: with an EAGER-queue provider, the pump (spawned before connect)
+    # reaches the callbacks — the whole point of the fix.
+    got: list[str] = []
+
+    async def on_utt(text: str) -> None:
+        got.append(text)
+
+    prov = _EagerQueueProvider()
+    w = _worker_direct(prov, on_utterance=on_utt)
+    w.start(_FakeTrack([b"\x01\x02" * 1600]))    # one 3200 B chunk
+    await asyncio.wait_for(w._reader_task, timeout=5)
+    await asyncio.wait_for(w._sender_task, timeout=5)
+    await asyncio.sleep(0.05)                     # let the pump drain
+    assert prov.connected
+    assert "hello there" in got
+    await w.aclose()
+
+
+async def test_worker_pump_death_is_loud_and_fail_honest() -> None:
+    # Hardening pin (the incident's SILENT nature): a LAZY-queue provider makes
+    # the pump die (AttributeError) — pre-fix that vanished (0 transcripts, no
+    # log). Now it MUST log web.voice.stt.pump_died AND fail-honest via on_fatal
+    # so the session closes instead of zombie-ing mute.
+    fatal: list = []
+
+    async def on_fatal(ev) -> None:
+        fatal.append(ev)
+
+    prov = _LazyQueueProvider()          # _events stays None (never connected)
+    w = _worker_direct(prov, on_fatal=on_fatal)
+    # Drive the pump DIRECTLY (deterministic — no race with the sender's connect):
+    # it reads events() on the None queue → AttributeError, exactly the incident.
+    with structlog.testing.capture_logs() as cap:
+        await w._pump()
+    died = [c for c in cap if c.get("event") == "web.voice.stt.pump_died"]
+    assert len(died) == 1
+    assert died[0]["error_class"] == "AttributeError"
+    assert died[0]["fatal"] is True
+    # Fail-honest: the dead pump surfaced via on_fatal (session closes, not mute).
+    assert len(fatal) == 1 and fatal[0].reason == "pump_died"
+
+
+# ---------------------------------------------------------------------------
 # Resampler return-shape coercion (PyAV<10 fallback)
 # ---------------------------------------------------------------------------
 
