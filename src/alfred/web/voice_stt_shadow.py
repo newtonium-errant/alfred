@@ -64,6 +64,11 @@ _SHADOW_TASKS: set[asyncio.Task] = set()
 # Divergence metric — copied byte-identically from the replay harness
 # (aftermath-honeydew-review/teams/honeydew-review/stt_replay.py) via
 # telegram/stt_shadow.py, so the live-captured number == the replay number.
+#
+# KEEP IN SYNC with stt_replay.py:divergence (vendored copy — no shared source
+# until the harness is repo-vendored). If the harness formula changes, update
+# _norm/_edit_distance/divergence here AND in telegram/stt_shadow.py, else the
+# live divergence silently stops matching the replay-computed one.
 # ---------------------------------------------------------------------------
 
 

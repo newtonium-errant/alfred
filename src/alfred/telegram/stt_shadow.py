@@ -57,6 +57,10 @@ log = get_logger(__name__)
 # these three functions are copied verbatim so the divergence written by the
 # live capture is the SAME number the harness would compute on replay. Keep
 # them in lockstep with the harness if either side changes.
+#
+# KEEP IN SYNC with stt_replay.py:divergence (vendored copy — no shared source
+# until the harness is repo-vendored). Sibling vendored copy also lives in
+# web/voice_stt_shadow.py; update all three together.
 # ---------------------------------------------------------------------------
 
 
