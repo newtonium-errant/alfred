@@ -1219,10 +1219,23 @@ def _messages_for_api(transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
     level so an operator can grep ``conversation.transcript_healed``
     to spot the gap-then-recovery pattern.
     """
-    stripped = [
-        {k: v for k, v in turn.items() if not k.startswith("_")}
-        for turn in transcript
-    ]
+    stripped: list[dict[str, Any]] = []
+    for turn in transcript:
+        clean = {k: v for k, v in turn.items() if not k.startswith("_")}
+        # Sanitize assistant content blocks on the way out (3rd responsibility):
+        # a transcript stored by an older build carries OUTPUT-ONLY block fields
+        # (parsed_output / caller / null citations) that the API rejects on
+        # replay — the 2nd-turn 400. _clean_content_block whitelists the known
+        # assistant block types and passes user-side blocks (tool_result/…)
+        # through untouched. This heals already-stored dirty transcripts without
+        # a state reset; _blocks_to_jsonable keeps new stores clean at the source.
+        content = clean.get("content")
+        if isinstance(content, list):
+            clean["content"] = [
+                _clean_content_block(b) if isinstance(b, dict) else b
+                for b in content
+            ]
+        stripped.append(clean)
     return _heal_dangling_tool_use(stripped)
 
 
@@ -5277,35 +5290,87 @@ def _extract_text(content: Any) -> str:
     return "\n".join(parts).strip()
 
 
-def _blocks_to_jsonable(content: Any) -> list[dict[str, Any]]:
-    """Convert an Anthropic response.content list to plain JSON-serialisable dicts.
+# Assistant content-block types we have an API-INPUT whitelist for. A raw
+# ``block.model_dump()`` emits OUTPUT-ONLY fields the Messages API rejects when
+# the transcript is REPLAYED as history on a later turn (400: "Extra inputs are
+# not permitted"): streamed TextBlocks carry ``parsed_output`` (structured-output
+# echo), ToolUseBlocks carry ``caller``, and TextBlocks carry ``citations: null``.
+# Whitelist each type to exactly its input params so history round-trips.
+_ASSISTANT_INPUT_BLOCK_TYPES = frozenset(
+    {"text", "tool_use", "thinking", "redacted_thinking"}
+)
+# ILB dedup: log an unrecognized assistant block type once per process so a new
+# SDK block type we should round-trip surfaces instead of silently degrading.
+_unknown_block_types_logged: set[str] = set()
 
-    The SDK returns rich block objects (TextBlock, ToolUseBlock, ...), but the
-    state file stores the transcript as JSON — we need plain dicts. On the
-    next API call the SDK accepts either shape for the assistant side, so
-    this trip-through-dicts is safe.
+
+def _clean_content_block(block: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist ONE assistant content block to its API-INPUT fields.
+
+    Drops output-only fields (``parsed_output``, ``caller``, ``citations: null``)
+    that the Messages API rejects on replay. Preserves the fields each block
+    type's INPUT param needs — critically the ``thinking`` block ``signature``
+    (extended-thinking round-trip breaks without it). **Unknown / user-side block
+    types pass through UNCHANGED** — this is applied to whole transcripts in
+    ``_messages_for_api`` and must not mangle ``tool_result`` / ``image`` /
+    ``document`` blocks.
+    """
+    btype = block.get("type")
+    if btype == "text":
+        out: dict[str, Any] = {"type": "text", "text": block.get("text") or ""}
+        cites = block.get("citations")
+        if cites:  # valid non-null/non-empty citations survive; null is dropped
+            out["citations"] = cites
+        return out
+    if btype == "tool_use":
+        return {
+            "type": "tool_use",
+            "id": block.get("id") or "",
+            "name": block.get("name") or "",
+            "input": block.get("input") or {},
+        }
+    if btype == "thinking":
+        out = {"type": "thinking", "thinking": block.get("thinking") or ""}
+        sig = block.get("signature")
+        if sig:  # CRITICAL: preserve the signature or same-model round-trip 400s
+            out["signature"] = sig
+        return out
+    if btype == "redacted_thinking":
+        return {"type": "redacted_thinking", "data": block.get("data") or ""}
+    return block  # user-side (tool_result/image/document) or unknown — untouched
+
+
+def _blocks_to_jsonable(content: Any) -> list[dict[str, Any]]:
+    """Convert an Anthropic ``response.content`` list to API-INPUT-clean dicts.
+
+    The SDK returns rich block objects (TextBlock, ToolUseBlock, ...) whose
+    ``model_dump()`` includes OUTPUT-ONLY fields the API rejects when the
+    transcript is replayed as history (see ``_clean_content_block``). We store
+    only the whitelisted input fields so a later turn's history round-trips.
     """
     if not content:
         return []
     out: list[dict[str, Any]] = []
     for block in content:
-        # anthropic SDK blocks expose .model_dump(); fall back to attribute
-        # access if someone hands us a plain dict already (tests / mocks).
         if hasattr(block, "model_dump"):
-            out.append(block.model_dump())
+            raw = block.model_dump()
         elif isinstance(block, dict):
-            out.append(block)
+            raw = block
+        else:  # attribute-access fallback (test mocks without model_dump)
+            raw = {"type": getattr(block, "type", "unknown")}
+            for attr in ("text", "id", "name", "input",
+                         "thinking", "signature", "data", "citations"):
+                if hasattr(block, attr):
+                    raw[attr] = getattr(block, attr)
+        btype = raw.get("type")
+        if btype in _ASSISTANT_INPUT_BLOCK_TYPES:
+            out.append(_clean_content_block(raw))
         else:
-            btype = getattr(block, "type", "unknown")
-            if btype == "text":
-                out.append({"type": "text", "text": getattr(block, "text", "")})
-            elif btype == "tool_use":
-                out.append({
-                    "type": "tool_use",
-                    "id": getattr(block, "id", ""),
-                    "name": getattr(block, "name", ""),
-                    "input": getattr(block, "input", {}) or {},
-                })
-            else:
-                out.append({"type": btype})
+            # ILB: a type we don't have an input-whitelist for. Reduce to {type}
+            # (never round-trip its raw output-only fields) and log once so we
+            # notice a new assistant block type that needs whitelisting.
+            if btype not in _unknown_block_types_logged:
+                _unknown_block_types_logged.add(btype)
+                log.warning("chat.block_type_unknown", block_type=btype)
+            out.append({"type": btype})
     return out
