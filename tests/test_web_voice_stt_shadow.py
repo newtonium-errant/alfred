@@ -383,9 +383,14 @@ async def test_real_groq_accepts_wav_and_roundtrips() -> None:
     assert isinstance(result.text, str)
 
 
-# A checked-in short SPEECH clip lets the gate assert ≥1 word (fuller check).
-# Skips until the operator drops the fixture — see the builder report.
+# A checked-in short SPEECH clip ("The quick brown fox jumps over the lazy dog.",
+# 16k mono WAV) lets the gate assert real word-level transcription — the fuller
+# real-provider check the tone-accept test can't make.
 _SPEECH_WAV = Path(__file__).parent / "fixtures" / "stt" / "short_speech.wav"
+# Distinctive content words from the pangram — any one appearing (case-
+# insensitive substring, so Whisper punctuation like "fox," / "dog." is fine)
+# proves the WAV was truly transcribed, not just accepted.
+_SPEECH_WORDS = ("quick", "brown", "fox", "jumps", "lazy", "dog")
 
 
 @pytest.mark.skipif(
@@ -396,4 +401,8 @@ async def test_real_groq_transcribes_speech_to_words() -> None:
     from alfred.telegram.stt_backends import GroqWhisperBackend
     backend = GroqWhisperBackend(api_key=os.environ["GROQ_API_KEY"])
     result = await backend.transcribe(_SPEECH_WAV.read_bytes(), "audio/wav", [])
-    assert len(result.text.split()) >= 1     # real speech → ≥1 word
+    text = result.text.lower()
+    hits = [w for w in _SPEECH_WORDS if w in text]
+    # Surface the real transcript so the run's actual output is visible (-s).
+    print(f"\n[real-groq speech] transcript={result.text!r} matched={hits}")
+    assert hits, f"no recognizable pangram word in real Groq transcript: {result.text!r}"
