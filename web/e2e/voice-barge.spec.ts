@@ -53,12 +53,19 @@ test('a mid-playout utterance barges in: tone stops early, both exchanges land',
   const tSpeakingStart = Date.now();
 
   // (b) With ZERO user interaction the scripted second utterance barges: the pill
-  //     LEAVES 'Speaking' (→ 'Thinking' as stt_final registers) BEFORE the reply's
-  //     natural drain. This is the audio-stops-early signal.
-  await expect(status).toContainText('Thinking', { timeout: 20_000 });
+  //     LEAVES 'Speaking' BEFORE the reply's natural drain — the audio-stops-early
+  //     signal. Assert the DURABLE fact (pill no longer Speaking), NOT the transient
+  //     'Thinking' window: with fake providers the Thinking phase is milliseconds and
+  //     falls between Playwright polls (observed: 9 polls saw Speaking, 35 saw
+  //     Listening, Thinking never sampled). Transient states on an instant-fake
+  //     pipeline are unobservable by polling — assert durable outcomes only (the same
+  //     lesson as the V1 dictation + V2 tts specs). not-Speaking fires on Thinking OR
+  //     Listening, whichever the poll catches; the metric's meaning is unchanged
+  //     (FE-observed playout-until-audio-cut).
+  await expect(status).not.toContainText('Speaking', { timeout: 20_000 });
   const bargeStopMs = Date.now() - tSpeakingStart;
   // Reported gate metric (§1.11) — FE-observed playout-until-barge-cut.
-  console.log(`[barge-smoke] FE-observed barge stop (Speaking→Thinking): ${bargeStopMs}ms`);
+  console.log(`[barge-smoke] FE-observed barge stop (Speaking→not-Speaking): ${bargeStopMs}ms`);
 
   // (c) The barge is ACCEPTED, not the V2 discard — the "Heard you — hold on"
   //     notice must NOT appear on the accept path.
