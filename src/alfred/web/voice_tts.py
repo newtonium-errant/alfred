@@ -48,7 +48,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from .tts_stream import EVENT_AUDIO, EVENT_ERROR, EVENT_TURN_DONE, TTSEvent
-from .utils import get_logger
+from .utils import get_logger, pcm_rms
 
 log = get_logger(__name__)
 
@@ -117,7 +117,14 @@ class _AvResampler:
             self._pts += n
             frame.planes[0].update(pcm)
             frames = self._r.resample(frame)
-        return b"".join(bytes(f.planes[0]) for f in (frames or []))
+        # PyAV plane-padding trap (same as voice_stt._frame_to_pcm): a resampled
+        # frame's plane is FFmpeg-padded, so bytes(f.planes[0]) appends ~64
+        # samples/frame of garbage → ~17 % corruption into the playout buffer
+        # (clicky TTS). Slice to the frame's ACTUAL sample count (mono s16).
+        return b"".join(
+            bytes(f.planes[0])[: f.samples * 2]
+            for f in (frames or []) if f.samples > 0
+        )
 
 
 def _default_frame_factory(pcm: bytes, pts: int) -> Any:
@@ -186,6 +193,10 @@ class TTSPlayoutSource:
         self._silence_frames = 0
         self._underruns = 0
         self._dropped_ms = 0
+        # output-energy stats — RMS of the (resampled) audio ingested for play.
+        self._rms_sumsq = 0.0
+        self._rms_samples = 0
+        self._rms_peak = 0.0
 
         # Fired (turn_id) when a marked turn's last frame is emitted. Wired by
         # the worker to bridge speaking_done{drained} to the driver.
@@ -204,6 +215,7 @@ class TTSPlayoutSource:
         resampled = self._resample(pcm)
         if not resampled:
             return
+        self._account_output_energy(resampled)
         gen = self._gen
         while not self._closed and len(self._buf) >= self._max_buffer_bytes:
             self._space.clear()
@@ -259,6 +271,19 @@ class TTSPlayoutSource:
             )
         return dropped_ms
 
+    def _account_output_energy(self, pcm: bytes) -> None:
+        """Fold one ingested (resampled) buffer into the RMS avg/peak — the
+        played-audio-energy signal (a padding-corrupted or silent TTS stream
+        shows here). Counts/energy only, never content."""
+        n = len(pcm) // 2
+        if n <= 0:
+            return
+        r = pcm_rms(pcm)
+        self._rms_sumsq += (r * r) * n
+        self._rms_samples += n
+        if r > self._rms_peak:
+            self._rms_peak = r
+
     @property
     def speaking(self) -> bool:
         """Playout-active signal (facet-2 STT echo-gate / V3 barge-in)."""
@@ -266,6 +291,9 @@ class TTSPlayoutSource:
 
     @property
     def stats(self) -> dict:
+        avg_rms = (
+            (self._rms_sumsq / self._rms_samples) ** 0.5 if self._rms_samples else 0.0
+        )
         return {
             "frames_out": self._frames_out,
             "speech_frames": self._speech_frames,
@@ -273,6 +301,8 @@ class TTSPlayoutSource:
             "underruns": self._underruns,
             "dropped_ms": self._dropped_ms,
             "buffered_ms": int(len(self._buf) / (TRACK_RATE * 2) * 1000),
+            "avg_rms": round(avg_rms, 1),
+            "peak_rms": round(self._rms_peak, 1),
         }
 
     # -- track source contract ----------------------------------------------

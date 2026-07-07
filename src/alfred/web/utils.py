@@ -75,3 +75,25 @@ def setup_logging(
 
 def get_logger(name: str = __name__) -> structlog.stdlib.BoundLogger:
     return structlog.get_logger(name)
+
+
+def pcm_rms(data: bytes) -> float:
+    """RMS energy of s16le mono PCM (0 .. ~32767). Pure stdlib — no numpy /
+    audioop (audioop is removed in 3.13). Used ONLY for input-energy
+    observability (avg/peak, quiet detection); it never touches transcript
+    content. An odd trailing byte (half a sample) is dropped."""
+    import array
+    import math
+
+    if not data:
+        return 0.0
+    if len(data) % 2:
+        data = data[:-1]
+    samples = array.array("h")
+    samples.frombytes(data)
+    if not samples:
+        return 0.0
+    total = 0
+    for s in samples:
+        total += s * s
+    return math.sqrt(total / len(samples))

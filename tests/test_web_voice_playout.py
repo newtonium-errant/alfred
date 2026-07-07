@@ -266,3 +266,49 @@ async def test_av_resampler_survives_flush_then_next_turn() -> None:
     await src.enqueue_pcm("t3", _tone_pcm_24k())
     await src.enqueue_pcm("t3", _tone_pcm_24k())
     assert len(src._buf) > 0, "turn-3 audio lost after a natural drain (resampler EOF)"
+
+
+@pytest.mark.skipif(not _HAS_AV, reason="av not installed (webrtc extra)")
+async def test_av_resampler_strips_plane_padding() -> None:
+    # THE playout-side padding pin (mirror of voice_stt._frame_to_pcm): the TTS
+    # resampler must extract exactly f.samples*2 per frame, NOT bytes(f.planes[0])
+    # — else ~17 % padding (zeros) is interleaved into the played audio (clicky
+    # TTS). Content-exact vs to_ndarray; fails on the pre-fix extraction.
+    from fractions import Fraction
+
+    import av
+
+    from alfred.web.voice_tts import TRACK_RATE, _AvResampler
+
+    pcm = _tone_pcm_24k(2400)                  # 2400 samples @24k
+    got = _AvResampler(24000)(pcm)
+
+    # Independent reference: the identical input frame through a bare resampler,
+    # extracted padding-free via to_ndarray.
+    r_ref = av.AudioResampler(format="s16", layout="mono", rate=TRACK_RATE)
+    frame = av.AudioFrame(format="s16", layout="mono", samples=len(pcm) // 2)
+    frame.sample_rate = 24000
+    frame.pts = 0
+    frame.time_base = Fraction(1, 24000)
+    frame.planes[0].update(pcm)
+    outs = r_ref.resample(frame)
+    if not isinstance(outs, list):
+        outs = [outs] if outs is not None else []
+    outs = [o for o in outs if o is not None and o.samples > 0]
+    expected = b"".join(o.to_ndarray().tobytes() for o in outs)
+    assert len(got) == sum(o.samples for o in outs) * 2   # exact sample count
+    assert got == expected                                # padding-free content
+
+
+async def test_playout_stats_carry_output_rms() -> None:
+    import array
+
+    p, _, _ = _playout()                       # identity resample_fn
+    tone = array.array("h", [8000] * 4800).tobytes()   # constant 8000 → RMS 8000
+    await p.enqueue_pcm("t", tone)
+    assert p.stats["peak_rms"] == 8000.0
+    assert p.stats["avg_rms"] == 8000.0
+    # silence keeps the peak at zero (a dead / silent TTS provider shows here).
+    p2, _, _ = _playout()
+    await p2.enqueue_pcm("t", b"\x00\x00" * 4800)
+    assert p2.stats["peak_rms"] == 0.0

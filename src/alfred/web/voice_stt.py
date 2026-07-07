@@ -26,6 +26,7 @@ seam lets the reader logic be unit-tested WITHOUT ``av``/aiortc.
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .stt_stream import (
@@ -36,12 +37,19 @@ from .stt_stream import (
     STTEvent,
     STTStreamProvider,
 )
-from .utils import get_logger
+from .utils import get_logger, pcm_rms
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
 
 log = get_logger(__name__)
+
+# Input-energy observability (contract §ILB). "Silence-in is invisible" — an
+# idle / muted / dead mic streams frames but yields zero transcripts, which used
+# to look identical to a healthy quiet session. Counts + energy only; NEVER
+# transcript content.
+_INPUT_QUIET_RMS_FLOOR = 30.0     # s16 RMS peak below this after N ms = ~silent
+_INPUT_QUIET_AFTER_MS = 5000      # only judge quiet once enough audio has fed
 
 
 # --- pure byte-chunker -----------------------------------------------------
@@ -133,6 +141,18 @@ class VoiceSttWorker:
         self._dropped = 0
         self._chunks_sent = 0
 
+        # input-energy stats — RMS of the PCM actually fed to the provider.
+        self._rms_sumsq = 0.0
+        self._rms_samples = 0
+        self._rms_peak = 0.0
+        self._input_quiet_logged = False
+
+    @property
+    def _avg_rms(self) -> float:
+        if not self._rms_samples:
+            return 0.0
+        return math.sqrt(self._rms_sumsq / self._rms_samples)
+
     @property
     def stats(self) -> dict:
         return {
@@ -141,7 +161,33 @@ class VoiceSttWorker:
             "partials": self._partials,
             "dropped_chunks": self._dropped,
             "chunks_sent": self._chunks_sent,
+            "avg_rms": round(self._avg_rms, 1),
+            "peak_rms": round(self._rms_peak, 1),
         }
+
+    def _account_input_energy(self, chunk: bytes) -> None:
+        """Fold one fed chunk into the RMS avg/peak + warn ONCE if the mic is
+        near-silent after enough audio (contract §ILB). Counts/energy only."""
+        n = len(chunk) // 2
+        if n <= 0:
+            return
+        r = pcm_rms(chunk)
+        self._rms_sumsq += (r * r) * n
+        self._rms_samples += n
+        if r > self._rms_peak:
+            self._rms_peak = r
+        if (not self._input_quiet_logged
+                and self._chunks_sent * self._chunk_ms >= _INPUT_QUIET_AFTER_MS
+                and self._rms_peak < _INPUT_QUIET_RMS_FLOOR):
+            self._input_quiet_logged = True
+            log.warning(
+                "web.voice.stt.input_quiet",
+                voice_session_id=self._vid,
+                fed_ms=self._chunks_sent * self._chunk_ms,
+                peak_rms=round(self._rms_peak, 1),
+                floor=_INPUT_QUIET_RMS_FLOOR,
+                detail="mic audio flowing but near-silent — check mic / mute",
+            )
 
     # -- start --------------------------------------------------------------
 
@@ -162,13 +208,24 @@ class VoiceSttWorker:
     # -- reader -------------------------------------------------------------
 
     def _frame_to_pcm(self, frame: Any, resampler: Any) -> list[bytes]:
-        """Frame (or None flush) → list of resampled PCM byte buffers."""
+        """Frame (or None flush) → list of resampled PCM byte buffers.
+
+        PyAV plane-padding trap: a resampled ``AudioFrame``'s plane buffer is
+        FFmpeg-padded (samples rounded up for SIMD alignment), so
+        ``bytes(o.planes[0])`` yields ~64 EXTRA samples/frame of interleaved
+        garbage beyond ``o.samples``. Feeding that to Deepgram put ~17 % padding
+        into the PCM stream — a discontinuity every 20 ms that killed real
+        phone-mic transcription (studio-clean probe speech survived it). Slice
+        to the frame's ACTUAL sample count (mono s16 → 2 bytes/sample)."""
         if self._resample_fn is not None:
             return self._resample_fn(frame)
         outs = resampler.resample(frame)
         if not isinstance(outs, list):  # PyAV<10 returned a single frame
             outs = [outs] if outs is not None else []
-        return [bytes(o.planes[0]) for o in outs if o is not None]
+        return [
+            bytes(o.planes[0])[: o.samples * 2]
+            for o in outs if o is not None and o.samples > 0
+        ]
 
     async def _reader(self) -> None:
         resampler = None
@@ -273,6 +330,7 @@ class VoiceSttWorker:
                 connected = True
             await self._provider.feed(item)
             self._chunks_sent += 1
+            self._account_input_energy(item)
         if connected:
             try:
                 await self._provider.finalize()

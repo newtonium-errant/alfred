@@ -341,6 +341,47 @@ async def test_worker_closed_summary_carries_stats() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Input-energy observability (silence-in is invisible) — §ILB
+# ---------------------------------------------------------------------------
+
+
+async def test_worker_closed_carries_input_rms() -> None:
+    import array
+    prov = _ScriptedProvider()
+    w = _worker(prov)
+    # A constant-amplitude 8000 tone: every s16 sample = 8000 → RMS = 8000.
+    tone = array.array("h", [8000] * (1600 * 2)).tobytes()   # 2 full chunks
+    w.start(_FakeTrack([tone]))
+    await asyncio.wait_for(w._reader_task, timeout=5)
+    await asyncio.wait_for(w._sender_task, timeout=5)
+    with structlog.testing.capture_logs() as cap:
+        await w.aclose()
+    summary = [c for c in cap if c.get("event") == "web.voice.stt.worker_closed"][0]
+    assert summary["peak_rms"] == 8000.0
+    assert summary["avg_rms"] == 8000.0
+    # A loud mic never trips the quiet warning.
+    assert not any(c.get("event") == "web.voice.stt.input_quiet" for c in cap)
+
+
+async def test_input_quiet_warns_once_after_silence() -> None:
+    prov = _ScriptedProvider()
+    # Wide queue so drop-oldest doesn't shave the fed count below the threshold.
+    w = _worker(prov, queue_max_chunks=200)
+    # 55 chunks (chunk = 100 ms) of digital silence → > _INPUT_QUIET_AFTER_MS
+    # with peak RMS 0 → one input_quiet warning (deduped, not per-chunk).
+    silence = b"\x00\x00" * (1600 * 55)
+    with structlog.testing.capture_logs() as cap:
+        w.start(_FakeTrack([silence]))
+        await asyncio.wait_for(w._reader_task, timeout=5)
+        await asyncio.wait_for(w._sender_task, timeout=5)
+        await w.aclose()
+    quiet = [c for c in cap if c.get("event") == "web.voice.stt.input_quiet"]
+    assert len(quiet) == 1
+    assert quiet[0]["peak_rms"] == 0.0
+    assert quiet[0]["fed_ms"] >= 5000
+
+
+# ---------------------------------------------------------------------------
 # Resampler return-shape coercion (PyAV<10 fallback)
 # ---------------------------------------------------------------------------
 
@@ -353,6 +394,7 @@ async def test_frame_to_pcm_coerces_non_list_resample_return() -> None:
     class _Frame:
         def __init__(self, data: bytes) -> None:
             self.planes = [data]
+            self.samples = len(data) // 2   # s16 mono; sliced to samples*2
 
     class _SingleFrameResampler:
         def resample(self, frame):
