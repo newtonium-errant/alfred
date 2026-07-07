@@ -82,6 +82,18 @@ async def test_fake_bounded_by_max_turn_ms() -> None:
     assert len(audio) == 4               # 1000 ms / 250 ms, not 100
 
 
+async def test_fake_long_tone_via_raised_cap() -> None:
+    # Finding-3: a harness/e2e needs a genuinely multi-second tone (utterance
+    # cadence ~2 s) so a confirm lands MID-playout, not post-drain. The existing
+    # ms_per_char / max_turn_ms ctor knobs already allow it — 203 chars at the
+    # default 50 ms/char is 10150 ms, so a raised max_turn_ms yields ~8 s+.
+    fp = FakeTTSProvider(rate=24000, ms_per_char=50, chunk_ms=250, max_turn_ms=12000)
+    got = await _run_turn(fp, feed="x" * 203)   # 203*50 = 10150 ms (< 12000 cap)
+    audio = [e for e in got if e.type == EVENT_AUDIO]
+    assert len(audio) == math.ceil(10150 / 250)   # not capped at 5 s
+    assert len(audio) * 250 / 1000 >= 8.0         # ≥ 8 s — the harness target
+
+
 async def test_fake_zero_feed_turn_is_turn_done_only() -> None:
     got = await _run_turn(FakeTTSProvider(), feed="")
     assert [e.type for e in got] == [EVENT_TURN_DONE]

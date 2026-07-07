@@ -1007,6 +1007,38 @@ async def test_barge_grace_window_late_echo_suppressed() -> None:
     await d.aclose()
 
 
+async def test_barge_grace_window_nonecho_is_normal_turn() -> None:
+    # §1.5 / smoke finding: a NON-echo real-speech final landing in the
+    # post-drain grace window (speaking window already CLOSED) is a NORMAL turn.
+    # The grace window runs the ECHO GATE ONLY — a non-echo final must NOT be a
+    # barge (no barge.confirmed / barge.outcome, no interrupt of drained audio).
+    clk = [1000.0]
+    ch = FakeChannel()
+    stub = _StubTts()
+    d = _barge_driver(_scripted_rts([{"type": "final", "reply": "the plan"}]), clk)
+    d.attach_tts(stub)
+    d.attach_channel(ch)
+    _hello(d)
+    d._spoken_text = "the quarterly report shows revenue grew twelve percent"
+    d.on_speaking_started("t1")
+    d.on_speaking_done("t1", "drained")          # grace window open, gate closed
+    ch.sent.clear()                              # isolate the grace-window turn
+    with structlog.testing.capture_logs() as cap:
+        await d.submit_utterance("what about the budget for marketing next year")
+        await _wait_for(ch, {"turn_final"})
+    t = _types(ch)
+    # Ran as a normal turn …
+    assert "stt_final" in t and "turn_started" in t and "turn_final" in t
+    # … and was NOT a barge: no speaking_done{barged_in}, no discard notice.
+    assert "speaking_done" not in t
+    assert "utterance_discarded" not in t
+    assert not any(c[0] == "interrupt" for c in stub.calls)
+    barge_events = [c.get("event") for c in cap
+                    if "barge" in str(c.get("event", ""))]
+    assert barge_events == [], barge_events
+    await d.aclose()
+
+
 # --- Missed-barge signal: cancel log carries last_suppressed_utt (§1.9b(c)) ---
 async def test_barge_cancel_carries_last_suppressed() -> None:
     import json

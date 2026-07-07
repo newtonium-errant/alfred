@@ -105,6 +105,12 @@ _T1_REPLY = (
     "water and a small fishing boat drifted slowly past the old wooden pier "
     "toward the open bay"
 )
+# A non-empty T2 reply for the audio-after-barge variant (disjoint from the
+# barge utterance so nothing re-triggers). Long enough for a multi-second tone.
+_T2_REPLY = (
+    "the second reply flows on for a while so its spoken tone runs several "
+    "seconds and can be measured cleanly on the outbound track after the flush"
+)
 # The barge utterance — a partial that already qualifies for the Stage-A audio
 # flush (>= min_words / min_chars, not a backchannel/interrupt-phrase, disjoint
 # from _T1_REPLY) and a final that re-confirms at Stage B.
@@ -206,6 +212,41 @@ async def barge_client(aiohttp_client, tmp_path, monkeypatch):
     client = _streaming_client([
         ([_text_delta(_T1_REPLY)], _FinalMsg([_TextBlk(_T1_REPLY)], "end_turn")),
         ([], _FinalMsg([_TextBlk("")], "end_turn")),
+        ([], _FinalMsg([_TextBlk("")], "end_turn")),
+    ])
+    register_web_routes(
+        app, web_config=_web_config(), web_auth_state=web_auth_state,
+        anthropic_client=client, state_mgr=state_mgr,
+        talker_config=_talker_config(tmp_path),
+        system_prompt_provider=lambda: "SYS", vault_context_str="CTX",
+        allowed_user_ids=[1],
+    )
+    return await aiohttp_client(app)
+
+
+@pytest.fixture
+async def barge_speaking_client(aiohttp_client, tmp_path, monkeypatch):
+    # As barge_client, but T2 (the barge's turn) has a NON-EMPTY reply so it
+    # SPEAKS after the flush — the regression pin for the av-resampler EOF that
+    # killed the TTS pump on the first post-barge audio frame (all further
+    # session audio lost). The empty-T2 test masks that bug by construction.
+    from alfred.web import routes_voice
+
+    def _fake_stt(stt_norm, vid):
+        from alfred.web.stt_stream import FakeStreamProvider
+        return FakeStreamProvider(script=_barge_script(), voice_session_id=vid)
+
+    monkeypatch.setattr(routes_voice, "_make_stt_provider", _fake_stt)
+
+    tstate = TransportState.create(tmp_path / "transport_state.json")
+    app = build_app(_transport_config(), tstate)
+    state_mgr = StateManager(tmp_path / "talker_state.json")
+    state_mgr.load()
+    web_auth_state = WebAuthState.create(tmp_path / "web_auth_state.json")
+    web_auth_state.load()
+    client = _streaming_client([
+        ([_text_delta(_T1_REPLY)], _FinalMsg([_TextBlk(_T1_REPLY)], "end_turn")),
+        ([_text_delta(_T2_REPLY)], _FinalMsg([_TextBlk(_T2_REPLY)], "end_turn")),
         ([], _FinalMsg([_TextBlk("")], "end_turn")),
     ])
     register_web_routes(
@@ -374,5 +415,99 @@ async def test_barge_full_loop_flushes_audio_and_runs_t2(barge_client) -> None:
         # after the barge the track must be silent. A leaked T1 frame (gen-gate
         # miss) would ring at the ~440 Hz tone's amplitude here.
         assert max(post) < 500, f"stale T1 audio after the flush: peak={max(post)}"
+    finally:
+        await pc.close()
+
+
+async def test_barge_then_t2_speaks_over_the_track(barge_speaking_client) -> None:
+    # Regression for the av-resampler EOF (the smoke's "silent after the first
+    # barge"): T2 has a NON-EMPTY reply, so after the flush the real playout
+    # must resample + carry T2's tone. Before the fix, flush()'s resampler drain
+    # left av's resampler EOF, the first post-flush frame raised EOFError inside
+    # the worker pump and killed it → T2 (and every later turn) produced ZERO
+    # audio while still emitting speaking_started. Assert SUSTAINED T2 tone.
+    import json
+
+    import numpy as np
+    from aiortc import RTCPeerConnection, RTCSessionDescription
+
+    client = barge_speaking_client
+    state_mgr = client.app[KEY_WEB_STATE_MGR]
+    chat = open_chat_session(
+        state_mgr, synthetic_chat_id("andrew"), model="claude-sonnet-4-6")
+
+    pc = RTCPeerConnection()
+    events: list[dict] = []
+    frame_peaks: list[tuple[float, int]] = []
+    barge_at: list[float] = []
+    got_barge = asyncio.Event()
+    got_t2_final = asyncio.Event()
+
+    dc = pc.createDataChannel("voice", ordered=True)
+
+    @dc.on("open")
+    def _on_open() -> None:
+        dc.send(json.dumps({"v": 1, "type": "hello"}))
+
+    @dc.on("message")
+    def _on_message(raw) -> None:
+        ev = json.loads(raw)
+        events.append(ev)
+        etype = ev.get("type")
+        if etype == "speaking_done" and ev.get("reason") == "barged_in":
+            barge_at.append(asyncio.get_event_loop().time())
+            got_barge.set()
+        if etype == "turn_final" and got_barge.is_set():
+            got_t2_final.set()
+
+    @pc.on("track")
+    def _on_track(track) -> None:
+        async def consume():
+            try:
+                while True:
+                    frame = await track.recv()
+                    arr = frame.to_ndarray()
+                    frame_peaks.append(
+                        (asyncio.get_event_loop().time(), int(np.abs(arr).max())))
+            except Exception:  # noqa: BLE001 — track ends on teardown
+                pass
+
+        asyncio.ensure_future(consume())
+
+    pc.addTrack(_tone_track())
+    try:
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        resp = await client.post(
+            "/voice/offer", headers=_headers(),
+            json={"sdp": pc.localDescription.sdp, "type": "offer",
+                  "session_key": chat.session_id},
+        )
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+        await pc.setRemoteDescription(
+            RTCSessionDescription(sdp=body["sdp"], type="answer"))
+
+        await asyncio.wait_for(got_barge.wait(), timeout=30)
+        barge_time = barge_at[0]
+        await asyncio.wait_for(got_t2_final.wait(), timeout=15)
+        # T2's tone plays out over several seconds AFTER the barge — capture it.
+        await asyncio.sleep(3.0)
+
+        # T2 attempted to speak (its own speaking_started) AND completed.
+        speaking_starts = [e for e in events if e["type"] == "speaking_started"]
+        assert len(speaking_starts) == 2                      # T1 then T2
+        t2_id = [e for e in events if e["type"] == "turn_started"][1]["turn_id"]
+        assert any(e["type"] == "turn_final" and e["turn_id"] == t2_id
+                   for e in events)
+
+        # THE PIN: sustained non-silent audio AFTER the barge = T2's tone made it
+        # through the real resampler + playout. A pump killed by the resampler
+        # EOF would leave this window silent (speaking_started fired, then dead).
+        post = [p for (t, p) in frame_peaks if t > barge_time + 1.0]
+        loud = [p for p in post if p > 500]
+        assert len(loud) >= 20, (
+            "T2 produced no sustained audio after the barge (av-resampler EOF "
+            f"would kill the pump): {len(loud)} loud of {len(post)} frames")
     finally:
         await pc.close()

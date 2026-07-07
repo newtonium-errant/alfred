@@ -80,14 +80,33 @@ class _AvResampler:
 
         self._av = av
         self._Fraction = Fraction
-        self._r = av.AudioResampler(format="s16", layout="mono", rate=TRACK_RATE)
         self._src = source_rate
+        self._pts = 0
+        self._drained = False
+        self._build()
+
+    def _build(self) -> None:
+        self._r = self._av.AudioResampler(
+            format="s16", layout="mono", rate=TRACK_RATE)
         self._pts = 0
 
     def __call__(self, pcm: bytes | None) -> bytes:
         if pcm is None:
             frames = self._r.resample(None)
+            # Draining with None puts av's resampler into a terminal EOF state:
+            # a subsequent resample(frame) raises EOFError. Latch it so the NEXT
+            # real input rebuilds a fresh resampler (see below). Load-bearing:
+            # both flush() and mark_end_of_turn() drain this way, so WITHOUT the
+            # rebuild the first audio frame of the turn after any drain (a barge,
+            # or the next turn after a natural end) crashes VoiceTtsWorker._pump
+            # with EOFError → all further session audio is lost.
+            self._drained = True
         else:
+            if self._drained:
+                # Rebuild after a drain — discards the (already-flushed) tail so
+                # nothing bleeds into the next turn, and clears the EOF state.
+                self._build()
+                self._drained = False
             n = len(pcm) // 2
             if n == 0:
                 return b""
