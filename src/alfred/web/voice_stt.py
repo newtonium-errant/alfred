@@ -50,6 +50,8 @@ log = get_logger(__name__)
 # transcript content.
 _INPUT_QUIET_RMS_FLOOR = 30.0     # s16 RMS peak below this after N ms = ~silent
 _INPUT_QUIET_AFTER_MS = 5000      # only judge quiet once enough audio has fed
+# Shadow-capture per-utterance PCM ring cap (drop-oldest past this).
+_SHADOW_PCM_MAX_S = 30
 
 
 # --- pure byte-chunker -----------------------------------------------------
@@ -82,6 +84,22 @@ class PcmChunker:
         return tail
 
 
+def pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
+    """Wrap raw s16le MONO PCM in a WAV container. Pure stdlib (``wave`` into
+    ``BytesIO``); no new dependency. Used by shadow-capture to hand the fed PCM
+    to Groq's Whisper endpoint (which validates the file extension → WAV)."""
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)          # s16 = 2 bytes/sample
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
 # --- worker ----------------------------------------------------------------
 
 
@@ -102,6 +120,7 @@ class VoiceSttWorker:
         sample_rate: int = 16000,
         resample_fn: Callable[[Any], list[bytes]] | None = None,
         hello_gate: bool = True,
+        shadow_capture: Callable[[bytes, str, float], None] | None = None,
     ) -> None:
         self._provider = provider
         self._vid = voice_session_id
@@ -112,6 +131,16 @@ class VoiceSttWorker:
         self._sample_rate = sample_rate
         self._chunk_ms = chunk_ms
         self._resample_fn = resample_fn
+
+        # Shadow-capture (STT test series, default-OFF). When wired, the sender
+        # TEES each fed chunk into a bounded per-utterance PCM buffer and the
+        # pump hands the snapshot to ``shadow_capture`` AFTER the unchanged live
+        # ``on_utterance`` — fire-and-forget, never blocking the served turn.
+        # None ⇒ the tee + snapshot + hook are all skipped (live path byte-
+        # identical). Bound at ~30 s (drop-oldest keeps the speech tail near EOU).
+        self._shadow_capture = shadow_capture
+        self._utt_pcm = bytearray()
+        self._utt_pcm_max = _SHADOW_PCM_MAX_S * sample_rate * 2
 
         # Hello-gate (contract §17b): the reader + relay wiring run immediately,
         # but the provider is NOT connected/fed until the client's DC hello
@@ -344,6 +373,12 @@ class VoiceSttWorker:
                 await self._provider.feed(item)
                 self._chunks_sent += 1
                 self._account_input_energy(item)
+                if self._shadow_capture is not None:
+                    # Tee the fed chunk into the per-utterance buffer (bounded,
+                    # drop-oldest). Same loop as the pump snapshot → lock-free.
+                    self._utt_pcm.extend(item)
+                    if len(self._utt_pcm) > self._utt_pcm_max:
+                        del self._utt_pcm[: len(self._utt_pcm) - self._utt_pcm_max]
             if connected:
                 try:
                     await self._provider.finalize()
@@ -368,6 +403,15 @@ class VoiceSttWorker:
                         detail=type(exc).__name__, fatal=True))
                 except Exception:  # noqa: BLE001 — on_fatal must not re-raise here
                     pass
+
+    def _snapshot_utt_pcm(self) -> bytes:
+        """Snapshot + clear the per-utterance PCM buffer (sync, same loop as the
+        sender tee → lock-free). ``b""`` when shadow-capture is off."""
+        if self._shadow_capture is None:
+            return b""
+        snap = bytes(self._utt_pcm)
+        self._utt_pcm.clear()
+        return snap
 
     # -- event-pump ---------------------------------------------------------
 
@@ -409,6 +453,10 @@ class VoiceSttWorker:
             elif ev.type == EVENT_UTTERANCE_END:
                 text = " ".join(buffer).strip()
                 buffer = []
+                # Snapshot + RESET the per-utterance PCM (both the served and
+                # the empty path reset it, so the next utterance never carries
+                # this one's audio). b"" when shadow is off.
+                utt_pcm = self._snapshot_utt_pcm()
                 if len(text) >= self._min_utterance_chars:
                     self._utterances += 1
                     if self._closing:
@@ -423,7 +471,20 @@ class VoiceSttWorker:
                             voice_session_id=self._vid,
                             trigger=ev.trigger, transcript_chars=len(text),
                         )
-                        await self._on_utterance(text)
+                        await self._on_utterance(text)   # LIVE TURN — unchanged
+                        # Shadow AFTER the served turn: fire-and-forget. The hook
+                        # (VoiceSttShadow.capture) owns isolation, but wrap the
+                        # call too so even a buggy hook can NEVER kill the live
+                        # pump (isolation is the #1 property).
+                        if self._shadow_capture is not None and utt_pcm:
+                            duration_s = len(utt_pcm) / (self._sample_rate * 2)
+                            try:
+                                self._shadow_capture(utt_pcm, text, duration_s)
+                            except Exception:  # noqa: BLE001 — never break the pump
+                                log.warning(
+                                    "web.voice.stt.shadow_hook_raised",
+                                    voice_session_id=self._vid,
+                                )
                 else:
                     # Intentionally-left-blank: endpointer fired on noise.
                     log.info(

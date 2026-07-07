@@ -374,7 +374,8 @@ def register_voice_handlers(
     # fail closed (no mount, loud log) if it's absent / unknown / keyless.
     stt_worker_factory = None
     if voice.pipeline == "assistant":
-        stt_worker_factory = _build_assistant_stt(voice)
+        stt_worker_factory = _build_assistant_stt(
+            voice, app.get(KEY_WEB_TALKER_CONFIG))
         if stt_worker_factory is None:
             return False  # _build_assistant_stt logged the specific reason
 
@@ -460,7 +461,7 @@ def register_voice_handlers(
 # ---------------------------------------------------------------------------
 
 
-def _build_assistant_stt(voice: Any):
+def _build_assistant_stt(voice: Any, talker_config: Any = None):
     """Validate the assistant STT config and return a worker factory, or
     ``None`` after logging the fail-closed no-mount reason.
 
@@ -468,7 +469,12 @@ def _build_assistant_stt(voice: Any):
     ``stt_unconfigured``; unknown provider → ``unknown_stt_provider``;
     ``deepgram`` with an unresolved key → ``stt_key_missing``. ``fake`` always
     mounts (the keyless dev / test path). Clamps are logged as
-    ``web.voice.stt.config_clamped``."""
+    ``web.voice.stt.config_clamped``.
+
+    ``talker_config`` is threaded through so shadow-capture (default-OFF STT
+    test-series measurement) can resolve its Groq backend from the served
+    ``talker_config.stt`` chain — the SAME creds/model/vocab the batch path
+    uses. Shadow build failure NEVER unmounts STT (it degrades to no-shadow)."""
     stt = voice.stt
     provider = stt.provider
     if not provider:
@@ -498,14 +504,84 @@ def _build_assistant_stt(voice: Any):
     stt_norm, warnings = normalize_stt_settings(stt)
     for warning in warnings:
         log.warning("web.voice.stt.config_clamped", detail=warning)
-    return _make_stt_worker_factory(stt_norm)
+    shadow_factory = _build_stt_shadow(voice, talker_config, stt_norm)
+    return _make_stt_worker_factory(stt_norm, shadow_factory)
 
 
-def _make_stt_worker_factory(stt_norm: Any):
+def _build_stt_shadow(voice: Any, talker_config: Any, stt_norm: Any):
+    """Return a ``shadow_factory(vid) -> VoiceSttShadow`` or ``None``.
+
+    DEFAULT-OFF: no ``shadow_capture`` block / ``enabled: false`` → ``None`` +
+    an ILB ``shadow_disabled reason=not_enabled`` (idle distinguishable from
+    broken). When enabled, resolve the Groq backend from ``talker_config.stt``
+    (reuses the served creds/model/vocab). FAIL-CLOSED to no-shadow (never a
+    shadow that 100%-errors) if there is no talker STT, no Groq engine, or no
+    resolvable Groq key — always a loud ``shadow_disabled`` with the reason.
+    Shadow is fully isolated, so a no-shadow degrade never affects the turn."""
+    sc = getattr(voice.stt, "shadow_capture", None)
+    if sc is None or not getattr(sc, "enabled", False):
+        log.info("web.voice.stt.shadow_disabled", reason="not_enabled")
+        return None
+
+    tstt = getattr(talker_config, "stt", None)
+    if tstt is None:
+        log.error(
+            "web.voice.stt.shadow_disabled", reason="no_talker_stt",
+            detail="shadow_capture.enabled but no talker_config.stt to resolve "
+                   "the Groq backend — degrade to no-shadow",
+        )
+        return None
+
+    from alfred.telegram.stt_backends import build_chain
+
+    groq = None
+    try:
+        for engine in build_chain(tstt):
+            if getattr(engine, "backend_id", "") == "groq-whisper":
+                groq = engine
+                break
+    except Exception as exc:  # noqa: BLE001 — never unmount over a shadow build
+        log.error("web.voice.stt.shadow_disabled", reason="groq_build_failed",
+                  error=str(exc)[:200])
+        return None
+
+    if groq is None or not getattr(groq, "api_key", "") \
+            or _is_unresolved(groq.api_key):
+        log.error(
+            "web.voice.stt.shadow_disabled", reason="groq_key_missing",
+            detail="shadow_capture.enabled but talker_config.stt has no "
+                   "resolvable Groq key — degrade to no-shadow",
+        )
+        return None
+
+    vocab = list(getattr(tstt, "vocab_terms", []) or [])
+    instance_name = getattr(
+        getattr(talker_config, "instance", None), "name", "") or ""
+    log.info(
+        "web.voice.stt.shadow_enabled",
+        corpus_dir=sc.dir, groq_model=getattr(groq, "model", ""),
+        vocab_terms=len(vocab), instance=instance_name,
+    )
+
+    def shadow_factory(vid: str):
+        from .voice_stt_shadow import VoiceSttShadow
+
+        return VoiceSttShadow(
+            groq_backend=groq, vocab=vocab, corpus_dir=sc.dir,
+            instance_name=instance_name, voice_session_id=vid,
+            sample_rate=stt_norm.sample_rate,
+        )
+
+    return shadow_factory
+
+
+def _make_stt_worker_factory(stt_norm: Any, shadow_factory: Any = None):
     """Return ``factory(vid, driver, manager) -> VoiceSttWorker`` closing over
     the normalized STT config. The worker's callbacks bridge to the per-session
     turn driver (partials / utterances) and, fail-honest, close the session on
-    a fatal STT error (contract §1.15)."""
+    a fatal STT error (contract §1.15). ``shadow_factory`` (or ``None``) mints a
+    per-session shadow whose ``capture`` is wired as the worker's fire-and-forget
+    hook — ``None`` ⇒ the live path is byte-identical (no tee / snapshot / call)."""
 
     def factory(vid: str, driver: Any, manager: Any):
         from .voice_stt import VoiceSttWorker
@@ -525,6 +601,9 @@ def _make_stt_worker_factory(stt_norm: Any):
                 driver.emit_stt_unavailable(ev.reason)
             manager.schedule_close(vid, reason="stt_failed")
 
+        # Per-session shadow (default-OFF → shadow_factory is None → no hook).
+        shadow = shadow_factory(vid) if shadow_factory is not None else None
+
         worker = VoiceSttWorker(
             provider=provider,
             voice_session_id=vid,
@@ -534,6 +613,7 @@ def _make_stt_worker_factory(stt_norm: Any):
             min_utterance_chars=stt_norm.min_utterance_chars,
             sample_rate=stt_norm.sample_rate,
             hello_gate=True,  # §17b: connect/feed the provider only on DC hello
+            shadow_capture=shadow.capture if shadow is not None else None,
         )
         # Release the hello-gate when the client's DC hello arrives. With no
         # driver (no feedback channel) open it immediately — a DC-less session

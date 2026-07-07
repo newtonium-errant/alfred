@@ -617,6 +617,18 @@ transport:
 #       utterance_end_ms: 1000        # word-gap fallback; 0=off; clamp [1000,5000]
 #       min_utterance_chars: 3        # EOU noise floor
 #       smart_format: true            # tune off (→ punctuate) if it delays finals
+#       # --- STT shadow-capture (Groq-Whisper hybrid, Increment 1 measurement) ---
+#       # DEFAULT-OFF, Salem-only. ZERO latency / ZERO risk to the live turn:
+#       # after the served Deepgram utterance, ONE extra Groq batch call on the
+#       # fed PCM is captured (fire-and-forget) into a replayable corpus (audio +
+#       # both transcripts + divergence + noise tag). Reuses the served Groq
+#       # creds/model/vocab from telegram `stt` — fail-closed to no-shadow if the
+#       # Groq key is unresolvable. Score later with alfred.web.stt_shadow_score.
+#       # EGRESS: enabling this sends buffered mic PCM to api.groq.com — do NOT
+#       # enable on any PHI/sovereign instance (VERA/Hypatia).
+#       shadow_capture:
+#         enabled: false
+#         dir: "./data/stt_corpus"    # audio .wav + corpus.jsonl (under LUKS /data)
 #     # --- V2 TTS talk-back (streaming spoken reply) — OPTIONAL enhancement on
 #     # the assistant pipeline. enabled:false (default) = V1 byte-identical (no
 #     # spoken reply). Invalid/keyless tts DEGRADES to text-only voice (loud

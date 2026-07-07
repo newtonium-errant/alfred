@@ -189,6 +189,27 @@ class SttBackend(Protocol):
 
 _GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 
+# Groq's Whisper endpoint validates the multipart FILE EXTENSION, not just the
+# Content-Type — a body sent as ``voice.bin`` is rejected even with a correct
+# ``audio/wav`` mime. Derive the extension from the mime so WAV/WebM/MP4 (the
+# web shadow-capture WAVs + future paths) are accepted. Ogg/Telegram unchanged.
+_GROQ_MIME_EXT = {
+    "audio/ogg": "ogg", "application/ogg": "ogg",
+    "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav",
+    "audio/webm": "webm", "audio/mp4": "mp4", "audio/m4a": "m4a",
+    "audio/x-m4a": "m4a", "audio/mpeg": "mp3", "audio/mp3": "mp3",
+    "audio/flac": "flac", "audio/x-flac": "flac",
+}
+
+
+def _groq_filename_for_mime(mime: str) -> str:
+    """Multipart filename Groq accepts for ``mime`` (extension-validated)."""
+    base = (mime or "").split(";", 1)[0].strip().lower()
+    ext = _GROQ_MIME_EXT.get(base)
+    if ext is None:
+        ext = "ogg" if base.endswith("ogg") else "bin"
+    return f"voice.{ext}"
+
 
 @dataclass
 class GroqWhisperBackend:
@@ -227,7 +248,7 @@ class GroqWhisperBackend:
                 backend_id=self.backend_id,
             )
 
-        filename = "voice.ogg" if mime.endswith("ogg") else "voice.bin"
+        filename = _groq_filename_for_mime(mime)
         files = {"file": (filename, audio, mime)}
         data: dict[str, str] = {
             "model": self.model,

@@ -140,6 +140,21 @@ class VoiceIceConfig:
 
 
 @dataclass
+class WebSttShadowCaptureConfig:
+    """Web voice STT shadow-capture (``web.voice.stt.shadow_capture``).
+
+    DEFAULT-OFF, Salem-only, additive, fully isolated from the served voice
+    turn (mirrors Telegram's ``SttShadowCaptureConfig``). When ``enabled`` each
+    captured utterance runs ONE extra Groq batch call on the fed PCM (the
+    Deepgram STREAMING final is already in hand) and appends the audio + both
+    transcripts + divergence + a noise tag to a replayable corpus under ``dir``.
+    """
+
+    enabled: bool = False
+    dir: str = "./data/stt_corpus"
+
+
+@dataclass
 class WebVoiceSttConfig:
     """Streaming-STT config for the V1 assistant pipeline (``web.voice.stt``).
 
@@ -162,6 +177,8 @@ class WebVoiceSttConfig:
     utterance_end_ms: int = 1000  # word-gap fallback; 0=off; clamp [1000,5000]
     min_utterance_chars: int = 3  # EOU noise floor (mirrors talker stt)
     smart_format: bool = True
+    shadow_capture: WebSttShadowCaptureConfig = field(
+        default_factory=WebSttShadowCaptureConfig)
 
 
 @dataclass
@@ -404,6 +421,21 @@ def _build_voice_stt(raw: Any) -> WebVoiceSttConfig:
             filtered.get("min_utterance_chars"), defaults.min_utterance_chars,
         ),
         smart_format=bool(filtered.get("smart_format", defaults.smart_format)),
+        shadow_capture=_build_shadow_capture(filtered.get("shadow_capture")),
+    )
+
+
+def _build_shadow_capture(raw: Any) -> WebSttShadowCaptureConfig:
+    """Hand-roll ``WebSttShadowCaptureConfig`` (nested on stt) with a
+    schema-tolerance filter. DEFAULT-OFF; ``dir`` defaults under ``./data``."""
+    defaults = WebSttShadowCaptureConfig()
+    if not isinstance(raw, dict):
+        return defaults
+    known = WebSttShadowCaptureConfig.__dataclass_fields__
+    filtered = {k: v for k, v in raw.items() if k in known}
+    return WebSttShadowCaptureConfig(
+        enabled=bool(filtered.get("enabled", False)),
+        dir=str(filtered.get("dir", defaults.dir) or defaults.dir),
     )
 
 
