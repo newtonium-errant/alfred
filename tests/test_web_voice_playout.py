@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import array
 import asyncio
+import importlib.util
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -217,3 +219,50 @@ async def test_underrun_counted() -> None:
     await p.recv()
     await p.recv()
     assert p.stats["underruns"] >= 0   # underrun accounting present (no crash)
+
+
+# ---------------------------------------------------------------------------
+# REAL av resampler across a drain boundary (V3 barge regression) — av-gated
+# ---------------------------------------------------------------------------
+
+_HAS_AV = importlib.util.find_spec("av") is not None
+
+
+def _tone_pcm_24k(n: int = 4800) -> bytes:
+    """``n`` samples of a 440 Hz s16 tone at 24 kHz (the fake/ElevenLabs rate)."""
+    peak = int(0.3 * 32767)
+    buf = array.array("h", (
+        int(peak * math.sin(2 * math.pi * 440 * i / 24000)) for i in range(n)
+    ))
+    return buf.tobytes()
+
+
+@pytest.mark.skipif(not _HAS_AV, reason="av not installed (webrtc extra)")
+async def test_av_resampler_survives_flush_then_next_turn() -> None:
+    # Regression (V3 barge — the smoke's "silent after the first barge"):
+    # flush() and mark_end_of_turn() drain the av resampler via resample(None),
+    # which leaves av's AudioResampler in a TERMINAL EOF state. Before the
+    # self-heal rebuild, the NEXT turn's first enqueue_pcm called
+    # resample(frame) on that EOF resampler → raised EOFError, which propagates
+    # out of VoiceTtsWorker._pump and KILLS the pump → every turn after the
+    # first barge (or the first natural turn-end) produced ZERO audio. The unit
+    # playout tests missed it because they INJECT resample_fn; this one builds
+    # the real _AvResampler (source_rate 24000, no injected resample_fn).
+    src = TTSPlayoutSource(source_rate=24000, voice_session_id="v1")
+
+    # Turn 1 audio, then a barge flush (drains + EOFs the resampler).
+    await src.enqueue_pcm("t1", _tone_pcm_24k())
+    src.flush("barge")
+    assert len(src._buf) == 0
+
+    # Turn 2's first audio AFTER the flush must NOT raise EOFError and MUST
+    # resample into the buffer (a couple of feeds clear the resampler latency).
+    await src.enqueue_pcm("t2", _tone_pcm_24k())
+    await src.enqueue_pcm("t2", _tone_pcm_24k())
+    assert len(src._buf) > 0, "turn-2 audio lost after a flush (resampler EOF)"
+
+    # A NATURAL turn-end drain heals the same way for the following turn.
+    src.mark_end_of_turn("t2")
+    await src.enqueue_pcm("t3", _tone_pcm_24k())
+    await src.enqueue_pcm("t3", _tone_pcm_24k())
+    assert len(src._buf) > 0, "turn-3 audio lost after a natural drain (resampler EOF)"
