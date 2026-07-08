@@ -155,6 +155,30 @@ class WebSttShadowCaptureConfig:
 
 
 @dataclass
+class WebVoiceEndpointHoldConfig:
+    """Adaptive turn-end (endpointing) HOLD gate (``web.voice.stt.endpoint_hold``).
+
+    DEFAULT-OFF. When ``enabled`` each ``EVENT_UTTERANCE_END`` is a CANDIDATE:
+    a pure content-aware ``classify_tail`` on the buffer tail commits a complete
+    thought in the same tick (zero added latency) or arms a bounded concurrent
+    HOLD on a mid-thought signal (trailing conjunction/filler/dangling word).
+    ``base_extend_ms`` extends per hold; ``max_total_hold_ms`` is the hard
+    cumulative ceiling (deterministic worst-case latency). The three
+    ``hold_on_*`` toggles gate a signal category without a code change.
+    Telemetry (features-only) writes to ``data/voice_calibration/events.jsonl``.
+    See docs/adaptive_endpointing_scope.md.
+    """
+
+    enabled: bool = False
+    base_extend_ms: int = 500       # per-hold extension; clamp [0,1500]
+    max_total_hold_ms: int = 1500   # hard cumulative ceiling; clamp [base,3000]
+    hold_on_conjunction: bool = True
+    hold_on_filler: bool = True
+    hold_on_dangling: bool = True
+    telemetry_dir: str = "./data/voice_calibration"
+
+
+@dataclass
 class WebVoiceSttConfig:
     """Streaming-STT config for the V1 assistant pipeline (``web.voice.stt``).
 
@@ -179,6 +203,8 @@ class WebVoiceSttConfig:
     smart_format: bool = True
     shadow_capture: WebSttShadowCaptureConfig = field(
         default_factory=WebSttShadowCaptureConfig)
+    endpoint_hold: WebVoiceEndpointHoldConfig = field(
+        default_factory=WebVoiceEndpointHoldConfig)
 
 
 @dataclass
@@ -422,6 +448,32 @@ def _build_voice_stt(raw: Any) -> WebVoiceSttConfig:
         ),
         smart_format=bool(filtered.get("smart_format", defaults.smart_format)),
         shadow_capture=_build_shadow_capture(filtered.get("shadow_capture")),
+        endpoint_hold=_build_endpoint_hold(filtered.get("endpoint_hold")),
+    )
+
+
+def _build_endpoint_hold(raw: Any) -> WebVoiceEndpointHoldConfig:
+    """Hand-roll ``WebVoiceEndpointHoldConfig`` (nested on stt) with a
+    schema-tolerance filter — dodges the ``_build`` collision footgun. DEFAULT-OFF;
+    numeric fields are mount-clamped later by ``normalize_endpoint_hold_settings``."""
+    defaults = WebVoiceEndpointHoldConfig()
+    if not isinstance(raw, dict):
+        return defaults
+    known = WebVoiceEndpointHoldConfig.__dataclass_fields__
+    filtered = {k: v for k, v in raw.items() if k in known}
+    return WebVoiceEndpointHoldConfig(
+        enabled=bool(filtered.get("enabled", False)),
+        base_extend_ms=_int(filtered.get("base_extend_ms"), defaults.base_extend_ms),
+        max_total_hold_ms=_int(
+            filtered.get("max_total_hold_ms"), defaults.max_total_hold_ms),
+        hold_on_conjunction=bool(
+            filtered.get("hold_on_conjunction", defaults.hold_on_conjunction)),
+        hold_on_filler=bool(filtered.get("hold_on_filler", defaults.hold_on_filler)),
+        hold_on_dangling=bool(
+            filtered.get("hold_on_dangling", defaults.hold_on_dangling)),
+        telemetry_dir=str(
+            filtered.get("telemetry_dir", defaults.telemetry_dir)
+            or defaults.telemetry_dir),
     )
 
 

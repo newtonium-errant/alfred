@@ -505,7 +505,46 @@ def _build_assistant_stt(voice: Any, talker_config: Any = None):
     for warning in warnings:
         log.warning("web.voice.stt.config_clamped", detail=warning)
     shadow_factory = _build_stt_shadow(voice, talker_config, stt_norm)
-    return _make_stt_worker_factory(stt_norm, shadow_factory)
+
+    # Adaptive endpointing (default-OFF). Mount-clamp mirrors normalize_stt.
+    from .endpoint_hold import normalize_endpoint_hold_settings
+
+    endpoint_settings, ep_warnings = normalize_endpoint_hold_settings(
+        getattr(stt, "endpoint_hold", None) or object())
+    for warning in ep_warnings:
+        log.warning("web.voice.stt.config_clamped", detail=warning)
+    instance_name = getattr(
+        getattr(talker_config, "instance", None), "name", "") or ""
+    telemetry_dir = ""
+    if endpoint_settings.enabled:
+        telemetry_dir = getattr(
+            getattr(stt, "endpoint_hold", None), "telemetry_dir",
+            "./data/voice_calibration") or "./data/voice_calibration"
+        log.info(
+            "web.voice.stt.endpoint_hold_enabled",
+            base_extend_ms=endpoint_settings.base_extend_ms,
+            max_total_hold_ms=endpoint_settings.max_total_hold_ms,
+            telemetry_dir=telemetry_dir, instance=instance_name,
+        )
+    else:
+        # Intentionally-left-blank: idle distinguishable from broken.
+        log.info("web.voice.stt.endpoint_hold_disabled", reason="not_enabled")
+
+    return _make_stt_worker_factory(
+        stt_norm, shadow_factory,
+        endpoint_settings=endpoint_settings,
+        endpoint_telemetry_dir=telemetry_dir,
+        instance_name=instance_name,
+    )
+
+
+def _driver_web_user(driver: Any) -> str:
+    """The per-session ``identity.user`` (the endpoint-telemetry per-user key),
+    read defensively off the driver's deps. Empty when absent (a public
+    accessor on VoiceTurnDriver would be a clean follow-up)."""
+    deps = getattr(driver, "_deps", None)
+    ident = getattr(deps, "identity", None)
+    return getattr(ident, "user", "") or ""
 
 
 def _build_stt_shadow(voice: Any, talker_config: Any, stt_norm: Any):
@@ -575,13 +614,20 @@ def _build_stt_shadow(voice: Any, talker_config: Any, stt_norm: Any):
     return shadow_factory
 
 
-def _make_stt_worker_factory(stt_norm: Any, shadow_factory: Any = None):
+def _make_stt_worker_factory(
+    stt_norm: Any, shadow_factory: Any = None, *,
+    endpoint_settings: Any = None, endpoint_telemetry_dir: str = "",
+    instance_name: str = "",
+):
     """Return ``factory(vid, driver, manager) -> VoiceSttWorker`` closing over
     the normalized STT config. The worker's callbacks bridge to the per-session
     turn driver (partials / utterances) and, fail-honest, close the session on
     a fatal STT error (contract §1.15). ``shadow_factory`` (or ``None``) mints a
     per-session shadow whose ``capture`` is wired as the worker's fire-and-forget
-    hook — ``None`` ⇒ the live path is byte-identical (no tee / snapshot / call)."""
+    hook — ``None`` ⇒ the live path is byte-identical (no tee / snapshot / call).
+    ``endpoint_settings`` drives the adaptive turn-end hold (default-OFF ⇒ the
+    seam is byte-identical); per-session endpoint telemetry is wired only when
+    the feature is enabled."""
 
     def factory(vid: str, driver: Any, manager: Any):
         from .voice_stt import VoiceSttWorker
@@ -604,6 +650,21 @@ def _make_stt_worker_factory(stt_norm: Any, shadow_factory: Any = None):
         # Per-session shadow (default-OFF → shadow_factory is None → no hook).
         shadow = shadow_factory(vid) if shadow_factory is not None else None
 
+        # Per-session endpoint telemetry (features-only). Wired ONLY when the
+        # adaptive-endpoint feature is enabled (default-OFF → no hook → collect
+        # nothing). web_user is the per-user calibration key.
+        endpoint_telemetry = None
+        if (endpoint_settings is not None and getattr(endpoint_settings, "enabled", False)
+                and endpoint_telemetry_dir):
+            from .voice_endpoint_telemetry import VoiceEndpointTelemetry
+
+            endpoint_telemetry = VoiceEndpointTelemetry(
+                corpus_dir=endpoint_telemetry_dir,
+                web_user=_driver_web_user(driver),
+                voice_session_id=vid,
+                instance_name=instance_name,
+            ).emit
+
         worker = VoiceSttWorker(
             provider=provider,
             voice_session_id=vid,
@@ -614,6 +675,8 @@ def _make_stt_worker_factory(stt_norm: Any, shadow_factory: Any = None):
             sample_rate=stt_norm.sample_rate,
             hello_gate=True,  # §17b: connect/feed the provider only on DC hello
             shadow_capture=shadow.capture if shadow is not None else None,
+            endpoint_settings=endpoint_settings,
+            endpoint_telemetry=endpoint_telemetry,
         )
         # Release the hello-gate when the client's DC hello arrives. With no
         # driver (no feedback channel) open it immediately — a DC-less session

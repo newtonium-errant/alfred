@@ -629,6 +629,25 @@ transport:
 #       shadow_capture:
 #         enabled: false
 #         dir: "./data/stt_corpus"    # audio .wav + corpus.jsonl (under LUKS /data)
+#       # --- Adaptive turn-end HOLD (endpointing, Increment 1) ---
+#       # DEFAULT-OFF. Keeps Deepgram's 300ms snappy floor; treats each
+#       # utterance-end as a CANDIDATE — a pure classify_tail on the buffer tail
+#       # commits a complete thought in the SAME tick (zero added latency) or arms
+#       # a bounded concurrent HOLD on a mid-thought signal (trailing conjunction /
+#       # filler / dangling word) so Salem stops taking the turn during a
+#       # word-finding pause. base_extend_ms per hold; max_total_hold_ms is the
+#       # hard cumulative ceiling (deterministic worst-case latency). hold_on_*
+#       # toggle a signal category off for a soak without a code change.
+#       # Features-only telemetry (NEVER raw transcript) → data/voice_calibration/
+#       # events.jsonl (the unified per-user calibration corpus; endpoint family).
+#       endpoint_hold:
+#         enabled: false
+#         base_extend_ms: 500         # per-hold extension; clamp [0,1500]
+#         max_total_hold_ms: 1500     # hard cumulative ceiling; clamp [base,3000]
+#         hold_on_conjunction: true
+#         hold_on_filler: true
+#         hold_on_dangling: true
+#         telemetry_dir: "./data/voice_calibration"
 #     # --- V2 TTS talk-back (streaming spoken reply) — OPTIONAL enhancement on
 #     # the assistant pipeline. enabled:false (default) = V1 byte-identical (no
 #     # spoken reply). Invalid/keyless tts DEGRADES to text-only voice (loud

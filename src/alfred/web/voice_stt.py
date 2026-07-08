@@ -29,6 +29,7 @@ import asyncio
 import math
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from .endpoint_hold import HOLD, EndpointHoldSettings, classify_tail
 from .stt_stream import (
     EVENT_ERROR,
     EVENT_FINAL,
@@ -121,6 +122,8 @@ class VoiceSttWorker:
         resample_fn: Callable[[Any], list[bytes]] | None = None,
         hello_gate: bool = True,
         shadow_capture: Callable[[bytes, str, float], None] | None = None,
+        endpoint_settings: "EndpointHoldSettings | None" = None,
+        endpoint_telemetry: Callable[[dict], None] | None = None,
     ) -> None:
         self._provider = provider
         self._vid = voice_session_id
@@ -141,6 +144,30 @@ class VoiceSttWorker:
         self._shadow_capture = shadow_capture
         self._utt_pcm = bytearray()
         self._utt_pcm_max = _SHADOW_PCM_MAX_S * sample_rate * 2
+
+        # Adaptive endpointing (default-OFF). When ``endpoint_settings.enabled``,
+        # each EVENT_UTTERANCE_END is a CANDIDATE: a pure ``classify_tail`` on the
+        # buffer tail commits a complete thought in the same tick (zero added
+        # latency) or arms a bounded CONCURRENT hold (self._hold_task) on a
+        # mid-thought signal. The pump keeps consuming events during the hold; a
+        # resuming partial/final cancels it and folds into the SAME buffer.
+        # ``hold_gen`` is a session-monotonic supersede counter guarding
+        # _commit_held against a resume racing the timer. When disabled the whole
+        # branch is byte-identical to today (no classify, no task).
+        self._endpoint = endpoint_settings
+        self._endpoint_telemetry = endpoint_telemetry
+        self._buffer: list[str] = []            # promoted from pump-local (:443)
+        self._last_partial = ""
+        self._hold_gen = 0                       # session-monotonic (NEVER reset)
+        self._hold_task: asyncio.Task | None = None
+        self._first_hold_at: float | None = None  # per-utterance (cumulative cap)
+        self._hold_ms_applied = 0                # per-utterance
+        self._resumed_within_hold = False        # per-utterance
+        self._ever_held = False                  # per-utterance
+        self._last_tail_features: dict | None = None  # per-utterance (telemetry)
+        self._last_signal_category: str | None = None  # per-utterance attribution
+        self._last_audio_at: float | None = None
+        self._last_ev_trigger = ""
 
         # Hello-gate (contract §17b): the reader + relay wiring run immediately,
         # but the provider is NOT connected/fed until the client's DC hello
@@ -440,57 +467,23 @@ class VoiceSttWorker:
                     pass
 
     async def _pump_events(self) -> None:
-        buffer: list[str] = []
+        self._buffer = []
         async for ev in self._provider.events():
             if ev.type == EVENT_PARTIAL:
                 self._partials += 1
+                self._last_partial = ev.text
+                self._last_audio_at = self._now()
+                self._note_resume()  # a partial during a hold = resume → cancel
                 if self._on_partial is not None and not self._closing:
                     await self._on_partial(ev.text)
             elif ev.type == EVENT_FINAL:
                 self._finals += 1
+                self._last_audio_at = self._now()
                 if ev.text.strip():
-                    buffer.append(ev.text.strip())
+                    self._buffer.append(ev.text.strip())  # resumed finals fold in
+                self._note_resume()
             elif ev.type == EVENT_UTTERANCE_END:
-                text = " ".join(buffer).strip()
-                buffer = []
-                # Snapshot + RESET the per-utterance PCM (both the served and
-                # the empty path reset it, so the next utterance never carries
-                # this one's audio). b"" when shadow is off.
-                utt_pcm = self._snapshot_utt_pcm()
-                if len(text) >= self._min_utterance_chars:
-                    self._utterances += 1
-                    if self._closing:
-                        # Teardown must not fire new chat turns.
-                        log.info(
-                            "web.voice.stt.utterance_discarded_on_close",
-                            voice_session_id=self._vid, chars=len(text),
-                        )
-                    else:
-                        log.info(
-                            "web.voice.stt.utterance_end",
-                            voice_session_id=self._vid,
-                            trigger=ev.trigger, transcript_chars=len(text),
-                        )
-                        await self._on_utterance(text)   # LIVE TURN — unchanged
-                        # Shadow AFTER the served turn: fire-and-forget. The hook
-                        # (VoiceSttShadow.capture) owns isolation, but wrap the
-                        # call too so even a buggy hook can NEVER kill the live
-                        # pump (isolation is the #1 property).
-                        if self._shadow_capture is not None and utt_pcm:
-                            duration_s = len(utt_pcm) / (self._sample_rate * 2)
-                            try:
-                                self._shadow_capture(utt_pcm, text, duration_s)
-                            except Exception:  # noqa: BLE001 — never break the pump
-                                log.warning(
-                                    "web.voice.stt.shadow_hook_raised",
-                                    voice_session_id=self._vid,
-                                )
-                else:
-                    # Intentionally-left-blank: endpointer fired on noise.
-                    log.info(
-                        "web.voice.stt.utterance_empty",
-                        voice_session_id=self._vid, chars=len(text),
-                    )
+                await self._on_utterance_end(ev.trigger)
             elif ev.type == EVENT_ERROR and ev.fatal:
                 log.warning(
                     "web.voice.stt.error",
@@ -500,6 +493,178 @@ class VoiceSttWorker:
                 if self._on_fatal is not None and not self._closing:
                     await self._on_fatal(ev)
                 return  # provider ends events() after a fatal error
+
+    # -- adaptive endpointing (hold/commit state machine) -------------------
+
+    def _now(self) -> float:
+        return asyncio.get_running_loop().time()
+
+    async def _on_utterance_end(self, trigger: str) -> None:
+        """The candidate-EOU decision point. Order: noise (empty, no hold) →
+        closing (discard, no hold) → bypass (disabled / forced-flush → commit
+        inline, byte-identical to today) → classify_tail → commit-inline or
+        arm-hold. Every terminal path resets per-utterance state."""
+        self._last_ev_trigger = trigger
+        text = " ".join(self._buffer).strip()
+        if len(text) < self._min_utterance_chars:
+            # Intentionally-left-blank: endpointer fired on noise. NEVER hold.
+            self._cancel_hold()
+            self._snapshot_utt_pcm()
+            self._reset_utt()
+            log.info("web.voice.stt.utterance_empty",
+                     voice_session_id=self._vid, chars=len(text))
+            return
+        if self._closing:
+            # Teardown must not fire new chat turns; drop + cancel any hold.
+            self._utterances += 1
+            self._cancel_hold()
+            self._snapshot_utt_pcm()
+            self._reset_utt()
+            log.info("web.voice.stt.utterance_discarded_on_close",
+                     voice_session_id=self._vid, chars=len(text))
+            return
+        if (self._endpoint is None or not self._endpoint.enabled
+                or trigger in ("finalize", "fake")):
+            # DEFAULT-OFF / forced-flush → commit inline, no hold. When endpoint
+            # is disabled this branch IS today's exact path → byte-identical.
+            await self._commit_inline(trigger=trigger, decision=None)
+            return
+        result = classify_tail(text, self._last_partial, self._endpoint)
+        self._last_tail_features = result.features
+        self._last_signal_category = result.signal_category
+        if result.decision == HOLD:
+            await self._arm_or_commit_hold(trigger)
+        else:
+            await self._commit_inline(trigger=trigger, decision=result.decision)
+
+    def _note_resume(self) -> None:
+        """A partial/final arrived — if a hold is armed it's a resume: cancel it
+        (the buffer already accumulated the resumed final → automatic fold). A
+        no-op when endpointing is off (no hold is ever armed)."""
+        if self._hold_task is not None:
+            self._resumed_within_hold = True
+            self._cancel_hold()
+
+    def _cancel_hold(self) -> None:
+        """Cancel any armed hold + bump ``hold_gen`` so an in-flight
+        ``_commit_held`` supersede-check returns. Idempotent."""
+        if self._hold_task is not None:
+            self._hold_gen += 1
+            if not self._hold_task.done():
+                self._hold_task.cancel()
+            self._hold_task = None
+
+    def _reset_utt(self) -> None:
+        """Reset per-utterance state after a terminal decision (guards against
+        state bleeding into the next utterance). ``hold_gen`` is session-
+        monotonic and is NEVER reset. The teed PCM is reset by the caller's
+        ``_snapshot_utt_pcm``."""
+        self._buffer = []
+        self._last_partial = ""
+        self._first_hold_at = None
+        self._hold_ms_applied = 0
+        self._resumed_within_hold = False
+        self._ever_held = False
+        self._last_tail_features = None
+        self._last_signal_category = None
+
+    async def _commit_inline(self, *, trigger: str, decision: str | None) -> None:
+        """The single commit path — both the inline decision AND ``_commit_held``
+        call this. Snapshots the (held+folded) PCM here so audio stays aligned
+        with the committed text, fires the unchanged ``on_utterance``, then the
+        shadow hook + features-only telemetry, then resets per-utterance state.
+        ``decision=None`` = the bypass/disabled path (no telemetry, log fields
+        byte-identical to today)."""
+        text = " ".join(self._buffer).strip()
+        utt_pcm = self._snapshot_utt_pcm()
+        self._utterances += 1
+        extra = ({"held": self._ever_held, "hold_ms": self._hold_ms_applied}
+                 if decision is not None else {})
+        log.info("web.voice.stt.utterance_end", voice_session_id=self._vid,
+                 trigger=trigger, transcript_chars=len(text), **extra)
+        await self._on_utterance(text)   # LIVE TURN — unchanged
+        if self._shadow_capture is not None and utt_pcm:
+            duration_s = len(utt_pcm) / (self._sample_rate * 2)
+            try:
+                self._shadow_capture(utt_pcm, text, duration_s)
+            except Exception:  # noqa: BLE001 — never break the pump
+                log.warning("web.voice.stt.shadow_hook_raised",
+                            voice_session_id=self._vid)
+        if decision is not None:
+            self._emit_endpoint_telemetry()
+        self._reset_utt()
+
+    async def _arm_or_commit_hold(self, trigger: str) -> None:
+        """Arm a bounded CONCURRENT hold (a detached cancellable Task — the pump
+        keeps consuming events), unless the cumulative ceiling from
+        ``first_hold_at`` is already reached → force-commit now."""
+        self._cancel_hold()  # supersede any prior in-flight hold before re-deciding
+        now = self._now()
+        if self._first_hold_at is None:
+            self._first_hold_at = now
+        elapsed_ms = (now - self._first_hold_at) * 1000.0
+        remaining_ms = self._endpoint.max_total_hold_ms - elapsed_ms
+        if remaining_ms <= 0:
+            # Cumulative ceiling → force-commit regardless of signal (deterministic
+            # worst-case latency; an "and-um-and-uh" tail can never hang the turn).
+            log.info("web.voice.stt.endpoint_hold_ceiling",
+                     voice_session_id=self._vid, cum_ms=int(elapsed_ms))
+            await self._commit_inline(trigger=trigger, decision=HOLD)
+            return
+        delay_ms = min(float(self._endpoint.base_extend_ms), remaining_ms)
+        self._hold_ms_applied = int(elapsed_ms + delay_ms)
+        self._ever_held = True
+        self._hold_gen += 1
+        gen = self._hold_gen
+        self._hold_task = asyncio.ensure_future(
+            self._hold_then_commit(gen, delay_ms / 1000.0))
+        log.info("web.voice.stt.endpoint_hold_armed", voice_session_id=self._vid,
+                 delay_ms=int(delay_ms), cum_ms=self._hold_ms_applied)
+
+    async def _hold_then_commit(self, gen: int, delay_s: float) -> None:
+        try:
+            await asyncio.sleep(delay_s)
+            await self._commit_held(gen)
+        except asyncio.CancelledError:
+            raise  # resume/close cancelled us — expected, no commit fires
+
+    async def _commit_held(self, gen: int) -> None:
+        """Timer expired with no resumption → commit the accumulated buffer.
+        The ``hold_gen`` guard drops a stale timer that a resume/re-arm already
+        superseded (race-safe on the single loop)."""
+        if gen != self._hold_gen:
+            return  # superseded
+        self._hold_task = None
+        if self._closing:
+            self._snapshot_utt_pcm()
+            self._reset_utt()
+            return
+        text = " ".join(self._buffer).strip()
+        if len(text) < self._min_utterance_chars:
+            self._snapshot_utt_pcm()
+            self._reset_utt()
+            return
+        await self._commit_inline(trigger=self._last_ev_trigger, decision=HOLD)
+
+    def _emit_endpoint_telemetry(self) -> None:
+        """Fire the features-ONLY endpoint event (collect-only; applies nothing).
+        Never the raw tail text — only the category booleans in
+        ``_last_tail_features`` + the decision/timing scalars."""
+        if self._endpoint_telemetry is None or self._last_tail_features is None:
+            return
+        now = self._now()
+        ms_silence = (int((now - self._last_audio_at) * 1000)
+                      if self._last_audio_at is not None else 0)
+        fields = dict(self._last_tail_features)
+        fields.update({
+            "decision": HOLD if self._ever_held else "commit",
+            "signal_category": self._last_signal_category,   # per-signal attribution
+            "hold_ms_applied": self._hold_ms_applied,
+            "resumed_within_hold": self._resumed_within_hold,
+            "ms_trailing_silence_at_fire": ms_silence,
+            "trigger": self._last_ev_trigger,
+        })
+        self._endpoint_telemetry(fields)   # the fire-and-forget emit hook
 
     # -- close --------------------------------------------------------------
 
@@ -511,6 +676,7 @@ class VoiceSttWorker:
             return
         self._aclose_started = True
         self._closing = True
+        self._cancel_hold()  # an armed endpoint hold must not fire during teardown
 
         tasks = [self._reader_task, self._sender_task, self._pump_task]
         for t in tasks:
