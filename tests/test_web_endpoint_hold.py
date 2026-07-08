@@ -79,6 +79,8 @@ def test_classify_tail_decisions(text, expected) -> None:
     ("I'll think about that", COMMIT),         # 'that' EXCLUDED (that-trap avoided)
     ("leave it as is", COMMIT),                # 'is' EXCLUDED (copula-final avoided)
     ("so anyway", COMMIT),                     # trailing 'so' is NOT the tail token
+    ("get back to", HOLD),                     # last='to' ∈ DANGLING (infinitive)
+    ("what do you mean", COMMIT),              # 'you mean' ≠ FILLERS_MULTI 'i mean'
 ])
 def test_contract_worked_examples(text, expected) -> None:
     assert classify_tail(text, "", _ON).decision == expected
