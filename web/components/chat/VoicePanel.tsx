@@ -60,6 +60,7 @@ export function VoicePanel({
     ttsUnavailable,
     discardNotice,
     canCancel,
+    reconnecting,
   } = voice;
 
   // A voice turn needs the chat session_key (bound at offer time); gate start on it.
@@ -106,7 +107,24 @@ export function VoicePanel({
       ) : (
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-2">
-            {state === 'idle' && (
+            {/* An auto-reconnect (one-shot after a transient live drop) drives the
+                session back through idle → requesting-mic → connecting; show ONE
+                stable "Reconnecting…" affordance across that window instead of the
+                per-state copy flickering. */}
+            {reconnecting && (
+              <span
+                data-testid="voice-reconnecting"
+                className="inline-flex items-center gap-2 text-sm text-honeydew-600"
+              >
+                <span
+                  aria-hidden
+                  className="h-2 w-2 rounded-full bg-honeydew-500 motion-safe:animate-pulse"
+                />
+                Reconnecting…
+              </span>
+            )}
+
+            {!reconnecting && state === 'idle' && (
               <>
                 <Button
                   variant="outline"
@@ -125,20 +143,21 @@ export function VoicePanel({
               </>
             )}
 
-            {(state === 'requesting-mic' || state === 'connecting' || state === 'closing') && (
-              <span
-                data-testid="voice-status"
-                className="inline-flex items-center gap-2 text-sm text-honeydew-600"
-              >
+            {!reconnecting &&
+              (state === 'requesting-mic' || state === 'connecting' || state === 'closing') && (
                 <span
-                  aria-hidden
-                  className="h-2 w-2 rounded-full bg-honeydew-500 motion-safe:animate-pulse"
-                />
-                {state === 'requesting-mic' && 'Requesting microphone…'}
-                {state === 'connecting' && 'Connecting…'}
-                {state === 'closing' && 'Ending…'}
-              </span>
-            )}
+                  data-testid="voice-status"
+                  className="inline-flex items-center gap-2 text-sm text-honeydew-600"
+                >
+                  <span
+                    aria-hidden
+                    className="h-2 w-2 rounded-full bg-honeydew-500 motion-safe:animate-pulse"
+                  />
+                  {state === 'requesting-mic' && 'Requesting microphone…'}
+                  {state === 'connecting' && 'Connecting…'}
+                  {state === 'closing' && 'Ending…'}
+                </span>
+              )}
 
             {state === 'live' && (
               <>

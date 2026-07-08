@@ -75,9 +75,14 @@ export class FakeRTCPeerConnection {
   static instances: FakeRTCPeerConnection[] = [];
   static autoGather = true;
 
+  // When set, the NEXT constructor throws (one-shot) — simulates a transient
+  // RTCPeerConnection construction failure after a network transition.
+  static failNextConstruct = false;
+
   static reset() {
     FakeRTCPeerConnection.instances = [];
     FakeRTCPeerConnection.autoGather = true;
+    FakeRTCPeerConnection.failNextConstruct = false;
   }
 
   config: RTCConfiguration;
@@ -95,6 +100,10 @@ export class FakeRTCPeerConnection {
   private listeners: Record<string, Listener[]> = {};
 
   constructor(config: RTCConfiguration) {
+    if (FakeRTCPeerConnection.failNextConstruct) {
+      FakeRTCPeerConnection.failNextConstruct = false;
+      throw new DOMException('construction failed', 'InvalidStateError');
+    }
     this.config = config;
     FakeRTCPeerConnection.instances.push(this);
   }

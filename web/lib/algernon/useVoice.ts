@@ -48,7 +48,8 @@ export type VoiceErrorCode =
   | 'signaling-failed'
   | 'connection-failed'
   | 'channel-failed'
-  | 'stt-failed';
+  | 'stt-failed'
+  | 'reconnect-timeout';
 
 export interface VoiceError {
   code: VoiceErrorCode;
@@ -84,6 +85,8 @@ export interface UseVoice {
   discardNotice: boolean;
   /** True while a turn is in flight (a cancel frame would act). Mirrors the internal turn id. */
   canCancel: boolean;
+  /** An auto-reconnect (one-shot, after a transient live drop) is in flight. */
+  reconnecting: boolean;
   /** The user gesture — request mic + negotiate. Only acts from idle. */
   start: () => Promise<void>;
   /** Flip the mic track (live only). No renegotiation. Muting doubles as "over". */
@@ -101,9 +104,17 @@ export interface UseVoice {
 }
 
 const GATHER_TIMEOUT_MS = 3000; // vanilla-ICE gather-complete guard (host-only ⇒ sub-second)
-const CONNECT_WATCHDOG_MS = 10000; // connecting must reach 'connected' within this
+const CONNECT_WATCHDOG_MS = 15000; // connecting must reach 'connected' within this
 const DISCONNECT_GRACE_MS = 4000; // a transient 'disconnected' may recover within this
 const DC_READY_TIMEOUT_MS = 5000; // after connect, dictation should confirm within this
+// Pre-live (requesting-mic) hard cap: config-fetch + getUserMedia must complete
+// within this. Without it, a stall after a network transition wedges the panel at
+// 'requesting-mic' holding a live mic (the reconnect bug). Its two awaits also get
+// their own bounded timeouts so a never-resolving promise can't outlive the cap.
+const REQUESTING_MIC_WATCHDOG_MS = 10000;
+const CONFIG_TIMEOUT_MS = 8000; // voiceApi.config() bound (the BFF's own budget is 70s)
+const MIC_TIMEOUT_MS = 8000; // getUserMedia bound (native call has NO timeout)
+const AUTO_RETRY_DELAY_MS = 1500; // wait before the one-shot auto-reconnect
 
 const ERROR_MESSAGES: Record<VoiceErrorCode, string> = {
   unsupported: 'Voice isn’t supported in this browser.',
@@ -117,7 +128,50 @@ const ERROR_MESSAGES: Record<VoiceErrorCode, string> = {
   'connection-failed': 'The voice connection dropped. Try again.',
   'channel-failed': 'The voice data link dropped. Try again.',
   'stt-failed': 'Speech recognition failed. Try again.',
+  'reconnect-timeout': 'Couldn’t reconnect. Try again.',
 };
+
+// Reject `p` after `ms` (TimeoutError) so a stalled promise can't hang the machine.
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new DOMException(`${label} timed out`, 'TimeoutError')), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+}
+
+// getUserMedia with a timeout AND a late-grant guard: if the timeout wins but the
+// real getUserMedia resolves afterwards, its tracks are stopped so a late mic grant
+// can never leak (the reconnect hot-mic hazard). Native getUserMedia has no timeout.
+function getUserMediaWithTimeout(constraints: MediaStreamConstraints, ms: number): Promise<MediaStream> {
+  const gum = navigator.mediaDevices.getUserMedia(constraints);
+  return new Promise<MediaStream>((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      gum.then((s) => s.getTracks().forEach((t) => t.stop())).catch(() => {});
+      reject(new DOMException('microphone timed out', 'TimeoutError'));
+    }, ms);
+    gum.then(
+      (s) => {
+        if (done) {
+          s.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        done = true;
+        clearTimeout(timer);
+        resolve(s);
+      },
+      (e) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
 
 function isSupported(): boolean {
   return (
@@ -179,6 +233,7 @@ export function useVoice(opts: {
   const [ttsUnavailable, setTtsUnavailable] = useState(false);
   const [discardNotice, setDiscardNotice] = useState(false);
   const [canCancel, setCanCancel] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
   // All live handles in refs so async callbacks never close over stale state.
   const stateRef = useRef<VoiceState>('idle');
@@ -198,8 +253,15 @@ export function useVoice(opts: {
   // Latest opts mirrored to refs so async closures read the current value.
   const sessionKeyRef = useRef<string | null>(opts.sessionKey ?? null);
   const onTurnFinalRef = useRef(opts.onTurnFinal);
+  const enabledRef = useRef(enabled);
   sessionKeyRef.current = opts.sessionKey ?? null;
   onTurnFinalRef.current = opts.onTurnFinal;
+  enabledRef.current = enabled;
+  // Auto-reconnect (one-shot per live session): a budget flag + the delay timer +
+  // a ref to the latest start() so a connection handler can re-drive it.
+  const retriedRef = useRef(false);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const startRef = useRef<() => Promise<void>>(async () => {});
   // A monotonic generation: any teardown / new start bumps it, and every awaited
   // step in start() (and every dc callback) re-checks it so an aborted attempt
   // cannot resurrect state.
@@ -208,6 +270,7 @@ export function useVoice(opts: {
   const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dcReadyRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const preliveRef = useRef<ReturnType<typeof setTimeout> | null>(null); // requesting-mic cap
 
   const setState = useCallback((s: VoiceState) => {
     stateRef.current = s;
@@ -215,7 +278,7 @@ export function useVoice(opts: {
   }, []);
 
   const clearTimers = useCallback(() => {
-    for (const ref of [watchdogRef, disconnectRef, dcReadyRef]) {
+    for (const ref of [watchdogRef, disconnectRef, dcReadyRef, preliveRef, retryTimerRef]) {
       if (ref.current) {
         clearTimeout(ref.current);
         ref.current = null;
@@ -287,6 +350,7 @@ export function useVoice(opts: {
       setVoiceSessionId(null);
       setMuted(false);
       setAudioBlocked(false);
+      setReconnecting(false);
       resetDictation();
       setError({ code, message: ERROR_MESSAGES[code] });
       setState('error');
@@ -305,6 +369,8 @@ export function useVoice(opts: {
       setVoiceSessionId(null);
       setMuted(false);
       setAudioBlocked(false);
+      setReconnecting(false);
+      retriedRef.current = false; // a clean end resets the auto-retry budget
       resetDictation();
       setError(null);
       setState(nextState);
@@ -359,11 +425,26 @@ export function useVoice(opts: {
       .catch(() => setAudioBlocked(true));
   }, [audioRef]);
 
+  // CLEAN RECONNECT: a full teardown before returning to idle, so a fresh start()
+  // runs from a genuinely clean slate — never the dead session's remnants. Bumping
+  // the generation invalidates any lingering async continuation or dc callback;
+  // teardownLocal stops the mic, closes+nulls pc+dc+handlers, clears every timer,
+  // and detaches the audio element. The requesting-mic wedge cannot inherit stale
+  // gen/refs after this.
   const reset = useCallback(() => {
     if (stateRef.current !== 'error') return;
+    genRef.current += 1;
+    retriedRef.current = false; // a manual attempt gets its own one-shot auto-retry budget
+    teardownLocal();
+    sessionIdRef.current = null;
+    setVoiceSessionId(null);
+    setMuted(false);
+    setAudioBlocked(false);
+    setReconnecting(false);
+    resetDictation();
     setError(null);
     setState('idle');
-  }, [setState]);
+  }, [resetDictation, setState, teardownLocal]);
 
   // Apply one validated datachannel event to the dictation sub-state. `gen` is the
   // generation captured when the channel was wired — the async onTurnFinal
@@ -564,6 +645,10 @@ export function useVoice(opts: {
     resetDictation();
     const gen = (genRef.current += 1);
     const stale = () => genRef.current !== gen;
+    // A fresh attempt is NOT closing — reset here (not at pc creation) so the
+    // requesting-mic watchdog + handlers aren't suppressed by a prior teardown's
+    // leftover closingRef=true.
+    closingRef.current = false;
 
     if (!isSupported()) {
       fail('unsupported');
@@ -572,11 +657,22 @@ export function useVoice(opts: {
 
     setState('requesting-mic');
 
+    // PRE-LIVE WATCHDOG: config-fetch + getUserMedia must complete within the cap.
+    // After a network transition either can stall; without this the panel wedges
+    // forever at 'requesting-mic' holding a live mic (the reconnect bug). On fire →
+    // clean error + mic released (fail → teardownLocal; a late mic grant is stopped
+    // by getUserMediaWithTimeout's own guard).
+    preliveRef.current = setTimeout(() => {
+      preliveRef.current = null;
+      if (!closingRef.current && stateRef.current === 'requesting-mic') fail('reconnect-timeout');
+    }, REQUESTING_MIC_WATCHDOG_MS);
+
     // 1. Config probe FIRST — a disabled / aiortc-missing backend fails here,
-    //    BEFORE the mic is ever requested (no spurious permission prompt).
+    //    BEFORE the mic is ever requested (no spurious permission prompt). Bounded
+    //    so a stalled fetch can't outlive the watchdog.
     let config: VoiceConfigResponse;
     try {
-      config = await voiceApi.config();
+      config = await withTimeout(voiceApi.config(), CONFIG_TIMEOUT_MS, 'config');
     } catch (e) {
       if (stale()) return;
       fail(mapSignalError(e));
@@ -593,17 +689,21 @@ export function useVoice(opts: {
     assistantPipelineRef.current = config.pipeline === 'assistant';
 
     // 2. Mic — the tap that got us here is the gesture; constraints are hints
-    //    (unsupported ones don't throw).
+    //    (unsupported ones don't throw). Bounded (native getUserMedia has no timeout)
+    //    with a late-grant guard so a mic acquired after we bail is never leaked.
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: { ideal: 1 },
+      stream = await getUserMediaWithTimeout(
+        {
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: { ideal: 1 },
+          },
         },
-      });
+        MIC_TIMEOUT_MS,
+      );
     } catch (e) {
       if (stale()) return;
       fail(mapGetUserMediaError(e));
@@ -614,19 +714,33 @@ export function useVoice(opts: {
       return;
     }
 
-    // 3. Peer connection with the server-provided ICE servers (never hardcoded).
-    const pc = new RTCPeerConnection({ iceServers: config.ice_servers ?? [] });
-    pcRef.current = pc;
-    streamRef.current = stream;
-    closingRef.current = false;
-    const micTrack = stream.getAudioTracks()[0] ?? null;
-    micTrackRef.current = micTrack;
-    if (micTrack) pc.addTrack(micTrack, stream);
-
-    // 3a. The dictation datachannel — created BEFORE createOffer so its SCTP
-    //     m-section rides the initial vanilla-ICE offer (no renegotiation).
-    const dc = pc.createDataChannel('voice', { ordered: true });
-    dcRef.current = dc;
+    // 3. Peer connection + datachannel. The synchronous build is EXCEPTION-GUARDED:
+    //    a transient RTCPeerConnection/addTrack/createDataChannel throw (seen after a
+    //    network transition) must release the just-acquired mic + fail cleanly, NOT
+    //    wedge at 'requesting-mic' with a hot mic (the `void start()` caller swallows
+    //    the rejection, so an unguarded throw is invisible).
+    let pc: RTCPeerConnection;
+    let dc: RTCDataChannel;
+    try {
+      pc = new RTCPeerConnection({ iceServers: config.ice_servers ?? [] });
+      pcRef.current = pc;
+      streamRef.current = stream;
+      const micTrack = stream.getAudioTracks()[0] ?? null;
+      micTrackRef.current = micTrack;
+      if (micTrack) pc.addTrack(micTrack, stream);
+      // 3a. The dictation datachannel — created BEFORE createOffer so its SCTP
+      //     m-section rides the initial vanilla-ICE offer (no renegotiation).
+      dc = pc.createDataChannel('voice', { ordered: true });
+      dcRef.current = dc;
+    } catch {
+      if (stale()) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      stream.getTracks().forEach((t) => t.stop()); // release the just-acquired mic
+      fail('connection-failed');
+      return;
+    }
     dc.onopen = () => {
       if (genRef.current !== gen) return;
       // Client speaks first (aiortc #212 hello-gate: the server stays silent until
@@ -658,18 +772,43 @@ export function useVoice(opts: {
       void el.play().catch(() => setAudioBlocked(true));
     };
 
+    // A LIVE session dropped unexpectedly (pc failed / disconnected past grace, NOT a
+    // user hangup — closingRef guards that). AUTO-RETRY ONCE: clean-teardown the dead
+    // session, then re-drive start() after a short delay. Exactly one attempt per live
+    // session (retriedRef); a second failure surfaces the error + manual Reconnect.
+    const dropWhileLive = () => {
+      if (retriedRef.current) {
+        fail('connection-failed');
+        return;
+      }
+      retriedRef.current = true;
+      setReconnecting(true);
+      genRef.current += 1; // this handler's gen goes stale; nothing here can resurrect
+      teardownLocal();
+      sessionIdRef.current = null;
+      setVoiceSessionId(null);
+      setMuted(false);
+      setAudioBlocked(false);
+      resetDictation();
+      setError(null);
+      setState('idle'); // transient — start() re-drives; the panel shows "Reconnecting…"
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null;
+        if (!enabledRef.current || stateRef.current !== 'idle') {
+          setReconnecting(false);
+          return;
+        }
+        void startRef.current();
+      }, AUTO_RETRY_DELAY_MS);
+    };
+
     pc.onconnectionstatechange = () => {
       if (closingRef.current) return;
       const cs = pc.connectionState;
       if (cs === 'connected') {
-        if (disconnectRef.current) {
-          clearTimeout(disconnectRef.current);
-          disconnectRef.current = null;
-        }
-        if (watchdogRef.current) {
-          clearTimeout(watchdogRef.current);
-          watchdogRef.current = null;
-        }
+        clearTimers(); // clear the pre-live + connect watchdogs (disconnect grace too)
+        setReconnecting(false);
+        retriedRef.current = false; // a healthy live session re-arms the auto-retry budget
         if (stateRef.current === 'connecting' || stateRef.current === 'live') {
           setState('live');
         }
@@ -687,7 +826,10 @@ export function useVoice(opts: {
           }, DC_READY_TIMEOUT_MS);
         }
       } else if (cs === 'failed') {
-        fail('connection-failed');
+        // A LIVE drop auto-retries once; a failure while still connecting is a plain
+        // connect failure (surfaced immediately).
+        if (stateRef.current === 'live') dropWhileLive();
+        else fail('connection-failed');
       } else if (cs === 'closed') {
         // A close we didn't initiate (closingRef guards our own).
         fail('connection-failed');
@@ -695,12 +837,19 @@ export function useVoice(opts: {
         if (!disconnectRef.current) {
           disconnectRef.current = setTimeout(() => {
             disconnectRef.current = null;
-            if (!closingRef.current && pcRef.current === pc) fail('connection-failed');
+            if (closingRef.current || pcRef.current !== pc) return;
+            if (stateRef.current === 'live') dropWhileLive();
+            else fail('connection-failed');
           }, DISCONNECT_GRACE_MS);
         }
       }
     };
 
+    // Entering connecting — clear the pre-live watchdog, arm the connect watchdog.
+    if (preliveRef.current) {
+      clearTimeout(preliveRef.current);
+      preliveRef.current = null;
+    }
     setState('connecting');
 
     // Connecting watchdog — never let 'connecting' hang silently.
@@ -749,7 +898,20 @@ export function useVoice(opts: {
     }
     // From here the pc drives itself: onconnectionstatechange → 'connected' → live;
     // the datachannel drives dictation → the sub-state machine.
-  }, [audioRef, enabled, fail, handleDcMessage, resetDictation, setState, waitGatheringComplete]);
+  }, [
+    audioRef,
+    clearTimers,
+    enabled,
+    fail,
+    handleDcMessage,
+    resetDictation,
+    setState,
+    teardownLocal,
+    waitGatheringComplete,
+  ]);
+  // The auto-retry connection handler re-drives start() via this ref (breaks the
+  // start ↔ handler definition cycle).
+  startRef.current = start;
 
   // Auto-teardown when the capability is withdrawn (display flag off or an
   // instance switch away from home) — a live session can't straddle it.
@@ -824,6 +986,7 @@ export function useVoice(opts: {
     ttsUnavailable,
     discardNotice,
     canCancel,
+    reconnecting,
     start,
     toggleMute,
     toggleSpeakerMute,

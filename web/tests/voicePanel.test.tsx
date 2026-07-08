@@ -41,6 +41,7 @@ function setVoice(overrides: Partial<UseVoice> = {}) {
     ttsUnavailable: false,
     discardNotice: false,
     canCancel: false,
+    reconnecting: false,
     ...actions,
     ...overrides,
   });
@@ -220,6 +221,16 @@ describe('VoicePanel', () => {
       setVoice({ state: 'connecting' });
       render(<VoicePanel instance={HOME_INSTANCE_NAME} sessionKey="s1" />);
       expect(screen.getByTestId('voice-status').textContent).toContain('Connecting');
+    });
+
+    it('shows one stable "Reconnecting…" affordance during an auto-reconnect (overriding per-state copy)', () => {
+      // The auto-reconnect drives back through requesting-mic; the panel must show
+      // "Reconnecting…" and NOT the plain per-state copy or the idle Voice button.
+      setVoice({ state: 'requesting-mic', reconnecting: true });
+      render(<VoicePanel instance={HOME_INSTANCE_NAME} sessionKey="s1" />);
+      expect(screen.getByTestId('voice-reconnecting').textContent).toContain('Reconnecting');
+      expect(screen.queryByTestId('voice-status')).toBeNull();
+      expect(screen.queryByTestId('voice-start')).toBeNull();
     });
 
     it('renders an error banner (covers the new codes) + a reset affordance', () => {

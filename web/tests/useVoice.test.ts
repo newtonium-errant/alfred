@@ -184,13 +184,15 @@ describe('useVoice', () => {
     expect(result.current.error?.code).toBe('session-expired');
   });
 
-  it('goes to error connection-failed when the pc fails', async () => {
+  it('goes to error connection-failed when the pc fails before live (no pre-live auto-retry)', async () => {
+    // A failure while still connecting surfaces the error immediately. A failure of a
+    // LIVE session instead auto-retries once — that path is covered in
+    // useVoiceReconnect.test.ts.
     const { result } = renderHook(() => useVoice({ audioRef, enabled: true }));
     await act(async () => {
       await result.current.start();
     });
-    act(() => lastPC().emitConnectionState('connected'));
-    expect(result.current.state).toBe('live');
+    expect(result.current.state).toBe('connecting');
     act(() => lastPC().emitConnectionState('failed'));
     expect(result.current.state).toBe('error');
     expect(result.current.error?.code).toBe('connection-failed');
