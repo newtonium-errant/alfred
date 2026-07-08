@@ -166,6 +166,11 @@ class VoiceSttWorker:
         self._ever_held = False                  # per-utterance
         self._last_tail_features: dict | None = None  # per-utterance (telemetry)
         self._last_signal_category: str | None = None  # per-utterance attribution
+        # LATCHED at the FIRST hold of the utterance — a resume overwrites
+        # _last_* via a non-signal final classify_tail, so telemetry reads these
+        # back to report WHAT TRIGGERED the (correct) resumed hold.
+        self._hold_trigger_category: str | None = None
+        self._hold_trigger_features: dict | None = None
         self._last_audio_at: float | None = None
         self._last_ev_trigger = ""
 
@@ -567,6 +572,8 @@ class VoiceSttWorker:
         self._ever_held = False
         self._last_tail_features = None
         self._last_signal_category = None
+        self._hold_trigger_category = None
+        self._hold_trigger_features = None
 
     async def _commit_inline(self, *, trigger: str, decision: str | None) -> None:
         """The single commit path — both the inline decision AND ``_commit_held``
@@ -602,6 +609,10 @@ class VoiceSttWorker:
         now = self._now()
         if self._first_hold_at is None:
             self._first_hold_at = now
+            # Latch the TRIGGERING attribution at the first hold — resumed-hold
+            # telemetry emits these (the final classify_tail overwrites _last_*).
+            self._hold_trigger_category = self._last_signal_category
+            self._hold_trigger_features = self._last_tail_features
         elapsed_ms = (now - self._first_hold_at) * 1000.0
         remaining_ms = self._endpoint.max_total_hold_ms - elapsed_ms
         if remaining_ms <= 0:
@@ -648,17 +659,33 @@ class VoiceSttWorker:
 
     def _emit_endpoint_telemetry(self) -> None:
         """Fire the features-ONLY endpoint event (collect-only; applies nothing).
-        Never the raw tail text — only the category booleans in
-        ``_last_tail_features`` + the decision/timing scalars."""
-        if self._endpoint_telemetry is None or self._last_tail_features is None:
+        Never the raw tail text — only the category booleans + decision/timing.
+
+        For a RESUMED hold, ``_last_tail_features`` / ``_last_signal_category``
+        were overwritten by the final non-signal ``classify_tail`` (the utterance
+        committed on a non-signal tail after folding the resumed speech). Emit the
+        LATCHED trigger attribution instead, so the record reports WHAT TRIGGERED
+        the (correct) hold — otherwise a held record would read all-false /
+        signal_category=None ("held but nothing fired") and the soak could not
+        break resumed holds down per-signal (contract §6). The non-resumed path
+        is already correct (no second classify); cumulative scalars stay as-is."""
+        if self._endpoint_telemetry is None:
+            return
+        if self._resumed_within_hold and self._hold_trigger_features is not None:
+            base_features = self._hold_trigger_features
+            category = self._hold_trigger_category
+        else:
+            base_features = self._last_tail_features
+            category = self._last_signal_category
+        if base_features is None:
             return
         now = self._now()
         ms_silence = (int((now - self._last_audio_at) * 1000)
                       if self._last_audio_at is not None else 0)
-        fields = dict(self._last_tail_features)
+        fields = dict(base_features)
         fields.update({
             "decision": HOLD if self._ever_held else "commit",
-            "signal_category": self._last_signal_category,   # per-signal attribution
+            "signal_category": category,   # per-signal attribution (latched on resume)
             "hold_ms_applied": self._hold_ms_applied,
             "resumed_within_hold": self._resumed_within_hold,
             "ms_trailing_silence_at_fire": ms_silence,

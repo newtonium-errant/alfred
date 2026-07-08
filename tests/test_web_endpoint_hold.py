@@ -485,6 +485,41 @@ async def test_telemetry_never_logs_the_matched_word(tmp_path: Path) -> None:
     assert rec["hold_ms_applied"] > 0
 
 
+async def test_resumed_hold_latches_trigger_attribution(tmp_path: Path) -> None:
+    """Soak-critical: a hold TRIGGERED by a signal (conjunction) that RESUMES and
+    commits on a NON-signal tail must still record WHAT TRIGGERED it. Without the
+    latch the final classify_tail overwrites _last_* → the held record reads
+    signal_category=None / all-false ('held but nothing fired'), and the soak
+    can't break resumed holds down per-signal (contract §6)."""
+    from alfred.web.voice_endpoint_telemetry import (
+        VoiceEndpointTelemetry, _ENDPOINT_TASKS)
+    tel = VoiceEndpointTelemetry(
+        corpus_dir=str(tmp_path), web_user="u", voice_session_id="v")
+    w = _worker(await _collect([]), telemetry=tel.emit,
+                endpoint=EndpointHoldSettings(enabled=True, base_extend_ms=200))
+    # HOLD triggered by a trailing conjunction → latches signal=conjunction.
+    w._buffer = ["cancel the meeting and"]
+    await w._on_utterance_end("speech_final")
+    assert w._hold_task is not None
+    # Resume + fold, then commit on a NON-signal tail.
+    w._buffer.append("we are all set")
+    w._note_resume()
+    await w._on_utterance_end("speech_final")     # last='set' → COMMIT → emit
+    for _ in range(50):
+        pending = [t for t in list(_ENDPOINT_TASKS) if not t.done()]
+        if not pending:
+            break
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    rec = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
+    # The record reports WHAT TRIGGERED the hold — not the all-false final tail.
+    assert rec["decision"] == "hold" and rec["resumed_within_hold"] is True
+    assert rec["signal_category"] == "conjunction"
+    assert rec["trailing_is_conjunction"] is True
+    # And still no raw text / matched word.
+    assert "cancel" not in json.dumps(rec) and "meeting" not in json.dumps(rec)
+
+
 def test_telemetry_sink_drops_nonallowlisted_fields(tmp_path: Path) -> None:
     """Even if a caller passes a raw-text field, the sink allowlist drops it."""
     import asyncio as _a
