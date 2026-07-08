@@ -8,6 +8,7 @@ import {
   installVoiceGlobals,
   lastPC,
   makeTrack,
+  type FakeTrack,
   type VoiceGlobals,
 } from './helpers/webrtcFakes';
 
@@ -123,6 +124,72 @@ describe('useVoice reconnect hardening', () => {
     });
     expect(FakeRTCPeerConnection.instances.length).toBe(3); // a THIRD pc — the second reconnect
     expect(result.current.state).toBe('connecting');
+  });
+
+  it('Cancel (hangup) during the ~1.5s retry gap aborts cleanly — mic released, retry cancelled, no reconnect fires', async () => {
+    vi.useFakeTimers();
+    const tracks: FakeTrack[] = [];
+    h.getUserMedia.mockImplementation(() => {
+      const t = makeTrack();
+      tracks.push(t);
+      return Promise.resolve(new FakeMediaStream([t]));
+    });
+    const { result } = render();
+    await goLiveFake(result);
+    expect(tracks.length).toBe(1); // the live session's mic
+
+    act(() => lastPC().emitConnectionState('failed')); // drop → the ~1.5s retry gap
+    expect(result.current.state).toBe('idle'); // transient — retry timer armed
+    expect(result.current.reconnecting).toBe(true);
+    expect(tracks[0].stop).toHaveBeenCalled(); // dead session's mic already released
+
+    // Cancel mid-gap. hangup parks at 'idle' here, so this pins that hangup still
+    // aborts a pending reconnect (cancels the retry timer) rather than no-op'ing.
+    act(() => result.current.hangup());
+    expect(result.current.state).toBe('idle');
+    expect(result.current.reconnecting).toBe(false); // reconnect aborted
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000); // well past the retry delay
+    });
+    expect(FakeRTCPeerConnection.instances.length).toBe(1); // NO reconnect pc
+    expect(tracks.length).toBe(1); // NO second mic acquired — retry timer was cleared
+  });
+
+  it('Cancel (hangup) during a stalled reconnect attempt aborts cleanly — reconnect mic released, lands idle re-armed', async () => {
+    vi.useFakeTimers();
+    const tracks: FakeTrack[] = [];
+    h.getUserMedia.mockImplementation(() => {
+      const t = makeTrack();
+      tracks.push(t);
+      return Promise.resolve(new FakeMediaStream([t]));
+    });
+    const { result } = render();
+    await goLiveFake(result);
+    act(() => lastPC().emitConnectionState('failed')); // drop → auto-retry
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.state).toBe('connecting'); // reconnect in flight, never connects
+    expect(result.current.reconnecting).toBe(true);
+    expect(tracks.length).toBe(2); // the reconnect acquired a fresh mic
+    const pc2 = lastPC();
+
+    act(() => result.current.hangup()); // Cancel the stalled reconnect
+    expect(result.current.state).toBe('idle');
+    expect(result.current.reconnecting).toBe(false);
+    expect(pc2.closed).toBe(true);
+    expect(tracks[1].stop).toHaveBeenCalled(); // the reconnect's mic released
+
+    // Re-armed: a subsequent manual start() works from the clean idle slate.
+    await act(async () => {
+      const p = result.current.start();
+      await vi.advanceTimersByTimeAsync(0);
+      await p;
+    });
+    expect(result.current.state).toBe('connecting');
+    expect(tracks.length).toBe(3);
   });
 
   it('does NOT auto-retry on a user hangup', async () => {

@@ -112,16 +112,30 @@ export function VoicePanel({
                 stable "Reconnecting…" affordance across that window instead of the
                 per-state copy flickering. */}
             {reconnecting && (
-              <span
-                data-testid="voice-reconnecting"
-                className="inline-flex items-center gap-2 text-sm text-honeydew-600"
-              >
+              <>
                 <span
-                  aria-hidden
-                  className="h-2 w-2 rounded-full bg-honeydew-500 motion-safe:animate-pulse"
-                />
-                Reconnecting…
-              </span>
+                  data-testid="voice-reconnecting"
+                  className="inline-flex items-center gap-2 text-sm text-honeydew-600"
+                >
+                  <span
+                    aria-hidden
+                    className="h-2 w-2 rounded-full bg-honeydew-500 motion-safe:animate-pulse"
+                  />
+                  Reconnecting…
+                </span>
+                {/* An abort during the reconnect window — a stalled reconnect (up to
+                    the watchdog cap) would otherwise strand the user with nothing to
+                    tap. Wired to the same hangup teardown (stops mic/pc, cancels the
+                    retry timer + watchdogs, lands clean idle with Voice re-armed). */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  data-testid="voice-cancel-reconnect"
+                  onClick={() => voice.hangup()}
+                >
+                  Cancel
+                </Button>
+              </>
             )}
 
             {!reconnecting && state === 'idle' && (

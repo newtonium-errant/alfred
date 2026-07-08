@@ -233,6 +233,28 @@ describe('VoicePanel', () => {
       expect(screen.queryByTestId('voice-start')).toBeNull();
     });
 
+    it('offers a Cancel affordance during reconnecting, wired to hangup', () => {
+      setVoice({ state: 'requesting-mic', reconnecting: true });
+      render(<VoicePanel instance={HOME_INSTANCE_NAME} sessionKey="s1" />);
+      const cancel = screen.getByTestId('voice-cancel-reconnect');
+      expect(cancel.textContent).toContain('Cancel');
+      fireEvent.click(cancel);
+      expect(actions.hangup).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT show the reconnect Cancel in idle / live / error states', () => {
+      for (const s of ['idle', 'live', 'error'] as const) {
+        setVoice(
+          s === 'error'
+            ? { state: 'error', error: { code: 'connection-failed', message: 'x' } }
+            : { state: s, voiceSessionId: s === 'live' ? 'vs-1' : null },
+        );
+        const { unmount } = render(<VoicePanel instance={HOME_INSTANCE_NAME} sessionKey="s1" />);
+        expect(screen.queryByTestId('voice-cancel-reconnect')).toBeNull();
+        unmount();
+      }
+    });
+
     it('renders an error banner (covers the new codes) + a reset affordance', () => {
       setVoice({
         state: 'error',

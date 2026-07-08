@@ -262,6 +262,11 @@ export function useVoice(opts: {
   const retriedRef = useRef(false);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const startRef = useRef<() => Promise<void>>(async () => {});
+  // Mirror of the reconnecting flag so hangup() (a stable callback) can see it: the
+  // ~1.5s retry gap sits transiently at state==='idle' with a pending retry timer,
+  // and hangup's idle short-circuit would otherwise no-op there.
+  const reconnectingRef = useRef(false);
+  reconnectingRef.current = reconnecting;
   // A monotonic generation: any teardown / new start bumps it, and every awaited
   // step in start() (and every dc callback) re-checks it so an aborted attempt
   // cannot resurrect state.
@@ -380,7 +385,10 @@ export function useVoice(opts: {
 
   const hangup = useCallback(() => {
     const s = stateRef.current;
-    if (s === 'idle' || s === 'error' || s === 'closing') return;
+    // A reconnect in flight parks transiently at 'idle' during the retry gap (with a
+    // pending retry timer + reconnecting flag); hangup must still abort it — the
+    // teardown cancels the timer. Only a genuine idle/error/closing is a no-op.
+    if (!reconnectingRef.current && (s === 'idle' || s === 'error' || s === 'closing')) return;
     setState('closing');
     closeAndReset('idle');
   }, [closeAndReset, setState]);
