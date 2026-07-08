@@ -90,6 +90,41 @@ describe('useVoice reconnect hardening', () => {
     expect(pc1.closed).toBe(true); // old pc stays closed (no double-pc)
   });
 
+  it('RE-ARMS the one-shot budget on a healthy reconnect (a SECOND consecutive live drop auto-retries AGAIN)', async () => {
+    // The operator's repeated-drop scenario: the auto-retry budget is per live
+    // session, re-armed when a reconnect actually reaches 'connected' — so a second
+    // independent drop gets its own single retry (not exhausted by the first).
+    vi.useFakeTimers();
+    const { result } = render();
+    await goLiveFake(result);
+    expect(result.current.state).toBe('live');
+
+    // Drop 1 → auto-retry → the reconnect reaches live (re-arms retriedRef on 'connected').
+    act(() => lastPC().emitConnectionState('failed'));
+    expect(result.current.reconnecting).toBe(true);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(FakeRTCPeerConnection.instances.length).toBe(2); // first reconnect pc
+    act(() => lastPC().emitConnectionState('connected'));
+    expect(result.current.state).toBe('live');
+    expect(result.current.reconnecting).toBe(false);
+
+    // Drop 2 on the now-healthy session: the budget must have RE-ARMED, so a SECOND
+    // auto-retry genuinely fires (reconnecting again + a fresh reconnect attempt),
+    // NOT a straight-to-error because the budget was still spent.
+    act(() => lastPC().emitConnectionState('failed'));
+    expect(result.current.reconnecting).toBe(true); // <-- the re-arm pin
+    expect(result.current.state).not.toBe('error');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(FakeRTCPeerConnection.instances.length).toBe(3); // a THIRD pc — the second reconnect
+    expect(result.current.state).toBe('connecting');
+  });
+
   it('does NOT auto-retry on a user hangup', async () => {
     vi.useFakeTimers();
     const { result } = render();
