@@ -7,16 +7,16 @@ the accumulated finals-buffer tail. Complete thought → COMMIT in the same tick
 (zero added latency, structural). Mid-thought (trailing conjunction / filler /
 dangling function word) → the worker arms a bounded concurrent HOLD.
 
-TWO-AGENT SEAM: the prompt-tuner owns the SET CONTENTS of the three module-level
-frozensets (:data:`CONJUNCTIONS`, :data:`FILLERS`, :data:`DANGLING_FUNCTION_WORDS`
-+ :data:`FILLER_PHRASES`) and the decision-RULE wording, delivered as a frozen
-contract (``docs/endpoint_signal_contract.md``). This module owns the STRUCTURE:
+TWO-AGENT SEAM: the prompt-tuner owns the SET CONTENTS of the four module-level
+frozensets (:data:`CONJUNCTIONS`, :data:`FILLERS_SINGLE`, :data:`FILLERS_MULTI`,
+:data:`DANGLING`) and the decision-RULE wording, delivered as a frozen contract
+(``docs/endpoint_signal_contract.md``). This module owns the STRUCTURE:
 :class:`TailResult`'s shape, the tokenization, and the rule PLUMBING (the two
 prompt-tuner-owned rules — terminal-punct vetoes a weak hold; missing-punct
 alone never holds, only escalates a firing signal — are implemented here and
-must be reconciled against the contract's final wording when it lands). Swapping
-the contract's frozensets in is a DATA change; the contents below are a
-conservative STARTER lexicon (§2 of the scope), NOT the final calibration.
+reconciled against the contract's final wording). The frozensets below are the
+FINAL QA-cleared calibration (contract §2), swapped in from the conservative
+starter set.
 
 Privacy: :func:`classify_tail` is the SINGLE text-touching path — it returns the
 decision AND the feature booleans telemetry needs, so raw tail text is inspected

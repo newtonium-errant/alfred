@@ -22,11 +22,10 @@ builder has implemented this contract in `src/alfred/web/endpoint_hold.py`
 (`classify_tail`, `TailResult`, `EndpointHoldSettings`,
 `normalize_endpoint_hold_settings`) and wired it at the seam
 (`voice_stt.py:531` — `classify_tail(text, self._last_partial, self._endpoint)`).
-That module currently carries a CONSERVATIVE STARTER lexicon (scope §2), NOT the
-final calibration; the frozensets in §2 of THIS contract are the swap-in target
-— a DATA change to the module's identically-named sets (`CONJUNCTIONS`,
-`FILLERS`, `FILLER_PHRASES`, `DANGLING_FUNCTION_WORDS`). §3 documents the ACTUAL
-implemented signature and return shape.
+The frozensets in §2 of THIS contract have been swapped into that module
+(QA-cleared, no word moves), under the identifiers `CONJUNCTIONS`,
+`FILLERS_SINGLE`, `FILLERS_MULTI`, and `DANGLING` — verified matching the module
+contents. §3 documents the ACTUAL implemented signature and return shape.
 
 ---
 
@@ -91,12 +90,12 @@ Trailing coordinating/subordinating conjunctions that signal continuation.
 | `plus` | Noun terminal: "that's a plus", "a big plus". |
 | `nor` | Near-absent in spoken register; no recall. |
 
-### 2.2 FILLERS (`FILLERS`) + filler phrases (`FILLER_PHRASES`)
+### 2.2 FILLERS (`FILLERS_SINGLE`) + filler phrases (`FILLERS_MULTI`)
 Trailing hesitation markers.
 
 ```
-FILLERS         = {um, umm, uh, uhh, er, hmm}
-FILLER_PHRASES  = {let me, i mean}          (matched on the last two tokens)
+FILLERS_SINGLE  = {um, umm, uh, uhh, er, hmm}
+FILLERS_MULTI   = {let me, i mean}          (matched on the last two tokens)
 ```
 
 **Rationale (kept):**
@@ -117,7 +116,7 @@ FILLER_PHRASES  = {let me, i mean}          (matched on the last two tokens)
 | `kind of` / `sort of` | Scope-flagged. Standalone hedge replies are terminal: "kind of.", "sort of." (§6 monitors — the word-finding "it's kind of a… big deal" is genuine friction but too risky at ship.) |
 | `i guess` | Standalone/final resigned hedge terminal: "okay, I guess", "yeah I guess". |
 
-### 2.3 DANGLING_FUNCTION_WORDS
+### 2.3 DANGLING (`DANGLING`)
 Articles / prepositions / determiners / possessives an English utterance
 essentially never ends on. This is the tightest set — "near-zero FP as an
 utterance-final word" is a high bar.
@@ -158,8 +157,11 @@ considerations only.
 
 **Signature (as implemented in `endpoint_hold.py`):**
 `classify_tail(text: str, last_partial: str, settings: EndpointHoldSettings) -> TailResult`
-— a **pure function**. `TailResult` is a frozen dataclass with two fields:
-`decision` (`"commit"` | `"hold"`) and `features` (the telemetry dict, below).
+— a **pure function**. `TailResult` is a frozen dataclass with THREE fields:
+`decision` (`"commit"` | `"hold"`); `signal_category`
+(`"conjunction"` | `"filler"` | `"dangling"` | `None` — the per-signal
+attribution: the category that actually CAUSED the hold, `None` on any COMMIT);
+and `features` (the telemetry dict, below).
 COMMIT is the default; a HOLD requires a positive lexical signal.
 
 `last_partial` is a formal parameter but a **no-op for the Increment-1
@@ -177,7 +179,10 @@ identical: the classifier's verdict is a pure function of `text` + `settings`.)
 PRE-TOGGLE and PRE-VETO: a category that is vetoed (terminal punct) OR whose
 per-category toggle is OFF still records `trailing_is_X=true`, so a soak captures
 what WOULD have held. The toggle (§7) suppresses only the HOLD DECISION for that
-category — never its feature boolean.
+category — never its feature boolean. Distinguish the two content-derived
+outputs: the `features` booleans are PRE-toggle (what MATCHED); `signal_category`
+is POST-toggle (what CAUSED the hold, first-match precedence
+conjunction→filler→dangling, `None` if committed).
 
 ### 3.1 Evaluation order — NON-NEGOTIABLE
 
@@ -189,8 +194,11 @@ completeness cue. Therefore the veto MUST be evaluated on the raw string first;
 tokenization happens only afterward, and only for the lexical check.
 
 1. **VETO input — RAW string.** `stripped = text.rstrip()` (trailing WHITESPACE
-   only, no normalization). `ends_with_terminal_punct = bool(stripped) and
-   stripped[-1] in {".", "?", "!"}`. Source of the punctuation is `smart_format`
+   only, no normalization). Strip trailing closing quotes/brackets first
+   (`veto_str = stripped.rstrip(CLOSING_WRAP)`, where `CLOSING_WRAP` is the
+   closing quote/bracket set `"')]}»”’` — so `he said "go."` still vetoes), then
+   `ends_with_terminal_punct = bool(veto_str) and veto_str[-1] in
+   {".", "?", "!"}`. Source of the punctuation is `smart_format`
    (`config.py:203`, default `True`); if an operator sets `smart_format=false`
    the punctuation is simply never present, `ends_with_terminal_punct` is always
    `False`, and evaluation falls through to lexical-only (documented graceful
@@ -202,39 +210,47 @@ tokenization happens only afterward, and only for the lexical check.
    ("don't" stays "don't", "twenty-one" stays intact). This is the exact reason
    `normalize_text` must not be reused for the single token: it would split
    "don't"→"don t" and make the last token "t".
-3. **Last-two tokens — normalized path.** `last_two = " ".join(_tokens(text)[-2:])`
-   (using `barge_in._tokens`, the normalized path). This is SAFE for the phrase
-   check because no `FILLER_PHRASES` entry contains an apostrophe or internal
-   punctuation, so the apostrophe-mangling that bars `normalize_text` from the
-   single-token check is harmless here.
+3. **Last-two tokens — SAME whitespace-split + edge-strip (NOT `_tokens`).**
+   `last_two = f"{words[-2].strip(PUNCT_EDGES)} {last}"` when there are ≥2 words,
+   else `""`. The two-token phrase check uses the SAME apostrophe-safe
+   tokenization as the single token — `barge_in._tokens` / `normalize_text` are
+   NOT used anywhere in the classifier (they would mangle "don't"→"don t"). This
+   is the deliberate, QA-cleared choice.
 4. **Compute the category booleans + `n_tokens` UNCONDITIONALLY** (before the
    veto, before the toggles):
    - `trailing_is_conjunction = last ∈ CONJUNCTIONS`
-   - `trailing_is_filler = (last ∈ FILLERS) or (last_two ∈ FILLER_PHRASES)`
-   - `trailing_is_dangling = last ∈ DANGLING_FUNCTION_WORDS`
-   - `n_tokens = len(_tokens(text))`
+   - `trailing_is_filler = (last ∈ FILLERS_SINGLE) or (last_two ∈ FILLERS_MULTI)`
+   - `trailing_is_dangling = last ∈ DANGLING`
+   - `n_tokens = len(words)` — a WHITESPACE word count (the same `words` split
+     above), so the Increment-2 soak reads `n_tokens` consistently with the
+     tokenization the classifier actually used.
 
    Assemble the `features` dict now — it is returned on EVERY path (this is what
    lets a vetoed or toggled-off tail still record what would have held).
 5. **Completeness VETO.** If `ends_with_terminal_punct` → return
-   `TailResult("commit", features)`. High-confidence complete cue; overrides
-   every lexical signal. **Missing terminal punctuation ALONE never holds** —
-   absence-of-veto is not a signal; it only means evaluation proceeds to the
-   toggle-gated hold. At ship, punctuation is a **binary veto**; "escalation"
-   (scope §2) means missing-punct is *captured* as `ends_with_terminal_punct`
-   but does NOT itself size the hold in Increment 1.
-6. **Toggle-gated HOLD.** Otherwise HOLD iff any category fired AND its toggle is
-   on:
-   `hold = (trailing_is_conjunction and settings.hold_on_conjunction) or
-   (trailing_is_filler and settings.hold_on_filler) or (trailing_is_dangling and
-   settings.hold_on_dangling)`.
-   Return `TailResult("hold" if hold else "commit", features)`.
+   `TailResult("commit", None, features)` (`signal_category=None`).
+   High-confidence complete cue; overrides every lexical signal. **Missing
+   terminal punctuation ALONE never holds** — absence-of-veto is not a signal; it
+   only means evaluation proceeds to the toggle-gated hold. At ship, punctuation
+   is a **binary veto**; "escalation" (scope §2) means missing-punct is
+   *captured* as `ends_with_terminal_punct` but does NOT itself size the hold in
+   Increment 1.
+6. **Toggle-gated HOLD + attribution.** Otherwise pick `signal_category` as the
+   FIRST category that both fired AND has its toggle on, in precedence order
+   conjunction → filler → dangling:
+   `category = "conjunction"` if `trailing_is_conjunction and
+   settings.hold_on_conjunction`, elif `"filler"` if `trailing_is_filler and
+   settings.hold_on_filler`, elif `"dangling"` if `trailing_is_dangling and
+   settings.hold_on_dangling`, else `None`.
+   Return `TailResult("hold" if category else "commit", category, features)`.
 
-Structure note: the three category booleans are OR-combined into the decision, so
-"single-token vs multi-word filler" is not an ordered fallthrough —
-`trailing_is_filler` is simply `(last ∈ FILLERS) or (last_two ∈ FILLER_PHRASES)`.
-The result is identical to an ordered check because no `FILLER_PHRASES` entry's
-final word appears in any single-token set; the two can never disagree.
+Structure note: within `trailing_is_filler`, "single-token vs two-token phrase"
+is not an ordered fallthrough — it is simply `(last ∈ FILLERS_SINGLE) or
+(last_two ∈ FILLERS_MULTI)`. The result is identical to an ordered check because
+no `FILLERS_MULTI` entry's final word appears in `FILLERS_SINGLE`; the two can
+never disagree. (Across categories, `signal_category` DOES impose precedence —
+conjunction → filler → dangling, step 6 — for the ATTRIBUTION field only; the
+HOLD/COMMIT decision itself is order-independent.)
 
 ### 3.2 Caller-owned bypasses (never reach `classify_tail`, never hold)
 
@@ -249,12 +265,14 @@ refinement (only hold on a filler when substantive content precedes it).
 
 ### 3.3 Edge cases (benign, snappy-default)
 
-- **Empty / pure-punctuation trailing token.** An isolated pure-punctuation final
-  token (e.g. a stray `—`) strips to `""` via `PUNCT_EDGES`; `""` is in no set,
-  and with no second real token there is no phrase to form → all three category
-  booleans `False` → **COMMIT** (the snappy default). (A punctuation token that
-  trails two real filler-phrase words — e.g. "let me —" — still HOLDs via the
-  normalized last-two path, which is the correct mid-thought read.)
+- **Empty / pure-punctuation trailing token.** A trailing pure-punctuation token
+  (e.g. a stray `—`) strips to `""` via `PUNCT_EDGES`, so `last=""` (matches no
+  set) and `last_two` becomes `"<prev-word> "` (ending in the empty token, so it
+  matches no `FILLERS_MULTI` phrase) → all three category booleans `False` →
+  **COMMIT** (the snappy default). This is a consequence of the whitespace-split
+  tokenization: e.g. "let me —" → `last=""`, `last_two="me "` → COMMIT (the stray
+  dash suppresses the phrase match). Benign — a genuinely mid-thought "let me"
+  WITHOUT trailing punctuation still HOLDs (row 2, §4).
 - **Ellipsis.** Three ASCII periods (`...`) end in `.` → VETO → **COMMIT**. A
   single-character ellipsis `…` (U+2026) does NOT end in `.`/`?`/`!`, so it does
   not veto and falls through to the lexical check. Neither is a real production
@@ -271,9 +289,9 @@ Each row walks the ACTUAL rules of §3, not a paraphrase.
 | # | Tail (as `classify_tail` receives it) | Trace | Decision |
 |---|---|---|---|
 | 1 | `move it to the` | no `.?!`; last=`the` ∈ DANGLING | **HOLD** (word-finding) |
-| 2 | `let me` | no punct; last=`me` ∉ single sets; last-two=`let me` ∈ `FILLER_PHRASES` | **HOLD** |
+| 2 | `let me` | no punct; last=`me` ∉ `FILLERS_SINGLE`; last-two=`let me` ∈ `FILLERS_MULTI` | **HOLD** |
 | 3 | `I need to call him because` | no punct; last=`because` ∈ CONJUNCTIONS | **HOLD** |
-| 4 | `send it to Bob and, um` | no punct; last=`um` (edge-strip removes any trailing comma) ∈ `FILLERS` | **HOLD** |
+| 4 | `send it to Bob and, um` | no punct; last=`um` ∈ `FILLERS_SINGLE` (the comma sits on the non-final "and,") | **HOLD** |
 | 5 | `yes` | no punct (smart_format omits period on crisp final); last=`yes` ∉ all sets | **COMMIT** (proves missing-punct-alone ≠ hold; stays snappy) |
 | 6 | `move it to Friday.` | trailing `.` → VETO (and last token `friday` ∉ sets anyway) | **COMMIT** |
 | 7 | `I'll think about that` | no punct; last=`that` — deliberately EXCLUDED | **COMMIT** (that-trap avoided) |
@@ -298,7 +316,7 @@ independent QA/code review before merge:**
    `trailing_is_conjunction`, `trailing_is_filler`, `trailing_is_dangling`,
    `ends_with_terminal_punct`, `n_tokens`, `decision`, `hold_ms_applied`,
    `resumed_within_hold`, `ms_trailing_silence_at_fire`, and the per-signal
-   attribution category. The three category booleans are recorded on EVERY
+   attribution category (`signal_category`). The three category booleans are recorded on EVERY
    decision path — including a VETOED tail and a category whose toggle is OFF —
    so the soak corpus captures what WOULD have held (see the §3 return shape).
 2. **The raw tail text is NEVER logged.**
