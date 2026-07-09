@@ -85,7 +85,7 @@ describe('useVoice', () => {
     expect(mockConfig).toHaveBeenCalledTimes(1);
     expect(mockGetUserMedia).toHaveBeenCalledTimes(1);
     expect(mockOffer).toHaveBeenCalledTimes(1);
-    expect(mockOffer).toHaveBeenCalledWith('offer-sdp', undefined); // sdp + (no) sessionKey
+    expect(mockOffer).toHaveBeenCalledWith('offer-sdp', undefined, undefined); // sdp + (no) instance + (no) sessionKey
     // The dictation datachannel is created BEFORE the offer so its SCTP m-section
     // rides the initial vanilla-ICE offer (no renegotiation).
     const ops = lastPC().ops;
@@ -247,7 +247,7 @@ describe('useVoice', () => {
     await act(async () => {
       await result.current.start();
     });
-    expect(mockOffer).toHaveBeenCalledWith('offer-sdp', 'sess-abc');
+    expect(mockOffer).toHaveBeenCalledWith('offer-sdp', undefined, 'sess-abc');
   });
 
   it('fires the close beacon on unmount', async () => {

@@ -1,16 +1,19 @@
-import { useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Button } from '../ui/button';
 import { useVoice } from '../../lib/algernon/useVoice';
-import { HOME_INSTANCE_NAME, isHomeInstance } from '../../lib/algernon/instance';
+import { voiceApi } from '../../lib/algernon/voiceClient';
 import { subtle } from '../../lib/typography';
 
 // Voice affordance embedded in the chat surface (above the Composer). Two
 // fail-closed gates: a DISPLAY flag (NEXT_PUBLIC_VOICE_ENABLED — absent ⇒ renders
-// NOTHING) and a Salem-only instance guard (cross-instance ⇒ disabled control +
-// explicit hint). The authoritative gate is the backend (web.voice.enabled → GET
-// /voice/config). V1 adds the dictation surface: the live pill reflects the turn
-// sub-state (listening/thinking/replying), the transcript + streaming reply render
-// live, and the completed exchange is adopted into the chat thread via onTurnFinal.
+// NOTHING) and a per-instance BACKEND capability probe (GET /voice/config for the
+// selected instance). The backend is the authority: an instance with no web.voice
+// block answers available:false / 404, so voice hides NATURALLY for chat-only
+// instances (VERA, any no-voice instance) with no name special-case. While the
+// probe is in flight the panel shows an explicit "checking" state — never a dead
+// button (intentionally-left-blank). V1 adds the dictation surface: the live pill
+// reflects the turn sub-state, the transcript + streaming reply render live, and
+// the completed exchange is adopted into the chat thread via onTurnFinal.
 //
 // Reads process.env per-render (Next inlines NEXT_PUBLIC_* to a literal at build)
 // so the flag is testable via stubbed env without a module reset.
@@ -34,14 +37,35 @@ export function VoicePanel({
   onTurnFinal?: () => Promise<boolean>;
 }) {
   const audioRef = useRef<HTMLAudioElement>(null);
-  const homeOk = isHomeInstance(instance);
+  // Per-instance backend capability probe: null ⇒ still checking, true/false ⇒ the
+  // backend's answer. Re-probes on every instance switch. Fail-safe: any error ⇒
+  // unavailable (so a probe failure never shows a Voice button that can't connect).
+  const [voiceAvailable, setVoiceAvailable] = useState<boolean | null>(null);
   // Hooks run unconditionally (rules-of-hooks); the display gate returns below.
   const voice = useVoice({
     audioRef,
-    enabled: voiceDisplayEnabled() && homeOk,
+    enabled: voiceDisplayEnabled() && voiceAvailable === true,
+    instance,
     sessionKey,
     onTurnFinal,
   });
+
+  useEffect(() => {
+    if (!voiceDisplayEnabled()) return;
+    let cancelled = false;
+    setVoiceAvailable(null); // reset to "checking" while the new instance probes
+    voiceApi
+      .config(instance)
+      .then((cfg) => {
+        if (!cancelled) setVoiceAvailable(cfg.available === true);
+      })
+      .catch(() => {
+        if (!cancelled) setVoiceAvailable(false); // fail-safe: unavailable
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [instance]);
 
   if (!voiceDisplayEnabled()) return null;
 
@@ -95,15 +119,16 @@ export function VoicePanel({
       {/* Mounted whenever the panel renders so it exists BEFORE ontrack fires. */}
       <audio ref={audioRef} autoPlay playsInline className="hidden" data-testid="voice-audio" />
 
-      {!homeOk ? (
-        <div className="flex flex-col gap-1">
-          <Button variant="outline" size="sm" data-testid="voice-start" disabled>
-            🎙 Voice
-          </Button>
-          <p className={subtle} data-testid="voice-cross-instance-hint">
-            Voice is available with {HOME_INSTANCE_NAME} only (for now).
-          </p>
-        </div>
+      {voiceAvailable === null ? (
+        // Probe in flight — an explicit "checking" state, never a dead button.
+        <span data-testid="voice-availability-checking" className={subtle}>
+          Checking voice…
+        </span>
+      ) : voiceAvailable === false ? (
+        // The backend has no voice for this instance (chat-only) — hide the control.
+        <p className={subtle} data-testid="voice-unavailable-hint">
+          Voice isn’t available for this instance — you can still chat.
+        </p>
       ) : (
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-2">

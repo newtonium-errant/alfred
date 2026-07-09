@@ -195,10 +195,10 @@ export default function ChatPage() {
           )}
 
           {/* Voice panel. Renders nothing unless NEXT_PUBLIC_VOICE_ENABLED is on; a
-              cross-instance selection disables it (Salem-only). `instance` drives the
-              auto-hangup-on-switch; `sessionKey` binds the voice offer to this chat
-              session and gates start; `onTurnFinal` adopts a completed voice turn
-              into the thread. */}
+              per-instance /voice/config probe then hides it for chat-only instances.
+              `instance` drives the probe + the auto-hangup-on-switch; `sessionKey`
+              binds the voice offer to this chat session and gates start; `onTurnFinal`
+              adopts a completed voice turn into the thread. */}
           <VoicePanel
             instance={instance}
             sessionKey={sessionKey}
