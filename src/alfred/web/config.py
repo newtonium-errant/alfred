@@ -201,6 +201,13 @@ class WebVoiceSttConfig:
     utterance_end_ms: int = 1000  # word-gap fallback; 0=off; clamp [1000,5000]
     min_utterance_chars: int = 3  # EOU noise floor (mirrors talker stt)
     smart_format: bool = True
+    # Domain-term biasing for the LIVE stream (clinic-capture Piece 2a). NOT
+    # parsed from the web.voice.stt block — populated at mount from the shared
+    # per-instance ``talker.stt.vocab_terms`` (the SAME list the batch/shadow STT
+    # path uses) so the path the operator actually dictates into is biased too.
+    # ``build_deepgram_url`` maps these to Deepgram ``keyterm`` (nova-3) /
+    # ``keywords`` (nova-2). Empty = no biasing (byte-identical to today).
+    vocab_terms: list[str] = field(default_factory=list)
     shadow_capture: WebSttShadowCaptureConfig = field(
         default_factory=WebSttShadowCaptureConfig)
     endpoint_hold: WebVoiceEndpointHoldConfig = field(

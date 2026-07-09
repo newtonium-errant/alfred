@@ -288,6 +288,106 @@ async def test_process_capture_session_failure_path(tmp_path: Path) -> None:
     assert "cap4" in follow_ups[0]
 
 
+# --- Piece 2c: discarded_noise (code-sourced) -----------------------------
+
+
+def test_render_summary_has_discarded_noise_section() -> None:
+    """The rendered summary carries a ``### Discarded Noise`` section — items
+    when non-empty, ``(none)`` per ILB otherwise. Mutation: drop the section →
+    fails."""
+    from alfred.telegram.capture_batch import (
+        StructuredSummary, render_summary_markdown)
+
+    md = render_summary_markdown(
+        StructuredSummary(discarded_noise=["Thank you for watching!"]))
+    assert "### Discarded Noise" in md
+    assert "- Thank you for watching!" in md
+
+    md_none = render_summary_markdown(StructuredSummary())
+    assert "### Discarded Noise\n(none)" in md_none
+
+
+@pytest.mark.asyncio
+async def test_process_capture_session_filters_noise_and_reports(
+    tmp_path: Path,
+) -> None:
+    """A caption artifact in the transcript is dropped BEFORE structuring,
+    recorded as discarded_noise on the record, and the honest follow-up reports
+    the action-item + noise counts. Mutation: skip _filter_transcript_noise /
+    the replace() attach → 'Discarded Noise' has (none) + no 'Dropped' in the
+    follow-up → fails."""
+    rel = _make_session_record(tmp_path, "Voice Session — 2026-07-09 1002 cap9")
+    client = FakeAnthropicClient([
+        _tool_use_response({
+            "topics": ["clinic tasks"],
+            "decisions": [],
+            "open_questions": [],
+            "action_items": ["write the note", "invoice the room"],
+            "key_insights": [],
+            "raw_contradictions": [],
+        })
+    ])
+    follow_ups: list[str] = []
+
+    async def _sender(text: str) -> None:
+        follow_ups.append(text)
+
+    await capture_batch.process_capture_session(
+        client=client,
+        vault_path=tmp_path,
+        session_rel_path=rel,
+        transcript=[
+            {"role": "user", "content": "write the note and invoice the room",
+             "_ts": "2026-07-09T10:00:00+00:00"},
+            {"role": "user", "content": "Thank you for watching",
+             "_ts": "2026-07-09T10:00:05+00:00"},
+        ],
+        model="claude-sonnet-4-6",
+        send_follow_up=_sender,
+        short_id="cap9",
+    )
+
+    import frontmatter
+    post = frontmatter.load(tmp_path / rel)
+    # The caption was recorded as discarded noise (not structured into a bucket).
+    assert "### Discarded Noise" in post.content
+    assert "- Thank you for watching" in post.content
+    # Honest follow-up: action-item count + the noise-dropped note.
+    assert len(follow_ups) == 1
+    assert "2 action item(s)" in follow_ups[0]
+    assert "Dropped 1 noise line(s)" in follow_ups[0]
+
+
+@pytest.mark.asyncio
+async def test_process_capture_session_clean_transcript_no_noise_note(
+    tmp_path: Path,
+) -> None:
+    """A clean (already live-filtered) transcript → discarded_noise empty →
+    the follow-up carries NO 'Dropped' note (honest: nothing to report)."""
+    rel = _make_session_record(tmp_path, "Voice Session — 2026-07-09 1003 cap10")
+    client = FakeAnthropicClient([
+        _tool_use_response({
+            "topics": ["t"], "decisions": [], "open_questions": [],
+            "action_items": ["x"], "key_insights": [], "raw_contradictions": [],
+        })
+    ])
+    follow_ups: list[str] = []
+
+    async def _sender(text: str) -> None:
+        follow_ups.append(text)
+
+    await capture_batch.process_capture_session(
+        client=client, vault_path=tmp_path, session_rel_path=rel,
+        transcript=[{"role": "user", "content": "just a clean clinical note",
+                     "_ts": "2026-07-09T10:00:00+00:00"}],
+        model="claude-sonnet-4-6", send_follow_up=_sender, short_id="cap10",
+    )
+    assert "Dropped" not in follow_ups[0]
+    import frontmatter
+    post = frontmatter.load(tmp_path / rel)
+    assert "### Discarded Noise\n(none)" in post.content
+
+
 # --- _flatten_transcript --------------------------------------------------
 
 

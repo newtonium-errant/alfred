@@ -798,6 +798,25 @@ telegram:
     provider: "groq"
     api_key: "${GROQ_API_KEY}"
     model: "whisper-large-v3"
+    # Domain-term biasing. Defaults to a shared Algernon/Stoicism set (see
+    # _DEFAULT_STT_VOCAB_TERMS). This SAME list biases BOTH the Telegram STT
+    # chain (Whisper prompt= / Deepgram keywords) AND the live web/PWA Deepgram
+    # stream (keyterm on nova-3 / keywords on nova-2 — clinic-capture Piece 2a).
+    # Override PER INSTANCE — do NOT push instance-specific vocab into the shared
+    # default. A CLINIC instance (e.g. Hypatia) should seed its NON-PHI clinical
+    # + administrative vocab so dictated action items transcribe cleanly.
+    # NEVER seed patient names or any PHI — bias only stable non-PHI terms:
+    #   vocab_terms:
+    #     - "Hypatia"
+    #     - "VAC"                     # Veterans Affairs Canada
+    #     - "DTC"                     # Disability Tax Credit
+    #     - "disability tax credit"
+    #     - "EI"                      # Employment Insurance
+    #     - "Jane"                    # Jane App (practice-management software)
+    #     - "QuickBooks"
+    #     # + your practice's common injectable / medication BRAND names
+    #     #   (brand names are not PHI), e.g. "Botox", "Ozempic".
+    #     #   Do NOT add patient names.
   # wk2b: opt-in text-to-speech for /brief command. If this section is
   # absent, /brief replies "not configured". Default voice is "Rachel"
   # (ElevenLabs library default); model is Turbo v2.5 for low latency.

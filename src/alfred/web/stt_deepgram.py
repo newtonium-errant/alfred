@@ -67,6 +67,13 @@ def build_deepgram_url(cfg: "WebVoiceSttConfig") -> str:
     UtteranceEnd). ``smart_format`` comes from config (§1.8). ``utterance_end_ms``
     is omitted when 0 (fallback disabled). ``vad_events`` is deliberately
     omitted (its only payload is SpeechStarted, a V3 barge-in concern).
+
+    Domain-term biasing (clinic-capture Piece 2a): ``cfg.vocab_terms`` (the
+    shared per-instance vocab, injected at mount) is mapped to Deepgram's
+    keyword-boosting param — ``keyterm`` on nova-3 (Keyterm Prompting; ``keywords``
+    is NOT supported on nova-3), ``keywords`` on nova-2 and earlier. One repeated
+    param per term (Deepgram's multi-value convention), mirroring the Telegram
+    Deepgram backend. Empty vocab → no biasing params (byte-identical to today).
     """
     params = [
         ("encoding", "linear16"),
@@ -80,6 +87,12 @@ def build_deepgram_url(cfg: "WebVoiceSttConfig") -> str:
     ]
     if cfg.utterance_end_ms > 0:
         params.append(("utterance_end_ms", str(cfg.utterance_end_ms)))
+    # nova-3 → keyterm; nova-2/earlier → keywords (see docstring).
+    kw_param = "keyterm" if str(cfg.model).startswith("nova-3") else "keywords"
+    for term in (getattr(cfg, "vocab_terms", None) or []):
+        t = (term or "").strip()
+        if t:
+            params.append((kw_param, t))
     return "wss://api.deepgram.com/v1/listen?" + urlencode(params)
 
 

@@ -581,6 +581,21 @@ def _build_assistant_stt(voice: Any, talker_config: Any = None):
     stt_norm, warnings = normalize_stt_settings(stt)
     for warning in warnings:
         log.warning("web.voice.stt.config_clamped", detail=warning)
+    # Bias the LIVE Deepgram stream with the SAME per-instance vocab the
+    # batch/shadow STT path uses (clinic-capture Piece 2a). The live stream
+    # previously ignored vocab entirely — yet it is the path the operator
+    # actually dictates into; seeding vocab that never reaches it is theatre.
+    # build_deepgram_url maps these to keyterm (nova-3) / keywords (nova-2).
+    stt_norm.vocab_terms = list(
+        getattr(getattr(talker_config, "stt", None), "vocab_terms", []) or []
+    )
+    # Intentionally-left-blank: 0 = no biasing (distinguishable from broken).
+    log.info(
+        "web.voice.stt.vocab_wired",
+        terms=len(stt_norm.vocab_terms),
+        keyword_param="keyterm" if str(stt_norm.model).startswith("nova-3")
+        else "keywords",
+    )
     shadow_factory = _build_stt_shadow(voice, talker_config, stt_norm)
 
     # Adaptive endpointing (default-OFF). Mount-clamp mirrors normalize_stt.
@@ -607,11 +622,19 @@ def _build_assistant_stt(voice: Any, talker_config: Any = None):
         # Intentionally-left-blank: idle distinguishable from broken.
         log.info("web.voice.stt.endpoint_hold_disabled", reason="not_enabled")
 
+    # Clinical-safety denylist (Piece 2b): the SAME per-instance extra terms the
+    # Telegram voice seam uses (talker.stt.hallucination_denylist), unioned onto
+    # the universal default inside the worker's filter.
+    stt_denylist = list(
+        getattr(getattr(talker_config, "stt", None), "hallucination_denylist", [])
+        or []
+    )
     return _make_stt_worker_factory(
         stt_norm, shadow_factory,
         endpoint_settings=endpoint_settings,
         endpoint_telemetry_dir=telemetry_dir,
         instance_name=instance_name,
+        stt_denylist=stt_denylist,
     )
 
 
@@ -694,7 +717,7 @@ def _build_stt_shadow(voice: Any, talker_config: Any, stt_norm: Any):
 def _make_stt_worker_factory(
     stt_norm: Any, shadow_factory: Any = None, *,
     endpoint_settings: Any = None, endpoint_telemetry_dir: str = "",
-    instance_name: str = "",
+    instance_name: str = "", stt_denylist: "list[str] | None" = None,
 ):
     """Return ``factory(vid, driver, manager) -> VoiceSttWorker`` closing over
     the normalized STT config. The worker's callbacks bridge to the per-session
@@ -754,6 +777,7 @@ def _make_stt_worker_factory(
             shadow_capture=shadow.capture if shadow is not None else None,
             endpoint_settings=endpoint_settings,
             endpoint_telemetry=endpoint_telemetry,
+            stt_denylist=stt_denylist,
         )
         # Release the hello-gate when the client's DC hello arrives. With no
         # driver (no feedback channel) open it immediately — a DC-less session

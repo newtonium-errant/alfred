@@ -29,6 +29,7 @@ import asyncio
 import math
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from alfred.common.stt_noise import filter_stt_noise
 from .endpoint_hold import HOLD, EndpointHoldSettings, classify_tail
 from .stt_stream import (
     EVENT_ERROR,
@@ -124,6 +125,7 @@ class VoiceSttWorker:
         shadow_capture: Callable[[bytes, str, float], None] | None = None,
         endpoint_settings: "EndpointHoldSettings | None" = None,
         endpoint_telemetry: Callable[[dict], None] | None = None,
+        stt_denylist: "list[str] | None" = None,
     ) -> None:
         self._provider = provider
         self._vid = voice_session_id
@@ -131,6 +133,11 @@ class VoiceSttWorker:
         self._on_partial = on_partial
         self._on_fatal = on_fatal
         self._min_utterance_chars = min_utterance_chars
+        # Clinical-safety denylist (clinic-capture Piece 2b): per-instance EXTRA
+        # caption-artifact terms unioned onto the universal default. Applied in
+        # _commit_inline BEFORE the live turn fires. None ⇒ the universal default
+        # only (still active — captions are never allowed to drive a turn).
+        self._stt_denylist = stt_denylist
         self._sample_rate = sample_rate
         self._chunk_ms = chunk_ms
         self._resample_fn = resample_fn
@@ -584,20 +591,37 @@ class VoiceSttWorker:
         byte-identical to today)."""
         text = " ".join(self._buffer).strip()
         committed_n = len(self._buffer)   # segment count being committed NOW
+        # Clinical-safety (clinic-capture Piece 2b): drop caption-artifact
+        # hallucinations ("Thank you for watching!") BEFORE the LIVE turn fires —
+        # a hallucinated "send a prescription" must never drive an action. A
+        # fully-hallucinated utterance filters to "" → NO turn fires (below).
+        # Line-level exact match; real content is never substring-nuked.
+        if text:
+            filtered, dropped_noise = filter_stt_noise(text, self._stt_denylist)
+            if dropped_noise:
+                text = filtered
+                log.info("web.voice.stt.noise_filtered",
+                         voice_session_id=self._vid, dropped=len(dropped_noise))
         utt_pcm = self._snapshot_utt_pcm()
         self._utterances += 1
         extra = ({"held": self._ever_held, "hold_ms": self._hold_ms_applied}
                  if decision is not None else {})
         log.info("web.voice.stt.utterance_end", voice_session_id=self._vid,
                  trigger=trigger, transcript_chars=len(text), **extra)
-        await self._on_utterance(text)   # LIVE TURN — unchanged
-        if self._shadow_capture is not None and utt_pcm:
-            duration_s = len(utt_pcm) / (self._sample_rate * 2)
-            try:
-                self._shadow_capture(utt_pcm, text, duration_s)
-            except Exception:  # noqa: BLE001 — never break the pump
-                log.warning("web.voice.stt.shadow_hook_raised",
-                            voice_session_id=self._vid)
+        if text:
+            await self._on_utterance(text)   # LIVE TURN — only real content
+            if self._shadow_capture is not None and utt_pcm:
+                duration_s = len(utt_pcm) / (self._sample_rate * 2)
+                try:
+                    self._shadow_capture(utt_pcm, text, duration_s)
+                except Exception:  # noqa: BLE001 — never break the pump
+                    log.warning("web.voice.stt.shadow_hook_raised",
+                                voice_session_id=self._vid)
+        else:
+            # Intentionally-left-blank: the whole utterance was caption noise —
+            # dropped, no turn. Distinguishable from a silent bug.
+            log.info("web.voice.stt.utterance_all_noise",
+                     voice_session_id=self._vid)
         if decision is not None:
             self._emit_endpoint_telemetry()
         # LATE-FINAL CARRY-FORWARD (endpoint-hold #1). When this runs from the

@@ -29,10 +29,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final
 
+from alfred.common.stt_noise import filter_stt_noise
 from alfred.vault import ops
 
 from ._anthropic_compat import messages_create_kwargs
@@ -48,9 +49,16 @@ log = get_logger(__name__)
 class StructuredSummary:
     """The structured output of the capture batch pass.
 
-    Fields match the tool_use schema enforced on Sonnet. All are lists
-    of strings — empty lists are legal (a capture with no explicit
+    The six bucket fields match the tool_use schema enforced on Sonnet. All are
+    lists of strings — empty lists are legal (a capture with no explicit
     decisions, for example).
+
+    ``discarded_noise`` is NOT a Sonnet bucket — it is CODE-SOURCED (clinic-
+    capture Piece 2c): the deterministic ``common.stt_noise`` filter runs over
+    the transcript BEFORE structuring and records the caption-artifact lines it
+    dropped. It is a transparency + self-correcting-glossary surface (the
+    operator sees what was filtered and can correct a false-drop), and is
+    normally empty for a live-filtered capture (the STT seams already cleaned it).
     """
 
     topics: list[str] = field(default_factory=list)
@@ -59,6 +67,7 @@ class StructuredSummary:
     action_items: list[str] = field(default_factory=list)
     key_insights: list[str] = field(default_factory=list)
     raw_contradictions: list[str] = field(default_factory=list)
+    discarded_noise: list[str] = field(default_factory=list)
 
 
 # --- Dynamic-block markers -----------------------------------------------
@@ -191,6 +200,31 @@ def _flatten_transcript(transcript: list[dict[str, Any]]) -> str:
         else:
             lines.append(text)
     return "\n".join(lines)
+
+
+def _filter_transcript_noise(
+    transcript: list[dict[str, Any]],
+) -> "tuple[list[dict[str, Any]], list[str]]":
+    """Drop caption-artifact hallucination lines from the transcript BEFORE
+    structuring (clinic-capture Piece 2c). Defensive backstop: the live STT
+    seams already filter, so for a live-captured session this drops NOTHING
+    (``discarded_noise`` = []); it earns its keep on bypass paths (a synthetic
+    transcript, an ``/extract`` re-run over a raw session). Uses the universal
+    ``common.stt_noise`` default set. Returns ``(filtered_transcript, dropped)``;
+    only string-content user turns are examined (tool/assistant turns pass
+    through untouched)."""
+    out: list[dict[str, Any]] = []
+    dropped_all: list[str] = []
+    for turn in transcript:
+        content = turn.get("content")
+        if turn.get("role") == "user" and isinstance(content, str) and content:
+            kept, dropped = filter_stt_noise(content)
+            if dropped:
+                dropped_all.extend(dropped)
+                out.append({**turn, "content": kept})
+                continue
+        out.append(turn)
+    return out, dropped_all
 
 
 def _first_user_text(transcript: list[dict[str, Any]]) -> str:
@@ -338,6 +372,10 @@ def render_summary_markdown(
     _section("Action Items", summary.action_items)
     _section("Key Insights", summary.key_insights)
     _section("Raw Contradictions", summary.raw_contradictions)
+    # Discarded Noise (clinic-capture Piece 2c) — caption-artifact lines the
+    # deterministic filter dropped pre-structuring. ``(none)`` per
+    # intentionally-left-blank when nothing was dropped (the live-filtered norm).
+    _section("Discarded Noise", summary.discarded_noise)
 
     # Re-encounters (7th section, at end). Pre-rendered body in,
     # heading added here so the section shape matches its siblings.
@@ -875,6 +913,17 @@ async def process_capture_session(
                 user_turn_count=user_turn_count,
             )
 
+    # Clinic-capture Piece 2c: drop caption-artifact noise BEFORE structuring so
+    # Sonnet never structures a hallucinated line into an action item, and record
+    # what was dropped as ``discarded_noise`` (code-sourced transparency surface,
+    # normally empty for a live-filtered capture).
+    transcript, discarded_noise = _filter_transcript_noise(transcript)
+    if discarded_noise:
+        log.info(
+            "talker.capture.noise_filtered",
+            session_rel_path=session_rel_path, dropped=len(discarded_noise),
+        )
+
     try:
         summary = await run_batch_structuring(client, transcript, model)
     except Exception as exc:  # noqa: BLE001
@@ -909,6 +958,10 @@ async def process_capture_session(
                     error=str(send_exc),
                 )
         return
+
+    # Attach the code-sourced discarded-noise (Piece 2c) to the Sonnet summary
+    # so it renders + reports downstream. Sonnet never sees or emits this field.
+    summary = replace(summary, discarded_noise=discarded_noise)
 
     # Re-encounter scan — recency-capped vault search over source /
     # author / topic terms. Failure is non-fatal; section renders
@@ -1016,12 +1069,24 @@ async def process_capture_session(
         topics=len(summary.topics),
         decisions=len(summary.decisions),
         action_items=len(summary.action_items),
+        discarded_noise=len(summary.discarded_noise),
     )
 
     if send_follow_up is not None:
+        # Honest follow-up (clinic-capture Piece 2c): report WHAT was captured —
+        # action-item + topic counts, and (only when non-zero) the noise dropped
+        # — so the operator knows what landed vs was filtered, not a generic
+        # "structured" with no substance signal.
+        n_items = len(summary.action_items)
+        n_topics = len(summary.topics)
+        noise_note = (
+            f" Dropped {len(summary.discarded_noise)} noise line(s)."
+            if summary.discarded_noise else ""
+        )
         try:
             await send_follow_up(
-                f"Capture structured ({short_id}). "
+                f"Capture structured ({short_id}): {n_items} action item(s), "
+                f"{n_topics} topic(s).{noise_note} "
                 f"/extract {short_id} for notes, /brief {short_id} for audio."
             )
         except Exception as send_exc:  # noqa: BLE001
@@ -1113,6 +1178,7 @@ def summary_to_dict(summary: StructuredSummary) -> dict[str, Any]:
         "action_items": list(summary.action_items),
         "key_insights": list(summary.key_insights),
         "raw_contradictions": list(summary.raw_contradictions),
+        "discarded_noise": list(summary.discarded_noise),
     }
 
 

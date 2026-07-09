@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from alfred.common.stt_noise import filter_stt_noise
 from ._anthropic_compat import messages_create_kwargs
 from .state import StateManager
 from .utils import get_logger
@@ -1127,6 +1128,20 @@ def append_turn(
     }
     if role == "user":
         turn["_kind"] = kind
+        # Clinical-safety BACKSTOP (clinic-capture Piece 2b). The PRIMARY drop is
+        # at the STT seams (web voice_stt + the Telegram voice handler); this
+        # catches a caption artifact on any VOICE user turn that reached the
+        # transcript via a path that bypassed them. Universal-default denylist
+        # only (no per-instance config at this layer); a no-op on already-filtered
+        # or typed text.
+        if kind == "voice" and isinstance(content, str) and content:
+            kept, dropped = filter_stt_noise(content)
+            if dropped:
+                turn["content"] = kept
+                log.info(
+                    "talker.stt.noise_filtered_backstop",
+                    session_id=session.session_id, dropped=len(dropped),
+                )
     session.transcript.append(turn)
     session.last_message_at = now
     _persist(state, session)

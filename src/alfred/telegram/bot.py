@@ -4078,9 +4078,30 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # same as NoTranscript: ask the user to type, preserving today's
     # reprompt-on-empty UX. (The no-re-spend stays at the router; the UX
     # decision stays at the bot.)
+    # Clinical-safety (clinic-capture Piece 2b): drop caption-artifact
+    # hallucinations ("Thank you for watching!") from the served transcript
+    # BEFORE it drives a live turn. A fully-hallucinated note filters to empty →
+    # the reprompt-on-empty path below (ask the user to retype), exactly as a
+    # genuine no-transcript. Line-level exact match — real content is never
+    # substring-nuked. Byte-identical when the transcript is clean.
+    served_text = (
+        result.text if isinstance(result, stt_backends.SttResult) else ""
+    )
+    if isinstance(result, stt_backends.SttResult):
+        from alfred.common.stt_noise import filter_stt_noise
+        served_text, dropped_noise = filter_stt_noise(
+            served_text, config.stt.hallucination_denylist,
+        )
+        if dropped_noise:
+            log.info(
+                "talker.stt.noise_filtered",
+                chat_id=chat_id, dropped=len(dropped_noise),
+                detail="caption-artifact hallucination(s) dropped pre-turn",
+            )
+
     if (
         isinstance(result, stt_backends.NoTranscript)
-        or not result.text.strip()
+        or not served_text.strip()
     ):
         reason = (
             result.reason if isinstance(result, stt_backends.NoTranscript)
@@ -4092,7 +4113,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    await handle_message(update, ctx, text=result.text, voice=True)
+    await handle_message(update, ctx, text=served_text, voice=True)
 
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

@@ -638,3 +638,43 @@ def test_telemetry_sink_drops_nonallowlisted_fields(tmp_path: Path) -> None:
     rec = json.loads(raw.splitlines()[-1])
     assert rec["decision"] == "commit" and rec["trailing_is_filler"] is True
     assert "text" not in rec and "tail" not in rec
+
+
+# ---------------------------------------------------------------------------
+# Clinic-capture Piece 2b — STT hallucination denylist at the web commit seam
+# (a caption artifact must NEVER drive a live turn — clinical-safety control).
+# ---------------------------------------------------------------------------
+
+
+async def test_caption_hallucination_never_drives_a_turn() -> None:
+    """A fully-hallucinated utterance ("Thank you for watching!") is filtered to
+    empty in _commit_inline → NO on_utterance fires. Mutation: remove the
+    filter → the caption drives a live turn → ``got`` is non-empty → fails."""
+    got: list[str] = []
+    w = _worker(await _collect(got))                  # default denylist active
+    w._buffer = ["Thank you for watching!"]
+    with structlog.testing.capture_logs() as cap:
+        await w._on_utterance_end("speech_final")
+    assert got == []                                  # NO live turn fired
+    assert [c for c in cap
+            if c.get("event") == "web.voice.stt.utterance_all_noise"]
+
+
+async def test_real_utterance_survives_the_denylist() -> None:
+    """A genuine clinical utterance is untouched — the filter is exact-line, so
+    real content always fires."""
+    got: list[str] = []
+    w = _worker(await _collect(got))
+    w._buffer = ["send the prescription refill."]
+    await w._on_utterance_end("speech_final")
+    assert got == ["send the prescription refill."]
+
+
+async def test_per_instance_denylist_term_dropped_at_commit() -> None:
+    """A per-instance extra term (unioned onto the default) is dropped too."""
+    got: list[str] = []
+    w = _worker(await _collect(got))
+    w._stt_denylist = ["Hedgesha"]                    # per-instance extra
+    w._buffer = ["Hedgesha"]
+    await w._on_utterance_end("speech_final")
+    assert got == []

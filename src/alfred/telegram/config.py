@@ -209,6 +209,11 @@ class STTConfig:
     vocab_terms: list[str] = field(
         default_factory=lambda: list(_DEFAULT_STT_VOCAB_TERMS)
     )
+    # Per-instance EXTRA caption-artifact denylist (clinic-capture Piece 2b).
+    # UNIONS onto the universal ``common.stt_noise`` default (never replaces it).
+    # Empty = defaults only. Dropped at the STT seams BEFORE a hallucinated line
+    # can drive a live turn or land in structuring (clinical-safety control).
+    hallucination_denylist: list[str] = field(default_factory=list)
     total_budget_s: float = 30.0           # global per-message chain deadline
     min_transcript_chars: int = 3          # "empty" threshold (post-trim)
     chain: list[SttBackendConfig] = field(default_factory=list)
