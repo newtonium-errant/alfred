@@ -132,6 +132,10 @@ export const voiceOfferBodySchema = z.object({
   sdp: z.string().min(1).max(MAX_SDP_CHARS),
   type: z.literal('offer'),
   session_key: z.string().min(1).max(128).optional(),
+  // Cross-instance selector (multi-instance voice switcher). Absent / the home name
+  // ⇒ the existing same-instance session path. BFF-only — stripped before relay
+  // (mirror chatTurnBodySchema.instance).
+  instance: chatInstanceSchema.optional(),
 });
 
 export type VoiceOfferBody = z.infer<typeof voiceOfferBodySchema>;
@@ -140,6 +144,10 @@ export type VoiceOfferBody = z.infer<typeof voiceOfferBodySchema>;
 // guard (the backend is the authority on the exact format); absent ⇒ 400.
 export const voiceCloseBodySchema = z.object({
   voice_session_id: z.string().min(1).max(128),
+  // Cross-instance selector — routes the close to the session's OWN instance.
+  // BFF-only, stripped before relay (the close must reach the backend that minted
+  // the session, not the currently-selected one).
+  instance: chatInstanceSchema.optional(),
 });
 
 export type VoiceCloseBody = z.infer<typeof voiceCloseBodySchema>;

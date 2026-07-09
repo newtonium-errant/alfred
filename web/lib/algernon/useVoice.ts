@@ -211,12 +211,14 @@ function mapSignalError(e: unknown): VoiceErrorCode {
 export function useVoice(opts: {
   audioRef: RefObject<HTMLAudioElement>;
   enabled: boolean;
+  /** The instance this call binds to (multi-instance voice). Absent ⇒ home. */
+  instance?: string;
   /** Bound into voiceApi.offer at offer time (the V0 session_key forward-hook). */
   sessionKey?: string | null;
   /** Thread adoption after a completed turn; true ⇒ clear the in-panel reply. */
   onTurnFinal?: () => Promise<boolean>;
 }): UseVoice {
-  const { audioRef, enabled } = opts;
+  const { audioRef, enabled, instance } = opts;
 
   const [state, setStateRaw] = useState<VoiceState>('idle');
   const [muted, setMuted] = useState(false);
@@ -242,6 +244,11 @@ export function useVoice(opts: {
   const streamRef = useRef<MediaStream | null>(null);
   const micTrackRef = useRef<MediaStreamTrack | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+  // The instance the CURRENT live session was offered against (captured at offer
+  // success). The close beacon MUST route through THIS, not the currently-selected
+  // instance — else a Salem→Hypatia switch sends Salem's close to Hypatia's backend
+  // and strands/leaks the Salem session.
+  const sessionInstanceRef = useRef<string | undefined>(undefined);
   const closingRef = useRef(false); // suppress the 'closed' event we cause ourselves
   const dictationActiveRef = useRef(false); // true once state:ready seen
   const assistantPipelineRef = useRef(false); // config.pipeline === 'assistant'
@@ -254,9 +261,11 @@ export function useVoice(opts: {
   const sessionKeyRef = useRef<string | null>(opts.sessionKey ?? null);
   const onTurnFinalRef = useRef(opts.onTurnFinal);
   const enabledRef = useRef(enabled);
+  const instanceRef = useRef<string | undefined>(instance);
   sessionKeyRef.current = opts.sessionKey ?? null;
   onTurnFinalRef.current = opts.onTurnFinal;
   enabledRef.current = enabled;
+  instanceRef.current = instance;
   // Auto-reconnect (one-shot per live session): a budget flag + the delay timer +
   // a ref to the latest start() so a connection handler can re-drive it.
   const retriedRef = useRef(false);
@@ -352,6 +361,7 @@ export function useVoice(opts: {
       genRef.current += 1; // invalidate any in-flight start() + dc callbacks
       teardownLocal();
       sessionIdRef.current = null;
+      sessionInstanceRef.current = undefined;
       setVoiceSessionId(null);
       setMuted(false);
       setAudioBlocked(false);
@@ -368,9 +378,12 @@ export function useVoice(opts: {
     (nextState: VoiceState) => {
       genRef.current += 1;
       const id = sessionIdRef.current;
-      if (id) sendVoiceCloseBeacon(id);
+      // Route the close to the session's OWN instance (captured at offer), NOT the
+      // currently-selected one — the switch case depends on this.
+      if (id) sendVoiceCloseBeacon(id, sessionInstanceRef.current);
       teardownLocal();
       sessionIdRef.current = null;
+      sessionInstanceRef.current = undefined;
       setVoiceSessionId(null);
       setMuted(false);
       setAudioBlocked(false);
@@ -445,6 +458,7 @@ export function useVoice(opts: {
     retriedRef.current = false; // a manual attempt gets its own one-shot auto-retry budget
     teardownLocal();
     sessionIdRef.current = null;
+    sessionInstanceRef.current = undefined;
     setVoiceSessionId(null);
     setMuted(false);
     setAudioBlocked(false);
@@ -680,7 +694,11 @@ export function useVoice(opts: {
     //    so a stalled fetch can't outlive the watchdog.
     let config: VoiceConfigResponse;
     try {
-      config = await withTimeout(voiceApi.config(), CONFIG_TIMEOUT_MS, 'config');
+      config = await withTimeout(
+        voiceApi.config(instanceRef.current ?? undefined),
+        CONFIG_TIMEOUT_MS,
+        'config',
+      );
     } catch (e) {
       if (stale()) return;
       fail(mapSignalError(e));
@@ -886,9 +904,12 @@ export function useVoice(opts: {
       fail('signaling-failed');
       return;
     }
+    // Bind the offer to the instance active AT START; capture it so teardown routes
+    // the close to THIS instance even after the selection changes.
+    const offerInstance = instanceRef.current ?? undefined;
     let answer: VoiceOfferResponse;
     try {
-      answer = await voiceApi.offer(sdp, sessionKeyRef.current ?? undefined);
+      answer = await voiceApi.offer(sdp, offerInstance, sessionKeyRef.current ?? undefined);
     } catch (e) {
       if (stale()) return;
       fail(mapSignalError(e));
@@ -896,6 +917,7 @@ export function useVoice(opts: {
     }
     if (stale()) return;
     sessionIdRef.current = answer.voice_session_id;
+    sessionInstanceRef.current = offerInstance;
     setVoiceSessionId(answer.voice_session_id);
     try {
       await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
@@ -928,6 +950,20 @@ export function useVoice(opts: {
       closeAndReset('idle');
     }
   }, [enabled, closeAndReset]);
+
+  // Instance-change teardown. A live call can't straddle an instance switch. The
+  // enabled-flag effect above ONLY fires when a switch flips `enabled` false (e.g.
+  // switching to a chat-only instance) — but switching BETWEEN two voice-capable
+  // instances keeps `enabled` true, so that path no longer fires and THIS effect is
+  // the one that hangs the old call up. closeAndReset routes the close beacon
+  // through sessionInstanceRef (the OLD, offer-time instance), so the old session
+  // is torn down on ITS OWN backend, never the newly-selected one. Fires on mount
+  // too, but stateRef is 'idle' then ⇒ a no-op.
+  useEffect(() => {
+    if (stateRef.current !== 'idle' && stateRef.current !== 'error') {
+      closeAndReset('idle');
+    }
+  }, [instance, closeAndReset]);
 
   // Wake Lock: hold the screen awake while live so an auto-lock can't kill the
   // session mid-turn. Feature-detected silently (typed via a local shape so it
@@ -973,7 +1009,7 @@ export function useVoice(opts: {
   useEffect(() => {
     return () => {
       genRef.current += 1;
-      if (sessionIdRef.current) sendVoiceCloseBeacon(sessionIdRef.current);
+      if (sessionIdRef.current) sendVoiceCloseBeacon(sessionIdRef.current, sessionInstanceRef.current);
       teardownLocal();
     };
   }, [teardownLocal]);
