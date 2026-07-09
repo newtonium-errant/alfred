@@ -583,6 +583,7 @@ class VoiceSttWorker:
         ``decision=None`` = the bypass/disabled path (no telemetry, log fields
         byte-identical to today)."""
         text = " ".join(self._buffer).strip()
+        committed_n = len(self._buffer)   # segment count being committed NOW
         utt_pcm = self._snapshot_utt_pcm()
         self._utterances += 1
         extra = ({"held": self._ever_held, "hold_ms": self._hold_ms_applied}
@@ -599,7 +600,21 @@ class VoiceSttWorker:
                             voice_session_id=self._vid)
         if decision is not None:
             self._emit_endpoint_telemetry()
+        # LATE-FINAL CARRY-FORWARD (endpoint-hold #1). When this runs from the
+        # DETACHED _commit_held timer task, the pump is free to append a NEW final
+        # to self._buffer during the on_utterance await above (its EVENT_FINAL
+        # branch; _note_resume is a no-op there — the timer already nulled
+        # hold_task). A blanket _reset_utt would DROP that late final if its own
+        # utterance_end has not fired yet. Buffer segments only ever APPEND (never
+        # reorder), so [committed_n:] is EXACTLY the finals that arrived during the
+        # await — preserve them so the resumed speech commits on its own EOU (its
+        # teed PCM, already snapshot-cleared above, stays aligned with it). The
+        # committed span [:committed_n] is dropped, so no double-fire. In the
+        # inline pump-driven path the pump is blocked on this await, nothing
+        # appends, carried is empty → byte-identical to today.
+        carried = self._buffer[committed_n:]
         self._reset_utt()
+        self._buffer = carried
 
     async def _arm_or_commit_hold(self, trigger: str) -> None:
         """Arm a bounded CONCURRENT hold (a detached cancellable Task — the pump
@@ -609,8 +624,14 @@ class VoiceSttWorker:
         now = self._now()
         if self._first_hold_at is None:
             self._first_hold_at = now
-            # Latch the TRIGGERING attribution at the first hold — resumed-hold
-            # telemetry emits these (the final classify_tail overwrites _last_*).
+            # Latch the TRIGGERING attribution at the FIRST hold of the utterance
+            # — resumed-hold telemetry emits these (the final classify_tail
+            # overwrites _last_*). In a rare MULTI-hold utterance
+            # (hold→resume→hold→resume→commit) this DELIBERATELY attributes the
+            # one per-utterance record to the FIRST trigger, NOT last/all-trigger:
+            # the one-record-per-utterance model is code-reviewer-cleared as
+            # defensible (not a defect). Pinned by
+            # test_multi_hold_attributes_to_first_trigger — do not silently change.
             self._hold_trigger_category = self._last_signal_category
             self._hold_trigger_features = self._last_tail_features
         elapsed_ms = (now - self._first_hold_at) * 1000.0

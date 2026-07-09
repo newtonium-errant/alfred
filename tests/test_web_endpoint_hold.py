@@ -322,6 +322,56 @@ async def test_cumulative_ceiling_force_commits(monkeypatch) -> None:
     assert [c for c in cap if c.get("event") == "web.voice.stt.endpoint_hold_ceiling"]
 
 
+async def test_late_final_during_held_commit_await_survives() -> None:
+    """endpoint-hold #1 — late-final drop race. _commit_held runs in the DETACHED
+    timer task; during its ``await on_utterance`` the pump can append a NEW final
+    to the SAME buffer (its EVENT_FINAL branch). The reset must NOT clear that
+    late final — its own utterance_end has not fired yet. It is carried forward
+    and commits on its own EOU.
+
+    Negative check: revert the carry-forward and _reset_utt clears the whole
+    buffer → the late final is DROPPED → the buffer/second-commit asserts fail.
+    The on_utterance callback appends the late final at exactly the await window,
+    deterministically modelling the pump's FINAL-branch append during the timer
+    commit (where _note_resume is a no-op — hold_task is already None)."""
+    got: list[str] = []
+    injected = {"done": False}
+
+    async def on_utt(text: str) -> None:
+        got.append(text)
+        if not injected["done"]:
+            injected["done"] = True
+            # Resumed final appended to the SAME buffer DURING the commit await;
+            # its own EVENT_UTTERANCE_END has NOT arrived yet (the drop window).
+            w._buffer.append("wait one more thing.")
+
+    w = _worker(on_utt,
+                endpoint=EndpointHoldSettings(enabled=True, base_extend_ms=20))
+    w._buffer = ["book the flight and"]
+    await w._on_utterance_end("speech_final")          # HOLD armed
+    assert w._hold_task is not None
+    await asyncio.sleep(0.05)                            # timer → _commit_held
+    assert got == ["book the flight and"]               # the held text committed
+    # The late final appended DURING the commit await survived the reset.
+    assert w._buffer == ["wait one more thing."], "late final dropped by reset"
+    assert w._first_hold_at is None and w._ever_held is False  # per-utt state reset
+    # And it commits on its OWN utterance_end (carried forward, not lost).
+    await w._on_utterance_end("speech_final")
+    assert got == ["book the flight and", "wait one more thing."]
+
+
+async def test_late_final_carry_forward_noop_on_inline_commit() -> None:
+    """The carry-forward must be a NO-OP on the inline (pump-driven) commit path:
+    the pump is blocked on the on_utterance await, so nothing appends and the
+    whole buffer is cleared exactly as before — byte-identical to today."""
+    got: list[str] = []
+    w = _worker(await _collect(got))                     # default-off = inline path
+    w._buffer = ["just commit this now"]
+    await w._on_utterance_end("speech_final")
+    assert got == ["just commit this now"]
+    assert w._buffer == []                               # fully cleared (no carry)
+
+
 # ---------------------------------------------------------------------------
 # Snapshot / buffer alignment (held audio stays aligned with held text)
 # ---------------------------------------------------------------------------
@@ -518,6 +568,51 @@ async def test_resumed_hold_latches_trigger_attribution(tmp_path: Path) -> None:
     assert rec["trailing_is_conjunction"] is True
     # And still no raw text / matched word.
     assert "cancel" not in json.dumps(rec) and "meeting" not in json.dumps(rec)
+
+
+async def test_multi_hold_attributes_to_first_trigger(tmp_path: Path) -> None:
+    """endpoint-hold #2 — multi-hold attribution is DELIBERATELY first-trigger.
+    A rare utterance that holds on a DANGLING word, resumes, holds AGAIN on a
+    CONJUNCTION, resumes, then commits records ONE per-utterance endpoint event
+    attributed to the FIRST trigger (dangling) — the documented
+    one-record-per-utterance choice (code-reviewer: defensible, not a defect).
+    This pins the contract so a refactor to last/all-trigger can't land silently:
+    a last-trigger change would record 'conjunction' and fail here."""
+    from alfred.web.voice_endpoint_telemetry import (
+        VoiceEndpointTelemetry, _ENDPOINT_TASKS)
+    tel = VoiceEndpointTelemetry(
+        corpus_dir=str(tmp_path), web_user="u", voice_session_id="v")
+    w = _worker(await _collect([]), telemetry=tel.emit,
+                endpoint=EndpointHoldSettings(enabled=True, base_extend_ms=200))
+    # Hold #1: trailing dangling article → latches signal=dangling.
+    w._buffer = ["put it on the"]
+    await w._on_utterance_end("speech_final")
+    assert w._hold_task is not None
+    assert w._hold_trigger_category == "dangling"
+    # Resume, then Hold #2 on a trailing conjunction — must NOT overwrite the latch.
+    w._buffer.append("desk and")
+    w._note_resume()
+    await w._on_utterance_end("speech_final")
+    assert w._hold_task is not None
+    assert w._hold_trigger_category == "dangling"        # STILL the first trigger
+    # Resume + commit on a non-signal tail → emit.
+    w._buffer.append("we are set")
+    w._note_resume()
+    await w._on_utterance_end("speech_final")             # last='set' → COMMIT → emit
+    for _ in range(50):
+        pending = [t for t in list(_ENDPOINT_TASKS) if not t.done()]
+        if not pending:
+            break
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    rec = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
+    # ONE record, attributed to the FIRST trigger (dangling), not the last (conj).
+    assert rec["decision"] == "hold" and rec["resumed_within_hold"] is True
+    assert rec["signal_category"] == "dangling"
+    assert rec["trailing_is_dangling"] is True
+    assert rec["trailing_is_conjunction"] is False       # NOT the last trigger
+    # And still no raw text leaked.
+    assert "desk" not in json.dumps(rec) and "flight" not in json.dumps(rec)
 
 
 def test_telemetry_sink_drops_nonallowlisted_fields(tmp_path: Path) -> None:
