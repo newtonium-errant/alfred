@@ -62,22 +62,41 @@ export function VoiceCapture({
   const [transcript, setTranscript] = useState('');
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The last audio we tried to transcribe, RETAINED across a failure so the user
+  // can RESEND the same recording instead of re-recording from scratch — the
+  // lost-message fix (a dropped response on a successful server transcribe would
+  // otherwise throw the audio away). Freed on success (no hoarding of mic data) and
+  // on an explicit discard / re-record.
+  const lastBlobRef = useRef<Blob | null>(null);
+  const [retryable, setRetryable] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const runTranscribe = useCallback(async (blob: Blob) => {
+    lastBlobRef.current = blob; // retain BEFORE the request so a drop is recoverable
     setError(null);
     setNotice(null);
+    setRetryable(false);
     setPhase('transcribing');
     try {
       const r = await sttClient.transcribe(blob);
+      lastBlobRef.current = null; // success — free the audio (don't hoard mic data)
       setTranscript(r.transcript || '');
       setNotice(noticeFor(r));
       setPhase('review');
     } catch (e) {
       setError(sttErrorMessage(e));
+      setRetryable(true); // the blob is retained → offer a RESEND, not a re-record
       setPhase('idle');
     }
   }, []);
+
+  // Resend the SAME retained audio (a dropped/timed-out response on a transcribe
+  // that likely SUCCEEDED server-side — retry recovers the message).
+  const onRetry = useCallback(() => {
+    const blob = lastBlobRef.current;
+    if (!blob) return;
+    void runTranscribe(blob);
+  }, [runTranscribe]);
 
   const onStartStop = useCallback(async () => {
     if (recorder.recording) {
@@ -89,6 +108,9 @@ export function VoiceCapture({
       }
       return;
     }
+    // Starting a NEW recording = start over; drop any retained retry audio.
+    lastBlobRef.current = null;
+    setRetryable(false);
     setError(null);
     setNotice(null);
     recorder.reset();
@@ -113,6 +135,8 @@ export function VoiceCapture({
   }, [onTranscript, transcript]);
 
   const onDiscard = useCallback(() => {
+    lastBlobRef.current = null; // explicit give-up — free the retained audio
+    setRetryable(false);
     setTranscript('');
     setNotice(null);
     setError(null);
@@ -134,7 +158,7 @@ export function VoiceCapture({
           aria-pressed={recorder.recording}
           onClick={() => void onStartStop()}
         >
-          {recorder.recording ? '■ Stop' : '🎤 Record'}
+          {recorder.recording ? '■ Stop' : retryable ? '🎤 Record again' : '🎤 Record'}
         </Button>
 
         <label
@@ -172,9 +196,28 @@ export function VoiceCapture({
       )}
 
       {error && (
-        <p role="alert" data-testid={`${idPrefix}-error`} className="text-sm text-danger">
-          {error}
-        </p>
+        <div role="alert" data-testid={`${idPrefix}-error`} className="flex flex-col gap-1">
+          <p className="text-sm text-danger">{error}</p>
+          {retryable && (
+            // Resend the SAME recording (the message is likely already transcribed
+            // server-side; a retry recovers it). Distinct from "Record again", which
+            // starts over — so a dropped response never forces a re-record.
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                data-testid={`${idPrefix}-retry`}
+                disabled={controlsDisabled}
+                onClick={onRetry}
+              >
+                Try again
+              </Button>
+              <span className="text-xs text-honeydew-600">
+                Resends the recording you just made.
+              </span>
+            </div>
+          )}
+        </div>
       )}
 
       {phase === 'review' && (

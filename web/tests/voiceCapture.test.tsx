@@ -91,4 +91,61 @@ describe('VoiceCapture (file upload)', () => {
     expect(onTranscript).not.toHaveBeenCalled();
     expect(screen.queryByTestId('voice-transcript')).toBeNull();
   });
+
+  // --- the lost-message fix: blob retention + resend ---
+
+  it('RETAINS the audio on a failed transcribe and "Try again" RESENDS the SAME blob (not a re-record)', async () => {
+    // The incident: the server transcribed fine but the RESPONSE dropped on flaky
+    // LTE. A retry of the SAME audio recovers the message.
+    mockTranscribe
+      .mockRejectedValueOnce(new Error('response dropped'))
+      .mockResolvedValueOnce({ transcript: 'the long note that was nearly lost' });
+    const onTranscript = vi.fn();
+    render(<VoiceCapture onTranscript={onTranscript} />);
+
+    uploadAudio();
+    // Failure surfaces the error + a distinct "Try again" resend affordance.
+    expect(await screen.findByTestId('voice-error')).not.toBeNull();
+    const retry = await screen.findByTestId('voice-retry');
+    expect(screen.queryByTestId('voice-transcript')).toBeNull();
+
+    await userEvent.click(retry);
+
+    // The retry re-ran transcribe with the SAME blob object — a resend, NOT a new recording.
+    expect(mockTranscribe).toHaveBeenCalledTimes(2);
+    expect(mockTranscribe.mock.calls[1][0]).toBe(mockTranscribe.mock.calls[0][0]);
+    // The recovered transcript is now editable + committable.
+    const textarea = (await screen.findByTestId('voice-transcript')) as HTMLTextAreaElement;
+    expect(textarea.value).toBe('the long note that was nearly lost');
+    await userEvent.click(screen.getByTestId('voice-use'));
+    expect(onTranscript).toHaveBeenCalledWith('the long note that was nearly lost');
+  });
+
+  it('labels the record button "Record again" after a failure (distinct from the "Try again" resend)', async () => {
+    mockTranscribe.mockRejectedValue(new Error('boom'));
+    render(<VoiceCapture onTranscript={vi.fn()} />);
+    uploadAudio();
+    await screen.findByTestId('voice-retry');
+    expect(screen.getByTestId('voice-record').textContent).toContain('Record again');
+  });
+
+  it('a SUCCESSFUL transcribe leaves no retry affordance (the audio is freed, not hoarded)', async () => {
+    mockTranscribe.mockResolvedValue({ transcript: 'clean' });
+    render(<VoiceCapture onTranscript={vi.fn()} />);
+    uploadAudio();
+    await screen.findByTestId('voice-transcript');
+    expect(screen.queryByTestId('voice-retry')).toBeNull();
+    expect(screen.queryByTestId('voice-error')).toBeNull();
+  });
+
+  it('a recovered retry that SUCCEEDS clears the retry affordance (freed after resend)', async () => {
+    mockTranscribe
+      .mockRejectedValueOnce(new Error('dropped'))
+      .mockResolvedValueOnce({ transcript: 'recovered' });
+    render(<VoiceCapture onTranscript={vi.fn()} />);
+    uploadAudio();
+    await userEvent.click(await screen.findByTestId('voice-retry'));
+    await screen.findByTestId('voice-transcript');
+    expect(screen.queryByTestId('voice-retry')).toBeNull(); // freed on the successful resend
+  });
 });

@@ -86,16 +86,19 @@ export async function getJson<T>(url: string, opts: { timeoutMs?: number } = {})
 // application/json), routing the response through the same parseOrThrow / ApiError
 // machinery so STT edge errors (413/415/401/502) surface as the same ApiError the
 // chat UI already understands. Used by the STT client (→ BFF /api/stt/transcribe).
-export async function postBlob<T>(url: string, blob: Blob, contentType: string): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': contentType },
-      body: blob,
-    });
-  } catch (e) {
-    throw new ApiError(0, 'network_error', (e as Error).message);
-  }
+export async function postBlob<T>(
+  url: string,
+  blob: Blob,
+  contentType: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<T> {
+  // A GENEROUS bound (STT of a long note on flaky LTE is slow) so a legit long
+  // transcribe completes, but a DEAD connection surfaces as a clean timeout →
+  // retry affordance, instead of hanging on the OS TCP timeout for minutes.
+  const res = await fetchWithTimeout(
+    url,
+    { method: 'POST', headers: { 'Content-Type': contentType }, body: blob },
+    opts.timeoutMs ?? DEFAULT_BROWSER_TIMEOUT_MS,
+  );
   return parseOrThrow<T>(res);
 }
