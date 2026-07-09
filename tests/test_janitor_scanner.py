@@ -686,6 +686,12 @@ class TestScannerOrphanLeafTypes:
         # design in the VERA vault; reporter/area live as frontmatter
         # fields, not inbound links.
         #
+        # 2026-07 expansion: ``clinical_note`` (scribe P1-b, STAY-C
+        # sovereign scribe) — terminal by design; nothing wikilinks INTO
+        # a clinical note (patient/encounter context lives as frontmatter
+        # + the frozen body), so zero inbound links is the norm, not an
+        # ORPHAN001 defect.
+        #
         # (Diagnosis 2026-06-11: both expansions tagged is_leaf=True on
         # their TypeDefinitions with documented reasoning, but neither
         # ship bumped this pin — the set drift was schema-side-correct /
@@ -704,6 +710,7 @@ class TestScannerOrphanLeafTypes:
             "constraint",
             "daily",
             "ticket",
+            "clinical_note",
         }
 
     @pytest.mark.parametrize(

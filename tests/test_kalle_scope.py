@@ -412,4 +412,8 @@ def test_universal_deny_set_unchanged_by_architecture_addition():
         # tools — completion mutation routes through
         # ``alfred routine done``.
         "routine",
+        # Clinical note (scribe P1-b, 2026-07). ANTI-SPOLIATION — a
+        # medico-legal record whose body is frozen after draft; the
+        # supersede path is a NEW clinical_note with status: amended.
+        "clinical_note",
     })

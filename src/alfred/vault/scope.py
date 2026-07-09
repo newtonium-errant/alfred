@@ -93,6 +93,19 @@ _BODY_MUTATE_DENIED_TYPES: frozenset[str] = frozenset({
     # body sections is editing the template itself, not a body rewrite
     # on a record.
     "routine",
+    # Clinical note (scribe P1-b) — ANTI-SPOLIATION. A clinical_note is a
+    # medico-legal record: once the machine draft exists (and certainly once
+    # attested), its BODY is frozen. body_insert_at / body_replace would
+    # silently rewrite clinical content that was drafted (and possibly
+    # signed) at a point in time. The right path for a correction is a NEW
+    # clinical_note with ``status: amended`` that supersedes the original —
+    # the original draft is preserved in ``draft_original`` (retain-the-diff)
+    # and the record is never mutated in place. Body content is written ONCE
+    # at create (allow_body_writes gates that); every later edit is
+    # frontmatter-only (the ``stayc_clinical_attest_only`` gate refuses body
+    # writes outright). This universal-deny takes precedence over any scope's
+    # allowlist.
+    "clinical_note",
 })
 
 
@@ -111,6 +124,14 @@ _DELETE_DENIED_TYPES: frozenset[str] = frozenset({
     # authorised path for removing a preference from active effect;
     # the record itself stays for audit.
     "preference",
+    # Clinical note (scribe P1-b) — ANTI-SPOLIATION. A clinical record must
+    # never be deletable by ANY agent scope, even one carrying
+    # ``delete: True`` (none does today, but this universal-deny is the
+    # belt). Destroying a medico-legal record is spoliation; there is no
+    # agent-path recovery. The ``stayc_clinical`` scope itself also sets
+    # delete=False; this denyset is the defense-in-depth that survives a
+    # future scope mistake. Operator retains filesystem-level delete.
+    "clinical_note",
 })
 
 
@@ -929,6 +950,57 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "allow_body_insert_at": {},
         "allow_body_replace": {},
     },
+    # ``stayc_clinical`` — the SOVEREIGN ambient-scribe scope (scribe P1-b).
+    # The clinical instance's vault scope: the AI-drafted, human-attested
+    # ``clinical_note`` (DDx + future clinical work live under it). This is
+    # the scope that touches PHI; it is deliberately the NARROWEST write
+    # surface on the platform.
+    #
+    # Scope-first matrix (the principal artifact — instance × type × op):
+    #
+    #   | op                     | stayc_clinical                          |
+    #   |------------------------|----------------------------------------|
+    #   | create                 | clinical_note ONLY (gate 2 below)      |
+    #   | read/search/list/ctx   | True (resolve a note before attest)    |
+    #   | edit                   | attest-metadata ONLY + body FROZEN     |
+    #   | move                   | False (ANTI-SPOLIATION)                |
+    #   | delete                 | False (ANTI-SPOLIATION)                |
+    #   | body_append (create)   | True — the AI-draft body IS the payload|
+    #   | body_insert_at/replace | {} deny (+ universal _BODY_MUTATE deny) |
+    #
+    #   * ``create = stayc_clinical_types_only`` → STAYC_CLINICAL_CREATE_TYPES
+    #     {clinical_note}. clinical_note is NOT in CANONICAL_RECORD_TYPES, so
+    #     the gate skips the propose-hint guard (VERA owns its own records;
+    #     there is no peer Salem to propose to) — same shape as the vera /
+    #     rrts_intake gates.
+    #   * ``edit = stayc_clinical_attest_only`` — the note CONTENT is frozen
+    #     after draft; ONLY the attest metadata flips. A field-allowlist gate
+    #     permitting ONLY {attested_by, attested_at, status}, that ALSO
+    #     refuses any body write (body_append with an empty set_fields list
+    #     would otherwise clear the field-allowlist's empty ``rejected`` check
+    #     — see the gate handler's explicit ``body_write`` refusal), and
+    #     fail-closes on an empty record_type / missing field list.
+    #   * ``move = delete = False`` — ANTI-SPOLIATION. A clinical record is
+    #     medico-legal; it must not be relocatable or destroyable via the
+    #     agent path. Reinforced by the universal ``_DELETE_DENIED_TYPES``.
+    #   * ``allow_body_writes = True`` — REQUIRED for the create draft body
+    #     (vault_create passes ``body_write=(body is not None)``). Edit-time
+    #     body writes are refused by the attest gate; mid-doc/full-rewrite by
+    #     the universal ``_BODY_MUTATE_DENIED_TYPES``. So "body written once at
+    #     create, frozen forever after" holds across all three gates.
+    "stayc_clinical": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": "stayc_clinical_types_only",
+        "edit": "stayc_clinical_attest_only",
+        "move": False,
+        "delete": False,
+        "allow_body_writes": True,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
 }
 
 
@@ -1466,6 +1538,28 @@ RRTS_INTAKE_ROLE: str = "rrts_intake"
 RRTS_INTAKE_CREATE_TYPES: set[str] = {"ticket"}
 
 
+# --- VERA-clinical (sovereign ambient scribe, scribe P1-b) ----------------
+#
+# The clinical scope's create + edit surfaces. Kept in sync with the
+# ``clinical_note`` TypeDefinition's ``available_in_scopes`` tag in schema.py
+# (gate 1) — the VERA-P1 trap class is "type accepted by one gate, rejected by
+# the other"; BOTH gates must agree. Contract-pinned in
+# tests/test_stayc_clinical_scope.py — widening any of these sets is a
+# deliberate matrix change; update the pin in the same commit.
+#
+#   * ``STAYC_CLINICAL_CREATE_TYPES`` — the create allowlist (gate 2 via the
+#     ``stayc_clinical_types_only`` handler). ``clinical_note`` ONLY. None of
+#     these is a CANONICAL_RECORD_TYPE, so the gate skips the propose-hint
+#     guard the kalle/hypatia gates carry.
+#   * ``STAYC_CLINICAL_ATTEST_TYPES`` / ``STAYC_CLINICAL_ATTEST_FIELDS`` — the
+#     attest-only EDIT surface (gate via the ``stayc_clinical_attest_only``
+#     handler): the ONLY fields any edit may touch are the attest metadata.
+#     The note content (body + every clinical field) is frozen after draft.
+STAYC_CLINICAL_CREATE_TYPES: set[str] = {"clinical_note"}
+STAYC_CLINICAL_ATTEST_TYPES: set[str] = {"clinical_note"}
+STAYC_CLINICAL_ATTEST_FIELDS: set[str] = {"attested_by", "attested_at", "status"}
+
+
 # Per-scope hint mapping: when a peer instance attempts vault_create on
 # a canonical type, the error message points at the right propose tool.
 # Salem (talker scope) is the canonical owner — it creates these types
@@ -1839,6 +1933,29 @@ def check_scope(
             )
         return
 
+    if permission == "stayc_clinical_types_only":
+        # Sovereign ambient-scribe create gate (scribe P1-b). The allowlist
+        # is STAYC_CLINICAL_CREATE_TYPES {clinical_note} — the ONLY type the
+        # clinical scope may mint. NO canonical-type propose hint
+        # (clinical_note is not a CANONICAL_RECORD_TYPE; VERA-clinical owns
+        # its own records and — being sovereign — has no transport to propose
+        # over anyway). Fail-CLOSED on an empty record_type: an empty value
+        # is a caller bug, not a licence to create any type.
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'stayc_clinical_types_only' is "
+                f"type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass record_type."
+            )
+        if record_type not in STAYC_CLINICAL_CREATE_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' can only create vera-clinical types "
+                f"({', '.join(sorted(STAYC_CLINICAL_CREATE_TYPES))}). "
+                f"Got: '{record_type}'. The sovereign scribe scope mints "
+                f"clinical notes only; it cannot create any other type."
+            )
+        return
+
     if permission == "vera_ops_types_only":
         # VERA ops (Ben) create gate. Capability expansion 2026-06-15
         # (vera-assistant arc): both VERA roles create the same FIVE
@@ -1962,6 +2079,73 @@ def check_scope(
                 f"Rejected: {', '.join(rejected)}. The outcome write-back "
                 f"narrows to the resolution flip; ticket creation and "
                 f"content edits belong to the vera / vera_ops scopes."
+            )
+        return
+
+    if permission == "stayc_clinical_attest_only":
+        # Sovereign ambient-scribe ATTEST gate (scribe P1-b). The clinical
+        # note CONTENT is frozen after draft; the ONLY thing an edit may do is
+        # flip the attest metadata (a clinician reviews the AI draft and
+        # signs). FOUR checks, all must pass:
+        #
+        #   0. body_write REFUSED — THE security-critical check. The field-
+        #      allowlist below is NOT sufficient on its own: vault_edit builds
+        #      ``fields`` from set/append/unset keys, so a pure ``body_append``
+        #      arrives with fields=[] (EMPTY list, not None) → the "fields is
+        #      None" fail-closed does NOT fire and the empty ``rejected`` list
+        #      passes. Without this explicit refusal an agent could append to
+        #      (or, via body_rewriter, rewrite) a frozen clinical note through
+        #      the attest scope. body_insert_at / body_replace are separately
+        #      denied by ``_BODY_MUTATE_DENIED_TYPES``; this closes the
+        #      body_append / body_rewriter path. Content is written ONCE at
+        #      create (the ``allow_body_writes`` gate) and never again.
+        #   1. record_type must be present (fail-CLOSED on empty — vault_edit
+        #      parses it from the target's frontmatter; an empty value is a
+        #      caller bug, not a licence to edit any type).
+        #   2. record_type must be in STAYC_CLINICAL_ATTEST_TYPES.
+        #   3. fields must be supplied AND a subset of
+        #      STAYC_CLINICAL_ATTEST_FIELDS {attested_by, attested_at, status}.
+        if body_write:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'stayc_clinical_attest_only' refuses "
+                f"body writes — a clinical note's content is FROZEN after "
+                f"draft (anti-spoliation). Only the attest metadata "
+                f"({', '.join(sorted(STAYC_CLINICAL_ATTEST_FIELDS))}) may "
+                f"change; a correction is a NEW clinical_note with "
+                f"status: amended that supersedes the original, never a body "
+                f"rewrite."
+            )
+        if not record_type:
+            raise ScopeError(
+                f"Scope '{scope}' gate 'stayc_clinical_attest_only' is "
+                f"type-restricted but the record type is unavailable "
+                f"(empty) — failing closed. Callers must pass record_type "
+                f"(vault_edit parses it from the target record's frontmatter)."
+            )
+        if record_type not in STAYC_CLINICAL_ATTEST_TYPES:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit record types "
+                f"({', '.join(sorted(STAYC_CLINICAL_ATTEST_TYPES))}). "
+                f"Got: '{record_type}'. The sovereign scribe scope edits "
+                f"clinical notes only."
+            )
+        if fields is None:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the attest "
+                f"allowlist ({', '.join(sorted(STAYC_CLINICAL_ATTEST_FIELDS))}); "
+                f"caller did not supply the field list."
+            )
+        rejected = [
+            f for f in fields if f not in STAYC_CLINICAL_ATTEST_FIELDS
+        ]
+        if rejected:
+            raise ScopeError(
+                f"Scope '{scope}' may only edit fields in the attest "
+                f"allowlist ({', '.join(sorted(STAYC_CLINICAL_ATTEST_FIELDS))}). "
+                f"Rejected: {', '.join(rejected)}. The clinical note content "
+                f"(body + every clinical field) is frozen after draft; only "
+                f"the attest metadata flips. A correction is a NEW "
+                f"clinical_note with status: amended."
             )
         return
 

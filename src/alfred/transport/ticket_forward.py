@@ -44,6 +44,7 @@ from typing import Any
 
 import frontmatter
 
+from ..vault.schema import is_never_push
 from .client import peer_send
 from .exceptions import TransportError, TransportRejected
 from .utils import get_logger
@@ -510,6 +511,26 @@ async def run_forward_once(
         fm = item["frontmatter"]
         body = item["body"]
         uid = item["uid"]
+
+        # Never-push guard (scribe P1-b) — defense-in-depth. The forwarder
+        # only ever scans the ``ticket/`` dir today, so this never fires in
+        # practice; it is the belt that catches a future forwarder
+        # generalization (or a mis-typed record landing in the scan set)
+        # before a never-push type (``clinical_note`` — PHI) could be
+        # serialized onto the wire. One source of truth: schema.is_never_push.
+        if is_never_push(str(fm.get("type") or "")):
+            log.warning(
+                "ticket_forward.never_push_skipped",
+                relpath=relpath,
+                record_type=str(fm.get("type") or ""),
+                reason="type_in_never_push_set",
+            )
+            results.append({
+                "uid": uid,
+                "relpath": relpath,
+                "outcome": "never_push_skipped",
+            })
+            continue
 
         # First contact: mint + write the uid into the record via the
         # narrow scope BEFORE pushing (the uid travels in the record

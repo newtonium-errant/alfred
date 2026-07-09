@@ -99,6 +99,11 @@ def test_universal_deny_set_pinned_to_spec():
         # rewrite the template-driven sections — completion mutation
         # routes through ``alfred routine done``.
         "routine",
+        # Clinical note (scribe P1-b, 2026-07). ANTI-SPOLIATION — a
+        # medico-legal record whose body is frozen after draft.
+        # insert_at / replace would rewrite clinical content; the
+        # supersede path is a NEW clinical_note with status: amended.
+        "clinical_note",
     }
     assert _BODY_MUTATE_DENIED_TYPES == expected
 

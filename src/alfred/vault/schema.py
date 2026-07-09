@@ -562,6 +562,64 @@ _DEFINITIONS: list[TypeDefinition] = [
         is_leaf=True,
     ),
 
+    # --- VERA-clinical scope extension (sovereign ambient scribe) -------
+    #
+    # ``clinical_note`` (2026-07, scribe P1-b) — the AI-drafted, human-
+    # attested clinical note produced by the on-box sovereign scribe on the
+    # VERA-clinical slot. This is the record the whole sovereign no-egress
+    # boundary (scribe P1-a) exists to protect: it holds PHI and must NEVER
+    # reach a cloud provider, so it is scoped, gated, and denied-from-egress
+    # at every layer.
+    #
+    # ``available_in_scopes=frozenset({"stayc_clinical"})`` ONLY — NOT
+    # canonical. This is the schema-side gate 1 of the two-gate contract:
+    # ``_validate_type`` (via ``known_types("stayc_clinical")``) admits
+    # ``clinical_note`` ONLY under the stayc_clinical scope and REJECTS it
+    # everywhere else (Salem / KAL-LE / Hypatia / VERA-ops cannot create or
+    # even validate a clinical note — correct per-instance isolation). This
+    # AUTO-DERIVES ``KNOWN_TYPES_BY_SCOPE["stayc_clinical"]`` via the live
+    # comprehension over ``TYPE_REGISTRY`` (VERA-P1 trap confirmed absent;
+    # do NOT touch a KNOWN_TYPES_BY_SCOPE literal). Gate 2
+    # (``stayc_clinical_types_only`` in scope.py) then enforces the
+    # create policy.
+    #
+    # ``name_field="title"`` — clinical notes are titled by encounter (mirror
+    # ``ticket`` / ``conversation`` using a non-"name" title field).
+    #
+    # Statuses (the attest lifecycle): ``ai_draft`` (default on create — the
+    # machine draft, unsigned), ``attested`` (human clinician has reviewed +
+    # signed; ``attested_by`` / ``attested_at`` set on the flip), ``amended``
+    # (a correction was made AFTER attestation — via a NEW clinical_note that
+    # supersedes, NOT a body rewrite; see ``_BODY_MUTATE_DENIED_TYPES``).
+    #
+    # ``required_fields=("title",)`` — minimal gate; the frozen frontmatter
+    # contract (``ai_draft`` / ``synthetic`` / ``attested_by`` /
+    # ``attested_at`` / ``draft_original`` / ``status``) is optional-at-schema
+    # so a draft with only a title validates, but the scribe pipeline + the
+    # vault-vera-clinical SKILL (prompt-tuner) populate the full set. The
+    # ``synthetic: true`` provenance tag is the fail-closed mode line
+    # (scribe.mode gate, P1-c) — enforced in the pipeline, not schema-gated.
+    #
+    # ``is_leaf=True`` — nothing links INTO a clinical note; zero inbound
+    # wikilinks is the norm, not an ORPHAN001 defect (same as ticket / the
+    # learning types).
+    #
+    # Anti-spoliation is enforced in scope.py: ``clinical_note`` is in BOTH
+    # ``_DELETE_DENIED_TYPES`` (no scope may delete) and
+    # ``_BODY_MUTATE_DENIED_TYPES`` (no body_insert_at/body_replace — amend =
+    # NEW record); the ``stayc_clinical`` scope sets move/delete=False and its
+    # attest-only edit gate freezes the body. And ``_NEVER_PUSH_TYPES``
+    # (below) forbids it ever crossing an instance boundary.
+    TypeDefinition(
+        name="clinical_note",
+        directory="clinical_note",
+        statuses=frozenset({"ai_draft", "attested", "amended"}),
+        required_fields=("title",),
+        name_field="title",
+        available_in_scopes=frozenset({"stayc_clinical"}),
+        is_leaf=True,
+    ),
+
     # --- KAL-LE scope extensions (``~/aftermath-lab/``) ----------------
     #
     # Stage 3.5: record types KAL-LE uses inside the aftermath-lab
@@ -1058,6 +1116,35 @@ KNOWN_TYPES_BY_SCOPE: dict[str, set[str]] = {
 LEARN_TYPES: set[str] = {
     d.name for d in TYPE_REGISTRY if d.is_learn_type
 }
+
+
+# Record types that must NEVER cross an instance boundary — not over the
+# peer protocol, not via propose, not in a query response — even
+# de-identified. Co-located with the type metadata (schema.py) so every
+# outbound serializer imports ONE source of truth.
+#
+# ``clinical_note`` (scribe P1-b) holds PHI. De-identified cross-instance
+# transit waits on a legal de-id standard that does not exist yet, so the
+# answer today is a flat NO — the record stays on the sovereign box. This is
+# a LATENT belt at present: the sovereign VERA-clinical slot wires no
+# transport at all (the P1-a barrier-(d) allowlist forbids ``transport`` /
+# peer-push), so nothing on that box can push anything. The guard is
+# load-bearing the day ANY instance that holds clinical records gains a
+# transport surface — the outbound serializers (``peer_propose_canonical_
+# record``, the ticket forwarder, any future push path) refuse a never-push
+# type before it can leave the box.
+_NEVER_PUSH_TYPES: frozenset[str] = frozenset({"clinical_note"})
+
+
+def is_never_push(record_type: str) -> bool:
+    """Return True iff ``record_type`` must never cross an instance boundary.
+
+    Import this at every outbound push/propose serializer and refuse (or
+    skip) a record whose type it flags. One source of truth
+    (:data:`_NEVER_PUSH_TYPES`) so a new never-push type is enforced
+    everywhere by a single edit here.
+    """
+    return record_type in _NEVER_PUSH_TYPES
 
 
 STATUS_BY_TYPE: dict[str, set[str]] = {

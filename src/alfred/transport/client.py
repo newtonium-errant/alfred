@@ -902,12 +902,28 @@ async def peer_propose_canonical_record(
 
     ``correlation_id`` defaults to ``{self_name}-propose-{type}-<hex6>``
     so the audit trail is greppable by proposer + type.
+
+    Never-push guard (scribe P1-b): a record type in
+    ``schema._NEVER_PUSH_TYPES`` (e.g. ``clinical_note`` — PHI) must never
+    cross an instance boundary, even by propose. Refuse before any network
+    work. Latent belt today (a sovereign clinical slot wires no transport at
+    all per the P1-a barrier-(d) allowlist), load-bearing the day any
+    transport-bearing instance holds a never-push record.
     """
     import secrets
 
+    from ..vault.schema import is_never_push
     from .config import TransportConfig, load_config
     from .exceptions import TransportRejected
     from .peers import _resolve_peer
+
+    if is_never_push(record_type):
+        raise ValueError(
+            f"refusing to propose record type '{record_type}' across an "
+            f"instance boundary — it is in schema._NEVER_PUSH_TYPES (never "
+            f"crosses an instance boundary, even de-identified; awaits a "
+            f"legal de-id standard). No cloud/peer egress by design."
+        )
 
     if config is None:
         config = load_config()
