@@ -90,14 +90,18 @@ export async function postBlob<T>(
   url: string,
   blob: Blob,
   contentType: string,
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; headers?: Record<string, string> } = {},
 ): Promise<T> {
   // A GENEROUS bound (STT of a long note on flaky LTE is slow) so a legit long
   // transcribe completes, but a DEAD connection surfaces as a clean timeout →
   // retry affordance, instead of hanging on the OS TCP timeout for minutes.
   const res = await fetchWithTimeout(
     url,
-    { method: 'POST', headers: { 'Content-Type': contentType }, body: blob },
+    {
+      method: 'POST',
+      headers: { 'Content-Type': contentType, ...(opts.headers ?? {}) },
+      body: blob,
+    },
     opts.timeoutMs ?? DEFAULT_BROWSER_TIMEOUT_MS,
   );
   return parseOrThrow<T>(res);

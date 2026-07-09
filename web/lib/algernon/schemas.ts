@@ -117,6 +117,20 @@ export function normaliseAudioMime(contentType: string | undefined | null): stri
   return (AUDIO_MIME_ALLOWLIST as readonly string[]).includes(base) ? base : null;
 }
 
+// STT idempotency (lost-message #2): a CONTENT-ADDRESSED key — the SHA-256 hex of
+// the audio bytes — sent by the browser and RELAYED by the BFF to the backend,
+// which dedups (same key → cached transcript, no re-transcribe / no double-charge).
+// Because the key is derived from the blob content and VoiceCapture retains the blob
+// across a retry, a resend of the SAME audio hashes to the SAME key ⇒ a natural
+// cache hit with NO client-side state to mint or hold. The BFF allowlists ONLY this
+// header (never arbitrary client headers) and relays it only when it's a well-formed
+// 64-char lowercase hex digest.
+export const STT_IDEMPOTENCY_HEADER = 'X-Alfred-Stt-Idempotency-Key';
+
+export function isSttIdempotencyKey(v: unknown): v is string {
+  return typeof v === 'string' && /^[a-f0-9]{64}$/.test(v);
+}
+
 // --- Web voice (V0) trust-boundary constants + schemas (CONTRACT §7) ---------
 // The WebRTC signalling offer/close bodies cross the BFF trust boundary like every
 // other route — parsed here before relay. A vanilla-ICE offer (all candidates

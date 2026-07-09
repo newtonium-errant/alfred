@@ -1,6 +1,11 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { resolveSessionToken } from '../../../lib/algernon/identity';
-import { MAX_AUDIO_BYTES, normaliseAudioMime } from '../../../lib/algernon/schemas';
+import {
+  MAX_AUDIO_BYTES,
+  STT_IDEMPOTENCY_HEADER,
+  isSttIdempotencyKey,
+  normaliseAudioMime,
+} from '../../../lib/algernon/schemas';
 import { callTransportBinary } from '../../../lib/algernon/transport';
 import { sendTransportError } from '../../../lib/algernon/bffError';
 
@@ -11,6 +16,12 @@ import { sendTransportError } from '../../../lib/algernon/bffError';
 // audio is relayed via callTransportBinary which injects the peer token
 // server-side; this route holds NO secret. The transcript JSON (incl. the
 // low_confidence/empty/degraded signals) relays back verbatim.
+//
+// Idempotency (lost-message #2): the client's content-hash idempotency header is
+// ALLOWLISTED (only this one header is relayed, never arbitrary client headers) and
+// forwarded to the backend, which dedups a repeat key → the cached transcript. It
+// is relayed ONLY when it's a well-formed 64-char hex digest (a malformed/oversized
+// value is dropped — the backend simply doesn't dedup, which is safe).
 export const config = { api: { bodyParser: false } };
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -58,11 +69,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(400).json({ error: 'no_audio' });
   }
 
+  // Allowlist ONLY the idempotency header, and only when well-formed (a hex digest).
+  const rawKey = req.headers[STT_IDEMPOTENCY_HEADER.toLowerCase()];
+  const idempotencyKey = isSttIdempotencyKey(rawKey) ? rawKey : undefined;
+
   try {
     const { status, body } = await callTransportBinary('POST', '/stt/transcribe', {
       body: audio,
       contentType: mime,
       sessionToken,
+      idempotencyKey,
     });
     return res.status(status).json(body ?? {});
   } catch (e) {
