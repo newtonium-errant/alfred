@@ -94,12 +94,23 @@ CLOUD_KEY_ENV_VARS: tuple[str, ...] = (
     "RESEND_API_KEY",
 )
 
-# Barrier (d). Config sections that wire a network egress path — many of them
-# ESCAPE the in-process httpx guard, so they MUST be denied here at load (the
-# guard cannot see them at runtime). Presence of ANY of these on a sovereign
-# instance is a breach.
+# Known network-egress / agent / tunnel config sections — a DOCUMENTED
+# CATALOG, no longer the enforcement mechanism.
 #
-# Two escape classes barrier (d) closes (P1-a review):
+# As of the P1-a r2 review, barrier (d)'s ENFORCEMENT is the ALLOWLIST
+# ``SOVEREIGN_ALLOWED_SECTIONS`` below (fail-closed by default), NOT this
+# denylist. The denylist was the wrong shape for a "provable no-egress"
+# boundary: it required remembering to deny every egressing tool forever and
+# MISSED ``surveyor`` (cloud OpenRouter LLM) twice in one review cycle, plus
+# ``brief`` (weather API) and ``cloudflared`` (an outbound tunnel SUBPROCESS
+# the httpx guard can never see). This tuple is retained as (1) a readable
+# catalog of concrete known-bad sections and (2) explicit negative-test pins;
+# it is asserted DISJOINT from the allowlist (nothing here may ever be
+# allowlisted). The allowlist already denies every entry here AND every
+# future daemon.
+#
+# Two escape classes that motivated barrier (d) (P1-a review r1) — still the
+# reason these sections are catalogued as unsafe:
 #
 #   1. The ``claude -p`` OAuth SUBPROCESS path (BLOCK-1 — the serious one, a
 #      real cloud-LLM egress no other barrier catches).
@@ -146,7 +157,50 @@ EGRESS_CONFIG_SECTIONS: tuple[str, ...] = (
     "web",
     "gcal",
     "integrations",
+    # Denylist misses caught by the r2 review — the reason barrier (d) is now
+    # an allowlist. surveyor = cloud OpenRouter LLM (httpx, but its own
+    # daemon); brief = weather API HTTP; cloudflared = an outbound TUNNEL
+    # subprocess the guard can NEVER see.
+    "surveyor",
+    "brief",
+    "cloudflared",
 )
+
+
+# Barrier (d) ENFORCEMENT — the ALLOWLIST (fail-closed by default).
+#
+# A sovereign config (``sovereign.enabled``) may contain ONLY these top-level
+# sections; ANY other top-level key breaches barrier (d). This is the correct
+# shape for a "provable no-egress" boundary: every NEW daemon / block is
+# denied here BY DEFAULT until it is explicitly vetted sovereign-safe and
+# added, which structurally subsumes surveyor / brief / cloudflared and every
+# future tool. Each entry below is filesystem-only, identity-only, or the
+# sovereign workload itself — none opens a network surface. Widen ONLY with a
+# per-entry safety rationale (the same discipline as the scope allowlists).
+SOVEREIGN_ALLOWED_SECTIONS: frozenset[str] = frozenset({
+    # Synthetic key stamped onto EVERY raw config by ``_load_unified_config``
+    # (cli.py) — a resolved filesystem path string, no network. MUST be
+    # allowlisted or every real sovereign config (which always carries it)
+    # would refuse at load.
+    "_config_path",
+    # The enablement gate itself.
+    "sovereign",
+    # The sovereign workload. ``scribe.stt`` (barrier a) + ``scribe.llm``
+    # (barrier b) are independently validated to be local; the rest of the
+    # block is pipeline config with no egress.
+    "scribe",
+    # Filesystem: the PHI vault path + scan-dir lists. No network.
+    "vault",
+    # Filesystem: log level + log dir. No network.
+    "logging",
+    # Filesystem: the daemon PID-file path (per-instance collision-avoidance).
+    # No network.
+    "daemon",
+    # Identity-only: instance name / canonical / aliases used for record
+    # attribution + templating (``audit/cli.py`` reads ``raw.get("instance")``).
+    # No network surface.
+    "instance",
+})
 
 
 class SovereignBoundaryError(Exception):
@@ -295,15 +349,28 @@ def _cloud_key_placeholders_in_config(value: Any) -> set[str]:
 
 
 def _check_no_egress(raw: dict[str, Any]) -> None:
-    """Barrier (d) — no egress-capable config section wired. Fail-closed."""
-    wired = [s for s in EGRESS_CONFIG_SECTIONS if s in raw]
-    if wired:
+    """Barrier (d) — ALLOWLIST: only sovereign-safe top-level sections.
+
+    Fail-closed by default. A sovereign config may contain ONLY the sections
+    in :data:`SOVEREIGN_ALLOWED_SECTIONS`; ANY other top-level key — a tool
+    daemon, a transport/egress block, an agent backend, a tunnel, or a
+    future-added daemon nobody has vetted yet — is refused. This structurally
+    subsumes every known egress section (:data:`EGRESS_CONFIG_SECTIONS`) AND
+    every future daemon, so a new tool is denied here until it is explicitly
+    vetted sovereign-safe and allowlisted.
+    """
+    disallowed = sorted(k for k in raw if k not in SOVEREIGN_ALLOWED_SECTIONS)
+    if disallowed:
+        allowed = ", ".join(sorted(SOVEREIGN_ALLOWED_SECTIONS))
         raise SovereignBoundaryError(
             "barrier_d",
-            f"egress-capable config section(s) present: "
-            f"{', '.join(wired)}. A sovereign instance wires no transport / "
-            f"peer-push / brief-push / ticket-forward / mail / telegram — "
-            f"there must be no network surface to push PHI over.",
+            f"non-allowlisted top-level config section(s): "
+            f"{', '.join(disallowed)}. A sovereign config may contain ONLY "
+            f"[{allowed}] — every other section is fail-closed by default (a "
+            f"tool daemon, transport/egress block, agent backend, or tunnel "
+            f"must be vetted sovereign-safe and explicitly allowlisted before "
+            f"it can run here). This denies every known egress section AND "
+            f"every future daemon by default.",
         )
 
 

@@ -12,9 +12,20 @@ raises :class:`SovereignBoundaryError` (``reason="http_guard"``) so no bytes
 leave the box.
 
 Install is idempotent and reversible (``uninstall_...`` restores the original
-``send`` methods — used by tests). On Linux the orchestrator installs this in
-the parent process before forking children, so every sovereign child inherits
-the wrapped methods; a child launched fresh (spawn) re-installs on its own.
+``send`` methods — used by tests).
+
+PROCESS COVERAGE (honest, walked against source — do NOT claim spawn
+self-reinstall). The ONLY install site today is the run_all PARENT process
+(``orchestrator._enforce_sovereign_boundary_or_exit`` installs it after the
+boundary passes). It propagates to tool child processes ONLY via FORK
+inheritance — the current Linux ``multiprocessing`` default, so children fork
+with the already-patched ``httpx`` and are covered. It does NOT auto-reinstall:
+a child launched under the ``spawn`` start method would start with a fresh,
+UNGUARDED ``httpx``. A sovereign DAEMON process must therefore install the
+guard itself — the scribe daemon runner self-installs it in P1-d. With the
+barrier-(d) allowlist the scribe tool is the ONLY daemon a sovereign config
+can run, so P1-d's per-process self-install is the real coverage guarantee;
+the parent-fork inheritance is a belt on top of it, not the load-bearing path.
 
 SCOPE + KNOWN GAPS (honest, not a completeness claim). This guard wraps
 ``httpx.Client.send`` / ``httpx.AsyncClient.send`` ONLY. It catches httpx-backed
@@ -24,11 +35,13 @@ each of these is instead neutralised by barrier (d) denying the wiring config
 section at LOAD:
 
   * ``aiohttp`` — the web STT/TTS surfaces (``web/stt_deepgram.py`` Deepgram,
-    ``web/tts_elevenlabs.py`` ElevenLabs). Denied via ``web`` in
-    EGRESS_CONFIG_SECTIONS. An aiohttp guard extension is a HARD P2 BLOCKER
-    (task #40) before the scribe web UI may route PHI.
-  * ``googleapiclient`` — GCal (``integrations/gcal.py``). Denied via ``gcal``
-    / ``integrations`` in EGRESS_CONFIG_SECTIONS.
+    ``web/tts_elevenlabs.py`` ElevenLabs). Denied at LOAD by the barrier-(d)
+    allowlist (``web`` is not sovereign-safe, so it is not in
+    SOVEREIGN_ALLOWED_SECTIONS). An aiohttp guard extension is a HARD P2
+    BLOCKER (task #40) before the scribe web UI may route PHI.
+  * ``googleapiclient`` — GCal (``integrations/gcal.py``). Denied at LOAD by
+    the barrier-(d) allowlist (``gcal`` / ``integrations`` are not
+    allowlisted).
   * the ``claude -p`` SUBPROCESS — a separate process the guard cannot see.
     ⚠️ It is NOT neutralised by stripping the credential: ``subprocess_env``
     strips the API key precisely so ``claude -p`` REROUTES to cached OAuth

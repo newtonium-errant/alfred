@@ -19,6 +19,7 @@ import structlog
 from alfred.sovereign import (
     CLOUD_KEY_ENV_VARS,
     EGRESS_CONFIG_SECTIONS,
+    SOVEREIGN_ALLOWED_SECTIONS,
     SOVEREIGN_STT_ALLOWLIST,
     SovereignBoundaryError,
     host_is_loopback,
@@ -276,6 +277,68 @@ def test_barrier_c_resend_key_refused():
             raw, env={"RESEND_API_KEY": "DUMMY_RESEND_TEST_KEY"}
         )
     assert exc.value.reason == "barrier_c"
+
+
+# --- barrier (d) is an ALLOWLIST (P1-a review r2, BLOCK-A) -------------------
+
+def test_barrier_d_allowlist_only_config_passes():
+    # A realistic minimal sovereign config with EVERY allowlisted section
+    # (filesystem + identity + the workload) passes all four barriers.
+    raw = {
+        "_config_path": "/data/algernon/vera-clinical/config.vera-clinical.yaml",
+        "sovereign": {"enabled": True},
+        "scribe": {
+            "mode": "synthetic",
+            "stt": {"provider": "faster-whisper"},
+            "llm": {"base_url": "http://127.0.0.1:11434"},
+        },
+        "vault": {"path": "/data/algernon/vera-clinical/vault"},
+        "logging": {"level": "INFO", "dir": "/data/algernon/vera-clinical/data"},
+        "daemon": {"pid_path": "/data/algernon/vera-clinical/data/alfred.pid"},
+        "instance": {"name": "VERA-clinical", "canonical": "V.E.R.A.-clinical"},
+    }
+    validate_sovereign_boundary(raw, env=_CLEAN_ENV)  # no raise
+
+
+def test_barrier_d_config_path_synthetic_key_allowed():
+    # ``_config_path`` is stamped onto EVERY raw config by
+    # _load_unified_config (cli.py) — the real run_all shape. It must be
+    # allowlisted or every sovereign config would refuse at load.
+    assert "_config_path" in SOVEREIGN_ALLOWED_SECTIONS
+    raw = _sovereign_raw()
+    raw["_config_path"] = "/data/algernon/vera-clinical/config.vera-clinical.yaml"
+    validate_sovereign_boundary(raw, env=_CLEAN_ENV)  # no raise
+
+
+@pytest.mark.parametrize(
+    "section",
+    # surveyor/brief/cloudflared = the denylist misses that motivated the
+    # allowlist; the last two = arbitrary FUTURE daemons nobody has vetted.
+    ["surveyor", "brief", "cloudflared", "some_future_tool", "totally_new_daemon"],
+)
+def test_barrier_d_non_allowlisted_section_refused(section):
+    # Mutation-verify: ANY top-level section not in the allowlist refuses —
+    # fail-closed BY DEFAULT, including tools that don't exist yet.
+    raw = _sovereign_raw()
+    raw[section] = {"enabled": True}
+    with pytest.raises(SovereignBoundaryError) as exc:
+        validate_sovereign_boundary(raw, env=_CLEAN_ENV)
+    assert exc.value.reason == "barrier_d"
+
+
+def test_egress_catalog_disjoint_from_allowlist():
+    # The documented known-egress catalog and the enforcement allowlist must
+    # never intersect — an egress section slipping into the allowlist would
+    # silently reopen the boundary.
+    assert not (set(EGRESS_CONFIG_SECTIONS) & SOVEREIGN_ALLOWED_SECTIONS)
+
+
+def test_review_misses_are_catalogued():
+    # surveyor (OpenRouter) / brief (weather API) / cloudflared (tunnel) —
+    # the denylist misses — are pinned in the catalog + denied by the allowlist.
+    for section in ("surveyor", "brief", "cloudflared"):
+        assert section in EGRESS_CONFIG_SECTIONS
+        assert section not in SOVEREIGN_ALLOWED_SECTIONS
 
 
 # --- host_is_loopback helper ------------------------------------------------
