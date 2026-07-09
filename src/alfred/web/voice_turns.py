@@ -65,13 +65,15 @@ _INFLIGHT_POLL_S = 0.25
 # to the LLM, so it replies at TEXT length — 800-900-char monologues that are
 # ~30s of speech, which the operator barges to cut off. This addendum tells the
 # model it is speaking, not writing. Used when web.voice.reply_guidance is empty
-# (the common case); a per-instance config value overrides it. PLACEHOLDER text
-# — the prompt-tuner owns the final wording; the swap is a one-line data change
-# behind this named constant.
+# (the common case); a per-instance config value overrides it. Final wording
+# authored by the prompt-tuner + operator-approved (2026-07-09).
 DEFAULT_VOICE_REPLY_GUIDANCE = (
-    "You're in a spoken voice conversation — keep replies short and "
-    "conversational, a sentence or two; no lists, markdown, or long "
-    "paragraphs; go deeper only if explicitly asked."
+    "Voice mode — you're in a spoken conversation and your words are read "
+    "aloud, not shown on screen. Reply the way you'd talk: keep it short — "
+    "usually a sentence or two, rarely more than three. Answer directly, then "
+    "stop. No lists, bullets, headings, or markdown (they sound wrong read "
+    "aloud), and no multi-paragraph essays. If the user explicitly asks for "
+    "more detail or depth, you may go longer; otherwise stay brief."
 )
 
 
