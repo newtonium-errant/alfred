@@ -223,3 +223,104 @@ async def test_schedule_capture_structuring_runs_process(
     assert len(sched) == 1
     assert sched[0]["turns"] == 4
     assert task not in capture_batch._STRUCTURING_TASKS  # discarded when done
+
+
+# --- sweeper finalize: structuring targets the RENAMED path ---------------
+# (Piece-1 fast-follow — the substance-slug rename MOVES the file, so
+# structuring must aim at the renamed rel_path, not the stale original.)
+
+
+async def test_sweeper_finalize_structures_renamed_path(
+    talker_config, monkeypatch,
+) -> None:
+    """With BOTH derive_slug_from_substance AND auto_structure_on_close on, a
+    timed-out capture is renamed FIRST; structuring must target the RENAMED
+    path. Mutation: revert ``_finalize_swept_capture`` to discard the rename
+    return and reuse the original ``meta['rel_path']`` → the schedule receives
+    the stale path → this fails."""
+    from alfred.telegram import daemon as talker_daemon
+
+    talker_config.session.derive_slug_from_substance = True
+    talker_config.session.auto_structure_on_close = True
+
+    async def _fake_rename(*args, **kwargs):
+        return "session/RENAMED-abc12345.md"     # the MOVED path
+
+    monkeypatch.setattr(
+        talker_session, "maybe_apply_substance_slug", _fake_rename)
+
+    scheduled: dict = {}
+    monkeypatch.setattr(
+        talker_daemon.capture_batch, "schedule_capture_structuring",
+        lambda **kw: scheduled.update(kw) or None)
+
+    meta = {
+        "chat_id": 1,
+        "session_id": "abc12345-0000-0000-0000-000000000000",
+        "rel_path": "session/ORIGINAL-abc12345.md",
+        "transcript": _capture_transcript(),
+        "vault_path_root": talker_config.vault.path,
+        "capture_candidate": True,
+    }
+    await talker_daemon._finalize_swept_capture(
+        meta, config=talker_config, client=object(), state_mgr=None,
+    )
+
+    assert scheduled["session_rel_path"] == "session/RENAMED-abc12345.md"
+    assert meta["rel_path"] == "session/RENAMED-abc12345.md"  # reassigned in place
+
+
+async def test_sweeper_finalize_no_rename_uses_original(
+    talker_config, monkeypatch,
+) -> None:
+    """derive_slug OFF (client=None → real passthrough) → rel_path unchanged →
+    structuring targets the ORIGINAL path. Guards the reassign is a faithful
+    no-op passthrough when no rename fires."""
+    from alfred.telegram import daemon as talker_daemon
+
+    talker_config.session.derive_slug_from_substance = False
+    talker_config.session.auto_structure_on_close = True
+
+    scheduled: dict = {}
+    monkeypatch.setattr(
+        talker_daemon.capture_batch, "schedule_capture_structuring",
+        lambda **kw: scheduled.update(kw) or None)
+
+    meta = {
+        "chat_id": 2,
+        "session_id": "def67890-0000-0000-0000-000000000000",
+        "rel_path": "session/ORIGINAL-def67890.md",
+        "transcript": _capture_transcript(),
+        "vault_path_root": talker_config.vault.path,
+        "capture_candidate": True,
+    }
+    await talker_daemon._finalize_swept_capture(
+        meta, config=talker_config, client=None, state_mgr=None,
+    )
+    assert scheduled["session_rel_path"] == "session/ORIGINAL-def67890.md"
+
+
+async def test_sweeper_finalize_non_candidate_no_structuring(
+    talker_config, monkeypatch,
+) -> None:
+    """A non-candidate swept session is NOT structured even with the flag on."""
+    from alfred.telegram import daemon as talker_daemon
+
+    talker_config.session.derive_slug_from_substance = False
+    talker_config.session.auto_structure_on_close = True
+
+    scheduled: dict = {}
+    monkeypatch.setattr(
+        talker_daemon.capture_batch, "schedule_capture_structuring",
+        lambda **kw: scheduled.update(kw) or None)
+
+    meta = {
+        "chat_id": 3, "session_id": "aaa-0000", "rel_path": "session/x.md",
+        "transcript": _short_transcript(),
+        "vault_path_root": talker_config.vault.path,
+        "capture_candidate": False,
+    }
+    await talker_daemon._finalize_swept_capture(
+        meta, config=talker_config, client=None, state_mgr=None,
+    )
+    assert scheduled == {}

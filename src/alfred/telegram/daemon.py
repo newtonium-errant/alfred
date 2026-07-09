@@ -417,6 +417,73 @@ def _classify_transport_task_outcome(
     return "died_returned"
 
 
+async def _finalize_swept_capture(
+    meta: dict[str, Any],
+    *,
+    config: "TalkerConfig",
+    client: Any,
+    state_mgr: "StateManager",
+) -> None:
+    """Post-close finalization for ONE timeout-swept session.
+
+    Two steps, in order, each failure-isolated:
+
+    1. Substance-slug rename (opt-in). CRITICAL: ``maybe_apply_substance_slug``
+       returns a possibly-RENAMED rel_path (it MOVES the file on disk when the
+       slug fires), so we REASSIGN ``meta["rel_path"]`` from its return — exactly
+       as ``bot.on_end`` does (``bot.py:1816``). Discarding the return here was
+       the clinic-capture Piece-1 fast-follow bug: with both
+       ``derive_slug_from_substance`` AND ``auto_structure_on_close`` enabled
+       (Hypatia's posture), the file was renamed first and then structuring was
+       aimed at the STALE original path → a guaranteed misfire on a moved file.
+    2. Capture structuring (opt-in, candidate-gated) — scheduled against the
+       CURRENT (possibly-renamed) ``meta["rel_path"]``. No Telegram push (the
+       sweeper has no chat context); the ``capture_structured: pending`` marker
+       written at close is the fail-safe if this never runs.
+    """
+    try:
+        meta["rel_path"] = await session.maybe_apply_substance_slug(
+            state_mgr,
+            enabled=config.session.derive_slug_from_substance,
+            client=client,
+            model=config.anthropic.model,
+            vault_path_root=meta["vault_path_root"],
+            rel_path=meta["rel_path"],
+            transcript=meta["transcript"],
+            session_id=meta["session_id"],
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "talker.daemon.sweep_substance_slug_failed",
+            chat_id=meta.get("chat_id"),
+        )
+    if config.session.auto_structure_on_close and meta.get("capture_candidate"):
+        try:
+            from alfred.audit import agent_slug_for
+            anchor_scope = (
+                "hypatia"
+                if (config.instance.tool_set or "").lower() == "hypatia"
+                else ""
+            )
+            capture_batch.schedule_capture_structuring(
+                client=client,
+                vault_path=Path(meta["vault_path_root"]),
+                # The renamed path (reassigned above) — NOT the stale original.
+                session_rel_path=meta["rel_path"],
+                transcript=meta["transcript"],
+                model=config.anthropic.model or "claude-sonnet-4-6",
+                agent_slug=agent_slug_for(config),
+                anchor_scope=anchor_scope,
+                short_id=(meta.get("session_id") or "").split("-")[0],
+                send_follow_up=None,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "talker.daemon.sweep_structuring_failed",
+                chat_id=meta.get("chat_id"),
+            )
+
+
 # --- Main entry -----------------------------------------------------------
 
 
@@ -1702,61 +1769,16 @@ async def run(
                         "talker.daemon.sweep_closed",
                         count=len(closed_meta),
                     )
-                # Phase 2 deferred-enhancement #1: opportunistically
-                # rename each closed record to use a substance-derived
-                # slug. Off by default (config knob); failure-isolated.
+                # Phase 2 deferred-enhancement #1 + clinic-capture arc:
+                # opportunistically rename each closed record to a substance
+                # slug, THEN (candidate + flag) auto-structure it — both in
+                # ``_finalize_swept_capture``, which reassigns rel_path from the
+                # rename so structuring targets the RENAMED file, not the stale
+                # original. Failure-isolated per step.
                 for meta in closed_meta:
-                    try:
-                        await session.maybe_apply_substance_slug(
-                            state_mgr,
-                            enabled=config.session.derive_slug_from_substance,
-                            client=client,
-                            model=config.anthropic.model,
-                            vault_path_root=meta["vault_path_root"],
-                            rel_path=meta["rel_path"],
-                            transcript=meta["transcript"],
-                            session_id=meta["session_id"],
-                        )
-                    except Exception:  # noqa: BLE001
-                        log.exception(
-                            "talker.daemon.sweep_substance_slug_failed",
-                            chat_id=meta.get("chat_id"),
-                        )
-                    # Clinic-capture arc: a capture candidate that TIMED OUT
-                    # (never /end-ed) must not be silently lost. close_session
-                    # already stamped ``capture_structured: pending`` (fail-safe,
-                    # unconditional); when ``auto_structure_on_close`` is enabled
-                    # AND this was a capture candidate, also run the structuring
-                    # pass now (the sweeper loop is alive, unlike shutdown, so the
-                    # detached task completes). No Telegram push here — the
-                    # follow-up would need a chat context the sweeper lacks.
-                    if (config.session.auto_structure_on_close
-                            and meta.get("capture_candidate")):
-                        try:
-                            from alfred.audit import agent_slug_for
-                            anchor_scope = (
-                                "hypatia"
-                                if (config.instance.tool_set or "").lower()
-                                == "hypatia" else ""
-                            )
-                            capture_batch.schedule_capture_structuring(
-                                client=client,
-                                vault_path=Path(meta["vault_path_root"]),
-                                session_rel_path=meta["rel_path"],
-                                transcript=meta["transcript"],
-                                model=config.anthropic.model
-                                or "claude-sonnet-4-6",
-                                agent_slug=agent_slug_for(config),
-                                anchor_scope=anchor_scope,
-                                short_id=(meta.get("session_id") or "")
-                                .split("-")[0],
-                                send_follow_up=None,
-                            )
-                        except Exception:  # noqa: BLE001
-                            log.exception(
-                                "talker.daemon.sweep_structuring_failed",
-                                chat_id=meta.get("chat_id"),
-                            )
+                    await _finalize_swept_capture(
+                        meta, config=config, client=client, state_mgr=state_mgr,
+                    )
             except Exception:  # noqa: BLE001
                 log.exception("talker.daemon.sweep_error")
 

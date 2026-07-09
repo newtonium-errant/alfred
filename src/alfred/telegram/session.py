@@ -875,6 +875,15 @@ async def maybe_apply_substance_slug(
 
     Returns the (possibly new) ``rel_path``. Failure paths are logged
     via :func:`apply_substance_slug` / :func:`derive_slug_from_substance_async`.
+
+    CALLER CONTRACT: this MOVES the file on disk when the slug fires, so the
+    returned value may differ from the ``rel_path`` you passed in. Callers MUST
+    reassign ``rel_path = await maybe_apply_substance_slug(...)`` BEFORE any
+    downstream path-consuming op (scheduling structuring, reading the record,
+    building a wikilink). Discarding the return and reusing the original path
+    targets a MOVED file — the exact on_end/sweeper inconsistency that caused
+    the clinic-capture Piece-1 fast-follow bug (``bot.on_end`` reassigns at
+    ``bot.py:1816``; the timeout sweeper originally did not).
     """
     if not enabled or client is None:
         return rel_path
