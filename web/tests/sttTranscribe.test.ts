@@ -31,15 +31,25 @@ function mockRes() {
 
 // A POST request that is async-iterable (mimics the raw Node request stream the
 // route consumes with `for await (const chunk of req)`).
-function audioReq(contentType: string | undefined, chunks: Buffer[]): NextApiRequest {
+function audioReq(
+  contentType: string | undefined,
+  chunks: Buffer[],
+  idempotencyKey?: string,
+): NextApiRequest {
   return {
     method: 'POST',
-    headers: { 'content-type': contentType },
+    headers: {
+      'content-type': contentType,
+      // Node lowercases incoming header keys.
+      ...(idempotencyKey !== undefined ? { 'x-alfred-stt-idempotency-key': idempotencyKey } : {}),
+    },
     async *[Symbol.asyncIterator]() {
       for (const c of chunks) yield c;
     },
   } as unknown as NextApiRequest;
 }
+
+const HEX64 = 'a'.repeat(64); // a well-formed SHA-256 hex digest shape
 
 beforeEach(() => {
   mockResolveSessionToken.mockReset();
@@ -109,8 +119,30 @@ describe('POST /api/stt/transcribe', () => {
     expect(opts.body.toString()).toBe('audio'); // 'aud' + 'io' concatenated
     expect(opts.contentType).toBe('audio/webm'); // params stripped
     expect(opts.sessionToken).toBe('tok');
+    expect(opts.idempotencyKey).toBeUndefined(); // none sent → first transcribe unaffected
 
     expect(status).toHaveBeenCalledWith(200);
     expect(json).toHaveBeenCalledWith({ transcript: 'hello there', low_confidence: false });
+  });
+
+  it('relays a well-formed idempotency key (allowlisted) to the backend', async () => {
+    mockResolveSessionToken.mockReturnValue('tok');
+    mockCallTransportBinary.mockResolvedValue({ status: 200, body: { transcript: 'cached', deduped: true } });
+    const { res, status, json } = mockRes();
+    await handler(audioReq('audio/webm', [Buffer.from('aud')], HEX64), res);
+
+    const [, , opts] = mockCallTransportBinary.mock.calls[0];
+    expect(opts.idempotencyKey).toBe(HEX64);
+    expect(status).toHaveBeenCalledWith(200);
+    expect(json).toHaveBeenCalledWith({ transcript: 'cached', deduped: true });
+  });
+
+  it('DROPS a malformed idempotency key (not relayed) — no header injection', async () => {
+    mockResolveSessionToken.mockReturnValue('tok');
+    mockCallTransportBinary.mockResolvedValue({ status: 200, body: { transcript: 'x' } });
+    const { res } = mockRes();
+    await handler(audioReq('audio/webm', [Buffer.from('aud')], 'not-a-hex-digest'), res);
+    const [, , opts] = mockCallTransportBinary.mock.calls[0];
+    expect(opts.idempotencyKey).toBeUndefined(); // malformed → dropped, backend just won't dedup
   });
 });

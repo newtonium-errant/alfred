@@ -10,6 +10,8 @@
 //   - X-Alfred-Session: <instance-signed session token>   (verified server-side)
 // The /auth/* routes carry NO session token (the user isn't signed in yet).
 
+import { STT_IDEMPOTENCY_HEADER } from './schemas';
+
 // The peer/client name the transport knows this front-end by. Must match the
 // backend's web peer entry in `auth.tokens`. Config-driven so a backend rename is
 // a config change, not a code change. Defaults to "web".
@@ -120,6 +122,8 @@ export interface BinaryCallOptions {
   body: Buffer;
   contentType: string;
   sessionToken?: string | null;
+  /** Relayed verbatim as the STT idempotency header when present (BFF-allowlisted). */
+  idempotencyKey?: string;
 }
 
 export async function callTransportBinary(
@@ -135,6 +139,9 @@ export async function callTransportBinary(
   };
   if (opts.sessionToken) {
     headers['X-Alfred-Session'] = opts.sessionToken;
+  }
+  if (opts.idempotencyKey) {
+    headers[STT_IDEMPOTENCY_HEADER] = opts.idempotencyKey;
   }
 
   const res = await fetch(`${baseUrl()}${path}`, {
