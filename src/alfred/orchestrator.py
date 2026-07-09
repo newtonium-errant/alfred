@@ -129,6 +129,66 @@ def _run_instructor(raw: dict[str, Any], skills_dir: str, suppress_stdout: bool 
 
 _MISSING_DEPS_EXIT = 78  # exit code signaling missing optional dependencies
 
+# Sovereign no-egress boundary breach (scribe P1-a). Distinct from
+# _MISSING_DEPS_EXIT so "the boundary refused" is greppable and never
+# conflated with "an optional dep is missing." Like 78 it is a
+# NON-RESTARTABLE class: the orchestrator MUST NOT auto-restart a daemon
+# that exited 79 — restarting would only re-attempt a cloud-reachable
+# start. Raised from ``alfred.sovereign.boundary.SovereignBoundaryError``.
+_SOVEREIGN_BREACH_EXIT = 79
+
+
+def _is_no_restart_exit(exit_code: int | None) -> bool:
+    """True iff ``exit_code`` signals a deliberate no-auto-restart exit.
+
+    Both are "give up on this tool cleanly, don't loop": 78 = missing
+    optional deps, 79 = sovereign no-egress boundary breach. Pure +
+    pinned in tests so a new no-restart code gets a deliberate decision.
+    """
+    return exit_code in (_MISSING_DEPS_EXIT, _SOVEREIGN_BREACH_EXIT)
+
+
+def _enforce_sovereign_boundary_or_exit(raw: dict[str, Any]) -> None:
+    """Run the sovereign no-egress boundary; abort exit-79 on breach.
+
+    No-op unless ``raw`` declares ``sovereign: {enabled: true}``. When
+    enforcement is requested and every barrier holds, installs the
+    process-global :class:`SovereignHttpGuard` so every child forked below
+    inherits the loopback-before-connect assertion (defense against code
+    drift). On a breach, logs ``orchestrator.sovereign_breach_abort`` and
+    ``sys.exit(_SOVEREIGN_BREACH_EXIT)`` — the whole slot aborts here in the
+    parent, before any daemon is spawned, so nothing ever starts
+    cloud-reachable. The ``validate_sovereign_boundary`` call itself emits
+    the barrier-level ``sovereign_ok`` / ``sovereign_boundary_refused``
+    signal (intentionally-left-blank).
+    """
+    sovereign = raw.get("sovereign") or {}
+    if not (isinstance(sovereign, dict) and sovereign.get("enabled")):
+        return  # not a sovereign instance — no import, no cost
+
+    from alfred.sovereign import (
+        SovereignBoundaryError,
+        install_sovereign_http_guard,
+        validate_sovereign_boundary,
+    )
+
+    try:
+        validate_sovereign_boundary(raw)
+    except SovereignBoundaryError as e:
+        import structlog
+
+        structlog.get_logger(__name__).error(
+            "orchestrator.sovereign_breach_abort",
+            reason=e.reason,
+            detail=e.detail,
+            exit_code=_SOVEREIGN_BREACH_EXIT,
+        )
+        sys.exit(_SOVEREIGN_BREACH_EXIT)
+
+    # Boundary held — arm the per-call HTTP guard for this process (and,
+    # via fork, every child spawned below).
+    install_sovereign_http_guard()
+
 
 def _auto_load_dotenv_for_config(raw: dict[str, Any]) -> None:
     """Load the active config's sibling ``.env`` into ``os.environ``.
@@ -1357,6 +1417,15 @@ def run_all(
     # ``skipped_unresolved`` and the daemons inherit the wrong token.
     # P1 from QA 2026-05-05 — see ``_auto_load_dotenv_for_config``.
     _auto_load_dotenv_for_config(raw)
+    # Sovereign no-egress boundary (scribe P1-a) — fail-closed gate for
+    # instances that declare ``sovereign: {enabled: true}``. MUST run AFTER
+    # the .env auto-load above: barrier (c) inspects the FINAL process env,
+    # so it catches a cloud key the config-sibling .env re-introduced into
+    # os.environ even when the launch wrapper scrubbed the shell env with
+    # ``env -u`` (the .env gap-fill leak). A breach aborts the whole slot
+    # here in the parent — BEFORE any child is forked below — so nothing
+    # ever starts cloud-reachable. No-op for every non-sovereign instance.
+    _enforce_sovereign_boundary_or_exit(raw)
     # Resolve transport env vars once — orchestrator injects these
     # into every tool's child environment so any subprocess can call
     # the outbound-push client without looking at config.yaml again.
@@ -1496,8 +1565,15 @@ def run_all(
                         p = processes[tool]
                         if not p.is_alive():
                             exit_code = p.exitcode
-                            if exit_code == _MISSING_DEPS_EXIT:
-                                print(f"  [{tool}] missing dependencies, not restarting")
+                            if _is_no_restart_exit(exit_code):
+                                if exit_code == _SOVEREIGN_BREACH_EXIT:
+                                    print(
+                                        f"  [{tool}] sovereign boundary breach "
+                                        f"(exit 79), NOT restarting — refusing to "
+                                        f"re-enter a cloud-reachable state"
+                                    )
+                                else:
+                                    print(f"  [{tool}] missing dependencies, not restarting")
                                 tools = [t for t in tools if t != tool]
                                 continue
                             restart_counts[tool] += 1
