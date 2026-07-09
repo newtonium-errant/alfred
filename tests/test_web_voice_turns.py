@@ -18,6 +18,7 @@ import structlog
 from alfred.web.config import WebAuthConfig, WebConfig, WebUser
 from alfred.web.identity import WebIdentity, synthetic_chat_id
 from alfred.web.voice_turns import (
+    DEFAULT_VOICE_REPLY_GUIDANCE,
     EVENT_VERSION,
     MAX_DC_EVENT_BYTES,
     TURN_SLOT_WAIT_S,
@@ -95,7 +96,7 @@ def _web_config(users_multi: bool = False) -> WebConfig:
     return WebConfig(enabled=True, users=users, auth=WebAuthConfig(session_secret="x" * 40))
 
 
-def _deps(state, *, rts, in_flight=None, key=_KEY) -> TurnDeps:
+def _deps(state, *, rts, in_flight=None, key=_KEY, reply_guidance="") -> TurnDeps:
     return TurnDeps(
         client=object(),
         state_mgr=state,
@@ -106,6 +107,7 @@ def _deps(state, *, rts, in_flight=None, key=_KEY) -> TurnDeps:
         in_flight=in_flight if in_flight is not None else set(),
         identity=WebIdentity(user="andrew", role="owner", synthetic_chat_id=_OWNER),
         chat_session_key=key,
+        reply_guidance=reply_guidance,
         run_turn_streaming_fn=rts,
     )
 
@@ -218,6 +220,48 @@ async def test_full_turn_ordering_and_versioning() -> None:
     assert rts.calls[0]["user_kind"] == "voice"
     assert rts.calls[0]["on_event"] is None
     await driver.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Voice-only reply-brevity guidance (appended to the SKILL system prompt)
+# ---------------------------------------------------------------------------
+
+
+async def _run_one_turn_capture_system_prompt(*, reply_guidance="") -> str:
+    """Drive one voice turn and return the ``system_prompt`` the engine saw."""
+    ch = FakeChannel()
+    state = _FakeState(_active())
+    rts = _scripted_rts([{"type": "final", "reply": "ok"}])
+    driver = VoiceTurnDriver(
+        _deps(state, rts=rts, reply_guidance=reply_guidance), "v1",
+    )
+    driver.attach_channel(ch)
+    _hello(driver)
+    await driver.submit_utterance("hey")
+    await _wait_for(ch, {"turn_final"})
+    await driver.aclose()
+    assert len(rts.calls) == 1
+    return rts.calls[0]["system_prompt"]
+
+
+async def test_voice_turn_appends_default_guidance_when_config_empty() -> None:
+    """Empty config → the built-in DEFAULT_VOICE_REPLY_GUIDANCE is appended to
+    the SKILL system prompt (which _deps stubs as "SYS"). Mutation guard:
+    remove the append at _drive_stream and this endswith flips false."""
+    sp = await _run_one_turn_capture_system_prompt(reply_guidance="")
+    assert sp == "SYS\n\n" + DEFAULT_VOICE_REPLY_GUIDANCE
+    assert sp.endswith(DEFAULT_VOICE_REPLY_GUIDANCE)
+    # The base SKILL prompt is still present (guidance is ADDITIVE, not a swap).
+    assert sp.startswith("SYS")
+
+
+async def test_voice_turn_config_override_replaces_default() -> None:
+    """A per-instance web.voice.reply_guidance value is used verbatim in place
+    of the default (Hypatia's firmer variant path)."""
+    override = "SPEAK IN ONE SHORT SENTENCE."
+    sp = await _run_one_turn_capture_system_prompt(reply_guidance=override)
+    assert sp == "SYS\n\n" + override
+    assert DEFAULT_VOICE_REPLY_GUIDANCE not in sp
 
 
 async def test_exactly_one_turn_tool_per_tool_call() -> None:

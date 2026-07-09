@@ -60,6 +60,20 @@ TURN_SLOT_WAIT_S = 60.0
 _DC_BUFFER_LIMIT = 1024 * 1024   # 1 MiB SCTP send buffer → drop
 _INFLIGHT_POLL_S = 0.25
 
+# VOICE-ONLY reply-brevity guidance appended to the instance's SKILL system
+# prompt for voice turns (never chat). Voice is otherwise transport-transparent
+# to the LLM, so it replies at TEXT length — 800-900-char monologues that are
+# ~30s of speech, which the operator barges to cut off. This addendum tells the
+# model it is speaking, not writing. Used when web.voice.reply_guidance is empty
+# (the common case); a per-instance config value overrides it. PLACEHOLDER text
+# — the prompt-tuner owns the final wording; the swap is a one-line data change
+# behind this named constant.
+DEFAULT_VOICE_REPLY_GUIDANCE = (
+    "You're in a spoken voice conversation — keep replies short and "
+    "conversational, a sentence or two; no lists, markdown, or long "
+    "paragraphs; go deeper only if explicitly asked."
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -83,6 +97,11 @@ class TurnDeps:
     in_flight: set
     identity: "WebIdentity"
     chat_session_key: str
+    # VOICE-ONLY reply-brevity addendum appended to the SKILL system prompt for
+    # voice turns. Empty → DEFAULT_VOICE_REPLY_GUIDANCE; a per-instance
+    # web.voice.reply_guidance value overrides. Wired from config in
+    # routes_voice._offer_assistant.
+    reply_guidance: str = ""
     run_turn_streaming_fn: Callable[..., Any] | None = None
 
 
@@ -729,6 +748,15 @@ class VoiceTurnDriver:
         if rts is None:
             from alfred.telegram.conversation import run_turn_streaming as rts
 
+        # VOICE-ONLY: append the reply-brevity guidance to the instance's SKILL
+        # system prompt. This is the SOLE run_turn_streaming call site in the
+        # codebase (the chat path uses run_turn separately), so the addendum is
+        # voice-only by construction — the chat system prompt is untouched.
+        system_prompt = (
+            d.system_prompt_provider()
+            + "\n\n"
+            + (d.reply_guidance or DEFAULT_VOICE_REPLY_GUIDANCE)
+        )
         agen = rts(
             client=d.client,
             state=d.state_mgr,
@@ -736,7 +764,7 @@ class VoiceTurnDriver:
             user_message=text,
             config=d.talker_config,
             vault_context_str=d.vault_context_str,
-            system_prompt=d.system_prompt_provider(),
+            system_prompt=system_prompt,
             user_kind="voice",
             user_role=d.identity.role,
             user_name=_user_name_for(d.identity, d.web_config),

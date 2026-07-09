@@ -291,6 +291,14 @@ class WebVoiceConfig:
     # knob) but config-overridable per §4 "REAPER_INTERVAL from config or
     # 15s"; schema-tolerant so an older config without it still loads.
     reaper_interval_seconds: int = 15
+    # VOICE-ONLY reply-brevity guidance (assistant pipeline). Appended to the
+    # instance's SKILL system prompt for VOICE turns ONLY (never chat) so the
+    # LLM replies at spoken length, not text length — voice is otherwise
+    # transport-transparent to the model, which yields 800-900-char monologues
+    # awful to hear. Empty = use ``DEFAULT_VOICE_REPLY_GUIDANCE`` (voice_turns);
+    # a per-instance value here OVERRIDES the default (e.g. Hypatia sets a
+    # firmer variant). See voice_turns.py:_drive_stream.
+    reply_guidance: str = ""
     ice: VoiceIceConfig = field(default_factory=VoiceIceConfig)
     stt: WebVoiceSttConfig = field(default_factory=WebVoiceSttConfig)
     tts: WebVoiceTtsConfig = field(default_factory=WebVoiceTtsConfig)
@@ -599,6 +607,7 @@ def _build_voice(raw: Any) -> WebVoiceConfig:
             filtered.get("reaper_interval_seconds"),
             defaults.reaper_interval_seconds,
         ),
+        reply_guidance=str(filtered.get("reply_guidance", "") or ""),
         ice=_build_voice_ice(filtered.get("ice")),
         stt=_build_voice_stt(filtered.get("stt")),
         tts=_build_voice_tts(filtered.get("tts")),

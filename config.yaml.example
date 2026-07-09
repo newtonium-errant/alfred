@@ -596,6 +596,12 @@ transport:
 #                                     # with zero speech after this window
 #                                     # (bounds billable silent mic-open)
 #     # reaper_interval_seconds: 15   # advanced: sweep cadence (default 15)
+#     # VOICE-ONLY reply-brevity guidance appended to the SKILL system prompt
+#     # for voice turns (never chat), so the model replies at SPOKEN length
+#     # (a sentence or two) instead of text-length monologues. Empty (default)
+#     # uses the built-in DEFAULT_VOICE_REPLY_GUIDANCE; set a per-instance
+#     # string to override (e.g. a firmer variant for a chattier instance).
+#     reply_guidance: ""
 #     ice:
 #       # Rewrite answer-SDP host-candidate addrs to a public IP (1:1-NAT
 #       # deploys only; LEAVE EMPTY when the box's public IP is on-interface,

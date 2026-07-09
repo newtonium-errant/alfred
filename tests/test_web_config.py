@@ -304,8 +304,28 @@ def test_voice_absent_is_disabled_default() -> None:
     assert cfg.voice.pipeline == "echo"
     assert cfg.voice.offer_timeout_seconds == 10
     assert cfg.voice.reaper_interval_seconds == 15
+    # Voice-only reply-brevity guidance defaults empty → voice_turns falls back
+    # to DEFAULT_VOICE_REPLY_GUIDANCE.
+    assert cfg.voice.reply_guidance == ""
     assert isinstance(cfg.voice.ice, VoiceIceConfig)
     assert cfg.voice.ice.stun_servers == []
+
+
+def test_voice_reply_guidance_override_loads() -> None:
+    # A per-instance web.voice.reply_guidance overrides the built-in default
+    # (Hypatia's firmer-brevity path).
+    cfg = load_from_unified(
+        {
+            "web": {
+                "enabled": True,
+                "voice": {
+                    "enabled": True,
+                    "reply_guidance": "One short sentence. Never a list.",
+                },
+            }
+        }
+    )
+    assert cfg.voice.reply_guidance == "One short sentence. Never a list."
 
 
 def test_voice_full_block_loads() -> None:

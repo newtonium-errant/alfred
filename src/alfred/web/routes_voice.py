@@ -293,6 +293,7 @@ async def _offer_assistant(
         in_flight=request.app[KEY_WEB_INFLIGHT],
         identity=identity,
         chat_session_key=chat_session_key,
+        reply_guidance=web_config.voice.reply_guidance,
     )
     driver = VoiceTurnDriver(
         deps, voice_session_id=vid, barge=request.app.get(_KEY_WEB_BARGE),

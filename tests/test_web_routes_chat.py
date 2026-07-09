@@ -775,6 +775,47 @@ async def test_turn_normal_response_includes_deduped_false(web_client) -> None:
     assert body["deduped"] is False
 
 
+async def test_chat_turn_system_prompt_has_no_voice_guidance(
+    web_client, monkeypatch
+) -> None:
+    """VOICE-ONLY pin: the chat path (run_turn) receives the BARE SKILL system
+    prompt. The voice reply-brevity guidance is appended ONLY at
+    voice_turns._drive_stream (the sole run_turn_streaming call site); chat uses
+    run_turn and must be byte-identical (no guidance). If someone injects the
+    guidance into the chat path, this flips red."""
+    from alfred.web.voice_turns import DEFAULT_VOICE_REPLY_GUIDANCE
+
+    captured: dict = {}
+
+    async def _capturing_run_turn(**kwargs):
+        captured["system_prompt"] = kwargs["system_prompt"]
+        from alfred.telegram.session import append_turn
+
+        session = kwargs["session"]
+        state = kwargs["state"]
+        append_turn(
+            state, session, "user", kwargs["user_message"],
+            kind=kwargs.get("user_kind", "text"),
+        )
+        append_turn(state, session, "assistant", "ok")
+        return "ok"
+
+    monkeypatch.setattr(
+        "alfred.telegram.conversation.run_turn", _capturing_run_turn,
+    )
+    headers = _session_headers()
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    await web_client.post(
+        "/chat/turn",
+        json={"session_key": key, "message": "hi"},
+        headers=headers,
+    )
+    # Bare provider output — no "\n\n" + guidance suffix that voice turns add.
+    assert captured["system_prompt"] == "SYSTEM PROMPT"
+    assert DEFAULT_VOICE_REPLY_GUIDANCE not in captured["system_prompt"]
+
+
 async def test_turn_idempotent_retry_returns_cached_without_rerun(
     web_client, monkeypatch
 ) -> None:
