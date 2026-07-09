@@ -89,14 +89,43 @@ CLOUD_KEY_ENV_VARS: tuple[str, ...] = (
     "ELEVENLABS_API_KEY",
     "TOGETHER_API_KEY",
     "ZO_API_KEY",
+    # RESEND email egress (P1-a review WARN-4) — web/email.py POSTs to
+    # api.resend.com/emails; PHI can ride an email body.
+    "RESEND_API_KEY",
 )
 
-# Barrier (d). Config sections that wire a network egress path. Presence of
-# ANY of these on a sovereign instance is a breach. ``telegram`` is included
-# deliberately: a cloud Telegram bot (bot API + the in-process AsyncAnthropic
-# reply path) is definitionally non-sovereign. A future sovereign-talker
-# backed by a LOCAL model would need an explicit carve-out here — fail-closed
-# until then, per the scope-first "design the deny, widen deliberately" rule.
+# Barrier (d). Config sections that wire a network egress path — many of them
+# ESCAPE the in-process httpx guard, so they MUST be denied here at load (the
+# guard cannot see them at runtime). Presence of ANY of these on a sovereign
+# instance is a breach.
+#
+# Two escape classes barrier (d) closes (P1-a review):
+#
+#   1. The ``claude -p`` OAuth SUBPROCESS path (BLOCK-1 — the serious one, a
+#      real cloud-LLM egress no other barrier catches).
+#      ``subprocess_env.claude_subprocess_env`` DELIBERATELY strips
+#      ANTHROPIC_API_KEY/AUTH_TOKEN/BASE_URL so ``claude -p`` falls back to the
+#      CACHED OAuth creds in ~/.claude and STILL reaches api.anthropic.com.
+#      Stripping the key does NOT neutralise it — it REROUTES it to OAuth. And
+#      it is a separate process, so the httpx guard is blind to it.
+#      curator / janitor / distiller run ``claude -p`` and auto-start on their
+#      OWN block presence, defaulting to ``backend: claude`` (AgentConfig
+#      default) even with NO ``agent:`` block — so denying ``agent`` alone is
+#      INSUFFICIENT; the agent-backed TOOL blocks are denied too. instructor
+#      runs the Anthropic SDK in-process (httpx, guard-caught) but is denied
+#      here for defense-in-depth.
+#   2. Non-httpx cloud transports the guard cannot wrap (BLOCK-2 / WARN-3):
+#      ``web`` (aiohttp STT/TTS in web/stt_deepgram.py + web/tts_elevenlabs.py,
+#      plus RESEND email egress in web/email.py), ``gcal`` / ``integrations``
+#      (googleapiclient in integrations/gcal.py). The aiohttp guard extension
+#      is a hard P2 blocker (task #40) before the scribe web UI may route PHI;
+#      until then these are fail-closed here.
+#
+# ``telegram`` is included deliberately: a cloud Telegram bot (bot API + the
+# in-process AsyncAnthropic reply path) is definitionally non-sovereign. A
+# future sovereign-talker / sovereign-surveyor backed by a LOCAL model would
+# need an explicit carve-out here — fail-closed until then, per the scope-first
+# "design the deny, widen deliberately" rule.
 EGRESS_CONFIG_SECTIONS: tuple[str, ...] = (
     "transport",
     "brief_digest_push",
@@ -106,6 +135,17 @@ EGRESS_CONFIG_SECTIONS: tuple[str, ...] = (
     "mail",
     "daily_sync",
     "telegram",
+    # claude -p OAuth subprocess egress (BLOCK-1) — the backend selector AND
+    # the agent-backed tools that default to backend=claude without it.
+    "agent",
+    "curator",
+    "janitor",
+    "distiller",
+    "instructor",
+    # non-httpx cloud transports the httpx guard cannot see (BLOCK-2 / WARN-3).
+    "web",
+    "gcal",
+    "integrations",
 )
 
 

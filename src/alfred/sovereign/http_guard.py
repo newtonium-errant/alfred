@@ -16,11 +16,25 @@ Install is idempotent and reversible (``uninstall_...`` restores the original
 the parent process before forking children, so every sovereign child inherits
 the wrapped methods; a child launched fresh (spawn) re-installs on its own.
 
-httpx is the right seam: the tools' cloud paths (STT via httpx, ElevenLabs via
-httpx, and the Anthropic/OpenAI SDKs, which all use httpx underneath) route
-through ``Client.send`` / ``AsyncClient.send``. The ``claude -p`` SUBPROCESS
-path is out of scope here (a separate process) — it is neutralised by
-barrier (c) stripping the credential, not by this in-process guard.
+SCOPE + KNOWN GAPS (honest, not a completeness claim). This guard wraps
+``httpx.Client.send`` / ``httpx.AsyncClient.send`` ONLY. It catches httpx-backed
+cloud paths (the Anthropic/OpenAI SDKs use httpx underneath; ``telegram/
+transcribe.py``'s hardcoded Groq endpoint uses httpx). It does NOT cover, and
+each of these is instead neutralised by barrier (d) denying the wiring config
+section at LOAD:
+
+  * ``aiohttp`` — the web STT/TTS surfaces (``web/stt_deepgram.py`` Deepgram,
+    ``web/tts_elevenlabs.py`` ElevenLabs). Denied via ``web`` in
+    EGRESS_CONFIG_SECTIONS. An aiohttp guard extension is a HARD P2 BLOCKER
+    (task #40) before the scribe web UI may route PHI.
+  * ``googleapiclient`` — GCal (``integrations/gcal.py``). Denied via ``gcal``
+    / ``integrations`` in EGRESS_CONFIG_SECTIONS.
+  * the ``claude -p`` SUBPROCESS — a separate process the guard cannot see.
+    ⚠️ It is NOT neutralised by stripping the credential: ``subprocess_env``
+    strips the API key precisely so ``claude -p`` REROUTES to cached OAuth
+    creds (~/.claude) and STILL reaches api.anthropic.com. It is neutralised
+    by barrier (d) denying ``agent`` / ``curator`` / ``janitor`` / ``distiller``
+    / ``instructor`` — NOT by barrier (c).
 """
 
 from __future__ import annotations

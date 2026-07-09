@@ -231,6 +231,53 @@ def test_barrier_d_telegram_is_egress():
     assert "telegram" in EGRESS_CONFIG_SECTIONS
 
 
+def test_barrier_d_agent_block_refused():
+    # P1-a review BLOCK-1 headline pin: an ``agent:`` block (the claude-p
+    # backend selector) breaches. Stripping the API key REROUTES claude -p to
+    # cached OAuth creds (still reaches api.anthropic.com) — barrier (c) does
+    # NOT catch it; barrier (d) must.
+    raw = _sovereign_raw()
+    raw["agent"] = {"backend": "claude"}
+    with pytest.raises(SovereignBoundaryError) as exc:
+        validate_sovereign_boundary(raw, env=_CLEAN_ENV)
+    assert exc.value.reason == "barrier_d"
+
+
+@pytest.mark.parametrize("tool", ["curator", "janitor", "distiller", "instructor"])
+def test_barrier_d_agent_backed_tool_refused(tool):
+    # The real hole denying ``agent`` alone would leave open: these tools
+    # auto-start on their OWN block presence and default to backend=claude
+    # WITHOUT an ``agent:`` block — so each must be denied at barrier (d).
+    raw = _sovereign_raw()
+    raw[tool] = {"schedule": {}}  # no ``agent`` block — defaults to claude
+    with pytest.raises(SovereignBoundaryError) as exc:
+        validate_sovereign_boundary(raw, env=_CLEAN_ENV)
+    assert exc.value.reason == "barrier_d"
+
+
+@pytest.mark.parametrize("section", ["web", "gcal", "integrations"])
+def test_barrier_d_non_httpx_transport_refused(section):
+    # P1-a review BLOCK-2 / WARN-3: aiohttp (web STT/TTS) + googleapiclient
+    # (gcal) escape the httpx guard, so they are fail-closed at load.
+    raw = _sovereign_raw()
+    raw[section] = {"enabled": True}
+    with pytest.raises(SovereignBoundaryError) as exc:
+        validate_sovereign_boundary(raw, env=_CLEAN_ENV)
+    assert exc.value.reason == "barrier_d"
+
+
+def test_barrier_c_resend_key_refused():
+    # P1-a review WARN-4: RESEND_API_KEY (web/email.py → api.resend.com) is a
+    # cloud egress a PHI email body can ride. Present in env => barrier_c.
+    assert "RESEND_API_KEY" in CLOUD_KEY_ENV_VARS
+    raw = _sovereign_raw()
+    with pytest.raises(SovereignBoundaryError) as exc:
+        validate_sovereign_boundary(
+            raw, env={"RESEND_API_KEY": "DUMMY_RESEND_TEST_KEY"}
+        )
+    assert exc.value.reason == "barrier_c"
+
+
 # --- host_is_loopback helper ------------------------------------------------
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "[::1]", "LOCALHOST"])
