@@ -27,6 +27,7 @@ fake pattern in ``tests/telegram/conftest.py``).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1031,6 +1032,76 @@ async def process_capture_session(
             )
 
 
+# --- Shared close-path scheduler -----------------------------------------
+
+# Retain-set: a detached ``create_task`` whose reference nobody holds can be
+# garbage-collected mid-flight (the asyncio footgun). The web reopen path is the
+# sharpest case — the request handler returns immediately after scheduling, so
+# without a strong ref the structuring task can vanish before it runs. Mirror the
+# ``_SHADOW_TASKS`` / ``_ENDPOINT_TASKS`` pattern used elsewhere in the web voice
+# stack: hold the task until it completes, then drop it.
+_STRUCTURING_TASKS: set[asyncio.Task] = set()
+
+
+def schedule_capture_structuring(
+    *,
+    client: Any,
+    vault_path: Path,
+    session_rel_path: str,
+    transcript: list[dict[str, Any]],
+    model: str,
+    agent_slug: str,
+    anchor_scope: str = "",
+    short_id: str = "",
+    send_follow_up: Any | None = None,
+    extract_target_override: str = "",
+) -> "asyncio.Task | None":
+    """Schedule :func:`process_capture_session` as a detached, retained task.
+
+    The single scheduling seam shared by every close path that auto-structures a
+    capture (Telegram ``/end``, web ``/chat/open`` reopen, the daemon timeout
+    sweeper). Extracted from ``bot.on_end`` so the four callers stay in lockstep.
+    Returns the ``Task`` (retained in :data:`_STRUCTURING_TASKS` until done) or
+    ``None`` if scheduling raised (e.g. no running loop) — the caller keeps going
+    (the record's ``capture_structured: pending`` marker is the fail-safe if the
+    structuring never fires). Never raises.
+
+    ``send_follow_up`` is optional: Telegram passes a bound ``send_message``;
+    the web path passes ``None`` (no push channel — the record write + the
+    ``prior_capture`` field on the /chat/open response are the signal instead)."""
+    try:
+        task = asyncio.ensure_future(
+            process_capture_session(
+                client=client,
+                vault_path=vault_path,
+                session_rel_path=session_rel_path,
+                transcript=transcript,
+                model=model,
+                send_follow_up=send_follow_up,
+                short_id=short_id,
+                agent_slug=agent_slug,
+                anchor_scope=anchor_scope,
+                extract_target_override=extract_target_override,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — scheduling must not block the close
+        log.warning(
+            "talker.capture.schedule_failed",
+            session_rel_path=session_rel_path,
+            error=str(exc),
+        )
+        return None
+    _STRUCTURING_TASKS.add(task)
+    task.add_done_callback(_STRUCTURING_TASKS.discard)
+    log.info(
+        "talker.capture.structuring_scheduled",
+        session_rel_path=session_rel_path,
+        anchor_scope=anchor_scope,
+        turns=len(transcript),
+    )
+    return task
+
+
 # --- JSON-round-trip helper for tests ------------------------------------
 
 def summary_to_dict(summary: StructuredSummary) -> dict[str, Any]:
@@ -1271,6 +1342,7 @@ __all__ = [
     "render_failure_markdown",
     "write_summary_to_session_record",
     "process_capture_session",
+    "schedule_capture_structuring",
     "summary_to_dict",
     # Memo branch (Phase 1 Zettelkasten cutover, 2026-05-16) — exposed
     # for testability.

@@ -453,6 +453,38 @@ def is_substantive(transcript: list[dict[str, Any]]) -> bool:
     return len(substance) >= _SUBSTANCE_MIN_CHARS
 
 
+def is_capture_candidate(
+    session: "Session", session_type: str | None,
+) -> bool:
+    """Deterministic: should this closing session be treated as an unstructured
+    CAPTURE — worth flagging (so it is never silently lost) and, where enabled,
+    auto-structuring?
+
+    True when EITHER the session is explicitly capture-typed (the Telegram
+    ``/capture`` opener stamps ``_session_type="capture"``) OR it is a
+    SUBSTANTIVE session (``is_substantive`` — ≥ ``_SUBSTANCE_MIN_TURNS`` turns
+    AND ≥ ``_SUBSTANCE_MIN_CHARS`` of user substance).
+
+    The second clause is what catches the WEB/PWA case, which is the incident
+    this fixes: web sessions are ALWAYS ``session_type=="conversation"`` —
+    ``open_session`` takes no session_type and only the Telegram ``/capture``
+    opener (``bot.py``) ever stamps ``_session_type`` — so a clinician's dictated
+    action-item dump on the PWA carries NO capture flag. Substance is the only
+    deterministic, pre-structuring signal available.
+
+    ASYMMETRIC BIAS (deliberate — mirrors the endpoint-hold error-bias): err
+    toward True. A false-positive costs a benign ``capture_structured: pending``
+    marker (no code path GATES on that field — only the capture-batch writer sets
+    it and the SKILL prompt reads it) plus, ONLY where ``auto_structure_on_close``
+    is enabled, one Sonnet call whose buckets come back empty. A false-NEGATIVE
+    silently loses a clinician's dictated tasks. Cheap-wrong beats silent-loss.
+
+    Pure — no LLM, no I/O."""
+    if (session_type or "").lower() == "capture":
+        return True
+    return is_substantive(session.transcript)
+
+
 _SUBSTANCE_SYSTEM_PROMPT = (
     "You are a filename-labelling utility. The user will paste a chat "
     "transcript inside <transcript> tags. You must emit a 3-5 word "
@@ -1328,6 +1360,12 @@ def check_timeouts_with_meta(
         snap = _snapshot_for_post_close(raw)
         transcript_snap = snap["transcript"]
         session_id_snap = snap["session_id"]
+        # Capture-candidacy decided here (single source of truth — the same
+        # ``is_capture_candidate`` used for the close-time fail-safe marker), so
+        # the daemon sweeper reuses the verdict instead of re-deriving it.
+        capture_candidate = is_capture_candidate(
+            Session.from_dict(raw), raw.get("_session_type"),
+        )
         try:
             path = close_session(
                 state,
@@ -1354,6 +1392,12 @@ def check_timeouts_with_meta(
             "rel_path": path,
             "transcript": transcript_snap,
             "vault_path_root": vault_path_root,
+            # Carried so the daemon sweeper can gate capture-structuring without
+            # re-deriving candidacy. The record's fail-safe
+            # ``capture_structured: pending`` marker was already written by
+            # ``close_session`` above regardless of this flag.
+            "session_type": raw.get("_session_type", "note"),
+            "capture_candidate": capture_candidate,
         })
     return closed_meta
 
@@ -1416,6 +1460,28 @@ def close_session(
         mode=mode,
     )
     body = _build_session_body(session)
+
+    # Fail-safe capture marker (UNCONDITIONAL — safety invariant, NOT gated by
+    # ``auto_structure_on_close``). A capture candidate that closes on ANY path
+    # (web reopen, timeout, shutdown, /end, CLI) is stamped
+    # ``capture_structured: pending`` so an unstructured capture is DISCOVERABLE
+    # (grep / Bases) and drainable via ``/extract`` — never SILENTLY lost, which
+    # is the incident this fixes (a web dictation closed via web_session_reopened
+    # with no structuring and no signal). ``process_capture_session`` flips this
+    # to ``true`` / ``failed`` / ``memo`` when structuring runs; a ``pending`` that
+    # never flips is the intentionally-left-blank signal that structuring did not
+    # run. No code path gates on the field, so a heuristic false-positive is
+    # benign (see ``is_capture_candidate``'s asymmetric-bias note).
+    if is_capture_candidate(session, session_type):
+        fm["capture_structured"] = "pending"
+        log.info(
+            "talker.capture.candidate_marked",
+            chat_id=chat_id,
+            session_id=session.session_id,
+            reason=reason,
+            session_type=session_type,
+            turns=len(session.transcript),
+        )
 
     # Unique record name — collisions across multiple same-minute closes would
     # otherwise fail vault_create, so the per-instance helpers append a

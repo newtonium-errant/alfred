@@ -33,7 +33,7 @@ from typing import Any, Callable
 import anthropic
 from telegram import Update
 
-from . import bot, heartbeat, session
+from . import bot, capture_batch, heartbeat, session
 from .config import TalkerConfig, load_from_unified
 from .state import StateManager
 from .utils import get_logger, setup_logging
@@ -1722,6 +1722,41 @@ async def run(
                             "talker.daemon.sweep_substance_slug_failed",
                             chat_id=meta.get("chat_id"),
                         )
+                    # Clinic-capture arc: a capture candidate that TIMED OUT
+                    # (never /end-ed) must not be silently lost. close_session
+                    # already stamped ``capture_structured: pending`` (fail-safe,
+                    # unconditional); when ``auto_structure_on_close`` is enabled
+                    # AND this was a capture candidate, also run the structuring
+                    # pass now (the sweeper loop is alive, unlike shutdown, so the
+                    # detached task completes). No Telegram push here — the
+                    # follow-up would need a chat context the sweeper lacks.
+                    if (config.session.auto_structure_on_close
+                            and meta.get("capture_candidate")):
+                        try:
+                            from alfred.audit import agent_slug_for
+                            anchor_scope = (
+                                "hypatia"
+                                if (config.instance.tool_set or "").lower()
+                                == "hypatia" else ""
+                            )
+                            capture_batch.schedule_capture_structuring(
+                                client=client,
+                                vault_path=Path(meta["vault_path_root"]),
+                                session_rel_path=meta["rel_path"],
+                                transcript=meta["transcript"],
+                                model=config.anthropic.model
+                                or "claude-sonnet-4-6",
+                                agent_slug=agent_slug_for(config),
+                                anchor_scope=anchor_scope,
+                                short_id=(meta.get("session_id") or "")
+                                .split("-")[0],
+                                send_follow_up=None,
+                            )
+                        except Exception:  # noqa: BLE001
+                            log.exception(
+                                "talker.daemon.sweep_structuring_failed",
+                                chat_id=meta.get("chat_id"),
+                            )
             except Exception:  # noqa: BLE001
                 log.exception("talker.daemon.sweep_error")
 

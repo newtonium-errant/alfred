@@ -504,6 +504,133 @@ async def test_reopen_archives_prior_session(web_client) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Clinic-capture arc (Piece 1) — a dictated capture reopened via
+# web_session_reopened must NEVER be silently lost.
+# ---------------------------------------------------------------------------
+
+# Long clinic-shaped (non-PHI) user turns that clear is_substantive (≥3 turns,
+# ≥150 chars of user substance) → is_capture_candidate is True on the web
+# session even though its session_type is always "conversation".
+_CAPTURE_MSG_1 = (
+    "I need to write that clinical note tomorrow and invoice the room rental "
+    "for the Tuesday clinic and send the prescription refill to the pharmacy."
+)
+_CAPTURE_MSG_2 = (
+    "Also fax the disability forms for the client and book the follow-up "
+    "appointment for next week and submit the VAC paperwork before Friday."
+)
+
+
+async def _dictate_capture(web_client, headers) -> str:
+    """Open a session and dictate two substantive turns → returns its key."""
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    for msg in (_CAPTURE_MSG_1, _CAPTURE_MSG_2):
+        await web_client.post(
+            "/chat/turn",
+            json={"session_key": key, "message": msg, "kind": "voice"},
+            headers=headers,
+        )
+    return key
+
+
+async def test_reopen_capture_stamps_marker_and_signals(web_client) -> None:
+    """Flag OFF (default): reopening after a dictated capture stamps the
+    UNCONDITIONAL ``capture_structured: pending`` marker AND returns a
+    ``prior_capture`` signal on the /chat/open response (the web user's only
+    signal — no server push). Mutation: drop the marker → the frontmatter
+    assert fails; drop prior_capture → the response assert fails."""
+    state_mgr = web_client.app["_t_state_mgr"]
+    talker_config = web_client.app["_t_talker_config"]
+    assert talker_config.session.auto_structure_on_close is False  # default
+    headers = _session_headers()
+
+    first_key = await _dictate_capture(web_client, headers)
+
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    body = await r.json()
+    assert body["session_key"] != first_key
+    # The web user-facing signal (read on the NEXT open — no push channel).
+    assert body["prior_capture"]["status"] == "held_unstructured"
+    assert body["prior_capture"]["turns"] >= 3
+    record = body["prior_capture"]["record"]
+
+    # The fail-safe marker is on the archived record.
+    post = frontmatter.load(str(Path(talker_config.vault.path) / record))
+    assert post["capture_structured"] == "pending"
+
+
+async def test_reopen_capture_auto_structures_when_enabled(
+    web_client, monkeypatch,
+) -> None:
+    """Flag ON (Hypatia posture): reopening after a dictated capture schedules
+    the structuring pass and the signal flips to ``structuring``. Mutation: skip
+    the flag-gated schedule → status stays ``held_unstructured`` and the stub is
+    never called → both asserts fail."""
+    from alfred.telegram import capture_batch
+
+    talker_config = web_client.app["_t_talker_config"]
+    talker_config.session.auto_structure_on_close = True
+
+    called: dict = {}
+
+    async def _fake_process(**kwargs):
+        called.update(kwargs)
+
+    monkeypatch.setattr(capture_batch, "process_capture_session", _fake_process)
+
+    headers = _session_headers()
+    await _dictate_capture(web_client, headers)
+
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    body = await r.json()
+    assert body["prior_capture"]["status"] == "structuring"
+
+    # Let the detached structuring task run.
+    await asyncio.sleep(0.05)
+    assert called.get("session_rel_path") == body["prior_capture"]["record"]
+    assert called.get("send_follow_up") is None      # no push channel on web
+
+
+async def test_reopen_short_conversation_no_signal(web_client) -> None:
+    """A NON-candidate (short Q&A) reopen carries NO ``prior_capture`` and NO
+    marker — the fix only fires for captures. Mutation: make candidacy
+    always-True → prior_capture appears → fails."""
+    state_mgr = web_client.app["_t_state_mgr"]
+    talker_config = web_client.app["_t_talker_config"]
+    headers = _session_headers()
+
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    key = (await r.json())["session_key"]
+    await web_client.post(
+        "/chat/turn", json={"session_key": key, "message": "hi"}, headers=headers
+    )
+
+    r = await web_client.post("/chat/open", json={}, headers=headers)
+    body = await r.json()
+    assert "prior_capture" not in body
+    record_path = [c for c in state_mgr.state["closed_sessions"]
+                   if c["session_id"] == key][0]["record_path"]
+    post = frontmatter.load(str(Path(talker_config.vault.path) / record_path))
+    assert "capture_structured" not in post.keys()
+
+
+async def test_reopen_capture_held_emits_log(web_client) -> None:
+    """Observability pin: the held/structuring path emits
+    ``web.chat.prior_capture_held`` with record + status + turns (grep surface
+    for the operator). Mutation: drop the log → this fails."""
+    headers = _session_headers()
+    await _dictate_capture(web_client, headers)
+    with structlog.testing.capture_logs() as captured:
+        await web_client.post("/chat/open", json={}, headers=headers)
+    held = [c for c in captured if c.get("event") == "web.chat.prior_capture_held"]
+    assert len(held) == 1
+    assert held[0]["status"] == "held_unstructured"
+    assert held[0]["turns"] >= 3
+    assert held[0]["record"]
+
+
+# ---------------------------------------------------------------------------
 # SSE streaming — /chat/stream (Tier-1 keep-alive)
 # ---------------------------------------------------------------------------
 

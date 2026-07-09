@@ -471,20 +471,40 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
 
     # Lazy imports — the session module pulls vault ops (heavy) only when a
     # request actually fires, keeping this module import-light for tests.
-    from alfred.telegram.session import close_session, open_session
+    from alfred.telegram import capture_batch
+    from alfred.telegram.session import (
+        Session,
+        close_session,
+        is_capture_candidate,
+        open_session,
+    )
 
     existing = state_mgr.get_active(identity.synthetic_chat_id)
+    # Clinic-capture arc: the incident this fixes is a clinician's dictated
+    # capture SILENTLY lost when the PWA reopened the session — closed via
+    # web_session_reopened with no structuring and no signal. Web sessions are
+    # always session_type=="conversation" (no web /capture, no web /end), so we
+    # detect capture-worthiness deterministically (``is_capture_candidate``) and
+    # (a) close_session UNCONDITIONALLY stamps ``capture_structured: pending``,
+    # (b) auto-run structuring when enabled, and (c) surface a ``prior_capture``
+    # signal on the response (no server-push channel exists — this is the
+    # intentionally-left-blank signal for the web user, read on the next open).
+    prior_capture: dict[str, Any] | None = None
     if existing:
+        prior_type = existing.get("_session_type") or "conversation"
+        prior_session = Session.from_dict(existing)
+        candidate = is_capture_candidate(prior_session, prior_type)
+        rel_path: str | None = None
         try:
             primary_users = getattr(talker_config, "primary_users", None) or []
-            close_session(
+            rel_path = close_session(
                 state_mgr,
                 vault_path_root=talker_config.vault.path,
                 chat_id=identity.synthetic_chat_id,
                 reason="web_session_reopened",
                 user_vault_path=primary_users[0] if primary_users else None,
                 stt_model_used="",
-                session_type=existing.get("_session_type") or "conversation",
+                session_type=prior_type,
                 tool_set=talker_config.instance.tool_set,
             )
         except Exception as exc:  # noqa: BLE001 — archival is best-effort
@@ -495,6 +515,41 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
                 error=str(exc),
                 error_type=type(exc).__name__,
                 detail="proceeding to open a fresh session anyway",
+            )
+        if candidate and rel_path:
+            scheduled = False
+            if getattr(talker_config.session, "auto_structure_on_close", False):
+                from pathlib import Path as _Path
+                from alfred.audit import agent_slug_for
+                anchor_scope = (
+                    "hypatia"
+                    if (talker_config.instance.tool_set or "").lower() == "hypatia"
+                    else ""
+                )
+                task = capture_batch.schedule_capture_structuring(
+                    client=request.app[KEY_WEB_ANTHROPIC],
+                    vault_path=_Path(talker_config.vault.path),
+                    session_rel_path=rel_path,
+                    transcript=prior_session.transcript,
+                    model=talker_config.anthropic.model or "claude-sonnet-4-6",
+                    agent_slug=agent_slug_for(talker_config),
+                    anchor_scope=anchor_scope,
+                    short_id=(prior_session.session_id or "").split("-")[0],
+                    send_follow_up=None,  # no push channel on web
+                )
+                scheduled = task is not None
+            prior_capture = {
+                "record": rel_path,
+                "status": "structuring" if scheduled else "held_unstructured",
+                "turns": len(prior_session.transcript),
+            }
+            log.info(
+                "web.chat.prior_capture_held",
+                user=identity.user,
+                synthetic_chat_id=identity.synthetic_chat_id,
+                record=rel_path,
+                status=prior_capture["status"],
+                turns=prior_capture["turns"],
             )
 
     session_obj = open_session(
@@ -509,7 +564,10 @@ async def _handle_chat_open(request: web.Request) -> web.StreamResponse:
         session_id=session_obj.session_id,
         model=talker_config.anthropic.model,
     )
-    return web.json_response({"session_key": session_obj.session_id})
+    body_out: dict[str, Any] = {"session_key": session_obj.session_id}
+    if prior_capture is not None:
+        body_out["prior_capture"] = prior_capture
+    return web.json_response(body_out)
 
 
 async def _handle_chat_turn(request: web.Request) -> web.StreamResponse:

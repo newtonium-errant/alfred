@@ -248,6 +248,17 @@ class SessionConfig:
     # is isolated: if derivation errors, the original opening-text slug
     # is preserved and a warning is logged.
     derive_slug_from_substance: bool = False
+    # Clinic-capture arc (2026-07): when true, a capture CANDIDATE
+    # (``session.is_capture_candidate`` — explicitly /capture-typed OR a
+    # substantive session) that closes on a NON-/end path (web ``/chat/open``
+    # reopen, the daemon timeout sweeper) auto-runs the capture structuring pass
+    # so a dictated action-item dump is never lost. Defaults OFF to preserve
+    # Salem's current behaviour (Salem captures structure via Telegram /end);
+    # flipped ON for Hypatia, whose clinician captures land on the PWA (always
+    # session_type="conversation", no web /end). The fail-safe
+    # ``capture_structured: pending`` marker is written UNCONDITIONALLY at close
+    # regardless of this flag — the flag only governs the auto-LLM pass.
+    auto_structure_on_close: bool = False
 
 
 @dataclass

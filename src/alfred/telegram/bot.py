@@ -1894,45 +1894,35 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         async def _send_follow_up(text: str) -> None:
             await ctx.bot.send_message(chat_id=chat_id, text=text)
 
-        try:
-            from pathlib import Path as _Path
-            from alfred.audit import agent_slug_for
-            batch_model = config.anthropic.model or "claude-sonnet-4-6"
-            # Capture-source-anchor (2026-05-16): pass the per-instance
-            # scope key so the orchestrator can fire the opening-pattern
-            # resolver (``I'm reading X by Y``) → source/author records.
-            # Empty string for non-Hypatia instances; their scopes don't
-            # carry the ``author`` create-allowlist entry today.
-            anchor_scope = (
-                "hypatia" if (config.instance.tool_set or "").lower() == "hypatia"
-                else ""
-            )
-            asyncio.create_task(
-                capture_batch.process_capture_session(
-                    client=client,
-                    vault_path=_Path(config.vault.path),
-                    session_rel_path=rel_path,
-                    transcript=transcript_snapshot,
-                    model=batch_model,
-                    send_follow_up=_send_follow_up,
-                    short_id=short_id,
-                    agent_slug=agent_slug_for(config),
-                    anchor_scope=anchor_scope,
-                    # Phase 1.x (2026-05-16): operator's explicit
-                    # /end-zettel / /end-note choice (or ``""`` for
-                    # plain /end). process_capture_session writes the
-                    # value to session frontmatter so the later
-                    # /extract honours it via the three-tier
-                    # discriminator.
-                    extract_target_override=extract_target_override,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 — scheduling shouldn't block close reply
-            log.warning(
-                "talker.capture.schedule_failed",
-                chat_id=chat_id,
-                error=str(exc),
-            )
+        from pathlib import Path as _Path
+        from alfred.audit import agent_slug_for
+        batch_model = config.anthropic.model or "claude-sonnet-4-6"
+        # Capture-source-anchor (2026-05-16): pass the per-instance
+        # scope key so the orchestrator can fire the opening-pattern
+        # resolver (``I'm reading X by Y``) → source/author records.
+        # Empty string for non-Hypatia instances; their scopes don't
+        # carry the ``author`` create-allowlist entry today.
+        anchor_scope = (
+            "hypatia" if (config.instance.tool_set or "").lower() == "hypatia"
+            else ""
+        )
+        # Shared close-path scheduler (clinic-capture arc). /end keeps its
+        # existing session_type=="capture" gate (unchanged behaviour); the
+        # extracted helper is what the web reopen + timeout-sweep paths reuse.
+        # ``extract_target_override`` carries the operator's /end-zettel /
+        # /end-note choice through to the discriminator.
+        capture_batch.schedule_capture_structuring(
+            client=client,
+            vault_path=_Path(config.vault.path),
+            session_rel_path=rel_path,
+            transcript=transcript_snapshot,
+            model=batch_model,
+            agent_slug=agent_slug_for(config),
+            anchor_scope=anchor_scope,
+            short_id=short_id,
+            send_follow_up=_send_follow_up,
+            extract_target_override=extract_target_override,
+        )
 
         await update.message.reply_text(close_reply + suffix)
         return
