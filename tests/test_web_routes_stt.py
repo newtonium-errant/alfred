@@ -150,10 +150,18 @@ def _patch_chain(monkeypatch, *, served=None, first_backend="groq-whisper", rais
 
 # --- Idempotency test helpers ----------------------------------------------
 
-# Valid 64-hex idempotency keys (SHA-256 shape). Obviously-fake single-char
-# repeats — never a real hash.
+import hashlib as _hashlib
+
+# Valid 64-hex idempotency keys (SHA-256 shape) for UNIT cache tests, which
+# store by arbitrary ``(user, key)`` tuples (the cache never hashes — the
+# HANDLER does). Obviously-fake single-char repeats — never a real hash.
 _KEY_A = "a" * 64
 _KEY_B = "b" * 64
+
+
+def _hash(audio: bytes) -> str:
+    """The server-authoritative cache-key hash for a given audio blob."""
+    return _hashlib.sha256(audio).hexdigest()
 
 
 @pytest.fixture(autouse=True)
@@ -164,8 +172,15 @@ def _reset_stt_dedup(monkeypatch):
 
 
 def _keyed_headers(key: str, mime: str = "audio/webm") -> dict[str, str]:
-    """andrew's audio headers + the idempotency key header."""
+    """andrew's audio headers + a VERBATIM idempotency key header (used by the
+    mismatch / malformed tests that assert a specific asserted-key value)."""
     return {**_audio_headers(mime), routes_stt.STT_IDEMPOTENCY_HEADER: key}
+
+
+def _keyed_headers_for(audio: bytes, mime: str = "audio/webm") -> dict[str, str]:
+    """andrew's audio headers + the CORRECT FE hash for ``audio`` (the happy
+    path — asserted key == server hash, so no mismatch log fires)."""
+    return _keyed_headers(_hash(audio), mime)
 
 
 def _patch_counting(monkeypatch, *, served=None, raises=None, first_backend="groq-whisper"):
@@ -422,9 +437,9 @@ async def test_stt_dedup_hit_returns_cached_without_retranscribe(
             backend_id="groq-whisper", tier="comparable",
         ),
     )
-    # First POST — a real transcribe, cached under the key.
+    # First POST — a real transcribe, cached under (user, server-hash).
     r1 = await stt_client.post(
-        "/stt/transcribe", data=b"audio-blob", headers=_keyed_headers(_KEY_A)
+        "/stt/transcribe", data=b"audio-blob", headers=_keyed_headers_for(b"audio-blob")
     )
     assert r1.status == 200
     b1 = await r1.json()
@@ -432,11 +447,11 @@ async def test_stt_dedup_hit_returns_cached_without_retranscribe(
     assert b1["deduped"] is False
     assert counter["n"] == 1
 
-    # Retry with the SAME key (response-drop simulation) — served from cache,
+    # Retry with the SAME audio (response-drop simulation) — served from cache,
     # NO second transcribe.
     with structlog.testing.capture_logs() as captured:
         r2 = await stt_client.post(
-            "/stt/transcribe", data=b"audio-blob", headers=_keyed_headers(_KEY_A)
+            "/stt/transcribe", data=b"audio-blob", headers=_keyed_headers_for(b"audio-blob")
         )
     assert r2.status == 200
     b2 = await r2.json()
@@ -446,14 +461,18 @@ async def test_stt_dedup_hit_returns_cached_without_retranscribe(
     assert counter["n"] == 1, "retry re-transcribed — the dedup cache did not hit"
     deduped = [c for c in captured if c.get("event") == "web.stt.deduped"]
     assert len(deduped) == 1
-    assert deduped[0]["key_prefix"] == _KEY_A[:8]
+    # key_prefix is the SERVER-computed hash prefix (not the FE-asserted value).
+    assert deduped[0]["key_prefix"] == _hash(b"audio-blob")[:8]
     # NEVER the transcript text in the dedup log.
     assert "transcript" not in deduped[0]
     assert all("the long voice note transcript" not in str(v)
                for v in deduped[0].values())
 
 
-async def test_stt_different_key_retranscribes(stt_client, monkeypatch) -> None:
+async def test_stt_different_audio_retranscribes(stt_client, monkeypatch) -> None:
+    """DIFFERENT audio → different server hash → separate transcribe. (Under
+    server-hash-as-key the FE-asserted key VALUE is irrelevant — only the audio
+    content decides the cache key.)"""
     counter = _patch_counting(
         monkeypatch,
         served=stt_backends.SttResult(
@@ -461,12 +480,37 @@ async def test_stt_different_key_retranscribes(stt_client, monkeypatch) -> None:
         ),
     )
     await stt_client.post(
-        "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_A)
+        "/stt/transcribe", data=b"audio-one", headers=_keyed_headers_for(b"audio-one")
     )
     await stt_client.post(
-        "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_B)
+        "/stt/transcribe", data=b"audio-two", headers=_keyed_headers_for(b"audio-two")
     )
     assert counter["n"] == 2  # different content-hash → separate transcribe
+
+
+async def test_stt_same_audio_dedups_regardless_of_fe_key_value(
+    stt_client, monkeypatch
+) -> None:
+    """SAME audio with a DIFFERENT (even wrong) FE-asserted key still dedups —
+    the server hash of the identical audio is the key; the FE value is only the
+    eligibility signal. (Pins the server-authoritative-key semantics.)"""
+    counter = _patch_counting(
+        monkeypatch,
+        served=stt_backends.SttResult(
+            text="t", backend_id="groq-whisper", tier="comparable",
+        ),
+    )
+    # Both requests: identical audio, but the asserted FE key differs (_KEY_A
+    # then _KEY_B — both "wrong" vs the real hash). Server hash is identical →
+    # the 2nd hits the cache anyway.
+    await stt_client.post(
+        "/stt/transcribe", data=b"same-audio", headers=_keyed_headers(_KEY_A)
+    )
+    r2 = await stt_client.post(
+        "/stt/transcribe", data=b"same-audio", headers=_keyed_headers(_KEY_B)
+    )
+    assert (await r2.json())["deduped"] is True
+    assert counter["n"] == 1  # same audio → one transcribe, FE key value ignored
 
 
 async def test_stt_no_key_transcribes_every_time_byte_identical(
@@ -502,11 +546,11 @@ async def test_stt_failed_transcribe_not_cached(stt_client, monkeypatch) -> None
         monkeypatch, served=stt_backends.NoTranscript(reason="all_failed"),
     )
     r1 = await stt_client.post(
-        "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_A)
+        "/stt/transcribe", data=b"audio", headers=_keyed_headers_for(b"audio")
     )
     assert r1.status == 502
     r2 = await stt_client.post(
-        "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_A)
+        "/stt/transcribe", data=b"audio", headers=_keyed_headers_for(b"audio")
     )
     assert r2.status == 502
     assert counter["n"] == 2  # NOT cached — the retry re-attempted
@@ -515,10 +559,10 @@ async def test_stt_failed_transcribe_not_cached(stt_client, monkeypatch) -> None
 async def test_stt_exception_not_cached(stt_client, monkeypatch) -> None:
     counter = _patch_counting(monkeypatch, raises=RuntimeError("boom"))
     await stt_client.post(
-        "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_A)
+        "/stt/transcribe", data=b"audio", headers=_keyed_headers_for(b"audio")
     )
     await stt_client.post(
-        "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_A)
+        "/stt/transcribe", data=b"audio", headers=_keyed_headers_for(b"audio")
     )
     assert counter["n"] == 2  # engine exception (502) is never cached
 
@@ -530,12 +574,12 @@ async def test_stt_degraded_empty_not_cached(stt_client, monkeypatch) -> None:
         monkeypatch, served=stt_backends.NoTranscript(reason="degraded"),
     )
     r1 = await stt_client.post(
-        "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_A)
+        "/stt/transcribe", data=b"audio", headers=_keyed_headers_for(b"audio")
     )
     assert r1.status == 200
     assert (await r1.json())["degraded"] is True
     await stt_client.post(
-        "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_A)
+        "/stt/transcribe", data=b"audio", headers=_keyed_headers_for(b"audio")
     )
     assert counter["n"] == 2
 
@@ -548,10 +592,10 @@ async def test_stt_served_empty_not_cached(stt_client, monkeypatch) -> None:
         ),
     )
     await stt_client.post(
-        "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_A)
+        "/stt/transcribe", data=b"audio", headers=_keyed_headers_for(b"audio")
     )
     await stt_client.post(
-        "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_A)
+        "/stt/transcribe", data=b"audio", headers=_keyed_headers_for(b"audio")
     )
     assert counter["n"] == 2  # served-empty is not a cacheable success
 
@@ -591,7 +635,7 @@ async def test_stt_transcribed_log_stored_flag(stt_client, monkeypatch) -> None:
     )
     with structlog.testing.capture_logs() as cap_keyed:
         await stt_client.post(
-            "/stt/transcribe", data=b"audio", headers=_keyed_headers(_KEY_A)
+            "/stt/transcribe", data=b"audio", headers=_keyed_headers_for(b"audio")
         )
     t_keyed = [c for c in cap_keyed if c.get("event") == "web.stt.transcribed"]
     assert len(t_keyed) == 1 and t_keyed[0]["stored"] is True
@@ -641,17 +685,88 @@ async def test_stt_dedup_namespaced_per_user_route(aiohttp_client, tmp_path, mon
         )
         return {
             **_PEER_HEADERS, SESSION_HEADER: token, "Content-Type": "audio/webm",
-            routes_stt.STT_IDEMPOTENCY_HEADER: _KEY_A,
+            routes_stt.STT_IDEMPOTENCY_HEADER: _hash(b"same-audio"),
         }
 
-    # andrew transcribes + caches under (andrew, KEY_A).
+    # andrew transcribes + caches under (andrew, hash(same-audio)).
     ra = await client.post("/stt/transcribe", data=b"same-audio", headers=_hdr("andrew"))
     assert (await ra.json())["deduped"] is False
     assert counter["n"] == 1
-    # ben sends the SAME key — must NOT hit andrew's cache.
+    # ben sends the SAME audio (→ same server hash) — must NOT hit andrew's cache.
     rb = await client.post("/stt/transcribe", data=b"same-audio", headers=_hdr("ben"))
     assert "deduped" not in (await rb.json()) or (await rb.json())["deduped"] is False
     assert counter["n"] == 2, "cross-user cache bleed — key was not namespaced by user"
+
+
+# ---------------------------------------------------------------------------
+# Server-side hash-verify (the correctness harden)
+# ---------------------------------------------------------------------------
+
+
+async def test_stt_hash_verify_wrong_fe_key_no_wrong_hit(stt_client, monkeypatch) -> None:
+    """THE HASH-VERIFY PIN — a request whose asserted key does NOT match its
+    audio can never get a WRONG cache hit. Audio-2 reuses audio-1's (correct-
+    for-audio-1) key; the server hashes audio-2 → its own key → MISS → audio-2
+    is transcribed fresh (NOT served audio-1's cached transcript).
+
+    Mutation: key the cache on the FE-asserted value instead of the server hash
+    → audio-2 hits audio-1's cache → returns audio-1's transcript → this fails."""
+    monkeypatch.setattr(
+        stt_backends, "build_chain",
+        lambda cfg: [_FakeBackend("groq-whisper"), _FakeBackend("deepgram")],
+    )
+    counter = {"n": 0}
+
+    async def _fake(audio, mime, chain, vocab, budget):
+        counter["n"] += 1
+        return stt_backends.SttResult(
+            text=f"t:{audio.decode()}", backend_id="groq-whisper", tier="comparable",
+        )
+
+    monkeypatch.setattr(stt_backends, "transcribe_with_fallback", _fake)
+
+    audio1, audio2 = b"AUDIO-ONE", b"AUDIO-TWO"
+    key1 = _hash(audio1)  # correct for audio1, WRONG for audio2
+    r1 = await stt_client.post("/stt/transcribe", data=audio1, headers=_keyed_headers(key1))
+    assert (await r1.json())["transcript"] == "t:AUDIO-ONE"
+    assert counter["n"] == 1
+
+    # audio2 with audio1's key — the buggy/malicious-FE case.
+    with structlog.testing.capture_logs() as captured:
+        r2 = await stt_client.post("/stt/transcribe", data=audio2, headers=_keyed_headers(key1))
+    b2 = await r2.json()
+    assert b2["transcript"] == "t:AUDIO-TWO", (
+        "WRONG cache hit — audio2 was served audio1's cached transcript "
+        "(the FE-asserted key was trusted instead of the server hash)"
+    )
+    assert counter["n"] == 2  # audio2 transcribed fresh, not served from cache
+    mismatch = [
+        c for c in captured if c.get("event") == "web.stt.idempotency_hash_mismatch"
+    ]
+    assert len(mismatch) == 1
+    assert mismatch[0]["fe_key_prefix"] == key1[:8]
+    assert mismatch[0]["server_hash_prefix"] == _hash(audio2)[:8]
+    # NEVER the audio/transcript in the mismatch log.
+    assert all("AUDIO-TWO" not in str(v) for v in mismatch[0].values())
+
+
+async def test_stt_correct_fe_hash_no_mismatch_log(stt_client, monkeypatch) -> None:
+    """A correct FE hash (asserted == server hash) fires NO mismatch log — the
+    happy path stays clean; the mismatch warning is reserved for a real
+    mis-wired FE."""
+    _patch_counting(
+        monkeypatch,
+        served=stt_backends.SttResult(
+            text="ok", backend_id="groq-whisper", tier="comparable",
+        ),
+    )
+    with structlog.testing.capture_logs() as captured:
+        await stt_client.post(
+            "/stt/transcribe", data=b"clip", headers=_keyed_headers_for(b"clip")
+        )
+    assert not [
+        c for c in captured if c.get("event") == "web.stt.idempotency_hash_mismatch"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -670,13 +785,30 @@ def test_dedup_cache_ttl_evicts() -> None:
 
 
 def test_dedup_cache_lru_bounds() -> None:
-    cache = routes_stt._SttDedupCache(max_entries=3, clock=lambda: 0.0)
+    cache = routes_stt._SttDedupCache(max_per_user=3, clock=lambda: 0.0)
     for i in range(5):
         cache.put(("andrew", f"{i:064x}"), {"transcript": str(i)})
     # Only the last 3 survive; the 2 oldest were evicted.
     assert cache.get(("andrew", f"{0:064x}")) is None
     assert cache.get(("andrew", f"{1:064x}")) is None
     assert cache.get(("andrew", f"{4:064x}")) == {"transcript": "4"}
+
+
+def test_dedup_cache_bound_is_per_user() -> None:
+    """PER-USER BOUND PIN — one user's puts evict only THAT user's oldest
+    entries; a second user's cached entry is untouched even when the first user
+    floods well past the cap."""
+    cache = routes_stt._SttDedupCache(max_per_user=2, clock=lambda: 0.0)
+    cache.put(("ben", "ben-entry".ljust(64, "0")), {"transcript": "ben"})
+    # andrew floods 5 entries against a per-user cap of 2.
+    for i in range(5):
+        cache.put(("andrew", f"{i:064x}"), {"transcript": str(i)})
+    # andrew keeps only his last 2; his older 3 evicted.
+    assert cache.get(("andrew", f"{2:064x}")) is None
+    assert cache.get(("andrew", f"{3:064x}")) == {"transcript": "3"}
+    assert cache.get(("andrew", f"{4:064x}")) == {"transcript": "4"}
+    # ben's single entry survived andrew's flood — no cross-user eviction.
+    assert cache.get(("ben", "ben-entry".ljust(64, "0"))) == {"transcript": "ben"}
 
 
 def test_dedup_cache_namespaced_by_user() -> None:

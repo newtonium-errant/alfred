@@ -40,6 +40,7 @@ Salem only).
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections import OrderedDict
@@ -65,11 +66,17 @@ _CHUNK_BYTES = 64 * 1024
 # /stt/transcribe is stateless — every POST re-transcribes. On flaky LTE a
 # long note can transcribe successfully but drop the RESPONSE, so the operator
 # retries and the server re-does the whole STT (double work + double charge +
-# a possibly-different transcript). The BFF/FE computes a SHA-256 hex of the
-# audio blob and sends it in this header (content-addressed — same audio →
-# same key, so a retry dedups naturally with no key-retention). A retry that
-# hits a cached SUCCESS returns it WITHOUT re-running the chain. Frozen wire
-# contract (the voice-frontend builds to this header).
+# a possibly-different transcript). A retry that hits a cached SUCCESS returns
+# it WITHOUT re-running the chain.
+#
+# The BFF/FE sends this header carrying a SHA-256 hex of the audio blob — but
+# it is only the "this request is dedup-eligible" SIGNAL, NOT trusted as the
+# cache key. The backend recomputes the hash over the ALREADY-DRAINED audio
+# bytes (server-authoritative content addressing) and keys the cache on THAT,
+# so a buggy/malicious FE that asserts a hash NOT matching its audio can never
+# cause a WRONG cache hit (two different audios colliding on a reused key).
+# The recompute is milliseconds vs the multi-second STT and runs ONLY on keyed
+# requests. Frozen wire contract (the FE still sends the header, unchanged).
 STT_IDEMPOTENCY_HEADER = "X-Alfred-Stt-Idempotency-Key"
 
 # A SHA-256 hex digest is exactly 64 lowercase hex chars. A present-but-
@@ -79,8 +86,11 @@ _STT_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # Bounded in-process store: a retry happens within seconds/minutes, so a small
 # LRU + short TTL is enough. No persistence — a process restart losing the
-# cache just means a re-transcribe (acceptable).
-_STT_DEDUP_MAX_ENTRIES = 32
+# cache just means a re-transcribe (acceptable). The bound is PER-USER (not
+# global) so one user's traffic can never evict another user's cached entries
+# (correctness-neutral, but preserves each user's hit rate under a multi-user
+# roster). The roster is a bounded config list, so total ≈ roster × per-user.
+_STT_DEDUP_MAX_PER_USER = 16
 _STT_DEDUP_TTL_S = 15 * 60
 
 
@@ -89,10 +99,12 @@ class _SttDedupCache:
 
     Keys are ``(user, audio_sha256_hex)`` — namespaced by the authenticated
     user so a content-hash can never bleed a transcript across users if
-    ``web.users`` ever grows beyond the single owner. Values are
-    response-payload dicts (copies in, copies out, so a caller mutating the
-    returned dict can't corrupt the store). NOT persisted. In-process + a
-    single event-loop thread + await-free get/put → no lock needed.
+    ``web.users`` ever grows beyond the single owner. The bound is PER-USER
+    (``max_per_user``): a ``put`` evicts only the CALLING user's oldest entry
+    beyond the cap, so one user's traffic can never evict another's cached
+    entries. Values are response-payload dicts (copies in, copies out, so a
+    caller mutating the returned dict can't corrupt the store). NOT persisted.
+    In-process + a single event-loop thread + await-free get/put → no lock.
 
     Only SUCCESS is cached (an SttResult with a real transcript); a retry
     after any failure/empty MUST re-attempt (the caller enforces that — the
@@ -104,14 +116,14 @@ class _SttDedupCache:
     """
 
     def __init__(
-        self, *, max_entries: int = _STT_DEDUP_MAX_ENTRIES,
+        self, *, max_per_user: int = _STT_DEDUP_MAX_PER_USER,
         ttl_s: float = _STT_DEDUP_TTL_S,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._store: "OrderedDict[tuple[str, str], tuple[float, dict]]" = (
             OrderedDict()
         )
-        self._max = max_entries
+        self._max_per_user = max_per_user
         self._ttl = ttl_s
         self._clock = clock
 
@@ -128,7 +140,7 @@ class _SttDedupCache:
         item = self._store.get(key)
         if item is None:
             return None
-        self._store.move_to_end(key)  # LRU touch
+        self._store.move_to_end(key)  # LRU touch (per-user recency preserved)
         return dict(item[1])
 
     def put(self, key: "tuple[str, str]", payload: dict) -> None:
@@ -136,8 +148,14 @@ class _SttDedupCache:
         self._evict_expired(now)
         self._store[key] = (now, dict(payload))
         self._store.move_to_end(key)
-        while len(self._store) > self._max:
-            self._store.popitem(last=False)  # evict oldest (LRU)
+        # PER-USER LRU bound: evict only THIS user's oldest entries beyond the
+        # cap (the OrderedDict is global-ordered, so this user's keys appear
+        # oldest-first). One user can never evict another's entries.
+        user = key[0]
+        user_keys = [k for k in self._store if k[0] == user]
+        if self._max_per_user > 0:
+            for old in user_keys[: -self._max_per_user]:
+                del self._store[old]
 
     def clear(self) -> None:
         self._store.clear()
@@ -237,22 +255,40 @@ async def _handle_stt_transcribe(request: web.Request) -> web.StreamResponse:
         log.warning("web.stt.no_audio", user=identity.user)
         return web.json_response({"error": "no_audio"}, status=400)
 
-    # Idempotency: a content-addressed retry (same audio hash) returns the
-    # cached transcript WITHOUT re-running the STT chain. The GET happens
-    # POST-body (the body is fully drained above — clean keep-alive) but
-    # BEFORE transcribe_with_fallback, so the load-bearing win (no double STT
-    # call / charge) holds. Key is namespaced per authenticated user. A
-    # malformed / absent header → no key → transcribe fresh (byte-identical
-    # to the pre-idempotency behaviour; no ``deduped`` field in the response).
+    # Idempotency: a content-addressed retry (same audio) returns the cached
+    # transcript WITHOUT re-running the STT chain. The GET happens POST-body
+    # (the body is fully drained above — clean keep-alive) but BEFORE
+    # transcribe_with_fallback, so the load-bearing win (no double STT call /
+    # charge) holds. The FE header is only the "dedup-eligible" SIGNAL; the
+    # cache key is the SERVER-computed SHA-256 of the drained audio (namespaced
+    # per user), so a buggy/malicious FE asserting a hash that does NOT match
+    # its audio can never cause a WRONG cache hit. A malformed / absent header
+    # → no key → transcribe fresh (byte-identical to the pre-idempotency
+    # behaviour; no ``deduped`` field in the response).
     idem_key = _read_idempotency_key(request)
-    cache_key = (identity.user, idem_key) if idem_key else None
-    if cache_key is not None:
+    cache_key = None
+    if idem_key:
+        server_hash = hashlib.sha256(audio).hexdigest()
+        if idem_key != server_hash:
+            # Server-authoritative: we still key on server_hash (robust), but a
+            # mismatch means a mis-wired/buggy FE — surface it (prefixes only,
+            # NEVER the audio/transcript) so it is observable.
+            log.warning(
+                "web.stt.idempotency_hash_mismatch",
+                user=identity.user,
+                fe_key_prefix=idem_key[:8],
+                server_hash_prefix=server_hash[:8],
+                detail="asserted X-Alfred-Stt-Idempotency-Key does not match "
+                       "the SHA-256 of the received audio — using the "
+                       "server-computed hash as the authoritative cache key",
+            )
+        cache_key = (identity.user, server_hash)
         cached = _STT_DEDUP.get(cache_key)
         if cached is not None:
             log.info(
                 "web.stt.deduped",
                 user=identity.user,
-                key_prefix=idem_key[:8],
+                key_prefix=server_hash[:8],
                 chars=len(cached.get("transcript", "")),
             )
             return web.json_response({**cached, "deduped": True})
