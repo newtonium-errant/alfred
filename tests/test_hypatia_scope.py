@@ -70,17 +70,27 @@ def test_hypatia_scope_create_denies_salem_types() -> None:
 
     Phase A inter-instance comms differentiates the rejection messages:
       * ``event`` is canonical → "propose_event" suggestion.
-      * ``task`` and ``project`` are non-canonical Salem types → still
-        emit the generic "hypatia types" message.
+      * ``project`` is a non-canonical Salem type → generic "hypatia types".
+
+    NOTE (clinic-capture Piece 3, 2026-07): ``task`` was REMOVED from this
+    denial — Hypatia now creates ``task`` from a capture's action_items
+    (``HYPATIA_CREATE_TYPES`` gained ``task``). See
+    ``test_hypatia_scope_create_allows_task`` for the positive pin.
     """
     # Canonical event → propose suggestion.
     with pytest.raises(ScopeError, match="propose_event"):
         check_scope("hypatia", "create", record_type="event")
-    # Non-canonical Salem types → generic hypatia-types rejection.
-    for t in ("task", "project"):
-        with pytest.raises(ScopeError) as exc_info:
-            check_scope("hypatia", "create", record_type=t)
-        assert "hypatia types" in str(exc_info.value).lower()
+    # Non-canonical Salem type → generic hypatia-types rejection.
+    with pytest.raises(ScopeError) as exc_info:
+        check_scope("hypatia", "create", record_type="project")
+    assert "hypatia types" in str(exc_info.value).lower()
+
+
+def test_hypatia_scope_create_allows_task() -> None:
+    """clinic-capture Piece 3 scope-widen: Hypatia may CREATE ``task`` (from a
+    capture's action_items, option-local into her own vault). Mutation: drop
+    ``task`` from HYPATIA_CREATE_TYPES → this raises ScopeError → fails."""
+    check_scope("hypatia", "create", record_type="task")
 
 
 def test_hypatia_scope_create_denies_kalle_types() -> None:
@@ -175,6 +185,11 @@ def test_hypatia_create_types_shape() -> None:
         # ``applies_to_instance: Hypatia``) are Hypatia's authority.
         # Conflict resolution: local wins.
         "preference",
+        # Task (2026-07, clinic-capture Piece 3). Capture action_items ->
+        # task/ records in Hypatia's OWN vault (option-local, no push). CANONICAL
+        # type gated at gate 2 only — deliberately NOT in KNOWN_TYPES_HYPATIA (the
+        # is_separate_set pin below still excludes it). See scope.py note.
+        "task",
     }
 
 

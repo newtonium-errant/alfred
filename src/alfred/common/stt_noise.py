@@ -45,11 +45,14 @@ _DEFAULT_STT_HALLUCINATION_DENYLIST: frozenset[str] = frozenset({
     "please like and subscribe",
     "subscribe to my channel",
     "see you in the next video",
-    "see you in the next one",
-    "see you next time",
+    "i'll see you in the next video",
     "thanks for listening",
     "thank you for listening",
-    "i'll see you in the next video",
+    # REMOVED 2026-07 (Piece 2 review WARN): "see you next time" and "see you in
+    # the next one" are the two closest to plausible standalone HUMAN speech in
+    # clinical dictation ("see you next time" is a real sign-off), so the
+    # universal default must NOT drop them — real-speech-loss beats a missed
+    # caption. Instances that want them can add them to the per-instance extras.
 })
 
 

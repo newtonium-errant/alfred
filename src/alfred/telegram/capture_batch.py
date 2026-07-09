@@ -716,6 +716,87 @@ async def _create_memo_record(
     return result["path"]
 
 
+# Fixed confidence marker for capture-emitted tasks (clinic-capture Piece 3).
+# These are LLM-EXTRACTED, not operator-confirmed — ``created_by_capture`` +
+# ``capture_confidence`` are the self-correcting-by-design hook: they flag each
+# emitted task for review in the local Captured Tasks view, where the operator
+# confirms / edits / sets owner+due (the correction signal). A future increment
+# can promote reviewed-and-kept tasks to a higher confidence.
+_CAPTURE_TASK_CONFIDENCE = "unverified"
+
+
+async def _emit_capture_tasks(
+    vault_path: Path,
+    action_items: list[str],
+    session_rel_path: str,
+    *,
+    scope: str,
+    agent_slug: str,
+) -> list[str]:
+    """Emit one ``task/`` record per structured action_item into the CAPTURING
+    instance's OWN vault (option-local — NO cross-instance transit). Returns the
+    created rel_paths.
+
+    Mirrors ``_create_memo_record`` failure-isolation: each item is created in
+    its own try/except so one bad item (scope-deny, slug collision, write error)
+    doesn't sink the rest. Frontmatter: ``status: todo``,
+    ``created_by_capture: true``, ``capture_confidence`` (the self-correcting
+    review hook), and a ``session`` provenance wikilink.
+
+    ``owner``/``due``/``domain`` are DELIBERATELY left unset for operator
+    enrichment via the Captured Tasks view: the action_items are free text with
+    no reliably-parseable owner/due/domain, and a static guess would be exactly
+    the un-correctable heuristic the self-correcting-design standard rejects. The
+    canonical task template supplies those keys when the operator opens the
+    record."""
+    session_link = (
+        f"[[{session_rel_path[:-3]}]]" if session_rel_path.endswith(".md")
+        else f"[[{session_rel_path}]]"
+    )
+    created: list[str] = []
+    for item in action_items:
+        text = (item or "").strip()
+        if not text:
+            continue
+        slug = _memo_slug_from_text(text)
+        display = " ".join(text.split()[:12]) or slug.replace("-", " ").title()
+        body = "\n".join([
+            f"# {display}", "", text, "",
+            "## Context", "", f"Captured from {session_link}.", "",
+        ])
+        set_fields: dict[str, Any] = {
+            "status": "todo",
+            "created_by_capture": True,
+            "capture_confidence": _CAPTURE_TASK_CONFIDENCE,
+            "session": session_link,
+        }
+        try:
+            result = ops.vault_create(
+                vault_path, "task", slug,
+                set_fields=set_fields, body=body, scope=(scope or None),
+            )
+        except ops.VaultError as exc:
+            log.warning(
+                "talker.capture.task_create_failed",
+                session_rel_path=session_rel_path, slug=slug,
+                scope=scope, error=str(exc),
+            )
+            continue
+        # Best-effort human-readable display name (mirrors the memo path).
+        try:
+            ops.vault_edit(
+                vault_path, result["path"],
+                set_fields={"name": display}, scope=(scope or None),
+            )
+        except Exception as exc:  # noqa: BLE001 — record exists; name is cosmetic
+            log.info(
+                "talker.capture.task_name_update_failed",
+                task_path=result["path"], error=str(exc),
+            )
+        created.append(result["path"])
+    return created
+
+
 # --- Orchestrator --------------------------------------------------------
 
 
@@ -1063,6 +1144,39 @@ async def process_capture_session(
                 error=str(exc),
             )
 
+    # Piece 3: emit ``task/`` records from the structured action_items into THIS
+    # instance's OWN vault (option-local — no cross-instance transit) and
+    # regenerate the local Captured Tasks view so they surface in the operator's
+    # flow. Failure-isolated: task emission never blocks the (already-written)
+    # summary. LOCAL ONLY — nothing here touches transport / pending_items.
+    created_tasks: list[str] = []
+    if summary.action_items:
+        try:
+            created_tasks = await _emit_capture_tasks(
+                vault_path, summary.action_items, session_rel_path,
+                scope=anchor_scope, agent_slug=agent_slug,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "talker.capture.task_emit_unhandled",
+                session_rel_path=session_rel_path, error=str(exc),
+            )
+        if created_tasks:
+            try:
+                from .captured_tasks_view import regenerate_captured_tasks_view
+                regenerate_captured_tasks_view(vault_path)
+            except Exception as exc:  # noqa: BLE001 — view is decoration
+                log.warning(
+                    "talker.capture.captured_tasks_view_unhandled",
+                    session_rel_path=session_rel_path, error=str(exc),
+                )
+        log.info(
+            "talker.capture.tasks_emitted",
+            session_rel_path=session_rel_path,
+            action_items=len(summary.action_items),
+            tasks_created=len(created_tasks),
+        )
+
     log.info(
         "talker.capture.batch_done",
         session_rel_path=session_rel_path,
@@ -1073,20 +1187,23 @@ async def process_capture_session(
     )
 
     if send_follow_up is not None:
-        # Honest follow-up (clinic-capture Piece 2c): report WHAT was captured —
-        # action-item + topic counts, and (only when non-zero) the noise dropped
-        # — so the operator knows what landed vs was filtered, not a generic
-        # "structured" with no substance signal.
+        # Honest follow-up (clinic-capture Piece 2c + 3): report WHAT was
+        # captured — action-item + topic counts, tasks filed locally, and (only
+        # when non-zero) the noise dropped — so the operator knows what landed vs
+        # was filtered, not a generic "structured" with no substance signal.
         n_items = len(summary.action_items)
         n_topics = len(summary.topics)
         noise_note = (
             f" Dropped {len(summary.discarded_noise)} noise line(s)."
             if summary.discarded_noise else ""
         )
+        task_note = (
+            f" Filed {len(created_tasks)} task(s)." if created_tasks else ""
+        )
         try:
             await send_follow_up(
                 f"Capture structured ({short_id}): {n_items} action item(s), "
-                f"{n_topics} topic(s).{noise_note} "
+                f"{n_topics} topic(s).{task_note}{noise_note} "
                 f"/extract {short_id} for notes, /brief {short_id} for audio."
             )
         except Exception as send_exc:  # noqa: BLE001

@@ -266,6 +266,16 @@ _DEFINITIONS: list[TypeDefinition] = [
         # ``{vera, vera_ops}`` (2026-06-15, vera-assistant arc) — both
         # VERA roles create+edit ``task`` (action items). See the
         # ``project`` note above for the gate-1/gate-2 contract.
+        #
+        # HYPATIA (2026-07, clinic-capture Piece 3) also creates ``task`` (from a
+        # capture's action_items), but is DELIBERATELY *not* tagged here: ``task``
+        # is ``SCOPE_CANONICAL``, so gate 1 (``known_types("hypatia")`` =
+        # canonical ∪ scope) ALREADY admits it — a ``"hypatia"`` tag would be a
+        # gate-1 no-op AND would pollute ``KNOWN_TYPES_HYPATIA``
+        # (``types_in_scope("hypatia")``), the hypatia-ONLY extension set pinned
+        # to exclude Salem-core types. The lone fence for Hypatia is gate 2:
+        # ``task`` in ``scope.HYPATIA_CREATE_TYPES``. (Contrast ``ticket``, which
+        # IS non-canonical and therefore MUST carry its vera tag for gate 1.)
         available_in_scopes=frozenset({SCOPE_CANONICAL, "vera", "vera_ops"}),
     ),
     TypeDefinition(

@@ -388,6 +388,101 @@ async def test_process_capture_session_clean_transcript_no_noise_note(
     assert "### Discarded Noise\n(none)" in post.content
 
 
+# --- Piece 3: option-local task emission + local view + no-push default-deny --
+
+
+def _two_turn_capture(action_items):
+    """A 2-user-turn capture transcript (>1 so the Hypatia memo branch, which
+    triggers at <=1 user turn, does NOT fire and structuring runs) + a fake
+    client that emits ``action_items``."""
+    transcript = [
+        {"role": "user", "content": "write the clinical note and invoice room",
+         "_ts": "2026-07-09T10:00:00+00:00"},
+        {"role": "user", "content": "also book the follow-up appointment",
+         "_ts": "2026-07-09T10:00:05+00:00"},
+    ]
+    client = FakeAnthropicClient([_tool_use_response({
+        "topics": ["clinic tasks"], "decisions": [], "open_questions": [],
+        "action_items": action_items, "key_insights": [], "raw_contradictions": [],
+    })])
+    return transcript, client
+
+
+@pytest.mark.asyncio
+async def test_process_capture_session_emits_local_tasks(tmp_path: Path) -> None:
+    """Piece 3: action_items → ``task/`` records in THIS instance's own vault
+    (option-local), under the HYPATIA scope (exercises the scope-widen
+    end-to-end), with created_by_capture + capture_confidence + session
+    provenance + status todo, and the local Captured Tasks view regenerated.
+    Mutation: skip ``_emit_capture_tasks`` → no ``task/`` records → fails."""
+    rel = _make_session_record(tmp_path, "Voice Session — 2026-07-09 1005 cap11")
+    (tmp_path / "task").mkdir(exist_ok=True)
+    transcript, client = _two_turn_capture(
+        ["write the clinical note tomorrow", "invoice the room rental"])
+    follow_ups: list[str] = []
+
+    async def _sender(text: str) -> None:
+        follow_ups.append(text)
+
+    await capture_batch.process_capture_session(
+        client=client, vault_path=tmp_path, session_rel_path=rel,
+        transcript=transcript, model="claude-sonnet-4-6",
+        send_follow_up=_sender, short_id="cap11",
+        agent_slug="hypatia", anchor_scope="hypatia",
+    )
+
+    import frontmatter
+    tasks = sorted((tmp_path / "task").glob("*.md"))
+    assert len(tasks) == 2, [p.name for p in tasks]
+    post = frontmatter.load(str(tasks[0]))
+    assert post["type"] == "task" and post["status"] == "todo"
+    assert post["created_by_capture"] is True
+    assert post["capture_confidence"] == "unverified"
+    assert str(post["session"]).startswith("[[session/")
+
+    # Local Captured Tasks view surfaced (in-flow, not Obsidian-only).
+    view = (tmp_path / "process" / "Captured Tasks.md").read_text()
+    assert "Captured Tasks" in view and "[[task/" in view
+    # Honest follow-up mentions tasks filed.
+    assert "Filed 2 task(s)" in follow_ups[0]
+
+
+@pytest.mark.asyncio
+async def test_captured_tasks_never_pushed_cross_instance(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """DEFAULT-DENY negative pin (Piece 3 #4): a created_by_capture (potentially
+    clinic/PHI) task is emitted LOCALLY only — the capture flow must NEVER
+    enqueue it into the pending_items cross-instance push (which would carry raw
+    clinical text to Salem with no de-ID guard; that is the deferred sovereign
+    arc). Spy on the real pending_items enqueue. Mutation: wire an enqueue into
+    the emission path → the spy fires → fails."""
+    import alfred.pending_items.queue as pq
+
+    calls = {"n": 0}
+
+    def _spy(*a, **k):
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(pq, "append_item", _spy)
+
+    rel = _make_session_record(tmp_path, "Voice Session — 2026-07-09 1006 cap12")
+    (tmp_path / "task").mkdir(exist_ok=True)
+    transcript, client = _two_turn_capture(["fax the disability forms"])
+
+    await capture_batch.process_capture_session(
+        client=client, vault_path=tmp_path, session_rel_path=rel,
+        transcript=transcript, model="claude-sonnet-4-6",
+        short_id="cap12", agent_slug="hypatia", anchor_scope="hypatia",
+    )
+
+    # The task WAS created locally...
+    assert list((tmp_path / "task").glob("*.md"))
+    # ...but NOTHING was enqueued for cross-instance push.
+    assert calls["n"] == 0
+
+
 # --- _flatten_transcript --------------------------------------------------
 
 

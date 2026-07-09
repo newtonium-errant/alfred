@@ -93,6 +93,18 @@ def test_default_denylist_is_nonempty_and_normalized() -> None:
     assert "thank you for watching" in normalized_denylist()
 
 
+def test_borderline_signoffs_not_in_default() -> None:
+    """Piece 2 review WARN tuning: "see you next time" / "see you in the next
+    one" are plausible standalone HUMAN sign-offs in clinical dictation, so the
+    UNIVERSAL default must NOT drop them (real-speech-loss beats a missed
+    caption). Mutation: re-add either to the default set → it gets dropped →
+    fails. A per-instance extra can still opt in."""
+    for phrase in ("see you next time", "see you in the next one"):
+        assert filter_stt_noise(phrase) == (phrase, []), phrase
+    # opt-in via per-instance extra still works
+    assert filter_stt_noise("see you next time", ["see you next time"])[0] == ""
+
+
 # ---------------------------------------------------------------------------
 # 2a — build_deepgram_url vocab → keyterm/keywords (model-aware)
 # ---------------------------------------------------------------------------

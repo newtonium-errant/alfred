@@ -1262,6 +1262,17 @@ HYPATIA_CREATE_TYPES: set[str] = {
     # authority. Conflict resolution: local wins. See
     # ``project_operator_preferences_v1.md`` Hard Contract #6 + #8.
     "preference",
+    # Task (2026-07, clinic-capture Piece 3). Hypatia emits ``task/`` records
+    # from a capture's structured ``action_items`` into her OWN vault
+    # (option-local — no cross-instance transit). Unlike the Hypatia-only types
+    # above, ``task`` is CANONICAL (Salem-core), so it is DELIBERATELY *not*
+    # tagged ``"hypatia"`` in ``schema.py``'s ``available_in_scopes`` — gate 1
+    # (``known_types("hypatia")``) already admits every canonical type, and
+    # tagging it would wrongly place a Salem-core type into the hypatia-ONLY
+    # ``KNOWN_TYPES_HYPATIA`` extension set (``types_in_scope``). This gate-2
+    # entry is the sole policy fence; do NOT add ``task`` to
+    # ``KNOWN_TYPES_HYPATIA``. See ``schema.py`` task TypeDefinition note.
+    "task",
 }
 
 
