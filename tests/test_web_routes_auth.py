@@ -410,6 +410,37 @@ async def test_login_rate_limit_is_uniform_for_unknown_email(
     assert r2.status == 429
 
 
+async def test_login_unknown_flood_does_not_lock_out_legit_login(
+    aiohttp_client, tmp_path, captured_links, monkeypatch
+) -> None:
+    # FIX #6: a flood of UNKNOWN-email POSTs (which never send a magic link)
+    # must NOT exhaust the GLOBAL send budget — so a subsequent LEGITIMATE
+    # login is not 429'd. Small global ceiling; generous per-email so distinct
+    # junk emails don't trip the per-email gate.
+    limiter = auth_routes_mod._LoginRateLimiter(
+        max_per_email=99, window_s=900, max_global=3
+    )
+    monkeypatch.setattr(auth_routes_mod, "_LOGIN_RATE_LIMITER", limiter)
+    client = await _make_client(aiohttp_client, tmp_path, _web_config())
+
+    # 10 distinct unknown emails — each returns the uniform "sent", none sends.
+    for i in range(10):
+        r = await client.post(
+            "/auth/login",
+            json={"email": f"junk{i}@nope.com"},
+            headers=_PEER_HEADERS,
+        )
+        assert r.status == 200
+    assert captured_links == []  # nothing actually sent → global untouched
+
+    # The legitimate user is NOT locked out by the junk flood.
+    r = await client.post(
+        "/auth/login", json={"email": "andrew@example.com"}, headers=_PEER_HEADERS
+    )
+    assert r.status == 200
+    assert len(captured_links) == 1  # the real send happened
+
+
 # ---------------------------------------------------------------------------
 # BIT (c) — magic-link next-param deep-link (integration through the handler).
 # ---------------------------------------------------------------------------

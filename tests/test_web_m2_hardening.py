@@ -137,29 +137,29 @@ def test_rate_limiter_n_plus_one_rejected_then_window_recovers() -> None:
         max_per_email=3, window_s=900, max_global=999, clock=clock
     )
     key = ("1.2.3.4", "andrew@example.com")
-    # N allowed.
-    assert [rl.allow(key) for _ in range(3)] == [True, True, True]
-    # N+1th within the window → rejected.
-    assert rl.allow(key) is False
+    # N attempts allowed.
+    assert [rl.allow_attempt(key) for _ in range(3)] == [True, True, True]
+    # N+1th within the window → rejected (per-email gate).
+    assert rl.allow_attempt(key) is False
     # A send after the window elapses (injected clock) → allowed again.
     clock.advance(901)
-    assert rl.allow(key) is True
+    assert rl.allow_attempt(key) is True
 
 
-def test_rate_limiter_rejected_send_consumes_no_budget() -> None:
+def test_rate_limiter_rejected_attempt_consumes_no_budget() -> None:
     clock = _FakeClock()
     rl = _LoginRateLimiter(max_per_email=2, window_s=900, max_global=999, clock=clock)
     key = ("ip", "a@b.com")
-    assert rl.allow(key) is True
-    assert rl.allow(key) is True
+    assert rl.allow_attempt(key) is True
+    assert rl.allow_attempt(key) is True
     # Hammer past the cap — every extra attempt rejected, none recorded.
     for _ in range(10):
-        assert rl.allow(key) is False
+        assert rl.allow_attempt(key) is False
     # After the window, full capacity (max_per_email) is restored — the
     # rejected hammering did not push the recovery window forward.
     clock.advance(901)
-    assert [rl.allow(key) for _ in range(2)] == [True, True]
-    assert rl.allow(key) is False
+    assert [rl.allow_attempt(key) for _ in range(2)] == [True, True]
+    assert rl.allow_attempt(key) is False
 
 
 def test_rate_limiter_per_key_isolation() -> None:
@@ -167,32 +167,73 @@ def test_rate_limiter_per_key_isolation() -> None:
     rl = _LoginRateLimiter(max_per_email=1, window_s=900, max_global=999, clock=clock)
     a = ("ip", "a@b.com")
     b = ("ip", "b@b.com")
-    assert rl.allow(a) is True
-    assert rl.allow(a) is False   # a is capped
-    assert rl.allow(b) is True    # b is independent
+    assert rl.allow_attempt(a) is True
+    assert rl.allow_attempt(a) is False   # a is capped
+    assert rl.allow_attempt(b) is True    # b is independent
 
 
-def test_rate_limiter_global_ceiling_across_distinct_keys() -> None:
+def test_rate_limiter_global_ceiling_counts_sends_uniformly() -> None:
     clock = _FakeClock()
-    # Per-email cap is generous; the GLOBAL ceiling (email-rotation defense)
-    # trips first when an attacker rotates addresses.
+    # The GLOBAL ceiling (email-rotation defense) is driven by actual SENDS
+    # (record_send), not attempts. Once saturated, a subsequent attempt — even
+    # a brand-new email — is rejected UNIFORMLY (no known-vs-unknown leak).
     rl = _LoginRateLimiter(
         max_per_email=99, window_s=900, max_global=3, clock=clock
     )
-    results = [rl.allow(("ip", f"user{i}@b.com")) for i in range(4)]
-    assert results == [True, True, True, False]
+    for _ in range(3):
+        rl.record_send()
+    assert rl.allow_attempt(("ip", "brand-new@b.com")) is False
     # After the window the global budget restores.
     clock.advance(901)
-    assert rl.allow(("ip", "user5@b.com")) is True
+    assert rl.allow_attempt(("ip", "user5@b.com")) is True
+
+
+# --- FIX #6: global counts SENDS, not attempts (self-inflicted-DoS fix) -----
+
+
+def test_rate_limiter_global_not_exhausted_by_attempts() -> None:
+    clock = _FakeClock()
+    rl = _LoginRateLimiter(max_per_email=99, window_s=900, max_global=3, clock=clock)
+    # A flood of junk ATTEMPTS (distinct emails, none sent) must NOT consume
+    # the global budget — attempts don't increment the global window.
+    for i in range(50):
+        assert rl.allow_attempt(("ip", f"junk{i}@b.com")) is True
+    # The global budget is untouched → a legit attempt still passes.
+    assert rl.allow_attempt(("ip", "andrew@example.com")) is True
+    # Only actual SENDS fill the global window.
+    for _ in range(3):
+        rl.record_send()
+    assert rl.allow_attempt(("ip", "someone-new@b.com")) is False
+
+
+# --- FIX #5: rejected new keys must not grow _events past the bound ----------
+
+
+def test_rate_limiter_rejected_new_keys_do_not_grow_events() -> None:
+    clock = _FakeClock()
+    rl = _LoginRateLimiter(
+        max_per_email=5, window_s=900, max_global=3, max_keys=10, clock=clock
+    )
+    # Saturate the global ceiling with real sends so every fresh attempt below
+    # rejects on the GLOBAL gate with a brand-new (empty) key.
+    for _ in range(3):
+        rl.record_send()
+    for i in range(1000):
+        assert rl.allow_attempt(("ip", f"junk{i}@b.com")) is False
+    # Bounded-but-attacker-controlled growth is the bug: rejected NEW keys must
+    # leave no entry, so _events never exceeds max_keys.
+    assert len(rl._events) <= rl._max_keys
 
 
 def test_rate_limiter_clear_resets_both_gates() -> None:
     clock = _FakeClock()
     rl = _LoginRateLimiter(max_per_email=1, window_s=900, max_global=1, clock=clock)
-    assert rl.allow(("ip", "a@b.com")) is True
-    assert rl.allow(("ip", "a@b.com")) is False
+    assert rl.allow_attempt(("ip", "a@b.com")) is True
+    assert rl.allow_attempt(("ip", "a@b.com")) is False
+    rl.record_send()
+    assert rl.allow_attempt(("ip", "b@b.com")) is False  # global saturated
     rl.clear()
-    assert rl.allow(("ip", "a@b.com")) is True
+    assert rl.allow_attempt(("ip", "a@b.com")) is True   # both gates reset
 
 
 # ===========================================================================

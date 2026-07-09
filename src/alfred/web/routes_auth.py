@@ -60,16 +60,30 @@ _LOGIN_MAX_KEYS = 512          # bounded distinct-key set (LRU-evicted)
 class _LoginRateLimiter:
     """Bounded in-process sliding-window limiter for ``/auth/login``.
 
-    Two gates, both over the same window:
-      * per-key ``(client_ip, email)`` — caps repeat sends to one target;
-      * global — caps total sends across all keys (email-rotation defense).
+    Two gates, over separate signals:
+      * per-key ``(client_ip, email)`` — caps repeat ATTEMPTS to one target;
+        checked + recorded in :meth:`allow_attempt` (BEFORE the user lookup, so
+        known and unknown emails are rate-limited identically — the enumeration
+        defense).
+      * global — caps actual SENDS across all keys (email-rotation defense);
+        incremented ONLY in :meth:`record_send` (a real, looked-up user about
+        to be emailed). :meth:`allow_attempt` applies a READ-ONLY check of it.
 
-    Only ALLOWED sends are recorded; a rejected request consumes no budget, so
-    a hammering caller stays capped while a legit retry recovers as old
-    timestamps age out. In-process + single event-loop thread + await-free
-    ``allow`` → no lock needed. NOT persisted (a restart resetting the window is
-    acceptable). Tests reset via :meth:`clear` (autouse fixture) or swap the
-    module singleton for one with a fake clock.
+    Why the split (self-inflicted-DoS fix): an unknown/junk email never sends,
+    so counting attempts against the GLOBAL window let ~``max_global`` junk
+    POSTs lock out every legitimate login for a window. Counting SENDS instead
+    keeps the rotation defense intact (rotating through REAL addresses still
+    hits the send cap) while making junk-flood lockout impossible. The
+    per-email gate still runs on every attempt, so junk is bounded and
+    known-vs-unknown stays uniform.
+
+    Only accepted attempts / real sends are recorded; a rejected request
+    consumes no budget, and the reject path NEVER inserts a new key (a flood of
+    distinct rejected keys must not grow ``_events`` past ``max_keys``). In-
+    process + single event-loop thread + await-free methods → no lock needed.
+    NOT persisted (a restart resetting the window is acceptable). Tests reset
+    via :meth:`clear` (autouse fixture) or swap the module singleton for one
+    with a fake clock.
     """
 
     def __init__(
@@ -93,26 +107,51 @@ class _LoginRateLimiter:
         cutoff = now - self._window
         return [t for t in stamps if t > cutoff]
 
-    def allow(self, key: "tuple[str, str]") -> bool:
-        """Record + allow a send, or return ``False`` if over either gate."""
+    def allow_attempt(self, key: "tuple[str, str]") -> bool:
+        """Gate a login POST BEFORE the user lookup — ``False`` (→ 429) if over
+        either gate.
+
+        Records the PER-EMAIL attempt (so known and unknown emails are
+        rate-limited identically — no enumeration) and applies a READ-ONLY
+        check of the global send window. The global counter is NOT touched here
+        — it increments only on an actual send (:meth:`record_send`), so a junk
+        / unknown-email flood (which never sends) can't exhaust the global
+        window and lock out real logins.
+        """
         now = self._clock()
         bucket = self._prune(self._events.get(key, []), now)
-        glob = self._prune(self._global, now)
-        if len(bucket) >= self._max_per_email or len(glob) >= self._max_global:
-            # Persist the pruned views (so aged-out stamps don't linger) but
-            # record NOTHING — a rejected send consumes no budget.
-            self._events[key] = bucket
-            self._events.move_to_end(key)
-            self._global = glob
+        self._global = self._prune(self._global, now)  # keep pruned view
+        over_email = len(bucket) >= self._max_per_email
+        over_global = len(self._global) >= self._max_global
+        if over_email or over_global:
+            # Rejected: record NOTHING. Only refresh an ALREADY-TRACKED key's
+            # pruned window; NEVER insert a new key on the reject path — a flood
+            # of distinct rejected keys (e.g. a global-saturating junk flood)
+            # must not grow ``_events`` past ``max_keys`` (bounded-but-
+            # attacker-controlled memory growth otherwise).
+            if key in self._events:
+                self._events[key] = bucket
+                self._events.move_to_end(key)
             return False
         bucket.append(now)
         self._events[key] = bucket
         self._events.move_to_end(key)
-        glob.append(now)
-        self._global = glob
         while len(self._events) > self._max_keys:
             self._events.popitem(last=False)  # evict oldest (LRU)
         return True
+
+    def record_send(self) -> None:
+        """Increment the GLOBAL send window — called ONLY when a real,
+        looked-up user is about to be emailed a magic link.
+
+        Junk / unknown emails never reach here (the handler returns the uniform
+        "sent" at the allowlist miss WITHOUT sending), so a junk flood can't
+        consume the global budget. Rotating through REAL allowlisted addresses
+        still hits this cap — the email-rotation defense is intact.
+        """
+        now = self._clock()
+        self._global = self._prune(self._global, now)
+        self._global.append(now)
 
     def clear(self) -> None:
         self._events.clear()
@@ -205,10 +244,12 @@ async def _handle_auth_login(request: web.Request) -> web.StreamResponse:
     # small global ceiling, so an unauthenticated caller can't drive unbounded
     # Resend spend / email-bomb a user. Checked BEFORE the user lookup so a
     # known and an unknown email are treated identically (no enumeration via a
-    # 429). A legit "didn't get it, resend" stays under the per-email cap.
+    # 429). A legit "didn't get it, resend" stays under the per-email cap. The
+    # GLOBAL counter is NOT incremented here — only on an actual send below
+    # (record_send), so a junk-email flood can't lock out real logins.
     email_norm = email.strip().lower()
     client_ip = getattr(request, "remote", None) or ""
-    if not _LOGIN_RATE_LIMITER.allow((client_ip, email_norm)):
+    if not _LOGIN_RATE_LIMITER.allow_attempt((client_ip, email_norm)):
         log.warning(
             "web.auth.login_rate_limited",
             client_ip=client_ip,
@@ -242,9 +283,16 @@ async def _handle_auth_login(request: web.Request) -> web.StreamResponse:
 
     user = _find_user_by_email(web_config, email)
     if user is None:
-        # Uniform response — no enumeration. Logged server-side.
+        # Uniform response — no enumeration. Logged server-side. NOTE: no
+        # record_send() here — an unknown email never sends, so it never
+        # consumes the global budget (that's the junk-flood-lockout fix).
         log.info("web.auth.login_unknown_email")
         return web.json_response({"status": "sent"})
+
+    # A real, allowlisted user is about to be emailed a magic link — count it
+    # against the GLOBAL send window (email-rotation defense). The per-email
+    # gate above already recorded the attempt.
+    _LOGIN_RATE_LIMITER.record_send()
 
     secret = resolve_signing_secret(web_config.auth)
     ttl_minutes = web_config.auth.magic_link_ttl_minutes
