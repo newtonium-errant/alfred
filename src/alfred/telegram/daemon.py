@@ -137,22 +137,31 @@ def _reconcile_left_collapse_group(
 # --- Validation -----------------------------------------------------------
 
 
-def _missing_config_reasons(config: TalkerConfig) -> list[str]:
+def _missing_config_reasons(
+    config: TalkerConfig, *, web_only: bool = False
+) -> list[str]:
     """Return human-readable reasons why config is incomplete (or []).
 
     Anything that would crash the daemon on first use counts — a missing
     bot token leaves us unable to build the Application; an empty allowlist
     means no one can talk to us; missing API keys make the first message
     500 the user.
+
+    ``web_only`` (bit d): a PWA-only instance mounts the web surface with NO
+    Telegram bot. When set, the Telegram-specific prerequisites (``bot_token``
+    / ``allowed_users`` / ``stt.api_key``) are NOT required — but ``vault.path``
+    and ``anthropic.api_key`` (the agent needs both) stay required, and
+    ``instance.name`` still fails loud upstream at ``load_from_unified``.
+    Default ``False`` → today's five checks byte-for-byte (order preserved).
     """
     reasons: list[str] = []
-    if not config.bot_token:
+    if not web_only and not config.bot_token:
         reasons.append("telegram.bot_token is empty")
-    if not config.allowed_users:
+    if not web_only and not config.allowed_users:
         reasons.append("telegram.allowed_users is empty")
     if not config.anthropic.api_key:
         reasons.append("telegram.anthropic.api_key is empty")
-    if not config.stt.api_key:
+    if not web_only and not config.stt.api_key:
         reasons.append("telegram.stt.api_key is empty")
     if not config.vault.path:
         reasons.append("vault.path is empty")
@@ -446,10 +455,35 @@ async def run(
         backup_count=_backup_count,
     )
 
-    reasons = _missing_config_reasons(config)
+    # Web-only mode (bit d): a PWA-only instance may run the web surface with
+    # no Telegram bot. Opt-in + EXPLICIT — web.enabled AND web.web_only — so a
+    # standard instance (either flag absent) keeps every Telegram prerequisite
+    # required, byte-for-byte. Any web-config parse issue fails toward the
+    # strict default (web_only stays False → today's behavior).
+    web_only = False
+    try:
+        from alfred.web.config import load_from_unified as _load_web_cfg
+        _wc_probe = _load_web_cfg(raw)
+        web_only = bool(_wc_probe.enabled and _wc_probe.web_only)
+    except Exception:  # noqa: BLE001 — never let a web-config issue block boot
+        log.exception("talker.daemon.web_only_probe_failed")
+        web_only = False
+
+    reasons = _missing_config_reasons(config, web_only=web_only)
     if reasons:
         log.error("talker.daemon.missing_config", reasons=reasons)
         return _MISSING_CONFIG_EXIT
+
+    if web_only and not config.bot_token:
+        # Intentionally-left-blank: an explicit "running without Telegram"
+        # signal so a bot-less daemon is distinguishable from a broken one.
+        log.info(
+            "talker.daemon.web_only_mode",
+            detail=(
+                "web.web_only=true and no bot_token — Telegram bot disabled; "
+                "serving the web surface + transport only"
+            ),
+        )
 
     log.info("talker.daemon.starting", model=config.anthropic.model)
 
@@ -497,14 +531,22 @@ async def run(
     )
     vault_context_str = _build_vault_context_str(config)
 
-    app = bot.build_app(
-        config=config,
-        state_mgr=state_mgr,
-        anthropic_client=client,
-        system_prompt_provider=system_prompt_provider,
-        vault_context_str=vault_context_str,
-        raw_config=raw,
-    )
+    # Web-only mode (bit d): with no bot_token there is no Telegram
+    # Application to build — ``Application.builder().token("").build()`` raises
+    # InvalidToken, so we skip the build entirely. Every ``app.*`` touchpoint
+    # below is guarded on ``app is not None``. When a bot_token IS present (the
+    # only path a standard instance ever takes, since an empty token without
+    # web_only already early-returned above) this is byte-for-byte unchanged.
+    app = None
+    if config.bot_token:
+        app = bot.build_app(
+            config=config,
+            state_mgr=state_mgr,
+            anthropic_client=client,
+            system_prompt_provider=system_prompt_provider,
+            vault_context_str=vault_context_str,
+            raw_config=raw,
+        )
 
     # ---- Outbound-push transport --------------------------------------
     # The transport server runs as a sibling asyncio task inside the
@@ -539,6 +581,17 @@ async def run(
             250ms floor under an asyncio.Lock keyed by chat_id so
             bursts (batch sends, scheduler drains) don't trip 429.
             """
+            if app is None:
+                # Web-only mode (bit d) — no Telegram bot. Not reached in
+                # practice (empty allowed_users → no scheduler; web-only
+                # instances don't push to Telegram), but guard so a stray
+                # call no-ops loudly instead of raising on ``app.bot``.
+                log.warning(
+                    "talker.daemon.telegram_send_skipped",
+                    detail="web-only mode (no bot_token)",
+                    user_id=user_id,
+                )
+                return []
             lock = send_lock_map.setdefault(user_id, asyncio.Lock())
             async with lock:
                 try:
@@ -1717,6 +1770,9 @@ async def run(
             send raced with us). Failure is logged + swallowed — the
             structured record landed regardless of whether the DM made it.
             """
+            if app is None:
+                # Web-only mode (bit d) — no Telegram bot to DM through.
+                return
             lock = send_lock_map.setdefault(chat_id, asyncio.Lock())
             async with lock:
                 try:
@@ -1845,13 +1901,24 @@ async def run(
     polling = False
     exit_code = 0
     try:
-        await app.initialize()
-        initialised = True
-        await app.start()
-        started = True
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        polling = True
-        log.info("talker.daemon.polling")
+        if app is not None:
+            await app.initialize()
+            initialised = True
+            await app.start()
+            started = True
+            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            polling = True
+            log.info("talker.daemon.polling")
+        else:
+            # Web-only mode (bit d): no Telegram polling. The transport + web
+            # server tasks started above serve until SIGTERM; the finally
+            # block's PTB teardown is fully skipped (initialised/started/
+            # polling all stay False). Intentionally-left-blank: an explicit
+            # "serving without Telegram" signal.
+            log.info(
+                "talker.daemon.web_only_serving",
+                detail="no Telegram polling — transport + web surface only",
+            )
         await shutdown_event.wait()
     except Exception as exc:  # noqa: BLE001 — top-level: log and exit cleanly
         # InvalidToken / network failures during init are config-class

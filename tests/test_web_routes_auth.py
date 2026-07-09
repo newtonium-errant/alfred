@@ -108,6 +108,20 @@ def _web_config(*, email_configured: bool = True, base_url: str = "https://salem
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_login_rate_limiter():
+    """Reset the module-level login rate limiter around EACH test.
+
+    The limiter (bit b) is a process-global singleton; without this reset,
+    repeat /auth/login POSTs for the same (client-ip, email) across tests
+    accumulate and a later test would spuriously 429. Mirrors the STT dedup
+    cache's "tests use a fresh instance" convention.
+    """
+    auth_routes_mod._LOGIN_RATE_LIMITER.clear()
+    yield
+    auth_routes_mod._LOGIN_RATE_LIMITER.clear()
+
+
 @pytest.fixture
 def captured_links(monkeypatch):
     """Monkeypatch the Resend send to capture the magic link (no network)."""
@@ -337,3 +351,117 @@ async def test_verify_handler_resolves_secret_before_mint(tmp_path) -> None:
     req = _FakeReq(app, {"token": "any-nonempty-token"})
     with pytest.raises(ValueError, match="session_secret"):
         await auth_routes_mod._handle_auth_verify(req)
+
+
+# ---------------------------------------------------------------------------
+# BIT (b) — /auth/login rate limit (integration through the real handler).
+# ---------------------------------------------------------------------------
+
+
+async def test_login_rate_limit_blocks_over_cap_and_logs(
+    aiohttp_client, tmp_path, captured_links, monkeypatch
+) -> None:
+    import structlog
+
+    # A fresh limiter with a tight cap + fake clock (no real sleeping).
+    now = {"t": 1_000.0}
+    limiter = auth_routes_mod._LoginRateLimiter(
+        max_per_email=2, window_s=900, max_global=999, clock=lambda: now["t"]
+    )
+    monkeypatch.setattr(auth_routes_mod, "_LOGIN_RATE_LIMITER", limiter)
+
+    client = await _make_client(aiohttp_client, tmp_path, _web_config())
+    body = {"email": "andrew@example.com"}
+
+    # N sends allowed.
+    for _ in range(2):
+        r = await client.post("/auth/login", json=body, headers=_PEER_HEADERS)
+        assert r.status == 200
+
+    # The (N+1)th within the window → 429 + a logged rate-limit event (never
+    # the raw email — a hashed prefix only).
+    with structlog.testing.capture_logs() as captured:
+        r = await client.post("/auth/login", json=body, headers=_PEER_HEADERS)
+    assert r.status == 429
+    assert (await r.json())["error"] == "rate_limited"
+    events = [c for c in captured if c.get("event") == "web.auth.login_rate_limited"]
+    assert len(events) == 1
+    assert "email_sha" in events[0]  # hashed, not the raw address
+    assert "andrew@example.com" not in str(events[0])
+
+    # A send after the window elapses (injected clock) → allowed again.
+    now["t"] += 901
+    r = await client.post("/auth/login", json=body, headers=_PEER_HEADERS)
+    assert r.status == 200
+
+
+async def test_login_rate_limit_is_uniform_for_unknown_email(
+    aiohttp_client, tmp_path, captured_links, monkeypatch
+) -> None:
+    # The limit fires BEFORE the user lookup, so a known and an unknown email
+    # 429 identically — no enumeration via the rate-limit response.
+    limiter = auth_routes_mod._LoginRateLimiter(max_per_email=1, max_global=999)
+    monkeypatch.setattr(auth_routes_mod, "_LOGIN_RATE_LIMITER", limiter)
+    client = await _make_client(aiohttp_client, tmp_path, _web_config())
+    body = {"email": "nobody@example.com"}  # not on the allowlist
+    r1 = await client.post("/auth/login", json=body, headers=_PEER_HEADERS)
+    assert r1.status == 200
+    r2 = await client.post("/auth/login", json=body, headers=_PEER_HEADERS)
+    assert r2.status == 429
+
+
+# ---------------------------------------------------------------------------
+# BIT (c) — magic-link next-param deep-link (integration through the handler).
+# ---------------------------------------------------------------------------
+
+
+def _next_from_link(link: str) -> str | None:
+    qs = parse_qs(urlparse(link).query)
+    return qs["next"][0] if "next" in qs else None
+
+
+async def test_login_valid_next_round_trips_into_magic_link(
+    aiohttp_client, tmp_path, captured_links
+) -> None:
+    client = await _make_client(aiohttp_client, tmp_path, _web_config())
+    r = await client.post(
+        "/auth/login",
+        json={"email": "andrew@example.com", "next": "/chat?instance=hypatia"},
+        headers=_PEER_HEADERS,
+    )
+    assert r.status == 200
+    assert len(captured_links) == 1
+    # The emailed link carries the (URL-encoded) next; the callback decodes it.
+    assert _next_from_link(captured_links[0]) == "/chat?instance=hypatia"
+
+
+@pytest.mark.parametrize(
+    "evil", ["//evil.com", "https://evil.com", "/\\evil.com", "javascript:alert(1)"]
+)
+async def test_login_open_redirect_next_falls_back_to_default(
+    aiohttp_client, tmp_path, captured_links, evil
+) -> None:
+    client = await _make_client(aiohttp_client, tmp_path, _web_config())
+    r = await client.post(
+        "/auth/login",
+        json={"email": "andrew@example.com", "next": evil},
+        headers=_PEER_HEADERS,
+    )
+    assert r.status == 200
+    assert len(captured_links) == 1
+    # An open-redirect next is stripped — the emailed link carries no next.
+    assert _next_from_link(captured_links[0]) is None
+    assert "next=" not in captured_links[0]
+
+
+async def test_login_no_next_is_byte_identical_link(
+    aiohttp_client, tmp_path, captured_links
+) -> None:
+    # Merge-inert: a login with NO next produces the pre-deep-link URL shape.
+    client = await _make_client(aiohttp_client, tmp_path, _web_config())
+    r = await client.post(
+        "/auth/login", json={"email": "andrew@example.com"}, headers=_PEER_HEADERS
+    )
+    assert r.status == 200
+    assert "next=" not in captured_links[0]
+    assert "/auth/callback?token=" in captured_links[0]

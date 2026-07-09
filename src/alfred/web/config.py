@@ -322,6 +322,14 @@ class WebConfig:
     # (per the load() schema-tolerance contract's "default state paths must
     # be tool-scoped" rule). Overridable per-instance.
     state_path: str = "./data/web_auth_state.json"
+    # Web-only daemon mode (bit d). DEFAULT-OFF. When ``enabled`` AND
+    # ``web_only`` are both true, the talker daemon mounts the PWA web surface
+    # WITHOUT a Telegram bot — the Telegram prerequisites (bot_token /
+    # allowed_users / stt.api_key) become optional at the config gate. ``vault``
+    # + ``anthropic`` stay required (the agent needs both) and ``instance.name``
+    # still fails loud at talker-config load. Absent / false → today's behavior
+    # byte-for-byte (every Telegram prerequisite required).
+    web_only: bool = False
 
 
 # --- Hand-rolled construction ----------------------------------------------
@@ -651,6 +659,7 @@ def load_from_unified(raw: dict[str, Any]) -> WebConfig:
             section.get("state_path", "./data/web_auth_state.json")
             or "./data/web_auth_state.json"
         ),
+        web_only=bool(section.get("web_only", False)),
     )
 
 

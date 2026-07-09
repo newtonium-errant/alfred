@@ -547,6 +547,14 @@ transport:
 # --- Login instance (Salem) — session mode ---
 # web:
 #   enabled: true
+#   # Web-only daemon mode (PWA-only instances, no Telegram bot). DEFAULT-OFF.
+#   # When true (AND enabled: true) the talker daemon mounts this web surface
+#   # WITHOUT a Telegram bot — telegram.bot_token / allowed_users AND
+#   # telegram.stt.api_key become OPTIONAL (a text-chat-only PWA has no STT).
+#   # vault + telegram.anthropic.api_key STAY required (the agent needs both),
+#   # and telegram.instance.name still fails loud. Leave unset for a normal
+#   # instance (every Telegram prerequisite required, byte-for-byte).
+#   # web_only: false
 #   # Single-use magic-link nonce store (tool-scoped default shown).
 #   state_path: "./data/web_auth_state.json"
 #   # The named-user allowlist — this IS the user table (no DB). Each entry's
