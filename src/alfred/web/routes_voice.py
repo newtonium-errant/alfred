@@ -17,13 +17,24 @@ Auth gate order on EVERY route (fail-closed):
   1. peer-pin ``transport_peer == WEB_CHAT_PEER`` — pins OUT the ``web_ingest``
      token (which shares ``allowed_clients: [web]``), closing the escalation
      path per the CLAUDE.md peer-pin requirement. Logs ``web.voice.wrong_peer``.
-  2. ``require_web_session`` (``X-Alfred-Session``).
-  Both failures render as an indistinguishable 401.
+     This is the SINGLE load-bearing pin (unconditional, both modes); it pins
+     ONLY ``web`` — NEVER ``rrts_relay`` (the text bug-report lane never drives
+     voice).
+  2. identity resolution, mode-aware:
+       * ``session`` → ``require_web_session`` (``X-Alfred-Session`` token).
+       * ``relay``   → ``_resolve_voice_relay_identity`` (asserted
+         ``X-Alfred-User`` re-resolved against THIS instance's own
+         ``web.users``; NO ``rrts_relay`` branch — voice is web-peer-only).
+  All failures render as an indistinguishable 401.
 
 Mount modes (contract §1.6, §1.14):
   * ``voice.enabled`` false/absent → routes NOT mounted (route table
     byte-identical to today).
-  * ``web.auth.mode == "relay"`` → NOT mounted (fail-closed, security W5).
+  * ``web.auth.mode == "relay"`` → MOUNTED (multi-instance voice): relay-mode
+    voice re-resolves the asserted identity against this instance's own
+    ``web.users``, guarded by the unconditional ``web``-only peer-pin. (The
+    original V0 fail-closed-on-relay W5 gate was relaxed once the peer-pin was
+    proven the correct fail-closed guard — see ``_require_voice_identity``.)
   * ``pipeline`` != ``"echo"`` → NOT mounted, loud ``web.voice.disabled
     reason=unknown_pipeline`` (fail-closed-web; the daemon lives).
   * enabled + aiortc MISSING → routes mounted in 503 mode (manager is
@@ -42,8 +53,9 @@ from uuid import uuid4
 
 from aiohttp import web
 
-from .auth import WEB_CHAT_PEER, require_web_session
+from .auth import USER_HEADER, WEB_CHAT_PEER, require_web_session
 from .config import WebConfig, _is_unresolved
+from .identity import resolve_identity_from_name
 from .keys import (
     KEY_WEB_ANTHROPIC,
     KEY_WEB_CONFIG,
@@ -90,8 +102,27 @@ def _base_mime(content_type: str) -> str:
 
 
 def _require_voice_identity(request: web.Request, web_config: WebConfig):
-    """Peer-pin (WEB_CHAT_PEER) then session-verify. ``None`` → the handler
-    emits a fail-closed 401 (pin-fail and session-fail indistinguishable)."""
+    """Peer-pin (WEB_CHAT_PEER) then mode-aware identity resolution.
+
+    ``None`` → the handler emits a fail-closed 401 (pin-fail and
+    identity-fail render as an indistinguishable 401).
+
+    The ``transport_peer == WEB_CHAT_PEER`` pin is the SINGLE load-bearing
+    guard, applied UNCONDITIONALLY before the mode branch. It pins ONLY
+    ``web`` (never ``rrts_relay``), so the shared-``allowed_clients: [web]``
+    ``web_ingest`` token — and the vouched ``rrts_relay`` token — are both
+    refused here regardless of auth mode. The negative-check regression test
+    proves this: deleting this pin lets a ``web_ingest`` / ``rrts_relay``
+    request + ``X-Alfred-User`` escalate to a full voice session.
+
+    After the pin, identity resolution branches on ``web.auth.mode``:
+
+    * ``session`` (default) — instance-signed ``X-Alfred-Session`` token
+      (``require_web_session``); UNCHANGED (session-mode is byte-identical).
+    * ``relay`` — asserted ``X-Alfred-User`` re-resolved against THIS
+      instance's own ``web.users`` (``_resolve_voice_relay_identity``). No
+      ``rrts_relay`` vouched branch — voice is web-peer-only.
+    """
     peer = request.get("transport_peer", "")
     if peer != WEB_CHAT_PEER:
         log.warning(
@@ -100,11 +131,56 @@ def _require_voice_identity(request: web.Request, web_config: WebConfig):
             expected=WEB_CHAT_PEER,
             reason="wrong_peer",
             detail="voice requires the dedicated 'web' peer token — refusing "
-                   "(a web_ingest token shares allowed_clients [web] but must "
-                   "not drive voice) — rejecting (401)",
+                   "(a web_ingest token shares allowed_clients [web], and the "
+                   "rrts_relay token is a text bug-report lane — neither may "
+                   "drive voice) — rejecting (401)",
         )
         return None
+    mode = getattr(web_config.auth, "mode", "session") or "session"
+    if mode == "relay":
+        return _resolve_voice_relay_identity(request, web_config)
     return require_web_session(request, web_config)
+
+
+def _resolve_voice_relay_identity(request: web.Request, web_config: WebConfig):
+    """Relay-mode voice identity — FIXED-ROSTER ``web`` peer ONLY.
+
+    Mirrors the fixed-roster half of ``auth.py:_resolve_relay_identity`` but
+    deliberately DROPS its ``rrts_relay`` vouched branch: voice is web-peer-
+    only (§4.1 — the RRTS text bug-report lane must be *structurally* unable
+    to reach voice, not merely pin-gated). The unconditional peer-pin in
+    :func:`_require_voice_identity` has ALREADY confirmed
+    ``transport_peer == WEB_CHAT_PEER`` before this runs — so this resolver
+    does NOT re-check the peer. That is intentional: the line-96 pin stays the
+    single load-bearing guard, keeping the negative-check meaningful (a
+    redundant pin here would mask a line-96 regression).
+
+    Re-resolves the asserted ``X-Alfred-User`` name against THIS instance's
+    own ``web.users`` roster (never trusting an asserted role) → owner / role
+    / synthetic-id derived locally. Fail-closed (→ 401), each with an ILB log
+    so a mis-wired BFF (peer token present, user absent/unknown) is observably
+    distinct from a healthy idle route:
+
+    * missing / empty ``X-Alfred-User`` → ``web.voice.relay_user_missing``;
+    * name not in this instance's ``web.users`` → ``web.voice.relay_user_unknown``.
+    """
+    name = request.headers.get(USER_HEADER, "")
+    if not name or not name.strip():
+        log.warning(
+            "web.voice.relay_user_missing",
+            detail="relay-mode voice but X-Alfred-User absent — rejecting (401)",
+        )
+        return None
+    identity = resolve_identity_from_name(web_config, name)
+    if identity is None:
+        log.warning(
+            "web.voice.relay_user_unknown",
+            name=name.strip()[:64],
+            detail="X-Alfred-User not in this instance's web.users — "
+                   "rejecting (401)",
+        )
+        return None
+    return identity
 
 
 # ---------------------------------------------------------------------------
@@ -332,10 +408,11 @@ def register_voice_handlers(
     """Mount the ``/voice/*`` routes onto ``app`` — IFF voice is enabled.
 
     Returns ``True`` when routes were mounted (whether in full or 503 mode),
-    ``False`` when voice is absent / disabled / relay-mode / mis-piped
-    (nothing registered — the route table stays byte-identical). Called by
-    ``register_web_routes`` after the STT mount; ``KEY_WEB_CONFIG`` is
-    already stashed on the app.
+    ``False`` when voice is absent / disabled / mis-piped (nothing registered
+    — the route table stays byte-identical). Relay mode no longer blocks the
+    mount (multi-instance voice): both session and relay mount, guarded at
+    request time by the ``WEB_CHAT_PEER`` pin. Called by ``register_web_routes``
+    after the STT mount; ``KEY_WEB_CONFIG`` is already stashed on the app.
 
     Never raises — a voice-config problem disables the voice surface loudly
     but leaves the transport / chat / STT surface untouched.
@@ -347,17 +424,16 @@ def register_voice_handlers(
         log.info("web.voice.disabled", reason="not_enabled")
         return False
 
-    # Gate 2 — relay mode never gets voice (V0 pins the session-mode 'web'
-    # peer only; fail-closed, security W5).
+    # Gate 2 — auth-mode observability. Relay-mode voice is now PERMITTED
+    # (multi-instance voice): both session-mode (Salem, home) and relay-mode
+    # (Hypatia / KAL-LE switch-targets) mount /voice/*. The unconditional
+    # WEB_CHAT_PEER pin in _require_voice_identity is the fail-closed guard the
+    # original V0 relay-mode no-mount (W5) used to provide; relay-mode voice
+    # re-resolves the asserted identity against THIS instance's own web.users.
+    # Log the mode so mount-mode stays observable (ILB — relay-mount is
+    # log-distinguishable from session-mount).
     mode = getattr(web_config.auth, "mode", "session") or "session"
-    if mode == "relay":
-        log.info(
-            "web.voice.disabled",
-            reason="relay_mode",
-            detail="voice is session-mode only in V0 — relay instances do "
-                   "NOT mount /voice/* (fail-closed)",
-        )
-        return False
+    log.info("web.voice.auth_mode", mode=mode)
 
     # Gate 3 — pipeline enum (fail-closed on anything unknown).
     if voice.pipeline not in _KNOWN_PIPELINES:

@@ -569,15 +569,19 @@ transport:
 #     provider: resend
 #     api_key: "${RESEND_API_KEY}"
 #     from_address: "${ALFRED_WEB_FROM_ADDRESS}"
-#   # --- V0 WebRTC voice (PWA voice arc) ---
-#   # Browser mic → WebRTC → this server → echo back (V0 = "audio transport
-#   # up"; no STT/TTS/chat coupling yet). DISABLED by default — an absent or
+#   # --- WebRTC voice (PWA voice arc) ---
+#   # Browser mic → WebRTC → this server. DISABLED by default — an absent or
 #   # ``enabled: false`` block mounts NO /voice/* routes (route table
-#   # byte-identical). Session-mode ONLY (relay instances never mount voice).
-#   # Requires the ``webrtc`` pip extra:  pip install 'alfred-vault[webrtc]'
-#   # (aiortc; the daemon stays up + logs loudly if enabled-but-not-installed,
-#   # serving /voice/offer as 503 voice_unavailable). Deploy also needs an
-#   # inbound-UDP ufw allow for the ephemeral range — see docs/voice_v0.md.
+#   # byte-identical). Mounts in BOTH auth modes: session (home instance,
+#   # Salem — per-user X-Alfred-Session) AND relay (multi-instance switch
+#   # targets, e.g. Hypatia — the asserted X-Alfred-User is re-resolved
+#   # against this instance's own ``web.users``, guarded by the dedicated
+#   # ``web`` peer-pin). The relay-target ``web.voice`` block is shown further
+#   # down (search "Target instance"). Requires the ``webrtc`` pip extra:
+#   # pip install 'alfred-vault[webrtc]' (aiortc; the daemon stays up + logs
+#   # loudly if enabled-but-not-installed, serving /voice/offer as 503
+#   # voice_unavailable). Deploy also needs an inbound-UDP ufw allow for the
+#   # ephemeral range — see docs/voice_v0.md.
 #   voice:
 #     enabled: false
 #     max_sessions: 2                 # single-operator: 1 live + 1 grace slot
@@ -693,13 +697,49 @@ transport:
 # --- Target instance (KAL-LE / Hypatia / VERA) — relay mode ---
 # Pair this with a DEDICATED ``transport.auth.tokens.web`` entry above
 # (this instance's own ``web`` peer token, distinct from its ``web_ingest``
-# token and from every other instance's ``web`` token).
+# token and from every other instance's ``web`` token). That SAME ``web``
+# peer token is the authority for relay-mode VOICE too — there is no separate
+# voice token / env family (reusing it is deliberate; the peer-pin makes it
+# per-instance-correct).
 # web:
 #   enabled: true
 #   auth:
 #     mode: relay                     # trust-the-relay; no secret/email
 #   users:
 #     - { name: andrew, role: owner }   # email omitted — no magic-link here
+#   # --- Relay-mode voice (multi-instance) — assistant pipeline ---
+#   # Enables LIVE voice to a NON-home instance. Identical shape to the
+#   # session-mode voice block above; relay mode changes only WHO resolves the
+#   # identity (asserted X-Alfred-User → this instance's ``web.users``). The
+#   # per-instance ElevenLabs voice_id goes in ``tts.voice`` (a raw id passes
+#   # through unchanged). Requires DEEPGRAM_API_KEY + ELEVENLABS_API_KEY in
+#   # THIS daemon's runtime env, and the ``webrtc`` pip extra.
+#   voice:
+#     enabled: true
+#     max_sessions: 2
+#     pipeline: assistant             # streaming STT → spoken reply
+#     stt:
+#       provider: deepgram
+#       api_key: "${DEEPGRAM_API_KEY}"
+#       model: "nova-3"
+#       # EGRESS: assistant STT streams continuous mic audio to the cloud STT
+#       # provider — a per-instance decision. Do NOT enable cloud voice on a
+#       # PHI/sovereign instance (VERA has NO web.voice block, ever).
+#       shadow_capture:
+#         enabled: false              # LOAD-BEARING off: shadow_capture streams
+#                                     # raw mic PCM to Groq — FORBIDDEN on any
+#                                     # PHI instance (e.g. Hypatia). Salem-only.
+#       endpoint_hold:
+#         enabled: true               # adaptive turn-end hold (features-only
+#                                     # telemetry; no raw-transcript egress — safe)
+#     tts:
+#       enabled: true
+#       provider: elevenlabs
+#       api_key: "${ELEVENLABS_API_KEY}"
+#       model: "eleven_flash_v2_5"
+#       voice: "<this-instance-elevenlabs-voice-id>"   # raw ElevenLabs id
+#       barge_in:
+#         enabled: true
 
 telegram:
   # Telegram bot token from @BotFather

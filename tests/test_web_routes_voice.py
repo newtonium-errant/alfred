@@ -37,7 +37,7 @@ from alfred.transport.config import (
 from alfred.transport.server import build_app
 from alfred.transport.state import TransportState
 from alfred.web import routes_voice
-from alfred.web.auth import SESSION_HEADER, make_session_token
+from alfred.web.auth import SESSION_HEADER, USER_HEADER, make_session_token
 from alfred.web.config import (
     VoiceIceConfig,
     WebAuthConfig,
@@ -59,6 +59,7 @@ from tests.telegram.conftest import FakeAnthropicClient
 # Obviously-fake test secrets — never a real provider prefix.
 DUMMY_WEB_PEER_TOKEN = "DUMMY_WEB_PEER_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_0123456"
 DUMMY_WEB_INGEST_TOKEN = "DUMMY_WEB_INGEST_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_01234"
+DUMMY_RRTS_RELAY_TOKEN = "DUMMY_RRTS_RELAY_TOKEN_64CHAR_PLACEHOLDER_FOR_TESTING_ONLY_01234"
 DUMMY_WEB_SIGNING_SECRET = "DUMMY_WEB_SIGNING_SECRET_FOR_TESTING_ONLY_0123456789"
 
 _PEER_HEADERS = {
@@ -69,6 +70,14 @@ _PEER_HEADERS = {
 # but resolves transport_peer = "web_ingest", which the voice peer-pin refuses.
 _INGEST_PEER_HEADERS = {
     "Authorization": f"Bearer {DUMMY_WEB_INGEST_TOKEN}",
+    "X-Alfred-Client": "web",
+}
+# The rrts_relay token ALSO carries allowed_clients [web] (X-Alfred-Client: web
+# clears Layer 1) but resolves transport_peer = "rrts_relay" — a vouched TEXT
+# bug-report lane that _resolve_relay_identity admits for CHAT but the voice
+# path pins OUT. Proves voice is web-peer-only (structural, not just gated).
+_RRTS_PEER_HEADERS = {
+    "Authorization": f"Bearer {DUMMY_RRTS_RELAY_TOKEN}",
     "X-Alfred-Client": "web",
 }
 
@@ -119,10 +128,34 @@ def _transport_config() -> TransportConfig:
                 "web_ingest": AuthTokenEntry(
                     token=DUMMY_WEB_INGEST_TOKEN, allowed_clients=["web"],
                 ),
+                # A third peer sharing allowed_clients [web]: the vouched
+                # rrts_relay chat lane. Present in the auth table so the
+                # voice peer-pin negative check can drive a request that
+                # resolves transport_peer = "rrts_relay".
+                "rrts_relay": AuthTokenEntry(
+                    token=DUMMY_RRTS_RELAY_TOKEN, allowed_clients=["web"],
+                ),
             }
         ),
         state=StateConfig(),
     )
+
+
+def _relay_headers(name: str = "andrew", *, peer: str = "web", json: bool = True):
+    """Relay-mode request headers: peer token + asserted X-Alfred-User, NO
+    session token. ``peer`` selects which transport_peer the token resolves to
+    (web = the legitimate voice peer; web_ingest / rrts_relay = escalation
+    attempts the peer-pin must refuse)."""
+    base = {
+        "web": _PEER_HEADERS,
+        "web_ingest": _INGEST_PEER_HEADERS,
+        "rrts_relay": _RRTS_PEER_HEADERS,
+    }[peer]
+    headers = dict(base)
+    headers[USER_HEADER] = name
+    if json:
+        headers["Content-Type"] = "application/json"
+    return headers
 
 
 def _voice_config(**overrides) -> WebVoiceConfig:
@@ -193,10 +226,12 @@ class _FakeManager:
         self.close_result = True
         self._yours: list[_FakeSession] = []
         self.tts_enabled = False   # set by _patch_available from the factory kw
+        self.last_identity = None  # captured for the relay-identity assertions
 
     async def open_session(self, identity, sdp, **kwargs):
         # Accept the assistant-path kwargs (turn_binding, voice_session_id).
         self.open_kwargs = kwargs
+        self.last_identity = identity
         if self.open_exc is not None:
             raise self.open_exc
         vid = kwargs.get("voice_session_id") or self.open_result[0]
@@ -262,15 +297,37 @@ def test_voice_not_mounted_when_block_absent(tmp_path) -> None:
     assert not any(p.startswith("/voice") for p in _route_paths(app))
 
 
-def test_voice_not_mounted_in_relay_mode(tmp_path) -> None:
+def test_voice_mounted_in_relay_mode(tmp_path, monkeypatch) -> None:
+    """Multi-instance voice: relay mode now MOUNTS /voice/* (was fail-closed
+    W5). The old ``web.voice.disabled reason=relay_mode`` no-mount is gone;
+    the ``web.voice.auth_mode`` mount-mode observability log fires instead."""
+    _patch_available(monkeypatch, _FakeManager(_voice_config()))
     with structlog.testing.capture_logs() as cap:
         app = _build_app(tmp_path, _web_config(mode="relay"))
-    assert not any(p.startswith("/voice") for p in _route_paths(app))
-    disabled = [
-        c for c in cap
-        if c.get("event") == "web.voice.disabled" and c.get("reason") == "relay_mode"
-    ]
-    assert len(disabled) == 1
+    paths = _route_paths(app)
+    assert "/voice/offer" in paths
+    assert "/voice/close" in paths
+    assert "/voice/config" in paths
+    # No stale relay-mode no-mount log.
+    assert not any(
+        c.get("event") == "web.voice.disabled" and c.get("reason") == "relay_mode"
+        for c in cap
+    )
+    # Mount-mode observability (ILB): relay-mount is log-distinguishable.
+    auth_mode = [c for c in cap if c.get("event") == "web.voice.auth_mode"]
+    assert len(auth_mode) == 1
+    assert auth_mode[0]["mode"] == "relay"
+
+
+def test_auth_mode_logged_session_mount(tmp_path, monkeypatch) -> None:
+    """The mount-mode observability log also fires for session mode (mode is
+    always surfaced — idle-distinguishable-from-broken both ways)."""
+    _patch_available(monkeypatch, _FakeManager(_voice_config()))
+    with structlog.testing.capture_logs() as cap:
+        _build_app(tmp_path, _web_config())
+    auth_mode = [c for c in cap if c.get("event") == "web.voice.auth_mode"]
+    assert len(auth_mode) == 1
+    assert auth_mode[0]["mode"] == "session"
 
 
 def test_voice_not_mounted_unknown_pipeline(tmp_path) -> None:
@@ -415,6 +472,164 @@ async def test_close_401_wrong_peer(voice_client) -> None:
         json={"voice_session_id": "x"},
     )
     assert resp.status == 401
+
+
+# ---------------------------------------------------------------------------
+# Relay-mode voice (multi-instance) — asserted X-Alfred-User identity
+# ---------------------------------------------------------------------------
+#
+# Relay mode carries NO session token: the BFF holds the target's dedicated
+# ``web`` peer token (Layer-1 authority) + asserts the verified user NAME in
+# X-Alfred-User. This instance re-resolves that name against its OWN web.users.
+# The SINGLE line-96 WEB_CHAT_PEER pin is the load-bearing guard — deleting it
+# lets a web_ingest / rrts_relay token + X-Alfred-User escalate to a full voice
+# session (the two negative-check tests below flip red).
+
+
+@pytest.fixture
+async def relay_voice_client(aiohttp_client, tmp_path, monkeypatch):
+    """A relay-mode voice-enabled app with a fake manager injected."""
+    manager = _FakeManager(_voice_config())
+    _patch_available(monkeypatch, manager)
+    app = _build_app(tmp_path, _web_config(mode="relay"))
+    return await aiohttp_client(app)
+
+
+async def test_relay_voice_offer_resolves_identity(relay_voice_client) -> None:
+    """Relay-mode offer: web peer token + X-Alfred-User (no session) resolves
+    the identity against web.users and negotiates. The bound identity is the
+    re-resolved owner with the correct per-user synthetic_chat_id (isolation)."""
+    resp = await relay_voice_client.post(
+        "/voice/offer", headers=_relay_headers("andrew"),
+        json={"sdp": "v=0\r\nOFFER\r\n", "type": "offer"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["type"] == "answer"
+    assert body["voice_session_id"]
+    # The relay resolver bound andrew's identity (role from web.users, NOT an
+    # asserted role) with the deterministic per-user synthetic session id.
+    bound = relay_voice_client.app[KEY_WEB_VOICE_MANAGER].last_identity
+    assert bound is not None
+    assert bound.user == "andrew"
+    assert bound.role == "owner"
+    assert bound.synthetic_chat_id == synthetic_chat_id("andrew")
+
+
+async def test_relay_voice_wrong_peer_ingest(relay_voice_client) -> None:
+    """NEGATIVE CHECK — a web_ingest token (shares allowed_clients [web]) clears
+    Layer 1 as transport_peer=web_ingest but the voice peer-pin refuses it even
+    in relay mode. Deleting the line-96 pin makes THIS request escalate to a
+    full voice session (X-Alfred-User=andrew resolves) → this test flips red."""
+    with structlog.testing.capture_logs() as cap:
+        resp = await relay_voice_client.post(
+            "/voice/offer", headers=_relay_headers("andrew", peer="web_ingest"),
+            json={"sdp": "v=0\r\n", "type": "offer"},
+        )
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "invalid_session"
+    wrong = [c for c in cap if c.get("event") == "web.voice.wrong_peer"]
+    assert len(wrong) == 1
+    assert wrong[0]["peer"] == "web_ingest"
+    assert wrong[0]["expected"] == "web"
+    # The escalation was refused BEFORE any negotiation.
+    assert relay_voice_client.app[KEY_WEB_VOICE_MANAGER].last_identity is None
+
+
+async def test_relay_voice_wrong_peer_rrts(relay_voice_client) -> None:
+    """NEGATIVE CHECK — the vouched rrts_relay peer (which the CHAT relay path
+    admits) is STRUCTURALLY excluded from voice: _resolve_voice_relay_identity
+    has no rrts_relay branch and the line-96 pin refuses the peer outright. A
+    text bug-report token must never drive voice."""
+    with structlog.testing.capture_logs() as cap:
+        resp = await relay_voice_client.post(
+            "/voice/offer", headers=_relay_headers("andrew", peer="rrts_relay"),
+            json={"sdp": "v=0\r\n", "type": "offer"},
+        )
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "invalid_session"
+    wrong = [c for c in cap if c.get("event") == "web.voice.wrong_peer"]
+    assert len(wrong) == 1
+    assert wrong[0]["peer"] == "rrts_relay"
+    assert wrong[0]["expected"] == "web"
+    assert relay_voice_client.app[KEY_WEB_VOICE_MANAGER].last_identity is None
+
+
+async def test_relay_voice_missing_user_header(relay_voice_client) -> None:
+    """Web peer token present but NO X-Alfred-User → fail-closed 401 +
+    web.voice.relay_user_missing (mis-wired BFF is observably distinct)."""
+    with structlog.testing.capture_logs() as cap:
+        resp = await relay_voice_client.post(
+            "/voice/offer",
+            headers={**_PEER_HEADERS, "Content-Type": "application/json"},
+            json={"sdp": "v=0\r\n", "type": "offer"},
+        )
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "invalid_session"
+    missing = [c for c in cap if c.get("event") == "web.voice.relay_user_missing"]
+    assert len(missing) == 1
+
+
+async def test_relay_voice_unknown_user(relay_voice_client) -> None:
+    """Web peer token + an X-Alfred-User NOT in this instance's web.users →
+    fail-closed 401 + web.voice.relay_user_unknown (re-resolution against the
+    OWN roster, never trusting the asserted name)."""
+    with structlog.testing.capture_logs() as cap:
+        resp = await relay_voice_client.post(
+            "/voice/offer", headers=_relay_headers("mallory"),
+            json={"sdp": "v=0\r\n", "type": "offer"},
+        )
+    assert resp.status == 401
+    assert (await resp.json())["error"] == "invalid_session"
+    unknown = [c for c in cap if c.get("event") == "web.voice.relay_user_unknown"]
+    assert len(unknown) == 1
+    assert unknown[0]["name"] == "mallory"
+
+
+async def test_relay_voice_non_owner_identity(aiohttp_client, tmp_path, monkeypatch) -> None:
+    """A relay identity resolving to a NON-owner role is handled correctly: the
+    role comes from web.users (bob → ops), never from the asserted header, and
+    binds bob's own synthetic_chat_id (per-user isolation from andrew)."""
+    manager = _FakeManager(_voice_config())
+    _patch_available(monkeypatch, manager)
+    cfg = WebConfig(
+        enabled=True,
+        users=[WebUser(name="andrew", role="owner"), WebUser(name="bob", role="ops")],
+        auth=WebAuthConfig(session_secret="", mode="relay"),
+        voice=_voice_config(),
+    )
+    app = _build_app(tmp_path, cfg)
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/voice/offer", headers=_relay_headers("bob"),
+        json={"sdp": "v=0\r\nOFFER\r\n", "type": "offer"},
+    )
+    assert resp.status == 200
+    bound = manager.last_identity
+    assert bound.user == "bob"
+    assert bound.role == "ops"
+    assert bound.synthetic_chat_id == synthetic_chat_id("bob")
+    assert bound.synthetic_chat_id != synthetic_chat_id("andrew")
+
+
+async def test_relay_voice_config_and_close_resolve_identity(relay_voice_client) -> None:
+    """/voice/config and /voice/close also honor the relay identity path (all
+    three routes share _require_voice_identity) — a web peer token +
+    X-Alfred-User resolves; the wrong peer is refused on every route."""
+    ok = await relay_voice_client.get(
+        "/voice/config", headers={**_PEER_HEADERS, USER_HEADER: "andrew"},
+    )
+    assert ok.status == 200
+    assert (await ok.json())["available"] is True
+    bad = await relay_voice_client.get(
+        "/voice/config", headers={**_INGEST_PEER_HEADERS, USER_HEADER: "andrew"},
+    )
+    assert bad.status == 401
+    close_ok = await relay_voice_client.post(
+        "/voice/close", headers=_relay_headers("andrew"),
+        json={"voice_session_id": "abc"},
+    )
+    assert close_ok.status == 200
 
 
 # ---------------------------------------------------------------------------
