@@ -161,6 +161,28 @@ def test_grounding_decimal_self_match_is_clean(dose):
     assert verify_grounding(s, t).clean is True
 
 
+@pytest.mark.parametrize(
+    "claim, segment",
+    [
+        ("BP is 120", "bp is 120."),          # sentence-final INTEGER
+        ("Temp is 98.6", "temp is 98.6."),    # sentence-final DECIMAL
+        ("Heart rate over 80", "...over 80."),  # sentence-final, leading ellipsis
+    ],
+)
+def test_grounding_sentence_final_number_not_false_flagged(claim, segment):
+    # FALSE-POSITIVE FIX (P2-d): a number ending a sentence (period is NOT a
+    # decimal point) must be CLEAN — not a spurious ⚠ (alarm fatigue erodes the
+    # net). Mutation-bind: revert _token_in to (?<![\d.])...(?![\d.]) → THIS pin
+    # goes red while the decimal-flip pins stay green (fix closes the FP without
+    # reopening the 0.5mg BLOCK).
+    t = _transcript(segment)
+    s = _structured(objective=[{"claim": claim, "source_spans": ["S1"]}])
+    assert verify_grounding(s, t).clean is True, (
+        f"{claim!r} vs {segment!r} must NOT flag — trailing '.' is a sentence "
+        f"period, not a decimal"
+    )
+
+
 def test_grounding_catches_negation_flip_denies_reports():
     # THE denies→reports pin (dropped negation — the dangerous flip).
     t = _transcript("Patient denies shortness of breath.")

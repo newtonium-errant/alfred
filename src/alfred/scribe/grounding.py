@@ -149,17 +149,31 @@ def _number_tokens(text: str) -> list[str]:
 
 
 def _token_in(tok: str, norm_cited: str) -> bool:
-    """Numeric-boundary presence.
+    """Decimal-aware numeric-boundary presence.
 
     NOT ``\\b`` — ``\\b`` treats ``.`` as a word boundary, so ``\\b5mg\\b`` would
     match the ``5mg`` INSIDE ``0.5mg`` (a 10x dose overstate passing CLEAN — the
-    exact flip class this gate exists for). A DIGIT-OR-DOT boundary rejects any
-    adjacent digit or decimal point: ``5mg`` never matches ``0.5mg`` / ``2.5mg``
-    / ``12.5mg`` / ``500mg``, while legit ``5mg`` / ``5 mg`` / a self-match /
-    the ``12`` vs ``12.5`` truncation still resolve correctly.
+    exact flip class this gate exists for).
+
+    But a naive digit-OR-DOT boundary ``(?<![\\d.])...(?![\\d.])`` over-rejects a
+    SENTENCE-FINAL period: ``120`` vs ``"bp is 120."`` → a false ⚠ flag (the
+    trailing ``.`` is a sentence period, not a decimal point). On real dictation
+    numbers end sentences constantly → alarm fatigue → the flag that MATTERS
+    gets ignored. So distinguish a decimal point (``.`` with a DIGIT on the
+    fractional side) from a sentence period:
+      * left  ``(?<!\\d)(?<!\\d\\.)`` — reject a token in the fractional part
+        (``5`` in ``0.5``, preceded by ``0.``) or glued to a digit (``5`` in
+        ``15``);
+      * right ``(?!\\d)(?!\\.\\d)`` — reject a token that CONTINUES into a
+        decimal (``12`` before ``.5`` in ``12.5``) or another digit, but ACCEPT
+        a ``.`` NOT followed by a digit (a sentence end).
+
+    Regression-guarded (must stay REJECTED): 5mg vs 0.5mg / 2.5mg / 12.5mg /
+    15mg / 500mg, 5 vs 2.5, 12 vs 12.5. Newly ACCEPTED (FP closed): 120 vs
+    "bp is 120.", 98.6 vs "temp is 98.6.". Self-matches unchanged.
     """
     return re.search(
-        r"(?<![\d.])" + re.escape(tok) + r"(?![\d.])", norm_cited
+        r"(?<!\d)(?<!\d\.)" + re.escape(tok) + r"(?!\d)(?!\.\d)", norm_cited
     ) is not None
 
 
