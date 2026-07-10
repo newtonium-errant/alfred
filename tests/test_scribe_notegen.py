@@ -269,6 +269,7 @@ def test_generate_routes_through_loopback_ollama(monkeypatch):
         captured["endpoint"] = endpoint
         captured["model"] = model
         captured["system"] = system
+        captured["options"] = kw.get("options")
         return (
             json.dumps({
                 "subjective": [{"claim": "Chest pain", "source_spans": ["S1"]}],
@@ -293,6 +294,11 @@ def test_generate_routes_through_loopback_ollama(monkeypatch):
     assert captured["endpoint"] == "http://127.0.0.1:11434"
     assert captured["model"] == "qwen2.5:14b-instruct-q4_K_M"
     assert captured["system"] is not None  # the placeholder system prompt is passed
+    # #46: the note-gen forces num_ctx + temperature=0 (mutation-bind: drop the
+    # options pass-through at the call site → this goes RED).
+    assert captured["options"] is not None
+    assert captured["options"]["num_ctx"] >= 8192
+    assert captured["options"]["temperature"] == 0
 
 
 def test_notegen_constructs_no_http_client():
@@ -332,3 +338,46 @@ def test_real_qwen_end_to_end():
     body = render_soap(s, title="Integration encounter", grounding=r)
     assert "## Subjective" in body and "## Plan" in body
     assert isinstance(r.metadata, list)
+
+
+# ---------------------------------------------------------------------------
+# #46 — generate_structured drives the NATIVE /api/chat endpoint with the
+# num_ctx options block (httpx-level; the OpenAI-compat path silently
+# truncates at num_ctx=2048).
+# ---------------------------------------------------------------------------
+
+def test_generate_structured_hits_native_api_chat_with_num_ctx(monkeypatch):
+    import httpx
+    import alfred.distiller.backends.ollama as ollama_mod
+
+    captured = {}
+
+    def _dispatch(req):
+        captured["path"] = req.url.path
+        captured["payload"] = json.loads(req.content)
+        return httpx.Response(200, json={
+            "model": "qwen2.5:14b-instruct-q4_K_M",
+            "message": {"role": "assistant", "content": json.dumps({
+                "subjective": [{"claim": "Chest pain", "source_spans": ["S1"]}],
+                "objective": [], "assessment": [], "plan": [],
+                "assessment_reasoning_stated": False,
+            })},
+            "done_reason": "stop", "done": True,
+        })
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        ollama_mod.httpx, "AsyncClient",
+        lambda *a, **k: real(transport=httpx.MockTransport(_dispatch), timeout=k.get("timeout")),
+    )
+
+    cfg = load_from_unified({"scribe": {
+        "mode": "synthetic",
+        "stt": {"provider": "fake"},
+        "llm": {"base_url": "http://127.0.0.1:11434", "model": "qwen2.5:14b-instruct-q4_K_M"},
+    }})
+    s = asyncio.run(generate_structured(_transcript("Patient reports chest pain."), config=cfg))
+    assert s.subjective[0].claim == "Chest pain"          # parsed via native message.content
+    assert captured["path"] == "/api/chat"                 # NATIVE endpoint (honors num_ctx)
+    assert captured["payload"]["options"]["num_ctx"] >= 8192
+    assert captured["payload"]["options"]["temperature"] == 0

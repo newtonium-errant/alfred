@@ -61,8 +61,22 @@ async def call_ollama_no_tools(
     # under heavy load).
     max_tokens: int = 16384,
     endpoint: str = "http://localhost:11434",
+    options: dict | None = None,
 ) -> tuple[str, dict]:
-    """Call Ollama's OpenAI-compatible chat-completions endpoint.
+    """Call Ollama's chat-completions endpoint.
+
+    Two transport paths, selected by ``options``:
+
+      * ``options is None`` (the distiller's use, UNCHANGED): the
+        OpenAI-compatible ``/v1/chat/completions`` endpoint with
+        ``max_tokens``. Byte-for-byte the historical path.
+      * ``options`` provided (a dict of Ollama runtime options, e.g.
+        ``{"num_ctx": 8192, "temperature": 0}``): the NATIVE ``/api/chat``
+        endpoint with an ``options`` block. The OpenAI-compat endpoint does
+        NOT honor ``num_ctx`` (it silently defaults to 2048 → context
+        truncation on long inputs); ``/api/chat`` DOES. Used by the sovereign
+        scribe note-gen (#46, live-box A/B) to force ``num_ctx >= 8192`` +
+        ``temperature = 0`` for a faithfulness-critical clinical task.
 
     Mirrors :func:`call_anthropic_no_tools`'s signature so the
     extractor's dispatcher can call either backend without
@@ -101,17 +115,27 @@ async def call_ollama_no_tools(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    payload: dict = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        # ``stream: False`` because the extractor consumes the full
-        # response before validating against Pydantic. Streaming
-        # would complicate the parse path for zero spike benefit.
-        "stream": False,
-    }
-
-    url = f"{endpoint.rstrip('/')}/v1/chat/completions"
+    if options is not None:
+        # NATIVE /api/chat — honors options.num_ctx (the OpenAI-compat path
+        # does not). ``stream: False`` for the same full-response-parse reason.
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": dict(options),
+        }
+        url = f"{endpoint.rstrip('/')}/api/chat"
+    else:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            # ``stream: False`` because the extractor consumes the full
+            # response before validating against Pydantic. Streaming
+            # would complicate the parse path for zero spike benefit.
+            "stream": False,
+        }
+        url = f"{endpoint.rstrip('/')}/v1/chat/completions"
 
     try:
         async with httpx.AsyncClient(timeout=_OLLAMA_REQUEST_TIMEOUT_SECONDS) as client:
@@ -151,7 +175,10 @@ async def call_ollama_no_tools(
         )
 
     data = response.json()
-    text, finish_reason = _extract_first_choice(data)
+    if options is not None:
+        text, finish_reason = _extract_native_chat(data)
+    else:
+        text, finish_reason = _extract_first_choice(data)
     metadata: dict = {"stop_reason": finish_reason}
 
     if not text:
@@ -195,6 +222,28 @@ def _extract_first_choice(data: dict) -> tuple[str, str | None]:
     if finish_reason is not None and not isinstance(finish_reason, str):
         finish_reason = None
     return content, finish_reason
+
+
+def _extract_native_chat(data: dict) -> tuple[str, str | None]:
+    """Pull ``(content, done_reason)`` from Ollama's NATIVE ``/api/chat``
+    response shape ``{"message": {"content": str}, "done_reason": str}``.
+
+    Defensive (mirrors :func:`_extract_first_choice`): any structural deviation
+    returns ``("", None)`` rather than raising, so the caller's empty-string
+    handling / repair-retry path fires the same way.
+    """
+    if not isinstance(data, dict):
+        return "", None
+    message = data.get("message")
+    if not isinstance(message, dict):
+        return "", None
+    content = message.get("content")
+    done_reason = data.get("done_reason")
+    if not isinstance(content, str):
+        content = ""
+    if done_reason is not None and not isinstance(done_reason, str):
+        done_reason = None
+    return content, done_reason
 
 
 __all__ = [

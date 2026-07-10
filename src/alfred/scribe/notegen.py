@@ -90,6 +90,15 @@ _SECTION_HEADINGS = {
 _DEFAULT_MODEL = "qwen2.5:14b-instruct-q4_K_M"
 _DEFAULT_ENDPOINT = "http://127.0.0.1:11434"
 
+# Ollama runtime options for the sovereign note-gen (#46, live-box A/B).
+#   * num_ctx=8192: the clinical SYSTEM_PROMPT (~1962 tokens) + a long-encounter
+#     transcript EXCEEDS Ollama's OpenAI-compat default context of 2048 →
+#     SILENT context truncation (A/B: dtc_lbp 9 flags truncated vs 4 at 8192).
+#     Only the NATIVE /api/chat ``options`` block honors num_ctx.
+#   * temperature=0: faithfulness-critical extract-not-infer task — remove the
+#     nondeterminism the model's default temperature adds.
+_NOTEGEN_OLLAMA_OPTIONS: dict = {"num_ctx": 8192, "temperature": 0}
+
 # The clinical extract-not-infer system prompt (scribe P2-c). Authored to the
 # FROZEN CONTRACT above: the model emits EXACTLY the four-SOAP-section JSON object
 # of ATOMIC {claim, source_spans} objects. This prompt is the PRIMARY safety
@@ -431,6 +440,9 @@ async def generate_structured(
         system=SYSTEM_PROMPT,
         model=model,
         endpoint=endpoint,
+        # Route via native /api/chat so num_ctx=8192 + temperature=0 are honored
+        # (the OpenAI-compat path silently truncates at num_ctx=2048).
+        options=_NOTEGEN_OLLAMA_OPTIONS,
     )
     structured = parse_structured_json(text)
     log.info(

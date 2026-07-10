@@ -517,3 +517,64 @@ class TestExtractionDispatcher:
             prompt="x", system="y", config=cfg,
         )
         assert len(called) == 1
+
+
+# ---------------------------------------------------------------------------
+# #46 (live-box A/B) — the native /api/chat options path for num_ctx.
+# The distiller path (options=None) MUST stay byte-for-byte on
+# /v1/chat/completions; the scribe note-gen path (options=...) routes to the
+# NATIVE /api/chat with an options block (the ONLY path that honors num_ctx).
+# ---------------------------------------------------------------------------
+
+def _native_response(content: str, done_reason: str = "stop") -> dict:
+    """Ollama NATIVE /api/chat response shape."""
+    return {
+        "model": "qwen2.5:14b-instruct-q4_K_M",
+        "message": {"role": "assistant", "content": content},
+        "done_reason": done_reason,
+        "done": True,
+    }
+
+
+async def test_options_routes_native_api_chat_with_options_block(monkeypatch):
+    captured: list[httpx.Request] = []
+
+    def _dispatch(req: httpx.Request) -> httpx.Response:
+        captured.append(req)
+        return httpx.Response(200, json=_native_response("hello", "stop"))
+
+    _patch_httpx(monkeypatch, _dispatch)
+
+    text, meta = await ollama_mod.call_ollama_no_tools(
+        "prompt", system="sys", model="qwen2.5:14b-instruct-q4_K_M",
+        options={"num_ctx": 8192, "temperature": 0},
+    )
+    # NATIVE endpoint + options block honored
+    assert captured[0].url.path == "/api/chat"
+    payload = json.loads(captured[0].content)
+    assert payload["options"]["num_ctx"] == 8192
+    assert payload["options"]["temperature"] == 0
+    assert payload["stream"] is False
+    assert "max_tokens" not in payload  # native path does not send max_tokens
+    # parsed from the native message.content + done_reason
+    assert text == "hello"
+    assert meta["stop_reason"] == "stop"
+
+
+async def test_no_options_keeps_openai_compat_path_unchanged(monkeypatch):
+    # DISTILLER path (options=None) — byte-for-byte the historical
+    # /v1/chat/completions request with max_tokens; parsed from choices[0].
+    captured: list[httpx.Request] = []
+
+    def _dispatch(req: httpx.Request) -> httpx.Response:
+        captured.append(req)
+        return httpx.Response(200, json=_ollama_response("distiller-out", "stop"))
+
+    _patch_httpx(monkeypatch, _dispatch)
+
+    text, meta = await ollama_mod.call_ollama_no_tools("prompt", max_tokens=16384)
+    assert captured[0].url.path == "/v1/chat/completions"
+    payload = json.loads(captured[0].content)
+    assert payload["max_tokens"] == 16384
+    assert "options" not in payload
+    assert text == "distiller-out"
