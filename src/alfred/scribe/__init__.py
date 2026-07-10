@@ -28,7 +28,20 @@ from .config import (
     load_from_unified,
 )
 from .attest import ATTEST_SCOPE, attest, source_id_for
+from .grounding import GroundingResult, verify as verify_grounding
 from .ingest import ScribeIngestRefused, guard_ingest
+from .notegen import (
+    GROUNDING_UNVERIFIED,
+    NOT_ADDRESSED,
+    REASONING_NOT_STATED,
+    SOAP_SECTIONS,
+    Claim,
+    NoteGenError,
+    StructuredNote,
+    generate_structured,
+    parse_structured_json,
+    render_soap,
+)
 from .stt import (
     SCRIBE_STT_PROVIDERS,
     MissingSTTDependency,
@@ -71,4 +84,17 @@ __all__ = [
     "Transcript",
     "Segment",
     "make_segment_id",
+    # note-gen + grounding (P2-c)
+    "generate_structured",
+    "parse_structured_json",
+    "render_soap",
+    "StructuredNote",
+    "Claim",
+    "NoteGenError",
+    "SOAP_SECTIONS",
+    "NOT_ADDRESSED",
+    "REASONING_NOT_STATED",
+    "GROUNDING_UNVERIFIED",
+    "verify_grounding",
+    "GroundingResult",
 ]
