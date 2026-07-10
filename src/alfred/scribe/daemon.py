@@ -40,10 +40,9 @@ from alfred.sovereign import (
 
 log = structlog.get_logger(__name__)
 
-# ILB heartbeat cadence — "up, synthetic, no input" so an idle sovereign scribe
-# is observably distinct from a dead one. Hourly is ample for a slot with no
-# input pipeline yet (P2).
-_IDLE_TICK_SECONDS = 3600
+# How often the pipeline scans input_dir for new sources (P2-d). Short enough
+# to be responsive to a dropped encounter, long enough to be cheap when idle.
+_SWEEP_INTERVAL_SECONDS = 30
 
 
 def startup(
@@ -101,24 +100,46 @@ def startup(
     return config
 
 
+def _state_path(raw: dict, config) -> str:
+    """The pipeline state file — under the instance's logging.dir (filesystem
+    only). Mirrors the per-tool ``data/<tool>_state.json`` convention."""
+    log_dir = (raw.get("logging") or {}).get("dir", "./data")
+    return str(Path(log_dir) / "scribe_state.json")
+
+
 async def run(
     raw: dict,
     *,
     suppress_stdout: bool = False,
     env: Mapping[str, str] | None = None,
 ) -> None:
-    """Async entry point. Runs :func:`startup`, then the idle heartbeat loop.
+    """Async entry point. Runs :func:`startup`, then the pipeline sweep loop.
 
     Never returns under normal operation — the orchestrator terminates the
     process on shutdown. A boundary breach in :func:`startup` propagates out
-    (the runner maps it to exit 79).
+    (the runner maps it to exit 79); a missing STT dep → exit 78.
     """
     config = startup(raw, env=env)
+
+    # Import here (not at module load) so the daemon's boundary/dep checks in
+    # startup() run before the pipeline stack is imported.
+    from alfred.scribe.pipeline import run_sweep
+    from alfred.scribe.state import ScribeState
+
+    state = ScribeState(_state_path(raw, config))
+    state.load()
+    vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
+
+    log.info(
+        "scribe.daemon.pipeline_watching",
+        mode=config.mode,
+        input_dir=config.input_dir,
+        detail="sovereign scribe pipeline watching input_dir (synthetic-gated).",
+    )
+
     while True:
-        await asyncio.sleep(_IDLE_TICK_SECONDS)
-        log.info(
-            "scribe.daemon.idle_tick",
-            mode=config.mode,
-            has_input=False,
-            detail="sovereign scribe idle — synthetic mode, no input (P2).",
-        )
+        try:
+            await run_sweep(config, state, vault_path)
+        except Exception:  # noqa: BLE001 — a sweep-level error must not kill the loop
+            log.exception("scribe.daemon.sweep_error")
+        await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)

@@ -50,6 +50,25 @@ from .stt import (
     transcribe,
 )
 from .transcript import Segment, Transcript, make_segment_id
+# pipeline + state imported LAST — pipeline pulls in stt/notegen/transcript, so
+# they must already be package submodules to avoid a partial-init ordering trap.
+from .pipeline import (  # noqa: E402
+    VerifiedNote,
+    generate_verified_note,
+    process_source,
+    run_sweep,
+)
+from .state import (  # noqa: E402
+    STATE_ATTESTED,
+    STATE_DRAFTED,
+    STATE_FAILED,
+    STATE_RECORDED,
+    STATE_REFUSED,
+    STATE_STRUCTURING,
+    STATE_TRANSCRIBING,
+    ScribeState,
+    SourceState,
+)
 
 __all__ = [
     # config
@@ -97,4 +116,18 @@ __all__ = [
     "GROUNDING_UNVERIFIED",
     "verify_grounding",
     "GroundingResult",
+    # pipeline + state machine (P2-d)
+    "generate_verified_note",
+    "VerifiedNote",
+    "process_source",
+    "run_sweep",
+    "ScribeState",
+    "SourceState",
+    "STATE_RECORDED",
+    "STATE_TRANSCRIBING",
+    "STATE_STRUCTURING",
+    "STATE_DRAFTED",
+    "STATE_ATTESTED",
+    "STATE_REFUSED",
+    "STATE_FAILED",
 ]

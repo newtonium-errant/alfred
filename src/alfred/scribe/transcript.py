@@ -97,3 +97,34 @@ class Transcript:
             Segment.from_dict(s) for s in raw_segments if isinstance(s, dict)
         ]
         return cls(**known)
+
+    def unprocessed_segments(self) -> list[Segment]:
+        """Segments AFTER ``processed_through_segment`` (the P3 delta cursor).
+
+        For a fresh transcript (cursor ``None``) this is ALL segments — the P2
+        whole-file batch. P3 sets the cursor so a later checkpoint dump folds in
+        only the NEW segments. A cursor pointing at an id not present is treated
+        defensively as "process all" (never silently drop segments)."""
+        if self.processed_through_segment is None:
+            return list(self.segments)
+        ids = [s.id for s in self.segments]
+        try:
+            cut = ids.index(self.processed_through_segment) + 1
+        except ValueError:
+            return list(self.segments)
+        return list(self.segments[cut:])
+
+    def delta(self) -> "Transcript":
+        """A Transcript of only the unprocessed segments (delta-ready wiring).
+
+        The segments keep their ORIGINAL ids (S1, S2, ...) so the ``[S#]``
+        grounding contract still resolves. For P2 (cursor ``None``) this is the
+        whole transcript; the pipeline processes the delta so P3 slots in
+        without a rebuild."""
+        return Transcript(
+            source_id=self.source_id,
+            mode=self.mode,
+            segments=self.unprocessed_segments(),
+            version=self.version,
+            processed_through_segment=self.processed_through_segment,
+        )
