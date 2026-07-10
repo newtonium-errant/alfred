@@ -27,6 +27,7 @@ from .config import (
     ScribeSttConfig,
     load_from_unified,
 )
+from .attest import ATTEST_SCOPE, attest, source_id_for
 from .ingest import ScribeIngestRefused, guard_ingest
 
 __all__ = [
@@ -49,4 +50,8 @@ __all__ = [
     "validate_status_transition",
     "validate_attester",
     "authorize_attestation",
+    # structural attestation orchestrator (#41)
+    "attest",
+    "source_id_for",
+    "ATTEST_SCOPE",
 ]

@@ -2616,6 +2616,46 @@ def cmd_instance_status_all(args: argparse.Namespace) -> None:
     print(format_summary_sentinel("status", results))
 
 
+def cmd_scribe(args: argparse.Namespace) -> None:
+    """``alfred scribe attest`` — the ONLY sanctioned clinical_note attest path.
+
+    Runs the scribe.attest orchestrator (authorize_attestation → triad write
+    under the privileged stayc_clinical_attest scope → durable PHI-free attest
+    audit). Fail-closed: an empty ``scribe.clinicians`` list means no valid
+    attester; a self-attest / forward-only / non-clinician violation raises.
+    """
+    subcmd = getattr(args, "scribe_cmd", None)
+    if subcmd != "attest":
+        print("Usage: alfred scribe attest <note> --attester <clinician> [--new-status attested|amended]")
+        sys.exit(1)
+
+    raw = _load_unified_config(args.config)
+    from alfred.scribe.config import load_from_unified as load_scribe_config
+    from alfred.scribe.attest import attest as scribe_attest
+
+    cfg = load_scribe_config(raw)
+    vault_path = Path((raw.get("vault") or {}).get("path", "./vault"))
+    log_dir = Path((raw.get("logging") or {}).get("dir", "./data"))
+    audit_path = log_dir / "clinical_attest_audit.jsonl"
+
+    try:
+        result = scribe_attest(
+            vault_path,
+            args.note,
+            new_status=args.new_status,
+            attester=args.attester,
+            clinician_ids=set(cfg.clinicians),
+            audit_path=audit_path,
+        )
+    except Exception as e:  # noqa: BLE001 — surface any attest refusal to the operator
+        print(f"Attest REFUSED: {e}")
+        sys.exit(1)
+    print(
+        f"Attested: {result['path']} → {args.new_status} by {args.attester} "
+        f"(audit: {audit_path})"
+    )
+
+
 def cmd_mail(args: argparse.Namespace) -> None:
     raw = _load_unified_config(args.config)
     _setup_logging_from_config(raw, tool="mail")
@@ -3423,6 +3463,31 @@ def build_parser() -> argparse.ArgumentParser:
     jan_ignore = jan_sub.add_parser("ignore", help="Ignore a file")
     jan_ignore.add_argument("file", help="Relative file path to ignore")
     jan_ignore.add_argument("--reason", default="", help="Reason for ignoring")
+
+    # scribe (STAY-C sovereign scribe) — P2-a: attest a clinical_note ai_draft.
+    # The ONLY sanctioned path to flip a clinical_note's status/attested_by:
+    # runs scribe.authorize_attestation (forward-only + distinct-human-clinician
+    # + non-empty-creator) then writes the triad under the privileged
+    # stayc_clinical_attest scope. A raw ``alfred vault edit`` under
+    # stayc_clinical can NEVER flip the triad (structurally denied).
+    scribe_p = sub.add_parser("scribe", help="Sovereign scribe subcommands")
+    scribe_sub = scribe_p.add_subparsers(dest="scribe_cmd")
+    scribe_attest = scribe_sub.add_parser(
+        "attest", help="Attest a clinical_note ai_draft (a human clinician signs)",
+    )
+    scribe_attest.add_argument("note", help="Relative path of the clinical_note record")
+    scribe_attest.add_argument(
+        "--attester", required=True,
+        help=(
+            "Human clinician identity performing the attestation. Must be in "
+            "scribe.clinicians AND distinct from the scribe drafter — the AI "
+            "cannot attest its own draft."
+        ),
+    )
+    scribe_attest.add_argument(
+        "--new-status", default="attested", choices=["attested", "amended"],
+        help="Target status (forward-only lifecycle; default: attested)",
+    )
 
     # distiller
     dist = sub.add_parser("distiller", help="Vault distiller subcommands")
@@ -4569,6 +4634,7 @@ def main() -> None:
         "tui": cmd_tui,
         "brief": cmd_brief,
         "mail": cmd_mail,
+        "scribe": cmd_scribe,
         "instance": cmd_instance,
         "talker": cmd_talker,
         "voice": cmd_voice,

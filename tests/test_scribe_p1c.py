@@ -60,6 +60,15 @@ def test_mode_unknown_or_malformed_resolves_synthetic(bad):
     assert load_from_unified({"scribe": {"mode": bad}}).mode == SCRIBE_MODE_SYNTHETIC
 
 
+def test_config_clinicians_fail_closed_default_and_load():
+    # scribe P2-a — the designated-clinician allowlist. FAIL-CLOSED default:
+    # absent => empty list => no valid attester.
+    assert load_from_unified({"scribe": {}}).clinicians == []
+    assert load_from_unified({}).clinicians == []
+    cfg = load_from_unified({"scribe": {"clinicians": ["np_jamie", "dr_synthetic"]}})
+    assert cfg.clinicians == ["np_jamie", "dr_synthetic"]
+
+
 def test_config_schema_tolerant_and_no_empty_dict_crash():
     # Unknown sub-field ignored; empty sub-dicts don't crash the _build.
     cfg = load_from_unified({"scribe": {

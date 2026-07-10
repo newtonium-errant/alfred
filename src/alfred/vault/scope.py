@@ -994,10 +994,44 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         "list": True,
         "context": True,
         "create": "stayc_clinical_types_only",
-        "edit": "stayc_clinical_attest_only",
+        # #41 structural attestation (scribe P2-a). The pipeline/agent scope
+        # may NOT edit clinical_notes — content is frozen after ai_draft, and
+        # the attest triad {status, attested_by, attested_at} is settable ONLY
+        # via the scribe.attest orchestrator (which runs authorize_attestation
+        # under the privileged ``stayc_clinical_attest`` scope). This REPLACES
+        # the P1-b ``stayc_clinical_attest_only`` (which lived here and let a
+        # raw vault_edit set status=attested / attested_by=stayc_scribe and
+        # self-attest — the advisory-not-structural gap the P1-c cross-ref
+        # comment flagged). The triad-allow gate moves to the attest scope
+        # below; here it becomes a hard deny.
+        "edit": "stayc_clinical_no_attest",
         "move": False,
         "delete": False,
         "allow_body_writes": True,
+        "allow_body_insert_at": {},
+        "allow_body_replace": {},
+    },
+    # ``stayc_clinical_attest`` — the PRIVILEGED attest scope (scribe P2-a,
+    # #41 structural attestation). Settable ONLY by the scribe.attest
+    # orchestrator (scribe/attest.py), which runs authorize_attestation
+    # (forward-only lifecycle + distinct-human-clinician attester + non-empty
+    # creator) BEFORE writing. The pipeline/agent NEVER selects this scope —
+    # scope is set by the orchestrator, not by the agent's create/edit path,
+    # so an LLM/pipeline call under ``stayc_clinical`` can never reach it. Its
+    # edit gate allows EXACTLY the attest triad {status, attested_by,
+    # attested_at} on clinical_note and nothing else (the reused
+    # ``stayc_clinical_attest_only`` field-allowlist gate, which also refuses
+    # body writes). create / move / delete all denied; the note stays frozen.
+    "stayc_clinical_attest": {
+        "read": True,
+        "search": True,
+        "list": True,
+        "context": True,
+        "create": False,
+        "edit": "stayc_clinical_attest_only",
+        "move": False,
+        "delete": False,
+        "allow_body_writes": False,
         "allow_body_insert_at": {},
         "allow_body_replace": {},
     },
@@ -1949,11 +1983,39 @@ def check_scope(
             )
         if record_type not in STAYC_CLINICAL_CREATE_TYPES:
             raise ScopeError(
-                f"Scope '{scope}' can only create vera-clinical types "
+                f"Scope '{scope}' can only create stayc-clinical types "
                 f"({', '.join(sorted(STAYC_CLINICAL_CREATE_TYPES))}). "
                 f"Got: '{record_type}'. The sovereign scribe scope mints "
                 f"clinical notes only; it cannot create any other type."
             )
+        # CREATE-BYPASS GUARD (#41 structural attestation, scribe P2-a). A
+        # clinical_note must be BORN as an unsigned ai_draft — a caller cannot
+        # mint a note that is already attested (which would skip the attest
+        # transition + the distinct-clinician check entirely). Inspect the
+        # create frontmatter: status must be 'ai_draft' (or absent → schema/
+        # template default ai_draft), and attested_by / attested_at must be
+        # ABSENT. The ONLY path to status='attested' is the scribe.attest
+        # orchestrator (`alfred scribe attest`), which runs
+        # authorize_attestation under the privileged attest scope.
+        if record_type == "clinical_note":
+            fm = frontmatter or {}
+            status = fm.get("status")
+            if status is not None and status != "ai_draft":
+                raise ScopeError(
+                    f"Scope '{scope}' may only CREATE clinical_note records "
+                    f"with status 'ai_draft' (got {status!r}). A note cannot be "
+                    f"born attested — the ONLY path to 'attested' is the "
+                    f"scribe.attest orchestrator (`alfred scribe attest`), "
+                    f"which enforces the forward-only lifecycle + a distinct "
+                    f"human clinician attester."
+                )
+            if fm.get("attested_by") is not None or fm.get("attested_at") is not None:
+                raise ScopeError(
+                    f"Scope '{scope}' may not CREATE a clinical_note with "
+                    f"attested_by / attested_at set — attestation metadata is "
+                    f"written ONLY by the scribe.attest orchestrator after "
+                    f"authorize_attestation. A born-attested note is refused."
+                )
         return
 
     if permission == "vera_ops_types_only":
@@ -2082,15 +2144,40 @@ def check_scope(
             )
         return
 
+    if permission == "stayc_clinical_no_attest":
+        # #41 structural attestation (scribe P2-a) — the pipeline/agent scope
+        # DENIES all clinical_note edits. The note CONTENT is frozen after
+        # ai_draft create; the attest triad (status / attested_by /
+        # attested_at) is set ONLY via the scribe.attest orchestrator (which
+        # runs authorize_attestation under the ``stayc_clinical_attest`` scope
+        # — a scope the pipeline can never select). This is the STRUCTURAL
+        # half of #41: the P1-b field-NAME allowlist was necessary but NOT
+        # sufficient (it let a raw vault_edit set status=attested /
+        # attested_by=stayc_scribe and self-attest). Denying all agent edits
+        # closes the raw-flip hole; the create-bypass guard in
+        # ``stayc_clinical_types_only`` closes the born-attested hole.
+        raise ScopeError(
+            f"Scope '{scope}' may not edit clinical_note records — content is "
+            f"frozen after ai_draft, and the attest triad (status / "
+            f"attested_by / attested_at) is set ONLY via `alfred scribe "
+            f"attest` (the scribe.attest orchestrator; forward-only lifecycle "
+            f"+ distinct-human-clinician attester). Raw status / attested_by "
+            f"edits are structurally refused."
+        )
+
     if permission == "stayc_clinical_attest_only":
-        # ⚠️ FALSE-COVERAGE WARNING (P1-c review). This is a field-NAME
-        # allowlist ONLY. It does NOT enforce the forward-only status
-        # lifecycle or the distinct-attester identity check — those are in
-        # scribe.authorize_attestation, which is NOT yet wired. The pipeline
-        # (P2) MUST route every clinical_note status/attested_by write (create
-        # AND edit) through scribe.authorize_attestation; the scope
-        # field-allowlist is necessary but NOT sufficient. Do not mistake this
-        # gate for attestation enforcement.
+        # This is a field-NAME allowlist ONLY (it does NOT enforce the
+        # forward-only lifecycle or the distinct-attester check). As of
+        # scribe P2-a (#41) it is NO LONGER on the pipeline/agent scope —
+        # it is the edit gate of the PRIVILEGED ``stayc_clinical_attest``
+        # scope, reachable ONLY via the scribe.attest orchestrator, which
+        # runs scribe.authorize_attestation (forward-only + distinct-human-
+        # clinician + non-empty-creator) BEFORE selecting this scope. So the
+        # lifecycle/identity enforcement now lives structurally UPSTREAM of
+        # this gate; this gate is the narrow "and only the triad fields, no
+        # body" final check. The agent/pipeline scope (``stayc_clinical``)
+        # uses ``stayc_clinical_no_attest`` (hard deny) above — a raw
+        # vault_edit can never reach this gate.
         #
         # Sovereign ambient-scribe ATTEST gate (scribe P1-b). The clinical
         # note CONTENT is frozen after draft; the ONLY thing an edit may do is

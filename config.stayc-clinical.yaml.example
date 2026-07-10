@@ -71,6 +71,12 @@ scribe:
   llm:
     base_url: "http://127.0.0.1:11434"     # loopback Ollama — barrier (b) enforced
     model: "qwen2.5:14b-instruct-q4_K_M"
+  # Designated human-clinician identities allowed to ATTEST a clinical_note
+  # (scribe P2-a, #41). FAIL-CLOSED: an empty list = NO valid attester (every
+  # `alfred scribe attest` refused). A plain identity list — NOT a network
+  # field, so no boundary barrier applies. Deploy fills the real clinician ids
+  # (e.g. "np_jamie"); the AI scribe drafter ("stayc_scribe") can never attest.
+  clinicians: []
 
 # ---------------------------------------------------------------------------
 # Vault — STAY-C's OWN PHI vault, physically separate from every other vault

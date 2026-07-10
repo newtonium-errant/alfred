@@ -80,6 +80,13 @@ class ScribeConfig:
     input_dir: str = _DEFAULT_INPUT_DIR
     stt: ScribeSttConfig = field(default_factory=ScribeSttConfig)
     llm: ScribeLlmConfig = field(default_factory=ScribeLlmConfig)
+    # Designated human-clinician identities allowed to ATTEST a clinical_note
+    # (scribe P2-a, #41). A plain identity list — NOT a network sub-field, so
+    # no boundary barrier applies (barriers a/b gate only stt/llm). FAIL-CLOSED:
+    # an empty list (the default) means NO valid attester — every attest is
+    # refused (attester_not_clinician) until the operator populates it. The
+    # scribe.attest orchestrator passes this to authorize_attestation.
+    clinicians: list[str] = field(default_factory=list)
 
     @property
     def is_clinical(self) -> bool:
@@ -130,9 +137,12 @@ def load_from_unified(raw: dict[str, Any]) -> ScribeConfig:
     scribe = substitute_env_in_value(scribe)
 
     input_dir = scribe.get("input_dir") or _DEFAULT_INPUT_DIR
+    clinicians_raw = scribe.get("clinicians") or []
+    clinicians = [str(c) for c in clinicians_raw] if isinstance(clinicians_raw, list) else []
     return ScribeConfig(
         mode=_normalize_mode(scribe.get("mode")),
         input_dir=str(input_dir),
         stt=_build(ScribeSttConfig, scribe.get("stt")),
         llm=_build(ScribeLlmConfig, scribe.get("llm")),
+        clinicians=clinicians,
     )

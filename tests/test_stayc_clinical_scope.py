@@ -41,7 +41,8 @@ from alfred.vault.scope import (
 )
 
 
-_SCOPE = "stayc_clinical"
+_SCOPE = "stayc_clinical"                 # the pipeline/agent scope
+_ATTEST_SCOPE = "stayc_clinical_attest"   # the privileged orchestrator scope (P2-a)
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +95,8 @@ def test_clinical_note_typedefinition_shape():
     assert d.name_field == "title"
     assert d.required_fields == ("title",)
     assert d.statuses == frozenset({"ai_draft", "attested", "amended"})
-    assert d.available_in_scopes == frozenset({"stayc_clinical"})
+    # P2-a (#41) tagged the privileged attest scope for gate-1 list-safety.
+    assert d.available_in_scopes == frozenset({"stayc_clinical", "stayc_clinical_attest"})
     assert d.is_leaf is True
     assert d.is_learn_type is False
 
@@ -128,54 +130,105 @@ def test_read_family_allowed(op):
 
 
 # ---------------------------------------------------------------------------
-# attest edit gate — stayc_clinical_attest_only
+# #41 STRUCTURAL ATTESTATION (scribe P2-a) — the agent scope DENIES the triad;
+# the privileged stayc_clinical_attest scope allows exactly the triad.
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "fields",
+    [["status"], ["attested_by"], ["attested_at"], ["title"], []],
+)
+def test_agent_scope_denies_all_clinical_note_edits(fields):
+    # THE #41 raw-flip pin (mutation: allow raw triad edit => fails). The
+    # pipeline/agent scope may NOT edit clinical_notes at all — the attest
+    # triad is orchestrator-only. This is the structural half of #41.
+    with pytest.raises(ScopeError):
+        check_scope(_SCOPE, "edit", record_type="clinical_note", fields=fields)
+
+
+# The privileged attest scope (reachable ONLY via scribe.attest) allows the
+# triad — the P1-b field-allowlist logic now lives here.
 
 @pytest.mark.parametrize(
     "fields",
     [["status"], ["attested_by"], ["attested_at"],
      ["status", "attested_by", "attested_at"]],
 )
-def test_attest_edit_allowed_fields(fields):
-    check_scope(_SCOPE, "edit", record_type="clinical_note", fields=fields)
+def test_attest_scope_allowed_triad(fields):
+    check_scope(_ATTEST_SCOPE, "edit", record_type="clinical_note", fields=fields)
 
 
 @pytest.mark.parametrize("field", ["title", "assessment", "ai_draft", "synthetic", "draft_original", "body"])
-def test_attest_edit_non_allowlisted_field_denied(field):
+def test_attest_scope_non_triad_field_denied(field):
     with pytest.raises(ScopeError):
-        check_scope(_SCOPE, "edit", record_type="clinical_note", fields=[field])
+        check_scope(_ATTEST_SCOPE, "edit", record_type="clinical_note", fields=[field])
 
 
-def test_attest_edit_missing_fields_fail_closed():
+def test_attest_scope_missing_fields_fail_closed():
     with pytest.raises(ScopeError):
-        check_scope(_SCOPE, "edit", record_type="clinical_note", fields=None)
+        check_scope(_ATTEST_SCOPE, "edit", record_type="clinical_note", fields=None)
 
 
-def test_attest_edit_empty_type_fail_closed():
+def test_attest_scope_empty_type_fail_closed():
     with pytest.raises(ScopeError):
-        check_scope(_SCOPE, "edit", record_type="", fields=["status"])
+        check_scope(_ATTEST_SCOPE, "edit", record_type="", fields=["status"])
 
 
-def test_attest_edit_wrong_type_denied():
+def test_attest_scope_wrong_type_denied():
     with pytest.raises(ScopeError):
-        check_scope(_SCOPE, "edit", record_type="note", fields=["status"])
+        check_scope(_ATTEST_SCOPE, "edit", record_type="note", fields=["status"])
 
 
-def test_attest_edit_refuses_body_write_SECURITY_PIN():
-    # THE security-critical pin. A pure body_append arrives at check_scope
-    # with fields=[] (EMPTY list, not None) + body_write=True — the exact
-    # shape vault_edit builds. The field-allowlist alone would let it pass
-    # (empty rejected list); the explicit body_write refusal in the attest
-    # gate is what freezes clinical content after draft.
+def test_attest_scope_refuses_body_write_SECURITY_PIN():
+    # The body-freeze pin, now on the privileged attest scope. A pure
+    # body_append arrives with fields=[] (EMPTY, not None) + body_write=True;
+    # the explicit body_write refusal is what freezes clinical content.
     with pytest.raises(ScopeError):
-        check_scope(_SCOPE, "edit", record_type="clinical_note",
+        check_scope(_ATTEST_SCOPE, "edit", record_type="clinical_note",
                     fields=[], body_write=True)
 
 
-def test_attest_edit_status_only_no_body_passes():
-    # The real attest-flip shape: set status (+ attest metadata), no body.
-    check_scope(_SCOPE, "edit", record_type="clinical_note",
+def test_attest_scope_status_only_no_body_passes():
+    check_scope(_ATTEST_SCOPE, "edit", record_type="clinical_note",
                 fields=["status", "attested_by", "attested_at"], body_write=False)
+
+
+def test_attest_scope_cannot_create_or_delete():
+    with pytest.raises(ScopeError):
+        check_scope(_ATTEST_SCOPE, "create", record_type="clinical_note")
+    with pytest.raises(ScopeError):
+        check_scope(_ATTEST_SCOPE, "delete", record_type="clinical_note")
+    with pytest.raises(ScopeError):
+        check_scope(_ATTEST_SCOPE, "move", record_type="clinical_note")
+
+
+def test_gate1_admits_clinical_note_under_attest_scope():
+    # The attest scope has list:True; gate 1 (_validate_type) must admit
+    # clinical_note under it (VERA-P1 lesson). Auto-derived, no literal edit.
+    assert "clinical_note" in schema.TYPE_REGISTRY.known_types("stayc_clinical_attest")
+
+
+# ---------------------------------------------------------------------------
+# #41 CREATE-BYPASS GUARD — a clinical_note is born ai_draft only.
+# ---------------------------------------------------------------------------
+
+def test_create_bypass_born_attested_refused():
+    # THE born-attested pin (mutation: allow status=attested at create => fails).
+    with pytest.raises(ScopeError):
+        check_scope(_SCOPE, "create", record_type="clinical_note",
+                    frontmatter={"status": "attested"})
+
+
+@pytest.mark.parametrize("bad", [{"attested_by": "np_jamie"}, {"attested_at": "2026-07-09T00:00:00Z"}])
+def test_create_bypass_attest_fields_at_create_refused(bad):
+    with pytest.raises(ScopeError):
+        check_scope(_SCOPE, "create", record_type="clinical_note", frontmatter=bad)
+
+
+@pytest.mark.parametrize("fm", [{}, {"status": "ai_draft"}, {"status": "ai_draft", "synthetic": True}])
+def test_create_ai_draft_or_absent_status_allowed(fm):
+    # status absent (schema default ai_draft) or explicitly ai_draft => OK.
+    check_scope(_SCOPE, "create", record_type="clinical_note", frontmatter=fm)
 
 
 # ---------------------------------------------------------------------------
@@ -236,8 +289,8 @@ def test_peer_propose_refuses_never_push_type():
 # End-to-end — draft, attest flip, frozen body, anti-delete
 # ---------------------------------------------------------------------------
 
-def test_e2e_draft_then_attest_then_frozen(tmp_path):
-    # 1. Create the AI draft (body IS the payload).
+def test_e2e_draft_then_structural_attest_then_frozen(tmp_path):
+    # 1. Create the AI draft (body IS the payload; born ai_draft).
     result = vault_create(
         tmp_path, "clinical_note", "Encounter 2026-07-09 chest pain",
         set_fields={"ai_draft": True, "synthetic": True, "status": "ai_draft"},
@@ -247,21 +300,33 @@ def test_e2e_draft_then_attest_then_frozen(tmp_path):
     rel_path = result["path"]
     assert (tmp_path / rel_path).exists()
 
-    # 2. Attest flip — frontmatter only (status + attest metadata).
-    vault_edit(
+    # 2. RAW attest flip via the agent scope is STRUCTURALLY REFUSED (#41).
+    with pytest.raises((ScopeError, VaultError)):
+        vault_edit(
+            tmp_path, rel_path,
+            set_fields={"status": "attested", "attested_by": "stayc_scribe"},
+            scope=_SCOPE,
+        )
+    # Still ai_draft — the raw edit did not land.
+    assert frontmatter.load(str(tmp_path / rel_path))["status"] == "ai_draft"
+
+    # 3. Attestation goes ONLY through the scribe.attest orchestrator, by a
+    # distinct human clinician.
+    from alfred.scribe.attest import attest as scribe_attest
+    audit_path = tmp_path / "clinical_attest_audit.jsonl"
+    scribe_attest(
         tmp_path, rel_path,
-        set_fields={
-            "status": "attested",
-            "attested_by": "Dr Synthetic",
-            "attested_at": "2026-07-09T12:00:00Z",
-        },
-        scope=_SCOPE,
+        new_status="attested",
+        attester="np_jamie",
+        clinician_ids={"np_jamie"},
+        audit_path=audit_path,
     )
     post = frontmatter.load(str(tmp_path / rel_path))
     assert post["status"] == "attested"
-    assert post["attested_by"] == "Dr Synthetic"
+    assert post["attested_by"] == "np_jamie"
+    assert audit_path.exists()
 
-    # 3. Body is FROZEN — a body_append is refused.
+    # 4. Body is FROZEN — a body_append via the agent scope is refused.
     with pytest.raises((ScopeError, VaultError)):
         vault_edit(
             tmp_path, rel_path,
@@ -269,7 +334,7 @@ def test_e2e_draft_then_attest_then_frozen(tmp_path):
             scope=_SCOPE,
         )
 
-    # 4. Anti-spoliation — delete is refused.
+    # 5. Anti-spoliation — delete is refused.
     with pytest.raises((ScopeError, VaultError)):
         vault_delete(tmp_path, rel_path, scope=_SCOPE)
 

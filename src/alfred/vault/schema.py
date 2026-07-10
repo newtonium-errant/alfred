@@ -616,7 +616,15 @@ _DEFINITIONS: list[TypeDefinition] = [
         statuses=frozenset({"ai_draft", "attested", "amended"}),
         required_fields=("title",),
         name_field="title",
-        available_in_scopes=frozenset({"stayc_clinical"}),
+        # ``stayc_clinical`` — the pipeline/agent scope (create ai_draft).
+        # ``stayc_clinical_attest`` (scribe P2-a, #41) — the PRIVILEGED attest
+        # scope used ONLY by the scribe.attest orchestrator. Tagged here so
+        # gate 1 (_validate_type) admits clinical_note under the attest scope's
+        # ``list: True`` (the VERA-P1 lesson: gate 1 fires on list). The edit
+        # path (vault_edit) does NOT fire gate 1, but tagging keeps list-safe +
+        # matches the vera_forwarder / vera_ticket_outcome precedent.
+        # KNOWN_TYPES_BY_SCOPE auto-derives — do NOT edit a literal.
+        available_in_scopes=frozenset({"stayc_clinical", "stayc_clinical_attest"}),
         is_leaf=True,
     ),
 
