@@ -58,7 +58,7 @@ from alfred.scribe.state import (
     ScribeState,
 )
 from alfred.scribe.transcript import Transcript
-from alfred.vault.ops import VaultError, vault_create
+from alfred.vault.ops import VaultError, vault_create, vault_edit, vault_read
 
 log = structlog.get_logger(__name__)
 
@@ -190,32 +190,99 @@ def _create_ai_draft(
     vault_path: Path, title: str, source_id: str, config: ScribeConfig,
     vnote: VerifiedNote,
 ) -> str:
-    """Create the clinical_note ai_draft (NOTE-2: ai_draft ONLY). Idempotent on
-    the crash-window where a prior run created the file but did not persist the
-    drafted state → the already-exists case is treated as drafted."""
+    """Create-OR-update the clinical_note ai_draft (scribe P3-a).
+
+    Frozen-on-ATTEST (the P3 relaxation of P2's frozen-on-create): while the
+    note is a LIVE, unattested ``ai_draft`` the checkpoint co-pilot refreshes it
+    in place each pass; once ``status in {attested, amended}`` the body is SEALED
+    and this REFUSES (fail-closed — never clobber a sealed medico-legal record).
+
+    Three cases, dispatched on the note's LIVE on-disk status (attestation does
+    NOT update ScribeState, so the pipeline reads the note, not the state):
+
+      * New source (no existing note) → ``vault_create`` (born ai_draft, NOTE-2).
+      * Existing note, status == ``ai_draft`` → UPDATE in place
+        (``body_replace`` + refresh ``grounding_flags``); returns the SAME path
+        (no duplicate).
+      * Existing note, status ∈ {attested, amended} or missing/unknown → REFUSE
+        (raise ``VaultError``; fail-closed).
+
+    Also covers the P2-d crash-window (a prior run created the file but crashed
+    before persisting DRAFTED): the resume hits ``already exists`` → this reads
+    the live status (ai_draft) → UPDATE in place → resume completes. NOTE-4:
+    logs carry the opaque ``source_id`` + status only — never PHI.
+    """
+    draft_fields = {
+        "ai_draft": True,
+        "synthetic": config.mode != "clinical",
+        "status": "ai_draft",
+        "source_id": source_id,
+        "drafted_by": SCRIBE_DRAFTER_IDENTITY,
+        "grounding_flags": vnote.grounding_flags,
+    }
     try:
         result = vault_create(
             vault_path,
             "clinical_note",
             title,
-            set_fields={
-                "ai_draft": True,
-                "synthetic": config.mode != "clinical",
-                "status": "ai_draft",
-                "source_id": source_id,
-                "drafted_by": SCRIBE_DRAFTER_IDENTITY,
-                "grounding_flags": vnote.grounding_flags,
-            },
+            set_fields=draft_fields,
             body=vnote.body,
             scope="stayc_clinical",
         )
         return result["path"]
     except VaultError as e:
-        if "already exists" in str(e):
-            # Prior run drafted it but crashed pre-state-save → idempotent.
-            tail = str(e).split("already exists:")
-            return tail[-1].strip() if len(tail) > 1 else ""
-        raise
+        if "already exists" not in str(e):
+            raise
+        # The note already exists → create-OR-update. Recover its rel_path from
+        # the message (STRING-PARSE-COUPLED — same as P2-d) and read the LIVE
+        # status to decide UPDATE-in-place vs REFUSE.
+        tail = str(e).split("already exists:")
+        rel_path = tail[-1].strip() if len(tail) > 1 else ""
+        return _update_or_refuse_ai_draft(vault_path, rel_path, source_id, vnote)
+
+
+def _update_or_refuse_ai_draft(
+    vault_path: Path, rel_path: str, source_id: str, vnote: VerifiedNote,
+) -> str:
+    """Refresh an existing LIVE ai_draft in place, or REFUSE if sealed (P3-a).
+
+    Fail-closed: if the note cannot be recovered/read, or its status is not
+    ``ai_draft`` (attested / amended / missing / unknown), the draft is SEALED
+    and this raises rather than clobber it. NOTE-4: opaque ids only in logs.
+    """
+    if not rel_path:
+        raise VaultError(
+            "scribe: could not recover the existing clinical_note path from the "
+            "already-exists error — refusing to update (fail-closed)."
+        )
+    record = vault_read(vault_path, rel_path)
+    status = (record.get("frontmatter") or {}).get("status")
+    if status != "ai_draft":
+        log.warning(
+            "scribe.pipeline.update_refused_sealed",
+            source_id=source_id,          # opaque id only — NO PHI (NOTE-4)
+            status=status or "(missing)",
+        )
+        raise VaultError(
+            f"clinical_note is SEALED (status={status or '(missing)'}) — the "
+            f"body is frozen once attested/amended (anti-spoliation). Refusing "
+            f"to update the draft; create a status:amended supersede instead."
+        )
+    # Live ai_draft → mutable. Rewrite body + refresh grounding_flags in place;
+    # gated again by the stayc_clinical body_replace + edit carve-outs.
+    vault_edit(
+        vault_path,
+        rel_path,
+        body_replace=vnote.body,
+        set_fields={"grounding_flags": vnote.grounding_flags},
+        scope="stayc_clinical",
+    )
+    log.info(
+        "scribe.pipeline.draft_updated",
+        source_id=source_id,              # opaque id only — NO PHI (NOTE-4)
+        grounding_flags=vnote.flag_count,
+    )
+    return rel_path
 
 
 async def run_sweep(

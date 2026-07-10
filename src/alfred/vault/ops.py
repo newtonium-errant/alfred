@@ -1443,6 +1443,11 @@ def vault_edit(
             record_type=record_type,
             fields=fields_list,
             body_write=body_write_requested,
+            # P3-a: the status-aware clinical_note edit gate
+            # (``stayc_clinical_no_attest``) reads the note's LIVE on-disk
+            # status to decide mutable-while-ai_draft vs sealed-on-attest.
+            # Every other edit gate ignores this kwarg.
+            existing_frontmatter=fm,
         )
         # Body-mutation tools have their own per-instance × per-type
         # gate (per the c1 matrix). Run only if the corresponding kwarg

@@ -164,6 +164,40 @@ def _check_body_mutation_allowed(
     Raises ``ScopeError`` with a message naming the rule + the
     operator-actionable next step.
     """
+    # --- clinical_note: status-aware anti-spoliation gate (scribe P3-a) ------
+    # The medico-legal body freeze moves from CREATE (P2) to ATTEST (P3). While
+    # the note is a LIVE, unattested ``ai_draft`` the checkpoint co-pilot
+    # refreshes it via ``body_replace``; once ``status in {attested, amended}``
+    # the body is SEALED. ONLY the ``stayc_clinical`` pipeline scope may
+    # body-mutate a live draft, and ONLY via ``body_replace`` (mid-document
+    # ``body_insert_at`` stays universally denied). Every OTHER (scope, op)
+    # falls through to the universal deny below. Fail-CLOSED on missing /
+    # unknown / sealed status.
+    #
+    # ``clinical_note`` REMAINS in ``_BODY_MUTATE_DENIED_TYPES`` (defense-in-
+    # depth backstop): this carve-out is the SOLE permit path, so deleting it
+    # fails SAFE — reverts to the P2 fully-frozen posture. The DISTINCT sealed-
+    # status ScopeError below is load-bearing: a mutation-bind test asserts on
+    # its wording, so removing the status check flips the fired gate to the
+    # generic universal-deny message → RED (even though the write still denies).
+    if record_type == "clinical_note":
+        if scope == "stayc_clinical" and operation == "body_replace":
+            status = (
+                existing_frontmatter.get("status")
+                if isinstance(existing_frontmatter, dict)
+                else None
+            )
+            if status == "ai_draft":
+                return  # mutable while an unattested AI draft
+            raise ScopeError(
+                f"Scope '{scope}' may not 'body_replace' a clinical_note in "
+                f"status '{status or '(missing)'}' — the note body is SEALED "
+                f"once attested/amended (anti-spoliation). Body rewrites are "
+                f"permitted ONLY while status=='ai_draft'. To revise an "
+                f"attested note, create a new clinical_note with "
+                f"status:amended that supersedes it; the original is immutable."
+            )
+        # Any other scope, or ``body_insert_at`` → universal deny below.
     if record_type in _BODY_MUTATE_DENIED_TYPES:
         raise ScopeError(
             f"Operation '{operation}' is universally denied for "
@@ -1593,6 +1627,18 @@ STAYC_CLINICAL_CREATE_TYPES: set[str] = {"clinical_note"}
 STAYC_CLINICAL_ATTEST_TYPES: set[str] = {"clinical_note"}
 STAYC_CLINICAL_ATTEST_FIELDS: set[str] = {"attested_by", "attested_at", "status"}
 
+# P3-a frozen-on-ATTEST. While a clinical_note is a LIVE ``ai_draft`` the
+# checkpoint co-pilot pipeline refreshes it in place — a NARROW frontmatter
+# allowlist the ``stayc_clinical_no_attest`` edit gate permits ONLY while
+# status=='ai_draft'. ``grounding_flags`` is the re-verified grounding report,
+# refreshed alongside the ``body_replace`` on each checkpoint. The attest triad
+# (status / attested_by / attested_at) is NEVER in this set — it stays
+# orchestrator-only in ANY status. Every OTHER clinical field stays locked even
+# while drafting (body content changes via ``body_replace``, not raw frontmatter
+# edits). Widening this set is a deliberate matrix change — update the pin in
+# the same commit (tests/test_stayc_clinical_scope.py, pre-commit checklist #6).
+STAYC_CLINICAL_DRAFT_EDIT_FIELDS: frozenset[str] = frozenset({"grounding_flags"})
+
 
 # Per-scope hint mapping: when a peer instance attempts vault_create on
 # a canonical type, the error message points at the right propose tool.
@@ -2145,24 +2191,62 @@ def check_scope(
         return
 
     if permission == "stayc_clinical_no_attest":
-        # #41 structural attestation (scribe P2-a) — the pipeline/agent scope
-        # DENIES all clinical_note edits. The note CONTENT is frozen after
-        # ai_draft create; the attest triad (status / attested_by /
-        # attested_at) is set ONLY via the scribe.attest orchestrator (which
-        # runs authorize_attestation under the ``stayc_clinical_attest`` scope
-        # — a scope the pipeline can never select). This is the STRUCTURAL
-        # half of #41: the P1-b field-NAME allowlist was necessary but NOT
-        # sufficient (it let a raw vault_edit set status=attested /
-        # attested_by=stayc_scribe and self-attest). Denying all agent edits
-        # closes the raw-flip hole; the create-bypass guard in
+        # #41 structural attestation (scribe P2-a) + frozen-on-ATTEST (P3-a).
+        # The pipeline/agent scope may REFRESH a live ``ai_draft`` (the
+        # checkpoint co-pilot) but the note is SEALED once attested/amended,
+        # and the attest triad (status / attested_by / attested_at) is NEVER
+        # settable here — orchestrator-only in ANY status. The triad is set
+        # ONLY via the scribe.attest orchestrator (which runs
+        # authorize_attestation under the ``stayc_clinical_attest`` scope — a
+        # scope the pipeline can never select). This is the STRUCTURAL half of
+        # #41: the P1-b field-NAME allowlist was necessary but NOT sufficient
+        # (it let a raw vault_edit set status=attested / attested_by=
+        # stayc_scribe and self-attest). The triad-forbidden check below closes
+        # the raw-flip hole in every status; the create-bypass guard in
         # ``stayc_clinical_types_only`` closes the born-attested hole.
+        #
+        # Gate order (all fail-closed):
+        #   1. attest triad requested → REFUSE (any status — orchestrator-only)
+        #   2. status == ai_draft → permit a NARROW field refresh
+        #      (STAYC_CLINICAL_DRAFT_EDIT_FIELDS) + body mutation (the co-pilot
+        #      rewrites the body via body_replace, gated AGAIN by the
+        #      body_replace carve-out). Every other frontmatter field stays
+        #      locked even while drafting.
+        #   3. status attested / amended / missing / unknown → SEALED, deny all.
+        _triad = {"status", "attested_by", "attested_at"}
+        _requested = set(fields or [])
+        _forbidden = _requested & _triad
+        if _forbidden:
+            raise ScopeError(
+                f"Scope '{scope}' may not set the attest triad "
+                f"{sorted(_forbidden)} on a clinical_note — attestation "
+                f"(status / attested_by / attested_at) is set ONLY via "
+                f"`alfred scribe attest` (the scribe.attest orchestrator; "
+                f"forward-only lifecycle + distinct-human-clinician attester). "
+                f"Raw self-attest is structurally refused, in ANY status."
+            )
+        _status = (
+            existing_frontmatter.get("status")
+            if isinstance(existing_frontmatter, dict)
+            else None
+        )
+        if _status == "ai_draft":
+            _stray = _requested - STAYC_CLINICAL_DRAFT_EDIT_FIELDS
+            if _stray:
+                raise ScopeError(
+                    f"Scope '{scope}' may edit only "
+                    f"{sorted(STAYC_CLINICAL_DRAFT_EDIT_FIELDS)} on a LIVE "
+                    f"clinical_note ai_draft; refused fields: {sorted(_stray)}. "
+                    f"Body content changes via body_replace, not raw "
+                    f"frontmatter edits."
+                )
+            return  # live draft — narrow refresh + body_replace permitted
         raise ScopeError(
-            f"Scope '{scope}' may not edit clinical_note records — content is "
-            f"frozen after ai_draft, and the attest triad (status / "
-            f"attested_by / attested_at) is set ONLY via `alfred scribe "
-            f"attest` (the scribe.attest orchestrator; forward-only lifecycle "
-            f"+ distinct-human-clinician attester). Raw status / attested_by "
-            f"edits are structurally refused."
+            f"Scope '{scope}' may not edit a clinical_note in status "
+            f"'{_status or '(missing)'}' — content is SEALED once attested "
+            f"(anti-spoliation). Only a LIVE ai_draft is mutable, and only "
+            f"`alfred scribe attest` may seal it. To revise a sealed note, "
+            f"create a new clinical_note with status:amended that supersedes it."
         )
 
     if permission == "stayc_clinical_attest_only":

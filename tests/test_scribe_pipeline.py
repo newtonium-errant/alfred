@@ -292,28 +292,95 @@ def test_note3_pipeline_has_no_subprocess_or_claude_p():
 
 
 # ---------------------------------------------------------------------------
-# _create_ai_draft — the crash-window already-exists recovery branch
-# (functionally correct but was untested + STRING-PARSE-COUPLED to the
-# VaultError message; pin the current behavior so a message-format change
-# can't silently break the idempotent resume).
+# _create_ai_draft — create-OR-update-in-place (scribe P3-a, frozen-on-ATTEST)
+# plus the crash-window already-exists resume (STRING-PARSE-COUPLED to the
+# VaultError message — pinned so a message-format change can't silently break
+# the recovery).
 # ---------------------------------------------------------------------------
 
-def test_create_ai_draft_recovers_on_already_exists(tmp_path, monkeypatch):
-    # Crash-window: a prior run created the note but crashed before persisting
-    # DRAFTED → the resume hits VaultError("File already exists: <path>"),
-    # recovers the path, and treats it as drafted (no duplicate note).
+def test_create_ai_draft_creates_then_updates_ai_draft_in_place(tmp_path):
+    # P3-a: first call CREATES the born-ai_draft note; a second call (same
+    # source/title) hits already-exists, reads the LIVE status (ai_draft), and
+    # UPDATES the body in place — SAME path, NO duplicate, grounding refreshed.
+    vault = tmp_path / "vault"
+    v1 = pipeline_mod.VerifiedNote(
+        body="## S\nFirst pass.\n", grounding_flags=[], flag_count=0)
+    p1 = pipeline_mod._create_ai_draft(vault, "Encounter x", "x", _config(), v1)
+    # rel_path recovered/returned from vault_create (STRING-PARSE-COUPLED path)
+    assert p1 == "clinical_note/Encounter x.md"
+    assert "First pass." in frontmatter.load(str(vault / p1)).content
+
+    v2 = pipeline_mod.VerifiedNote(
+        body="## S\nSecond pass, more detail.\n",
+        grounding_flags=[{"reason": "number_mismatch"}], flag_count=1)
+    p2 = pipeline_mod._create_ai_draft(vault, "Encounter x", "x", _config(), v2)
+    assert p2 == p1                                   # SAME path — no duplicate
+    note = frontmatter.load(str(vault / p2))
+    assert "Second pass" in note.content              # body REPLACED
+    assert "First pass" not in note.content
+    assert note["status"] == "ai_draft"               # still a live draft
+    assert len(note["grounding_flags"]) == 1          # grounding refreshed
+    assert len(list((vault / "clinical_note").glob("*.md"))) == 1  # no dup
+
+
+def test_create_ai_draft_refuses_attested_no_clobber(tmp_path):
+    # P3-a fail-closed: once attested the body is SEALED — a pipeline re-process
+    # REFUSES (raises) rather than clobber the medico-legal record.
+    from alfred.scribe.attest import attest as scribe_attest
     from alfred.vault.ops import VaultError
 
-    def _raise_exists(*a, **k):
-        raise VaultError("File already exists: clinical_note/Encounter x.md")
+    vault = tmp_path / "vault"
+    v1 = pipeline_mod.VerifiedNote(
+        body="## S\nDraft.\n", grounding_flags=[], flag_count=0)
+    p1 = pipeline_mod._create_ai_draft(vault, "Encounter y", "y", _config(), v1)
+    scribe_attest(vault, p1, new_status="attested", attester="np_jamie",
+                  clinician_ids={"np_jamie"}, audit_path=vault / "audit.jsonl")
 
-    monkeypatch.setattr(pipeline_mod, "vault_create", _raise_exists)
-    vnote = pipeline_mod.VerifiedNote(body="b", grounding_flags=[], flag_count=0)
-    path = pipeline_mod._create_ai_draft(
-        tmp_path / "vault", "Encounter x", "x", _config(), vnote,
-    )
-    # the rel_path is recovered from the message (STRING-PARSE-COUPLED — pinned)
-    assert path == "clinical_note/Encounter x.md"
+    v2 = pipeline_mod.VerifiedNote(
+        body="## S\nSNEAKY.\n", grounding_flags=[], flag_count=0)
+    with pytest.raises(VaultError):
+        pipeline_mod._create_ai_draft(vault, "Encounter y", "y", _config(), v2)
+    note = frontmatter.load(str(vault / p1))          # attested body untouched
+    assert "SNEAKY" not in note.content
+    assert note["status"] == "attested"
+
+
+def test_draft_updated_log_emitted(tmp_path):
+    # Observability pin (pre-commit #9): the in-place update emits
+    # scribe.pipeline.draft_updated with the opaque source_id + grounding count
+    # (NO PHI). A refactor that drops the line stays RED.
+    vault = tmp_path / "vault"
+    v1 = pipeline_mod.VerifiedNote(body="## S\nA.\n", grounding_flags=[], flag_count=0)
+    pipeline_mod._create_ai_draft(vault, "Encounter z", "z", _config(), v1)
+    v2 = pipeline_mod.VerifiedNote(
+        body="## S\nB.\n", grounding_flags=[{"reason": "x"}], flag_count=1)
+    with structlog.testing.capture_logs() as cap:
+        pipeline_mod._create_ai_draft(vault, "Encounter z", "z", _config(), v2)
+    m = [c for c in cap if c.get("event") == "scribe.pipeline.draft_updated"]
+    assert len(m) == 1
+    assert m[0]["source_id"] == "z"
+    assert m[0]["grounding_flags"] == 1
+
+
+def test_update_refused_sealed_log_emitted(tmp_path):
+    # Observability pin (pre-commit #9): a refused-because-sealed re-process
+    # emits scribe.pipeline.update_refused_sealed with source_id + status only.
+    from alfred.scribe.attest import attest as scribe_attest
+    from alfred.vault.ops import VaultError
+
+    vault = tmp_path / "vault"
+    v1 = pipeline_mod.VerifiedNote(body="## S\nA.\n", grounding_flags=[], flag_count=0)
+    p1 = pipeline_mod._create_ai_draft(vault, "Encounter w", "w", _config(), v1)
+    scribe_attest(vault, p1, new_status="attested", attester="np_jamie",
+                  clinician_ids={"np_jamie"}, audit_path=vault / "a.jsonl")
+    v2 = pipeline_mod.VerifiedNote(body="## S\nB.\n", grounding_flags=[], flag_count=0)
+    with structlog.testing.capture_logs() as cap:
+        with pytest.raises(VaultError):
+            pipeline_mod._create_ai_draft(vault, "Encounter w", "w", _config(), v2)
+    m = [c for c in cap if c.get("event") == "scribe.pipeline.update_refused_sealed"]
+    assert len(m) == 1
+    assert m[0]["source_id"] == "w"
+    assert m[0]["status"] == "attested"
 
 
 def test_create_ai_draft_reraises_other_vaulterror(tmp_path, monkeypatch):
@@ -331,18 +398,26 @@ def test_create_ai_draft_reraises_other_vaulterror(tmp_path, monkeypatch):
 
 
 def test_process_source_recovers_drafted_on_crash_window(tmp_path, monkeypatch):
-    # End-to-end crash-window: process_source that hits already-exists still
-    # reaches DRAFTED (idempotent resume — no re-raise, no partial/failed state).
+    # End-to-end crash-window (P3-a): a prior run wrote the note but crashed
+    # before persisting DRAFTED. On resume, process_source re-generates and
+    # _create_ai_draft hits already-exists → reads live status (ai_draft) →
+    # UPDATES in place → reaches DRAFTED (no duplicate, no partial/failed state).
     monkeypatch.setattr(ollama_mod, "call_ollama_no_tools", _fake_ollama_returning(_CANNED_CLEAN))
-    from alfred.vault.ops import VaultError
-
-    def _raise_exists(*a, **k):
-        raise VaultError("File already exists: clinical_note/Encounter enc1.wav.md")
-
-    monkeypatch.setattr(pipeline_mod, "vault_create", _raise_exists)
     input_dir = tmp_path / "inbox"
     audio = _drop_input(input_dir)
+    vault = tmp_path / "vault"
     state = ScribeState(tmp_path / "state.json")
-    outcome = asyncio.run(process_source(audio, config=_config(), state=state, vault_path=tmp_path / "vault"))
+
+    # First pass drafts the note.
+    assert asyncio.run(process_source(audio, config=_config(), state=state, vault_path=vault)) == "drafted"
+    note_path = state.get("enc1.wav").note_path
+
+    # Simulate the crash: rewind state to an intermediate (non-done) status so
+    # the resume re-processes — the note file is still on disk.
+    state.set("enc1.wav", state=STATE_STRUCTURING)
+
+    outcome = asyncio.run(process_source(audio, config=_config(), state=state, vault_path=vault))
     assert outcome == "drafted"
     assert state.get("enc1.wav").state == STATE_DRAFTED
+    assert state.get("enc1.wav").note_path == note_path       # same note
+    assert len(list((vault / "clinical_note").glob("*.md"))) == 1  # no dup

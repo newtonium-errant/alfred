@@ -34,6 +34,7 @@ from alfred.vault.scope import (
     STAYC_CLINICAL_ATTEST_FIELDS,
     STAYC_CLINICAL_ATTEST_TYPES,
     STAYC_CLINICAL_CREATE_TYPES,
+    STAYC_CLINICAL_DRAFT_EDIT_FIELDS,
     ScopeError,
     _BODY_MUTATE_DENIED_TYPES,
     _DELETE_DENIED_TYPES,
@@ -138,10 +139,13 @@ def test_read_family_allowed(op):
     "fields",
     [["status"], ["attested_by"], ["attested_at"], ["title"], []],
 )
-def test_agent_scope_denies_all_clinical_note_edits(fields):
-    # THE #41 raw-flip pin (mutation: allow raw triad edit => fails). The
-    # pipeline/agent scope may NOT edit clinical_notes at all — the attest
-    # triad is orchestrator-only. This is the structural half of #41.
+def test_agent_scope_denies_clinical_note_edits_without_live_draft_status(fields):
+    # THE #41 raw-flip pin (mutation: allow raw triad edit => fails). With NO
+    # existing_frontmatter the gate cannot see a live ``ai_draft`` status, so it
+    # is FAIL-CLOSED: the attest triad is orchestrator-only in ANY status, and a
+    # non-triad / empty edit on a note of unknown status is SEALED-denied. The
+    # P3-a mutable-while-ai_draft ALLOW path requires existing_frontmatter with
+    # status==ai_draft (pinned separately below).
     with pytest.raises(ScopeError):
         check_scope(_SCOPE, "edit", record_type="clinical_note", fields=fields)
 
@@ -247,7 +251,10 @@ def test_move_delete_denied(op):
 
 
 @pytest.mark.parametrize("op", ["body_insert_at", "body_replace"])
-def test_body_mutation_denied(op):
+def test_body_mutation_denied_without_live_draft_status(op):
+    # Fail-closed: with NO existing_frontmatter the gate cannot see a live
+    # ``ai_draft`` status, so BOTH body ops are denied. body_insert_at stays
+    # denied even WITH ai_draft (only body_replace is opened — pinned below).
     with pytest.raises(ScopeError):
         check_scope(_SCOPE, op, record_type="clinical_note")
 
@@ -264,6 +271,178 @@ def test_body_mutate_deny_precedence_over_wildcard_scope():
     # _BODY_MUTATE_DENIED_TYPES takes precedence.
     with pytest.raises(ScopeError):
         check_scope("instructor", "body_replace", record_type="clinical_note")
+
+
+# ---------------------------------------------------------------------------
+# P3-a — FROZEN-ON-ATTEST. The clinical_note body is MUTABLE while status==
+# ai_draft (the checkpoint co-pilot refreshes it) and SEALED once attested/
+# amended. The anti-spoliation invariant moves from create (P2) to attest (P3).
+# The gate reads the note's LIVE frontmatter status; fail-closed on unknown.
+# ---------------------------------------------------------------------------
+
+def test_draft_edit_fields_matrix_pin():
+    # The narrow frontmatter-refresh allowlist for a LIVE draft. Widening is a
+    # deliberate matrix change (pre-commit checklist #6).
+    assert STAYC_CLINICAL_DRAFT_EDIT_FIELDS == frozenset({"grounding_flags"})
+
+
+# --- body_replace: the co-pilot's in-place update mechanism ----------------
+
+def test_body_replace_on_ai_draft_ALLOWED():
+    # THE mutable-while-ai_draft pin (mutation: break the ``status=='ai_draft'
+    # → return`` branch → the universal deny fires → RED). A live draft's body
+    # is rewritable by the pipeline scope.
+    check_scope(
+        _SCOPE, "body_replace", record_type="clinical_note",
+        existing_frontmatter={"status": "ai_draft"},
+    )  # no raise
+
+
+@pytest.mark.parametrize("sealed", ["attested", "amended"])
+def test_body_replace_on_sealed_note_DENIED_anti_spoliation(sealed):
+    # THE load-bearing anti-spoliation pin. The DISTINCT "anti-spoliation" /
+    # "SEALED" wording is asserted so removing the status check flips the fired
+    # gate to the generic universal-deny message → RED (mutation-bind), even
+    # though the defense-in-depth backstop still denies the write.
+    with pytest.raises(ScopeError) as ei:
+        check_scope(
+            _SCOPE, "body_replace", record_type="clinical_note",
+            existing_frontmatter={"status": sealed},
+        )
+    msg = str(ei.value)
+    assert "SEALED" in msg and "anti-spoliation" in msg
+
+
+@pytest.mark.parametrize("fm", [None, {}, {"status": ""}, {"status": "bogus"}])
+def test_body_replace_missing_or_unknown_status_fail_closed(fm):
+    with pytest.raises(ScopeError):
+        check_scope(
+            _SCOPE, "body_replace", record_type="clinical_note",
+            existing_frontmatter=fm,
+        )
+
+
+@pytest.mark.parametrize("other", ["janitor", "curator", "instructor", "talker"])
+def test_body_replace_on_ai_draft_denied_for_non_stayc_scope(other):
+    # Even a LIVE ai_draft is body-mutable ONLY by stayc_clinical; every other
+    # scope hits the universal deny (defense-in-depth backstop).
+    with pytest.raises(ScopeError):
+        check_scope(
+            other, "body_replace", record_type="clinical_note",
+            existing_frontmatter={"status": "ai_draft"},
+        )
+
+
+def test_body_insert_at_on_ai_draft_still_DENIED():
+    # Only body_replace is opened for the co-pilot; mid-document body_insert_at
+    # stays universally denied even on a live draft (higher corruption risk).
+    with pytest.raises(ScopeError):
+        check_scope(
+            _SCOPE, "body_insert_at", record_type="clinical_note",
+            existing_frontmatter={"status": "ai_draft"},
+        )
+
+
+# --- edit gate: narrow frontmatter refresh while ai_draft ------------------
+
+def test_edit_grounding_flags_on_ai_draft_ALLOWED():
+    check_scope(
+        _SCOPE, "edit", record_type="clinical_note",
+        fields=["grounding_flags"],
+        existing_frontmatter={"status": "ai_draft"},
+    )  # no raise
+
+
+def test_edit_body_replace_plus_grounding_flags_on_ai_draft_ALLOWED():
+    # The pipeline's combined update call: body_write=True + grounding_flags
+    # refresh, on a live draft → the edit gate passes (body_replace gate does
+    # the second status check separately).
+    check_scope(
+        _SCOPE, "edit", record_type="clinical_note",
+        fields=["grounding_flags"], body_write=True,
+        existing_frontmatter={"status": "ai_draft"},
+    )  # no raise
+
+
+@pytest.mark.parametrize("field", ["status", "attested_by", "attested_at"])
+def test_edit_triad_on_ai_draft_STILL_DENIED(field):
+    # The attest triad is orchestrator-only in EVERY status — a live draft may
+    # not self-attest via a raw frontmatter edit.
+    with pytest.raises(ScopeError):
+        check_scope(
+            _SCOPE, "edit", record_type="clinical_note", fields=[field],
+            existing_frontmatter={"status": "ai_draft"},
+        )
+
+
+@pytest.mark.parametrize("field", ["title", "assessment", "ai_draft", "synthetic"])
+def test_edit_non_allowlist_field_on_ai_draft_DENIED(field):
+    # Only STAYC_CLINICAL_DRAFT_EDIT_FIELDS may be refreshed on a live draft;
+    # every other clinical field stays locked even while drafting.
+    with pytest.raises(ScopeError):
+        check_scope(
+            _SCOPE, "edit", record_type="clinical_note", fields=[field],
+            existing_frontmatter={"status": "ai_draft"},
+        )
+
+
+@pytest.mark.parametrize("sealed", ["attested", "amended"])
+def test_edit_grounding_flags_on_sealed_note_DENIED(sealed):
+    # Once sealed, even the draft-refresh allowlist is frozen.
+    with pytest.raises(ScopeError):
+        check_scope(
+            _SCOPE, "edit", record_type="clinical_note",
+            fields=["grounding_flags"],
+            existing_frontmatter={"status": sealed},
+        )
+
+
+# --- end-to-end: draft update while ai_draft, then sealed on attest --------
+
+def test_e2e_body_replace_updates_draft_then_frozen_on_attest(tmp_path):
+    from alfred.scribe.attest import attest as scribe_attest
+
+    # 1. Create the AI draft (born ai_draft).
+    result = vault_create(
+        tmp_path, "clinical_note", "Encounter 2026-07-10 chest pain",
+        set_fields={"ai_draft": True, "synthetic": True, "status": "ai_draft",
+                    "grounding_flags": []},
+        body="## Subjective\nInitial checkpoint.\n",
+        scope=_SCOPE,
+    )
+    rel_path = result["path"]
+
+    # 2. Co-pilot checkpoint: body_replace + grounding_flags refresh is ALLOWED
+    # while ai_draft — the note updates in place (no supersede, no duplicate).
+    vault_edit(
+        tmp_path, rel_path,
+        body_replace="## Subjective\nRevised checkpoint with more detail.\n",
+        set_fields={"grounding_flags": [{"reason": "number_mismatch"}]},
+        scope=_SCOPE,
+    )
+    post = frontmatter.load(str(tmp_path / rel_path))
+    assert "Revised checkpoint" in post.content
+    assert post["status"] == "ai_draft"           # still a draft
+    assert len(post["grounding_flags"]) == 1      # refreshed
+
+    # 3. Attest (distinct human clinician, via the orchestrator ONLY).
+    scribe_attest(
+        tmp_path, rel_path, new_status="attested", attester="np_jamie",
+        clinician_ids={"np_jamie"},
+        audit_path=tmp_path / "clinical_attest_audit.jsonl",
+    )
+    assert frontmatter.load(str(tmp_path / rel_path))["status"] == "attested"
+
+    # 4. Now SEALED — a body_replace via the pipeline scope is REFUSED
+    # (anti-spoliation moved from create to attest).
+    with pytest.raises((ScopeError, VaultError)):
+        vault_edit(
+            tmp_path, rel_path,
+            body_replace="## Subjective\nSNEAKY post-attest rewrite.\n",
+            scope=_SCOPE,
+        )
+    # The attested body is intact — the sneaky rewrite did not land.
+    assert "SNEAKY" not in frontmatter.load(str(tmp_path / rel_path)).content
 
 
 # ---------------------------------------------------------------------------
