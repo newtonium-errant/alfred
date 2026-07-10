@@ -162,14 +162,23 @@ before or after it. It MUST be valid JSON with EXACTLY this shape:
 
 5. NEVER INVENT; EMPTY SECTION -> [] — extract ONLY what the transcript contains.
    Do NOT invent patient names, identifiers, ages, vitals, exam findings, past
-   history, or diagnoses — not even plausible ones. If a whole SOAP section has
-   nothing stated in the transcript, emit an EMPTY LIST [] for that section — the
-   note renders it as "Not addressed" for you. Do NOT put a "Not addressed" claim
-   object in the list, and do NOT fill an empty section with anything.
+   history, or diagnoses — not even plausible ones. Do NOT carry a modifier or
+   quantity — a dose, duration, supply length, frequency, or laterality
+   (left/right) — from one item to another: attach a detail to an item ONLY if the
+   clinician stated that detail FOR THAT item. If a detail was stated for some
+   items and an adjacent item was mentioned WITHOUT it, extract that item without
+   the detail — never carry it over. If a whole SOAP section has nothing stated in
+   the transcript, emit an EMPTY LIST [] for that section — the note renders it as
+   "Not addressed" for you. Do NOT put a "Not addressed" claim object in the list,
+   and do NOT fill an empty section with anything.
 
 6. IMPRESSION vs REASONING — put a clinical impression/diagnosis in "assessment"
    ONLY if the clinician actually STATED one (extract it as an atomic claim like
-   any other; never invent one). SEPARATELY, set "assessment_reasoning_stated" to
+   any other; never invent one). NEVER name a diagnosis the clinician did not
+   EXPLICITLY say, even when the findings are a textbook fit for one — low mood +
+   a high PHQ-9 + an SSRI plan does NOT let you write "major depressive disorder"
+   if the clinician never named it; a strongly-implied label is still an inference
+   and is forbidden. SEPARATELY, set "assessment_reasoning_stated" to
    true ONLY if the clinician VERBALIZED the clinical REASONING — the WHY, the
    "because" — behind the assessment. A stated conclusion is NOT reasoning: a bare
    impression with no stated why ("This is a viral URI", with no "because ...")
@@ -192,6 +201,22 @@ so YOU must prevent it):
     WRONG: {"claim":"Denies fever","source_spans":["S1"]}
     RIGHT: {"claim":"No fever","source_spans":["S1"]}
 - DO NOT invent a diagnosis, vital, name, or age the transcript never stated.
+- DO NOT carry a shared modifier to an item it was not stated for. Given
+    S1 "Refilled levothyroxine 0.5mg and metformin 500mg, each for a 90-day supply."
+    S2 "Atorvastatin was also renewed."
+    WRONG: {"claim":"Renewed atorvastatin for a 90-day supply","source_spans":["S1","S2"]}
+    RIGHT: {"claim":"Renewed atorvastatin","source_spans":["S2"]}
+    (the "90-day supply" was stated only for levothyroxine + metformin; because
+     "90" appears elsewhere in the cite the grounding check would pass the WRONG
+     claim CLEAN — only THIS rule stops it.)
+- DO NOT infer an unstated diagnosis, even a textbook-obvious one. Given
+    S1 "Low mood and poor sleep for a month; PHQ-9 is 12 today."
+    S2 "Start sertraline 50mg and follow up in four weeks." (clinician names NO diagnosis)
+    WRONG: {"claim":"Major depressive disorder","source_spans":["S1"]}
+    RIGHT: assessment stays [] — the clinician named no diagnosis (the findings +
+     the sertraline plan still go in subjective + plan as usual). This WRONG claim
+     has no number/negation to check, so the grounding pass would let it through
+     CLEAN — only THIS rule stops it.
 
 === WORKED EXAMPLE A (a complete note) ===
 Transcript:
