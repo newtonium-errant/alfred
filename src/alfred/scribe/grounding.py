@@ -1,10 +1,11 @@
 """Deterministic grounding-verify (scribe P2-c) — CODE, not an LLM.
 
-The anti-hallucination gate. Over the parsed :class:`~alfred.scribe.notegen.
-StructuredNote`, for EVERY claim it deterministically checks that the claim is
-grounded in the transcript segment(s) it cites — catching the small-model
-errors an extract-not-infer prompt cannot fully prevent (500mg→5mg dose flip,
-denies→reports negation flip, fabricated / uncited assertions).
+A strong NET for MECHANICAL flips — NOT semantic verification. Over the parsed
+:class:`~alfred.scribe.notegen.StructuredNote`, for EVERY claim it
+deterministically checks the claim against the transcript segment(s) it cites,
+catching the small-model MECHANICAL errors (dose/negation/citation flips) that
+an extract-not-infer prompt cannot fully prevent (500mg→5mg, denies→reports,
+uncited / fabricated-number assertions).
 
 Checks per claim (each failure ⇒ a flag):
   1. NO source_spans                 → ``ungrounded_assertion``.
@@ -13,22 +14,44 @@ Checks per claim (each failure ⇒ a flag):
   3. a NUMBER/DOSE token in the      → ``number_mismatch``   (FORWARD: a
      claim not present verbatim in       note-introduced/changed number is a
      the cited segment(s)                 fabrication; an OMITTED source number
-                                          is a legitimate summary, not flagged)
+                                          is a legitimate summary, not flagged.
+                                          Decimal-boundary-safe: 5mg never
+                                          matches 0.5mg / 2.5mg / 12.5mg.)
   4. the set of NEGATION tokens in   → ``negation_mismatch`` (BIDIRECTIONAL:
      the claim ≠ the set in the           BOTH a fabricated negation AND a
      cited segment(s)                      DROPPED one — the denies→reports flip
                                            — are dangerous; over-flagging is
                                            safe [flag-in-note, clinician
                                            confirms], under-flagging a dropped
-                                           negation is a patient-safety error)
+                                           negation is a patient-safety error.
+                                           SOUND ONLY under ATOMIC claims — see
+                                           the frozen contract in notegen.py:
+                                           one clinical finding per claim.)
+
+⚠️ NOT caught here — relies on the extract-not-infer PROMPT (prompt-tuner) +
+the human ATTEST. This gate verifies mechanical grounding, NOT meaning. An
+UNFLAGGED claim is NOT proof of grounding — a clinician's trust calibration
+depends on knowing these gaps:
+  (a) PURE QUALITATIVE fabrication — a claim with no numbers/negations cited to
+      a real segment (e.g. "history of MI" invented from a segment that never
+      says it) passes CLEAN, by design (no token to check).
+  (b) WRONG-SYMPTOM negation — "Denies SOB" cited to "denies chest pain": the
+      token ``denies`` matches on both sides, but the SYMPTOM is fabricated.
+  (c) ROS-LIST dropped negation — a non-atomic claim bundling a positive + a
+      negative can hide a flipped positive inside a matching negation set (why
+      the frozen contract REQUIRES atomic claims).
+  (d) COMPOSITE-number coincidence — "BP 120/80" whose digits happen to appear
+      as "Room 120, bed 80" in the cited segment passes CLEAN.
 
 FAILURE POLICY = FLAG-IN-NOTE (the draft still proceeds — it is an ai_draft and
 the clinician attest is the human gate):
-  * each flagged claim's ``grounding_flag`` is set to the frozen literal
-    ``notegen.GROUNDING_UNVERIFIED`` (rendered UNMISSABLE inline in the body);
   * every flag is recorded in :attr:`GroundingResult.metadata` — the
     ``grounding_flags`` frontmatter list — so ATTESTING a flagged draft is
-    AUDITABLE (the clinician sees exactly which claims + why).
+    AUDITABLE (the clinician sees exactly which claims + why);
+  * ``render_soap`` (notegen) REQUIRES a :class:`GroundingResult` and renders
+    each flag UNMISSABLE inline — so a note cannot be rendered without the
+    grounding result. (Airtight verify-BEFORE-render — a combined
+    generate→verify→render — is enforced structurally in the P2-d pipeline.)
 """
 
 from __future__ import annotations
@@ -93,6 +116,16 @@ class GroundingResult:
     def clean(self) -> bool:
         return not self.flags
 
+    def flag_for(self, section: str, index: int) -> str | None:
+        """Return the inline flag literal for the claim at
+        ``(section, index)``, or ``None`` if it is clean. The single source of
+        truth ``render_soap`` reads — no hidden mutation of the claim objects,
+        and render CANNOT run without a GroundingResult."""
+        for f in self.flags:
+            if f.section == section and f.claim_index == index:
+                return GROUNDING_UNVERIFIED
+        return None
+
 
 def _normalize(text: str) -> str:
     """Lowercase + glue ``<number> <space> <unit>`` → ``<number><unit>`` so a
@@ -116,9 +149,18 @@ def _number_tokens(text: str) -> list[str]:
 
 
 def _token_in(tok: str, norm_cited: str) -> bool:
-    """Word-bounded presence — ``5mg`` must not match ``500mg``; ``12`` must not
-    match ``120``."""
-    return re.search(r"\b" + re.escape(tok) + r"\b", norm_cited) is not None
+    """Numeric-boundary presence.
+
+    NOT ``\\b`` — ``\\b`` treats ``.`` as a word boundary, so ``\\b5mg\\b`` would
+    match the ``5mg`` INSIDE ``0.5mg`` (a 10x dose overstate passing CLEAN — the
+    exact flip class this gate exists for). A DIGIT-OR-DOT boundary rejects any
+    adjacent digit or decimal point: ``5mg`` never matches ``0.5mg`` / ``2.5mg``
+    / ``12.5mg`` / ``500mg``, while legit ``5mg`` / ``5 mg`` / a self-match /
+    the ``12`` vs ``12.5`` truncation still resolve correctly.
+    """
+    return re.search(
+        r"(?<![\d.])" + re.escape(tok) + r"(?![\d.])", norm_cited
+    ) is not None
 
 
 def _negation_set(text: str) -> set[str]:
@@ -130,8 +172,10 @@ def _cited_text(claim_spans, seg_by_id) -> str:
 
 
 def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResult:
-    """Deterministically verify grounding. MUTATES each flagged claim's
-    ``grounding_flag`` (for inline render) and returns the auditable result."""
+    """Deterministically verify grounding. Returns the auditable
+    :class:`GroundingResult` (no mutation of the claim objects — ``render_soap``
+    reads flags via ``GroundingResult.flag_for``, so a note can never be
+    rendered without the grounding result)."""
     seg_by_id = {s.id: s for s in transcript.segments}
     result = GroundingResult()
 
@@ -172,7 +216,6 @@ def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResul
             )
 
         if reasons:
-            claim.grounding_flag = GROUNDING_UNVERIFIED
             result.flags.append(
                 GroundingFlag(
                     section=section,

@@ -14,7 +14,7 @@ import os
 import pytest
 
 from alfred.scribe import load_from_unified
-from alfred.scribe.grounding import verify as verify_grounding
+from alfred.scribe.grounding import GroundingResult, verify as verify_grounding
 from alfred.scribe.notegen import (
     GROUNDING_UNVERIFIED,
     NOT_ADDRESSED,
@@ -53,7 +53,7 @@ def test_parse_and_render_soap_with_cites_and_literals():
         "assessment_reasoning_stated": False,  # → REASONING NOT STATED
     })
     s = parse_structured_json(canned)
-    body = render_soap(s, title="Encounter 1")
+    body = render_soap(s, title="Encounter 1", grounding=GroundingResult())
     assert "# Encounter 1" in body
     assert "- Chest pain for 2 days [S1]" in body
     # empty objective section → the ILB literal
@@ -68,8 +68,17 @@ def test_render_reasoning_stated_omits_literal():
         assessment=[{"claim": "Stable angina", "source_spans": ["S1"]}],
         assessment_reasoning_stated=True,
     )
-    body = render_soap(s, title="E")
+    body = render_soap(s, title="E", grounding=GroundingResult())
     assert REASONING_NOT_STATED not in body
+
+
+def test_render_requires_grounding_result_structural_guard():
+    # NOTE-2 cheap structural guard (P2-c): render_soap REQUIRES a
+    # GroundingResult — a note can never be rendered without a grounding pass.
+    # (Airtight verify-before-render is enforced in the P2-d pipeline.)
+    s = _structured(subjective=[{"claim": "x", "source_spans": ["S1"]}])
+    with pytest.raises(TypeError):
+        render_soap(s, title="E")  # missing required grounding= → TypeError
 
 
 def test_parse_unparseable_fails_loud():
@@ -81,6 +90,16 @@ def test_parse_strips_markdown_fence():
     fenced = "Sure:\n```json\n{\"subjective\": [], \"objective\": [], \"assessment\": [], \"plan\": [], \"assessment_reasoning_stated\": true}\n```\n"
     s = parse_structured_json(fenced)
     assert s.subjective == [] and s.assessment_reasoning_stated is True
+
+
+def test_frozen_contract_carries_atomic_claim_requirement():
+    # The atomic-claim requirement is LOAD-BEARING for the negation guard and is
+    # part of the FROZEN CONTRACT handed to prompt-tuner — pin it so it can't be
+    # silently dropped from the contract the prompt is authored against.
+    import alfred.scribe.notegen as ng
+    src = open(ng.__file__, encoding="utf-8").read()
+    assert "EXACTLY ONE clinical finding" in src        # the contract line
+    assert "atomic" in ng.SYSTEM_PROMPT_PLACEHOLDER.lower()  # the prompt instructs it
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +120,7 @@ def test_grounding_clean_note_zero_flags():
     r = verify_grounding(s, t)
     assert r.clean is True
     assert r.metadata == []
-    assert all(c.grounding_flag is None for _, _, c in s.all_claims())
+    assert all(r.flag_for(sec, i) is None for sec, i, _ in s.all_claims())
 
 
 def test_grounding_catches_dose_flip_500mg_5mg():
@@ -111,7 +130,35 @@ def test_grounding_catches_dose_flip_500mg_5mg():
     r = verify_grounding(s, t)
     assert not r.clean
     assert r.flags[0].reason == "number_mismatch"
-    assert s.plan[0].grounding_flag == GROUNDING_UNVERIFIED
+    assert r.flag_for("plan", 0) == GROUNDING_UNVERIFIED
+
+
+@pytest.mark.parametrize(
+    "truth, note_dose",
+    [
+        ("Digoxin 0.5mg daily.", "Digoxin 5mg"),      # 10x — \b would pass CLEAN
+        ("Colchicine 2.5mg.", "Colchicine 25mg"),      # decimal-boundary
+        ("Bumetanide 12.5mg.", "Bumetanide 12mg"),     # truncated decimal
+        ("Bumetanide 12mg.", "Bumetanide 12.5mg"),     # the reverse truncation
+    ],
+)
+def test_grounding_catches_decimal_dose_flip(truth, note_dose):
+    # THE decimal-boundary regression (mutation: revert _token_in to \b →
+    # 5mg matches inside 0.5mg → passes clean → this fails). No decimal test
+    # existed before this review — why the 10x hole shipped.
+    t = _transcript(truth)
+    s = _structured(plan=[{"claim": note_dose, "source_spans": ["S1"]}])
+    r = verify_grounding(s, t)
+    assert not r.clean, f"{note_dose!r} vs {truth!r} must FLAG"
+    assert r.flags[0].reason == "number_mismatch"
+
+
+@pytest.mark.parametrize("dose", ["Digoxin 0.5mg", "Colchicine 2.5mg", "Bumetanide 12.5mg"])
+def test_grounding_decimal_self_match_is_clean(dose):
+    # A correct decimal dose must NOT false-flag.
+    t = _transcript(f"{dose} daily.")
+    s = _structured(plan=[{"claim": dose, "source_spans": ["S1"]}])
+    assert verify_grounding(s, t).clean is True
 
 
 def test_grounding_catches_negation_flip_denies_reports():
@@ -171,9 +218,22 @@ def test_grounding_flags_recorded_in_metadata_auditable():
 def test_grounding_flag_rendered_inline_unmissable():
     t = _transcript("Amoxicillin 500mg.")
     s = _structured(plan=[{"claim": "Amoxicillin 5mg", "source_spans": ["S1"]}])
-    verify_grounding(s, t)
-    body = render_soap(s, title="E")
+    r = verify_grounding(s, t)
+    body = render_soap(s, title="E", grounding=r)
     assert f"- Amoxicillin 5mg [S1] {GROUNDING_UNVERIFIED}" in body
+
+
+def test_render_without_verify_shows_no_flags_documents_p2d_hole():
+    # The cheap guard requires a GroundingResult but does NOT force it to be
+    # VERIFIED — passing an EMPTY (unverified) result renders a would-be-flagged
+    # note CLEAN. This is the exact hole P2-d's combined generate→verify→render
+    # closes structurally; pinned here so the gap is explicit, not silent.
+    t = _transcript("Amoxicillin 500mg.")
+    s = _structured(plan=[{"claim": "Amoxicillin 5mg", "source_spans": ["S1"]}])
+    body = render_soap(s, title="E", grounding=GroundingResult())  # unverified
+    assert GROUNDING_UNVERIFIED not in body  # renders clean — the P2-d hole
+    # ... whereas verifying first flags it:
+    assert not verify_grounding(s, t).clean
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +307,6 @@ def test_real_qwen_end_to_end():
     )
     s = asyncio.run(generate_structured(t, config=cfg))
     r = verify_grounding(s, t)
-    body = render_soap(s, title="Integration encounter")
+    body = render_soap(s, title="Integration encounter", grounding=r)
     assert "## Subjective" in body and "## Plan" in body
     assert isinstance(r.metadata, list)

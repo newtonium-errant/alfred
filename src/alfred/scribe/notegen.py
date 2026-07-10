@@ -22,6 +22,13 @@ local Ollama client), shape:
     }
 
   * Four SOAP sections, each a LIST of claim objects ``{claim, source_spans}``.
+  * ATOMIC CLAIMS — each ``claim`` object states EXACTLY ONE clinical finding.
+    ⚠️ LOAD-BEARING: the deterministic NEGATION guard is only SOUND under atomic
+    claims. If the model bundles a positive + a negative into one claim string
+    ("Reports cough. Denies fever and SOB." cited to "denies fever, cough, SOB")
+    the negation set ``{denies}`` matches on both sides and the FLIPPED positive
+    passes UNFLAGGED (the ROS-list hole). Under one-finding-per-claim the guard
+    over-flags (safe). prompt-tuner MUST instruct qwen to emit atomic claims.
   * ``source_spans`` are transcript SEGMENT IDS — the ``[S#]`` citation format,
     matching ``transcript.make_segment_id`` (``S1``, ``S2``, ...). EVERY claim
     MUST cite the segment(s) it is grounded in; an uncited claim is flagged.
@@ -54,12 +61,15 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from alfred.scribe.config import ScribeConfig
 from alfred.scribe.transcript import Transcript
+
+if TYPE_CHECKING:  # annotation only — avoids a notegen↔grounding import cycle
+    from alfred.scribe.grounding import GroundingResult
 
 log = structlog.get_logger(__name__)
 
@@ -92,26 +102,48 @@ SYSTEM_PROMPT_PLACEHOLDER = (
     '"objective":[...],"assessment":[...],"plan":[...],'
     '"assessment_reasoning_stated":false}\n'
     "Every claim MUST cite the segment id(s) it came from in source_spans "
-    "(e.g. [\"S1\",\"S3\"]). If a section was not discussed, return an empty "
-    "list for it — NEVER invent content. Copy numbers, doses, and negations "
-    "VERBATIM from the segments. Set assessment_reasoning_stated true ONLY if "
-    "the clinician verbalized their reasoning; otherwise false. Output ONLY the "
-    "JSON object."
+    "(e.g. [\"S1\",\"S3\"]). Each claim states EXACTLY ONE finding (atomic) — do "
+    "NOT bundle a positive and a negative in one claim. If a section was not "
+    "discussed, return an empty list for it — NEVER invent content. Copy "
+    "numbers, doses, and negations VERBATIM from the segments. Set "
+    "assessment_reasoning_stated true ONLY if the clinician verbalized their "
+    "reasoning; otherwise false. Output ONLY the JSON object."
 )
 
 
+# Diagnostic tail length — the model output is derived from the PHI transcript.
+# Kept SHORT (a bad-JSON diagnosis rarely needs more than the trailing fragment).
+_DIAG_TAIL_CHARS = 120
+
+
+def _diag_tail(text: str) -> str:
+    """A short diagnostic tail of the model output for a parse-failure message.
+
+    ⚠️ PHI: this fragment is DERIVED FROM THE PHI TRANSCRIPT. It is SAFE ONLY
+    because the sovereign scribe slot is LOCAL-ONLY (the P1-a barrier-(d)
+    allowlist forbids ``transport`` — no egress path exists). A future transport
+    add MUST NOT route ``NoteGenError`` (or any note-gen output) to an
+    egressible sink — keep note-gen diagnostics on the local box.
+    """
+    return text[-_DIAG_TAIL_CHARS:]
+
+
 class NoteGenError(Exception):
-    """Note-gen failed — unparseable model output. Fail-loud, never fabricate."""
+    """Note-gen failed — unparseable model output. Fail-loud, never fabricate.
+
+    The message embeds a SHORT local-only diagnostic tail (see ``_diag_tail`` —
+    PHI-derived, safe only on the transport-less sovereign box)."""
 
 
 @dataclass
 class Claim:
-    """One SOAP claim + its segment citations. ``grounding_flag`` is set by the
-    deterministic grounding pass (``scribe.grounding``), never by the model."""
+    """One SOAP claim + its segment citations. Per the frozen contract each
+    claim states EXACTLY ONE clinical finding (atomic) — the deterministic
+    negation guard is only sound under atomic claims. Grounding flags live in
+    the :class:`~alfred.scribe.grounding.GroundingResult`, NOT on the claim."""
 
     claim: str
     source_spans: list[str] = field(default_factory=list)
-    grounding_flag: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Claim":
@@ -184,7 +216,7 @@ def _extract_json_object(text: str) -> str:
     end = candidate.rfind("}")
     if start == -1 or end == -1 or end < start:
         raise NoteGenError(
-            f"note-gen output has no JSON object; tail={text[-200:]!r}"
+            f"note-gen output has no JSON object; tail={_diag_tail(text)!r}"
         )
     return candidate[start : end + 1]
 
@@ -197,7 +229,7 @@ def parse_structured_json(text: str) -> StructuredNote:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         raise NoteGenError(
-            f"note-gen returned unparseable JSON: {e}; tail={text[-200:]!r}"
+            f"note-gen returned unparseable JSON: {e}; tail={_diag_tail(text)!r}"
         ) from e
     if not isinstance(data, dict):
         raise NoteGenError(f"note-gen JSON is not an object: {type(data).__name__}")
@@ -206,10 +238,20 @@ def parse_structured_json(text: str) -> StructuredNote:
 
 # --- render (faithful; flags inline) ----------------------------------------
 
-def render_soap(structured: StructuredNote, *, title: str) -> str:
+def render_soap(
+    structured: StructuredNote, *, title: str, grounding: "GroundingResult",
+) -> str:
     """Render the structured note to a SOAP markdown body. Emits ``[S#]`` cites,
-    the ``Not addressed`` / ``REASONING NOT STATED`` literals, and any per-claim
-    ``grounding_flag`` inline (set by ``scribe.grounding.verify`` beforehand).
+    the ``Not addressed`` / ``REASONING NOT STATED`` literals, and each claim's
+    ``GROUNDING_UNVERIFIED`` flag inline.
+
+    ``grounding`` is REQUIRED — a note can NEVER be rendered without a
+    :class:`~alfred.scribe.grounding.GroundingResult`, closing the "render
+    without verify ⇒ clean-looking flagged draft" hole. The flags are read from
+    the grounding result (``flag_for``), NOT from a mutated claim field — a
+    single source of truth. (The AIRTIGHT verify-BEFORE-render — a combined
+    generate→verify→render — is enforced structurally in the P2-d pipeline; this
+    required param is the cheap structural nudge at this layer.)
 
     Renders FAITHFULLY — never adds, drops, or edits a claim.
     """
@@ -220,9 +262,10 @@ def render_soap(structured: StructuredNote, *, title: str) -> str:
         if not claims:
             out.append(NOT_ADDRESSED)
         else:
-            for c in claims:
+            for i, c in enumerate(claims):
                 cites = f" [{', '.join(c.source_spans)}]" if c.source_spans else ""
-                flag = f" {c.grounding_flag}" if c.grounding_flag else ""
+                flag_lit = grounding.flag_for(sec, i)
+                flag = f" {flag_lit}" if flag_lit else ""
                 out.append(f"- {c.claim}{cites}{flag}")
             if sec == "assessment" and not structured.assessment_reasoning_stated:
                 out.append(REASONING_NOT_STATED)
