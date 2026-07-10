@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import frontmatter
 import pytest
@@ -220,6 +221,111 @@ def test_context_budget_exceeded_log_fields(tmp_path, monkeypatch):
     assert e["source_id"] == "enc-budget" and e["segment_count"] == 200
     assert e["num_ctx"] == 8192 and e["est_tokens"] > e["budget"]
     assert fake["calls"] == 0   # the guard fired BEFORE the LLM call
+
+
+# ---------------------------------------------------------------------------
+# 2b. AUTHORITATIVE post-call truncation guard (Ollama's real prompt_eval_count)
+# ---------------------------------------------------------------------------
+
+def _fake_ollama_with_pec(canned, prompt_eval_count):
+    async def _fake(prompt, system=None, model="", endpoint="", **kw):
+        return (canned, {"stop_reason": "stop", "prompt_eval_count": prompt_eval_count})
+    return _fake
+
+
+def test_post_call_truncation_raises_context_budget(monkeypatch):
+    # A SMALL transcript CLEARS the pre-flight estimate, but Ollama reports a
+    # prompt_eval_count at the truncation ceiling → the prompt was TRUNCATED →
+    # ContextBudgetExceeded (the AUTHORITATIVE guard, using the model's real
+    # tokenizer count, not an estimate).
+    from alfred.scribe.notegen import generate_structured, _PROMPT_TRUNCATION_CEILING
+    monkeypatch.setattr(ollama_mod, "call_ollama_no_tools",
+                        _fake_ollama_with_pec(_CANNED_CITES_S1, _PROMPT_TRUNCATION_CEILING))
+    t = Transcript(source_id="enc-trunc", mode="synthetic",
+                   segments=[Segment(id="S1", start_s=0.0, end_s=5.0, text="chest pain")])
+    with pytest.raises(ContextBudgetExceeded):
+        asyncio.run(generate_structured(t, config=_config()))
+
+
+def test_post_call_within_ceiling_is_accepted(monkeypatch):
+    from alfred.scribe.notegen import generate_structured, _PROMPT_TRUNCATION_CEILING
+    monkeypatch.setattr(ollama_mod, "call_ollama_no_tools",
+                        _fake_ollama_with_pec(_CANNED_CITES_S1, _PROMPT_TRUNCATION_CEILING - 1))
+    t = Transcript(source_id="enc-ok", mode="synthetic",
+                   segments=[Segment(id="S1", start_s=0.0, end_s=5.0, text="chest pain")])
+    s = asyncio.run(generate_structured(t, config=_config()))   # no raise — fit
+    assert s.subjective[0].claim == "Reports chest pain"
+
+
+def test_post_call_truncation_log_fields(monkeypatch):
+    from alfred.scribe.notegen import generate_structured, _PROMPT_TRUNCATION_CEILING
+    monkeypatch.setattr(ollama_mod, "call_ollama_no_tools",
+                        _fake_ollama_with_pec(_CANNED_CITES_S1, 9000))
+    t = Transcript(source_id="enc-trunc2", mode="synthetic",
+                   segments=[Segment(id="S1", start_s=0.0, end_s=5.0, text="chest pain")])
+    with structlog.testing.capture_logs() as caps:
+        with pytest.raises(ContextBudgetExceeded):
+            asyncio.run(generate_structured(t, config=_config()))
+    ev = [c for c in caps if c.get("event") == "scribe.notegen.prompt_truncated"]
+    assert len(ev) == 1 and ev[0]["prompt_eval_count"] == 9000        # obs pin (#9)
+    assert ev[0]["source_id"] == "enc-trunc2"
+    assert ev[0]["ceiling"] == _PROMPT_TRUNCATION_CEILING
+
+
+def test_post_call_truncation_preserves_draft_at_checkpoint(tmp_path, monkeypatch):
+    # THE crown post-call MUTATION-BIND at the checkpoint level: checkpoint 1
+    # drafts (pec in-range); on checkpoint 2 Ollama reports a TRUNCATED prompt →
+    # the note is REFUSED (budget_capped), the last-good draft stays. Remove the
+    # post-call check → checkpoint 2 body_replaces with the truncated-prompt note
+    # → draft changes + state=drafted → RED.
+    from alfred.scribe.notegen import _PROMPT_TRUNCATION_CEILING
+    pec = {"v": 1000}
+
+    async def _fake(prompt, system=None, model="", endpoint="", **kw):
+        return (_CANNED_CITES_S1, {"stop_reason": "stop", "prompt_eval_count": pec["v"]})
+    monkeypatch.setattr(ollama_mod, "call_ollama_no_tools", _fake)
+
+    enc = tmp_path / "inbox" / "enc-T"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    r, _ = _checkpoint(enc, config=_config(), state=state, vault=vault)
+    eid = r.encounter_id
+    good_path = state.get(eid).note_path
+    good_body = vault_read(vault, good_path)["body"]
+
+    # Ollama now reports a TRUNCATED prompt on the regen.
+    pec["v"] = _PROMPT_TRUNCATION_CEILING + 5
+    _write_chunk(enc, 2, ["Follow-up in one week."])
+    r2, outcome = _checkpoint(enc, config=_config(), state=state, vault=vault)
+
+    assert outcome == "budget_capped"
+    assert state.get(eid).state == STATE_BUDGET_CAPPED
+    assert vault_read(vault, good_path)["body"] == good_body      # last-good draft INTACT
+
+
+@pytest.mark.skipif(
+    not os.environ.get("ALFRED_SCRIBE_QWEN_IT"),
+    reason="real-qwen integration — set ALFRED_SCRIBE_QWEN_IT=1 with a running Ollama + qwen2.5-14b",
+)
+def test_real_qwen_post_call_truncation_empirical(monkeypatch):
+    # EMPIRICAL verification (runs ONLY on the box): with the pre-flight estimate
+    # bypassed, a real transcript LARGER than num_ctx reaches qwen; Ollama's REAL
+    # prompt_eval_count trips the post-call ceiling → ContextBudgetExceeded. This
+    # confirms Ollama's actual over-context behavior + the ceiling threshold.
+    import alfred.scribe.notegen as ng
+    monkeypatch.setattr(ng, "_estimate_tokens", lambda _t: 0)   # bypass the pre-flight hint
+    segs = [Segment(id=f"S{i+1}", start_s=i * 5.0, end_s=i * 5.0 + 5,
+                    text=f"BP 120/80 HR 72 temp 37.{i % 10} patient reports symptom {i}")
+            for i in range(4000)]   # ~10x num_ctx worth of real tokens
+    t = Transcript(source_id="enc-real-oversized", mode="synthetic", segments=segs)
+    cfg = load_from_unified({"scribe": {
+        "mode": "synthetic", "encounter_salt": _SALT,
+        "stt": {"provider": "fake"},
+        "llm": {"base_url": "http://127.0.0.1:11434", "model": "qwen2.5:14b-instruct-q4_K_M"},
+    }})
+    with pytest.raises(ContextBudgetExceeded):
+        asyncio.run(ng.generate_structured(t, config=cfg))
 
 
 # ---------------------------------------------------------------------------

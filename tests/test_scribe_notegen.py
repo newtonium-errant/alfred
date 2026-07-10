@@ -19,6 +19,7 @@ from alfred.scribe.notegen import (
     GROUNDING_UNVERIFIED,
     NOT_ADDRESSED,
     REASONING_NOT_STATED,
+    ContextBudgetExceeded,
     NoteGenError,
     StructuredNote,
     generate_structured,
@@ -482,3 +483,57 @@ def test_generate_structured_hits_native_api_chat_with_num_ctx(monkeypatch):
     assert captured["path"] == "/api/chat"                 # NATIVE endpoint (honors num_ctx)
     assert captured["payload"]["options"]["num_ctx"] >= 8192
     assert captured["payload"]["options"]["temperature"] == 0
+
+
+# ---------------------------------------------------------------------------
+# P3-b2 — the native /api/chat path surfaces Ollama's real prompt_eval_count,
+# and the POST-CALL truncation guard fires end-to-end (REAL response-parse path,
+# not a mock of call_ollama_no_tools).
+# ---------------------------------------------------------------------------
+
+def _native_chat_transport(monkeypatch, *, prompt_eval_count):
+    import httpx
+    import alfred.distiller.backends.ollama as ollama_mod
+
+    def _dispatch(req):
+        return httpx.Response(200, json={
+            "model": "qwen2.5:14b-instruct-q4_K_M",
+            "message": {"role": "assistant", "content": json.dumps({
+                "subjective": [{"claim": "Chest pain", "source_spans": ["S1"]}],
+                "objective": [], "assessment": [], "plan": [],
+                "assessment_reasoning_stated": False,
+            })},
+            "done_reason": "stop", "done": True,
+            "prompt_eval_count": prompt_eval_count,
+        })
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        ollama_mod.httpx, "AsyncClient",
+        lambda *a, **k: real(transport=httpx.MockTransport(_dispatch), timeout=k.get("timeout")),
+    )
+
+
+def _cfg():
+    return load_from_unified({"scribe": {
+        "mode": "synthetic",
+        "stt": {"provider": "fake"},
+        "llm": {"base_url": "http://127.0.0.1:11434", "model": "qwen2.5:14b-instruct-q4_K_M"},
+    }})
+
+
+def test_native_chat_prompt_eval_under_ceiling_accepted(monkeypatch):
+    from alfred.scribe.notegen import _PROMPT_TRUNCATION_CEILING
+    _native_chat_transport(monkeypatch, prompt_eval_count=_PROMPT_TRUNCATION_CEILING - 1)
+    s = asyncio.run(generate_structured(_transcript("Patient reports chest pain."), config=_cfg()))
+    assert s.subjective[0].claim == "Chest pain"          # fit → accepted
+
+
+def test_native_chat_prompt_eval_at_ceiling_refused(monkeypatch):
+    # The REAL native-parse path surfaces prompt_eval_count into metadata, and the
+    # post-call guard refuses a truncated-prompt note (proves the ollama.py
+    # metadata surfacing works end-to-end, not just a mocked call).
+    from alfred.scribe.notegen import _PROMPT_TRUNCATION_CEILING
+    _native_chat_transport(monkeypatch, prompt_eval_count=_PROMPT_TRUNCATION_CEILING)
+    with pytest.raises(ContextBudgetExceeded):
+        asyncio.run(generate_structured(_transcript("Patient reports chest pain."), config=_cfg()))

@@ -102,28 +102,50 @@ _DEFAULT_ENDPOINT = "http://127.0.0.1:11434"
 #     the reserved output window is a KNOWN quantity the context-budget guard
 #     can subtract — an unbounded num_predict lets a long generation collide
 #     with the prompt inside num_ctx.
-_NOTEGEN_OLLAMA_OPTIONS: dict = {"num_ctx": 8192, "temperature": 0, "num_predict": 2048}
+_NUM_CTX = 8192
+_NUM_PREDICT = 2048             # reserved generation window (single source of truth)
+_NOTEGEN_OLLAMA_OPTIONS: dict = {
+    "num_ctx": _NUM_CTX, "temperature": 0, "num_predict": _NUM_PREDICT,
+}
 
 # --- context-budget guard (scribe P3-b2, full-regen fail-loud cap) -----------
 # The checkpoint co-pilot re-generates the note from the FULL accumulated
 # transcript each checkpoint. A long encounter can grow past what fits in
 # num_ctx alongside the system prompt + the reserved output window. A silent
 # overflow makes Ollama TRUNCATE the prompt → earlier segments' findings vanish
-# from the regen → a note that looks complete but dropped content. The operator
-# chose FAIL-LOUD over silent truncation: estimate the prompt size BEFORE the
-# call and, if it will not fit, REFUSE (raise) so the last-good draft stays.
+# from the regen → a note that looks complete but dropped content. FAIL-LOUD
+# over silent truncation, via TWO guards:
 #
-# Estimator is deliberately CONSERVATIVE (over-estimates tokens → fails early
-# rather than late): ~3.5 chars/token. The rendered prompt string already
-# includes each segment's ``S## [x-y s]: `` header, so counting its characters
-# captures the per-segment header overhead without a separate per-segment add.
-_CHARS_PER_TOKEN = 3.5
-_OUTPUT_RESERVE_TOKENS = 2048   # == num_predict — the reserved generation window
+#   (1) PRE-FLIGHT ESTIMATE — a cheap EFFICIENCY HINT that skips the ~35s
+#       generation for obviously-over cases. NOT the safety guarantee: no
+#       chars/token rate is provably conservative for BOTH digit/header-dense
+#       clinical text (vitals/doses ~2.0-2.2 chars/tok, headers ~1.5-2.0) AND
+#       prose. So it is tuned CONSERVATIVE — a LOW chars/token AND a fixed
+#       per-segment header surcharge (the ``S## [x-y s]:`` header format is
+#       fixed; bound it high). Over-firing here is fail-SAFE: it skips a
+#       checkpoint update (keeps the last-good draft), never accepts a bad note.
+#   (2) AUTHORITATIVE POST-CALL CHECK (in generate_structured) — Ollama's OWN
+#       ``prompt_eval_count`` (its real tokenizer's count of the prompt it
+#       processed). If it hit the context ceiling the prompt was TRUNCATED →
+#       refuse the note. This is the PROVABLY-correct safety net; the estimate
+#       above is only a hint.
+_CHARS_PER_TOKEN = 2.5          # low (over-estimating) rate — first-line hint only
+_HEADER_TOKENS_PER_SEGMENT = 8  # fixed surcharge/seg for the dense ``S## [x-y s]:`` header
 _BUDGET_SAFETY_MARGIN = 512     # slack for tokenizer variance vs the char estimate
+# A prompt Ollama evaluated at/above this many tokens did NOT safely fit
+# alongside the reserved output window → treat as TRUNCATED (fail-closed). Set
+# to the LOWER of the two clamp points Ollama might use (num_ctx vs
+# num_ctx−num_predict) so it catches EITHER truncation behavior; the exact
+# behavior is confirmed/tuned against the real box via the
+# ``ALFRED_SCRIBE_QWEN_IT`` integration test (Ollama unreachable in CI).
+_PROMPT_TRUNCATION_CEILING = _NUM_CTX - _NUM_PREDICT
 
 
 def _estimate_tokens(text: str) -> int:
-    """Conservative (over-estimating) token count for ``text`` — ceil(chars/3.5)."""
+    """Conservative (over-estimating) token count for ``text`` — ceil(chars/2.5).
+
+    A first-line efficiency HINT only; the authoritative guard is the post-call
+    ``prompt_eval_count`` check (Ollama's real tokenizer)."""
     return math.ceil(len(text) / _CHARS_PER_TOKEN)
 
 # The clinical extract-not-infer system prompt (scribe P2-c). Authored to the
@@ -470,14 +492,19 @@ async def generate_structured(
     endpoint = (config.llm.base_url or "").strip() or _DEFAULT_ENDPOINT
     model = (config.llm.model or "").strip() or _DEFAULT_MODEL
 
-    # PRE-FLIGHT CONTEXT-BUDGET GUARD (scribe P3-b2) — fire BEFORE the Ollama
-    # call so a silently-truncated regen never reaches the draft. The system
-    # prompt is measured DYNAMICALLY (never a hardcoded token count that drifts
-    # when the prompt is edited).
-    num_ctx = int(_NOTEGEN_OLLAMA_OPTIONS.get("num_ctx", 8192))
+    # (1) PRE-FLIGHT ESTIMATE (efficiency HINT) — skip the ~35s generation for
+    # obviously-over cases. Conservative: LOW chars/token + a fixed per-segment
+    # header surcharge (headers are dense). The system prompt is measured
+    # DYNAMICALLY (never a hardcoded count that drifts when the prompt is edited).
+    # Over-firing here is fail-SAFE (skips this checkpoint, keeps the last-good
+    # draft). The AUTHORITATIVE guard is the post-call ``prompt_eval_count`` check.
+    num_ctx = int(_NOTEGEN_OLLAMA_OPTIONS.get("num_ctx", _NUM_CTX))
     sys_tokens = _estimate_tokens(SYSTEM_PROMPT)
-    prompt_tokens = _estimate_tokens(prompt)
-    budget = num_ctx - sys_tokens - _OUTPUT_RESERVE_TOKENS - _BUDGET_SAFETY_MARGIN
+    prompt_tokens = (
+        _estimate_tokens(prompt)
+        + _HEADER_TOKENS_PER_SEGMENT * len(transcript.segments)
+    )
+    budget = num_ctx - sys_tokens - _NUM_PREDICT - _BUDGET_SAFETY_MARGIN
     if prompt_tokens > budget:
         log.warning(
             "scribe.notegen.context_budget_exceeded",
@@ -488,15 +515,15 @@ async def generate_structured(
             segment_count=len(transcript.segments),
         )
         raise ContextBudgetExceeded(
-            f"note-gen prompt (~{prompt_tokens} tok, "
+            f"note-gen prompt (~{prompt_tokens} est tok, "
             f"{len(transcript.segments)} segments) exceeds the context budget "
             f"({budget} tok = num_ctx {num_ctx} − system {sys_tokens} − output "
-            f"{_OUTPUT_RESERVE_TOKENS} − margin {_BUDGET_SAFETY_MARGIN}). "
-            f"Refusing to regen — a truncated regen would silently drop earlier "
-            f"segments' findings; the last-good draft stays intact."
+            f"{_NUM_PREDICT} − margin {_BUDGET_SAFETY_MARGIN}) on the pre-flight "
+            f"estimate. Refusing to regen — a truncated regen would silently drop "
+            f"earlier segments' findings; the last-good draft stays intact."
         )
 
-    text, _meta = await call_ollama_no_tools(
+    text, meta = await call_ollama_no_tools(
         prompt,
         system=SYSTEM_PROMPT,
         model=model,
@@ -505,6 +532,35 @@ async def generate_structured(
         # (the OpenAI-compat path silently truncates at num_ctx=2048).
         options=_NOTEGEN_OLLAMA_OPTIONS,
     )
+
+    # (2) AUTHORITATIVE POST-CALL TRUNCATION CHECK — Ollama's own
+    # ``prompt_eval_count`` is the EXACT number of prompt tokens its real
+    # tokenizer processed. If it reached the context ceiling the prompt was
+    # TRUNCATED (Ollama drops the oldest tokens → earlier segments' findings
+    # vanish), so the note was generated from an INCOMPLETE transcript → REFUSE
+    # it (never accept a note from a truncated prompt). Fires the same fail-loud
+    # path as the pre-flight (checkpoint → budget_capped, last-good draft kept).
+    # Provably conservative: it uses the model's real count, not an estimate.
+    prompt_eval = meta.get("prompt_eval_count") if isinstance(meta, dict) else None
+    if isinstance(prompt_eval, int) and prompt_eval >= _PROMPT_TRUNCATION_CEILING:
+        log.warning(
+            "scribe.notegen.prompt_truncated",
+            source_id=transcript.source_id,          # opaque encounter id (NOTE-4)
+            prompt_eval_count=prompt_eval,
+            ceiling=_PROMPT_TRUNCATION_CEILING,
+            num_ctx=num_ctx,
+            num_predict=_NUM_PREDICT,
+            segment_count=len(transcript.segments),
+        )
+        raise ContextBudgetExceeded(
+            f"Ollama evaluated {prompt_eval} prompt tokens (>= the truncation "
+            f"ceiling {_PROMPT_TRUNCATION_CEILING} = num_ctx {num_ctx} − "
+            f"num_predict {_NUM_PREDICT}) — the prompt was TRUNCATED (earlier "
+            f"segments dropped). Refusing the note; the last-good draft stays "
+            f"intact. AUTHORITATIVE guard (Ollama's real tokenizer, not an "
+            f"estimate)."
+        )
+
     structured = parse_structured_json(text)
     log.info(
         "scribe.notegen.structured",

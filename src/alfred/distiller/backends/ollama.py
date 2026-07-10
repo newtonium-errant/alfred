@@ -181,6 +181,19 @@ async def call_ollama_no_tools(
         text, finish_reason = _extract_first_choice(data)
     metadata: dict = {"stop_reason": finish_reason}
 
+    # Surface the NATIVE /api/chat token accounting (scribe P3-b2). Ollama's own
+    # tokenizer count of the prompt it ACTUALLY processed — the authoritative
+    # context-truncation signal the sovereign scribe uses to refuse a note built
+    # from a truncated prompt. ADDITIVE to the metadata dict; existing callers
+    # (the distiller) read only ``stop_reason`` and are unaffected.
+    if options is not None and isinstance(data, dict):
+        pec = data.get("prompt_eval_count")
+        if isinstance(pec, int):
+            metadata["prompt_eval_count"] = pec
+        ec = data.get("eval_count")
+        if isinstance(ec, int):
+            metadata["eval_count"] = ec
+
     if not text:
         # Per ``feedback_intentionally_left_blank.md``: explicit
         # "ran, nothing to do" log. Empty response is unusual but
