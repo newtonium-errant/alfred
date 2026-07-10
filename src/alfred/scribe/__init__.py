@@ -29,6 +29,14 @@ from .config import (
 )
 from .attest import ATTEST_SCOPE, attest, source_id_for
 from .ingest import ScribeIngestRefused, guard_ingest
+from .stt import (
+    SCRIBE_STT_PROVIDERS,
+    MissingSTTDependency,
+    STTError,
+    ensure_backend_available,
+    transcribe,
+)
+from .transcript import Segment, Transcript, make_segment_id
 
 __all__ = [
     # config
@@ -54,4 +62,13 @@ __all__ = [
     "attest",
     "source_id_for",
     "ATTEST_SCOPE",
+    # STT + transcript (P2-b)
+    "transcribe",
+    "ensure_backend_available",
+    "SCRIBE_STT_PROVIDERS",
+    "MissingSTTDependency",
+    "STTError",
+    "Transcript",
+    "Segment",
+    "make_segment_id",
 ]

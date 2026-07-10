@@ -429,6 +429,7 @@ def _run_scribe(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
     from alfred.brief.utils import setup_logging
     setup_logging(level=log_cfg.get("level", "INFO"), log_file=log_file, suppress_stdout=suppress_stdout, **_rotation_kwargs(log_cfg))
     from alfred.scribe.daemon import run as scribe_run
+    from alfred.scribe.stt import MissingSTTDependency
     from alfred.sovereign import SovereignBoundaryError
     try:
         asyncio.run(scribe_run(raw, suppress_stdout=suppress_stdout))
@@ -441,6 +442,16 @@ def _run_scribe(raw: dict[str, Any], suppress_stdout: bool = False) -> None:
             exit_code=_SOVEREIGN_BREACH_EXIT,
         )
         sys.exit(_SOVEREIGN_BREACH_EXIT)
+    except MissingSTTDependency as e:
+        # Real-model STT provider configured but the [scribe] extra is missing.
+        # Exit 78 (missing deps, no-restart) — mirrors surveyor's ML-deps path.
+        import structlog
+        structlog.get_logger(__name__).error(
+            "scribe.daemon.missing_stt_dependency",
+            detail=str(e),
+            exit_code=_MISSING_DEPS_EXIT,
+        )
+        sys.exit(_MISSING_DEPS_EXIT)
 
 
 def _run_mail_webhook(raw: dict[str, Any], suppress_stdout: bool = False) -> None:

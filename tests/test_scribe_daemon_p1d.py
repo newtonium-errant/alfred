@@ -16,7 +16,7 @@ import pytest
 import structlog
 import yaml
 
-from alfred.orchestrator import _SOVEREIGN_BREACH_EXIT, _run_scribe
+from alfred.orchestrator import _MISSING_DEPS_EXIT, _SOVEREIGN_BREACH_EXIT, _run_scribe
 from alfred.scribe import SCRIBE_MODE_SYNTHETIC, load_from_unified
 from alfred.scribe.daemon import startup
 from alfred.sovereign import (
@@ -35,12 +35,16 @@ _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.stayc-clinical.yaml
 
 
 def _sovereign_raw(**overrides):
+    # provider=fake so the boot tests need no [scribe] extra — startup() now
+    # runs ensure_backend_available (P2-b), and the fake backend needs no dep.
+    # (The barrier-a allowlist still admits fake; faster-whisper is exercised
+    # separately in test_scribe_stt.py.)
     raw = {
         "instance": {"name": "STAY-C"},
         "sovereign": {"enabled": True},
         "scribe": {
             "mode": "synthetic",
-            "stt": {"provider": "faster-whisper"},
+            "stt": {"provider": "fake"},
             "llm": {"base_url": "http://127.0.0.1:11434"},
         },
         "logging": {"dir": "./data"},
@@ -118,6 +122,26 @@ def test_runner_exits_79_on_cloud_key_breach(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         _run_scribe(raw, suppress_stdout=False)
     assert exc.value.code == _SOVEREIGN_BREACH_EXIT == 79
+
+
+def test_runner_exits_78_when_stt_extra_missing(tmp_path, monkeypatch):
+    # scribe P2-b: a real-model STT provider (faster-whisper) configured while
+    # the [scribe] extra is missing => the daemon exits 78 (missing deps,
+    # no-restart) rather than boot a scribe that cannot transcribe. Deterministic
+    # regardless of install state: force faster-whisper "unavailable".
+    import alfred.scribe.stt as stt_mod
+    monkeypatch.setattr(stt_mod, "_faster_whisper_available", lambda: False)
+    raw = _sovereign_raw(
+        logging={"dir": str(tmp_path)},
+        scribe={
+            "mode": "synthetic",
+            "stt": {"provider": "faster-whisper"},
+            "llm": {"base_url": "http://127.0.0.1:11434"},
+        },
+    )
+    with pytest.raises(SystemExit) as exc:
+        _run_scribe(raw, suppress_stdout=False)
+    assert exc.value.code == _MISSING_DEPS_EXIT == 78
 
 
 # ---------------------------------------------------------------------------

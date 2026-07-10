@@ -26,6 +26,16 @@ dependencies = [
 
 [project.optional-dependencies]
 temporal = ["temporalio>=1.9.0"]
+# STAY-C sovereign scribe local STT (scribe P2-b). faster-whisper runs
+# distil-large-v3 on CPU via CTranslate2 (TORCH-FREE); P0b measured RTF 0.10 /
+# WER 2.6% on the target box. Pulls ctranslate2 + onnxruntime (VAD) +
+# tokenizers + av — all wheels, no torch. The scribe daemon exits 78 (missing
+# deps, no-restart) if this extra isn't installed AND the configured
+# stt.provider is a real-model provider (faster-whisper / local-whisper); the
+# ``fake`` provider needs no dep (CI + the unconditional fake-backend coverage).
+scribe = [
+    "faster-whisper>=1.0",
+]
 surveyor = [
     # PINNED 2026-06-25: >=2.4 let the box's fresh install grab pymilvus 3.0 /
     # milvus-lite 3.0 (directory-based), which cannot open the existing 2.5.1
@@ -123,6 +133,7 @@ all = [
     "alfred-vault[voice]",
     "alfred-vault[webrtc]",
     "alfred-vault[gcal]",
+    "alfred-vault[scribe]",
 ]
 
 [project.urls]

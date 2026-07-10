@@ -77,6 +77,14 @@ def startup(
     # (c) self-install the per-call HTTP guard in THIS process (real coverage).
     install_sovereign_http_guard()
 
+    # (c.1) STT backend availability (scribe P2-b). A real-model provider
+    # (faster-whisper / local-whisper) needs the [scribe] extra; if it's
+    # missing, raise MissingSTTDependency → the runner exits 78 (missing deps,
+    # no-restart) rather than boot a scribe that cannot transcribe. The ``fake``
+    # provider needs no dep and passes.
+    from alfred.scribe.stt import ensure_backend_available
+    ensure_backend_available(config)
+
     # (d) ILB up signal.
     log.info(
         "scribe.daemon.up",
