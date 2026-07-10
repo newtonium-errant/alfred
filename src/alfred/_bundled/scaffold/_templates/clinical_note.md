@@ -11,7 +11,7 @@ synthetic: true # PROVENANCE / the mode line — true = synthetic input (fail-cl
 attested_by: null # clinician identity that reviewed + signed the note; null while ai_draft
 attested_at: null # ISO timestamp of attestation; null while ai_draft
 # --- Retain-the-diff (anti-spoliation) ---
-draft_original: null # anti-spoliation retain-the-diff: the AI's FINAL pre-attestation draft body — with an evolving ai_draft the meaningful snapshot is the LAST checkpoint before the clinician signs (captured at ATTEST time, NOT first-draft), preserved beside the signed version so the machine's un-edited work is never lost and the attest-diff shows exactly what the clinician changed. Capture point is the attest path; stays null until that write is wired (see P3-b attest-semantics).
+draft_original: null # anti-spoliation retain-the-diff: the AI's un-edited draft body, written by the PIPELINE (a frontmatter field — NOT the body, so it never perturbs the clobber-detect body-sha) on every checkpoint while status==ai_draft, always set to the pipeline's latest generated body (== body at create; a DRAFT_EDIT_FIELD alongside grounding_flags in STAYC_CLINICAL_DRAFT_EDIT_FIELDS, pipeline-writable ONLY while ai_draft). If the clinician hand-edits the body, clobber-detect freezes auto-evolution so this stays = the pipeline's LAST generated body (the machine's un-edited final work). Sealed with the note at attest → the attest-diff of the signed body vs draft_original shows exactly what the clinician changed. (NOT captured-at-attest, NOT null-until-wired — wired in P3-b3.)
 tags: []
 ---
 
