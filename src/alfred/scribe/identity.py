@@ -23,6 +23,16 @@ config load stays tolerant for non-scribe instances.
 
 The salt is SECRET: it is an input to this function only and is NEVER returned,
 logged, vaulted, or audited.
+
+IDENTITY SHIFT, P2 → P3 (LOAD-BEARING CONVENTION). P2 clinical mode identified a
+source by an AUDIO-CONTENT hash (``sha256(bytes)``); P3 identifies by a LABEL
+hash — the encounter's subdir name, or a legacy flat file's basename. Content-
+hashing cannot work for the checkpoint accumulator (each chunk has different
+bytes, but all chunks of one encounter must share ONE id), so the id is
+label-based and stable across an encounter's chunks. Consequence: two DIFFERENT-
+content flat files with the SAME name now collide to one encounter_id. The
+operator's UNIQUE-LABEL convention is therefore load-bearing for flat inputs (a
+per-encounter subdir name is naturally unique; a reused flat filename is not).
 """
 
 from __future__ import annotations

@@ -61,8 +61,13 @@ def load_ledger(path: Path) -> Transcript | None:
     except (json.JSONDecodeError, OSError) as e:
         log.warning(
             "scribe.ledger.unreadable",
-            path=str(p),
-            error_class=type(e).__name__,   # class only — the path is opaque; no PHI
+            # OPAQUE BASENAME ONLY (``enc-xxx.transcript.json``). ``str(p)`` would
+            # leak the PARENT dir, which IS the encounter's raw label (MAY be
+            # PHI — see identity.py); logging it verbatim violates NOTE-4. Only
+            # the salted opaque filename is safe. (Comment-lies trap fixed in
+            # review: the prior "path is opaque" claim was FALSE for str(p).)
+            path=Path(p).name,
+            error_class=type(e).__name__,   # class only — never the message
         )
         return None
     if not isinstance(data, dict):

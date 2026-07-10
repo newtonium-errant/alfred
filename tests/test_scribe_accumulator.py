@@ -54,17 +54,18 @@ def _config(mode="synthetic", salt=_SALT):
     }})
 
 
-def _write_chunk(enc_dir, seq, lines, *, meta=True, ext=".wav", pad=3):
+def _write_chunk(enc_dir, seq, lines, *, meta=True, synthetic=True, ext=".wav", pad=3):
     """Write ``chunk_<seq>.<ext>`` + fake-STT ``.txt`` sidecar + optional
     ``.meta.json`` commit marker. Distinct audio bytes per seq so content-hashes
-    differ (else two chunks would collapse as an idempotent no-op)."""
+    differ (else two chunks would collapse as an idempotent no-op). ``synthetic``
+    sets the meta's ``synthetic`` flag (False exercises the mode gate)."""
     enc_dir.mkdir(parents=True, exist_ok=True)
     name = f"chunk_{seq:0{pad}d}" if pad else f"chunk_{seq}"
     (enc_dir / f"{name}{ext}").write_bytes(f"audio-bytes-seq-{seq}".encode())
     (enc_dir / f"{name}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     if meta:
         (enc_dir / f"{name}.meta.json").write_text(
-            json.dumps({"synthetic": True, "seq": seq}), encoding="utf-8"
+            json.dumps({"synthetic": synthetic, "seq": seq}), encoding="utf-8"
         )
     return enc_dir / f"{name}{ext}"
 
@@ -99,14 +100,29 @@ def test_encounter_id_fail_loud_on_empty_label():
 
 
 def test_accumulate_logs_and_ledger_are_opaque(tmp_path):
-    # A PHI-ish encounter dir name must NOT leak into logs OR the ledger filename.
+    # A PHI-ish encounter dir name must NOT leak into logs OR the ledger filename
+    # — in ANY code path. The ledger file lives UNDER the PHI-named dir, so a
+    # naive path log leaks the label. This asserts NO raw label in ANY log field
+    # across the fold AND the unreadable-ledger path (the review-caught leak).
     enc = tmp_path / "inbox" / "patient_jane_doe"
     _write_chunk(enc, 1, ["Reports chest pain."])
+    eid = compute_encounter_id("patient_jane_doe", salt=_SALT)
+    # Plant a CORRUPT ledger UNDER the PHI dir so accumulate's load hits the
+    # unreadable-path log (this is exactly where the str(p) leak lived).
+    ledger_path(enc, eid).write_text("{ corrupt json", encoding="utf-8")
+
     with structlog.testing.capture_logs() as caps:
         accumulate_encounter(enc, config=_config())
-    eid = compute_encounter_id("patient_jane_doe", salt=_SALT)
+
     assert ledger_path(enc, eid).is_file()                 # named by the opaque id
-    assert not any("jane" in str(v) for c in caps for v in c.values())
+    # NO raw label ("jane"/"doe") in ANY field of ANY captured log line.
+    assert not any(
+        "jane" in str(v) or "doe" in str(v) for c in caps for v in c.values()
+    )
+    # the unreadable-ledger log DID fire, and its path field is the opaque basename.
+    unread = [c for c in caps if c.get("event") == "scribe.ledger.unreadable"]
+    assert len(unread) == 1 and unread[0]["path"] == ledger_path(enc, eid).name
+    assert "patient_jane_doe" not in unread[0]["path"]     # PARENT dir NEVER in the log
     folded = [c for c in caps if c.get("event") == "scribe.accumulator.folded"]
     assert len(folded) == 1 and folded[0]["encounter_id"] == eid
 
@@ -330,7 +346,7 @@ def test_ledger_unreadable_returns_none_and_logs(tmp_path):
     warns = [c for c in caps if c.get("event") == "scribe.ledger.unreadable"]
     assert len(warns) == 1
     assert warns[0]["error_class"] == "JSONDecodeError"
-    assert warns[0]["path"] == str(lp)
+    assert warns[0]["path"] == lp.name          # OPAQUE basename only — never the PHI parent
 
 
 def test_ledger_resume_continues_ids(tmp_path):
@@ -416,3 +432,33 @@ def test_accumulate_holds_unsettled_chunk(tmp_path):
     _write_chunk(enc, 2, ["two"], meta=False)   # no marker → unsettled
     r = accumulate_encounter(enc, config=_config())
     assert r.folded == 1 and r.held == 1 and r.segments == 1  # folded 1, held 2
+
+
+# ---------------------------------------------------------------------------
+# Mode gate in the fold — a non-synthetic chunk is REFUSED before STT (review)
+# ---------------------------------------------------------------------------
+
+def test_accumulate_refuses_nonsynthetic_chunk_before_stt(tmp_path):
+    # The settle-gate checks marker PRESENCE, not synthetic CONTENT. A settled
+    # but NON-synthetic chunk in synthetic mode must be REFUSED (mode gate) —
+    # never STT'd/folded. Remove guard_ingest from the fold → it folds → RED.
+    enc = tmp_path / "inbox" / "enc-A"
+    _write_chunk(enc, 1, ["Real PHI line."], meta=True, synthetic=False)
+    with structlog.testing.capture_logs() as caps:
+        r = accumulate_encounter(enc, config=_config())
+    assert r.refused == 1 and r.folded == 0 and r.segments == 0   # not STT'd/folded
+    refused = [c for c in caps if c.get("event") == "scribe.accumulator.refused_nonsynthetic"]
+    assert len(refused) == 1 and refused[0]["seq"] == 1
+    tx = load_ledger(ledger_path(enc, r.encounter_id))
+    assert tx is not None and len(tx.segments) == 0              # ledger has no folded content
+
+
+def test_run_sweep_counts_refused_chunks(tmp_path):
+    import asyncio
+    from alfred.scribe import ScribeState, run_sweep
+    input_dir = tmp_path / "inbox"
+    _write_chunk(input_dir / "enc-A", 1, ["Real PHI."], synthetic=False)
+    cfg = _config()
+    cfg.input_dir = str(input_dir)
+    counts = asyncio.run(run_sweep(cfg, ScribeState(tmp_path / "s.json"), tmp_path / "v"))
+    assert counts["chunks_refused"] == 1 and counts["chunks_folded"] == 0

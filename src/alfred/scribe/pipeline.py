@@ -318,6 +318,7 @@ class AccumResult:
     encounter_id: str
     folded: int = 0          # chunks freshly folded into the ledger this pass
     held: int = 0            # unsettled chunks left for a later sweep
+    refused: int = 0         # non-synthetic chunk refused by the mode gate (fail-closed)
     frozen: bool = False     # a seq gap → encounter frozen (never fold over a hole)
     closed: bool = False     # the _CLOSED sentinel finalized the encounter
     segments: int = 0        # accumulated segment count after this pass
@@ -387,8 +388,22 @@ def accumulate_encounter(
       * ordered by integer seq; a seq GAP FREEZES the encounter (logs loudly,
         folds nothing past the hole — never build over a hole);
       * each chunk must be SETTLED (commit marker) before hash/STT;
+      * the MODE GATE (``guard_ingest``) runs BEFORE STT — a non-synthetic chunk
+        in synthetic mode is REFUSED (not STT'd/folded); no real-PHI processing
+        until clinical is deliberately enabled;
       * folding is idempotent on the chunk content-hash (replay = no-op);
       * the ledger is persisted ATOMICALLY after the pass.
+
+    Two contracts this depends on:
+      * SETTLE-GATE / commit-marker — the recorder MUST write the chunk audio
+        FULLY, THEN drop the ``.meta.json`` sidecar LAST. Its presence is the
+        "audio complete" signal; the deferred size+mtime-across-2-sweeps path is
+        the defense-in-depth fallback for a recorder that omits the marker.
+      * UNIQUE-LABEL — the encounter_id is the salted hash of the LABEL
+        (subdir/filename), NOT the audio CONTENT (P2 clinical mode hashed the
+        bytes). So two DIFFERENT-content flat files with the SAME name now
+        collide to one id — the operator's unique-label convention is LOAD-
+        BEARING for flat files (a per-encounter subdir name is naturally unique).
     """
     now = time.time() if now is None else now
     encounter_id = compute_encounter_id(
@@ -426,6 +441,25 @@ def accumulate_encounter(
         if transcript.has_folded(chunk_key):
             expected += 1                 # idempotent: this content already folded
             continue
+        # MODE GATE (fail-closed) BEFORE any STT — the settle-gate checks marker
+        # PRESENCE, not synthetic CONTENT, so a non-synthetic chunk would
+        # otherwise be STT-processed. Refuse it (not STT'd/folded); the mode
+        # gate's purpose is no real-PHI PROCESSING until clinical is enabled.
+        try:
+            guard_ingest(
+                config,
+                provenance=_read_provenance(chunk_path),
+                source_id=encounter_id,   # opaque id in the ingest_decision log
+            )
+        except ScribeIngestRefused:
+            result.refused += 1
+            log.warning(
+                "scribe.accumulator.refused_nonsynthetic",
+                encounter_id=encounter_id,
+                seq=seq,
+                detail="chunk not synthetic in synthetic mode — REFUSED, not folded",
+            )
+            break                         # fail-closed: never fold past a refusal
         chunk_tx = stt_mod.transcribe(config, chunk_path, source_id=encounter_id)
         offset = transcript.segments[-1].end_s if transcript.segments else 0.0
         if transcript.append_chunk(
@@ -448,6 +482,7 @@ def accumulate_encounter(
         encounter_id=encounter_id,
         folded=result.folded,
         held=result.held,
+        refused=result.refused,
         frozen=result.frozen,
         closed=result.closed,
         segments=result.segments,
@@ -473,6 +508,7 @@ async def run_sweep(
     counts = {
         "scanned": 0, "drafted": 0, "refused": 0, "failed": 0, "skipped": 0,
         "encounters": 0, "chunks_folded": 0, "held": 0, "frozen": 0,
+        "chunks_refused": 0,
     }
 
     if not input_dir.is_dir():
@@ -507,10 +543,11 @@ async def run_sweep(
         counts["encounters"] += 1
         counts["chunks_folded"] += r.folded
         counts["held"] += r.held
+        counts["chunks_refused"] += r.refused
         counts["frozen"] += 1 if r.frozen else 0
 
     flat_work = counts["drafted"] + counts["refused"] + counts["failed"]
-    acc_work = counts["chunks_folded"] + counts["frozen"]
+    acc_work = counts["chunks_folded"] + counts["frozen"] + counts["chunks_refused"]
     if flat_work == 0 and acc_work == 0:
         log.info(
             "scribe.pipeline.idle",
