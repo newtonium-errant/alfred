@@ -1630,14 +1630,26 @@ STAYC_CLINICAL_ATTEST_FIELDS: set[str] = {"attested_by", "attested_at", "status"
 # P3-a frozen-on-ATTEST. While a clinical_note is a LIVE ``ai_draft`` the
 # checkpoint co-pilot pipeline refreshes it in place — a NARROW frontmatter
 # allowlist the ``stayc_clinical_no_attest`` edit gate permits ONLY while
-# status=='ai_draft'. ``grounding_flags`` is the re-verified grounding report,
-# refreshed alongside the ``body_replace`` on each checkpoint. The attest triad
-# (status / attested_by / attested_at) is NEVER in this set — it stays
-# orchestrator-only in ANY status. Every OTHER clinical field stays locked even
-# while drafting (body content changes via ``body_replace``, not raw frontmatter
-# edits). Widening this set is a deliberate matrix change — update the pin in
-# the same commit (tests/test_stayc_clinical_scope.py, pre-commit checklist #6).
-STAYC_CLINICAL_DRAFT_EDIT_FIELDS: frozenset[str] = frozenset({"grounding_flags"})
+# status=='ai_draft'. The pipeline refreshes these alongside the ``body_replace``
+# on each checkpoint:
+#   * ``grounding_flags`` — the re-verified grounding report.
+#   * ``draft_original`` (P3-b3) — retain-the-diff anti-spoliation: the AI's
+#     LAST-generated body. The pipeline writes it EACH checkpoint so it always
+#     holds the machine's latest un-edited work; if the clinician then edits the
+#     body, the clobber-detect FREEZES auto-evolution so draft_original stays =
+#     the pipeline's last body → at attest the diff (final body vs
+#     draft_original) shows exactly the clinician's change. It is a frontmatter
+#     field (NOT the body), so writing it does not affect the clobber-detect
+#     body-sha; and it is a DRAFT_EDIT_FIELD (not an ATTEST_FIELD), so attest
+#     SEALS it with the rest of the note.
+# The attest triad (status / attested_by / attested_at) is NEVER in this set — it
+# stays orchestrator-only in ANY status. Every OTHER clinical field stays locked
+# even while drafting (body content changes via ``body_replace``, not raw
+# frontmatter edits). Widening this set is a deliberate matrix change — update
+# the pin in the same commit (tests/test_stayc_clinical_scope.py, checklist #6).
+STAYC_CLINICAL_DRAFT_EDIT_FIELDS: frozenset[str] = frozenset(
+    {"grounding_flags", "draft_original"}
+)
 
 
 # Per-scope hint mapping: when a peer instance attempts vault_create on

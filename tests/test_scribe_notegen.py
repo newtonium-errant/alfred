@@ -378,7 +378,7 @@ def test_generate_routes_through_loopback_ollama(monkeypatch):
                 "objective": [], "assessment": [], "plan": [],
                 "assessment_reasoning_stated": False,
             }),
-            {"stop_reason": "stop"},
+            {"stop_reason": "stop", "prompt_eval_count": 500},  # P3-b3: pec required
         )
 
     import alfred.distiller.backends.ollama as ollama_mod
@@ -465,6 +465,7 @@ def test_generate_structured_hits_native_api_chat_with_num_ctx(monkeypatch):
                 "assessment_reasoning_stated": False,
             })},
             "done_reason": "stop", "done": True,
+            "prompt_eval_count": 500,   # P3-b3: pec required (native path always returns it)
         })
 
     real = httpx.AsyncClient

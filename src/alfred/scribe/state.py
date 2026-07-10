@@ -42,6 +42,8 @@ STATE_FAILED = "failed"     # mid-pipeline exception (retriable until the cap)
 STATE_BUDGET_CAPPED = "budget_capped"   # regen over context budget; last-good draft kept, still folding
 STATE_HUMAN_EDITED = "human_edited"     # a human edited the draft; auto-evolution FROZEN (opt-in to resume)
 STATE_READY = "ready"                   # _CLOSED: draft complete, ready for attestation (attest stays orchestrator-only)
+# --- P3-b3 attest-semantics state -------------------------------------------
+STATE_POST_ATTEST_AUDIO = "post_attest_audio"  # new audio arrived AFTER the draft was attested — REFUSED + surfaced (clinician may need to amend); the signed note is untouched
 
 # Success/terminal states — never reprocessed by the flat one-shot path.
 # NOTE: the checkpoint (subdir) path does NOT gate on this — it makes its own

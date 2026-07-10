@@ -61,6 +61,7 @@ from alfred.scribe.state import (
     STATE_DRAFTED,
     STATE_FAILED,
     STATE_HUMAN_EDITED,
+    STATE_POST_ATTEST_AUDIO,
     STATE_READY,
     STATE_REFUSED,
     STATE_STRUCTURING,
@@ -246,6 +247,12 @@ def _create_ai_draft(
         "source_id": source_id,
         "drafted_by": SCRIBE_DRAFTER_IDENTITY,
         "grounding_flags": vnote.grounding_flags,
+        # P3-b3 retain-the-diff: the AI's generated body, written INTO the note
+        # (frontmatter — NOT the body, so it doesn't affect the clobber-detect
+        # body-sha). At create, body == draft_original; they diverge only when a
+        # clinician later edits the body (clobber-detect then freezes so this
+        # stays = the pipeline's last body). Sealed with the note at attest.
+        "draft_original": vnote.body,
     }
     try:
         result = vault_create(
@@ -295,13 +302,18 @@ def _update_or_refuse_ai_draft(
             f"body is frozen once attested/amended (anti-spoliation). Refusing "
             f"to update the draft; create a status:amended supersede instead."
         )
-    # Live ai_draft → mutable. Rewrite body + refresh grounding_flags in place;
-    # gated again by the stayc_clinical body_replace + edit carve-outs.
+    # Live ai_draft → mutable. Rewrite body + refresh grounding_flags AND
+    # draft_original (P3-b3 retain-the-diff: keep draft_original = the pipeline's
+    # LATEST generated body each checkpoint). Gated again by the stayc_clinical
+    # body_replace + edit carve-outs (draft_original is a DRAFT_EDIT_FIELD).
     vault_edit(
         vault_path,
         rel_path,
         body_replace=vnote.body,
-        set_fields={"grounding_flags": vnote.grounding_flags},
+        set_fields={
+            "grounding_flags": vnote.grounding_flags,
+            "draft_original": vnote.body,
+        },
         scope="stayc_clinical",
     )
     log.info(
@@ -502,7 +514,7 @@ _CHECKPOINT_COUNT_KEY = {
     "budget_capped": "budget_capped",
     "human_edited": "human_edited",
     "ready": "ready",
-    "attested_refused": "checkpoint_refused",
+    "post_attest_audio": "post_attest_audio",
 }
 
 
@@ -519,7 +531,7 @@ async def _regen_checkpoint(
     """FULL-REGEN the ai_draft from the ACCUMULATED transcript, guarded by
     clobber-detect (before) + the context-budget cap (inside generate). Returns
     an outcome tag: ``drafted`` / ``budget_capped`` / ``human_edited`` /
-    ``attested_refused`` / ``noop``."""
+    ``post_attest_audio`` / ``noop``."""
     transcript = ledger_mod.load_ledger(
         ledger_mod.ledger_path(encounter_dir, encounter_id)
     )
@@ -527,13 +539,19 @@ async def _regen_checkpoint(
         return "noop"                    # nothing to draft yet
 
     title = f"Encounter {encounter_id}"  # STABLE across checkpoints (opaque id)
+    # The seq of the most-recently-folded chunk — the NEW audio (P3-b3 surfaces
+    # it when it arrives post-attest). Opaque + PHI-free.
+    last_seq = (
+        transcript.chunk_provenance[-1].get("seq")
+        if transcript.chunk_provenance else None
+    )
     prior = state.get(encounter_id)
     note_path = prior.note_path if prior else ""
 
     # CLOBBER-DETECT — before ANY write, compare the on-disk body sha against the
     # sha the pipeline recorded on its LAST write. Differ ⇒ a human edited the
     # draft ⇒ FREEZE (never clobber a clinician correction — the load-bearing
-    # guard). Also short-circuit an already-sealed note (defense before regen).
+    # guard). Also short-circuit an already-attested note (P3-b3 post-attest audio).
     if note_path:
         try:
             rec = vault_read(vault_path, note_path)
@@ -542,11 +560,22 @@ async def _regen_checkpoint(
         else:
             status = (rec.get("frontmatter") or {}).get("status")
             if status in ("attested", "amended"):
+                # POST-ATTEST AUDIO — new audio arrived AFTER the draft was
+                # signed. REFUSE + SURFACE (a distinct, human-visible terminal
+                # outcome for this chunk — NOT a transient FAILED that would
+                # retry-churn and bury the signal). The signed note is untouched;
+                # the clinician may need to AMEND.
+                state.set(encounter_id, state=STATE_POST_ATTEST_AUDIO)
                 log.warning(
-                    "scribe.pipeline.checkpoint_refused_sealed",
-                    encounter_id=encounter_id, status=status,
+                    "scribe.pipeline.post_attest_audio",
+                    encounter_id=encounter_id,   # opaque id (NOTE-4)
+                    seq=last_seq,
+                    status=status,
+                    detail="new audio arrived AFTER attestation — refused + "
+                           "surfaced; the signed note is untouched. The clinician "
+                           "may need to amend.",
                 )
-                return "attested_refused"
+                return "post_attest_audio"
             on_disk = _body_sha(rec.get("body", ""))
             if prior and prior.pipeline_body_sha and on_disk != prior.pipeline_body_sha:
                 state.set(encounter_id, state=STATE_HUMAN_EDITED)
@@ -580,11 +609,19 @@ async def _regen_checkpoint(
         new_path = _create_ai_draft(vault_path, title, encounter_id, config, vnote)
     except VaultError as e:
         if "SEALED" in str(e):
+            # The note was attested BETWEEN the clobber-detect read and this write
+            # (mid-flight attest race) → same post-attest-audio outcome; the
+            # regenerated note is discarded, the signed note untouched.
+            state.set(encounter_id, state=STATE_POST_ATTEST_AUDIO)
             log.warning(
-                "scribe.pipeline.checkpoint_refused_sealed",
-                encounter_id=encounter_id,
+                "scribe.pipeline.post_attest_audio",
+                encounter_id=encounter_id,   # opaque id (NOTE-4)
+                seq=last_seq,
+                status="attested",
+                detail="draft attested mid-regen (race) — refused + surfaced; "
+                       "the signed note is untouched.",
             )
-            return "attested_refused"
+            return "post_attest_audio"
         raise
     # Record the sha of the ACTUAL on-disk body (post-write) so the next
     # checkpoint's clobber-detect compares like-for-like. note_path + sha are set
@@ -664,9 +701,9 @@ async def run_sweep(
         "scanned": 0, "drafted": 0, "refused": 0, "failed": 0, "skipped": 0,
         "encounters": 0, "chunks_folded": 0, "held": 0, "frozen": 0,
         "chunks_refused": 0,
-        # P3-b2 checkpoint outcomes
+        # P3-b2/b3 checkpoint outcomes
         "checkpoint_drafted": 0, "budget_capped": 0, "human_edited": 0,
-        "ready": 0, "checkpoint_refused": 0,
+        "ready": 0, "post_attest_audio": 0,
     }
 
     if not input_dir.is_dir():
@@ -719,7 +756,7 @@ async def run_sweep(
     acc_work = (
         counts["chunks_folded"] + counts["frozen"] + counts["chunks_refused"]
         + counts["checkpoint_drafted"] + counts["budget_capped"]
-        + counts["human_edited"] + counts["ready"] + counts["checkpoint_refused"]
+        + counts["human_edited"] + counts["ready"] + counts["post_attest_audio"]
     )
     if flat_work == 0 and acc_work == 0:
         log.info(

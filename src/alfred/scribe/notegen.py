@@ -542,7 +542,27 @@ async def generate_structured(
     # path as the pre-flight (checkpoint → budget_capped, last-good draft kept).
     # Provably conservative: it uses the model's real count, not an estimate.
     prompt_eval = meta.get("prompt_eval_count") if isinstance(meta, dict) else None
-    if isinstance(prompt_eval, int) and prompt_eval >= _PROMPT_TRUNCATION_CEILING:
+    if not isinstance(prompt_eval, int):
+        # FAIL-LOUD on a MISSING authoritative count (P3-b3). The native
+        # /api/chat path always returns prompt_eval_count; its absence means the
+        # authoritative truncation signal is unavailable, so the note CANNOT be
+        # verified as generated from a complete prompt. A medico-legal guard must
+        # refuse rather than silently degrade to the (not-provably-conservative)
+        # pre-flight estimate. Uses the same fail-loud path → checkpoint
+        # budget_capped, last-good draft intact.
+        log.warning(
+            "scribe.notegen.missing_prompt_eval_count",
+            source_id=transcript.source_id,          # opaque encounter id (NOTE-4)
+            segment_count=len(transcript.segments),
+        )
+        raise ContextBudgetExceeded(
+            "Ollama's /api/chat response lacked prompt_eval_count — the "
+            "AUTHORITATIVE truncation count is unavailable, so the note cannot be "
+            "verified as generated from a complete (untruncated) prompt. Refusing "
+            "FAIL-LOUD rather than accept an unverifiable note (a medico-legal "
+            "guard must not silently degrade to the pre-flight estimate)."
+        )
+    if prompt_eval >= _PROMPT_TRUNCATION_CEILING:
         log.warning(
             "scribe.notegen.prompt_truncated",
             source_id=transcript.source_id,          # opaque encounter id (NOTE-4)

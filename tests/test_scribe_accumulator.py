@@ -280,7 +280,7 @@ def test_run_sweep_walks_subdirs_and_legacy_flat(tmp_path, monkeypatch):
     async def _fake(prompt, system=None, model="", endpoint="", **kw):
         return (json.dumps({"subjective": [], "objective": [], "assessment": [],
                             "plan": [], "assessment_reasoning_stated": False}),
-                {"stop_reason": "stop"})
+                {"stop_reason": "stop", "prompt_eval_count": 500})  # P3-b3: pec required
     monkeypatch.setattr(ollama_mod, "call_ollama_no_tools", _fake)
 
     import asyncio

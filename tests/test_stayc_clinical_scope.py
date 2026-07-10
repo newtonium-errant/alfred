@@ -282,8 +282,12 @@ def test_body_mutate_deny_precedence_over_wildcard_scope():
 
 def test_draft_edit_fields_matrix_pin():
     # The narrow frontmatter-refresh allowlist for a LIVE draft. Widening is a
-    # deliberate matrix change (pre-commit checklist #6).
-    assert STAYC_CLINICAL_DRAFT_EDIT_FIELDS == frozenset({"grounding_flags"})
+    # deliberate matrix change (pre-commit checklist #6). ``draft_original``
+    # (P3-b3) is the retain-the-diff AI-body snapshot the pipeline refreshes each
+    # checkpoint; it is a DRAFT_EDIT_FIELD (sealed at attest), not an ATTEST_FIELD.
+    assert STAYC_CLINICAL_DRAFT_EDIT_FIELDS == frozenset(
+        {"grounding_flags", "draft_original"}
+    )
 
 
 # --- body_replace: the co-pilot's in-place update mechanism ----------------

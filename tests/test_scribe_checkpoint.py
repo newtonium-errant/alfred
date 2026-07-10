@@ -31,6 +31,7 @@ from alfred.scribe import (
     STATE_BUDGET_CAPPED,
     STATE_DRAFTED,
     STATE_HUMAN_EDITED,
+    STATE_POST_ATTEST_AUDIO,
     STATE_READY,
     ScribeState,
     Segment,
@@ -75,7 +76,8 @@ def _install_fake_ollama(monkeypatch, canned=_CANNED_CITES_S1):
     async def _fake(prompt, system=None, model="", endpoint="", **kw):
         state["prompts"].append(prompt)
         state["calls"] += 1
-        return (canned, {"stop_reason": "stop"})
+        # prompt_eval_count present + in-range (P3-b3 fail-loud requires it).
+        return (canned, {"stop_reason": "stop", "prompt_eval_count": 500})
 
     monkeypatch.setattr(ollama_mod, "call_ollama_no_tools", _fake)
     return state
@@ -396,10 +398,11 @@ def test_checkpoint_updates_in_place_no_duplicate(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 5. Attested draft → refuse (no clobber)
+# 5. POST-ATTEST AUDIO — a chunk for an already-attested encounter (P3-b3):
+# REFUSED + SURFACED (distinct terminal state, NOT FAILED/retry), note untouched.
 # ---------------------------------------------------------------------------
 
-def test_checkpoint_refuses_attested_draft(tmp_path, monkeypatch):
+def test_post_attest_audio_refuses_and_surfaces(tmp_path, monkeypatch):
     _install_fake_ollama(monkeypatch)
     from alfred.scribe.attest import attest as scribe_attest
     enc = tmp_path / "inbox" / "enc-E"
@@ -414,16 +417,42 @@ def test_checkpoint_refuses_attested_draft(tmp_path, monkeypatch):
                   clinician_ids={"np_jamie"}, audit_path=vault / "audit.jsonl")
     attested_body = vault_read(vault, note_path)["body"]
 
+    # NEW audio arrives AFTER attestation (seq 2).
     _write_chunk(enc, 2, ["Follow-up in one week."])
     with structlog.testing.capture_logs() as caps:
         r2, outcome = _checkpoint(enc, config=_config(), state=state, vault=vault)
 
-    assert outcome == "attested_refused"
-    refused = [c for c in caps if c.get("event") == "scribe.pipeline.checkpoint_refused_sealed"]
-    assert len(refused) == 1 and refused[0]["encounter_id"] == eid   # observability pin (#9)
-    # the sealed note is untouched.
+    # DISTINCT terminal outcome — refused + surfaced, NOT a transient FAILED.
+    assert outcome == "post_attest_audio"
+    assert state.get(eid).state == STATE_POST_ATTEST_AUDIO
+    assert state.get(eid).state != "failed" and state.get(eid).attempts == 0  # no retry-churn
+    # surfaced with the opaque id + the NEW chunk's seq (obs pin #9).
+    surfaced = [c for c in caps if c.get("event") == "scribe.pipeline.post_attest_audio"]
+    assert len(surfaced) == 1
+    assert surfaced[0]["encounter_id"] == eid and surfaced[0]["seq"] == 2
+    # the signed note is UNTOUCHED.
     post = frontmatter.load(str(vault / note_path))
     assert post["status"] == "attested" and post.content.strip() == attested_body.strip()
+
+
+def test_post_attest_audio_counted_in_run_sweep(tmp_path, monkeypatch):
+    _install_fake_ollama(monkeypatch)
+    from alfred.scribe import run_sweep
+    from alfred.scribe.attest import attest as scribe_attest
+    input_dir = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+    _write_chunk(input_dir / "enc-P", 1, ["Patient reports chest pain."])
+    cfg = _config()
+    cfg.input_dir = str(input_dir)
+    asyncio.run(run_sweep(cfg, state, vault))
+    eid = compute_encounter_id("enc-P", salt=_SALT)
+    scribe_attest(vault, state.get(eid).note_path, new_status="attested",
+                  attester="np_jamie", clinician_ids={"np_jamie"},
+                  audit_path=vault / "audit.jsonl")
+    _write_chunk(input_dir / "enc-P", 2, ["Post-attest line."])
+    counts = asyncio.run(run_sweep(cfg, state, vault))
+    assert counts["post_attest_audio"] == 1 and counts["checkpoint_drafted"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -465,3 +494,71 @@ def test_run_sweep_drives_checkpoint_end_to_end(tmp_path, monkeypatch):
     assert state.get(eid).state == STATE_DRAFTED
     drafted = [c for c in caps if c.get("event") == "scribe.pipeline.checkpoint_drafted"]
     assert len(drafted) == 1 and drafted[0]["encounter_id"] == eid   # obs pin (#9)
+
+
+# ---------------------------------------------------------------------------
+# 7. draft_original (P3-b3 retain-the-diff) — THE load-bearing pin
+# ---------------------------------------------------------------------------
+
+def test_draft_original_holds_pipeline_body_not_clinician_edit(tmp_path, monkeypatch):
+    # draft_original = the PIPELINE's LAST body, NOT the current body at attest.
+    # A clinician edit → clobber-detect FREEZES → draft_original stays = the AI's
+    # body → the attest-diff (final body vs draft_original) shows EXACTLY the
+    # clinician's change (non-empty). Verifies draft_original is NOT
+    # "current-body-at-attest" (which would capture the clinician's edit → empty diff).
+    from alfred.scribe.attest import attest as scribe_attest
+    from alfred.vault.ops import vault_edit
+    _install_fake_ollama(monkeypatch)
+    enc = tmp_path / "inbox" / "enc-DO"
+    vault = tmp_path / "vault"
+    state = ScribeState(tmp_path / "state.json")
+
+    _write_chunk(enc, 1, ["Patient reports chest pain."])
+    r, _ = _checkpoint(enc, config=_config(), state=state, vault=vault)
+    eid = r.encounter_id
+    note_path = state.get(eid).note_path
+    ai_body = vault_read(vault, note_path)["body"]                  # the AI's body (B1)
+    assert frontmatter.load(str(vault / note_path))["draft_original"].strip() == ai_body.strip()
+
+    # a CLINICIAN edits the body (a correction the AI never wrote).
+    clinician_body = "## Subjective\n- CLINICIAN: stable angina, ECG ordered.\n"
+    vault_edit(vault, note_path, body_replace=clinician_body, scope="stayc_clinical")
+
+    # a new chunk folds → clobber-detect FREEZES; draft_original stays = the AI body.
+    _write_chunk(enc, 2, ["Follow-up in one week."])
+    _, outcome = _checkpoint(enc, config=_config(), state=state, vault=vault)
+    assert outcome == "human_edited"
+
+    scribe_attest(vault, note_path, new_status="attested", attester="np_jamie",
+                  clinician_ids={"np_jamie"}, audit_path=vault / "audit.jsonl")
+    sealed = frontmatter.load(str(vault / note_path))
+
+    # draft_original = the AI's un-edited body; the note body = the clinician's edit.
+    assert sealed["draft_original"].strip() == ai_body.strip()      # the pipeline's LAST body
+    assert sealed.content.strip() == clinician_body.strip()         # body = clinician's edit
+    assert sealed["draft_original"].strip() != sealed.content.strip()  # the diff is NON-EMPTY
+    assert "CLINICIAN" not in sealed["draft_original"]              # NOT current-body-at-attest
+    assert sealed["status"] == "attested"                          # sealed with the note
+
+
+# ---------------------------------------------------------------------------
+# 8. Fail-loud on a MISSING authoritative prompt_eval_count (P3-b3 fold-in)
+# ---------------------------------------------------------------------------
+
+def test_missing_prompt_eval_count_fails_loud(monkeypatch):
+    # A native response LACKING prompt_eval_count → the AUTHORITATIVE truncation
+    # count is unavailable → FAIL-LOUD (refuse), not silent-accept via the
+    # pre-flight estimate. MUTATION-BIND: revert to silent-skip → the note is
+    # accepted → RED.
+    from alfred.scribe.notegen import generate_structured
+
+    async def _fake(prompt, system=None, model="", endpoint="", **kw):
+        return (_CANNED_CITES_S1, {"stop_reason": "stop"})   # NO prompt_eval_count
+    monkeypatch.setattr(ollama_mod, "call_ollama_no_tools", _fake)
+    t = Transcript(source_id="enc-nopec", mode="synthetic",
+                   segments=[Segment(id="S1", start_s=0.0, end_s=5.0, text="chest pain")])
+    with structlog.testing.capture_logs() as caps:
+        with pytest.raises(ContextBudgetExceeded):
+            asyncio.run(generate_structured(t, config=_config()))
+    ev = [c for c in caps if c.get("event") == "scribe.notegen.missing_prompt_eval_count"]
+    assert len(ev) == 1 and ev[0]["source_id"] == "enc-nopec"   # obs pin (#9)

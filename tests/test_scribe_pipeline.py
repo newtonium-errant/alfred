@@ -72,7 +72,8 @@ _CANNED_CLEAN = json.dumps({
 
 def _fake_ollama_returning(canned):
     async def _fake(prompt, system=None, model="", endpoint="", **kw):
-        return (canned, {"stop_reason": "stop"})
+        # prompt_eval_count present + in-range (P3-b3 fail-loud requires it).
+        return (canned, {"stop_reason": "stop", "prompt_eval_count": 500})
     return _fake
 
 
