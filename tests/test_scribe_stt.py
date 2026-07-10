@@ -252,3 +252,67 @@ def test_faster_whisper_real_model_smoke(tmp_path):
     assert isinstance(t, Transcript)
     assert t.source_id == "smoke" and t.mode == "synthetic"
     assert all(seg.id.startswith("S") for seg in t.segments)
+
+
+# ---------------------------------------------------------------------------
+# SOVEREIGN cache-only model load (P2-b, live-box smoke). A bare-name
+# WhisperModel does a HF revision-check egress EVEN when cached → the armed
+# guard blocks it → every encounter fails. local_files_only=True is the ONLY
+# reliable fix (env-offline is unhonored + daemonize-stripped). Mock the model
+# (no real model / dep needed) via sys.modules injection.
+# ---------------------------------------------------------------------------
+
+import sys as _sys
+import types as _types
+
+
+class _FakeSeg:
+    def __init__(self, start, end, text):
+        self.start, self.end, self.text = start, end, text
+
+
+def _inject_fake_faster_whisper(monkeypatch, model_class):
+    fake = _types.ModuleType("faster_whisper")
+    fake.WhisperModel = model_class
+    monkeypatch.setitem(_sys.modules, "faster_whisper", fake)
+
+
+def test_faster_whisper_loads_local_files_only(tmp_path, monkeypatch):
+    # THE sovereign pin (mutation-bind: remove local_files_only=True → RED).
+    captured = {}
+
+    class _MockModel:
+        def __init__(self, model_name, **kwargs):
+            captured["model_name"] = model_name
+            captured["kwargs"] = kwargs
+
+        def transcribe(self, audio, **kw):
+            return iter([_FakeSeg(0.0, 5.0, "hello world")]), object()
+
+    _inject_fake_faster_whisper(monkeypatch, _MockModel)
+    audio = tmp_path / "enc1.wav"
+    audio.write_bytes(b"")
+    t = stt_mod._faster_whisper_transcribe(
+        _cfg(provider="faster-whisper"), audio, source_id="s", mode="synthetic",
+    )
+    # cache-only load — no HF revision-check egress (the guard would block it).
+    assert captured["kwargs"].get("local_files_only") is True
+    assert len(t.segments) == 1 and t.segments[0].text == "hello world"
+
+
+def test_faster_whisper_uncached_model_raises_clear_sttError(tmp_path, monkeypatch):
+    # With local_files_only=True, an un-pre-staged model raises an obscure HF
+    # error — wrap it into an actionable STTError (pre-stage message), not a
+    # cryptic cache-miss.
+    class _RaisingModel:
+        def __init__(self, model_name, **kwargs):
+            raise RuntimeError("Model Systran/... not found in local cache")
+
+    _inject_fake_faster_whisper(monkeypatch, _RaisingModel)
+    audio = tmp_path / "enc1.wav"
+    audio.write_bytes(b"")
+    with pytest.raises(STTError) as exc:
+        stt_mod._faster_whisper_transcribe(
+            _cfg(provider="faster-whisper"), audio, source_id="s", mode="synthetic",
+        )
+    assert "pre-stage" in str(exc.value).lower()

@@ -162,9 +162,33 @@ def _faster_whisper_transcribe(
         ) from e
 
     model_name = (config.stt.model or "").strip() or _DEFAULT_MODEL
-    model = WhisperModel(
-        model_name, device="cpu", compute_type="int8", cpu_threads=8,
-    )
+    # SOVEREIGN: cache-only load — NO HuggingFace revision-check egress.
+    #
+    # A bare-name ``WhisperModel(model_name)`` triggers a HF ``repo_info`` /
+    # revision-check HTTP GET (Systran/faster-distil-whisper-large-v3) EVEN when
+    # the model is fully cached locally — which the armed SovereignHttpGuard
+    # (correctly) blocks → SovereignBoundaryError → every encounter fails.
+    #
+    # The env-var path is DEAD (both verified on the box): (a) HF_HUB_OFFLINE=1
+    # / TRANSFORMERS_OFFLINE=1 are UNHONORED by huggingface_hub 1.23 /
+    # faster-whisper 1.2 (still calls ``repo_info``); AND (b) the ``alfred up``
+    # daemonize re-exec STRIPS launch-env vars before the daemon process. So the
+    # fix MUST be an in-process WhisperModel PARAMETER, not an env var.
+    #
+    # ``local_files_only=True`` is the ONLY reliable mechanism: load from the
+    # local HF cache, never check the remote revision. The model MUST be
+    # pre-staged in the HF cache offline before use.
+    try:
+        model = WhisperModel(
+            model_name, device="cpu", compute_type="int8", cpu_threads=8,
+            local_files_only=True,
+        )
+    except Exception as e:  # noqa: BLE001 — obscure HF cache-miss → actionable ops error
+        raise STTError(
+            f"STT model {model_name!r} is not pre-staged in the local model "
+            f"cache; a sovereign box cannot download at runtime (egress is "
+            f"blocked by design). Pre-stage the model offline before use."
+        ) from e
     seg_iter, _info = model.transcribe(
         str(audio_path), vad_filter=True, word_timestamps=True,
     )
