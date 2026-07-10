@@ -251,6 +251,55 @@ def test_grounding_non_prefix_not_in_negation_lexicon():
     assert "no" in _negation_set("no ear pain")
 
 
+def test_grounding_lexicon_lacks_neither_nor_are_word_bounded_safe():
+    # Re-added negations (review BLOCK): word-bounded-safe — must NOT register
+    # inside longer words, but DO register as standalone negations.
+    from alfred.scribe.grounding import _negation_set
+    for benign in ["black", "lackadaisical", "lacerate", "norepinephrine",
+                   "north", "minor", "normal"]:
+        assert _negation_set(benign) == set(), f"{benign!r} false-registered"
+    assert "lacks" in _negation_set("abdomen lacks bowel sounds")
+    assert {"neither", "nor"} <= _negation_set("neither fever nor chills")
+
+
+def test_grounding_lacks_flip_flags():
+    # (C) FLIP via "lacks" (mutation-bind: drop lacks? from the lexicon → RED,
+    # while the non-productive/pain-free clean pins stay GREEN).
+    t = _transcript("Abdomen lacks bowel sounds.")
+    s = _structured(objective=[{"claim": "Bowel sounds present", "source_spans": ["S1"]}])
+    r = verify_grounding(s, t)
+    assert not r.clean and r.flags[0].reason == "negation_mismatch"
+
+
+def test_grounding_lacks_invented_flags():
+    # (B) INVENTED via "lacks" — cited segment never negates insight.
+    t = _transcript("Patient is oriented.")
+    s = _structured(objective=[{"claim": "Lacks insight", "source_spans": ["S1"]}])
+    r = verify_grounding(s, t)
+    assert not r.clean and r.flags[0].reason == "negation_mismatch"
+
+
+def test_grounding_neither_nor_flip_flags():
+    # (C) FLIP via "neither/nor" coordinator — the " nor " phrase boundary makes
+    # "Neither fever nor chills" negate "fever" (not "fever nor chills").
+    t = _transcript("Neither fever nor chills.")
+    s = _structured(objective=[{"claim": "Reports fever", "source_spans": ["S1"]}])
+    assert not verify_grounding(s, t).clean
+
+
+@pytest.mark.parametrize("claim, segment", [
+    ("Reports nasal congestion", "non-productive cough, nasal congestion"),
+    ("Reports pain", "left ankle is pain-free"),
+    ("Reports carbohydrate intake", "diet is carbohydrate-free"),
+])
+def test_grounding_non_free_prefixes_stay_clean_no_new_fp(claim, segment):
+    # non-/free stay OUT of the lexicon → no new FP. Mutation-bind partner: when
+    # lacks? is dropped these stay GREEN, proving the flip fix is targeted.
+    t = _transcript(segment)
+    s = _structured(objective=[{"claim": claim, "source_spans": ["S1"]}])
+    assert verify_grounding(s, t).clean is True
+
+
 def test_grounding_catches_ungrounded_span_S99():
     t = _transcript("Patient reports chest pain.")
     s = _structured(subjective=[{"claim": "Chest pain", "source_spans": ["S99"]}])

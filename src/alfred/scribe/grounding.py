@@ -48,6 +48,17 @@ depends on knowing these gaps:
       empirically safe; the 66%-FP set-equality "safety" was net-negative).
   (d) COMPOSITE-number coincidence — "BP 120/80" whose digits happen to appear
       as "Room 120, bed 80" in the cited segment passes CLEAN.
+  (e) (C)-FLIP mechanism limits — the targeted-flip check extracts the
+      finding-phrase that FOLLOWS a negation and requires it to be >=4 chars, so
+      two flip shapes slip through (both SAFE-direction under-flags, backstopped
+      by the atomic prompt + human attest):
+        * SHORT ABBREVIATIONS below the len>=4 filter — "denies SOB" → the
+          negated phrase "sob" (3 chars) is dropped → a "Reports SOB" flip is
+          MISSED.
+        * POST-POSITIVE negation — "bowel sounds absent" (the negation comes
+          AFTER the finding) → no finding-phrase is extracted after the
+          negation → a "Bowel sounds present" flip is MISSED. (The pre-finding
+          form "absent bowel sounds" / "lacks bowel sounds" IS caught.)
 
 FAILURE POLICY = FLAG-IN-NOTE (the draft still proceeds — it is an ai_draft and
 the clinician attest is the human gate):
@@ -79,16 +90,25 @@ _UNIT = (
 )
 _NUMBER_UNIT_RE = re.compile(rf"\d+(?:\.\d+)?\s*{_UNIT}\b", re.IGNORECASE)
 _BARE_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
-# Negation tokens (clinical), word-bounded. CURATED set — deliberately does
-# NOT include "non": ``\bnon\b`` matches the "non" INSIDE "non-productive" /
-# "nonspecific" (the "-" is a word boundary), so a POSITIVE claim citing a
-# segment with "non-productive cough" false-flagged as a negation (66% FP
-# root-cause #2). "no" is safe — ``\bno\b`` does NOT match inside "none" /
-# "nonspecific" (a word char follows "no"). "neither/nor/lacks/free" also
-# dropped ("free" false-matches "carbohydrate-free" etc.); "no evidence of" is
-# covered by "no".
+# Negation tokens (clinical), word-bounded. CURATED set. TWO tokens are
+# deliberately EXCLUDED because they false-register (their FP justification):
+#   * "non": ``\bnon\b`` matches the "non" INSIDE "non-productive" /
+#     "nonspecific" (the "-" is a word boundary), so a POSITIVE claim citing a
+#     segment with "non-productive cough" false-flagged (66% FP root-cause #2).
+#   * "free": ``\bfree\b`` matches "carbohydrate-free" / "pain-free" as
+#     positives.
+# "no" is safe — ``\bno\b`` does NOT match inside "none"/"nonspecific" (a word
+# char follows "no"). "neither/nor/lacks" ARE included — they are word-bounded-
+# SAFE (verified: ``\blacks?\b`` ∌ black/lackadaisical/lacerate; ``\bnor\b`` ∌
+# norepinephrine/north/minor/normal; ``\bneither\b`` clean) AND real clinical
+# negations. Dropping them (an earlier over-correction) opened confirmed holes:
+# (C) "Bowel sounds present" citing "Abdomen lacks bowel sounds" missed the
+# flip; (B) "Lacks insight" citing "Patient is oriented" missed the invented
+# negation; "Reports fever" citing "Neither fever nor chills" missed the flip.
+# "no evidence of" is covered by "no".
 _NEGATION_RE = re.compile(
-    r"\b(no|not|denies|denied|deny|without|negative|none|never|absent)\b",
+    r"\b(no|not|denies|denied|deny|without|negative|none|never|absent|"
+    r"neither|nor|lacks?)\b",
     re.IGNORECASE,
 )
 
@@ -206,7 +226,10 @@ def _negated_finding_phrases(text: str) -> list[str]:
     low = text.lower()
     for m in _NEGATION_RE.finditer(low):
         tail = low[m.end():]
-        raw = re.split(r"[.,;:]| and | or | but | with ", tail, maxsplit=1)[0]
+        # " nor " is a coordinator boundary too, so "neither fever nor chills"
+        # → the "neither" phrase is "fever" (not "fever nor chills"); the "nor"
+        # negation separately governs "chills".
+        raw = re.split(r"[.,;:]| and | or | nor | but | with ", tail, maxsplit=1)[0]
         words = [w for w in raw.strip().split() if w]
         while words and words[0] in _FLIP_STOPWORDS:
             words = words[1:]
