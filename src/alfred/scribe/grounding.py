@@ -17,16 +17,19 @@ Checks per claim (each failure ⇒ a flag):
                                           is a legitimate summary, not flagged.
                                           Decimal-boundary-safe: 5mg never
                                           matches 0.5mg / 2.5mg / 12.5mg.)
-  4. the set of NEGATION tokens in   → ``negation_mismatch`` (BIDIRECTIONAL:
-     the claim ≠ the set in the           BOTH a fabricated negation AND a
-     cited segment(s)                      DROPPED one — the denies→reports flip
-                                           — are dangerous; over-flagging is
-                                           safe [flag-in-note, clinician
-                                           confirms], under-flagging a dropped
-                                           negation is a patient-safety error.
-                                           SOUND ONLY under ATOMIC claims — see
-                                           the frozen contract in notegen.py:
-                                           one clinical finding per claim.)
+  4. NEGATION — INVENTED or FLIPPED  → ``negation_mismatch`` (P2-e redesign,
+     (B) the claim asserts a negation     REPLACES the P2-c bidirectional
+         NOT in the cited segment;        set-EQUALITY. Set-equality was
+     (C) the cited segment NEGATES a      empirically CATASTROPHIC — 66% flag
+         finding the claim asserts        rate — because it is incompatible with
+         POSITIVELY (targeted phrase      the atomic-claim design: an atomic
+         check, not set-diff).            claim carries a SUBSET of its
+                                          multi-finding segment's negations, so
+                                          it could NEVER equal the full set →
+                                          near-everything flagged → alarm
+                                          fatigue. The SUBSET case is now CLEAN;
+                                          (B) invented + (C) targeted-flip keep
+                                          the real safety catches.)
 
 ⚠️ NOT caught here — relies on the extract-not-infer PROMPT (prompt-tuner) +
 the human ATTEST. This gate verifies mechanical grounding, NOT meaning. An
@@ -36,10 +39,13 @@ depends on knowing these gaps:
       a real segment (e.g. "history of MI" invented from a segment that never
       says it) passes CLEAN, by design (no token to check).
   (b) WRONG-SYMPTOM negation — "Denies SOB" cited to "denies chest pain": the
-      token ``denies`` matches on both sides, but the SYMPTOM is fabricated.
-  (c) ROS-LIST dropped negation — a non-atomic claim bundling a positive + a
-      negative can hide a flipped positive inside a matching negation set (why
-      the frozen contract REQUIRES atomic claims).
+      token ``denies`` matches on both sides, the segment does not negate SOB,
+      so the (C) flip does not fire — the SYMPTOM is fabricated but passes.
+  (c) DROPPED negation in a BUNDLED (non-atomic) claim — a claim bundling a
+      positive + a negative can hide a flipped positive inside a matching
+      negation set. Delegated to the atomic-claim contract + human attest (the
+      A/B corpus found ZERO flipped/dropped negations across 189 real claims —
+      empirically safe; the 66%-FP set-equality "safety" was net-negative).
   (d) COMPOSITE-number coincidence — "BP 120/80" whose digits happen to appear
       as "Room 120, bed 80" in the cited segment passes CLEAN.
 
@@ -73,12 +79,22 @@ _UNIT = (
 )
 _NUMBER_UNIT_RE = re.compile(rf"\d+(?:\.\d+)?\s*{_UNIT}\b", re.IGNORECASE)
 _BARE_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
-# Negation tokens (clinical). Word-bounded.
+# Negation tokens (clinical), word-bounded. CURATED set — deliberately does
+# NOT include "non": ``\bnon\b`` matches the "non" INSIDE "non-productive" /
+# "nonspecific" (the "-" is a word boundary), so a POSITIVE claim citing a
+# segment with "non-productive cough" false-flagged as a negation (66% FP
+# root-cause #2). "no" is safe — ``\bno\b`` does NOT match inside "none" /
+# "nonspecific" (a word char follows "no"). "neither/nor/lacks/free" also
+# dropped ("free" false-matches "carbohydrate-free" etc.); "no evidence of" is
+# covered by "no".
 _NEGATION_RE = re.compile(
-    r"\b(no|not|non|denies|denied|deny|without|negative|absent|none|never|"
-    r"neither|nor|lacks?|free)\b",
+    r"\b(no|not|denies|denied|deny|without|negative|none|never|absent)\b",
     re.IGNORECASE,
 )
+
+# Leading quantifiers/articles stripped off a negated finding-phrase before the
+# targeted-flip check, so "denies any chest pain" → phrase "chest pain".
+_FLIP_STOPWORDS = frozenset({"any", "a", "an", "the", "his", "her", "their", "of"})
 
 
 @dataclass
@@ -181,6 +197,41 @@ def _negation_set(text: str) -> set[str]:
     return {m.group(1).lower() for m in _NEGATION_RE.finditer(text)}
 
 
+def _negated_finding_phrases(text: str) -> list[str]:
+    """For each negation in ``text``, the finding-phrase it governs — the run
+    after the negation up to the next punctuation / conjunction, with leading
+    quantifiers stripped. ("denies shortness of breath. reports cough" →
+    ["shortness of breath"].) Trivial (<4-char) phrases are dropped."""
+    phrases: list[str] = []
+    low = text.lower()
+    for m in _NEGATION_RE.finditer(low):
+        tail = low[m.end():]
+        raw = re.split(r"[.,;:]| and | or | but | with ", tail, maxsplit=1)[0]
+        words = [w for w in raw.strip().split() if w]
+        while words and words[0] in _FLIP_STOPWORDS:
+            words = words[1:]
+        phrase = " ".join(words)
+        if len(phrase) >= 4:
+            phrases.append(phrase)
+    return phrases
+
+
+def _flipped_positive_findings(claim_text: str, cited_text: str) -> list[str]:
+    """Targeted FLIP check (C): findings the cited segment NEGATES that the
+    claim asserts POSITIVELY. Only applies to a positive claim (one that carries
+    NO negation of its own) — a negative claim about the same finding is the
+    consistent subset case, not a flip. Word-bounded phrase match to avoid
+    trivial substring hits."""
+    if _negation_set(claim_text):
+        return []  # the claim itself negates → not a positive flip
+    claim_low = claim_text.lower()
+    flipped: list[str] = []
+    for phrase in _negated_finding_phrases(cited_text):
+        if re.search(r"\b" + re.escape(phrase) + r"\b", claim_low):
+            flipped.append(phrase)
+    return flipped
+
+
 def _cited_text(claim_spans, seg_by_id) -> str:
     return " ".join(seg_by_id[s].text for s in claim_spans if s in seg_by_id)
 
@@ -220,14 +271,39 @@ def verify(structured: StructuredNote, transcript: Transcript) -> GroundingResul
                 f"number_mismatch: {missing_nums} not verbatim in cited segment(s)"
             )
 
-        # (4) BIDIRECTIONAL negation check — the negation set must match.
+        # (4) NEGATION check — INVENTED + targeted FLIP (P2-e redesign).
+        #
+        # REPLACES the P2-c bidirectional set-EQUALITY, which was empirically
+        # catastrophic: it is FUNDAMENTALLY incompatible with the atomic-claim
+        # design we mandated in P2-c — each atomic claim carries a SUBSET of its
+        # multi-finding segment's negations, so it could NEVER equal the full
+        # set → 66% flag rate (~all negation_mismatch), alarm fatigue, the ⚠
+        # that matters ignored. The subset case is now CLEAN.
+        #
+        # Two genuine-error catches preserve the real safety intent:
+        #   (B) INVENTED negation — the claim asserts a negation NOT present in
+        #       the cited segment (claim_negs ⊄ cited_negs).
+        #   (C) FLIPPED negation — the cited segment NEGATES a finding that the
+        #       claim asserts POSITIVELY (targeted phrase check, not set-diff).
+        # The dropped-negation-in-a-bundled-claim case is delegated to the
+        # atomic-claim prompt + human attest (the A/B corpus found ZERO
+        # flipped/dropped negations across 189 real claims — empirically safe).
         claim_negs = _negation_set(claim.claim)
         cited_negs = _negation_set(cited)
-        if claim_negs != cited_negs:
-            reasons.append(
-                f"negation_mismatch: claim negations {sorted(claim_negs)} != "
-                f"cited {sorted(cited_negs)}"
-            )
+        invented = claim_negs - cited_negs
+        flipped = _flipped_positive_findings(claim.claim, cited)
+        if invented or flipped:
+            detail: list[str] = []
+            if invented:
+                detail.append(
+                    f"invented negation(s) {sorted(invented)} not in cited segment(s)"
+                )
+            if flipped:
+                detail.append(
+                    f"claim asserts positively a finding the cited segment "
+                    f"negates: {flipped}"
+                )
+            reasons.append("negation_mismatch: " + "; ".join(detail))
 
         if reasons:
             result.flags.append(

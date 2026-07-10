@@ -199,6 +199,58 @@ def test_grounding_catches_fabricated_negation():
     assert r.flags[0].reason == "negation_mismatch"
 
 
+# ---------------------------------------------------------------------------
+# Negation redesign (P2-e, 66%→~0 FP) — invented + targeted-flip, subset clean.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "claim, segment",
+    [
+        # (A) SUBSET IS CLEAN — atomic claim's negation is a subset of the
+        # multi-finding segment's negations; the claim's finding is not one the
+        # segment flips. MUTATION-BIND: revert to set-equality → THESE go RED.
+        ("Denies fever", "denies fever, no ear pain"),
+        ("Reports cough", "denies fever, productive cough"),
+        # (D) "non-" must NOT register as a negation — a positive claim citing a
+        # segment with "non-productive cough" must be CLEAN.
+        ("Reports nasal congestion", "non-productive cough, nasal congestion"),
+        ("Reports nonspecific findings", "nonspecific ST changes noted"),
+    ],
+)
+def test_grounding_negation_subset_and_non_are_clean(claim, segment):
+    t = _transcript(segment)
+    s = _structured(objective=[{"claim": claim, "source_spans": ["S1"]}])
+    assert verify_grounding(s, t).clean is True, f"{claim!r} vs {segment!r} must NOT flag"
+
+
+def test_grounding_negation_invented_flags():
+    # (B) the claim asserts a negation NOT present in the cited segment.
+    t = _transcript("Patient reports headache.")
+    s = _structured(objective=[{"claim": "Denies chest pain", "source_spans": ["S1"]}])
+    r = verify_grounding(s, t)
+    assert not r.clean and r.flags[0].reason == "negation_mismatch"
+    assert "invented" in r.flags[0].detail
+
+
+def test_grounding_negation_targeted_flip_flags():
+    # (C) the cited segment NEGATES a finding the claim asserts POSITIVELY.
+    t = _transcript("Patient denies shortness of breath.")
+    s = _structured(objective=[{"claim": "Reports shortness of breath", "source_spans": ["S1"]}])
+    r = verify_grounding(s, t)
+    assert not r.clean and r.flags[0].reason == "negation_mismatch"
+    assert "positively" in r.flags[0].detail
+
+
+def test_grounding_non_prefix_not_in_negation_lexicon():
+    # (D) the curated lexicon must not register the bare "non-" prefix.
+    from alfred.scribe.grounding import _negation_set
+    assert _negation_set("non-productive cough") == set()
+    assert _negation_set("nonspecific changes") == set()
+    # but real negations still register
+    assert "denies" in _negation_set("patient denies fever")
+    assert "no" in _negation_set("no ear pain")
+
+
 def test_grounding_catches_ungrounded_span_S99():
     t = _transcript("Patient reports chest pain.")
     s = _structured(subjective=[{"claim": "Chest pain", "source_spans": ["S99"]}])
