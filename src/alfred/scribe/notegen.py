@@ -167,11 +167,17 @@ before or after it. It MUST be valid JSON with EXACTLY this shape:
    note renders it as "Not addressed" for you. Do NOT put a "Not addressed" claim
    object in the list, and do NOT fill an empty section with anything.
 
-6. NO INVENTED IMPRESSION — set "assessment_reasoning_stated" to true ONLY if the
-   clinician actually VERBALIZED their clinical reasoning or impression. If they
-   gave a plan but never said why, or deliberately declined to diagnose ("I'm not
-   going to commit to a diagnosis yet"), set it false AND leave "assessment"
-   empty ([]). NEVER fabricate a diagnosis or the reasoning behind one.
+6. IMPRESSION vs REASONING — put a clinical impression/diagnosis in "assessment"
+   ONLY if the clinician actually STATED one (extract it as an atomic claim like
+   any other; never invent one). SEPARATELY, set "assessment_reasoning_stated" to
+   true ONLY if the clinician VERBALIZED the clinical REASONING — the WHY, the
+   "because" — behind the assessment. A stated conclusion is NOT reasoning: a bare
+   impression with no stated why ("This is a viral URI", with no "because ...")
+   keeps its claim in "assessment" but sets "assessment_reasoning_stated" FALSE
+   (so the note's completeness nudge fires). If the clinician deliberately
+   declined to diagnose ("I'm not going to commit to a diagnosis yet") or stated
+   no impression at all, leave "assessment" empty ([]) and set the flag false.
+   Default false. NEVER fabricate a diagnosis or the reasoning behind one.
 
 DO NOT (each WRONG below is a real failure the safety check may or may not catch —
 so YOU must prevent it):
