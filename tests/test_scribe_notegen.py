@@ -99,7 +99,7 @@ def test_frozen_contract_carries_atomic_claim_requirement():
     import alfred.scribe.notegen as ng
     src = open(ng.__file__, encoding="utf-8").read()
     assert "EXACTLY ONE clinical finding" in src        # the contract line
-    assert "atomic" in ng.SYSTEM_PROMPT_PLACEHOLDER.lower()  # the prompt instructs it
+    assert "atomic" in ng.SYSTEM_PROMPT.lower()  # the prompt instructs it
 
 
 # ---------------------------------------------------------------------------
